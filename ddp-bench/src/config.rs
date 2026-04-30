@@ -9,8 +9,6 @@ use flodl::distributed::{ApplyPolicy, AverageBackend};
 pub enum DdpMode {
     /// Single GPU, no DDP.
     Solo(usize),
-    /// Synchronous El Che via `Trainer::setup_with()` (graph-based).
-    Sync,
     /// Thread-per-GPU via `Trainer::builder()`.
     Builder {
         policy: ApplyPolicy,
@@ -19,10 +17,9 @@ pub enum DdpMode {
 }
 
 impl DdpMode {
-    /// Parse a mode string like "solo-0", "sync", "nccl-cadence", "cpu-async".
+    /// Parse a mode string like "solo-0", "nccl-sync", "nccl-cadence", "cpu-async".
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "sync" => Some(DdpMode::Sync),
             "nccl-sync" => Some(DdpMode::Builder {
                 policy: ApplyPolicy::Sync,
                 backend: AverageBackend::Nccl,
@@ -58,7 +55,6 @@ impl DdpMode {
             "solo-0",
             "solo-1",
             "solo-2",
-            "sync",
             "nccl-sync",
             "nccl-cadence",
             "nccl-async",
@@ -78,7 +74,6 @@ impl fmt::Display for DdpMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DdpMode::Solo(idx) => write!(f, "solo-{idx}"),
-            DdpMode::Sync => write!(f, "sync"),
             DdpMode::Builder { policy, backend } => {
                 let b = match backend {
                     AverageBackend::Nccl => "nccl",
