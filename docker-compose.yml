@@ -38,6 +38,11 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # NCCL falls back to SHM transport when GPUs lack peer-to-peer (no NVLink,
+    # separate PCIe slots — the consumer-rig case). 3-GPU heterogeneous DDP on
+    # any non-trivial model exhausts Docker's default 64 MB /dev/shm. 2 GB is
+    # generous headroom for ResNet-class workspaces.
+    shm_size: 2gb
     environment:
       - FLODL_VERBOSITY
     deploy:
@@ -62,6 +67,9 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # See `cuda` service: NCCL SHM transport on multi-GPU heterogeneous setups
+    # exhausts the 64 MB Docker default /dev/shm.
+    shm_size: 2gb
     environment:
       - FLODL_VERBOSITY
     deploy:
