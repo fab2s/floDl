@@ -66,6 +66,9 @@ schema:
       type: string
       description: GPU selection. Comma-separated physical indices ("0,1") or "all". Sets CUDA_VISIBLE_DEVICES before libtorch init.
       default: all
+    partition-ratios:
+      type: string
+      description: Static per-rank partition ratios, e.g. "0.55,0.225,0.225". Honored only in nccl-sync and cpu-sync modes (Cadence/Async use progressive dispatch driven by ElChe).
     report:
       type: path
       description: Analyze saved runs and write a markdown report (skips training). Use "-" for stdout.

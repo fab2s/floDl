@@ -87,6 +87,15 @@ struct Cli {
     #[option(default = "all")]
     gpus: Option<String>,
 
+    /// Static per-rank partition ratios, e.g. "0.55,0.225,0.225".
+    /// Values must sum to ~1.0 and the count must match the visible GPU count.
+    ///
+    /// Currently honored in nccl-sync and cpu-sync modes only (the framework's
+    /// progressive dispatch path used by Cadence/Async modes does not consult
+    /// these). Solo modes ignore this flag.
+    #[option]
+    partition_ratios: Option<String>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -97,6 +106,39 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Parse `--partition-ratios "0.55,0.225,0.225"` into a Vec<f64>.
+///
+/// Sum-to-1 and length-vs-world-size validation lives in the framework
+/// (the orchestrator checks before dispatch); we only enforce that the
+/// string is non-empty, comma-separated, and parses as floats.
+fn parse_partition_ratios(spec: &str) -> flodl::tensor::Result<Vec<f64>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(flodl::tensor::TensorError::new(
+            "invalid --partition-ratios: empty value",
+        ));
+    }
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let mut out = Vec::with_capacity(parts.len());
+    for s in &parts {
+        if s.is_empty() {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "invalid --partition-ratios value '{spec}': empty entry in list",
+            )));
+        }
+        let v: f64 = s.parse().map_err(|_| flodl::tensor::TensorError::new(&format!(
+            "invalid --partition-ratios entry '{s}' (expected float)",
+        )))?;
+        if !v.is_finite() || v < 0.0 {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "invalid --partition-ratios entry '{s}' (must be non-negative finite)",
+            )));
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// Resolve `--gpus` to a `CUDA_VISIBLE_DEVICES` value and set it before
@@ -136,6 +178,11 @@ fn run() -> flodl::tensor::Result<()> {
     if let Some(spec) = cli.gpus.as_deref() {
         apply_gpu_selection(spec)?;
     }
+
+    let partition_ratios = match cli.partition_ratios.as_deref() {
+        None => None,
+        Some(spec) => Some(parse_partition_ratios(spec)?),
+    };
 
     // Map parsed fields to the variable names the rest of this function
     // already uses. Thin bridge keeps the business logic bit-for-bit
@@ -362,6 +409,7 @@ fn run() -> flodl::tensor::Result<()> {
                 output_dir: output.clone(),
                 data_dir: data_dir.clone(),
                 monitor_port,
+                partition_ratios: partition_ratios.clone(),
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

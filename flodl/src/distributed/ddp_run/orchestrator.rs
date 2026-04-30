@@ -1182,6 +1182,24 @@ where
         self
     }
 
+    /// Set explicit per-rank partition ratios, e.g. `[0.55, 0.225, 0.225]`
+    /// for a fast rank plus two slower ranks.
+    ///
+    /// **Static fixed splits — does not auto-rebalance.** When set, the
+    /// coordinator dispatches each epoch's batches in proportion to these
+    /// ratios and skips ElChe's throughput-based rebalancer. Length must
+    /// match the auto-detected `world_size` and values must sum to ~1.0.
+    ///
+    /// **Currently honored in `Sync` policy only.** The `Cadence` and
+    /// `Async` policies use progressive dispatch driven by ElChe; they
+    /// do not consult `partition_ratios`. For dynamic heterogeneous
+    /// scheduling under those policies, ElChe's auto-calibration is
+    /// the intended path (see `speed_hint` for an initial seed).
+    pub fn partition_ratios(mut self, ratios: &[f64]) -> Self {
+        self.config = self.config.with_partition_ratios(ratios);
+        self
+    }
+
     /// Set the maximum overshoot past the planned sync point.
     ///
     /// Controls how far a fast GPU can stream past its planned batch count

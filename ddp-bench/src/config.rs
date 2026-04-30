@@ -110,4 +110,9 @@ pub struct RunConfig {
     pub output_dir: String,
     pub data_dir: std::path::PathBuf,
     pub monitor_port: Option<u16>,
+    /// Explicit per-rank partition ratios for heterogeneous DDP. When set,
+    /// passed to `DdpBuilder::partition_ratios` to disable the uniform
+    /// default and dispatch batches in proportion. Length must match the
+    /// visible GPU count and values must sum to ~1.0.
+    pub partition_ratios: Option<Vec<f64>>,
 }

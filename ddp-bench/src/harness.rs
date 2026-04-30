@@ -518,6 +518,13 @@ fn run_unified(
     .backend(backend)
     .timeline(Arc::clone(timeline));
 
+    // Heterogeneous topology: explicit per-rank shares disable the uniform
+    // default. Without this, the fast GPU idles waiting for the slow ones at
+    // every sync barrier (the publication-arc anti-pattern).
+    if let Some(ratios) = &config.partition_ratios {
+        builder = builder.partition_ratios(ratios);
+    }
+
     if let Some(sf) = sched_factory {
         let bpe = batches_per_epoch;
         builder = builder.scheduler(move |world_size| {
