@@ -80,6 +80,13 @@ struct Cli {
     #[option(default = "runs/report.md")]
     report: Option<String>,
 
+    /// GPU selection: comma-separated physical indices ("0,1", "1,2") or "all".
+    /// Sets CUDA_VISIBLE_DEVICES before libtorch init; selected GPUs are
+    /// renumbered 0..N for the rest of the run (so `solo-N` picks among the
+    /// survivors, not the original physical indices).
+    #[option(default = "all")]
+    gpus: Option<String>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -92,8 +99,43 @@ fn main() {
     }
 }
 
+/// Resolve `--gpus` to a `CUDA_VISIBLE_DEVICES` value and set it before
+/// libtorch sees any device. `"all"` is a no-op (lets the host env or
+/// physical hardware decide).
+fn apply_gpu_selection(spec: &str) -> flodl::tensor::Result<()> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "all" {
+        return Ok(());
+    }
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    if parts.iter().any(|s| s.is_empty()) {
+        return Err(flodl::tensor::TensorError::new(&format!(
+            "invalid --gpus value '{spec}': empty index in list",
+        )));
+    }
+    for s in &parts {
+        s.parse::<u32>().map_err(|_| flodl::tensor::TensorError::new(&format!(
+            "invalid --gpus index '{s}' (expected non-negative integer)",
+        )))?;
+    }
+    let canonical = parts.join(",");
+    eprintln!("ddp-bench: --gpus {spec} -> CUDA_VISIBLE_DEVICES={canonical}");
+    // SAFETY: we are still in `main`, no threads spawned, no libtorch
+    // touched yet. Setting CUDA_VISIBLE_DEVICES from a single-threaded
+    // context before any FFI call into libtorch is safe.
+    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", &canonical); }
+    Ok(())
+}
+
 fn run() -> flodl::tensor::Result<()> {
     let cli: Cli = parse_or_schema();
+
+    // GPU selection MUST be applied before any libtorch / CUDA init
+    // (cuda_device_count() at line ~260 is the first such call). Once
+    // libtorch latches onto a device list, CUDA_VISIBLE_DEVICES is ignored.
+    if let Some(spec) = cli.gpus.as_deref() {
+        apply_gpu_selection(spec)?;
+    }
 
     // Map parsed fields to the variable names the rest of this function
     // already uses. Thin bridge keeps the business logic bit-for-bit
@@ -286,6 +328,14 @@ fn run() -> flodl::tensor::Result<()> {
             // Skip multi-GPU modes if only 1 GPU
             if mode.requires_multi_gpu() && gpu_count < 2 {
                 eprintln!("  skipping {} (requires 2+ GPUs, have {})", mode, gpu_count);
+                continue;
+            }
+            // Skip solo-N when GPU index N is out of range (e.g. solo-2
+            // on a 2-GPU rig). Renumbering via --gpus also folds in here.
+            if let DdpMode::Solo(idx) = mode
+                && *idx >= gpu_count
+            {
+                eprintln!("  skipping {} (GPU index {} not available, have {})", mode, idx, gpu_count);
                 continue;
             }
 

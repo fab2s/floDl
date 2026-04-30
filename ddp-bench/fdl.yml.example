@@ -17,7 +17,7 @@ schema:
       type: string
       description: Run a specific DDP mode (or "all" for every mode)
       default: solo-0
-      choices: [solo-0, solo-1, nccl-sync, nccl-cadence, nccl-async, cpu-sync, cpu-cadence, cpu-async, all]
+      choices: [solo-0, solo-1, solo-2, nccl-sync, nccl-cadence, nccl-async, cpu-sync, cpu-cadence, cpu-async, all]
     epochs:
       type: int
       description: Override epoch count (default comes from training.epochs)
@@ -62,6 +62,10 @@ schema:
     list:
       type: bool
       description: Show available models and modes, then exit
+    gpus:
+      type: string
+      description: GPU selection. Comma-separated physical indices ("0,1") or "all". Sets CUDA_VISIBLE_DEVICES before libtorch init.
+      default: all
     report:
       type: path
       description: Analyze saved runs and write a markdown report (skips training). Use "-" for stdout.
@@ -82,9 +86,9 @@ output:
 
 commands:
   quick:
-    description: Fast smoke test (linear, 1 epoch)
+    description: Fast smoke test (logistic, 1 epoch)
     training: { epochs: 1 }
-    options: { model: linear, mode: solo-0, batches: 100 }
+    options: { model: logistic, mode: solo-0, batches: 100 }
 
   full-sweep:
     description: All models, all DDP modes
@@ -97,6 +101,10 @@ commands:
   solo-1:
     description: Solo baseline on slow GPU (all models)
     options: { model: all, mode: solo-1 }
+
+  solo-2:
+    description: Solo baseline on second slow GPU (all models, 3-GPU rigs)
+    options: { model: all, mode: solo-2 }
 
   nccl-async:
     description: NCCL async for all models

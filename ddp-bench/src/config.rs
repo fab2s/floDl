@@ -57,6 +57,7 @@ impl DdpMode {
         &[
             "solo-0",
             "solo-1",
+            "solo-2",
             "sync",
             "nccl-sync",
             "nccl-cadence",
