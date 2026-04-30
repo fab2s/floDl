@@ -157,6 +157,25 @@ pub struct RunAnalysis {
     pub epoch_overlap_ms: f64,
     /// Sync intervals: time between consecutive SyncEnd events (ms).
     pub sync_intervals: Vec<f64>,
+    /// Training-only wall time (ms). Set for `run_baseline_solo` runs from
+    /// the `# train_only:` log footer; lets the speedup table compare DDP
+    /// against solo's training-only wall time, excluding solo's per-epoch
+    /// eval cost (DDP only pays one final eval).
+    pub train_only_ms: Option<u64>,
+    /// Per-rank averages across the run (from `per-rank:` log lines).
+    /// Empty for solo and single-rank runs.
+    pub per_rank_avg: Vec<PerRankAvg>,
+}
+
+/// Per-rank stats averaged across the run.
+#[derive(Debug, Clone)]
+pub struct PerRankAvg {
+    pub rank: usize,
+    pub device: u8,
+    /// Mean batch_share across observed epochs (0..1).
+    pub batch_share: f64,
+    /// Mean throughput in samples/ms.
+    pub throughput: f64,
 }
 
 /// Total idle time for one GPU broken down by cause.
@@ -473,6 +492,8 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
         vram_stats,
         epoch_overlap_ms,
         sync_intervals,
+        train_only_ms: None,
+        per_rank_avg: Vec::new(),
     }
 }
 
@@ -500,6 +521,8 @@ pub fn empty_analysis(model: &str, mode: &str) -> RunAnalysis {
         vram_stats: Vec::new(),
         epoch_overlap_ms: 0.0,
         sync_intervals: Vec::new(),
+        train_only_ms: None,
+        per_rank_avg: Vec::new(),
     }
 }
 
@@ -567,6 +590,11 @@ pub struct TrainingLog {
     pub final_eval: Option<f64>,
     /// Total wall time from `# total:` footer (ms).
     pub total_ms: Option<f64>,
+    /// Training-only wall time from `# train_only:` summary (ms). Set by
+    /// `run_baseline_solo` so the report can compare DDP wall time against
+    /// solo's training-only time, excluding the per-epoch eval cost solo
+    /// pays but DDP only pays once at the end.
+    pub train_only_ms: Option<f64>,
     /// GPU header lines (e.g. `gpu0: NVIDIA GeForce RTX 5060 Ti (15GB, sm_120)`).
     pub gpu_info: Vec<String>,
 }
@@ -576,7 +604,24 @@ pub struct LogEpoch {
     pub epoch: usize,
     pub loss: f64,
     pub eval: Option<f64>,
+    /// Training-only wall time for the epoch (ms). Parsed from `train=Xs`
+    /// (new format) or `time=Xs` (legacy, where the value was already
+    /// training-only).
     pub time_ms: f64,
+    /// Per-rank breakdown from the `per-rank:` line that follows multi-rank
+    /// epoch lines. Empty for solo and single-rank runs.
+    pub per_rank: Vec<RankSnapshot>,
+}
+
+/// Per-rank stats for one epoch.
+#[derive(Debug, Clone)]
+pub struct RankSnapshot {
+    pub rank: usize,
+    pub device: u8,
+    /// Fraction of batches this rank consumed (0..1, sums to ~1 across ranks).
+    pub batch_share: f64,
+    /// Throughput in samples/ms.
+    pub throughput: f64,
 }
 
 /// Parse a `training.log` file.
@@ -596,6 +641,7 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
     let mut epochs = Vec::new();
     let mut final_eval = None;
     let mut total_ms = None;
+    let mut train_only_ms = None;
     let mut gpu_info = Vec::new();
 
     for line in data.lines() {
@@ -609,7 +655,7 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
             continue;
         }
 
-        // epoch N: loss=X.XXXXXX[, eval=X.XXXX][, train_acc=X.XXXX], time=X.Xs
+        // epoch N: loss=X.XXXXXX[, eval=X.XXXX][, train_acc=X.XXXX][, train=X.Xs|time=X.Xs][, eval_time=X.Xs]
         if let Some(rest) = line.strip_prefix("epoch ") {
             if let Some((epoch_str, kv_part)) = rest.split_once(": ") {
                 let epoch: usize = epoch_str.parse().unwrap_or(0);
@@ -624,21 +670,41 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
                         .or_else(|| kv.strip_prefix("metric="))
                     {
                         eval = Some(v.parse().unwrap_or(0.0));
-                    } else if let Some(v) = kv.strip_prefix("time=") {
+                    } else if let Some(v) = kv.strip_prefix("train=")
+                        .or_else(|| kv.strip_prefix("time="))
+                    {
+                        // `train=` is the new explicit form (training-only);
+                        // `time=` is the legacy column (also training-only,
+                        // since epoch_ms was always measured before eval).
                         if let Some(ms) = v.strip_suffix("ms") {
                             time_ms = ms.parse::<f64>().unwrap_or(0.0);
                         } else if let Some(secs) = v.strip_suffix('s') {
                             time_ms = secs.parse::<f64>().unwrap_or(0.0) * 1000.0;
                         }
                     }
+                    // eval_time is parsed but not stored on LogEpoch yet; the
+                    // total is in the `# train_only: Xs (eval: Ys)` summary.
                 }
 
-                epochs.push(LogEpoch { epoch, loss, eval, time_ms });
+                epochs.push(LogEpoch { epoch, loss, eval, time_ms, per_rank: Vec::new() });
+            }
+        }
+        // per-rank: rank0[cuda0,share=0.3447,tput=56.88] rank1[cuda1,share=...]
+        else if let Some(rest) = line.strip_prefix("per-rank:") {
+            let snapshots = parse_per_rank_line(rest);
+            if let Some(last) = epochs.last_mut() {
+                last.per_rank = snapshots;
             }
         }
         // final eval=X.XXXX
         else if let Some(v) = line.strip_prefix("final eval=") {
             final_eval = Some(v.parse().unwrap_or(0.0));
+        }
+        // # train_only: 13.6s (eval: 0.6s)
+        else if let Some(rest) = line.strip_prefix("# train_only: ")
+            && let Some(secs_str) = rest.split('s').next()
+        {
+            train_only_ms = secs_str.trim().parse::<f64>().ok().map(|s| s * 1000.0);
         }
         // # total: 12.7s (0m 13s)
         else if let Some(rest) = line.strip_prefix("# total: ")
@@ -648,7 +714,39 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
         }
     }
 
-    Ok(TrainingLog { epochs, final_eval, total_ms, gpu_info })
+    Ok(TrainingLog { epochs, final_eval, total_ms, train_only_ms, gpu_info })
+}
+
+/// Parse the body of a `per-rank:` line into [`RankSnapshot`]s.
+///
+/// Format (from `harness::run_unified`):
+/// ` rank0[cuda0,share=0.3447,tput=56.88] rank1[cuda1,share=0.3533,tput=57.35]`
+fn parse_per_rank_line(rest: &str) -> Vec<RankSnapshot> {
+    let mut out = Vec::new();
+    for token in rest.split_whitespace() {
+        // token: rankN[cudaD,share=X,tput=Y]
+        let Some(open) = token.find('[') else { continue };
+        let Some(close_idx) = token.find(']') else { continue };
+        let rank_str = &token[..open];
+        let body = &token[open + 1..close_idx];
+        let Some(rank_num) = rank_str.strip_prefix("rank") else { continue };
+        let Ok(rank) = rank_num.parse::<usize>() else { continue };
+
+        let mut device: u8 = 0;
+        let mut batch_share = 0.0;
+        let mut throughput = 0.0;
+        for kv in body.split(',') {
+            if let Some(v) = kv.strip_prefix("cuda") {
+                device = v.parse().unwrap_or(0);
+            } else if let Some(v) = kv.strip_prefix("share=") {
+                batch_share = v.parse().unwrap_or(0.0);
+            } else if let Some(v) = kv.strip_prefix("tput=") {
+                throughput = v.parse().unwrap_or(0.0);
+            }
+        }
+        out.push(RankSnapshot { rank, device, batch_share, throughput });
+    }
+    out
 }
 
 /// Apply training log data to a RunAnalysis, overriding timeline-derived
@@ -680,6 +778,33 @@ pub fn apply_training_log(analysis: &mut RunAnalysis, log: &TrainingLog) {
         && let Some(ms) = log.total_ms
     {
         analysis.total_ms = ms as u64;
+    }
+
+    // Training-only time (set by run_baseline_solo via `# train_only:` line).
+    analysis.train_only_ms = log.train_only_ms.map(|ms| ms as u64);
+
+    // Per-rank averages: collect snapshots across epochs, average per rank.
+    if log.epochs.iter().any(|e| !e.per_rank.is_empty()) {
+        use std::collections::BTreeMap;
+        let mut acc: BTreeMap<usize, (u8, f64, f64, usize)> = BTreeMap::new();
+        for ep in &log.epochs {
+            for snap in &ep.per_rank {
+                let entry = acc.entry(snap.rank).or_insert((snap.device, 0.0, 0.0, 0));
+                entry.0 = snap.device;
+                entry.1 += snap.batch_share;
+                entry.2 += snap.throughput;
+                entry.3 += 1;
+            }
+        }
+        analysis.per_rank_avg = acc.into_iter().map(|(rank, (device, share_sum, tput_sum, n))| {
+            let n_f = n as f64;
+            PerRankAvg {
+                rank,
+                device,
+                batch_share: if n > 0 { share_sum / n_f } else { 0.0 },
+                throughput: if n > 0 { tput_sum / n_f } else { 0.0 },
+            }
+        }).collect();
     }
 }
 

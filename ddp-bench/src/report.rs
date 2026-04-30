@@ -225,6 +225,17 @@ surpasses solo convergence while completing faster -- the whole point of multi-G
         write_speedup_table(&mut md, groups);
     }
 
+    // Per-rank schedule (heterogeneous-DDP key insight: fast rank gets
+    // proportionally more work via batch_share, throughput in samples/ms
+    // shows the raw GPU speed gap that justifies the asymmetry).
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| !r.per_rank_avg.is_empty())) {
+        md.push_str("## Per-Rank Schedule\n\n");
+        md.push_str("`share` is fraction of batches consumed by each rank (sums to ~1). \
+`tput` is samples/ms. Heterogeneous topology shows up here: in cadence/async modes the \
+fast GPU consumes a proportionally larger share to keep pace with the slow ones.\n\n");
+        write_per_rank_table(&mut md, groups);
+    }
+
     // VRAM overhead
     if groups.iter().any(|(_, runs)| runs.iter().any(|r| !r.vram_stats.is_empty() && r.vram_stats[0].peak_allocated > 0)) {
         md.push_str("## VRAM Usage\n\n");
@@ -662,7 +673,13 @@ fn write_speedup_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
 
     for (model, runs) in groups {
         let solo0 = runs.iter().find(|r| r.mode == "solo-0");
-        let solo0_ms = solo0.map(|r| r.total_ms as f64).unwrap_or(0.0);
+        // Solo's `# train_only:` summary excludes per-epoch eval cost that
+        // DDP modes don't pay. Use it when present so the speedup ratio is
+        // training-time vs training-time, not a mixed wall-time comparison.
+        let solo0_ms = solo0
+            .and_then(|r| r.train_only_ms.map(|v| v as f64))
+            .or_else(|| solo0.map(|r| r.total_ms as f64))
+            .unwrap_or(0.0);
         let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
 
         let _ = write!(md, "| {model} |");
@@ -681,6 +698,13 @@ fn write_speedup_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         md.push('\n');
     }
     md.push('\n');
+
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.mode == "solo-0" && r.train_only_ms.is_some())) {
+        md.push_str("\nSpeedup denominator uses solo-0's `# train_only:` time when reported \
+(paper-baseline models), so the ratio compares DDP wall time against solo's \
+training-only wall time. Solo's per-epoch eval is excluded from this comparison \
+because DDP runs only eval once at the end.\n\n");
+    }
 }
 
 /// VRAM usage table per mode per GPU.
@@ -821,6 +845,24 @@ fn write_elche_details(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
 }
 
 /// Streaming epoch overlap table.
+fn write_per_rank_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    md.push_str("| Model | Mode | Rank | Device | Share | Tput (samp/ms) |\n");
+    md.push_str("|-------|------|------|--------|-------|----------------|\n");
+    for (model, runs) in groups {
+        for r in runs {
+            if r.per_rank_avg.is_empty() { continue; }
+            for snap in &r.per_rank_avg {
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} | cuda:{} | {:.4} | {:.1} |",
+                    model, r.mode, snap.rank, snap.device, snap.batch_share, snap.throughput,
+                );
+            }
+        }
+    }
+    md.push('\n');
+}
+
 fn write_epoch_overlap(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
     md.push_str("| Model | Mode | Overlap (s) | % of Total |\n");
     md.push_str("|-------|------|------------|------------|\n");

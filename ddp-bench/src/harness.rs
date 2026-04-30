@@ -543,6 +543,27 @@ fn run_unified(
         line.push_str(&format!(", time={:.1}s", metrics.epoch_ms / 1000.0));
         eprintln!("    {line}");
         log_lines.push(line);
+
+        // Per-rank breakdown line for multi-rank runs. Captures heterogeneous
+        // proportional scheduling (batch_share) and raw GPU speed (throughput
+        // in samples/ms). The publication arc reads this to show that ElChe
+        // gives the fast rank a larger share of work. Per-rank loss is omitted:
+        // EpochMetrics aggregates it into avg_loss; per_rank only carries
+        // user-recorded scalars, none of which are loss by default.
+        if metrics.device_indices.len() >= 2 {
+            let mut rank_line = String::from("per-rank:");
+            for rank in 0..metrics.device_indices.len() {
+                let dev = metrics.device_indices[rank];
+                let share = metrics.per_rank_batch_share.get(rank).copied().unwrap_or(0.0);
+                let tput = metrics.per_rank_throughput.get(rank).copied().unwrap_or(0.0);
+                rank_line.push_str(&format!(
+                    " rank{rank}[cuda{dev},share={share:.4},tput={tput:.2}]"
+                ));
+            }
+            eprintln!("    {rank_line}");
+            log_lines.push(rank_line);
+        }
+
         monitor.log(
             metrics.epoch,
             Duration::from_millis(metrics.epoch_ms as u64),
