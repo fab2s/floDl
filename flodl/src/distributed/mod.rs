@@ -23,7 +23,7 @@ pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use ddp::{Ddp, DdpConfig, HasGraph, Trainer};
-pub use el_che::ElChe;
+pub use el_che::{ElChe, Phase};
 pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker};
 // Deprecated aliases
 #[allow(deprecated)]

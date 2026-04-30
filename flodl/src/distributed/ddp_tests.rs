@@ -973,6 +973,96 @@
         assert!(c.batches(0) > c.batches(1), "fast device should get more batches");
     }
 
+    // -- PR 1: Phase machine + tie-band anchor election -----------------------
+
+    use crate::distributed::Phase;
+
+    #[test]
+    fn test_phase_starts_at_probe() {
+        let c = ElChe::new(3, 10);
+        assert_eq!(c.phase(), Phase::Probe);
+        assert_eq!(c.anchor_rank(), None);
+    }
+
+    #[test]
+    fn test_phase_advances_on_first_calibration() {
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 380.0, 395.0], &bc, 10.0);
+        assert_eq!(c.phase(), Phase::Warmup);
+        assert!(c.anchor_rank().is_some());
+    }
+
+    #[test]
+    fn test_phase_warmup_to_stable_at_5() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        for _ in 0..5 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        }
+        assert_eq!(c.phase(), Phase::Stable);
+    }
+
+    #[test]
+    fn test_phase_stable_to_mature_at_20() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        for _ in 0..20 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        }
+        assert_eq!(c.phase(), Phase::Mature);
+    }
+
+    #[test]
+    fn test_anchor_stable_under_tied_slow_ranks() {
+        // The 3-GPU bug case: rank 0 fast (100ms), ranks 1 and 2 within 5%
+        // of each other (380 vs 395). Old argmax flapped between 1 and 2 each
+        // cycle; tie-band + sticky should pin one and keep it.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 380.0, 395.0], &bc, 10.0);
+        let first = c.anchor_rank().expect("anchor elected");
+
+        // Subsequent cycles with the slowest swapping inside the tie band.
+        for (a, b) in &[(390.0, 380.0), (385.0, 388.0), (392.0, 386.0)] {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[100.0, *a, *b], &bc, 10.0);
+            assert_eq!(
+                c.anchor_rank(), Some(first),
+                "anchor must stay sticky across tied slow-rank fluctuations",
+            );
+        }
+    }
+
+    #[test]
+    fn test_anchor_switches_when_clear_winner_emerges() {
+        // Outside the tie band (>5% margin), anchor must follow the real slow.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 400.0, 200.0], &bc, 10.0);
+        assert_eq!(c.anchor_rank(), Some(1));
+
+        // Rank 2 becomes clearly slower (>5% beyond rank 1).
+        // EMA dampens the change; push hard enough to clear the band.
+        for _ in 0..3 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[100.0, 200.0, 600.0], &bc, 10.0);
+        }
+        assert_eq!(c.anchor_rank(), Some(2), "real slowdown must be tracked");
+    }
+
+    #[test]
+    fn test_anchor_election_lowest_rank_tiebreak() {
+        // No prior anchor (Probe phase first call): with all ranks tied, the
+        // deterministic tiebreak picks the lowest-indexed candidate.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 100.0, 100.0], &bc, 10.0);
+        assert_eq!(c.anchor_rank(), Some(0));
+    }
+
     // -- DdpConfig tests ------------------------------------------------------
 
     #[test]

@@ -32,6 +32,29 @@
 ///     cadence.report_timing(&wall_ms, cadence.batch_counts(), sync_ms);
 /// }
 /// ```
+/// Tie band for anchor election: a candidate within `(1 - TIE_BAND)` of the
+/// max ms is considered tied with the current anchor. Prevents argmax flip
+/// between similar-speed slow ranks (thermal noise, OS jitter).
+const TIE_BAND: f64 = 0.05;
+
+/// Lifecycle phase of the cadence balancer. Each phase tightens or loosens
+/// the rules around anchor selection, EMA dampening, and failure handling.
+/// PR 1 introduces the phases and tracks transitions; per-phase parameter
+/// tightening (locked Warmup, stricter Mature thresholds) lands in PR 2-3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Initial fixed-size measurement period before any averaging-driven
+    /// calibration. Same code path as the legacy "uncalibrated" branch;
+    /// exits to `Warmup` on the first successful `report_timing` call.
+    Probe,
+    /// First few calibrations after Probe — anchor should change rarely.
+    Warmup,
+    /// Normal operation with hysteresis on anchor changes.
+    Stable,
+    /// Long-running steady-state with full failure-state machinery.
+    Mature,
+}
+
 pub struct ElChe {
     world_size: usize,
     /// Anchor batch count (slow device processes this many per step).
@@ -52,6 +75,16 @@ pub struct ElChe {
     /// When set, workers that exceed this lead are throttled until the
     /// slowest catches up. `Some(0)` = strict lockstep (sync DDP behavior).
     max_batch_diff: Option<usize>,
+    /// Current lifecycle phase. Starts at `Probe`, progresses on calibration.
+    phase: Phase,
+    /// Currently elected slow-anchor rank (None until first calibration).
+    /// Replaces the implicit `argmax(ms_per_batch)` pick: stickiness +
+    /// deterministic tiebreak prevents flap when two ranks are within
+    /// `TIE_BAND` of each other in measured speed.
+    anchor_rank: Option<usize>,
+    /// Number of successful `report_timing` calls (each one a calibration).
+    /// Drives phase transitions Warmup→Stable→Mature.
+    calibration_count: u64,
 }
 
 impl ElChe {
@@ -76,7 +109,55 @@ impl ElChe {
             min_anchor: anchor,
             max_anchor: 200,
             max_batch_diff: None,
+            phase: Phase::Probe,
+            anchor_rank: None,
+            calibration_count: 0,
         }
+    }
+
+    /// Current lifecycle phase.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Currently elected slow-anchor rank (None until first calibration).
+    pub fn anchor_rank(&self) -> Option<usize> {
+        self.anchor_rank
+    }
+
+    /// Elect the slow-anchor rank from current `ms_per_batch`, with tie-band
+    /// hysteresis and deterministic tiebreak.
+    ///
+    /// A rank is a candidate if its ms is within `(1 - TIE_BAND)` of the max.
+    /// If the current anchor is among the candidates, it is kept (sticky).
+    /// Otherwise, the lowest-indexed candidate wins. Returns `None` when no
+    /// rank has a positive measurement yet.
+    fn elect_anchor(&self) -> Option<usize> {
+        let max_ms = self.ms_per_batch.iter().copied().fold(0.0_f64, f64::max);
+        if max_ms <= 0.0 {
+            return None;
+        }
+        let threshold = max_ms * (1.0 - TIE_BAND);
+        let candidates: Vec<usize> = self
+            .ms_per_batch
+            .iter()
+            .enumerate()
+            .filter(|&(_, &m)| m >= threshold)
+            .map(|(r, _)| r)
+            .collect();
+        if let Some(c) = self.anchor_rank {
+            if candidates.contains(&c) {
+                return Some(c);
+            }
+        }
+        candidates.into_iter().min()
+    }
+
+    /// `ms_per_batch` of the elected anchor (or 0.0 if not yet elected).
+    fn slow_ms(&self) -> f64 {
+        self.anchor_rank
+            .and_then(|r| self.ms_per_batch.get(r).copied())
+            .unwrap_or(0.0)
     }
 
     /// Set the target AllReduce overhead as a fraction of compute time.
@@ -187,8 +268,7 @@ impl ElChe {
         if !self.calibrated {
             return 0.0;
         }
-        let slow_ms = self.ms_per_batch.iter().copied().fold(0.0_f64, f64::max);
-        self.anchor as f64 * slow_ms
+        self.anchor as f64 * self.slow_ms()
     }
 
     /// Reduce the anchor by `factor` (e.g. 0.5 = halve).
@@ -203,11 +283,7 @@ impl ElChe {
     pub fn nudge_anchor_down(&mut self, factor: f64) {
         let new = (self.anchor as f64 * factor.clamp(0.1, 1.0)).ceil() as usize;
         self.anchor = new.max(1).min(self.anchor);
-        // Recompute batch counts from the reduced anchor.
-        let slow_ms = self.ms_per_batch
-            .iter()
-            .copied()
-            .fold(0.0_f64, f64::max);
+        let slow_ms = self.slow_ms();
         if slow_ms > 0.0 {
             self.recompute_batch_counts(slow_ms);
         }
@@ -270,15 +346,18 @@ impl ElChe {
             }
         }
 
-        // Find the slowest device (highest ms per batch).
-        let slow_ms = self
-            .ms_per_batch
-            .iter()
-            .copied()
-            .fold(0.0_f64, f64::max);
-
+        // Elect the anchor rank: tie-band hysteresis + sticky preference for
+        // the current anchor + lowest-rank deterministic tiebreak. Replaces
+        // raw `argmax(ms_per_batch)` which flapped when two ranks were within
+        // measurement noise of each other.
+        let elected = match self.elect_anchor() {
+            Some(r) => r,
+            None => return, // no valid timing yet
+        };
+        self.anchor_rank = Some(elected);
+        let slow_ms = self.ms_per_batch[elected];
         if slow_ms <= 0.0 {
-            return; // no valid timing
+            return;
         }
 
         // Auto-tune anchor: increase aggressively if AllReduce overhead
@@ -310,6 +389,29 @@ impl ElChe {
         // Recompute batch counts from (possibly updated) anchor.
         self.recompute_batch_counts(slow_ms);
         self.calibrated = true;
+        self.calibration_count += 1;
+        self.advance_phase();
+    }
+
+    /// Phase transition rules. Probe→Warmup at first calibration; Warmup→Stable
+    /// at 5 calibrations; Stable→Mature at 20. Per-phase parameter tightening
+    /// (locked anchor in Warmup, stricter Mature thresholds) lands in PR 2-3 —
+    /// PR 1 only tracks transitions and logs them.
+    fn advance_phase(&mut self) {
+        let next = match self.phase {
+            Phase::Probe => Phase::Warmup,
+            Phase::Warmup if self.calibration_count >= 5 => Phase::Stable,
+            Phase::Stable if self.calibration_count >= 20 => Phase::Mature,
+            p => p,
+        };
+        if next != self.phase {
+            crate::verbose!(
+                "  ddp: ElChe phase {:?} -> {:?} (calibration #{}, anchor=rank {})",
+                self.phase, next, self.calibration_count,
+                self.anchor_rank.map(|r| r as i64).unwrap_or(-1),
+            );
+            self.phase = next;
+        }
     }
 
     /// Clamp batch counts to a maximum total, preserving proportions.
