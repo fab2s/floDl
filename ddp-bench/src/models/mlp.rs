@@ -30,6 +30,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST ~97-98% acc ([PyTorch tutorial](https://pytorch.org/tutorials/beginner/basics/quickstart_tutorial.html))",
         eval_higher_is_better: true,
         published_eval: Some(0.975),
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

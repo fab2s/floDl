@@ -34,6 +34,7 @@ pub fn def() -> ModelDef {
         reference: "CIFAR-10 91.25% acc, Graph builder ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6)",
         eval_higher_is_better: true,
         published_eval: Some(0.9125),
+        needs_baseline_eval: true,
         defaults: ModelDefaults {
             epochs: 200,
             batches_per_epoch: 0,

@@ -30,6 +30,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST reconstruction, eval=MSE ([PyTorch AE tutorial](https://pytorch.org/tutorials/beginner/introyt/autoencoders_intro.html))",
         eval_higher_is_better: false,
         published_eval: None,
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

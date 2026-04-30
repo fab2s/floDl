@@ -65,6 +65,12 @@ pub struct ModelDef {
     pub published_eval: Option<f64>,
     /// True if higher eval is better (accuracy). False for loss-like metrics.
     pub eval_higher_is_better: bool,
+    /// True when the published baseline is reported as a per-epoch curve
+    /// (loss + accuracy at every epoch). Solo runs of such models go through
+    /// the dedicated `run_baseline_solo` path so we can reproduce the curve
+    /// shape; every other run (multi-GPU, non-baseline solo) flows through
+    /// the unified `Trainer::builder` path with final-only eval.
+    pub needs_baseline_eval: bool,
 }
 
 /// All registered benchmark models.

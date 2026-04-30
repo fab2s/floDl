@@ -47,6 +47,7 @@ pub fn def() -> ModelDef {
         reference: "Shakespeare CE loss ~1.5-2.0, eval=val loss ([nanoGPT](https://github.com/karpathy/nanoGPT), [Vaswani 2017](https://arxiv.org/abs/1706.03762))",
         eval_higher_is_better: false,
         published_eval: None,
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 50,
             batches_per_epoch: 0, // full dataset

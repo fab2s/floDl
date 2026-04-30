@@ -29,6 +29,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST ~92% acc (linear baseline)",
         eval_higher_is_better: true,
         published_eval: Some(0.92),
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

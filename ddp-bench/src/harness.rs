@@ -78,17 +78,19 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     };
 
     let preload_tag = if mode.requires_multi_gpu() { "cpu" } else { "gpu-preload" };
+    let baseline_tag = if model_def.needs_baseline_eval { " [paper-baseline]" } else { "" };
     if real_data {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}) ===",
+            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}){} ===",
             model_def.name, mode_str, config.epochs, dataset.len(), actual_batches,
-            config.batch_size, lr_note,
+            config.batch_size, lr_note, baseline_tag,
         );
         eprintln!("  data: {} samples, mode={preload_tag} ({load_ms}ms)", dataset.len());
     } else {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} batches x {}{}) ===",
+            "\n=== {} / {} ({} epochs, {} batches x {}{}){} ===",
             model_def.name, mode_str, config.epochs, actual_batches, config.batch_size, lr_note,
+            baseline_tag,
         );
         eprintln!("  data: pool={pool_size}, virtual={virtual_len}, mode={preload_tag} ({load_ms}ms)");
     }
@@ -107,7 +109,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     let start = Instant::now();
     let result = match mode {
-        DdpMode::Solo(gpu_idx) => run_solo(
+        DdpMode::Solo(gpu_idx) => run_baseline_solo(
             model_def,
             *gpu_idx,
             dataset,
@@ -269,9 +271,19 @@ fn slice_batch(gpu_data: &[Tensor], start: usize, end: usize, device: Device) ->
 // Solo GPU
 // ---------------------------------------------------------------------------
 
-/// Solo GPU: no DDP, standard training loop.
+/// Solo GPU run for paper-baseline reproduction.
+///
+/// Used for models whose published baseline reports per-epoch loss + accuracy
+/// curves (set `ModelDef::needs_baseline_eval = true`). Runs eval on the test
+/// set after every training epoch and emits `train=` / `eval_time=` columns
+/// in the log so the report can subtract eval cost from solo's wall time
+/// when computing DDP speedup.
+///
+/// All Solo runs currently route here. A follow-up commit will move
+/// non-baseline Solo to the unified `Trainer::builder` path with
+/// final-only eval, matching the multi-GPU shape.
 #[allow(clippy::too_many_arguments)]
-fn run_solo(
+fn run_baseline_solo(
     model_def: &ModelDef,
     gpu_idx: usize,
     dataset: Arc<dyn flodl::data::BatchDataSet>,
@@ -317,6 +329,13 @@ fn run_solo(
             eprintln!("  eval: {tn} test samples");
         }
 
+        // Track training-only and eval-only wall time so the report can
+        // strip eval cost from the speedup denominator. DDP modes pay only
+        // a single final eval; folding solo's per-epoch eval into the
+        // comparison would silently inflate DDP's speedup.
+        let mut total_train_ms = 0.0_f64;
+        let mut total_eval_ms = 0.0_f64;
+
         for epoch in 0..config.epochs {
             timeline.event(flodl::monitor::EventKind::EpochStart { epoch });
             let epoch_start = Instant::now();
@@ -348,7 +367,8 @@ fn run_solo(
                 global_batch += 1;
             }
 
-            let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            let train_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+            total_train_ms += train_ms;
             final_loss = if batch_count > 0 { total_loss / batch_count as f64 } else { 0.0 };
             timeline.event(flodl::monitor::EventKind::EpochEnd {
                 epoch,
@@ -362,6 +382,7 @@ fn run_solo(
             // Use held-out test data when present, otherwise fall back to training data.
             if let Some(eval_fn) = model_def.eval_fn {
                 model.eval();
+                let eval_start = Instant::now();
                 let eval_data = test_gpu_data.as_deref().unwrap_or(&gpu_data);
                 let eval_n = eval_data[0].shape()[0] as usize;
                 let avg = flodl::autograd::no_grad(|| -> Result<f64> {
@@ -377,23 +398,37 @@ fn run_solo(
                     }
                     Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
                 })?;
+                let eval_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
+                total_eval_ms += eval_ms;
                 model.train();
                 let mut line = format!("epoch {epoch}: loss={final_loss:.6}, eval={avg:.4}");
                 line.push_str(&format_scalars(&scalars));
-                line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
+                line.push_str(&format!(
+                    ", train={:.1}s, eval_time={:.1}s",
+                    train_ms / 1000.0, eval_ms / 1000.0,
+                ));
                 eprintln!("    {line}");
                 log_lines.push(line);
             } else {
                 let mut line = format!("epoch {epoch}: loss={final_loss:.6}");
                 line.push_str(&format_scalars(&scalars));
-                line.push_str(&format!(", time={:.1}s", epoch_ms / 1000.0));
+                line.push_str(&format!(", train={:.1}s", train_ms / 1000.0));
                 eprintln!("    {line}");
                 log_lines.push(line);
             }
 
             monitor.log(epoch, epoch_start.elapsed(), &[("loss", final_loss)]);
-            epoch_times.push(epoch_ms);
+            epoch_times.push(train_ms);
         }
+
+        // Summary line consumed by `analyze::parse_training_log`: lets the
+        // speedup table compare DDP wall-time against solo's training-only
+        // wall-time rather than total (which would include eval cost solo
+        // pays per-epoch but DDP only pays once at the end).
+        log_lines.push(format!(
+            "# train_only: {:.1}s (eval: {:.1}s)",
+            total_train_ms / 1000.0, total_eval_ms / 1000.0,
+        ));
     } else {
         // Synthetic pool mode: preload small pool, recycle batches.
         let gpu_pool = preload_gpu_batches(dataset.as_ref(), device, config.batch_size)?;

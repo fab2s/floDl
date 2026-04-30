@@ -37,6 +37,7 @@ pub fn def() -> ModelDef {
         reference: "Shakespeare CE loss ~1.5, eval=val loss ([Karpathy 2015](https://karpathy.github.io/2015/05/21/rnn-effectiveness/))",
         eval_higher_is_better: false,
         published_eval: Some(1.5),
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 50,
             batches_per_epoch: 0, // full dataset

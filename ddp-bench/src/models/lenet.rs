@@ -30,6 +30,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST ~99% acc ([LeCun 1998](http://yann.lecun.com/exdb/publis/pdf/lecun-98.pdf))",
         eval_higher_is_better: true,
         published_eval: Some(0.99),
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset
