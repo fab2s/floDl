@@ -586,15 +586,20 @@ mod tests {
     use crate::distributed::ddp::NCCL_LOCK;
 
     fn require_multi_gpu() -> bool {
-        if !test_device().is_cuda() || cuda_device_count() < 2 {
+        require_n_gpu(2)
+    }
+
+    fn require_n_gpu(n: i32) -> bool {
+        if !test_device().is_cuda() || cuda_device_count() < n {
             return false;
         }
-        // Verify all devices can run compute kernels (e.g., GTX 1060
+        // Verify all required devices can run compute kernels (e.g., GTX 1060
         // sm_61 is unsupported by libtorch cu128 builds).
-        for i in 0..2 {
-            let opts = TensorOptions { dtype: DType::Float32, device: Device::CUDA(i) };
+        for i in 0..n {
+            let dev = Device::CUDA(i as u8);
+            let opts = TensorOptions { dtype: DType::Float32, device: dev };
             if Tensor::zeros(&[1], opts).is_err() {
-                eprintln!("Device CUDA({i}) cannot run compute kernels, skipping multi-GPU test");
+                eprintln!("Device CUDA({i}) cannot run compute kernels, skipping {n}-GPU test");
                 return false;
             }
         }
@@ -930,5 +935,40 @@ mod tests {
         let vb1 = b1.to_f32_vec().unwrap();
         assert!(va1.iter().all(|&v| (v - 2.0).abs() < 1e-5), "a1 should be 2.0");
         assert!(vb1.iter().all(|&v| (v - 150.0).abs() < 1e-5), "b1 should be 150.0");
+    }
+
+    // 3-GPU smoke: heterogeneous topology (e.g. RTX 5060 Ti sm_120 +
+    // 2x GTX 1060 sm_61). Uses NcclComms main-thread init since
+    // ncclCommInitRank from worker threads corrupts CUDA context across
+    // heterogeneous architectures.
+    #[test]
+    #[ignore = "NCCL init needs exclusive GPU; needs 3 GPUs; run with: fdl cuda-test-all"]
+    fn test_nccl_three_gpu_all_reduce_sum() {
+        if !require_n_gpu(3) { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let comms = NcclComms::new(&[
+            Device::CUDA(0), Device::CUDA(1), Device::CUDA(2),
+        ]).unwrap();
+        assert_eq!(comms.size(), 3);
+
+        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
+        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
+        let opts2 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(2) };
+
+        let t0 = Tensor::full(&[64], 1.0, opts0).unwrap();
+        let t1 = Tensor::full(&[64], 2.0, opts1).unwrap();
+        let t2 = Tensor::full(&[64], 3.0, opts2).unwrap();
+
+        comms.all_reduce(&[&t0, &t1, &t2], ReduceOp::Sum).unwrap();
+        cuda_synchronize(0);
+        cuda_synchronize(1);
+        cuda_synchronize(2);
+
+        // Sum: 1 + 2 + 3 = 6 on every device.
+        for (i, t) in [&t0, &t1, &t2].iter().enumerate() {
+            let vals = t.to_f32_vec().unwrap();
+            assert!(vals.iter().all(|&v| (v - 6.0).abs() < 1e-5),
+                "rank {i} should have 6.0 after AllReduce Sum, got {}", vals[0]);
+        }
     }
 }
