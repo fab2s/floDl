@@ -1054,6 +1054,45 @@
     }
 
     #[test]
+    fn test_relax_anchor_up_grows_anchor() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 5.0);
+        let before = c.anchor();
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), before + 1, "anchor should grow by 1 on relax");
+    }
+
+    #[test]
+    fn test_relax_anchor_up_capped_by_max_batch_diff() {
+        // Ratio 1:3 means at anchor=N, batch_counts=[N, 3N], diff=2N.
+        // With max_batch_diff=20, anchor caps at 10 (yielding [10, 30]).
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50)
+            .with_max_batch_diff(20);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[300.0, 900.0], &bc, 5.0); // 1:3 speed ratio
+        // Already at anchor=10, [10,30], diff=20. Next relax would project
+        // anchor=11 → [11, 33], diff=22 > 20 → refuse.
+        let before = c.anchor();
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), before, "relax must refuse when projected diff exceeds cap");
+    }
+
+    #[test]
+    fn test_relax_anchor_up_capped_by_max_anchor() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50)
+            .with_max_anchor(11);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 5.0);
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), 11);
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), 11, "relax must respect max_anchor");
+    }
+
+    #[test]
     fn test_anchor_election_lowest_rank_tiebreak() {
         // No prior anchor (Probe phase first call): with all ranks tied, the
         // deterministic tiebreak picks the lowest-indexed candidate.

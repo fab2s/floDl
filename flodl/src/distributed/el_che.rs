@@ -289,6 +289,50 @@ impl ElChe {
         }
     }
 
+    /// Relax the anchor upward by 1 batch on stable convergence.
+    ///
+    /// Symmetric upward path to [`nudge_anchor_down`]: lets async-mode anchor
+    /// drift toward [`max_anchor`] over time as long as the convergence guard
+    /// reports `Stable`, amortizing AllReduce barrier cost over more local
+    /// SGD steps. Closes a half-implemented loop where the convergence guard
+    /// previously had a downward path (`NudgeDown`) but no upward path —
+    /// `max_overshoot` grew on stable but anchor stayed stuck at `min_anchor`.
+    ///
+    /// Honors the user-defined `max_batch_diff` cap when set: refuses to
+    /// relax if the projected per-rank batch_counts spread at `anchor + 1`
+    /// would exceed `max_batch_diff`. With ratio R between fastest and
+    /// slowest rank and cap M, anchor is bounded by `M / (R - 1)` — e.g.
+    /// for ratio 3 and `max_batch_diff = 100`, anchor caps at 50 (yielding
+    /// `[50, 150]`, diff exactly 100).
+    ///
+    /// No-op when already at [`max_anchor`], or when no calibrated
+    /// `ms_per_batch` exists yet (Probe phase).
+    pub fn relax_anchor_up(&mut self) {
+        if self.anchor >= self.max_anchor {
+            return;
+        }
+        // Honor user-defined drift cap.
+        if let Some(max_diff) = self.max_batch_diff {
+            let max_ms = self.ms_per_batch.iter().copied().fold(0.0_f64, f64::max);
+            let min_ms = self.ms_per_batch.iter().copied()
+                .filter(|&m| m > 0.0)
+                .fold(f64::MAX, f64::min);
+            if max_ms > 0.0 && min_ms.is_finite() && min_ms > 0.0 {
+                let new_anchor = self.anchor + 1;
+                let projected_fast =
+                    (new_anchor as f64 * max_ms / min_ms).round().max(1.0) as usize;
+                if projected_fast.saturating_sub(new_anchor) > max_diff {
+                    return;
+                }
+            }
+        }
+        self.anchor += 1;
+        let slow_ms = self.slow_ms();
+        if slow_ms > 0.0 {
+            self.recompute_batch_counts(slow_ms);
+        }
+    }
+
     /// Whether at least one timing measurement has been reported.
     pub fn is_calibrated(&self) -> bool {
         self.calibrated
@@ -390,6 +434,13 @@ impl ElChe {
         self.recompute_batch_counts(slow_ms);
         self.calibrated = true;
         self.calibration_count += 1;
+        crate::verbose!(
+            "  ddp-diag: ms_per_batch={:?} batch_counts={:?} anchor_rank={:?} anchor={}",
+            self.ms_per_batch.iter().map(|m| (m * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            self.batch_counts,
+            self.anchor_rank,
+            self.anchor,
+        );
         self.advance_phase();
     }
 

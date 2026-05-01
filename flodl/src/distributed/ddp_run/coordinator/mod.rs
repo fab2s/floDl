@@ -160,6 +160,12 @@ pub struct Coordinator {
     timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
     /// Instant when the last NCCL sync started (for duration measurement).
     nccl_sync_start: Option<std::time::Instant>,
+    /// Wall-time duration (ms) of the most-recent completed NCCL sync.
+    /// Captured in `process_timing_msg` when the last rank acks. Fed to
+    /// `ElChe::report_timing` as `sync_ms` so the anchor auto-tune block
+    /// (el_che.rs:292-308) actually fires on NCCL backend. Was previously
+    /// always 0 because `last_avg_ms` is only populated by the CPU avg path.
+    last_nccl_sync_ms: f64,
 
     // NCCL sync acknowledgment
     /// Per-rank: last worker `step_count` seen in a TimingMsg.
@@ -342,6 +348,7 @@ impl CoordinatorBuilder {
             wall_ms_accum: vec![0.0; self.world_size],
             last_batch_ms: vec![0.0; self.world_size],
             last_avg_ms: 0.0,
+            last_nccl_sync_ms: 0.0,
             throttled: vec![false; self.world_size],
             avg_count: 0,
             checkpoint_every: self.checkpoint_every,
@@ -861,6 +868,7 @@ impl Coordinator {
                     && step_count > self.nccl_sync_step[rank]
                 {
                     self.nccl_ack[rank] = true;
+                    self.capture_nccl_sync_elapsed_if_complete();
                 }
             }
             TimingMsg::SyncAck { rank, step_count, divergence } => {
@@ -877,10 +885,26 @@ impl Coordinator {
                     && step_count > self.nccl_sync_step[rank]
                 {
                     self.nccl_ack[rank] = true;
+                    self.capture_nccl_sync_elapsed_if_complete();
                 }
             }
             TimingMsg::Exiting { .. } => {
                 self.active_count = self.active_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// If every rank has now acknowledged the in-flight NCCL sync, record
+    /// its wall-time duration (sent SyncNow → all ranks past the AllReduce).
+    /// The next call to `finish_averaging_nccl` will feed this as `sync_ms`
+    /// to `ElChe::report_timing`, so the anchor auto-tune block actually
+    /// fires on NCCL backend (was always 0 before — `last_avg_ms` is only
+    /// populated by the CPU averaging path).
+    fn capture_nccl_sync_elapsed_if_complete(&mut self) {
+        if self.nccl_ack.iter().all(|&a| a) {
+            if let Some(start) = self.nccl_sync_start.take() {
+                self.last_nccl_sync_ms =
+                    start.elapsed().as_secs_f64() * 1000.0;
             }
         }
     }

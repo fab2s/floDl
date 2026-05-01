@@ -1073,8 +1073,11 @@ fn test_divergence_correction_nudges_anchor_down() {
 }
 
 #[test]
-fn test_divergence_below_threshold_no_correction() {
-    // Low divergence should NOT change the anchor.
+fn test_divergence_below_threshold_relaxes_anchor() {
+    // Low divergence in async mode should relax the anchor upward by 1
+    // (symmetric upward path to NudgeDown on stable convergence). The
+    // convergence guard returns Stable, finish_averaging_cpu calls
+    // ElChe::relax_anchor_up which grows anchor toward max_anchor.
     let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
 
     // Calibrate with zero sync_ms.
@@ -1092,8 +1095,8 @@ fn test_divergence_below_threshold_no_correction() {
         post_norm: None,
     }));
 
-    // Divergence 0.01 < threshold 0.05: no correction applied.
-    assert_eq!(h.coord.el_che.anchor(), anchor_after_calibration);
+    // Divergence 0.01 < threshold: Stable. relax_anchor_up grows anchor by 1.
+    assert_eq!(h.coord.el_che.anchor(), anchor_after_calibration + 1);
 }
 
 // -----------------------------------------------------------------------

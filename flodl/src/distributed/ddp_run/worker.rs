@@ -513,6 +513,7 @@ impl<M: Module> GpuWorker<M> {
     /// Returns the weight-space divergence for this rank: `||pre - post|| / ||post||`.
     /// `None` when scratch buffers are absent (Sync mode or no NCCL comm).
     fn sync_now_nccl(&self) -> Result<Option<f64>> {
+        let _diag_start = Instant::now();
         let comm = match &self.nccl_comm {
             Some(c) => c,
             None => return Ok(None),
@@ -531,11 +532,14 @@ impl<M: Module> GpuWorker<M> {
 
         if let Some(stream) = &self.comm_stream {
             // AllReduce on comm_stream (in-place averaging)
+            let nccl_start = Instant::now();
             comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
             // HOST-synchronize: block until AllReduce completes.
             stream.synchronize()?;
+            let nccl_ms = nccl_start.elapsed().as_secs_f64() * 1000.0;
 
             // Compute weight-space divergence: ||pre - post|| / ||post||
+            let divg_start = Instant::now();
             let divergence = if let Some(ref scratch) = self.pre_sync_scratch {
                 // scratch = pre (from copy above). Compute diff in-place:
                 // scratch[i] += (-1) * param_tensors[i]  ->  scratch[i] = pre[i] - post[i]
@@ -575,6 +579,12 @@ impl<M: Module> GpuWorker<M> {
             if let Some(ev) = &self.copy_done {
                 ev.record_on(stream)?;
             }
+            let divg_ms = divg_start.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = _diag_start.elapsed().as_secs_f64() * 1000.0;
+            crate::verbose!(
+                "  ddp-sync-diag: rank {} sync_total={:.1}ms (nccl={:.1}ms divg={:.1}ms)",
+                self.rank, total_ms, nccl_ms, divg_ms,
+            );
 
             Ok(divergence)
         } else {
@@ -861,16 +871,21 @@ impl<M: Module> GpuWorker<M> {
     /// Returns `Some(plan)` for the next epoch, or `None` on Shutdown/disconnect.
     pub fn wait_for_epoch_plan(&mut self) -> Result<Option<EpochPlan>> {
         crate::debug!("  ddp-worker: rank {} waiting for plan (step={})", self.rank, self.local_step);
+        let wait_start = Instant::now();
         loop {
             // Check if a plan was queued by dispatch_control (e.g. StartEpoch
             // arrived during Throttle handler). Must be checked each iteration,
             // not just at entry, because dispatch_control may set it mid-loop.
             if let Some(plan) = self.pending_plan.take() {
+                let waited = wait_start.elapsed().as_secs_f64() * 1000.0;
+                crate::verbose!("  ddp-dispatch-diag: rank {} waited {:.0}ms (pending plan)", self.rank, waited);
                 crate::debug!("  ddp-worker: rank {} got plan (pending) epoch={}", self.rank, plan.epoch);
                 return Ok(Some(plan));
             }
             match self.control_rx.recv() {
                 Ok(ControlMsg::StartEpoch(plan)) => {
+                    let waited = wait_start.elapsed().as_secs_f64() * 1000.0;
+                    crate::verbose!("  ddp-dispatch-diag: rank {} waited {:.0}ms for StartEpoch", self.rank, waited);
                     crate::debug!("  ddp-worker: rank {} got plan epoch={}", self.rank, plan.epoch);
                     return Ok(Some(plan));
                 }
@@ -1007,6 +1022,9 @@ impl<M: Module> GpuWorker<M> {
 
             // Consume prefetched batches as they become ready
             let mut batch_done = 0usize;
+            let chunk_diag_start = Instant::now();
+            let mut prefetch_wait_diag = std::time::Duration::ZERO;
+            let mut compute_ms_diag = 0.0_f64;
             for _ in 0..num_batches {
                 // Interleave control message processing with prefetch waiting.
                 // SyncNow can arrive at any time; if we block on batch_rx.recv()
@@ -1015,6 +1033,7 @@ impl<M: Module> GpuWorker<M> {
                 if self.handle_control()? {
                     return Ok(true);
                 }
+                let wait_start = Instant::now();
                 let prefetched = loop {
                     match batch_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                         Ok(batch) => break batch
@@ -1029,6 +1048,7 @@ impl<M: Module> GpuWorker<M> {
                         }
                     }
                 };
+                prefetch_wait_diag += wait_start.elapsed();
 
                 // Ensure compute stream waits for async H2D copy to finish
                 #[cfg(feature = "cuda")]
@@ -1039,6 +1059,7 @@ impl<M: Module> GpuWorker<M> {
                 }
 
                 let (loss, ms) = self.train_step(&prefetched.tensors, train_fn)?;
+                compute_ms_diag += ms;
                 batch_done += 1;
                 total_loss += loss;
                 let norm = if self.steps_since_avg % 10 == 0 {
@@ -1051,6 +1072,13 @@ impl<M: Module> GpuWorker<M> {
                     return Ok(true); // Shutdown
                 }
             }
+            let chunk_total_ms = chunk_diag_start.elapsed().as_secs_f64() * 1000.0;
+            let prefetch_ms = prefetch_wait_diag.as_secs_f64() * 1000.0;
+            let other_ms = chunk_total_ms - prefetch_ms - compute_ms_diag;
+            crate::verbose!(
+                "  ddp-worker-diag: rank {} chunk={} batches | total={:.0}ms compute={:.0}ms prefetch_wait={:.0}ms other(sync/ctrl)={:.0}ms",
+                self.rank, batch_done, chunk_total_ms, compute_ms_diag, prefetch_ms, other_ms,
+            );
             crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, plan.epoch, batch_done);
         } else {
             // Sync path: load one batch at a time, move to device if needed.

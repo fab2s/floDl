@@ -133,8 +133,15 @@ impl Coordinator {
     /// Cadence/Async use trend detection on `||pre-post|| / ||post||`.
     pub(in super::super) fn finish_averaging_nccl(&mut self) {
         let old_anchor = self.el_che.anchor();
+        // Use the wall-time elapsed of the PREVIOUS NCCL sync (captured in
+        // process_timing_msg when the last rank acked) as `sync_ms`. Without
+        // this, NCCL's `last_avg_ms` stayed at 0 and the anchor auto-tune
+        // block in el_che.rs:292-308 silently skipped. Result: anchor pinned
+        // at min, syncs too frequent, AllReduce barrier wait dominates.
+        let prev_sync_ms = self.last_nccl_sync_ms;
+        self.last_nccl_sync_ms = 0.0;
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
-            self.el_che.report_timing(&self.wall_ms_accum, &self.steps_since_avg, self.last_avg_ms);
+            self.el_che.report_timing(&self.wall_ms_accum, &self.steps_since_avg, prev_sync_ms);
             self.last_avg_ms = 0.0;
             if !self.calibrated && self.el_che.is_calibrated() {
                 self.calibrated = true;
@@ -159,9 +166,17 @@ impl Coordinator {
         // Apply convergence action. Overshoot is an Async-only concept.
         match action {
             convergence::ConvergenceAction::Stable => {
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-                    self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                if self.policy == ApplyPolicy::Async {
+                    if self.overshoot_auto {
+                        let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                        self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                    }
+                    // Symmetric upward path for anchor: relax cadence on stable
+                    // convergence (capped by max_batch_diff and max_anchor).
+                    // Without this, anchor stays pinned at min_anchor forever
+                    // because the overhead-based auto-tune lives in a dead
+                    // zone for low-overhead workloads.
+                    self.el_che.relax_anchor_up();
                 }
             }
             convergence::ConvergenceAction::SuppressGrowth => {
@@ -179,12 +194,14 @@ impl Coordinator {
             self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
         }
 
-        // Timeline: sync duration and anchor changes
+        // Timeline: sync duration and anchor changes. Uses the previous
+        // sync's measured duration (captured when last rank acked). The
+        // earlier code took `nccl_sync_start.elapsed()` here but that runs
+        // synchronously inside trigger_averaging immediately after sending
+        // SyncNow, before any rank can complete AllReduce — so the elapsed
+        // was always ~0ms.
         if let Some(ref tl) = self.timeline {
-            let dur = self.nccl_sync_start.take()
-                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: dur });
+            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms: prev_sync_ms });
             let new_anchor = self.el_che.anchor();
             if new_anchor != old_anchor {
                 tl.event(crate::monitor::EventKind::AnchorChanged {
@@ -277,9 +294,12 @@ impl Coordinator {
 
         match action {
             convergence::ConvergenceAction::Stable => {
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-                    self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                if self.policy == ApplyPolicy::Async {
+                    if self.overshoot_auto {
+                        let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                        self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                    }
+                    self.el_che.relax_anchor_up();
                 }
             }
             convergence::ConvergenceAction::SuppressGrowth => {}
