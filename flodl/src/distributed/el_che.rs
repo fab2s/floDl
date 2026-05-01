@@ -661,9 +661,11 @@ impl ElChe {
     /// get proportionally more based on their ms_per_batch.
     ///
     /// Applies a dead zone: a rank's count only changes when the new value
-    /// differs from the current by more than 10%. This prevents batch count
-    /// oscillation from minor speed fluctuations (thermal jitter, OS noise)
-    /// while still adapting to genuine throughput shifts within a few reports.
+    /// differs from the current by more than 5%. Trust-window smoothing
+    /// already filters per-call noise, so the dead zone only needs to
+    /// suppress 1-batch chatter; sized at 5% to capture genuine
+    /// within-cohort speed differences (e.g. two near-identical 1060s
+    /// where one runs ~7-8% slower) that a 10% gate would mask.
     fn recompute_batch_counts(&mut self, slow_ms: f64) {
         for rank in 0..self.world_size {
             let ms = self.smoothed_ms(rank);
@@ -676,9 +678,9 @@ impl ElChe {
 
             let current = self.batch_counts[rank];
             let diff = (target as f64 - current as f64).abs();
-            // Dead zone: only update if change exceeds 10% of current count.
+            // Dead zone: only update if change exceeds 5% of current count.
             // Always update on first calibration (current == anchor for all).
-            if diff > current as f64 * 0.10 || !self.calibrated {
+            if diff > current as f64 * 0.05 || !self.calibrated {
                 // Clamp per-update change to max_batch_diff (if set).
                 // Without this, a sudden speed change (thermal throttle, power
                 // limit) can cause the batch count to jump far beyond the
