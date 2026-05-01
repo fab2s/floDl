@@ -759,8 +759,11 @@ impl DdpHandle {
                 msgs.push(m);
             }
             if !msgs.is_empty() {
+                // Single-GPU fast path: only one rank, so the cadence-share
+                // is trivially [1.0]. No balancer involved.
+                let bc_share = vec![1.0_f64];
                 let metrics = super::coordinator::aggregate_epoch_metrics(
-                    epoch, &msgs, &device_indices,
+                    epoch, &msgs, &device_indices, &bc_share,
                 );
                 if let Some(f) = &metrics_fn {
                     if let Err(e) = f(&metrics) {

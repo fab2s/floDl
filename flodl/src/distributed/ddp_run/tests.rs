@@ -2702,7 +2702,10 @@ fn test_aggregate_epoch_metrics() {
     ];
 
     let dev_indices = vec![0_u8, 1];
-    let m = aggregate_epoch_metrics(0, &msgs, &dev_indices);
+    // bc_share now comes from the balancer (smoothed batch_counts). Pass
+    // 60/40 explicitly to match the historical samples-driven assertion.
+    let bc_share = vec![0.6_f64, 0.4];
+    let m = aggregate_epoch_metrics(0, &msgs, &dev_indices, &bc_share);
     assert_eq!(m.epoch, 0);
 
     // Batch-weighted average loss: (0.5*60 + 0.7*40) / 100 = 0.58
@@ -2775,7 +2778,8 @@ fn test_aggregate_epoch_metrics_progressive() {
     ];
 
     let dev_indices = vec![0_u8, 1];
-    let m = aggregate_epoch_metrics(0, &msgs, &dev_indices);
+    let bc_share = vec![0.6_f64, 0.4];
+    let m = aggregate_epoch_metrics(0, &msgs, &dev_indices, &bc_share);
 
     // Must have exactly 2 entries (world_size), not 5 (one per msg)
     assert_eq!(m.per_rank_throughput.len(), 2, "should have world_size entries");

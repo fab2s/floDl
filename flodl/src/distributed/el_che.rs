@@ -51,6 +51,13 @@ const DOMINANCE_MARGIN: f64 = 0.10;
 /// dominance margin) and batch-count proportions.
 const TRUST_WINDOW_CAP: usize = 5;
 
+/// Sliding-window capacity for `batch_counts` snapshots. Source for
+/// `recent_batch_share`, the smoothed view of cadence per-rank allocation
+/// reported as the per-epoch batch-share metric. ~10 syncs balances
+/// responsiveness (catches genuine cadence shifts within an epoch) and
+/// stability (one noisy sync doesn't move the metric).
+const BATCH_COUNTS_WINDOW_CAP: usize = 10;
+
 // Anchor swaps are gated by `Phase::Stable` (≥5 calibrations). Stable starts
 // at the 6th `report_timing` call, by which point each rank has a full
 // 5-sample trust window AND the noisiest first sample (kernel JIT, cuBLAS
@@ -129,6 +136,12 @@ pub struct ElChe {
     /// rank misses `TRUST_WINDOW_CAP` reports in a row, its window is cleared
     /// so smoothing can react fast on recovery (death exception).
     consecutive_zero_reports: Vec<usize>,
+    /// Sliding window of recent batch_counts snapshots, captured at the end
+    /// of each `report_timing` after `recompute_batch_counts` settles. Source
+    /// for `recent_batch_share` — exposes the cadence's actual per-rank
+    /// allocation as an observation, not a separate prediction. Capped at
+    /// `BATCH_COUNTS_WINDOW_CAP`.
+    batch_counts_window: std::collections::VecDeque<Vec<usize>>,
     /// Whether at least one real measurement has been taken.
     calibrated: bool,
     /// Target: max AllReduce overhead as fraction of compute time.
@@ -173,6 +186,9 @@ impl ElChe {
                 .map(|_| RingBuffer::new(TRUST_WINDOW_CAP))
                 .collect(),
             consecutive_zero_reports: vec![0; world_size],
+            batch_counts_window: std::collections::VecDeque::with_capacity(
+                BATCH_COUNTS_WINDOW_CAP,
+            ),
             calibrated: false,
             overhead_target: 0.10,
             min_anchor: anchor,
@@ -596,6 +612,13 @@ impl ElChe {
 
         // Recompute batch counts from (possibly updated) anchor.
         self.recompute_batch_counts(slow_ms);
+        // Snapshot the post-recompute batch_counts so `recent_batch_share`
+        // can report the cadence's actual per-rank allocation as a smoothed
+        // observation. Cap is FIFO, oldest dropped on overflow.
+        if self.batch_counts_window.len() >= BATCH_COUNTS_WINDOW_CAP {
+            self.batch_counts_window.pop_front();
+        }
+        self.batch_counts_window.push_back(self.batch_counts.clone());
         self.calibrated = true;
         self.calibration_count += 1;
         crate::verbose!(
@@ -606,6 +629,45 @@ impl ElChe {
             self.anchor,
         );
         self.advance_phase();
+    }
+
+    /// Smoothed per-rank batch share as an observation of recent cadence.
+    ///
+    /// Averages the last `BATCH_COUNTS_WINDOW_CAP` `batch_counts` snapshots
+    /// (each captured at the end of `report_timing`) and normalizes to sum
+    /// to 1.0. This is the metric source for per-epoch `share` reporting:
+    /// it answers "what fraction of work did the balancer assign each rank,
+    /// recently?" rather than "what fraction of samples did each rank
+    /// happen to consume?" — those agree in steady state but diverge under
+    /// progressive dispatch's tail-balance equalization near epoch end.
+    ///
+    /// Falls back to the current `batch_counts` ratio when no snapshots
+    /// have been captured yet (no `report_timing` calls), and to equal
+    /// shares if both are degenerate.
+    pub fn recent_batch_share(&self) -> Vec<f64> {
+        if self.batch_counts_window.is_empty() {
+            let total: usize = self.batch_counts.iter().sum();
+            if total == 0 {
+                return vec![1.0 / self.world_size as f64; self.world_size];
+            }
+            return self
+                .batch_counts
+                .iter()
+                .map(|&c| c as f64 / total as f64)
+                .collect();
+        }
+        let mut sums = vec![0.0_f64; self.world_size];
+        let mut total = 0.0_f64;
+        for snap in &self.batch_counts_window {
+            for (r, &c) in snap.iter().enumerate() {
+                sums[r] += c as f64;
+                total += c as f64;
+            }
+        }
+        if total <= 0.0 {
+            return vec![1.0 / self.world_size as f64; self.world_size];
+        }
+        sums.into_iter().map(|s| s / total).collect()
     }
 
     /// Phase transition rules. Probe→Warmup at first calibration; Warmup→Stable

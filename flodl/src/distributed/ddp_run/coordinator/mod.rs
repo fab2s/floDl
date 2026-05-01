@@ -1007,7 +1007,8 @@ impl Coordinator {
         complete.sort_unstable();
         for epoch in complete {
             if let Some(msgs) = self.epoch_buffer.remove(&epoch) {
-                let metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices);
+                let bc_share = self.el_che.recent_batch_share();
+                let metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices, &bc_share);
                 if let Some(f) = &self.metrics_fn {
                     if let Err(e) = f(&metrics) {
                         eprintln!("  ddp: metrics_fn returned error (epoch {epoch}): {e}");
@@ -1043,7 +1044,8 @@ impl Coordinator {
             self.chunk_pools.remove(&epoch);
 
             if let Some(msgs) = self.epoch_buffer.remove(&epoch) {
-                let mut metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices);
+                let bc_share = self.el_che.recent_batch_share();
+                let mut metrics = aggregate_epoch_metrics(epoch, &msgs, &self.device_indices, &bc_share);
                 metrics.epoch_ms = epoch_ms;
                 if let Some(f) = &self.metrics_fn {
                     if let Err(e) = f(&metrics) {
@@ -1323,7 +1325,18 @@ fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
 /// chunk (not per epoch), so there may be many more messages than ranks.
 /// This function aggregates by rank first so the output always has
 /// exactly `world_size` entries per vector.
-pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_indices: &[u8]) -> super::EpochMetrics {
+/// `bc_share` is the smoothed per-rank batch-share view from the balancer
+/// (i.e. `el_che.recent_batch_share()` averaged over the last few sync
+/// snapshots). It replaces the prior "samples-consumed / total-samples"
+/// share, which conflated cadence allocation with progressive dispatch
+/// tail-balance dynamics. Caller is expected to pass `world_size` entries
+/// summing to ~1.0; degenerate input falls back to equal shares.
+pub(super) fn aggregate_epoch_metrics(
+    epoch: usize,
+    msgs: &[MetricsMsg],
+    device_indices: &[u8],
+    bc_share: &[f64],
+) -> super::EpochMetrics {
     let world_size = device_indices.len();
 
     // --- Step 1: Aggregate per-chunk messages by rank ---
@@ -1428,9 +1441,22 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
         };
         if denom > 0.0 { rank_samples[r] as f64 / denom } else { 0.0 }
     }).collect();
-    let per_rank_batch_share: Vec<f64> = (0..world_size).map(|r| {
-        if total_samples > 0 { rank_samples[r] as f64 / total_samples as f64 } else { 0.0 }
-    }).collect();
+    // Per-rank batch share comes from the balancer's smoothed view of its
+    // own recent batch_counts allocation (`el_che.recent_batch_share()`),
+    // not from samples consumed. Under progressive dispatch the latter is
+    // equalized by tail-balance and obscures the cadence's actual ratios.
+    // Degenerate input (wrong length, all zeros) falls back to equal shares.
+    let per_rank_batch_share: Vec<f64> = if bc_share.len() == world_size {
+        let sum: f64 = bc_share.iter().sum();
+        if sum > 0.0 {
+            bc_share.to_vec()
+        } else {
+            vec![1.0 / world_size as f64; world_size]
+        }
+    } else {
+        vec![1.0 / world_size as f64; world_size]
+    };
+    let _ = total_samples; // retained above for per_rank_throughput
 
     super::EpochMetrics {
         epoch, scalars, per_rank, avg_loss, epoch_ms,
