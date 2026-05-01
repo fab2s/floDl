@@ -283,6 +283,36 @@ impl DdpHandle {
             el_che = el_che.with_max_batch_diff(diff);
         }
 
+        // Cold-start anchor: precedence is partition_ratios > spec prior >
+        // rank-0 fallback. When the user supplied per-rank ratios, the
+        // smallest ratio is the slow rank by user assertion. Otherwise we
+        // ask the GPUs themselves (compute capability + VRAM) which one is
+        // most likely the slowest. Either way, the pick is "soft" — once
+        // timing data accumulates, election may move the anchor.
+        if let Some(ratios) = config.partition_ratios.as_ref() {
+            if ratios.len() == world_size {
+                if let Some((slow_rank, _)) = ratios
+                    .iter()
+                    .enumerate()
+                    .min_by(|(ra, a), (rb, b)| {
+                        a.partial_cmp(b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(ra.cmp(rb))
+                    })
+                {
+                    el_che = el_che.with_initial_anchor(slow_rank);
+                }
+            }
+        } else {
+            let cuda_indices: Vec<i32> = devices.iter().filter_map(|d| match d {
+                Device::CUDA(idx) => Some(*idx as i32),
+                _ => None,
+            }).collect();
+            if cuda_indices.len() == world_size {
+                el_che = el_che.with_device_indices(&cuda_indices);
+            }
+        }
+
         // Step 3b: Create epoch metrics channel (coordinator -> main thread)
         let (epoch_metrics_tx, epoch_metrics_rx) = mpsc::channel();
 
