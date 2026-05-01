@@ -421,16 +421,24 @@ impl Monitor {
         }
         line.push(']');
 
-        // Resource summary (compact)
+        // Resource summary (compact). The VRAM/util numbers come from a
+        // randomly-sampled rank (see ResourceSample::aggregate_rank); the
+        // label exposes which rank, so a reader can correlate across
+        // epochs as the sample drifts.
         let res = &resources;
         if let Some(alloc) = res.vram_allocated_bytes {
             let spill = match res.vram_total_bytes {
                 Some(total) if alloc > total => alloc - total,
                 _ => 0,
             };
+            let label = match res.aggregate_rank {
+                Some(idx) => format!("VRAM[cuda{idx}]"),
+                None => String::from("VRAM"),
+            };
             let _ = write!(
                 line,
-                "  VRAM: {} / {}",
+                "  {}: {} / {}",
+                label,
                 format_bytes(alloc),
                 format_bytes(spill),
             );

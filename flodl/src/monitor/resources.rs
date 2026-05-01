@@ -33,13 +33,19 @@ pub struct ResourceSample {
     pub ram_used_bytes: Option<u64>,
     /// Total system RAM in bytes.
     pub ram_total_bytes: Option<u64>,
-    /// GPU utilization percentage (0-100), None if NVML unavailable.
-    /// Aggregate: mean across all GPUs (background-averaged over the epoch).
+    /// GPU utilization percentage (0-100) for the rank in `aggregate_rank`,
+    /// None if NVML unavailable.
     pub gpu_util_percent: Option<f32>,
-    /// Total physical VRAM in bytes (device 0).
+    /// Total physical VRAM in bytes for the rank in `aggregate_rank`.
     pub vram_total_bytes: Option<u64>,
-    /// Bytes reserved by the CUDA caching allocator (device 0).
+    /// Bytes reserved by the CUDA caching allocator on the rank in
+    /// `aggregate_rank`.
     pub vram_allocated_bytes: Option<u64>,
+    /// CUDA device index whose data populates the aggregate fields above.
+    /// Picked uniformly at random per `sample()` call so that, over the
+    /// run, each rank is observed roughly equally without paying O(N)
+    /// per-tick aggregation cost. Per-GPU detail is preserved in `gpus`.
+    pub aggregate_rank: Option<u8>,
     /// Per-GPU snapshots (empty on CPU builds).
     pub gpus: Vec<GpuSnapshot>,
 }
@@ -268,22 +274,19 @@ impl ResourceSampler {
             s.gpus.push(gpu);
         }
 
-        // Aggregate VRAM from device 0
-        if let Some(gpu0) = s.gpus.first() {
-            s.vram_total_bytes = gpu0.vram_total_bytes;
-            s.vram_allocated_bytes = gpu0.vram_allocated_bytes;
-        }
-        // Aggregate GPU utilization: mean across all GPUs
-        let mut util_sum = 0.0f64;
-        let mut util_count = 0u32;
-        for gpu in &s.gpus {
-            if let Some(util) = gpu.util_percent {
-                util_sum += util as f64;
-                util_count += 1;
-            }
-        }
-        if util_count > 0 {
-            s.gpu_util_percent = Some((util_sum / util_count as f64) as f32);
+        // Aggregate fields: pick one GPU uniformly at random and copy its
+        // VRAM + util into the top-level fields. Over many ticks the
+        // displayed values cover every rank ergodically; each tick pays
+        // O(1) instead of O(world_size). Per-GPU detail stays in `s.gpus`
+        // for the timeline CSV / dashboard so this only affects the
+        // compact summary surface (epoch log line, summary string).
+        if !s.gpus.is_empty() {
+            let pick = crate::rng::Rng::from_entropy().usize(s.gpus.len());
+            let g = &s.gpus[pick];
+            s.aggregate_rank = Some(g.device_index);
+            s.vram_total_bytes = g.vram_total_bytes;
+            s.vram_allocated_bytes = g.vram_allocated_bytes;
+            s.gpu_util_percent = g.util_percent;
         }
 
         s

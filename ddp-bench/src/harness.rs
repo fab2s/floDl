@@ -555,22 +555,47 @@ fn run_unified(
         eprintln!("    {line}");
         log_lines.push(line);
 
-        // Per-rank breakdown line for multi-rank runs. Captures heterogeneous
-        // proportional scheduling (batch_share) and raw GPU speed (throughput
-        // in samples/ms). The publication arc reads this to show that ElChe
-        // gives the fast rank a larger share of work. Per-rank loss is omitted:
-        // EpochMetrics aggregates it into avg_loss; per_rank only carries
-        // user-recorded scalars, none of which are loss by default.
+        // Per-rank breakdown for multi-rank runs. Layout is
+        //   [highest-share]  [random middle]  [lowest-share]
+        // where highest-share is the fastest rank in the cadence (gets
+        // the most batches) and lowest-share is the slow-anchor rank.
+        // Random middle is sampled uniformly from the in-between ranks
+        // each epoch — O(1) per epoch and ergodic over the run, which
+        // scales to large worlds without flooding the log line. For
+        // world_size == 2 the middle is omitted; for == 3 the middle is
+        // the unique non-extreme rank (no randomness needed).
         if metrics.device_indices.len() >= 2 {
+            let n = metrics.device_indices.len();
+            let mut sorted: Vec<usize> = (0..n).collect();
+            sorted.sort_by(|&a, &b| {
+                let sa = metrics.per_rank_batch_share.get(a).copied().unwrap_or(0.0);
+                let sb = metrics.per_rank_batch_share.get(b).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let highest = sorted[0];
+            let lowest = sorted[n - 1];
+            let middle: Option<usize> = match n {
+                2 => None,
+                3 => Some(sorted[1]),
+                _ => {
+                    let pick = flodl::Rng::from_entropy().usize(n - 2);
+                    Some(sorted[1 + pick])
+                }
+            };
+
+            let render = |r: usize| -> String {
+                let dev = metrics.device_indices[r];
+                let share = metrics.per_rank_batch_share.get(r).copied().unwrap_or(0.0);
+                let tput = metrics.per_rank_throughput.get(r).copied().unwrap_or(0.0);
+                format!(" rank{r}[cuda{dev},share={share:.4},tput={tput:.2}]")
+            };
+
             let mut rank_line = String::from("per-rank:");
-            for rank in 0..metrics.device_indices.len() {
-                let dev = metrics.device_indices[rank];
-                let share = metrics.per_rank_batch_share.get(rank).copied().unwrap_or(0.0);
-                let tput = metrics.per_rank_throughput.get(rank).copied().unwrap_or(0.0);
-                rank_line.push_str(&format!(
-                    " rank{rank}[cuda{dev},share={share:.4},tput={tput:.2}]"
-                ));
+            rank_line.push_str(&render(highest));
+            if let Some(mid) = middle {
+                rank_line.push_str(&render(mid));
             }
+            rank_line.push_str(&render(lowest));
             eprintln!("    {rank_line}");
             log_lines.push(rank_line);
         }
