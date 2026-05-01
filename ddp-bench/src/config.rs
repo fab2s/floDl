@@ -115,4 +115,8 @@ pub struct RunConfig {
     /// default and dispatch batches in proportion. Length must match the
     /// visible GPU count and values must sum to ~1.0.
     pub partition_ratios: Option<Vec<f64>>,
+    /// Enable ElChe's anchor relax-up on stable convergence verdicts.
+    /// When true, passed as `DdpBuilder::elche_relax_up(true)`. Default
+    /// false (relax-up disabled, anchor under overhead-based auto-tune only).
+    pub elche_relax_up: bool,
 }

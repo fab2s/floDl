@@ -851,7 +851,15 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// Drains the thread-local scalar accumulator populated by
     /// [`record_scalar()`](super::record_scalar) calls during this epoch.
-    pub fn report_epoch(&self, avg_loss: f64, batches: usize, epoch_ms: f64) -> Result<()> {
+    pub fn report_epoch(
+        &self,
+        avg_loss: f64,
+        batches: usize,
+        epoch_ms: f64,
+        share_complete_ms: f64,
+        compute_only_ms: f64,
+        data_starve_ms: f64,
+    ) -> Result<()> {
         let scalars = super::drain_scalars();
         self.metrics_tx.send(MetricsMsg {
             rank: self.rank,
@@ -860,6 +868,9 @@ impl<M: Module> GpuWorker<M> {
             batches_processed: batches,
             epoch_ms,
             samples_processed: batches * self.batch_size,
+            share_complete_ms,
+            compute_only_ms,
+            data_starve_ms,
             scalars,
         }).map_err(|_| TensorError::new("metrics channel disconnected"))
     }
@@ -937,7 +948,7 @@ impl<M: Module> GpuWorker<M> {
         let num_batches = self.partition.len() / self.batch_size;
         if num_batches == 0 {
             // Still report so coordinator gets the "done" signal.
-            let _ = self.report_epoch(0.0, 0, 0.0);
+            let _ = self.report_epoch(0.0, 0, 0.0, 0.0, 0.0, 0.0);
             return Ok(false);
         }
 
@@ -1004,6 +1015,11 @@ impl<M: Module> GpuWorker<M> {
         }
         let epoch_start = Instant::now();
         let mut total_loss = 0.0;
+        // Per-chunk timing accumulators populated by both prefetch and sync
+        // paths. Read at chunk end to populate MetricsMsg fields and feed
+        // the balancer with an honest tput signal.
+        let mut compute_ms_total = 0.0_f64;
+        let mut data_starve_ms_total = 0.0_f64;
 
         if use_prefetch {
             // CUDA async path: prefetch with VRAM gauge.
@@ -1079,6 +1095,8 @@ impl<M: Module> GpuWorker<M> {
                 "  ddp-worker-diag: rank {} chunk={} batches | total={:.0}ms compute={:.0}ms prefetch_wait={:.0}ms other(sync/ctrl)={:.0}ms",
                 self.rank, batch_done, chunk_total_ms, compute_ms_diag, prefetch_ms, other_ms,
             );
+            compute_ms_total = compute_ms_diag;
+            data_starve_ms_total = prefetch_ms;
             crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, plan.epoch, batch_done);
         } else {
             // Sync path: load one batch at a time, move to device if needed.
@@ -1089,6 +1107,7 @@ impl<M: Module> GpuWorker<M> {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
                 let indices = &self.partition[start..end];
+                let data_start = Instant::now();
                 let batch = self.dataset.get_batch(indices)?;
 
                 let batch: Vec<Tensor> = if self.device.is_cuda() {
@@ -1098,8 +1117,10 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     batch
                 };
+                data_starve_ms_total += data_start.elapsed().as_secs_f64() * 1000.0;
 
                 let (loss, ms) = self.train_step(&batch, train_fn)?;
+                compute_ms_total += ms;
                 total_loss += loss;
 
                 // After first batch: measure activation peak from CUDA stats.
@@ -1136,6 +1157,14 @@ impl<M: Module> GpuWorker<M> {
         }
 
         let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+        // Honest balancer denominator: time the rank spent on its assigned
+        // work (compute + data wait), excluding any post-completion idle
+        // waiting at a sync barrier. epoch_ms includes that idle on the
+        // fast rank, which inverts the tput signal the balancer reads.
+        // share_complete_ms is computed from the rank's own pipeline times
+        // (compute_ms_total + data_starve_ms_total), so it tracks the
+        // rank's actual capacity, not how long it idles for peers.
+        let share_complete_ms = compute_ms_total + data_starve_ms_total;
         let avg_loss = total_loss / num_batches as f64;
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochEnd {
@@ -1143,7 +1172,10 @@ impl<M: Module> GpuWorker<M> {
                 loss: avg_loss,
             });
         }
-        let _ = self.report_epoch(avg_loss, num_batches, epoch_ms);
+        let _ = self.report_epoch(
+            avg_loss, num_batches, epoch_ms,
+            share_complete_ms, compute_ms_total, data_starve_ms_total,
+        );
 
         Ok(false)
     }

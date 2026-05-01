@@ -525,6 +525,10 @@ fn run_unified(
         builder = builder.partition_ratios(ratios);
     }
 
+    if config.elche_relax_up {
+        builder = builder.elche_relax_up(true);
+    }
+
     if let Some(sf) = sched_factory {
         let bpe = batches_per_epoch;
         builder = builder.scheduler(move |world_size| {

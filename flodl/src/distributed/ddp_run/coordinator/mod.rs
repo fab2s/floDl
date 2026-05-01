@@ -142,6 +142,10 @@ pub struct Coordinator {
     pub(super) overshoot_initial: usize,
     /// Absolute ceiling on max_overshoot (safety valve, applied after auto-tune).
     overshoot_ceiling: usize,
+    /// Allow ElChe to grow the anchor on Stable convergence verdicts.
+    /// When false, `relax_anchor_up()` is suppressed so the anchor only
+    /// changes via the overhead-based auto-tune in `el_che.report_timing`.
+    pub(super) elche_relax_up: bool,
 
     // Divergence monitoring (per-sync-interval, reset after averaging)
     /// Per-rank cumulative loss since last sync (monitoring/logging only,
@@ -207,6 +211,8 @@ pub struct CoordinatorBuilder {
     max_overshoot: Option<usize>,
     /// Absolute ceiling on max_overshoot (safety valve). Default: 15.
     overshoot_ceiling: usize,
+    /// Allow anchor relax-up on Stable convergence. Default: false.
+    elche_relax_up: bool,
     metrics_fn: Option<super::MetricsFn>,
 }
 
@@ -320,6 +326,14 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Allow or suppress ElChe's anchor relax-up on Stable convergence.
+    /// Default: false (off). Opt in to grow the anchor on `Stable` verdicts;
+    /// when false the anchor only changes via the overhead-based auto-tune.
+    pub fn elche_relax_up(mut self, enabled: bool) -> Self {
+        self.elche_relax_up = enabled;
+        self
+    }
+
     /// Build the coordinator.
     pub fn build(self) -> Coordinator {
         let total_batches = self.total_samples / self.batch_size.max(1);
@@ -372,6 +386,7 @@ impl CoordinatorBuilder {
             overshoot_auto,
             overshoot_initial,
             overshoot_ceiling: self.overshoot_ceiling,
+            elche_relax_up: self.elche_relax_up,
             loss_accum: vec![0.0; self.world_size],
             loss_count: vec![0; self.world_size],
             nccl_sync_divergence: vec![None; self.world_size],
@@ -429,6 +444,7 @@ impl Coordinator {
             timeline: None,
             max_overshoot: None,
             overshoot_ceiling: 15,
+            elche_relax_up: false,
             metrics_fn: None,
         }
     }
@@ -1315,6 +1331,9 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
     let mut rank_samples: Vec<usize> = vec![0; world_size];
     let mut rank_loss_sum: Vec<f64> = vec![0.0; world_size];
     let mut rank_time_ms: Vec<f64> = vec![0.0; world_size];
+    let mut rank_share_complete_ms: Vec<f64> = vec![0.0; world_size];
+    let mut rank_compute_only_ms: Vec<f64> = vec![0.0; world_size];
+    let mut rank_data_starve_ms: Vec<f64> = vec![0.0; world_size];
     // Per-rank scalar accumulators: (sum, count) per key
     let mut rank_scalars: Vec<std::collections::HashMap<String, (f64, usize)>> =
         (0..world_size).map(|_| std::collections::HashMap::new()).collect();
@@ -1324,8 +1343,15 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
         rank_batches[r] += m.batches_processed;
         rank_samples[r] += m.samples_processed;
         rank_loss_sum[r] += m.avg_loss * m.batches_processed as f64;
-        // Max time across chunks (sequential within a rank)
+        // Max time across chunks (sequential within a rank). Mirrors
+        // existing epoch_ms aggregation: chunk messages report monotonic
+        // cumulative-from-epoch-start times in progressive dispatch, so the
+        // largest is the rank's epoch total. The new fields use the same
+        // convention so the worker can populate them consistently.
         rank_time_ms[r] = rank_time_ms[r].max(m.epoch_ms);
+        rank_share_complete_ms[r] = rank_share_complete_ms[r].max(m.share_complete_ms);
+        rank_compute_only_ms[r] = rank_compute_only_ms[r].max(m.compute_only_ms);
+        rank_data_starve_ms[r] = rank_data_starve_ms[r].max(m.data_starve_ms);
         for (k, (sum, count)) in &m.scalars {
             let entry = rank_scalars[r].entry(k.clone()).or_insert((0.0, 0));
             entry.0 += sum;
@@ -1380,10 +1406,27 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
         }
     }
 
-    // Per-rank throughput (samples/ms) and batch share
+    // Per-rank throughput (samples/ms) and batch share.
+    //
+    // Throughput uses share_complete_ms as the denominator, NOT epoch_ms.
+    // epoch_ms includes any post-completion idle the fast rank spends
+    // waiting at the sync barrier for slower ranks; dividing by it produces
+    // an inverted tput signal (the fast rank looks slow because it idles
+    // more), which feeds the balancer a signal that says "give the fast
+    // rank less work" — exactly backwards. share_complete_ms = compute +
+    // data-pipeline wait, measured per rank, excludes peer-induced idle,
+    // so the resulting tput tracks the rank's actual capacity.
+    //
+    // Falls back to epoch_ms when share_complete_ms wasn't populated (legacy
+    // call sites or test fixtures using the old MetricsMsg shape).
     let total_samples: usize = rank_samples.iter().sum();
     let per_rank_throughput: Vec<f64> = (0..world_size).map(|r| {
-        if rank_time_ms[r] > 0.0 { rank_samples[r] as f64 / rank_time_ms[r] } else { 0.0 }
+        let denom = if rank_share_complete_ms[r] > 0.0 {
+            rank_share_complete_ms[r]
+        } else {
+            rank_time_ms[r]
+        };
+        if denom > 0.0 { rank_samples[r] as f64 / denom } else { 0.0 }
     }).collect();
     let per_rank_batch_share: Vec<f64> = (0..world_size).map(|r| {
         if total_samples > 0 { rank_samples[r] as f64 / total_samples as f64 } else { 0.0 }
@@ -1391,7 +1434,11 @@ pub(super) fn aggregate_epoch_metrics(epoch: usize, msgs: &[MetricsMsg], device_
 
     super::EpochMetrics {
         epoch, scalars, per_rank, avg_loss, epoch_ms,
-        per_rank_throughput, per_rank_batch_share, device_indices: device_indices.to_vec(),
+        per_rank_throughput, per_rank_batch_share,
+        per_rank_share_complete_ms: rank_share_complete_ms,
+        per_rank_compute_only_ms: rank_compute_only_ms,
+        per_rank_data_starve_ms: rank_data_starve_ms,
+        device_indices: device_indices.to_vec(),
     }
 }
 

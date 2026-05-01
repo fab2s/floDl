@@ -175,8 +175,12 @@ impl Coordinator {
                     // convergence (capped by max_batch_diff and max_anchor).
                     // Without this, anchor stays pinned at min_anchor forever
                     // because the overhead-based auto-tune lives in a dead
-                    // zone for low-overhead workloads.
-                    self.el_che.relax_anchor_up();
+                    // zone for low-overhead workloads. Suppressed when the
+                    // user disables relax-up (e.g. to isolate share-allocation
+                    // dynamics from the periodic anchor cycle).
+                    if self.elche_relax_up {
+                        self.el_che.relax_anchor_up();
+                    }
                 }
             }
             convergence::ConvergenceAction::SuppressGrowth => {
@@ -299,7 +303,9 @@ impl Coordinator {
                         let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
                         self.max_overshoot = (self.max_overshoot + 1).min(cap);
                     }
-                    self.el_che.relax_anchor_up();
+                    if self.elche_relax_up {
+                        self.el_che.relax_anchor_up();
+                    }
                 }
             }
             convergence::ConvergenceAction::SuppressGrowth => {}

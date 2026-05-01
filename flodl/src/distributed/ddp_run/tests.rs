@@ -326,7 +326,7 @@ fn test_worker_report_timing() {
 fn test_worker_report_epoch() {
     let (worker, ch) = make_test_worker();
 
-    worker.report_epoch(0.5, 100, 5000.0).unwrap();
+    worker.report_epoch(0.5, 100, 5000.0, 5000.0, 0.0, 0.0).unwrap();
 
     let msg = ch.metrics_rx.recv().unwrap();
     assert_eq!(msg.rank, 0);
@@ -465,7 +465,7 @@ fn test_worker_channels_create() {
     assert!(matches!(msg, TimingMsg::Batch { rank: 0, .. }));
 
     metrics_tx.send(MetricsMsg {
-        rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 10, epoch_ms: 100.0,
+        rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 10, epoch_ms: 100.0, share_complete_ms: 100.0, compute_only_ms: 100.0, data_starve_ms: 0.0,
         samples_processed: 320, scalars: HashMap::new(),
     }).unwrap();
     let msg = ch.metrics_rx.recv().unwrap();
@@ -835,7 +835,7 @@ fn test_coordinator_drain_metrics() {
     let mut h = make_coord_harness(2, ApplyPolicy::Sync, AverageBackend::Nccl);
 
     h.metrics_tx.send(MetricsMsg {
-        rank: 0, epoch: 1, avg_loss: 0.3, batches_processed: 50, epoch_ms: 2000.0,
+        rank: 0, epoch: 1, avg_loss: 0.3, batches_processed: 50, epoch_ms: 2000.0, share_complete_ms: 2000.0, compute_only_ms: 2000.0, data_starve_ms: 0.0,
         samples_processed: 1600, scalars: HashMap::new(),
     }).unwrap();
 
@@ -890,12 +890,12 @@ fn test_coordinator_metrics_fn_fires_per_epoch() {
 
     // Both ranks report epoch 0 -> aggregator fires.
     metrics_tx.send(MetricsMsg {
-        rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 60, epoch_ms: 1000.0,
+        rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 60, epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0,
         samples_processed: 1920,
         scalars: [("loss".to_string(), (3.0, 3_usize))].into(),
     }).unwrap();
     metrics_tx.send(MetricsMsg {
-        rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 40, epoch_ms: 1200.0,
+        rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 40, epoch_ms: 1200.0, share_complete_ms: 1200.0, compute_only_ms: 1200.0, data_starve_ms: 0.0,
         samples_processed: 1280,
         scalars: [("loss".to_string(), (4.0, 2_usize))].into(),
     }).unwrap();
@@ -1018,11 +1018,11 @@ fn test_coordinator_metrics_fn_error_continues_training() {
     // Fire two epochs; both should invoke the callback despite the error.
     for epoch in [0_usize, 1_usize] {
         metrics_tx.send(MetricsMsg {
-            rank: 0, epoch, avg_loss: 0.5, batches_processed: 50, epoch_ms: 1000.0,
+            rank: 0, epoch, avg_loss: 0.5, batches_processed: 50, epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0,
             samples_processed: 1600, scalars: HashMap::new(),
         }).unwrap();
         metrics_tx.send(MetricsMsg {
-            rank: 1, epoch, avg_loss: 0.5, batches_processed: 50, epoch_ms: 1000.0,
+            rank: 1, epoch, avg_loss: 0.5, batches_processed: 50, epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0,
             samples_processed: 1600, scalars: HashMap::new(),
         }).unwrap();
         coord.drain_metrics();
@@ -1078,7 +1078,11 @@ fn test_divergence_below_threshold_relaxes_anchor() {
     // (symmetric upward path to NudgeDown on stable convergence). The
     // convergence guard returns Stable, finish_averaging_cpu calls
     // ElChe::relax_anchor_up which grows anchor toward max_anchor.
+    //
+    // Relax-up is opt-in (default off) since 2026-05-01. This test
+    // explicitly opts in to exercise the relax-up code path.
     let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
+    h.coord.elche_relax_up = true;
 
     // Calibrate with zero sync_ms.
     let steps = vec![10; 2];
@@ -1097,6 +1101,33 @@ fn test_divergence_below_threshold_relaxes_anchor() {
 
     // Divergence 0.01 < threshold: Stable. relax_anchor_up grows anchor by 1.
     assert_eq!(h.coord.el_che.anchor(), anchor_after_calibration + 1);
+}
+
+#[test]
+fn test_relax_up_default_off_holds_anchor_on_stable() {
+    // Default: relax_up disabled. On Stable convergence verdict the anchor
+    // must NOT grow via relax_anchor_up; it stays where the overhead-based
+    // auto-tune in el_che.report_timing left it.
+    let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
+    assert!(!h.coord.elche_relax_up, "default should be opt-out (off)");
+
+    let steps = vec![10; 2];
+    let wall_ms = vec![100.0; 2];
+    h.coord.finish_averaging_cpu(0.0, &steps, &wall_ms, None);
+    let anchor_after_calibration = h.coord.el_che.anchor();
+
+    let steps2 = vec![10; 2];
+    let wall_ms2 = vec![100.0; 2];
+    h.coord.finish_averaging_cpu(0.0, &steps2, &wall_ms2, Some(super::convergence::DivergenceReport {
+        deltas: vec![0.01, 0.01],
+        pre_norms: None,
+        post_norm: None,
+    }));
+
+    assert_eq!(
+        h.coord.el_che.anchor(), anchor_after_calibration,
+        "relax_up default-off must hold anchor on Stable verdict"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -2662,11 +2693,11 @@ fn test_aggregate_epoch_metrics() {
     let msgs = vec![
         MetricsMsg {
             rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 60,
-            epoch_ms: 1000.0, samples_processed: 1920, scalars: scalars_r0,
+            epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0, samples_processed: 1920, scalars: scalars_r0,
         },
         MetricsMsg {
             rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 40,
-            epoch_ms: 1200.0, samples_processed: 1280, scalars: scalars_r1,
+            epoch_ms: 1200.0, share_complete_ms: 1200.0, compute_only_ms: 1200.0, data_starve_ms: 0.0, samples_processed: 1280, scalars: scalars_r1,
         },
     ];
 
@@ -2714,31 +2745,31 @@ fn test_aggregate_epoch_metrics_progressive() {
         // Rank 0 chunk 1
         MetricsMsg {
             rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 20,
-            epoch_ms: 300.0, samples_processed: 640,
+            epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
             scalars: [("loss".to_string(), (2.0, 2_usize))].into(),
         },
         // Rank 0 chunk 2
         MetricsMsg {
             rank: 0, epoch: 0, avg_loss: 0.4, batches_processed: 20,
-            epoch_ms: 600.0, samples_processed: 640,
+            epoch_ms: 600.0, share_complete_ms: 600.0, compute_only_ms: 600.0, data_starve_ms: 0.0, samples_processed: 640,
             scalars: [("loss".to_string(), (1.6, 2_usize))].into(),
         },
         // Rank 0 chunk 3
         MetricsMsg {
             rank: 0, epoch: 0, avg_loss: 0.6, batches_processed: 20,
-            epoch_ms: 900.0, samples_processed: 640,
+            epoch_ms: 900.0, share_complete_ms: 900.0, compute_only_ms: 900.0, data_starve_ms: 0.0, samples_processed: 640,
             scalars: [("loss".to_string(), (1.8, 2_usize))].into(),
         },
         // Rank 1 chunk 1
         MetricsMsg {
             rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 20,
-            epoch_ms: 500.0, samples_processed: 640,
+            epoch_ms: 500.0, share_complete_ms: 500.0, compute_only_ms: 500.0, data_starve_ms: 0.0, samples_processed: 640,
             scalars: [("loss".to_string(), (2.8, 2_usize))].into(),
         },
         // Rank 1 chunk 2
         MetricsMsg {
             rank: 1, epoch: 0, avg_loss: 0.8, batches_processed: 20,
-            epoch_ms: 1000.0, samples_processed: 640,
+            epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0, samples_processed: 640,
             scalars: [("loss".to_string(), (3.2, 2_usize))].into(),
         },
     ];
@@ -3031,7 +3062,7 @@ fn test_streaming_cross_epoch_dispatch() {
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1,
         batches_processed: dispatched / 10,
-        epoch_ms: 50.0, samples_processed: dispatched,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: dispatched,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3065,12 +3096,12 @@ fn test_streaming_global_epoch_event_fires_when_all_complete() {
     // Report completion from both ranks.
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 1,
-        epoch_ms: 10.0, samples_processed: 10,
+        epoch_ms: 10.0, share_complete_ms: 10.0, compute_only_ms: 10.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.metrics_tx.send(MetricsMsg {
         rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 1,
-        epoch_ms: 20.0, samples_processed: 10,
+        epoch_ms: 20.0, share_complete_ms: 20.0, compute_only_ms: 20.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3097,7 +3128,7 @@ fn test_overshoot_gate_blocks_runaway() {
     // Report rank 0 completion (matches dispatched amount).
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
-        epoch_ms: 50.0, samples_processed: 50,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: 50,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3160,7 +3191,7 @@ fn test_overshoot_gate_skipped_for_nccl() {
     // Report rank 0 chunk completion.
     metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
-        epoch_ms: 50.0, samples_processed: 50,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: 50,
         scalars: Default::default(),
     }).unwrap();
     coord.drain_metrics();
@@ -3257,13 +3288,13 @@ fn test_multi_pool_completion_tracking() {
     // Report epoch 0 completion from rank 0
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
-        epoch_ms: 50.0, samples_processed: 50,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: 50,
         scalars: Default::default(),
     }).unwrap();
     // Report epoch 1 completion from rank 0
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 1, avg_loss: 0.2, batches_processed: 3,
-        epoch_ms: 30.0, samples_processed: 30,
+        epoch_ms: 30.0, share_complete_ms: 30.0, compute_only_ms: 30.0, data_starve_ms: 0.0, samples_processed: 30,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3292,12 +3323,12 @@ fn test_shutdown_with_streaming_pools() {
     // Complete epoch 0 from both ranks.
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 1,
-        epoch_ms: 10.0, samples_processed: 10,
+        epoch_ms: 10.0, share_complete_ms: 10.0, compute_only_ms: 10.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.metrics_tx.send(MetricsMsg {
         rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 1,
-        epoch_ms: 20.0, samples_processed: 10,
+        epoch_ms: 20.0, share_complete_ms: 20.0, compute_only_ms: 20.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3319,12 +3350,12 @@ fn test_shutdown_with_streaming_pools() {
     // Complete epoch 1 (the last epoch).
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 1, avg_loss: 0.05, batches_processed: 1,
-        epoch_ms: 10.0, samples_processed: 10,
+        epoch_ms: 10.0, share_complete_ms: 10.0, compute_only_ms: 10.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.metrics_tx.send(MetricsMsg {
         rank: 1, epoch: 1, avg_loss: 0.06, batches_processed: 1,
-        epoch_ms: 20.0, samples_processed: 10,
+        epoch_ms: 20.0, share_complete_ms: 20.0, compute_only_ms: 20.0, data_starve_ms: 0.0, samples_processed: 10,
         scalars: Default::default(),
     }).unwrap();
     h.coord.drain_metrics();
@@ -3376,7 +3407,7 @@ fn test_epoch_event_fires_with_mixed_epoch_ranks() {
     // -- Rank 0 reported epoch 1 completion earlier (buffered) --
     sh.inner.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 1, avg_loss: 0.10, batches_processed: 3,
-        epoch_ms: 30.0, samples_processed: 30,
+        epoch_ms: 30.0, share_complete_ms: 30.0, compute_only_ms: 30.0, data_starve_ms: 0.0, samples_processed: 30,
         scalars: [("loss".to_string(), (0.30, 3_usize))].into(),
     }).unwrap();
     sh.inner.coord.drain_metrics();
@@ -3393,7 +3424,7 @@ fn test_epoch_event_fires_with_mixed_epoch_ranks() {
     // -- Now slow rank (1) completes epoch 1 --
     sh.inner.metrics_tx.send(MetricsMsg {
         rank: 1, epoch: 1, avg_loss: 0.20, batches_processed: 3,
-        epoch_ms: 60.0, samples_processed: 30,
+        epoch_ms: 60.0, share_complete_ms: 60.0, compute_only_ms: 60.0, data_starve_ms: 0.0, samples_processed: 30,
         scalars: [("loss".to_string(), (0.60, 3_usize))].into(),
     }).unwrap();
     sh.inner.coord.drain_metrics();
@@ -3463,17 +3494,17 @@ fn test_dispatch_skips_aggregated_epochs() {
     // Complete all chunks: both ranks for epoch 0, rank 0 for epoch 1.
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 7,
-        epoch_ms: 50.0, samples_processed: 70,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: 70,
         scalars: Default::default(),
     }).unwrap();
     h.metrics_tx.send(MetricsMsg {
         rank: 1, epoch: 0, avg_loss: 0.2, batches_processed: 3,
-        epoch_ms: 80.0, samples_processed: 30,
+        epoch_ms: 80.0, share_complete_ms: 80.0, compute_only_ms: 80.0, data_starve_ms: 0.0, samples_processed: 30,
         scalars: Default::default(),
     }).unwrap();
     h.metrics_tx.send(MetricsMsg {
         rank: 0, epoch: 1, avg_loss: 0.1, batches_processed: 10,
-        epoch_ms: 100.0, samples_processed: 100,
+        epoch_ms: 100.0, share_complete_ms: 100.0, compute_only_ms: 100.0, data_starve_ms: 0.0, samples_processed: 100,
         scalars: Default::default(),
     }).unwrap();
 

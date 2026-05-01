@@ -96,6 +96,17 @@ struct Cli {
     #[option]
     partition_ratios: Option<String>,
 
+    /// Enable ElChe anchor relax-up on stable convergence (default: disabled).
+    ///
+    /// When set, each `Stable` convergence verdict grows the ElChe anchor
+    /// toward `max_anchor` to reduce sync frequency. Opt in to measure the
+    /// relax-up regime explicitly. Default keeps the anchor under
+    /// overhead-based auto-tune alone, matching pre-relax-up behavior.
+    ///
+    /// Honored in Cadence/Async modes only; ignored by Sync and solo modes.
+    #[option]
+    elche_relax_up: bool,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -410,6 +421,7 @@ fn run() -> flodl::tensor::Result<()> {
                 data_dir: data_dir.clone(),
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
+                elche_relax_up: cli.elche_relax_up,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

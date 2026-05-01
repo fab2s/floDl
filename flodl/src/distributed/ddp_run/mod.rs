@@ -250,10 +250,22 @@ pub struct EpochMetrics {
     pub avg_loss: f64,
     /// Wall-clock epoch time (ms), max across ranks.
     pub epoch_ms: f64,
-    /// Per-rank throughput in samples/ms (index = rank).
+    /// Per-rank throughput in samples/ms (index = rank). Computed from
+    /// `share_complete_ms` (epoch start to end of rank's last batch),
+    /// not from `epoch_ms`, to exclude post-completion sync-barrier idle.
+    /// This is the honest capacity signal that the balancer should consume.
     pub per_rank_throughput: Vec<f64>,
     /// Per-rank batch share as fraction 0.0..1.0 (index = rank).
     pub per_rank_batch_share: Vec<f64>,
+    /// Per-rank time on assigned work (ms), from epoch start to last batch
+    /// finishing. Excludes post-completion sync wait. Source of `per_rank_throughput`.
+    pub per_rank_share_complete_ms: Vec<f64>,
+    /// Per-rank pure compute time (ms): sum of train_step durations.
+    /// Diagnostic only; not used by the balancer.
+    pub per_rank_compute_only_ms: Vec<f64>,
+    /// Per-rank cumulative data-wait time (ms): time blocked waiting for
+    /// the next batch. Diagnostic for prefetch tuning; not a balancer input.
+    pub per_rank_data_starve_ms: Vec<f64>,
     /// CUDA device index per rank (for dashboard GPU tabs).
     pub device_indices: Vec<u8>,
 }
@@ -406,6 +418,19 @@ pub struct DdpRunConfig {
     ///
     /// Tune this if convergence degrades at higher GPU counts.
     pub lr_scale_ratio: f64,
+    /// Allow ElChe to relax the anchor upward on stable convergence. Default: `false`.
+    ///
+    /// When `false` (default), the anchor only changes via the overhead-based
+    /// auto-tune in `el_che.report_timing`. This matches pre-relax-up
+    /// behavior and is the reproducibility-friendly default.
+    ///
+    /// When `true`, each `Stable` convergence-guard verdict triggers
+    /// `el_che.relax_anchor_up()`, growing the anchor toward `max_anchor` to
+    /// reduce sync frequency on workloads where convergence is healthy.
+    /// Opt in when measuring the relax-up policy specifically; aware that
+    /// the periodic loosen → drift → tighten → recover cycle adds an
+    /// implicit regularizer to the optimizer's gradient-averaging schedule.
+    pub elche_relax_up: bool,
 }
 
 impl Default for DdpRunConfig {
@@ -432,6 +457,7 @@ impl DdpRunConfig {
             timeline: None,
             max_overshoot: None,
             lr_scale_ratio: 1.0,
+            elche_relax_up: false,
         }
     }
 
@@ -554,6 +580,18 @@ impl DdpRunConfig {
         self.lr_scale_ratio = ratio;
         self
     }
+
+    /// Allow or suppress ElChe's anchor relax-up on stable convergence.
+    ///
+    /// Default: `false` (off). Set to `true` to enable: each `Stable`
+    /// convergence-guard verdict will grow the anchor via
+    /// `el_che.relax_anchor_up()`. Opt in when measuring the relax-up
+    /// regime; the default keeps the anchor under overhead-based control
+    /// alone, matching pre-relax-up behavior.
+    pub fn with_elche_relax_up(mut self, enabled: bool) -> Self {
+        self.elche_relax_up = enabled;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +649,7 @@ pub enum TimingMsg {
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
 ///
 /// Fire-and-forget: worker sends this and immediately starts the next epoch.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MetricsMsg {
     /// Which GPU sent this.
     pub rank: usize,
@@ -621,10 +659,30 @@ pub struct MetricsMsg {
     pub avg_loss: f64,
     /// Number of batches processed in this epoch.
     pub batches_processed: usize,
-    /// Wall-clock time for this epoch (ms).
+    /// Wall-clock time for this epoch (ms). Includes any post-completion
+    /// idle time waiting for collective sync. Kept for backwards-compatibility
+    /// and as a coarse outer-bound timing; do not use as a balancer denominator
+    /// for heterogeneous DDP — see `share_complete_ms`.
     pub epoch_ms: f64,
     /// Total samples processed this epoch (batches * batch_size).
     pub samples_processed: usize,
+    /// Time the rank spent on its assigned work, from epoch start to its last
+    /// batch finishing (ms). Includes data-pipeline waits (the rank's own
+    /// pipeline limitation), excludes post-completion sync-barrier idle.
+    /// This is the honest balancer denominator: tput = samples_processed
+    /// / share_complete_ms reflects the rank's actual capacity.
+    pub share_complete_ms: f64,
+    /// Pure compute time within the epoch (sum of forward+backward+optimizer
+    /// step durations, ms). Diagnostic only — not used by the balancer.
+    /// Useful for capacity / saturation analysis.
+    pub compute_only_ms: f64,
+    /// Cumulative time the rank was blocked waiting for data (ms).
+    /// On the prefetch path this is time spent in `recv()` on the prefetch
+    /// channel; on the sync path this is time spent in `dataset.get_batch()`
+    /// plus host-to-device transfer. Diagnostic only: surfacing this drives
+    /// prefetch-tuning decisions, not balancer share allocation. Feeding
+    /// it back to the balancer would create a contaminated control loop.
+    pub data_starve_ms: f64,
     /// Named scalar metrics recorded via [`record_scalar()`] during this epoch.
     /// Each value is `(sum, count)` for computing the mean.
     pub scalars: HashMap<String, (f64, usize)>,

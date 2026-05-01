@@ -324,7 +324,8 @@ impl DdpHandle {
                 .progressive(progressive)
                 .batch_size(coord_batch_size)
                 .timeline(coord_timeline.clone())
-                .max_overshoot(config.max_overshoot);
+                .max_overshoot(config.max_overshoot)
+                .elche_relax_up(config.elche_relax_up);
                 if let Some(mf) = metrics_fn {
                     builder = builder.metrics_fn(mf);
                 }
@@ -1206,6 +1207,17 @@ where
     /// into the next epoch's data. Default: auto-tuned from convergence.
     pub fn max_overshoot(mut self, max: usize) -> Self {
         self.config = self.config.with_max_overshoot(max);
+        self
+    }
+
+    /// Allow or suppress ElChe's anchor relax-up on stable convergence.
+    ///
+    /// Default: `false` (opt-in). When `true`, each `Stable` convergence
+    /// verdict triggers `el_che.relax_anchor_up()` to grow the anchor toward
+    /// `max_anchor`. Opt in when measuring the relax-up regime; the default
+    /// keeps the anchor under overhead-based auto-tune alone.
+    pub fn elche_relax_up(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_elche_relax_up(enabled);
         self
     }
 
