@@ -645,6 +645,11 @@ pub enum TimingMsg {
         /// can take any rank's value. Used for longitudinal meta-velocity
         /// tracking. `None` when divergence is also `None`.
         post_norm: Option<f64>,
+        /// Pre-AllReduce per-rank L2 norm `||params_before||_i`. With
+        /// `divergence` and `post_norm` this gives the cosine-similarity /
+        /// magnitude-shift decomposition (MSF/SWA directional vs magnitude
+        /// split). `None` when divergence is also `None`.
+        pre_norm: Option<f64>,
     },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.

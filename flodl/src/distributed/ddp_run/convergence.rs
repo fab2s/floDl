@@ -108,34 +108,52 @@ pub enum ConvergenceAction {
 
 /// Per-event sample of the across-event transversal Lyapunov proxy.
 ///
-/// `lambda_raw_t = (1/k) * log(D_t / D_{t-1})` from the MSF cadence-control
-/// design (`docs/design/msf-cadence-control.md`). `None` on the first event
-/// or when either operand is below the noise floor (R4 clamp).
+/// `lambda_raw_t = (1/k_max) * log(D_t / D_{t-1})` where `k_max` is the
+/// per-rank step count of the slowest rank between consecutive AllReduces
+/// (i.e. the wallclock cadence interval). See
+/// `docs/design/msf-cadence-control.md`. Using `k_max` (rather than
+/// `sum(steps_since_avg)`) puts the rate on the wallclock-time axis the
+/// MSF framework expects; cross-world-size comparison stays meaningful.
+/// `None` on the first event or when either operand is below the noise
+/// floor (R4 clamp triggers a full estimator reset).
 #[derive(Debug, Clone)]
 pub struct LambdaSample {
     /// Max normalized delta this event (= `report.max_relative_delta()`).
     pub d_raw: f64,
-    /// Across-event proxy `(1/k) * log(D_t / D_{t-1})`. `None` on first event
-    /// or below noise floor.
+    /// Across-event proxy `(1/k_max) * log(D_t / D_{t-1})`. `None` on first
+    /// event after a reset or below noise floor.
     pub lambda_raw: Option<f64>,
-    /// EMA-smoothed `lambda_raw` (C2 in the design doc, default `alpha = 0.9`).
+    /// Bias-corrected EMA of `lambda_raw` (C2 in the design doc, default
+    /// `alpha = 0.9`). Adam-style `EMA / (1 - alpha^t)` removes the
+    /// startup-toward-zero bias for the first ~10 events — exactly the
+    /// warmup phase where lambda is most informative.
     pub lambda_ema: Option<f64>,
-    /// Cadence interval just completed: `sum(steps_since_avg)` across ranks.
+    /// Cadence interval just completed expressed as total batches consumed
+    /// across all ranks (`sum(steps_since_avg)`). Kept for accounting only
+    /// — NOT used as the lambda denominator.
     pub k_used: usize,
-    /// `max(steps_since_avg)` — useful under heterogeneous DDP where ranks
-    /// drift apart. Equal to `k_used / world_size` only for homogeneous Sync.
+    /// `max(steps_since_avg)` — wallclock cadence interval per rank.
+    /// Used as the lambda denominator (per-rank time axis).
     pub k_max: usize,
 }
 
 /// Estimator for the across-event lambda proxy.
 ///
-/// Holds the previous `D_t` and the EMA state. Updated at every AllReduce
-/// via [`ConvergenceGuard::observe_lambda`]. Reset across mode/run boundaries
+/// Holds the previous `D_t`, the raw EMA state, and an event counter for
+/// Adam-style bias correction. Updated at every AllReduce via
+/// [`ConvergenceGuard::observe_lambda`]. Reset across mode/run boundaries
 /// (epoch boundaries do NOT reset the estimator: lambda continuity matters
 /// across epochs; only mode transitions or full re-init reset).
 pub struct LambdaEstimator {
     prev_d: Option<f64>,
-    ema: Option<f64>,
+    /// Raw EMA — uncorrected, starts at 0.0. Bias correction
+    /// `1 / (1 - alpha^t)` is applied at sample time. Adam-style: requires
+    /// the EMA to start from 0 so the formula recovers `l_1` exactly on
+    /// the first update.
+    ema_raw: f64,
+    /// Number of `lambda_raw` updates since last reset. `0` means no
+    /// observations yet → `lambda_ema` is `None`.
+    ema_t: u32,
     alpha: f64,
     noise_floor: f64,
 }
@@ -144,7 +162,8 @@ impl Default for LambdaEstimator {
     fn default() -> Self {
         Self {
             prev_d: None,
-            ema: None,
+            ema_raw: 0.0,
+            ema_t: 0,
             alpha: 0.9,
             noise_floor: 1e-8,
         }
@@ -153,35 +172,56 @@ impl Default for LambdaEstimator {
 
 impl LambdaEstimator {
     /// Observe a new `D_t` and return the resulting [`LambdaSample`].
+    ///
+    /// `k_max` (per-rank steps since last AllReduce) is the rate denominator;
+    /// `k_used` (sum across ranks) is carried for accounting.
+    ///
+    /// Below-noise-floor `d_raw` triggers a full estimator reset: `prev_d`
+    /// cleared, EMA preserved (state from above-floor events still useful
+    /// once the system climbs back). Half-skipping (keep `prev_d`, skip
+    /// sample) breaks the time axis on resume, since the next `lambda_raw`
+    /// would be computed against the wrong elapsed-time baseline.
     pub fn observe(&mut self, d_raw: f64, k_used: usize, k_max: usize) -> LambdaSample {
         let lambda_raw = match self.prev_d {
-            Some(prev) if prev > self.noise_floor && d_raw > self.noise_floor && k_used > 0 => {
-                Some((d_raw / prev).ln() / k_used as f64)
+            Some(prev) if prev > self.noise_floor && d_raw > self.noise_floor && k_max > 0 => {
+                Some((d_raw / prev).ln() / k_max as f64)
             }
             _ => None,
         };
         if let Some(l) = lambda_raw {
-            self.ema = Some(match self.ema {
-                Some(e) => self.alpha * e + (1.0 - self.alpha) * l,
-                None => l,
-            });
+            self.ema_raw = self.alpha * self.ema_raw + (1.0 - self.alpha) * l;
+            self.ema_t = self.ema_t.saturating_add(1);
         }
         if d_raw > self.noise_floor {
             self.prev_d = Some(d_raw);
+        } else {
+            self.prev_d = None;
         }
+        let lambda_ema = if self.ema_t == 0 {
+            None
+        } else {
+            let denom = 1.0 - self.alpha.powi(self.ema_t as i32);
+            Some(if denom > 0.0 {
+                self.ema_raw / denom
+            } else {
+                self.ema_raw
+            })
+        };
         LambdaSample {
             d_raw,
             lambda_raw,
-            lambda_ema: self.ema,
+            lambda_ema,
             k_used,
             k_max,
         }
     }
 
-    /// Full reset: clears `prev_d` and EMA. Use across mode/run boundaries.
+    /// Full reset: clears `prev_d`, EMA, and event counter. Use across
+    /// mode/run boundaries.
     pub fn reset(&mut self) {
         self.prev_d = None;
-        self.ema = None;
+        self.ema_raw = 0.0;
+        self.ema_t = 0;
     }
 }
 
@@ -547,61 +587,94 @@ mod tests {
     }
 
     #[test]
-    fn lambda_growth_positive() {
+    fn lambda_growth_positive_uses_k_max() {
         let mut e = LambdaEstimator::default();
         e.observe(0.01, 8, 4);
         let s = e.observe(0.02, 8, 4);
-        // (1/8) * ln(2) ~= 0.0866
-        let expected = std::f64::consts::LN_2 / 8.0;
+        // Denominator is k_max (per-rank steps), NOT k_used (sum across ranks).
+        // (1/4) * ln(2) ~= 0.1733.
+        let expected = std::f64::consts::LN_2 / 4.0;
         let got = s.lambda_raw.expect("second event must produce lambda");
         assert!((got - expected).abs() < 1e-10);
         assert!(got > 0.0);
     }
 
     #[test]
-    fn lambda_decay_negative() {
+    fn lambda_decay_negative_uses_k_max() {
         let mut e = LambdaEstimator::default();
         e.observe(0.04, 8, 4);
         let s = e.observe(0.02, 8, 4);
-        // (1/8) * ln(0.5) = -ln(2)/8 ~= -0.0866
-        let expected = -std::f64::consts::LN_2 / 8.0;
+        // (1/k_max) * ln(0.5) = -ln(2)/4 ~= -0.1733
+        let expected = -std::f64::consts::LN_2 / 4.0;
         let got = s.lambda_raw.expect("second event must produce lambda");
         assert!((got - expected).abs() < 1e-10);
         assert!(got < 0.0);
     }
 
     #[test]
-    fn lambda_noise_floor_clamps() {
+    fn lambda_k_max_unchanged_by_world_size() {
+        // Two estimators see the same per-rank trajectory but different
+        // world sizes. With k_max as the denominator, they must agree;
+        // the previous k_used=sum convention would have given a 2x split.
+        let mut e_two = LambdaEstimator::default();
+        e_two.observe(0.01, 8, 4); // 2 ranks, 4 steps each
+        let s_two = e_two.observe(0.02, 8, 4);
+        let mut e_three = LambdaEstimator::default();
+        e_three.observe(0.01, 12, 4); // 3 ranks, 4 steps each
+        let s_three = e_three.observe(0.02, 12, 4);
+        let l_two = s_two.lambda_raw.unwrap();
+        let l_three = s_three.lambda_raw.unwrap();
+        assert!((l_two - l_three).abs() < 1e-12, "{l_two} vs {l_three}");
+    }
+
+    #[test]
+    fn lambda_noise_floor_resets_estimator() {
         let mut e = LambdaEstimator::default();
         e.observe(0.01, 8, 4);
-        // d_raw below noise floor -> lambda_raw None and prev_d unchanged
+        // d_raw below noise floor -> full reset: lambda_raw None, prev_d cleared.
         let s = e.observe(1e-12, 8, 4);
         assert!(s.lambda_raw.is_none());
-        // Next event uses prev_d = 0.01 (the last valid one), not 1e-12
+        // Next event treats this as the first post-reset sample: lambda_raw None.
+        // Half-skipping (keeping prev_d=0.01) would have produced ln(2)/k_max
+        // off the wrong baseline — that contract was wrong on the time axis.
         let s2 = e.observe(0.02, 8, 4);
-        let expected = std::f64::consts::LN_2 / 8.0;
-        assert!((s2.lambda_raw.unwrap() - expected).abs() < 1e-10);
+        assert!(s2.lambda_raw.is_none());
+        // Subsequent event resumes lambda computation against the post-reset prev_d.
+        let s3 = e.observe(0.04, 8, 4);
+        let expected = std::f64::consts::LN_2 / 4.0;
+        assert!((s3.lambda_raw.unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lambda_ema_bias_corrected_at_warmup() {
+        // First lambda_raw of e.g. 1.0 should produce a bias-corrected EMA
+        // also at 1.0 (not 1.0 * 0.1 = 0.1, the raw EMA value). Adam-style
+        // 1/(1-alpha^t) correction removes the startup-toward-zero pull.
+        let mut e = LambdaEstimator::default();
+        e.observe(1.0, 1, 1);
+        let s = e.observe(std::f64::consts::E, 1, 1);
+        let lambda = s.lambda_raw.unwrap();
+        let ema = s.lambda_ema.unwrap();
+        // Both should be ~1.0; bias-corrected EMA matches lambda_raw exactly
+        // on the first update.
+        assert!((lambda - 1.0).abs() < 1e-10, "lambda={lambda}");
+        assert!((ema - 1.0).abs() < 1e-10, "ema={ema}");
     }
 
     #[test]
     fn lambda_ema_smooths_over_constant_input() {
         let mut e = LambdaEstimator::default();
-        // After many constant +1 events, EMA should approach the input.
-        e.observe(1.0, 1, 1); // first: lambda None, ema None
-        for _ in 0..200 {
-            // d goes 1, e, e^2, ... -> lambda_raw = 1.0/k = 1.0 each step
-            // Use prev=1.0, d=e^1, then prev=e, d=e^2, etc.
-        }
-        // Simpler: feed a sequence where consecutive ratios are constant=e^1.
+        // Feed a sequence where consecutive ratios are constant = e^1.
+        // lambda_raw = 1.0 every step at k_max=1; bias-corrected EMA must
+        // sit at 1.0 every step (constant input -> no bias to correct away).
         let mut prev = 1.0_f64;
         for _ in 0..200 {
             let next = prev * std::f64::consts::E;
             e.observe(next, 1, 1);
             prev = next;
         }
-        let ema = e.ema.expect("ema must be Some after many events");
-        // lambda_raw is 1.0 every step, EMA must converge to 1.0
-        assert!((ema - 1.0).abs() < 1e-3, "ema = {ema}");
+        // Raw EMA also converges to 1.0 since constant input has no startup bias.
+        assert!((e.ema_raw - 1.0).abs() < 1e-3, "raw_ema = {}", e.ema_raw);
     }
 
     #[test]
@@ -639,9 +712,9 @@ mod tests {
         let snap1 = g.take_epoch_snapshot();
         assert_eq!(snap1.count, 2);
         // After snapshot, accumulator empty but prev_d still 0.02.
-        // Next event computes lambda against 0.02, so doubling -> +ln(2)/8.
+        // Next event computes lambda against 0.02, so doubling -> +ln(2)/k_max.
         let s = g.observe_lambda(0.04, 8, 4);
-        let expected = std::f64::consts::LN_2 / 8.0;
+        let expected = std::f64::consts::LN_2 / 4.0;
         assert!((s.lambda_raw.unwrap() - expected).abs() < 1e-10);
         let snap2 = g.take_epoch_snapshot();
         assert_eq!(snap2.count, 1);

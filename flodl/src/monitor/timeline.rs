@@ -119,6 +119,16 @@ pub enum EventKind {
         /// longitudinal meta-oscillator state: tracking `||W̄_t||` across
         /// events gives consensus magnitude trajectory between syncs.
         post_norm: Option<f64>,
+        /// Per-rank pre-AllReduce L2 norm `||W_i||`. `None` when not
+        /// computed. With `post_norm` and `deltas` this enables the
+        /// cosine-similarity / magnitude-shift decomposition (MSF/SWA
+        /// directional vs magnitude split).
+        pre_norms: Option<Vec<f64>>,
+        /// In-flight epoch at the time of this event (= `last_aggregated_epoch
+        /// + 1`, or 0 before the first epoch aggregates). `None` for
+        /// timelines emitted before this field was added; consumers fall
+        /// back to `EpochEnd` timestamp lookup.
+        epoch: Option<usize>,
     },
     /// MSF passive observation: per-epoch divergence + lambda aggregates.
     ///
@@ -731,11 +741,16 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 step,
                 deltas,
                 post_norm,
+                pre_norms,
+                epoch,
             } => {
                 let _ = write!(
                     out,
                     "\"k\":\"div\",\"d\":{d_raw:.6e},\"k_used\":{k_used},\"k_max\":{k_max},\"step\":{step}"
                 );
+                if let Some(ep) = epoch {
+                    let _ = write!(out, ",\"epoch\":{ep}");
+                }
                 if let Some(l) = lambda_raw {
                     let _ = write!(out, ",\"lambda\":{l:.6e}");
                 }
@@ -744,6 +759,16 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 }
                 if let Some(p) = post_norm {
                     let _ = write!(out, ",\"post_norm\":{p:.6e}");
+                }
+                if let Some(prs) = pre_norms {
+                    out.push_str(",\"pre_norms\":[");
+                    for (i, p) in prs.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let _ = write!(out, "{p:.6e}");
+                    }
+                    out.push(']');
                 }
                 out.push_str(",\"deltas\":[");
                 for (i, d) in deltas.iter().enumerate() {

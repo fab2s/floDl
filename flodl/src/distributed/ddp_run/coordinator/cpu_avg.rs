@@ -151,15 +151,21 @@ impl Coordinator {
         // Feed weight-space divergence (from previous sync's acks) to the guard.
         // Invariant: should_average() requires all nccl_ack == true before next
         // trigger, so all nccl_sync_divergence[rank] are populated by now.
-        // Post-norm is identical across ranks post-AllReduce; take first
-        // populated entry (rank 0 by convention, all others equal).
-        let nccl_post_norm = self.nccl_sync_post_norm.iter().find_map(|p| *p);
+        // Post-norm is identical across ranks post-AllReduce; we keep a single
+        // scalar populated by the first rank's ack (debug_assert in the
+        // SyncAck handler enforces inter-rank agreement).
+        let nccl_pre_norms: Option<Vec<f64>> =
+            if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
+                Some(self.nccl_sync_pre_norm.iter().map(|p| p.unwrap()).collect())
+            } else {
+                None
+            };
         let report = convergence::DivergenceReport {
             deltas: self.nccl_sync_divergence.iter()
                 .map(|d| d.unwrap_or(0.0))
                 .collect(),
-            pre_norms: None,
-            post_norm: nccl_post_norm,
+            pre_norms: nccl_pre_norms,
+            post_norm: self.nccl_sync_post_norm,
         };
         let action = self.convergence_guard.report(&report);
 
@@ -227,6 +233,7 @@ impl Coordinator {
         // Reads quantities already in scope (D_t, k); no behavior change.
         let d_raw = report.max_relative_delta();
         let lambda_sample = self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::Divergence {
                 d_raw,
@@ -237,6 +244,8 @@ impl Coordinator {
                 step: self.global_step,
                 deltas: report.deltas.clone(),
                 post_norm: report.post_norm,
+                pre_norms: report.pre_norms.clone(),
+                epoch: Some(in_flight_epoch),
             });
         }
 
@@ -270,9 +279,10 @@ impl Coordinator {
         for d in &mut self.nccl_sync_divergence {
             *d = None;
         }
-        for p in &mut self.nccl_sync_post_norm {
+        for p in &mut self.nccl_sync_pre_norm {
             *p = None;
         }
+        self.nccl_sync_post_norm = None;
 
         // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)
         // and may have been waiting at the overshoot gate. Now that
@@ -378,6 +388,7 @@ impl Coordinator {
             let d_raw = report.max_relative_delta();
             let lambda_sample =
                 self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+            let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::Divergence {
                     d_raw,
@@ -388,6 +399,8 @@ impl Coordinator {
                     step: self.global_step,
                     deltas: report.deltas.clone(),
                     post_norm: report.post_norm,
+                    pre_norms: report.pre_norms.clone(),
+                    epoch: Some(in_flight_epoch),
                 });
             }
         }

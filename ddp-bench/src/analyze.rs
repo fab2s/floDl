@@ -56,9 +56,18 @@ pub enum EventKind {
         k_max: usize,
         step: usize,
         deltas: Vec<f64>,
-        /// L2 norm of the post-AllReduce consensus weights. Only emitted by
-        /// CPU averaging path (NCCL v1 doesn't compute it).
+        /// L2 norm of the post-AllReduce consensus weights `||W̄||`. `None`
+        /// for timelines emitted before the post_norm wiring landed.
         post_norm: Option<f64>,
+        /// Per-rank pre-AllReduce L2 norm `||W_i||`. `None` for timelines
+        /// emitted before the pre_norm wiring landed; combined with `deltas`
+        /// and `post_norm` enables the cosine-similarity / magnitude-shift
+        /// decomposition (MSF/SWA directional vs magnitude split).
+        pre_norms: Option<Vec<f64>>,
+        /// In-flight epoch at the time of this event. `None` for timelines
+        /// emitted before the field was added; consumers fall back to
+        /// `EpochEnd` timestamp lookup.
+        epoch: Option<usize>,
     },
     /// MSF per-epoch aggregate snapshot.
     DivergenceEpoch {
@@ -455,6 +464,11 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
                             .collect::<Vec<f64>>()
                     })
                     .unwrap_or_default();
+                let pre_norms = item["pre_norms"].as_array().map(|a| {
+                    a.iter()
+                        .map(|v| v.as_f64().unwrap_or(0.0))
+                        .collect::<Vec<f64>>()
+                });
                 EventKind::Divergence {
                     d_raw: item["d"].as_f64().unwrap_or(0.0),
                     lambda_raw: item["lambda"].as_f64(),
@@ -464,6 +478,8 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
                     step: item["step"].as_u64().unwrap_or(0) as usize,
                     deltas,
                     post_norm: item["post_norm"].as_f64(),
+                    pre_norms,
+                    epoch: item["epoch"].as_u64().map(|v| v as usize),
                 }
             }
             "div_epoch" => EventKind::DivergenceEpoch {

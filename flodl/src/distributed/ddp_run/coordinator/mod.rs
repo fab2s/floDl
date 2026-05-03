@@ -156,10 +156,15 @@ pub struct Coordinator {
     /// Per-rank weight-space divergence from the most recent AllReduce.
     /// Set via `sync_divergence` in TimingMsg ack. Reset after averaging.
     nccl_sync_divergence: Vec<Option<f64>>,
+    /// Per-rank pre-AllReduce L2 norm `||params_before||_i` from the most
+    /// recent AllReduce. Set via `pre_norm` in SyncAck (workers compute it
+    /// alongside divergence in the same loop). Reset after averaging.
+    nccl_sync_pre_norm: Vec<Option<f64>>,
     /// Post-AllReduce consensus L2 norm `||params_after||`. Identical across
-    /// ranks; coordinator uses any populated entry. Set via `post_norm` in
-    /// SyncAck. Reset after averaging.
-    nccl_sync_post_norm: Vec<Option<f64>>,
+    /// ranks by AllReduce construction, so a single scalar suffices. Set
+    /// from the first rank's SyncAck; subsequent rank acks are ignored
+    /// (debug_assert checks consistency). Reset after averaging.
+    nccl_sync_post_norm: Option<f64>,
     /// Unified convergence guard: owns ring buffer and mode-specific logic.
     convergence_guard: super::convergence::ConvergenceGuard,
 
@@ -394,7 +399,8 @@ impl CoordinatorBuilder {
             loss_accum: vec![0.0; self.world_size],
             loss_count: vec![0; self.world_size],
             nccl_sync_divergence: vec![None; self.world_size],
-            nccl_sync_post_norm: vec![None; self.world_size],
+            nccl_sync_pre_norm: vec![None; self.world_size],
+            nccl_sync_post_norm: None,
             convergence_guard: super::convergence::ConvergenceGuard::new(
                 self.policy,
                 self.divergence_guard,
@@ -923,17 +929,29 @@ impl Coordinator {
                     self.capture_nccl_sync_elapsed_if_complete();
                 }
             }
-            TimingMsg::SyncAck { rank, step_count, divergence, post_norm } => {
+            TimingMsg::SyncAck { rank, step_count, divergence, post_norm, pre_norm } => {
                 // Post-SyncNow ack: update step count for nccl_ack + capture
-                // divergence + post_norm, but do NOT increment steps_since_avg.
-                // Treating this as a batch inflates global_step by one per sync
-                // per rank, firing LR schedulers early.
+                // divergence + pre/post_norm, but do NOT increment
+                // steps_since_avg. Treating this as a batch inflates
+                // global_step by one per sync per rank, firing LR schedulers
+                // early.
                 self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 if let Some(div) = divergence {
                     self.nccl_sync_divergence[rank] = Some(div);
                 }
+                if let Some(p) = pre_norm {
+                    self.nccl_sync_pre_norm[rank] = Some(p);
+                }
                 if let Some(p) = post_norm {
-                    self.nccl_sync_post_norm[rank] = Some(p);
+                    // Post-AllReduce identical across ranks; first rank wins,
+                    // subsequent acks must agree to within fp tolerance.
+                    match self.nccl_sync_post_norm {
+                        None => self.nccl_sync_post_norm = Some(p),
+                        Some(prev) => debug_assert!(
+                            (prev - p).abs() <= 1e-6 * prev.abs().max(1.0),
+                            "post_norm rank-disagreement: prev={prev} new={p} (rank {rank})"
+                        ),
+                    }
                 }
                 if rank < self.nccl_ack.len()
                     && !self.nccl_ack[rank]
@@ -2170,7 +2188,8 @@ mod tests {
         // Inject a SyncAck for each rank (post-NCCL ack).
         for rank in 0..2 {
             coord.process_timing_msg(TimingMsg::SyncAck {
-                rank, step_count: 11, divergence: Some(0.01), post_norm: Some(1.0),
+                rank, step_count: 11, divergence: Some(0.01),
+                post_norm: Some(1.0), pre_norm: Some(1.01),
             });
         }
 
@@ -2197,7 +2216,8 @@ mod tests {
         // Worker reports SyncAck with step_count=6 (one past snapshot).
         for rank in 0..2 {
             coord.process_timing_msg(TimingMsg::SyncAck {
-                rank, step_count: 6, divergence: None, post_norm: None,
+                rank, step_count: 6, divergence: None,
+                post_norm: None, pre_norm: None,
             });
         }
         assert_eq!(coord.nccl_ack, vec![true, true],
