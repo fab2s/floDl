@@ -217,7 +217,24 @@ impl Coordinator {
 
         // Advance global step by total batches from all GPUs in this cycle.
         let cycle_batches: usize = self.steps_since_avg.iter().sum();
+        let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
         self.global_step += cycle_batches;
+
+        // MSF passive observation: lambda_hat sample for this AllReduce.
+        // Reads quantities already in scope (D_t, k); no behavior change.
+        let d_raw = report.max_relative_delta();
+        let lambda_sample = self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::Divergence {
+                d_raw,
+                lambda_raw: lambda_sample.lambda_raw,
+                lambda_ema: lambda_sample.lambda_ema,
+                k_used: cycle_batches,
+                k_max,
+                step: self.global_step,
+                deltas: report.deltas.clone(),
+            });
+        }
 
         // Broadcast new global step to all workers so they can compute
         // per-batch LR as scheduler.lr(global_step + local_offset).
@@ -344,7 +361,28 @@ impl Coordinator {
         // Use snapshot (not current) counters -- batches during the averaging
         // window belong to the next cycle.
         let cycle_batches: usize = steps_snapshot.iter().sum();
+        let k_max = steps_snapshot.iter().copied().max().unwrap_or(0);
         self.global_step += cycle_batches;
+
+        // MSF passive observation: lambda_hat sample for this AllReduce.
+        // Only emit when a divergence report was actually produced (Sync mode
+        // skips divergence computation entirely).
+        if let Some(ref report) = divergence_report {
+            let d_raw = report.max_relative_delta();
+            let lambda_sample =
+                self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::Divergence {
+                    d_raw,
+                    lambda_raw: lambda_sample.lambda_raw,
+                    lambda_ema: lambda_sample.lambda_ema,
+                    k_used: cycle_batches,
+                    k_max,
+                    step: self.global_step,
+                    deltas: report.deltas.clone(),
+                });
+            }
+        }
 
         // Broadcast new global step to all workers.
         for tx in &self.control_txs {

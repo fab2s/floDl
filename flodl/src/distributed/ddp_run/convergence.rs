@@ -103,6 +103,170 @@ pub enum ConvergenceAction {
 }
 
 // ---------------------------------------------------------------------------
+// MSF lambda_hat estimator (Phase 1: passive observation)
+// ---------------------------------------------------------------------------
+
+/// Per-event sample of the across-event transversal Lyapunov proxy.
+///
+/// `lambda_raw_t = (1/k) * log(D_t / D_{t-1})` from the MSF cadence-control
+/// design (`docs/design/msf-cadence-control.md`). `None` on the first event
+/// or when either operand is below the noise floor (R4 clamp).
+#[derive(Debug, Clone)]
+pub struct LambdaSample {
+    /// Max normalized delta this event (= `report.max_relative_delta()`).
+    pub d_raw: f64,
+    /// Across-event proxy `(1/k) * log(D_t / D_{t-1})`. `None` on first event
+    /// or below noise floor.
+    pub lambda_raw: Option<f64>,
+    /// EMA-smoothed `lambda_raw` (C2 in the design doc, default `alpha = 0.9`).
+    pub lambda_ema: Option<f64>,
+    /// Cadence interval just completed: `sum(steps_since_avg)` across ranks.
+    pub k_used: usize,
+    /// `max(steps_since_avg)` — useful under heterogeneous DDP where ranks
+    /// drift apart. Equal to `k_used / world_size` only for homogeneous Sync.
+    pub k_max: usize,
+}
+
+/// Estimator for the across-event lambda proxy.
+///
+/// Holds the previous `D_t` and the EMA state. Updated at every AllReduce
+/// via [`ConvergenceGuard::observe_lambda`]. Reset across mode/run boundaries
+/// (epoch boundaries do NOT reset the estimator: lambda continuity matters
+/// across epochs; only mode transitions or full re-init reset).
+pub struct LambdaEstimator {
+    prev_d: Option<f64>,
+    ema: Option<f64>,
+    alpha: f64,
+    noise_floor: f64,
+}
+
+impl Default for LambdaEstimator {
+    fn default() -> Self {
+        Self {
+            prev_d: None,
+            ema: None,
+            alpha: 0.9,
+            noise_floor: 1e-8,
+        }
+    }
+}
+
+impl LambdaEstimator {
+    /// Observe a new `D_t` and return the resulting [`LambdaSample`].
+    pub fn observe(&mut self, d_raw: f64, k_used: usize, k_max: usize) -> LambdaSample {
+        let lambda_raw = match self.prev_d {
+            Some(prev) if prev > self.noise_floor && d_raw > self.noise_floor && k_used > 0 => {
+                Some((d_raw / prev).ln() / k_used as f64)
+            }
+            _ => None,
+        };
+        if let Some(l) = lambda_raw {
+            self.ema = Some(match self.ema {
+                Some(e) => self.alpha * e + (1.0 - self.alpha) * l,
+                None => l,
+            });
+        }
+        if d_raw > self.noise_floor {
+            self.prev_d = Some(d_raw);
+        }
+        LambdaSample {
+            d_raw,
+            lambda_raw,
+            lambda_ema: self.ema,
+            k_used,
+            k_max,
+        }
+    }
+
+    /// Full reset: clears `prev_d` and EMA. Use across mode/run boundaries.
+    pub fn reset(&mut self) {
+        self.prev_d = None;
+        self.ema = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-epoch accumulator
+// ---------------------------------------------------------------------------
+
+/// Aggregated divergence + lambda statistics over a single epoch.
+///
+/// Updated at every AllReduce within the epoch via
+/// [`ConvergenceGuard::observe_lambda`]. Drained at epoch boundaries via
+/// [`ConvergenceGuard::take_epoch_snapshot`], which resets the accumulator
+/// (but not the underlying [`LambdaEstimator`] — lambda continuity carries
+/// across epochs).
+#[derive(Debug, Clone, Default)]
+pub struct EpochSnapshot {
+    /// Number of AllReduce events in this epoch.
+    pub count: usize,
+    /// Number of events that produced a finite `lambda_raw` (excludes the
+    /// first event in a fresh estimator and noise-floor-clamped events).
+    pub lambda_count: usize,
+    pub d_min: f64,
+    pub d_max: f64,
+    pub d_sum: f64,
+    pub lambda_min: f64,
+    pub lambda_max: f64,
+    pub lambda_sum: f64,
+    /// Last sample observed in this epoch (snapshot at epoch end).
+    pub last_sample: Option<LambdaSample>,
+}
+
+impl EpochSnapshot {
+    fn new() -> Self {
+        Self {
+            d_min: f64::INFINITY,
+            d_max: f64::NEG_INFINITY,
+            lambda_min: f64::INFINITY,
+            lambda_max: f64::NEG_INFINITY,
+            ..Default::default()
+        }
+    }
+
+    fn update(&mut self, sample: &LambdaSample) {
+        self.count += 1;
+        self.d_sum += sample.d_raw;
+        if sample.d_raw < self.d_min {
+            self.d_min = sample.d_raw;
+        }
+        if sample.d_raw > self.d_max {
+            self.d_max = sample.d_raw;
+        }
+        if let Some(l) = sample.lambda_raw {
+            self.lambda_count += 1;
+            self.lambda_sum += l;
+            if l < self.lambda_min {
+                self.lambda_min = l;
+            }
+            if l > self.lambda_max {
+                self.lambda_max = l;
+            }
+        }
+        self.last_sample = Some(sample.clone());
+    }
+
+    /// Mean `D_t` across this epoch's events. Zero if no events.
+    pub fn d_mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.d_sum / self.count as f64
+        }
+    }
+
+    /// Mean `lambda_raw` across this epoch's finite-lambda events. `None` if
+    /// no event in this epoch produced a finite `lambda_raw`.
+    pub fn lambda_mean(&self) -> Option<f64> {
+        if self.lambda_count == 0 {
+            None
+        } else {
+            Some(self.lambda_sum / self.lambda_count as f64)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convergence guard
 // ---------------------------------------------------------------------------
 
@@ -113,6 +277,11 @@ pub enum ConvergenceAction {
 /// the guard returns a [`ConvergenceAction`] that the coordinator applies
 /// to ElChe's anchor and overshoot controls.
 ///
+/// Also owns the [`LambdaEstimator`] and per-epoch accumulator for MSF
+/// passive observation (Phase 1). These are pure measurement: they observe
+/// the same quantities the trend rule already computes, with no behavioral
+/// effect on cadence.
+///
 /// The ring buffer persists across sync intervals (required for trend
 /// detection). Per-interval accumulators (`nccl_sync_divergence`) live
 /// in the coordinator and are reset there.
@@ -122,6 +291,10 @@ pub struct ConvergenceGuard {
     threshold: f64,
     /// Ring buffer of `max_relative_delta` from recent sync intervals (up to 5).
     history: VecDeque<f64>,
+    /// MSF lambda estimator (passive: log-only, no controller effect).
+    lambda: LambdaEstimator,
+    /// Per-epoch aggregates over [`LambdaSample`]s.
+    epoch: EpochSnapshot,
 }
 
 
@@ -136,7 +309,38 @@ impl ConvergenceGuard {
             enabled,
             threshold,
             history: VecDeque::with_capacity(6),
+            lambda: LambdaEstimator::default(),
+            epoch: EpochSnapshot::new(),
         }
+    }
+
+    /// Observe a divergence event for MSF passive logging.
+    ///
+    /// Updates the [`LambdaEstimator`] and the per-epoch accumulator. Returns
+    /// the resulting [`LambdaSample`] for downstream emission. Call this in
+    /// addition to (or after) [`ConvergenceGuard::report`] at every AllReduce.
+    pub fn observe_lambda(&mut self, d_raw: f64, k_used: usize, k_max: usize) -> LambdaSample {
+        let sample = self.lambda.observe(d_raw, k_used, k_max);
+        self.epoch.update(&sample);
+        sample
+    }
+
+    /// Drain the per-epoch accumulator and return the snapshot.
+    ///
+    /// Resets the accumulator. Does NOT reset the underlying
+    /// [`LambdaEstimator`]: lambda continuity carries across epoch
+    /// boundaries (epochs are not theoretical-framework boundaries).
+    pub fn take_epoch_snapshot(&mut self) -> EpochSnapshot {
+        std::mem::replace(&mut self.epoch, EpochSnapshot::new())
+    }
+
+    /// Full reset of the lambda estimator (mode/run boundary).
+    ///
+    /// Clears `prev_d` and EMA. The trend ring buffer (`history`) is not
+    /// touched here; it is owned by the existing reset path.
+    pub fn reset_lambda(&mut self) {
+        self.lambda.reset();
+        self.epoch = EpochSnapshot::new();
     }
 
     /// Feed a divergence report and get a cadence action.
@@ -328,6 +532,134 @@ mod tests {
         }
         assert_eq!(g.history().len(), 5);
     }
+
+    // --- LambdaEstimator ---
+
+    #[test]
+    fn lambda_first_event_is_none() {
+        let mut e = LambdaEstimator::default();
+        let s = e.observe(0.05, 8, 4);
+        assert!(s.lambda_raw.is_none());
+        assert!(s.lambda_ema.is_none());
+        assert!((s.d_raw - 0.05).abs() < 1e-12);
+        assert_eq!(s.k_used, 8);
+        assert_eq!(s.k_max, 4);
+    }
+
+    #[test]
+    fn lambda_growth_positive() {
+        let mut e = LambdaEstimator::default();
+        e.observe(0.01, 8, 4);
+        let s = e.observe(0.02, 8, 4);
+        // (1/8) * ln(2) ~= 0.0866
+        let expected = std::f64::consts::LN_2 / 8.0;
+        let got = s.lambda_raw.expect("second event must produce lambda");
+        assert!((got - expected).abs() < 1e-10);
+        assert!(got > 0.0);
+    }
+
+    #[test]
+    fn lambda_decay_negative() {
+        let mut e = LambdaEstimator::default();
+        e.observe(0.04, 8, 4);
+        let s = e.observe(0.02, 8, 4);
+        // (1/8) * ln(0.5) = -ln(2)/8 ~= -0.0866
+        let expected = -std::f64::consts::LN_2 / 8.0;
+        let got = s.lambda_raw.expect("second event must produce lambda");
+        assert!((got - expected).abs() < 1e-10);
+        assert!(got < 0.0);
+    }
+
+    #[test]
+    fn lambda_noise_floor_clamps() {
+        let mut e = LambdaEstimator::default();
+        e.observe(0.01, 8, 4);
+        // d_raw below noise floor -> lambda_raw None and prev_d unchanged
+        let s = e.observe(1e-12, 8, 4);
+        assert!(s.lambda_raw.is_none());
+        // Next event uses prev_d = 0.01 (the last valid one), not 1e-12
+        let s2 = e.observe(0.02, 8, 4);
+        let expected = std::f64::consts::LN_2 / 8.0;
+        assert!((s2.lambda_raw.unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lambda_ema_smooths_over_constant_input() {
+        let mut e = LambdaEstimator::default();
+        // After many constant +1 events, EMA should approach the input.
+        e.observe(1.0, 1, 1); // first: lambda None, ema None
+        for _ in 0..200 {
+            // d goes 1, e, e^2, ... -> lambda_raw = 1.0/k = 1.0 each step
+            // Use prev=1.0, d=e^1, then prev=e, d=e^2, etc.
+        }
+        // Simpler: feed a sequence where consecutive ratios are constant=e^1.
+        let mut prev = 1.0_f64;
+        for _ in 0..200 {
+            let next = prev * std::f64::consts::E;
+            e.observe(next, 1, 1);
+            prev = next;
+        }
+        let ema = e.ema.expect("ema must be Some after many events");
+        // lambda_raw is 1.0 every step, EMA must converge to 1.0
+        assert!((ema - 1.0).abs() < 1e-3, "ema = {ema}");
+    }
+
+    #[test]
+    fn lambda_zero_d_does_not_crash() {
+        let mut e = LambdaEstimator::default();
+        let s1 = e.observe(0.0, 8, 4);
+        assert!(s1.lambda_raw.is_none());
+        let s2 = e.observe(0.0, 8, 4);
+        assert!(s2.lambda_raw.is_none());
+    }
+
+    // --- EpochSnapshot ---
+
+    #[test]
+    fn epoch_snapshot_aggregates() {
+        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
+        g.observe_lambda(0.04, 8, 4);
+        g.observe_lambda(0.02, 8, 4);
+        g.observe_lambda(0.03, 8, 4);
+        let snap = g.take_epoch_snapshot();
+        assert_eq!(snap.count, 3);
+        assert!((snap.d_min - 0.02).abs() < 1e-12);
+        assert!((snap.d_max - 0.04).abs() < 1e-12);
+        assert!((snap.d_mean() - 0.03).abs() < 1e-12);
+        assert_eq!(snap.lambda_count, 2); // first event has no lambda
+        assert!(snap.lambda_mean().is_some());
+        assert!(snap.last_sample.is_some());
+    }
+
+    #[test]
+    fn epoch_snapshot_resets_accumulator_not_prev_d() {
+        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
+        g.observe_lambda(0.01, 8, 4);
+        g.observe_lambda(0.02, 8, 4);
+        let snap1 = g.take_epoch_snapshot();
+        assert_eq!(snap1.count, 2);
+        // After snapshot, accumulator empty but prev_d still 0.02.
+        // Next event computes lambda against 0.02, so doubling -> +ln(2)/8.
+        let s = g.observe_lambda(0.04, 8, 4);
+        let expected = std::f64::consts::LN_2 / 8.0;
+        assert!((s.lambda_raw.unwrap() - expected).abs() < 1e-10);
+        let snap2 = g.take_epoch_snapshot();
+        assert_eq!(snap2.count, 1);
+        assert_eq!(snap2.lambda_count, 1);
+    }
+
+    #[test]
+    fn reset_lambda_clears_prev_d() {
+        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
+        g.observe_lambda(0.01, 8, 4);
+        g.observe_lambda(0.02, 8, 4);
+        g.reset_lambda();
+        // After reset, next event has no prev_d -> lambda_raw None
+        let s = g.observe_lambda(0.04, 8, 4);
+        assert!(s.lambda_raw.is_none());
+    }
+
+    // --- ConvergenceGuard (existing tests continued) ---
 
     #[test]
     fn async_same_as_cadence_v1() {

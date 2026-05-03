@@ -806,6 +806,37 @@ impl Coordinator {
         self.last_aggregated_epoch = Some(epoch);
         self.epoch_plan_cache.remove(&epoch);
 
+        // MSF passive observation: drain per-epoch lambda/D aggregates.
+        // Emit only when at least one AllReduce happened in this epoch (Sync
+        // mode with no convergence guard activity yields count=0).
+        let snap = self.convergence_guard.take_epoch_snapshot();
+        if snap.count > 0 {
+            if let Some(ref tl) = self.timeline {
+                let last = snap.last_sample.as_ref();
+                tl.event(crate::monitor::EventKind::DivergenceEpoch {
+                    epoch,
+                    sync_count: snap.count,
+                    d_min: snap.d_min,
+                    d_max: snap.d_max,
+                    d_mean: snap.d_mean(),
+                    lambda_min: if snap.lambda_count > 0 {
+                        Some(snap.lambda_min)
+                    } else {
+                        None
+                    },
+                    lambda_max: if snap.lambda_count > 0 {
+                        Some(snap.lambda_max)
+                    } else {
+                        None
+                    },
+                    lambda_mean: snap.lambda_mean(),
+                    lambda_ema_at_epoch_end: last.and_then(|s| s.lambda_ema),
+                    d_at_epoch_end: last.map(|s| s.d_raw).unwrap_or(0.0),
+                    k_at_epoch_end: last.map(|s| s.k_used).unwrap_or(0),
+                });
+            }
+        }
+
         // Checkpoint on global epoch boundaries (1-based for file naming).
         if let Some(every) = self.checkpoint_every {
             if every > 0 && (epoch + 1) % every == 0 {

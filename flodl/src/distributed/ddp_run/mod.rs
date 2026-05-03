@@ -69,7 +69,10 @@ pub mod convergence;
 pub use worker::*;
 pub use coordinator::*;
 pub use orchestrator::*;
-pub use convergence::{ConvergenceAction, ConvergenceGuard, DivergenceReport};
+pub use convergence::{
+    ConvergenceAction, ConvergenceGuard, DivergenceReport, EpochSnapshot, LambdaEstimator,
+    LambdaSample,
+};
 
 use std::cell::RefCell;
 use std::collections::HashMap;

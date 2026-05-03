@@ -95,6 +95,41 @@ pub enum EventKind {
     Idle { device: u8, duration_ms: f64 },
     /// User-defined event.
     Custom { label: String },
+    /// MSF passive observation: per-AllReduce divergence + lambda sample.
+    ///
+    /// Emitted at every `ConvergenceGuard::observe_lambda` call. `d_raw` is
+    /// the max normalized delta across ranks; `lambda_raw`/`lambda_ema` are
+    /// the across-event Lyapunov proxy `(1/k) * log(D_t / D_{t-1})` and its
+    /// EMA. `None` on the first event in a fresh estimator or when below the
+    /// noise floor. See `docs/design/msf-cadence-control.md`.
+    Divergence {
+        d_raw: f64,
+        lambda_raw: Option<f64>,
+        lambda_ema: Option<f64>,
+        k_used: usize,
+        k_max: usize,
+        step: usize,
+        /// Per-rank `||pre - post|| / ||post||`. Length = world_size.
+        deltas: Vec<f64>,
+    },
+    /// MSF passive observation: per-epoch divergence + lambda aggregates.
+    ///
+    /// Emitted at `on_epoch_aggregated`. Aggregates over all `Divergence`
+    /// events in this epoch plus a snapshot of the last sample. The lambda
+    /// estimator state is NOT reset across epochs — `prev_d` carries forward.
+    DivergenceEpoch {
+        epoch: usize,
+        sync_count: usize,
+        d_min: f64,
+        d_max: f64,
+        d_mean: f64,
+        lambda_min: Option<f64>,
+        lambda_max: Option<f64>,
+        lambda_mean: Option<f64>,
+        lambda_ema_at_epoch_end: Option<f64>,
+        d_at_epoch_end: f64,
+        k_at_epoch_end: usize,
+    },
 }
 
 /// Aggregate statistics from a timeline.
@@ -678,6 +713,66 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 // Escape quotes in label
                 let escaped = label.replace('\\', "\\\\").replace('"', "\\\"");
                 let _ = write!(out, "\"k\":\"custom\",\"label\":\"{escaped}\"");
+            }
+            EventKind::Divergence {
+                d_raw,
+                lambda_raw,
+                lambda_ema,
+                k_used,
+                k_max,
+                step,
+                deltas,
+            } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"div\",\"d\":{d_raw:.6e},\"k_used\":{k_used},\"k_max\":{k_max},\"step\":{step}"
+                );
+                if let Some(l) = lambda_raw {
+                    let _ = write!(out, ",\"lambda\":{l:.6e}");
+                }
+                if let Some(l) = lambda_ema {
+                    let _ = write!(out, ",\"lambda_ema\":{l:.6e}");
+                }
+                out.push_str(",\"deltas\":[");
+                for (i, d) in deltas.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, "{d:.6e}");
+                }
+                out.push(']');
+            }
+            EventKind::DivergenceEpoch {
+                epoch,
+                sync_count,
+                d_min,
+                d_max,
+                d_mean,
+                lambda_min,
+                lambda_max,
+                lambda_mean,
+                lambda_ema_at_epoch_end,
+                d_at_epoch_end,
+                k_at_epoch_end,
+            } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"div_epoch\",\"epoch\":{epoch},\"syncs\":{sync_count},\
+                     \"d_min\":{d_min:.6e},\"d_max\":{d_max:.6e},\"d_mean\":{d_mean:.6e},\
+                     \"d_end\":{d_at_epoch_end:.6e},\"k_end\":{k_at_epoch_end}"
+                );
+                if let Some(l) = lambda_min {
+                    let _ = write!(out, ",\"lambda_min\":{l:.6e}");
+                }
+                if let Some(l) = lambda_max {
+                    let _ = write!(out, ",\"lambda_max\":{l:.6e}");
+                }
+                if let Some(l) = lambda_mean {
+                    let _ = write!(out, ",\"lambda_mean\":{l:.6e}");
+                }
+                if let Some(l) = lambda_ema_at_epoch_end {
+                    let _ = write!(out, ",\"lambda_ema_end\":{l:.6e}");
+                }
             }
         }
         out.push('}');
