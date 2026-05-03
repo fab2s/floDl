@@ -151,12 +151,15 @@ impl Coordinator {
         // Feed weight-space divergence (from previous sync's acks) to the guard.
         // Invariant: should_average() requires all nccl_ack == true before next
         // trigger, so all nccl_sync_divergence[rank] are populated by now.
+        // Post-norm is identical across ranks post-AllReduce; take first
+        // populated entry (rank 0 by convention, all others equal).
+        let nccl_post_norm = self.nccl_sync_post_norm.iter().find_map(|p| *p);
         let report = convergence::DivergenceReport {
             deltas: self.nccl_sync_divergence.iter()
                 .map(|d| d.unwrap_or(0.0))
                 .collect(),
             pre_norms: None,
-            post_norm: None,
+            post_norm: nccl_post_norm,
         };
         let action = self.convergence_guard.report(&report);
 
@@ -266,6 +269,9 @@ impl Coordinator {
         }
         for d in &mut self.nccl_sync_divergence {
             *d = None;
+        }
+        for p in &mut self.nccl_sync_post_norm {
+            *p = None;
         }
 
         // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)

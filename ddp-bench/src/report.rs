@@ -1084,6 +1084,139 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         }
     }
 
+    // Guard comparison: current 3-rises vs MSF λ̂_ema sustained-positive.
+    let any_guard = groups.iter().any(|(_, runs)| {
+        runs.iter().any(|r| {
+            !r.msf.guard_comparison.current_fires.is_empty()
+                || !r.msf.guard_comparison.msf_fires.is_empty()
+        })
+    });
+    if any_guard {
+        md.push_str("### Convergence Guard Comparison (post-hoc simulators)\n\n");
+        md.push_str(
+            "Two guards simulated against the same `div_epoch` series. \
+             **Current**: fires when `D_max` rises 3 epochs in a row with last \
+             value > 0.01 (production default). **MSF**: fires when `λ_ema` is \
+             sustained above 1e-3 for 3 consecutive epochs (R5-style innovation \
+             rule from the design doc). Both passive — neither affected the \
+             actual run, this is a what-would-have-fired analysis.\n\n",
+        );
+        md.push_str(
+            "| Model | Mode | Current fires | MSF fires | Both | Current only | MSF only |\n",
+        );
+        md.push_str(
+            "|-------|------|--------------:|----------:|-----:|-------------:|---------:|\n",
+        );
+        let fmt_eps = |v: &Vec<usize>| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
+        for (model, runs) in groups {
+            for r in runs {
+                let g = &r.msf.guard_comparison;
+                if g.current_fires.is_empty() && g.msf_fires.is_empty() {
+                    continue;
+                }
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} ({}) | {} ({}) | {} | {} | {} |",
+                    model,
+                    r.mode,
+                    g.current_fires.len(),
+                    fmt_eps(&g.current_fires),
+                    g.msf_fires.len(),
+                    fmt_eps(&g.msf_fires),
+                    fmt_eps(&g.both),
+                    fmt_eps(&g.current_only),
+                    fmt_eps(&g.msf_only),
+                );
+            }
+        }
+        md.push('\n');
+    }
+
+    // Longitudinal meta-velocity (consensus magnitude motion).
+    let any_long = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| r.msf.longitudinal.is_some()));
+    if any_long {
+        md.push_str("### Longitudinal Meta-Velocity\n\n");
+        md.push_str(
+            "Per-event consensus magnitude motion `|Δ||W̄|||/||W̄||_prev`. \
+             Independent of `D_t` (transversal): tracks LR schedule + gradient \
+             size, not inter-rank synchronization. Phase-transition signal \
+             complementary to λ̂. Only available on backends that report \
+             `post_norm` (CPU averaging always; NCCL after post_norm wiring).\n\n",
+        );
+        md.push_str("| Model | Mode | n | ||W̄|| range | ||W̄||_mean | v_mean | v_sd | v_max |\n");
+        md.push_str("|-------|------|--:|-------------|----------:|------:|----:|------:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                if let Some(lg) = &r.msf.longitudinal {
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {} | {:.2e}–{:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.2e} |",
+                        model,
+                        r.mode,
+                        lg.n,
+                        lg.post_norm_min,
+                        lg.post_norm_max,
+                        lg.post_norm_mean,
+                        lg.velocity_mean,
+                        lg.velocity_sd,
+                        lg.velocity_max,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
+    // R1 informal: log(d_max) vs step linear fit per auto-detected LR window.
+    let any_fits = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| !r.msf.lr_window_fits.is_empty()));
+    if any_fits {
+        md.push_str("### R1 informal: log(D_max) vs step per LR window\n\n");
+        md.push_str(
+            "LR windows auto-detected from `EpochEnd` LR transitions (>5% change \
+             starts a new window). Within each window, OLS fit of `ln(D_max)` vs \
+             cumulative step. Slope is in units of ln(D)/step. R² > 0.9 supports \
+             R1 (exponential growth at the slope rate); R² ≈ 0 with slope ≈ 0 is \
+             the marginal-stability prediction in noise-dominated equilibria. \
+             Smaller LR phases empirically give cleaner fits (less SGD stochasticity).\n\n",
+        );
+        md.push_str("| Model | Mode | LR | Epochs | n | Step range | Slope/step | R² |\n");
+        md.push_str("|-------|------|---:|--------|--:|-----------:|----------:|----:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                for f in &r.msf.lr_window_fits {
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {:.2e} | {}–{} | {} | {}–{} | {:+.3e} | {:.3} |",
+                        model,
+                        r.mode,
+                        f.lr,
+                        f.epoch_start,
+                        f.epoch_end,
+                        f.n_events,
+                        f.step_min,
+                        f.step_max,
+                        f.slope_per_step,
+                        f.r2,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
     // Per-run sparklines: log10(D_max) and lambda_ema_end across epochs.
     md.push_str("### Trajectories\n\n");
     md.push_str(

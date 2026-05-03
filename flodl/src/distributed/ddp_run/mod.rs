@@ -640,6 +640,11 @@ pub enum TimingMsg {
         /// Weight-space divergence from the AllReduce:
         /// `||params_before - params_after|| / ||params_after||`.
         divergence: Option<f64>,
+        /// Post-AllReduce consensus L2 norm `||params_after||`. Identical
+        /// across ranks (all params identical post-AllReduce); the coordinator
+        /// can take any rank's value. Used for longitudinal meta-velocity
+        /// tracking. `None` when divergence is also `None`.
+        post_norm: Option<f64>,
     },
     /// Worker is about to exit. Coordinator must stop including this rank
     /// in collectives before processing any further messages.

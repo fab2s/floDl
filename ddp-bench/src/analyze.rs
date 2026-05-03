@@ -254,6 +254,69 @@ pub struct MsfPerRank {
     pub lambda_sd: f64,
 }
 
+/// Comparison of the existing convergence guard's "3 consecutive D rises
+/// above threshold" rule vs an MSF-style guard firing on sustained positive
+/// `λ_ema` (R5 in the design doc).
+///
+/// Both guards are simulated post-hoc against the per-epoch `div_epoch`
+/// series. The comparison answers: "would an MSF-based guard fire at the
+/// same epochs the current heuristic does?" and "do they catch different
+/// regime transitions?"
+#[derive(Debug, Clone, Default)]
+pub struct MsfGuardComparison {
+    /// Epochs where the current guard's "3 rises above threshold" rule fires.
+    pub current_fires: Vec<usize>,
+    /// Epochs where the MSF guard's "λ_ema sustained > λ_threshold" rule fires.
+    pub msf_fires: Vec<usize>,
+    /// Epochs where both rules fire (intersection).
+    pub both: Vec<usize>,
+    /// Epochs where only the current guard fires.
+    pub current_only: Vec<usize>,
+    /// Epochs where only the MSF guard fires.
+    pub msf_only: Vec<usize>,
+}
+
+/// Longitudinal meta-oscillator velocity stats: per-event consensus
+/// magnitude motion `|Δ||W̄|||/||W̄||_prev` aggregated across the run.
+///
+/// Independent of D_t (transversal): tracks LR schedule + gradient size, not
+/// inter-rank synchronization. Phase-transition signal complementary to λ̂.
+#[derive(Debug, Clone, Default)]
+pub struct MsfLongitudinal {
+    /// Number of events with both prev_post_norm and post_norm available.
+    pub n: usize,
+    /// `||W̄||` summary statistics across the run.
+    pub post_norm_min: f64,
+    pub post_norm_max: f64,
+    pub post_norm_mean: f64,
+    /// Per-event velocity `|Δ||W̄|||/||W̄||_prev` summary statistics.
+    #[allow(dead_code)]
+    pub velocity_min: f64,
+    pub velocity_max: f64,
+    pub velocity_mean: f64,
+    pub velocity_sd: f64,
+}
+
+/// R1 informal-test result: log(d_max) vs cumulative step linear fit within
+/// a single LR window (auto-detected from EpochEnd LR transitions).
+///
+/// Slope is in units of ln(D)/step. R² is the coefficient of determination.
+/// R1 predicts log(D_t) approximately linear in step within stable phases;
+/// high R² supports R1, low R² either falsifies or indicates noise-dominated
+/// equilibria where the marginal-stability prediction (slope ≈ 0) is correct
+/// but the variance can't be fit against.
+#[derive(Debug, Clone)]
+pub struct MsfLrWindowFit {
+    pub lr: f64,
+    pub epoch_start: usize,
+    pub epoch_end: usize,
+    pub n_events: usize,
+    pub step_min: usize,
+    pub step_max: usize,
+    pub slope_per_step: f64,
+    pub r2: f64,
+}
+
 /// Aggregate MSF analysis for a single run.
 #[derive(Debug, Clone, Default)]
 pub struct MsfAnalysis {
@@ -271,6 +334,16 @@ pub struct MsfAnalysis {
     /// supports the meta-oscillator framing (ranks are coupled, not
     /// independent oscillators).
     pub rank_correlations: Vec<((usize, usize), f64)>,
+    /// R1 informal linear fits per auto-detected LR window. Empty when no
+    /// EpochEnd events carry LR (runs predating per-event LR logging).
+    pub lr_window_fits: Vec<MsfLrWindowFit>,
+    /// Longitudinal meta-velocity (consensus magnitude motion). `None` when
+    /// no `Divergence` event carries `post_norm` (runs predating post_norm
+    /// wiring, or backends that don't compute it).
+    pub longitudinal: Option<MsfLongitudinal>,
+    /// Guard simulator comparison: current guard fires vs MSF-style guard
+    /// fires on the same `div_epoch` series.
+    pub guard_comparison: MsfGuardComparison,
 }
 
 impl MsfAnalysis {
@@ -647,6 +720,131 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     }
 }
 
+/// LR change above this fraction starts a new auto-detected window.
+/// Step-decays jump 10x and trigger cleanly; cosine schedules accumulate
+/// into ~5%-step buckets which is acceptable resolution for analysis.
+const LR_WINDOW_CHANGE_FRAC: f64 = 0.05;
+
+/// Compute log(d_max) vs cumulative step OLS within a (start_epoch, end_epoch)
+/// range. Filters non-positive d_max (log undefined). Returns `None` if too
+/// few finite points (n < 5).
+fn fit_lr_window(
+    events: &[Event],
+    epoch_step_ranges: &[(usize, usize, usize)], // (epoch, step_first, step_last)
+    start_ep: usize,
+    end_ep: usize,
+) -> Option<(usize, usize, usize, f64, f64)> {
+    let mut step_lo = usize::MAX;
+    let mut step_hi = 0usize;
+    for (ep, lo, hi) in epoch_step_ranges {
+        if *ep >= start_ep && *ep <= end_ep {
+            step_lo = step_lo.min(*lo);
+            step_hi = step_hi.max(*hi);
+        }
+    }
+    if step_lo > step_hi {
+        return None;
+    }
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    for e in events {
+        if let EventKind::Divergence { d_raw, step, .. } = &e.kind
+            && *step >= step_lo
+            && *step <= step_hi
+            && *d_raw > 1e-12
+        {
+            xs.push(*step as f64);
+            ys.push(d_raw.ln());
+        }
+    }
+    let n = xs.len();
+    if n < 5 {
+        return None;
+    }
+    let mx = xs.iter().sum::<f64>() / n as f64;
+    let my = ys.iter().sum::<f64>() / n as f64;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    let mut sxy = 0.0;
+    for k in 0..n {
+        let dx = xs[k] - mx;
+        let dy = ys[k] - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    if sxx <= 0.0 {
+        return None;
+    }
+    let slope = sxy / sxx;
+    let r2 = if syy > 0.0 {
+        (sxy * sxy) / (sxx * syy)
+    } else {
+        1.0
+    };
+    Some((n, step_lo, step_hi, slope, r2))
+}
+
+/// Threshold for the current convergence guard simulator. Matches the
+/// production default in `flodl::distributed::ddp_run::ConvergenceGuard`.
+/// Used in the post-hoc guard-comparison analysis.
+const GUARD_CURRENT_D_THRESHOLD: f64 = 0.01;
+/// MSF-style guard: λ_ema must exceed this for `GUARD_MSF_CONSECUTIVE`
+/// consecutive epochs to fire. λ_ema > 0 means transversal deviation is
+/// growing cycle-over-cycle (R5 innovation interpretation).
+const GUARD_MSF_LAMBDA_THRESHOLD: f64 = 1.0e-3;
+/// Number of consecutive epochs above `GUARD_MSF_LAMBDA_THRESHOLD` before
+/// the MSF guard fires.
+const GUARD_MSF_CONSECUTIVE: usize = 3;
+
+fn simulate_guard_comparison(epochs: &[MsfEpoch]) -> MsfGuardComparison {
+    // Current guard: 3 consecutive D_max rises, last > threshold.
+    let mut current_fires: Vec<usize> = Vec::new();
+    if epochs.len() >= 3 {
+        for i in 2..epochs.len() {
+            let d_now = epochs[i].d_max;
+            let d_prev = epochs[i - 1].d_max;
+            let d_prev2 = epochs[i - 2].d_max;
+            if d_now > d_prev && d_prev > d_prev2 && d_now > GUARD_CURRENT_D_THRESHOLD {
+                current_fires.push(epochs[i].epoch);
+            }
+        }
+    }
+    // MSF guard: λ_ema_at_epoch_end sustained above threshold.
+    let mut msf_fires: Vec<usize> = Vec::new();
+    let mut streak = 0usize;
+    for me in epochs {
+        let above = me
+            .lambda_ema_at_epoch_end
+            .map(|v| v > GUARD_MSF_LAMBDA_THRESHOLD)
+            .unwrap_or(false);
+        if above {
+            streak += 1;
+            if streak >= GUARD_MSF_CONSECUTIVE {
+                msf_fires.push(me.epoch);
+                streak = 0;
+            }
+        } else {
+            streak = 0;
+        }
+    }
+    let cur_set: std::collections::HashSet<usize> = current_fires.iter().copied().collect();
+    let msf_set: std::collections::HashSet<usize> = msf_fires.iter().copied().collect();
+    let mut both: Vec<usize> = cur_set.intersection(&msf_set).copied().collect();
+    let mut current_only: Vec<usize> = cur_set.difference(&msf_set).copied().collect();
+    let mut msf_only: Vec<usize> = msf_set.difference(&cur_set).copied().collect();
+    both.sort_unstable();
+    current_only.sort_unstable();
+    msf_only.sort_unstable();
+    MsfGuardComparison {
+        current_fires,
+        msf_fires,
+        both,
+        current_only,
+        msf_only,
+    }
+}
+
 /// Heuristic threshold for phase-transition candidate detection.
 ///
 /// Marks an epoch as a candidate when its `lambda_min` is more negative than
@@ -831,12 +1029,163 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
         }
     }
 
+    // Per-epoch step ranges: walk div events in chronological order, assign
+    // each to the first containing-epoch by div_epoch event timestamps.
+    // (epoch -> (min step, max step))
+    let mut epoch_step_min: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut epoch_step_max: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut div_with_t: Vec<(u64, &Event)> = Vec::new();
+    let mut epoch_end_t: Vec<(u64, usize)> = Vec::new();
+    for ev in events {
+        match &ev.kind {
+            EventKind::Divergence { .. } => div_with_t.push((ev.t, ev)),
+            EventKind::DivergenceEpoch { epoch, .. } => epoch_end_t.push((ev.t, *epoch)),
+            _ => {}
+        }
+    }
+    div_with_t.sort_by_key(|x| x.0);
+    epoch_end_t.sort_by_key(|x| x.0);
+    let mut ep_idx = 0usize;
+    for (t, ev) in &div_with_t {
+        while ep_idx < epoch_end_t.len() && epoch_end_t[ep_idx].0 < *t {
+            ep_idx += 1;
+        }
+        let cur_epoch = if ep_idx < epoch_end_t.len() {
+            epoch_end_t[ep_idx].1
+        } else {
+            continue;
+        };
+        if let EventKind::Divergence { step, .. } = &ev.kind {
+            epoch_step_min
+                .entry(cur_epoch)
+                .and_modify(|s| *s = (*s).min(*step))
+                .or_insert(*step);
+            epoch_step_max
+                .entry(cur_epoch)
+                .and_modify(|s| *s = (*s).max(*step))
+                .or_insert(*step);
+        }
+    }
+    let mut epoch_step_ranges: Vec<(usize, usize, usize)> = epoch_step_min
+        .iter()
+        .filter_map(|(ep, lo)| epoch_step_max.get(ep).map(|hi| (*ep, *lo, *hi)))
+        .collect();
+    epoch_step_ranges.sort_by_key(|x| x.0);
+
+    // Detect LR windows from MsfEpoch.lr transitions.
+    let lr_window_fits: Vec<MsfLrWindowFit> = if epochs.iter().any(|e| e.lr.is_some()) {
+        let mut windows: Vec<(f64, usize, usize)> = Vec::new();
+        let mut cur: Option<(f64, usize, usize)> = None;
+        for me in &epochs {
+            if let Some(lr) = me.lr {
+                match cur {
+                    None => cur = Some((lr, me.epoch, me.epoch)),
+                    Some((cur_lr, start, _)) => {
+                        let frac = if cur_lr.abs() > 1e-12 {
+                            (lr - cur_lr).abs() / cur_lr.abs()
+                        } else {
+                            f64::INFINITY
+                        };
+                        if frac > LR_WINDOW_CHANGE_FRAC {
+                            windows.push((cur_lr, start, me.epoch.saturating_sub(1)));
+                            cur = Some((lr, me.epoch, me.epoch));
+                        } else {
+                            cur = Some((cur_lr, start, me.epoch));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((lr, start, end)) = cur {
+            windows.push((lr, start, end));
+        }
+        windows
+            .into_iter()
+            .filter_map(|(lr, start, end)| {
+                fit_lr_window(events, &epoch_step_ranges, start, end).map(
+                    |(n, s_lo, s_hi, slope, r2)| MsfLrWindowFit {
+                        lr,
+                        epoch_start: start,
+                        epoch_end: end,
+                        n_events: n,
+                        step_min: s_lo,
+                        step_max: s_hi,
+                        slope_per_step: slope,
+                        r2,
+                    },
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Longitudinal meta-velocity: walk div events in chronological order,
+    // compute |Δ post_norm| / post_norm_prev. Only available when post_norm
+    // is logged (cpu modes always; nccl modes after post_norm wiring).
+    let mut velocities: Vec<f64> = Vec::new();
+    let mut post_norms: Vec<f64> = Vec::new();
+    let mut prev_pn: Option<f64> = None;
+    for (_, ev) in &div_with_t {
+        if let EventKind::Divergence { post_norm, .. } = &ev.kind
+            && let Some(pn) = post_norm
+            && pn.is_finite()
+            && *pn > 0.0
+        {
+            post_norms.push(*pn);
+            if let Some(prev) = prev_pn
+                && prev > 0.0
+            {
+                velocities.push((pn - prev).abs() / prev);
+            }
+            prev_pn = Some(*pn);
+        } else {
+            // Lost a sample (no post_norm) — break the velocity chain so
+            // we don't compare across non-contiguous events.
+            prev_pn = None;
+        }
+    }
+    let longitudinal = if post_norms.is_empty() {
+        None
+    } else {
+        let pn_min = post_norms.iter().copied().fold(f64::INFINITY, f64::min);
+        let pn_max = post_norms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let pn_mean = post_norms.iter().sum::<f64>() / post_norms.len() as f64;
+        let (v_min, v_max, v_mean, v_sd) = if velocities.is_empty() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            let mn = velocities.iter().copied().fold(f64::INFINITY, f64::min);
+            let mx = velocities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mean = velocities.iter().sum::<f64>() / velocities.len() as f64;
+            let var = velocities.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / velocities.len() as f64;
+            (mn, mx, mean, var.sqrt())
+        };
+        Some(MsfLongitudinal {
+            n: velocities.len(),
+            post_norm_min: pn_min,
+            post_norm_max: pn_max,
+            post_norm_mean: pn_mean,
+            velocity_min: v_min,
+            velocity_max: v_max,
+            velocity_mean: v_mean,
+            velocity_sd: v_sd,
+        })
+    };
+
+    let guard_comparison = simulate_guard_comparison(&epochs);
+
     MsfAnalysis {
         div_event_count,
         epochs,
         phase_candidates,
         per_rank,
         rank_correlations,
+        lr_window_fits,
+        longitudinal,
+        guard_comparison,
     }
 }
 

@@ -512,11 +512,16 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// Returns the weight-space divergence for this rank: `||pre - post|| / ||post||`.
     /// `None` when scratch buffers are absent (Sync mode or no NCCL comm).
-    fn sync_now_nccl(&self) -> Result<Option<f64>> {
+    /// Returns `(divergence, post_norm)`: divergence is `||pre - post|| / ||post||`,
+    /// post_norm is `||post||` (the L2 norm of the consensus weights after AllReduce).
+    /// Post-norm is identical across ranks since all ranks have identical params
+    /// after AllReduce; reporting it lets the coordinator track longitudinal
+    /// meta-oscillator velocity.
+    fn sync_now_nccl(&self) -> Result<(Option<f64>, Option<f64>)> {
         let _diag_start = Instant::now();
         let comm = match &self.nccl_comm {
             Some(c) => c,
-            None => return Ok(None),
+            None => return Ok((None, None)),
         };
 
         let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
@@ -570,9 +575,9 @@ impl<M: Module> GpuWorker<M> {
                     "  ddp-worker: rank {} sync divergence={:.6} (||delta||={:.4}, ||post||={:.4})",
                     self.rank, div, diff_sq.sqrt(), post_norm,
                 );
-                Some(div)
+                (Some(div), Some(post_norm))
             } else {
-                None
+                (None, None)
             };
 
             // Record event so compute_stream waits before next forward
@@ -589,7 +594,7 @@ impl<M: Module> GpuWorker<M> {
             Ok(divergence)
         } else {
             comm.all_reduce(&param_refs, ReduceOp::Avg)?;
-            Ok(None)
+            Ok((None, None))
         }
     }
 
@@ -720,7 +725,7 @@ impl<M: Module> GpuWorker<M> {
             }
             ControlMsg::SyncNow => {
                 crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
-                let divergence = self.sync_now_nccl()?;
+                let (divergence, post_norm) = self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 self.steps_since_avg = 0;
                 // Bump local_step and send a dedicated SyncAck so the
@@ -738,6 +743,7 @@ impl<M: Module> GpuWorker<M> {
                     rank: self.rank,
                     step_count: self.local_step,
                     divergence,
+                    post_norm,
                 });
             }
             ControlMsg::StartEpoch(plan) => {
