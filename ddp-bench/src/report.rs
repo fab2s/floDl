@@ -1304,38 +1304,91 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         md.push('\n');
     }
 
-    // R1 informal: log(d_max) vs step linear fit per auto-detected LR window.
+    // R1 informal: log(D) vs step linear fit per auto-detected LR window.
+    // Two bases: D_max (per-event max across ranks; legacy) and D_mean
+    // (meta-oscillator amplitude — averages out per-rank step asymmetry).
     let any_fits = groups
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| !r.msf.lr_window_fits.is_empty()));
     if any_fits {
-        md.push_str("### R1 informal: log(D_max) vs step per LR window\n\n");
+        md.push_str("### R1 informal: log(D) vs step per LR window\n\n");
         md.push_str(
             "LR windows auto-detected from `EpochEnd` LR transitions (>5% change \
-             starts a new window). Within each window, OLS fit of `ln(D_max)` vs \
-             cumulative step. Slope is in units of ln(D)/step. R² > 0.9 supports \
-             R1 (exponential growth at the slope rate); R² ≈ 0 with slope ≈ 0 is \
-             the marginal-stability prediction in noise-dominated equilibria. \
-             Smaller LR phases empirically give cleaner fits (less SGD stochasticity).\n\n",
+             starts a new window). Within each window, OLS fit of `ln(D)` vs \
+             cumulative step on two bases: `D_max` (per-event max across ranks; \
+             legacy — sensitive to per-rank step asymmetry) and `D_mean` (per-event \
+             mean across ranks; the meta-oscillator amplitude — averages out \
+             per-rank noise. Cross-rank Pearson r ≥ 0.99 empirically, so the two \
+             bases trace one process up to scale, but `D_mean` is the cleaner \
+             estimator). Slope is in units of ln(D)/step. R² > 0.9 supports R1 \
+             (exponential growth at the slope rate); R² ≈ 0 with slope ≈ 0 is the \
+             marginal-stability prediction in noise-dominated equilibria. Rows \
+             tagged `(post-transient, skipped N)` are sub-window fits emitted \
+             alongside the first LR window when an initialization transient is \
+             detected — separating the warmup spike from the stable-LR steady \
+             state. The third basis `epoch d_mean` aggregates per-event \
+             `ln(D_mean)` to one log-mean per epoch and fits those aggregates \
+             — denoises intra-epoch SGD variance, which is the dominant \
+             remaining noise source after the cross-rank swap.\n\n",
         );
-        md.push_str("| Model | Mode | LR | Epochs | n | Step range | Slope/step | R² |\n");
-        md.push_str("|-------|------|---:|--------|--:|-----------:|----------:|----:|\n");
+        md.push_str(
+            "| Model | Mode | LR | Epochs | n_events | Step range | \
+             Slope/step (max) | R² (max) | Slope/step (mean) | R² (mean) | \
+             n_epochs | Slope/step (epoch d_mean) | R² (epoch d_mean) |\n",
+        );
+        md.push_str(
+            "|-------|------|---:|--------|--:|-----------:|----------:|----:|\
+             ----------:|----:|--:|----------:|----:|\n",
+        );
         for (model, runs) in groups {
             for r in runs {
                 for f in &r.msf.lr_window_fits {
+                    let label = if f.transient_skipped == 0 {
+                        format!("{}–{}", f.epoch_start, f.epoch_end)
+                    } else {
+                        format!(
+                            "{}–{} (post-transient, skipped {})",
+                            f.epoch_start, f.epoch_end, f.transient_skipped
+                        )
+                    };
+                    let dmean_slope = match f.slope_per_step_dmean {
+                        Some(v) => format!("{v:+.3e}"),
+                        None => "—".to_string(),
+                    };
+                    let dmean_r2 = match f.r2_dmean {
+                        Some(v) => format!("{v:.3}"),
+                        None => "—".to_string(),
+                    };
+                    let n_ep = match f.n_epoch_points {
+                        Some(n) => n.to_string(),
+                        None => "—".to_string(),
+                    };
+                    let ep_dmean_slope = match f.slope_per_step_epoch_dmean {
+                        Some(v) => format!("{v:+.3e}"),
+                        None => "—".to_string(),
+                    };
+                    let ep_dmean_r2 = match f.r2_epoch_dmean {
+                        Some(v) => format!("{v:.3}"),
+                        None => "—".to_string(),
+                    };
                     let _ = writeln!(
                         md,
-                        "| {} | {} | {:.2e} | {}–{} | {} | {}–{} | {:+.3e} | {:.3} |",
+                        "| {} | {} | {:.2e} | {} | {} | {}–{} | {:+.3e} | {:.3} \
+                         | {} | {} | {} | {} | {} |",
                         model,
                         r.mode,
                         f.lr,
-                        f.epoch_start,
-                        f.epoch_end,
+                        label,
                         f.n_events,
                         f.step_min,
                         f.step_max,
                         f.slope_per_step,
                         f.r2,
+                        dmean_slope,
+                        dmean_r2,
+                        n_ep,
+                        ep_dmean_slope,
+                        ep_dmean_r2,
                     );
                 }
             }

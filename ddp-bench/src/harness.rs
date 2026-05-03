@@ -640,6 +640,27 @@ fn run_unified(
         while let Ok((ep, val)) = eval_rx.try_recv() {
             pending_eval.insert(ep, val);
         }
+        // Emit eval values for past epochs (race losers) as supplemental
+        // lines BEFORE printing the current metrics. Eval(N) typically
+        // arrives after metrics(N) but before metrics(N+1) — surfacing it
+        // here means streaming output shows `epoch N: eval=X.XXXX` right
+        // before `epoch N+1: loss=...`, instead of all evals batched at
+        // end-of-run. The current-epoch eval (if it somehow already
+        // arrived) is still folded inline below; this drain only emits
+        // strictly-past epochs.
+        let mut past_keys: Vec<usize> = pending_eval
+            .keys()
+            .copied()
+            .filter(|ep| *ep < metrics.epoch)
+            .collect();
+        past_keys.sort_unstable();
+        for ep in past_keys {
+            if let Some(val) = pending_eval.remove(&ep) {
+                let line = format!("epoch {ep}: eval={val:.4}");
+                eprintln!("    {line}");
+                log_lines.push(line);
+            }
+        }
         // Build log line: loss + (eval if available) + model-defined scalars + time.
         let scalars: std::collections::BTreeMap<String, f64> =
             metrics.scalars.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -704,10 +725,9 @@ fn run_unified(
         );
     }
 
-    // Drain any eval values that arrived after their corresponding
-    // metrics tick (race losers). Emit each as a supplemental
-    // `epoch N: eval=X.XXXX` line so `parse_training_log` picks them up
-    // and merges with the earlier loss-only line for the same epoch.
+    // Final drain: catches the last epoch's eval (which has no subsequent
+    // metrics tick to surface it via the per-tick past-epoch drain above)
+    // and any straggler values that arrived after the last metrics tick.
     while let Ok((ep, val)) = eval_rx.try_recv() {
         pending_eval.insert(ep, val);
     }

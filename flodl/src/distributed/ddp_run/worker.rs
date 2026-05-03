@@ -51,6 +51,20 @@ pub struct GpuWorker<M: Module> {
     /// Recorded on comm_stream after param copy/AllReduce.
     /// compute_stream waits on this before each forward.
     copy_done: Option<CudaEvent>,
+    /// Pending H2D wait flag for the cpu-avg path. Set in `load_averaged`
+    /// when params are copy_(non_blocking) on `comm_stream`, cleared in
+    /// `sync_before_forward` after host-synchronizing the comm stream.
+    /// Moves the post-Update H2D wait OUTSIDE `train_step`'s timing window —
+    /// otherwise the implicit GPU sync at `loss.data().item()?` propagates
+    /// the queued `wait_event` into `batch_ms` and pollutes ElChe's
+    /// throughput signal mode-asymmetrically (cpu-avg only; NCCL path
+    /// host-synchronizes inside `sync_now_nccl` already, so no flag set there).
+    pending_param_h2d: bool,
+    /// Most recent host-side H2D wait inside `sync_before_forward` (ms).
+    /// Diagnostic only — not fed back into the controller. Useful for
+    /// verifying the pollution removal under different rig topologies
+    /// (e.g. PCIe x8 vs chipset x2 lines on heterogeneous boards).
+    last_h2d_wait_ms: f64,
 
     // -- NCCL per-rank communicator (None for CPU averaging or CPU device) --
     nccl_comm: Option<NcclRankComm>,
@@ -338,6 +352,8 @@ impl<M: Module> GpuWorker<M> {
             compute_stream,
             comm_stream,
             copy_done,
+            pending_param_h2d: false,
+            last_h2d_wait_ms: 0.0,
             nccl_comm,
             timing_tx,
             metrics_tx,
@@ -499,6 +515,11 @@ impl<M: Module> GpuWorker<M> {
         if let (Some(ev), Some(stream)) = (&self.copy_done, &self.comm_stream) {
             ev.record_on(stream)?;
         }
+        // Mark H2D pending so the next `sync_before_forward` host-syncs the
+        // comm stream BEFORE `train_step`'s timing window opens. Without
+        // this, the wait_event-based path leaks the H2D wait into
+        // `batch_ms` via the implicit GPU sync at `loss.item()`.
+        self.pending_param_h2d = true;
 
         self.current_version = update.version;
         Ok(())
@@ -614,13 +635,31 @@ impl<M: Module> GpuWorker<M> {
         }
     }
 
-    /// Wait for any pending parameter copy to complete on the compute stream.
+    /// Host-synchronize the comm stream so any pending cpu-avg H2D copy
+    /// completes BEFORE `train_step`'s timing window opens.
     ///
-    /// Must be called before each forward pass to prevent reading mid-copy params.
+    /// Must be called before each forward pass. The previous implementation
+    /// queued a `compute_stream.wait_event(copy_done)` here — a stream-level
+    /// dependency that returned to the host immediately. The catch: the
+    /// implicit GPU sync at `loss.data().item()?` inside the timing window
+    /// then propagated the H2D wait into the measured `batch_ms`, polluting
+    /// ElChe's throughput signal asymmetrically (cpu-avg only — NCCL's
+    /// `sync_now_nccl` host-synchronizes internally, so there's nothing to
+    /// wait for here on that path).
+    ///
+    /// The host-sync moves that wait outside the timing window. Total wall
+    /// time is identical (we pay the H2D wait either way); only the clock
+    /// that measures it changes. The `pending_param_h2d` flag avoids
+    /// per-batch synchronize overhead on batches that don't follow an Update.
     /// No-op on CPU (no streams).
-    fn sync_before_forward(&self) -> Result<()> {
-        if let (Some(ev), Some(stream)) = (&self.copy_done, &self.compute_stream) {
-            stream.wait_event(ev)?;
+    fn sync_before_forward(&mut self) -> Result<()> {
+        if self.pending_param_h2d
+            && let Some(stream) = &self.comm_stream
+        {
+            let t = Instant::now();
+            stream.synchronize()?;
+            self.last_h2d_wait_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.pending_param_h2d = false;
         }
         Ok(())
     }

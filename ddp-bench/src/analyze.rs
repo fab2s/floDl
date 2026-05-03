@@ -306,7 +306,7 @@ pub struct MsfLongitudinal {
     pub velocity_sd: f64,
 }
 
-/// R1 informal-test result: log(d_max) vs cumulative step linear fit within
+/// R1 informal-test result: log(D) vs cumulative step linear fit within
 /// a single LR window (auto-detected from EpochEnd LR transitions).
 ///
 /// Slope is in units of ln(D)/step. R² is the coefficient of determination.
@@ -314,6 +314,20 @@ pub struct MsfLongitudinal {
 /// high R² supports R1, low R² either falsifies or indicates noise-dominated
 /// equilibria where the marginal-stability prediction (slope ≈ 0) is correct
 /// but the variance can't be fit against.
+///
+/// Two bases are reported: `D_max` (per-event maximum across ranks; the legacy
+/// metric — sensitive to per-rank step asymmetry, especially under NCCL) and
+/// `D_mean` (per-event mean across ranks; the meta-oscillator amplitude —
+/// averages out per-rank noise. Cross-rank Pearson r ≥ 0.99 empirically, so
+/// the mean and max trace the same underlying process up to scale, but the
+/// mean is less noisy). `D_mean` fields are `None` for runs predating per-rank
+/// `deltas` capture.
+///
+/// `transient_skipped` is the number of leading epochs trimmed from the
+/// window before fitting (0 = full window). A non-zero value indicates a
+/// post-transient sub-window: typically emitted alongside the full-window
+/// fit for the first LR window to separate the initialization transient
+/// from the stable-LR steady state.
 #[derive(Debug, Clone)]
 pub struct MsfLrWindowFit {
     pub lr: f64,
@@ -324,6 +338,15 @@ pub struct MsfLrWindowFit {
     pub step_max: usize,
     pub slope_per_step: f64,
     pub r2: f64,
+    pub slope_per_step_dmean: Option<f64>,
+    pub r2_dmean: Option<f64>,
+    /// Per-epoch aggregation of `ln(D_mean)` (intra-epoch log-mean) vs the
+    /// epoch's mean cumulative step. Denoises intra-epoch SGD variance — the
+    /// dominant remaining noise source after the cross-rank D_mean swap.
+    pub slope_per_step_epoch_dmean: Option<f64>,
+    pub r2_epoch_dmean: Option<f64>,
+    pub n_epoch_points: Option<usize>,
+    pub transient_skipped: usize,
 }
 
 /// Aggregate MSF analysis for a single run.
@@ -803,40 +826,18 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
 /// into ~5%-step buckets which is acceptable resolution for analysis.
 const LR_WINDOW_CHANGE_FRAC: f64 = 0.05;
 
-/// Compute log(d_max) vs cumulative step OLS within a (start_epoch, end_epoch)
-/// range. Filters non-positive d_max (log undefined). Returns `None` if too
-/// few finite points (n < 5).
-fn fit_lr_window(
-    events: &[Event],
-    epoch_step_ranges: &[(usize, usize, usize)], // (epoch, step_first, step_last)
-    start_ep: usize,
-    end_ep: usize,
-) -> Option<(usize, usize, usize, f64, f64)> {
-    let mut step_lo = usize::MAX;
-    let mut step_hi = 0usize;
-    for (ep, lo, hi) in epoch_step_ranges {
-        if *ep >= start_ep && *ep <= end_ep {
-            step_lo = step_lo.min(*lo);
-            step_hi = step_hi.max(*hi);
-        }
-    }
-    if step_lo > step_hi {
-        return None;
-    }
-    let mut xs: Vec<f64> = Vec::new();
-    let mut ys: Vec<f64> = Vec::new();
-    for e in events {
-        if let EventKind::Divergence { d_raw, step, .. } = &e.kind
-            && *step >= step_lo
-            && *step <= step_hi
-            && *d_raw > 1e-12
-        {
-            xs.push(*step as f64);
-            ys.push(d_raw.ln());
-        }
-    }
+/// Result of an OLS fit over the (xs, ys) collected for an LR window.
+/// `r2 = 1.0` when the y-series has zero variance (degenerate but finite).
+struct OlsFit {
+    slope: f64,
+    r2: f64,
+}
+
+/// OLS slope + R² for a (xs, ys) sample. Returns `None` if `sxx <= 0`
+/// (degenerate x — should not happen for distinct steps).
+fn ols(xs: &[f64], ys: &[f64]) -> Option<OlsFit> {
     let n = xs.len();
-    if n < 5 {
+    if n != ys.len() || n < 5 {
         return None;
     }
     let mx = xs.iter().sum::<f64>() / n as f64;
@@ -860,7 +861,275 @@ fn fit_lr_window(
     } else {
         1.0
     };
-    Some((n, step_lo, step_hi, slope, r2))
+    Some(OlsFit { slope, r2 })
+}
+
+/// Collected event data for an LR window: per-event step + ln(D_max), and
+/// (when per-rank `deltas` are available) ln(D_mean). Used as the input to
+/// both bases' OLS fits and to the transient-detection heuristic.
+struct LrWindowSamples {
+    /// Per-event (step, epoch, ln_d_max).
+    pts_max: Vec<(usize, usize, f64)>,
+    /// Per-event ln(D_mean) parallel to `pts_max`. `None` entry when that
+    /// event had empty `deltas`. The fit drops `None` entries; if any are
+    /// present the d_mean fit reports on the surviving subset only.
+    pts_mean: Vec<Option<f64>>,
+    /// True when at least one event in the window carried non-empty `deltas`.
+    has_deltas: bool,
+}
+
+/// Walk events for the (start_ep, end_ep) range and collect the per-event
+/// samples needed for both the D_max and D_mean OLS fits.
+fn collect_lr_window_samples(
+    events: &[Event],
+    epoch_step_ranges: &[(usize, usize, usize)],
+    start_ep: usize,
+    end_ep: usize,
+) -> Option<LrWindowSamples> {
+    let mut step_lo = usize::MAX;
+    let mut step_hi = 0usize;
+    for (ep, lo, hi) in epoch_step_ranges {
+        if *ep >= start_ep && *ep <= end_ep {
+            step_lo = step_lo.min(*lo);
+            step_hi = step_hi.max(*hi);
+        }
+    }
+    if step_lo > step_hi {
+        return None;
+    }
+    // Step → epoch lookup for events whose `epoch` field is `None` (old
+    // timelines predating per-event epoch tagging).
+    let epoch_for_step = |s: usize| -> usize {
+        epoch_step_ranges
+            .iter()
+            .find_map(|(ep, lo, hi)| {
+                if *lo <= s && s <= *hi {
+                    Some(*ep)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    };
+    let mut pts_max: Vec<(usize, usize, f64)> = Vec::new();
+    let mut pts_mean: Vec<Option<f64>> = Vec::new();
+    let mut has_deltas = false;
+    for e in events {
+        if let EventKind::Divergence {
+            d_raw,
+            step,
+            epoch,
+            deltas,
+            ..
+        } = &e.kind
+            && *step >= step_lo
+            && *step <= step_hi
+            && *d_raw > 1e-12
+        {
+            let resolved_epoch = epoch.unwrap_or_else(|| epoch_for_step(*step));
+            pts_max.push((*step, resolved_epoch, d_raw.ln()));
+            if !deltas.is_empty() {
+                has_deltas = true;
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                if mean > 1e-12 {
+                    pts_mean.push(Some(mean.ln()));
+                } else {
+                    pts_mean.push(None);
+                }
+            } else {
+                pts_mean.push(None);
+            }
+        }
+    }
+    if pts_max.is_empty() {
+        return None;
+    }
+    Some(LrWindowSamples {
+        pts_max,
+        pts_mean,
+        has_deltas,
+    })
+}
+
+/// Run OLS for both bases on the collected samples, optionally trimming the
+/// first `skip_first_n_epochs` epochs of the window. Returns `None` if the
+/// D_max fit doesn't have enough points.
+fn fit_samples(samples: &LrWindowSamples, skip_first_n_epochs: usize) -> Option<MsfLrWindowFit> {
+    let cutoff_epoch: Option<usize> = if skip_first_n_epochs == 0 {
+        None
+    } else {
+        let first_ep = samples.pts_max.first().map(|(_, ep, _)| *ep)?;
+        Some(first_ep + skip_first_n_epochs)
+    };
+    let mut xs_max: Vec<f64> = Vec::new();
+    let mut ys_max: Vec<f64> = Vec::new();
+    let mut xs_mean: Vec<f64> = Vec::new();
+    let mut ys_mean: Vec<f64> = Vec::new();
+    let mut step_lo = usize::MAX;
+    let mut step_hi = 0usize;
+    let mut start_ep = usize::MAX;
+    let mut end_ep = 0usize;
+    for (i, (step, epoch, ln_max)) in samples.pts_max.iter().enumerate() {
+        if let Some(ce) = cutoff_epoch
+            && *epoch < ce
+        {
+            continue;
+        }
+        xs_max.push(*step as f64);
+        ys_max.push(*ln_max);
+        step_lo = step_lo.min(*step);
+        step_hi = step_hi.max(*step);
+        start_ep = start_ep.min(*epoch);
+        end_ep = end_ep.max(*epoch);
+        if let Some(ln_mean) = samples.pts_mean.get(i).and_then(|p| *p) {
+            xs_mean.push(*step as f64);
+            ys_mean.push(ln_mean);
+        }
+    }
+    let n = xs_max.len();
+    if n < 5 {
+        return None;
+    }
+    let fit_max = ols(&xs_max, &ys_max)?;
+    let (slope_dmean, r2_dmean) = if samples.has_deltas {
+        match ols(&xs_mean, &ys_mean) {
+            Some(f) => (Some(f.slope), Some(f.r2)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    // Per-epoch aggregation: collapse intra-epoch SGD variance by averaging
+    // `ln(D_mean)` and `step` within each epoch, then fit those aggregates.
+    // Uses log-mean (mean of ln(D)) rather than ln of arithmetic-mean(D) so
+    // that R1 linearity is preserved under the aggregation.
+    let (slope_epoch_dmean, r2_epoch_dmean, n_epoch_points) = if samples.has_deltas {
+        use std::collections::BTreeMap;
+        let mut by_epoch: BTreeMap<usize, (Vec<f64>, Vec<usize>)> = BTreeMap::new();
+        for (i, (step, epoch, _)) in samples.pts_max.iter().enumerate() {
+            if let Some(ce) = cutoff_epoch
+                && *epoch < ce
+            {
+                continue;
+            }
+            if let Some(ln_mean) = samples.pts_mean.get(i).and_then(|p| *p) {
+                let entry = by_epoch.entry(*epoch).or_default();
+                entry.0.push(ln_mean);
+                entry.1.push(*step);
+            }
+        }
+        let mut xs_ep: Vec<f64> = Vec::new();
+        let mut ys_ep: Vec<f64> = Vec::new();
+        for (ln_means, steps) in by_epoch.values() {
+            if ln_means.is_empty() {
+                continue;
+            }
+            let y_mean = ln_means.iter().sum::<f64>() / ln_means.len() as f64;
+            let x_mean =
+                steps.iter().map(|s| *s as f64).sum::<f64>() / steps.len() as f64;
+            xs_ep.push(x_mean);
+            ys_ep.push(y_mean);
+        }
+        let n_ep = xs_ep.len();
+        match ols(&xs_ep, &ys_ep) {
+            Some(f) => (Some(f.slope), Some(f.r2), Some(n_ep)),
+            None => (None, None, if n_ep > 0 { Some(n_ep) } else { None }),
+        }
+    } else {
+        (None, None, None)
+    };
+
+    Some(MsfLrWindowFit {
+        lr: 0.0, // filled in by caller
+        epoch_start: start_ep,
+        epoch_end: end_ep,
+        n_events: n,
+        step_min: step_lo,
+        step_max: step_hi,
+        slope_per_step: fit_max.slope,
+        r2: fit_max.r2,
+        slope_per_step_dmean: slope_dmean,
+        r2_dmean,
+        slope_per_step_epoch_dmean: slope_epoch_dmean,
+        r2_epoch_dmean,
+        n_epoch_points,
+        transient_skipped: skip_first_n_epochs,
+    })
+}
+
+/// Heuristic: count leading epochs in the window where D_max is anomalously
+/// high vs the rest (initialization transient). Returns 0 if no clear
+/// transient is detected. Threshold: epoch is "transient" if its peak D_max
+/// exceeds 1.5× the median of the remaining window's per-epoch peak D_max.
+/// Capped at 20% of window length to avoid eating into stable-LR data.
+fn detect_transient_epochs(samples: &LrWindowSamples) -> usize {
+    if samples.pts_max.is_empty() {
+        return 0;
+    }
+    use std::collections::BTreeMap;
+    let mut peak_by_epoch: BTreeMap<usize, f64> = BTreeMap::new();
+    for (_, epoch, ln_max) in &samples.pts_max {
+        let d_max = ln_max.exp();
+        let cur = peak_by_epoch.entry(*epoch).or_insert(0.0);
+        if d_max > *cur {
+            *cur = d_max;
+        }
+    }
+    let epochs_sorted: Vec<(usize, f64)> = peak_by_epoch.into_iter().collect();
+    let total = epochs_sorted.len();
+    if total < 10 {
+        return 0;
+    }
+    let cap = (total / 5).max(1);
+    let mut skipped = 0usize;
+    while skipped < cap {
+        let remainder = &epochs_sorted[skipped..];
+        if remainder.len() < 5 {
+            break;
+        }
+        let mut peaks: Vec<f64> = remainder.iter().map(|(_, p)| *p).collect();
+        peaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med = peaks[peaks.len() / 2];
+        let head_peak = epochs_sorted[skipped].1;
+        if med > 0.0 && head_peak > 1.5 * med {
+            skipped += 1;
+        } else {
+            break;
+        }
+    }
+    skipped
+}
+
+/// Compute log(D) vs cumulative step OLS within a (start_epoch, end_epoch)
+/// range, on both D_max and D_mean bases. Emits one `MsfLrWindowFit` for the
+/// full window; for the first window of the run, also emits a post-transient
+/// fit when the initialization-transient heuristic detects leading epochs to
+/// trim.
+fn fit_lr_window(
+    events: &[Event],
+    epoch_step_ranges: &[(usize, usize, usize)],
+    start_ep: usize,
+    end_ep: usize,
+    is_first_window: bool,
+) -> Vec<MsfLrWindowFit> {
+    let Some(samples) = collect_lr_window_samples(events, epoch_step_ranges, start_ep, end_ep)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<MsfLrWindowFit> = Vec::new();
+    if let Some(full) = fit_samples(&samples, 0) {
+        out.push(full);
+    }
+    if is_first_window {
+        let skip = detect_transient_epochs(&samples);
+        if skip > 0
+            && let Some(post) = fit_samples(&samples, skip)
+        {
+            out.push(post);
+        }
+    }
+    out
 }
 
 /// Threshold for the current convergence guard simulator. Matches the
@@ -1395,19 +1664,15 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
         }
         windows
             .into_iter()
-            .filter_map(|(lr, start, end)| {
-                fit_lr_window(events, &epoch_step_ranges, start, end).map(
-                    |(n, s_lo, s_hi, slope, r2)| MsfLrWindowFit {
-                        lr,
-                        epoch_start: start,
-                        epoch_end: end,
-                        n_events: n,
-                        step_min: s_lo,
-                        step_max: s_hi,
-                        slope_per_step: slope,
-                        r2,
-                    },
-                )
+            .enumerate()
+            .flat_map(|(idx, (lr, start, end))| {
+                let is_first = idx == 0;
+                fit_lr_window(events, &epoch_step_ranges, start, end, is_first)
+                    .into_iter()
+                    .map(move |mut f| {
+                        f.lr = lr;
+                        f
+                    })
             })
             .collect()
     } else {
@@ -1510,6 +1775,7 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
     // pick up the LR-drop collapse as artefactual signal).
     let predictive_by_lr_window: Vec<MsfPredictiveByLrWindow> = lr_window_fits
         .iter()
+        .filter(|w| w.transient_skipped == 0)
         .map(|w| {
             let mut xs = Vec::new();
             let mut ys = Vec::new();
