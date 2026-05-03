@@ -1084,7 +1084,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         }
     }
 
-    // Guard comparison: current 3-rises vs MSF λ̂_ema sustained-positive.
+    // Guard comparison (per-event simulators on recomputed λ̂).
     let any_guard = groups.iter().any(|(_, runs)| {
         runs.iter().any(|r| {
             !r.msf.guard_comparison.current_fires.is_empty()
@@ -1092,14 +1092,18 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         })
     });
     if any_guard {
-        md.push_str("### Convergence Guard Comparison (post-hoc simulators)\n\n");
+        md.push_str("### Convergence Guard Comparison (per-event simulators)\n\n");
         md.push_str(
-            "Two guards simulated against the same `div_epoch` series. \
-             **Current**: fires when `D_max` rises 3 epochs in a row with last \
-             value > 0.01 (production default). **MSF**: fires when `λ_ema` is \
-             sustained above 1e-3 for 3 consecutive epochs (R5-style innovation \
-             rule from the design doc). Both passive — neither affected the \
-             actual run, this is a what-would-have-fired analysis.\n\n",
+            "Both guards replayed against the per-AllReduce divergence \
+             trajectory (matching the production guard's temporal grain). \
+             **Current**: ConvergenceGuard::check_trend — fires when 3 \
+             consecutive `d_raw` events rise AND the latest exceeds 0.01 \
+             (production default). **MSF**: fires when the recomputed bias-\
+             corrected `λ_ema` exceeds 1e-3 for 3 consecutive events (R5-\
+             style innovation rule, threshold and sustain are the centre \
+             point of the sweep below). Lambda is recomputed in analyze.rs \
+             from `(d_raw, k_max)` so old timelines and new ones produce \
+             the same numbers. Counts are distinct firing epochs.\n\n",
         );
         md.push_str(
             "| Model | Mode | Current fires | MSF fires | Both | Current only | MSF only |\n",
@@ -1110,11 +1114,14 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         let fmt_eps = |v: &Vec<usize>| {
             if v.is_empty() {
                 "—".to_string()
+            } else if v.len() <= 12 {
+                v.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",")
             } else {
-                v.iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                let head: Vec<String> =
+                    v.iter().take(8).map(|e| e.to_string()).collect();
+                let tail: Vec<String> =
+                    v.iter().rev().take(2).map(|e| e.to_string()).collect();
+                format!("{}…{}", head.join(","), tail.into_iter().rev().collect::<Vec<_>>().join(","))
             }
         };
         for (model, runs) in groups {
@@ -1135,6 +1142,82 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
                     fmt_eps(&g.both),
                     fmt_eps(&g.current_only),
                     fmt_eps(&g.msf_only),
+                );
+            }
+        }
+        md.push('\n');
+    }
+
+    // MSF threshold sweep — sensitivity grid.
+    let any_sweep = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| !r.msf.msf_threshold_sweep.is_empty()));
+    if any_sweep {
+        md.push_str("### MSF Guard Threshold Sweep\n\n");
+        md.push_str(
+            "Per-event MSF guard fires across (threshold × sustain) grid. \
+             `fires` = total firing events, `epochs` = distinct epochs \
+             touched by ≥1 fire. Reading: a useful detector should have \
+             monotone fall-off as `threshold` rises (signal-driven, not \
+             threshold-driven), and `epochs` should concentrate near the \
+             phase boundaries the design doc predicts (LR drops, warmup \
+             stabilization).\n\n",
+        );
+        md.push_str("| Model | Mode | threshold | sustain | fires | epochs |\n");
+        md.push_str("|-------|------|----------:|--------:|------:|------:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                for row in &r.msf.msf_threshold_sweep {
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {:.0e} | {} | {} | {} |",
+                        model,
+                        r.mode,
+                        row.threshold,
+                        row.sustain,
+                        row.fires,
+                        row.epochs_covered,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
+    // Predictive value (Phase-1 kill criterion).
+    let any_pred = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| r.msf.predictive.is_some()));
+    if any_pred {
+        md.push_str("### Predictive Value (Phase-1 kill criterion)\n\n");
+        md.push_str(
+            "Pearson correlations testing whether λ̂ carries forward-looking \
+             signal independent of D itself. **`λ_raw_t → ln(D_{t+1})`**: \
+             does the rate at event t predict the next D? **`λ_mean_per_ep \
+             → eval`**: does the epoch's mean λ̂ correlate with held-out \
+             accuracy? **`λ_ema_end_of_ep → eval`**: does the EMA value at \
+             epoch boundary correlate with eval? All Pearson, scale-\
+             invariant under the `k_used` ↔ `k_max` rescale, so values are \
+             robust to the pipeline correction.\n\n",
+        );
+        md.push_str("| Model | Mode | n_evt | r(λ→ln D_{t+1}) | n_ep | r(λ_mean→eval) | r(λ_ema→eval) |\n");
+        md.push_str("|-------|------|------:|---------------:|-----:|---------------:|--------------:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                let Some(p) = &r.msf.predictive else { continue };
+                let fmt = |v: Option<f64>| {
+                    v.map(|x| format!("{x:+.3}")).unwrap_or_else(|| "—".into())
+                };
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} | {} | {} | {} | {} |",
+                    model,
+                    r.mode,
+                    p.n_lambda_to_next_logd,
+                    fmt(p.lambda_to_next_logd_r),
+                    p.n_lambda_to_eval,
+                    fmt(p.lambda_mean_to_eval_r),
+                    fmt(p.lambda_ema_to_eval_r),
                 );
             }
         }

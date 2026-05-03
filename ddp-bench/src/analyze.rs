@@ -351,8 +351,55 @@ pub struct MsfAnalysis {
     /// wiring, or backends that don't compute it).
     pub longitudinal: Option<MsfLongitudinal>,
     /// Guard simulator comparison: current guard fires vs MSF-style guard
-    /// fires on the same `div_epoch` series.
+    /// fires on per-event recomputed lambda. Replaces the old per-epoch
+    /// d_max simulator; both sides now match production temporal grain.
     pub guard_comparison: MsfGuardComparison,
+    /// Threshold sweep for the MSF guard (R5). Each row: `(threshold,
+    /// sustain, fires, epochs_covered)`. Lets the reader judge sensitivity
+    /// without committing to a single magic-number threshold.
+    pub msf_threshold_sweep: Vec<MsfThresholdSweepRow>,
+    /// Predictive-value stats for the design-doc Phase-1 kill criterion.
+    /// `None` when too few events for stable Pearson estimates.
+    pub predictive: Option<MsfPredictive>,
+    /// Per-event recomputed λ̂ trajectory. Populated by `build_msf_analysis`;
+    /// consumed by `apply_training_log` to fill `predictive` once per-epoch
+    /// eval is available. Kept on the struct so we don't re-walk events.
+    pub recomputed: Vec<RecomputedLambda>,
+}
+
+/// One row of the MSF-guard threshold sweep.
+#[derive(Debug, Clone)]
+pub struct MsfThresholdSweepRow {
+    pub threshold: f64,
+    pub sustain: usize,
+    pub fires: usize,
+    /// Distinct epochs touched by at least one fire.
+    pub epochs_covered: usize,
+}
+
+/// Phase-1 kill-criterion predictive correlations.
+///
+/// All correlations are Pearson and scale-invariant under the `k_used` ↔
+/// `k_max` rescale, so values reported here transfer cleanly between the
+/// pre-correction and post-correction λ̂ formulae. The point of these
+/// numbers is not to validate the *magnitude* of λ̂ but to validate that
+/// it carries forward-looking signal.
+#[derive(Debug, Clone)]
+pub struct MsfPredictive {
+    /// Number of (λ̂_t, log D_{t+1}) pairs with both finite.
+    pub n_lambda_to_next_logd: usize,
+    /// Pearson(λ_raw_t, ln(D_{t+1})). Negative correlation is the design
+    /// doc's expected sign: high λ̂ (transversal stretching) → larger
+    /// next-event divergence... wait — the *correct* sign depends on
+    /// whether D collapses or stretches over the window the rate covers.
+    /// Reporting raw correlation; interpretation goes in the report prose.
+    pub lambda_to_next_logd_r: Option<f64>,
+    /// Number of (λ_mean_per_epoch, eval[ep]) pairs with both finite.
+    pub n_lambda_to_eval: usize,
+    /// Pearson(epoch-mean λ̂, eval at end of same epoch).
+    pub lambda_mean_to_eval_r: Option<f64>,
+    /// Pearson(λ_ema_at_epoch_end, eval at end of same epoch).
+    pub lambda_ema_to_eval_r: Option<f64>,
 }
 
 impl MsfAnalysis {
@@ -803,47 +850,165 @@ fn fit_lr_window(
 
 /// Threshold for the current convergence guard simulator. Matches the
 /// production default in `flodl::distributed::ddp_run::ConvergenceGuard`.
-/// Used in the post-hoc guard-comparison analysis.
 const GUARD_CURRENT_D_THRESHOLD: f64 = 0.01;
-/// MSF-style guard: λ_ema must exceed this for `GUARD_MSF_CONSECUTIVE`
-/// consecutive epochs to fire. λ_ema > 0 means transversal deviation is
-/// growing cycle-over-cycle (R5 innovation interpretation).
+/// Default centre threshold used in the headline guard-comparison row;
+/// the threshold sweep table covers a grid around this point.
 const GUARD_MSF_LAMBDA_THRESHOLD: f64 = 1.0e-3;
-/// Number of consecutive epochs above `GUARD_MSF_LAMBDA_THRESHOLD` before
-/// the MSF guard fires.
+/// Default sustain length for the headline MSF guard row.
 const GUARD_MSF_CONSECUTIVE: usize = 3;
+/// MSF-guard sweep grids.
+const MSF_THRESHOLD_GRID: &[f64] = &[0.0, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1];
+const MSF_SUSTAIN_GRID: &[usize] = &[3, 5, 10];
 
-fn simulate_guard_comparison(epochs: &[MsfEpoch]) -> MsfGuardComparison {
-    // Current guard: 3 consecutive D_max rises, last > threshold.
-    let mut current_fires: Vec<usize> = Vec::new();
-    if epochs.len() >= 3 {
-        for i in 2..epochs.len() {
-            let d_now = epochs[i].d_max;
-            let d_prev = epochs[i - 1].d_max;
-            let d_prev2 = epochs[i - 2].d_max;
-            if d_now > d_prev && d_prev > d_prev2 && d_now > GUARD_CURRENT_D_THRESHOLD {
-                current_fires.push(epochs[i].epoch);
+/// Per-event recomputed lambda sample. Cached on `MsfAnalysis` so the
+/// predictive-value step (which runs after `apply_training_log` joins
+/// per-epoch eval) can reuse the canonical pipeline without re-walking
+/// the event list.
+#[derive(Debug, Clone, Copy)]
+pub struct RecomputedLambda {
+    pub epoch: usize,
+    /// Cumulative training step at this event. Kept for downstream
+    /// scatter/diagnostic plots; not currently consumed by the report
+    /// tables, which aggregate by epoch.
+    #[allow(dead_code)]
+    pub step: usize,
+    pub d_raw: f64,
+    pub lambda_raw: Option<f64>,
+    pub lambda_ema: Option<f64>,
+}
+
+/// In-analyzer port of `flodl::distributed::ddp_run::convergence::LambdaEstimator`.
+///
+/// Mirrors the post-corrections semantics: rate denominator `k_max`,
+/// full-reset on noise-floor `d_raw`, Adam-style bias-corrected EMA from
+/// `ema_raw=0.0`. We rebuild λ̂ here so analyze.rs is a single canonical
+/// pipeline — old timelines (which emit `lambda_raw = log(D/prev) / k_used`)
+/// produce the same downstream tables as new ones (`/ k_max`).
+struct LambdaEstimator {
+    prev_d: Option<f64>,
+    ema_raw: f64,
+    ema_t: u32,
+    alpha: f64,
+    noise_floor: f64,
+}
+
+impl LambdaEstimator {
+    fn new() -> Self {
+        Self { prev_d: None, ema_raw: 0.0, ema_t: 0, alpha: 0.9, noise_floor: 1e-8 }
+    }
+
+    fn observe(&mut self, d_raw: f64, k_max: usize) -> (Option<f64>, Option<f64>) {
+        let lambda_raw = match self.prev_d {
+            Some(prev) if prev > self.noise_floor && d_raw > self.noise_floor && k_max > 0 => {
+                Some((d_raw / prev).ln() / k_max as f64)
             }
+            _ => None,
+        };
+        if let Some(l) = lambda_raw {
+            self.ema_raw = self.alpha * self.ema_raw + (1.0 - self.alpha) * l;
+            self.ema_t = self.ema_t.saturating_add(1);
+        }
+        self.prev_d = if d_raw > self.noise_floor { Some(d_raw) } else { None };
+        let lambda_ema = if self.ema_t == 0 {
+            None
+        } else {
+            let denom = 1.0 - self.alpha.powi(self.ema_t as i32);
+            Some(if denom > 0.0 { self.ema_raw / denom } else { self.ema_raw })
+        };
+        (lambda_raw, lambda_ema)
+    }
+}
+
+/// Per-event recomputed-λ̂ trajectory in t-order.
+fn recompute_lambdas(events: &[Event]) -> Vec<RecomputedLambda> {
+    // Walk div events in event-list order (already t-sorted at load).
+    let mut out: Vec<RecomputedLambda> = Vec::new();
+    let mut est = LambdaEstimator::new();
+    // For old timelines without an `epoch` field, we t-lookup via the
+    // sorted EpochEnd timestamps: an event at time t belongs to the
+    // first epoch whose EpochEnd has t' >= t.
+    let mut epoch_ends: Vec<(u64, usize)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::EpochEnd { epoch, .. } => Some((e.t, *epoch)),
+            _ => None,
+        })
+        .collect();
+    epoch_ends.sort_by_key(|x| x.0);
+    let mut ep_idx = 0usize;
+    for ev in events {
+        let EventKind::Divergence { d_raw, k_max, step, epoch, .. } = &ev.kind else { continue };
+        let (lambda_raw, lambda_ema) = est.observe(*d_raw, *k_max);
+        let cur_epoch = if let Some(e) = epoch {
+            *e
+        } else {
+            while ep_idx < epoch_ends.len() && epoch_ends[ep_idx].0 < ev.t {
+                ep_idx += 1;
+            }
+            if ep_idx < epoch_ends.len() { epoch_ends[ep_idx].1 } else { continue }
+        };
+        out.push(RecomputedLambda {
+            epoch: cur_epoch,
+            step: *step,
+            d_raw: *d_raw,
+            lambda_raw,
+            lambda_ema,
+        });
+    }
+    out
+}
+
+/// Per-event simulator: ConvergenceGuard::check_trend over a 5-element
+/// ring of `d_raw`. Fires whenever the last 3 samples are strictly rising
+/// AND the latest exceeds `threshold`. Returns the epoch numbers of the
+/// firing events (de-duplicated, sorted).
+fn simulate_current_guard_per_event(rec: &[RecomputedLambda], threshold: f64) -> Vec<usize> {
+    let mut fires: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    if rec.len() < 3 {
+        return Vec::new();
+    }
+    for i in 2..rec.len() {
+        let a = rec[i - 2].d_raw;
+        let b = rec[i - 1].d_raw;
+        let c = rec[i].d_raw;
+        if c > b && b > a && c > threshold {
+            fires.insert(rec[i].epoch);
         }
     }
-    // MSF guard: λ_ema_at_epoch_end sustained above threshold.
-    let mut msf_fires: Vec<usize> = Vec::new();
+    fires.into_iter().collect()
+}
+
+/// Per-event simulator: MSF-style. Fires whenever `lambda_ema` has been
+/// strictly above `threshold` for `sustain` consecutive events. Streak
+/// resets after each fire. Returns firing epoch numbers (de-duplicated,
+/// sorted).
+fn simulate_msf_guard_per_event(
+    rec: &[RecomputedLambda],
+    threshold: f64,
+    sustain: usize,
+) -> Vec<usize> {
+    let mut fires: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut streak = 0usize;
-    for me in epochs {
-        let above = me
-            .lambda_ema_at_epoch_end
-            .map(|v| v > GUARD_MSF_LAMBDA_THRESHOLD)
-            .unwrap_or(false);
+    for r in rec {
+        let above = r.lambda_ema.map(|v| v > threshold).unwrap_or(false);
         if above {
             streak += 1;
-            if streak >= GUARD_MSF_CONSECUTIVE {
-                msf_fires.push(me.epoch);
+            if streak >= sustain {
+                fires.insert(r.epoch);
                 streak = 0;
             }
         } else {
             streak = 0;
         }
     }
+    fires.into_iter().collect()
+}
+
+fn simulate_guard_comparison(rec: &[RecomputedLambda]) -> MsfGuardComparison {
+    let current_fires =
+        simulate_current_guard_per_event(rec, GUARD_CURRENT_D_THRESHOLD);
+    let msf_fires =
+        simulate_msf_guard_per_event(rec, GUARD_MSF_LAMBDA_THRESHOLD, GUARD_MSF_CONSECUTIVE);
     let cur_set: std::collections::HashSet<usize> = current_fires.iter().copied().collect();
     let msf_set: std::collections::HashSet<usize> = msf_fires.iter().copied().collect();
     let mut both: Vec<usize> = cur_set.intersection(&msf_set).copied().collect();
@@ -852,13 +1017,109 @@ fn simulate_guard_comparison(epochs: &[MsfEpoch]) -> MsfGuardComparison {
     both.sort_unstable();
     current_only.sort_unstable();
     msf_only.sort_unstable();
-    MsfGuardComparison {
-        current_fires,
-        msf_fires,
-        both,
-        current_only,
-        msf_only,
+    MsfGuardComparison { current_fires, msf_fires, both, current_only, msf_only }
+}
+
+fn build_msf_threshold_sweep(rec: &[RecomputedLambda]) -> Vec<MsfThresholdSweepRow> {
+    let mut rows = Vec::with_capacity(MSF_THRESHOLD_GRID.len() * MSF_SUSTAIN_GRID.len());
+    for &threshold in MSF_THRESHOLD_GRID {
+        for &sustain in MSF_SUSTAIN_GRID {
+            let fires = simulate_msf_guard_per_event(rec, threshold, sustain);
+            let epochs_covered: std::collections::HashSet<usize> =
+                fires.iter().copied().collect();
+            rows.push(MsfThresholdSweepRow {
+                threshold,
+                sustain,
+                fires: fires.len(),
+                epochs_covered: epochs_covered.len(),
+            });
+        }
     }
+    rows
+}
+
+fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    let n = xs.len().min(ys.len());
+    if n < 3 {
+        return None;
+    }
+    let mx = xs.iter().take(n).sum::<f64>() / n as f64;
+    let my = ys.iter().take(n).sum::<f64>() / n as f64;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    let mut sxy = 0.0;
+    for k in 0..n {
+        let dx = xs[k] - mx;
+        let dy = ys[k] - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    if sxx <= 0.0 || syy <= 0.0 {
+        return None;
+    }
+    Some(sxy / (sxx * syy).sqrt())
+}
+
+/// Predictive-value correlations: λ̂_t → next D, λ̂ aggregates → eval.
+fn build_predictive(
+    rec: &[RecomputedLambda],
+    epochs: &[MsfEpoch],
+    epoch_data: &[EpochData],
+) -> Option<MsfPredictive> {
+    if rec.len() < 4 {
+        return None;
+    }
+    // Within-event: pair λ_raw[t] with ln(D[t+1]).
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for i in 0..rec.len() - 1 {
+        let Some(l) = rec[i].lambda_raw else { continue };
+        let d_next = rec[i + 1].d_raw;
+        if d_next <= 0.0 || !d_next.is_finite() || !l.is_finite() {
+            continue;
+        }
+        xs.push(l);
+        ys.push(d_next.ln());
+    }
+    let lambda_to_next_logd_r = pearson(&xs, &ys);
+    let n_lambda_to_next_logd = xs.len();
+
+    // Per-epoch: pair recomputed lambda aggregates with eval. Use eval
+    // from `EpochData` (training log) joined by epoch index.
+    let eval_by_epoch: std::collections::HashMap<usize, f64> = epoch_data
+        .iter()
+        .filter_map(|e| e.eval.map(|v| (e.epoch, v)))
+        .collect();
+    let mut x_mean = Vec::new();
+    let mut y_mean = Vec::new();
+    let mut x_ema = Vec::new();
+    let mut y_ema = Vec::new();
+    for me in epochs {
+        let Some(eval) = eval_by_epoch.get(&me.epoch).copied() else { continue };
+        if let Some(lm) = me.lambda_mean {
+            if lm.is_finite() {
+                x_mean.push(lm);
+                y_mean.push(eval);
+            }
+        }
+        if let Some(le) = me.lambda_ema_at_epoch_end {
+            if le.is_finite() {
+                x_ema.push(le);
+                y_ema.push(eval);
+            }
+        }
+    }
+    let n_lambda_to_eval = x_mean.len();
+    let lambda_mean_to_eval_r = pearson(&x_mean, &y_mean);
+    let lambda_ema_to_eval_r = pearson(&x_ema, &y_ema);
+    Some(MsfPredictive {
+        n_lambda_to_next_logd,
+        lambda_to_next_logd_r,
+        n_lambda_to_eval,
+        lambda_mean_to_eval_r,
+        lambda_ema_to_eval_r,
+    })
 }
 
 /// Heuristic threshold for phase-transition candidate detection.
@@ -1191,7 +1452,42 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
         })
     };
 
-    let guard_comparison = simulate_guard_comparison(&epochs);
+    // Canonical λ̂ pipeline: re-run estimation in t-order using the
+    // post-corrections semantics (k_max denominator, full-reset on
+    // noise-floor, bias-corrected EMA). Old timelines that emitted
+    // lambda computed with k_used become equivalent to new ones once
+    // analyze.rs takes over the math.
+    let recomputed = recompute_lambdas(events);
+
+    // Override per-epoch lambda aggregates with values derived from the
+    // recomputed per-event series so MsfEpoch is self-consistent under
+    // the new pipeline. Per-epoch d aggregates (d_min/d_max/d_mean/
+    // d_at_epoch_end) are pure observations and don't need recompute.
+    let mut by_epoch: std::collections::HashMap<usize, Vec<&RecomputedLambda>> =
+        std::collections::HashMap::new();
+    for r in &recomputed {
+        by_epoch.entry(r.epoch).or_default().push(r);
+    }
+    for me in &mut epochs {
+        let Some(rs) = by_epoch.get(&me.epoch) else { continue };
+        let lambdas: Vec<f64> = rs.iter().filter_map(|r| r.lambda_raw).collect();
+        if lambdas.is_empty() {
+            me.lambda_min = None;
+            me.lambda_max = None;
+            me.lambda_mean = None;
+        } else {
+            let mn = lambdas.iter().copied().fold(f64::INFINITY, f64::min);
+            let mx = lambdas.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mean = lambdas.iter().sum::<f64>() / lambdas.len() as f64;
+            me.lambda_min = Some(mn);
+            me.lambda_max = Some(mx);
+            me.lambda_mean = Some(mean);
+        }
+        me.lambda_ema_at_epoch_end = rs.last().and_then(|r| r.lambda_ema);
+    }
+
+    let guard_comparison = simulate_guard_comparison(&recomputed);
+    let msf_threshold_sweep = build_msf_threshold_sweep(&recomputed);
 
     MsfAnalysis {
         div_event_count,
@@ -1202,6 +1498,9 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
         lr_window_fits,
         longitudinal,
         guard_comparison,
+        msf_threshold_sweep,
+        predictive: None, // filled by apply_training_log once eval is joined
+        recomputed,
     }
 }
 
@@ -1515,6 +1814,16 @@ pub fn apply_training_log(analysis: &mut RunAnalysis, log: &TrainingLog) {
             }
         }).collect();
     }
+
+    // Predictive-value (Phase-1 kill criterion): now that eval is joined,
+    // compute λ̂_t → log(D_{t+1}) and λ̂_aggregate → eval correlations.
+    // Pearson is scale-invariant so the numbers transfer cleanly between
+    // pre- and post-correction λ̂ formulae.
+    analysis.msf.predictive = build_predictive(
+        &analysis.msf.recomputed,
+        &analysis.msf.epochs,
+        &analysis.epoch_data,
+    );
 }
 
 // ---------------------------------------------------------------------------
