@@ -369,6 +369,7 @@ fn run_baseline_solo(
             timeline.event(flodl::monitor::EventKind::EpochEnd {
                 epoch,
                 loss: final_loss,
+                lr: optimizer.lr(),
             });
 
             // Drain per-batch scalars from record_scalar (training accuracy etc.).
@@ -457,6 +458,7 @@ fn run_baseline_solo(
             timeline.event(flodl::monitor::EventKind::EpochEnd {
                 epoch,
                 loss: final_loss,
+                lr: optimizer.lr(),
             });
 
             monitor.log(epoch, epoch_start.elapsed(), &[("loss", final_loss)]);

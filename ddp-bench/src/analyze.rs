@@ -37,13 +37,43 @@ pub struct Event {
 #[derive(Debug, Clone)]
 pub enum EventKind {
     EpochStart { epoch: usize },
-    EpochEnd { epoch: usize, loss: f64 },
+    EpochEnd { epoch: usize, loss: f64, #[allow(dead_code)] lr: f64 },
     SyncStart,
     SyncEnd { ms: f64 },
     CpuAvgStart,
     CpuAvgEnd { ms: f64 },
     Anchor { #[allow(dead_code)] from: usize, #[allow(dead_code)] to: usize },
     Throttle { #[allow(dead_code)] rank: usize },
+    /// MSF per-AllReduce sample (passive observation, no behavior effect).
+    /// Currently we only count these for the summary; per-event detail is
+    /// kept on the JSON for downstream analysis tools.
+    #[allow(dead_code)]
+    Divergence {
+        d_raw: f64,
+        lambda_raw: Option<f64>,
+        lambda_ema: Option<f64>,
+        k_used: usize,
+        k_max: usize,
+        step: usize,
+        deltas: Vec<f64>,
+        /// L2 norm of the post-AllReduce consensus weights. Only emitted by
+        /// CPU averaging path (NCCL v1 doesn't compute it).
+        post_norm: Option<f64>,
+    },
+    /// MSF per-epoch aggregate snapshot.
+    DivergenceEpoch {
+        epoch: usize,
+        sync_count: usize,
+        d_min: f64,
+        d_max: f64,
+        d_mean: f64,
+        lambda_min: Option<f64>,
+        lambda_max: Option<f64>,
+        lambda_mean: Option<f64>,
+        lambda_ema_at_epoch_end: Option<f64>,
+        d_at_epoch_end: f64,
+        k_at_epoch_end: usize,
+    },
 }
 
 /// Loaded timeline data for one run.
@@ -165,6 +195,89 @@ pub struct RunAnalysis {
     /// Per-rank averages across the run (from `per-rank:` log lines).
     /// Empty for solo and single-rank runs.
     pub per_rank_avg: Vec<PerRankAvg>,
+    /// MSF passive observation data (lambda_hat, per-epoch aggregates,
+    /// phase-transition candidates). Empty for runs predating MSF logging
+    /// or for modes that produce no AllReduce events (Solo, Sync without
+    /// divergence reports).
+    pub msf: MsfAnalysis,
+}
+
+/// Per-epoch MSF aggregate (mirrors EventKind::DivergenceEpoch).
+#[derive(Debug, Clone)]
+pub struct MsfEpoch {
+    pub epoch: usize,
+    pub sync_count: usize,
+    pub d_min: f64,
+    pub d_max: f64,
+    pub d_mean: f64,
+    pub d_at_epoch_end: f64,
+    pub k_at_epoch_end: usize,
+    pub lambda_min: Option<f64>,
+    pub lambda_max: Option<f64>,
+    pub lambda_mean: Option<f64>,
+    pub lambda_ema_at_epoch_end: Option<f64>,
+    /// Learning rate at end of this epoch (from the matching EpochEnd event).
+    /// `None` for runs predating per-event LR logging.
+    pub lr: Option<f64>,
+}
+
+/// A detected phase-transition candidate (heuristic threshold).
+#[derive(Debug, Clone)]
+pub struct MsfPhaseCandidate {
+    pub epoch: usize,
+    /// `lambda_min` at the candidate event (most-negative single sample).
+    pub lambda_min: f64,
+    /// `d_at_epoch_end` (where the system landed after the transition).
+    pub d_end: f64,
+    /// Ratio `d_at_epoch_end / d_at_previous_epoch_end` (smaller = bigger collapse).
+    pub d_ratio: f64,
+}
+
+/// Per-rank D distribution + per-rank lambda estimates.
+///
+/// Rank 0 is conventionally the fast GPU under heterogeneous dispatch (gets
+/// the largest batch_share). Backend-dependent: NCCL exposes per-rank-step
+/// asymmetry in D_t (rank 0 wins max-D race ~57% of events on heterogeneous
+/// 3-GPU rigs), CPU averaging hides it (~33% per rank).
+#[derive(Debug, Clone)]
+pub struct MsfPerRank {
+    pub rank: usize,
+    pub n: usize,
+    pub d_mean: f64,
+    pub d_sd: f64,
+    pub d_min: f64,
+    pub d_max: f64,
+    /// Fraction of events where this rank had the highest delta across ranks.
+    /// Uniform = 1/world_size. Higher = this rank dominates the max-D race.
+    pub win_pct: f64,
+    pub lambda_mean: f64,
+    pub lambda_sd: f64,
+}
+
+/// Aggregate MSF analysis for a single run.
+#[derive(Debug, Clone, Default)]
+pub struct MsfAnalysis {
+    /// Number of `Divergence` (per-AllReduce) events seen.
+    pub div_event_count: usize,
+    /// Per-epoch aggregates, in epoch order.
+    pub epochs: Vec<MsfEpoch>,
+    /// Heuristic phase-transition candidates: epochs where `lambda_min` is
+    /// strongly negative AND `d_end / prev_d_end` shows a sharp collapse.
+    pub phase_candidates: Vec<MsfPhaseCandidate>,
+    /// Per-rank D distribution stats. Empty for runs without per-rank deltas.
+    pub per_rank: Vec<MsfPerRank>,
+    /// Pairwise Pearson correlation of D trajectories: list of `((i, j), r)`
+    /// for `i < j`. Values consistently > 0.99 across modes empirically —
+    /// supports the meta-oscillator framing (ranks are coupled, not
+    /// independent oscillators).
+    pub rank_correlations: Vec<((usize, usize), f64)>,
+}
+
+impl MsfAnalysis {
+    /// Whether any MSF data was captured for this run.
+    pub fn has_data(&self) -> bool {
+        !self.epochs.is_empty()
+    }
 }
 
 /// Per-rank stats averaged across the run.
@@ -243,6 +356,7 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
             "epoch_end" => EventKind::EpochEnd {
                 epoch: item["epoch"].as_u64().unwrap_or(0) as usize,
                 loss: item["loss"].as_f64().unwrap_or(0.0),
+                lr: item["lr"].as_f64().unwrap_or(f64::NAN),
             },
             "sync_start" => EventKind::SyncStart,
             "sync_end" => EventKind::SyncEnd {
@@ -258,6 +372,39 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
             },
             "throttle" => EventKind::Throttle {
                 rank: item["rank"].as_u64().unwrap_or(0) as usize,
+            },
+            "div" => {
+                let deltas = item["deltas"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| v.as_f64().unwrap_or(0.0))
+                            .collect::<Vec<f64>>()
+                    })
+                    .unwrap_or_default();
+                EventKind::Divergence {
+                    d_raw: item["d"].as_f64().unwrap_or(0.0),
+                    lambda_raw: item["lambda"].as_f64(),
+                    lambda_ema: item["lambda_ema"].as_f64(),
+                    k_used: item["k_used"].as_u64().unwrap_or(0) as usize,
+                    k_max: item["k_max"].as_u64().unwrap_or(0) as usize,
+                    step: item["step"].as_u64().unwrap_or(0) as usize,
+                    deltas,
+                    post_norm: item["post_norm"].as_f64(),
+                }
+            }
+            "div_epoch" => EventKind::DivergenceEpoch {
+                epoch: item["epoch"].as_u64().unwrap_or(0) as usize,
+                sync_count: item["syncs"].as_u64().unwrap_or(0) as usize,
+                d_min: item["d_min"].as_f64().unwrap_or(0.0),
+                d_max: item["d_max"].as_f64().unwrap_or(0.0),
+                d_mean: item["d_mean"].as_f64().unwrap_or(0.0),
+                lambda_min: item["lambda_min"].as_f64(),
+                lambda_max: item["lambda_max"].as_f64(),
+                lambda_mean: item["lambda_mean"].as_f64(),
+                lambda_ema_at_epoch_end: item["lambda_ema_end"].as_f64(),
+                d_at_epoch_end: item["d_end"].as_f64().unwrap_or(0.0),
+                k_at_epoch_end: item["k_end"].as_u64().unwrap_or(0) as usize,
             },
             _ => continue, // skip unknown
         };
@@ -354,7 +501,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     let mut epoch_starts: Vec<(usize, u64)> = Vec::new();
     for e in &tl.events {
         match &e.kind {
-            EventKind::EpochEnd { epoch, loss } => epoch_ends.push((*epoch, *loss, e.t)),
+            EventKind::EpochEnd { epoch, loss, .. } => epoch_ends.push((*epoch, *loss, e.t)),
             EventKind::EpochStart { epoch } => epoch_starts.push((*epoch, e.t)),
             _ => {}
         }
@@ -471,6 +618,8 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             + idle.unexplained_ms;
     }
 
+    let msf = build_msf_analysis(&tl.events);
+
     RunAnalysis {
         model: model.to_string(),
         mode: mode.to_string(),
@@ -494,6 +643,200 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
         sync_intervals,
         train_only_ms: None,
         per_rank_avg: Vec::new(),
+        msf,
+    }
+}
+
+/// Heuristic threshold for phase-transition candidate detection.
+///
+/// Marks an epoch as a candidate when its `lambda_min` is more negative than
+/// this AND the per-epoch end-D collapses by at least a factor of 3 vs the
+/// previous epoch's end-D. Tuned against the 200-epoch ResNet-20 sweep where
+/// LR-drop epochs (100, 150) show `lambda_min` around -2e-2 to -5e-2.
+const PHASE_LAMBDA_THRESHOLD: f64 = -1.0e-2;
+/// Minimum collapse ratio (`d_end / prev_d_end < 1/3`) to flag as a candidate.
+const PHASE_D_COLLAPSE_RATIO: f64 = 1.0 / 3.0;
+
+fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
+    let mut div_event_count = 0usize;
+    let mut epochs: Vec<MsfEpoch> = Vec::new();
+    // Per-rank tracking: walk div events in step order.
+    // (rank index -> list of d at each event), step list per event.
+    let mut per_rank_d: Vec<Vec<f64>> = Vec::new();
+    let mut per_rank_step: Vec<Vec<usize>> = Vec::new();
+    let mut win_counts: Vec<usize> = Vec::new();
+    // Map epoch index -> LR at end of that epoch (from EpochEnd events).
+    let mut epoch_lr: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    for e in events {
+        if let EventKind::EpochEnd { epoch, lr, .. } = &e.kind
+            && lr.is_finite()
+        {
+            epoch_lr.insert(*epoch, *lr);
+        }
+    }
+
+    for e in events {
+        match &e.kind {
+            EventKind::Divergence { deltas, step, .. } => {
+                div_event_count += 1;
+                // Initialize per-rank vectors once we see world_size.
+                if per_rank_d.is_empty() && !deltas.is_empty() {
+                    per_rank_d = vec![Vec::new(); deltas.len()];
+                    per_rank_step = vec![Vec::new(); deltas.len()];
+                    win_counts = vec![0; deltas.len()];
+                }
+                if deltas.len() == per_rank_d.len() {
+                    for (r, d) in deltas.iter().enumerate() {
+                        per_rank_d[r].push(*d);
+                        per_rank_step[r].push(*step);
+                    }
+                    // Win = rank with max d this event.
+                    if let Some((max_r, _)) = deltas
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    {
+                        win_counts[max_r] += 1;
+                    }
+                }
+            }
+            EventKind::DivergenceEpoch {
+                epoch,
+                sync_count,
+                d_min,
+                d_max,
+                d_mean,
+                lambda_min,
+                lambda_max,
+                lambda_mean,
+                lambda_ema_at_epoch_end,
+                d_at_epoch_end,
+                k_at_epoch_end,
+            } => {
+                epochs.push(MsfEpoch {
+                    epoch: *epoch,
+                    sync_count: *sync_count,
+                    d_min: *d_min,
+                    d_max: *d_max,
+                    d_mean: *d_mean,
+                    d_at_epoch_end: *d_at_epoch_end,
+                    k_at_epoch_end: *k_at_epoch_end,
+                    lambda_min: *lambda_min,
+                    lambda_max: *lambda_max,
+                    lambda_mean: *lambda_mean,
+                    lambda_ema_at_epoch_end: *lambda_ema_at_epoch_end,
+                    lr: epoch_lr.get(epoch).copied(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Per-rank summary stats + per-rank lambda from consecutive event ratios.
+    let world_size = per_rank_d.len();
+    let total_wins: usize = win_counts.iter().sum();
+    let mut per_rank: Vec<MsfPerRank> = Vec::with_capacity(world_size);
+    for r in 0..world_size {
+        let ds = &per_rank_d[r];
+        let steps = &per_rank_step[r];
+        let n = ds.len();
+        if n == 0 {
+            continue;
+        }
+        let d_mean = ds.iter().sum::<f64>() / n as f64;
+        let d_sd = (ds.iter().map(|x| (x - d_mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let d_min = ds.iter().copied().fold(f64::INFINITY, f64::min);
+        let d_max = ds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let win_pct = if total_wins > 0 {
+            win_counts[r] as f64 / total_wins as f64 * 100.0
+        } else {
+            0.0
+        };
+        // Per-rank lambda from consecutive d ratios.
+        let mut lambdas: Vec<f64> = Vec::with_capacity(n);
+        for i in 1..n {
+            if ds[i - 1] > 1e-8 && ds[i] > 1e-8 {
+                let k_diff = steps[i].saturating_sub(steps[i - 1]).max(1);
+                lambdas.push((ds[i] / ds[i - 1]).ln() / k_diff as f64);
+            }
+        }
+        let (lambda_mean, lambda_sd) = if lambdas.is_empty() {
+            (0.0, 0.0)
+        } else {
+            let m = lambdas.iter().sum::<f64>() / lambdas.len() as f64;
+            let s = (lambdas.iter().map(|x| (x - m).powi(2)).sum::<f64>() / lambdas.len() as f64)
+                .sqrt();
+            (m, s)
+        };
+        per_rank.push(MsfPerRank {
+            rank: r,
+            n,
+            d_mean,
+            d_sd,
+            d_min,
+            d_max,
+            win_pct,
+            lambda_mean,
+            lambda_sd,
+        });
+    }
+
+    // Pairwise Pearson correlation of per-rank D trajectories.
+    let mut rank_correlations: Vec<((usize, usize), f64)> = Vec::new();
+    for i in 0..world_size {
+        for j in (i + 1)..world_size {
+            let xs = &per_rank_d[i];
+            let ys = &per_rank_d[j];
+            let n = xs.len().min(ys.len());
+            if n < 2 {
+                continue;
+            }
+            let mx = xs.iter().take(n).sum::<f64>() / n as f64;
+            let my = ys.iter().take(n).sum::<f64>() / n as f64;
+            let mut sxx = 0.0;
+            let mut syy = 0.0;
+            let mut sxy = 0.0;
+            for k in 0..n {
+                let dx = xs[k] - mx;
+                let dy = ys[k] - my;
+                sxx += dx * dx;
+                syy += dy * dy;
+                sxy += dx * dy;
+            }
+            if sxx > 0.0 && syy > 0.0 {
+                rank_correlations.push(((i, j), sxy / (sxx * syy).sqrt()));
+            }
+        }
+    }
+
+    let mut phase_candidates: Vec<MsfPhaseCandidate> = Vec::new();
+    for i in 1..epochs.len() {
+        let curr = &epochs[i];
+        let prev = &epochs[i - 1];
+        let Some(lmin) = curr.lambda_min else { continue };
+        if lmin >= PHASE_LAMBDA_THRESHOLD {
+            continue;
+        }
+        if prev.d_at_epoch_end <= 0.0 {
+            continue;
+        }
+        let ratio = curr.d_at_epoch_end / prev.d_at_epoch_end;
+        if ratio < PHASE_D_COLLAPSE_RATIO {
+            phase_candidates.push(MsfPhaseCandidate {
+                epoch: curr.epoch,
+                lambda_min: lmin,
+                d_end: curr.d_at_epoch_end,
+                d_ratio: ratio,
+            });
+        }
+    }
+
+    MsfAnalysis {
+        div_event_count,
+        epochs,
+        phase_candidates,
+        per_rank,
+        rank_correlations,
     }
 }
 
@@ -523,6 +866,7 @@ pub fn empty_analysis(model: &str, mode: &str) -> RunAnalysis {
         sync_intervals: Vec::new(),
         train_only_ms: None,
         per_rank_avg: Vec::new(),
+        msf: MsfAnalysis::default(),
     }
 }
 

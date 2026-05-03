@@ -265,6 +265,18 @@ fast GPU consumes a proportionally larger share to keep pace with the slow ones.
         write_epoch_overlap(&mut md, groups);
     }
 
+    // MSF passive observation (lambda_hat trajectory + phase candidates).
+    // Only emit when at least one run has MSF data; otherwise the section
+    // is just empty noise.
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.msf.has_data())) {
+        md.push_str("## MSF Passive Observation\n\n");
+        md.push_str("Across-event Lyapunov proxy `λ̂ = (1/k) * log(D_t / D_{t-1})` from \
+            `docs/design/msf-cadence-control.md`. Passive logging only — no controller effect. \
+            Phase candidates flag epochs where `λ_min < -1e-2` AND `D_end / prev_D_end < 1/3` \
+            (collapse signature, e.g. LR drop boundary).\n\n");
+        write_msf_section(&mut md, groups);
+    }
+
     md
 }
 
@@ -886,4 +898,276 @@ fn write_epoch_overlap(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         }
     }
     md.push('\n');
+}
+
+// ---------------------------------------------------------------------------
+// MSF section (lambda_hat passive observation)
+// ---------------------------------------------------------------------------
+
+/// Render a sparkline using Unicode block characters.
+///
+/// Returns 8-level sparkline matching `xs.len()` characters. NaN/None positions
+/// render as a space. Width-bounded: input is downsampled (mean-binned) when
+/// longer than `max_chars` so output fits markdown columns.
+fn sparkline(xs: &[Option<f64>], max_chars: usize) -> String {
+    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let n = xs.len();
+    if n == 0 {
+        return String::new();
+    }
+    // Downsample by mean-binning if too wide.
+    let target = max_chars.min(n).max(1);
+    let bin = n.div_ceil(target);
+    let mut binned: Vec<Option<f64>> = Vec::with_capacity(target);
+    let mut i = 0;
+    while i < n {
+        let end = (i + bin).min(n);
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for x in xs.iter().take(end).skip(i) {
+            if let Some(v) = x
+                && v.is_finite()
+            {
+                sum += v;
+                count += 1;
+            }
+        }
+        binned.push(if count == 0 { None } else { Some(sum / count as f64) });
+        i = end;
+    }
+    // Find min/max across populated bins.
+    let finite: Vec<f64> = binned.iter().filter_map(|x| *x).collect();
+    if finite.is_empty() {
+        return " ".repeat(binned.len());
+    }
+    let lo = finite.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = hi - lo;
+    binned
+        .iter()
+        .map(|v| match v {
+            None => ' ',
+            Some(x) => {
+                if span <= 0.0 {
+                    BARS[BARS.len() / 2]
+                } else {
+                    let f = ((x - lo) / span).clamp(0.0, 1.0);
+                    let idx = ((f * (BARS.len() - 1) as f64).round() as usize).min(BARS.len() - 1);
+                    BARS[idx]
+                }
+            }
+        })
+        .collect()
+}
+
+fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    // Per-run summary table: count, sync count, final phase regime.
+    md.push_str("### Summary\n\n");
+    md.push_str("| Model | Mode | Epochs | Div Events | Phase Candidates | Final D | Final λ_ema |\n");
+    md.push_str("|-------|------|--------|-----------:|-----------------:|--------:|------------:|\n");
+    for (model, runs) in groups {
+        for r in runs {
+            if !r.msf.has_data() {
+                continue;
+            }
+            let last = r.msf.epochs.last();
+            let final_d = last.map(|e| e.d_at_epoch_end).unwrap_or(0.0);
+            let final_ema = last
+                .and_then(|e| e.lambda_ema_at_epoch_end)
+                .map(|v| format!("{v:+.2e}"))
+                .unwrap_or_else(|| "—".to_string());
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {:.2e} | {} |",
+                model,
+                r.mode,
+                r.msf.epochs.len(),
+                r.msf.div_event_count,
+                r.msf.phase_candidates.len(),
+                final_d,
+                final_ema,
+            );
+        }
+    }
+    md.push('\n');
+
+    // Phase candidates table: only when there are any.
+    let any_candidates = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| !r.msf.phase_candidates.is_empty()));
+    if any_candidates {
+        md.push_str("### Phase-Transition Candidates\n\n");
+        md.push_str(
+            "Heuristic: `λ_min < -1e-2` AND `D_end / prev_D_end < 1/3`. Strong negative \
+             excursion + sharp collapse fingerprints LR drops or other regime shifts.\n\n",
+        );
+        md.push_str("| Model | Mode | Epoch | λ_min | D_end | D ratio (vs prev) |\n");
+        md.push_str("|-------|------|------:|------:|------:|------------------:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                for c in &r.msf.phase_candidates {
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {} | {:+.2e} | {:.2e} | {:.3} |",
+                        model, r.mode, c.epoch, c.lambda_min, c.d_end, c.d_ratio,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
+    // Per-rank breakdown: D distribution + win share + per-rank lambda.
+    let any_per_rank = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| !r.msf.per_rank.is_empty()));
+    if any_per_rank {
+        md.push_str("### Per-Rank Breakdown\n\n");
+        md.push_str(
+            "Rank 0 is the fast GPU under heterogeneous dispatch (largest `batch_share`). \
+             `win%` is the fraction of AllReduce events where this rank had the highest D \
+             across ranks (uniform = 100/world_size). NCCL backends typically expose \
+             per-rank-step asymmetry (rank 0 wins ~57% on heterogeneous 3-GPU rigs); \
+             CPU averaging hides it (~33% per rank).\n\n",
+        );
+        md.push_str(
+            "| Model | Mode | Rank | n | D_mean | D_sd | D_min | D_max | win% | λ_mean | λ_sd |\n",
+        );
+        md.push_str(
+            "|-------|------|-----:|--:|-------:|-----:|------:|------:|-----:|-------:|-----:|\n",
+        );
+        for (model, runs) in groups {
+            for r in runs {
+                for pr in &r.msf.per_rank {
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {} | {} | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.1} | {:+.2e} | {:.2e} |",
+                        model,
+                        r.mode,
+                        pr.rank,
+                        pr.n,
+                        pr.d_mean,
+                        pr.d_sd,
+                        pr.d_min,
+                        pr.d_max,
+                        pr.win_pct,
+                        pr.lambda_mean,
+                        pr.lambda_sd,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+
+        // Cross-rank Pearson correlations of D trajectories.
+        let any_corr = groups
+            .iter()
+            .any(|(_, runs)| runs.iter().any(|r| !r.msf.rank_correlations.is_empty()));
+        if any_corr {
+            md.push_str("Cross-rank Pearson correlation of D trajectories. Values consistently \
+                near 1.0 (>0.99 empirically) support the meta-oscillator framing: ranks are \
+                coupled views of one process, not independent oscillators.\n\n");
+            md.push_str("| Model | Mode | Pair | Pearson r |\n");
+            md.push_str("|-------|------|------|----------:|\n");
+            for (model, runs) in groups {
+                for r in runs {
+                    for ((i, j), corr) in &r.msf.rank_correlations {
+                        let _ = writeln!(
+                            md,
+                            "| {} | {} | rank{} ↔ rank{} | {:+.4} |",
+                            model, r.mode, i, j, corr
+                        );
+                    }
+                }
+            }
+            md.push('\n');
+        }
+    }
+
+    // Per-run sparklines: log10(D_max) and lambda_ema_end across epochs.
+    md.push_str("### Trajectories\n\n");
+    md.push_str(
+        "Sparklines span all epochs in the run. `log10(D_max)` shows the magnitude-decay \
+         structure (LR drops appear as steps). `λ_ema` shows the smoothed Lyapunov proxy \
+         (zero-crossings = phase transitions; sharp negatives = collapse).\n\n",
+    );
+    md.push_str("| Model | Mode | log10(D_max) | λ_ema |\n");
+    md.push_str("|-------|------|--------------|-------|\n");
+    for (model, runs) in groups {
+        for r in runs {
+            if !r.msf.has_data() {
+                continue;
+            }
+            let log_d: Vec<Option<f64>> = r
+                .msf
+                .epochs
+                .iter()
+                .map(|e| {
+                    if e.d_max > 0.0 {
+                        Some(e.d_max.log10())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let ema: Vec<Option<f64>> = r
+                .msf
+                .epochs
+                .iter()
+                .map(|e| e.lambda_ema_at_epoch_end)
+                .collect();
+            let _ = writeln!(
+                md,
+                "| {} | {} | `{}` | `{}` |",
+                model,
+                r.mode,
+                sparkline(&log_d, 60),
+                sparkline(&ema, 60),
+            );
+        }
+    }
+    md.push('\n');
+
+    // Per-epoch detail table when narrowly scoped (one or two runs).
+    let total_runs: usize = groups.iter().map(|(_, runs)| runs.iter().filter(|r| r.msf.has_data()).count()).sum();
+    if total_runs <= 2 {
+        for (model, runs) in groups {
+            for r in runs {
+                if !r.msf.has_data() {
+                    continue;
+                }
+                let _ = writeln!(md, "### Per-Epoch Detail: {} / {}\n", model, r.mode);
+                md.push_str(
+                    "| Epoch | LR | Syncs | D_min | D_max | D_mean | D_end | k_end | λ_min | λ_max | λ_mean | λ_ema_end |\n",
+                );
+                md.push_str(
+                    "|------:|---:|------:|------:|------:|-------:|------:|------:|------:|------:|-------:|----------:|\n",
+                );
+                for e in &r.msf.epochs {
+                    let lr = e.lr.map(|v| format!("{v:.2e}")).unwrap_or_else(|| "—".into());
+                    let lmin = e.lambda_min.map(|v| format!("{v:+.2e}")).unwrap_or_else(|| "—".into());
+                    let lmax = e.lambda_max.map(|v| format!("{v:+.2e}")).unwrap_or_else(|| "—".into());
+                    let lmean = e.lambda_mean.map(|v| format!("{v:+.2e}")).unwrap_or_else(|| "—".into());
+                    let lema = e.lambda_ema_at_epoch_end.map(|v| format!("{v:+.2e}")).unwrap_or_else(|| "—".into());
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {} | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {} | {} | {} | {} | {} |",
+                        e.epoch,
+                        lr,
+                        e.sync_count,
+                        e.d_min,
+                        e.d_max,
+                        e.d_mean,
+                        e.d_at_epoch_end,
+                        e.k_at_epoch_end,
+                        lmin,
+                        lmax,
+                        lmean,
+                        lema,
+                    );
+                }
+                md.push('\n');
+            }
+        }
+    }
 }

@@ -1170,6 +1170,7 @@ impl<M: Module> GpuWorker<M> {
             tl.event(crate::monitor::EventKind::EpochEnd {
                 epoch: plan.epoch,
                 loss: avg_loss,
+                lr: self.optimizer.lr(),
             });
         }
         let _ = self.report_epoch(

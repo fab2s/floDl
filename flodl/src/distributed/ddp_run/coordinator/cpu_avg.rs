@@ -233,6 +233,7 @@ impl Coordinator {
                 k_max,
                 step: self.global_step,
                 deltas: report.deltas.clone(),
+                post_norm: report.post_norm,
             });
         }
 
@@ -380,6 +381,7 @@ impl Coordinator {
                     k_max,
                     step: self.global_step,
                     deltas: report.deltas.clone(),
+                    post_norm: report.post_norm,
                 });
             }
         }

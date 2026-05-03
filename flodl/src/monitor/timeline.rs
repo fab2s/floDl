@@ -13,7 +13,7 @@
 //! // ... training with event injection ...
 //! tl.event(EventKind::EpochStart { epoch: 0 });
 //! // ... training ...
-//! tl.event(EventKind::EpochEnd { epoch: 0, loss: 0.42 });
+//! tl.event(EventKind::EpochEnd { epoch: 0, loss: 0.42, lr: 0.001 });
 //!
 //! tl.stop();
 //! tl.save_html("timeline.html")?;
@@ -77,8 +77,11 @@ pub struct TimelineEvent {
 pub enum EventKind {
     /// Worker started processing an epoch.
     EpochStart { epoch: usize },
-    /// Worker finished an epoch.
-    EpochEnd { epoch: usize, loss: f64 },
+    /// Worker finished an epoch. `lr` is the optimizer's current learning
+    /// rate at end-of-epoch; under step-decay schedules this is the LR that
+    /// was active throughout the epoch, under continuous schedules it is the
+    /// last value the scheduler wrote.
+    EpochEnd { epoch: usize, loss: f64, lr: f64 },
     /// AllReduce or parameter sync started.
     SyncStart,
     /// AllReduce or parameter sync completed.
@@ -111,6 +114,11 @@ pub enum EventKind {
         step: usize,
         /// Per-rank `||pre - post|| / ||post||`. Length = world_size.
         deltas: Vec<f64>,
+        /// L2 norm of the post-AllReduce consensus weights `||W̄_t||`.
+        /// `None` when not computed (NCCL v1 path skips this). Carries the
+        /// longitudinal meta-oscillator state: tracking `||W̄_t||` across
+        /// events gives consensus magnitude trajectory between syncs.
+        post_norm: Option<f64>,
     },
     /// MSF passive observation: per-epoch divergence + lambda aggregates.
     ///
@@ -676,10 +684,10 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
             EventKind::EpochStart { epoch } => {
                 let _ = write!(out, "\"k\":\"epoch_start\",\"epoch\":{epoch}");
             }
-            EventKind::EpochEnd { epoch, loss } => {
+            EventKind::EpochEnd { epoch, loss, lr } => {
                 let _ = write!(
                     out,
-                    "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6}"
+                    "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6},\"lr\":{lr:.6e}"
                 );
             }
             EventKind::SyncStart => {
@@ -722,6 +730,7 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 k_max,
                 step,
                 deltas,
+                post_norm,
             } => {
                 let _ = write!(
                     out,
@@ -732,6 +741,9 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 }
                 if let Some(l) = lambda_ema {
                     let _ = write!(out, ",\"lambda_ema\":{l:.6e}");
+                }
+                if let Some(p) = post_norm {
+                    let _ = write!(out, ",\"post_norm\":{p:.6e}");
                 }
                 out.push_str(",\"deltas\":[");
                 for (i, d) in deltas.iter().enumerate() {
@@ -792,6 +804,7 @@ mod tests {
         tl.event(EventKind::EpochEnd {
             epoch: 0,
             loss: 0.42,
+            lr: 0.001,
         });
 
         let events = tl.events.lock().unwrap();
