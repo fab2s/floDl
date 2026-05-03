@@ -9,7 +9,7 @@ use flodl::monitor::{Monitor, Timeline};
 use flodl::nn::{Module, Optimizer, Parameter};
 use flodl::tensor::{Device, Result, Tensor, TensorError};
 
-use crate::config::{DdpMode, RunConfig};
+use crate::config::{DdpMode, GuardChoice, RunConfig};
 use crate::models::ModelDef;
 
 /// Wrapper so `Box<dyn Optimizer>` satisfies the `O: Optimizer` bound
@@ -531,6 +531,30 @@ fn run_unified(
         builder = builder.elche_relax_up(true);
     }
 
+    // Materialize the configured convergence guard. NoGuard / TrendGuard /
+    // MsfGuard each implement the trait; we pass through the generic
+    // `convergence_guard` builder method which boxes internally.
+    builder = match &config.guard {
+        GuardChoice::None => builder
+            .convergence_guard(flodl::distributed::ddp_run::NoGuard),
+        GuardChoice::Trend { threshold } => builder
+            .convergence_guard(flodl::distributed::ddp_run::TrendGuard::new(*threshold)),
+        GuardChoice::Msf {
+            suppress_threshold,
+            suppress_sustain,
+            nudge_threshold,
+            nudge_sustain,
+            nudge_factor,
+            alpha,
+        } => {
+            let g = flodl::distributed::ddp_run::MsfGuard::default()
+                .with_alpha(*alpha)
+                .with_suppress(*suppress_threshold, *suppress_sustain)
+                .with_nudge(*nudge_threshold, *nudge_sustain, *nudge_factor);
+            builder.convergence_guard(g)
+        }
+    };
+
     if let Some(sf) = sched_factory {
         let bpe = batches_per_epoch;
         builder = builder.scheduler(move |world_size| {
@@ -539,19 +563,90 @@ fn run_unified(
         });
     }
 
+    // Per-epoch eval hook: when --per-epoch-eval is set and the model
+    // exposes eval_fn, install an EpochFn that fires on the worker's
+    // transition into epoch N+1 (so the model state is post-epoch-N).
+    // Only rank 0 evaluates (test data is identical across ranks; in
+    // Sync mode all ranks have consensus params, in Cadence/Async rank 0
+    // sees its own near-consensus state). Eval values stream back to the
+    // host over an mpsc channel and are merged into the per-epoch log
+    // line.
+    let (eval_tx, eval_rx) = std::sync::mpsc::channel::<(usize, f64)>();
+    if config.per_epoch_eval
+        && let Some(eval_fn) = model_def.eval_fn
+        && let Some(test_ds) = test_dataset.as_ref()
+    {
+        // Pre-load test data on rank 0's device. Workers run on
+        // `Device::CUDA(rank)`; rank 0 is `Device::CUDA(0)`.
+        let device = Device::CUDA(0);
+        let test_data = Arc::new(preload_full_dataset(test_ds.as_ref(), device)?);
+        let bs = config.batch_size;
+        let eval_tx_efn = eval_tx.clone();
+        builder = builder.epoch_fn(move |epoch: usize, worker: &mut flodl::distributed::ddp_run::GpuWorker<Box<dyn Module>>| {
+            // Skip rank > 0: eval is identical across ranks (Sync) or
+            // approximately so (Cadence/Async). Single eval per epoch.
+            if worker.rank() != 0 {
+                return;
+            }
+            // Skip epoch 0: this fires on transition INTO epoch 0, before
+            // any training has happened. There is no "previous epoch" to
+            // evaluate. The first useful eval fires on transition into
+            // epoch 1 and tags the result as epoch 0.
+            if epoch == 0 {
+                return;
+            }
+            let prev_epoch = epoch - 1;
+            let model: &Box<dyn Module> = worker.model();
+            model.eval();
+            let result = flodl::autograd::no_grad(|| -> Result<f64> {
+                let n = test_data[0].shape()[0] as usize;
+                let mut total_metric = 0.0;
+                let mut samples = 0usize;
+                for batch_start in (0..n).step_by(bs) {
+                    let end = (batch_start + bs).min(n);
+                    if end - batch_start < bs { break; }
+                    let batch = slice_batch(&test_data, batch_start, end, device)?;
+                    let metric = eval_fn(model.as_ref(), &batch)?;
+                    total_metric += metric * (end - batch_start) as f64;
+                    samples += end - batch_start;
+                }
+                Ok(if samples > 0 { total_metric / samples as f64 } else { 0.0 })
+            });
+            model.train();
+            if let Ok(metric) = result {
+                let _ = eval_tx_efn.send((prev_epoch, metric));
+            }
+        });
+    }
+    drop(eval_tx); // worker keeps its own clone via the EpochFn closure
+
     let handle = builder.run()?;
 
     let mut epoch_times = Vec::new();
     let mut final_loss = 0.0;
     let mut log_lines: Vec<String> = Vec::new();
+    // Eval values arrive on `eval_rx` from the worker EpochFn. The hook
+    // for epoch N's eval fires on transition into epoch N+1 — which can
+    // race with the host receiving metrics for epoch N. Buffer pending
+    // evals here and fold them into the log line on the next metrics
+    // tick if not yet present.
+    let mut pending_eval: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::new();
 
     while let Some(metrics) = handle.next_metrics() {
         final_loss = metrics.avg_loss;
         epoch_times.push(metrics.epoch_ms);
-        // Build log line: loss + model-defined scalars + time.
+        // Drain any eval values that arrived since the last tick.
+        while let Ok((ep, val)) = eval_rx.try_recv() {
+            pending_eval.insert(ep, val);
+        }
+        // Build log line: loss + (eval if available) + model-defined scalars + time.
         let scalars: std::collections::BTreeMap<String, f64> =
             metrics.scalars.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let mut line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
+        if let Some(eval_val) = pending_eval.remove(&metrics.epoch) {
+            line.push_str(&format!(", eval={eval_val:.4}"));
+        }
         line.push_str(&format_scalars(&scalars));
         line.push_str(&format!(", time={:.1}s", metrics.epoch_ms / 1000.0));
         eprintln!("    {line}");
@@ -607,6 +702,21 @@ fn run_unified(
             Duration::from_millis(metrics.epoch_ms as u64),
             &metrics,
         );
+    }
+
+    // Drain any eval values that arrived after their corresponding
+    // metrics tick (race losers). Emit each as a supplemental
+    // `epoch N: eval=X.XXXX` line so `parse_training_log` picks them up
+    // and merges with the earlier loss-only line for the same epoch.
+    while let Ok((ep, val)) = eval_rx.try_recv() {
+        pending_eval.insert(ep, val);
+    }
+    let mut leftovers: Vec<(usize, f64)> = pending_eval.into_iter().collect();
+    leftovers.sort_unstable_by_key(|x| x.0);
+    for (ep, val) in leftovers {
+        let line = format!("epoch {ep}: eval={val:.4}");
+        eprintln!("    {line}");
+        log_lines.push(line);
     }
 
     let state = handle.join()?;

@@ -99,6 +99,35 @@ pub struct ModelDefaults {
     pub lr: f64,
 }
 
+/// Convergence guard selection. Materialised by the harness into a concrete
+/// `flodl::distributed::ddp_run::ConvergenceGuard` and passed through
+/// `DdpBuilder::convergence_guard`. Default is `Trend` with the production
+/// threshold (matches pre-pluggable behavior).
+#[derive(Debug, Clone)]
+pub enum GuardChoice {
+    /// Pass-through: no convergence-driven anchor adjustments. ElChe's
+    /// overhead auto-tune drives cadence alone.
+    None,
+    /// 3-rises-above-threshold rule on `||pre - post|| / ||post||`.
+    Trend { threshold: f64 },
+    /// Rate-based detector with soft (`SuppressGrowth`) + hard (`NudgeDown`)
+    /// thresholds on the bias-corrected `λ_ema`.
+    Msf {
+        suppress_threshold: f64,
+        suppress_sustain: usize,
+        nudge_threshold: f64,
+        nudge_sustain: usize,
+        nudge_factor: f64,
+        alpha: f64,
+    },
+}
+
+impl Default for GuardChoice {
+    fn default() -> Self {
+        GuardChoice::Trend { threshold: 0.01 }
+    }
+}
+
 /// Runtime configuration for a single benchmark run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -119,4 +148,20 @@ pub struct RunConfig {
     /// When true, passed as `DdpBuilder::elche_relax_up(true)`. Default
     /// false (relax-up disabled, anchor under overhead-based auto-tune only).
     pub elche_relax_up: bool,
+    /// Run `eval_fn` at the end of every epoch (rank 0 only) and emit
+    /// `epoch N: ... eval=X.XXXX` into `training.log` so the analysis
+    /// pipeline can correlate λ̂ aggregates with held-out metric per epoch.
+    /// Default false (only the post-training `final eval=...` line is
+    /// emitted, matching the historical bench behavior).
+    ///
+    /// In Sync mode the eval is on consensus params (all ranks identical
+    /// post-AllReduce). In Cadence/Async modes the eval is on rank-0's
+    /// state at the start of the next epoch — near-consensus but not
+    /// exact, since the coordinator doesn't force an AllReduce at the
+    /// epoch boundary. Trend-correlation analyses are robust to that
+    /// noise.
+    pub per_epoch_eval: bool,
+    /// Convergence-guard configuration. Default = `GuardChoice::Trend`
+    /// with production threshold 0.01.
+    pub guard: GuardChoice,
 }

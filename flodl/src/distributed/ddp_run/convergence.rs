@@ -1,17 +1,27 @@
-//! Unified convergence guard for DDP parameter averaging.
+//! Pluggable convergence guards for DDP parameter averaging.
 //!
-//! Monitors weight-space divergence across replicas and recommends cadence
-//! adjustments. Replaces the old dual system (loss-based for NCCL, norm-based
-//! for CPU) with a single guard that both paths feed into.
+//! A guard observes the per-AllReduce divergence trajectory and recommends
+//! cadence adjustments through a [`ConvergenceAction`]. Three concrete impls
+//! ship out of the box:
 //!
-//! The primary signal is `||params_before_sync - params_after_sync|| / ||params_after_sync||`,
-//! which measures each replica's L2 distance from the consensus (average).
-//! Three norms (pre, post, diff) give a full decomposition into magnitude
-//! shift and directional coherence for free.
+//! - [`NoGuard`]: passive baseline, always [`ConvergenceAction::Stable`]. Use
+//!   to collect an unconditioned trajectory for fair guard comparison.
+//! - [`TrendGuard`]: production default. Three-rises-above-threshold rule on
+//!   the per-rank `||pre - post|| / ||post||` ring buffer. Returns
+//!   [`ConvergenceAction::SuppressGrowth`] on persistent rising drift.
+//! - [`MsfGuard`]: rate-based detector built on the across-event MSF proxy
+//!   `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds:
+//!   sustained `λ_ema > suppress_threshold` → `SuppressGrowth`; sustained
+//!   `λ_ema > nudge_threshold` → [`ConvergenceAction::NudgeDown`].
+//!
+//! All three implement [`ConvergenceGuard`]. The Trainer accepts any
+//! `impl ConvergenceGuard + 'static` via `DdpBuilder::convergence_guard`;
+//! the coordinator boxes it internally.
+//!
+//! See `docs/design/msf-cadence-control.md` for the theoretical framing
+//! and the soft/hard threshold derivation.
 
 use std::collections::VecDeque;
-
-use super::ApplyPolicy;
 
 // ---------------------------------------------------------------------------
 // Divergence report
@@ -19,7 +29,7 @@ use super::ApplyPolicy;
 
 /// Divergence measurements from a single sync event.
 ///
-/// The primary signal is `deltas` -- per-rank normalized L2 distance from the
+/// The primary signal is `deltas` — per-rank normalized L2 distance from the
 /// replica's pre-sync params to the post-sync average. This captures both
 /// magnitude drift and directional divergence.
 ///
@@ -29,10 +39,10 @@ use super::ApplyPolicy;
 pub struct DivergenceReport {
     /// Per-rank normalized delta: `||pre - post|| / ||post||`.
     pub deltas: Vec<f64>,
-    /// Per-rank pre-sync param L2 norm. `None` when not computed (NCCL v1).
+    /// Per-rank pre-sync param L2 norm. `None` when not computed.
     pub pre_norms: Option<Vec<f64>>,
     /// Post-sync param L2 norm (same across ranks after AllReduce).
-    /// `None` when not computed (NCCL v1).
+    /// `None` when not computed.
     pub post_norm: Option<f64>,
 }
 
@@ -64,7 +74,6 @@ impl DivergenceReport {
                     if pre_norm < 1e-10 {
                         return 0.0;
                     }
-                    // ||pre - post||^2 = (delta * ||post||)^2 since delta is normalized
                     let diff_sq = (delta * post_norm).powi(2);
                     let pre_sq = pre_norm.powi(2);
                     let post_sq = post_norm.powi(2);
@@ -76,7 +85,7 @@ impl DivergenceReport {
 
     /// Per-rank magnitude shift: `||pre|| - ||post||`.
     ///
-    /// Positive = replica had larger weights than consensus (possible overfitting).
+    /// Positive = replica had larger weights than consensus.
     /// Negative = replica had smaller weights.
     /// Returns `None` if `pre_norms` or `post_norm` are not available.
     pub fn magnitude_shifts(&self) -> Option<Vec<f64>> {
@@ -98,12 +107,49 @@ pub enum ConvergenceAction {
     /// Divergence trending up. Suppress anchor/overshoot growth (hold current values).
     SuppressGrowth,
     /// High sustained divergence. Nudge anchor down by `factor` (0.0-1.0).
-    /// Factor 0.5 = halve the anchor. Same as the existing CPU path behavior.
+    /// Factor 0.5 = halve the anchor.
     NudgeDown { factor: f64 },
 }
 
 // ---------------------------------------------------------------------------
-// MSF lambda_hat estimator (Phase 1: passive observation)
+// Trait
+// ---------------------------------------------------------------------------
+
+/// Pluggable convergence-monitoring strategy.
+///
+/// Called by the coordinator after every AllReduce with a [`DivergenceReport`]
+/// plus the cadence interval (`k_used` = total batches across ranks since
+/// last AllReduce, `k_max` = max per-rank steps = wallclock interval). The
+/// guard returns a [`ConvergenceAction`] applied to ElChe's anchor and
+/// overshoot controls.
+///
+/// Implementations are owned per-run and are not thread-shared (the
+/// coordinator runs `report` on a single thread). `Send` is required so the
+/// guard can be moved into the DDP runtime; `Sync` is a future-proofing bound
+/// for cross-thread observation.
+pub trait ConvergenceGuard: Send + Sync {
+    /// Observe a divergence event and return the recommended action.
+    fn report(
+        &mut self,
+        report: &DivergenceReport,
+        k_used: usize,
+        k_max: usize,
+    ) -> ConvergenceAction;
+
+    /// Guard-specific diagnostic values for the current observation. Default
+    /// empty. Used to populate the `EventKind::GuardTelemetry` timeline event
+    /// after each `report` call.
+    fn telemetry(&self) -> Vec<(&'static str, f64)> {
+        Vec::new()
+    }
+
+    /// Reset guard state (clear history / estimator). Called at mode/run
+    /// boundaries. Default no-op for stateless guards.
+    fn reset(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// MSF lambda estimator (used by MsfGuard)
 // ---------------------------------------------------------------------------
 
 /// Per-event sample of the across-event transversal Lyapunov proxy.
@@ -111,11 +157,7 @@ pub enum ConvergenceAction {
 /// `lambda_raw_t = (1/k_max) * log(D_t / D_{t-1})` where `k_max` is the
 /// per-rank step count of the slowest rank between consecutive AllReduces
 /// (i.e. the wallclock cadence interval). See
-/// `docs/design/msf-cadence-control.md`. Using `k_max` (rather than
-/// `sum(steps_since_avg)`) puts the rate on the wallclock-time axis the
-/// MSF framework expects; cross-world-size comparison stays meaningful.
-/// `None` on the first event or when either operand is below the noise
-/// floor (R4 clamp triggers a full estimator reset).
+/// `docs/design/msf-cadence-control.md`.
 #[derive(Debug, Clone)]
 pub struct LambdaSample {
     /// Max normalized delta this event (= `report.max_relative_delta()`).
@@ -123,14 +165,10 @@ pub struct LambdaSample {
     /// Across-event proxy `(1/k_max) * log(D_t / D_{t-1})`. `None` on first
     /// event after a reset or below noise floor.
     pub lambda_raw: Option<f64>,
-    /// Bias-corrected EMA of `lambda_raw` (C2 in the design doc, default
-    /// `alpha = 0.9`). Adam-style `EMA / (1 - alpha^t)` removes the
-    /// startup-toward-zero bias for the first ~10 events — exactly the
-    /// warmup phase where lambda is most informative.
+    /// Bias-corrected EMA of `lambda_raw` (Adam-style `EMA / (1 - alpha^t)`).
     pub lambda_ema: Option<f64>,
-    /// Cadence interval just completed expressed as total batches consumed
-    /// across all ranks (`sum(steps_since_avg)`). Kept for accounting only
-    /// — NOT used as the lambda denominator.
+    /// Cadence interval just completed expressed as total batches across ranks.
+    /// Kept for accounting only — NOT used as the lambda denominator.
     pub k_used: usize,
     /// `max(steps_since_avg)` — wallclock cadence interval per rank.
     /// Used as the lambda denominator (per-rank time axis).
@@ -140,16 +178,11 @@ pub struct LambdaSample {
 /// Estimator for the across-event lambda proxy.
 ///
 /// Holds the previous `D_t`, the raw EMA state, and an event counter for
-/// Adam-style bias correction. Updated at every AllReduce via
-/// [`ConvergenceGuard::observe_lambda`]. Reset across mode/run boundaries
-/// (epoch boundaries do NOT reset the estimator: lambda continuity matters
-/// across epochs; only mode transitions or full re-init reset).
+/// Adam-style bias correction. Reset across mode/run boundaries (epoch
+/// boundaries do NOT reset: lambda continuity matters across epochs).
 pub struct LambdaEstimator {
     prev_d: Option<f64>,
-    /// Raw EMA — uncorrected, starts at 0.0. Bias correction
-    /// `1 / (1 - alpha^t)` is applied at sample time. Adam-style: requires
-    /// the EMA to start from 0 so the formula recovers `l_1` exactly on
-    /// the first update.
+    /// Raw EMA — uncorrected, starts at 0.0.
     ema_raw: f64,
     /// Number of `lambda_raw` updates since last reset. `0` means no
     /// observations yet → `lambda_ema` is `None`.
@@ -171,16 +204,20 @@ impl Default for LambdaEstimator {
 }
 
 impl LambdaEstimator {
+    /// Construct with a custom alpha. `noise_floor` keeps its default 1e-8.
+    pub fn with_alpha(alpha: f64) -> Self {
+        Self {
+            alpha,
+            ..Default::default()
+        }
+    }
+
     /// Observe a new `D_t` and return the resulting [`LambdaSample`].
     ///
     /// `k_max` (per-rank steps since last AllReduce) is the rate denominator;
     /// `k_used` (sum across ranks) is carried for accounting.
     ///
-    /// Below-noise-floor `d_raw` triggers a full estimator reset: `prev_d`
-    /// cleared, EMA preserved (state from above-floor events still useful
-    /// once the system climbs back). Half-skipping (keep `prev_d`, skip
-    /// sample) breaks the time axis on resume, since the next `lambda_raw`
-    /// would be computed against the wrong elapsed-time baseline.
+    /// Below-noise-floor `d_raw` triggers a full estimator reset.
     pub fn observe(&mut self, d_raw: f64, k_used: usize, k_max: usize) -> LambdaSample {
         let lambda_raw = match self.prev_d {
             Some(prev) if prev > self.noise_floor && d_raw > self.noise_floor && k_max > 0 => {
@@ -192,11 +229,11 @@ impl LambdaEstimator {
             self.ema_raw = self.alpha * self.ema_raw + (1.0 - self.alpha) * l;
             self.ema_t = self.ema_t.saturating_add(1);
         }
-        if d_raw > self.noise_floor {
-            self.prev_d = Some(d_raw);
+        self.prev_d = if d_raw > self.noise_floor {
+            Some(d_raw)
         } else {
-            self.prev_d = None;
-        }
+            None
+        };
         let lambda_ema = if self.ema_t == 0 {
             None
         } else {
@@ -216,8 +253,7 @@ impl LambdaEstimator {
         }
     }
 
-    /// Full reset: clears `prev_d`, EMA, and event counter. Use across
-    /// mode/run boundaries.
+    /// Full reset.
     pub fn reset(&mut self) {
         self.prev_d = None;
         self.ema_raw = 0.0;
@@ -226,205 +262,73 @@ impl LambdaEstimator {
 }
 
 // ---------------------------------------------------------------------------
-// Per-epoch accumulator
+// NoGuard
 // ---------------------------------------------------------------------------
 
-/// Aggregated divergence + lambda statistics over a single epoch.
-///
-/// Updated at every AllReduce within the epoch via
-/// [`ConvergenceGuard::observe_lambda`]. Drained at epoch boundaries via
-/// [`ConvergenceGuard::take_epoch_snapshot`], which resets the accumulator
-/// (but not the underlying [`LambdaEstimator`] — lambda continuity carries
-/// across epochs).
-#[derive(Debug, Clone, Default)]
-pub struct EpochSnapshot {
-    /// Number of AllReduce events in this epoch.
-    pub count: usize,
-    /// Number of events that produced a finite `lambda_raw` (excludes the
-    /// first event in a fresh estimator and noise-floor-clamped events).
-    pub lambda_count: usize,
-    pub d_min: f64,
-    pub d_max: f64,
-    pub d_sum: f64,
-    pub lambda_min: f64,
-    pub lambda_max: f64,
-    pub lambda_sum: f64,
-    /// Last sample observed in this epoch (snapshot at epoch end).
-    pub last_sample: Option<LambdaSample>,
-}
+/// Always-stable guard. Use as the unconditioned baseline trajectory
+/// generator: lets ElChe's overhead-tune drive cadence with no convergence
+/// intervention. The right control-experiment partner for any other guard.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoGuard;
 
-impl EpochSnapshot {
-    fn new() -> Self {
-        Self {
-            d_min: f64::INFINITY,
-            d_max: f64::NEG_INFINITY,
-            lambda_min: f64::INFINITY,
-            lambda_max: f64::NEG_INFINITY,
-            ..Default::default()
-        }
-    }
-
-    fn update(&mut self, sample: &LambdaSample) {
-        self.count += 1;
-        self.d_sum += sample.d_raw;
-        if sample.d_raw < self.d_min {
-            self.d_min = sample.d_raw;
-        }
-        if sample.d_raw > self.d_max {
-            self.d_max = sample.d_raw;
-        }
-        if let Some(l) = sample.lambda_raw {
-            self.lambda_count += 1;
-            self.lambda_sum += l;
-            if l < self.lambda_min {
-                self.lambda_min = l;
-            }
-            if l > self.lambda_max {
-                self.lambda_max = l;
-            }
-        }
-        self.last_sample = Some(sample.clone());
-    }
-
-    /// Mean `D_t` across this epoch's events. Zero if no events.
-    pub fn d_mean(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.d_sum / self.count as f64
-        }
-    }
-
-    /// Mean `lambda_raw` across this epoch's finite-lambda events. `None` if
-    /// no event in this epoch produced a finite `lambda_raw`.
-    pub fn lambda_mean(&self) -> Option<f64> {
-        if self.lambda_count == 0 {
-            None
-        } else {
-            Some(self.lambda_sum / self.lambda_count as f64)
-        }
+impl ConvergenceGuard for NoGuard {
+    fn report(&mut self, _: &DivergenceReport, _: usize, _: usize) -> ConvergenceAction {
+        ConvergenceAction::Stable
     }
 }
 
 // ---------------------------------------------------------------------------
-// Convergence guard
+// TrendGuard (production default)
 // ---------------------------------------------------------------------------
 
-/// Unified convergence guard for both NCCL and CPU averaging paths.
-///
-/// Owns the divergence ring buffer and mode-specific reaction logic.
-/// The coordinator feeds [`DivergenceReport`]s after each sync event;
-/// the guard returns a [`ConvergenceAction`] that the coordinator applies
-/// to ElChe's anchor and overshoot controls.
-///
-/// Also owns the [`LambdaEstimator`] and per-epoch accumulator for MSF
-/// passive observation (Phase 1). These are pure measurement: they observe
-/// the same quantities the trend rule already computes, with no behavioral
-/// effect on cadence.
-///
-/// The ring buffer persists across sync intervals (required for trend
-/// detection). Per-interval accumulators (`nccl_sync_divergence`) live
-/// in the coordinator and are reset there.
-pub struct ConvergenceGuard {
-    policy: ApplyPolicy,
-    enabled: bool,
+/// Production guard: 3-consecutive-rises-above-threshold rule on
+/// `max_relative_delta` history. Suppresses anchor growth on persistent
+/// rising drift. Does not currently issue [`ConvergenceAction::NudgeDown`]
+/// — adding that is a separate decision (the trend signal is too noisy on
+/// its own to drive aggressive anchor reduction).
+pub struct TrendGuard {
     threshold: f64,
     /// Ring buffer of `max_relative_delta` from recent sync intervals (up to 5).
     history: VecDeque<f64>,
-    /// MSF lambda estimator (passive: log-only, no controller effect).
-    lambda: LambdaEstimator,
-    /// Per-epoch aggregates over [`LambdaSample`]s.
-    epoch: EpochSnapshot,
 }
 
+impl Default for TrendGuard {
+    fn default() -> Self {
+        Self::new(0.01)
+    }
+}
 
-impl ConvergenceGuard {
-    /// Create a new guard for the given training policy.
+impl TrendGuard {
+    /// Build with the given divergence threshold.
     ///
-    /// `threshold` controls sensitivity. Set high (e.g. 1.0) for log-only mode
-    /// during calibration. A value of ~2x steady-state divergence is typical.
-    pub fn new(policy: ApplyPolicy, enabled: bool, threshold: f64) -> Self {
+    /// Set high (e.g. 1.0) for log-only mode during calibration.
+    /// `~2x steady-state divergence` is typical for active operation.
+    pub fn new(threshold: f64) -> Self {
         Self {
-            policy,
-            enabled,
             threshold,
             history: VecDeque::with_capacity(6),
-            lambda: LambdaEstimator::default(),
-            epoch: EpochSnapshot::new(),
         }
     }
 
-    /// Observe a divergence event for MSF passive logging.
-    ///
-    /// Updates the [`LambdaEstimator`] and the per-epoch accumulator. Returns
-    /// the resulting [`LambdaSample`] for downstream emission. Call this in
-    /// addition to (or after) [`ConvergenceGuard::report`] at every AllReduce.
-    pub fn observe_lambda(&mut self, d_raw: f64, k_used: usize, k_max: usize) -> LambdaSample {
-        let sample = self.lambda.observe(d_raw, k_used, k_max);
-        self.epoch.update(&sample);
-        sample
+    /// Builder: set the divergence threshold.
+    pub fn with_threshold(mut self, threshold: f64) -> Self {
+        self.threshold = threshold;
+        self
     }
 
-    /// Drain the per-epoch accumulator and return the snapshot.
-    ///
-    /// Resets the accumulator. Does NOT reset the underlying
-    /// [`LambdaEstimator`]: lambda continuity carries across epoch
-    /// boundaries (epochs are not theoretical-framework boundaries).
-    pub fn take_epoch_snapshot(&mut self) -> EpochSnapshot {
-        std::mem::replace(&mut self.epoch, EpochSnapshot::new())
+    /// Direct access to divergence history for testing and monitoring.
+    pub fn history(&self) -> &VecDeque<f64> {
+        &self.history
     }
 
-    /// Full reset of the lambda estimator (mode/run boundary).
-    ///
-    /// Clears `prev_d` and EMA. The trend ring buffer (`history`) is not
-    /// touched here; it is owned by the existing reset path.
-    pub fn reset_lambda(&mut self) {
-        self.lambda.reset();
-        self.epoch = EpochSnapshot::new();
-    }
-
-    /// Feed a divergence report and get a cadence action.
-    ///
-    /// Mode-specific logic:
-    /// - `Sync`: always `Stable` (sync every batch, divergence near-zero by construction).
-    ///   In practice, the worker skips divergence computation entirely for Sync mode.
-    /// - `Cadence`: trend detection (3 consecutive rising values above threshold).
-    /// - `Async`: same as Cadence for v1 (spike detection deferred to v2).
-    pub fn report(&mut self, report: &DivergenceReport) -> ConvergenceAction {
-        if !self.enabled {
-            return ConvergenceAction::Stable;
-        }
-
-        let divergence = report.max_relative_delta();
-
-        // Push to ring buffer (keep last 5 intervals).
-        if self.history.len() >= 5 {
-            self.history.pop_front();
-        }
-        self.history.push_back(divergence);
-
-        match self.policy {
-            ApplyPolicy::Sync => ConvergenceAction::Stable,
-            ApplyPolicy::Cadence | ApplyPolicy::Async => self.check_trend(),
-        }
-    }
-
-    /// Trend detection: 3 consecutive rising values, latest above threshold.
-    ///
-    /// Filters out single spikes and noise. Only sustained drift suppresses
-    /// growth. Returns `SuppressGrowth` (not `NudgeDown`) because aggressive
-    /// anchor reduction on trends alone can kill convergence. The overhead
-    /// auto-tune in ElChe handles loosening.
     fn check_trend(&self) -> ConvergenceAction {
         if self.history.len() < 3 {
             return ConvergenceAction::Stable;
         }
-
         let len = self.history.len();
         let rising = self.history[len - 1] > self.history[len - 2]
             && self.history[len - 2] > self.history[len - 3]
             && self.history[len - 1] > self.threshold;
-
         if rising {
             crate::verbose!(
                 "  ddp: weight-space divergence trending up | history={:.4?} | suppressing growth",
@@ -435,10 +339,187 @@ impl ConvergenceGuard {
             ConvergenceAction::Stable
         }
     }
+}
 
-    /// Direct access to divergence history for testing and monitoring.
-    pub fn history(&self) -> &VecDeque<f64> {
-        &self.history
+impl ConvergenceGuard for TrendGuard {
+    fn report(&mut self, report: &DivergenceReport, _: usize, _: usize) -> ConvergenceAction {
+        let divergence = report.max_relative_delta();
+        if self.history.len() >= 5 {
+            self.history.pop_front();
+        }
+        self.history.push_back(divergence);
+        self.check_trend()
+    }
+
+    fn telemetry(&self) -> Vec<(&'static str, f64)> {
+        // Latest observation only — mirror the production signal in the
+        // timeline so dashboards can plot the trend buffer's head.
+        match self.history.back() {
+            Some(&d) => vec![("d_history_last", d)],
+            None => Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MsfGuard
+// ---------------------------------------------------------------------------
+
+/// MSF-based rate detector with soft (suppress) + hard (nudge) thresholds.
+///
+/// Tracks `λ_ema` (bias-corrected EMA of `(1/k_max) * log(D_t / D_{t-1})`)
+/// and escalates:
+///
+/// - `λ_ema > suppress_threshold` for `suppress_sustain` consecutive events
+///   → [`ConvergenceAction::SuppressGrowth`]
+/// - `λ_ema > nudge_threshold` for `nudge_sustain` consecutive events
+///   → [`ConvergenceAction::NudgeDown`] with `nudge_factor`
+///
+/// Streaks are independent: nudge fires the first time its own threshold has
+/// been sustained (it doesn't require suppress to have fired first). Either
+/// fire resets only its own streak, so the guard can fall back from nudge to
+/// suppress as `λ_ema` decays.
+///
+/// Disable nudge by setting `nudge_threshold = f64::INFINITY` (or via
+/// [`MsfGuard::without_nudge`]).
+pub struct MsfGuard {
+    estimator: LambdaEstimator,
+    suppress_threshold: f64,
+    suppress_sustain: usize,
+    nudge_threshold: f64,
+    nudge_sustain: usize,
+    nudge_factor: f64,
+    suppress_streak: usize,
+    nudge_streak: usize,
+    /// Latest sample (cached for telemetry).
+    last_sample: Option<LambdaSample>,
+}
+
+impl Default for MsfGuard {
+    fn default() -> Self {
+        Self {
+            estimator: LambdaEstimator::default(),
+            suppress_threshold: 1.0e-3,
+            suppress_sustain: 3,
+            nudge_threshold: 1.0e-2,
+            nudge_sustain: 3,
+            nudge_factor: 0.5,
+            suppress_streak: 0,
+            nudge_streak: 0,
+            last_sample: None,
+        }
+    }
+}
+
+impl MsfGuard {
+    /// Builder: set EMA smoothing coefficient (0.0-1.0). Default 0.9.
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        self.estimator = LambdaEstimator::with_alpha(alpha);
+        self
+    }
+
+    /// Builder: configure the soft (SuppressGrowth) trigger.
+    pub fn with_suppress(mut self, threshold: f64, sustain: usize) -> Self {
+        self.suppress_threshold = threshold;
+        self.suppress_sustain = sustain;
+        self
+    }
+
+    /// Builder: configure the hard (NudgeDown) trigger.
+    ///
+    /// `factor` is the ElChe anchor reduction multiplier (0.5 = halve).
+    pub fn with_nudge(mut self, threshold: f64, sustain: usize, factor: f64) -> Self {
+        self.nudge_threshold = threshold;
+        self.nudge_sustain = sustain;
+        self.nudge_factor = factor;
+        self
+    }
+
+    /// Builder: disable the NudgeDown trigger entirely (only SuppressGrowth fires).
+    pub fn without_nudge(mut self) -> Self {
+        self.nudge_threshold = f64::INFINITY;
+        self
+    }
+
+    /// Last observation, primarily for testing.
+    pub fn last_sample(&self) -> Option<&LambdaSample> {
+        self.last_sample.as_ref()
+    }
+}
+
+impl ConvergenceGuard for MsfGuard {
+    fn report(
+        &mut self,
+        report: &DivergenceReport,
+        k_used: usize,
+        k_max: usize,
+    ) -> ConvergenceAction {
+        let d_raw = report.max_relative_delta();
+        let sample = self.estimator.observe(d_raw, k_used, k_max);
+        let lambda_ema = sample.lambda_ema;
+        self.last_sample = Some(sample);
+
+        // Streak update. Each threshold has its own counter so the guard can
+        // de-escalate naturally as λ_ema decays past nudge but stays above
+        // suppress.
+        let lema = lambda_ema.unwrap_or(f64::NEG_INFINITY);
+        if lema > self.suppress_threshold {
+            self.suppress_streak += 1;
+        } else {
+            self.suppress_streak = 0;
+        }
+        if lema > self.nudge_threshold {
+            self.nudge_streak += 1;
+        } else {
+            self.nudge_streak = 0;
+        }
+
+        // Hard trigger wins over soft when both fire on the same event.
+        if self.nudge_streak >= self.nudge_sustain && self.nudge_threshold.is_finite() {
+            self.nudge_streak = 0;
+            crate::verbose!(
+                "  ddp: msf λ_ema={:.4e} sustained > nudge_threshold {:.4e} | nudging anchor down by {:.2}",
+                lema, self.nudge_threshold, self.nudge_factor,
+            );
+            return ConvergenceAction::NudgeDown {
+                factor: self.nudge_factor,
+            };
+        }
+        if self.suppress_streak >= self.suppress_sustain {
+            self.suppress_streak = 0;
+            crate::verbose!(
+                "  ddp: msf λ_ema={:.4e} sustained > suppress_threshold {:.4e} | suppressing growth",
+                lema, self.suppress_threshold,
+            );
+            return ConvergenceAction::SuppressGrowth;
+        }
+        ConvergenceAction::Stable
+    }
+
+    fn telemetry(&self) -> Vec<(&'static str, f64)> {
+        let s = match &self.last_sample {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(2);
+        if let Some(l) = s.lambda_raw {
+            out.push(("lambda_raw", l));
+        }
+        if let Some(l) = s.lambda_ema {
+            out.push(("lambda_ema", l));
+        }
+        out
+    }
+
+    fn reset(&mut self) {
+        self.estimator.reset();
+        self.suppress_streak = 0;
+        self.nudge_streak = 0;
+        self.last_sample = None;
     }
 }
 
@@ -458,11 +539,7 @@ mod tests {
         }
     }
 
-    fn make_full_report(
-        deltas: &[f64],
-        pre_norms: &[f64],
-        post_norm: f64,
-    ) -> DivergenceReport {
+    fn make_full_report(deltas: &[f64], pre_norms: &[f64], post_norm: f64) -> DivergenceReport {
         DivergenceReport {
             deltas: deltas.to_vec(),
             pre_norms: Some(pre_norms.to_vec()),
@@ -493,7 +570,6 @@ mod tests {
 
     #[test]
     fn cosine_similarities_correct_for_small_delta() {
-        // Small delta -> pre and post nearly identical -> cos near 1.0
         let r = make_full_report(&[0.001], &[10.0], 10.0);
         let cos = r.cosine_similarities().unwrap();
         assert!(cos[0] > 0.999, "expected cos near 1.0, got {}", cos[0]);
@@ -507,70 +583,96 @@ mod tests {
         assert!((shifts[1] - (-0.2)).abs() < 1e-10);
     }
 
-    // --- ConvergenceGuard ---
+    // --- NoGuard ---
 
     #[test]
-    fn sync_always_stable() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Sync, true, 0.01);
+    fn no_guard_is_always_stable() {
+        let mut g = NoGuard;
         for _ in 0..10 {
-            let action = g.report(&make_report(&[0.5, 0.5]));
-            assert_eq!(action, ConvergenceAction::Stable);
+            assert_eq!(
+                g.report(&make_report(&[0.5, 0.5]), 8, 4),
+                ConvergenceAction::Stable
+            );
         }
     }
 
     #[test]
-    fn cadence_trend_suppresses_growth() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        // 3 rising values above threshold
-        assert_eq!(g.report(&make_report(&[0.02])), ConvergenceAction::Stable); // only 1
-        assert_eq!(g.report(&make_report(&[0.03])), ConvergenceAction::Stable); // only 2
+    fn no_guard_emits_no_telemetry() {
+        let g = NoGuard;
+        assert!(g.telemetry().is_empty());
+    }
+
+    // --- TrendGuard ---
+
+    #[test]
+    fn trend_default_threshold_is_0_01() {
+        let g = TrendGuard::default();
+        // Behavioural check: 3 rising values just above 0.01 should fire.
+        let mut g = g;
+        g.report(&make_report(&[0.011]), 8, 4);
+        g.report(&make_report(&[0.012]), 8, 4);
         assert_eq!(
-            g.report(&make_report(&[0.04])),
+            g.report(&make_report(&[0.013]), 8, 4),
             ConvergenceAction::SuppressGrowth
-        ); // 3 rising
+        );
     }
 
     #[test]
-    fn cadence_non_rising_is_stable() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        g.report(&make_report(&[0.05]));
-        g.report(&make_report(&[0.04])); // dropped
+    fn trend_3_rises_above_threshold_suppress() {
+        let mut g = TrendGuard::new(0.01);
         assert_eq!(
-            g.report(&make_report(&[0.06])),
+            g.report(&make_report(&[0.02]), 8, 4),
             ConvergenceAction::Stable
-        ); // not 3 consecutive rising
+        );
+        assert_eq!(
+            g.report(&make_report(&[0.03]), 8, 4),
+            ConvergenceAction::Stable
+        );
+        assert_eq!(
+            g.report(&make_report(&[0.04]), 8, 4),
+            ConvergenceAction::SuppressGrowth
+        );
     }
 
     #[test]
-    fn below_threshold_is_stable() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.10);
-        // Rising but below threshold
-        g.report(&make_report(&[0.01]));
-        g.report(&make_report(&[0.02]));
+    fn trend_non_rising_is_stable() {
+        let mut g = TrendGuard::new(0.01);
+        g.report(&make_report(&[0.05]), 8, 4);
+        g.report(&make_report(&[0.04]), 8, 4); // dropped
         assert_eq!(
-            g.report(&make_report(&[0.03])),
+            g.report(&make_report(&[0.06]), 8, 4),
             ConvergenceAction::Stable
         );
     }
 
     #[test]
-    fn disabled_always_stable() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, false, 0.01);
-        g.report(&make_report(&[0.1]));
-        g.report(&make_report(&[0.2]));
+    fn trend_below_threshold_is_stable() {
+        let mut g = TrendGuard::new(0.10);
+        g.report(&make_report(&[0.01]), 8, 4);
+        g.report(&make_report(&[0.02]), 8, 4);
         assert_eq!(
-            g.report(&make_report(&[0.3])),
+            g.report(&make_report(&[0.03]), 8, 4),
             ConvergenceAction::Stable
         );
     }
 
     #[test]
-    fn history_capped_at_5() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
+    fn trend_history_capped_at_5() {
+        let mut g = TrendGuard::new(0.01);
         for i in 0..10 {
-            g.report(&make_report(&[i as f64 * 0.01]));
+            g.report(&make_report(&[i as f64 * 0.01]), 8, 4);
         }
         assert_eq!(g.history().len(), 5);
+    }
+
+    #[test]
+    fn trend_reset_clears_history() {
+        let mut g = TrendGuard::new(0.01);
+        for _ in 0..5 {
+            g.report(&make_report(&[0.05]), 8, 4);
+        }
+        g.reset();
+        assert!(g.history().is_empty());
     }
 
     // --- LambdaEstimator ---
@@ -591,12 +693,9 @@ mod tests {
         let mut e = LambdaEstimator::default();
         e.observe(0.01, 8, 4);
         let s = e.observe(0.02, 8, 4);
-        // Denominator is k_max (per-rank steps), NOT k_used (sum across ranks).
-        // (1/4) * ln(2) ~= 0.1733.
         let expected = std::f64::consts::LN_2 / 4.0;
         let got = s.lambda_raw.expect("second event must produce lambda");
         assert!((got - expected).abs() < 1e-10);
-        assert!(got > 0.0);
     }
 
     #[test]
@@ -604,23 +703,18 @@ mod tests {
         let mut e = LambdaEstimator::default();
         e.observe(0.04, 8, 4);
         let s = e.observe(0.02, 8, 4);
-        // (1/k_max) * ln(0.5) = -ln(2)/4 ~= -0.1733
         let expected = -std::f64::consts::LN_2 / 4.0;
         let got = s.lambda_raw.expect("second event must produce lambda");
         assert!((got - expected).abs() < 1e-10);
-        assert!(got < 0.0);
     }
 
     #[test]
     fn lambda_k_max_unchanged_by_world_size() {
-        // Two estimators see the same per-rank trajectory but different
-        // world sizes. With k_max as the denominator, they must agree;
-        // the previous k_used=sum convention would have given a 2x split.
         let mut e_two = LambdaEstimator::default();
-        e_two.observe(0.01, 8, 4); // 2 ranks, 4 steps each
+        e_two.observe(0.01, 8, 4);
         let s_two = e_two.observe(0.02, 8, 4);
         let mut e_three = LambdaEstimator::default();
-        e_three.observe(0.01, 12, 4); // 3 ranks, 4 steps each
+        e_three.observe(0.01, 12, 4);
         let s_three = e_three.observe(0.02, 12, 4);
         let l_two = s_two.lambda_raw.unwrap();
         let l_three = s_three.lambda_raw.unwrap();
@@ -631,15 +725,10 @@ mod tests {
     fn lambda_noise_floor_resets_estimator() {
         let mut e = LambdaEstimator::default();
         e.observe(0.01, 8, 4);
-        // d_raw below noise floor -> full reset: lambda_raw None, prev_d cleared.
         let s = e.observe(1e-12, 8, 4);
         assert!(s.lambda_raw.is_none());
-        // Next event treats this as the first post-reset sample: lambda_raw None.
-        // Half-skipping (keeping prev_d=0.01) would have produced ln(2)/k_max
-        // off the wrong baseline — that contract was wrong on the time axis.
         let s2 = e.observe(0.02, 8, 4);
         assert!(s2.lambda_raw.is_none());
-        // Subsequent event resumes lambda computation against the post-reset prev_d.
         let s3 = e.observe(0.04, 8, 4);
         let expected = std::f64::consts::LN_2 / 4.0;
         assert!((s3.lambda_raw.unwrap() - expected).abs() < 1e-10);
@@ -647,16 +736,11 @@ mod tests {
 
     #[test]
     fn lambda_ema_bias_corrected_at_warmup() {
-        // First lambda_raw of e.g. 1.0 should produce a bias-corrected EMA
-        // also at 1.0 (not 1.0 * 0.1 = 0.1, the raw EMA value). Adam-style
-        // 1/(1-alpha^t) correction removes the startup-toward-zero pull.
         let mut e = LambdaEstimator::default();
         e.observe(1.0, 1, 1);
         let s = e.observe(std::f64::consts::E, 1, 1);
         let lambda = s.lambda_raw.unwrap();
         let ema = s.lambda_ema.unwrap();
-        // Both should be ~1.0; bias-corrected EMA matches lambda_raw exactly
-        // on the first update.
         assert!((lambda - 1.0).abs() < 1e-10, "lambda={lambda}");
         assert!((ema - 1.0).abs() < 1e-10, "ema={ema}");
     }
@@ -664,86 +748,123 @@ mod tests {
     #[test]
     fn lambda_ema_smooths_over_constant_input() {
         let mut e = LambdaEstimator::default();
-        // Feed a sequence where consecutive ratios are constant = e^1.
-        // lambda_raw = 1.0 every step at k_max=1; bias-corrected EMA must
-        // sit at 1.0 every step (constant input -> no bias to correct away).
         let mut prev = 1.0_f64;
         for _ in 0..200 {
             let next = prev * std::f64::consts::E;
             e.observe(next, 1, 1);
             prev = next;
         }
-        // Raw EMA also converges to 1.0 since constant input has no startup bias.
         assert!((e.ema_raw - 1.0).abs() < 1e-3, "raw_ema = {}", e.ema_raw);
     }
 
-    #[test]
-    fn lambda_zero_d_does_not_crash() {
-        let mut e = LambdaEstimator::default();
-        let s1 = e.observe(0.0, 8, 4);
-        assert!(s1.lambda_raw.is_none());
-        let s2 = e.observe(0.0, 8, 4);
-        assert!(s2.lambda_raw.is_none());
-    }
-
-    // --- EpochSnapshot ---
+    // --- MsfGuard ---
 
     #[test]
-    fn epoch_snapshot_aggregates() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        g.observe_lambda(0.04, 8, 4);
-        g.observe_lambda(0.02, 8, 4);
-        g.observe_lambda(0.03, 8, 4);
-        let snap = g.take_epoch_snapshot();
-        assert_eq!(snap.count, 3);
-        assert!((snap.d_min - 0.02).abs() < 1e-12);
-        assert!((snap.d_max - 0.04).abs() < 1e-12);
-        assert!((snap.d_mean() - 0.03).abs() < 1e-12);
-        assert_eq!(snap.lambda_count, 2); // first event has no lambda
-        assert!(snap.lambda_mean().is_some());
-        assert!(snap.last_sample.is_some());
+    fn msf_default_starts_stable() {
+        let mut g = MsfGuard::default();
+        let s = g.report(&make_report(&[0.01]), 8, 4);
+        assert_eq!(s, ConvergenceAction::Stable);
     }
 
     #[test]
-    fn epoch_snapshot_resets_accumulator_not_prev_d() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        g.observe_lambda(0.01, 8, 4);
-        g.observe_lambda(0.02, 8, 4);
-        let snap1 = g.take_epoch_snapshot();
-        assert_eq!(snap1.count, 2);
-        // After snapshot, accumulator empty but prev_d still 0.02.
-        // Next event computes lambda against 0.02, so doubling -> +ln(2)/k_max.
-        let s = g.observe_lambda(0.04, 8, 4);
-        let expected = std::f64::consts::LN_2 / 4.0;
-        assert!((s.lambda_raw.unwrap() - expected).abs() < 1e-10);
-        let snap2 = g.take_epoch_snapshot();
-        assert_eq!(snap2.count, 1);
-        assert_eq!(snap2.lambda_count, 1);
-    }
-
-    #[test]
-    fn reset_lambda_clears_prev_d() {
-        let mut g = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        g.observe_lambda(0.01, 8, 4);
-        g.observe_lambda(0.02, 8, 4);
-        g.reset_lambda();
-        // After reset, next event has no prev_d -> lambda_raw None
-        let s = g.observe_lambda(0.04, 8, 4);
-        assert!(s.lambda_raw.is_none());
-    }
-
-    // --- ConvergenceGuard (existing tests continued) ---
-
-    #[test]
-    fn async_same_as_cadence_v1() {
-        let mut gc = ConvergenceGuard::new(ApplyPolicy::Cadence, true, 0.01);
-        let mut ga = ConvergenceGuard::new(ApplyPolicy::Async, true, 0.01);
-        let reports: Vec<DivergenceReport> =
-            vec![make_report(&[0.02]), make_report(&[0.03]), make_report(&[0.04])];
-        for r in &reports {
-            let ac = gc.report(r);
-            let aa = ga.report(r);
-            assert_eq!(ac, aa);
+    fn msf_suppress_fires_after_sustain() {
+        // Feed an exponentially-rising D so λ_ema climbs quickly and stays
+        // above suppress_threshold for ≥ suppress_sustain events.
+        let mut g = MsfGuard::default()
+            .with_suppress(1.0e-3, 3)
+            .with_nudge(f64::INFINITY, 3, 0.5); // disable nudge
+        // Drive λ_raw ≈ ln(2)/4 ≈ 0.173 every event so EMA quickly clears 1e-3.
+        let mut prev = 1.0e-4;
+        let mut fired = false;
+        for _ in 0..20 {
+            let next = prev * 2.0;
+            let action = g.report(&make_report(&[next]), 8, 4);
+            if matches!(action, ConvergenceAction::SuppressGrowth) {
+                fired = true;
+                break;
+            }
+            prev = next;
         }
+        assert!(fired, "expected SuppressGrowth within 20 events");
+    }
+
+    #[test]
+    fn msf_nudge_fires_on_sustained_steeper_growth() {
+        // Same shape but nudge_threshold is also 1e-3 → fires immediately
+        // once λ_ema clears the bar (default suppress 1e-3 fires too, but
+        // nudge wins when both trigger on the same event).
+        let mut g = MsfGuard::default()
+            .with_suppress(1.0e-3, 3)
+            .with_nudge(1.0e-3, 3, 0.5);
+        let mut prev = 1.0e-4;
+        let mut nudge_fires = 0;
+        for _ in 0..20 {
+            let next = prev * 2.0;
+            if matches!(
+                g.report(&make_report(&[next]), 8, 4),
+                ConvergenceAction::NudgeDown { .. }
+            ) {
+                nudge_fires += 1;
+            }
+            prev = next;
+        }
+        assert!(nudge_fires >= 1, "expected NudgeDown to fire at least once");
+    }
+
+    #[test]
+    fn msf_decaying_lambda_does_not_fire() {
+        // Feed a halving D every event → λ_raw ≈ -ln(2)/4 < 0; neither trigger
+        // should ever fire.
+        let mut g = MsfGuard::default();
+        let mut prev = 0.5;
+        for _ in 0..30 {
+            let next = prev * 0.5;
+            let action = g.report(&make_report(&[next]), 8, 4);
+            assert_eq!(action, ConvergenceAction::Stable);
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn msf_without_nudge_disables_hard_trigger() {
+        let mut g = MsfGuard::default()
+            .with_suppress(1.0e-3, 3)
+            .without_nudge();
+        let mut prev = 1.0e-4;
+        let mut nudge_fires = 0;
+        for _ in 0..20 {
+            let next = prev * 2.0;
+            if matches!(
+                g.report(&make_report(&[next]), 8, 4),
+                ConvergenceAction::NudgeDown { .. }
+            ) {
+                nudge_fires += 1;
+            }
+            prev = next;
+        }
+        assert_eq!(nudge_fires, 0);
+    }
+
+    #[test]
+    fn msf_telemetry_carries_lambda_after_first_observation() {
+        let mut g = MsfGuard::default();
+        g.report(&make_report(&[0.01]), 8, 4);
+        g.report(&make_report(&[0.02]), 8, 4);
+        let t = g.telemetry();
+        assert!(t.iter().any(|(k, _)| *k == "lambda_raw"));
+        assert!(t.iter().any(|(k, _)| *k == "lambda_ema"));
+    }
+
+    #[test]
+    fn msf_reset_clears_state() {
+        let mut g = MsfGuard::default();
+        g.report(&make_report(&[0.01]), 8, 4);
+        g.report(&make_report(&[0.02]), 8, 4);
+        g.reset();
+        let s = g.report(&make_report(&[0.04]), 8, 4);
+        assert_eq!(s, ConvergenceAction::Stable);
+        // After reset the next event has no prev_d, so lambda_raw is None
+        // and there's no telemetry to publish until a second observation.
+        assert!(g.last_sample().unwrap().lambda_raw.is_none());
     }
 }

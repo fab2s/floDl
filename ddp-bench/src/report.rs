@@ -1184,6 +1184,49 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         md.push('\n');
     }
 
+    // Stratified predictive by LR window — surfaces signal that the
+    // run-global correlation dilutes when steady-state events outnumber
+    // transient ones.
+    let any_strat = groups
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|r| !r.msf.predictive_by_lr_window.is_empty()));
+    if any_strat {
+        md.push_str("### Predictive Value by LR Window\n\n");
+        md.push_str(
+            "Per-LR-window Pearson `r(λ_raw_t, ln(D_{t+1}))`. Pairs that \
+             straddle a window boundary are excluded so the LR-drop \
+             collapse cannot leak in as artefactual signal. Reading: a \
+             clean R1 (exponential growth at fixed LR) shows up as \
+             *non-zero* `r` within each window, with sign and magnitude \
+             that may differ between warmup, post-drop transient, and \
+             late-training phases.\n\n",
+        );
+        md.push_str("| Model | Mode | LR | Epochs | n_pairs | r(λ → ln D_{t+1}) |\n");
+        md.push_str("|-------|------|---:|--------|--------:|----------------:|\n");
+        for (model, runs) in groups {
+            for r in runs {
+                for w in &r.msf.predictive_by_lr_window {
+                    let r_str = w
+                        .r
+                        .map(|x| format!("{x:+.3}"))
+                        .unwrap_or_else(|| "—".into());
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {:.2e} | {}–{} | {} | {} |",
+                        model,
+                        r.mode,
+                        w.lr,
+                        w.epoch_start,
+                        w.epoch_end,
+                        w.n_pairs,
+                        r_str,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
     // Predictive value (Phase-1 kill criterion).
     let any_pred = groups
         .iter()

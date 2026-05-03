@@ -365,6 +365,21 @@ pub struct MsfAnalysis {
     /// consumed by `apply_training_log` to fill `predictive` once per-epoch
     /// eval is available. Kept on the struct so we don't re-walk events.
     pub recomputed: Vec<RecomputedLambda>,
+    /// Stratified predictive: Pearson(λ_raw_t, ln(D_{t+1})) restricted to
+    /// events inside each LR window. Steady-state events dilute the
+    /// run-global correlation; per-window numbers surface where the
+    /// signal actually lives (warmup, post-LR-drop transient).
+    pub predictive_by_lr_window: Vec<MsfPredictiveByLrWindow>,
+}
+
+/// Per-LR-window predictive correlation row.
+#[derive(Debug, Clone)]
+pub struct MsfPredictiveByLrWindow {
+    pub lr: f64,
+    pub epoch_start: usize,
+    pub epoch_end: usize,
+    pub n_pairs: usize,
+    pub r: Option<f64>,
 }
 
 /// One row of the MSF-guard threshold sweep.
@@ -1097,17 +1112,17 @@ fn build_predictive(
     let mut y_ema = Vec::new();
     for me in epochs {
         let Some(eval) = eval_by_epoch.get(&me.epoch).copied() else { continue };
-        if let Some(lm) = me.lambda_mean {
-            if lm.is_finite() {
-                x_mean.push(lm);
-                y_mean.push(eval);
-            }
+        if let Some(lm) = me.lambda_mean
+            && lm.is_finite()
+        {
+            x_mean.push(lm);
+            y_mean.push(eval);
         }
-        if let Some(le) = me.lambda_ema_at_epoch_end {
-            if le.is_finite() {
-                x_ema.push(le);
-                y_ema.push(eval);
-            }
+        if let Some(le) = me.lambda_ema_at_epoch_end
+            && le.is_finite()
+        {
+            x_ema.push(le);
+            y_ema.push(eval);
         }
     }
     let n_lambda_to_eval = x_mean.len();
@@ -1489,6 +1504,41 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
     let guard_comparison = simulate_guard_comparison(&recomputed);
     let msf_threshold_sweep = build_msf_threshold_sweep(&recomputed);
 
+    // Stratified predictive: r(λ_raw_t, ln(D_{t+1})) per LR window. Only
+    // pairs WHERE BOTH ENDPOINTS are in the same window are counted, so a
+    // pair straddling a phase transition doesn't contribute (otherwise we
+    // pick up the LR-drop collapse as artefactual signal).
+    let predictive_by_lr_window: Vec<MsfPredictiveByLrWindow> = lr_window_fits
+        .iter()
+        .map(|w| {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for i in 0..recomputed.len().saturating_sub(1) {
+                let cur = &recomputed[i];
+                let nxt = &recomputed[i + 1];
+                if cur.epoch < w.epoch_start || cur.epoch > w.epoch_end {
+                    continue;
+                }
+                if nxt.epoch < w.epoch_start || nxt.epoch > w.epoch_end {
+                    continue;
+                }
+                let Some(l) = cur.lambda_raw else { continue };
+                if !l.is_finite() || nxt.d_raw <= 0.0 || !nxt.d_raw.is_finite() {
+                    continue;
+                }
+                xs.push(l);
+                ys.push(nxt.d_raw.ln());
+            }
+            MsfPredictiveByLrWindow {
+                lr: w.lr,
+                epoch_start: w.epoch_start,
+                epoch_end: w.epoch_end,
+                n_pairs: xs.len(),
+                r: pearson(&xs, &ys),
+            }
+        })
+        .collect();
+
     MsfAnalysis {
         div_event_count,
         epochs,
@@ -1501,6 +1551,7 @@ fn build_msf_analysis(events: &[Event]) -> MsfAnalysis {
         msf_threshold_sweep,
         predictive: None, // filled by apply_training_log once eval is joined
         recomputed,
+        predictive_by_lr_window,
     }
 }
 
@@ -1646,7 +1697,7 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let mut epochs = Vec::new();
+    let mut epochs: Vec<LogEpoch> = Vec::new();
     let mut final_eval = None;
     let mut total_ms = None;
     let mut train_only_ms = None;
@@ -1694,7 +1745,25 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
                     // total is in the `# train_only: Xs (eval: Ys)` summary.
                 }
 
-                epochs.push(LogEpoch { epoch, loss, eval, time_ms, per_rank: Vec::new() });
+                // Merge into an existing same-epoch entry if one already
+                // exists (the harness emits a "loss-only" line during the
+                // metrics tick and may emit a supplemental "eval-only"
+                // line afterwards when the EpochFn finishes after the
+                // metrics line was already printed). Last non-default
+                // value wins per field.
+                if let Some(prev) = epochs.iter_mut().find(|e| e.epoch == epoch) {
+                    if loss != 0.0 {
+                        prev.loss = loss;
+                    }
+                    if eval.is_some() {
+                        prev.eval = eval;
+                    }
+                    if time_ms != 0.0 {
+                        prev.time_ms = time_ms;
+                    }
+                } else {
+                    epochs.push(LogEpoch { epoch, loss, eval, time_ms, per_rank: Vec::new() });
+                }
             }
         }
         // per-rank: rank0[cuda0,share=0.3447,tput=56.88] rank1[cuda1,share=...]

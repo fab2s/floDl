@@ -107,6 +107,61 @@ struct Cli {
     #[option]
     elche_relax_up: bool,
 
+    /// Run `eval_fn` at the end of every epoch and emit per-epoch
+    /// `eval=X.XXXX` into `training.log`. Required for the MSF
+    /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
+    ///
+    /// Adds an eval pass per epoch on rank 0 (Sync: consensus params;
+    /// Cadence/Async: rank-local at start of next epoch — near-consensus,
+    /// trend-preserving for correlation analyses).
+    #[option]
+    per_epoch_eval: bool,
+
+    /// Convergence guard selector. Default: `trend` (production behavior,
+    /// 3-rises-above-threshold rule).
+    ///
+    /// - `none`: passive baseline; ElChe overhead-tune drives cadence.
+    /// - `trend`: production guard (TrendGuard).
+    /// - `msf`: MSF rate-based guard with soft (suppress) + hard (nudge)
+    ///   thresholds on the bias-corrected `λ_ema`.
+    #[option]
+    guard: Option<String>,
+
+    /// Primary divergence threshold. Trend: 3-rises-above-threshold cut-off
+    /// (default 0.01). MSF: soft (`SuppressGrowth`) threshold on `λ_ema`
+    /// (default 1e-3).
+    #[option]
+    guard_threshold: Option<f64>,
+
+    /// MSF only: number of consecutive events `λ_ema` must remain above
+    /// `--guard-threshold` before `SuppressGrowth` fires. Default 3.
+    #[option]
+    guard_sustain: Option<usize>,
+
+    /// MSF only: hard (`NudgeDown`) threshold on `λ_ema`. Default 1e-2.
+    /// Set to a very large value (or use `--guard-no-nudge`) to disable.
+    #[option]
+    guard_nudge_threshold: Option<f64>,
+
+    /// MSF only: consecutive events `λ_ema` must remain above
+    /// `--guard-nudge-threshold` before `NudgeDown` fires. Default 3.
+    #[option]
+    guard_nudge_sustain: Option<usize>,
+
+    /// MSF only: anchor reduction factor on `NudgeDown` (0.0-1.0).
+    /// Default 0.5 (halve the anchor).
+    #[option]
+    guard_nudge_factor: Option<f64>,
+
+    /// MSF only: disable the hard (`NudgeDown`) trigger entirely. Soft
+    /// (`SuppressGrowth`) trigger remains active.
+    #[option]
+    guard_no_nudge: bool,
+
+    /// MSF only: EMA smoothing coefficient (0.0-1.0). Default 0.9.
+    #[option]
+    guard_alpha: Option<f64>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -152,6 +207,57 @@ fn parse_partition_ratios(spec: &str) -> flodl::tensor::Result<Vec<f64>> {
     Ok(out)
 }
 
+/// Validate the `--guard*` flag bundle and return a [`GuardChoice`] that
+/// the harness can materialize into a concrete `ConvergenceGuard`.
+///
+/// Loud-error policy: every guard-specific flag that doesn't apply to the
+/// selected `--guard` exits with a clear message rather than being silently
+/// ignored. Default guard is `trend` (production behavior).
+fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::GuardChoice> {
+    use crate::config::GuardChoice;
+    let kind = cli.guard.as_deref().unwrap_or("trend").trim().to_lowercase();
+    let only_msf = |name: &str, present: bool| -> flodl::tensor::Result<()> {
+        if present && kind != "msf" {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "--{name} is only valid with --guard msf (current: --guard {kind})",
+            )));
+        }
+        Ok(())
+    };
+    only_msf("guard-sustain", cli.guard_sustain.is_some())?;
+    only_msf("guard-nudge-threshold", cli.guard_nudge_threshold.is_some())?;
+    only_msf("guard-nudge-sustain", cli.guard_nudge_sustain.is_some())?;
+    only_msf("guard-nudge-factor", cli.guard_nudge_factor.is_some())?;
+    only_msf("guard-no-nudge", cli.guard_no_nudge)?;
+    only_msf("guard-alpha", cli.guard_alpha.is_some())?;
+    if kind == "none" && cli.guard_threshold.is_some() {
+        return Err(flodl::tensor::TensorError::new(
+            "--guard-threshold is not used by --guard none",
+        ));
+    }
+    match kind.as_str() {
+        "none" => Ok(GuardChoice::None),
+        "trend" => Ok(GuardChoice::Trend {
+            threshold: cli.guard_threshold.unwrap_or(0.01),
+        }),
+        "msf" => Ok(GuardChoice::Msf {
+            suppress_threshold: cli.guard_threshold.unwrap_or(1.0e-3),
+            suppress_sustain: cli.guard_sustain.unwrap_or(3),
+            nudge_threshold: if cli.guard_no_nudge {
+                f64::INFINITY
+            } else {
+                cli.guard_nudge_threshold.unwrap_or(1.0e-2)
+            },
+            nudge_sustain: cli.guard_nudge_sustain.unwrap_or(3),
+            nudge_factor: cli.guard_nudge_factor.unwrap_or(0.5),
+            alpha: cli.guard_alpha.unwrap_or(0.9),
+        }),
+        other => Err(flodl::tensor::TensorError::new(&format!(
+            "unknown --guard '{other}' (expected: none, trend, msf)",
+        ))),
+    }
+}
+
 /// Resolve `--gpus` to a `CUDA_VISIBLE_DEVICES` value and set it before
 /// libtorch sees any device. `"all"` is a no-op (lets the host env or
 /// physical hardware decide).
@@ -194,6 +300,11 @@ fn run() -> flodl::tensor::Result<()> {
         None => None,
         Some(spec) => Some(parse_partition_ratios(spec)?),
     };
+
+    // Convergence guard selection + flag-compatibility validation.
+    // Loud errors when guard-specific flags don't match the chosen guard
+    // (the `--guard <name>` selector is the source of truth).
+    let guard_choice = validate_guard_selection(&cli)?;
 
     // Map parsed fields to the variable names the rest of this function
     // already uses. Thin bridge keeps the business logic bit-for-bit
@@ -422,6 +533,8 @@ fn run() -> flodl::tensor::Result<()> {
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
                 elche_relax_up: cli.elche_relax_up,
+                per_epoch_eval: cli.per_epoch_eval,
+                guard: guard_choice.clone(),
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

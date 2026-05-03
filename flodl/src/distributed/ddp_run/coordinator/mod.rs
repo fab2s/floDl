@@ -165,8 +165,18 @@ pub struct Coordinator {
     /// from the first rank's SyncAck; subsequent rank acks are ignored
     /// (debug_assert checks consistency). Reset after averaging.
     nccl_sync_post_norm: Option<f64>,
-    /// Unified convergence guard: owns ring buffer and mode-specific logic.
-    convergence_guard: super::convergence::ConvergenceGuard,
+    /// Pluggable convergence-monitoring strategy. Wired in by the
+    /// builder; defaults to `TrendGuard::default()` when not set.
+    convergence_guard: Box<dyn super::convergence::ConvergenceGuard>,
+    /// Per-epoch d-aggregator (replaces the old EpochSnapshot owned by the
+    /// guard). Lambda aggregates moved out — analyze.rs recomputes them
+    /// from per-event observables now that the guard pipeline is plural.
+    epoch_d_min: f64,
+    epoch_d_max: f64,
+    epoch_d_sum: f64,
+    epoch_d_count: usize,
+    epoch_last_d: f64,
+    epoch_last_k_max: usize,
 
     // Timeline profiling
     /// Optional high-frequency system timeline for event injection.
@@ -207,6 +217,10 @@ pub struct CoordinatorBuilder {
     el_che: crate::distributed::ddp::ElChe,
     divergence_threshold: f64,
     divergence_guard: bool,
+    /// Pluggable convergence guard. When set, takes precedence over the
+    /// legacy `(divergence_guard, divergence_threshold)` pair, which become
+    /// `TrendGuard` configuration only when no explicit guard is supplied.
+    convergence_guard_override: Option<Box<dyn super::convergence::ConvergenceGuard>>,
     checkpoint_every: Option<usize>,
     snapshot_timeout_secs: u64,
     epoch_metrics_tx: Option<mpsc::Sender<super::EpochMetrics>>,
@@ -257,6 +271,16 @@ impl CoordinatorBuilder {
     /// is an optional safety net that suppresses anchor growth when replicas
     /// drift apart. Disable when you know your workload is stable or prefer
     /// full control via ElChe's parameters.
+    /// Install a fully-configured convergence guard. Takes precedence over
+    /// the legacy `divergence_threshold` / `no_divergence_guard` settings.
+    pub fn convergence_guard(
+        mut self,
+        guard: Box<dyn super::convergence::ConvergenceGuard>,
+    ) -> Self {
+        self.convergence_guard_override = Some(guard);
+        self
+    }
+
     pub fn no_divergence_guard(mut self) -> Self {
         self.divergence_guard = false;
         self
@@ -401,11 +425,19 @@ impl CoordinatorBuilder {
             nccl_sync_divergence: vec![None; self.world_size],
             nccl_sync_pre_norm: vec![None; self.world_size],
             nccl_sync_post_norm: None,
-            convergence_guard: super::convergence::ConvergenceGuard::new(
-                self.policy,
-                self.divergence_guard,
-                self.divergence_threshold,
-            ),
+            convergence_guard: self.convergence_guard_override.unwrap_or_else(|| {
+                if self.divergence_guard {
+                    Box::new(super::convergence::TrendGuard::new(self.divergence_threshold))
+                } else {
+                    Box::new(super::convergence::NoGuard)
+                }
+            }),
+            epoch_d_min: f64::INFINITY,
+            epoch_d_max: f64::NEG_INFINITY,
+            epoch_d_sum: 0.0,
+            epoch_d_count: 0,
+            epoch_last_d: 0.0,
+            epoch_last_k_max: 0,
             timeline: self.timeline,
             nccl_sync_start: None,
             last_step_count: vec![0; self.world_size],
@@ -444,6 +476,7 @@ impl Coordinator {
             el_che,
             divergence_threshold: 0.05,
             divergence_guard: true,
+            convergence_guard_override: None,
             checkpoint_every: None,
             snapshot_timeout_secs: 5,
             epoch_metrics_tx: None,
@@ -817,35 +850,29 @@ impl Coordinator {
         self.last_aggregated_epoch = Some(epoch);
         self.epoch_plan_cache.remove(&epoch);
 
-        // MSF passive observation: drain per-epoch lambda/D aggregates.
-        // Emit only when at least one AllReduce happened in this epoch (Sync
-        // mode with no convergence guard activity yields count=0).
-        let snap = self.convergence_guard.take_epoch_snapshot();
-        if snap.count > 0 {
-            if let Some(ref tl) = self.timeline {
-                let last = snap.last_sample.as_ref();
-                tl.event(crate::monitor::EventKind::DivergenceEpoch {
-                    epoch,
-                    sync_count: snap.count,
-                    d_min: snap.d_min,
-                    d_max: snap.d_max,
-                    d_mean: snap.d_mean(),
-                    lambda_min: if snap.lambda_count > 0 {
-                        Some(snap.lambda_min)
-                    } else {
-                        None
-                    },
-                    lambda_max: if snap.lambda_count > 0 {
-                        Some(snap.lambda_max)
-                    } else {
-                        None
-                    },
-                    lambda_mean: snap.lambda_mean(),
-                    lambda_ema_at_epoch_end: last.and_then(|s| s.lambda_ema),
-                    d_at_epoch_end: last.map(|s| s.d_raw).unwrap_or(0.0),
-                    k_at_epoch_end: last.map(|s| s.k_used).unwrap_or(0),
-                });
-            }
+        // Drain per-epoch d-aggregator. Lambda fields are intentionally
+        // None going forward — pluggable guards mean per-epoch lambda
+        // aggregation belongs to analyze.rs (it recomputes from per-event
+        // observables) rather than to a guard-specific snapshot. Emit only
+        // when at least one AllReduce happened (Sync mode with no
+        // divergence reports yields count=0).
+        let snap = self.take_epoch_d_summary();
+        if snap.count > 0
+            && let Some(ref tl) = self.timeline
+        {
+            tl.event(crate::monitor::EventKind::DivergenceEpoch {
+                epoch,
+                sync_count: snap.count,
+                d_min: snap.d_min,
+                d_max: snap.d_max,
+                d_mean: snap.d_mean(),
+                lambda_min: None,
+                lambda_max: None,
+                lambda_mean: None,
+                lambda_ema_at_epoch_end: None,
+                d_at_epoch_end: snap.d_at_epoch_end,
+                k_at_epoch_end: snap.k_at_epoch_end,
+            });
         }
 
         // Checkpoint on global epoch boundaries (1-based for file naming).
@@ -2107,17 +2134,9 @@ mod tests {
         assert_eq!(coord.nccl_sync_divergence, vec![None, None]);
     }
 
-    #[test]
-    fn divergence_history_capped_at_5() {
-        let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
-
-        for _ in 0..8 {
-            run_interval_with_divergence(&mut coord, 0.03, 0.05);
-        }
-
-        assert!(coord.convergence_guard.history().len() <= 5,
-            "history should be capped at 5, got {}", coord.convergence_guard.history().len());
-    }
+    // `divergence_history_capped_at_5` removed: the ring-buffer cap is
+    // now an implementation detail of the concrete guard. Coverage moved
+    // to `convergence::tests::trend_history_capped_at_5`.
 
     #[test]
     fn divergence_overshoot_ceiling_caps() {

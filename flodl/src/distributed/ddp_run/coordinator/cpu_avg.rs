@@ -54,7 +54,63 @@ pub(super) struct CpuAvgResult {
     divergence: Option<convergence::DivergenceReport>,
 }
 
+/// Per-epoch d-statistic summary drained at `on_epoch_aggregated`. Pure
+/// observables; lambda aggregates moved into the (pluggable) guard.
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) struct EpochDSummary {
+    pub count: usize,
+    pub d_min: f64,
+    pub d_max: f64,
+    pub d_sum: f64,
+    pub d_at_epoch_end: f64,
+    pub k_at_epoch_end: usize,
+}
+
+impl EpochDSummary {
+    pub fn d_mean(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.d_sum / self.count as f64 }
+    }
+}
+
 impl Coordinator {
+    /// Push one observation into the per-epoch d aggregator. Drained at
+    /// `on_epoch_aggregated` to populate the `DivergenceEpoch` event with
+    /// purely-observable d statistics. Lambda aggregates moved out of this
+    /// path now that guard pipelines are pluggable; analyze.rs recomputes
+    /// per-epoch lambda from the per-event observable trail.
+    pub(in super::super) fn update_epoch_d_aggregator(&mut self, d_raw: f64, k_max: usize) {
+        self.epoch_d_count += 1;
+        self.epoch_d_sum += d_raw;
+        if d_raw < self.epoch_d_min {
+            self.epoch_d_min = d_raw;
+        }
+        if d_raw > self.epoch_d_max {
+            self.epoch_d_max = d_raw;
+        }
+        self.epoch_last_d = d_raw;
+        self.epoch_last_k_max = k_max;
+    }
+
+    /// Drain the per-epoch d aggregator and return its summary; resets the
+    /// fields to fresh state for the next epoch.
+    pub(in super::super) fn take_epoch_d_summary(&mut self) -> EpochDSummary {
+        let summary = EpochDSummary {
+            count: self.epoch_d_count,
+            d_min: self.epoch_d_min,
+            d_max: self.epoch_d_max,
+            d_sum: self.epoch_d_sum,
+            d_at_epoch_end: self.epoch_last_d,
+            k_at_epoch_end: self.epoch_last_k_max,
+        };
+        self.epoch_d_min = f64::INFINITY;
+        self.epoch_d_max = f64::NEG_INFINITY;
+        self.epoch_d_sum = 0.0;
+        self.epoch_d_count = 0;
+        self.epoch_last_d = 0.0;
+        self.epoch_last_k_max = 0;
+        summary
+    }
+
     /// Trigger parameter averaging based on the configured backend.
     ///
     /// For NCCL: sends `SyncNow` to all workers, then runs the common tail
@@ -167,7 +223,14 @@ impl Coordinator {
             pre_norms: nccl_pre_norms,
             post_norm: self.nccl_sync_post_norm,
         };
-        let action = self.convergence_guard.report(&report);
+        // k_used / k_max passed to the guard match the values emitted into
+        // the Divergence event below — both refer to the cadence interval
+        // just completed.
+        let cycle_batches_for_guard: usize = self.steps_since_avg.iter().sum();
+        let k_max_for_guard = self.steps_since_avg.iter().copied().max().unwrap_or(0);
+        let action = self
+            .convergence_guard
+            .report(&report, cycle_batches_for_guard, k_max_for_guard);
 
         self.version += 1;
         self.avg_count += 1;
@@ -229,16 +292,19 @@ impl Coordinator {
         let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
         self.global_step += cycle_batches;
 
-        // MSF passive observation: lambda_hat sample for this AllReduce.
-        // Reads quantities already in scope (D_t, k); no behavior change.
+        // Per-AllReduce divergence event. Lambda fields are intentionally
+        // None going forward: λ̂ is now guard-specific (lives inside
+        // MsfGuard) and analyze.rs recomputes it from the observables
+        // (d_raw, k_max) regardless of which guard was active. Old logs
+        // still deserialize cleanly.
         let d_raw = report.max_relative_delta();
-        let lambda_sample = self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+        self.update_epoch_d_aggregator(d_raw, k_max);
         let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::Divergence {
                 d_raw,
-                lambda_raw: lambda_sample.lambda_raw,
-                lambda_ema: lambda_sample.lambda_ema,
+                lambda_raw: None,
+                lambda_ema: None,
                 k_used: cycle_batches,
                 k_max,
                 step: self.global_step,
@@ -247,6 +313,20 @@ impl Coordinator {
                 pre_norms: report.pre_norms.clone(),
                 epoch: Some(in_flight_epoch),
             });
+            // Guard-specific diagnostics (e.g., MsfGuard's λ_raw / λ_ema)
+            // arrive on a separate event so analyze.rs can keep observables
+            // and interpretations cleanly separated.
+            let telemetry = self.convergence_guard.telemetry();
+            if !telemetry.is_empty() {
+                tl.event(crate::monitor::EventKind::GuardTelemetry {
+                    epoch: in_flight_epoch,
+                    step: self.global_step,
+                    values: telemetry
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                });
+            }
         }
 
         // Broadcast new global step to all workers so they can compute
@@ -323,9 +403,15 @@ impl Coordinator {
             }
         }
 
-        // Feed divergence to the unified convergence guard.
+        // Feed divergence to the unified convergence guard. Use snapshot
+        // counters (the cadence interval that triggered this averaging) for
+        // k_used / k_max so the guard's rate computations align with the
+        // Divergence event payload below.
+        let cycle_batches_for_guard: usize = steps_snapshot.iter().sum();
+        let k_max_for_guard = steps_snapshot.iter().copied().max().unwrap_or(0);
         let action = if let Some(report) = divergence_report.as_ref() {
-            self.convergence_guard.report(report)
+            self.convergence_guard
+                .report(report, cycle_batches_for_guard, k_max_for_guard)
         } else {
             convergence::ConvergenceAction::Stable
         };
@@ -381,19 +467,19 @@ impl Coordinator {
         let k_max = steps_snapshot.iter().copied().max().unwrap_or(0);
         self.global_step += cycle_batches;
 
-        // MSF passive observation: lambda_hat sample for this AllReduce.
-        // Only emit when a divergence report was actually produced (Sync mode
-        // skips divergence computation entirely).
+        // Per-AllReduce divergence event. Lambda fields are intentionally
+        // None going forward (see finish_averaging_nccl for rationale).
+        // Only emit when a divergence report was actually produced (Sync
+        // mode skips divergence computation entirely).
         if let Some(ref report) = divergence_report {
             let d_raw = report.max_relative_delta();
-            let lambda_sample =
-                self.convergence_guard.observe_lambda(d_raw, cycle_batches, k_max);
+            self.update_epoch_d_aggregator(d_raw, k_max);
             let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::Divergence {
                     d_raw,
-                    lambda_raw: lambda_sample.lambda_raw,
-                    lambda_ema: lambda_sample.lambda_ema,
+                    lambda_raw: None,
+                    lambda_ema: None,
                     k_used: cycle_batches,
                     k_max,
                     step: self.global_step,
@@ -402,6 +488,17 @@ impl Coordinator {
                     pre_norms: report.pre_norms.clone(),
                     epoch: Some(in_flight_epoch),
                 });
+                let telemetry = self.convergence_guard.telemetry();
+                if !telemetry.is_empty() {
+                    tl.event(crate::monitor::EventKind::GuardTelemetry {
+                        epoch: in_flight_epoch,
+                        step: self.global_step,
+                        values: telemetry
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect(),
+                    });
+                }
             }
         }
 

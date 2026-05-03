@@ -144,7 +144,7 @@ impl DdpHandle {
         Self::launch(
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
-            policy, backend, config, None, None, None, None,
+            policy, backend, config, None, None, None, None, None,
         )
     }
 
@@ -164,6 +164,7 @@ impl DdpHandle {
         epoch_fn: Option<EpochFn<M>>,
         metrics_fn: Option<super::MetricsFn>,
         scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
+        convergence_guard: Option<Box<dyn super::ConvergenceGuard>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -359,11 +360,19 @@ impl DdpHandle {
                 if let Some(mf) = metrics_fn {
                     builder = builder.metrics_fn(mf);
                 }
-                if let Some(dt) = div_threshold {
-                    builder = builder.divergence_threshold(dt);
-                }
-                if no_div_guard {
-                    builder = builder.no_divergence_guard();
+                // Pluggable guard takes precedence; legacy
+                // divergence_threshold/no_divergence_guard still flow into
+                // the default TrendGuard configuration when no explicit
+                // guard is supplied.
+                if let Some(g) = convergence_guard {
+                    builder = builder.convergence_guard(g);
+                } else {
+                    if let Some(dt) = div_threshold {
+                        builder = builder.divergence_threshold(dt);
+                    }
+                    if no_div_guard {
+                        builder = builder.no_divergence_guard();
+                    }
                 }
                 if let Some(n) = ckpt_every {
                     builder = builder.checkpoint_every(n);
@@ -1137,6 +1146,10 @@ where
     metrics_fn: Option<super::MetricsFn>,
     /// Factory receives `world_size`, returns the scheduler.
     scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
+    /// Pluggable convergence guard. When set, takes precedence over the
+    /// legacy `divergence_threshold` / `no_divergence_guard` fields on
+    /// [`DdpRunConfig`]. Boxed because trait-object guards aren't `Clone`.
+    convergence_guard: Option<Box<dyn super::ConvergenceGuard>>,
     _phantom: PhantomData<(M, O)>,
 }
 
@@ -1204,8 +1217,33 @@ where
 
     /// Disable the divergence guardrail. ElChe's overhead auto-tune
     /// handles cadence alone. Use when you know your workload is stable.
+    ///
+    /// Equivalent to `.convergence_guard(NoGuard)` but kept for backward
+    /// compatibility with the older boolean-flag API.
     pub fn no_divergence_guard(mut self) -> Self {
         self.config = self.config.with_no_divergence_guard();
+        self
+    }
+
+    /// Install a custom convergence guard.
+    ///
+    /// When set, takes precedence over the legacy `divergence_threshold` and
+    /// `no_divergence_guard` settings. Three concrete impls ship in flodl:
+    /// [`super::NoGuard`], [`super::TrendGuard`] (production default), and
+    /// [`super::MsfGuard`] (rate-based detector with soft+hard thresholds).
+    ///
+    /// ```text
+    /// .convergence_guard(
+    ///     MsfGuard::default()
+    ///         .with_suppress(1e-3, 3)
+    ///         .with_nudge(1e-2, 3, 0.5),
+    /// )
+    /// ```
+    pub fn convergence_guard<C>(mut self, guard: C) -> Self
+    where
+        C: super::ConvergenceGuard + 'static,
+    {
+        self.convergence_guard = Some(Box::new(guard));
         self
     }
 
@@ -1418,6 +1456,7 @@ where
             self.epoch_fn,
             self.metrics_fn,
             self.scheduler_fn,
+            self.convergence_guard,
         )
     }
 }
@@ -1470,6 +1509,7 @@ impl DdpHandle {
             epoch_fn: None,
             metrics_fn: None,
             scheduler_fn: None,
+            convergence_guard: None,
             _phantom: PhantomData,
         }
     }

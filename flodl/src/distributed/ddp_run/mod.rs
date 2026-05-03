@@ -70,8 +70,8 @@ pub use worker::*;
 pub use coordinator::*;
 pub use orchestrator::*;
 pub use convergence::{
-    ConvergenceAction, ConvergenceGuard, DivergenceReport, EpochSnapshot, LambdaEstimator,
-    LambdaSample,
+    ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample,
+    MsfGuard, NoGuard, TrendGuard,
 };
 
 use std::cell::RefCell;

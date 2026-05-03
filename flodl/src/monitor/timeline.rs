@@ -130,6 +130,18 @@ pub enum EventKind {
         /// back to `EpochEnd` timestamp lookup.
         epoch: Option<usize>,
     },
+    /// Guard-specific diagnostic values for the current AllReduce event.
+    /// Emitted by the coordinator after each `report()` call to a
+    /// pluggable [`crate::distributed::ddp_run::ConvergenceGuard`]. The key
+    /// set depends on the active guard (e.g. MsfGuard emits
+    /// `lambda_raw` / `lambda_ema`; TrendGuard emits `d_history_last`;
+    /// NoGuard emits nothing). Old timelines lack this event entirely;
+    /// consumers should treat absence as "no diagnostics available".
+    GuardTelemetry {
+        epoch: usize,
+        step: usize,
+        values: Vec<(String, f64)>,
+    },
     /// MSF passive observation: per-epoch divergence + lambda aggregates.
     ///
     /// Emitted at `on_epoch_aggregated`. Aggregates over all `Divergence`
@@ -778,6 +790,20 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                     let _ = write!(out, "{d:.6e}");
                 }
                 out.push(']');
+            }
+            EventKind::GuardTelemetry { epoch, step, values } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"guard_telemetry\",\"epoch\":{epoch},\"step\":{step},\"values\":{{",
+                );
+                for (i, (k, v)) in values.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let escaped = k.replace('\\', "\\\\").replace('"', "\\\"");
+                    let _ = write!(out, "\"{escaped}\":{v:.6e}");
+                }
+                out.push('}');
             }
             EventKind::DivergenceEpoch {
                 epoch,
