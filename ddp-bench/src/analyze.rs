@@ -346,6 +346,29 @@ pub struct MsfLrWindowFit {
     pub slope_per_step_epoch_dmean: Option<f64>,
     pub r2_epoch_dmean: Option<f64>,
     pub n_epoch_points: Option<usize>,
+    /// OLS of `ln(D_mean)` vs `k_used` (per-event cycle length: steps since
+    /// last sync). Tests the alternative R1 framing where the relevant
+    /// "drift clock" restarts at each AllReduce — sync is a reset, so within
+    /// a fixed-LR window the natural axis is steps-since-sync, not
+    /// cumulative training step. `None` when no events have non-empty
+    /// `deltas`, or when k_used has zero variance across the window.
+    pub slope_by_k_used_dmean: Option<f64>,
+    pub r2_by_k_used_dmean: Option<f64>,
+    /// Range of k_used observed in the window (controller-determined; varies
+    /// per event when ElChe's convergence guard truncates cycles early).
+    pub k_used_min: Option<usize>,
+    pub k_used_max: Option<usize>,
+    /// Per-rank by-k OLS: bottom-scale consistency check on the meta-
+    /// oscillator framing. `slope_by_k_per_rank[i]` is the within-cycle
+    /// Lyapunov estimate computed from rank i's `D_i` trajectory alone.
+    /// Under the meta-oscillator framing (cross-rank Pearson r > 0.99),
+    /// per-rank slopes should match the meta-D_mean slope within seed-to-
+    /// seed sd; divergence between per-rank and meta slopes indicates the
+    /// framing is breaking down and per-rank treatment is required.
+    /// Empty when `deltas` are unavailable or rank count varies across
+    /// events.
+    pub slope_by_k_per_rank: Vec<f64>,
+    pub r2_by_k_per_rank: Vec<f64>,
     pub transient_skipped: usize,
 }
 
@@ -874,6 +897,16 @@ struct LrWindowSamples {
     /// event had empty `deltas`. The fit drops `None` entries; if any are
     /// present the d_mean fit reports on the surviving subset only.
     pts_mean: Vec<Option<f64>>,
+    /// Per-event ln(D_i) for each rank i, parallel to `pts_max`. Outer Vec
+    /// indexed by rank, inner Vec parallel to `pts_max` with `None` for
+    /// events that had empty `deltas` or a different rank count than the
+    /// dominant one for this window. Empty (outer Vec length 0) when no
+    /// event had non-empty `deltas` or rank count varied.
+    pts_per_rank: Vec<Vec<Option<f64>>>,
+    /// Per-event `k_used` (cycle length: actual training steps elapsed since
+    /// the previous AllReduce). Parallel to `pts_max`. The "step since last
+    /// sync" axis for the alternative R1 framing.
+    pts_k_used: Vec<usize>,
     /// True when at least one event in the window carried non-empty `deltas`.
     has_deltas: bool,
 }
@@ -913,6 +946,10 @@ fn collect_lr_window_samples(
     };
     let mut pts_max: Vec<(usize, usize, f64)> = Vec::new();
     let mut pts_mean: Vec<Option<f64>> = Vec::new();
+    let mut pts_k_used: Vec<usize> = Vec::new();
+    // Collect raw deltas first; we'll build the per-rank ln-vectors after we
+    // know the dominant rank count for this window (most-common deltas.len()).
+    let mut pts_deltas: Vec<Option<Vec<f64>>> = Vec::new();
     let mut has_deltas = false;
     for e in events {
         if let EventKind::Divergence {
@@ -920,6 +957,7 @@ fn collect_lr_window_samples(
             step,
             epoch,
             deltas,
+            k_used,
             ..
         } = &e.kind
             && *step >= step_lo
@@ -928,6 +966,7 @@ fn collect_lr_window_samples(
         {
             let resolved_epoch = epoch.unwrap_or_else(|| epoch_for_step(*step));
             pts_max.push((*step, resolved_epoch, d_raw.ln()));
+            pts_k_used.push(*k_used);
             if !deltas.is_empty() {
                 has_deltas = true;
                 let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
@@ -936,17 +975,55 @@ fn collect_lr_window_samples(
                 } else {
                     pts_mean.push(None);
                 }
+                pts_deltas.push(Some(deltas.clone()));
             } else {
                 pts_mean.push(None);
+                pts_deltas.push(None);
             }
         }
     }
     if pts_max.is_empty() {
         return None;
     }
+
+    // Determine dominant rank count (events whose rank count differs are
+    // dropped from the per-rank fit). For homogeneous runs this is always
+    // the same number; defensive against partial events.
+    let dominant_n_ranks = {
+        use std::collections::HashMap;
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for v in pts_deltas.iter().flatten() {
+            *counts.entry(v.len()).or_insert(0) += 1;
+        }
+        counts.into_iter().max_by_key(|(_, c)| *c).map(|(n, _)| n).unwrap_or(0)
+    };
+
+    // Build per-rank ln-vectors. Outer index = rank, inner parallel to pts_max.
+    let pts_per_rank: Vec<Vec<Option<f64>>> = if dominant_n_ranks > 0 {
+        (0..dominant_n_ranks)
+            .map(|rank| {
+                pts_deltas
+                    .iter()
+                    .map(|d| {
+                        d.as_ref()
+                            .filter(|v| v.len() == dominant_n_ranks)
+                            .and_then(|v| {
+                                let x = v[rank];
+                                if x > 1e-12 { Some(x.ln()) } else { None }
+                            })
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Some(LrWindowSamples {
         pts_max,
         pts_mean,
+        pts_per_rank,
+        pts_k_used,
         has_deltas,
     })
 }
@@ -1040,6 +1117,85 @@ fn fit_samples(samples: &LrWindowSamples, skip_first_n_epochs: usize) -> Option<
         (None, None, None)
     };
 
+    // Alternative R1 axis: ln(D_mean) vs k_used (steps since last sync).
+    // Sync resets transversal deviation to ~0, so the natural drift clock
+    // restarts at every AllReduce. If pure exponential growth holds within
+    // a cycle, then D_t ≈ ε·exp(λ_T · k_used) and ln(D_t) is linear in
+    // k_used at fixed LR. If the system is in the OU/spiral-to-consensus
+    // regime, D_t saturates toward a setpoint D*(LR) and the slope flattens
+    // for large k_used.
+    let mut xs_k: Vec<f64> = Vec::new();
+    let mut ys_k: Vec<f64> = Vec::new();
+    let mut k_lo = usize::MAX;
+    let mut k_hi = 0usize;
+    for (i, (_step, epoch, _ln_max)) in samples.pts_max.iter().enumerate() {
+        if let Some(ce) = cutoff_epoch
+            && *epoch < ce
+        {
+            continue;
+        }
+        if let Some(ln_mean) = samples.pts_mean.get(i).and_then(|p| *p) {
+            let k = samples.pts_k_used[i];
+            xs_k.push(k as f64);
+            ys_k.push(ln_mean);
+            k_lo = k_lo.min(k);
+            k_hi = k_hi.max(k);
+        }
+    }
+    let (slope_by_k_used_dmean, r2_by_k_used_dmean, k_used_min, k_used_max) =
+        if samples.has_deltas && xs_k.len() >= 5 {
+            match ols(&xs_k, &ys_k) {
+                Some(f) => (
+                    Some(f.slope),
+                    Some(f.r2),
+                    Some(k_lo),
+                    Some(k_hi),
+                ),
+                None => (None, None, Some(k_lo), Some(k_hi)),
+            }
+        } else {
+            (None, None, None, None)
+        };
+
+    // Per-rank by-k OLS — bottom-scale Lyapunov estimate per rank. Used as
+    // a consistency check on the meta-oscillator framing: under r > 0.99
+    // cross-rank Pearson, per-rank slopes should match the meta-D_mean
+    // slope. Per-rank divergence indicates the framing is breaking and
+    // bottom-scale per-rank treatment is required (e.g. cpu-async backend).
+    let (slope_by_k_per_rank, r2_by_k_per_rank): (Vec<f64>, Vec<f64>) =
+        if !samples.pts_per_rank.is_empty() {
+            let mut slopes = Vec::with_capacity(samples.pts_per_rank.len());
+            let mut r2s = Vec::with_capacity(samples.pts_per_rank.len());
+            for rank_pts in &samples.pts_per_rank {
+                let mut xs_rk: Vec<f64> = Vec::new();
+                let mut ys_rk: Vec<f64> = Vec::new();
+                for (i, (_step, epoch, _ln_max)) in samples.pts_max.iter().enumerate() {
+                    if let Some(ce) = cutoff_epoch
+                        && *epoch < ce
+                    {
+                        continue;
+                    }
+                    if let Some(ln_d_i) = rank_pts.get(i).and_then(|v| *v) {
+                        xs_rk.push(samples.pts_k_used[i] as f64);
+                        ys_rk.push(ln_d_i);
+                    }
+                }
+                if xs_rk.len() >= 5
+                    && let Some(f) = ols(&xs_rk, &ys_rk)
+                {
+                    slopes.push(f.slope);
+                    r2s.push(f.r2);
+                    continue;
+                }
+                // Fill placeholder so per-rank vector length stays = n_ranks.
+                slopes.push(f64::NAN);
+                r2s.push(f64::NAN);
+            }
+            (slopes, r2s)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
     Some(MsfLrWindowFit {
         lr: 0.0, // filled in by caller
         epoch_start: start_ep,
@@ -1054,6 +1210,12 @@ fn fit_samples(samples: &LrWindowSamples, skip_first_n_epochs: usize) -> Option<
         slope_per_step_epoch_dmean: slope_epoch_dmean,
         r2_epoch_dmean,
         n_epoch_points,
+        slope_by_k_used_dmean,
+        r2_by_k_used_dmean,
+        k_used_min,
+        k_used_max,
+        slope_by_k_per_rank,
+        r2_by_k_per_rank,
         transient_skipped: skip_first_n_epochs,
     })
 }

@@ -148,6 +148,12 @@ pub struct RunConfig {
     /// When true, passed as `DdpBuilder::elche_relax_up(true)`. Default
     /// false (relax-up disabled, anchor under overhead-based auto-tune only).
     pub elche_relax_up: bool,
+    /// EASGD elastic averaging weight α. When `Some`, the cpu-async
+    /// `load_averaged` path blends `W_local := (1-α)·W_local + α·W_avg`
+    /// instead of full overwrite. `None` preserves current behavior.
+    /// Honored on cpu-async only. Reference: Zhang, Choromanska, LeCun
+    /// NeurIPS 2015.
+    pub easgd_alpha: Option<f64>,
     /// Run `eval_fn` at the end of every epoch (rank 0 only) and emit
     /// `epoch N: ... eval=X.XXXX` into `training.log` so the analysis
     /// pipeline can correlate λ̂ aggregates with held-out metric per epoch.

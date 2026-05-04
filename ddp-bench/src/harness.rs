@@ -531,6 +531,10 @@ fn run_unified(
         builder = builder.elche_relax_up(true);
     }
 
+    if let Some(alpha) = config.easgd_alpha {
+        builder = builder.easgd_alpha(alpha);
+    }
+
     // Materialize the configured convergence guard. NoGuard / TrendGuard /
     // MsfGuard each implement the trait; we pass through the generic
     // `convergence_guard` builder method which boxes internally.

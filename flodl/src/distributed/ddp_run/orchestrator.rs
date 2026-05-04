@@ -501,6 +501,7 @@ impl DdpHandle {
                 batch_size,
                 seed,
                 max_grad_norm,
+                easgd_alpha: config.easgd_alpha,
                 timeline: worker_tl,
                 policy,
             };
@@ -707,6 +708,10 @@ impl DdpHandle {
             batch_size,
             seed: 42,
             max_grad_norm,
+            // Single-GPU fallback never goes through the cpu-async load_averaged
+            // path, so EASGD alpha is irrelevant here. None keeps the
+            // current-behavior copy_ path in case the code path changes.
+            easgd_alpha: None,
             timeline: None,
             policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
         };
@@ -1289,6 +1294,13 @@ where
     /// keeps the anchor under overhead-based auto-tune alone.
     pub fn elche_relax_up(mut self, enabled: bool) -> Self {
         self.config = self.config.with_elche_relax_up(enabled);
+        self
+    }
+
+    /// Enable EASGD elastic averaging on the cpu-async path with weight α.
+    /// `α` must be in `(0, 1]`. See [`DdpRunConfig::with_easgd_alpha`].
+    pub fn easgd_alpha(mut self, alpha: f64) -> Self {
+        self.config = self.config.with_easgd_alpha(alpha);
         self
     }
 

@@ -107,6 +107,22 @@ struct Cli {
     #[option]
     elche_relax_up: bool,
 
+    /// EASGD elastic averaging weight α (must be in `(0, 1]` when set).
+    ///
+    /// When set, the cpu-async `load_averaged` path blends
+    /// `W_local := (1-α)·W_local + α·W_avg` instead of full overwrite.
+    /// Preserves the local progress made during the averaging window
+    /// ("ahead-of-sync drift") that current cpu-async discards. Reference:
+    /// Zhang, Choromanska, LeCun 2015, "Deep learning with Elastic
+    /// Averaging SGD," NeurIPS 2015 (<https://arxiv.org/abs/1412.6651>).
+    ///
+    /// Honored on cpu-async only; ignored on NCCL paths (which use
+    /// in-place AllReduce(Avg) and have no equivalent overwrite step).
+    /// `None` (default) preserves current behavior (full overwrite, fast
+    /// non-blocking copy_ path).
+    #[option]
+    easgd_alpha: Option<f64>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -533,6 +549,7 @@ fn run() -> flodl::tensor::Result<()> {
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
                 elche_relax_up: cli.elche_relax_up,
+                easgd_alpha: cli.easgd_alpha,
                 per_epoch_eval: cli.per_epoch_eval,
                 guard: guard_choice.clone(),
             };

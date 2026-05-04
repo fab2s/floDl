@@ -122,6 +122,11 @@ pub struct GpuWorker<M: Module> {
     activation_peak_bytes: usize,
     /// Maximum gradient norm for clipping (None = no clipping).
     max_grad_norm: Option<f64>,
+    /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite
+    /// (current behavior; uses fast non-blocking copy_). When `Some(α)`,
+    /// `load_averaged` blends `W_local := (1-α)·W_local + α·W_avg` instead
+    /// of overwriting. Reference: Zhang, Choromanska, LeCun, NeurIPS 2015.
+    easgd_alpha: Option<f64>,
     /// Optional system timeline for event injection.
     timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
 
@@ -377,6 +382,7 @@ impl<M: Module> GpuWorker<M> {
             per_sample_bytes,
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,
+            easgd_alpha: config.easgd_alpha,
             timeline: config.timeline.clone(),
             pre_sync_scratch,
             _grad_accumulators: grad_accumulators,
@@ -501,10 +507,41 @@ impl<M: Module> GpuWorker<M> {
         let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
 
         // no_grad: parameters are leaf tensors with requires_grad=true
+        //
+        // Two paths: full overwrite (default, fast — single non-blocking
+        // copy_ per param) and EASGD elastic blend (opt-in, when
+        // `easgd_alpha` is set — stages averaged params on GPU, then
+        // applies a batched in-place lerp `var := var + α(avg − var)`
+        // = `(1−α)·var + α·avg` across all params via one CUDA kernel
+        // launch). Buffers (BatchNorm running stats etc.) always overwrite
+        // — blending them is undefined under the EASGD framework.
         {
             let _no_grad = NoGradGuard::new();
-            for (var, src) in self.param_vars.iter().zip(&update.params) {
-                var.data().copy_(src, non_blocking)?;
+            match self.easgd_alpha {
+                None => {
+                    for (var, src) in self.param_vars.iter().zip(&update.params) {
+                        var.data().copy_(src, non_blocking)?;
+                    }
+                }
+                Some(alpha) => {
+                    let mut avg_staged: Vec<crate::tensor::Tensor> =
+                        Vec::with_capacity(update.params.len());
+                    let mut dst_handles: Vec<crate::tensor::Tensor> =
+                        Vec::with_capacity(update.params.len());
+                    for (var, src) in self.param_vars.iter().zip(&update.params) {
+                        let dst = var.data();
+                        // zeros_like allocates a same-shape/dtype/device
+                        // tensor; we immediately overwrite via copy_ so the
+                        // initial zeroing is unused (no `empty_like` in flodl).
+                        let avg_gpu = crate::tensor::Tensor::zeros_like(&dst)?;
+                        avg_gpu.copy_(src, non_blocking)?;
+                        avg_staged.push(avg_gpu);
+                        dst_handles.push(dst);
+                    }
+                    crate::tensor::Tensor::foreach_lerp_scalar_(
+                        &dst_handles, &avg_staged, alpha,
+                    )?;
+                }
             }
         }
         for (buf, src) in self.buffer_list.iter().zip(&update.buffers) {

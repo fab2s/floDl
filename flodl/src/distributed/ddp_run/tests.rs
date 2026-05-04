@@ -86,6 +86,7 @@ fn test_worker_config_clone() {
         batch_size: 32,
         seed: 42,
         max_grad_norm: None,
+        easgd_alpha: None,
         timeline: None,
         policy: ApplyPolicy::Sync,
     };
@@ -170,6 +171,7 @@ fn make_test_worker_with(
         batch_size: 4,
         seed: 42,
         max_grad_norm: None,
+        easgd_alpha: None,
         timeline: None,
         policy: ApplyPolicy::Sync,
     };

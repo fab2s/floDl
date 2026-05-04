@@ -270,10 +270,31 @@ fast GPU consumes a proportionally larger share to keep pace with the slow ones.
     // is just empty noise.
     if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.msf.has_data())) {
         md.push_str("## MSF Passive Observation\n\n");
-        md.push_str("Across-event Lyapunov proxy `λ̂ = (1/k) * log(D_t / D_{t-1})` from \
-            `docs/design/msf-cadence-control.md`. Passive logging only — no controller effect. \
-            Phase candidates flag epochs where `λ_min < -1e-2` AND `D_end / prev_D_end < 1/3` \
-            (collapse signature, e.g. LR drop boundary).\n\n");
+        md.push_str("Per the v2 framing (`docs/design/msf-cadence-control-v2.md`), \
+            DDP is a synchronization-of-coupled-chaotic-oscillators problem at \
+            **two scales** linked by AllReduce. Each subsection below is tagged \
+            by the scale it operates at:\n\n\
+            - **Top scale (meta-oscillator)**: the cross-rank-collapsed observable \
+            `D_mean(t)`, the OU process the system spirals toward. The model we \
+            ship is the centroid that sits on the synchronization manifold; \
+            convergence is exclusively a top-scale phenomenon.\n\
+            - **Bottom scale (per-GPU)**: per-rank `D_i(τ)` within a cycle, \
+            chaotic by construction with positive within-cycle Lyapunov \
+            `λ_T(LR)`. Per-replica trajectories don't converge — that's by \
+            design.\n\
+            - **Cross-scale consistency**: cross-rank Pearson `r` and per-rank \
+            vs meta slope agreement. The gate that validates the meta-oscillator \
+            framing — when `r < 0.95` for any rank pair, the framing has broken \
+            and bottom-scale per-rank treatment is required (e.g. cpu-async \
+            backend's pipelined averaging is a special case of this gate \
+            firing for backend reasons).\n\n\
+            Historical proxy `λ̂ = (1/k) * log(D_t / D_{t-1})` from v1 doc \
+            survives only as a coarse phase indicator; the v2 estimators are \
+            the by-k OLS slope (within-cycle Lyapunov, bottom-scale) and \
+            CUSUM-on-OU-residual (regime detection, top-scale).\n\n\
+            Phase candidates flag epochs where `λ_min < -1e-2` AND \
+            `D_end / prev_D_end < 1/3` (collapse signature, e.g. LR drop \
+            boundary).\n\n");
         write_msf_section(&mut md, groups);
     }
 
@@ -962,7 +983,7 @@ fn sparkline(xs: &[Option<f64>], max_chars: usize) -> String {
 
 fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
     // Per-run summary table: count, sync count, final phase regime.
-    md.push_str("### Summary\n\n");
+    md.push_str("### Summary (top scale)\n\n");
     md.push_str("| Model | Mode | Epochs | Div Events | Phase Candidates | Final D | Final λ_ema |\n");
     md.push_str("|-------|------|--------|-----------:|-----------------:|--------:|------------:|\n");
     for (model, runs) in groups {
@@ -1022,7 +1043,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| !r.msf.per_rank.is_empty()));
     if any_per_rank {
-        md.push_str("### Per-Rank Breakdown\n\n");
+        md.push_str("### Per-Rank Breakdown (bottom scale + cross-scale consistency)\n\n");
         md.push_str(
             "Rank 0 is the fast GPU under heterogeneous dispatch (largest `batch_share`). \
              `win%` is the fraction of AllReduce events where this rank had the highest D \
@@ -1092,7 +1113,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         })
     });
     if any_guard {
-        md.push_str("### Convergence Guard Comparison (per-event simulators)\n\n");
+        md.push_str("### Convergence Guard Comparison (per-event simulators) (top scale)\n\n");
         md.push_str(
             "Both guards replayed against the per-AllReduce divergence \
              trajectory (matching the production guard's temporal grain). \
@@ -1153,7 +1174,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| !r.msf.msf_threshold_sweep.is_empty()));
     if any_sweep {
-        md.push_str("### MSF Guard Threshold Sweep\n\n");
+        md.push_str("### MSF Guard Threshold Sweep (top scale)\n\n");
         md.push_str(
             "Per-event MSF guard fires across (threshold × sustain) grid. \
              `fires` = total firing events, `epochs` = distinct epochs \
@@ -1191,7 +1212,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| !r.msf.predictive_by_lr_window.is_empty()));
     if any_strat {
-        md.push_str("### Predictive Value by LR Window\n\n");
+        md.push_str("### Predictive Value by LR Window (top scale)\n\n");
         md.push_str(
             "Per-LR-window Pearson `r(λ_raw_t, ln(D_{t+1}))`. Pairs that \
              straddle a window boundary are excluded so the LR-drop \
@@ -1232,7 +1253,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| r.msf.predictive.is_some()));
     if any_pred {
-        md.push_str("### Predictive Value (Phase-1 kill criterion)\n\n");
+        md.push_str("### Predictive Value (Phase-1 kill criterion) (top scale)\n\n");
         md.push_str(
             "Pearson correlations testing whether λ̂ carries forward-looking \
              signal independent of D itself. **`λ_raw_t → ln(D_{t+1})`**: \
@@ -1272,7 +1293,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| r.msf.longitudinal.is_some()));
     if any_long {
-        md.push_str("### Longitudinal Meta-Velocity\n\n");
+        md.push_str("### Longitudinal Meta-Velocity (top scale)\n\n");
         md.push_str(
             "Per-event consensus magnitude motion `|Δ||W̄|||/||W̄||_prev`. \
              Independent of `D_t` (transversal): tracks LR schedule + gradient \
@@ -1311,7 +1332,7 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
         .iter()
         .any(|(_, runs)| runs.iter().any(|r| !r.msf.lr_window_fits.is_empty()));
     if any_fits {
-        md.push_str("### R1 informal: log(D) vs step per LR window\n\n");
+        md.push_str("### R1 informal: log(D) vs step per LR window (top scale)\n\n");
         md.push_str(
             "LR windows auto-detected from `EpochEnd` LR transitions (>5% change \
              starts a new window). Within each window, OLS fit of `ln(D)` vs \
@@ -1329,16 +1350,27 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
              state. The third basis `epoch d_mean` aggregates per-event \
              `ln(D_mean)` to one log-mean per epoch and fits those aggregates \
              — denoises intra-epoch SGD variance, which is the dominant \
-             remaining noise source after the cross-rank swap.\n\n",
+             remaining noise source after the cross-rank swap. The fourth \
+             basis `by k_used` reframes the x-axis: instead of cumulative \
+             step, fit `ln(D_mean)` vs `k_used` (the cycle length: steps \
+             since the last AllReduce). Sync is a reset — D ≈ 0 immediately \
+             after AllReduce — so the natural drift clock restarts at every \
+             coupling event. If pure exponential growth holds *within* a \
+             cycle, then `ln(D_t) ≈ const + λ_T · k_used` and the by-k slope \
+             is the within-cycle Lyapunov exponent. If the system is in the \
+             OU / spiral-to-consensus regime, D_t saturates toward a \
+             setpoint D*(LR) and the by-k slope flattens for large k_used \
+             (R² collapses).\n\n",
         );
         md.push_str(
             "| Model | Mode | LR | Epochs | n_events | Step range | \
              Slope/step (max) | R² (max) | Slope/step (mean) | R² (mean) | \
-             n_epochs | Slope/step (epoch d_mean) | R² (epoch d_mean) |\n",
+             n_epochs | Slope/step (epoch d_mean) | R² (epoch d_mean) | \
+             k_used range | Slope/k (mean) | R² (k, mean) |\n",
         );
         md.push_str(
             "|-------|------|---:|--------|--:|-----------:|----------:|----:|\
-             ----------:|----:|--:|----------:|----:|\n",
+             ----------:|----:|--:|----------:|----:|------:|----------:|----:|\n",
         );
         for (model, runs) in groups {
             for r in runs {
@@ -1371,10 +1403,22 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
                         Some(v) => format!("{v:.3}"),
                         None => "—".to_string(),
                     };
+                    let k_range = match (f.k_used_min, f.k_used_max) {
+                        (Some(lo), Some(hi)) => format!("{lo}–{hi}"),
+                        _ => "—".to_string(),
+                    };
+                    let by_k_slope = match f.slope_by_k_used_dmean {
+                        Some(v) => format!("{v:+.3e}"),
+                        None => "—".to_string(),
+                    };
+                    let by_k_r2 = match f.r2_by_k_used_dmean {
+                        Some(v) => format!("{v:.3}"),
+                        None => "—".to_string(),
+                    };
                     let _ = writeln!(
                         md,
                         "| {} | {} | {:.2e} | {} | {} | {}–{} | {:+.3e} | {:.3} \
-                         | {} | {} | {} | {} | {} |",
+                         | {} | {} | {} | {} | {} | {} | {} | {} |",
                         model,
                         r.mode,
                         f.lr,
@@ -1389,6 +1433,130 @@ fn write_msf_section(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
                         n_ep,
                         ep_dmean_slope,
                         ep_dmean_r2,
+                        k_range,
+                        by_k_slope,
+                        by_k_r2,
+                    );
+                }
+            }
+        }
+        md.push('\n');
+    }
+
+    // R1' per-rank by-k slopes — bottom-scale consistency check on the
+    // meta-oscillator framing. Under cross-rank Pearson r > 0.99 (the
+    // empirical anchor), per-rank within-cycle Lyapunov estimates should
+    // match the meta-D_mean slope. Per-rank divergence indicates the
+    // framing is breaking; warn when meta vs per-rank slopes differ by
+    // more than a factor of 2 on any LR window.
+    let any_per_rank = groups.iter().any(|(_, runs)| {
+        runs.iter().any(|r| {
+            r.msf
+                .lr_window_fits
+                .iter()
+                .any(|f| !f.slope_by_k_per_rank.is_empty())
+        })
+    });
+    if any_per_rank {
+        md.push_str(
+            "### R1' per-rank by-k slopes (bottom scale + cross-scale consistency)\n\n",
+        );
+        md.push_str(
+            "Bottom-scale within-cycle Lyapunov estimate computed independently \
+             from each rank's `D_i` trajectory (instead of the cross-rank-collapsed \
+             `D_mean`). The meta-oscillator framing predicts these per-rank slopes \
+             match the meta `D_mean` by-k slope (already in the R1 table above) within \
+             seed-to-seed sd, because cross-rank Pearson `r > 0.99` says ranks are \
+             colinear at the bottom scale up to a per-rank scaling factor. Used as \
+             a falsifier: if a per-rank slope diverges from the meta slope by more \
+             than 2× on any LR window, the meta-oscillator framing has broken for \
+             this run and bottom-scale per-rank treatment is required (cpu-async \
+             backend's pipelined averaging is a special case of this gate firing \
+             for backend reasons rather than dynamics reasons).\n\n",
+        );
+        md.push_str(
+            "| Model | Mode | LR | Epochs | Meta slope/k | Per-rank slopes (k_used basis) | Per-rank R² | Max ratio (max/min per-rank) | Framing OK? |\n",
+        );
+        md.push_str(
+            "|-------|------|---:|--------|----------:|---|---|---|---|\n",
+        );
+        for (model, runs) in groups {
+            for r in runs {
+                for f in &r.msf.lr_window_fits {
+                    if f.slope_by_k_per_rank.is_empty() {
+                        continue;
+                    }
+                    let label = if f.transient_skipped == 0 {
+                        format!("{}–{}", f.epoch_start, f.epoch_end)
+                    } else {
+                        format!(
+                            "{}–{} (post-transient, skipped {})",
+                            f.epoch_start, f.epoch_end, f.transient_skipped
+                        )
+                    };
+                    let meta_slope = match f.slope_by_k_used_dmean {
+                        Some(v) => format!("{v:+.3e}"),
+                        None => "—".to_string(),
+                    };
+                    let per_rank_str = f
+                        .slope_by_k_per_rank
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            if s.is_finite() {
+                                format!("r{}: {:+.3e}", i, s)
+                            } else {
+                                format!("r{}: —", i)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let per_rank_r2 = f
+                        .r2_by_k_per_rank
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            if v.is_finite() {
+                                format!("r{}: {:.3}", i, v)
+                            } else {
+                                format!("r{}: —", i)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let finite_slopes: Vec<f64> = f
+                        .slope_by_k_per_rank
+                        .iter()
+                        .copied()
+                        .filter(|s| s.is_finite() && s.abs() > 1e-12)
+                        .collect();
+                    let (ratio_str, ok_str) = if finite_slopes.len() >= 2 {
+                        let max_abs = finite_slopes.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
+                        let min_abs = finite_slopes
+                            .iter()
+                            .map(|s| s.abs())
+                            .fold(f64::INFINITY, f64::min);
+                        let ratio = max_abs / min_abs;
+                        let ok = ratio <= 2.0;
+                        (
+                            format!("{:.2}×", ratio),
+                            if ok { "✓" } else { "⚠ framing breaking" }.to_string(),
+                        )
+                    } else {
+                        ("—".to_string(), "—".to_string())
+                    };
+                    let _ = writeln!(
+                        md,
+                        "| {} | {} | {:.2e} | {} | {} | {} | {} | {} | {} |",
+                        model,
+                        r.mode,
+                        f.lr,
+                        label,
+                        meta_slope,
+                        per_rank_str,
+                        per_rank_r2,
+                        ratio_str,
+                        ok_str,
                     );
                 }
             }

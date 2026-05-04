@@ -434,6 +434,28 @@ pub struct DdpRunConfig {
     /// the periodic loosen → drift → tighten → recover cycle adds an
     /// implicit regularizer to the optimizer's gradient-averaging schedule.
     pub elche_relax_up: bool,
+    /// EASGD elastic averaging weight (0.0 < α ≤ 1.0). Default: `None`
+    /// (current behavior: full overwrite of local params with averaged
+    /// consensus, equivalent to α=1.0).
+    ///
+    /// When set to a value in `(0, 1)`, the cpu-async load_averaged path
+    /// applies an elastic blend instead of full overwrite:
+    ///
+    /// ```text
+    /// W_local := (1 − α) · W_local + α · W_avg
+    /// ```
+    ///
+    /// Preserves the local progress made between snapshot-time and
+    /// averaging-completion (the "ahead-of-sync drift" that current
+    /// cpu-async discards). Reference: Zhang, Choromanska, LeCun 2015,
+    /// "Deep learning with Elastic Averaging SGD," NeurIPS 2015
+    /// (<https://arxiv.org/abs/1412.6651>).
+    ///
+    /// Honored on the cpu-async path only (`AverageBackend::Cpu` +
+    /// `ApplyPolicy::Async`). NCCL paths use in-place AllReduce(Avg) and
+    /// have no equivalent overwrite step. Values outside `(0, 1]` are
+    /// rejected at config time.
+    pub easgd_alpha: Option<f64>,
 }
 
 impl Default for DdpRunConfig {
@@ -461,6 +483,7 @@ impl DdpRunConfig {
             max_overshoot: None,
             lr_scale_ratio: 1.0,
             elche_relax_up: false,
+            easgd_alpha: None,
         }
     }
 
@@ -593,6 +616,21 @@ impl DdpRunConfig {
     /// alone, matching pre-relax-up behavior.
     pub fn with_elche_relax_up(mut self, enabled: bool) -> Self {
         self.elche_relax_up = enabled;
+        self
+    }
+
+    /// Set the EASGD elastic averaging weight α. Must be in `(0, 1]`.
+    /// `None` (default) is full overwrite (equivalent to α=1.0 with the
+    /// fast copy_ path). Values in `(0, 1)` enable elastic blending on
+    /// the cpu-async path; α=1.0 also enables blending but is functionally
+    /// identical to the overwrite default. See `easgd_alpha` field docs
+    /// for the formula and reference.
+    pub fn with_easgd_alpha(mut self, alpha: f64) -> Self {
+        assert!(
+            alpha > 0.0 && alpha <= 1.0,
+            "easgd_alpha must be in (0, 1], got {alpha}"
+        );
+        self.easgd_alpha = Some(alpha);
         self
     }
 }
@@ -812,6 +850,12 @@ pub struct WorkerConfig {
     pub seed: u64,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,
+    /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
+    /// local params with averaged consensus on the cpu-async path (current
+    /// behavior). When set, [`super::worker::GpuWorker::load_averaged`]
+    /// blends `W_local := (1-α)·W_local + α·W_avg` instead. See
+    /// [`DdpRunConfig::easgd_alpha`] for details.
+    pub easgd_alpha: Option<f64>,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
     /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:
