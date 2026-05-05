@@ -107,6 +107,30 @@ struct Cli {
     #[option]
     elche_relax_up: bool,
 
+    /// Override ElChe's anchor upper bound (`max_anchor`, library default
+    /// 200). When set, passed to `DdpBuilder::max_anchor(N)`. Used by
+    /// Sweep C of the MSF cadence-control program to bracket the
+    /// Pecora-Carroll synchronization threshold by walking the cap across
+    /// multiples of the default (e.g. 200, 300, 400, 800).
+    ///
+    /// Honored in Cadence/Async modes only; ignored by Sync and solo modes.
+    #[option]
+    max_anchor: Option<usize>,
+
+    /// Override ElChe's anchor lower bound (`min_anchor`, defaults to the
+    /// initial anchor). Forces the overhead auto-tune above its natural
+    /// equilibrium. Combined with `--max-anchor N` (same value) plus
+    /// `--guard none`, pins the cadence at exactly N batches per cycle —
+    /// the fixed-k probe used by Sweep B of the MSF cadence-control
+    /// program to walk past the auto-tune's preferred operating point and
+    /// locate the synchronization threshold k*(LR). The convergence
+    /// guard's `NudgeDown` is the only path that bypasses `min_anchor`;
+    /// disabling it via `--guard none` is sufficient for hard pinning.
+    ///
+    /// Honored in Cadence/Async modes only; ignored by Sync and solo modes.
+    #[option]
+    min_anchor: Option<usize>,
+
     /// EASGD elastic averaging weight α (must be in `(0, 1]` when set).
     ///
     /// When set, the cpu-async `load_averaged` path blends
@@ -549,6 +573,8 @@ fn run() -> flodl::tensor::Result<()> {
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
                 elche_relax_up: cli.elche_relax_up,
+                max_anchor: cli.max_anchor,
+                min_anchor: cli.min_anchor,
                 easgd_alpha: cli.easgd_alpha,
                 per_epoch_eval: cli.per_epoch_eval,
                 guard: guard_choice.clone(),

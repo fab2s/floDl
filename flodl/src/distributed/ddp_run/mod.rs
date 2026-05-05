@@ -354,6 +354,16 @@ pub struct DdpRunConfig {
     pub overhead_target: Option<f64>,
     /// Maximum anchor count (gradient staleness limit). Default: 200.
     pub max_anchor: Option<usize>,
+    /// Minimum anchor count (auto-tune floor). Default: equals the
+    /// initial anchor (so the auto-tune cannot shrink below the start
+    /// value). Set explicitly to force the auto-tune above its natural
+    /// overhead-equilibrium setpoint, or together with `max_anchor` to
+    /// pin the anchor at a fixed cadence (`min == max`).
+    ///
+    /// Note: the convergence guard's `NudgeDown` action is the only
+    /// path that bypasses this floor (treated as a stronger signal than
+    /// overhead). Use `with_convergence_guard(NoGuard)` for hard pinning.
+    pub min_anchor: Option<usize>,
     /// Initial ElChe anchor (batches before first sync). Default: 10.
     pub anchor: Option<usize>,
     /// Divergence threshold for the trend guardrail. Default: 0.05.
@@ -470,6 +480,7 @@ impl DdpRunConfig {
         DdpRunConfig {
             overhead_target: None,
             max_anchor: None,
+            min_anchor: None,
             anchor: None,
             divergence_threshold: None,
             no_divergence_guard: false,
@@ -496,6 +507,19 @@ impl DdpRunConfig {
     /// Set the maximum anchor count.
     pub fn with_max_anchor(mut self, max: usize) -> Self {
         self.max_anchor = Some(max);
+        self
+    }
+
+    /// Set the minimum anchor count (auto-tune floor).
+    ///
+    /// Forces the overhead auto-tune above its natural equilibrium. Combined
+    /// with `with_max_anchor(min)` (same value), pins the anchor at a fixed
+    /// cadence — useful for fixed-k experiments. The convergence guard and
+    /// divergence nudge-down paths BYPASS this floor; pair with
+    /// `with_convergence_guard(NoGuard)` + `with_no_divergence_guard()` for
+    /// truly hard pinning.
+    pub fn with_min_anchor(mut self, min: usize) -> Self {
+        self.min_anchor = Some(min);
         self
     }
 

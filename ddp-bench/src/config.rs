@@ -148,6 +148,17 @@ pub struct RunConfig {
     /// When true, passed as `DdpBuilder::elche_relax_up(true)`. Default
     /// false (relax-up disabled, anchor under overhead-based auto-tune only).
     pub elche_relax_up: bool,
+    /// Override ElChe's `max_anchor` (anchor upper bound, default 200).
+    /// Used by Sweep C to bracket the Pecora-Carroll synchronization
+    /// threshold by walking k_max across multiples of the default. `None`
+    /// preserves library default.
+    pub max_anchor: Option<usize>,
+    /// Override ElChe's `min_anchor` (anchor lower bound, defaults to the
+    /// initial anchor). Forces the overhead auto-tune above its natural
+    /// equilibrium. Pair with `max_anchor` set to the same value plus
+    /// `guard=NoGuard` to pin the cadence at exactly N batches per cycle
+    /// (Sweep B fixed-k probe). `None` preserves library default.
+    pub min_anchor: Option<usize>,
     /// EASGD elastic averaging weight α. When `Some`, the cpu-async
     /// `load_averaged` path blends `W_local := (1-α)·W_local + α·W_avg`
     /// instead of full overwrite. `None` preserves current behavior.

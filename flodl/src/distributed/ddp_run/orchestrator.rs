@@ -280,6 +280,9 @@ impl DdpHandle {
         if let Some(max) = config.max_anchor {
             el_che = el_che.with_max_anchor(max);
         }
+        if let Some(min) = config.min_anchor {
+            el_che = el_che.with_min_anchor(min);
+        }
         if let Some(diff) = config.max_batch_diff {
             el_che = el_che.with_max_batch_diff(diff);
         }
@@ -1086,6 +1089,9 @@ impl DdpHandle {
         if let Some(max) = config.max_anchor {
             meta["max_anchor"] = serde_json::json!(max);
         }
+        if let Some(min) = config.min_anchor {
+            meta["min_anchor"] = serde_json::json!(min);
+        }
         if let Some(diff) = config.max_batch_diff {
             meta["max_batch_diff"] = serde_json::json!(diff);
         }
@@ -1205,6 +1211,16 @@ where
     /// Set the maximum anchor count.
     pub fn max_anchor(mut self, max: usize) -> Self {
         self.config = self.config.with_max_anchor(max);
+        self
+    }
+
+    /// Set the minimum anchor count (auto-tune floor).
+    ///
+    /// Combined with `max_anchor(min)` (same value) plus
+    /// [`Self::convergence_guard`] = `NoGuard` and
+    /// [`Self::no_divergence_guard`], pins the anchor at a fixed cadence.
+    pub fn min_anchor(mut self, min: usize) -> Self {
+        self.config = self.config.with_min_anchor(min);
         self
     }
 

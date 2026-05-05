@@ -531,6 +531,14 @@ fn run_unified(
         builder = builder.elche_relax_up(true);
     }
 
+    if let Some(max) = config.max_anchor {
+        builder = builder.max_anchor(max);
+    }
+
+    if let Some(min) = config.min_anchor {
+        builder = builder.min_anchor(min);
+    }
+
     if let Some(alpha) = config.easgd_alpha {
         builder = builder.easgd_alpha(alpha);
     }

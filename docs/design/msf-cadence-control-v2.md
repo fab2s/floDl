@@ -283,6 +283,123 @@ training. We do not expect this to be the headline result.
 
 ---
 
+## Phase 2 verdict (Sweep A landed 2026-05-05)
+
+The 4-cell experiment (5 seeds × 2 guards × {default, relaxed} anchor)
+landed cleanly. Sweep ran 6h51m, 12/12 OK, 0 FAIL. Cells map onto a
+Pecora-Carroll proximity gradient that correlates with eval AND with
+framing-validity gate firing — empirical confirmation of the v2
+two-scale framing.
+
+### Headline 4-cell table
+
+| Cell | Eval (mean ± sd, N=5) | Sync count | Cross-rank r̄ | Per-rank ratio (warmup) | Gates ✓ |
+|---|---|---|---|---|---|
+| trend default | 91.71% ± 0.21 | 539 ± 205 | 0.993 | 1.04 ± 0.02 | 5/5 |
+| trend relaxed | 91.74% ± 0.07 | 402 ± 160 | 0.981 | 1.04 ± 0.04 | 5/5 |
+| msf default | 91.83% ± 0.20 | 882 ± 299 | 0.993 | 1.05 ± 0.02 | 5/5 |
+| **msf relaxed** | **91.95% ± 0.32** | **641 ± 162** | **0.981** | **2.07 ± 1.19** | **3/5** |
+
+**Eval optimum sits at the noisiest framing-gate corner.** The msf
+relaxed cell beats trend default by +0.24pp and msf default by +0.12pp,
+while having 2/5 framing-gate violations. This is the Pecora-Carroll
+prediction made concrete: optimal coupling sits at the edge of the
+synchronized regime.
+
+### Within-cycle Lyapunov is a property of the system, not the guard
+
+| Cell | Slope | R²(by-k) |
+|---|---|---|
+| trend default | +1.45e-3 ± 1.94e-4 | 0.737 ± 0.070 |
+| msf default | +1.47e-3 ± 5.25e-5 | 0.752 ± 0.053 |
+
+Match within 1% on slope, 2pp on R². The msf guard's smoothing only
+tightens the sd; it doesn't change what's measured. R1' is the same
+underlying physics regardless of guard choice.
+
+### Heterogeneous decoupling pattern
+
+Cross-rank Pearson r drop under relax-up is asymmetric:
+
+| Pair | Default | Relaxed | Δ |
+|---|---|---|---|
+| rank 0 ↔ rank 1 (fast↔slow) | +0.9927 | +0.9814 | −0.011 |
+| rank 0 ↔ rank 2 (fast↔slow) | +0.9932 | +0.9811 | −0.012 |
+| rank 1 ↔ rank 2 (slow↔slow) | +0.9962 | +0.9962 | **0.000** |
+
+The fast GPU (rank 0, RTX 5060 Ti) decouples; the slow GPUs (1060s)
+stay perfectly locked. Hardware heterogeneity dictates the
+decoupling-direction structure: rank 0 has the largest batch share,
+runs farthest ahead between syncs, drifts most when cadence loosens.
+Slow GPUs are pinned together — both anchored to the same plodding
+pace.
+
+This is a publishable empirical fact about heterogeneous-DDP
+synchronization that has no homogeneous-cluster analog. The HetSeq
+framing (mixed-GPU university clusters) is exactly the regime where
+this matters.
+
+### Critical mechanism — guard silence breaks relax-up
+
+| Cell | Trend-rule fires/run | MSF-rule fires/run |
+|---|---|---|
+| msf default | 54.5 ± 7.9 | 1.0 ± 1.4 |
+| msf relaxed | 80.4 ± 17.2 | **0.0 ± 0.0** |
+
+**The MSF guard never fires across all 5 relaxed-anchor seeds.**
+Mechanism: ElChe's anchor relax-up grows cadence on every "Stable"
+verdict; with MSF silent, every verdict is Stable, anchor grows
+unbounded, cycles get very long, cycles saturate to D*(LR) before sync,
+R² collapses, framing breaks at 2/5 seeds.
+
+trend-relaxed avoids this because trend fires 80×/run, keeping ElChe
+from growing the anchor too aggressively. The alarm cadence is what
+bounds the anchor.
+
+**Implication for production**: a threshold-aware controller (C5')
+that targets `μ·k*(LR)` directly is required for safe deployment.
+Silence ≠ stability; the relax-up policy currently composes badly with
+a quiet guard. v1's "loose by default" intuition fails when the safety
+mechanism never reports.
+
+### EASGD smoke (single seed, cpu-async α=0.5)
+
+Side experiment validates the Zhang/Choromanska/LeCun 2015 elastic
+blending fix at one seed:
+
+| Cell | Eval (seed 0) | R²(by-k) | Per-rank ratio | Sync count |
+|---|---|---|---|---|
+| cpu-async α=1.0 trend (current) | 92.18% | (impulsive coupling broken) | | 812 |
+| cpu-async α=1.0 msf (current) | 91.91% | (same) | | 617 |
+| cpu-async α=0.5 trend (EASGD) | 91.39% | 0.86–0.89 | 1.05× | 726 |
+| **cpu-async α=0.5 msf (EASGD)** | **91.91%** | **0.92–0.94** | **1.04×** | **408** |
+
+EASGD blending fixes impulsive coupling AND tightens framing beyond
+the default-anchor nccl-async R² baseline (0.74). The msf+α=0.5 cell
+matches the α=1.0 baseline at seed 0 (91.91% vs 91.91%) with **34%
+fewer syncs** and the cleanest cross-rank coupling we've measured.
+
+trend at α=0.5 loses 0.79pp — the impulsive-coupling perturbation
+breaks trend's "3 rises in D" detector, but msf's λ_ema smoothing
+rides through it. This is independent evidence for R5' (top-scale
+smoothing is the right detector level).
+
+Single-seed only. Multi-seed α-sweep is justified.
+
+### Phase 2 verdict against R1'–R5'
+
+| Hypothesis | Result |
+|---|---|
+| R1' within-cycle exponential | **confirmed** at warmup (R² 0.74–0.75 across both default-anchor guards, slopes match within 1%). Mid-LR and late-training are OU-saturated as predicted (R² < 0.3 universally). |
+| R2' phase-dependent setpoint D*(LR) | **inferred** from saturation pattern; quantitative fit pending Sweep D. |
+| R3' by-k controller A/B | **untested in Sweep A** (still on v1's λ̂); pending C1' implementation + Sweep E. |
+| R4' Pecora-Carroll threshold proximity | **partially confirmed** — proximity gradient observed; quantitative threshold pending Sweep C. |
+| R5' meta-CUSUM | **partially supported** — λ_ema smoothing demonstrably more robust than 3-rises rule (0 false fires under EASGD perturbation that trend can't survive). Full CUSUM detector still pending implementation. |
+
+**No kill criterion triggered.** Phase 2 advances to Phase 3.
+
+---
+
 ## Refined hypotheses
 
 ### R1' — within-cycle exponential growth on by-k axis
@@ -341,6 +458,11 @@ and cause divergence.
 cadence bound (`k_max`) across orders of magnitude; observe where
 accuracy degrades and sync count saturates. The threshold sits where
 these two regimes meet.
+
+**Status (2026-05-05).** Phase 2 sweep landed. Proximity gradient
+empirically observed across 4 cells (see Phase 2 verdict section below).
+Threshold not yet quantitatively localized — Sweep C is the natural
+follow-up.
 
 **Why this matters.** This is the literal Pecora-Carroll experiment in
 DDP form. If the threshold can be located, the paper has a quantitative
@@ -675,6 +797,118 @@ v2 adds and reframes the following:
 
 The v1 doc remains the historical reference; v2 supersedes it for the
 go-forward research program.
+
+---
+
+## Reproducibility — artifact pointers
+
+Every empirical claim in this document maps to a specific run directory
+and analysis script. Co-located rather than gathered, but tracked here
+so any number in the doc can be traced to its source.
+
+### Phase 1 (passive observation, 2026-05-04)
+
+- **Sweep base:** `ddp-bench/runs/overnight-2026-05-04/`
+- **Run script:** `ddp-bench/runs/overnight-2026-05-04/run.sh` (21 runs:
+  1 validation + 5 seeds × 2 modes × 2 guards). Note: this script has
+  the relative-path doubling bug that produced
+  `ddp-bench/ddp-bench/runs/...` artifacts; fixed in-place 2026-05-04
+  afternoon by `mv`'ing into the correct layout.
+- **Per-seed reports:** `runs/overnight-2026-05-04/seed-*/report.md`
+  (regenerated 2026-05-05 morning to add by-k columns and per-rank
+  consistency check from step 1 of the v2 plan).
+- **Per-seed timeline data:** `runs/overnight-2026-05-04/seed-*/resnet-graph/<mode>/timeline.{csv,json,html}`
+  + `training.log` + `run.stdout.log`.
+- **Aggregation scripts:**
+  - `aggregate_phase1_v1.py` — original 5-seed verdict (eval, R1
+    cumulative-step OLS, guard fires, kill-criterion correlations).
+    First pass before by-k axis correction.
+  - `aggregate_phase1_v2_byk.py` — second pass after by-k axis added
+    to the analyzer, includes the post-transient subwindow split.
+  - `aggregate_phase1_byk_only.py` — focused by-k analysis for the
+    Phase 1 reframing.
+- **Key numbers anchored here**: cross-rank Pearson r > 0.99 across
+  all seeds (meta-oscillator anchor), R1 cumulative-step R² 0.49 ± 0.11
+  (failed), R1 by-k R² 0.69 ± 0.05 (succeeds at warmup), within-cycle
+  λ_T = +1.46e-3 ± 5.25e-5 ln(D)/step (warmup), MSF guard fires
+  1.0 ± 1.4 vs trend 54.5 ± 7.9.
+
+### Phase 2 (Sweep A relaxed-anchor + EASGD smoke, 2026-05-05)
+
+- **Sweep base:** `ddp-bench/runs/overnight-2026-05-05-relaxed-easgd/`
+- **Run script:** `runs/overnight-2026-05-05-relaxed-easgd/run.sh`
+  (12 runs: 10 nccl-async × `--elche-relax-up` × 5 seeds × 2 guards
+  + 2 cpu-async × `--easgd-alpha 0.5` × seed 0 × 2 guards). Uses
+  `fdl cuda-shell -- -c "..."` pattern to bypass the fdl-preset
+  clobber. Output paths stripped of `ddp-bench/` prefix to avoid the
+  2026-05-04 doubling bug.
+- **Run log:** `runs/overnight-2026-05-05-relaxed-easgd/_runlog.txt`
+  (sweep started 2026-05-04T18:43:33Z, completed 2026-05-05T01:34:14Z,
+  6h51m total).
+- **Per-seed reports + timeline:** same shape as Phase 1.
+- **Aggregation script:** `runs/overnight-2026-05-05-relaxed-easgd/aggregate.py`
+  — the 4-cell aggregator that produced the Phase 2 verdict table.
+  Compares Phase 1 default-anchor against Phase 2 relaxed-anchor.
+  Outputs eval mean/sd/range, sync counts, cross-rank Pearson r per
+  pair, R1 by-k slopes + R² + per-rank ratios + gates per LR window,
+  guard fire counts.
+- **Key numbers anchored here**: 4-cell eval ordering (trend default
+  91.71% → trend relaxed 91.74% → msf default 91.83% → msf relaxed
+  91.95%), proximity gradient via per-rank ratio (1.04 → 1.04 → 1.05
+  → 2.07), MSF guard 0/5 fires under relax-up, cpu-async α=0.5 + msf
+  R² 0.92–0.94 (best framing observed), 34% sync reduction at
+  α=0.5+msf vs α=1.0+msf.
+
+### Code state at Phase 2
+
+Tree `321a401` on `ddp-scale` branch with two uncommitted change
+families:
+
+- **Step 1 (analyzer scale labels + per-rank by-k consistency
+  check):**
+  - `ddp-bench/src/analyze.rs`: `MsfLrWindowFit` + `LrWindowSamples`
+    extended with per-rank by-k fields and pts_per_rank capture in
+    `collect_lr_window_samples`. Per-rank OLS in `fit_samples`.
+  - `ddp-bench/src/report.rs`: MSF section intro rewritten with
+    two-scale framing convention. All 8 subsection headings tagged
+    with scale. New `### R1' per-rank by-k slopes` subsection with
+    framing-validity gate (warns when max/min per-rank slope ratio
+    > 2×).
+- **Step 2 (EASGD elastic blending):**
+  - `flodl/src/distributed/ddp_run/mod.rs`: `DdpRunConfig.easgd_alpha:
+    Option<f64>` field + `with_easgd_alpha(α)` builder method
+    (asserts α ∈ (0, 1]). Same field on `WorkerConfig` for plumbing.
+  - `flodl/src/distributed/ddp_run/orchestrator.rs`:
+    `DdpBuilder::easgd_alpha(α)` method, two `WorkerConfig`
+    construction sites updated.
+  - `flodl/src/distributed/ddp_run/worker.rs`: `GpuWorker.easgd_alpha`
+    field + two-path `load_averaged()` (None → fast non-blocking
+    `copy_`; Some(α) → stage averaged params on GPU then batched
+    `Tensor::foreach_lerp_scalar_` for in-place blend).
+  - `flodl/src/distributed/ddp_run/tests.rs`: 2 test `WorkerConfig`
+    literals updated with `easgd_alpha: None`.
+  - `ddp-bench/src/main.rs`: `Cli.easgd_alpha: Option<f64>` field +
+    Zhang/Choromanska/LeCun 2015 doc-comment.
+  - `ddp-bench/src/config.rs`: `RunConfig.easgd_alpha` field.
+  - `ddp-bench/src/harness.rs`: builder wiring.
+
+Both change families pass `fdl cuda-clippy` clean and `fdl
+cuda-test-nccl` (12 tests pass).
+
+### Sweep names map to numbered phases
+
+| Sweep | Run dir | Phase |
+|---|---|---|
+| Phase 1 passive observation | `runs/overnight-2026-05-04/` | landed |
+| **Sweep A relaxed-anchor** | `runs/overnight-2026-05-05-relaxed-easgd/` | landed |
+| **EASGD smoke (in Sweep A)** | (same dir, seed-0-cpu-async-*-easgd05) | landed |
+| Sweep B fixed-k probe | (not yet run) | pending |
+| Sweep C threshold bracket | (not yet run) | pending |
+| Sweep D D*(LR) extended | (not yet run) | pending |
+| Sweep E controller A/B | (not yet run) | pending |
+
+When new sweeps land, append rows here with their run dir + key claims
+anchored.
 
 ---
 

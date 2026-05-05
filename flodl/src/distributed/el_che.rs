@@ -305,6 +305,33 @@ impl ElChe {
         self
     }
 
+    /// Set the minimum anchor count (overhead auto-tune floor).
+    ///
+    /// Default: equals the initial anchor (so the auto-tune cannot shrink
+    /// below the start value). Set explicitly to force the auto-tune above
+    /// its natural overhead-equilibrium setpoint, or together with
+    /// [`Self::with_max_anchor`] (same value) to pin the anchor at a fixed
+    /// cadence.
+    ///
+    /// Note: only the overhead auto-tune's shrink path honors this floor.
+    /// The convergence guard's `NudgeDown`, which routes through
+    /// [`Self::nudge_anchor_down`], bypasses it (treated as a stronger
+    /// signal than overhead). For hard pinning, also disable the
+    /// convergence guard at the
+    /// [`crate::distributed::ddp_run::DdpRunConfig`] level.
+    pub fn with_min_anchor(mut self, min: usize) -> Self {
+        self.min_anchor = min.max(1);
+        // Ensure min_anchor doesn't exceed max_anchor
+        if self.min_anchor > self.max_anchor {
+            self.min_anchor = self.max_anchor;
+        }
+        // Lift the current anchor up to the new floor if needed
+        if self.anchor < self.min_anchor {
+            self.anchor = self.min_anchor;
+        }
+        self
+    }
+
     /// Set the maximum batch difference between fastest and slowest worker.
     ///
     /// When the fastest worker leads the slowest by more than this many
