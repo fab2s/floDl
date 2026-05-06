@@ -452,7 +452,7 @@ fn write_missing_runs(md: &mut String, groups: &[(String, Vec<RunAnalysis>)], al
         let canon_epochs = runs.iter()
             .find(|r| r.mode == "solo-0")
             .map(|r| r.n_epochs)
-            .unwrap_or(0);
+            .unwrap_or_else(|| runs.iter().map(|r| r.n_epochs).max().unwrap_or(0));
 
         for mode in all_modes {
             if let Some(r) = runs.iter().find(|r| r.mode == *mode) {
@@ -491,7 +491,9 @@ fn write_best_mode(md: &mut String, groups: &[(String, Vec<RunAnalysis>)], refer
 
     for (model, runs) in groups {
         let solo0 = runs.iter().find(|r| r.mode == "solo-0");
-        let canon_epochs = solo0.map(|r| r.n_epochs).unwrap_or(0);
+        let canon_epochs = solo0
+            .map(|r| r.n_epochs)
+            .unwrap_or_else(|| runs.iter().map(|r| r.n_epochs).max().unwrap_or(0));
 
         // Filter to runs that completed the full epoch count.
         let full_runs: Vec<&RunAnalysis> = runs.iter()

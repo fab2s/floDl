@@ -1,0 +1,92 @@
+====================================================================================================
+ Summary — final eval (held-out test, 200 epochs), N=3 seeds per cell
+====================================================================================================
+     k  syncs    seed 0    seed 1    seed 2            mean ± sd   range  flag
+----------------------------------------------------------------------------------------------------
+  3200     13    91.76%    91.76%    91.28%     91.60% ±0.28    0.5pp  
+  6400      7    91.31%    91.39%    91.64%     91.45% ±0.17    0.3pp  
+ 12800      4    91.29%    91.37%    91.21%     91.29% ±0.08    0.2pp  
+ 16000      3    90.31%    89.32%    90.53%     90.05% ±0.64    1.2pp  
+ 25600      2    90.89%    55.80%    84.58%     77.09% ±18.71   35.1pp  BIMODAL
+ 51200      1    63.22%    10.02%    10.02%     27.75% ±30.72   53.2pp  BIMODAL
+
+ Adjacent-cell deltas — locates the cliff bracket:
+  transition               Δ mean eval                         verdict
+  k= 3200 → k= 6400       -0.15pp                               flat
+  k= 6400 → k=12800       -0.16pp                               flat
+  k=12800 → k=16000       -1.24pp                   soft drop (>1pp)
+  k=16000 → k=25600      -12.96pp                   soft drop (>1pp)
+  k=25600 → k=51200      -49.34pp                 *** CLIFF EDGE ***
+
+====================================================================================================
+ Cross-rank Pearson r per cell (gate fires if any single seed × pair < 0.95)
+====================================================================================================
+ Cells with too few sync events to compute r are listed as '—' (cliff cells: 1 sync only).
+
+     k    r01 (mean)    r02 (mean)    r12 (mean)      cell min  gate
+----------------------------------------------------------------------------------------------------
+  3200       +0.9926       +0.9876       +0.9986    +0.9659    ✓
+  6400       +0.9991       +0.9998       +0.9996    +0.9982    ✓
+ 12800       +0.9970       +0.9970       +0.9983    +0.9930    ✓
+ 16000       +0.9996       +0.9997       +0.9994    +0.9982    ✓
+ 25600       +1.0000       +1.0000       +1.0000    +1.0000    ✓
+ 51200       +1.0000       +1.0000       +1.0000    +1.0000    ✓
+
+ Per-seed Pearson minima (any single-seed pair < 0.95 fires the gate):
+      k      seed 0      seed 1      seed 2      cell min
+   3200     +0.9659     +0.9970     +0.9999       +0.9659
+   6400     +0.9982     +0.9997     +0.9994       +0.9982
+  12800     +0.9980     +0.9964     +0.9930       +0.9930
+  16000     +0.9982     +1.0000     +0.9992       +0.9982
+  25600     +1.0000     +1.0000     +1.0000       +1.0000
+  51200     +1.0000           —           —       +1.0000
+
+====================================================================================================
+ R1 by-k axis: log(D_mean) vs k_used per LR window — cross-seed N=3
+====================================================================================================
+ Note: the analyzer emits R1 only when an LR window has enough sync events for OLS
+ (≳4 events). At k=3200 the LR=0.3 window has 6 events and yields a fit; k≥6400
+ the within-cycle by-k axis is unobservable — itself the empirical signature of
+ crossing into the sparse-coupling regime.
+
+  LR=0.3:
+         k     meta slope (by-k)          R²    per-rank ratio   gates ✓
+      3200  -1.975e-04 ±1.43e-04  0.235 ±0.099     1.12 ± 0.10        3/3
+      6400  no data (cliff cells: too few syncs for OLS fit)
+     12800  no data (cliff cells: too few syncs for OLS fit)
+     16000  no data (cliff cells: too few syncs for OLS fit)
+     25600  no data (cliff cells: too few syncs for OLS fit)
+     51200  no data (cliff cells: too few syncs for OLS fit)
+
+  LR=0.03:
+         k     meta slope (by-k)          R²    per-rank ratio   gates ✓
+      3200  no data (cliff cells: too few syncs for OLS fit)
+      6400  no data (cliff cells: too few syncs for OLS fit)
+     12800  no data (cliff cells: too few syncs for OLS fit)
+     16000  no data (cliff cells: too few syncs for OLS fit)
+     25600  no data (cliff cells: too few syncs for OLS fit)
+     51200  no data (cliff cells: too few syncs for OLS fit)
+
+  LR=0.003:
+         k     meta slope (by-k)          R²    per-rank ratio   gates ✓
+      3200  no data (cliff cells: too few syncs for OLS fit)
+      6400  no data (cliff cells: too few syncs for OLS fit)
+     12800  no data (cliff cells: too few syncs for OLS fit)
+     16000  no data (cliff cells: too few syncs for OLS fit)
+     25600  no data (cliff cells: too few syncs for OLS fit)
+     51200  no data (cliff cells: too few syncs for OLS fit)
+
+====================================================================================================
+ CLIFF VERDICT
+====================================================================================================
+
+  ✓  k=51200 collapses (mean eval < 0.5)
+     mean = 27.75%
+  ✓  Cliff edge has bimodal cell (range > 30pp)
+     bimodal at k ∈ [25600, 51200]
+  ✓  Adjacent-cell hard drop (Δ > 30pp) present
+     k=25600→51200: -49.3pp
+  ✓  No eval peak above ElChe default (k=3200 wins safe regime)
+     monotone non-increasing
+
+Cliff localization: between k = 16000 (last fully safe) and k = 25600 (first bimodal).

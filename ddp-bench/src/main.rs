@@ -202,6 +202,21 @@ struct Cli {
     #[option]
     guard_alpha: Option<f64>,
 
+    /// Per-stage block count for `resnet-graph` (He et al. 2015 CIFAR family,
+    /// total depth = 6n+2). Default 3 = ResNet-20.
+    ///
+    /// Recognized depths with published Table 6 evals:
+    ///   n=3 → ResNet-20 (91.25%), n=5 → ResNet-32 (92.49%),
+    ///   n=7 → ResNet-44 (92.83%), n=9 → ResNet-56 (93.03%),
+    ///   n=18 → ResNet-110 (93.39%).
+    /// Other values build a depth-n variant with no published_eval (delta
+    /// reporting falls back to absolute eval only).
+    ///
+    /// Honored only when `--model resnet-graph` (or "all"); ignored by
+    /// other models.
+    #[option]
+    depth_n: Option<usize>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -334,6 +349,18 @@ fn run() -> flodl::tensor::Result<()> {
     // libtorch latches onto a device list, CUDA_VISIBLE_DEVICES is ignored.
     if let Some(spec) = cli.gpus.as_deref() {
         apply_gpu_selection(spec)?;
+    }
+
+    // ResNet depth-n MUST be set before model_defs are constructed below;
+    // `def()` reads the static to populate description / published_eval /
+    // reference for the selected variant.
+    if let Some(n) = cli.depth_n {
+        if n < 1 {
+            return Err(flodl::tensor::TensorError::new(
+                "--depth-n must be >= 1 (He et al. CIFAR family, depth = 6n+2)",
+            ));
+        }
+        models::resnet_graph::set_depth_n(n);
     }
 
     let partition_ratios = match cli.partition_ratios.as_deref() {

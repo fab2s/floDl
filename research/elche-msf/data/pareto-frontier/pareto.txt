@@ -1,0 +1,87 @@
+====================================================================================================
+ PARETO FRONTIER AGGREGATION — eval vs cost (syncs/200ep)
+====================================================================================================
+ Loaded 48 cells across 12 configurations.
+
+----------------------------------------------------------------------------------------------------
+ Per-config aggregate (sorted by mean sync count, ascending)
+----------------------------------------------------------------------------------------------------
+ config                             n     eval mean ± sd    syncs mean ± sd    wall (s) mean ± sd  status
+ ---------------------------------------------------------------------------------------------------
+ fixed k=51200                      3   27.75% ± 30.72            1 ±     1       1705.0 ±   3.6     FRONTIER
+ fixed k=25600                      3   77.09% ± 18.71            2 ±     0       1705.6 ±   4.5     FRONTIER
+ fixed k=16000                      3   90.05% ± 0.64            3 ±     0       1705.6 ±   3.7     FRONTIER
+ fixed k=12800                      3   91.29% ± 0.08            4 ±     1       1703.4 ±   8.5     FRONTIER
+ fixed k=6400                       3   91.45% ± 0.17            7 ±     0       1704.6 ±   2.6     FRONTIER
+ fixed k=3200                       3   91.60% ± 0.28           13 ±     1       1712.0 ±   8.7     FRONTIER
+ nccl-async relaxed trend           5   91.74% ± 0.07          402 ±   160       2016.7 ±  83.4     FRONTIER
+ nccl-async default trend           5   91.71% ± 0.21          539 ±   205       1947.7 ±  77.1     dominated by nccl-async relaxed trend
+ cpu-async default trend            5   91.75% ± 0.22          594 ±   162       1784.8 ±  86.8     FRONTIER
+ cpu-async default msf              5   91.67% ± 0.19          604 ±   154       1790.4 ±  84.6     dominated by nccl-async relaxed trend
+ nccl-async relaxed msf             5   91.95% ± 0.32          641 ±   162       1993.8 ±  58.1     FRONTIER
+ nccl-async default msf             5   91.83% ± 0.20          882 ±   299       1953.9 ±  74.1     dominated by nccl-async relaxed msf
+
+----------------------------------------------------------------------------------------------------
+ Pareto frontier (non-dominated configs, sorted by sync count)
+----------------------------------------------------------------------------------------------------
+  fixed k=51200                     eval = 27.75%  syncs =      1
+  fixed k=25600                     eval = 77.09%  syncs =      2
+  fixed k=16000                     eval = 90.05%  syncs =      3
+  fixed k=12800                     eval = 91.29%  syncs =      4
+  fixed k=6400                      eval = 91.45%  syncs =      7
+  fixed k=3200                      eval = 91.60%  syncs =     13
+  nccl-async relaxed trend          eval = 91.74%  syncs =    402
+  cpu-async default trend           eval = 91.75%  syncs =    594
+  nccl-async relaxed msf            eval = 91.95%  syncs =    641
+
+----------------------------------------------------------------------------------------------------
+ ASCII Pareto scatter (eval vs syncs, x is log-spaced)
+----------------------------------------------------------------------------------------------------
+   eval %
+    92.0 |                                                                       
+         |         F   F    F     F                                    F  xFF   x
+         |                                                                       
+         |                                                                       
+    76.4 |     F                                                                 
+         |                                                                       
+         |                                                                       
+         |                                                                       
+    60.8 |                                                                       
+         |                                                                       
+         |                                                                       
+         |                                                                       
+    45.1 |                                                                       
+         |                                                                       
+         |                                                                       
+         |                                                                       
+    29.5 |                                                                       
+         | F                                                                     
+         |                                                                       
+         |                                                                       
+    13.9 |                                                                       
+         |                                                                       
+          +----------------------------------------------------------------------
+           1             10            100           1000   syncs/200ep (log)
+  Legend: F = on Pareto frontier;  x = dominated configuration
+
+----------------------------------------------------------------------------------------------------
+ Writing matplotlib plot
+----------------------------------------------------------------------------------------------------
+ Wrote /home/peta/src/fab2s/ai/rdl/research/elche-msf/data/pareto-frontier/pareto.png
+ Wrote /home/peta/src/fab2s/ai/rdl/research/elche-msf/data/pareto-frontier/pareto-safe-zoom.png
+
+====================================================================================================
+ SUMMARY
+====================================================================================================
+ Configurations on frontier: 9
+ Configurations dominated:   3
+ Total cells loaded:         48
+ Cells missing on disk:      0
+
+ Production default verdict (ElChe default + msf):
+   eval = 91.83% ± 0.20, syncs = 882 ± 299
+   DOMINATED by: nccl-async relaxed msf
+
+ cpu-async default candidacy check (EASGD α=0.5 cohort):
+   cpu-async default msf: eval = 91.67%, syncs = 604  →  dominated by nccl-async relaxed trend
+   cpu-async default trend: eval = 91.75%, syncs = 594  →  FRONTIER

@@ -1,0 +1,35 @@
+2026-05-04T18:43:33Z  OVERNIGHT SWEEP START (relaxed-anchor + EASGD smoke)
+2026-05-04T18:43:33Z  tree: 321a401
+2026-05-04T18:43:33Z  branch: ddp-scale
+2026-05-04T18:43:33Z  uncommitted state: analyzer scale labels + EASGD blend
+2026-05-04T18:43:33Z  
+2026-05-04T18:43:33Z  primary: relaxed-anchor on nccl-async, 5 seeds × 2 guards
+2026-05-04T18:43:33Z  START  seed-0-nccl-async-trend-relaxed  seed=0 mode=nccl-async guard=trend extra='--elche-relax-up'
+2026-05-04T19:19:23Z  OK     seed-0-nccl-async-trend-relaxed  2150s  exit=0
+2026-05-04T19:19:23Z  START  seed-0-nccl-async-msf-relaxed  seed=0 mode=nccl-async guard=msf extra='--elche-relax-up'
+2026-05-04T19:55:07Z  OK     seed-0-nccl-async-msf-relaxed  2144s  exit=0
+2026-05-04T19:55:07Z  START  seed-1-nccl-async-trend-relaxed  seed=1 mode=nccl-async guard=trend extra='--elche-relax-up'
+2026-05-04T20:30:28Z  OK     seed-1-nccl-async-trend-relaxed  2121s  exit=0
+2026-05-04T20:30:28Z  START  seed-1-nccl-async-msf-relaxed  seed=1 mode=nccl-async guard=msf extra='--elche-relax-up'
+2026-05-04T21:04:51Z  OK     seed-1-nccl-async-msf-relaxed  2063s  exit=0
+2026-05-04T21:04:51Z  START  seed-2-nccl-async-trend-relaxed  seed=2 mode=nccl-async guard=trend extra='--elche-relax-up'
+2026-05-04T21:39:24Z  OK     seed-2-nccl-async-trend-relaxed  2073s  exit=0
+2026-05-04T21:39:24Z  START  seed-2-nccl-async-msf-relaxed  seed=2 mode=nccl-async guard=msf extra='--elche-relax-up'
+2026-05-04T22:13:12Z  OK     seed-2-nccl-async-msf-relaxed  2028s  exit=0
+2026-05-04T22:13:12Z  START  seed-3-nccl-async-trend-relaxed  seed=3 mode=nccl-async guard=trend extra='--elche-relax-up'
+2026-05-04T22:46:39Z  OK     seed-3-nccl-async-trend-relaxed  2007s  exit=0
+2026-05-04T22:46:39Z  START  seed-3-nccl-async-msf-relaxed  seed=3 mode=nccl-async guard=msf extra='--elche-relax-up'
+2026-05-04T23:20:22Z  OK     seed-3-nccl-async-msf-relaxed  2023s  exit=0
+2026-05-04T23:20:22Z  START  seed-4-nccl-async-trend-relaxed  seed=4 mode=nccl-async guard=trend extra='--elche-relax-up'
+2026-05-04T23:53:38Z  OK     seed-4-nccl-async-trend-relaxed  1996s  exit=0
+2026-05-04T23:53:38Z  START  seed-4-nccl-async-msf-relaxed  seed=4 mode=nccl-async guard=msf extra='--elche-relax-up'
+2026-05-05T00:27:16Z  OK     seed-4-nccl-async-msf-relaxed  2018s  exit=0
+2026-05-05T00:27:16Z  
+2026-05-05T00:27:16Z  EASGD smoke: cpu-async α=0.5, seed 0, 2 guards
+2026-05-05T00:27:16Z  START  seed-0-cpu-async-trend-easgd05  seed=0 mode=cpu-async guard=trend extra='--easgd-alpha 0.5'
+2026-05-05T01:00:45Z  OK     seed-0-cpu-async-trend-easgd05  2009s  exit=0
+2026-05-05T01:00:45Z  START  seed-0-cpu-async-msf-easgd05  seed=0 mode=cpu-async guard=msf extra='--easgd-alpha 0.5'
+2026-05-05T01:34:14Z  OK     seed-0-cpu-async-msf-easgd05  2009s  exit=0
+2026-05-05T01:34:14Z  
+2026-05-05T01:34:14Z  OVERNIGHT SWEEP DONE
+2026-05-05T01:34:14Z  Summary: 12 OK, 0 FAIL

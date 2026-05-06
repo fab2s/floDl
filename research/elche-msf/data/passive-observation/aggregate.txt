@@ -1,0 +1,47 @@
+==============================================================================
+MSF passive-observation — cross-seed verdict on nccl-async (N=5)
+==============================================================================
+
+--- R3: final eval (held-out test, 200 epochs)
+  msf:   91.83% ± 0.20  (range [91.58, 92.08])  N=5
+  trend: 91.71% ± 0.21  (range [91.55, 92.06])  N=5
+  Δ(msf−trend) = +0.11pp  (within seed range)
+
+--- Meta-oscillator anchor: cross-rank Pearson r(D)
+  rank0 ↔ rank1:  +0.9927 ± 0.0027  (range [+0.9896, +0.9959])
+  rank0 ↔ rank2:  +0.9932 ± 0.0036  (range [+0.9898, +0.9990])
+  rank1 ↔ rank2:  +0.9962 ± 0.0026  (range [+0.9933, +0.9984])
+
+--- R1: log(D) vs step OLS per LR window
+    (3 bases: D_max per-event, D_mean per-event, per-epoch d_mean)
+    Per-epoch d_mean is the meta-oscillator-aware basis (averages SGD intra-epoch variance).
+
+      LR                         window  N_seeds    R²(D_max)   R²(D_mean)    R²(epoch)
+     0.3                           0–99        5 0.474±0.115  0.490±0.114  0.442±0.266
+     0.3 1–99 (post-transient, skipped 1)        5 0.510±0.138  0.519±0.140  0.430±0.271
+    0.03                        100–148        1 0.002±0.000  0.004±0.000  0.196±0.000
+    0.03                        100–149        4 0.085±0.095  0.087±0.106  0.144±0.087
+   0.003                        149–199        1 0.011±0.000  0.013±0.000  0.011±0.000
+   0.003                        150–199        4 0.398±0.247  0.406±0.253  0.370±0.279
+
+--- R1 slopes (epoch d_mean basis, ln(D) per step)
+      LR                         window          slope (mean ± sd)
+     0.3                           0–99 +1.266e-05 ± 6.97e-06  (5/5 seeds positive)
+     0.3 1–99 (post-transient, skipped 1) +1.235e-05 ± 7.32e-06  (5/5 seeds positive)
+    0.03                        100–148 -1.282e-05 ± 0.00e+00  (0/1 seeds positive)
+    0.03                        100–149 +4.636e-06 ± 1.47e-05  (3/4 seeds positive)
+   0.003                        149–199 -2.938e-06 ± 0.00e+00  (0/1 seeds positive)
+   0.003                        150–199 -1.517e-06 ± 3.90e-05  (2/4 seeds positive)
+
+--- R5: guard fires per 200-epoch run
+  trend guard (3 rises in D): mean 54.5 ± 7.9  (range [43, 60])  N=4
+  MSF guard (λ_ema > 1e-3, sustain 3): mean 1.0 ± 1.4  (range [0, 3])
+  Reduction:  98.2% fewer false positives
+
+--- Kill criterion (predictive correlations)
+  r(λ_raw → ln D_{t+1})  [tests across-event proxy validity]
+    mean=+0.0056 ± 0.0095  range=[-0.0050, +0.0200]
+  r(λ_mean per epoch → eval)  [tests passive-observation success metric]
+    mean=+0.1604 ± 0.0527  range=[+0.0710, +0.2070]
+  r(λ_ema end-of-epoch → eval)
+    mean=+0.1252 ± 0.0941  range=[-0.0360, +0.1950]

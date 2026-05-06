@@ -1,0 +1,469 @@
+% References for elche-msf manuscript.
+% All entries verified against canonical venue records (DOI / arXiv /
+% OJS) on 2026-05-06.
+%
+% Organized by section. Sort within each section is alphabetical by
+% author to keep grep useful as the manuscript pulls citations.
+
+% =========================================================================
+% Synchronization theory (apparatus tradition the paper imports from)
+% =========================================================================
+
+@article{boccaletti2002synchronization,
+  author    = {Boccaletti, S. and Kurths, J. and Osipov, G. and
+               Valladares, D. L. and Zhou, C. S.},
+  title     = {The synchronization of chaotic systems},
+  journal   = {Physics Reports},
+  volume    = {366},
+  number    = {1--2},
+  pages     = {1--101},
+  year      = {2002},
+  doi       = {10.1016/S0370-1573(02)00137-0},
+  note      = {Comprehensive review of synchronization regimes
+               (phase, generalized, complete); covers the
+               chaotic-but-coupled regime that bottom-scale per-rank
+               dynamics inhabit.}
+}
+
+@article{pecora1990synchronization,
+  author    = {Pecora, Louis M. and Carroll, Thomas L.},
+  title     = {Synchronization in chaotic systems},
+  journal   = {Physical Review Letters},
+  volume    = {64},
+  number    = {8},
+  pages     = {821--824},
+  year      = {1990},
+  doi       = {10.1103/PhysRevLett.64.821},
+  note      = {Foundational paper introducing the Pecora-Carroll
+               synchronization framework. Original demonstration of
+               chaotic synchronization via subsystem coupling.}
+}
+
+@article{pecora1998master,
+  author    = {Pecora, Louis M. and Carroll, Thomas L.},
+  title     = {Master Stability Functions for Synchronized Coupled
+               Systems},
+  journal   = {Physical Review Letters},
+  volume    = {80},
+  number    = {10},
+  pages     = {2109--2112},
+  year      = {1998},
+  doi       = {10.1103/PhysRevLett.80.2109},
+  note      = {Master Stability Function (MSF) machinery: stability of
+               the synchronization manifold reduces to a transversal
+               eigenvalue problem. Discrete coupling-strength parameter
+               maps onto cadence $k$ in the DDP setting.}
+}
+
+% =========================================================================
+% Statistical change-detection methodology
+% =========================================================================
+
+@article{page1954continuous,
+  author    = {Page, E. S.},
+  title     = {Continuous Inspection Schemes},
+  journal   = {Biometrika},
+  volume    = {41},
+  number    = {1/2},
+  pages     = {100--115},
+  year      = {1954},
+  doi       = {10.1093/biomet/41.1-2.100},
+  note      = {Original CUSUM paper. Basis for the meta-CUSUM regime
+               detector (R5') in the v2 controller refinements.}
+}
+
+% =========================================================================
+% Optimization machinery cited directly
+% =========================================================================
+
+@inproceedings{stich2019local,
+  author    = {Stich, Sebastian U.},
+  title     = {Local {SGD} Converges Fast and Communicates Little},
+  booktitle = {International Conference on Learning Representations
+               (ICLR)},
+  year      = {2019},
+  eprint    = {1805.09767},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/1805.09767},
+  note      = {Foundational Local SGD convergence analysis. Proves
+               linear worker-speedup with $H = O(\sqrt{T/K})$
+               on convex problems. Subsequent Local SGD work
+               (DiLoCo / PALSGD / HALoS / QSR / Lau-Kolar) builds on
+               this framework.}
+}
+
+@inproceedings{zhang2015deep,
+  author    = {Zhang, Sixin and Choromanska, Anna E. and LeCun, Yann},
+  title     = {Deep learning with Elastic Averaging {SGD}},
+  booktitle = {Advances in Neural Information Processing Systems
+               (NeurIPS)},
+  volume    = {28},
+  pages     = {685--693},
+  year      = {2015},
+  eprint    = {1412.6651},
+  archivePrefix = {arXiv},
+  url       = {https://papers.nips.cc/paper_files/paper/2015/hash/d18f655c3fce66ca401d5f38b48c89af-Abstract.html},
+  note      = {Elastic blending fix:
+               $W_{\text{local}} \leftarrow (1-\alpha) W_{\text{local}}
+               + \alpha W_{\text{avg}}$ instead of full overwrite.
+               flodl exposes $\alpha$ on cpu-async via
+               \texttt{--easgd-alpha}.}
+}
+
+% =========================================================================
+% Architecture / dataset
+% =========================================================================
+
+@inproceedings{he2016deep,
+  author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and
+               Sun, Jian},
+  title     = {Deep Residual Learning for Image Recognition},
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision
+               and Pattern Recognition (CVPR)},
+  pages     = {770--778},
+  year      = {2016},
+  eprint    = {1512.03385},
+  archivePrefix = {arXiv},
+  doi       = {10.1109/CVPR.2016.90},
+  note      = {ResNet. CIFAR-10 baselines (Table 6, $n$-block per stage,
+               total depth = $6n+2$): ResNet-20 91.25\%, ResNet-32
+               92.49\%, ResNet-44 92.83\%, ResNet-56 93.03\%, ResNet-110
+               93.39\%. Source for the $n=3$ vs $n=9$ comparison in the
+               bytes-axis Gate D.}
+}
+
+% =========================================================================
+% Heterogeneous DDP — prior systems
+% =========================================================================
+
+@inproceedings{ding2021hetseq,
+  author    = {Ding, Yifan and Botzer, Nicholas and Weninger, Tim},
+  title     = {{HetSeq}: Distributed {GPU} Training on Heterogeneous
+               Infrastructure},
+  booktitle = {Proceedings of the AAAI Conference on Artificial
+               Intelligence (Innovative Applications of AI track)},
+  volume    = {35},
+  number    = {17},
+  pages     = {15432--15438},
+  year      = {2021},
+  eprint    = {2009.14783},
+  archivePrefix = {arXiv},
+  url       = {https://ojs.aaai.org/index.php/AAAI/article/view/17813},
+  note      = {2-way step-sync heterogeneous DDP via per-device batch
+               sizing + weighted-loss aggregation on top of unmodified
+               PyTorch DDP AllReduce. Reports 5.94$\times$ speedup on
+               BERT at 8 heterogeneous nodes; expansion decays to 0.60
+               on translation with BLEU regression $25.09 \to 18.74$.}
+}
+
+@inproceedings{nie2024cannikin,
+  author    = {Nie, Chengyi and Maghakian, Jessica and Liu, Zhenhua},
+  title     = {{Cannikin}: Optimal Adaptive Distributed {DNN} Training
+               over Heterogeneous Clusters},
+  booktitle = {Proceedings of the 25th International Middleware
+               Conference (Middleware '24)},
+  year      = {2024},
+  eprint    = {2402.05302},
+  archivePrefix = {arXiv},
+  doi       = {10.1145/3652892.3700767},
+  note      = {Stony Brook University. Closed-form per-machine batch
+               sizing + gradient-noise-scale-weighted aggregation;
+               52--85\% speedup over baselines; step-synchronous.
+               arXiv preprint title differs from the published
+               version: ``Training DNN Models over Heterogeneous
+               Clusters with Optimal Performance.''}
+}
+
+@inproceedings{guo2025cephalo,
+  author    = {Guo, Runsheng Benson and Anand, Utkarsh and
+               Chen, Arthur and Daudjee, Khuzaima},
+  title     = {{Cephalo}: Harnessing Heterogeneous {GPU} Clusters for
+               Training Transformer Models},
+  booktitle = {Proceedings of the 39th ACM International Conference on
+               Supercomputing (ICS '25)},
+  year      = {2025},
+  eprint    = {2411.01075},
+  archivePrefix = {arXiv},
+  doi       = {10.1145/3721145.3730418},
+  note      = {Decouples compute distribution from training-state
+               assignment; 10$\times$ speedup on 7B transformers across
+               64 GPUs. Conceptually closest to ElChe's uneven-anchor
+               framing, at a different control layer (plan synthesis).}
+}
+
+@inproceedings{mo2025fft,
+  author    = {Mo, Zizhao and Xu, Huanle and Lau, Wing Cheong},
+  title     = {Fast and Fair Training for Deep Learning in
+               Heterogeneous {GPU} Clusters ({FFT})},
+  booktitle = {Proceedings of the 39th ACM International Conference on
+               Supercomputing (ICS '25)},
+  year      = {2025},
+  doi       = {10.1145/3721145.3728488},
+  note      = {Cluster-level scheduler using Neely-style queueing-theory
+               Lyapunov-drift analysis. Note that the queueing-theory
+               ``Lyapunov function for scheduler fairness'' is distinct
+               from the dynamical-systems ``Lyapunov exponent for
+               transversal stability.''}
+}
+
+@inproceedings{um2024metis,
+  author    = {Um, Taegeon and Oh, Byungsoo and Kang, Minyoung and
+               Lee, Woo-Yeon and Kim, Goeun and Kim, Dongseob and
+               Kim, Youngtaek and Muzzammil, Mohd and Jeon, Myeongjae},
+  title     = {{Metis}: Fast Automatic Distributed Training on
+               Heterogeneous {GPUs}},
+  booktitle = {Proceedings of the 2024 USENIX Annual Technical
+               Conference (USENIX ATC '24)},
+  pages     = {563--578},
+  year      = {2024},
+  url       = {https://www.usenix.org/conference/atc24/presentation/um},
+  note      = {Holistic profiler + estimator + planner for
+               heterogeneous-cluster training plans;
+               1.05--8.43$\times$ speedup. Plan-synthesis axis.}
+}
+
+@inproceedings{ye2024asteroid,
+  author    = {Ye, Shengyuan and Zeng, Liekang and Chu, Xiaowen and
+               Xing, Guoliang and Chen, Xu},
+  title     = {{Asteroid}: Resource-Efficient Hybrid Pipeline
+               Parallelism for Collaborative {DNN} Training on
+               Heterogeneous Edge Devices},
+  booktitle = {Proceedings of the 30th Annual International Conference
+               on Mobile Computing and Networking (MobiCom '24)},
+  year      = {2024},
+  eprint    = {2408.08015},
+  archivePrefix = {arXiv},
+  doi       = {10.1145/3636534.3649363},
+  note      = {Hybrid pipeline parallelism with failure tolerance for
+               edge-device collaborative training. Different deployment
+               regime (edge), thematically aligned heterogeneity
+               handling.}
+}
+
+@inproceedings{yi2020heterog,
+  author    = {Yi, Xiaodong and Zhang, Shiwei and Luo, Ziyue and
+               Long, Guoping and Diao, Lansong and Wu, Chuan and
+               Zheng, Zhen and Yang, Jun and Lin, Wei},
+  title     = {Optimizing Distributed Training Deployment in
+               Heterogeneous {GPU} Clusters ({HeteroG})},
+  booktitle = {Proceedings of the 16th International Conference on
+               emerging Networking EXperiments and Technologies
+               (CoNEXT '20)},
+  year      = {2020},
+  doi       = {10.1145/3386367.3432728},
+  note      = {Foundational predecessor of the HAP / Cephalo plan-
+               synthesis lineage. TensorFlow graph transformation via
+               GNN + combinatorial optimization; 222\% speedup.}
+}
+
+@inproceedings{zhang2024hap,
+  author    = {Zhang, Shiwei and Diao, Lansong and Wu, Chuan and
+               Cao, Zongyan and Wang, Siyu and Lin, Wei},
+  title     = {{HAP}: {SPMD} {DNN} Training on Heterogeneous {GPU}
+               Clusters with Automated Program Synthesis},
+  booktitle = {Proceedings of the 19th European Conference on Computer
+               Systems (EuroSys '24)},
+  year      = {2024},
+  eprint    = {2401.05965},
+  archivePrefix = {arXiv},
+  doi       = {10.1145/3627703.3629580},
+  note      = {A* search + LP over SPMD tensor sharding; 2.41$\times$
+               speedup. Plan-compiler axis (HKU + Alibaba).}
+}
+
+@misc{hetccl2026,
+  author    = {{Anonymous}},
+  title     = {{HetCCL}: Accelerating {LLM} Training with Heterogeneous
+               {GPUs}},
+  howpublished = {arXiv preprint},
+  year      = {2026},
+  eprint    = {2601.22585},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2601.22585},
+  note      = {Cross-vendor (NVIDIA + AMD) LLM training. TACC
+               abstraction + capability-proportional batch sizing;
+               1.48--2.97$\times$ speedup. Author list anonymized in
+               preprint; verify before final submission.}
+}
+
+% =========================================================================
+% Local SGD lineage and adaptive-cadence cousins
+% =========================================================================
+
+@inproceedings{douillard2023diloco,
+  author    = {Douillard, Arthur and Feng, Qixuan and Rusu, Andrei A.
+               and Chhaparia, Rachita and Donchev, Yani and
+               Kuncoro, Adhiguna and Ranzato, Marc'Aurelio and
+               Szlam, Arthur and Shen, Jiajun},
+  title     = {{DiLoCo}: Distributed Low-Communication Training of
+               Language Models},
+  booktitle = {Workshop on Distributed Machine Learning at NeurIPS
+               2023 (continued in main-conference follow-ups)},
+  year      = {2023},
+  eprint    = {2311.08105},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2311.08105},
+  note      = {Local SGD variant (DeepMind). Inner AdamW + outer
+               Nesterov on pseudo-gradients; 500$\times$ less
+               communication at 8 workers with fully-synchronous
+               parity. $H$ is a fixed hyperparameter.}
+}
+
+@inproceedings{gu2024quadratic,
+  author    = {Gu, Xinran and Lyu, Kaifeng and Arora, Sanjeev},
+  title     = {A Quadratic Synchronization Rule for Distributed Deep
+               Learning ({QSR})},
+  booktitle = {International Conference on Learning Representations
+               (ICLR)},
+  year      = {2024},
+  eprint    = {2310.14423},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2310.14423},
+  note      = {SDE analysis near the manifold of minimizers derives
+               $H = \Theta(1/\eta^2)$ as an adaptive-cadence rule;
+               cadence is set by learning rate rather than by
+               online divergence measurement.}
+}
+
+@inproceedings{kim2025halos,
+  author    = {Kim, Geon-Woo and Li, Junbo and Gandham, Shashidhar and
+               Baldonado, Xavier and Gangidi, Adithya and
+               Balaji, Pavan and Wang, Zhangyang and Akella, Aditya},
+  title     = {{HALoS}: Hierarchical Asynchronous Local {SGD} over Slow
+               Networks for Geo-Distributed {LLM} Training},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2025},
+  eprint    = {2506.04531},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2506.04531},
+  note      = {Two-tier hierarchy (local + global parameter servers)
+               for geo-distributed LLM training. 7.5$\times$ over
+               sync, 2.1$\times$ over existing async; non-convex
+               convergence analysis.}
+}
+
+@misc{lau2024communication,
+  author    = {Lau, Tim Tsz-Kit and Li, Weijian and Xu, Chenwei and
+               Liu, Han and Kolar, Mladen},
+  title     = {Communication-Efficient Adaptive Batch Size Strategies
+               for Distributed Local Gradient Methods},
+  howpublished = {arXiv preprint},
+  year      = {2024},
+  eprint    = {2406.13936},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2406.13936},
+  note      = {Single-axis predecessor to the CPAL'25 paper. Variance-
+               norm test (Byrd-Chin-Nocedal) for per-worker batch-size
+               growth in homogeneous Local SGD. Adaptive control on
+               the orthogonal batch-size axis.}
+}
+
+@inproceedings{lau2025adaptive,
+  author    = {Lau, Tim Tsz-Kit and Li, Weijian and Xu, Chenwei and
+               Liu, Han and Kolar, Mladen},
+  title     = {Adaptive Batch Size Schedules for Distributed Training
+               of Language Models with Data and Model Parallelism},
+  booktitle = {Conference on Parsimony and Learning (CPAL)},
+  year      = {2025},
+  eprint    = {2412.21124},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2412.21124},
+  note      = {Generalizes the variance-norm batch-size test to
+               data + model parallelism; complementary control surface
+               to ElChe's adaptive cadence.}
+}
+
+@article{naganuma2025palsgd,
+  author    = {Naganuma, Hiroki and Zhang, Juntang and Yue, Zhaochen
+               and Mitliagkas, Ioannis and Witte, Philipp A. and
+               Hewett, Russell J. and Lee, Yin Tat},
+  title     = {Pseudo-Asynchronous Local {SGD} ({PALSGD})},
+  journal   = {Transactions on Machine Learning Research (TMLR)},
+  year      = {2025},
+  eprint    = {2504.18454},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2504.18454},
+  note      = {Probabilistic mixing with outdated global model:
+               18--24\% faster than DDP on ImageNet (ResNet-50) and
+               GPT-Neo testbeds. Cadence is stochastic rather than
+               feedback-driven.}
+}
+
+% =========================================================================
+% Nearest dynamical-systems-flavored framing
+% =========================================================================
+
+@inproceedings{benati2025lyapunov,
+  author    = {Benati, Matteo and Londei, Alessandro and
+               Lanzieri, Alessio and Loreto, Vittorio},
+  title     = {Lyapunov Learning at the Onset of Chaos},
+  booktitle = {Proceedings of the 3rd Workshop on High-dimensional
+               Learning Dynamics (HiLD), ICML 2025},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {267},
+  year      = {2025},
+  eprint    = {2506.12810},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2506.12810},
+  note      = {Single-machine Lyapunov regularizer on loss-landscape
+               dynamics. Sapienza / Sony CSL Roma / Complexity Science
+               Hub Vienna. Operates on the regularization axis rather
+               than on distributed-training cadence.}
+}
+
+@misc{muhebwa2025kuramoto,
+  author    = {Muhebwa, Aggrey and Selialia, Khotso and
+               Anwar, Abdulrahman and Osman, Mohammed},
+  title     = {Kuramoto-{FedAvg}: Coupled-Oscillator Federated
+               Averaging},
+  howpublished = {arXiv preprint},
+  year      = {2025},
+  eprint    = {2505.19605},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2505.19605},
+  note      = {Phase-angle weighting at FedAvg aggregation;
+               Kuramoto-flavored static weighting (not Kuramoto-
+               dynamical). Applies a synchronization-of-oscillators
+               lens at the aggregation step rather than to cadence
+               control.}
+}
+
+% =========================================================================
+% Apparatus / framing-foil background (introduction context only)
+% =========================================================================
+
+@article{zaqueros2023fuzzy,
+  author    = {Zaqueros-Martinez, Jessica and Rodriguez-Gomez, Gustavo
+               and Tlelo-Cuautle, Esteban and Orihuela-Espina, Felipe},
+  title     = {Fuzzy Synchronization of Chaotic Systems with Hidden
+               Attractors},
+  journal   = {Entropy},
+  volume    = {25},
+  number    = {3},
+  pages     = {495},
+  year      = {2023},
+  doi       = {10.3390/e25030495},
+  note      = {Synchronization of chaotic systems with hidden
+               attractors via Takagi-Sugeno fuzzy linearization +
+               LMI / PDC controller. Representative of the control-
+               engineering tradition of chaos synchronization
+               (LMI-eigenvalue guarantees on TS-linearized blends),
+               distinct from the physics tradition (Pecora-Carroll /
+               MSF / transversal Lyapunov).}
+}
+
+@misc{kesgin2023chaotic,
+  author    = {Kesgin, Bahad{\i}r Utku and Te{\u{g}}in, U{\u{g}}ur},
+  title     = {Machine Learning with Chaotic Strange Attractors},
+  howpublished = {arXiv preprint},
+  year      = {2023},
+  eprint    = {2309.13361},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2309.13361},
+  note      = {Analog reservoir computing on a physical Lorenz circuit;
+               chaos is constructed (Bayesian-tuned $\sigma / \beta /
+               \rho$) and the system collapses if those parameters are
+               wrong. Illustrates a control philosophy that constructs
+               the chaotic dynamics, complementary to approaches that
+               regulate divergence as it arises.}
+}

@@ -1,0 +1,50 @@
+2026-05-05T20:46:28Z  OVERNIGHT SWEEP START (cliff bracket — synchronization-collapse at 200ep)
+2026-05-05T20:46:28Z  tree: 0806f84
+2026-05-05T20:46:28Z  branch: ddp-scale
+2026-05-05T20:46:28Z  design: 3 seeds × 6 k values (3200, 6400, 12800, 16000, 25600, 51200) × --guard none × pinned anchor × 200 epochs
+2026-05-05T20:46:28Z  
+2026-05-05T20:46:28Z  k=3200
+2026-05-05T20:46:28Z  START  seed-0-fixed-k-3200  seed=0 k=3200
+2026-05-05T21:18:05Z  OK     seed-0-fixed-k-3200  1897s  exit=0
+2026-05-05T21:18:05Z  START  seed-1-fixed-k-3200  seed=1 k=3200
+2026-05-05T21:49:41Z  OK     seed-1-fixed-k-3200  1896s  exit=0
+2026-05-05T21:49:41Z  START  seed-2-fixed-k-3200  seed=2 k=3200
+2026-05-05T22:21:30Z  OK     seed-2-fixed-k-3200  1909s  exit=0
+2026-05-05T22:21:30Z  k=6400
+2026-05-05T22:21:30Z  START  seed-0-fixed-k-6400  seed=0 k=6400
+2026-05-05T22:53:04Z  OK     seed-0-fixed-k-6400  1894s  exit=0
+2026-05-05T22:53:04Z  START  seed-1-fixed-k-6400  seed=1 k=6400
+2026-05-05T23:24:43Z  OK     seed-1-fixed-k-6400  1899s  exit=0
+2026-05-05T23:24:43Z  START  seed-2-fixed-k-6400  seed=2 k=6400
+2026-05-05T23:56:24Z  OK     seed-2-fixed-k-6400  1901s  exit=0
+2026-05-05T23:56:24Z  k=12800
+2026-05-05T23:56:24Z  START  seed-0-fixed-k-12800  seed=0 k=12800
+2026-05-06T00:27:50Z  OK     seed-0-fixed-k-12800  1886s  exit=0
+2026-05-06T00:27:50Z  START  seed-1-fixed-k-12800  seed=1 k=12800
+2026-05-06T00:59:31Z  OK     seed-1-fixed-k-12800  1901s  exit=0
+2026-05-06T00:59:31Z  START  seed-2-fixed-k-12800  seed=2 k=12800
+2026-05-06T01:31:13Z  OK     seed-2-fixed-k-12800  1902s  exit=0
+2026-05-06T01:31:13Z  k=16000
+2026-05-06T01:31:13Z  START  seed-0-fixed-k-16000  seed=0 k=16000
+2026-05-06T02:02:56Z  OK     seed-0-fixed-k-16000  1903s  exit=0
+2026-05-06T02:02:56Z  START  seed-1-fixed-k-16000  seed=1 k=16000
+2026-05-06T02:34:31Z  OK     seed-1-fixed-k-16000  1895s  exit=0
+2026-05-06T02:34:31Z  START  seed-2-fixed-k-16000  seed=2 k=16000
+2026-05-06T03:06:11Z  OK     seed-2-fixed-k-16000  1900s  exit=0
+2026-05-06T03:06:11Z  k=25600
+2026-05-06T03:06:11Z  START  seed-0-fixed-k-25600  seed=0 k=25600
+2026-05-06T03:37:47Z  OK     seed-0-fixed-k-25600  1896s  exit=0
+2026-05-06T03:37:47Z  START  seed-1-fixed-k-25600  seed=1 k=25600
+2026-05-06T04:09:31Z  OK     seed-1-fixed-k-25600  1904s  exit=0
+2026-05-06T04:09:31Z  START  seed-2-fixed-k-25600  seed=2 k=25600
+2026-05-06T04:41:08Z  OK     seed-2-fixed-k-25600  1897s  exit=0
+2026-05-06T04:41:08Z  k=51200
+2026-05-06T04:41:08Z  START  seed-0-fixed-k-51200  seed=0 k=51200
+2026-05-06T05:12:48Z  OK     seed-0-fixed-k-51200  1900s  exit=0
+2026-05-06T05:12:48Z  START  seed-1-fixed-k-51200  seed=1 k=51200
+2026-05-06T05:44:28Z  OK     seed-1-fixed-k-51200  1900s  exit=0
+2026-05-06T05:44:28Z  START  seed-2-fixed-k-51200  seed=2 k=51200
+2026-05-06T06:15:58Z  OK     seed-2-fixed-k-51200  1890s  exit=0
+2026-05-06T06:15:58Z  
+2026-05-06T06:15:58Z  OVERNIGHT SWEEP DONE
+2026-05-06T06:15:58Z  Summary: 18 OK, 0 FAIL

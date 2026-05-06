@@ -1,0 +1,603 @@
+# gpu0: NVIDIA GeForce RTX 5060 Ti (15GB, sm_120)
+# gpu1: NVIDIA GeForce GTX 1060 6GB (5GB, sm_61)
+# gpu2: NVIDIA GeForce GTX 1060 6GB (5GB, sm_61)
+epoch 0: loss=2.030613, train_acc=0.2250, time=9.2s
+per-rank: rank1[cuda1,share=0.3612,tput=3.12] rank2[cuda2,share=0.3297,tput=5.28] rank0[cuda0,share=0.3090,tput=2.66]
+epoch 0: eval=0.2999
+epoch 1: loss=1.756895, train_acc=0.3304, time=8.8s
+per-rank: rank1[cuda1,share=0.3612,tput=4.28] rank2[cuda2,share=0.3297,tput=2.44] rank0[cuda0,share=0.3090,tput=3.67]
+epoch 1: eval=0.3694
+epoch 2: loss=1.606963, train_acc=0.4010, time=9.4s
+per-rank: rank1[cuda1,share=0.3612,tput=2.08] rank2[cuda2,share=0.3297,tput=3.37] rank0[cuda0,share=0.3090,tput=5.75]
+epoch 2: eval=0.4327
+epoch 3: loss=1.485804, train_acc=0.4510, time=8.9s
+per-rank: rank1[cuda1,share=0.3612,tput=3.88] rank2[cuda2,share=0.3297,tput=2.44] rank0[cuda0,share=0.3090,tput=3.52]
+epoch 3: eval=0.4447
+epoch 4: loss=1.370407, train_acc=0.5034, time=8.5s
+per-rank: rank1[cuda1,share=0.3612,tput=5.76] rank2[cuda2,share=0.3297,tput=3.32] rank0[cuda0,share=0.3090,tput=2.38]
+epoch 4: eval=0.5493
+epoch 5: loss=1.249445, train_acc=0.5504, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.26] rank2[cuda2,share=0.3297,tput=4.36] rank0[cuda0,share=0.3090,tput=4.29]
+epoch 5: eval=0.5271
+epoch 6: loss=1.164088, train_acc=0.5838, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.63] rank2[cuda2,share=0.3297,tput=2.16] rank0[cuda0,share=0.3090,tput=3.67]
+epoch 6: eval=0.6107
+epoch 7: loss=1.095081, train_acc=0.6116, time=8.8s
+per-rank: rank1[cuda1,share=0.3612,tput=2.22] rank2[cuda2,share=0.3297,tput=3.79] rank0[cuda0,share=0.3090,tput=4.50]
+epoch 7: eval=0.6098
+epoch 8: loss=1.034442, train_acc=0.6336, time=8.8s
+per-rank: rank1[cuda1,share=0.3612,tput=4.04] rank2[cuda2,share=0.3297,tput=2.45] rank0[cuda0,share=0.3090,tput=3.56]
+epoch 8: eval=0.6433
+epoch 9: loss=0.981773, train_acc=0.6528, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=3.68] rank2[cuda2,share=0.3297,tput=2.12] rank0[cuda0,share=0.3090,tput=5.12]
+epoch 9: eval=0.6766
+epoch 10: loss=0.923811, train_acc=0.6742, time=8.9s
+per-rank: rank1[cuda1,share=0.3612,tput=4.67] rank2[cuda2,share=0.3297,tput=2.01] rank0[cuda0,share=0.3090,tput=3.48]
+epoch 10: eval=0.6783
+epoch 11: loss=0.891278, train_acc=0.6857, time=8.8s
+per-rank: rank1[cuda1,share=0.3612,tput=3.82] rank2[cuda2,share=0.3297,tput=3.74] rank0[cuda0,share=0.3090,tput=2.62]
+epoch 11: eval=0.6397
+epoch 12: loss=0.858417, train_acc=0.7000, time=8.5s
+per-rank: rank1[cuda1,share=0.3612,tput=4.95] rank2[cuda2,share=0.3297,tput=3.00] rank0[cuda0,share=0.3090,tput=2.28]
+epoch 12: eval=0.6995
+epoch 13: loss=0.820678, train_acc=0.7151, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=4.78] rank2[cuda2,share=0.3297,tput=3.34] rank0[cuda0,share=0.3090,tput=2.31]
+epoch 13: eval=0.6829
+epoch 14: loss=0.800503, train_acc=0.7217, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.46] rank2[cuda2,share=0.3297,tput=4.20] rank0[cuda0,share=0.3090,tput=3.40]
+epoch 14: eval=0.7048
+epoch 15: loss=0.772364, train_acc=0.7329, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=2.31] rank2[cuda2,share=0.3297,tput=4.97] rank0[cuda0,share=0.3090,tput=3.37]
+epoch 15: eval=0.7037
+epoch 16: loss=0.752115, train_acc=0.7400, time=8.5s
+per-rank: rank1[cuda1,share=0.3612,tput=3.39] rank2[cuda2,share=0.3297,tput=4.38] rank0[cuda0,share=0.3090,tput=2.50]
+epoch 16: eval=0.6946
+epoch 17: loss=0.734669, train_acc=0.7441, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=3.86] rank2[cuda2,share=0.3297,tput=3.39] rank0[cuda0,share=0.3090,tput=2.64]
+epoch 17: eval=0.5906
+epoch 18: loss=0.713591, train_acc=0.7527, time=8.4s
+per-rank: rank1[cuda1,share=0.3612,tput=5.01] rank2[cuda2,share=0.3297,tput=2.75] rank0[cuda0,share=0.3090,tput=2.73]
+epoch 18: eval=0.7042
+epoch 19: loss=0.705163, train_acc=0.7565, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.76] rank2[cuda2,share=0.3297,tput=2.14] rank0[cuda0,share=0.3090,tput=3.65]
+epoch 19: eval=0.7194
+epoch 20: loss=0.693837, train_acc=0.7598, time=9.1s
+per-rank: rank1[cuda1,share=0.3612,tput=4.75] rank2[cuda2,share=0.3297,tput=3.30] rank0[cuda0,share=0.3090,tput=2.09]
+epoch 20: eval=0.7652
+epoch 21: loss=0.680834, train_acc=0.7656, time=8.8s
+per-rank: rank1[cuda1,share=0.3612,tput=3.05] rank2[cuda2,share=0.3297,tput=2.37] rank0[cuda0,share=0.3090,tput=5.33]
+epoch 21: eval=0.7517
+epoch 22: loss=0.672077, train_acc=0.7688, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=5.32] rank2[cuda2,share=0.3297,tput=3.02] rank0[cuda0,share=0.3090,tput=2.30]
+epoch 22: eval=0.7609
+epoch 23: loss=0.658124, train_acc=0.7734, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.45] rank2[cuda2,share=0.3297,tput=2.40] rank0[cuda0,share=0.3090,tput=3.18]
+epoch 23: eval=0.7597
+epoch 24: loss=0.656618, train_acc=0.7726, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.26] rank2[cuda2,share=0.3297,tput=3.41] rank0[cuda0,share=0.3090,tput=5.12]
+epoch 24: eval=0.7249
+epoch 25: loss=0.650081, train_acc=0.7770, time=9.4s
+per-rank: rank1[cuda1,share=0.3612,tput=4.82] rank2[cuda2,share=0.3297,tput=3.30] rank0[cuda0,share=0.3090,tput=2.02]
+epoch 25: eval=0.7567
+epoch 26: loss=0.644560, train_acc=0.7749, time=8.9s
+per-rank: rank1[cuda1,share=0.3612,tput=2.24] rank2[cuda2,share=0.3297,tput=3.76] rank0[cuda0,share=0.3090,tput=4.68]
+epoch 26: eval=0.6674
+epoch 27: loss=0.632073, train_acc=0.7824, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=3.57] rank2[cuda2,share=0.3297,tput=4.08] rank0[cuda0,share=0.3090,tput=2.56]
+epoch 27: eval=0.7582
+epoch 28: loss=0.627107, train_acc=0.7835, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=2.74] rank2[cuda2,share=0.3297,tput=2.30] rank0[cuda0,share=0.3090,tput=6.07]
+epoch 28: eval=0.6898
+epoch 29: loss=0.627156, eval=0.7521, train_acc=0.7829, time=9.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.01] rank2[cuda2,share=0.3297,tput=5.03] rank0[cuda0,share=0.3090,tput=3.89]
+epoch 30: loss=0.615002, train_acc=0.7877, time=9.1s
+per-rank: rank1[cuda1,share=0.3612,tput=3.27] rank2[cuda2,share=0.3297,tput=3.74] rank0[cuda0,share=0.3090,tput=2.73]
+epoch 30: eval=0.7653
+epoch 31: loss=0.615700, train_acc=0.7879, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.16] rank2[cuda2,share=0.3297,tput=3.63] rank0[cuda0,share=0.3090,tput=2.25]
+epoch 31: eval=0.7664
+epoch 32: loss=0.607384, train_acc=0.7890, time=8.5s
+per-rank: rank1[cuda1,share=0.3612,tput=4.85] rank2[cuda2,share=0.3297,tput=3.16] rank0[cuda0,share=0.3090,tput=2.25]
+epoch 32: eval=0.7526
+epoch 33: loss=0.603674, train_acc=0.7932, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.68] rank2[cuda2,share=0.3297,tput=2.39] rank0[cuda0,share=0.3090,tput=3.32]
+epoch 33: eval=0.6835
+epoch 34: loss=0.608378, train_acc=0.7903, time=8.5s
+per-rank: rank1[cuda1,share=0.3612,tput=4.76] rank2[cuda2,share=0.3297,tput=3.13] rank0[cuda0,share=0.3090,tput=2.43]
+epoch 34: eval=0.7768
+epoch 35: loss=0.601012, train_acc=0.7922, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=3.10] rank2[cuda2,share=0.3297,tput=4.55] rank0[cuda0,share=0.3090,tput=2.54]
+epoch 35: eval=0.7381
+epoch 36: loss=0.589646, train_acc=0.7968, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=4.59] rank2[cuda2,share=0.3297,tput=2.09] rank0[cuda0,share=0.3090,tput=3.85]
+epoch 36: eval=0.7506
+epoch 37: loss=0.592502, train_acc=0.7971, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.83] rank2[cuda2,share=0.3297,tput=4.84] rank0[cuda0,share=0.3090,tput=2.60]
+epoch 37: eval=0.7676
+epoch 38: loss=0.590237, train_acc=0.7969, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=3.96] rank2[cuda2,share=0.3297,tput=2.29] rank0[cuda0,share=0.3090,tput=3.66]
+epoch 38: eval=0.7320
+epoch 39: loss=0.577875, train_acc=0.7999, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=3.01] rank2[cuda2,share=0.3297,tput=2.46] rank0[cuda0,share=0.3090,tput=4.86]
+epoch 39: eval=0.7470
+epoch 40: loss=0.585944, train_acc=0.7992, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=2.26] rank2[cuda2,share=0.3297,tput=4.63] rank0[cuda0,share=0.3090,tput=3.81]
+epoch 40: eval=0.7412
+epoch 41: loss=0.571043, train_acc=0.8040, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.80] rank2[cuda2,share=0.3297,tput=2.94] rank0[cuda0,share=0.3090,tput=2.55]
+epoch 41: eval=0.7317
+epoch 42: loss=0.582269, train_acc=0.7996, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.49] rank2[cuda2,share=0.3297,tput=2.09] rank0[cuda0,share=0.3090,tput=3.56]
+epoch 42: eval=0.7820
+epoch 43: loss=0.570937, train_acc=0.8041, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=5.64] rank2[cuda2,share=0.3297,tput=3.88] rank0[cuda0,share=0.3090,tput=2.31]
+epoch 43: eval=0.7488
+epoch 44: loss=0.579680, train_acc=0.8019, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.27] rank2[cuda2,share=0.3297,tput=5.27] rank0[cuda0,share=0.3090,tput=3.40]
+epoch 44: eval=0.7666
+epoch 45: loss=0.575880, train_acc=0.8019, time=8.6s
+per-rank: rank1[cuda1,share=0.3612,tput=4.07] rank2[cuda2,share=0.3297,tput=2.35] rank0[cuda0,share=0.3090,tput=4.14]
+epoch 45: eval=0.7613
+epoch 46: loss=0.563063, train_acc=0.8063, time=8.7s
+per-rank: rank1[cuda1,share=0.3612,tput=2.93] rank2[cuda2,share=0.3297,tput=4.84] rank0[cuda0,share=0.3090,tput=2.48]
+epoch 46: eval=0.7188
+epoch 47: loss=1.334653, train_acc=0.5217, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=4.12] rank2[cuda2,share=0.3244,tput=3.88] rank0[cuda0,share=0.3203,tput=2.66]
+epoch 47: eval=0.5130
+epoch 48: loss=1.047210, train_acc=0.6312, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=2.18] rank2[cuda2,share=0.3244,tput=5.38] rank0[cuda0,share=0.3203,tput=3.37]
+epoch 48: eval=0.6628
+epoch 49: loss=0.921633, train_acc=0.6809, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=4.82] rank2[cuda2,share=0.3244,tput=3.20] rank0[cuda0,share=0.3203,tput=2.36]
+epoch 49: eval=0.6430
+epoch 50: loss=0.838530, train_acc=0.7088, time=8.8s
+per-rank: rank1[cuda1,share=0.3553,tput=3.60] rank2[cuda2,share=0.3244,tput=2.52] rank0[cuda0,share=0.3203,tput=3.53]
+epoch 50: eval=0.6774
+epoch 51: loss=0.791581, train_acc=0.7258, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.42] rank2[cuda2,share=0.3244,tput=5.47] rank0[cuda0,share=0.3203,tput=2.74]
+epoch 51: eval=0.7174
+epoch 52: loss=0.751021, train_acc=0.7404, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=5.21] rank2[cuda2,share=0.3244,tput=3.01] rank0[cuda0,share=0.3203,tput=2.32]
+epoch 52: eval=0.7223
+epoch 53: loss=0.723807, train_acc=0.7489, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=2.18] rank2[cuda2,share=0.3244,tput=3.46] rank0[cuda0,share=0.3203,tput=5.15]
+epoch 53: eval=0.6735
+epoch 54: loss=0.704236, train_acc=0.7561, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=5.39] rank2[cuda2,share=0.3244,tput=2.37] rank0[cuda0,share=0.3203,tput=2.94]
+epoch 54: eval=0.7198
+epoch 55: loss=0.680949, train_acc=0.7636, time=8.9s
+per-rank: rank1[cuda1,share=0.3553,tput=2.12] rank2[cuda2,share=0.3244,tput=5.57] rank0[cuda0,share=0.3203,tput=3.52]
+epoch 55: eval=0.7331
+epoch 56: loss=0.676672, train_acc=0.7670, time=8.9s
+per-rank: rank1[cuda1,share=0.3553,tput=4.27] rank2[cuda2,share=0.3244,tput=3.24] rank0[cuda0,share=0.3203,tput=2.45]
+epoch 56: eval=0.7190
+epoch 57: loss=0.655827, train_acc=0.7735, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.18] rank2[cuda2,share=0.3244,tput=5.62] rank0[cuda0,share=0.3203,tput=3.12]
+epoch 57: eval=0.7067
+epoch 58: loss=0.649113, train_acc=0.7753, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=4.64] rank2[cuda2,share=0.3244,tput=2.28] rank0[cuda0,share=0.3203,tput=3.26]
+epoch 58: eval=0.7366
+epoch 59: loss=0.637628, train_acc=0.7815, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=4.67] rank2[cuda2,share=0.3244,tput=3.25] rank0[cuda0,share=0.3203,tput=2.39]
+epoch 59: eval=0.7503
+epoch 60: loss=0.624134, train_acc=0.7836, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.32] rank2[cuda2,share=0.3244,tput=3.04] rank0[cuda0,share=0.3203,tput=5.39]
+epoch 60: eval=0.7610
+epoch 61: loss=0.620384, train_acc=0.7870, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=3.70] rank2[cuda2,share=0.3244,tput=4.61] rank0[cuda0,share=0.3203,tput=2.43]
+epoch 61: eval=0.6975
+epoch 62: loss=0.620215, train_acc=0.7857, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=2.50] rank2[cuda2,share=0.3244,tput=4.59] rank0[cuda0,share=0.3203,tput=3.51]
+epoch 62: eval=0.7709
+epoch 63: loss=0.601391, train_acc=0.7928, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=4.76] rank2[cuda2,share=0.3244,tput=4.16] rank0[cuda0,share=0.3203,tput=2.36]
+epoch 63: eval=0.7428
+epoch 64: loss=0.601492, train_acc=0.7930, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.59] rank2[cuda2,share=0.3244,tput=3.12] rank0[cuda0,share=0.3203,tput=4.99]
+epoch 64: eval=0.6797
+epoch 65: loss=0.597181, train_acc=0.7968, time=9.0s
+per-rank: rank1[cuda1,share=0.3553,tput=3.85] rank2[cuda2,share=0.3244,tput=4.78] rank0[cuda0,share=0.3203,tput=2.31]
+epoch 65: eval=0.7094
+epoch 66: loss=0.597136, train_acc=0.7955, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=2.57] rank2[cuda2,share=0.3244,tput=2.89] rank0[cuda0,share=0.3203,tput=5.11]
+epoch 66: eval=0.7679
+epoch 67: loss=0.597878, train_acc=0.7933, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=2.19] rank2[cuda2,share=0.3244,tput=5.40] rank0[cuda0,share=0.3203,tput=3.38]
+epoch 67: eval=0.7357
+epoch 68: loss=0.585435, train_acc=0.7998, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=5.27] rank2[cuda2,share=0.3244,tput=2.40] rank0[cuda0,share=0.3203,tput=2.84]
+epoch 68: eval=0.7316
+epoch 69: loss=0.579517, train_acc=0.8012, time=9.0s
+per-rank: rank1[cuda1,share=0.3553,tput=2.13] rank2[cuda2,share=0.3244,tput=3.01] rank0[cuda0,share=0.3203,tput=5.74]
+epoch 69: eval=0.7263
+epoch 70: loss=0.579941, train_acc=0.8016, time=8.7s
+per-rank: rank1[cuda1,share=0.3553,tput=4.11] rank2[cuda2,share=0.3244,tput=3.11] rank0[cuda0,share=0.3203,tput=2.63]
+epoch 70: eval=0.7560
+epoch 71: loss=0.579068, train_acc=0.8010, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=4.70] rank2[cuda2,share=0.3244,tput=3.22] rank0[cuda0,share=0.3203,tput=2.36]
+epoch 71: eval=0.7864
+epoch 72: loss=0.567272, train_acc=0.8054, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.35] rank2[cuda2,share=0.3244,tput=5.16] rank0[cuda0,share=0.3203,tput=3.36]
+epoch 72: eval=0.7891
+epoch 73: loss=0.570808, train_acc=0.8052, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=5.29] rank2[cuda2,share=0.3244,tput=2.08] rank0[cuda0,share=0.3203,tput=4.45]
+epoch 73: eval=0.7762
+epoch 74: loss=0.568773, train_acc=0.8047, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=2.50] rank2[cuda2,share=0.3244,tput=3.58] rank0[cuda0,share=0.3203,tput=4.43]
+epoch 74: eval=0.7786
+epoch 75: loss=0.564996, train_acc=0.8067, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.36] rank2[cuda2,share=0.3244,tput=3.85] rank0[cuda0,share=0.3203,tput=4.17]
+epoch 75: eval=0.8052
+epoch 76: loss=0.557857, train_acc=0.8097, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=3.26] rank2[cuda2,share=0.3244,tput=2.44] rank0[cuda0,share=0.3203,tput=4.82]
+epoch 76: eval=0.7461
+epoch 77: loss=0.558902, train_acc=0.8105, time=9.0s
+per-rank: rank1[cuda1,share=0.3553,tput=3.00] rank2[cuda2,share=0.3244,tput=5.76] rank0[cuda0,share=0.3203,tput=2.26]
+epoch 77: eval=0.7431
+epoch 78: loss=0.562664, train_acc=0.8066, time=8.8s
+per-rank: rank1[cuda1,share=0.3553,tput=4.26] rank2[cuda2,share=0.3244,tput=2.53] rank0[cuda0,share=0.3203,tput=3.64]
+epoch 78: eval=0.7908
+epoch 79: loss=0.550755, train_acc=0.8104, time=9.1s
+per-rank: rank1[cuda1,share=0.3553,tput=4.47] rank2[cuda2,share=0.3244,tput=3.70] rank0[cuda0,share=0.3203,tput=2.25]
+epoch 79: eval=0.7825
+epoch 80: loss=0.554184, train_acc=0.8093, time=8.8s
+per-rank: rank1[cuda1,share=0.3553,tput=6.18] rank2[cuda2,share=0.3244,tput=2.50] rank0[cuda0,share=0.3203,tput=3.15]
+epoch 80: eval=0.7586
+epoch 81: loss=0.553993, train_acc=0.8096, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=3.35] rank2[cuda2,share=0.3244,tput=2.03] rank0[cuda0,share=0.3203,tput=5.70]
+epoch 81: eval=0.7529
+epoch 82: loss=0.543480, train_acc=0.8140, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=3.30] rank2[cuda2,share=0.3244,tput=4.72] rank0[cuda0,share=0.3203,tput=2.55]
+epoch 82: eval=0.7729
+epoch 83: loss=0.541538, train_acc=0.8137, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.81] rank2[cuda2,share=0.3244,tput=2.32] rank0[cuda0,share=0.3203,tput=5.89]
+epoch 83: eval=0.7910
+epoch 84: loss=0.544915, train_acc=0.8133, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=4.73] rank2[cuda2,share=0.3244,tput=2.36] rank0[cuda0,share=0.3203,tput=4.34]
+epoch 84: eval=0.7944
+epoch 85: loss=0.543722, train_acc=0.8137, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=2.35] rank2[cuda2,share=0.3244,tput=3.13] rank0[cuda0,share=0.3203,tput=5.14]
+epoch 85: eval=0.7918
+epoch 86: loss=0.545378, train_acc=0.8131, time=9.1s
+per-rank: rank1[cuda1,share=0.3553,tput=5.25] rank2[cuda2,share=0.3244,tput=3.33] rank0[cuda0,share=0.3203,tput=2.18]
+epoch 86: eval=0.7860
+epoch 87: loss=0.548725, train_acc=0.8112, time=8.9s
+per-rank: rank1[cuda1,share=0.3553,tput=3.62] rank2[cuda2,share=0.3244,tput=2.26] rank0[cuda0,share=0.3203,tput=4.47]
+epoch 87: eval=0.7815
+epoch 88: loss=0.541002, train_acc=0.8135, time=9.2s
+per-rank: rank1[cuda1,share=0.3553,tput=2.04] rank2[cuda2,share=0.3244,tput=3.64] rank0[cuda0,share=0.3203,tput=4.86]
+epoch 88: eval=0.7737
+epoch 89: loss=0.540113, train_acc=0.8153, time=9.0s
+per-rank: rank1[cuda1,share=0.3553,tput=4.39] rank2[cuda2,share=0.3244,tput=2.24] rank0[cuda0,share=0.3203,tput=3.47]
+epoch 89: eval=0.7964
+epoch 90: loss=0.533511, train_acc=0.8165, time=9.1s
+per-rank: rank1[cuda1,share=0.3553,tput=4.51] rank2[cuda2,share=0.3244,tput=3.29] rank0[cuda0,share=0.3203,tput=2.17]
+epoch 90: eval=0.7803
+epoch 91: loss=0.535514, train_acc=0.8159, time=8.8s
+per-rank: rank1[cuda1,share=0.3553,tput=2.43] rank2[cuda2,share=0.3244,tput=3.60] rank0[cuda0,share=0.3203,tput=4.05]
+epoch 91: eval=0.7629
+epoch 92: loss=0.535357, train_acc=0.8149, time=8.6s
+per-rank: rank1[cuda1,share=0.3553,tput=5.18] rank2[cuda2,share=0.3244,tput=2.21] rank0[cuda0,share=0.3203,tput=3.57]
+epoch 92: eval=0.7632
+epoch 93: loss=0.538146, train_acc=0.8164, time=9.2s
+per-rank: rank1[cuda1,share=0.3553,tput=3.88] rank2[cuda2,share=0.3244,tput=4.49] rank0[cuda0,share=0.3203,tput=2.16]
+epoch 93: eval=0.7815
+epoch 94: loss=0.535873, train_acc=0.8149, time=9.1s
+per-rank: rank1[cuda1,share=0.3553,tput=2.29] rank2[cuda2,share=0.3244,tput=3.97] rank0[cuda0,share=0.3203,tput=3.85]
+epoch 94: eval=0.7330
+epoch 95: loss=0.528145, train_acc=0.8184, time=8.5s
+per-rank: rank1[cuda1,share=0.3553,tput=2.28] rank2[cuda2,share=0.3244,tput=5.58] rank0[cuda0,share=0.3203,tput=3.05]
+epoch 95: eval=0.7712
+epoch 96: loss=0.697296, train_acc=0.7583, time=8.5s
+per-rank: rank1[cuda1,share=0.3509,tput=2.46] rank0[cuda0,share=0.3287,tput=5.22] rank2[cuda2,share=0.3204,tput=3.09]
+epoch 96: eval=0.6769
+epoch 97: loss=0.679257, train_acc=0.7678, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=2.36] rank0[cuda0,share=0.3287,tput=4.38] rank2[cuda2,share=0.3204,tput=3.62]
+epoch 97: eval=0.6998
+epoch 98: loss=0.635923, train_acc=0.7810, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.34] rank0[cuda0,share=0.3287,tput=4.16] rank2[cuda2,share=0.3204,tput=3.49]
+epoch 98: eval=0.7754
+epoch 99: loss=0.608756, train_acc=0.7901, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=2.57] rank0[cuda0,share=0.3287,tput=3.79] rank2[cuda2,share=0.3204,tput=3.75]
+epoch 99: eval=0.7833
+epoch 100: loss=0.606555, train_acc=0.7925, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.12] rank0[cuda0,share=0.3287,tput=3.29] rank2[cuda2,share=0.3204,tput=5.32]
+epoch 100: eval=0.7731
+epoch 101: loss=0.592487, train_acc=0.7966, time=9.2s
+per-rank: rank1[cuda1,share=0.3509,tput=5.24] rank0[cuda0,share=0.3287,tput=2.27] rank2[cuda2,share=0.3204,tput=4.22]
+epoch 101: eval=0.6967
+epoch 102: loss=0.586550, train_acc=0.7987, time=8.9s
+per-rank: rank1[cuda1,share=0.3509,tput=2.28] rank0[cuda0,share=0.3287,tput=3.80] rank2[cuda2,share=0.3204,tput=4.06]
+epoch 102: eval=0.7429
+epoch 103: loss=0.574676, train_acc=0.8036, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.35] rank0[cuda0,share=0.3287,tput=3.82] rank2[cuda2,share=0.3204,tput=4.94]
+epoch 103: eval=0.7811
+epoch 104: loss=0.575645, train_acc=0.8030, time=8.8s
+per-rank: rank1[cuda1,share=0.3509,tput=4.36] rank0[cuda0,share=0.3287,tput=2.44] rank2[cuda2,share=0.3204,tput=3.71]
+epoch 104: eval=0.7643
+epoch 105: loss=0.569988, train_acc=0.8045, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=2.07] rank0[cuda0,share=0.3287,tput=5.13] rank2[cuda2,share=0.3204,tput=3.69]
+epoch 105: eval=0.7889
+epoch 106: loss=0.560068, train_acc=0.8079, time=8.8s
+per-rank: rank1[cuda1,share=0.3509,tput=5.04] rank0[cuda0,share=0.3287,tput=2.87] rank2[cuda2,share=0.3204,tput=2.32]
+epoch 106: eval=0.7803
+epoch 107: loss=0.501975, train_acc=0.8271, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.30] rank0[cuda0,share=0.3287,tput=4.53] rank2[cuda2,share=0.3204,tput=3.53]
+epoch 107: eval=0.7362
+epoch 108: loss=0.413222, train_acc=0.8586, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=5.27] rank0[cuda0,share=0.3287,tput=3.32] rank2[cuda2,share=0.3204,tput=1.96]
+epoch 108: eval=0.8580
+epoch 109: loss=0.364936, train_acc=0.8733, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=3.97] rank0[cuda0,share=0.3287,tput=2.41] rank2[cuda2,share=0.3204,tput=4.43]
+epoch 109: eval=0.8631
+epoch 110: loss=0.348769, train_acc=0.8804, time=8.9s
+per-rank: rank1[cuda1,share=0.3509,tput=2.16] rank0[cuda0,share=0.3287,tput=4.36] rank2[cuda2,share=0.3204,tput=3.96]
+epoch 110: eval=0.8689
+epoch 111: loss=0.338862, train_acc=0.8833, time=9.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.94] rank0[cuda0,share=0.3287,tput=2.16] rank2[cuda2,share=0.3204,tput=5.05]
+epoch 111: eval=0.8706
+epoch 112: loss=0.323350, train_acc=0.8880, time=8.8s
+per-rank: rank1[cuda1,share=0.3509,tput=3.50] rank0[cuda0,share=0.3287,tput=4.71] rank2[cuda2,share=0.3204,tput=2.33]
+epoch 112: eval=0.8766
+epoch 113: loss=0.317469, train_acc=0.8903, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=4.21] rank0[cuda0,share=0.3287,tput=3.30] rank2[cuda2,share=0.3204,tput=2.43]
+epoch 113: eval=0.8787
+epoch 114: loss=0.315344, train_acc=0.8893, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.97] rank0[cuda0,share=0.3287,tput=4.18] rank2[cuda2,share=0.3204,tput=2.59]
+epoch 114: eval=0.8748
+epoch 115: loss=0.306608, train_acc=0.8938, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=4.87] rank0[cuda0,share=0.3287,tput=2.75] rank2[cuda2,share=0.3204,tput=2.51]
+epoch 115: eval=0.8805
+epoch 116: loss=0.305080, train_acc=0.8939, time=9.6s
+per-rank: rank1[cuda1,share=0.3509,tput=5.05] rank0[cuda0,share=0.3287,tput=2.19] rank2[cuda2,share=0.3204,tput=3.37]
+epoch 116: eval=0.8749
+epoch 117: loss=0.295447, train_acc=0.8984, time=9.1s
+per-rank: rank1[cuda1,share=0.3509,tput=2.34] rank0[cuda0,share=0.3287,tput=4.69] rank2[cuda2,share=0.3204,tput=3.45]
+epoch 117: eval=0.8809
+epoch 118: loss=0.294760, train_acc=0.8973, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=4.99] rank0[cuda0,share=0.3287,tput=3.05] rank2[cuda2,share=0.3204,tput=2.27]
+epoch 118: eval=0.8759
+epoch 119: loss=0.288611, train_acc=0.8983, time=8.4s
+per-rank: rank1[cuda1,share=0.3509,tput=2.20] rank0[cuda0,share=0.3287,tput=5.03] rank2[cuda2,share=0.3204,tput=3.33]
+epoch 119: eval=0.8821
+epoch 120: loss=0.282876, train_acc=0.9023, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=4.46] rank0[cuda0,share=0.3287,tput=3.46] rank2[cuda2,share=0.3204,tput=2.26]
+epoch 120: eval=0.8796
+epoch 121: loss=0.279993, train_acc=0.9019, time=9.1s
+per-rank: rank1[cuda1,share=0.3509,tput=2.03] rank0[cuda0,share=0.3287,tput=3.61] rank2[cuda2,share=0.3204,tput=5.49]
+epoch 121: eval=0.8833
+epoch 122: loss=0.274306, train_acc=0.9055, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=4.71] rank0[cuda0,share=0.3287,tput=3.04] rank2[cuda2,share=0.3204,tput=2.45]
+epoch 122: eval=0.8854
+epoch 123: loss=0.276733, train_acc=0.9041, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.58] rank0[cuda0,share=0.3287,tput=3.33] rank2[cuda2,share=0.3204,tput=4.75]
+epoch 123: eval=0.8818
+epoch 124: loss=0.268129, train_acc=0.9066, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.56] rank0[cuda0,share=0.3287,tput=3.96] rank2[cuda2,share=0.3204,tput=3.53]
+epoch 124: eval=0.8850
+epoch 125: loss=0.266571, train_acc=0.9077, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=4.98] rank0[cuda0,share=0.3287,tput=2.97] rank2[cuda2,share=0.3204,tput=2.38]
+epoch 125: eval=0.8884
+epoch 126: loss=0.268169, train_acc=0.9069, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=2.40] rank0[cuda0,share=0.3287,tput=2.84] rank2[cuda2,share=0.3204,tput=5.22]
+epoch 126: eval=0.8837
+epoch 127: loss=0.260955, train_acc=0.9092, time=9.3s
+per-rank: rank1[cuda1,share=0.3509,tput=4.51] rank0[cuda0,share=0.3287,tput=2.26] rank2[cuda2,share=0.3204,tput=3.64]
+epoch 127: eval=0.8860
+epoch 128: loss=0.259945, train_acc=0.9095, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=3.13] rank0[cuda0,share=0.3287,tput=4.55] rank2[cuda2,share=0.3204,tput=2.50]
+epoch 128: eval=0.8777
+epoch 129: loss=0.257027, train_acc=0.9102, time=10.0s
+per-rank: rank1[cuda1,share=0.3509,tput=3.19] rank0[cuda0,share=0.3287,tput=2.11] rank2[cuda2,share=0.3204,tput=4.71]
+epoch 129: eval=0.8904
+epoch 130: loss=0.256756, train_acc=0.9114, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=3.59] rank0[cuda0,share=0.3287,tput=4.81] rank2[cuda2,share=0.3204,tput=2.16]
+epoch 130: eval=0.8869
+epoch 131: loss=0.248759, train_acc=0.9127, time=9.3s
+per-rank: rank1[cuda1,share=0.3509,tput=3.68] rank0[cuda0,share=0.3287,tput=2.24] rank2[cuda2,share=0.3204,tput=4.73]
+epoch 131: eval=0.8870
+epoch 132: loss=0.250709, train_acc=0.9127, time=9.1s
+per-rank: rank1[cuda1,share=0.3509,tput=2.75] rank0[cuda0,share=0.3287,tput=3.84] rank2[cuda2,share=0.3204,tput=3.16]
+epoch 132: eval=0.8854
+epoch 133: loss=0.247376, train_acc=0.9135, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=2.95] rank0[cuda0,share=0.3287,tput=4.87] rank2[cuda2,share=0.3204,tput=2.52]
+epoch 133: eval=0.8862
+epoch 134: loss=0.245925, train_acc=0.9140, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=2.45] rank0[cuda0,share=0.3287,tput=2.96] rank2[cuda2,share=0.3204,tput=5.72]
+epoch 134: eval=0.8870
+epoch 135: loss=0.245638, train_acc=0.9143, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=2.61] rank0[cuda0,share=0.3287,tput=2.68] rank2[cuda2,share=0.3204,tput=5.24]
+epoch 135: eval=0.8865
+epoch 136: loss=0.242512, train_acc=0.9159, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=3.44] rank0[cuda0,share=0.3287,tput=4.79] rank2[cuda2,share=0.3204,tput=2.19]
+epoch 136: eval=0.8851
+epoch 137: loss=0.240733, train_acc=0.9167, time=9.4s
+per-rank: rank1[cuda1,share=0.3509,tput=4.24] rank0[cuda0,share=0.3287,tput=2.23] rank2[cuda2,share=0.3204,tput=4.61]
+epoch 137: eval=0.8885
+epoch 138: loss=0.237975, train_acc=0.9165, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=5.18] rank0[cuda0,share=0.3287,tput=3.64] rank2[cuda2,share=0.3204,tput=2.44]
+epoch 138: eval=0.8814
+epoch 139: loss=0.236317, train_acc=0.9186, time=8.8s
+per-rank: rank1[cuda1,share=0.3509,tput=5.78] rank0[cuda0,share=0.3287,tput=2.39] rank2[cuda2,share=0.3204,tput=3.44]
+epoch 139: eval=0.8864
+epoch 140: loss=0.239148, train_acc=0.9163, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=3.23] rank0[cuda0,share=0.3287,tput=4.75] rank2[cuda2,share=0.3204,tput=2.34]
+epoch 140: eval=0.8879
+epoch 141: loss=0.236203, train_acc=0.9176, time=8.5s
+per-rank: rank1[cuda1,share=0.3509,tput=3.28] rank0[cuda0,share=0.3287,tput=5.29] rank2[cuda2,share=0.3204,tput=2.14]
+epoch 141: eval=0.8867
+epoch 142: loss=0.234687, train_acc=0.9177, time=8.4s
+per-rank: rank1[cuda1,share=0.3509,tput=2.60] rank0[cuda0,share=0.3287,tput=4.37] rank2[cuda2,share=0.3204,tput=3.22]
+epoch 142: eval=0.8839
+epoch 143: loss=0.234053, train_acc=0.9190, time=9.1s
+per-rank: rank1[cuda1,share=0.3509,tput=3.76] rank0[cuda0,share=0.3287,tput=2.30] rank2[cuda2,share=0.3204,tput=4.49]
+epoch 143: eval=0.8865
+epoch 144: loss=0.226408, train_acc=0.9212, time=9.0s
+per-rank: rank1[cuda1,share=0.3509,tput=2.07] rank0[cuda0,share=0.3287,tput=4.82] rank2[cuda2,share=0.3204,tput=3.38]
+epoch 144: eval=0.8838
+epoch 145: loss=0.230255, train_acc=0.9187, time=8.7s
+per-rank: rank1[cuda1,share=0.3509,tput=4.64] rank0[cuda0,share=0.3287,tput=3.19] rank2[cuda2,share=0.3204,tput=2.37]
+epoch 145: eval=0.8871
+epoch 146: loss=0.230583, train_acc=0.9192, time=8.8s
+per-rank: rank1[cuda1,share=0.3509,tput=2.10] rank0[cuda0,share=0.3287,tput=3.55] rank2[cuda2,share=0.3204,tput=5.27]
+epoch 146: eval=0.8842
+epoch 147: loss=0.229535, train_acc=0.9189, time=8.6s
+per-rank: rank1[cuda1,share=0.3509,tput=3.88] rank0[cuda0,share=0.3287,tput=3.68] rank2[cuda2,share=0.3204,tput=2.43]
+epoch 147: eval=0.8861
+epoch 148: loss=0.230943, train_acc=0.9192, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=2.38] rank0[cuda0,share=0.3328,tput=4.85] rank2[cuda2,share=0.3184,tput=3.14]
+epoch 148: eval=0.8946
+epoch 149: loss=0.230012, train_acc=0.9186, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=3.73] rank0[cuda0,share=0.3328,tput=4.26] rank2[cuda2,share=0.3184,tput=2.11]
+epoch 149: eval=0.8887
+epoch 150: loss=0.229771, train_acc=0.9199, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=4.29] rank0[cuda0,share=0.3328,tput=2.31] rank2[cuda2,share=0.3184,tput=3.65]
+epoch 150: eval=0.8902
+epoch 151: loss=0.231876, train_acc=0.9184, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=4.54] rank0[cuda0,share=0.3328,tput=4.78] rank2[cuda2,share=0.3184,tput=2.10]
+epoch 151: eval=0.8896
+epoch 152: loss=0.232617, train_acc=0.9184, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.33] rank0[cuda0,share=0.3328,tput=2.80] rank2[cuda2,share=0.3184,tput=5.88]
+epoch 152: eval=0.8847
+epoch 153: loss=0.224107, train_acc=0.9204, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=4.35] rank0[cuda0,share=0.3328,tput=3.86] rank2[cuda2,share=0.3184,tput=2.54]
+epoch 153: eval=0.8956
+epoch 154: loss=0.194925, train_acc=0.9321, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=5.89] rank0[cuda0,share=0.3328,tput=2.29] rank2[cuda2,share=0.3184,tput=2.74]
+epoch 154: eval=0.9015
+epoch 155: loss=0.186620, train_acc=0.9351, time=9.0s
+per-rank: rank1[cuda1,share=0.3488,tput=2.56] rank0[cuda0,share=0.3328,tput=3.95] rank2[cuda2,share=0.3184,tput=3.27]
+epoch 155: eval=0.9008
+epoch 156: loss=0.180895, train_acc=0.9377, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=4.43] rank0[cuda0,share=0.3328,tput=3.12] rank2[cuda2,share=0.3184,tput=2.58]
+epoch 156: eval=0.9028
+epoch 157: loss=0.177244, train_acc=0.9380, time=9.3s
+per-rank: rank1[cuda1,share=0.3488,tput=2.02] rank0[cuda0,share=0.3328,tput=3.36] rank2[cuda2,share=0.3184,tput=5.94]
+epoch 157: eval=0.9042
+epoch 158: loss=0.175608, train_acc=0.9394, time=8.9s
+per-rank: rank1[cuda1,share=0.3488,tput=3.92] rank0[cuda0,share=0.3328,tput=2.46] rank2[cuda2,share=0.3184,tput=3.82]
+epoch 158: eval=0.9023
+epoch 159: loss=0.174001, train_acc=0.9388, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=6.35] rank0[cuda0,share=0.3328,tput=2.61] rank2[cuda2,share=0.3184,tput=2.35]
+epoch 159: eval=0.9040
+epoch 160: loss=0.175597, train_acc=0.9396, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=3.91] rank0[cuda0,share=0.3328,tput=3.56] rank2[cuda2,share=0.3184,tput=2.29]
+epoch 160: eval=0.9043
+epoch 161: loss=0.171875, train_acc=0.9400, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=3.66] rank0[cuda0,share=0.3328,tput=4.48] rank2[cuda2,share=0.3184,tput=2.16]
+epoch 161: eval=0.9078
+epoch 162: loss=0.170358, train_acc=0.9410, time=8.5s
+per-rank: rank1[cuda1,share=0.3488,tput=5.48] rank0[cuda0,share=0.3328,tput=2.87] rank2[cuda2,share=0.3184,tput=2.43]
+epoch 162: eval=0.9056
+epoch 163: loss=0.169785, train_acc=0.9399, time=9.3s
+per-rank: rank1[cuda1,share=0.3488,tput=3.04] rank0[cuda0,share=0.3328,tput=2.26] rank2[cuda2,share=0.3184,tput=5.67]
+epoch 163: eval=0.9064
+epoch 164: loss=0.168231, train_acc=0.9422, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=2.07] rank0[cuda0,share=0.3328,tput=3.88] rank2[cuda2,share=0.3184,tput=4.08]
+epoch 164: eval=0.9077
+epoch 165: loss=0.163372, train_acc=0.9436, time=10.0s
+per-rank: rank1[cuda1,share=0.3488,tput=3.57] rank0[cuda0,share=0.3328,tput=2.04] rank2[cuda2,share=0.3184,tput=5.07]
+epoch 165: eval=0.9060
+epoch 166: loss=0.163040, train_acc=0.9444, time=9.1s
+per-rank: rank1[cuda1,share=0.3488,tput=3.48] rank0[cuda0,share=0.3328,tput=3.73] rank2[cuda2,share=0.3184,tput=2.75]
+epoch 166: eval=0.9077
+epoch 167: loss=0.163692, train_acc=0.9442, time=9.5s
+per-rank: rank1[cuda1,share=0.3488,tput=3.28] rank0[cuda0,share=0.3328,tput=2.19] rank2[cuda2,share=0.3184,tput=5.47]
+epoch 167: eval=0.9069
+epoch 168: loss=0.158566, train_acc=0.9457, time=9.0s
+per-rank: rank1[cuda1,share=0.3488,tput=2.30] rank0[cuda0,share=0.3328,tput=4.01] rank2[cuda2,share=0.3184,tput=3.96]
+epoch 168: eval=0.9076
+epoch 169: loss=0.161236, train_acc=0.9438, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=2.46] rank0[cuda0,share=0.3328,tput=3.63] rank2[cuda2,share=0.3184,tput=3.83]
+epoch 169: eval=0.9072
+epoch 170: loss=0.159773, train_acc=0.9445, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=3.63] rank0[cuda0,share=0.3328,tput=4.09] rank2[cuda2,share=0.3184,tput=2.28]
+epoch 170: eval=0.9073
+epoch 171: loss=0.157124, train_acc=0.9451, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=2.21] rank0[cuda0,share=0.3328,tput=4.25] rank2[cuda2,share=0.3184,tput=3.69]
+epoch 171: eval=0.9090
+epoch 172: loss=0.157853, train_acc=0.9457, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=5.09] rank0[cuda0,share=0.3328,tput=3.99] rank2[cuda2,share=0.3184,tput=2.29]
+epoch 172: eval=0.9054
+epoch 173: loss=0.157096, train_acc=0.9453, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=4.67] rank0[cuda0,share=0.3328,tput=2.87] rank2[cuda2,share=0.3184,tput=2.49]
+epoch 173: eval=0.9096
+epoch 174: loss=0.157174, train_acc=0.9461, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=2.22] rank0[cuda0,share=0.3328,tput=3.27] rank2[cuda2,share=0.3184,tput=5.23]
+epoch 174: eval=0.9095
+epoch 175: loss=0.153025, train_acc=0.9470, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=2.40] rank0[cuda0,share=0.3328,tput=4.51] rank2[cuda2,share=0.3184,tput=3.51]
+epoch 175: eval=0.9083
+epoch 176: loss=0.154499, train_acc=0.9461, time=8.5s
+per-rank: rank1[cuda1,share=0.3488,tput=5.22] rank0[cuda0,share=0.3328,tput=3.38] rank2[cuda2,share=0.3184,tput=2.00]
+epoch 176: eval=0.9076
+epoch 177: loss=0.153256, train_acc=0.9470, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=3.72] rank0[cuda0,share=0.3328,tput=2.27] rank2[cuda2,share=0.3184,tput=4.34]
+epoch 177: eval=0.9101
+epoch 178: loss=0.149665, train_acc=0.9483, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=3.79] rank0[cuda0,share=0.3328,tput=4.21] rank2[cuda2,share=0.3184,tput=2.20]
+epoch 178: eval=0.9089
+epoch 179: loss=0.152217, train_acc=0.9470, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=5.61] rank0[cuda0,share=0.3328,tput=3.39] rank2[cuda2,share=0.3184,tput=1.99]
+epoch 179: eval=0.9079
+epoch 180: loss=0.151411, train_acc=0.9471, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=2.41] rank0[cuda0,share=0.3328,tput=3.06] rank2[cuda2,share=0.3184,tput=4.87]
+epoch 180: eval=0.9074
+epoch 181: loss=0.153236, train_acc=0.9465, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=5.38] rank0[cuda0,share=0.3328,tput=2.29] rank2[cuda2,share=0.3184,tput=3.34]
+epoch 181: eval=0.9092
+epoch 182: loss=0.146192, train_acc=0.9495, time=8.9s
+per-rank: rank1[cuda1,share=0.3488,tput=3.54] rank0[cuda0,share=0.3328,tput=3.90] rank2[cuda2,share=0.3184,tput=2.52]
+epoch 182: eval=0.9091
+epoch 183: loss=0.148779, train_acc=0.9482, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.19] rank0[cuda0,share=0.3328,tput=4.13] rank2[cuda2,share=0.3184,tput=4.96]
+epoch 183: eval=0.9086
+epoch 184: loss=0.145679, train_acc=0.9496, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=5.45] rank0[cuda0,share=0.3328,tput=2.80] rank2[cuda2,share=0.3184,tput=2.40]
+epoch 184: eval=0.9084
+epoch 185: loss=0.144583, train_acc=0.9505, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.44] rank0[cuda0,share=0.3328,tput=3.36] rank2[cuda2,share=0.3184,tput=4.09]
+epoch 185: eval=0.9100
+epoch 186: loss=0.144517, train_acc=0.9493, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.45] rank0[cuda0,share=0.3328,tput=4.16] rank2[cuda2,share=0.3184,tput=3.44]
+epoch 186: eval=0.9096
+epoch 187: loss=0.143660, train_acc=0.9508, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.17] rank0[cuda0,share=0.3328,tput=5.21] rank2[cuda2,share=0.3184,tput=3.52]
+epoch 187: eval=0.9091
+epoch 188: loss=0.147667, train_acc=0.9487, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=5.20] rank0[cuda0,share=0.3328,tput=2.59] rank2[cuda2,share=0.3184,tput=2.32]
+epoch 188: eval=0.9092
+epoch 189: loss=0.142955, train_acc=0.9497, time=8.5s
+per-rank: rank1[cuda1,share=0.3488,tput=2.71] rank0[cuda0,share=0.3328,tput=3.51] rank2[cuda2,share=0.3184,tput=3.80]
+epoch 189: eval=0.9071
+epoch 190: loss=0.143374, train_acc=0.9502, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=2.27] rank0[cuda0,share=0.3328,tput=3.84] rank2[cuda2,share=0.3184,tput=3.95]
+epoch 190: eval=0.9080
+epoch 191: loss=0.141144, train_acc=0.9511, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=2.42] rank0[cuda0,share=0.3328,tput=3.52] rank2[cuda2,share=0.3184,tput=4.08]
+epoch 191: eval=0.9068
+epoch 192: loss=0.141868, train_acc=0.9507, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=5.84] rank0[cuda0,share=0.3328,tput=2.26] rank2[cuda2,share=0.3184,tput=3.53]
+epoch 192: eval=0.9087
+epoch 193: loss=0.142157, train_acc=0.9503, time=8.8s
+per-rank: rank1[cuda1,share=0.3488,tput=4.32] rank0[cuda0,share=0.3328,tput=4.31] rank2[cuda2,share=0.3184,tput=2.18]
+epoch 193: eval=0.9076
+epoch 194: loss=0.142023, train_acc=0.9511, time=8.7s
+per-rank: rank1[cuda1,share=0.3488,tput=4.66] rank0[cuda0,share=0.3328,tput=3.37] rank2[cuda2,share=0.3184,tput=2.26]
+epoch 194: eval=0.9084
+epoch 195: loss=0.140927, train_acc=0.9509, time=9.2s
+per-rank: rank1[cuda1,share=0.3488,tput=4.63] rank0[cuda0,share=0.3328,tput=2.30] rank2[cuda2,share=0.3184,tput=3.35]
+epoch 195: eval=0.9094
+epoch 196: loss=0.137169, train_acc=0.9527, time=9.0s
+per-rank: rank1[cuda1,share=0.3488,tput=2.10] rank0[cuda0,share=0.3328,tput=4.00] rank2[cuda2,share=0.3184,tput=3.95]
+epoch 196: eval=0.9090
+epoch 197: loss=0.140454, train_acc=0.9513, time=8.5s
+per-rank: rank1[cuda1,share=0.3488,tput=2.63] rank0[cuda0,share=0.3328,tput=5.41] rank2[cuda2,share=0.3184,tput=2.49]
+epoch 197: eval=0.9077
+epoch 198: loss=0.137707, train_acc=0.9522, time=8.6s
+per-rank: rank1[cuda1,share=0.3488,tput=4.83] rank0[cuda0,share=0.3328,tput=3.10] rank2[cuda2,share=0.3184,tput=2.26]
+epoch 198: eval=0.9087
+epoch 199: loss=0.138230, train_acc=0.9516, time=8.5s
+per-rank: rank1[cuda1,share=0.3488,tput=5.41] rank0[cuda0,share=0.3328,tput=3.26] rank2[cuda2,share=0.3184,tput=2.38]
+final eval=0.9137
+# total: 1707.3s (28m 27s)

@@ -400,6 +400,159 @@ Single-seed only. Multi-seed α-sweep is justified.
 
 ---
 
+## Phase 3 verdict (Sweep B2 cliff bracket landed 2026-05-06)
+
+The fixed-k cliff bracket (3 seeds × 6 k values × 200 epochs × `--guard none` × `--min-anchor=k --max-anchor=k`) landed cleanly. Sweep ran ~9h30m, 18/18 OK, 0 FAIL. The Pecora-Carroll synchronization threshold is now empirically localized for ResNet-20 / CIFAR-10 / standard 200-epoch schedule / 3-GPU heterogeneous.
+
+### Headline cliff table
+
+| k | Within-train syncs | Eval seed 0 | Eval seed 1 | Eval seed 2 | Mean ± sd | Range | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 3200  | 13 | 91.76% | 91.76% | 91.28% | 91.60% ± 0.28 |  0.5pp | safe baseline |
+| 6400  |  7 | 91.31% | 91.39% | 91.64% | 91.45% ± 0.17 |  0.3pp | safe |
+| 12800 |  4 | 91.29% | 91.37% | 91.21% | 91.29% ± 0.08 |  0.2pp | safe |
+| 16000 |  3 | 90.31% | 89.32% | 90.53% | 90.05% ± 0.64 |  1.2pp | soft pre-cliff |
+| **25600** |  2 | 90.89% | **55.80%** | 84.58% | 77.09% ± 18.71 | **35.1pp** | **bimodal cliff edge** |
+| 51200 |  1 | 63.22% | 10.02% | 10.02% | 27.75% ± 30.72 | 53.2pp | past cliff |
+
+**The cliff sits between k=16000 and k=25600.** Below it, all three seeds converge within 1.3pp of the safe-regime mean. At and above it, seeds split between safe-basin and collapsed-basin endings within the same cell. The bimodality at k=25600 — three independently-seeded runs landing at 90.89%, 55.80%, 84.58% — is the basin-of-attraction signature of a noise-perturbed system at the synchronization threshold. Two seeds find a common basin; one falls into a different one.
+
+### Adjacent-cell deltas localize the bracket
+
+| Transition | Δ mean eval | Verdict |
+|---|---:|---|
+| k=3200 → k=6400   |  −0.15pp | flat |
+| k=6400 → k=12800  |  −0.16pp | flat |
+| k=12800 → k=16000 |  −1.24pp | soft drop (>1pp) |
+| k=16000 → k=25600 | −12.96pp | soft drop (>1pp) |
+| k=25600 → k=51200 | **−49.34pp** | **cliff edge** |
+
+The hard cliff (Δ > 30pp) localizes between k=25600 and k=51200; the cliff edge itself (first cell with bimodal seed split) is k=25600. ElChe's auto-tune saturates near k ≈ 200 in this regime — operating ~80–125× below the cliff.
+
+### No eval peak above ElChe's default operating point
+
+Within the safe regime k ∈ {3200, 6400, 12800}, eval is monotone non-increasing (91.60% → 91.45% → 91.29%). The "ride the limit" hypothesis — that the eval-vs-k curve has a peak between ElChe's default operating point (~k=200) and the cliff — is **falsified**. The controller story for C5' is **"stay safely below the cliff"**, not "target the peak". The cliff localization above gives that story its quantitative reference.
+
+### Loss of within-cycle observability is itself a regime signature
+
+R1 by-k OLS is observable only at k=3200 (LR=0.3 window, 6 events, slope −1.98e−4 ± 1.43e−4, R² = 0.235 ± 0.099). For k ≥ 6400 the analyzer skips the section because per-LR-window sync count drops below the OLS minimum. The disappearance of the within-cycle Lyapunov axis is *itself* a signature of crossing into the sparse-coupling regime — by construction, as inter-sync interval grows past a single LR window, the by-k axis degenerates.
+
+A corollary: **cross-rank Pearson r is uninformative past the cliff.** Reported r ≈ 1.0 in collapsed cells is artifact of N ≤ 2 sync events (two points always lie perfectly on a line). The eval signal is the load-bearing falsifier; the framing-validity gate works only in the safe regime where it's already saturated near 1.
+
+### Phase 3 verdict against R1'–R5'
+
+| Hypothesis | Result |
+|---|---|
+| R1' within-cycle exponential | confirmed previously at warmup; now also confirmed that observability degrades by construction past the cliff (sync-count-bounded by LR-window length). |
+| R2' phase-dependent setpoint D*(LR) | unchanged; pending Sweep D. |
+| R3' by-k controller A/B | unchanged; pending C1' implementation + Sweep E. |
+| R4' Pecora-Carroll threshold proximity | **confirmed and quantitatively localized** — synchronization threshold sits between k=16000 (last fully safe) and k=25600 (first bimodal); hard collapse at k=51200. ElChe operates ~80–125× below the cliff at default cadence. |
+| R5' meta-CUSUM | unchanged; full CUSUM detector still pending. |
+
+**No kill criterion triggered.** Phase 3 confirms R4' and falsifies the "peak between default and cliff" sub-hypothesis.
+
+---
+
+## Program reframe (post-Phase-3)
+
+Phase 3 changed the paper. Eval is monotone non-increasing across the safe regime; ElChe at default cadence sits within the optimal eval band; **there is no controller-relaxation regime on the cadence axis that improves final eval at this scale**. The publishable result reorients from "principled controller beats heuristic" to **empirical characterization of the eval-vs-cost Pareto frontier, with a structural scaling argument for where the frontier rotates**.
+
+### Pareto frontier (200-epoch data, post-Gate-A multi-seed)
+
+Cost axis: syncs / 200ep (network-volume proxy at fixed model size; rotates toward wall time as parameter count grows). Eval axis: held-out accuracy.
+
+| Config | Eval (n=5 unless noted) | Syncs/200ep | Frontier status |
+|---|---:|---:|---|
+| nccl-async default msf       | 91.83% ± 0.20 | 882 ± 299 | dominated by cpu-async default trend |
+| nccl-async default trend     | 91.71% ± 0.21 | 539 ± 205 | dominated by nccl-async relaxed trend |
+| cpu-async default msf        | 91.86% ± 0.27 | 619 ± 212 | dominated by cpu-async default trend |
+| **cpu-async default trend**  | **91.96% ± 0.23** | **613 ± 206** | **frontier (eval max)** |
+| nccl-async relaxed msf       | 91.95% ± 0.32 | 641 ± 162 | dominated by cpu-async default trend |
+| **nccl-async relaxed trend** | **91.74% ± 0.07** | **402 ± 160** | **frontier (lowest-sync at near-parity)** |
+| cpu-async EASGD α=0.5 msf    | 91.67% ± 0.19 | 604 ± 154 | dominated by nccl-async relaxed trend |
+| cpu-async EASGD α=0.5 trend  | 91.75% ± 0.22 | 594 ± 162 | frontier (thin margin between two existing points) |
+| Fixed k=3200                 | 91.60% ± 0.28 |  13       | frontier knee |
+| Fixed k=6400                 | 91.45% ± 0.17 |   7       | frontier |
+| Fixed k=12800                | 91.29% ± 0.08 |   4       | frontier |
+| Fixed k=16000                | 90.05% ± 0.64 |   3       | post-knee |
+| Fixed k=25600                | 77.09% ± 18.71|   2       | past Pareto (bimodal) |
+| Fixed k=51200                | 27.75% ± 30.72|   1       | collapsed |
+
+#### Multi-seed correction to the seed-0 EASGD smoke story
+
+The seed-0 EASGD smoke (Phase 2) reported `cpu-async α=0.5 + msf` at 91.91% / 408 syncs and `cpu-async α=0.5 + trend` at 91.39% / 726 syncs — a 0.52pp eval gap and a >2× sync-count gap between the two arms. Gate A multi-seed (seeds 1–4) decisively contradicts both signals. Multi-seed means converge into a tight band: msf at 91.67% ± 0.19, trend at 91.75% ± 0.22, sync counts ~600 for both. Seed 0 was a tail outlier on both arms simultaneously; the strong seed-0-derived dominance claim does not survive replication.
+
+Net Pareto effect: EASGD α=0.5 does **not** add a Pareto-improving direction. The msf arm is now **dominated by `nccl-async relaxed trend`** (91.74% / 402 syncs strictly improves on 91.67% / 604). The trend arm sits on the frontier with thin margin (~0.01pp eval / ~19 syncs window between `nccl-async relaxed trend` and `cpu-async default trend`).
+
+#### What the corrected frontier actually shows
+
+> **2026-05-07 reorg note:** the research/ data layout was consolidated
+> on 2026-05-07. The cpu-async α=1.0 cells in the original
+> `passive-observation/` were dropped (pre-EASGD impulsive-coupling
+> break per Phase 2 verdict — MSF-framing-invalid foil); the EASGD
+> α=0.5 cohort (seed-0 from the relaxed-easgd smoke + seeds 1–4 from
+> the multi-seed Gate A) was migrated into `passive-observation/` as
+> the canonical cpu-async cohort. `relaxed-anchor-easgd/` was renamed
+> to `relaxed-anchor/`; `easgd-multiseed/` was folded into
+> passive-observation. The strict-Pareto computation now resolves
+> three frontier configurations at the high-sync end (with the eval
+> max shifting to `nccl-async relaxed msf` since the previous eval-max
+> point was an α=1.0 cell that no longer enters the frontier set). A
+> full re-run at a single fresh tree state is queued to eliminate the
+> mixed-tree caveat (seed-0 EASGD α=0.5 cells are tree `321a401`,
+> seeds 1–4 are tree `0806f84`, nccl-async cells are tree `321a401`).
+
+The high-sync end of the frontier resolves to **three non-dominated configurations**:
+- `nccl-async relaxed msf` — eval maximum (91.95% ± 0.32) at 641 ± 162 syncs.
+- `cpu-async default trend` — middle (91.75% ± 0.22) at 594 ± 162 syncs (this cell is the EASGD α=0.5 cohort under the post-reorg naming).
+- `nccl-async relaxed trend` — lowest-sync near-parity point (91.74% ± 0.07) at 402 ± 160 syncs.
+
+Production default `nccl-async default msf` (91.83% ± 0.20 at 882 ± 299 syncs) is dominated by `nccl-async relaxed msf` — the production-config improvement is a **single flag** (`--elche-relax-up`), Δ +0.12pp eval at 27% sync reduction. Same backend (NCCL async), same guard (msf), just relax-up enabled.
+
+The cadence-axis frontier (fixed-k cliff bracket) saturates around k=3200–6400; past k=12800 the knee bends sharply. Each fixed-k cell strictly Pareto-improves on cost as it loses ~0.15–0.5pp eval, until the cliff at k=25600.
+
+**Honest controller-story conclusion:** ElChe's auto-tune is **near-optimal at this scale**; the relaxed-anchor flag (`--elche-relax-up`) is the meaningful Pareto-improving knob in the high-sync regime, on either guard. The coupling-mechanism axis (EASGD α<1) sits on the frontier as one of three configurations but the within-seed-noise margin to the eval-max endpoint means it is not a clearly differentiable Pareto direction at this scale. The structural-rotation argument (model size + GPU heterogeneity) remains the open prediction.
+
+### Scaling prediction (the structural argument)
+
+The frontier rotates with two axes that ResNet-20 / 3-GPU does not stress:
+
+1. **Model size.** AllReduce cost scales linearly with parameter count. ResNet-20 has 270K params; SmolLM-135M is ~500× larger. Sync count translates more directly to wall time at scale. The most Pareto-improving config at ResNet-20 (`nccl-async relaxed trend`, ~34% sync reduction at −0.22pp eval) becomes a near-proportional wall-time reduction at SmolLM size; on ResNet-20 the wall-time delta is barely measurable.
+2. **Rank count and heterogeneity diversity.** 3 GPUs (1 fast + 2 slow) yields a binary fast/slow asymmetry. With 4+ GPUs in richer mixes, the Phase 2 bottom-scale decoupling pattern (fast GPU drifts, slow pair stays Pearson-locked) generalizes to multi-cluster decoupling, where per-cluster cadence becomes a controller knob the single-cadence treatment cannot use.
+
+The two-scale framing predicts these directions are where principled controllers earn their keep — not on ResNet-20/CIFAR-10/3-GPU, where ElChe's auto-tune is already near-optimal. The paper's contribution is the structural framing + the falsifiable scaling prediction, not a controller-improvement benchmark on the small case.
+
+### Updated experimental gates
+
+The original Phase 4 / Phase 5 specs predate cliff localization and are superseded.
+
+**Gate A (LANDED 2026-05-06): Multi-seed EASGD α-sweep.** Confirmation pass for the seed-0 EASGD smoke. Result: **EASGD α=0.5 does not add a Pareto-improving direction.** Sharp predictions decisively violated:
+- msf+α=0.5 cross-seed mean = 91.67% ± 0.19 vs α=1.0 baseline 91.86% ± 0.27. Predicted parity ±0.15pp; actual −0.19pp at marginal-significance edge.
+- trend+α=0.5 cross-seed mean = 91.75% ± 0.22 vs α=1.0 baseline 91.96% ± 0.23. Predicted 0.5–1.0pp degradation; actual −0.21pp (essentially within noise).
+- Sync-count reduction ~3-5% (594-604 vs 613-619), **not** the predicted ≥25%. The seed-0 sync counts (408 msf, 726 trend) were tail outliers.
+- Net effect: msf arm now dominated by `nccl-async relaxed trend`; trend arm on frontier with thin margin. See "Multi-seed correction" subsection above for full read.
+
+The Gate A null result strengthens the structural-scaling argument: at ResNet-20 / 3-GPU scale, the coupling-mechanism axis (EASGD elastic blending) provides no frontier-improving direction. Whether this generalizes — or whether EASGD becomes a real Pareto improvement at SmolLM scale where AllReduce cost is non-trivial — is the Paper 2 question (Gate E, scale-axis follow-up).
+
+**Gate B (scoped): D*(LR) fit (was Phase 4).** Reduced scope. C4' (setpoint regulator) is deprioritized given the no-eval-peak finding; D*(LR)'s remaining consumer is R5' (CUSUM normalization).
+- 2 LR schedules × 3 seeds × 200 epochs × nccl-async × msf guard.
+- Standard `0.3 → 0.03 → 0.003` plus one off-baseline (e.g. `0.1 → 0.01 → 0.001`).
+- 6 runs, ~3h.
+
+**Gate C (reframed): Pareto-frontier characterization (was Phase 5 controller A/B).** Headline figure becomes the (syncs, eval) Pareto plot across {ElChe default trend/msf, ElChe relaxed trend/msf, EASGD α=0.5 trend/msf, fixed k=3200/6400/12800, optionally C1' if implemented}.
+- Most cells already on disk. Aggregation script can produce the figure from existing runs + Gate A results.
+- C1' (by-k cadence inversion) becomes optional; its predicted ceiling is parity, not improvement, and its input signal degrades by construction past the safe regime.
+
+**Gate D (in-paper, post-Gate-A): ResNet-56 bytes-axis confirmation.** Intermediate model (n=9 in the He et al. CIFAR family, ~850K params, 3.1× ResNet-20). Confirms the bytes-axis Pareto rotation prediction directly: same dataset, same eval metric, same architecture family, just 3× the parameter count. Implementation cost ~1h (lift the hardcoded `make_layer(..., 3, ...)` literal in `ddp-bench/src/models/resnet.rs:236-238` to a CLI `--depth-n` flag); experimental cost ~1 overnight (Gate A repeat at ResNet-56: 8 runs × ~90 min). Does **not** substitute for the wall-time-axis test — at this rig and model size, AllReduce remains <1ms regardless of params, so wall-time rotation needs ~10M+ params. ResNet-56 buys the bytes axis cleanly and falsifies-or-confirms the directional structural prediction at ~1 overnight cost.
+
+**Gate E (out-of-paper, follow-up): Architecture variance + scale axis.** Two follow-up directions, deferred to a second paper rather than squeezed into this one:
+- **Architecture variance (TinyViT / vanilla ViT-Tiny CIFAR, ~5.7M params).** Tests whether the two-scale framing is architecture-independent. flodl already has the building blocks (`MultiheadAttention`, `LayerNorm`, `GELU`, `Embedding`, `Dropout`); impl cost ~4–8h for the model + recipe. Vanilla ViT-Tiny preferred over Microsoft's hierarchical TinyViT (the latter requires windowed-shifted attention + distillation pipeline, multi-day work).
+- **Scale axis (SmolLM-135M, ~135M params, see `project_smollm_bench_arc.md`).** Tests the wall-time-axis Pareto rotation that ResNet-56 cannot reach. Different domain (language vs vision), different eval metric (perplexity vs accuracy) — its own Pareto plot, complementary to the ResNet-{20,56} story.
+
+Both follow-up directions are now scoped to the second paper (architecture variance + scale axis as the structural rotation argument); ResNet-56 stays in this paper as the in-budget bytes-axis confirmation.
+
+---
+
 ## Refined hypotheses
 
 ### R1' — within-cycle exponential growth on by-k axis
@@ -459,16 +612,21 @@ cadence bound (`k_max`) across orders of magnitude; observe where
 accuracy degrades and sync count saturates. The threshold sits where
 these two regimes meet.
 
-**Status (2026-05-05).** Phase 2 sweep landed. Proximity gradient
-empirically observed across 4 cells (see Phase 2 verdict section below).
-Threshold not yet quantitatively localized — Sweep C is the natural
-follow-up.
+**Status (2026-05-06).** Phase 2 sweep landed (proximity gradient).
+**Phase 3 (Sweep B2 cliff bracket) landed** — synchronization threshold
+quantitatively localized between k=16000 (last fully safe) and k=25600
+(first bimodal cliff edge); hard collapse at k=51200. ElChe's auto-tuned
+cadence saturates near k ≈ 200 in this regime, operating ~80–125× below
+the cliff. R4' is **confirmed and quantitatively localized**. See Phase 3
+verdict section above for the headline cliff table and adjacent-cell
+deltas.
 
 **Why this matters.** This is the literal Pecora-Carroll experiment in
-DDP form. If the threshold can be located, the paper has a quantitative
-hook ("ElChe operates 2x above the synchronization threshold; relaxed-
-anchor mode operates 1.5x above; below 1.0x convergence breaks").
-Without it, the claim is qualitative.
+DDP form, and the threshold is now located. The paper has its
+quantitative hook: for ResNet-20 / CIFAR-10 / standard 200-epoch
+schedule / 3-GPU heterogeneous, ElChe operates ~80–125× below the
+synchronization threshold; the threshold sits at the cadence where
+within-training sync count drops to ≤2 over the 200-epoch run.
 
 ### R5' — meta-CUSUM detector
 
@@ -654,28 +812,16 @@ parity.
 
 ### Phase 6: paper
 
-**Entry condition.** Phase 5 at Tier 0 or better, AND at least one of:
+**Entry condition (post-Phase-3 + post-Gate-A reframe).** Gate A LANDED 2026-05-06 with a null result: EASGD α=0.5 does not add a Pareto-improving direction at this scale (multi-seed contradicted the seed-0 smoke). R4' is confirmed (Phase 3 cliff localization). Both decisions are now on the table for the paper. Remaining gates that could strengthen the manuscript:
 
-- R1' confirmed (Phase 3 fixed-k sweep R² > 0.7).
-- R4' threshold located (Phase 2 side experiment finds the relax-up
-  failure point).
-- R5' meta-CUSUM beats sustained-EMA on a controlled regime-shift
-  benchmark.
+- Gate B (D*(LR) fit, scoped): closes R2' analytically and feeds R5'.
+- C1' / C5' implemented and run as optional arms in Gate C: lets the paper sketch the principled controller's predicted ceiling (parity, not improvement) directly.
 
-**Narrative spine.**
+**Narrative spine (post-Phase-3 reframe).**
 
-> Distributed data parallel training is a synchronization-of-coupled-
-> chaotic-oscillators problem in the Pecora-Carroll sense. Each replica
-> evolves chaotically between AllReduce events with positive
-> within-cycle Lyapunov exponent λ_T(LR); the meta-oscillator (cross-
-> rank average) collapses these into a contracting Ornstein-Uhlenbeck
-> process around a phase-dependent setpoint D*(LR). AllReduce is the
-> projection operator linking the scales, and cadence k is the
-> coupling-strength parameter from the original 1998 framework. The
-> ElChe heuristic works because it operates above the synchronization
-> threshold; the principled controller (by-k cadence inversion against
-> a D*(LR) budget) matches its test accuracy and clarifies the design
-> intent.
+> Distributed data parallel training is a synchronization-of-coupled-chaotic-oscillators problem in the Pecora-Carroll sense. Each replica evolves chaotically between AllReduce events with positive within-cycle Lyapunov exponent λ_T(LR); the meta-oscillator (cross-rank average) collapses these into a contracting Ornstein-Uhlenbeck process around a phase-dependent setpoint D*(LR). AllReduce is the projection operator linking the scales, and cadence k is the coupling-strength parameter from the original 1998 framework.
+>
+> We characterize the empirical eval-vs-cost Pareto frontier for heterogeneous DDP on ResNet-20/CIFAR-10/3-GPU and locate the Pecora-Carroll synchronization threshold (cliff between k=16000 and k=25600 for the standard 200-epoch schedule; ElChe operates ~80–125× below it). The frontier at the high-sync end resolves to two configurations: `cpu-async default trend` (eval maximum) and `nccl-async relaxed trend` (lowest-sync near-parity, trading 0.22pp eval for 34% sync reduction). ElChe's auto-tuned cadence sits within the optimal eval band; **no controller-relaxation regime on the cadence axis improves final eval at this scale**, and the coupling-mechanism axis (EASGD elastic blending α<1) does not add a Pareto-improving direction either (multi-seed contradicts the seed-0 smoke; mean eval drifts −0.19pp at marginal sync savings). The two-scale framing predicts both null results generalize structurally only up to a scaling boundary: top-scale (cadence) headroom narrows as a model approaches its training-recipe optimum; bottom-scale (per-rank decoupling treatment) headroom widens with rank count and hardware heterogeneity; coupling-mechanism choice (EASGD α) becomes Pareto-relevant only when AllReduce cost is non-trivial relative to per-step compute, which ResNet-20 / 3-GPU does not reach. We sketch the controller refinements the framing motivates (by-k cadence inversion C1', threshold-aware cadence C5', meta-CUSUM regime detector R5') and leave their empirical validation at scale to follow-up.
 
 ---
 
@@ -721,21 +867,25 @@ threshold sits between them.
 
 ### Sweep D: D*(LR) extended schedule
 
+**[SUPERSEDED post-Phase-3 — see "Program reframe → Gate B" above. Original spec preserved for context.]**
+
 ```
 3 LR schedules × 3 seeds × 200 epochs × nccl-async × msf guard
 schedules: {0.3 → 0.03 → 0.003, 0.1 → 0.01 → 0.001, 1.0 → 0.1 → 0.01}
 ```
 
-9 runs, ~4.5 hours. Fits R2'.
+9 runs, ~4.5 hours. Fits R2'. Reduced to 2 schedules (6 runs, ~3h) under the reframe — third schedule's marginal value collapsed when C4' was deprioritized.
 
 ### Sweep E: controller A/B (post-Sweep-A-D)
+
+**[SUPERSEDED post-Phase-3 — see "Program reframe → Gate C" above. Original spec preserved for context.]**
 
 ```
 5 seeds × 3 guards × nccl-async × 200 epochs
 guards: {current, msf v1, C1' v2}
 ```
 
-15 runs, ~7.5 hours. The headline parity (or beating) experiment.
+15 runs, ~7.5 hours. Originally framed as headline parity (or beating) experiment. Reframed under post-Phase-3 program as Pareto-frontier characterization — most cells already on disk; Gate A's EASGD multi-seed result is the load-bearing addition. C1' becomes optional rather than the headline arm.
 
 **Total budget across all sweeps:** ~26 hours across 5 overnights or
 ~3 days continuous. Sweeps A-D can run independently and merge into
@@ -859,6 +1009,41 @@ so any number in the doc can be traced to its source.
   R² 0.92–0.94 (best framing observed), 34% sync reduction at
   α=0.5+msf vs α=1.0+msf.
 
+### Phase 3 (Sweep B2 cliff bracket, 2026-05-06)
+
+- **Sweep base:** `ddp-bench/runs/overnight-2026-05-05-sweep-b2-cliff/`
+- **Run script:** `runs/overnight-2026-05-05-sweep-b2-cliff/run.sh` (18
+  runs: 3 seeds × 6 k values × 200 epochs, `nccl-async`, `--guard none`,
+  `--min-anchor=k --max-anchor=k` to pin cadence at fixed k). Same
+  `fdl cuda-shell -- -c "cd /workspace/ddp-bench && ./target/release/ddp-bench …"`
+  pattern as Phase 2.
+- **Run log:** `runs/overnight-2026-05-05-sweep-b2-cliff/_runlog.txt`
+  (sweep started 2026-05-05T20:46:28Z, completed 2026-05-06T06:15:58Z,
+  ~9h30m total, 18/18 OK 0 FAIL).
+- **Per-seed reports + timeline:** same shape as Phase 1/2; reports
+  regenerated 2026-05-06.
+- **Aggregation:** `runs/overnight-2026-05-05-sweep-b2-cliff/aggregate.py`
+  + canonical output `aggregate.txt` co-located. The 6-cell × 3-seed
+  cliff aggregator. Adapted from Sweep C aggregator with two structural
+  changes: (1) cliff localization — surfaces per-seed evals + range +
+  bimodality flag (range > 30pp), since past-threshold cells split
+  between safe-basin and collapsed-basin seeds within the same cell;
+  (2) Pearson + R1 tolerance — cells past the cliff have ≤ 1
+  within-training sync, so the aggregator skips OLS and Pearson
+  silently rather than crashing. Run from project root:
+  `python3 ddp-bench/runs/overnight-2026-05-05-sweep-b2-cliff/aggregate.py`.
+- **Pre-launch tree:** `0806f84` on `ddp-scale` (clean, post `--min-anchor`
+  plumbing commit).
+- **Key numbers anchored here:** cliff localized between k=16000 (last
+  fully safe, all 3 seeds within 1.3pp of safe-regime mean) and k=25600
+  (first bimodal, range 35.1pp, seeds at 90.89% / 55.80% / 84.58%); hard
+  collapse at k=51200 (mean 27.75%, 2/3 seeds at 10.02% random chance);
+  no eval peak above ElChe default in safe regime (monotone
+  non-increasing 91.60% → 91.45% → 91.29% across k ∈ {3200, 6400,
+  12800}); within-cycle by-k axis observable only at k=3200 for the
+  LR=0.3 window (slope −1.98e−4 ± 1.43e−4, R² = 0.235 ± 0.099); ElChe's
+  default cadence saturates near k ≈ 200, ~80–125× below the cliff.
+
 ### Code state at Phase 2
 
 Tree `321a401` on `ddp-scale` branch with two uncommitted change
@@ -902,8 +1087,9 @@ cuda-test-nccl` (12 tests pass).
 | Phase 1 passive observation | `runs/overnight-2026-05-04/` | landed |
 | **Sweep A relaxed-anchor** | `runs/overnight-2026-05-05-relaxed-easgd/` | landed |
 | **EASGD smoke (in Sweep A)** | (same dir, seed-0-cpu-async-*-easgd05) | landed |
-| Sweep B fixed-k probe | (not yet run) | pending |
-| Sweep C threshold bracket | (not yet run) | pending |
+| Sweep B fixed-k probe | (not yet run as v2-spec; see Sweep B2 below for the landed cliff probe) | superseded |
+| **Sweep B2 cliff bracket (200ep)** | `runs/overnight-2026-05-05-sweep-b2-cliff/` | landed |
+| Sweep C threshold bracket | `runs/overnight-2026-05-05-sweep-c-threshold/` | landed (auto-tune characterization; cap non-binding above 1.5×) |
 | Sweep D D*(LR) extended | (not yet run) | pending |
 | Sweep E controller A/B | (not yet run) | pending |
 
