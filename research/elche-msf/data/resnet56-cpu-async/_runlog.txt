@@ -1,0 +1,18 @@
+2026-05-06T13:35:18Z  OVERNIGHT SWEEP START (Gate D Batch 1 — ResNet-56 bytes-axis confirmation)
+2026-05-06T13:35:18Z  tree: 0806f84
+2026-05-06T13:35:18Z  branch: ddp-scale
+2026-05-06T13:35:18Z  design: 4 seeds (1-4) × 2 α-values ({0.5, 1.0}) × cpu-async × msf × ResNet-56 (n=9) × 200 epochs
+2026-05-06T13:35:18Z  
+2026-05-06T13:35:18Z  PHASE: alpha=0.5
+2026-05-06T13:35:19Z  START  seed-1-cpu-async-msf-easgd05  seed=1 alpha=0.5
+2026-05-06T15:05:19Z  OK     seed-1-cpu-async-msf-easgd05  5400s  exit=0
+2026-05-06T15:05:19Z  START  seed-2-cpu-async-msf-easgd05  seed=2 alpha=0.5
+2026-05-06T16:36:35Z  OK     seed-2-cpu-async-msf-easgd05  5476s  exit=0
+2026-05-06T16:36:35Z  START  seed-3-cpu-async-msf-easgd05  seed=3 alpha=0.5
+2026-05-06T18:09:19Z  OK     seed-3-cpu-async-msf-easgd05  5564s  exit=0
+2026-05-06T18:09:19Z  START  seed-4-cpu-async-msf-easgd05  seed=4 alpha=0.5
+2026-05-06T19:43:12Z  OK     seed-4-cpu-async-msf-easgd05  5633s  exit=0
+2026-05-06T19:43:12Z  PHASE: alpha=1.0
+2026-05-06T19:43:12Z  START  seed-1-cpu-async-msf-easgd10  seed=1 alpha=1.0
+2026-05-06T21:08:08Z  OK     seed-1-cpu-async-msf-easgd10  5096s  exit=0  (salvaged manually 2026-05-07; bench training completed cleanly per training.log final eval=0.9288, but launcher bash was killed before writing OK marker; report.md regenerated via --report mode after bug fix in report.rs)
+2026-05-07T00:00:00Z  HALT   sweep terminated after seed-1-cpu-async-msf-easgd10; seeds 2/3/4 alpha=1.0 not run; α=0.5 cohort complete (n=4), α=1.0 cohort partial (n=1)

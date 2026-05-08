@@ -1,0 +1,26 @@
+2026-05-06T07:05:46Z  OVERNIGHT SWEEP START (Gate A — multi-seed EASGD α=0.5 confirmation)
+2026-05-06T07:05:46Z  tree: 0806f84
+2026-05-06T07:05:46Z  branch: ddp-scale
+2026-05-06T07:05:46Z  design: 4 seeds (1-4) × 2 guards (msf, trend) × cpu-async × --easgd-alpha 0.5 × 200 epochs
+2026-05-06T07:05:46Z  
+2026-05-06T07:05:46Z  PHASE: guard=msf
+2026-05-06T07:05:46Z  START  seed-1-cpu-async-msf-easgd05  seed=1 guard=msf
+2026-05-06T07:38:56Z  OK     seed-1-cpu-async-msf-easgd05  1990s  exit=0
+2026-05-06T07:38:56Z  START  seed-2-cpu-async-msf-easgd05  seed=2 guard=msf
+2026-05-06T08:11:21Z  OK     seed-2-cpu-async-msf-easgd05  1945s  exit=0
+2026-05-06T08:11:21Z  START  seed-3-cpu-async-msf-easgd05  seed=3 guard=msf
+2026-05-06T08:43:36Z  OK     seed-3-cpu-async-msf-easgd05  1935s  exit=0
+2026-05-06T08:43:36Z  START  seed-4-cpu-async-msf-easgd05  seed=4 guard=msf
+2026-05-06T09:15:59Z  OK     seed-4-cpu-async-msf-easgd05  1943s  exit=0
+2026-05-06T09:15:59Z  PHASE: guard=trend
+2026-05-06T09:16:00Z  START  seed-1-cpu-async-trend-easgd05  seed=1 guard=trend
+2026-05-06T09:48:20Z  OK     seed-1-cpu-async-trend-easgd05  1940s  exit=0
+2026-05-06T09:48:20Z  START  seed-2-cpu-async-trend-easgd05  seed=2 guard=trend
+2026-05-06T10:20:37Z  OK     seed-2-cpu-async-trend-easgd05  1937s  exit=0
+2026-05-06T10:20:37Z  START  seed-3-cpu-async-trend-easgd05  seed=3 guard=trend
+2026-05-06T10:53:03Z  OK     seed-3-cpu-async-trend-easgd05  1946s  exit=0
+2026-05-06T10:53:03Z  START  seed-4-cpu-async-trend-easgd05  seed=4 guard=trend
+2026-05-06T11:25:37Z  OK     seed-4-cpu-async-trend-easgd05  1954s  exit=0
+2026-05-06T11:25:37Z  
+2026-05-06T11:25:37Z  OVERNIGHT SWEEP DONE
+2026-05-06T11:25:37Z  Summary: 8 OK, 0 FAIL

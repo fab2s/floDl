@@ -1,52 +1,48 @@
-2026-05-03T21:10:41Z  OVERNIGHT SWEEP START
-2026-05-03T21:10:42Z  tree: 321a401
-2026-05-03T21:10:42Z  branch: ddp-scale
-2026-05-03T21:10:42Z  
-2026-05-03T21:10:42Z  validation: load_averaged fix verification
-2026-05-03T21:10:42Z  START  validation  seed=42 mode=cpu-async guard=msf
-2026-05-03T21:44:01Z  OK     validation  1999s  exit=0
-2026-05-03T21:44:01Z  
-2026-05-03T21:44:01Z  N=5 sweep (seed-major)
-2026-05-03T21:44:01Z  START  seed-0-nccl-async-trend  seed=0 mode=nccl-async guard=trend
-2026-05-03T22:18:49Z  OK     seed-0-nccl-async-trend  2088s  exit=0
-2026-05-03T22:18:49Z  START  seed-0-nccl-async-msf  seed=0 mode=nccl-async guard=msf
-2026-05-03T22:53:34Z  OK     seed-0-nccl-async-msf  2085s  exit=0
-2026-05-03T22:53:34Z  START  seed-0-cpu-async-trend  seed=0 mode=cpu-async guard=trend
-2026-05-03T23:26:51Z  OK     seed-0-cpu-async-trend  1997s  exit=0
-2026-05-03T23:26:51Z  START  seed-0-cpu-async-msf  seed=0 mode=cpu-async guard=msf
-2026-05-03T23:59:58Z  OK     seed-0-cpu-async-msf  1987s  exit=0
-2026-05-03T23:59:58Z  START  seed-1-nccl-async-trend  seed=1 mode=nccl-async guard=trend
-2026-05-04T00:33:10Z  OK     seed-1-nccl-async-trend  1991s  exit=0
-2026-05-04T00:33:10Z  START  seed-1-nccl-async-msf  seed=1 mode=nccl-async guard=msf
-2026-05-04T01:06:43Z  OK     seed-1-nccl-async-msf  2013s  exit=0
-2026-05-04T01:06:43Z  START  seed-1-cpu-async-trend  seed=1 mode=cpu-async guard=trend
-2026-05-04T01:40:01Z  OK     seed-1-cpu-async-trend  1998s  exit=0
-2026-05-04T01:40:01Z  START  seed-1-cpu-async-msf  seed=1 mode=cpu-async guard=msf
-2026-05-04T02:13:11Z  OK     seed-1-cpu-async-msf  1990s  exit=0
-2026-05-04T02:13:11Z  START  seed-2-nccl-async-trend  seed=2 mode=nccl-async guard=trend
-2026-05-04T02:46:34Z  OK     seed-2-nccl-async-trend  2003s  exit=0
-2026-05-04T02:46:34Z  START  seed-2-nccl-async-msf  seed=2 mode=nccl-async guard=msf
-2026-05-04T03:19:53Z  OK     seed-2-nccl-async-msf  1999s  exit=0
-2026-05-04T03:19:53Z  START  seed-2-cpu-async-trend  seed=2 mode=cpu-async guard=trend
-2026-05-04T03:52:50Z  OK     seed-2-cpu-async-trend  1977s  exit=0
-2026-05-04T03:52:50Z  START  seed-2-cpu-async-msf  seed=2 mode=cpu-async guard=msf
-2026-05-04T04:25:47Z  OK     seed-2-cpu-async-msf  1977s  exit=0
-2026-05-04T04:25:47Z  START  seed-3-nccl-async-trend  seed=3 mode=nccl-async guard=trend
-2026-05-04T04:59:01Z  OK     seed-3-nccl-async-trend  1994s  exit=0
-2026-05-04T04:59:01Z  START  seed-3-nccl-async-msf  seed=3 mode=nccl-async guard=msf
-2026-05-04T05:32:27Z  OK     seed-3-nccl-async-msf  2006s  exit=0
-2026-05-04T05:32:27Z  START  seed-3-cpu-async-trend  seed=3 mode=cpu-async guard=trend
-2026-05-04T06:05:20Z  OK     seed-3-cpu-async-trend  1973s  exit=0
-2026-05-04T06:05:20Z  START  seed-3-cpu-async-msf  seed=3 mode=cpu-async guard=msf
-2026-05-04T06:38:14Z  OK     seed-3-cpu-async-msf  1974s  exit=0
-2026-05-04T06:38:14Z  START  seed-4-nccl-async-trend  seed=4 mode=nccl-async guard=trend
-2026-05-04T07:11:52Z  OK     seed-4-nccl-async-trend  2018s  exit=0
-2026-05-04T07:11:52Z  START  seed-4-nccl-async-msf  seed=4 mode=nccl-async guard=msf
-2026-05-04T07:45:41Z  OK     seed-4-nccl-async-msf  2029s  exit=0
-2026-05-04T07:45:41Z  START  seed-4-cpu-async-trend  seed=4 mode=cpu-async guard=trend
-2026-05-04T08:19:02Z  OK     seed-4-cpu-async-trend  2001s  exit=0
-2026-05-04T08:19:02Z  START  seed-4-cpu-async-msf  seed=4 mode=cpu-async guard=msf
-2026-05-04T08:52:24Z  OK     seed-4-cpu-async-msf  2002s  exit=0
-2026-05-04T08:52:24Z  
-2026-05-04T08:52:24Z  OVERNIGHT SWEEP DONE
-2026-05-04T08:52:24Z  Summary: 21 OK, 0 FAIL
+2026-05-07T07:00:15Z  OVERNIGHT SWEEP START (passive-observation re-run, post-reorg clean tree)
+2026-05-07T07:00:15Z  tree: 4544408
+2026-05-07T07:00:15Z  branch: ddp-scale
+2026-05-07T07:00:15Z  design: 5 seeds (0-4) x 2 modes (cpu-async, nccl-async) x 2 guards (msf, trend) x 200 epochs
+2026-05-07T07:00:15Z          cpu-async cells use --easgd-alpha 0.5; nccl-async cells use default anchor
+2026-05-07T07:00:15Z  
+2026-05-07T07:00:15Z  START  seed-0-nccl-async-trend  seed=0 mode=nccl-async guard=trend
+2026-05-07T07:32:38Z  OK     seed-0-nccl-async-trend  1943s  exit=0
+2026-05-07T07:32:38Z  START  seed-0-nccl-async-msf  seed=0 mode=nccl-async guard=msf
+2026-05-07T08:04:57Z  OK     seed-0-nccl-async-msf  1939s  exit=0
+2026-05-07T08:04:57Z  START  seed-0-cpu-async-trend  seed=0 mode=cpu-async guard=trend
+2026-05-07T08:37:28Z  OK     seed-0-cpu-async-trend  1951s  exit=0
+2026-05-07T08:37:28Z  START  seed-0-cpu-async-msf  seed=0 mode=cpu-async guard=msf
+2026-05-07T09:09:43Z  OK     seed-0-cpu-async-msf  1935s  exit=0
+2026-05-07T09:09:43Z  START  seed-1-nccl-async-trend  seed=1 mode=nccl-async guard=trend
+2026-05-07T09:42:03Z  OK     seed-1-nccl-async-trend  1940s  exit=0
+2026-05-07T09:42:03Z  START  seed-1-nccl-async-msf  seed=1 mode=nccl-async guard=msf
+2026-05-07T10:14:24Z  OK     seed-1-nccl-async-msf  1941s  exit=0
+2026-05-07T10:14:24Z  START  seed-1-cpu-async-trend  seed=1 mode=cpu-async guard=trend
+2026-05-07T10:46:34Z  OK     seed-1-cpu-async-trend  1930s  exit=0
+2026-05-07T10:46:34Z  START  seed-1-cpu-async-msf  seed=1 mode=cpu-async guard=msf
+2026-05-07T11:19:05Z  OK     seed-1-cpu-async-msf  1951s  exit=0
+2026-05-07T11:19:05Z  START  seed-2-nccl-async-trend  seed=2 mode=nccl-async guard=trend
+2026-05-07T11:52:21Z  OK     seed-2-nccl-async-trend  1996s  exit=0
+2026-05-07T11:52:21Z  START  seed-2-nccl-async-msf  seed=2 mode=nccl-async guard=msf
+2026-05-07T12:24:40Z  OK     seed-2-nccl-async-msf  1939s  exit=0
+2026-05-07T12:24:40Z  START  seed-2-cpu-async-trend  seed=2 mode=cpu-async guard=trend
+2026-05-07T12:56:49Z  OK     seed-2-cpu-async-trend  1929s  exit=0
+2026-05-07T12:56:49Z  START  seed-2-cpu-async-msf  seed=2 mode=cpu-async guard=msf
+2026-05-07T13:29:00Z  OK     seed-2-cpu-async-msf  1931s  exit=0
+2026-05-07T13:29:00Z  START  seed-3-nccl-async-trend  seed=3 mode=nccl-async guard=trend
+2026-05-07T14:01:27Z  OK     seed-3-nccl-async-trend  1947s  exit=0
+2026-05-07T14:01:27Z  START  seed-3-nccl-async-msf  seed=3 mode=nccl-async guard=msf
+2026-05-07T14:33:47Z  OK     seed-3-nccl-async-msf  1940s  exit=0
+2026-05-07T14:33:47Z  START  seed-3-cpu-async-trend  seed=3 mode=cpu-async guard=trend
+2026-05-07T15:05:57Z  OK     seed-3-cpu-async-trend  1930s  exit=0
+2026-05-07T15:05:57Z  START  seed-3-cpu-async-msf  seed=3 mode=cpu-async guard=msf
+2026-05-07T15:38:05Z  OK     seed-3-cpu-async-msf  1928s  exit=0
+2026-05-07T15:38:05Z  START  seed-4-nccl-async-trend  seed=4 mode=nccl-async guard=trend
+2026-05-07T16:10:41Z  OK     seed-4-nccl-async-trend  1956s  exit=0
+2026-05-07T16:10:41Z  START  seed-4-nccl-async-msf  seed=4 mode=nccl-async guard=msf
+2026-05-07T16:43:39Z  OK     seed-4-nccl-async-msf  1978s  exit=0
+2026-05-07T16:43:39Z  START  seed-4-cpu-async-trend  seed=4 mode=cpu-async guard=trend
+2026-05-07T17:15:48Z  OK     seed-4-cpu-async-trend  1929s  exit=0
+2026-05-07T17:15:48Z  START  seed-4-cpu-async-msf  seed=4 mode=cpu-async guard=msf
+2026-05-07T17:48:08Z  OK     seed-4-cpu-async-msf  1940s  exit=0
+2026-05-07T17:48:08Z  
+2026-05-07T17:48:08Z  OVERNIGHT.SWEEP.DONE
