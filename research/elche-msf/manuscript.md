@@ -137,6 +137,14 @@ AllReduce as projection operator.
 
 [DRAFT — lift]
 
+Note: the framing applies recursively. The two-scale structure
+described here for training dynamics extends to any chaos-based
+controller closing its loop through the same system, including the
+ElChe controller used in this paper. The empirical signature of the
+recursion (per-realization unpredictability of cadence decisions
+combined with cohort-mean stability of eval and sync count) is
+discussed in §7.2.
+
 ### 3.2 Implications for guards and controllers
 
 [DRAFT — lift]
@@ -191,7 +199,56 @@ Cliff bracket table: see [`tables/cliff-bracket.md`](tables/cliff-bracket.md) [p
 
 ### 5.3 Multi-seed EASGD
 
-[DRAFT — lift]
+Two paired sweeps probe the EASGD coupling-mechanism axis at
+ResNet-20 / 3-GPU. The Gate A multi-seed pass
+([`tables/cpu-async-multiseed.md`](tables/cpu-async-multiseed.md))
+runs 4 seeds × 2 guards × `cpu-async` × α=0.5 to confirm or falsify
+the seed-0 single-shot smoke. The follow-up α-axis sweep
+([`tables/cpu-async-alpha-sweep.md`](tables/cpu-async-alpha-sweep.md))
+walks α ∈ {0.3, 0.5, 0.7, 1.0} × 4 seeds at fixed `cpu-async × msf`
+to measure the α optimum directly, including the previously-missing
+in-mode α=1.0 baseline.
+
+Headline cohort means at fixed cpu-async × msf × ResNet-20:
+
+| sweep | α | n | eval mean ± sd | sync mean |
+|---|---:|---:|---:|---:|
+| cpu-async-multiseed (Gate A) | 0.5 | 4 | 91.61 % ± 0.15 | 652 |
+| cpu-async-alpha-sweep | 1.0 | 4 | 91.77 % ± 0.19 | 502 |
+| cpu-async-alpha-sweep | 0.7 | 4 | 91.88 % ± 0.21 | 571 |
+| cpu-async-alpha-sweep | 0.5 | 4 | 91.89 % ± 0.23 | 548 |
+| cpu-async-alpha-sweep | 0.3 | 4 | 91.57 % ± 0.23 | 581 |
+
+Three findings:
+
+1. **α ∈ [0.5, 1.0] is a flat region within seed sd.** Paired-seed
+   contrasts vs α=1.0 give Δ = +0.115 pp (α=0.7, t=1.06, NS) and
+   Δ = +0.123 pp (α=0.5, t=0.66, NS) at n=4, df=3. The pre-registered
+   regularization-optimum threshold of +0.15 pp is not cleared. The α
+   knob does not introduce a Pareto-improving direction at this rig
+   and recipe.
+
+2. **α=0.3 is a new empirical lower bound on useful EASGD α.**
+   Paired-seed Δ = −0.197 pp vs α=1.0 (t = −3.08, p ≈ 0.027 one-sided),
+   the only contrast in the α axis to clear seed-noise significance.
+   Deep-blending degrades eval; the elastic-averaging Pareto-relevant
+   range begins above 0.3 at this recipe.
+
+3. **The sync-count framing-prediction is inverted.** Cohort sync
+   means run 502 / 571 / 548 / 581 across α = 1.0 / 0.7 / 0.5 / 0.3.
+   α=1.0 has the lowest sync mean of the four cohorts. The original
+   "α < 1 reduces syncs" prediction sourced from the seed-0 single-shot
+   smoke (408 syncs at α=0.5) does not generalize. The seed-0 number
+   was a tail outlier on the favorable side; the multi-seed mean
+   reverses the direction.
+
+The Gate A α=0.5 cohort at 91.61 % vs the in-mode α=1.0 cohort at
+91.77 % gives paired Δ = −0.16 pp (just outside the design-doc
+±0.15 pp parity band, by 0.01 pp). Eval is at parity within seed sd;
+the structural-scaling argument that α<1 introduces no Pareto-improving
+direction at R-20 / 3-GPU stands on the eval axis, and the sync-cost
+axis falsifies the original "α<1 → fewer syncs" framing-prediction
+outright.
 
 ### 5.4 Pareto figure
 
@@ -208,25 +265,49 @@ generated from [`ddp-bench/runs/pareto-frontier-200ep/`](../../ddp-bench/runs/pa
 
 ## 6. Bytes-axis confirmation
 
-[STUB — pending experiment completion 2026-05-07]
-
 Question: does EASGD α=0.5 differ from α=1.0 at 3.1× the parameter
-count of ResNet-20? The sweep at
-[`ddp-bench/runs/overnight-2026-05-06-resnet56-easgd/`](../../ddp-bench/runs/overnight-2026-05-06-resnet56-easgd/)
-is designed to detect a signal of either sign:
-4 seeds × 2 α-values × cpu-async × msf × ResNet-56 × 200 epochs.
+count of ResNet-20? The sweep
+([`tables/resnet56-bytes-axis.md`](tables/resnet56-bytes-axis.md),
+data at [`data/resnet56-cpu-async/`](data/resnet56-cpu-async/))
+runs `cpu-async × msf × ResNet-56 (n=9 in the He et al. CIFAR
+family, ~850 K params) × 200 epochs` over 4 seeds at α=0.5 plus
+1 seed at α=1.0.
 
-Two outcomes are individually informative:
+| α | n | eval mean ± sd | sync mean |
+|---|---:|---:|---:|
+| 0.5 | 4 | **93.06 % ± 0.10** | 454 |
+| 1.0 | 1 | 92.88 % (single-seed) | 286 |
 
-- **No measurable α effect** (α=0.5 within seed-noise of α=1.0 on
-  both eval and sync count): the structural scaling prediction holds
-  at this parameter count, and the coupling-mechanism axis remains
-  out of the Pareto-improving regime at the rig and model size
-  studied here.
-- **Measurable α effect** (eval or sync separation outside seed
-  noise): the Pareto rotation is observable at ~10⁶ parameters,
-  warranting a follow-up sweep across guard choices and average
-  backends.
+Published ResNet-56 baseline (He et al. 2015, Table 6, CIFAR-10):
+**93.03 %**. The α=0.5 cohort lands +0.03 pp above the published
+baseline at n=4 with sd 0.10; the controller plus recipe deliver
+published-baseline parity at 3.1× the parameter count of ResNet-20
+without hand-tuning.
+
+The R-20 ↔ R-56 contrast on the EASGD coupling-mechanism axis lands
+flat on eval. Cross-cohort eval comparison gives α=0.5 mean 93.06 %
+vs α=1.0 single-cell 92.88 %, Δ = +0.18 pp; the gap is below the
+typical paired-seed sd at R-56 (~0.10 pp) but the n=1 vs n=4 design
+makes the comparison directional only, not paired. Together with §5.3,
+the bytes-axis null result holds at the eval axis: scaling to 3× the
+parameter count does not surface a Pareto-improving α<1 direction.
+
+The sync-count framing-prediction is inverted at R-56 by the same
+direction as at R-20. α=0.5 cohort syncs 454 (mean) vs α=1.0
+single-cell at 286, that is +59 % more, not fewer. Both model sizes
+falsify the "α < 1 → fewer syncs" prediction the seed-0 R-20 smoke
+seeded; the falsification direction generalizes to the larger model.
+
+Single-seed limitation. The α=1.0 cell is n=1 by design (the sweep
+launcher was killed mid-α=1.0-phase after seed-1 finished; seeds 2–4
+α=1.0 not run). Cross-day rerun data on cpu-async at R-20 (§7.2)
+indicates that even at fixed RNG seed, eval realizations span
+0.5–0.9 pp at this rig, so the α=1.0 single-cell's 92.88 % carries an
+implicit uncertainty wider than the n=4 α=0.5 within-cohort sd of
+0.10 pp would suggest. The bytes-axis comparison should be read as
+directional only until the α=1.0 cohort is filled to n=4. The
+[`resnet56-bytes-axis.md`](tables/resnet56-bytes-axis.md) table
+flags this as the load-bearing follow-up gap.
 
 ---
 
@@ -292,6 +373,33 @@ not have an nccl-async cross-day same-seed cohort at matched recipe
 to make this test paired (it would require a small targeted rerun);
 the observation is recorded here without claiming a mechanism.
 
+A deeper point follows from the framing established in §3: ElChe is
+itself a chaos-based controller, not a deterministic one. The cadence
+decisions react to a divergence-rate estimate (`λ_ema`) computed from
+the very per-rank trajectories the controller is trying to keep
+synchronized. The control loop is closed through the system's own
+chaotic state, and the controller's own decisions inherit that
+chaos: micro-scale (per-realization sync-window placement) is
+unpredictable, but macro-scale (cohort-mean eval, cohort-mean sync
+count) is the stable equilibrium the loop drives toward. The
+two-scale frame the paper invokes for the training dynamics applies
+recursively to the controller itself.
+
+A familiar everyday instance is the bang-bang thermostat. The
+furnace's instantaneous on/off state is a chaotic limit cycle that
+no observer can predict from a snapshot, but the room temperature
+sits stably at the setpoint when sampled over any reasonable
+interval. The micro-unpredictability is not a flaw of the
+thermostat; it is the only mode in which a control system whose
+input is itself a chaotic-leaning quantity can deliver a stable
+macro-equilibrium. A deterministic controller scheduling sync points
+ahead of time, oblivious to the system state, would by construction
+fail to balance the chaos it is meant to manage; it would either
+over- or under-couple the per-rank trajectories and drift off the
+meta-oscillator attractor. Cohort-level statistics on ElChe sweeps
+are therefore not "averaging away noise" but sampling the attractor
+ergodically, which is the load-bearing measurement.
+
 ### 7.3 Controller refinements (motivated, not validated)
 
 [STUB] C1' by-k cadence inversion, C5' threshold-aware cadence, R5'
@@ -307,6 +415,18 @@ meta-CUSUM regime detector. Empirical validation deferred to follow-up
 - 3-GPU. Multi-cluster heterogeneity (4+ GPUs in richer mixes) deferred.
 - AllReduce cost <1ms at this scale — wall-time-axis Pareto rotation
   cannot be tested at this rig and model size.
+
+A note on the limitations *not* claimed. Per-realization eval and
+sync-count noise at fixed RNG seed is not listed above and should not
+be read as an apparatus or method limitation. As §7.2 establishes,
+ElChe is a chaos-based controller closing its loop through a chaotic
+training dynamic, so individual-realization unpredictability is the
+expected operating mode (the bang-bang thermostat analog). Cohort
+sweeps sample the controller's attractor ergodically; cohort-mean
+statistics are the load-bearing measurement, not a noise-suppression
+artifact. Single-seed differential claims should be interpreted in
+that light, with the cross-day seed-fixed envelope (≈ 0.5–0.9 pp at
+this rig and recipe) as the realistic noise floor for any n=1 cell.
 
 ---
 

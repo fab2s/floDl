@@ -876,7 +876,7 @@ pub struct WorkerConfig {
     pub max_grad_norm: Option<f64>,
     /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
     /// local params with averaged consensus on the cpu-async path (current
-    /// behavior). When set, [`super::worker::GpuWorker::load_averaged`]
+    /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]
     /// blends `W_local := (1-α)·W_local + α·W_avg` instead. See
     /// [`DdpRunConfig::easgd_alpha`] for details.
     pub easgd_alpha: Option<f64>,

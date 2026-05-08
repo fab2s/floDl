@@ -484,8 +484,8 @@ impl ElChe {
 
     /// Relax the anchor upward by 1 batch on stable convergence.
     ///
-    /// Symmetric upward path to [`nudge_anchor_down`]: lets async-mode anchor
-    /// drift toward [`max_anchor`] over time as long as the convergence guard
+    /// Symmetric upward path to [`Self::nudge_anchor_down`]: lets async-mode anchor
+    /// drift toward `max_anchor` over time as long as the convergence guard
     /// reports `Stable`, amortizing AllReduce barrier cost over more local
     /// SGD steps. Closes a half-implemented loop where the convergence guard
     /// previously had a downward path (`NudgeDown`) but no upward path —
@@ -498,7 +498,7 @@ impl ElChe {
     /// for ratio 3 and `max_batch_diff = 100`, anchor caps at 50 (yielding
     /// `[50, 150]`, diff exactly 100).
     ///
-    /// No-op when already at [`max_anchor`], or when no calibrated
+    /// No-op when already at `max_anchor`, or when no calibrated
     /// `ms_per_batch` exists yet (Probe phase).
     pub fn relax_anchor_up(&mut self) {
         if self.anchor >= self.max_anchor {
