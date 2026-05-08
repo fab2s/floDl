@@ -882,6 +882,11 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Send a timing report to the coordinator.
+    ///
+    /// Also emits a [`TimingMsg::LrUpdate`] piggyback message so the
+    /// coordinator's LR-aware meta-controller (when enabled) can track the
+    /// LR trajectory between averaging cycles. Cheap fire-and-forget; the
+    /// coordinator caches only the most recent value per rank.
     pub fn report_timing(
         &self,
         batch_ms: f64,
@@ -889,14 +894,21 @@ impl<M: Module> GpuWorker<M> {
         batch_loss: f64,
         sync_divergence: Option<f64>,
     ) -> Result<()> {
-        self.timing_tx.send(TimingMsg::Batch {
+        let res = self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
             step_count: self.local_step,
             param_norm,
             batch_loss,
             sync_divergence,
-        }).map_err(|_| TensorError::new("timing channel disconnected"))
+        }).map_err(|_| TensorError::new("timing channel disconnected"));
+        // Piggyback the current LR after the primary Batch. Failures are
+        // tolerated — the meta layer simply observes a stale value next cycle.
+        let _ = self.timing_tx.send(TimingMsg::LrUpdate {
+            rank: self.rank,
+            lr: self.optimizer.lr(),
+        });
+        res
     }
 
     /// Compute the L2 norm of all model parameters.

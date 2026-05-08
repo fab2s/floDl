@@ -190,14 +190,15 @@ pub struct Coordinator {
     /// always 0 because `last_avg_ms` is only populated by the CPU avg path.
     last_nccl_sync_ms: f64,
 
-    // LR-aware meta-controller (Stage 1: dormant, no observe() calls yet)
+    // LR-aware meta-controller (Stage 2: observed but emission not yet
+    // dispatched to nudge_anchor_down — that lands in Stage 3.)
     /// Optional meta-controller above ElChe. `None` when
     /// [`super::DdpRunConfig::with_meta_controller`] is `false` (default).
-    /// When `Some`, future stages will route LR + anchor + guard verdict
-    /// observations into it and dispatch [`crate::distributed::ElChe::nudge_anchor_down`]
-    /// from emitted [`crate::distributed::lr_event_meta::MetaAction`]s.
-    #[allow(dead_code, reason = "Stage 1: field constructed from config but not yet observed; observation + dispatch wiring lands in Stage 2/3.")]
-    lr_event_meta: Option<crate::distributed::lr_event_meta::LrEventMeta>,
+    pub(super) lr_event_meta: Option<crate::distributed::lr_event_meta::LrEventMeta>,
+    /// Most recent LR observed per rank from
+    /// [`super::TimingMsg::LrUpdate`]. Indexed by rank. `None` until the
+    /// first message from that rank arrives.
+    pub(super) last_lr_per_rank: Vec<Option<f64>>,
 
     // NCCL sync acknowledgment
     /// Per-rank: last worker `step_count` seen in a TimingMsg.
@@ -469,6 +470,7 @@ impl CoordinatorBuilder {
             } else {
                 None
             },
+            last_lr_per_rank: vec![None; self.world_size],
             last_step_count: vec![0; self.world_size],
             nccl_sync_step: vec![0; self.world_size],
             nccl_ack: vec![true; self.world_size],
@@ -520,6 +522,27 @@ impl Coordinator {
             elche_relax_up: false,
             metrics_fn: None,
             meta_controller: false,
+        }
+    }
+
+    /// Feed an averaging-cycle observation to the LR-aware meta-controller
+    /// (when enabled). The returned [`crate::distributed::lr_event_meta::MetaAction`]
+    /// is dropped in Stage 2; Stage 3 wires it to `nudge_anchor_down` dispatch.
+    ///
+    /// No-op when:
+    /// - meta is disabled (`lr_event_meta` is `None`),
+    /// - no rank has reported its LR yet (cold-start, ≤ 1 cycle).
+    pub(super) fn observe_meta(
+        &mut self,
+        verdict: super::convergence::ConvergenceAction,
+    ) {
+        let Some(lr) = self.last_lr_per_rank.iter().copied().find_map(|x| x) else {
+            return;
+        };
+        let anchor = self.el_che.anchor();
+        let phase = self.el_che.phase();
+        if let Some(meta) = self.lr_event_meta.as_mut() {
+            let _ = meta.observe(lr, anchor, verdict, phase);
         }
     }
 
@@ -1020,6 +1043,11 @@ impl Coordinator {
             }
             TimingMsg::Exiting { .. } => {
                 self.active_count = self.active_count.saturating_sub(1);
+            }
+            TimingMsg::LrUpdate { rank, lr } => {
+                if rank < self.last_lr_per_rank.len() {
+                    self.last_lr_per_rank[rank] = Some(lr);
+                }
             }
         }
     }

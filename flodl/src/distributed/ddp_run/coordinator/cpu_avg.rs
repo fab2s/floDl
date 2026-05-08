@@ -232,6 +232,10 @@ impl Coordinator {
             .convergence_guard
             .report(&report, cycle_batches_for_guard, k_max_for_guard);
 
+        // Stage 2: meta-controller observes the verdict alongside LR / anchor
+        // / phase. Action emission is dropped — Stage 3 wires it to dispatch.
+        self.observe_meta(action);
+
         self.version += 1;
         self.avg_count += 1;
 
@@ -415,6 +419,10 @@ impl Coordinator {
         } else {
             convergence::ConvergenceAction::Stable
         };
+
+        // Stage 2: meta-controller observes the verdict alongside LR / anchor
+        // / phase. Action emission is dropped — Stage 3 wires it to dispatch.
+        self.observe_meta(action);
 
         match action {
             convergence::ConvergenceAction::Stable => {

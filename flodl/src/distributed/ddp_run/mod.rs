@@ -741,6 +741,20 @@ pub enum TimingMsg {
         /// Which GPU is exiting.
         rank: usize,
     },
+    /// Per-batch learning rate snapshot from a worker, used by the LR-aware
+    /// meta-controller to detect sharp drops between averaging cycles.
+    ///
+    /// Cheap fire-and-forget message: just a `(rank, lr)` pair. The
+    /// coordinator caches the most recent value per rank and feeds it into
+    /// [`crate::distributed::lr_event_meta::LrEventMeta::observe`] each
+    /// averaging cycle. Workers can choose to emit only on LR change or on
+    /// every batch — receiver is idempotent.
+    LrUpdate {
+        /// Which GPU sent this.
+        rank: usize,
+        /// Current optimizer learning rate.
+        lr: f64,
+    },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
