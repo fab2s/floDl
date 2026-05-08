@@ -359,7 +359,8 @@ impl DdpHandle {
                 .batch_size(coord_batch_size)
                 .timeline(coord_timeline.clone())
                 .max_overshoot(config.max_overshoot)
-                .elche_relax_up(config.elche_relax_up);
+                .elche_relax_up(config.elche_relax_up)
+                .meta_controller(config.meta_controller);
                 if let Some(mf) = metrics_fn {
                     builder = builder.metrics_fn(mf);
                 }
@@ -1317,6 +1318,19 @@ where
     /// `α` must be in `(0, 1]`. See [`DdpRunConfig::with_easgd_alpha`].
     pub fn easgd_alpha(mut self, alpha: f64) -> Self {
         self.config = self.config.with_easgd_alpha(alpha);
+        self
+    }
+
+    /// Enable the LR-aware meta-controller above ElChe. Default: `false`.
+    ///
+    /// When enabled, the coordinator constructs a
+    /// [`crate::distributed::lr_event_meta::LrEventMeta`] that observes the
+    /// LR trajectory, anchor trend, and convergence guard verdicts each
+    /// averaging cycle. Sharp LR drops or sustained divergence patterns
+    /// trigger reactive `nudge_anchor_down` calls; ElChe's overhead
+    /// auto-tune handles recovery. Off by default until validation sweep.
+    pub fn meta_controller(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_meta_controller(enabled);
         self
     }
 

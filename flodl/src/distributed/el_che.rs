@@ -192,7 +192,7 @@ impl ElChe {
             calibrated: false,
             overhead_target: 0.10,
             min_anchor: anchor,
-            max_anchor: 200,
+            max_anchor: 1000,
             max_batch_diff: None,
             phase: Phase::Probe,
             anchor_rank: None,
@@ -292,9 +292,11 @@ impl ElChe {
 
     /// Set the maximum anchor count (gradient staleness limit).
     ///
-    /// Default: 200. Higher values allow fewer syncs but accumulate more
+    /// Default: 1000. Higher values allow fewer syncs but accumulate more
     /// batches of gradient before averaging. Set to 1 to sync after every
     /// slow-device batch (minimal accumulation, traditional DDP cadence).
+    /// The overhead auto-tune typically settles well below this cap; the
+    /// default exists primarily as a safety net against runaway growth.
     pub fn with_max_anchor(mut self, max: usize) -> Self {
         self.max_anchor = max.max(1);
         // Ensure min_anchor doesn't exceed max_anchor

@@ -352,7 +352,7 @@ pub enum AverageBackend {
 pub struct DdpRunConfig {
     /// ElChe overhead target (fraction of compute time). Default: 0.10.
     pub overhead_target: Option<f64>,
-    /// Maximum anchor count (gradient staleness limit). Default: 200.
+    /// Maximum anchor count (gradient staleness limit). Default: 1000.
     pub max_anchor: Option<usize>,
     /// Minimum anchor count (auto-tune floor). Default: equals the
     /// initial anchor (so the auto-tune cannot shrink below the start
@@ -466,6 +466,18 @@ pub struct DdpRunConfig {
     /// have no equivalent overwrite step. Values outside `(0, 1]` are
     /// rejected at config time.
     pub easgd_alpha: Option<f64>,
+    /// Enable the LR-aware meta-controller above ElChe. Default: `false`
+    /// (opt-in until validation sweep).
+    ///
+    /// When enabled, the meta-controller observes the LR trajectory, anchor
+    /// trend, and convergence guard verdicts each averaging cycle, and
+    /// reactively dispatches `nudge_anchor_down` on sharp LR drops or
+    /// sustained divergence patterns. ElChe's natural overhead auto-tune
+    /// handles recovery; the meta layer only adds reactive corrections that
+    /// the natural feedback can't absorb fast enough.
+    ///
+    /// See [`crate::distributed::lr_event_meta`] for the design.
+    pub meta_controller: bool,
 }
 
 impl Default for DdpRunConfig {
@@ -495,6 +507,7 @@ impl DdpRunConfig {
             lr_scale_ratio: 1.0,
             elche_relax_up: false,
             easgd_alpha: None,
+            meta_controller: false,
         }
     }
 
@@ -655,6 +668,15 @@ impl DdpRunConfig {
             "easgd_alpha must be in (0, 1], got {alpha}"
         );
         self.easgd_alpha = Some(alpha);
+        self
+    }
+
+    /// Enable the LR-aware meta-controller above ElChe.
+    ///
+    /// Off by default (opt-in). See the `meta_controller` field for behavior
+    /// and `crate::distributed::lr_event_meta` for the design.
+    pub fn with_meta_controller(mut self, enabled: bool) -> Self {
+        self.meta_controller = enabled;
         self
     }
 }

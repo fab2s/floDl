@@ -2027,9 +2027,9 @@ fn test_cpu_averaging_divergence_correction() {
     // After one round: report_timing auto-tunes anchor up (from overhead),
     // then divergence correction halves it. Final anchor should be lower
     // than the post-overhead-auto-tune value. We verify it completed and
-    // the anchor is reasonable (not at max_anchor=200).
+    // the anchor is reasonable (not at max_anchor=1000).
     let anchor = h.coord.el_che.anchor();
-    assert!(anchor < 200,
+    assert!(anchor < 1000,
         "divergence correction should have kept anchor below max, got {}", anchor);
     // Verify calibration happened.
     assert!(h.coord.is_calibrated());

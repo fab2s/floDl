@@ -556,7 +556,11 @@
         .unwrap();
 
         assert!(model.is_distributed());
-        assert_eq!(model.world_size(), 2);
+        assert!(
+            model.world_size() >= 2,
+            "Ddp::auto picks all visible GPUs; expected >=2 for multi-GPU test, got {}",
+            model.world_size(),
+        );
 
         // Full training step
         let opts = TensorOptions {
@@ -1242,7 +1246,11 @@
 
         assert!(model.is_distributed());
         assert!(model.has_el_che());
-        assert_eq!(model.world_size(), 2);
+        assert!(
+            model.world_size() >= 2,
+            "Ddp::auto picks all visible GPUs; expected >=2 for multi-GPU test, got {}",
+            model.world_size(),
+        );
 
         // Set up DataLoader
         let loader = DataLoader::from_dataset(TinyData)

@@ -190,6 +190,15 @@ pub struct Coordinator {
     /// always 0 because `last_avg_ms` is only populated by the CPU avg path.
     last_nccl_sync_ms: f64,
 
+    // LR-aware meta-controller (Stage 1: dormant, no observe() calls yet)
+    /// Optional meta-controller above ElChe. `None` when
+    /// [`super::DdpRunConfig::with_meta_controller`] is `false` (default).
+    /// When `Some`, future stages will route LR + anchor + guard verdict
+    /// observations into it and dispatch [`crate::distributed::ElChe::nudge_anchor_down`]
+    /// from emitted [`crate::distributed::lr_event_meta::MetaAction`]s.
+    #[allow(dead_code, reason = "Stage 1: field constructed from config but not yet observed; observation + dispatch wiring lands in Stage 2/3.")]
+    lr_event_meta: Option<crate::distributed::lr_event_meta::LrEventMeta>,
+
     // NCCL sync acknowledgment
     /// Per-rank: last worker `step_count` seen in a TimingMsg.
     /// Monotonically increasing (workers never reset `local_step`).
@@ -237,6 +246,10 @@ pub struct CoordinatorBuilder {
     /// Allow anchor relax-up on Stable convergence. Default: false.
     elche_relax_up: bool,
     metrics_fn: Option<super::MetricsFn>,
+    /// Enable the LR-aware meta-controller. Default: false (off; opt-in
+    /// until validation sweep). See
+    /// [`crate::distributed::lr_event_meta`] for the design.
+    meta_controller: bool,
 }
 
 impl CoordinatorBuilder {
@@ -294,7 +307,7 @@ impl CoordinatorBuilder {
     }
 
     /// Set the maximum anchor (max batches between AllReduce).
-    /// Default: 200. Controls gradient staleness bound.
+    /// Default: 1000. Controls gradient staleness bound.
     pub fn max_anchor(mut self, max: usize) -> Self {
         self.el_che = self.el_che.with_max_anchor(max);
         self
@@ -364,6 +377,17 @@ impl CoordinatorBuilder {
     /// when false the anchor only changes via the overhead-based auto-tune.
     pub fn elche_relax_up(mut self, enabled: bool) -> Self {
         self.elche_relax_up = enabled;
+        self
+    }
+
+    /// Enable the LR-aware meta-controller above ElChe. Default: false.
+    ///
+    /// When enabled, a [`crate::distributed::lr_event_meta::LrEventMeta`]
+    /// is constructed and held by the coordinator. Stage 1 of the rollout
+    /// keeps the meta dormant (field present, no observations); later
+    /// stages wire LR + verdict forwarding and action dispatch.
+    pub fn meta_controller(mut self, enabled: bool) -> Self {
+        self.meta_controller = enabled;
         self
     }
 
@@ -440,6 +464,11 @@ impl CoordinatorBuilder {
             epoch_last_k_max: 0,
             timeline: self.timeline,
             nccl_sync_start: None,
+            lr_event_meta: if self.meta_controller {
+                Some(crate::distributed::lr_event_meta::LrEventMeta::with_default_config())
+            } else {
+                None
+            },
             last_step_count: vec![0; self.world_size],
             nccl_sync_step: vec![0; self.world_size],
             nccl_ack: vec![true; self.world_size],
@@ -490,6 +519,7 @@ impl Coordinator {
             overshoot_ceiling: 15,
             elche_relax_up: false,
             metrics_fn: None,
+            meta_controller: false,
         }
     }
 

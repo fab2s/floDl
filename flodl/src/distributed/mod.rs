@@ -18,12 +18,14 @@ pub mod nccl;
 pub mod ddp;
 pub mod ddp_run;
 pub mod el_che;
+pub mod lr_event_meta;
 
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use ddp::{Ddp, DdpConfig, HasGraph, Trainer};
 pub use el_che::{ElChe, Phase};
+pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
 pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker};
 // Deprecated aliases
 #[allow(deprecated)]
