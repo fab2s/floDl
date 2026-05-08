@@ -12,7 +12,8 @@ numbers; this directory is the human-readable rollup.
 | Table | Source sweep(s) | What it answers |
 |---|---|---|
 | [pareto-frontier.md](pareto-frontier.md) | passive-observation + relaxed-anchor + cliff-bracket | Cross-sweep eval vs sync-cost frontier (12 configs, 48 cells). Manuscript §5.4 / §"Program reframe". |
-| [framing-validity-gates.md](framing-validity-gates.md) | all framing-valid sweeps | Cross-rank Pearson r̄ + per-rank by-k slope ratio across 50 framing-valid cells. Establishes that the two-scale framing applies uniformly. Manuscript §3 / methodology. |
+| [framing-validity-gates.md](framing-validity-gates.md) | all framing-valid sweeps | Cross-rank Pearson r̄ + per-rank by-k slope ratio across 48 framing-valid cells. Establishes that the two-scale framing applies uniformly. Manuscript §3 / methodology. |
+| [cross-sweep-analyses.md](cross-sweep-analyses.md) | all 6 sweeps (61 cells) | Six aggregated figures: R-20↔R-56 head-to-head, wall-time Pareto, R1' slope invariance, per-cell eval strip plot, Pearson r̄ vs cadence, cadence regime map. Manuscript §3, §5, §6, §7. |
 
 ## Per-sweep tables
 
@@ -64,6 +65,7 @@ python3 research/elche-msf/data/pareto-frontier/analyze.py
 python3 research/elche-msf/data/cpu-async-multiseed/fig.py
 python3 research/elche-msf/data/resnet56-cpu-async/fig.py
 python3 research/elche-msf/tables/fig_framing_gates.py
+python3 research/elche-msf/tables/cross_sweep.py
 ```
 
 ## Known gaps for follow-up batches
