@@ -27,12 +27,12 @@ Configurations span three upstream sweeps:
 | `fixed k=12800` | 3 | 91.29 ± 0.08 | 4 ± 1 | **frontier** |
 | `fixed k=6400` | 3 | 91.45 ± 0.17 | 7 ± 0 | **frontier** |
 | `fixed k=3200` | 3 | 91.60 ± 0.28 | 13 ± 1 | **frontier** |
-| `nccl-async relaxed trend` | 5 | 91.74 ± 0.07 | 402 ± 160 | **frontier** |
-| `nccl-async default trend` | 5 | 91.71 ± 0.21 | 539 ± 205 | dominated by nccl-async relaxed trend |
-| `cpu-async default trend` | 5 | 91.75 ± 0.22 | 594 ± 162 | **frontier** |
-| `cpu-async default msf` | 5 | 91.67 ± 0.19 | 604 ± 154 | dominated by nccl-async relaxed trend |
-| `nccl-async relaxed msf` | 5 | 91.95 ± 0.32 | 641 ± 162 | **frontier** |
-| `nccl-async default msf` | 5 | 91.83 ± 0.20 | 882 ± 299 | dominated by nccl-async relaxed msf |
+| `nccl-async relaxed trend` | 5 | 91.64 ± 0.32 | 402 ± 160 | **frontier** |
+| `nccl-async relaxed msf` | 5 | 91.82 ± 0.31 | 431 ± 178 | **frontier** |
+| `cpu-async default trend` | 5 | 91.70 ± 0.10 | 468 ± 149 | dominated by nccl-async relaxed msf |
+| `cpu-async default msf` | 5 | 92.03 ± 0.31 | 613 ± 128 | **frontier** |
+| `nccl-async default msf` | 5 | 91.70 ± 0.25 | 671 ± 242 | dominated by nccl-async relaxed msf |
+| `nccl-async default trend` | 5 | 91.80 ± 0.22 | 676 ± 104 | dominated by nccl-async relaxed msf |
 
 Sorted by mean sync count, ascending. Per-config aggregates are
 mean ± standard deviation across seeds. Status is the Pareto-frontier
@@ -63,9 +63,9 @@ the frontier knee visible at the low-sync end of the safe regime.
 ## Key observations
 
 - **The frontier is 9 configurations of 12 total** (48 cells across the four upstream sweeps).
-- **Eval maximum sits at `nccl-async relaxed msf`** (91.95% ± 0.32, 641 ± 162 syncs).
-- **Lowest-sync near-parity point is `nccl-async relaxed trend`** (91.74%, 402 syncs) — trades a small eval drop for a sync-count reduction at the high-sync end.
-- **Production default `nccl-async default msf` (91.83%, 882 syncs) is dominated by `nccl-async relaxed msf`** — the production-config improvement is a backend swap, not a coupling-mechanism change.
+- **Eval maximum sits at `cpu-async default msf`** (92.03% ± 0.31, 613 ± 128 syncs).
+- **Lowest-sync near-parity point is `nccl-async relaxed trend`** (91.64%, 402 syncs) — trades a small eval drop for a sync-count reduction at the high-sync end.
+- **Production default `nccl-async default msf` (91.70%, 671 syncs) is dominated by `nccl-async relaxed msf`** — the production-config improvement is a backend swap, not a coupling-mechanism change.
 - **Fixed-k cells dominate the low-sync end** by construction: pinning the cadence at `k` produces ~`200/k` syncs per 200-epoch run, three orders of magnitude below the auto-tuned regime. The cliff-localization sweep at [`../cliff-bracket/`](../cliff-bracket/) shows this is also where the synchronization threshold lives.
 
 ## Source data

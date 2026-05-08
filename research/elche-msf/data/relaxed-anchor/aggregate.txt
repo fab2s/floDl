@@ -2,32 +2,32 @@
  Summary — final eval (held-out test, 200 epochs)
 ==========================================================================================
 condition                                mean      sd     min     max
-  nccl-async msf   (default)          91.83% ±0.20  91.58  92.08
-  nccl-async msf   (relaxed)          91.95% ±0.32  91.54  92.27
-  nccl-async trend (default)          91.71% ±0.21  91.55  92.06
-  nccl-async trend (relaxed)          91.74% ±0.07  91.65  91.82
+  nccl-async msf   (default)          91.70% ±0.25  91.32  91.94
+  nccl-async msf   (relaxed)          91.82% ±0.31  91.32  92.10
+  nccl-async trend (default)          91.80% ±0.22  91.56  92.12
+  nccl-async trend (relaxed)          91.64% ±0.32  91.24  92.00
 
 ==========================================================================================
  Sync counts per 200-epoch run
 ==========================================================================================
-  nccl-async msf   (default)          882 ±299  range [537, 1356]
-  nccl-async msf   (relaxed)          641 ±162  range [387, 790]
-  nccl-async trend (default)          539 ±205  range [307, 767]
-  nccl-async trend (relaxed)          402 ±160  range [229, 598]
+  nccl-async msf   (default)          671 ±242  range [464, 1075]
+  nccl-async msf   (relaxed)          431 ±178  range [248, 619]
+  nccl-async trend (default)          676 ±104  range [543, 802]
+  nccl-async trend (relaxed)          402 ±160  range [275, 598]
 
 ==========================================================================================
  Cross-rank Pearson r (rank pair) — meta-oscillator coupling
 ==========================================================================================
 
   nccl-async msf (default):
-    rank0 ↔ rank1:  +0.9927 ± 0.0027  range [+0.9896, +0.9959]
-    rank0 ↔ rank2:  +0.9932 ± 0.0036  range [+0.9898, +0.9990]
-    rank1 ↔ rank2:  +0.9962 ± 0.0026  range [+0.9933, +0.9984]
+    rank0 ↔ rank1:  +0.9950 ± 0.0055  range [+0.9859, +0.9991]
+    rank0 ↔ rank2:  +0.9939 ± 0.0067  range [+0.9863, +0.9995]
+    rank1 ↔ rank2:  +0.9974 ± 0.0034  range [+0.9916, +0.9996]
 
   nccl-async msf (relaxed):
-    rank0 ↔ rank1:  +0.9814 ± 0.0068  range [+0.9710, +0.9901]
-    rank0 ↔ rank2:  +0.9811 ± 0.0073  range [+0.9700, +0.9897]
-    rank1 ↔ rank2:  +0.9962 ± 0.0018  range [+0.9939, +0.9987]
+    rank0 ↔ rank1:  +0.9897 ± 0.0086  range [+0.9802, +0.9986]
+    rank0 ↔ rank2:  +0.9890 ± 0.0068  range [+0.9812, +0.9983]
+    rank1 ↔ rank2:  +0.9953 ± 0.0038  range [+0.9888, +0.9983]
 
 ==========================================================================================
  R1 by-k axis: log(D_mean) vs k_used per LR window — cross-seed N=5
@@ -35,27 +35,27 @@ condition                                mean      sd     min     max
 
   LR=0.3:
     condition                        meta slope       R²(by-k)     per-rank ratio    gates ✓
-    msf default                  +1.465e-03 ±5.25e-05  0.752 ±0.053     1.05 ± 0.02        5/5
-    msf relaxed                  +4.958e-04 ±3.82e-04  0.256 ±0.359     2.07 ± 1.19        3/5
-    trend default                +1.447e-03 ±1.94e-04  0.737 ±0.070     1.04 ± 0.02        5/5
-    trend relaxed                +1.171e-03 ±1.98e-04  0.701 ±0.193     1.04 ± 0.04        5/5
+    msf default                  +1.558e-03 ±3.03e-04  0.779 ±0.123     1.03 ± 0.02        5/5
+    msf relaxed                  +1.047e-03 ±1.38e-04  0.703 ±0.212     1.02 ± 0.01        5/5
+    trend default                +1.626e-03 ±1.63e-04  0.777 ±0.048     1.04 ± 0.01        5/5
+    trend relaxed                +1.121e-03 ±1.43e-04  0.807 ±0.108     1.03 ± 0.01        5/5
 
   LR=0.03:
     condition                        meta slope       R²(by-k)     per-rank ratio    gates ✓
-    msf default                  +7.336e-04 ±1.42e-03  0.242 ±0.200     1.07 ± 0.06        5/5
-    msf relaxed                  +1.480e-03 ±5.03e-04  0.316 ±0.343     1.03 ± 0.03        5/5
-    trend default                +8.071e-04 ±1.41e-03  0.128 ±0.108     1.09 ± 0.15        5/5
-    trend relaxed                -1.943e-04 ±9.07e-04  0.063 ±0.116     1.26 ± 0.31        5/5
+    msf default                  -1.496e-04 ±1.47e-03  0.184 ±0.172     1.06 ± 0.04        5/5
+    msf relaxed                  -2.938e-04 ±1.52e-03  0.029 ±0.045    7.13 ± 13.48        4/5
+    trend default                +1.633e-03 ±1.68e-03  0.473 ±0.328     1.04 ± 0.01        5/5
+    trend relaxed                -8.243e-04 ±8.62e-04  0.022 ±0.028     4.99 ± 8.11        3/5
 
   LR=0.003:
     condition                        meta slope       R²(by-k)     per-rank ratio    gates ✓
-    msf default                  +2.088e-03 ±1.04e-03  0.419 ±0.368     1.05 ± 0.05        5/5
-    msf relaxed                  +4.273e-04 ±8.01e-04  0.019 ±0.034     1.20 ± 0.22        5/5
-    trend default                +1.661e-03 ±9.34e-04  0.281 ±0.260     1.05 ± 0.03        5/5
-    trend relaxed                +5.340e-04 ±1.13e-03  0.024 ±0.036     1.52 ± 0.77        4/5
+    msf default                  +2.620e-03 ±9.88e-04  0.527 ±0.246     1.04 ± 0.01        5/5
+    msf relaxed                  +5.050e-05 ±1.71e-03  0.065 ±0.103     1.12 ± 0.12        5/5
+    trend default                +1.714e-03 ±6.16e-04  0.379 ±0.242     1.04 ± 0.03        5/5
+    trend relaxed                -3.130e-04 ±6.32e-04  0.009 ±0.009     1.64 ± 0.96        4/5
 
 ==========================================================================================
  Guard fire counts per 200-epoch run
 ==========================================================================================
-  msf default:  trend-fires 54.5±7.9  msf-fires 1.0±1.4
-  msf relaxed:  trend-fires 80.4±17.2  msf-fires 0.0±0.0
+  msf default:  trend-fires 44.4±18.7  msf-fires 1.2±1.1
+  msf relaxed:  trend-fires 64.4±16.6  msf-fires 0.0±0.0

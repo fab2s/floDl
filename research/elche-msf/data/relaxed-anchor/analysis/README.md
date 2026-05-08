@@ -13,10 +13,10 @@ Model / dataset / hardware as in `../passive-observation/README.md`.
 
 | guard | anchor | n | final eval | syncs | Pearson r (3-pair mean) | rate-based fires |
 |---|---|---:|---:|---:|---:|---:|
-| `msf` | default | 5 | 91.83% ± 0.20 pp | 882 ± 299 | 0.9940 ± 0.0012 | 2.2 ± 2.9 |
-| `msf` | relaxed | 5 | 91.95% ± 0.32 pp | 641 ± 162 | 0.9862 ± 0.0052 | 0.0 ± 0.0 |
-| `trend` | default | 5 | 91.71% ± 0.21 pp | 539 ± 205 | 0.9936 ± 0.0084 | 0.8 ± 1.1 |
-| `trend` | relaxed | 5 | 91.74% ± 0.07 pp | 402 ± 160 | 0.9931 ± 0.0034 | 0.0 ± 0.0 |
+| `msf` | default | 5 | 91.70% ± 0.25 pp | 671 ± 242 | 0.9954 ± 0.0047 | 1.2 ± 1.1 |
+| `msf` | relaxed | 5 | 91.82% ± 0.31 pp | 431 ± 178 | 0.9913 ± 0.0050 | 0.0 ± 0.0 |
+| `trend` | default | 5 | 91.80% ± 0.22 pp | 676 ± 104 | 0.9963 ± 0.0023 | 0.6 ± 1.3 |
+| `trend` | relaxed | 5 | 91.64% ± 0.32 pp | 402 ± 160 | 0.9949 ± 0.0039 | 0.0 ± 0.0 |
 
 `anchor=default` cells are read from
 [`../passive-observation/`](../passive-observation/) for the
@@ -33,9 +33,9 @@ Error bars are seed-to-seed standard deviation.
 
 | pair | default mean ± sd | relaxed mean ± sd | Δ |
 |---|---:|---:|---:|
-| rank 0 ↔ 1 (fast ↔ slow) | +0.9923 ± 0.0077 | +0.9870 ± 0.0084 | -0.0052 |
-| rank 0 ↔ 2 (fast ↔ slow) | +0.9943 ± 0.0037 | +0.9859 ± 0.0078 | -0.0084 |
-| rank 1 ↔ 2 (slow ↔ slow) | +0.9949 ± 0.0081 | +0.9961 ± 0.0034 | +0.0011 |
+| rank 0 ↔ 1 (fast ↔ slow) | +0.9950 ± 0.0043 | +0.9914 ± 0.0072 | -0.0036 |
+| rank 0 ↔ 2 (fast ↔ slow) | +0.9946 ± 0.0051 | +0.9912 ± 0.0060 | -0.0034 |
+| rank 1 ↔ 2 (slow ↔ slow) | +0.9980 ± 0.0024 | +0.9967 ± 0.0031 | -0.0013 |
 
 Mean across all 5 seeds × 2 guards = 10 cells per anchor. Δ is
 relaxed minus default.
@@ -53,9 +53,9 @@ heterogeneous-DDP synchronization with no homogeneous-cluster analog.
 
 | rank | GPU | mean share | mean throughput (samples/ms) | mean util | peak VRAM |
 |---|---|---:|---:|---:|---:|
-| 0 | RTX 5060 Ti | 0.397 ± 0.004 | 2.45 ± 0.10 | 20.9% | 356 MB |
-| 1 | GTX 1060 (#1) | 0.306 ± 0.002 | 3.26 ± 0.12 | 55.2% | 395 MB |
-| 2 | GTX 1060 (#2) | 0.297 ± 0.003 | 3.26 ± 0.14 | 57.6% | 386 MB |
+| 0 | RTX 5060 Ti | 0.403 ± 0.003 | 2.67 ± 0.06 | 22.0% | 356 MB |
+| 1 | GTX 1060 (#1) | 0.302 ± 0.003 | 3.49 ± 0.06 | 57.7% | 391 MB |
+| 2 | GTX 1060 (#2) | 0.295 ± 0.002 | 3.44 ± 0.08 | 60.7% | 383 MB |
 
 Mean ± standard deviation across cells. Peak VRAM is the maximum
 allocated by libtorch over the run, sampled at ~100 ms intervals from
@@ -72,17 +72,17 @@ Three panels (share, throughput, GPU utilization). Cell labels:
 
 - **Relaxed anchor preserves eval at lower sync count**. Under the
   msf guard, the relaxed-anchor cohort sits at
-  91.95% eval vs
-  91.83% for default-anchor
+  91.82% eval vs
+  91.70% for default-anchor
   (Δ = +0.12 pp), with a
-  27% sync-count reduction
-  (882 → 641).
+  36% sync-count reduction
+  (671 → 431).
 - **Hardware heterogeneity dictates decoupling direction**. The
   cross-rank Pearson r drop under relax-up is asymmetric: fast ↔ slow
   pairs (rank 0 against ranks 1, 2) shed
-  0.005 of correlation, while the slow ↔ slow
+  0.004 of correlation, while the slow ↔ slow
   pair (ranks 1, 2) loses essentially nothing
-  (+0.0011). The fast GPU runs farthest ahead between
+  (-0.0013). The fast GPU runs farthest ahead between
   syncs, so it drifts most when cadence loosens; the two slow GPUs
   stay anchored to the same plodding pace.
 - **The rate-based detector goes silent under relax-up on the msf
@@ -94,12 +94,12 @@ Three panels (share, throughput, GPU utilization). Cell labels:
 - **Heterogeneous load balancing visible**. The fast GPU (rank 0,
   RTX 5060 Ti) carries a mean batch share of
   0.40 but runs at
-  21% mean
+  22% mean
   GPU utilization; the slow GPUs (ranks 1, 2, GTX 1060) take
-  0.31 /
-0.30 and run at
-  55% /
-58% utilization.
+  0.30 /
+0.29 and run at
+  58% /
+61% utilization.
 
 
 ## Source data

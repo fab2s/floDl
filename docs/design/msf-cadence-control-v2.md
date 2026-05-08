@@ -295,16 +295,18 @@ two-scale framing.
 
 | Cell | Eval (mean ± sd, N=5) | Sync count | Cross-rank r̄ | Per-rank ratio (warmup) | Gates ✓ |
 |---|---|---|---|---|---|
-| trend default | 91.71% ± 0.21 | 539 ± 205 | 0.993 | 1.04 ± 0.02 | 5/5 |
-| trend relaxed | 91.74% ± 0.07 | 402 ± 160 | 0.981 | 1.04 ± 0.04 | 5/5 |
-| msf default | 91.83% ± 0.20 | 882 ± 299 | 0.993 | 1.05 ± 0.02 | 5/5 |
-| **msf relaxed** | **91.95% ± 0.32** | **641 ± 162** | **0.981** | **2.07 ± 1.19** | **3/5** |
+| trend default | 91.80% ± 0.22 | 676 ± 104 | 0.996 | 1.04 ± 0.01 | 5/5 |
+| trend relaxed | 91.64% ± 0.32 | 402 ± 160 | 0.995 | 1.03 ± 0.01 | 5/5 |
+| msf default | 91.70% ± 0.25 | 671 ± 242 | 0.995 | 1.03 ± 0.02 | 5/5 |
+| **msf relaxed** | **91.82% ± 0.31** | **431 ± 178** | **0.991** | **1.02 ± 0.01** | **5/5** |
 
-**Eval optimum sits at the noisiest framing-gate corner.** The msf
-relaxed cell beats trend default by +0.24pp and msf default by +0.12pp,
-while having 2/5 framing-gate violations. This is the Pecora-Carroll
-prediction made concrete: optimal coupling sits at the edge of the
-synchronized regime.
+[NARRATIVE-AUDIT-PENDING] The msf relaxed cell beats msf default by
++0.12pp at 36% fewer syncs. Cross-rank Pearson and warmup-window
+per-rank ratios remain tight across all four cells (5/5 framing gates
+pass everywhere on the warmup window); the v1 "noisiest framing-gate
+corner" narrative anchored on pre-rerun data does not survive the
+clean-tree replication and is held for revision in the consistency
+audit pass.
 
 ### Within-cycle Lyapunov is a property of the system, not the guard
 
@@ -463,14 +465,12 @@ Cost axis: syncs / 200ep (network-volume proxy at fixed model size; rotates towa
 
 | Config | Eval (n=5 unless noted) | Syncs/200ep | Frontier status |
 |---|---:|---:|---|
-| nccl-async default msf       | 91.83% ± 0.20 | 882 ± 299 | dominated by cpu-async default trend |
-| nccl-async default trend     | 91.71% ± 0.21 | 539 ± 205 | dominated by nccl-async relaxed trend |
-| cpu-async default msf        | 91.86% ± 0.27 | 619 ± 212 | dominated by cpu-async default trend |
-| **cpu-async default trend**  | **91.96% ± 0.23** | **613 ± 206** | **frontier (eval max)** |
-| nccl-async relaxed msf       | 91.95% ± 0.32 | 641 ± 162 | dominated by cpu-async default trend |
-| **nccl-async relaxed trend** | **91.74% ± 0.07** | **402 ± 160** | **frontier (lowest-sync at near-parity)** |
-| cpu-async EASGD α=0.5 msf    | 91.67% ± 0.19 | 604 ± 154 | dominated by nccl-async relaxed trend |
-| cpu-async EASGD α=0.5 trend  | 91.75% ± 0.22 | 594 ± 162 | frontier (thin margin between two existing points) |
+| nccl-async default msf       | 91.70% ± 0.25 | 671 ± 242 | dominated by nccl-async relaxed msf |
+| nccl-async default trend     | 91.80% ± 0.22 | 676 ± 104 | dominated by nccl-async relaxed msf |
+| **cpu-async default msf**    | **92.03% ± 0.31** | **613 ± 128** | **frontier (eval max, EASGD α=0.5)** |
+| cpu-async default trend      | 91.70% ± 0.10 | 468 ± 149 | dominated by nccl-async relaxed msf |
+| **nccl-async relaxed msf**   | **91.82% ± 0.31** | **431 ± 178** | **frontier (mid)** |
+| **nccl-async relaxed trend** | **91.64% ± 0.32** | **402 ± 160** | **frontier (lowest-sync at near-parity)** |
 | Fixed k=3200                 | 91.60% ± 0.28 |  13       | frontier knee |
 | Fixed k=6400                 | 91.45% ± 0.17 |   7       | frontier |
 | Fixed k=12800                | 91.29% ± 0.08 |   4       | frontier |
@@ -478,36 +478,14 @@ Cost axis: syncs / 200ep (network-volume proxy at fixed model size; rotates towa
 | Fixed k=25600                | 77.09% ± 18.71|   2       | past Pareto (bimodal) |
 | Fixed k=51200                | 27.75% ± 30.72|   1       | collapsed |
 
-#### Multi-seed correction to the seed-0 EASGD smoke story
-
-The seed-0 EASGD smoke (Phase 2) reported `cpu-async α=0.5 + msf` at 91.91% / 408 syncs and `cpu-async α=0.5 + trend` at 91.39% / 726 syncs — a 0.52pp eval gap and a >2× sync-count gap between the two arms. Gate A multi-seed (seeds 1–4) decisively contradicts both signals. Multi-seed means converge into a tight band: msf at 91.67% ± 0.19, trend at 91.75% ± 0.22, sync counts ~600 for both. Seed 0 was a tail outlier on both arms simultaneously; the strong seed-0-derived dominance claim does not survive replication.
-
-Net Pareto effect: EASGD α=0.5 does **not** add a Pareto-improving direction. The msf arm is now **dominated by `nccl-async relaxed trend`** (91.74% / 402 syncs strictly improves on 91.67% / 604). The trend arm sits on the frontier with thin margin (~0.01pp eval / ~19 syncs window between `nccl-async relaxed trend` and `cpu-async default trend`).
-
-#### What the corrected frontier actually shows
-
-> **2026-05-07 reorg note:** the research/ data layout was consolidated
-> on 2026-05-07. The cpu-async α=1.0 cells in the original
-> `passive-observation/` were dropped (pre-EASGD impulsive-coupling
-> break per Phase 2 verdict — MSF-framing-invalid foil); the EASGD
-> α=0.5 cohort (seed-0 from the relaxed-easgd smoke + seeds 1–4 from
-> the multi-seed Gate A) was migrated into `passive-observation/` as
-> the canonical cpu-async cohort. `relaxed-anchor-easgd/` was renamed
-> to `relaxed-anchor/`; `easgd-multiseed/` was folded into
-> passive-observation. The strict-Pareto computation now resolves
-> three frontier configurations at the high-sync end (with the eval
-> max shifting to `nccl-async relaxed msf` since the previous eval-max
-> point was an α=1.0 cell that no longer enters the frontier set). A
-> full re-run at a single fresh tree state is queued to eliminate the
-> mixed-tree caveat (seed-0 EASGD α=0.5 cells are tree `321a401`,
-> seeds 1–4 are tree `0806f84`, nccl-async cells are tree `321a401`).
+#### What the frontier shows
 
 The high-sync end of the frontier resolves to **three non-dominated configurations**:
-- `nccl-async relaxed msf` — eval maximum (91.95% ± 0.32) at 641 ± 162 syncs.
-- `cpu-async default trend` — middle (91.75% ± 0.22) at 594 ± 162 syncs (this cell is the EASGD α=0.5 cohort under the post-reorg naming).
-- `nccl-async relaxed trend` — lowest-sync near-parity point (91.74% ± 0.07) at 402 ± 160 syncs.
+- `cpu-async default msf` — eval maximum (92.03% ± 0.31) at 613 ± 128 syncs (EASGD α=0.5 elastic blending cohort).
+- `nccl-async relaxed msf` — mid-frontier (91.82% ± 0.31) at 431 ± 178 syncs.
+- `nccl-async relaxed trend` — lowest-sync near-parity point (91.64% ± 0.32) at 402 ± 160 syncs.
 
-Production default `nccl-async default msf` (91.83% ± 0.20 at 882 ± 299 syncs) is dominated by `nccl-async relaxed msf` — the production-config improvement is a **single flag** (`--elche-relax-up`), Δ +0.12pp eval at 27% sync reduction. Same backend (NCCL async), same guard (msf), just relax-up enabled.
+Production default `nccl-async default msf` (91.70% ± 0.25 at 671 ± 242 syncs) is dominated by `nccl-async relaxed msf` — the production-config improvement is a **single flag** (`--elche-relax-up`), Δ +0.12pp eval at 36% sync reduction. Same backend (NCCL async), same guard (msf), just relax-up enabled.
 
 The cadence-axis frontier (fixed-k cliff bracket) saturates around k=3200–6400; past k=12800 the knee bends sharply. Each fixed-k cell strictly Pareto-improves on cost as it loses ~0.15–0.5pp eval, until the cliff at k=25600.
 
@@ -517,7 +495,7 @@ The cadence-axis frontier (fixed-k cliff bracket) saturates around k=3200–6400
 
 The frontier rotates with two axes that ResNet-20 / 3-GPU does not stress:
 
-1. **Model size.** AllReduce cost scales linearly with parameter count. ResNet-20 has 270K params; SmolLM-135M is ~500× larger. Sync count translates more directly to wall time at scale. The most Pareto-improving config at ResNet-20 (`nccl-async relaxed trend`, ~34% sync reduction at −0.22pp eval) becomes a near-proportional wall-time reduction at SmolLM size; on ResNet-20 the wall-time delta is barely measurable.
+1. **Model size.** AllReduce cost scales linearly with parameter count. ResNet-20 has 270K params; SmolLM-135M is ~500× larger. Sync count translates more directly to wall time at scale. The most Pareto-improving config at ResNet-20 (`nccl-async relaxed trend`, ~41% sync reduction at −0.16pp eval) becomes a near-proportional wall-time reduction at SmolLM size; on ResNet-20 the wall-time delta is barely measurable.
 2. **Rank count and heterogeneity diversity.** 3 GPUs (1 fast + 2 slow) yields a binary fast/slow asymmetry. With 4+ GPUs in richer mixes, the Phase 2 bottom-scale decoupling pattern (fast GPU drifts, slow pair stays Pearson-locked) generalizes to multi-cluster decoupling, where per-cluster cadence becomes a controller knob the single-cadence treatment cannot use.
 
 The two-scale framing predicts these directions are where principled controllers earn their keep — not on ResNet-20/CIFAR-10/3-GPU, where ElChe's auto-tune is already near-optimal. The paper's contribution is the structural framing + the falsifiable scaling prediction, not a controller-improvement benchmark on the small case.

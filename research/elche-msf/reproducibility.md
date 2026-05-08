@@ -19,7 +19,7 @@ landed sweeps) carry every numeric the aggregators read.
 
 | Sweep | Extracts | Aggregator | Status |
 |---|---|---|---|
-| Passive observation (5 seeds × 2 modes × 2 guards = 20 cells; cpu-async = EASGD α=0.5) | [`data/passive-observation/`](data/passive-observation/) | `aggregate.py` | landed; mixed-tree caveat (see below) |
+| Passive observation (5 seeds × 2 modes × 2 guards = 20 cells; cpu-async = EASGD α=0.5) | [`data/passive-observation/`](data/passive-observation/) | `aggregate.py` | landed |
 | Relaxed-anchor sweep (5 seeds × 2 guards × nccl-async × `--elche-relax-up`) | [`data/relaxed-anchor/`](data/relaxed-anchor/) | `aggregate.py` (reads `passive-observation/` + `./`) | landed |
 | Cliff bracket (fixed-k probe) | [`data/cliff-bracket/`](data/cliff-bracket/) | `aggregate.py` | landed; byte-identical |
 | ResNet-56 bytes-axis | (pending) | (pending) | landing on 2026-05-07 |

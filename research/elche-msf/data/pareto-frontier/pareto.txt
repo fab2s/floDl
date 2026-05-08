@@ -14,12 +14,12 @@
  fixed k=12800                      3   91.29% ± 0.08            4 ±     1       1703.4 ±   8.5     FRONTIER
  fixed k=6400                       3   91.45% ± 0.17            7 ±     0       1704.6 ±   2.6     FRONTIER
  fixed k=3200                       3   91.60% ± 0.28           13 ±     1       1712.0 ±   8.7     FRONTIER
- nccl-async relaxed trend           5   91.74% ± 0.07          402 ±   160       2016.7 ±  83.4     FRONTIER
- nccl-async default trend           5   91.71% ± 0.21          539 ±   205       1947.7 ±  77.1     dominated by nccl-async relaxed trend
- cpu-async default trend            5   91.75% ± 0.22          594 ±   162       1784.8 ±  86.8     FRONTIER
- cpu-async default msf              5   91.67% ± 0.19          604 ±   154       1790.4 ±  84.6     dominated by nccl-async relaxed trend
- nccl-async relaxed msf             5   91.95% ± 0.32          641 ±   162       1993.8 ±  58.1     FRONTIER
- nccl-async default msf             5   91.83% ± 0.20          882 ±   299       1953.9 ±  74.1     dominated by nccl-async relaxed msf
+ nccl-async relaxed trend           5   91.64% ± 0.32          402 ±   160       1863.4 ±  20.4     FRONTIER
+ nccl-async relaxed msf             5   91.82% ± 0.31          431 ±   178       1857.0 ±  14.3     FRONTIER
+ cpu-async default trend            5   91.70% ± 0.10          468 ±   149       1890.4 ±  45.6     dominated by nccl-async relaxed msf
+ cpu-async default msf              5   92.03% ± 0.31          613 ±   128       1917.4 ±  23.3     FRONTIER
+ nccl-async default msf             5   91.70% ± 0.25          671 ±   242       1891.2 ±  83.6     dominated by nccl-async relaxed msf
+ nccl-async default trend           5   91.80% ± 0.22          676 ±   104       1902.3 ±  91.9     dominated by nccl-async relaxed msf
 
 ----------------------------------------------------------------------------------------------------
  Pareto frontier (non-dominated configs, sorted by sync count)
@@ -30,16 +30,16 @@
   fixed k=12800                     eval = 91.29%  syncs =      4
   fixed k=6400                      eval = 91.45%  syncs =      7
   fixed k=3200                      eval = 91.60%  syncs =     13
-  nccl-async relaxed trend          eval = 91.74%  syncs =    402
-  cpu-async default trend           eval = 91.75%  syncs =    594
-  nccl-async relaxed msf            eval = 91.95%  syncs =    641
+  nccl-async relaxed trend          eval = 91.64%  syncs =    402
+  nccl-async relaxed msf            eval = 91.82%  syncs =    431
+  cpu-async default msf             eval = 92.03%  syncs =    613
 
 ----------------------------------------------------------------------------------------------------
  ASCII Pareto scatter (eval vs syncs, x is log-spaced)
 ----------------------------------------------------------------------------------------------------
    eval %
-    92.0 |                                                                       
-         |         F   F    F     F                                    F  xFF   x
+    92.0 |                                                                    F  
+         |         F    F    F     F                                      FF   xx
          |                                                                       
          |                                                                       
     76.4 |     F                                                                 
@@ -79,9 +79,9 @@
  Cells missing on disk:      0
 
  Production default verdict (ElChe default + msf):
-   eval = 91.83% ± 0.20, syncs = 882 ± 299
+   eval = 91.70% ± 0.25, syncs = 671 ± 242
    DOMINATED by: nccl-async relaxed msf
 
  cpu-async default candidacy check (EASGD α=0.5 cohort):
-   cpu-async default msf: eval = 91.67%, syncs = 604  →  dominated by nccl-async relaxed trend
-   cpu-async default trend: eval = 91.75%, syncs = 594  →  FRONTIER
+   cpu-async default msf: eval = 92.03%, syncs = 613  →  FRONTIER
+   cpu-async default trend: eval = 91.70%, syncs = 468  →  dominated by nccl-async relaxed msf

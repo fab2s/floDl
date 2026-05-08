@@ -19,8 +19,8 @@ fires), and the meta-oscillator anchor (cross-rank Pearson r).
 
 | guard | n cells | mean eval | mean syncs | mean fires (3-rises) | mean fires (rate-based) |
 |---|---:|---:|---:|---:|---:|
-| `msf`   | 5 | 91.83% ± 0.20 pp | 882 ± 299 | 55.4 ± 7.1 | 2.2 ± 2.9 |
-| `trend` | 5 | 91.71% ± 0.21 pp | 539 ± 205 | 40.6 ± 9.7 | 0.8 ± 1.1 |
+| `msf`   | 5 | 91.70% ± 0.25 pp | 671 ± 242 | 44.4 ± 18.7 | 1.2 ± 1.1 |
+| `trend` | 5 | 91.80% ± 0.22 pp | 676 ± 104 | 48.8 ± 12.4 | 0.6 ± 1.3 |
 
 ### Eval and guard fires per cell
 
@@ -34,9 +34,9 @@ run for both detectors on the same cells.
 
 | pair | mean r ± sd | min | max |
 |---|---:|---:|---:|
-| rank 0 ↔ 1 | +0.9923 ± 0.0077 | +0.9728 | +0.9988 |
-| rank 0 ↔ 2 | +0.9943 ± 0.0037 | +0.9898 | +0.9990 |
-| rank 1 ↔ 2 | +0.9949 ± 0.0081 | +0.9726 | +0.9992 |
+| rank 0 ↔ 1 | +0.9950 ± 0.0043 | +0.9859 | +0.9991 |
+| rank 0 ↔ 2 | +0.9946 ± 0.0051 | +0.9863 | +0.9995 |
+| rank 1 ↔ 2 | +0.9980 ± 0.0024 | +0.9916 | +0.9996 |
 
 ![Meta-oscillator anchor](meta_oscillator_pearson.png)
 
@@ -51,9 +51,9 @@ framing breaks and per-rank treatment is required).
 
 | rank | GPU | mean share | mean throughput (samples/ms) | mean util | peak VRAM |
 |---|---|---:|---:|---:|---:|
-| 0 | RTX 5060 Ti | 0.401 ± 0.002 | 2.63 ± 0.16 | 21.4% | 357 MB |
-| 1 | GTX 1060 (#1) | 0.304 ± 0.002 | 3.54 ± 0.22 | 56.5% | 396 MB |
-| 2 | GTX 1060 (#2) | 0.295 ± 0.001 | 3.47 ± 0.24 | 59.1% | 390 MB |
+| 0 | RTX 5060 Ti | 0.401 ± 0.002 | 2.60 ± 0.10 | 22.0% | 357 MB |
+| 1 | GTX 1060 (#1) | 0.302 ± 0.002 | 3.43 ± 0.14 | 57.5% | 397 MB |
+| 2 | GTX 1060 (#2) | 0.296 ± 0.001 | 3.40 ± 0.14 | 60.4% | 388 MB |
 
 Mean ± standard deviation across cells. Peak VRAM is the maximum
 allocated by libtorch over the run, sampled at ~100 ms intervals from
@@ -72,17 +72,17 @@ GPU. Cell labels: `s{seed}-{c|n}-{m|t}` where `c` = cpu-async,
 
 - **Cross-rank Pearson r anchors the meta-oscillator framing**. Across
   all 10 `nccl-async` cells, every rank pair stays at
-  r > 0.9726 (mean r ≥ 0.9923 on the lowest-mean
+  r > 0.9859 (mean r ≥ 0.9946 on the lowest-mean
   pair). The framing-validity gate at r = 0.95 is comfortably
   non-binding — ranks behave as coupled views of one D-trajectory,
   not as independent oscillators.
-- **The rate-based detector fires ~25× less
+- **The rate-based detector fires ~37× less
   than the 3-rises rule at no eval cost**. On the
   5 msf-guard cells (where the rate-based detector is
   the active gate), mean fires per 200-epoch run:
-  55.4 (3-rises rule) vs
-  2.2 (rate-based). Final eval is
-  statistically equivalent across guards (Δ = +0.11 pp,
+  44.4 (3-rises rule) vs
+  1.2 (rate-based). Final eval is
+  statistically equivalent across guards (Δ = -0.09 pp,
   within seed sd ≈ 0.20 pp). The aggregator output in
   [`aggregate.txt`](aggregate.txt) reports a slightly higher reduction
   ratio (98.2%) because its detector-table parser excludes one cell
@@ -91,12 +91,12 @@ GPU. Cell labels: `s{seed}-{c|n}-{m|t}` where `c` = cpu-async,
 - **Heterogeneous load balancing visible**. The fast GPU (rank 0,
   RTX 5060 Ti) carries a mean batch share of
   0.40 but runs at
-  21% mean
+  22% mean
   GPU utilization; the slow GPUs (ranks 1, 2, GTX 1060) take
   0.30 /
 0.30 and run at
-  57% /
-59% utilization.
+  58% /
+60% utilization.
 
 
 ## Source data

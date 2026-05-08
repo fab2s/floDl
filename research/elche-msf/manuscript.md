@@ -27,14 +27,14 @@ Working spine (from working spec):
 > Pecora-Carroll synchronization threshold (cliff between k=16000 and
 > k=25600 for the standard 200-epoch schedule; ElChe operates ~80–128×
 > below it). The frontier at the high-sync end resolves to three
-> non-dominated configurations: `nccl-async relaxed trend` (91.74% ±
-> 0.07 / 402 ± 160 syncs, lowest-sync near-parity), `cpu-async default
-> trend` (91.75% ± 0.22 / 594 ± 162, EASGD α=0.5 elastic blending),
-> and `nccl-async relaxed msf` (91.95% ± 0.32 / 641 ± 162, eval
-> maximum). The production default `nccl-async default msf` (91.83% ±
-> 0.20 / 882 ± 299) is dominated by the eval-max configuration via a
-> single flag (`--elche-relax-up`), with Δ +0.12pp eval at 27% sync
-> reduction.
+> non-dominated configurations: `nccl-async relaxed trend` (91.64% ±
+> 0.32 / 402 ± 160 syncs, lowest-sync near-parity), `nccl-async
+> relaxed msf` (91.82% ± 0.31 / 431 ± 178, mid-frontier), and
+> `cpu-async default msf` (92.03% ± 0.31 / 613 ± 128, EASGD α=0.5
+> elastic blending, eval maximum). The production default
+> `nccl-async default msf` (91.70% ± 0.25 / 671 ± 242) is dominated by
+> `nccl-async relaxed msf` via a single flag (`--elche-relax-up`),
+> with Δ +0.12pp eval at 36% sync reduction.
 
 ---
 
@@ -197,9 +197,9 @@ Cliff bracket table: see [`tables/cliff-bracket.md`](tables/cliff-bracket.md) [p
 
 [STUB] Figure: eval vs syncs/200ep. Cells: ElChe default trend/msf,
 ElChe relaxed trend/msf, EASGD α=0.5 trend/msf, fixed-k {3200, 6400,
-12800, 16000, 25600, 51200}. Frontier resolves to two configs:
-cpu-async default trend (eval max) + nccl-async relaxed trend
-(lowest-sync near-parity).
+12800, 16000, 25600, 51200}. Frontier resolves to three configs:
+cpu-async default msf (eval max) + nccl-async relaxed msf (mid) +
+nccl-async relaxed trend (lowest-sync near-parity).
 
 See [`figures/pareto-200ep.svg`](figures/pareto-200ep.svg) [pending],
 generated from [`ddp-bench/runs/pareto-frontier-200ep/`](../../ddp-bench/runs/pareto-frontier-200ep/).
