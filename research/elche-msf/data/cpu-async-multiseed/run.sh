@@ -32,7 +32,7 @@ set -u
 BASE="ddp-bench/runs/overnight-2026-05-06-easgd-multiseed"
 RUNLOG="${BASE}/_runlog.txt"
 
-cd "$(dirname "$0")/../../.."
+cd "$(dirname "$0")/../../../.."
 
 mkdir -p "${BASE}"
 : > "${RUNLOG}"

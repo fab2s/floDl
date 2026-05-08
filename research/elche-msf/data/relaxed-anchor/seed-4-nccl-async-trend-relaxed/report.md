@@ -26,15 +26,15 @@ DDP modes are expected to show slightly lower eval than solo on small models wit
 
 ## Per-Model Results
 
-GPU0/GPU1 = compute utilization % (not load). Idle = total time with <5% utilization.
+GPU columns = compute utilization % (not load). Idle = total time with <5% utilization.
 
 ### resnet-graph
 
 > Published: CIFAR-10 91.25% acc, Graph builder ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6)
 
-| Mode | Loss | Eval | vs Ref | Total (s) | Syncs | Avg Sync (ms) | GPU0 | GPU1 | Idle (s) |
-|------|------|------|--------|-----------|-------|--------------|------|------|----------|
-| nccl-async | 0.063339 | 0.9187 | +0.0062 | 1852.1 | 598 | 38.0 | 100% | 100% | 11.6 |
+| Mode | Loss | Eval | vs Ref | Total (s) | Syncs | Avg Sync (ms) | GPU0 | GPU1 | GPU2 | Idle (s) |
+|------|------|------|--------|-----------|-------|--------------|------|------|------|----------|
+| nccl-async | 0.063339 | 0.9187 | +0.0062 | 1852.1 | 598 | 38.0 | 100% | 100% | 100% | 11.6 |
 
 ## Best Mode per Model
 
@@ -74,9 +74,9 @@ GPU0/GPU1 = compute utilization % (not load). Idle = total time with <5% utiliza
 
 ## VRAM Usage
 
-| Model | Mode | GPU0 Peak (MB) | GPU0 Mean (MB) | GPU1 Peak (MB) | GPU1 Mean (MB) |
-|-------|------|---------------|---------------|---------------|---------------|
-| resnet-graph | nccl-async | 356 | 355 | 386 | 384 |
+| Model | Mode | GPU0 Peak (MB) | GPU0 Mean (MB) | GPU1 Peak (MB) | GPU1 Mean (MB) | GPU2 Peak (MB) | GPU2 Mean (MB) |
+|-------|------|---------------|---------------|---------------|---------------|---------------|---------------|
+| resnet-graph | nccl-async | 356 | 355 | 386 | 384 | 384 | 381 |
 
 ## GPU Idle Analysis
 

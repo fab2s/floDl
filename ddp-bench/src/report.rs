@@ -194,7 +194,7 @@ surpasses solo convergence while completing faster -- the whole point of multi-G
 
     // Per-model comparison
     md.push_str("## Per-Model Results\n\n");
-    md.push_str("GPU0/GPU1 = compute utilization % (not load). Idle = total time with <5% utilization.\n\n");
+    md.push_str("GPU columns = compute utilization % (not load). Idle = total time with <5% utilization.\n\n");
     for (model, runs) in groups {
         write_model_table(&mut md, model, runs, references.get(model));
     }
@@ -335,20 +335,28 @@ fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis], mref: O
         let _ = writeln!(md, "> Published: {}\n", r.note);
     }
 
-    // Header
+    // Header — dynamic GPU columns sized to the widest run in this group
+    let max_gpus = runs.iter()
+        .map(|r| r.gpu_active_pct.len())
+        .max()
+        .unwrap_or(2)
+        .max(2); // keep at least 2 columns for legacy single-GPU/2-GPU rigs
+
     let _ = write!(md, "| Mode | Loss |");
     if has_eval { md.push_str(" Eval |"); }
     if has_delta { md.push_str(" vs Ref |"); }
-    md.push_str(" Total (s) | Syncs | Avg Sync (ms) | GPU0 | GPU1 | Idle (s) |\n");
+    md.push_str(" Total (s) | Syncs | Avg Sync (ms) |");
+    for i in 0..max_gpus { let _ = write!(md, " GPU{i} |"); }
+    md.push_str(" Idle (s) |\n");
 
     let _ = write!(md, "|------|------|");
     if has_eval { md.push_str("------|"); }
     if has_delta { md.push_str("--------|"); }
-    md.push_str("-----------|-------|--------------|------|------|----------|\n");
+    md.push_str("-----------|-------|--------------|");
+    for _ in 0..max_gpus { md.push_str("------|"); }
+    md.push_str("----------|\n");
 
     for r in runs {
-        let a0 = r.gpu_active_pct.first().copied().unwrap_or(0.0);
-        let a1 = r.gpu_active_pct.get(1).copied().unwrap_or(0.0);
         let total_idle_s: f64 = r.idle_by_cause.iter()
             .map(|c| c.total_ms)
             .sum::<f64>() / 1000.0;
@@ -376,16 +384,18 @@ fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysis], mref: O
             }
         }
 
-        let _ = writeln!(
+        let _ = write!(
             md,
-            " {:.1} | {} | {:.1} | {:.0}% | {:.0}% | {:.1} |",
+            " {:.1} | {} | {:.1} |",
             r.total_ms as f64 / 1000.0,
             r.sync_count,
             r.avg_sync_ms,
-            a0,
-            a1,
-            total_idle_s,
         );
+        for i in 0..max_gpus {
+            let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
+            let _ = write!(md, " {pct:.0}% |");
+        }
+        let _ = writeln!(md, " {total_idle_s:.1} |");
     }
     md.push('\n');
 }
@@ -744,26 +754,33 @@ because DDP runs only eval once at the end.\n\n");
 
 /// VRAM usage table per mode per GPU.
 fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
-    md.push_str("| Model | Mode | GPU0 Peak (MB) | GPU0 Mean (MB) | GPU1 Peak (MB) | GPU1 Mean (MB) |\n");
-    md.push_str("|-------|------|---------------|---------------|---------------|---------------|\n");
+    let max_gpus = groups.iter()
+        .flat_map(|(_, runs)| runs.iter())
+        .map(|r| r.vram_stats.len())
+        .max()
+        .unwrap_or(2)
+        .max(2);
+
+    md.push_str("| Model | Mode |");
+    for i in 0..max_gpus { let _ = write!(md, " GPU{i} Peak (MB) | GPU{i} Mean (MB) |"); }
+    md.push('\n');
+    md.push_str("|-------|------|");
+    for _ in 0..max_gpus { md.push_str("---------------|---------------|"); }
+    md.push('\n');
 
     for (model, runs) in groups {
         for r in runs {
-            let g0 = r.vram_stats.first();
-            let g1 = r.vram_stats.get(1);
+            let any_nonzero = r.vram_stats.iter().any(|v| v.peak_allocated > 0);
+            if !any_nonzero { continue; }
 
-            let g0_peak = g0.map(|v| v.peak_allocated / (1024 * 1024)).unwrap_or(0);
-            let g0_mean = g0.map(|v| v.mean_allocated / (1024 * 1024)).unwrap_or(0);
-            let g1_peak = g1.map(|v| v.peak_allocated / (1024 * 1024)).unwrap_or(0);
-            let g1_mean = g1.map(|v| v.mean_allocated / (1024 * 1024)).unwrap_or(0);
-
-            if g0_peak == 0 && g1_peak == 0 { continue; }
-
-            let _ = writeln!(
-                md,
-                "| {} | {} | {} | {} | {} | {} |",
-                model, r.mode, g0_peak, g0_mean, g1_peak, g1_mean,
-            );
+            let _ = write!(md, "| {} | {} |", model, r.mode);
+            for i in 0..max_gpus {
+                let v = r.vram_stats.get(i);
+                let peak = v.map(|s| s.peak_allocated / (1024 * 1024)).unwrap_or(0);
+                let mean = v.map(|s| s.mean_allocated / (1024 * 1024)).unwrap_or(0);
+                let _ = write!(md, " {peak} | {mean} |");
+            }
+            md.push('\n');
         }
     }
     md.push('\n');

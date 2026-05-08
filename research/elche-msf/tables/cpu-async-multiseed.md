@@ -42,19 +42,29 @@ baseline (~ 680).
 
 The Gate A seed-0 single-shot smoke produced
 **msf+α=0.5 = 91.91 % at 408 syncs** (parity with the α=1.0 baseline
-at 34 % sync reduction). Three falsifiable predictions for the
-multi-seed pass:
+at 34 % sync reduction). The launcher header set three falsifiable
+predictions for the multi-seed pass.
 
-| prediction | result | verdict |
+The baseline values originally used to evaluate those predictions came
+from `passive-observation/seed-N-nccl-async-msf` (eval ~91.86 % /
+~680 syncs) — **mode-confounded**: that cohort is `nccl-async`, not
+`cpu-async`. The in-mode `cpu-async` α=1.0 R-20 cohort was first
+measured cleanly in [`cpu-async-alpha-sweep`](../data/cpu-async-alpha-sweep/)
+on 2026-05-08: **91.77 % ± 0.19 / 502 syncs (n=4)**. The verdicts below
+use the in-mode baseline.
+
+| prediction | result vs in-mode α=1.0 baseline (91.77 % / 502 syncs) | verdict |
 |---|---|---|
-| msf+α=0.5 cross-seed mean within ±0.15 pp of msf+α=1.0 baseline | mean 91.61 % vs baseline 91.86 % (Δ = −0.25 pp) | **at the margin** — outside ±0.15 pp band by 0.10 pp |
-| sync reduction ≥ 25 % across all 4 seeds vs α=1.0 baseline | mean syncs 653 vs baseline ~680, reduction ≈ 4 % | **falsified** — seed-0's 408 syncs (34 % reduction) was a tail outlier |
-| trend+α=0.5 degrades by 0.5–1.0 pp consistently | trend mean 91.84 % vs trend α=1.0 baseline 91.96 % (Δ = −0.12 pp) | **falsified** — degradation within seed noise |
+| msf+α=0.5 cross-seed mean within ±0.15 pp of msf+α=1.0 baseline | mean 91.61 % vs in-mode baseline 91.77 % (Δ = −0.16 pp) | **borderline** — just outside ±0.15 pp band by 0.01 pp |
+| sync reduction ≥ 25 % across all 4 seeds vs α=1.0 baseline | mean syncs 653 vs in-mode baseline 502 — α=0.5 syncs **+30 % MORE**, not fewer | **falsified** — direction inverted; the seed-0 408-sync result was a tail outlier on the favorable side |
+| trend+α=0.5 degrades by 0.5–1.0 pp consistently | trend mean 91.84 % vs trend α=1.0 baseline 91.96 % from `passive-observation/nccl-async` (Δ = −0.12 pp; in-mode trend α=1.0 has not been measured) | **falsified** — degradation within seed noise |
 
 Net effect: **α=0.5 does not add a Pareto-improving direction at
-ResNet-20 / 3-GPU**. The seed-0 sync count was a tail outlier; the
-multi-seed mean shows essentially no sync reduction, eval at the
-edge of the parity band.
+ResNet-20 / 3-GPU**. The eval contrast is at parity within seed sd; the
+sync-cost prediction is inverted (α=0.5 actually requires more syncs
+than α=1.0 in the in-mode comparison). The seed-0 single-shot smoke
+sat on the favorable tail of both axes simultaneously, which is why it
+generated overly-optimistic predictions for the multi-seed pass.
 
 ## Relationship to the canonical Pareto frontier
 

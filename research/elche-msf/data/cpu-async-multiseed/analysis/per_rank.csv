@@ -1,0 +1,25 @@
+seed,guard,cell,rank,gpu_label,util_pct,peak_vram_mb,mean_vram_mb
+1,msf,seed-1-cpu-async-msf,0,RTX 5060 Ti,100,358,357
+1,msf,seed-1-cpu-async-msf,1,GTX 1060 (#1),100,400,381
+1,msf,seed-1-cpu-async-msf,2,GTX 1060 (#2),100,388,386
+1,trend,seed-1-cpu-async-trend,0,RTX 5060 Ti,100,358,357
+1,trend,seed-1-cpu-async-trend,1,GTX 1060 (#1),100,398,393
+1,trend,seed-1-cpu-async-trend,2,GTX 1060 (#2),100,390,379
+2,msf,seed-2-cpu-async-msf,0,RTX 5060 Ti,100,358,357
+2,msf,seed-2-cpu-async-msf,1,GTX 1060 (#1),100,398,392
+2,msf,seed-2-cpu-async-msf,2,GTX 1060 (#2),100,390,379
+2,trend,seed-2-cpu-async-trend,0,RTX 5060 Ti,100,358,357
+2,trend,seed-2-cpu-async-trend,1,GTX 1060 (#1),100,394,390
+2,trend,seed-2-cpu-async-trend,2,GTX 1060 (#2),100,390,388
+3,msf,seed-3-cpu-async-msf,0,RTX 5060 Ti,100,358,357
+3,msf,seed-3-cpu-async-msf,1,GTX 1060 (#1),100,396,391
+3,msf,seed-3-cpu-async-msf,2,GTX 1060 (#2),100,386,384
+3,trend,seed-3-cpu-async-trend,0,RTX 5060 Ti,100,358,357
+3,trend,seed-3-cpu-async-trend,1,GTX 1060 (#1),99,394,386
+3,trend,seed-3-cpu-async-trend,2,GTX 1060 (#2),99,390,384
+4,msf,seed-4-cpu-async-msf,0,RTX 5060 Ti,100,358,357
+4,msf,seed-4-cpu-async-msf,1,GTX 1060 (#1),100,396,386
+4,msf,seed-4-cpu-async-msf,2,GTX 1060 (#2),100,390,386
+4,trend,seed-4-cpu-async-trend,0,RTX 5060 Ti,100,358,357
+4,trend,seed-4-cpu-async-trend,1,GTX 1060 (#1),100,396,391
+4,trend,seed-4-cpu-async-trend,2,GTX 1060 (#2),99,396,392

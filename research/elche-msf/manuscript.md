@@ -242,13 +242,63 @@ Two axes ResNet-20/3-GPU does not stress:
 2. Rank count and heterogeneity diversity — fast/slow asymmetry
    generalizes to multi-cluster decoupling at 4+ GPUs in richer mixes.
 
-### 7.2 Controller refinements (motivated, not validated)
+### 7.2 cpu-async vs nccl-async — eval / noise observation
+
+A side observation from rerunning the same recipe across days: at
+ResNet-20 / 3-GPU, **cpu-async cohorts have higher cross-day
+realization noise but a slight cohort-mean lead over nccl-async**.
+
+Cross-cohort means (R-20, msf guard, n ≥ 4 per cohort):
+
+| mode | cohorts (n) | cohort-mean (across cohorts) |
+|---|---|---:|
+| cpu-async (α = 0.5 or 1.0) | 4 (multiseed, passive-observation, alpha-sweep α=0.5, alpha-sweep α=1.0) | **91.83 %** |
+| nccl-async (default or relax-up) | 2 (passive-observation, relaxed-anchor) | **91.76 %** |
+
+The +0.07 pp lead is within seed sd, but it appears in every cpu-async
+cohort vs every nccl-async cohort. Three independent cpu-async runs of
+the *same* α=0.5 msf recipe on different days (2026-05-06 / -07 / -08,
+seeds 1–4 each) give per-seed cross-day swings up to 0.87 pp at fixed
+RNG seed — substantially wider than the 0.18–0.31 pp within-day cohort
+sd.
+
+A commit-by-commit walk of the three trees the sweeps ran on
+(`0806f84`, `4544408`, `54bcfe6`) ruled out code drift as the source:
+no commit in the range modifies the training path in a way that
+changes the realized trajectory at fixed seed (the only training-path
+delta is a refactor of the ResNet builder that is byte-equivalent at
+n=3, with all other behavior gated behind unused CLI flags).
+`flodl/`, `flodl-sys/`, `Cargo.lock`, and `libtorch/.active` are
+untouched across the range.
+
+The noise is therefore non-determinism on the heterogeneous 3-GPU
+rig. The most likely dominant source, given the structure, is
+**cadence-controller timing variability** — sync-window boundaries on
+cpu-async are placed by a controller that consults wall-time and
+overhead measurements, both of which vary slightly across runs. Once
+sync points shift, the per-rank parameter snapshots being averaged
+shift with them, and the trajectory diverges. This is at a different
+scale than the micro-level CUDA / NCCL kernel-ordering jitter that
+both modes share.
+
+The two-scale framing offers a tentative interpretation: cpu-async's
+elastic blending (`W ← (1−α)·W_local + α·W_avg` with α ≤ 1) preserves
+some of the per-rank Lyapunov drift between syncs, where nccl-async's
+in-place `AllReduce(Mean)` discards it at every sync. If the drift
+carries any structured information (which the meta-oscillator framing
+suggests it does), cpu-async would inherit both more eval-axis upside
+*and* more cross-day variance — which is what the data shows. We do
+not have an nccl-async cross-day same-seed cohort at matched recipe
+to make this test paired (it would require a small targeted rerun);
+the observation is recorded here without claiming a mechanism.
+
+### 7.3 Controller refinements (motivated, not validated)
 
 [STUB] C1' by-k cadence inversion, C5' threshold-aware cadence, R5'
 meta-CUSUM regime detector. Empirical validation deferred to follow-up
 (SmolLM-135M scale-axis study, Meta-ElChe model-parallel study).
 
-### 7.3 Limitations
+### 7.4 Limitations
 
 [STUB]
 

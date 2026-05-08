@@ -1,0 +1,16 @@
+alpha,seed,cell,rank,gpu_label,util_pct,peak_vram_mb,mean_vram_mb
+0.5,1,seed-1-cpu-async-msf,0,RTX 5060 Ti,100,514,513
+0.5,1,seed-1-cpu-async-msf,1,GTX 1060 (#1),100,580,576
+0.5,1,seed-1-cpu-async-msf,2,GTX 1060 (#2),100,574,571
+0.5,2,seed-2-cpu-async-msf,0,RTX 5060 Ti,100,514,513
+0.5,2,seed-2-cpu-async-msf,1,GTX 1060 (#1),100,580,576
+0.5,2,seed-2-cpu-async-msf,2,GTX 1060 (#2),100,574,569
+0.5,3,seed-3-cpu-async-msf,0,RTX 5060 Ti,100,514,513
+0.5,3,seed-3-cpu-async-msf,1,GTX 1060 (#1),100,582,580
+0.5,3,seed-3-cpu-async-msf,2,GTX 1060 (#2),100,576,567
+0.5,4,seed-4-cpu-async-msf,0,RTX 5060 Ti,100,514,513
+0.5,4,seed-4-cpu-async-msf,1,GTX 1060 (#1),100,588,586
+0.5,4,seed-4-cpu-async-msf,2,GTX 1060 (#2),100,576,572
+1.0,1,seed-1-cpu-async-msf-alpha10,0,RTX 5060 Ti,100,514,513
+1.0,1,seed-1-cpu-async-msf-alpha10,1,GTX 1060 (#1),100,578,574
+1.0,1,seed-1-cpu-async-msf-alpha10,2,GTX 1060 (#2),100,572,569

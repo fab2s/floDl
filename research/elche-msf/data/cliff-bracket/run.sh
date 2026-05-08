@@ -41,7 +41,7 @@ set -u
 BASE="ddp-bench/runs/overnight-2026-05-05-sweep-b2-cliff"
 RUNLOG="${BASE}/_runlog.txt"
 
-cd "$(dirname "$0")/../../.."
+cd "$(dirname "$0")/../../../.."
 
 mkdir -p "${BASE}"
 : > "${RUNLOG}"

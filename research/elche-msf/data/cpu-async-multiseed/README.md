@@ -52,6 +52,12 @@ RNG, same conclusion).
 ├── run.sh                          original launcher (verbatim)
 ├── _runlog.txt                     sweep timing + START/OK/FAIL log
 ├── extract.py                      raw → committed extracts
+├── analyze.py                      cohort + per-rank aggregator
+├── analysis/
+│   ├── README.md                   analysis walkthrough + key observations
+│   ├── per_cell.csv                8 rows × 18 cols
+│   ├── per_rank.csv                24 rows = 8 cells × 3 ranks
+│   └── gate_a_alpha_predictions.png
 └── seed-N-cpu-async-{msf|trend}/
     ├── timeline.csv.gz
     ├── training.log

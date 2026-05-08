@@ -1,0 +1,45 @@
+2026-05-08T10:31:32Z  OVERNIGHT SWEEP START (P1 — EASGD α-axis sweep, cpu-async × msf × ResNet-20)
+2026-05-08T10:31:32Z  tree: 54bcfe6
+2026-05-08T10:31:32Z  branch: ddp-scale
+2026-05-08T10:31:32Z  design: 4 α-values [1.0, 0.7, 0.5, 0.3] × 4 seeds [1-4] × cpu-async × msf × ResNet-20 × 200 epochs
+2026-05-08T10:31:32Z          α-major outer loop; load-bearing α=1.0 baseline completes first
+2026-05-08T10:31:32Z  
+2026-05-08T10:31:32Z  PHASE: alpha=1.0 (suffix=alpha10)
+2026-05-08T10:31:32Z  START  seed-1-cpu-async-msf-alpha10  seed=1 alpha=1.0
+2026-05-08T11:04:41Z  OK     seed-1-cpu-async-msf-alpha10  1989s  exit=0
+2026-05-08T11:04:41Z  START  seed-2-cpu-async-msf-alpha10  seed=2 alpha=1.0
+2026-05-08T11:38:05Z  OK     seed-2-cpu-async-msf-alpha10  2004s  exit=0
+2026-05-08T11:38:05Z  START  seed-3-cpu-async-msf-alpha10  seed=3 alpha=1.0
+2026-05-08T12:11:01Z  OK     seed-3-cpu-async-msf-alpha10  1976s  exit=0
+2026-05-08T12:11:01Z  START  seed-4-cpu-async-msf-alpha10  seed=4 alpha=1.0
+2026-05-08T12:44:02Z  OK     seed-4-cpu-async-msf-alpha10  1981s  exit=0
+2026-05-08T12:44:02Z  PHASE: alpha=0.7 (suffix=alpha07)
+2026-05-08T12:44:02Z  START  seed-1-cpu-async-msf-alpha07  seed=1 alpha=0.7
+2026-05-08T13:17:03Z  OK     seed-1-cpu-async-msf-alpha07  1981s  exit=0
+2026-05-08T13:17:03Z  START  seed-2-cpu-async-msf-alpha07  seed=2 alpha=0.7
+2026-05-08T13:49:27Z  OK     seed-2-cpu-async-msf-alpha07  1944s  exit=0
+2026-05-08T13:49:27Z  START  seed-3-cpu-async-msf-alpha07  seed=3 alpha=0.7
+2026-05-08T14:21:56Z  OK     seed-3-cpu-async-msf-alpha07  1949s  exit=0
+2026-05-08T14:21:56Z  START  seed-4-cpu-async-msf-alpha07  seed=4 alpha=0.7
+2026-05-08T14:54:44Z  OK     seed-4-cpu-async-msf-alpha07  1968s  exit=0
+2026-05-08T14:54:44Z  PHASE: alpha=0.5 (suffix=alpha05)
+2026-05-08T14:54:44Z  START  seed-1-cpu-async-msf-alpha05  seed=1 alpha=0.5
+2026-05-08T15:27:25Z  OK     seed-1-cpu-async-msf-alpha05  1961s  exit=0
+2026-05-08T15:27:25Z  START  seed-2-cpu-async-msf-alpha05  seed=2 alpha=0.5
+2026-05-08T15:59:52Z  OK     seed-2-cpu-async-msf-alpha05  1947s  exit=0
+2026-05-08T15:59:52Z  START  seed-3-cpu-async-msf-alpha05  seed=3 alpha=0.5
+2026-05-08T16:32:53Z  OK     seed-3-cpu-async-msf-alpha05  1981s  exit=0
+2026-05-08T16:32:53Z  START  seed-4-cpu-async-msf-alpha05  seed=4 alpha=0.5
+2026-05-08T17:05:36Z  OK     seed-4-cpu-async-msf-alpha05  1963s  exit=0
+2026-05-08T17:05:36Z  PHASE: alpha=0.3 (suffix=alpha03)
+2026-05-08T17:05:36Z  START  seed-1-cpu-async-msf-alpha03  seed=1 alpha=0.3
+2026-05-08T17:38:11Z  OK     seed-1-cpu-async-msf-alpha03  1955s  exit=0
+2026-05-08T17:38:11Z  START  seed-2-cpu-async-msf-alpha03  seed=2 alpha=0.3
+2026-05-08T18:10:59Z  OK     seed-2-cpu-async-msf-alpha03  1968s  exit=0
+2026-05-08T18:10:59Z  START  seed-3-cpu-async-msf-alpha03  seed=3 alpha=0.3
+2026-05-08T18:43:58Z  OK     seed-3-cpu-async-msf-alpha03  1979s  exit=0
+2026-05-08T18:43:58Z  START  seed-4-cpu-async-msf-alpha03  seed=4 alpha=0.3
+2026-05-08T19:17:32Z  OK     seed-4-cpu-async-msf-alpha03  2014s  exit=0
+2026-05-08T19:17:32Z  
+2026-05-08T19:17:32Z  OVERNIGHT SWEEP DONE
+2026-05-08T19:17:32Z  Summary: 16 OK, 0 FAIL

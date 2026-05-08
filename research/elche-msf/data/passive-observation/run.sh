@@ -18,7 +18,7 @@ set -u
 BASE="ddp-bench/runs/overnight-2026-05-07-passive-observation"
 RUNLOG="${BASE}/_runlog.txt"
 
-cd "$(dirname "$0")/../../.."
+cd "$(dirname "$0")/../../../.."
 
 mkdir -p "${BASE}"
 : > "${RUNLOG}"

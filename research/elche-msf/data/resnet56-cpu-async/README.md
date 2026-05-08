@@ -46,6 +46,12 @@ So the four α=0.5 cells become `seed-{N}-cpu-async-msf` and the one
 ├── run.sh                          original launcher (verbatim)
 ├── _runlog.txt                     sweep timing + START/OK/FAIL log
 ├── extract.py                      raw → committed extracts
+├── analyze.py                      cohort + per-rank aggregator
+├── analysis/
+│   ├── README.md                   analysis walkthrough + key observations
+│   ├── per_cell.csv                5 rows × 18 cols
+│   ├── per_rank.csv                15 rows = 5 cells × 3 ranks
+│   └── gate_d_resnet56_alpha.png
 ├── seed-{1..4}-cpu-async-msf/      α=0.5 cohort (canonical)
 │   ├── timeline.csv.gz
 │   ├── training.log
