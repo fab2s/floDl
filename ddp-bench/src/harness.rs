@@ -531,6 +531,10 @@ fn run_unified(
         builder = builder.elche_relax_up(true);
     }
 
+    if config.meta_controller {
+        builder = builder.meta_controller(true);
+    }
+
     if let Some(max) = config.max_anchor {
         builder = builder.max_anchor(max);
     }

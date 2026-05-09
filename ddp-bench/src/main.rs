@@ -107,6 +107,16 @@ struct Cli {
     #[option]
     elche_relax_up: bool,
 
+    /// Enable the LR-aware meta-controller above ElChe. Watches the LR
+    /// trajectory + anchor trend + convergence-guard verdicts each
+    /// averaging cycle and dispatches reactive `nudge_anchor_down` calls on
+    /// sharp LR drops or sustained divergence patterns. Off by default
+    /// until validation sweep.
+    ///
+    /// Honored in Cadence/Async modes only; ignored by Sync and solo modes.
+    #[option]
+    meta_controller: bool,
+
     /// Override ElChe's anchor upper bound (`max_anchor`, library default
     /// 200). When set, passed to `DdpBuilder::max_anchor(N)`. Used by
     /// Sweep C of the MSF cadence-control program to bracket the
@@ -600,6 +610,7 @@ fn run() -> flodl::tensor::Result<()> {
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
                 elche_relax_up: cli.elche_relax_up,
+                meta_controller: cli.meta_controller,
                 max_anchor: cli.max_anchor,
                 min_anchor: cli.min_anchor,
                 easgd_alpha: cli.easgd_alpha,

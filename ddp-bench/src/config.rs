@@ -148,6 +148,10 @@ pub struct RunConfig {
     /// When true, passed as `DdpBuilder::elche_relax_up(true)`. Default
     /// false (relax-up disabled, anchor under overhead-based auto-tune only).
     pub elche_relax_up: bool,
+    /// Enable the LR-aware meta-controller above ElChe. When true, passed
+    /// as `DdpBuilder::meta_controller(true)`. Default false (opt-in until
+    /// validation sweep).
+    pub meta_controller: bool,
     /// Override ElChe's `max_anchor` (anchor upper bound, default 1000).
     /// Used by Sweep C to bracket the Pecora-Carroll synchronization
     /// threshold by walking k_max across multiples of the default. `None`

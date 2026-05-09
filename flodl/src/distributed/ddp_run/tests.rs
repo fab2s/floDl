@@ -3858,3 +3858,143 @@ fn test_cross_mode_lr_parity_with_lr_scale() {
             "step {step}: solo*scale={} vs graph={}", manual_lrs[step], graph_lrs[step]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// LR-aware meta-controller integration
+// ---------------------------------------------------------------------------
+
+/// Build a coordinator harness with the LR-aware meta-controller enabled.
+fn make_coord_harness_meta(n: usize) -> CoordTestHarness {
+    let (timing_tx, timing_rx) = mpsc::channel();
+    let (metrics_tx, metrics_rx) = mpsc::channel();
+    let (param_tx, param_rx) = mpsc::channel();
+
+    let mut control_txs = Vec::new();
+    let mut control_rxs = Vec::new();
+    let mut final_param_rxs = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = mpsc::channel();
+        control_txs.push(tx);
+        control_rxs.push(rx);
+        let (_ftx, frx) = mpsc::channel();
+        final_param_rxs.push(frx);
+    }
+
+    let el_che = crate::distributed::ddp::ElChe::new(n, 10);
+    let coord = Coordinator::builder(
+        timing_rx, metrics_rx, param_rx,
+        final_param_rxs, control_txs,
+        ApplyPolicy::Async, AverageBackend::Cpu,
+        n, 10000, el_che,
+    )
+    .meta_controller(true)
+    .build();
+
+    CoordTestHarness { coord, timing_tx, metrics_tx, param_tx, control_rxs }
+}
+
+/// Drive ElChe past Probe/Warmup into Stable so the meta-controller will
+/// act on observations (Probe is always silent, Warmup requires K=5
+/// sustained for convergence pattern).
+fn calibrate_to_stable(coord: &mut Coordinator) {
+    for _ in 0..6 {
+        coord.el_che.report_timing(&[10.0, 20.0], &[10, 10], 1.0);
+    }
+    assert!(coord.el_che.phase() >= crate::distributed::Phase::Stable);
+}
+
+#[test]
+fn test_meta_controller_dispatches_nudge_on_lr_cliff() {
+    let mut h = make_coord_harness_meta(2);
+    calibrate_to_stable(&mut h.coord);
+
+    // Establish baseline LR via the LrUpdate channel + drain.
+    h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr: 0.1 }).unwrap();
+    h.coord.drain_timing();
+
+    // First observation: builds the LR window. anchor_window also starts here.
+    h.coord.observe_meta(super::convergence::ConvergenceAction::Stable);
+    let anchor_after_warmup = h.coord.el_che.anchor();
+
+    // Sharp LR drop (10x) on the next cycle: cliff watcher should fire.
+    h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr: 0.01 }).unwrap();
+    h.coord.drain_timing();
+    h.coord.observe_meta(super::convergence::ConvergenceAction::Stable);
+
+    let anchor_after_cliff = h.coord.el_che.anchor();
+    assert!(
+        anchor_after_cliff < anchor_after_warmup,
+        "meta-controller should nudge anchor down on sharp LR drop: \
+         {anchor_after_warmup} -> {anchor_after_cliff}",
+    );
+}
+
+#[test]
+fn test_meta_controller_silent_on_smooth_decay() {
+    let mut h = make_coord_harness_meta(2);
+    calibrate_to_stable(&mut h.coord);
+
+    let anchor_initial = h.coord.el_che.anchor();
+    let mut lr = 0.1;
+    for _ in 0..10 {
+        h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr }).unwrap();
+        h.coord.drain_timing();
+        h.coord.observe_meta(super::convergence::ConvergenceAction::Stable);
+        lr *= 0.98; // 2% per cycle, well under 30% cliff threshold
+    }
+
+    let anchor_final = h.coord.el_che.anchor();
+    assert_eq!(
+        anchor_final, anchor_initial,
+        "smooth decay should not trigger meta-controller; anchor unchanged \
+         from {anchor_initial}, got {anchor_final}",
+    );
+}
+
+#[test]
+fn test_meta_controller_disabled_no_dispatch() {
+    // Default harness: meta_controller flag off. Even with LR cliff input,
+    // observe_meta is a no-op.
+    let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Cpu);
+    calibrate_to_stable(&mut h.coord);
+
+    let anchor_initial = h.coord.el_che.anchor();
+
+    h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr: 0.1 }).unwrap();
+    h.coord.drain_timing();
+    h.coord.observe_meta(super::convergence::ConvergenceAction::Stable);
+
+    h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr: 0.01 }).unwrap();
+    h.coord.drain_timing();
+    h.coord.observe_meta(super::convergence::ConvergenceAction::Stable);
+
+    assert_eq!(
+        h.coord.el_che.anchor(),
+        anchor_initial,
+        "meta-controller off should not change anchor",
+    );
+}
+
+#[test]
+fn test_meta_controller_dispatches_on_sustained_convergence_pattern() {
+    let mut h = make_coord_harness_meta(2);
+    calibrate_to_stable(&mut h.coord);
+
+    h.timing_tx.send(TimingMsg::LrUpdate { rank: 0, lr: 0.1 }).unwrap();
+    h.coord.drain_timing();
+
+    // Stable phase requires K=3 sustained NudgeDown / SuppressGrowth verdicts.
+    let nudge = super::convergence::ConvergenceAction::NudgeDown { factor: 0.5 };
+    h.coord.observe_meta(nudge);
+    h.coord.observe_meta(nudge);
+    let anchor_after_two = h.coord.el_che.anchor();
+
+    h.coord.observe_meta(nudge);
+    let anchor_after_three = h.coord.el_che.anchor();
+
+    assert!(
+        anchor_after_three < anchor_after_two,
+        "convergence pattern (K=3 at Stable) should fire on third sustained verdict: \
+         {anchor_after_two} -> {anchor_after_three}",
+    );
+}

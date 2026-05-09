@@ -526,12 +526,16 @@ impl Coordinator {
     }
 
     /// Feed an averaging-cycle observation to the LR-aware meta-controller
-    /// (when enabled). The returned [`crate::distributed::lr_event_meta::MetaAction`]
-    /// is dropped in Stage 2; Stage 3 wires it to `nudge_anchor_down` dispatch.
+    /// (when enabled) and dispatch any returned action to ElChe.
     ///
     /// No-op when:
     /// - meta is disabled (`lr_event_meta` is `None`),
     /// - no rank has reported its LR yet (cold-start, ≤ 1 cycle).
+    ///
+    /// On [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`], calls
+    /// [`crate::distributed::ElChe::nudge_anchor_down`] with the
+    /// trend-dampened factor and logs the transition. ElChe's overhead
+    /// auto-tune handles the natural relax-back over subsequent cycles.
     pub(super) fn observe_meta(
         &mut self,
         verdict: super::convergence::ConvergenceAction,
@@ -541,8 +545,27 @@ impl Coordinator {
         };
         let anchor = self.el_che.anchor();
         let phase = self.el_che.phase();
-        if let Some(meta) = self.lr_event_meta.as_mut() {
-            let _ = meta.observe(lr, anchor, verdict, phase);
+        let action = match self.lr_event_meta.as_mut() {
+            Some(meta) => meta.observe(lr, anchor, verdict, phase),
+            None => return,
+        };
+        if let crate::distributed::lr_event_meta::MetaAction::NudgeDown { factor } = action {
+            let old = self.el_che.anchor();
+            self.el_che.nudge_anchor_down(factor);
+            let new = self.el_che.anchor();
+            // Don't emit AnchorChanged here: the post-match block in
+            // finish_averaging_{nccl,cpu} captures the cycle's net anchor
+            // change and emits a single event covering both the meta nudge
+            // and any guard-driven adjustment that follows.
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::Custom {
+                    label: format!("meta-nudge factor={factor:.3} anchor={old}->{new}"),
+                });
+            }
+            crate::verbose!(
+                "  ddp: meta-controller nudge factor={:.3} anchor {} -> {}",
+                factor, old, new,
+            );
         }
     }
 
