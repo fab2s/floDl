@@ -536,6 +536,48 @@ extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
     }
 }
 
+extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
+                                             int ntensors, void* stream,
+                                             int root) {
+    auto* h = static_cast<FlodlNcclRankComm*>(handle);
+    try {
+        cudaStream_t cuda_stream;
+        if (stream) {
+            cuda_stream = static_cast<at::cuda::CUDAStream*>(stream)->stream();
+        } else {
+            cuda_stream = at::cuda::getCurrentCUDAStream().stream();
+        }
+
+        ncclGroupStart();
+        for (int i = 0; i < ntensors; i++) {
+            auto& t = *reinterpret_cast<torch::Tensor*>(tensors[i]);
+            void* data = t.data_ptr();
+            size_t count = static_cast<size_t>(t.numel());
+            ncclDataType_t dtype = to_nccl_dtype(t.scalar_type());
+
+            ncclResult_t result = ncclBroadcast(
+                data, data, count, dtype, root,
+                h->comm, cuda_stream);
+            if (result != ncclSuccess) {
+                ncclGroupEnd();
+                return make_error(
+                    std::string("ncclBroadcast (rank) failed on tensor ") +
+                    std::to_string(i) + ": " +
+                    ncclGetErrorString(result));
+            }
+        }
+        ncclResult_t result = ncclGroupEnd();
+        if (result != ncclSuccess) {
+            return make_error(
+                std::string("ncclGroupEnd (rank broadcast) failed: ") +
+                ncclGetErrorString(result));
+        }
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+}
+
 extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,
                                          void** rank_handle_out) {
     auto* g = static_cast<FlodlNcclComms*>(group_handle);
@@ -694,6 +736,12 @@ extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                               int ntensors, void* stream,
                                               int op) {
     (void)handle; (void)tensors; (void)ntensors; (void)stream; (void)op;
+    return make_error("NCCL requires a CUDA build");
+}
+extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
+                                             int ntensors, void* stream,
+                                             int root) {
+    (void)handle; (void)tensors; (void)ntensors; (void)stream; (void)root;
     return make_error("NCCL requires a CUDA build");
 }
 extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,

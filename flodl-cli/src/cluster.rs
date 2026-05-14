@@ -1,20 +1,20 @@
 //! Multi-host launcher: ssh fan-out for `cluster:`-marked commands.
 //!
-//! Entry point [`dispatch`] iterates `project.cluster.hosts`, builds a
-//! per-host slim envelope (via
-//! [`ClusterConfig::local_envelope_for`](crate::config::ClusterConfig::local_envelope_for)),
-//! hex-encodes the JSON into `FLODL_CLUSTER_JSON`, and spawns one child per
-//! host:
+//! Process-per-rank model: each rank is its own process, one CUDA device per
+//! process. [`dispatch`] iterates `project.cluster.hosts` and spawns
+//! `host.ranks.len()` children per host, each carrying its local-rank index.
+//! Mirrors torchrun's `LOCAL_RANK` convention so users coming from PyTorch see
+//! a familiar runtime model.
 //!
 //! ```text
-//! # remote host (host.name != controller's hostname)
+//! # remote host (host.name != controller's hostname), one child per local rank
 //! ssh -T <host> bash -lc 'cd <path> && \
-//!     FLODL_CLUSTER_JSON=<hex> FLODL_HOST_NAME=<name> \
+//!     FLODL_CLUSTER_JSON=<hex> FLODL_HOST_NAME=<name> FLODL_LOCAL_RANK=<i> \
 //!     exec fdl <cmd> <user_args>'
 //!
-//! # local fast path (host.name == controller's hostname)
+//! # local fast path (host.name == controller's hostname), one child per local rank
 //! bash -lc 'cd <path> && FLODL_CLUSTER_JSON=<hex> FLODL_HOST_NAME=<name> \
-//!     exec fdl <cmd> <user_args>'
+//!     FLODL_LOCAL_RANK=<i> exec fdl <cmd> <user_args>'
 //! ```
 //!
 //! The local fast path drops the sshd-on-controller prereq -- a fresh
@@ -23,9 +23,10 @@
 //! stderr, same env propagation via the inline shell prefix), so the
 //! mux / wait / exit-code logic downstream doesn't branch.
 //!
-//! Stdout/stderr from each ssh child are line-prefixed with `[host] ` at the
-//! launcher; library-prefixed lines (`[host:dev:rN]`) appear after the
-//! launcher prefix, making the layering visible during debug.
+//! Stdout/stderr from each child are line-prefixed with `[host:idx] ` at the
+//! launcher (`idx` is the local-rank index, 0..host.ranks.len()).
+//! Library-prefixed lines (`[host:dev:rN]`) appear after the launcher prefix,
+//! making the layering visible during debug.
 //!
 //! Recursion guard: a remote `fdl` invocation sees `FLODL_CLUSTER_JSON` in
 //! its env and [`should_dispatch`] returns false -- the remote runs the
@@ -60,6 +61,13 @@ pub const ENV_HOST_OVERRIDE: &str = "FLODL_HOST_NAME";
 /// fdl-cli reads this at startup; setting it on the remote ssh invocation
 /// makes the remote see the same `commands:` resolution as the controller.
 pub const ENV_FDL_ENV: &str = "FDL_ENV";
+
+/// Environment variable picking this process's local-rank index within its
+/// host. Indexes into `cluster.host.ranks` / `cluster.host.local_devices`
+/// (positionally paired). Mirrors torchrun's `LOCAL_RANK`. The global rank
+/// and CUDA device are derived in the library by indexing the envelope with
+/// this value.
+pub const ENV_LOCAL_RANK: &str = "FLODL_LOCAL_RANK";
 
 /// SSH options shared by every host invocation.
 ///
@@ -129,8 +137,12 @@ pub fn dispatch(
         );
     }
 
-    // Spawn one ssh process per host; pin reader threads to each.
-    let mut children: Vec<HostChild> = Vec::with_capacity(cluster.hosts.len());
+    // Spawn host.ranks.len() processes per host, one per local rank.
+    // The envelope is serialized once per host (same for every local rank);
+    // each child gets a distinct FLODL_LOCAL_RANK so the library can pick its
+    // global rank and CUDA device out of the envelope.
+    let total_children: usize = cluster.hosts.iter().map(|h| h.ranks.len()).sum();
+    let mut children: Vec<HostChild> = Vec::with_capacity(total_children);
     for host in &cluster.hosts {
         let envelope = cluster.local_envelope_for(host);
         let envelope_bytes = match serde_json::to_vec(&envelope) {
@@ -146,51 +158,55 @@ pub fn dispatch(
         };
         let envelope_hex = hex_encode(&envelope_bytes);
 
-        let remote_cmd = build_remote_command(
-            &host.path,
-            &envelope_hex,
-            &host.name,
-            overlay_env,
-            cmd,
-            user_args,
-        );
+        for local_rank in 0..host.ranks.len() {
+            let remote_cmd = build_remote_command(
+                &host.path,
+                &envelope_hex,
+                &host.name,
+                local_rank,
+                overlay_env,
+                cmd,
+                user_args,
+            );
 
-        let mut child = match build_spawn_command(
-            &host.name,
-            &me,
-            cluster.ssh_target(host),
-            &remote_cmd,
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let kind = if host.name == me { "bash" } else { "ssh" };
-                crate::cli_error!(
-                    "cluster: failed to spawn {kind} for {:?}: {e}",
-                    host.name
-                );
-                kill_all(&mut children);
-                return ExitCode::FAILURE;
+            let mut child = match build_spawn_command(
+                &host.name,
+                &me,
+                cluster.ssh_target(host),
+                &remote_cmd,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let kind = if host.name == me { "bash" } else { "ssh" };
+                    crate::cli_error!(
+                        "cluster: failed to spawn {kind} for {:?}[{local_rank}]: {e}",
+                        host.name
+                    );
+                    kill_all(&mut children);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let child_label = format!("{}:{local_rank}", host.name);
+            let prefix = format!("[{child_label}] ");
+            let mut threads = Vec::with_capacity(2);
+            if let Some(out) = child.stdout.take() {
+                threads.push(relay_lines(out, prefix.clone(), Stream::Stdout));
             }
-        };
-
-        let prefix = format!("[{}] ", host.name);
-        let mut threads = Vec::with_capacity(2);
-        if let Some(out) = child.stdout.take() {
-            threads.push(relay_lines(out, prefix.clone(), Stream::Stdout));
+            if let Some(err) = child.stderr.take() {
+                threads.push(relay_lines(err, prefix.clone(), Stream::Stderr));
+            }
+            children.push(HostChild {
+                name: child_label,
+                child,
+                threads,
+            });
         }
-        if let Some(err) = child.stderr.take() {
-            threads.push(relay_lines(err, prefix.clone(), Stream::Stderr));
-        }
-        children.push(HostChild {
-            name: host.name.clone(),
-            child,
-            threads,
-        });
     }
 
     // Wait for all children. A non-zero exit on any host fails the run.
@@ -331,6 +347,7 @@ pub(crate) fn build_remote_command(
     path: &str,
     cluster_json_hex: &str,
     host_name: &str,
+    local_rank: usize,
     overlay_env: Option<&str>,
     cmd: &str,
     user_args: &[String],
@@ -350,6 +367,10 @@ pub(crate) fn build_remote_command(
     s.push_str(ENV_HOST_OVERRIDE);
     s.push('=');
     s.push_str(&shell_quote(host_name));
+    s.push(' ');
+    s.push_str(ENV_LOCAL_RANK);
+    s.push('=');
+    s.push_str(&local_rank.to_string());
     if let Some(env) = overlay_env {
         s.push(' ');
         s.push_str(ENV_FDL_ENV);
@@ -528,6 +549,7 @@ commands:
             "/opt/flodl",
             "abcd1234",
             "worker-host",
+            0,
             Some("cluster"),
             "train",
             &["--epochs".into(), "10".into()],
@@ -535,6 +557,7 @@ commands:
         assert!(s.starts_with("cd '/opt/flodl' && "), "got: {s}");
         assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"), "got: {s}");
         assert!(s.contains("FLODL_HOST_NAME='worker-host'"), "got: {s}");
+        assert!(s.contains("FLODL_LOCAL_RANK=0"), "got: {s}");
         assert!(s.contains("FDL_ENV='cluster'"), "got: {s}");
         assert!(s.contains(" exec fdl 'train' "), "got: {s}");
         assert!(s.contains("'--epochs'"), "got: {s}");
@@ -547,6 +570,7 @@ commands:
             "/opt/flodl",
             "abcd",
             "node-a",
+            0,
             None,
             "test",
             &[],
@@ -560,6 +584,7 @@ commands:
             "/opt/my flodl",
             "00",
             "node",
+            0,
             None,
             "x",
             &[],
@@ -575,11 +600,57 @@ commands:
             "/opt/flodl",
             "00",
             "node",
+            0,
             None,
             "cmd",
             &["it's fine".into()],
         );
         assert!(s.contains("'it'\\''s fine'"), "got: {s}");
+    }
+
+    #[test]
+    fn build_remote_command_carries_distinct_local_ranks() {
+        // Two ranks on the same host produce identical commands except for
+        // the FLODL_LOCAL_RANK value -- that's the load-bearing distinction
+        // that makes the library pick the right rank/device from the envelope.
+        let s0 = build_remote_command(
+            "/opt/flodl",
+            "00",
+            "vm",
+            0,
+            None,
+            "train",
+            &[],
+        );
+        let s1 = build_remote_command(
+            "/opt/flodl",
+            "00",
+            "vm",
+            1,
+            None,
+            "train",
+            &[],
+        );
+        assert!(s0.contains("FLODL_LOCAL_RANK=0"), "got: {s0}");
+        assert!(s1.contains("FLODL_LOCAL_RANK=1"), "got: {s1}");
+        assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn build_remote_command_local_rank_not_quoted() {
+        // LOCAL_RANK is a numeric we emit ourselves; no shell escaping needed.
+        // Quoting would still work but the unquoted form is cleaner in logs.
+        let s = build_remote_command(
+            "/opt/flodl",
+            "00",
+            "n",
+            42,
+            None,
+            "x",
+            &[],
+        );
+        assert!(s.contains("FLODL_LOCAL_RANK=42 "), "got: {s}");
+        assert!(!s.contains("FLODL_LOCAL_RANK='42'"), "got: {s}");
     }
 
     #[test]
@@ -619,6 +690,7 @@ commands:
             "/opt/flodl",
             "00",
             "n",
+            0,
             None,
             "x",
             &[],

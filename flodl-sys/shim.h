@@ -900,6 +900,16 @@ void flodl_nccl_destroy_rank(void* handle);
 char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                   int ntensors, void* stream, int op);
 
+// Broadcast on a single-rank communicator (cross-process / cross-host).
+// root rank's tensors are sent in-place to all other ranks.
+// All ranks must call this concurrently for the collective to complete.
+// tensors: array of ntensors FlodlTensors (all on this rank's device).
+// ntensors: number of tensors to broadcast (batched with ncclGroupStart/End).
+// stream: CUDA stream handle, or NULL for default stream.
+// root: source rank (in 0..world_size).
+char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
+                                 int ntensors, void* stream, int root);
+
 // Abort a single-rank communicator, unblocking any in-progress collective.
 // Thread-safe: can be called from any thread to unblock a stuck AllReduce.
 // After abort, the communicator is destroyed and must not be used again.

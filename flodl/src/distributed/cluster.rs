@@ -31,6 +31,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::log;
+use crate::tensor::Device;
 use crate::{Result, TensorError};
 
 use super::{NcclUniqueId, TcpRendezvous};
@@ -49,6 +50,16 @@ pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
 /// `cluster.hosts[].name` entry (e.g. a VM whose libvirt-assigned hostname
 /// drifts from the deployment label).
 pub const ENV_HOST_OVERRIDE: &str = "FLODL_HOST_NAME";
+
+/// Environment variable picking this process's local-rank index within its
+/// host. Indexes into `cluster.host.ranks` / `cluster.host.local_devices`
+/// (positionally paired). Mirrors torchrun's `LOCAL_RANK`.
+///
+/// In the process-per-rank model, each spawned child has exactly one entry
+/// here. The launcher (`flodl-cli/src/cluster.rs`) injects a distinct value
+/// per child. The library uses it via [`LocalCluster::my_rank`] to pick the
+/// global rank and CUDA device for this process out of the envelope.
+pub const ENV_LOCAL_RANK: &str = "FLODL_LOCAL_RANK";
 
 thread_local! {
     /// Per-thread hostname override used by integration tests that spawn
@@ -284,6 +295,26 @@ impl LocalCluster {
         Ok(self.host.ranks.contains(&0))
     }
 
+    /// Pick this process's `(global_rank, device)` out of the envelope.
+    ///
+    /// Reads [`ENV_LOCAL_RANK`] and indexes into `this_host().ranks` /
+    /// `this_host().local_devices` (positionally paired). In the
+    /// process-per-rank model, each spawned child owns exactly one slot here.
+    ///
+    /// Loud errors:
+    /// - [`ENV_LOCAL_RANK`] unset (cluster mode requires every process to
+    ///   know its own slot; the launcher injects this per child)
+    /// - value does not parse as `usize`
+    /// - value is out of bounds vs `this_host().ranks.len()`
+    ///
+    /// Side effect: calls [`Self::this_host`], which validates the hostname
+    /// matches the envelope and registers the node label with the logger.
+    pub fn my_rank(&self) -> Result<(usize, Device)> {
+        let host = self.this_host()?;
+        let idx = local_rank_index_from_env(host.ranks.len(), &host.name)?;
+        Ok((host.ranks[idx], Device::CUDA(host.local_devices[idx])))
+    }
+
     /// Whether the cluster spans more than one physical host.
     pub fn spans_multiple_hosts(&self) -> bool {
         self.num_hosts > 1
@@ -403,6 +434,36 @@ fn parse_u64_array(v: Option<&Value>, label: &str) -> Result<Vec<u64>> {
                 .ok_or_else(|| TensorError::new(&format!("{label}: non-integer entry")))
         })
         .collect()
+}
+
+/// Read and validate [`ENV_LOCAL_RANK`].
+///
+/// `local_count` is `this_host().ranks.len()`; `host_name` surfaces in error
+/// messages to disambiguate which host the launcher targeted. Loud errors on
+/// unset / unparseable / out-of-bounds.
+fn local_rank_index_from_env(local_count: usize, host_name: &str) -> Result<usize> {
+    let raw = env::var(ENV_LOCAL_RANK).map_err(|_| {
+        TensorError::new(&format!(
+            "cluster: {ENV_LOCAL_RANK} not set; in cluster mode each process \
+             must own exactly one local rank. The fdl-cli launcher injects \
+             this env var per spawned child -- if you are running cluster \
+             code without the launcher, set it manually."
+        ))
+    })?;
+    let trimmed = raw.trim();
+    let idx: usize = trimmed.parse().map_err(|e| {
+        TensorError::new(&format!(
+            "cluster: {ENV_LOCAL_RANK}={trimmed:?} is not a valid usize: {e}"
+        ))
+    })?;
+    if idx >= local_count {
+        return Err(TensorError::new(&format!(
+            "cluster: {ENV_LOCAL_RANK}={idx} out of bounds for host {host_name:?} \
+             (host owns {local_count} local rank(s); valid indexes are \
+             0..{local_count})"
+        )));
+    }
+    Ok(idx)
 }
 
 fn resolve_hostname() -> Result<String> {
@@ -697,6 +758,135 @@ mod tests {
     #[test]
     fn hex_decode_rejects_odd_length() {
         assert!(hex_decode("abc").is_err());
+    }
+
+    #[test]
+    fn my_rank_picks_first_slot() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "0");
+        }
+        let (global_rank, device) = c.my_rank().expect("my_rank ok");
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        // worker_envelope: ranks=[1,2], local_devices=[0,1]. Index 0 -> (1, CUDA(0)).
+        assert_eq!(global_rank, 1);
+        assert_eq!(device, Device::CUDA(0));
+    }
+
+    #[test]
+    fn my_rank_picks_second_slot() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "1");
+        }
+        let (global_rank, device) = c.my_rank().expect("my_rank ok");
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        // worker_envelope: index 1 -> (2, CUDA(1)).
+        assert_eq!(global_rank, 2);
+        assert_eq!(device, Device::CUDA(1));
+    }
+
+    #[test]
+    fn my_rank_loud_error_when_env_unset() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        let err = c.my_rank().unwrap_err();
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+        }
+        let msg = err.to_string();
+        assert!(msg.contains(ENV_LOCAL_RANK), "got: {msg}");
+        assert!(msg.contains("not set"), "got: {msg}");
+    }
+
+    #[test]
+    fn my_rank_loud_error_on_unparseable_value() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "not-a-number");
+        }
+        let err = c.my_rank().unwrap_err();
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        let msg = err.to_string();
+        assert!(msg.contains(ENV_LOCAL_RANK), "got: {msg}");
+        assert!(msg.contains("not-a-number"), "got: {msg}");
+    }
+
+    #[test]
+    fn my_rank_loud_error_on_oob_index() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "5"); // host owns 2 ranks (indexes 0,1)
+        }
+        let err = c.my_rank().unwrap_err();
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("out of bounds"), "got: {msg}");
+        assert!(msg.contains("worker-host"), "got: {msg}");
+        // The error names the valid range so the user can fix the launcher.
+        assert!(msg.contains("0..2"), "got: {msg}");
+    }
+
+    #[test]
+    fn my_rank_accepts_whitespace_padded_value() {
+        // The launcher emits unquoted numeric, but defending against
+        // user-set values with stray whitespace is cheap.
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "  1  ");
+        }
+        let (gr, _) = c.my_rank().expect("trimmed parse ok");
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        assert_eq!(gr, 2);
+    }
+
+    #[test]
+    fn my_rank_single_rank_host() {
+        // master_envelope: ranks=[0], local_devices=[0]. Single-rank host.
+        // FLODL_LOCAL_RANK=0 still must be set per the explicit-overlay
+        // contract -- launcher always injects it.
+        let c = LocalCluster::from_value(&master_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "master-host");
+            env::set_var(ENV_LOCAL_RANK, "0");
+        }
+        let (global_rank, device) = c.my_rank().expect("single-rank ok");
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        assert_eq!(global_rank, 0);
+        assert_eq!(device, Device::CUDA(0));
     }
 
     // Env-mutating tests need a module-level Mutex; "unique env var name" is

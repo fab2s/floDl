@@ -51,7 +51,8 @@ use crate::autograd::Variable;
 use crate::graph::Graph;
 use crate::nn::{Buffer, Module, Optimizer, Parameter};
 use super::cuda_event::CudaEvent;
-use super::nccl::{NcclComms, ReduceOp};
+use super::nccl::{NcclComms, NcclRankComm, ReduceOp};
+use super::rendezvous::TcpRendezvous;
 use super::ddp_run::{DdpBuilder, DdpHandle};
 pub use super::el_che::ElChe;
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -380,14 +381,40 @@ impl DistributedState {
 ///
 /// For standard training, use [`crate::graph::Graph::distribute`] instead.
 pub struct Ddp {
-    comms: NcclComms,
-    devices: Vec<Device>,
-    param_groups: Vec<Vec<Variable>>,
-    buffer_groups: Vec<Vec<Buffer>>,
+    inner: DdpInner,
+}
+
+/// Variant-specific state for [`Ddp`].
+///
+/// Two variants during migration to the C-model (process-per-rank):
+/// - `Group`: legacy single-process multi-rank (created by [`Ddp::wrap`]).
+///   Holds an in-process [`NcclComms`] and N replicas worth of parameters /
+///   buffers, where N = world_size on this single process.
+/// - `Rank`: process-per-rank (created by [`Ddp::wrap_single`]). Holds a
+///   single [`NcclRankComm`] joining a cross-process / cross-host group, plus
+///   this process's slice of parameters / buffers.
+///
+/// Stage 3 of the multi-host DDP arc deletes the `Group` variant; the enum
+/// collapses to one variant at that point.
+enum DdpInner {
+    Group {
+        comms: NcclComms,
+        devices: Vec<Device>,
+        param_groups: Vec<Vec<Variable>>,
+        buffer_groups: Vec<Vec<Buffer>>,
+    },
+    Rank {
+        comms: NcclRankComm,
+        device: Device,
+        params: Vec<Variable>,
+        buffers: Vec<Buffer>,
+    },
 }
 
 impl Ddp {
-    /// Wrap pre-created model replicas for manual DDP control.
+    /// Wrap pre-created model replicas for manual DDP control (single-process,
+    /// multiple ranks). Legacy path; use [`Ddp::wrap_single`] for the
+    /// process-per-rank cluster mode.
     ///
     /// Models must have identical architecture (same parameter count/shapes).
     /// Each model should already reside on its target device.
@@ -437,53 +464,168 @@ impl Ddp {
         }
 
         Ok(Ddp {
-            comms,
-            devices: devices.to_vec(),
-            param_groups,
-            buffer_groups,
+            inner: DdpInner::Group {
+                comms,
+                devices: devices.to_vec(),
+                param_groups,
+                buffer_groups,
+            },
+        })
+    }
+
+    /// Wrap a single model replica joined to a cross-process NCCL group.
+    ///
+    /// Each process in the cluster calls this with its own model, its own
+    /// CUDA device, its own global rank (typically from
+    /// [`super::LocalCluster::my_rank`]), and the rendezvous's shared
+    /// [`NcclUniqueId`](super::NcclUniqueId) (from
+    /// [`super::LocalCluster::rendezvous`]). NCCL synchronizes the group
+    /// internally via the UID handshake.
+    ///
+    /// In contrast to [`Ddp::wrap`], this owns exactly one replica per
+    /// process — the runtime model used by `torchrun` and friends.
+    ///
+    /// Loud errors: `global_rank >= rdv.world_size()`. NCCL init failures
+    /// propagate from [`NcclRankComm::init_rank`].
+    pub fn wrap_single(
+        model: &dyn Module,
+        device: Device,
+        global_rank: usize,
+        rdv: &TcpRendezvous,
+    ) -> Result<Self> {
+        let world_size = rdv.world_size();
+        if global_rank >= world_size {
+            return Err(TensorError::new(&format!(
+                "Ddp::wrap_single: global_rank {global_rank} >= world_size {world_size}"
+            )));
+        }
+        if let Device::CUDA(idx) = device {
+            crate::tensor::set_current_cuda_device(idx);
+        }
+        let comms = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+
+        let params: Vec<Variable> = model
+            .parameters()
+            .into_iter()
+            .map(|p| p.variable)
+            .collect();
+        let buffers: Vec<Buffer> = model.buffers();
+
+        Ok(Ddp {
+            inner: DdpInner::Rank {
+                comms,
+                device,
+                params,
+                buffers,
+            },
         })
     }
 
     /// Broadcast all parameters and buffers from rank 0 to all replicas.
     pub fn sync_params(&self) -> Result<()> {
-        for group in &self.param_groups {
-            let tensors: Vec<Tensor> = group.iter().map(|v| v.data()).collect();
-            let refs: Vec<&Tensor> = tensors.iter().collect();
-            self.comms.broadcast(&refs, 0)?;
+        match &self.inner {
+            DdpInner::Group {
+                comms,
+                param_groups,
+                buffer_groups,
+                ..
+            } => {
+                for group in param_groups {
+                    let tensors: Vec<Tensor> = group.iter().map(|v| v.data()).collect();
+                    let refs: Vec<&Tensor> = tensors.iter().collect();
+                    comms.broadcast(&refs, 0)?;
+                }
+                for group in buffer_groups {
+                    let tensors: Vec<Tensor> = group.iter().map(|b| b.get()).collect();
+                    let refs: Vec<&Tensor> = tensors.iter().collect();
+                    comms.broadcast(&refs, 0)?;
+                }
+                Ok(())
+            }
+            DdpInner::Rank {
+                comms,
+                params,
+                buffers,
+                ..
+            } => {
+                let p_tensors: Vec<Tensor> = params.iter().map(|v| v.data()).collect();
+                if !p_tensors.is_empty() {
+                    let refs: Vec<&Tensor> = p_tensors.iter().collect();
+                    comms.broadcast(&refs, 0)?;
+                }
+                let b_tensors: Vec<Tensor> = buffers.iter().map(|b| b.get()).collect();
+                if !b_tensors.is_empty() {
+                    let refs: Vec<&Tensor> = b_tensors.iter().collect();
+                    comms.broadcast(&refs, 0)?;
+                }
+                Ok(())
+            }
         }
-        for group in &self.buffer_groups {
-            let tensors: Vec<Tensor> = group.iter().map(|b| b.get()).collect();
-            let refs: Vec<&Tensor> = tensors.iter().collect();
-            self.comms.broadcast(&refs, 0)?;
-        }
-        Ok(())
     }
 
     /// AllReduce-average gradients across all replicas.
     /// Call after backward(), before optimizer.step().
     pub fn all_reduce_gradients(&self) -> Result<()> {
-        for group in &self.param_groups {
-            if group[0].grad().is_none() {
-                continue;
+        match &self.inner {
+            DdpInner::Group {
+                comms,
+                param_groups,
+                ..
+            } => {
+                for group in param_groups {
+                    if group[0].grad().is_none() {
+                        continue;
+                    }
+                    let grads: Vec<Tensor> = group
+                        .iter()
+                        .map(|v| v.grad().expect("gradient missing on replica"))
+                        .collect();
+                    let refs: Vec<&Tensor> = grads.iter().collect();
+                    comms.all_reduce(&refs, ReduceOp::Avg)?;
+                }
+                Ok(())
             }
-            let grads: Vec<Tensor> = group
-                .iter()
-                .map(|v| v.grad().expect("gradient missing on replica"))
-                .collect();
-            let refs: Vec<&Tensor> = grads.iter().collect();
-            self.comms.all_reduce(&refs, ReduceOp::Avg)?;
+            DdpInner::Rank { comms, params, .. } => {
+                // Batch every grad on this rank into a single NCCL group call.
+                // Frozen params (no grad) are skipped; collective ranks must
+                // call all_reduce with the same tensor count, so the user
+                // contract is "freeze the same params on every rank".
+                let grads: Vec<Tensor> = params.iter().filter_map(|v| v.grad()).collect();
+                if grads.is_empty() {
+                    return Ok(());
+                }
+                let refs: Vec<&Tensor> = grads.iter().collect();
+                comms.all_reduce(&refs, ReduceOp::Avg)?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Broadcast buffers from rank 0 (BatchNorm running stats etc).
     pub fn sync_buffers(&self) -> Result<()> {
-        for group in &self.buffer_groups {
-            let tensors: Vec<Tensor> = group.iter().map(|b| b.get()).collect();
-            let refs: Vec<&Tensor> = tensors.iter().collect();
-            self.comms.broadcast(&refs, 0)?;
+        match &self.inner {
+            DdpInner::Group {
+                comms,
+                buffer_groups,
+                ..
+            } => {
+                for group in buffer_groups {
+                    let tensors: Vec<Tensor> = group.iter().map(|b| b.get()).collect();
+                    let refs: Vec<&Tensor> = tensors.iter().collect();
+                    comms.broadcast(&refs, 0)?;
+                }
+                Ok(())
+            }
+            DdpInner::Rank { comms, buffers, .. } => {
+                let tensors: Vec<Tensor> = buffers.iter().map(|b| b.get()).collect();
+                if tensors.is_empty() {
+                    return Ok(());
+                }
+                let refs: Vec<&Tensor> = tensors.iter().collect();
+                comms.broadcast(&refs, 0)?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// AllReduce gradients weighted by per-device batch contribution.
@@ -500,45 +642,100 @@ impl Ddp {
     /// ddp.weighted_all_reduce_gradients(cadence.batch_counts())?;
     /// ```
     pub fn weighted_all_reduce_gradients(&self, batch_counts: &[usize]) -> Result<()> {
-        if batch_counts.len() != self.devices.len() {
-            return Err(TensorError::new(&format!(
-                "weighted_all_reduce: batch_counts len ({}) != device count ({})",
-                batch_counts.len(),
-                self.devices.len(),
-            )));
-        }
-        let total: usize = batch_counts.iter().sum();
-        if total == 0 {
-            return Err(TensorError::new("weighted_all_reduce: total batch count is 0"));
-        }
-        for group in &self.param_groups {
-            if group[0].grad().is_none() {
-                continue;
+        match &self.inner {
+            DdpInner::Group {
+                comms,
+                devices,
+                param_groups,
+                ..
+            } => {
+                if batch_counts.len() != devices.len() {
+                    return Err(TensorError::new(&format!(
+                        "weighted_all_reduce: batch_counts len ({}) != device count ({})",
+                        batch_counts.len(),
+                        devices.len(),
+                    )));
+                }
+                let total: usize = batch_counts.iter().sum();
+                if total == 0 {
+                    return Err(TensorError::new(
+                        "weighted_all_reduce: total batch count is 0",
+                    ));
+                }
+                for group in param_groups {
+                    if group[0].grad().is_none() {
+                        continue;
+                    }
+                    let grads: Vec<Tensor> = group
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, v)| {
+                            let g = v.grad().expect("gradient missing on replica");
+                            let weight = batch_counts[rank] as f64 / total as f64;
+                            g.mul_scalar_(weight).ok();
+                            g
+                        })
+                        .collect();
+                    let refs: Vec<&Tensor> = grads.iter().collect();
+                    comms.all_reduce(&refs, ReduceOp::Sum)?;
+                }
+                Ok(())
             }
-            let grads: Vec<Tensor> = group
-                .iter()
-                .enumerate()
-                .map(|(rank, v)| {
-                    let g = v.grad().expect("gradient missing on replica");
-                    let weight = batch_counts[rank] as f64 / total as f64;
-                    g.mul_scalar_(weight).ok();
-                    g
-                })
-                .collect();
-            let refs: Vec<&Tensor> = grads.iter().collect();
-            self.comms.all_reduce(&refs, ReduceOp::Sum)?;
+            DdpInner::Rank { comms, params, .. } => {
+                if batch_counts.len() != comms.world_size() {
+                    return Err(TensorError::new(&format!(
+                        "weighted_all_reduce: batch_counts len ({}) != world_size ({})",
+                        batch_counts.len(),
+                        comms.world_size(),
+                    )));
+                }
+                let total: usize = batch_counts.iter().sum();
+                if total == 0 {
+                    return Err(TensorError::new(
+                        "weighted_all_reduce: total batch count is 0",
+                    ));
+                }
+                let my_rank = comms.rank();
+                let weight = batch_counts[my_rank] as f64 / total as f64;
+                let grads: Vec<Tensor> = params
+                    .iter()
+                    .filter_map(|v| {
+                        v.grad().inspect(|g| {
+                            g.mul_scalar_(weight).ok();
+                        })
+                    })
+                    .collect();
+                if grads.is_empty() {
+                    return Ok(());
+                }
+                let refs: Vec<&Tensor> = grads.iter().collect();
+                comms.all_reduce(&refs, ReduceOp::Sum)?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
-    /// Number of devices.
+    /// World size: total ranks participating in the collective.
+    ///
+    /// For `Ddp::wrap` (legacy), this is the in-process device count.
+    /// For `Ddp::wrap_single` (cluster mode), this is the cross-process /
+    /// cross-host total from the rendezvous.
     pub fn world_size(&self) -> usize {
-        self.devices.len()
+        match &self.inner {
+            DdpInner::Group { devices, .. } => devices.len(),
+            DdpInner::Rank { comms, .. } => comms.world_size(),
+        }
     }
 
-    /// Devices in use.
+    /// Devices owned by this `Ddp` instance.
+    ///
+    /// `Ddp::wrap` returns all devices in this process. `Ddp::wrap_single`
+    /// returns a one-element slice — this process owns exactly one device.
     pub fn devices(&self) -> &[Device] {
-        &self.devices
+        match &self.inner {
+            DdpInner::Group { devices, .. } => devices,
+            DdpInner::Rank { device, .. } => std::slice::from_ref(device),
+        }
     }
 
     // --- Deprecated aliases: use Trainer:: as the primary entry point ---
