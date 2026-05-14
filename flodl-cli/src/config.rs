@@ -493,8 +493,10 @@ pub struct OutputConfig {
 // ── Cluster topology (multi-host DDP) ───────────────────────────────────
 
 /// Multi-host cluster topology, parsed from the `cluster:` block at the
-/// project root. Mirrors `flodl::distributed::Cluster` on the library side
-/// but adds launcher-only fields (`ssh:`) that the library ignores.
+/// project root. This is the controller-side full topology; per-host slim
+/// envelopes are derived from it and shipped to each node, where the
+/// library reads them via `flodl::distributed::LocalCluster::from_env`.
+/// Launcher-only fields (`ssh:`) are not propagated to the envelope.
 ///
 /// The library re-validates after reading; this validation runs earlier so
 /// errors surface before `fdl-cli` opens any SSH connection.

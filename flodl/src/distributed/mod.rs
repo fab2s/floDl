@@ -22,7 +22,7 @@ pub mod el_che;
 pub mod lr_event_meta;
 pub mod rendezvous;
 
-pub use cluster::{Cluster, HostBlock};
+pub use cluster::{HostBlock, LocalCluster};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};

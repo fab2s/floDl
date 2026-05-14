@@ -1,17 +1,25 @@
-//! Cluster topology for multi-host DDP.
+//! Per-node cluster view for multi-host DDP.
 //!
-//! A [`Cluster`] is the canonical JSON form of the `cluster:` block from
-//! `fdl.yml` (or its overlay). `fdl-cli` deep-merges the YAML, canonicalizes
-//! to JSON, and ships the file to each host; the library reads it via
-//! [`Cluster::from_json`].
+//! A [`LocalCluster`] is the per-node slice of the cluster topology, shipped
+//! by `fdl-cli` to each host via the `FLODL_CLUSTER_JSON` environment
+//! variable (hex-encoded JSON). It carries:
 //!
-//! Each rank is named explicitly: rank assignment survives YAML reorderings
-//! and resumed-training restarts. Hostname self-lookup picks the right host
-//! block at startup (`FLODL_HOST_NAME` env var overrides for test rigs).
+//! - Master coordinates (`master_addr`, `master_port`) so non-master ranks
+//!   know where to phone home.
+//! - World metadata (`world_size`, `num_hosts`) needed by NCCL bootstrap.
+//! - This host's slice (`host`) -- its ranks, CUDA devices, NCCL socket
+//!   interface, project path, libtorch path.
 //!
-//! Use [`Cluster::rendezvous`] to bootstrap the NCCL communicator across
-//! hosts -- it returns a [`TcpRendezvous`](super::TcpRendezvous) carrying the
-//! shared NCCL unique ID, this host's local ranks, and CUDA devices.
+//! The library never sees the full cross-host topology; that lives in
+//! `fdl-cli` and stays on the controller. The slim envelope is roughly
+//! 250 bytes for a 3-host setup, comfortably below `ARG_MAX` even for
+//! pathological cluster sizes.
+//!
+//! Use [`LocalCluster::from_env`] at startup -- absent env var returns
+//! `Ok(None)` (single-host mode). [`LocalCluster::rendezvous`] bootstraps
+//! the NCCL communicator, returning a
+//! [`TcpRendezvous`](super::TcpRendezvous) with this host's local ranks,
+//! CUDA devices, and the shared NCCL unique ID.
 
 use std::cell::RefCell;
 use std::env;
@@ -27,6 +35,14 @@ use crate::{Result, TensorError};
 
 use super::{NcclUniqueId, TcpRendezvous};
 
+/// Environment variable carrying the hex-encoded JSON envelope.
+///
+/// `fdl-cli`'s launcher sets this when invoking the remote command per host;
+/// the library reads it via [`LocalCluster::from_env`]. Presence of this var
+/// is also the recursion guard -- a remote `fdl <cmd>` invocation seeing it
+/// skips its own cluster-dispatch branch.
+pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
+
 /// Environment variable that overrides the OS hostname for cluster lookup.
 ///
 /// Useful for production test rigs where the OS hostname doesn't match the
@@ -41,7 +57,7 @@ thread_local! {
     static THREAD_HOSTNAME_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Set the per-thread hostname override seen by [`Cluster::this_host`].
+/// Set the per-thread hostname override seen by [`LocalCluster::this_host`].
 ///
 /// Test-only seam. Production code should set [`ENV_HOST_OVERRIDE`] or rely
 /// on the OS `hostname` command. Calling with `None` clears the override.
@@ -52,29 +68,31 @@ pub(crate) fn set_thread_hostname_override(name: Option<&str>) {
     });
 }
 
-/// Canonical cluster topology, parsed from the JSON config file shipped by
-/// `fdl-cli` to each host.
+/// Per-node view of the cluster, shipped by `fdl-cli` via [`ENV_CLUSTER_JSON`].
 ///
-/// Fields are public to keep the type a transparent value: the canonical
-/// constructor is [`Cluster::from_json`], which validates rank assignment
-/// before returning. Mutating fields after construction bypasses validation;
-/// don't.
+/// Fields are public for transparency; the canonical constructor is
+/// [`LocalCluster::from_env`] (production) or [`LocalCluster::from_json`] /
+/// [`LocalCluster::from_value`] (tests / standalone scripts).
 #[derive(Debug, Clone)]
-pub struct Cluster {
-    /// Hostname or IP where the NCCL bootstrap rendezvous listens.
-    ///
-    /// Must be reachable by every non-master host. Typically the address of
-    /// whichever host owns rank 0.
+pub struct LocalCluster {
+    /// Hostname or IP where the NCCL bootstrap rendezvous listens. Must be
+    /// reachable by every non-master host. Typically the address of the host
+    /// owning rank 0.
     pub master_addr: String,
 
-    /// TCP port for the rendezvous handshake.
-    ///
-    /// Port `master_port + 1` is reserved for the dashboard side-channel
-    /// (see the multi-host DDP design doc).
+    /// TCP port for the rendezvous handshake. Port `master_port + 1` is
+    /// reserved for the future dashboard side-channel.
     pub master_port: u16,
 
-    /// One entry per physical host in the cluster.
-    pub hosts: Vec<HostBlock>,
+    /// Total number of ranks across the cluster.
+    pub world_size: usize,
+
+    /// Number of physical hosts in the cluster. The master accepts
+    /// `num_hosts - 1` incoming TCP connections during rendezvous.
+    pub num_hosts: usize,
+
+    /// This host's slice of the topology.
+    pub host: HostBlock,
 }
 
 /// Per-host topology entry.
@@ -111,11 +129,40 @@ pub struct HostBlock {
     pub libtorch_path: Option<String>,
 }
 
-impl Cluster {
-    /// Parse a canonical cluster config JSON file.
+impl LocalCluster {
+    /// Read the per-node envelope from [`ENV_CLUSTER_JSON`].
     ///
-    /// Validates that ranks form `0..world_size` exactly (no duplicates,
-    /// no gaps) and that every host's `ranks.len() == local_devices.len()`.
+    /// Returns `Ok(None)` when the env var is absent -- single-host mode is
+    /// the default and not an error. Returns `Err` on malformed hex / JSON /
+    /// invalid topology (loud errors over silent fallback).
+    pub fn from_env() -> Result<Option<Self>> {
+        let raw = match env::var(ENV_CLUSTER_JSON) {
+            Ok(s) => s,
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Err(e) => {
+                return Err(TensorError::new(&format!(
+                    "cluster: reading {ENV_CLUSTER_JSON} failed: {e}"
+                )));
+            }
+        };
+        let bytes = hex_decode(raw.trim()).map_err(|e| {
+            TensorError::new(&format!(
+                "cluster: {ENV_CLUSTER_JSON} hex-decode failed: {e}"
+            ))
+        })?;
+        let val: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            TensorError::new(&format!(
+                "cluster: {ENV_CLUSTER_JSON} JSON parse failed: {e}"
+            ))
+        })?;
+        Self::from_value(&val).map(Some)
+    }
+
+    /// Parse a slim per-node envelope from a JSON file.
+    ///
+    /// Production reads via [`Self::from_env`]; this entry point exists for
+    /// tests and any standalone driver that wants to persist envelopes to
+    /// disk.
     pub fn from_json(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path).map_err(|e| {
@@ -135,17 +182,20 @@ impl Cluster {
         Self::from_value(&val)
     }
 
-    /// Parse from an already-deserialized JSON value. Useful for tests.
+    /// Parse from an already-deserialized JSON value. Validates structure.
     pub fn from_value(val: &Value) -> Result<Self> {
-        let obj = val.as_object().ok_or_else(|| {
-            TensorError::new("cluster: top-level JSON must be an object")
-        })?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| TensorError::new("cluster: top-level JSON must be an object"))?;
 
         let master_addr = obj
             .get("master_addr")
             .and_then(Value::as_str)
             .ok_or_else(|| TensorError::new("cluster: master_addr (string) required"))?
             .to_string();
+        if master_addr.trim().is_empty() {
+            return Err(TensorError::new("cluster: master_addr must be non-empty"));
+        }
 
         let master_port_u64 = obj
             .get("master_port")
@@ -157,65 +207,86 @@ impl Cluster {
             ))
         })?;
 
-        let hosts_arr = obj
-            .get("hosts")
-            .and_then(Value::as_array)
-            .ok_or_else(|| TensorError::new("cluster: hosts (array) required"))?;
-
-        if hosts_arr.is_empty() {
-            return Err(TensorError::new("cluster: hosts must be non-empty"));
+        let world_size = obj
+            .get("world_size")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| TensorError::new("cluster: world_size (usize) required"))?;
+        if world_size == 0 {
+            return Err(TensorError::new("cluster: world_size must be > 0"));
         }
 
-        let mut hosts = Vec::with_capacity(hosts_arr.len());
-        for (i, h) in hosts_arr.iter().enumerate() {
-            hosts.push(parse_host(h, i)?);
+        let num_hosts = obj
+            .get("num_hosts")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| TensorError::new("cluster: num_hosts (usize) required"))?;
+        if num_hosts == 0 {
+            return Err(TensorError::new("cluster: num_hosts must be > 0"));
+        }
+        if num_hosts > world_size {
+            return Err(TensorError::new(&format!(
+                "cluster: num_hosts ({num_hosts}) cannot exceed world_size ({world_size})"
+            )));
         }
 
-        validate_rank_assignment(&hosts)?;
+        let host_val = obj
+            .get("host")
+            .ok_or_else(|| TensorError::new("cluster: host (object) required"))?;
+        let host = parse_host(host_val)?;
 
-        Ok(Cluster {
+        for &r in &host.ranks {
+            if r >= world_size {
+                return Err(TensorError::new(&format!(
+                    "cluster.host ({:?}): rank {r} out of bounds for world_size {world_size}",
+                    host.name
+                )));
+            }
+        }
+
+        Ok(LocalCluster {
             master_addr,
             master_port,
-            hosts,
+            world_size,
+            num_hosts,
+            host,
         })
     }
 
     /// Total number of ranks across the cluster.
     pub fn world_size(&self) -> usize {
-        self.hosts.iter().map(|h| h.ranks.len()).sum()
+        self.world_size
     }
 
-    /// Identify this host within the cluster.
-    ///
-    /// Resolves the local hostname (overridable via [`ENV_HOST_OVERRIDE`])
-    /// and looks it up in `self.hosts`. Loud error listing all known host
-    /// names if not found -- silent fallthrough on a mistyped hostname would
-    /// be hours of debugging.
+    /// Consistency check: resolved hostname must match the envelope's
+    /// `host.name`. If they mismatch, the launcher shipped this envelope to
+    /// the wrong host -- loud error.
     ///
     /// **Side effect**: on success, registers the host name with the logger
     /// via [`crate::log::set_node_label`]. This must happen before worker
     /// threads spawn; subsequent calls are no-ops (the label is a `OnceLock`).
     pub fn this_host(&self) -> Result<&HostBlock> {
         let name = resolve_hostname()?;
-        let host = self.hosts.iter().find(|h| h.name == name).ok_or_else(|| {
-            let known: Vec<&str> = self.hosts.iter().map(|h| h.name.as_str()).collect();
-            TensorError::new(&format!(
-                "cluster: hostname {name:?} not in cluster.hosts {known:?} \
-                 (set {ENV_HOST_OVERRIDE} to override)"
-            ))
-        })?;
-        log::set_node_label(&host.name);
-        Ok(host)
+        if name != self.host.name {
+            return Err(TensorError::new(&format!(
+                "cluster: resolved hostname {name:?} does not match envelope's \
+                 host.name {:?} -- the launcher shipped this envelope to the \
+                 wrong host (set {ENV_HOST_OVERRIDE} to override for test rigs)",
+                self.host.name
+            )));
+        }
+        log::set_node_label(&self.host.name);
+        Ok(&self.host)
     }
 
     /// Whether this host owns rank 0 (the rendezvous master).
     pub fn is_master_host(&self) -> Result<bool> {
-        Ok(self.this_host()?.ranks.contains(&0))
+        Ok(self.host.ranks.contains(&0))
     }
 
     /// Whether the cluster spans more than one physical host.
     pub fn spans_multiple_hosts(&self) -> bool {
-        self.hosts.len() > 1
+        self.num_hosts > 1
     }
 
     /// Bootstrap the NCCL communicator across hosts.
@@ -233,36 +304,31 @@ impl Cluster {
     }
 }
 
-fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
-    let obj = v.as_object().ok_or_else(|| {
-        TensorError::new(&format!("cluster.hosts[{idx}]: must be an object"))
-    })?;
+fn parse_host(v: &Value) -> Result<HostBlock> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| TensorError::new("cluster.host: must be an object"))?;
 
     let name = obj
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            TensorError::new(&format!("cluster.hosts[{idx}].name (string) required"))
-        })?
+        .ok_or_else(|| TensorError::new("cluster.host.name (string) required"))?
         .to_string();
 
-    let ranks = parse_usize_array(obj.get("ranks"), &format!("cluster.hosts[{idx}].ranks"))?;
+    let ranks = parse_usize_array(obj.get("ranks"), "cluster.host.ranks")?;
     if ranks.is_empty() {
         return Err(TensorError::new(&format!(
-            "cluster.hosts[{idx}] ({name:?}): ranks must be non-empty"
+            "cluster.host ({name:?}): ranks must be non-empty"
         )));
     }
 
-    let devs_u64 = parse_u64_array(
-        obj.get("local_devices"),
-        &format!("cluster.hosts[{idx}].local_devices"),
-    )?;
+    let devs_u64 = parse_u64_array(obj.get("local_devices"), "cluster.host.local_devices")?;
     let local_devices: Vec<u8> = devs_u64
         .into_iter()
         .map(|d| {
             u8::try_from(d).map_err(|_| {
                 TensorError::new(&format!(
-                    "cluster.hosts[{idx}].local_devices: value {d} does not fit in u8"
+                    "cluster.host.local_devices: value {d} does not fit in u8"
                 ))
             })
         })
@@ -270,7 +336,7 @@ fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
 
     if ranks.len() != local_devices.len() {
         return Err(TensorError::new(&format!(
-            "cluster.hosts[{idx}] ({name:?}): ranks ({}) and local_devices ({}) length mismatch",
+            "cluster.host ({name:?}): ranks ({}) and local_devices ({}) length mismatch",
             ranks.len(),
             local_devices.len()
         )));
@@ -281,7 +347,7 @@ fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
         .and_then(Value::as_str)
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster.hosts[{idx}] ({name:?}): nccl_socket_ifname (string) required"
+                "cluster.host ({name:?}): nccl_socket_ifname (string) required"
             ))
         })?
         .to_string();
@@ -291,7 +357,7 @@ fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
         .and_then(Value::as_str)
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster.hosts[{idx}] ({name:?}): path (string) required"
+                "cluster.host ({name:?}): path (string) required"
             ))
         })?
         .to_string();
@@ -339,25 +405,6 @@ fn parse_u64_array(v: Option<&Value>, label: &str) -> Result<Vec<u64>> {
         .collect()
 }
 
-fn validate_rank_assignment(hosts: &[HostBlock]) -> Result<()> {
-    let mut all: Vec<usize> = hosts.iter().flat_map(|h| h.ranks.iter().copied()).collect();
-    let ws = all.len();
-    if ws == 0 {
-        return Err(TensorError::new(
-            "cluster: total rank count is zero (every host has empty ranks)",
-        ));
-    }
-    all.sort_unstable();
-    let expected: Vec<usize> = (0..ws).collect();
-    if all != expected {
-        return Err(TensorError::new(&format!(
-            "cluster: ranks across hosts must be exactly 0..{ws} with no duplicates or gaps, \
-             got sorted-unique sequence {all:?}"
-        )));
-    }
-    Ok(())
-}
-
 fn resolve_hostname() -> Result<String> {
     if let Some(s) = THREAD_HOSTNAME_OVERRIDE.with(|c| c.borrow().clone()) {
         return Ok(s);
@@ -385,111 +432,171 @@ fn resolve_hostname() -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Decode a hex string (any case, no separators) to raw bytes.
+///
+/// Used by [`LocalCluster::from_env`]; also exposed for the matching encoder
+/// in test setup. Zero-dep: hand-rolled to keep `flodl` free of `hex` crate.
+pub(crate) fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err(format!("odd-length hex string ({} chars)", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> std::result::Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(10 + b - b'a'),
+        b'A'..=b'F' => Ok(10 + b - b'A'),
+        _ => Err(format!("invalid hex character {:?}", b as char)),
+    }
+}
+
+/// Hex-encode raw bytes. Companion to [`hex_decode`]; used by tests and by
+/// the matching encoder in `fdl-cli`'s launcher.
+#[cfg(test)]
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(TABLE[(b >> 4) as usize] as char);
+        s.push(TABLE[(b & 0x0F) as usize] as char);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn three_rank_two_host() -> Value {
+    fn worker_envelope() -> Value {
         json!({
             "master_addr": "192.168.122.1",
             "master_port": 29500,
-            "hosts": [
-                { "name": "master-host", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "virbr0",
-                  "path": "/opt/flodl",
-                  "libtorch_path": "/data/ssd/flodl/libtorch" },
-                { "name": "worker-host", "ranks": [1, 2], "local_devices": [0, 1],
-                  "nccl_socket_ifname": "enp1s0",
-                  "path": "/srv/flodl",
-                  "libtorch_path": "/mnt/flodl/libtorch" }
-            ]
+            "world_size": 3,
+            "num_hosts": 2,
+            "host": {
+                "name": "worker-host",
+                "ranks": [1, 2],
+                "local_devices": [0, 1],
+                "nccl_socket_ifname": "enp1s0",
+                "path": "/srv/flodl",
+                "libtorch_path": "/mnt/flodl/libtorch"
+            }
+        })
+    }
+
+    fn master_envelope() -> Value {
+        json!({
+            "master_addr": "192.168.122.1",
+            "master_port": 29500,
+            "world_size": 3,
+            "num_hosts": 2,
+            "host": {
+                "name": "master-host",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "virbr0",
+                "path": "/opt/flodl",
+                "libtorch_path": "/data/ssd/flodl/libtorch"
+            }
         })
     }
 
     #[test]
-    fn parses_canonical_topology() {
-        let c = Cluster::from_value(&three_rank_two_host()).expect("parse");
+    fn parses_canonical_envelope() {
+        let c = LocalCluster::from_value(&worker_envelope()).expect("parse");
         assert_eq!(c.master_addr, "192.168.122.1");
         assert_eq!(c.master_port, 29500);
         assert_eq!(c.world_size(), 3);
-        assert_eq!(c.hosts.len(), 2);
+        assert_eq!(c.num_hosts, 2);
         assert!(c.spans_multiple_hosts());
 
-        let worker = &c.hosts[1];
-        assert_eq!(worker.name, "worker-host");
-        assert_eq!(worker.ranks, vec![1, 2]);
-        assert_eq!(worker.local_devices, vec![0, 1]);
-        assert_eq!(worker.nccl_socket_ifname, "enp1s0");
-        assert_eq!(worker.path, "/srv/flodl");
-        assert_eq!(worker.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
+        assert_eq!(c.host.name, "worker-host");
+        assert_eq!(c.host.ranks, vec![1, 2]);
+        assert_eq!(c.host.local_devices, vec![0, 1]);
+        assert_eq!(c.host.nccl_socket_ifname, "enp1s0");
+        assert_eq!(c.host.path, "/srv/flodl");
+        assert_eq!(c.host.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
     }
 
     #[test]
     fn rejects_missing_path() {
-        let mut v = three_rank_two_host();
-        v["hosts"][1].as_object_mut().unwrap().remove("path");
-        let err = Cluster::from_value(&v).unwrap_err();
+        let mut v = worker_envelope();
+        v["host"].as_object_mut().unwrap().remove("path");
+        let err = LocalCluster::from_value(&v).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("path"), "got: {msg}");
         assert!(msg.contains("worker-host"), "got: {msg}");
     }
 
     #[test]
-    fn rejects_duplicate_ranks() {
-        let mut v = three_rank_two_host();
-        v["hosts"][1]["ranks"] = json!([1, 1]);
-        let err = Cluster::from_value(&v).unwrap_err();
-        assert!(err.to_string().contains("duplicates or gaps"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_rank_gap() {
-        let mut v = three_rank_two_host();
-        v["hosts"][1]["ranks"] = json!([2, 3]); // 1 missing
-        let err = Cluster::from_value(&v).unwrap_err();
-        assert!(err.to_string().contains("duplicates or gaps"), "got: {err}");
-    }
-
-    #[test]
     fn rejects_ranks_devices_len_mismatch() {
-        let mut v = three_rank_two_host();
-        v["hosts"][1]["ranks"] = json!([1]);
-        v["hosts"][1]["local_devices"] = json!([0, 1]);
-        let err = Cluster::from_value(&v).unwrap_err();
+        let mut v = worker_envelope();
+        v["host"]["ranks"] = json!([1]);
+        v["host"]["local_devices"] = json!([0, 1]);
+        let err = LocalCluster::from_value(&v).unwrap_err();
         assert!(err.to_string().contains("length mismatch"), "got: {err}");
     }
 
     #[test]
-    fn rejects_empty_host_list() {
-        let v = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 29500,
-            "hosts": []
-        });
-        let err = Cluster::from_value(&v).unwrap_err();
-        assert!(err.to_string().contains("hosts must be non-empty"), "got: {err}");
+    fn rejects_rank_out_of_bounds() {
+        let mut v = worker_envelope();
+        v["host"]["ranks"] = json!([1, 5]);
+        v["host"]["local_devices"] = json!([0, 1]);
+        let err = LocalCluster::from_value(&v).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_zero_world_size() {
+        let mut v = worker_envelope();
+        v["world_size"] = json!(0);
+        let err = LocalCluster::from_value(&v).unwrap_err();
+        assert!(err.to_string().contains("world_size"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_num_hosts_exceeding_world_size() {
+        let mut v = worker_envelope();
+        v["num_hosts"] = json!(99);
+        let err = LocalCluster::from_value(&v).unwrap_err();
+        assert!(err.to_string().contains("num_hosts"), "got: {err}");
     }
 
     #[test]
     fn rejects_master_port_overflow() {
-        let mut v = three_rank_two_host();
+        let mut v = worker_envelope();
         v["master_port"] = json!(100_000); // > u16::MAX
-        let err = Cluster::from_value(&v).unwrap_err();
+        let err = LocalCluster::from_value(&v).unwrap_err();
         assert!(err.to_string().contains("u16"), "got: {err}");
     }
 
     #[test]
-    fn this_host_uses_env_override() {
-        let v = three_rank_two_host();
-        let c = Cluster::from_value(&v).unwrap();
-        // SAFETY: serial sets/unsets a process-wide env var; tests in this
-        // module rely on env_mutex below to avoid races.
+    fn is_master_host_works() {
+        let worker = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let master = LocalCluster::from_value(&master_envelope()).unwrap();
+        assert!(!worker.is_master_host().unwrap());
+        assert!(master.is_master_host().unwrap());
+    }
+
+    #[test]
+    fn this_host_matches_envelope() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: ENV_MUTEX serializes env-mutating tests in this module.
         unsafe {
             env::set_var(ENV_HOST_OVERRIDE, "worker-host");
         }
-        let h = c.this_host().expect("lookup");
+        let h = c.this_host().expect("hostname matches");
         assert_eq!(h.name, "worker-host");
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
@@ -497,43 +604,99 @@ mod tests {
     }
 
     #[test]
-    fn this_host_loud_error_on_unknown() {
-        let v = three_rank_two_host();
-        let c = Cluster::from_value(&v).unwrap();
+    fn this_host_loud_error_on_mismatch() {
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "not-in-cluster");
+            env::set_var(ENV_HOST_OVERRIDE, "wrong-host");
         }
         let err = c.this_host().unwrap_err();
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
         }
         let msg = err.to_string();
-        assert!(msg.contains("not-in-cluster"), "got: {msg}");
-        assert!(msg.contains("master-host") && msg.contains("worker-host"), "got: {msg}");
+        assert!(msg.contains("wrong-host"), "got: {msg}");
+        assert!(msg.contains("worker-host"), "got: {msg}");
         assert!(msg.contains(ENV_HOST_OVERRIDE), "got: {msg}");
     }
 
     #[test]
     fn thread_local_override_beats_env_var() {
-        let v = three_rank_two_host();
-        let c = Cluster::from_value(&v).unwrap();
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "master-host");
+            env::set_var(ENV_HOST_OVERRIDE, "wrong-host");
         }
-        // Thread-local takes precedence; the env var pointing at "master-host"
-        // should be ignored when the thread-local says "worker-host".
+        // Thread-local takes precedence; even though env says "wrong-host",
+        // the thread-local says "worker-host" which matches the envelope.
         set_thread_hostname_override(Some("worker-host"));
-        let h = c.this_host().expect("lookup");
+        let h = c.this_host().expect("thread-local wins");
         assert_eq!(h.name, "worker-host");
         set_thread_hostname_override(None);
-        // With thread-local cleared, the env var wins.
-        let h2 = c.this_host().expect("lookup via env");
-        assert_eq!(h2.name, "master-host");
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
         }
+    }
+
+    #[test]
+    fn from_env_returns_none_when_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::remove_var(ENV_CLUSTER_JSON);
+        }
+        assert!(LocalCluster::from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn from_env_round_trips_hex() {
+        let v = worker_envelope();
+        let bytes = serde_json::to_vec(&v).unwrap();
+        let hex = hex_encode(&bytes);
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_CLUSTER_JSON, &hex);
+        }
+        let c = LocalCluster::from_env().expect("decode ok").expect("Some");
+        unsafe {
+            env::remove_var(ENV_CLUSTER_JSON);
+        }
+        assert_eq!(c.host.name, "worker-host");
+        assert_eq!(c.world_size, 3);
+        assert_eq!(c.num_hosts, 2);
+    }
+
+    #[test]
+    fn from_env_rejects_bad_hex() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_CLUSTER_JSON, "not-valid-hex-zz");
+        }
+        let err = LocalCluster::from_env().unwrap_err();
+        unsafe {
+            env::remove_var(ENV_CLUSTER_JSON);
+        }
+        assert!(err.to_string().contains("hex-decode"), "got: {err}");
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        let data = b"\x00\x0fhello\xff\xab";
+        let h = hex_encode(data);
+        assert_eq!(h, "000f68656c6c6fffab");
+        let back = hex_decode(&h).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn hex_decode_uppercase() {
+        let back = hex_decode("FF0A").unwrap();
+        assert_eq!(back, vec![0xFF, 0x0A]);
+    }
+
+    #[test]
+    fn hex_decode_rejects_odd_length() {
+        assert!(hex_decode("abc").is_err());
     }
 
     // Env-mutating tests need a module-level Mutex; "unique env var name" is

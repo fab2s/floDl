@@ -2,9 +2,9 @@
 //!
 //! One process per host. The host owning rank 0 is the **master**: it
 //! generates the [`NcclUniqueId`] and listens on
-//! [`Cluster::master_port`](super::Cluster::master_port). Every other host is
-//! a **worker** that connects to the master, swaps a dataset signature for
-//! verification, and receives the unique ID.
+//! [`LocalCluster::master_port`](super::LocalCluster::master_port). Every
+//! other host is a **worker** that connects to the master, swaps a dataset
+//! signature for verification, and receives the unique ID.
 //!
 //! Wire protocol (one TCP connection per worker host):
 //!
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::{Device, Result, TensorError};
 
-use super::{Cluster, HostBlock, NCCL_UNIQUE_ID_BYTES, NcclUniqueId};
+use super::{HostBlock, LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId};
 
 const HOSTNAME_MAX_LEN: usize = 255;
 const CONNECT_RETRIES: usize = 60;
@@ -38,7 +38,7 @@ const ENV_NCCL_SOCKET_IFNAME: &str = "NCCL_SOCKET_IFNAME";
 /// Result of the TCP rendezvous: this host's local rank/device list plus the
 /// cluster-wide NCCL unique ID.
 ///
-/// Construct via [`Cluster::rendezvous`](super::Cluster::rendezvous).
+/// Construct via [`LocalCluster::rendezvous`](super::LocalCluster::rendezvous).
 #[derive(Debug)]
 pub struct TcpRendezvous {
     world_size: usize,
@@ -70,7 +70,7 @@ impl TcpRendezvous {
     }
 
     /// Drive the TCP handshake. Invoked from
-    /// [`Cluster::rendezvous`](super::Cluster::rendezvous).
+    /// [`LocalCluster::rendezvous`](super::LocalCluster::rendezvous).
     ///
     /// The `gen_uid` closure is called at most once -- on the master host only,
     /// after `this_host` resolution and socket-interface validation succeed.
@@ -78,7 +78,7 @@ impl TcpRendezvous {
     /// [`NcclUniqueId::new`]; tests pass a closure that returns a fixed-byte
     /// stub to avoid linking against CUDA-bound NCCL.
     pub(crate) fn establish<F>(
-        cluster: &Cluster,
+        cluster: &LocalCluster,
         dataset_signature: [u8; 32],
         gen_uid: F,
     ) -> Result<Self>
@@ -120,11 +120,11 @@ impl TcpRendezvous {
 /// dataset signatures, send the unique ID. Pure byte-level work -- callable
 /// from tests that don't have CUDA-backed NCCL.
 fn run_master(
-    cluster: &Cluster,
+    cluster: &LocalCluster,
     uid_bytes: &[u8; NCCL_UNIQUE_ID_BYTES],
     expected_sig: &[u8; 32],
 ) -> Result<()> {
-    let n_workers = cluster.hosts.len().saturating_sub(1);
+    let n_workers = cluster.num_hosts.saturating_sub(1);
     if n_workers == 0 {
         return Ok(());
     }
@@ -170,7 +170,7 @@ fn run_master(
 /// receive the unique ID. Returns the raw bytes; caller wraps them in an
 /// [`NcclUniqueId`].
 fn run_worker(
-    cluster: &Cluster,
+    cluster: &LocalCluster,
     my_name: &str,
     sig: &[u8; 32],
 ) -> Result<[u8; NCCL_UNIQUE_ID_BYTES]> {
@@ -250,7 +250,7 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream> {
     )))
 }
 
-fn validate_socket_ifname(cluster: &Cluster) -> Result<()> {
+fn validate_socket_ifname(cluster: &LocalCluster) -> Result<()> {
     if cluster.spans_multiple_hosts() && env::var(ENV_NCCL_SOCKET_IFNAME).is_err() {
         return Err(TensorError::new(&format!(
             "rendezvous: {ENV_NCCL_SOCKET_IFNAME} must be set when the cluster spans \
@@ -261,16 +261,13 @@ fn validate_socket_ifname(cluster: &Cluster) -> Result<()> {
     Ok(())
 }
 
-fn cluster_mapping(cluster: &Cluster) -> String {
-    let parts: Vec<String> = cluster
-        .hosts
+fn cluster_mapping(cluster: &LocalCluster) -> String {
+    let h: &HostBlock = &cluster.host;
+    let parts: Vec<String> = h
+        .ranks
         .iter()
-        .flat_map(|h: &HostBlock| {
-            h.ranks
-                .iter()
-                .zip(h.local_devices.iter())
-                .map(move |(r, d)| format!("{}:{} -> r{}", h.name, d, r))
-        })
+        .zip(h.local_devices.iter())
+        .map(|(r, d)| format!("{}:{} -> r{}", h.name, d, r))
         .collect();
     parts.join(", ")
 }
@@ -297,35 +294,45 @@ mod tests {
         NEXT_PORT.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn two_host_cluster(port: u16) -> Cluster {
+    /// Build a 2-host envelope from this host's perspective. The two
+    /// envelopes share `master_addr`, `master_port`, `world_size`, and
+    /// `num_hosts`; they differ only in the `host` field.
+    fn envelope_for(host_name: &str, port: u16) -> LocalCluster {
+        let (ranks, devices) = match host_name {
+            "master-host" => (vec![0], vec![0]),
+            "worker-host" => (vec![1], vec![0]),
+            other => panic!("unknown test host {other:?}"),
+        };
         let v = json!({
             "master_addr": "127.0.0.1",
             "master_port": port,
-            "hosts": [
-                { "name": "master-host", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "lo", "path": "/tmp/test-master" },
-                { "name": "worker-host", "ranks": [1], "local_devices": [0],
-                  "nccl_socket_ifname": "lo", "path": "/tmp/test-worker" }
-            ]
+            "world_size": 2,
+            "num_hosts": 2,
+            "host": {
+                "name": host_name,
+                "ranks": ranks,
+                "local_devices": devices,
+                "nccl_socket_ifname": "lo",
+                "path": format!("/tmp/test-{host_name}"),
+            }
         });
-        Cluster::from_value(&v).expect("test cluster")
+        LocalCluster::from_value(&v).expect("test envelope")
     }
 
     #[test]
     fn wire_protocol_roundtrip() {
         let port = next_port();
-        let cluster = two_host_cluster(port);
+        let master_env = envelope_for("master-host", port);
+        let worker_env = envelope_for("worker-host", port);
         let sig = [0x42u8; 32];
         let expected_uid = [0xabu8; NCCL_UNIQUE_ID_BYTES];
 
-        let master_cluster = cluster.clone();
         let master_sig = sig;
         let master_handle = thread::spawn(move || {
-            run_master(&master_cluster, &expected_uid, &master_sig)
+            run_master(&master_env, &expected_uid, &master_sig)
         });
 
-        // Worker side
-        let got_uid = run_worker(&cluster, "worker-host", &sig).expect("worker");
+        let got_uid = run_worker(&worker_env, "worker-host", &sig).expect("worker");
         master_handle.join().expect("master thread").expect("master ok");
 
         assert_eq!(got_uid, expected_uid, "uid bytes must round-trip");
@@ -334,18 +341,18 @@ mod tests {
     #[test]
     fn wire_protocol_rejects_signature_mismatch() {
         let port = next_port();
-        let cluster = two_host_cluster(port);
+        let master_env = envelope_for("master-host", port);
+        let worker_env = envelope_for("worker-host", port);
         let master_sig = [0x42u8; 32];
         let worker_sig = [0x43u8; 32];
         let uid = [0xabu8; NCCL_UNIQUE_ID_BYTES];
 
-        let master_cluster = cluster.clone();
         let master_handle =
-            thread::spawn(move || run_master(&master_cluster, &uid, &master_sig));
+            thread::spawn(move || run_master(&master_env, &uid, &master_sig));
 
         // Worker happily sends its (wrong) sig and tries to read the UID;
         // master will reject before sending, so worker's read fails.
-        let worker_result = run_worker(&cluster, "worker-host", &worker_sig);
+        let worker_result = run_worker(&worker_env, "worker-host", &worker_sig);
         let master_result = master_handle.join().expect("master thread");
 
         assert!(master_result.is_err(), "master must reject sig mismatch");
@@ -359,17 +366,19 @@ mod tests {
 
     #[test]
     fn cluster_rendezvous_single_host_no_master_socket_ifname_required() {
-        // Single-host cluster (1 entry in hosts) does not require
+        // num_hosts = 1: single-host envelope does not require
         // NCCL_SOCKET_IFNAME. validate_socket_ifname should let it through.
         let v = json!({
             "master_addr": "127.0.0.1",
             "master_port": next_port(),
-            "hosts": [
-                { "name": "solo", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "lo", "path": "/tmp/test-solo" }
-            ]
+            "world_size": 1,
+            "num_hosts": 1,
+            "host": {
+                "name": "solo", "ranks": [0], "local_devices": [0],
+                "nccl_socket_ifname": "lo", "path": "/tmp/test-solo"
+            }
         });
-        let c = Cluster::from_value(&v).expect("parse");
+        let c = LocalCluster::from_value(&v).expect("parse");
         let _guard = ENV_MUTEX.lock().unwrap();
         let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
         unsafe {
@@ -385,7 +394,7 @@ mod tests {
 
     #[test]
     fn multi_host_loud_error_when_socket_ifname_unset() {
-        let cluster = two_host_cluster(next_port());
+        let cluster = envelope_for("master-host", next_port());
         let _guard = ENV_MUTEX.lock().unwrap();
         let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
         unsafe {
@@ -405,13 +414,14 @@ mod tests {
     #[test]
     fn full_rendezvous_through_cluster_api() {
         // End-to-end: two threads claim different hostnames via the
-        // thread-local override, both go through TcpRendezvous::establish
-        // (the same entry point production uses), exchange a fake UID over
-        // a real TCP socket on 127.0.0.1, and end up agreeing on every
-        // observable: world_size, their own local ranks, local devices, and
-        // the unique-ID bytes.
+        // thread-local override, each holding its own per-node envelope,
+        // both go through TcpRendezvous::establish (the same entry point
+        // production uses), exchange a fake UID over a real TCP socket on
+        // 127.0.0.1, and end up agreeing on every observable: world_size,
+        // their own local ranks, local devices, and the unique-ID bytes.
         let port = next_port();
-        let cluster = two_host_cluster(port);
+        let master_env = envelope_for("master-host", port);
+        let worker_env = envelope_for("worker-host", port);
         let sig = [0x42u8; 32];
         let stub_uid_bytes = [0xabu8; NCCL_UNIQUE_ID_BYTES];
 
@@ -421,17 +431,15 @@ mod tests {
             env::set_var(ENV_NCCL_SOCKET_IFNAME, "lo");
         }
 
-        let mc = cluster.clone();
         let master_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("master-host"));
-            TcpRendezvous::establish(&mc, sig, || {
+            TcpRendezvous::establish(&master_env, sig, || {
                 Ok(NcclUniqueId::from_bytes(stub_uid_bytes))
             })
         });
-        let wc = cluster.clone();
         let worker_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("worker-host"));
-            TcpRendezvous::establish(&wc, sig, || {
+            TcpRendezvous::establish(&worker_env, sig, || {
                 panic!("worker must never invoke the uid-generator closure")
             })
         });
@@ -457,22 +465,32 @@ mod tests {
 
     #[test]
     fn cluster_mapping_format() {
-        let v = json!({
+        // cluster_mapping now shows only THIS host's slice -- each node
+        // logs its own ranks/devices banner, not a cross-cluster summary.
+        let single_rank = json!({
             "master_addr": "127.0.0.1",
             "master_port": 29500,
-            "hosts": [
-                { "name": "node-a", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "virbr0", "path": "/tmp/test-a" },
-                { "name": "node-b", "ranks": [1, 2], "local_devices": [0, 1],
-                  "nccl_socket_ifname": "enp1s0", "path": "/tmp/test-b" }
-            ]
+            "world_size": 3,
+            "num_hosts": 2,
+            "host": {
+                "name": "node-a", "ranks": [0], "local_devices": [0],
+                "nccl_socket_ifname": "virbr0", "path": "/tmp/test-a"
+            }
         });
-        let c = Cluster::from_value(&v).unwrap();
-        let m = cluster_mapping(&c);
-        assert_eq!(
-            m,
-            "node-a:0 -> r0, node-b:0 -> r1, node-b:1 -> r2"
-        );
+        let multi_rank = json!({
+            "master_addr": "127.0.0.1",
+            "master_port": 29500,
+            "world_size": 3,
+            "num_hosts": 2,
+            "host": {
+                "name": "node-b", "ranks": [1, 2], "local_devices": [0, 1],
+                "nccl_socket_ifname": "enp1s0", "path": "/tmp/test-b"
+            }
+        });
+        let c1 = LocalCluster::from_value(&single_rank).unwrap();
+        let c2 = LocalCluster::from_value(&multi_rank).unwrap();
+        assert_eq!(cluster_mapping(&c1), "node-a:0 -> r0");
+        assert_eq!(cluster_mapping(&c2), "node-b:0 -> r1, node-b:1 -> r2");
     }
 
 }
