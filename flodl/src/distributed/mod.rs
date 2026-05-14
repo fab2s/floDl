@@ -12,6 +12,7 @@
 //! Supporting infrastructure: NCCL bindings, CUDA events/streams, El Che
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
+pub mod cluster;
 pub mod cuda_event;
 pub mod cuda_stream;
 pub mod nccl;
@@ -19,10 +20,13 @@ pub mod ddp;
 pub mod ddp_run;
 pub mod el_che;
 pub mod lr_event_meta;
+pub mod rendezvous;
 
+pub use cluster::{Cluster, HostBlock};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
-pub use nccl::{NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
+pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
+pub use rendezvous::TcpRendezvous;
 pub use ddp::{Ddp, DdpConfig, HasGraph, Trainer};
 pub use el_che::{ElChe, Phase};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};

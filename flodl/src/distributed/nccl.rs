@@ -364,6 +364,15 @@ impl NcclUniqueId {
     pub fn as_bytes(&self) -> &[u8; NCCL_UNIQUE_ID_BYTES] {
         &self.bytes
     }
+
+    /// Reconstruct a unique ID from raw bytes.
+    ///
+    /// Used by the multi-host rendezvous to materialize the master-generated
+    /// ID on worker hosts after receiving it over TCP. Single-process callers
+    /// should use [`new`](Self::new) instead.
+    pub fn from_bytes(bytes: [u8; NCCL_UNIQUE_ID_BYTES]) -> Self {
+        NcclUniqueId { bytes }
+    }
 }
 
 impl std::fmt::Debug for NcclUniqueId {
