@@ -66,6 +66,13 @@ thread_local! {
     /// multiple "host" threads in one process. Higher priority than the
     /// env var because cargo tests cannot set distinct env values per thread.
     static THREAD_HOSTNAME_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Per-thread local-rank override used by integration tests that spawn
+    /// multiple rank threads in one process (each thread is one rank).
+    /// Higher priority than [`ENV_LOCAL_RANK`] because cargo tests cannot
+    /// set distinct env values per thread. Parallel to
+    /// [`THREAD_HOSTNAME_OVERRIDE`].
+    static THREAD_LOCAL_RANK_OVERRIDE: RefCell<Option<usize>> = const { RefCell::new(None) };
 }
 
 /// Set the per-thread hostname override seen by [`LocalCluster::this_host`].
@@ -76,6 +83,19 @@ thread_local! {
 pub(crate) fn set_thread_hostname_override(name: Option<&str>) {
     THREAD_HOSTNAME_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = name.map(String::from);
+    });
+}
+
+/// Set the per-thread local-rank override seen by [`LocalCluster::my_rank`]
+/// (via [`local_rank_index_from_env`]).
+///
+/// Test-only seam. Production code sets [`ENV_LOCAL_RANK`] (the fdl-cli
+/// launcher injects this per spawned child). Calling with `None` clears the
+/// override. Parallel to [`set_thread_hostname_override`].
+#[cfg(test)]
+pub(crate) fn set_thread_local_rank_override(idx: Option<usize>) {
+    THREAD_LOCAL_RANK_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = idx;
     });
 }
 
@@ -436,26 +456,32 @@ fn parse_u64_array(v: Option<&Value>, label: &str) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// Read and validate [`ENV_LOCAL_RANK`].
+/// Read and validate the local-rank index.
 ///
-/// `local_count` is `this_host().ranks.len()`; `host_name` surfaces in error
-/// messages to disambiguate which host the launcher targeted. Loud errors on
-/// unset / unparseable / out-of-bounds.
+/// Priority: thread-local override (test seam, [`set_thread_local_rank_override`])
+/// first, then [`ENV_LOCAL_RANK`]. `local_count` is `this_host().ranks.len()`;
+/// `host_name` surfaces in error messages to disambiguate which host the
+/// launcher targeted. Loud errors on env-unset (when no thread override),
+/// unparseable, or out-of-bounds.
 fn local_rank_index_from_env(local_count: usize, host_name: &str) -> Result<usize> {
-    let raw = env::var(ENV_LOCAL_RANK).map_err(|_| {
-        TensorError::new(&format!(
-            "cluster: {ENV_LOCAL_RANK} not set; in cluster mode each process \
-             must own exactly one local rank. The fdl-cli launcher injects \
-             this env var per spawned child -- if you are running cluster \
-             code without the launcher, set it manually."
-        ))
-    })?;
-    let trimmed = raw.trim();
-    let idx: usize = trimmed.parse().map_err(|e| {
-        TensorError::new(&format!(
-            "cluster: {ENV_LOCAL_RANK}={trimmed:?} is not a valid usize: {e}"
-        ))
-    })?;
+    let idx = if let Some(i) = THREAD_LOCAL_RANK_OVERRIDE.with(|c| *c.borrow()) {
+        i
+    } else {
+        let raw = env::var(ENV_LOCAL_RANK).map_err(|_| {
+            TensorError::new(&format!(
+                "cluster: {ENV_LOCAL_RANK} not set; in cluster mode each process \
+                 must own exactly one local rank. The fdl-cli launcher injects \
+                 this env var per spawned child -- if you are running cluster \
+                 code without the launcher, set it manually."
+            ))
+        })?;
+        let trimmed = raw.trim();
+        trimmed.parse::<usize>().map_err(|e| {
+            TensorError::new(&format!(
+                "cluster: {ENV_LOCAL_RANK}={trimmed:?} is not a valid usize: {e}"
+            ))
+        })?
+    };
     if idx >= local_count {
         return Err(TensorError::new(&format!(
             "cluster: {ENV_LOCAL_RANK}={idx} out of bounds for host {host_name:?} \
@@ -867,6 +893,93 @@ mod tests {
             env::remove_var(ENV_LOCAL_RANK);
         }
         assert_eq!(gr, 2);
+    }
+
+    #[test]
+    fn my_rank_thread_local_override_beats_env() {
+        // Threaded multi-rank tests set distinct thread-local rank overrides
+        // per thread; env vars are process-wide and would conflict. The
+        // thread-local must win.
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_LOCAL_RANK, "0"); // env says 0, override says 1
+        }
+        set_thread_local_rank_override(Some(1));
+        let (global_rank, device) = c.my_rank().expect("my_rank ok");
+        set_thread_local_rank_override(None);
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        // worker_envelope: index 1 -> (2, CUDA(1)). Override wins over env=0.
+        assert_eq!(global_rank, 2);
+        assert_eq!(device, Device::CUDA(1));
+    }
+
+    #[test]
+    fn my_rank_thread_local_override_works_without_env() {
+        // In threaded tests, env var is typically unset; the override is the
+        // sole source of the local-rank index.
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        set_thread_local_rank_override(Some(0));
+        let (global_rank, device) = c.my_rank().expect("my_rank ok");
+        set_thread_local_rank_override(None);
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+        }
+        assert_eq!(global_rank, 1);
+        assert_eq!(device, Device::CUDA(0));
+    }
+
+    #[test]
+    fn my_rank_thread_local_override_clears_back_to_env() {
+        // After clearing the override (passing None), the env path takes
+        // over -- and absent env should produce the canonical loud error.
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        set_thread_local_rank_override(Some(0));
+        let _ = c.my_rank().expect("override path ok");
+        set_thread_local_rank_override(None);
+        let err = c.my_rank().unwrap_err();
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+        }
+        // No override, no env -> loud error mentioning the env var.
+        assert!(err.to_string().contains(ENV_LOCAL_RANK), "got: {err}");
+        assert!(err.to_string().contains("not set"), "got: {err}");
+    }
+
+    #[test]
+    fn my_rank_thread_local_override_oob_still_bounds_checked() {
+        // The bounds check runs regardless of source: an out-of-bounds
+        // override index produces the same loud error as an out-of-bounds
+        // env value. Catches test bugs (wrong index passed to the helper).
+        let c = LocalCluster::from_value(&worker_envelope()).unwrap();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::remove_var(ENV_LOCAL_RANK);
+        }
+        set_thread_local_rank_override(Some(99)); // host owns 2 ranks
+        let err = c.my_rank().unwrap_err();
+        set_thread_local_rank_override(None);
+        unsafe {
+            env::remove_var(ENV_HOST_OVERRIDE);
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("out of bounds"), "got: {msg}");
+        assert!(msg.contains("0..2"), "got: {msg}");
     }
 
     #[test]
