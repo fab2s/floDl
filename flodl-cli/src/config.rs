@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ── Root project config ─────────────────────────────────────────────────
 
@@ -617,13 +618,52 @@ impl ClusterConfig {
         Ok(())
     }
 
-    /// Canonical JSON shipped to each host's flodl library. `serde_json`'s
-    /// default key order is preservation order, which is what the library
-    /// expects (it navigates by name, not position, but stable output also
-    /// keeps file hashes stable for caching / debugging).
+    /// Canonical JSON of the full topology. Used for debug-dumping the
+    /// controller-side view; per-host envelopes go through
+    /// [`Self::local_envelope_for`] instead.
     pub fn canonical_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self)
             .map_err(|e| format!("cluster: JSON serialization failed: {e}"))
+    }
+
+    /// Build the slim per-host envelope the library reads via
+    /// `flodl::distributed::LocalCluster::from_env`.
+    ///
+    /// The envelope strips launcher-only fields (`ssh`), embeds derived
+    /// world metadata (`world_size`, `num_hosts`), and carries only the
+    /// requested host's slice. The launcher hex-encodes the resulting JSON
+    /// into `FLODL_CLUSTER_JSON` per ssh invocation, so each remote process
+    /// sees only itself + the master coordinates.
+    pub fn local_envelope_for(&self, host: &ClusterHost) -> Value {
+        let mut host_obj = serde_json::Map::new();
+        host_obj.insert("name".into(), Value::String(host.name.clone()));
+        host_obj.insert(
+            "ranks".into(),
+            Value::Array(host.ranks.iter().map(|r| Value::from(*r)).collect()),
+        );
+        host_obj.insert(
+            "local_devices".into(),
+            Value::Array(host.local_devices.iter().map(|d| Value::from(*d)).collect()),
+        );
+        host_obj.insert(
+            "nccl_socket_ifname".into(),
+            Value::String(host.nccl_socket_ifname.clone()),
+        );
+        host_obj.insert("path".into(), Value::String(host.path.clone()));
+        if let Some(p) = &host.libtorch_path {
+            host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
+        }
+
+        let mut envelope = serde_json::Map::new();
+        envelope.insert(
+            "master_addr".into(),
+            Value::String(self.master_addr.clone()),
+        );
+        envelope.insert("master_port".into(), Value::from(self.master_port));
+        envelope.insert("world_size".into(), Value::from(self.world_size()));
+        envelope.insert("num_hosts".into(), Value::from(self.hosts.len()));
+        envelope.insert("host".into(), Value::Object(host_obj));
+        Value::Object(envelope)
     }
 
     /// Look up the SSH target for a host, defaulting to `name` if `ssh:` is
@@ -2285,6 +2325,60 @@ cluster:
         assert_eq!(parsed.hosts.len(), cluster.hosts.len());
         assert_eq!(parsed.world_size(), cluster.world_size());
         assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("worker-host"));
+    }
+
+    #[test]
+    fn local_envelope_strips_ssh_adds_world_metadata() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let cluster = cfg.cluster.as_ref().unwrap();
+        let worker = &cluster.hosts[1];
+        let env = cluster.local_envelope_for(worker);
+
+        // Top-level: master coords + world metadata.
+        assert_eq!(env["master_addr"], "192.168.122.1");
+        assert_eq!(env["master_port"], 29500);
+        assert_eq!(env["world_size"], 3); // 1 + 2 ranks
+        assert_eq!(env["num_hosts"], 2);
+
+        // Host slice: only this host's fields.
+        let h = &env["host"];
+        assert_eq!(h["name"], "worker-host");
+        assert_eq!(h["ranks"], serde_json::json!([1, 2]));
+        assert_eq!(h["local_devices"], serde_json::json!([0, 1]));
+        assert_eq!(h["nccl_socket_ifname"], "enp1s0");
+        assert_eq!(h["path"], "/srv/flodl");
+        assert_eq!(h["libtorch_path"], "/mnt/flodl/libtorch");
+
+        // ssh: stripped (launcher-only).
+        assert!(h.get("ssh").is_none(), "ssh must not appear in envelope");
+    }
+
+    #[test]
+    fn local_envelope_omits_optional_libtorch_path() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let mut cluster = cfg.cluster.unwrap();
+        cluster.hosts[0].libtorch_path = None;
+        let env = cluster.local_envelope_for(&cluster.hosts[0]);
+        assert!(
+            env["host"].get("libtorch_path").is_none(),
+            "libtorch_path should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn local_envelope_master_host_carries_rank_zero() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let cluster = cfg.cluster.as_ref().unwrap();
+        let master = &cluster.hosts[0];
+        let env = cluster.local_envelope_for(master);
+        let ranks = env["host"]["ranks"].as_array().unwrap();
+        assert!(
+            ranks.iter().any(|r| r.as_u64() == Some(0)),
+            "master host's envelope must include rank 0"
+        );
     }
 
     #[test]
