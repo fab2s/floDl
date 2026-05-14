@@ -120,6 +120,11 @@ pub enum WalkOutcome {
         user_args: Vec<String>,
         docker: Option<String>,
         cwd: PathBuf,
+        /// `CommandSpec.cluster` values walked from root → leaf. Caller
+        /// pairs with `ProjectConfig.cluster` and
+        /// [`config::cluster_dispatch_enabled`] to decide whether to
+        /// fan out across hosts instead of running locally.
+        cluster_chain: Vec<Option<bool>>,
     },
     /// Path-or-Preset terminal → caller invokes the child's entry. For
     /// a Preset, `preset` is the preset name inside the enclosing
@@ -129,6 +134,8 @@ pub enum WalkOutcome {
         preset: Option<String>,
         tail: Vec<String>,
         cmd_dir: PathBuf,
+        /// See [`WalkOutcome::RunScript::cluster_chain`].
+        cluster_chain: Vec<Option<bool>>,
     },
     /// Path terminal with `--refresh-schema` in the tail.
     RefreshSchema {
@@ -194,6 +201,12 @@ pub fn walk_commands(
     // (`flodl-hf export`) so help renderers can show the correct
     // invocation. `name` is always the leaf used for command-map lookup.
     let mut qualified: String = cmd_name.to_string();
+    // Accumulates `CommandSpec.cluster` at every step (root → leaf). The
+    // caller pairs this with `ProjectConfig.cluster` to decide whether the
+    // resolved terminal command should fan out across the cluster. Per-
+    // command `cluster: false` deeper in the chain overrides an ancestor's
+    // `cluster: true`; see [`config::resolve_cluster_dispatch`].
+    let mut cluster_chain: Vec<Option<bool>> = Vec::new();
     let mut current_tail: Vec<String> = tail.to_vec();
 
     loop {
@@ -201,6 +214,7 @@ pub fn walk_commands(
             Some(s) => s.clone(),
             None => return WalkOutcome::UnknownCommand { name },
         };
+        cluster_chain.push(spec.cluster);
 
         let kind = match spec.kind() {
             Ok(k) => k,
@@ -247,6 +261,7 @@ pub fn walk_commands(
                     user_args: after,
                     docker: spec.docker,
                     cwd: current_dir,
+                    cluster_chain,
                 };
             }
             CommandKind::Path => {
@@ -289,6 +304,7 @@ pub fn walk_commands(
                             preset: None,
                             tail: current_tail,
                             cmd_dir: child_dir,
+                            cluster_chain,
                         };
                     }
                 }
@@ -316,6 +332,7 @@ pub fn walk_commands(
                     preset: Some(name),
                     tail: current_tail,
                     cmd_dir: current_dir,
+                    cluster_chain,
                 };
             }
         }
@@ -547,12 +564,15 @@ mod tests {
                 user_args,
                 docker,
                 cwd,
+                cluster_chain,
             } => {
                 assert_eq!(command, "echo hello");
                 assert!(append.is_none());
                 assert!(user_args.is_empty());
                 assert!(docker.is_none());
                 assert_eq!(cwd, tmp.path());
+                // No cluster: directive anywhere → chain has one entry: None.
+                assert_eq!(cluster_chain, vec![None]);
             }
             _ => panic!("expected RunScript"),
         }
@@ -891,6 +911,90 @@ mod tests {
                 assert_eq!(config.entry.as_deref(), Some("echo-base"));
             }
             _ => panic!("expected ExecCommand with base entry"),
+        }
+    }
+
+    // ── cluster_chain accumulation along the walk ───────────────────
+
+    #[test]
+    fn walk_run_with_cluster_true_carries_single_entry_chain() {
+        let tmp = TempDir::new();
+        let commands = top_commands(
+            "commands:\n  train:\n    cluster: true\n    run: cargo run\n",
+        );
+        let out = walk_commands("train", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::RunScript { cluster_chain, .. } => {
+                assert_eq!(cluster_chain, vec![Some(true)]);
+            }
+            _ => panic!("expected RunScript"),
+        }
+    }
+
+    #[test]
+    fn walk_path_carries_ancestor_cluster_into_chain() {
+        // Root marks ddp-bench: cluster: true. Sub-fdl.yml's leaf command
+        // leaves it unset → chain = [Some(true), None]. Per the resolver,
+        // this would inherit cluster: true at dispatch.
+        let tmp = TempDir::new();
+        mkcmd(tmp.path(), "ddp-bench", "entry: cargo run -p ddp-bench\n");
+        let commands = top_commands(
+            "commands:\n  ddp-bench:\n    cluster: true\n",
+        );
+        let out = walk_commands("ddp-bench", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand { cluster_chain, .. } => {
+                assert_eq!(cluster_chain, vec![Some(true)]);
+            }
+            _ => panic!("expected ExecCommand"),
+        }
+    }
+
+    #[test]
+    fn walk_path_preset_chain_includes_both_levels() {
+        // Root: ddp-bench (Path, cluster: true). ddp-bench/fdl.yml: quick
+        // preset with cluster: false → chain = [Some(true), Some(false)].
+        // Per the resolver, leaf override wins → effective false (stays
+        // local despite ancestor saying cluster).
+        let tmp = TempDir::new();
+        mkcmd(
+            tmp.path(),
+            "ddp-bench",
+            "entry: cargo run -p ddp-bench\n\
+             commands:\n  quick:\n    cluster: false\n    options: { model: linear }\n",
+        );
+        let commands = top_commands(
+            "commands:\n  ddp-bench:\n    cluster: true\n",
+        );
+        let tail = args(&["quick"]);
+        let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand {
+                preset,
+                cluster_chain,
+                ..
+            } => {
+                assert_eq!(preset.as_deref(), Some("quick"));
+                assert_eq!(cluster_chain, vec![Some(true), Some(false)]);
+            }
+            _ => panic!("expected ExecCommand with preset"),
+        }
+    }
+
+    #[test]
+    fn walk_no_cluster_anywhere_yields_all_none_chain() {
+        // Plain `fdl ddp-bench` with no cluster directives anywhere →
+        // chain has one None entry per walked level. The resolver returns
+        // false (no dispatch) for any all-None chain.
+        let tmp = TempDir::new();
+        mkcmd(tmp.path(), "ddp-bench", "entry: cargo run -p ddp-bench\n");
+        let commands = top_commands("commands:\n  ddp-bench: {}\n");
+        let out = walk_commands("ddp-bench", &[], &commands, tmp.path(), None);
+        match out {
+            WalkOutcome::ExecCommand { cluster_chain, .. } => {
+                assert_eq!(cluster_chain, vec![None]);
+            }
+            _ => panic!("expected ExecCommand"),
         }
     }
 }

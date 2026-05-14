@@ -1232,7 +1232,11 @@ fn dispatch_config(
             user_args,
             docker,
             cwd,
+            cluster_chain,
         } => {
+            if config::cluster_dispatch_enabled(&project, &cluster_chain) {
+                return cluster_dispatch_stub(&project, cmd);
+            }
             let effective_append = if no_append { None } else { append.as_deref() };
             run::exec_script(
                 &command,
@@ -1243,11 +1247,17 @@ fn dispatch_config(
             )
         }
         WalkOutcome::ExecCommand {
-            config,
+            config: cmd_config,
             preset,
             tail,
             cmd_dir,
-        } => run::exec_command(&config, preset.as_deref(), &tail, &cmd_dir, &project_root),
+            cluster_chain,
+        } => {
+            if config::cluster_dispatch_enabled(&project, &cluster_chain) {
+                return cluster_dispatch_stub(&project, cmd);
+            }
+            run::exec_command(&cmd_config, preset.as_deref(), &tail, &cmd_dir, &project_root)
+        }
         WalkOutcome::RefreshSchema {
             config,
             cmd_dir,
@@ -1299,6 +1309,28 @@ fn dispatch_config(
             ExitCode::FAILURE
         }
     }
+}
+
+/// Phase-1 stub for cluster dispatch. Prints what would happen and exits 0.
+///
+/// Real ssh fan-out (parallel exec, JSON shipping, output muxing, exit-code
+/// propagation) is a separate piece of work. This stub exists so the
+/// resolver wiring (chain accumulation in `walk_commands` →
+/// [`config::cluster_dispatch_enabled`] → here) can be exercised end-to-end
+/// before the launcher itself lands.
+fn cluster_dispatch_stub(project: &config::ProjectConfig, cmd: &str) -> ExitCode {
+    let cluster = project
+        .cluster
+        .as_ref()
+        .expect("cluster_dispatch_enabled returned true; cluster: block must be present");
+    let hosts: Vec<&str> = cluster.hosts.iter().map(|h| h.name.as_str()).collect();
+    eprintln!(
+        "fdl: would dispatch `{cmd}` across {n}-host cluster ({hosts}); \
+         ssh dispatch not yet implemented",
+        n = hosts.len(),
+        hosts = hosts.join(", ")
+    );
+    ExitCode::SUCCESS
 }
 
 /// `fdl config show [<env>]` — print the resolved merged config.

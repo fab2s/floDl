@@ -216,6 +216,15 @@ impl<M: Module> GpuWorker<M> {
         G: FnOnce(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        // Set the per-thread log prefix so every flodl log line from this
+        // worker carries its identity. Single-host shows [rN]; cluster mode
+        // (when set_node_label has been called) shows [host:dev:rN].
+        let local_dev = match config.device {
+            Device::CUDA(d) => d,
+            _ => 0,
+        };
+        crate::log::set_thread_device(local_dev, Some(config.rank));
+
         // Create CUDA streams first (before model construction) so model
         // parameters are allocated on the same stream used by subsequent
         // forward/backward passes. Without this, AccumulateGrad nodes end
