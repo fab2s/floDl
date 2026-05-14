@@ -1185,14 +1185,27 @@ fn download_release_binary(tag: &str, home: &std::path::Path) -> Result<std::pat
 // fdl.yaml dispatch
 // ---------------------------------------------------------------------------
 
+/// Locate and parse the project's `fdl.yml` (with optional env overlay).
+///
+/// Returns `None` only when there is no `fdl.yml` anywhere up the tree --
+/// that's the normal "running outside a project" case. Parse errors are
+/// loud: a malformed YAML or a `cluster:` block that fails strict
+/// deserialization prints to stderr and aborts the process. Silently
+/// falling through to "unknown command" hid real config typos
+/// (`feedback_loud_errors_over_silent`).
 fn load_project_config(
     cwd: &std::path::Path,
     env: Option<&str>,
 ) -> Option<(config::ProjectConfig, std::path::PathBuf)> {
     let config_path = config::find_config(cwd)?;
     let root = config_path.parent()?.to_path_buf();
-    let project = config::load_project_with_env(&config_path, env).ok()?;
-    Some((project, root))
+    match config::load_project_with_env(&config_path, env) {
+        Ok(project) => Some((project, root)),
+        Err(e) => {
+            cli_error!("{e}");
+            std::process::exit(2);
+        }
+    }
 }
 
 

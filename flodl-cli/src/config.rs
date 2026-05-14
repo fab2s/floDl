@@ -797,9 +797,69 @@ pub fn load_project_with_env(
     base_path: &Path,
     env: Option<&str>,
 ) -> Result<ProjectConfig, String> {
-    let merged = load_merged_value(base_path, env)?;
-    serde_yaml::from_value::<ProjectConfig>(merged)
-        .map_err(|e| format!("{}: {}", base_path.display(), e))
+    let layers = resolve_config_layers(base_path, env)?;
+    let merged = crate::overlay::merge_layers(
+        layers.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+    );
+    // Re-serialize so `from_str`'s parser tracks line/col through deserialize.
+    // `from_value` discards positional info, leaving errors location-less.
+    let merged_str = serde_yaml::to_string(&merged).map_err(|e| {
+        format!(
+            "{}: failed to re-serialize merged YAML for diagnostics: {e}",
+            base_path.display()
+        )
+    })?;
+    serde_yaml::from_str::<ProjectConfig>(&merged_str).map_err(|e| {
+        let names: Vec<String> = layers
+            .iter()
+            .map(|(p, _)| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        let env_hint = env
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default();
+        let (loc_str, context) = match e.location() {
+            Some(loc) => (
+                format!(" at merged-view line {}, col {}", loc.line(), loc.column()),
+                extract_context(&merged_str, loc.line()),
+            ),
+            None => (String::new(), String::new()),
+        };
+        format!(
+            "{} (layers: {}){}: {}{}\n  inspect merged view: fdl{} config show",
+            base_path.display(),
+            names.join(" + "),
+            loc_str,
+            e,
+            context,
+            env_hint
+        )
+    })
+}
+
+/// Extract 3 lines of context around `line_no` (1-based) from the merged
+/// YAML string, formatted as numbered indented lines for inclusion in error
+/// messages. Returns empty if line_no is out of range.
+fn extract_context(text: &str, line_no: usize) -> String {
+    if line_no == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if line_no > lines.len() {
+        return String::new();
+    }
+    let start = line_no.saturating_sub(2).max(1);
+    let end = (line_no + 1).min(lines.len());
+    let mut out = String::from("\n");
+    for n in start..=end {
+        let marker = if n == line_no { ">>" } else { "  " };
+        out.push_str(&format!("  {marker} {n:>4}: {}\n", lines[n - 1]));
+    }
+    out
 }
 
 /// Load the raw merged [`serde_yaml::Value`] for a config + optional env

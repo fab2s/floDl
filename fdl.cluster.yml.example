@@ -3,11 +3,13 @@
 # Usage:
 #   cp fdl.cluster.yml.example fdl.cluster.yml
 #   # edit hosts: section to match your rig
-#   fdl @cluster <command>     # activates this overlay
+#   fdl cluster <command>      # activates this overlay (first-arg env convention)
+#   FDL_ENV=cluster fdl <cmd>  # equivalent
 #
 # Conventions:
 #   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism picks
-#     it up when invoked as `fdl @cluster <cmd>`.
+#     it up when invoked as `fdl cluster <cmd>` (first arg = overlay name)
+#     or with `FDL_ENV=cluster` set in the environment.
 #   - One process per host. Each host owns a contiguous (or sparse) set of
 #     ranks listed in `ranks:`, with CUDA devices paired by position in
 #     `local_devices:`. Rank 0's host is the NCCL rendezvous master.

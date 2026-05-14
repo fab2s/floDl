@@ -254,12 +254,17 @@ fn deep_merge_annotated(
 /// and the resulting line fits the `INLINE_SEQ_LIMIT` threshold; otherwise
 /// they drop to block style with the source tag on the key line.
 pub fn render_annotated_yaml(node: &AnnotatedNode, source_labels: &[String]) -> String {
-    // Two-pass render so we can align comment columns. First pass emits
-    // lines with `\0` between body and source tag; second pass computes
-    // the target column and pads.
+    // Three-pass render:
+    // 1. Emit raw lines with `\0` between body and source tag.
+    // 2. Pad bodies so `# tag` comments align.
+    // 3. Colorize: green keys + dim-gray tags (no-op if color disabled).
+    //
+    // Color happens AFTER alignment so the ANSI escape bytes don't get
+    // counted as body width.
     let mut raw = String::new();
     render_node(node, 0, source_labels, &mut raw);
-    align_comments(&raw)
+    let aligned = align_comments(&raw);
+    colorize_keys(&aligned)
 }
 
 /// Inline-sequence threshold: combined line length beyond which a
@@ -318,22 +323,18 @@ fn render_leaf_entry(key: &str, value: &Value, tag: &str, indent: usize, out: &m
             for item in items {
                 match item {
                     Value::Mapping(m) => {
-                        // Rare in fdl configs but render sensibly: first
-                        // key on the `-` line, rest indented.
+                        // First entry on the `-` line, rest indented at the
+                        // same column. Each entry recurses through
+                        // `render_mapping_field` so nested sequences render
+                        // correctly (was `ranks: - 0` from format_scalar's
+                        // defensive fallback).
                         let mut it = m.iter();
                         if let Some((first_k, first_v)) = it.next() {
-                            let first_key = format_key(first_k);
-                            emit_header(
-                                out,
-                                indent + 2,
-                                &format!("- {first_key}: {}", format_scalar(first_v)),
+                            render_mapping_field(
+                                first_k, first_v, indent + 2, Some("- "), out,
                             );
                             for (k, v) in it {
-                                emit_header(
-                                    out,
-                                    indent + 4,
-                                    &format!("{}: {}", format_key(k), format_scalar(v)),
-                                );
+                                render_mapping_field(k, v, indent + 4, None, out);
                             }
                         }
                     }
@@ -345,6 +346,62 @@ fn render_leaf_entry(key: &str, value: &Value, tag: &str, indent: usize, out: &m
         }
         other => {
             emit_line(out, indent, &format!("{key}: {}", format_scalar(other)), Some(tag));
+        }
+    }
+}
+
+/// Render one `key: value` field inside a mapping that is itself a list
+/// item. Same logic as [`render_leaf_entry`] but emits header lines (no
+/// source tag) since the containing list already carried the source.
+///
+/// `prefix` is `Some("- ")` for the first key of a list item (printed
+/// flush with the dash) and `None` for subsequent keys (printed at the
+/// indent column for alignment with the first key).
+fn render_mapping_field(
+    k: &Value,
+    v: &Value,
+    indent: usize,
+    prefix: Option<&str>,
+    out: &mut String,
+) {
+    let key = format_key(k);
+    let head = format!("{}{key}", prefix.unwrap_or(""));
+    match v {
+        Value::Sequence(items) if items.iter().all(is_inline_scalar) => {
+            let inline = format!(
+                "{head}: [{}]",
+                items
+                    .iter()
+                    .map(format_scalar)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if indent + inline.len() <= INLINE_SEQ_LIMIT {
+                emit_header(out, indent, &inline);
+            } else {
+                emit_header(out, indent, &format!("{head}:"));
+                for item in items {
+                    emit_header(out, indent + 2, &format!("- {}", format_scalar(item)));
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            emit_header(out, indent, &format!("{head}:"));
+            for item in items {
+                emit_header(out, indent + 2, &format!("- {}", format_scalar(item)));
+            }
+        }
+        Value::Mapping(_) => {
+            emit_header(out, indent, &format!("{head}:"));
+            // Mapping values inside list items: walk recursively.
+            if let Value::Mapping(m) = v {
+                for (k2, v2) in m {
+                    render_mapping_field(k2, v2, indent + 2, None, out);
+                }
+            }
+        }
+        other => {
+            emit_header(out, indent, &format!("{head}: {}", format_scalar(other)));
         }
     }
 }
@@ -377,12 +434,23 @@ fn emit_header(out: &mut String, indent: usize, body: &str) {
 /// Align `# <tag>` comments across lines that carry the `\0` sentinel.
 /// Lines without the sentinel pass through unchanged. Comment column is
 /// `max(body_width) + 2`, clamped to a minimum for single-line configs.
+/// Maximum body width to track for comment alignment. Beyond this, a long
+/// line (e.g. a multi-flag shell command) breaks alignment for that line
+/// only -- its comment falls right after with a 2-space gutter. This stops
+/// one 90-char clippy command from pushing every comment past the terminal
+/// edge and triggering wrap.
+const ALIGN_CAP: usize = 50;
+
 fn align_comments(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     let mut max_body = 0;
     for line in &lines {
         if let Some(idx) = line.find('\0') {
-            max_body = max_body.max(idx);
+            // Only count lines that fit under the cap; outliers don't
+            // drag everyone else's column rightward.
+            if idx <= ALIGN_CAP {
+                max_body = max_body.max(idx);
+            }
         }
     }
     // 2-space gutter before the `#`. Minimum column so single-key files
@@ -396,9 +464,17 @@ fn align_comments(raw: &str) -> String {
                 let (body, rest) = line.split_at(idx);
                 let tag = &rest[1..]; // skip the '\0'
                 out.push_str(body);
-                for _ in body.chars().count()..col {
+                let body_width = body.chars().count();
+                // If the body is too wide to align cleanly, fall back to a
+                // 2-space gutter for that single line.
+                let target_col = if body_width > ALIGN_CAP { body_width + 2 } else { col };
+                for _ in body_width..target_col {
                     out.push(' ');
                 }
+                // Preserve a `\0` sentinel between padding and `# tag` so
+                // the next pass (colorize_keys) can split unambiguously.
+                // colorize_keys is mandatory and always strips it.
+                out.push('\0');
                 out.push_str("# ");
                 out.push_str(tag);
             }
@@ -407,6 +483,85 @@ fn align_comments(raw: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Final render pass: colorize keys (green) and source tags (dark-gray),
+/// and strip the `\0` body/tag sentinel emitted by [`align_comments`].
+///
+/// When color is disabled the function still runs (to remove `\0`) but
+/// emits no ANSI escapes. `\x1b[32m` (green) matches `fdl -h`'s
+/// `-h, --help` style for option names. `\x1b[90m` (bright-black) is the
+/// most reliable "dim" effect across terminal themes; `\x1b[2m` actual-dim
+/// is unimplemented or near-invisible in many setups.
+fn colorize_keys(text: &str) -> String {
+    let color = crate::style::color_enabled();
+    let key_open = if color { "\x1b[32m" } else { "" };
+    let key_close = if color { "\x1b[0m" } else { "" };
+    let tag_open = if color { "\x1b[90m" } else { "" };
+    let tag_close = if color { "\x1b[0m" } else { "" };
+
+    let mut out = String::with_capacity(text.len() + text.lines().count() * 16);
+    for line in text.lines() {
+        // The `\0` sentinel marks the body / tag boundary (emitted by
+        // align_comments). Unambiguous -- can't appear in user content.
+        let (body, comment) = match line.find('\0') {
+            Some(i) => (&line[..i], Some(&line[i + 1..])),
+            None => (line, None),
+        };
+
+        // Key colorization on the body part.
+        match find_key_segment(body) {
+            Some((key_start, key_end)) => {
+                out.push_str(&body[..key_start]);
+                out.push_str(key_open);
+                out.push_str(&body[key_start..key_end]);
+                out.push_str(key_close);
+                out.push_str(&body[key_end..]);
+            }
+            None => out.push_str(body),
+        }
+
+        if let Some(c) = comment {
+            out.push_str(tag_open);
+            out.push_str(c);
+            out.push_str(tag_close);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Locate the `(start, end)` byte range of the YAML key on this line, or
+/// None if there is no key (blank, list-scalar, etc.). Handles list-item
+/// prefix `- ` and arbitrary indent.
+fn find_key_segment(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    // Optional list-item dash.
+    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b' ' {
+        i += 2;
+    }
+    let key_start = i;
+    // Scan for the first `:` followed by space / end / newline.
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let next = bytes.get(i + 1).copied();
+            match next {
+                None | Some(b' ') | Some(b'\n') => {
+                    if i > key_start {
+                        return Some((key_start, i));
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn label(labels: &[String], source: usize) -> String {
@@ -1063,6 +1218,52 @@ mod tests {
         let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
         assert!(out.contains("items:  "), "expected header line with tag");
         assert!(out.contains("- item-number-0"));
+    }
+
+    #[test]
+    fn render_sequence_in_mapping_list_item_inlines_scalars() {
+        // Regression: previously rendered `ranks: - 0` because
+        // format_scalar's defensive Sequence fallback emitted block YAML.
+        let layers = vec![yaml(
+            "cluster:\n  hosts:\n    - name: exa\n      ranks: [0, 1]\n      local_devices: [2, 3]\n",
+        )];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        assert!(
+            out.contains("ranks: [0, 1]"),
+            "ranks should inline as `[0, 1]`, got:\n{out}"
+        );
+        assert!(
+            out.contains("local_devices: [2, 3]"),
+            "local_devices should inline as `[2, 3]`, got:\n{out}"
+        );
+        assert!(
+            !out.contains("ranks: - "),
+            "must not produce `ranks: - 0`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_long_line_does_not_push_comments_past_cap() {
+        // Regression: previously, one ~90-char clippy command pushed every
+        // other comment to ~100+ cols, wrapping in the terminal.
+        let layers = vec![yaml(
+            "short: 1\nlong: \"some pretty long shell command with many flags and pipes\"\nshort2: 2\n",
+        )];
+        let node = merge_layers_annotated(&layers);
+        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let short_col = out
+            .lines()
+            .find(|l| l.starts_with("short:"))
+            .unwrap()
+            .find('#')
+            .unwrap();
+        // ALIGN_CAP + small padding; assert short lines align to a sane
+        // column (well under terminal width).
+        assert!(
+            short_col < 60,
+            "short-line comment ended up at col {short_col}, expected < 60"
+        );
     }
 
     // ── inherit-from chain resolution ────────────────────────────────────
