@@ -27,6 +27,8 @@
 //!
 //! **Programmatic override:** [`set_verbosity`] takes precedence over the env var.
 
+use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Verbosity level for `flodl` output.
@@ -108,6 +110,56 @@ pub fn enabled(level: Verbosity) -> bool {
     load_or_init() >= level as u8
 }
 
+/// Optional cluster-wide host label, set once at startup.
+static NODE_LABEL: OnceLock<String> = OnceLock::new();
+
+thread_local! {
+    /// Per-thread log prefix, computed once at [`set_thread_device`] time.
+    ///
+    /// Macros prepend this verbatim; the hot path is one thread-local read
+    /// and no formatting work.
+    pub static THREAD_PREFIX: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Build the prefix string from host label, local device, and optional global rank.
+///
+/// Pure helper, factored out so the four-case shape is testable in isolation
+/// (the global `NODE_LABEL` is a `OnceLock`, so it can't be re-set per test).
+fn build_thread_prefix(host: &str, local_dev: u8, global_rank: Option<usize>) -> String {
+    match (host.is_empty(), global_rank) {
+        (true, None) => String::new(),
+        (true, Some(r)) => format!("[r{r}] "),
+        (false, None) => format!("[{host}:{local_dev}] "),
+        (false, Some(r)) => format!("[{host}:{local_dev}:r{r}] "),
+    }
+}
+
+/// Register the cluster-wide host label (e.g. `"fab2s"`, `"flodl-pascal"`).
+///
+/// MUST run before worker threads spawn. The label is read by
+/// [`set_thread_device`] when computing each worker's prefix. Idempotent:
+/// later calls are silently ignored (single-source-of-truth invariant).
+pub fn set_node_label(host: impl Into<String>) {
+    let _ = NODE_LABEL.set(host.into());
+}
+
+/// Compute and store this thread's log prefix.
+///
+/// Called once per worker thread on entry. The resulting prefix is stored in
+/// the [`THREAD_PREFIX`] thread-local and reused verbatim by every log macro
+/// on this thread — no per-call formatting.
+///
+/// Prefix shape:
+/// - No node label, no rank → empty (single-host, today's behavior)
+/// - No node label, rank `r` → `"[rN] "`
+/// - Node label `H`, dev `D`, no rank → `"[H:D] "`
+/// - Node label `H`, dev `D`, rank `r` → `"[H:D:rN] "`
+pub fn set_thread_device(local_dev: u8, global_rank: Option<usize>) {
+    let host = NODE_LABEL.get().map(String::as_str).unwrap_or("");
+    let prefix = build_thread_prefix(host, local_dev, global_rank);
+    THREAD_PREFIX.with(|p| *p.borrow_mut() = prefix);
+}
+
 /// Print to stdout, gated by verbosity level.
 ///
 /// ```ignore
@@ -124,13 +176,17 @@ macro_rules! msg {
     // With explicit level: flodl::msg!(@Verbose, "msg", arg)
     (@$level:expr, $($arg:tt)+) => {
         if $crate::log::enabled($level) {
-            println!($($arg)+)
+            $crate::log::THREAD_PREFIX.with(|p|
+                println!("{}{}", p.borrow().as_str(), format_args!($($arg)+))
+            )
         }
     };
     // Default (Normal): flodl::msg!("msg", arg)
     ($($arg:tt)+) => {
         if $crate::log::enabled($crate::log::Verbosity::Normal) {
-            println!($($arg)+)
+            $crate::log::THREAD_PREFIX.with(|p|
+                println!("{}{}", p.borrow().as_str(), format_args!($($arg)+))
+            )
         }
     };
 }
@@ -142,7 +198,9 @@ macro_rules! msg {
 macro_rules! verbose {
     ($($arg:tt)*) => {
         if $crate::log::enabled($crate::log::Verbosity::Verbose) {
-            println!($($arg)*)
+            $crate::log::THREAD_PREFIX.with(|p|
+                println!("{}{}", p.borrow().as_str(), format_args!($($arg)*))
+            )
         }
     };
 }
@@ -155,7 +213,9 @@ macro_rules! verbose {
 macro_rules! debug {
     ($($arg:tt)*) => {
         if $crate::log::enabled($crate::log::Verbosity::Debug) {
-            eprintln!($($arg)*)
+            $crate::log::THREAD_PREFIX.with(|p|
+                eprintln!("{}{}", p.borrow().as_str(), format_args!($($arg)*))
+            )
         }
     };
 }
@@ -168,7 +228,9 @@ macro_rules! debug {
 macro_rules! trace {
     ($($arg:tt)*) => {
         if $crate::log::enabled($crate::log::Verbosity::Trace) {
-            eprintln!($($arg)*)
+            $crate::log::THREAD_PREFIX.with(|p|
+                eprintln!("{}{}", p.borrow().as_str(), format_args!($($arg)*))
+            )
         }
     };
 }
@@ -176,6 +238,11 @@ macro_rules! trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serializes tests that mutate the global `LEVEL` atomic; without this,
+    // parallel runs race and observe each other's writes.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_verbosity_ordering() {
@@ -187,6 +254,7 @@ mod tests {
 
     #[test]
     fn test_set_and_get() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         let orig = verbosity();
 
         set_verbosity(Verbosity::Debug);
@@ -206,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_enabled() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         let orig = verbosity();
 
         set_verbosity(Verbosity::Verbose);
@@ -229,6 +298,7 @@ mod tests {
 
     #[test]
     fn test_msg_with_level() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         let orig = verbosity();
 
         set_verbosity(Verbosity::Normal);
@@ -238,5 +308,25 @@ mod tests {
         crate::msg!(@Verbosity::Debug, "debug: {}", 42);
 
         set_verbosity(orig);
+    }
+
+    #[test]
+    fn test_build_thread_prefix() {
+        // Single-host mode: no node label, no rank → empty (today's behavior).
+        assert_eq!(build_thread_prefix("", 0, None), "");
+        assert_eq!(build_thread_prefix("", 3, None), "");
+
+        // No node label, rank only → "[rN] ".
+        assert_eq!(build_thread_prefix("", 0, Some(2)), "[r2] ");
+
+        // Node label, dev only → "[host:dev] ".
+        assert_eq!(build_thread_prefix("fab2s", 0, None), "[fab2s:0] ");
+
+        // Full cluster mode: node label, dev, rank → "[host:dev:rN] ".
+        assert_eq!(
+            build_thread_prefix("flodl-pascal", 1, Some(2)),
+            "[flodl-pascal:1:r2] "
+        );
+        assert_eq!(build_thread_prefix("fab2s", 0, Some(0)), "[fab2s:0:r0] ");
     }
 }

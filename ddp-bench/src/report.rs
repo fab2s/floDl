@@ -805,7 +805,7 @@ fn write_idle_analysis(md: &mut String, model: &str, runs: &[RunAnalysis]) {
         let mut gaps: Vec<&crate::analyze::IdleGap> = r.idle_gaps.iter()
             .filter(|g| !matches!(g.cause, crate::analyze::IdleCause::Startup))
             .collect();
-        gaps.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms));
+        gaps.sort_by_key(|g| std::cmp::Reverse(g.duration_ms));
 
         // Show top 10 longest gaps per run
         for g in gaps.iter().take(10) {

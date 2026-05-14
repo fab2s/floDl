@@ -25,8 +25,8 @@ site/_site/
 site/.jekyll-cache/
 site/Gemfile.lock
 
-# libtorch variants (downloaded or built from source)
-/libtorch/
+# libtorch variants (downloaded or built from source, or symlink to off-disk location)
+/libtorch
 
 # Local fdl config (fdl.yaml.example is committed; fdl copies it on first run)
 fdl.yaml

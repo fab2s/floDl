@@ -670,15 +670,11 @@ fn test_async_uses_batch_count_not_wall_time() {
     // fire (fast rank wall = 100ms, slow = 100ms, but batch counts would
     // differ). With batch-count trigger it fires immediately.
     let counts = h.coord.el_che.batch_counts();
-    let mut step0 = 11usize;
-    let mut step1 = 11usize;
-    for _ in 0..counts[0] {
+    for step0 in 11..(11 + counts[0]) {
         h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: step0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
-        step0 += 1;
     }
-    for _ in 0..counts[1] {
+    for step1 in 11..(11 + counts[1]) {
         h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: step1, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
-        step1 += 1;
     }
     h.coord.drain_timing();
     assert!(h.coord.should_average(), "async triggers on batch counts, not wall time");
