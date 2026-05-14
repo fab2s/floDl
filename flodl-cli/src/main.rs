@@ -7,8 +7,8 @@
 //! is managed under `~/.flodl/` (override with `$FLODL_HOME`).
 
 use flodl_cli::{
-    add, api_ref, builtins, cli_error, completions, config, context, diagnose, dispatch, init,
-    libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style,
+    add, api_ref, builtins, cli_error, cluster, completions, config, context, diagnose, dispatch,
+    init, libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style,
     update_check, util,
 };
 
@@ -1225,6 +1225,22 @@ fn dispatch_config(
     let tail: &[String] = args.get(2..).unwrap_or(&[]);
     let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);
 
+    // Cluster dispatch is decided uniformly across RunScript / ExecCommand
+    // outcomes: both flavors of `cluster:`-marked command fan out across
+    // `cluster.hosts` via ssh, forwarding the original tail unchanged.
+    // Recursion guard lives in `cluster::should_dispatch` (returns false
+    // when `FLODL_CLUSTER_JSON` is already set in env -- we're a remote node).
+    let cluster_chain: Option<&[Option<bool>]> = match &outcome {
+        WalkOutcome::RunScript { cluster_chain, .. } => Some(cluster_chain.as_slice()),
+        WalkOutcome::ExecCommand { cluster_chain, .. } => Some(cluster_chain.as_slice()),
+        _ => None,
+    };
+    if let Some(chain) = cluster_chain
+        && cluster::should_dispatch(&project, chain)
+    {
+        return cluster::dispatch(&project, env, cmd, tail);
+    }
+
     match outcome {
         WalkOutcome::RunScript {
             command,
@@ -1232,11 +1248,8 @@ fn dispatch_config(
             user_args,
             docker,
             cwd,
-            cluster_chain,
+            cluster_chain: _,
         } => {
-            if config::cluster_dispatch_enabled(&project, &cluster_chain) {
-                return cluster_dispatch_stub(&project, cmd);
-            }
             let effective_append = if no_append { None } else { append.as_deref() };
             run::exec_script(
                 &command,
@@ -1251,11 +1264,8 @@ fn dispatch_config(
             preset,
             tail,
             cmd_dir,
-            cluster_chain,
+            cluster_chain: _,
         } => {
-            if config::cluster_dispatch_enabled(&project, &cluster_chain) {
-                return cluster_dispatch_stub(&project, cmd);
-            }
             run::exec_command(&cmd_config, preset.as_deref(), &tail, &cmd_dir, &project_root)
         }
         WalkOutcome::RefreshSchema {
@@ -1309,28 +1319,6 @@ fn dispatch_config(
             ExitCode::FAILURE
         }
     }
-}
-
-/// Phase-1 stub for cluster dispatch. Prints what would happen and exits 0.
-///
-/// Real ssh fan-out (parallel exec, JSON shipping, output muxing, exit-code
-/// propagation) is a separate piece of work. This stub exists so the
-/// resolver wiring (chain accumulation in `walk_commands` →
-/// [`config::cluster_dispatch_enabled`] → here) can be exercised end-to-end
-/// before the launcher itself lands.
-fn cluster_dispatch_stub(project: &config::ProjectConfig, cmd: &str) -> ExitCode {
-    let cluster = project
-        .cluster
-        .as_ref()
-        .expect("cluster_dispatch_enabled returned true; cluster: block must be present");
-    let hosts: Vec<&str> = cluster.hosts.iter().map(|h| h.name.as_str()).collect();
-    eprintln!(
-        "fdl: would dispatch `{cmd}` across {n}-host cluster ({hosts}); \
-         ssh dispatch not yet implemented",
-        n = hosts.len(),
-        hosts = hosts.join(", ")
-    );
-    ExitCode::SUCCESS
 }
 
 /// `fdl config show [<env>]` — print the resolved merged config.

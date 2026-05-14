@@ -61,6 +61,10 @@ pub mod completions;
 /// `fdl.yml` manifest loading, validation, and resolved-command types.
 pub mod config;
 
+/// Multi-host launcher: ssh fan-out for `cluster:`-marked commands.
+/// Entry point [`cluster::dispatch`]; recursion guard via [`cluster::should_dispatch`].
+pub mod cluster;
+
 /// Cross-cutting context passed to sub-command handlers (resolved config,
 /// verbosity, overlay selection, working directory, ...).
 pub mod context;
