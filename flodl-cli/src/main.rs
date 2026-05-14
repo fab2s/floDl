@@ -8,8 +8,8 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, context, diagnose, dispatch,
-    init, libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style,
-    update_check, util,
+    gpus, init, libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill,
+    style, update_check, util,
 };
 
 use builtins::{
@@ -88,6 +88,20 @@ fn main() -> ExitCode {
     // `append:` suffix declared by a run-kind command. Scoped to this
     // invocation only — nested `fdl` calls re-evaluate their own flags.
     let (args, no_append) = extract_no_append(&args);
+
+    // Extract `--gpus` (global; accepted at any position). Cluster-aware
+    // commands with N>=2 GPUs trigger single-host envelope synthesis and
+    // multi-process spawn. Non-cluster commands map `--gpus` to
+    // `CUDA_VISIBLE_DEVICES` on the single child process. Recursive
+    // invocations (FLODL_CLUSTER_JSON set) shouldn't normally see this
+    // flag in their args -- the launcher strips it before re-exec'ing.
+    let (args, gpus_spec) = match extract_gpus_flag(&args) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            cli_error!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Environment selection: `--env X` > `FDL_ENV=X` > first-arg convention.
     // Explicit selectors must resolve to an existing overlay; first-arg
@@ -191,7 +205,13 @@ fn main() -> ExitCode {
             println!("flodl-cli {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        other => dispatch_config(other, &args, active_env.as_deref(), no_append),
+        other => dispatch_config(
+            other,
+            &args,
+            active_env.as_deref(),
+            no_append,
+            gpus_spec.as_ref(),
+        ),
     }
 }
 
@@ -239,6 +259,54 @@ fn resolve_env(
 /// (`--env=ci`) form. Errors on missing value, empty value, or duplicate
 /// occurrence. Returns `(filtered_args, Some(value))` on success, or
 /// `(filtered_args, None)` when the flag is absent.
+/// Extract the global `--gpus` flag. Accepted at any position; both forms:
+/// `--gpus 0,1` and `--gpus=0,1`. Errors on duplicate, missing value, or
+/// value that looks like another flag.
+///
+/// Returns the args with `--gpus` (and its value) removed, plus the parsed
+/// [`gpus::GpusSpec`] when set.
+fn extract_gpus_flag(
+    args: &[String],
+) -> Result<(Vec<String>, Option<gpus::GpusSpec>), String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut spec: Option<gpus::GpusSpec> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--gpus" {
+            let value = args.get(i + 1).ok_or_else(|| {
+                "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)"
+                    .to_string()
+            })?;
+            if value.is_empty() || value.starts_with('-') {
+                return Err(format!("--gpus requires a value, got `{value}`"));
+            }
+            if spec.is_some() {
+                return Err("--gpus specified more than once".to_string());
+            }
+            spec = Some(gpus::GpusSpec::parse(value)?);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = a.strip_prefix("--gpus=") {
+            if spec.is_some() {
+                return Err("--gpus specified more than once".to_string());
+            }
+            if value.is_empty() {
+                return Err(
+                    "--gpus= requires a value (e.g. `--gpus=0,1`)".to_string(),
+                );
+            }
+            spec = Some(gpus::GpusSpec::parse(value)?);
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    Ok((out, spec))
+}
+
 fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     let mut out = Vec::with_capacity(args.len());
     let mut env: Option<String> = None;
@@ -1223,6 +1291,7 @@ fn dispatch_config(
     args: &[String],
     env: Option<&str>,
     no_append: bool,
+    gpus_spec: Option<&gpus::GpusSpec>,
 ) -> ExitCode {
     let cwd = env::current_dir().unwrap_or_default();
     let (project, project_root) = match load_project_config(&cwd, env) {
@@ -1238,20 +1307,90 @@ fn dispatch_config(
     let tail: &[String] = args.get(2..).unwrap_or(&[]);
     let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);
 
-    // Cluster dispatch is decided uniformly across RunScript / ExecCommand
-    // outcomes: both flavors of `cluster:`-marked command fan out across
-    // `cluster.hosts` via ssh, forwarding the original tail unchanged.
-    // Recursion guard lives in `cluster::should_dispatch` (returns false
-    // when `FLODL_CLUSTER_JSON` is already set in env -- we're a remote node).
+    // Cluster dispatch sources: YAML `cluster:` block, or synthesized from
+    // `--gpus` on a cluster-aware command (loopback, one host, N ranks).
+    // Recursion guard skips both paths when `FLODL_CLUSTER_JSON` is already
+    // set in env -- we're a spawned child of a parent launcher.
     let cluster_chain: Option<&[Option<bool>]> = match &outcome {
         WalkOutcome::RunScript { cluster_chain, .. } => Some(cluster_chain.as_slice()),
         WalkOutcome::ExecCommand { cluster_chain, .. } => Some(cluster_chain.as_slice()),
         _ => None,
     };
-    if let Some(chain) = cluster_chain
-        && cluster::should_dispatch(&project, chain)
-    {
-        return cluster::dispatch(&project, env, cmd, tail);
+    let wants_cluster = cluster_chain
+        .map(config::resolve_cluster_dispatch)
+        .unwrap_or(false)
+        && !cluster::is_recursive_invocation();
+
+    let cluster_to_dispatch: Option<config::ClusterConfig> = if wants_cluster {
+        match (project.cluster.as_ref(), gpus_spec) {
+            (Some(_), Some(_)) => {
+                cli_error!(
+                    "--gpus cannot be combined with a `cluster:` block in \
+                     fdl.yml; remove one or the other"
+                );
+                return ExitCode::FAILURE;
+            }
+            (Some(c), None) => Some(c.clone()),
+            (None, Some(spec)) => {
+                let devs = match spec.resolve() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cli_error!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if devs.len() < 2 {
+                    // Degenerate single-device: no synthesis, no spawn.
+                    // Pin CUDA_VISIBLE_DEVICES and fall through to the
+                    // regular RunScript / ExecCommand path.
+                    // SAFETY: main has not spawned threads yet.
+                    unsafe { gpus::apply_cuda_visible_devices(&devs) };
+                    None
+                } else {
+                    match gpus::synthesize_local_cluster(&devs) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            cli_error!("{e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+            (None, None) => {
+                // No YAML cluster, no --gpus, but the command opted into
+                // cluster mode. Print a one-line hint if N>=2 GPUs visible.
+                if let Ok(n) = gpus::count_visible_gpus_via_nvidia_smi() {
+                    if n >= 2 {
+                        eprintln!(
+                            "flodl: {n} GPUs visible but cluster mode is off; \
+                             running single-device on GPU 0. Use --gpus all \
+                             for multi-GPU."
+                        );
+                    }
+                }
+                None
+            }
+        }
+    } else {
+        // Non-cluster path (test/clippy/etc., or recursive child).
+        // `--gpus`, if present, restricts CUDA_VISIBLE_DEVICES for the single
+        // child process. No cluster dispatch.
+        if let Some(spec) = gpus_spec {
+            let devs = match spec.resolve() {
+                Ok(d) => d,
+                Err(e) => {
+                    cli_error!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // SAFETY: main has not spawned threads yet.
+            unsafe { gpus::apply_cuda_visible_devices(&devs) };
+        }
+        None
+    };
+
+    if let Some(cluster) = cluster_to_dispatch {
+        return cluster::dispatch(&cluster, env, cmd, tail);
     }
 
     match outcome {
@@ -1728,6 +1867,89 @@ mod tests {
     fn extract_env_flag_duplicate_mixed_forms_errors() {
         let err = extract_env_flag(&args(&["fdl", "--env=ci", "--env", "prod"])).unwrap_err();
         assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    // --- extract_gpus_flag ----------------------------------------------------
+    //
+    // Same shape as extract_env_flag: both forms, scan-anywhere, duplicate
+    // detection, missing-value error, value-looks-like-flag error.
+
+    #[test]
+    fn extract_gpus_flag_absent_returns_none() {
+        let (out, spec) = extract_gpus_flag(&args(&["fdl", "test"])).unwrap();
+        assert_eq!(out, args(&["fdl", "test"]));
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn extract_gpus_flag_long_separated_form() {
+        let (out, spec) = extract_gpus_flag(&args(&["fdl", "--gpus", "0,1", "train"])).unwrap();
+        assert_eq!(out, args(&["fdl", "train"]));
+        assert_eq!(spec, Some(gpus::GpusSpec::List(vec![0, 1])));
+    }
+
+    #[test]
+    fn extract_gpus_flag_equals_form() {
+        let (out, spec) = extract_gpus_flag(&args(&["fdl", "--gpus=0,2", "train"])).unwrap();
+        assert_eq!(out, args(&["fdl", "train"]));
+        assert_eq!(spec, Some(gpus::GpusSpec::List(vec![0, 2])));
+    }
+
+    #[test]
+    fn extract_gpus_flag_all_keyword() {
+        let (out, spec) = extract_gpus_flag(&args(&["fdl", "--gpus", "all", "train"])).unwrap();
+        assert_eq!(out, args(&["fdl", "train"]));
+        assert_eq!(spec, Some(gpus::GpusSpec::All));
+    }
+
+    #[test]
+    fn extract_gpus_flag_scans_anywhere() {
+        // Global flag, accepted after the command name too.
+        let (out, spec) =
+            extract_gpus_flag(&args(&["fdl", "train", "--gpus", "0,1", "--epochs=5"])).unwrap();
+        assert_eq!(out, args(&["fdl", "train", "--epochs=5"]));
+        assert_eq!(spec, Some(gpus::GpusSpec::List(vec![0, 1])));
+    }
+
+    #[test]
+    fn extract_gpus_flag_missing_value_errors() {
+        let err = extract_gpus_flag(&args(&["fdl", "--gpus"])).unwrap_err();
+        assert!(err.contains("requires a value"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_gpus_flag_empty_equals_errors() {
+        let err = extract_gpus_flag(&args(&["fdl", "--gpus="])).unwrap_err();
+        assert!(err.contains("requires a value"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_gpus_flag_value_looks_like_flag_errors() {
+        // Catches `fdl --gpus --help` shape -- user forgot a value.
+        let err = extract_gpus_flag(&args(&["fdl", "--gpus", "--help"])).unwrap_err();
+        assert!(err.contains("requires a value"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_gpus_flag_duplicate_errors() {
+        let err =
+            extract_gpus_flag(&args(&["fdl", "--gpus", "0,1", "--gpus", "2,3"])).unwrap_err();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_gpus_flag_duplicate_mixed_forms_errors() {
+        let err =
+            extract_gpus_flag(&args(&["fdl", "--gpus=0,1", "--gpus", "2,3"])).unwrap_err();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_gpus_flag_propagates_parse_error() {
+        // Invalid index value -> parse error surfaces from GpusSpec::parse.
+        let err = extract_gpus_flag(&args(&["fdl", "--gpus", "0,abc"])).unwrap_err();
+        assert!(err.contains("cannot parse"), "got: {err}");
+        assert!(err.contains("abc"), "got: {err}");
     }
 
     // --- resolve_env: precedence + error paths ----------------------------

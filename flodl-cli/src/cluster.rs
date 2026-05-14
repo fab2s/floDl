@@ -93,35 +93,38 @@ const SSH_OPTS: &[&str] = &[
 /// that signals we're a remote node, not the controller. Otherwise delegates
 /// to [`config::cluster_dispatch_enabled`].
 pub fn should_dispatch(project: &ProjectConfig, chain: &[Option<bool>]) -> bool {
-    if std::env::var_os(ENV_CLUSTER_JSON).is_some() {
+    if is_recursive_invocation() {
         return false;
     }
     config::cluster_dispatch_enabled(project, chain)
 }
 
-/// Dispatch `<cmd> <user_args>` across every host in `project.cluster.hosts`.
+/// Whether this `fdl` invocation is itself a spawned child of a parent
+/// `fdl` launcher (`FLODL_CLUSTER_JSON` already set in env). Used as the
+/// recursion guard everywhere cluster dispatch is evaluated.
+pub fn is_recursive_invocation() -> bool {
+    std::env::var_os(ENV_CLUSTER_JSON).is_some()
+}
+
+/// Dispatch `<cmd> <user_args>` across every host in `cluster.hosts`.
+///
+/// `cluster` is the resolved cluster config -- either from `fdl.yml`'s
+/// `cluster:` block (multi-host case) or synthesized from `--gpus` for
+/// single-host loopback (see [`crate::gpus::synthesize_local_cluster`]).
+/// Caller decides which source.
 ///
 /// `overlay_env` is forwarded via `FDL_ENV` so the remote sees the same
 /// `commands:` resolution (overlay-merged `fdl.<env>.yml`).
 ///
 /// Returns `ExitCode::FAILURE` if any host's ssh child fails or the cluster
 /// config validation fails. Output muxing prefixes every remote line with
-/// `[host] ` at the controller side.
+/// `[host:idx] ` at the controller side.
 pub fn dispatch(
-    project: &ProjectConfig,
+    cluster: &crate::config::ClusterConfig,
     overlay_env: Option<&str>,
     cmd: &str,
     user_args: &[String],
 ) -> ExitCode {
-    let cluster = match project.cluster.as_ref() {
-        Some(c) => c,
-        None => {
-            crate::cli_error!(
-                "cluster dispatch requested but no `cluster:` block in fdl.yml"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
     if let Err(e) = cluster.validate() {
         crate::cli_error!("cluster config invalid: {e}");
         return ExitCode::FAILURE;
@@ -414,7 +417,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn resolve_local_hostname() -> String {
+pub(crate) fn resolve_local_hostname() -> String {
     if let Ok(s) = std::env::var(ENV_HOST_OVERRIDE) {
         let s = s.trim().to_string();
         if !s.is_empty() {

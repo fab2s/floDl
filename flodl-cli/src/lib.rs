@@ -65,6 +65,11 @@ pub mod config;
 /// Entry point [`cluster::dispatch`]; recursion guard via [`cluster::should_dispatch`].
 pub mod cluster;
 
+/// `--gpus` flag parsing + single-host cluster envelope synthesis (loopback,
+/// one host, N ranks). Used when `--gpus` is set on a cluster-aware command
+/// and no `cluster:` block is configured in YAML.
+pub mod gpus;
+
 /// Cross-cutting context passed to sub-command handlers (resolved config,
 /// verbosity, overlay selection, working directory, ...).
 pub mod context;
