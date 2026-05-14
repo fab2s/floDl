@@ -99,6 +99,12 @@ pub struct HostBlock {
     /// cluster spans multiple hosts.
     pub nccl_socket_ifname: String,
 
+    /// Project checkout path on this host. `fdl-cli` cd's here before
+    /// invoking the remote command. Surfaces in logs for "which checkout
+    /// am I running from?" diagnostics; the library does not otherwise
+    /// consume this field.
+    pub path: String,
+
     /// Path to the libtorch install for `fdl-cli` to bind-mount into the
     /// Docker container on this host. Hint for the launcher only; the
     /// library does not consume this field.
@@ -280,6 +286,16 @@ fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
         })?
         .to_string();
 
+    let path = obj
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            TensorError::new(&format!(
+                "cluster.hosts[{idx}] ({name:?}): path (string) required"
+            ))
+        })?
+        .to_string();
+
     let libtorch_path = obj
         .get("libtorch_path")
         .and_then(Value::as_str)
@@ -290,6 +306,7 @@ fn parse_host(v: &Value, idx: usize) -> Result<HostBlock> {
         ranks,
         local_devices,
         nccl_socket_ifname,
+        path,
         libtorch_path,
     })
 }
@@ -378,11 +395,13 @@ mod tests {
             "master_addr": "192.168.122.1",
             "master_port": 29500,
             "hosts": [
-                { "name": "fab2s", "ranks": [0], "local_devices": [0],
+                { "name": "master-host", "ranks": [0], "local_devices": [0],
                   "nccl_socket_ifname": "virbr0",
+                  "path": "/opt/flodl",
                   "libtorch_path": "/data/ssd/flodl/libtorch" },
-                { "name": "flodl-pascal", "ranks": [1, 2], "local_devices": [0, 1],
+                { "name": "worker-host", "ranks": [1, 2], "local_devices": [0, 1],
                   "nccl_socket_ifname": "enp1s0",
+                  "path": "/srv/flodl",
                   "libtorch_path": "/mnt/flodl/libtorch" }
             ]
         })
@@ -397,12 +416,23 @@ mod tests {
         assert_eq!(c.hosts.len(), 2);
         assert!(c.spans_multiple_hosts());
 
-        let pascal = &c.hosts[1];
-        assert_eq!(pascal.name, "flodl-pascal");
-        assert_eq!(pascal.ranks, vec![1, 2]);
-        assert_eq!(pascal.local_devices, vec![0, 1]);
-        assert_eq!(pascal.nccl_socket_ifname, "enp1s0");
-        assert_eq!(pascal.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
+        let worker = &c.hosts[1];
+        assert_eq!(worker.name, "worker-host");
+        assert_eq!(worker.ranks, vec![1, 2]);
+        assert_eq!(worker.local_devices, vec![0, 1]);
+        assert_eq!(worker.nccl_socket_ifname, "enp1s0");
+        assert_eq!(worker.path, "/srv/flodl");
+        assert_eq!(worker.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
+    }
+
+    #[test]
+    fn rejects_missing_path() {
+        let mut v = three_rank_two_host();
+        v["hosts"][1].as_object_mut().unwrap().remove("path");
+        let err = Cluster::from_value(&v).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("path"), "got: {msg}");
+        assert!(msg.contains("worker-host"), "got: {msg}");
     }
 
     #[test]
@@ -457,10 +487,10 @@ mod tests {
         // module rely on env_mutex below to avoid races.
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "flodl-pascal");
+            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
         }
         let h = c.this_host().expect("lookup");
-        assert_eq!(h.name, "flodl-pascal");
+        assert_eq!(h.name, "worker-host");
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
         }
@@ -480,7 +510,7 @@ mod tests {
         }
         let msg = err.to_string();
         assert!(msg.contains("not-in-cluster"), "got: {msg}");
-        assert!(msg.contains("fab2s") && msg.contains("flodl-pascal"), "got: {msg}");
+        assert!(msg.contains("master-host") && msg.contains("worker-host"), "got: {msg}");
         assert!(msg.contains(ENV_HOST_OVERRIDE), "got: {msg}");
     }
 
@@ -490,17 +520,17 @@ mod tests {
         let c = Cluster::from_value(&v).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "fab2s");
+            env::set_var(ENV_HOST_OVERRIDE, "master-host");
         }
-        // Thread-local takes precedence; the env var pointing at "fab2s"
-        // should be ignored when the thread-local says "flodl-pascal".
-        set_thread_hostname_override(Some("flodl-pascal"));
+        // Thread-local takes precedence; the env var pointing at "master-host"
+        // should be ignored when the thread-local says "worker-host".
+        set_thread_hostname_override(Some("worker-host"));
         let h = c.this_host().expect("lookup");
-        assert_eq!(h.name, "flodl-pascal");
+        assert_eq!(h.name, "worker-host");
         set_thread_hostname_override(None);
         // With thread-local cleared, the env var wins.
         let h2 = c.this_host().expect("lookup via env");
-        assert_eq!(h2.name, "fab2s");
+        assert_eq!(h2.name, "master-host");
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
         }

@@ -134,7 +134,7 @@ fn build_thread_prefix(host: &str, local_dev: u8, global_rank: Option<usize>) ->
     }
 }
 
-/// Register the cluster-wide host label (e.g. `"fab2s"`, `"flodl-pascal"`).
+/// Register the cluster-wide host label (e.g. `"master-host"`, `"worker-host"`).
 ///
 /// MUST run before worker threads spawn. The label is read by
 /// [`set_thread_device`] when computing each worker's prefix. Idempotent:
@@ -320,13 +320,13 @@ mod tests {
         assert_eq!(build_thread_prefix("", 0, Some(2)), "[r2] ");
 
         // Node label, dev only → "[host:dev] ".
-        assert_eq!(build_thread_prefix("fab2s", 0, None), "[fab2s:0] ");
+        assert_eq!(build_thread_prefix("node-a", 0, None), "[node-a:0] ");
 
         // Full cluster mode: node label, dev, rank → "[host:dev:rN] ".
         assert_eq!(
-            build_thread_prefix("flodl-pascal", 1, Some(2)),
-            "[flodl-pascal:1:r2] "
+            build_thread_prefix("node-b", 1, Some(2)),
+            "[node-b:1:r2] "
         );
-        assert_eq!(build_thread_prefix("fab2s", 0, Some(0)), "[fab2s:0:r0] ");
+        assert_eq!(build_thread_prefix("node-a", 0, Some(0)), "[node-a:0:r0] ");
     }
 }

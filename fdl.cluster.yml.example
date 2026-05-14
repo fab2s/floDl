@@ -16,23 +16,36 @@
 #     auto-detection is brittle so fdl errors loudly if it's missing.
 #   - `ssh:` is launcher-only -- fdl-cli uses it to connect; flodl itself
 #     ignores it. Defaults to `name:` when absent.
+#   - `path:` is the project checkout dir on this host. fdl-cli cd's here
+#     before invoking the remote command. Heterogeneous mounts are fine
+#     (e.g. /opt/flodl on the controller, /srv/flodl in a VM); training
+#     data is the user's responsibility to mount identically across hosts
+#     (NAS / SMB / virtiofs / S3-FUSE).
 #   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
 #     bind-mounts it into the Docker container at /usr/local/libtorch.
+#
+# Controller participation: if the controller's hostname appears in
+# `hosts:` below, it participates as a rank. If absent, it dispatches and
+# tails logs but takes no NCCL role -- "orchestrator-only" mode. A typo'd
+# hostname silently switches between modes, so fdl-cli emits a warning
+# (not an error) when the controller's hostname doesn't match any entry.
 
 cluster:
   master_addr: 192.168.122.1
   master_port: 29500
   hosts:
-    - name: fab2s              # must match `hostname` on the host
+    - name: node-a             # must match `hostname` on the host
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: virbr0
+      path: /opt/flodl                # checkout path on this host
       libtorch_path: /data/ssd/flodl/libtorch
-    - name: flodl-pascal
-      ssh: flodl-pascal        # ssh target; defaults to name if omitted
+    - name: node-b
+      ssh: node-b              # ssh target; defaults to name if omitted
       ranks: [1, 2]
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0
+      path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch
 
 # Mark which commands fan out across cluster.hosts. Commands without

@@ -303,9 +303,9 @@ mod tests {
             "master_port": port,
             "hosts": [
                 { "name": "master-host", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "lo" },
+                  "nccl_socket_ifname": "lo", "path": "/tmp/test-master" },
                 { "name": "worker-host", "ranks": [1], "local_devices": [0],
-                  "nccl_socket_ifname": "lo" }
+                  "nccl_socket_ifname": "lo", "path": "/tmp/test-worker" }
             ]
         });
         Cluster::from_value(&v).expect("test cluster")
@@ -366,7 +366,7 @@ mod tests {
             "master_port": next_port(),
             "hosts": [
                 { "name": "solo", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "lo" }
+                  "nccl_socket_ifname": "lo", "path": "/tmp/test-solo" }
             ]
         });
         let c = Cluster::from_value(&v).expect("parse");
@@ -461,17 +461,17 @@ mod tests {
             "master_addr": "127.0.0.1",
             "master_port": 29500,
             "hosts": [
-                { "name": "fab2s", "ranks": [0], "local_devices": [0],
-                  "nccl_socket_ifname": "virbr0" },
-                { "name": "flodl-pascal", "ranks": [1, 2], "local_devices": [0, 1],
-                  "nccl_socket_ifname": "enp1s0" }
+                { "name": "node-a", "ranks": [0], "local_devices": [0],
+                  "nccl_socket_ifname": "virbr0", "path": "/tmp/test-a" },
+                { "name": "node-b", "ranks": [1, 2], "local_devices": [0, 1],
+                  "nccl_socket_ifname": "enp1s0", "path": "/tmp/test-b" }
             ]
         });
         let c = Cluster::from_value(&v).unwrap();
         let m = cluster_mapping(&c);
         assert_eq!(
             m,
-            "fab2s:0 -> r0, flodl-pascal:0 -> r1, flodl-pascal:1 -> r2"
+            "node-a:0 -> r0, node-b:0 -> r1, node-b:1 -> r2"
         );
     }
 

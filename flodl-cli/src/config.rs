@@ -518,11 +518,17 @@ pub struct ClusterHost {
     /// Network interface NCCL binds to (e.g. `virbr0`, `enp1s0`). Becomes
     /// `NCCL_SOCKET_IFNAME` in the spawned process environment.
     pub nccl_socket_ifname: String,
+    /// Project checkout path on this host. `fdl-cli` cd's here before
+    /// invoking the remote command. Heterogeneous mounts are fine
+    /// (e.g. `/opt/flodl` on the controller, `/srv/flodl` in a VM); training
+    /// data is the user's responsibility to mount identically across hosts
+    /// (NAS / SMB / virtiofs / S3-FUSE).
+    pub path: String,
     /// libtorch install path on this host. `fdl-cli` bind-mounts it into
     /// the Docker container. Library ignores this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub libtorch_path: Option<String>,
-    /// SSH target for `fdl-cli`'s launcher (e.g. `flodl-pascal`, or
+    /// SSH target for `fdl-cli`'s launcher (e.g. a short hostname, a
     /// `user@host`, or anything `ssh` accepts). Defaults to `name` when
     /// absent. Library ignores this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -547,7 +553,8 @@ impl ClusterConfig {
     /// - `master_addr` non-empty
     /// - at least one host
     /// - per host: `ranks` non-empty, equal length to `local_devices`,
-    ///   `nccl_socket_ifname` non-empty (when cluster spans multiple hosts)
+    ///   `nccl_socket_ifname` non-empty (when cluster spans multiple hosts),
+    ///   `path` non-empty
     /// - across hosts: ranks form exactly `0..world_size` with no duplicates
     ///   or gaps
     pub fn validate(&self) -> Result<(), String> {
@@ -580,6 +587,13 @@ impl ClusterConfig {
                 return Err(format!(
                     "cluster.hosts[{i}] ({:?}): nccl_socket_ifname must be \
                      non-empty when the cluster spans multiple hosts",
+                    h.name
+                ));
+            }
+            if h.path.trim().is_empty() {
+                return Err(format!(
+                    "cluster.hosts[{i}] ({:?}): path (project checkout dir) \
+                     must be non-empty",
                     h.name
                 ));
             }
@@ -2075,16 +2089,18 @@ cluster:
   master_addr: 192.168.122.1
   master_port: 29500
   hosts:
-    - name: fab2s
+    - name: master-host
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: virbr0
+      path: /opt/flodl
       libtorch_path: /data/ssd/flodl/libtorch
-    - name: flodl-pascal
-      ssh: flodl-pascal
+    - name: worker-host
+      ssh: worker-host
       ranks: [1, 2]
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0
+      path: /srv/flodl
       libtorch_path: /mnt/flodl/libtorch
 
 commands:
@@ -2107,12 +2123,13 @@ commands:
         assert_eq!(cluster.hosts.len(), 2);
         assert!(cluster.spans_multiple_hosts());
 
-        let pascal = &cluster.hosts[1];
-        assert_eq!(pascal.name, "flodl-pascal");
-        assert_eq!(pascal.ranks, vec![1, 2]);
-        assert_eq!(pascal.local_devices, vec![0, 1]);
-        assert_eq!(pascal.nccl_socket_ifname, "enp1s0");
-        assert_eq!(pascal.ssh.as_deref(), Some("flodl-pascal"));
+        let worker = &cluster.hosts[1];
+        assert_eq!(worker.name, "worker-host");
+        assert_eq!(worker.ranks, vec![1, 2]);
+        assert_eq!(worker.local_devices, vec![0, 1]);
+        assert_eq!(worker.nccl_socket_ifname, "enp1s0");
+        assert_eq!(worker.path, "/srv/flodl");
+        assert_eq!(worker.ssh.as_deref(), Some("worker-host"));
 
         // CommandSpec cluster: true survives the custom Deserialize.
         let test_cmd = cfg.commands.get("cuda-test").expect("cuda-test command");
@@ -2145,6 +2162,7 @@ cluster:
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
+      path: /tmp/test-solo
 commands:
   train:
     cluster: true
@@ -2212,6 +2230,16 @@ commands:
     }
 
     #[test]
+    fn validate_rejects_empty_path() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts[0].path = String::new();
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("path"), "got: {err}");
+        assert!(err.contains("master-host"), "got: {err}");
+    }
+
+    #[test]
     fn validate_allows_empty_socket_ifname_when_single_host() {
         // Single-host clusters don't go through NCCL TCP, so the ifname
         // requirement doesn't apply.
@@ -2224,6 +2252,7 @@ cluster:
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: \"\"
+      path: /tmp/test-solo
 ";
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         cfg.cluster.as_ref().unwrap().validate().expect("single-host with empty ifname must pass");
@@ -2253,7 +2282,7 @@ cluster:
         assert_eq!(parsed.master_port, cluster.master_port);
         assert_eq!(parsed.hosts.len(), cluster.hosts.len());
         assert_eq!(parsed.world_size(), cluster.world_size());
-        assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("flodl-pascal"));
+        assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("worker-host"));
     }
 
     #[test]
@@ -2261,8 +2290,8 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
-        assert_eq!(cluster.ssh_target(&cluster.hosts[0]), "fab2s"); // no ssh: → name
-        assert_eq!(cluster.ssh_target(&cluster.hosts[1]), "flodl-pascal"); // explicit
+        assert_eq!(cluster.ssh_target(&cluster.hosts[0]), "master-host"); // no ssh: → name
+        assert_eq!(cluster.ssh_target(&cluster.hosts[1]), "worker-host"); // explicit
     }
 
     // ── Path-inheritance cluster-dispatch resolver ──────────────────
