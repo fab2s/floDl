@@ -1,0 +1,59 @@
+# Multi-host cluster overlay -- deep-merges onto fdl.yml.
+#
+# Usage:
+#   cp fdl.cluster.yml.example fdl.cluster.yml
+#   # edit hosts: section to match your rig
+#   fdl @cluster <command>     # activates this overlay
+#
+# Conventions:
+#   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism picks
+#     it up when invoked as `fdl @cluster <cmd>`.
+#   - One process per host. Each host owns a contiguous (or sparse) set of
+#     ranks listed in `ranks:`, with CUDA devices paired by position in
+#     `local_devices:`. Rank 0's host is the NCCL rendezvous master.
+#   - `nccl_socket_ifname:` is required on every host when the cluster
+#     spans multiple machines. NCCL needs it to bind its TCP transport;
+#     auto-detection is brittle so fdl errors loudly if it's missing.
+#   - `ssh:` is launcher-only -- fdl-cli uses it to connect; flodl itself
+#     ignores it. Defaults to `name:` when absent.
+#   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
+#     bind-mounts it into the Docker container at /usr/local/libtorch.
+
+cluster:
+  master_addr: 192.168.122.1
+  master_port: 29500
+  hosts:
+    - name: fab2s              # must match `hostname` on the host
+      ranks: [0]
+      local_devices: [0]
+      nccl_socket_ifname: virbr0
+      libtorch_path: /data/ssd/flodl/libtorch
+    - name: flodl-pascal
+      ssh: flodl-pascal        # ssh target; defaults to name if omitted
+      ranks: [1, 2]
+      local_devices: [0, 1]
+      nccl_socket_ifname: enp1s0
+      libtorch_path: /mnt/flodl/libtorch
+
+# Mark which commands fan out across cluster.hosts. Commands without
+# `cluster: true` continue to run locally on whichever host invoked fdl.
+#
+# `cluster:` on a Path-kind command (one that routes to a sub-fdl.yml,
+# e.g. ddp-bench/) propagates as the default for every command inside that
+# subtree, recursively. Sub-commands can still opt out individually with
+# `cluster: false`. Resolution walks leaf → root; the deepest `cluster:`
+# value wins. This means one root overlay can mark a whole subtree
+# cluster-capable in one line, without touching the sub-fdl.yml files.
+#
+# Example: `ddp-bench: { cluster: true }` below makes every command inside
+# ddp-bench/fdl.yml (and nested fdl.yml files under it) fan out by default.
+# Override with a sibling `ddp-bench/fdl.cluster.yml` if a specific command
+# should stay local.
+commands:
+  cuda-test:
+    cluster: true
+  ddp-bench:
+    cluster: true            # inherited by every command under ddp-bench/
+  train:
+    cluster: true
+    run: cargo run --release --bin my-training-app

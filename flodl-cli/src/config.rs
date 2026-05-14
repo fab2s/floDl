@@ -20,6 +20,15 @@ pub struct ProjectConfig {
     /// a child fdl.yml, or inline preset reusing the parent entry).
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
+    /// Multi-host cluster topology. When present, commands marked
+    /// `cluster: true` are dispatched across every host in
+    /// [`ClusterConfig::hosts`]. Lives at the project root because the
+    /// topology is shared across all sub-command fdl.yml files; the
+    /// canonical author pattern is to put the cluster block in a
+    /// `fdl.<env>.yml` overlay (e.g. `fdl.vm.yml`) that deep-merges over
+    /// the base `fdl.yml`.
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
 }
 
 // ── Sub-command config ──────────────────────────────────────────────────
@@ -112,6 +121,12 @@ pub struct CommandSpec {
     pub training: Option<TrainingConfig>,
     pub output: Option<OutputConfig>,
     pub options: BTreeMap<String, serde_json::Value>,
+    /// Dispatch this command across every host in
+    /// [`ProjectConfig::cluster`]'s `hosts` list. Set to `true` to opt the
+    /// command into multi-host execution. Default `None` means single-host
+    /// (today's behavior). Has no effect when no `cluster:` block is
+    /// declared at the project root.
+    pub cluster: Option<bool>,
 }
 
 /// What kind of command is this, resolved from a [`CommandSpec`].
@@ -213,6 +228,8 @@ impl<'de> Deserialize<'de> for CommandSpec {
             output: Option<OutputConfig>,
             #[serde(default)]
             options: BTreeMap<String, serde_json::Value>,
+            #[serde(default)]
+            cluster: Option<bool>,
         }
 
         let raw = serde_yaml::Value::deserialize(deserializer)?;
@@ -231,6 +248,7 @@ impl<'de> Deserialize<'de> for CommandSpec {
             training: inner.training,
             output: inner.output,
             options: inner.options,
+            cluster: inner.cluster,
         })
     }
 }
@@ -470,6 +488,171 @@ pub struct OutputConfig {
     pub dir: Option<String>,
     pub timeline: Option<bool>,
     pub monitor: Option<u16>,
+}
+
+// ── Cluster topology (multi-host DDP) ───────────────────────────────────
+
+/// Multi-host cluster topology, parsed from the `cluster:` block at the
+/// project root. Mirrors `flodl::distributed::Cluster` on the library side
+/// but adds launcher-only fields (`ssh:`) that the library ignores.
+///
+/// The library re-validates after reading; this validation runs earlier so
+/// errors surface before `fdl-cli` opens any SSH connection.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ClusterConfig {
+    pub master_addr: String,
+    pub master_port: u16,
+    pub hosts: Vec<ClusterHost>,
+}
+
+/// One physical host in the cluster.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterHost {
+    /// Hostname as reported by `hostname` on the host (or
+    /// `FLODL_HOST_NAME`-overridden value).
+    pub name: String,
+    /// Global ranks owned by this host.
+    pub ranks: Vec<usize>,
+    /// CUDA device indices paired by position with `ranks`.
+    pub local_devices: Vec<u8>,
+    /// Network interface NCCL binds to (e.g. `virbr0`, `enp1s0`). Becomes
+    /// `NCCL_SOCKET_IFNAME` in the spawned process environment.
+    pub nccl_socket_ifname: String,
+    /// libtorch install path on this host. `fdl-cli` bind-mounts it into
+    /// the Docker container. Library ignores this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub libtorch_path: Option<String>,
+    /// SSH target for `fdl-cli`'s launcher (e.g. `flodl-pascal`, or
+    /// `user@host`, or anything `ssh` accepts). Defaults to `name` when
+    /// absent. Library ignores this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
+}
+
+impl ClusterConfig {
+    /// Total ranks across the cluster.
+    pub fn world_size(&self) -> usize {
+        self.hosts.iter().map(|h| h.ranks.len()).sum()
+    }
+
+    /// Whether the cluster spans more than one physical host. Single-host
+    /// clusters don't require `NCCL_SOCKET_IFNAME`.
+    pub fn spans_multiple_hosts(&self) -> bool {
+        self.hosts.len() > 1
+    }
+
+    /// Pre-flight validation. Mirrors the library check so failures surface
+    /// before SSH dispatch instead of from a stack trace on a remote host:
+    ///
+    /// - `master_addr` non-empty
+    /// - at least one host
+    /// - per host: `ranks` non-empty, equal length to `local_devices`,
+    ///   `nccl_socket_ifname` non-empty (when cluster spans multiple hosts)
+    /// - across hosts: ranks form exactly `0..world_size` with no duplicates
+    ///   or gaps
+    pub fn validate(&self) -> Result<(), String> {
+        if self.master_addr.trim().is_empty() {
+            return Err("cluster.master_addr must be non-empty".into());
+        }
+        if self.hosts.is_empty() {
+            return Err("cluster.hosts must be non-empty".into());
+        }
+        let multi_host = self.spans_multiple_hosts();
+        for (i, h) in self.hosts.iter().enumerate() {
+            if h.name.trim().is_empty() {
+                return Err(format!("cluster.hosts[{i}].name must be non-empty"));
+            }
+            if h.ranks.is_empty() {
+                return Err(format!(
+                    "cluster.hosts[{i}] ({:?}): ranks must be non-empty",
+                    h.name
+                ));
+            }
+            if h.ranks.len() != h.local_devices.len() {
+                return Err(format!(
+                    "cluster.hosts[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
+                    h.name,
+                    h.ranks.len(),
+                    h.local_devices.len()
+                ));
+            }
+            if multi_host && h.nccl_socket_ifname.trim().is_empty() {
+                return Err(format!(
+                    "cluster.hosts[{i}] ({:?}): nccl_socket_ifname must be \
+                     non-empty when the cluster spans multiple hosts",
+                    h.name
+                ));
+            }
+        }
+        let mut all: Vec<usize> = self
+            .hosts
+            .iter()
+            .flat_map(|h| h.ranks.iter().copied())
+            .collect();
+        let ws = all.len();
+        all.sort_unstable();
+        let expected: Vec<usize> = (0..ws).collect();
+        if all != expected {
+            return Err(format!(
+                "cluster: ranks across hosts must be exactly 0..{ws} with no \
+                 duplicates or gaps, got sorted-unique sequence {all:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical JSON shipped to each host's flodl library. `serde_json`'s
+    /// default key order is preservation order, which is what the library
+    /// expects (it navigates by name, not position, but stable output also
+    /// keeps file hashes stable for caching / debugging).
+    pub fn canonical_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| format!("cluster: JSON serialization failed: {e}"))
+    }
+
+    /// Look up the SSH target for a host, defaulting to `name` if `ssh:` is
+    /// not set. Used by the launcher; library callers don't need this.
+    pub fn ssh_target<'a>(&'a self, host: &'a ClusterHost) -> &'a str {
+        host.ssh.as_deref().unwrap_or(&host.name)
+    }
+}
+
+/// Resolve whether a leaf command should fan out across the cluster, given
+/// the chain of [`CommandSpec::cluster`] directives along its command path,
+/// ordered root → leaf.
+///
+/// Walks the chain from leaf back to root; the first `Some` value wins.
+/// This makes deeper overrides take precedence:
+///
+/// - root sets `cluster: true`, leaf unset → `true` (inherits)
+/// - root sets `cluster: true`, leaf sets `cluster: false` → `false` (override)
+/// - root unset, leaf sets `cluster: true` → `true`
+/// - all unset → `false` (no clustering by default)
+///
+/// Intended caller pattern (from a future dispatch in `run.rs`):
+///
+/// ```ignore
+/// let chain: Vec<Option<bool>> = ancestors.iter()
+///     .map(|spec| spec.cluster)
+///     .collect();
+/// if cluster_dispatch_enabled(&project, &chain) {
+///     // fan out across project.cluster.hosts
+/// }
+/// ```
+///
+/// This is a pure function on the chain; cluster-block presence is checked
+/// separately by [`cluster_dispatch_enabled`].
+pub fn resolve_cluster_dispatch(chain: &[Option<bool>]) -> bool {
+    chain.iter().rev().find_map(|x| *x).unwrap_or(false)
+}
+
+/// Whether the leaf command's effective `cluster:` value resolves to `true`
+/// AND a `cluster:` topology is declared at the project root.
+///
+/// Without a project-root `cluster:` block, multi-host dispatch is
+/// unavailable regardless of any per-command directives along the chain.
+pub fn cluster_dispatch_enabled(project: &ProjectConfig, chain: &[Option<bool>]) -> bool {
+    project.cluster.is_some() && resolve_cluster_dispatch(chain)
 }
 
 
@@ -1882,5 +2065,294 @@ mod tests {
 
         let cfg = load_command(&cmd_dir).expect("load must succeed despite probe error");
         assert!(cfg.schema.is_none());
+    }
+
+    // ── Cluster topology (multi-host DDP overlay) ───────────────────
+
+    fn canonical_cluster_yaml() -> &'static str {
+        "\
+cluster:
+  master_addr: 192.168.122.1
+  master_port: 29500
+  hosts:
+    - name: fab2s
+      ranks: [0]
+      local_devices: [0]
+      nccl_socket_ifname: virbr0
+      libtorch_path: /data/ssd/flodl/libtorch
+    - name: flodl-pascal
+      ssh: flodl-pascal
+      ranks: [1, 2]
+      local_devices: [0, 1]
+      nccl_socket_ifname: enp1s0
+      libtorch_path: /mnt/flodl/libtorch
+
+commands:
+  cuda-test:
+    cluster: true
+  train:
+    cluster: true
+    run: cargo run --release --bin my-training-app
+"
+    }
+
+    #[test]
+    fn cluster_overlay_parses() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).expect("parse cluster overlay");
+        let cluster = cfg.cluster.as_ref().expect("cluster: block present");
+        assert_eq!(cluster.master_addr, "192.168.122.1");
+        assert_eq!(cluster.master_port, 29500);
+        assert_eq!(cluster.world_size(), 3);
+        assert_eq!(cluster.hosts.len(), 2);
+        assert!(cluster.spans_multiple_hosts());
+
+        let pascal = &cluster.hosts[1];
+        assert_eq!(pascal.name, "flodl-pascal");
+        assert_eq!(pascal.ranks, vec![1, 2]);
+        assert_eq!(pascal.local_devices, vec![0, 1]);
+        assert_eq!(pascal.nccl_socket_ifname, "enp1s0");
+        assert_eq!(pascal.ssh.as_deref(), Some("flodl-pascal"));
+
+        // CommandSpec cluster: true survives the custom Deserialize.
+        let test_cmd = cfg.commands.get("cuda-test").expect("cuda-test command");
+        assert_eq!(test_cmd.cluster, Some(true));
+        let train_cmd = cfg.commands.get("train").expect("train command");
+        assert_eq!(train_cmd.cluster, Some(true));
+        assert_eq!(train_cmd.run.as_deref(), Some("cargo run --release --bin my-training-app"));
+    }
+
+    #[test]
+    fn cluster_block_optional() {
+        let yaml = "commands: { foo: { run: \"echo hi\" } }\n";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse without cluster");
+        assert!(cfg.cluster.is_none());
+        // CommandSpec cluster defaults to None.
+        assert_eq!(cfg.commands.get("foo").and_then(|c| c.cluster), None);
+    }
+
+    #[test]
+    fn cluster_overlay_merges_via_deep_merge() {
+        // The canonical author pattern: `cluster:` lives in `fdl.vm.yml`
+        // (the overlay), not the base `fdl.yml`. deep_merge stitches them.
+        let base_yaml = "commands:\n  train:\n    run: cargo run --release\n";
+        let overlay_yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: [0]
+      nccl_socket_ifname: lo
+commands:
+  train:
+    cluster: true
+";
+        let base: serde_yaml::Value = serde_yaml::from_str(base_yaml).unwrap();
+        let overlay: serde_yaml::Value = serde_yaml::from_str(overlay_yaml).unwrap();
+        let merged = crate::overlay::deep_merge(base, overlay);
+        let merged_yaml = serde_yaml::to_string(&merged).unwrap();
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(&merged_yaml).expect("merged config parses");
+        let cluster = cfg.cluster.as_ref().expect("cluster: from overlay");
+        assert_eq!(cluster.world_size(), 1);
+        assert_eq!(cluster.hosts[0].name, "solo");
+        // Overlay added `cluster: true` to the train command; the base's
+        // `run:` survived the merge.
+        let train = cfg.commands.get("train").expect("train command");
+        assert_eq!(train.cluster, Some(true));
+        assert_eq!(train.run.as_deref(), Some("cargo run --release"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ranks() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts[1].ranks = vec![1, 1];
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("duplicates or gaps"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_rank_gap() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts[1].ranks = vec![2, 3];
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("duplicates or gaps"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_len_mismatch() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts[1].local_devices = vec![0];
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("length mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_hosts() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts.clear();
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_missing_socket_ifname_when_multi_host() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().hosts[0].nccl_socket_ifname = String::new();
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("nccl_socket_ifname"), "got: {err}");
+        assert!(err.contains("multiple hosts"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_allows_empty_socket_ifname_when_single_host() {
+        // Single-host clusters don't go through NCCL TCP, so the ifname
+        // requirement doesn't apply.
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: [0]
+      nccl_socket_ifname: \"\"
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.cluster.as_ref().unwrap().validate().expect("single-host with empty ifname must pass");
+    }
+
+    #[test]
+    fn validate_passes_canonical() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_ref().unwrap().validate().expect("canonical topology must validate");
+    }
+
+    #[test]
+    fn canonical_json_stable_and_round_trips() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let cluster = cfg.cluster.as_ref().unwrap();
+        let json = cluster.canonical_json().expect("serialize");
+
+        // Stability: serialization twice produces identical output.
+        let json2 = cluster.canonical_json().unwrap();
+        assert_eq!(json, json2);
+
+        // Round-trip: parsing back gives the same observable state.
+        let parsed: ClusterConfig = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(parsed.master_addr, cluster.master_addr);
+        assert_eq!(parsed.master_port, cluster.master_port);
+        assert_eq!(parsed.hosts.len(), cluster.hosts.len());
+        assert_eq!(parsed.world_size(), cluster.world_size());
+        assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("flodl-pascal"));
+    }
+
+    #[test]
+    fn ssh_target_defaults_to_name() {
+        let cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let cluster = cfg.cluster.as_ref().unwrap();
+        assert_eq!(cluster.ssh_target(&cluster.hosts[0]), "fab2s"); // no ssh: → name
+        assert_eq!(cluster.ssh_target(&cluster.hosts[1]), "flodl-pascal"); // explicit
+    }
+
+    // ── Path-inheritance cluster-dispatch resolver ──────────────────
+
+    #[test]
+    fn cluster_dispatch_empty_chain_is_false() {
+        // No command directives anywhere → default false.
+        assert!(!resolve_cluster_dispatch(&[]));
+    }
+
+    #[test]
+    fn cluster_dispatch_all_unset_is_false() {
+        // Every level along the path declined to set cluster: → false.
+        assert!(!resolve_cluster_dispatch(&[None, None, None]));
+    }
+
+    #[test]
+    fn cluster_dispatch_leaf_true_wins_over_unset_ancestors() {
+        // root unset, leaf cluster: true → fan out.
+        assert!(resolve_cluster_dispatch(&[None, Some(true)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_leaf_false_wins_over_unset_ancestors() {
+        // root unset, leaf cluster: false → explicit local.
+        assert!(!resolve_cluster_dispatch(&[None, Some(false)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_inherits_from_path_command_at_root() {
+        // commands.ddp-bench in root: cluster: true. ddp-bench/fdl.yml's
+        // leaf command leaves it unset → inherits parent's true.
+        assert!(resolve_cluster_dispatch(&[Some(true), None]));
+    }
+
+    #[test]
+    fn cluster_dispatch_leaf_overrides_ancestor_true_to_false() {
+        // root: ddp-bench cluster: true. ddp-bench/cuda: cluster: false
+        // (e.g. for a single-host quick smoke test) → stays local despite
+        // ancestor saying yes.
+        assert!(!resolve_cluster_dispatch(&[Some(true), Some(false)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_leaf_overrides_ancestor_false_to_true() {
+        // root: research/ cluster: false (everything stays local).
+        // research/multi-host-experiment: cluster: true (opt back in).
+        assert!(resolve_cluster_dispatch(&[Some(false), Some(true)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_intermediate_override_wins_at_sub_sub_depth() {
+        // 4-level chain: root → ddp-bench → sweep → experiment.
+        // root true, ddp-bench false (turns ddp-bench off wholesale),
+        // sweep unset, experiment unset → effective false. The deepest
+        // explicit value (ddp-bench's false) outranks root's true; sweep
+        // and experiment inherit from there.
+        assert!(!resolve_cluster_dispatch(&[Some(true), Some(false), None, None]));
+    }
+
+    #[test]
+    fn cluster_dispatch_deepest_override_wins_through_chain() {
+        // Same 4-level chain but the experiment opts back in: effective true.
+        // Resolution walks leaf-first, finds Some(true) immediately.
+        assert!(resolve_cluster_dispatch(&[Some(true), Some(false), None, Some(true)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_enabled_requires_cluster_block() {
+        // Even with leaf cluster: true, dispatching is disabled when no
+        // cluster topology is declared at root.
+        let no_cluster: ProjectConfig = serde_yaml::from_str(
+            "commands: { foo: { run: \"echo hi\" } }\n",
+        )
+        .unwrap();
+        assert!(!cluster_dispatch_enabled(&no_cluster, &[Some(true)]));
+        assert!(!cluster_dispatch_enabled(&no_cluster, &[Some(true), Some(true)]));
+    }
+
+    #[test]
+    fn cluster_dispatch_enabled_when_block_and_chain_agree() {
+        let with_cluster: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        assert!(cluster_dispatch_enabled(&with_cluster, &[Some(true)]));
+        assert!(cluster_dispatch_enabled(&with_cluster, &[Some(true), None]));
+        // Cluster block present but chain says false → not enabled.
+        assert!(!cluster_dispatch_enabled(&with_cluster, &[Some(false)]));
+        assert!(!cluster_dispatch_enabled(&with_cluster, &[None, Some(false)]));
+        // Cluster block present but no directives anywhere → not enabled.
+        assert!(!cluster_dispatch_enabled(&with_cluster, &[]));
+        assert!(!cluster_dispatch_enabled(&with_cluster, &[None, None]));
     }
 }

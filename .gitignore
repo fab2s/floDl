@@ -29,8 +29,11 @@ site/Gemfile.lock
 /libtorch
 
 # Local fdl config (fdl.yaml.example is committed; fdl copies it on first run)
+# fdl.*.yml covers per-environment overlays (fdl.cluster.yml, fdl.vm.yml, ...)
+# while keeping `fdl.*.yml.example` templates in the repo.
 fdl.yaml
 fdl.yml
+fdl.*.yml
 
 mempalace.yaml
 entities.json
