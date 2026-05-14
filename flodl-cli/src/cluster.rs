@@ -3,14 +3,25 @@
 //! Entry point [`dispatch`] iterates `project.cluster.hosts`, builds a
 //! per-host slim envelope (via
 //! [`ClusterConfig::local_envelope_for`](crate::config::ClusterConfig::local_envelope_for)),
-//! hex-encodes the JSON into `FLODL_CLUSTER_JSON`, and spawns one ssh child
-//! per host:
+//! hex-encodes the JSON into `FLODL_CLUSTER_JSON`, and spawns one child per
+//! host:
 //!
 //! ```text
+//! # remote host (host.name != controller's hostname)
 //! ssh -T <host> bash -lc 'cd <path> && \
 //!     FLODL_CLUSTER_JSON=<hex> FLODL_HOST_NAME=<name> \
 //!     exec fdl <cmd> <user_args>'
+//!
+//! # local fast path (host.name == controller's hostname)
+//! bash -lc 'cd <path> && FLODL_CLUSTER_JSON=<hex> FLODL_HOST_NAME=<name> \
+//!     exec fdl <cmd> <user_args>'
 //! ```
+//!
+//! The local fast path drops the sshd-on-controller prereq -- a fresh
+//! workstation can run `fdl @cluster <cmd>` without first configuring
+//! ssh-to-self. Both paths produce identical child shapes (piped stdout /
+//! stderr, same env propagation via the inline shell prefix), so the
+//! mux / wait / exit-code logic downstream doesn't branch.
 //!
 //! Stdout/stderr from each ssh child are line-prefixed with `[host] ` at the
 //! launcher; library-prefixed lines (`[host:dev:rN]`) appear after the
@@ -144,20 +155,22 @@ pub fn dispatch(
             user_args,
         );
 
-        let target = cluster.ssh_target(host);
-        let mut child = match Command::new("ssh")
-            .args(SSH_OPTS)
-            .arg(target)
-            .arg(&remote_cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let mut child = match build_spawn_command(
+            &host.name,
+            &me,
+            cluster.ssh_target(host),
+            &remote_cmd,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         {
             Ok(c) => c,
             Err(e) => {
+                let kind = if host.name == me { "bash" } else { "ssh" };
                 crate::cli_error!(
-                    "cluster: failed to spawn ssh to {:?}: {e}",
+                    "cluster: failed to spawn {kind} for {:?}: {e}",
                     host.name
                 );
                 kill_all(&mut children);
@@ -280,6 +293,30 @@ fn write_line(stream: Stream, prefix: &[u8], line: &[u8]) {
             }
             let _ = w.flush();
         }
+    }
+}
+
+/// Build the `Command` that spawns the per-host child.
+///
+/// When `host_name == me`, returns a `bash -lc '<remote_cmd>'` Command --
+/// the controller doesn't need sshd-on-self for its own rank. Otherwise
+/// returns `ssh <SSH_OPTS> <ssh_target> '<remote_cmd>'`. Both shapes
+/// produce identical child semantics (piped streams, same env propagation
+/// via the inline shell prefix in `remote_cmd`).
+pub(crate) fn build_spawn_command(
+    host_name: &str,
+    me: &str,
+    ssh_target: &str,
+    remote_cmd: &str,
+) -> Command {
+    if host_name == me {
+        let mut c = Command::new("bash");
+        c.arg("-lc").arg(remote_cmd);
+        c
+    } else {
+        let mut c = Command::new("ssh");
+        c.args(SSH_OPTS).arg(ssh_target).arg(remote_cmd);
+        c
     }
 }
 
@@ -543,6 +580,35 @@ commands:
             &["it's fine".into()],
         );
         assert!(s.contains("'it'\\''s fine'"), "got: {s}");
+    }
+
+    #[test]
+    fn build_spawn_command_local_uses_bash() {
+        let cmd = build_spawn_command("master-host", "master-host", "irrelevant", "echo hi");
+        assert_eq!(cmd.get_program(), "bash");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-lc");
+        assert_eq!(args[1], "echo hi");
+    }
+
+    #[test]
+    fn build_spawn_command_remote_uses_ssh() {
+        let cmd = build_spawn_command("worker-host", "master-host", "worker.lan", "echo hi");
+        assert_eq!(cmd.get_program(), "ssh");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        // SSH_OPTS (7 entries) + ssh_target + remote_cmd = 9 args.
+        assert_eq!(args.len(), SSH_OPTS.len() + 2);
+        // Last two are target then command.
+        assert_eq!(args[args.len() - 2], "worker.lan");
+        assert_eq!(args[args.len() - 1], "echo hi");
+        // SSH_OPTS includes -T and BatchMode=yes among others.
+        let joined: Vec<String> = args.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert!(joined.iter().any(|s| s == "-T"), "got: {joined:?}");
+        assert!(
+            joined.iter().any(|s| s == "BatchMode=yes"),
+            "got: {joined:?}"
+        );
     }
 
     #[test]
