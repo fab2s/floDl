@@ -45,7 +45,7 @@ pub mod datasets;
 pub(crate) mod prefetch;
 
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
-pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator, DistributedEpochIterator};
+pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
 pub(crate) use loader::prefetch_depth_from_vram;
 
 use crate::tensor::{Result, Tensor};

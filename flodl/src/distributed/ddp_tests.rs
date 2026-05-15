@@ -23,214 +23,58 @@
         true
     }
 
-    // -- CPU validation tests -----------------------------------------------
+    // -- Cluster ElChe state tests ------------------------------------------
 
     #[test]
-    fn test_ddp_requires_two_models() {
-        // Can't construct Ddp with 1 model (NCCL needs 2+ CUDA devices).
-        // Just verify the validation logic.
-        let result = Ddp::wrap(&[], &[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_ddp_model_device_mismatch() {
-        // Model count must match device count
-        let result = Ddp::wrap(
-            &[],
-            &[Device::CUDA(0), Device::CUDA(1)],
-        );
-        assert!(result.is_err());
+    fn cluster_el_che_state_defaults() {
+        let cfg = DdpConfig::new();
+        let state = ClusterElCheState::from_config(3, &cfg);
+        assert_eq!(state.local_batch_idx, 0);
+        assert!(state.cycle_start.is_none());
+        assert_eq!(state.max_grad_norm, None);
+        // Default initial anchor → equal counts across ranks before timing.
+        let counts = state.el_che.batch_counts();
+        assert_eq!(counts.len(), 3);
+        assert_eq!(counts[0], ClusterElCheState::DEFAULT_INITIAL_ANCHOR);
+        assert!(!state.el_che.has_speed_hint());
     }
 
     #[test]
-    fn test_shard_sizes_equal() {
-        let ratios = vec![0.5, 0.5];
-        let state = mock_state(&ratios);
-        assert_eq!(state.compute_shard_sizes(10), vec![5, 5]);
-        assert_eq!(state.compute_shard_sizes(11), vec![6, 5]);
-        assert_eq!(state.compute_shard_sizes(3), vec![2, 1]);
+    fn cluster_el_che_state_honors_speed_hint() {
+        // Speed hint biases initial counts so the fast rank gets more work
+        // pre-calibration. 2.0× ratio on the fast rank → counts in ~2:1.
+        let cfg = DdpConfig::new().speed_hint(0, 2.0);
+        let state = ClusterElCheState::from_config(2, &cfg);
+        assert!(state.el_che.has_speed_hint());
+        let counts = state.el_che.batch_counts();
+        assert_eq!(counts.len(), 2);
     }
 
     #[test]
-    fn test_shard_sizes_unequal() {
-        let ratios = vec![0.7, 0.3];
-        let state = mock_state(&ratios);
-        assert_eq!(state.compute_shard_sizes(10), vec![7, 3]);
-        assert_eq!(state.compute_shard_sizes(100), vec![70, 30]);
+    fn cluster_el_che_state_honors_max_grad_norm() {
+        let cfg = DdpConfig::new().max_grad_norm(1.5);
+        let state = ClusterElCheState::from_config(2, &cfg);
+        assert_eq!(state.max_grad_norm, Some(1.5));
     }
 
     #[test]
-    fn test_shard_sizes_three_devices() {
-        let ratios = vec![0.5, 0.3, 0.2];
-        let state = mock_state(&ratios);
-        let sizes = state.compute_shard_sizes(10);
-        assert_eq!(sizes.iter().sum::<i64>(), 10);
-        assert_eq!(sizes, vec![5, 3, 2]);
-    }
-
-    /// Helper: create a minimal DistributedState for unit tests.
-    fn mock_state(ratios: &[f64]) -> DistributedState {
-        let n = ratios.len();
-        DistributedState {
-            replicas: Vec::new(),
-            // Safety: we never use comms in shard/balance tests. Build a dummy.
-            comms: unsafe { mock_nccl_comms(n) },
-            devices: (0..n as u8)
-                .map(Device::CUDA)
-                .collect(),
-            optimizers: Vec::new(),
-            chunk_ratios: ratios.to_vec(),
-            param_groups: Vec::new(),
-            buffer_groups: Vec::new(),
-            last_timing: None,
-            last_shard_sizes: vec![0; n],
-            ema_throughput: vec![0.0; n],
-            step_count: 0,
-            calibration_steps: DEFAULT_CALIBRATION_STEPS,
-            rebalance_interval: DEFAULT_REBALANCE_INTERVAL,
-            el_che: None,
-            last_el_che_counts: Vec::new(),
-            last_el_che_sync: None,
-            max_grad_norm: None,
-            timeline: None,
-        }
-    }
-
-    /// Create a NcclComms with a null handle for shard-size unit tests only.
-    /// Never call any actual NCCL operations on this.
-    unsafe fn mock_nccl_comms(n: usize) -> NcclComms {
-        let devices: Vec<Device> = (0..n as u8).map(Device::CUDA).collect();
-        // Drop on a null handle is a no-op.
-        unsafe { NcclComms::from_raw(std::ptr::null_mut(), devices) }
-    }
-
-    // -- Auto-balancer unit tests (CPU, no NCCL needed) ---------------------
-
-    #[test]
-    fn test_is_balanced_equal() {
-        let state = mock_state(&[0.5, 0.5]);
-        assert!(state.is_balanced());
+    fn cluster_el_che_state_honors_max_anchor() {
+        let cfg = DdpConfig::new().max_anchor(Some(42));
+        let state = ClusterElCheState::from_config(2, &cfg);
+        // max_anchor caps how high El Che will tune the anchor up.
+        // The initial anchor uses DEFAULT_INITIAL_ANCHOR, not max_anchor.
+        let counts = state.el_che.batch_counts();
+        assert_eq!(counts[0], ClusterElCheState::DEFAULT_INITIAL_ANCHOR);
     }
 
     #[test]
-    fn test_is_balanced_unequal() {
-        let state = mock_state(&[0.7, 0.3]);
-        assert!(!state.is_balanced());
-    }
-
-    #[test]
-    fn test_rebalance_proportional() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // GPU 0 is 3x faster than GPU 1
-        state.ema_throughput = vec![30.0, 10.0];
-        state.rebalance();
-        // Expect ~75/25 split
-        assert!((state.chunk_ratios[0] - 0.75).abs() < 0.01,
-            "fast GPU should get ~75%, got {}", state.chunk_ratios[0]);
-        assert!((state.chunk_ratios[1] - 0.25).abs() < 0.01,
-            "slow GPU should get ~25%, got {}", state.chunk_ratios[1]);
-        // Must sum to 1.0
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9, "ratios must sum to 1.0, got {sum}");
-    }
-
-    #[test]
-    fn test_rebalance_three_devices() {
-        let mut state = mock_state(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
-        // Throughput: 50, 30, 20 (total 100)
-        state.ema_throughput = vec![50.0, 30.0, 20.0];
-        state.rebalance();
-        assert!((state.chunk_ratios[0] - 0.50).abs() < 0.01);
-        assert!((state.chunk_ratios[1] - 0.30).abs() < 0.01);
-        assert!((state.chunk_ratios[2] - 0.20).abs() < 0.01);
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_rebalance_respects_min_ratio() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // GPU 1 is extremely slow (would get <5% without clamping)
-        state.ema_throughput = vec![100.0, 1.0];
-        state.rebalance();
-        assert!(state.chunk_ratios[1] >= MIN_CHUNK_RATIO,
-            "slow GPU should get at least MIN_CHUNK_RATIO, got {}", state.chunk_ratios[1]);
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_rebalance_no_data() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        state.ema_throughput = vec![0.0, 0.0];
-        state.rebalance();
-        // Should not change ratios when no data
-        assert_eq!(state.chunk_ratios, vec![0.5, 0.5]);
-    }
-
-    #[test]
-    fn test_update_balance_calibration_timing() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Simulate steps without timing (no CudaEvents on CPU)
-        for _ in 0..DEFAULT_CALIBRATION_STEPS - 1 {
-            let rebalanced = state.update_balance().unwrap();
-            assert!(!rebalanced, "should not rebalance during calibration");
-        }
-        // Step at calibration boundary triggers rebalance (but no-op without data)
-        let rebalanced = state.update_balance().unwrap();
-        assert!(rebalanced, "should rebalance at calibration boundary");
-    }
-
-    #[test]
-    fn test_update_balance_interval() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Skip past calibration
-        state.step_count = DEFAULT_CALIBRATION_STEPS;
-        // Steps up to next interval should not rebalance
-        for _ in 0..DEFAULT_REBALANCE_INTERVAL - 1 {
-            let rebalanced = state.update_balance().unwrap();
-            assert!(!rebalanced);
-        }
-        // At interval boundary: rebalance
-        let rebalanced = state.update_balance().unwrap();
-        assert!(rebalanced);
-    }
-
-    #[test]
-    fn test_ema_throughput_init() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // First measurement initializes directly (not blended)
-        state.ema_throughput = vec![0.0, 0.0];
-        // Manually set what update_throughput would compute from timing
-        let throughput_0 = 10.0;
-        state.ema_throughput[0] = throughput_0; // simulates first measurement
-        assert_eq!(state.ema_throughput[0], 10.0);
-    }
-
-    #[test]
-    fn test_ema_throughput_smoothing() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        state.ema_throughput = vec![10.0, 5.0];
-        // Simulate what update_balance does with a new measurement
-        let new_measurement = 20.0;
-        state.ema_throughput[0] =
-            EMA_ALPHA * new_measurement + (1.0 - EMA_ALPHA) * state.ema_throughput[0];
-        // EMA: 0.3 * 20 + 0.7 * 10 = 6 + 7 = 13
-        assert!((state.ema_throughput[0] - 13.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_shard_sizes_after_rebalance() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Rebalance to 70/30
-        state.ema_throughput = vec![70.0, 30.0];
-        state.rebalance();
-        // Verify shard computation uses new ratios
-        let sizes = state.compute_shard_sizes(100);
-        assert_eq!(sizes.iter().sum::<i64>(), 100);
-        assert_eq!(sizes[0], 70);
-        assert_eq!(sizes[1], 30);
+    fn cluster_el_che_state_honors_overhead_target() {
+        // overhead_target is clamped to [0.01, 0.50] by DdpConfig::overhead_target.
+        let cfg = DdpConfig::new().overhead_target(0.05);
+        let _state = ClusterElCheState::from_config(2, &cfg);
+        // No public getter on ElChe for the target; just verify construction
+        // succeeds and doesn't panic. Behavior validation is in
+        // distributed::el_che::tests.
     }
 
     // -- Cross-device autograd verification ---------------------------------
@@ -446,35 +290,6 @@
             .zip(&params_after)
             .any(|(a, b)| (a - b).abs() > 1e-8);
         assert!(changed, "parameters should change after step()");
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_graph_distribute_adapts_to_hardware() {
-        use crate::graph::FlowBuilder;
-        use crate::nn::Linear;
-        use crate::tensor::usable_cuda_devices;
-
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
-            .build()
-            .unwrap();
-
-        let result = model.distribute(|dev| {
-            FlowBuilder::from(Linear::on_device(4, 2, dev)?).build()
-        });
-        assert!(result.is_ok());
-
-        let usable = usable_cuda_devices();
-        if usable.len() >= 2 {
-            // Multi-GPU: should be distributed
-            assert!(model.is_distributed());
-            assert_eq!(model.world_size(), usable.len());
-        } else {
-            // Single GPU or CPU: no-op
-            assert!(!model.is_distributed());
-            assert_eq!(model.world_size(), 1);
-        }
     }
 
     #[test]
@@ -1157,41 +972,6 @@
     fn test_ddp_config_disable_el_che() {
         let c = DdpConfig::new().max_anchor(Some(0));
         assert_eq!(c.max_anchor, Some(0));
-    }
-
-    #[test]
-    fn test_configure_el_che_creates_from_config() {
-        let mut state = mock_state(&[0.5, 0.5]);
-
-        let config = DdpConfig::new().speed_hint(1, 2.0).overhead_target(0.15);
-        state.configure_el_che(&config);
-
-        assert!(state.el_che.is_some());
-        let el = state.el_che.as_ref().unwrap();
-        // Slow rank gets anchor, fast gets more
-        assert_eq!(el.batches(1), el.anchor());
-        assert!(el.batches(0) > el.batches(1));
-    }
-
-    #[test]
-    fn test_configure_el_che_disabled() {
-        let mut state = mock_state(&[0.5, 0.5]);
-
-        let config = DdpConfig::new().max_anchor(Some(0));
-        state.configure_el_che(&config);
-
-        assert!(state.el_che.is_none());
-    }
-
-    #[test]
-    fn test_configure_el_che_single_device_noop() {
-        let mut state = mock_state(&[1.0]);
-
-        let config = DdpConfig::new();
-        state.configure_el_che(&config);
-
-        // Single device -- El Che not created
-        assert!(state.el_che.is_none());
     }
 
     // -- El Che CUDA integration tests (multi-GPU, NCCL) ----------------------

@@ -108,8 +108,19 @@ pub struct Graph {
     pub(crate) node_input_count: Vec<usize>,
     // Cached execution buffers (reused across forward calls, avoids re-allocation)
     pub(crate) exec_slots: RefCell<Vec<Vec<Option<Variable>>>>,
-    // Distributed Data Parallel state (set by distribute(), None for single-GPU)
-    pub(crate) distributed: RefCell<Option<crate::distributed::ddp::DistributedState>>,
+    // Cluster-mode DDP state (process-per-rank). Holds the local replica and
+    // a `Ddp` wrapping a single `NcclRankComm` joined to the cross-process
+    // group. Set by `Trainer::setup` when `LocalCluster::from_env()` returns
+    // `Some`. Exists alongside `distributed` during the multi-host DDP
+    // consolidation arc; a follow-up collapses both into a single field.
+    pub(crate) cluster_ddp:
+        RefCell<Option<(crate::distributed::ddp::Ddp, Box<dyn Module>)>>,
+    // Cluster-mode El Che cadence state (heterogeneous DDP across processes).
+    // When set, `step()` defers the sync + optimizer step until the local
+    // cadence target is reached; cross-process timing AllReduce keeps every
+    // rank's anchor in lockstep without a broadcast.
+    pub(crate) cluster_el_che:
+        RefCell<Option<crate::distributed::ddp::ClusterElCheState>>,
     // Optimizer for step() (works for both single-GPU and distributed)
     pub(crate) optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
     // Optional per-batch LR scheduler. When set, `step()` updates every
@@ -152,7 +163,7 @@ pub struct Graph {
 /// Created by [`Graph::set_data_loader`]. Maps batch tensor names to
 /// graph inputs and stores the loader reference.
 pub(crate) struct DataLoaderBinding {
-    /// The DataLoader (possibly upgraded to distributed mode).
+    /// The DataLoader.
     pub loader: crate::data::DataLoader,
     /// Name of the batch field used as the primary forward input (e.g., "image").
     pub forward_input: String,
@@ -163,16 +174,10 @@ pub(crate) struct DataLoaderBinding {
     /// Names of batch fields that are targets (for loss), not consumed by forward.
     #[allow(dead_code)]
     pub target_names: Vec<String>,
-    /// Maps graph input index → shard/batch tensor position.
-    /// `shard_input_map[i]` is the index into `per_rank_shards[rank]` or
-    /// `Batch` that provides `self.inputs[i]`.
+    /// Maps graph input index → batch tensor position.
+    /// `shard_input_map[i]` is the index into `Batch` that provides
+    /// `self.inputs[i]`.
     pub shard_input_map: Vec<usize>,
-    /// Chunk ratios for distributed training (updated by auto-balancer).
-    /// Stored here so the epoch iterator can read them without borrowing DistributedState.
-    pub chunk_ratios: Vec<f64>,
-    /// Batch field names (from loader) for reconstructing Batch objects in
-    /// forward_distributed_el_che's per-batch backward path.
-    pub batch_names: Vec<String>,
 }
 
 impl Graph {
@@ -417,7 +422,8 @@ impl Graph {
             output_port_idx,
             node_input_count,
             exec_slots,
-            distributed: RefCell::new(None),
+            cluster_ddp: RefCell::new(None),
+            cluster_el_che: RefCell::new(None),
             optimizer: RefCell::new(None),
             scheduler: RefCell::new(None),
             lr_scale: Cell::new(1.0),
@@ -721,7 +727,23 @@ impl Graph {
 
     /// Forward with multiple inputs (for graphs with Input ports).
     /// Inputs are in declaration order: From entry first, then each Input.
+    ///
+    /// In cluster mode, routes to the local replica's graph (via
+    /// [`Module::as_graph`]) so the replica's parameters drive the forward.
+    /// Loud error if the replica does not expose a graph — `forward_multi`
+    /// is graph-specific and has no meaningful fallback.
     pub fn forward_multi(&self, inputs: &[Variable]) -> Result<Variable> {
+        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
+            return match replica.as_graph() {
+                Some(g) => g.forward_multi(inputs),
+                None => Err(TensorError::new(
+                    "forward_multi: cluster-mode replica does not expose a Graph \
+                     (Module::as_graph returned None) — multi-input forward has \
+                     no fallback. Wrap the model in something that implements \
+                     as_graph (e.g. HeadReplica for HasGraph wrappers).",
+                )),
+            };
+        }
         self.forward_impl(inputs)
     }
 
@@ -1063,23 +1085,19 @@ impl Module for Graph {
     }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        if self.distributed.borrow().is_some() {
-            // Check if presharded data is available from the DataLoader
-            let has_shards = self.data_binding.borrow()
-                .as_ref()
-                .is_some_and(|b| b.loader.has_shards());
-
-            if has_shards {
-                self.forward_distributed_presharded()
-            } else {
-                self.forward_distributed_scatter(input)
-            }
-        } else {
-            self.forward_impl(std::slice::from_ref(input))
+        // Cluster mode: route through the local replica. `self`'s own nodes
+        // act as a structural template only; the replica owns this rank's
+        // training parameters.
+        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
+            return replica.forward(input);
         }
+        self.forward_impl(std::slice::from_ref(input))
     }
 
     fn parameters(&self) -> Vec<Parameter> {
+        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
+            return replica.parameters();
+        }
         let mut params = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1098,6 +1116,9 @@ impl Module for Graph {
     }
 
     fn buffers(&self) -> Vec<crate::nn::Buffer> {
+        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
+            return replica.buffers();
+        }
         let mut bufs = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1122,6 +1143,10 @@ impl Module for Graph {
     }
 
     fn set_training(&self, training: bool) {
+        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
+            replica.set_training(training);
+            return;
+        }
         let mut visited = HashSet::new();
         for &ni in &self.order {
             if let Some(ref module) = self.nodes[ni].module {
@@ -1146,20 +1171,16 @@ impl Module for Graph {
 
 /// Iterator over training batches, returned by [`Graph::epoch`].
 ///
-/// Wraps either a single-GPU `EpochIterator` or a distributed
-/// `DistributedEpochIterator`. Yields `Result<Batch>`.
+/// Delegates to the attached DataLoader's epoch iterator. Yields
+/// `Result<Batch>`.
 pub enum GraphEpochIterator<'a> {
-    /// Distributed mode: per-device backends, presharded data.
-    Distributed(&'a Graph, usize),
-    /// Single GPU: delegates to DataLoader's epoch iterator.
+    /// Delegates to DataLoader's epoch iterator.
     Single(&'a Graph, usize),
 }
 
 /// Internal state once iteration starts (lazily initialized on first next()).
 enum GraphEpochState<'a> {
-    DistributedActive(crate::data::DistributedEpochIterator<'a>),
     SingleActive(crate::data::EpochIterator<'a>),
-    Pending,
 }
 
 /// Active graph epoch iterator (initialized from GraphEpochIterator on first call).
@@ -1174,46 +1195,16 @@ impl<'a> GraphEpochIterator<'a> {
     /// This resolves the borrow on the DataLoader binding.
     pub fn activate(self) -> ActiveGraphEpochIterator<'a> {
         match self {
-            GraphEpochIterator::Distributed(graph, epoch) => {
-                // Get chunk_ratios and create the distributed iterator
-                let binding = graph.data_binding.borrow();
-                let binding = binding.as_ref().unwrap();
-                let chunk_ratios = &binding.chunk_ratios as *const Vec<f64>;
-
-                // Safety: chunk_ratios lives in the DataLoaderBinding which is
-                // behind a RefCell in the Graph. The Graph outlives the iterator.
-                // We only read chunk_ratios, and they're only mutated between epochs
-                // (in step()), not during iteration.
-                let ratios_ref: &'a [f64] = unsafe { &*chunk_ratios };
-
-                if let crate::data::loader::LoaderInner::Distributed(ref dist_loader) = binding.loader.inner {
-                    let iter = crate::data::DistributedEpochIterator::new(
-                        // Safety: same reasoning -- dist_loader lives in the DataLoaderBinding
-                        unsafe { &*(dist_loader as *const _) },
-                        epoch,
-                        ratios_ref,
-                    );
-                    ActiveGraphEpochIterator {
-                        state: GraphEpochState::DistributedActive(iter),
-                        graph,
-                    }
-                } else {
-                    ActiveGraphEpochIterator {
-                        state: GraphEpochState::Pending,
-                        graph,
-                    }
-                }
-            }
             GraphEpochIterator::Single(graph, epoch) => {
-                // For single GPU, we need a mutable borrow to call epoch()
-                // on the inner DataLoader.
+                // Need a mutable borrow to call epoch() on the inner DataLoader.
                 let mut binding = graph.data_binding.borrow_mut();
                 let binding = binding.as_mut().unwrap();
                 let loader_ptr = &mut binding.loader as *mut crate::data::DataLoader;
 
                 // Safety: the DataLoader lives in the Graph's DataLoaderBinding.
-                // We create an EpochIterator that borrows from it. The Graph outlives
-                // the iterator. No concurrent mutation occurs during iteration.
+                // We create an EpochIterator that borrows from it. The Graph
+                // outlives the iterator. No concurrent mutation occurs during
+                // iteration.
                 let iter = unsafe { (*loader_ptr).epoch(epoch) };
                 ActiveGraphEpochIterator {
                     state: GraphEpochState::SingleActive(iter),
@@ -1229,39 +1220,18 @@ impl Iterator for ActiveGraphEpochIterator<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.state {
-            GraphEpochState::DistributedActive(iter) => iter.next(),
             GraphEpochState::SingleActive(iter) => iter.next(),
-            GraphEpochState::Pending => None,
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.state {
-            GraphEpochState::DistributedActive(iter) => iter.size_hint(),
             GraphEpochState::SingleActive(iter) => iter.size_hint(),
-            GraphEpochState::Pending => (0, Some(0)),
         }
     }
 }
 
 impl ExactSizeIterator for ActiveGraphEpochIterator<'_> {}
-
-impl Drop for ActiveGraphEpochIterator<'_> {
-    fn drop(&mut self) {
-        // El Che epoch-end flush: if forward_distributed_el_che() was called
-        // but step() hasn't been called yet, gradients are accumulated and
-        // un-synced. Force a step() to prevent silent gradient loss.
-        if self.graph.has_el_che() {
-            let needs_flush = self.graph.distributed.borrow()
-                .as_ref()
-                .is_some_and(|d| d.last_timing.is_some());
-
-            if needs_flush {
-                let _ = self.graph.step();
-            }
-        }
-    }
-}
 
 /// Current time as seconds since epoch (monotonic approximation for ETA).
 pub(crate) fn instant_secs() -> f64 {

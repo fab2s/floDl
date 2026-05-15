@@ -63,16 +63,6 @@ pub struct NcclComms {
 unsafe impl Send for NcclComms {}
 
 impl NcclComms {
-    /// Create from a raw handle and device list. Used internally for testing.
-    ///
-    /// # Safety
-    /// Caller must ensure `handle` is a valid NCCL communicator handle
-    /// (or null for mock/test use). Drop on null handle is a no-op.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_raw(handle: *mut c_void, devices: Vec<Device>) -> Self {
-        NcclComms { handle, devices }
-    }
-
     /// Initialize NCCL communicators for the given CUDA devices.
     ///
     /// All devices must be distinct CUDA devices. Returns error on CPU

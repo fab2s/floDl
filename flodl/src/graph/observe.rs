@@ -397,30 +397,6 @@ impl Graph {
         self.traces_validated.set(true);
     }
 
-    /// Replace trace buffer contents for the given tag.
-    ///
-    /// Used by El Che gathering to set catted traces from all devices/batches.
-    /// Routes to the legacy `trace_buf` when `name` matches a post-loop tag,
-    /// otherwise writes into the first loop's `named_trace_buf` whose store
-    /// already carries `name` (i.e. the loop that produced it on this rank).
-    pub(crate) fn set_traces(&self, name: &str, traces: Vec<Variable>) {
-        if let Some(&(ni, _)) = self.tag_names.get(name)
-            && let Some(ref buf) = self.nodes[ni].trace_buf
-        {
-            *buf.borrow_mut() = traces;
-            return;
-        }
-        for node in &self.nodes {
-            if let Some(ref store) = node.named_trace_buf {
-                let mut store_mut = store.borrow_mut();
-                if store_mut.contains_key(name) {
-                    store_mut.insert(name.to_string(), traces);
-                    return;
-                }
-            }
-        }
-    }
-
     /// Get the last trace output from the most recent loop iteration.
     ///
     /// Convenience wrapper around [`traces()`](Self::traces) that returns only
