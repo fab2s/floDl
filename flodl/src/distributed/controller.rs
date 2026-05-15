@@ -66,10 +66,10 @@ use std::time::Duration;
 
 use crate::tensor::{Result, TensorError};
 
-const HANDSHAKE_MAGIC_RANK: u32 = 0xF10D_17C0;
-const HANDSHAKE_MAGIC_CONTROLLER_ACK: u32 = 0xF10D_17C1;
-const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
-const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const HANDSHAKE_MAGIC_RANK: u32 = 0xF10D_17C0;
+pub(crate) const HANDSHAKE_MAGIC_CONTROLLER_ACK: u32 = 0xF10D_17C1;
+pub(crate) const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
 /// dtype tag for f32 in the wire protocol. Only dtype supported in v1.
 pub const DTYPE_F32: u8 = 0;
@@ -325,7 +325,10 @@ impl TensorPayload {
 
 /// Read a RoundFrame from a single rank's stream. Returns `Ok(None)` on
 /// clean EOF (rank closed its end normally — signals shutdown).
-fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFrame>> {
+///
+/// `pub(crate)` so the rank-side client in `cpu_reduce` can share the
+/// wire format without duplication.
+pub(crate) fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFrame>> {
     let mut hdr = [0u8; 8];
     match stream.read_exact(&mut hdr) {
         Ok(()) => {}
@@ -405,7 +408,9 @@ fn read_round_from_all(streams: &mut [TcpStream]) -> Result<Option<Vec<RoundFram
     Ok(Some(frames))
 }
 
-fn write_round_frame(stream: &mut TcpStream, frame: &RoundFrame) -> Result<()> {
+/// Write a RoundFrame to a stream. `pub(crate)` companion to
+/// [`read_round_frame`]; shared by the rank-side client.
+pub(crate) fn write_round_frame(stream: &mut TcpStream, frame: &RoundFrame) -> Result<()> {
     let mut hdr = [0u8; 8];
     hdr[0..4].copy_from_slice(&ROUND_FRAME_MAGIC.to_le_bytes());
     hdr[4..8].copy_from_slice(&(frame.tensors.len() as u32).to_le_bytes());
