@@ -183,6 +183,58 @@ impl CpuReduceClient {
         let averaged = self.all_reduce(&frame)?;
         round_frame_to_tensors(&averaged)
     }
+
+    /// Broadcast a root rank's tensors to every rank via the avg-trick.
+    ///
+    /// The controller only supports AllReduce-Avg (sum then divide by
+    /// `world_size`). To express "every rank receives root's values" with
+    /// that primitive: root scales its tensors by `world_size`, every
+    /// other rank sends zeros. After avg = sum/world_size, every rank
+    /// ends up with root's original values.
+    ///
+    /// Used by the cluster-rank entry points to align initial parameter
+    /// state across ranks (mirrors `nccl_comm.broadcast(refs, root=0)` on
+    /// the NCCL path). Caller passes their factory-built params; the
+    /// returned tensors carry root's values and should be loaded back
+    /// into the live parameters via `copy_`.
+    ///
+    /// v1 supports root=0 only and f32 tensors (per
+    /// [`tensors_to_round_frame`]). All ranks must call concurrently.
+    pub fn broadcast_from_root(
+        &mut self,
+        tensors: &[&Tensor],
+        root: u32,
+    ) -> Result<Vec<Tensor>> {
+        if root >= self.world_size {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: broadcast root {root} >= world_size {}",
+                self.world_size,
+            )));
+        }
+        // Build the per-rank contribution: root multiplies by world_size,
+        // non-root ranks send zeros_like. Tensors are moved to CPU via
+        // tensors_to_round_frame downstream; the scaled / zeroed copies
+        // are short-lived (single-round scratch).
+        let n = self.world_size as f64;
+        let scaled: Vec<Tensor> = if self.rank_id == root {
+            tensors
+                .iter()
+                .map(|t| {
+                    let copy = Tensor::zeros_like(t)?;
+                    copy.copy_(t, false)?;
+                    copy.mul_scalar_(n)?;
+                    Ok(copy)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            tensors
+                .iter()
+                .map(|t| Tensor::zeros_like(t))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let scaled_refs: Vec<&Tensor> = scaled.iter().collect();
+        self.all_reduce_tensors(&scaled_refs)
+    }
 }
 
 // ---------------------------------------------------------------------------

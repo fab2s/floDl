@@ -886,6 +886,100 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
+    /// Self-driven inline training loop for `ApplyPolicy::Sync +
+    /// AverageBackend::Cpu` — CPU-averaging counterpart of
+    /// [`Self::run_self_driven_sync_nccl`].
+    ///
+    /// Same per-batch protocol (forward + backward + optimizer step) and
+    /// same K=1 cadence (AllReduce-Avg after every batch). The reduce
+    /// mechanism switches from NCCL collective to TCP round-trip via
+    /// [`CpuReduceClient`]:
+    ///
+    /// - Each batch: `train_step` (Local SGD, identical to NCCL path)
+    /// - Then: `cpu_client.all_reduce_tensors(&params_on_cpu)` → averaged
+    ///   tensors on CPU
+    /// - Load averaged tensors back into the live params via `copy_`
+    ///   (handles the CPU-to-GPU move when params live on a CUDA device)
+    ///
+    /// **Behavior preserved (vs old threaded coordinator):** same
+    /// `train_step` (grad clipping, scheduler, optimizer step), Local SGD
+    /// semantics every batch, same `param_vars` set being averaged. The
+    /// orchestration switch (TCP rather than NCCL) is the only change.
+    ///
+    /// **Not yet supported (carried forward through later slices):**
+    /// VRAM-aware prefetch, per-epoch [`MetricsMsg`] aggregation,
+    /// `epoch_fn` / `metrics_fn` / `scheduler_fn` / `checkpoint_every`
+    /// callbacks, EASGD blending (the CPU-async slice's α-mixing —
+    /// 4b.D.1c).
+    ///
+    /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
+    pub fn run_self_driven_sync_cpu(
+        &mut self,
+        cpu_client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
+        num_epochs: usize,
+        train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
+    ) -> Result<()> {
+        if (cpu_client.world_size() as usize) != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_sync_cpu: cpu_client world_size ({}) \
+                 must equal worker world_size ({})",
+                cpu_client.world_size(), self.world_size,
+            )));
+        }
+
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        for epoch in 0..num_epochs {
+            self.current_epoch = epoch;
+            let total_samples = self.dataset.len();
+            let share = total_samples / self.world_size;
+            let offset = self.rank * share;
+            let size = if self.rank == self.world_size - 1 {
+                total_samples - offset
+            } else {
+                share
+            };
+            self.partition = make_partition(
+                offset, size, total_samples, epoch, self.base_seed,
+            );
+
+            let num_batches = self.partition.len() / self.batch_size;
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * self.batch_size;
+                let end = start + self.batch_size;
+                let indices = &self.partition[start..end];
+                let batch = self.dataset.get_batch(indices)?;
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch
+                        .into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+
+                let (_loss, _ms) = self.train_step(&batch, train_fn)?;
+
+                // CPU AllReduce-Avg: ship live params (move to CPU
+                // happens inside tensors_to_round_frame), receive
+                // averaged tensors, load back into live params.
+                let param_tensors: Vec<Tensor> = self
+                    .param_vars
+                    .iter()
+                    .map(|v| v.data())
+                    .collect();
+                let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
+                let averaged = cpu_client.all_reduce_tensors(&param_refs)?;
+                for (dst, src) in param_tensors.iter().zip(&averaged) {
+                    dst.copy_(src, false)?;
+                }
+                self.steps_since_avg = 0;
+                self.local_step += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Self-driven inline training loop for `ApplyPolicy::Cadence` /
     /// `ApplyPolicy::Async` + `AverageBackend::Nccl` — heterogeneous
     /// Local-SGD with ElChe-driven K and the full convergence-guard

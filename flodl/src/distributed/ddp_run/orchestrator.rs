@@ -217,14 +217,27 @@ impl DdpHandle {
                         convergence_guard,
                     )
                 }
+                (ApplyPolicy::Sync, AverageBackend::Cpu) => {
+                    Self::run_cluster_rank_sync_cpu(
+                        cluster,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                    )
+                }
                 _ => Err(crate::tensor::TensorError::new(&format!(
-                    "Trainer::builder cluster mode: ApplyPolicy::Sync (4b.D.1a.ii) \
-                     + Cadence / Async (4b.D.1a.iii / iv) on AverageBackend::Nccl \
-                     are implemented. Cpu backend (all policies) lands in \
-                     4b.D.1b. Requested: {policy:?} + {backend:?}. Use \
-                     Trainer::setup / setup_with for cluster-aware training \
-                     in the meantime (user owns \
-                     the loop).",
+                    "Trainer::builder cluster mode: Sync+Nccl (4b.D.1a.ii), \
+                     Cadence+Nccl / Async+Nccl (4b.D.1a.iii / iv), and \
+                     Sync+Cpu (4b.D.1b.i) are implemented. Remaining: \
+                     Cadence+Cpu → 4b.D.1b.ii, Async+Cpu → 4b.D.1c (genuine \
+                     async needs the 3-phase machine landing in controller.rs). \
+                     Requested: {policy:?} + {backend:?}. Use Trainer::setup / \
+                     setup_with for cluster-aware training in the meantime \
+                     (user owns the loop).",
                 ))),
             };
         }
@@ -1067,6 +1080,208 @@ impl DdpHandle {
             final_state: None,
             metrics_rx: None, // wired in a follow-up slice
             architecture_svg: None, // model lives inside thread; metadata deferred
+            graph_label: None,
+            graph_hash: None,
+            training_meta,
+        })
+    }
+
+    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Cpu`.
+    ///
+    /// CPU-averaging counterpart of
+    /// [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl).
+    /// Same shape: one training thread per rank-process, no in-process
+    /// N-thread coordinator. The reduce primitive switches from NCCL
+    /// collective to TCP round-trip via [`CpuReduceClient`]:
+    ///
+    /// - Connect to the launcher's [`CpuAverager`] at
+    ///   `master_addr:master_port + 2` (convention set in
+    ///   [`crate::distributed::launcher`]).
+    /// - Broadcast initial params from rank 0 via the avg-trick (see
+    ///   [`CpuReduceClient::broadcast_from_root`]) so all ranks start
+    ///   with identical weights, even when the user's model factory
+    ///   isn't deterministic across ranks.
+    /// - Spawn the training thread which runs
+    ///   [`GpuWorker::run_self_driven_sync_cpu`]: per batch `train_step`
+    ///   then `cpu_client.all_reduce_tensors(&params)` → averaged back
+    ///   into live params.
+    ///
+    /// **Not yet wired in this slice (4b.D.1b.i):** per-epoch metrics
+    /// aggregation, `epoch_fn` / `metrics_fn` / `scheduler_fn` /
+    /// `checkpoint_every` callbacks, EASGD blending, divergence /
+    /// guard pipeline (CPU-Cadence ships in 4b.D.1b.ii).
+    ///
+    /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
+    /// [`CpuReduceClient::broadcast_from_root`]:
+    ///     crate::distributed::CpuReduceClient::broadcast_from_root
+    /// [`CpuAverager`]: crate::distributed::CpuAverager
+    /// [`GpuWorker::run_self_driven_sync_cpu`]:
+    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_sync_cpu
+    #[allow(clippy::too_many_arguments)]
+    fn run_cluster_rank_sync_cpu<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::cpu_reduce::CpuReduceClient;
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Sync+Cpu)"
+        );
+
+        // Controller address convention: master_addr:master_port + 2.
+        // master_port + 1 is reserved for the log side-channel
+        // (see CpuReduceClient::connect doc + launcher.rs).
+        let controller_port = cluster.master_port.saturating_add(2);
+        let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
+        let controller_addr: std::net::SocketAddr = controller_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse controller addr '{controller_addr_str}': {e}"
+            )))?;
+
+        let training_meta = Some(serde_json::json!({
+            "mode": "cluster-rank Sync+Cpu",
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "controller_addr": controller_addr_str,
+        }));
+
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Connect to the CpuAverager and complete the handshake. The
+            // launcher binds before spawning rank children, so the
+            // controller is up by the time we get here. Connect failure
+            // is a loud error per CpuReduceClient::connect.
+            let mut cpu_client = CpuReduceClient::connect(
+                controller_addr,
+                global_rank as u32,
+                world_size as u32,
+            )?;
+
+            // Build the local model; extract initial params for the
+            // root-broadcast then pin to CPU for the WorkerConfig.
+            let tmp_model = model_factory(device)?;
+            let initial_params_local: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_local: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+
+            // Broadcast initial params from rank 0 via the avg-trick.
+            // Each rank ends up with rank 0's values. Buffers (e.g.
+            // BatchNorm running stats) typically don't need broadcast at
+            // step 0 — they're either zero-initialized identically per
+            // factory determinism, or get rewritten by training before
+            // any first inference. Skip for now; reintroduce in a polish
+            // pass if a real workload surfaces the gap.
+            if !initial_params_local.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_local.iter().collect();
+                let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
+                for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                    dst.copy_(src, false)?;
+                }
+            }
+
+            let initial_params: Vec<Tensor> = initial_params_local
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_local
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha: None,
+                timeline: timeline_for_thread,
+                policy: ApplyPolicy::Sync,
+            };
+
+            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
+            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
+                worker_endpoints;
+
+            // GpuWorker built with nccl_comm = None: this slice uses the
+            // CPU client for all collectives. Worker channels held
+            // inside the closure so its internal sends silently buffer.
+            let mut worker = GpuWorker::new(
+                &worker_config,
+                model_factory,
+                optim_factory,
+                dataset,
+                None,
+                None,
+                timing_tx,
+                metrics_tx,
+                param_tx,
+                final_param_tx,
+                control_rx,
+            )?;
+
+            worker.run_self_driven_sync_cpu(&mut cpu_client, num_epochs, &train_fn)?;
+            let snap = worker.snapshot_params();
+            Ok(TrainedState {
+                params: snap
+                    .params
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+                buffers: snap
+                    .buffers
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(),
+            final_state: None,
+            metrics_rx: None,
+            architecture_svg: None,
             graph_label: None,
             graph_hash: None,
             training_meta,
