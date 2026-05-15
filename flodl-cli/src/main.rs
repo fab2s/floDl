@@ -1390,7 +1390,15 @@ fn dispatch_config(
     };
 
     if let Some(cluster) = cluster_to_dispatch {
-        return cluster::dispatch(&cluster, env, cmd, tail);
+        // Cluster mode: set env vars on this process so the user binary
+        // (spawned by the normal dispatch below) detects launcher role
+        // and fans out via flodl::distributed::launcher. Fall through —
+        // no early return. The launcher in the spawned subprocess owns
+        // fan-out, log fan-in, CpuAverager, exit propagation.
+        if let Err(e) = cluster::prepare_cluster_env(&cluster, env, cmd) {
+            cli_error!("{e}");
+            return ExitCode::FAILURE;
+        }
     }
 
     match outcome {

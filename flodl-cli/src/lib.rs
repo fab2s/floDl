@@ -61,8 +61,13 @@ pub mod completions;
 /// `fdl.yml` manifest loading, validation, and resolved-command types.
 pub mod config;
 
-/// Multi-host launcher: ssh fan-out for `cluster:`-marked commands.
-/// Entry point [`cluster::dispatch`]; recursion guard via [`cluster::should_dispatch`].
+/// Cluster-mode env preparation. fdl-cli sets `FLODL_FULL_CLUSTER_JSON`
+/// + `FLODL_FDL_CMD` + `FDL_ENV` on its process env so the user binary
+/// inherits them and detects launcher role via
+/// `flodl::distributed::launcher::dispatch`. Fan-out, log fan-in, and
+/// CpuAverager all live on the flodl side.
+/// Entry point [`cluster::prepare_cluster_env`]; recursion guard via
+/// [`cluster::should_dispatch`].
 pub mod cluster;
 
 /// `--gpus` flag parsing + single-host cluster envelope synthesis (loopback,
