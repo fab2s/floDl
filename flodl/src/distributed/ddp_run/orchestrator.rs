@@ -175,6 +175,31 @@ impl DdpHandle {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        // Cluster-mode detection: under the process-per-rank model,
+        // Trainer::builder runs inside each rank process — one device per
+        // process, no in-process N-thread coordinator. The new inline
+        // rank-loop scaffolding is being staged across 4b.D.1a sub-slices
+        // (one ApplyPolicy × AverageBackend combo per commit). Until the
+        // matching slice lands, fail loudly so users get a clear pointer
+        // instead of a confusing N² worker fan-out that doesn't reflect
+        // the actual cluster topology.
+        if let Some(cluster) = crate::distributed::cluster::LocalCluster::from_env()? {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "Trainer::builder in cluster mode (this rank lives on host \
+                 {:?} with global ranks {:?}, world_size {}) is being \
+                 refactored — the single-rank inline loop lands in 4b.D.1a.ii \
+                 (Sync+Nccl), 4b.D.1a.iii (Cadence+Nccl), 4b.D.1a.iv (Async+Nccl), \
+                 4b.D.1b (Cpu backend), 4b.D.1c (3-phase port), 4b.D.1d (chunk \
+                 dispatch port). Until then, use Trainer::setup / setup_with for \
+                 cluster-aware training (user owns the loop), or invoke \
+                 Trainer::builder outside cluster mode (no FLODL_CLUSTER_JSON, \
+                 e.g. `cargo run` directly).",
+                cluster.host.name,
+                cluster.host.ranks,
+                cluster.world_size(),
+            )));
+        }
+
         let devices = crate::tensor::usable_cuda_devices();
 
         // Single-GPU fallback: run on main thread, no coordinator.
