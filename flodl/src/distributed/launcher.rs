@@ -73,6 +73,35 @@ use crate::tensor::{Result, TensorError};
 /// instead via `FLODL_CLUSTER_JSON`).
 pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
 
+/// Environment variable carrying the fdl command name (e.g. `train`) the
+/// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
+/// fdl-cli when invoking the user binary as a launcher; required by the
+/// ssh fan-out path. Local fork+exec doesn't consume this — the launcher
+/// re-execs `current_exe()` directly with its own argv.
+pub const ENV_FDL_CMD: &str = "FLODL_FDL_CMD";
+
+/// Environment variable carrying the overlay-env name (e.g. `cluster`) so
+/// the remote `fdl <cmd>` invocation resolves the same overlay-merged
+/// `fdl.<env>.yml` view the controller did. Optional; absent means no
+/// overlay (base `fdl.yml` only).
+pub const ENV_FDL_ENV: &str = "FDL_ENV";
+
+/// SSH options shared by every remote host invocation. Match fdl-cli's
+/// existing flodl-cli/src/cluster.rs constants verbatim:
+/// - `-T`: disable PTY (keeps stdout/stderr clean)
+/// - `ServerAliveInterval=10` + `ServerAliveCountMax=3`: client gives up
+///   after ~30s of silence so a dead remote doesn't hang the controller
+/// - `BatchMode=yes`: fail fast on auth issues; no interactive prompts
+const SSH_OPTS: &[&str] = &[
+    "-T",
+    "-o",
+    "ServerAliveInterval=10",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-o",
+    "BatchMode=yes",
+];
+
 /// Role this process plays in the cluster, decided by [`dispatch`].
 ///
 /// Returned to the caller so it can either continue with training
@@ -142,10 +171,12 @@ fn on_off(b: bool) -> &'static str {
 /// Launcher-mode orchestration. Read full topology, spawn ranks, wait
 /// for them, return when every rank child has exited.
 ///
-/// **4b.B.4a scope: local-only fan-out.** Spawns rank processes for
-/// the host whose name matches this launcher's hostname (fork-exec of
-/// `current_exe`). Errors loudly when the topology lists any other host
-/// (ssh fan-out lands in 4b.B.4b).
+/// Local hosts (`host.name == this_hostname`) get fork+exec of
+/// `current_exe()` with env vars set directly. Remote hosts get
+/// `ssh <target> bash -lc '<remote_cmd>'`, where `<remote_cmd>` exports
+/// env vars and execs `fdl <cmd>` — same shape fdl-cli used to use
+/// before this lift. Both produce identical child semantics (piped
+/// streams, [host:rN] line-prefix on stdout/stderr).
 ///
 /// **Not yet wired:** during the 4b transition, today's
 /// `flodl-cli/src/cluster.rs` still does its own N-child fan-out, so
@@ -157,110 +188,113 @@ fn run_launcher() -> Result<()> {
     let full = FullCluster::from_env()?;
     let me = crate::distributed::cluster::resolve_hostname()?;
 
-    // Reject ssh-requiring topologies in 4b.B.4a.
-    for host in &full.hosts {
-        if host.name != me && host.ssh.is_some() {
-            return Err(TensorError::new(&format!(
-                "cluster launcher: ssh fan-out to remote host {:?} not yet \
-                 implemented (4b.B.4b). Local-only topologies work in this \
-                 build.",
-                host.name
-            )));
-        }
-        if host.name != me && host.ssh.is_none() {
-            return Err(TensorError::new(&format!(
-                "cluster launcher: host {:?} declared but missing ssh: field \
-                 and hostname doesn't match this launcher ({me:?}). Either \
-                 set ssh: for remote hosts (deferred to 4b.B.4b) or restrict \
-                 the topology to this host.",
-                host.name
-            )));
-        }
+    // Controller participation is implicit-by-presence in cluster.hosts.
+    // Orchestrator-only mode (controller not in hosts) is valid; spawn
+    // remote ranks but no local rank for this host.
+    let my_host_idx = full.hosts.iter().position(|h| h.name == me);
+    if my_host_idx.is_none() {
+        eprintln!(
+            "cluster launcher: controller hostname {me:?} not in cluster.hosts; \
+             running orchestrator-only (no rank on this host)."
+        );
     }
 
-    // Find our host's slice.
-    let my_host = full.hosts.iter().find(|h| h.name == me).ok_or_else(|| {
-        TensorError::new(&format!(
-            "cluster launcher: this host's name {me:?} doesn't appear in \
-             cluster.hosts. Controller-without-rank orchestrator-only mode \
-             isn't supported in 4b.B.4a (no remote hosts to spawn). Add this \
-             host to cluster.hosts or run on a host that's already listed."
-        ))
-    })?;
-
+    // For remote hosts, fdl-cli must have passed the original fdl command
+    // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent;
+    // 4b.C is responsible for setting it.
+    let has_remote = full.hosts.iter().any(|h| h.name != me);
+    let fdl_cmd = if has_remote {
+        Some(env::var(ENV_FDL_CMD).map_err(|_| {
+            TensorError::new(&format!(
+                "cluster launcher: topology has remote hosts but {ENV_FDL_CMD} \
+                 is not set in env. fdl-cli must export the fdl command name \
+                 (e.g. {ENV_FDL_CMD}=train) when invoking the launcher; this is \
+                 expected to land in 4b.C alongside the single-launcher-child \
+                 flip in flodl-cli/src/cluster.rs."
+            ))
+        })?)
+    } else {
+        None
+    };
+    let overlay_env = env::var(ENV_FDL_ENV).ok().filter(|s| !s.trim().is_empty());
+    let user_args: Vec<String> = env::args().skip(1).collect();
     let exe = env::current_exe().map_err(|e| {
         TensorError::new(&format!(
             "cluster launcher: current_exe() failed: {e}"
         ))
     })?;
-    let user_args: Vec<String> = env::args().skip(1).collect();
 
-    // Spawn one child per rank on this host.
-    let mut children: Vec<(usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
-        Vec::with_capacity(my_host.ranks.len());
-    for local_rank in 0..my_host.ranks.len() {
-        let envelope = build_slim_envelope_for(&full, my_host);
-        let envelope_hex = crate::distributed::cluster::hex_encode(
-            serde_json::to_string(&envelope)
-                .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster launcher: serialize slim envelope failed: {e}"
-                    ))
-                })?
-                .as_bytes(),
-        );
+    // Spawn one child per rank across every host.
+    let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
+        Vec::with_capacity(full.world_size());
+    for host in &full.hosts {
+        for local_rank in 0..host.ranks.len() {
+            let envelope = build_slim_envelope_for(&full, host);
+            let envelope_hex = crate::distributed::cluster::hex_encode(
+                serde_json::to_string(&envelope)
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster launcher: serialize slim envelope failed: {e}"
+                        ))
+                    })?
+                    .as_bytes(),
+            );
 
-        let mut cmd = Command::new(&exe);
-        cmd.args(&user_args)
-            .env(
-                crate::distributed::cluster::ENV_CLUSTER_JSON,
-                &envelope_hex,
-            )
-            .env(
-                crate::distributed::cluster::ENV_LOCAL_RANK,
-                local_rank.to_string(),
-            )
-            // FLODL_FULL_CLUSTER_JSON is launcher-only — strip it from
-            // children so they detect Role::Rank, not Role::Launcher.
-            .env_remove(ENV_FULL_CLUSTER_JSON)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            let mut cmd = if host.name == me {
+                build_local_spawn_command(&exe, &user_args, &envelope_hex, local_rank)
+            } else {
+                let remote_cmd = build_remote_bash_command(
+                    &host.path,
+                    &envelope_hex,
+                    &host.name,
+                    local_rank,
+                    overlay_env.as_deref(),
+                    fdl_cmd
+                        .as_deref()
+                        .expect("ENV_FDL_CMD presence enforced above when has_remote"),
+                    &user_args,
+                );
+                build_ssh_spawn_command(host.ssh.as_deref().unwrap_or(&host.name), &remote_cmd)
+            };
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            TensorError::new(&format!(
-                "cluster launcher: spawn rank {local_rank} of {} failed: {e}",
-                my_host.name
-            ))
-        })?;
+            let mut child = cmd.spawn().map_err(|e| {
+                let kind = if host.name == me { "local bash/exec" } else { "ssh" };
+                TensorError::new(&format!(
+                    "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
+                    host.name
+                ))
+            })?;
 
-        // Forward stdout/stderr line-by-line with a rank prefix so the
-        // controller's terminal shows interleaved-but-attributable output.
-        let global_rank = my_host.ranks[local_rank];
-        let prefix = format!("[{}:r{global_rank}] ", my_host.name);
-        let mut forwarders = Vec::with_capacity(2);
-        if let Some(out) = child.stdout.take() {
-            let prefix_clone = prefix.clone();
-            forwarders.push(thread::spawn(move || {
-                forward_lines(out, prefix_clone, false);
-            }));
+            let global_rank = host.ranks[local_rank];
+            let prefix = format!("[{}:r{global_rank}] ", host.name);
+            let mut forwarders = Vec::with_capacity(2);
+            if let Some(out) = child.stdout.take() {
+                let prefix_clone = prefix.clone();
+                forwarders.push(thread::spawn(move || {
+                    forward_lines(out, prefix_clone, false);
+                }));
+            }
+            if let Some(err) = child.stderr.take() {
+                let prefix_clone = prefix.clone();
+                forwarders.push(thread::spawn(move || {
+                    forward_lines(err, prefix_clone, true);
+                }));
+            }
+            children.push((host.name.clone(), local_rank, child, forwarders));
         }
-        if let Some(err) = child.stderr.take() {
-            let prefix_clone = prefix.clone();
-            forwarders.push(thread::spawn(move || {
-                forward_lines(err, prefix_clone, true);
-            }));
-        }
-        children.push((local_rank, child, forwarders));
     }
+    let _ = my_host_idx; // currently unused but kept for parity with future logic
 
-    // Wait for every child + join forwarders. Propagate non-zero exit
-    // codes as a loud error.
+    // Wait for every child + join forwarders. Propagate first non-zero
+    // exit; keep waiting on the rest so we don't leave zombies.
     let mut any_failure: Option<TensorError> = None;
-    for (local_rank, mut child, forwarders) in children {
+    for (host_name, local_rank, mut child, forwarders) in children {
         let status = child.wait().map_err(|e| {
             TensorError::new(&format!(
-                "cluster launcher: wait on rank {local_rank} failed: {e}"
+                "cluster launcher: wait on rank {local_rank} of {host_name} failed: {e}"
             ))
         })?;
         for f in forwarders {
@@ -269,11 +303,8 @@ fn run_launcher() -> Result<()> {
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             let msg = format!(
-                "cluster launcher: rank {local_rank} of {} exited with status {code}",
-                my_host.name
+                "cluster launcher: rank {local_rank} of {host_name} exited with status {code}"
             );
-            // Keep the first failure; continue waiting on the rest so
-            // we don't leave zombies if multiple ranks die.
             if any_failure.is_none() {
                 any_failure = Some(TensorError::new(&msg));
             } else {
@@ -285,6 +316,107 @@ fn run_launcher() -> Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+/// Build the `Command` that fork+execs a local rank child. Sets all the
+/// env vars the rank-side `LocalCluster::from_env` + `dispatch` expect,
+/// and strips `FLODL_FULL_CLUSTER_JSON` so the child detects `Role::Rank`.
+fn build_local_spawn_command(
+    exe: &std::path::Path,
+    user_args: &[String],
+    envelope_hex: &str,
+    local_rank: usize,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(user_args)
+        .env(
+            crate::distributed::cluster::ENV_CLUSTER_JSON,
+            envelope_hex,
+        )
+        .env(
+            crate::distributed::cluster::ENV_LOCAL_RANK,
+            local_rank.to_string(),
+        )
+        .env_remove(ENV_FULL_CLUSTER_JSON);
+    cmd
+}
+
+/// Build the `Command` that ssh's into a remote host and runs the given
+/// bash command string. Matches fdl-cli's existing ssh shape verbatim.
+fn build_ssh_spawn_command(ssh_target: &str, remote_cmd: &str) -> Command {
+    let mut c = Command::new("ssh");
+    c.args(SSH_OPTS).arg(ssh_target).arg(remote_cmd);
+    c
+}
+
+/// Build the bash command shipped via ssh to the remote.
+///
+/// Single level of shell quoting: ssh delivers the string verbatim to
+/// the remote login shell, which parses it once. Every interpolated
+/// value is single-quoted via [`shell_quote`]. `exec` replaces the
+/// bash process so the remote returns fdl's exit code directly.
+///
+/// Mirrors fdl-cli's `build_remote_command` exactly (this is the move
+/// of that logic into flodl proper, per the 4b boundary lift).
+fn build_remote_bash_command(
+    path: &str,
+    cluster_json_hex: &str,
+    host_name: &str,
+    local_rank: usize,
+    overlay_env: Option<&str>,
+    fdl_cmd: &str,
+    user_args: &[String],
+) -> String {
+    use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_HOST_OVERRIDE, ENV_LOCAL_RANK};
+
+    let mut s = String::with_capacity(
+        256 + cluster_json_hex.len() + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
+    );
+    s.push_str("cd ");
+    s.push_str(&shell_quote(path));
+    s.push_str(" && ");
+    s.push_str(ENV_CLUSTER_JSON);
+    s.push('=');
+    s.push_str(&shell_quote(cluster_json_hex));
+    s.push(' ');
+    s.push_str(ENV_HOST_OVERRIDE);
+    s.push('=');
+    s.push_str(&shell_quote(host_name));
+    s.push(' ');
+    s.push_str(ENV_LOCAL_RANK);
+    s.push('=');
+    s.push_str(&local_rank.to_string());
+    if let Some(env) = overlay_env {
+        s.push(' ');
+        s.push_str(ENV_FDL_ENV);
+        s.push('=');
+        s.push_str(&shell_quote(env));
+    }
+    s.push_str(" exec fdl ");
+    s.push_str(&shell_quote(fdl_cmd));
+    for a in user_args {
+        s.push(' ');
+        s.push_str(&shell_quote(a));
+    }
+    s
+}
+
+/// Single-quote a string for shell consumption. Internal single quotes
+/// are escaped via the `'\''` idiom (close, backslash-escape, reopen).
+/// Same implementation as fdl-cli's; kept as a private helper here
+/// rather than introducing a shared utilities crate.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Build the slim per-host envelope JSON the rank process consumes via
@@ -787,6 +919,81 @@ mod tests {
         let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
         let env = build_slim_envelope_for(&full, master);
         assert_eq!(env["host"]["local_devices"], serde_json::json!([0]));
+    }
+
+    #[test]
+    fn shell_quote_simple() {
+        assert_eq!(shell_quote("foo"), "'foo'");
+    }
+
+    #[test]
+    fn shell_quote_with_spaces() {
+        assert_eq!(shell_quote("foo bar"), "'foo bar'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_internal_quotes() {
+        assert_eq!(shell_quote("don't"), "'don'\\''t'");
+    }
+
+    #[test]
+    fn build_remote_bash_command_shape() {
+        let s = build_remote_bash_command(
+            "/srv/flodl",
+            "abcd1234",
+            "worker-host",
+            0,
+            Some("cluster"),
+            "train",
+            &["--epochs".to_string(), "10".to_string()],
+        );
+        assert!(s.starts_with("cd '/srv/flodl' && "));
+        assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"));
+        assert!(s.contains("FLODL_HOST_NAME='worker-host'"));
+        assert!(s.contains("FLODL_LOCAL_RANK=0"));
+        assert!(s.contains("FDL_ENV='cluster'"));
+        assert!(s.contains("exec fdl 'train' '--epochs' '10'"));
+    }
+
+    #[test]
+    fn build_remote_bash_command_omits_fdl_env_when_none() {
+        let s = build_remote_bash_command(
+            "/srv/flodl",
+            "abcd",
+            "worker",
+            0,
+            None,
+            "train",
+            &[],
+        );
+        assert!(
+            !s.contains("FDL_ENV"),
+            "FDL_ENV must be absent when overlay_env is None; got: {s}"
+        );
+    }
+
+    #[test]
+    fn build_remote_bash_command_uses_exec() {
+        // `exec` is load-bearing: it replaces the bash process so the
+        // remote returns fdl's exit code directly. Catching this
+        // explicitly so a future refactor doesn't silently drop it.
+        let s = build_remote_bash_command(
+            "/srv", "ff", "w", 0, None, "train", &[],
+        );
+        assert!(s.contains(" exec fdl "), "missing `exec` prefix: {s}");
+    }
+
+    #[test]
+    fn build_remote_bash_command_quotes_dangerous_path() {
+        // Single quotes in the path must round-trip through the
+        // single-quote-escape idiom.
+        let s = build_remote_bash_command(
+            "/srv/it's", "ff", "w", 0, None, "train", &[],
+        );
+        assert!(
+            s.contains("cd '/srv/it'\\''s'"),
+            "path with single quote not properly escaped: {s}"
+        );
     }
 
     #[test]
