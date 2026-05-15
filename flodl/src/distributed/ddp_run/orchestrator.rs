@@ -195,14 +195,27 @@ impl DdpHandle {
                         config,
                     )
                 }
+                (ApplyPolicy::Cadence, AverageBackend::Nccl) => {
+                    Self::run_cluster_rank_cadence_nccl(
+                        cluster,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                    )
+                }
                 _ => Err(crate::tensor::TensorError::new(&format!(
-                    "Trainer::builder cluster mode: only ApplyPolicy::Sync + \
-                     AverageBackend::Nccl is implemented (4b.D.1a.ii). \
-                     Other combinations land in: Cadence+Nccl → 4b.D.1a.iii, \
-                     Async+Nccl → 4b.D.1a.iv, Cpu backend (all policies) → \
-                     4b.D.1b. Requested: {policy:?} + {backend:?}. Use \
-                     Trainer::setup / setup_with for cluster-aware training \
-                     in the meantime (user owns the loop).",
+                    "Trainer::builder cluster mode: ApplyPolicy::Sync + \
+                     AverageBackend::Nccl (4b.D.1a.ii) and ApplyPolicy::Cadence + \
+                     AverageBackend::Nccl (4b.D.1a.iii) are implemented. \
+                     Remaining combinations land in: Async+Nccl → 4b.D.1a.iv, \
+                     Cpu backend (all policies) → 4b.D.1b. Requested: \
+                     {policy:?} + {backend:?}. Use Trainer::setup / setup_with \
+                     for cluster-aware training in the meantime (user owns \
+                     the loop).",
                 ))),
             };
         }
@@ -1045,6 +1058,288 @@ impl DdpHandle {
             final_state: None,
             metrics_rx: None, // wired in a follow-up slice
             architecture_svg: None, // model lives inside thread; metadata deferred
+            graph_label: None,
+            graph_hash: None,
+            training_meta,
+        })
+    }
+
+    /// Cluster-rank entry point for `ApplyPolicy::Cadence + AverageBackend::Nccl`.
+    ///
+    /// Same shape as [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl)
+    /// but the inline loop runs the heterogeneous Local-SGD cadence protocol
+    /// from [`GpuWorker::run_self_driven_cadence_nccl`]:
+    ///
+    /// - Per-batch `train_step` (Local SGD: each rank advances independently)
+    /// - At ElChe-driven K boundary: cross-rank timing AllReduce → parameter
+    ///   AllReduce-Avg → [`ElChe::report_timing`] keeps every rank's cadence
+    ///   state in lockstep via the deterministic timing vector
+    ///
+    /// **Comm ownership:** the [`NcclRankComm`] is built inside the spawned
+    /// thread (rendezvous lives inside, since `M` isn't `Send`) and handed to
+    /// [`Ddp::from_comm`] after the initial-state broadcast. The
+    /// [`GpuWorker`] is constructed with `nccl_comm = None`; the cadence
+    /// loop drives all NCCL collectives through the `Ddp` handle
+    /// (`average_params`, `all_reduce_per_rank_f64`).
+    ///
+    /// **ElChe construction** mirrors the orchestrator's main path:
+    /// `anchor` / `max_anchor` / `min_anchor` / `overhead_target` /
+    /// `max_batch_diff` from [`DdpRunConfig`]; cold-start anchor pick
+    /// follows the same precedence (`partition_ratios` > device-indices
+    /// prior).
+    ///
+    /// **Not yet wired in this slice (4b.D.1a.iii):** progressive chunk
+    /// dispatch, per-epoch metrics aggregation, `epoch_fn` / `metrics_fn` /
+    /// `scheduler_fn` / `checkpoint_every` / `convergence_guard` callbacks,
+    /// divergence-driven early sync (Async-only — 4b.D.1a.iv).
+    ///
+    /// [`GpuWorker::run_self_driven_cadence_nccl`]:
+    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_cadence_nccl
+    /// [`Ddp::from_comm`]: crate::distributed::Ddp::from_comm
+    /// [`ElChe::report_timing`]: crate::distributed::ElChe::report_timing
+    #[allow(clippy::too_many_arguments)]
+    fn run_cluster_rank_cadence_nccl<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::nccl::NcclRankComm;
+        use crate::distributed::ddp::{Ddp, ElChe};
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Cadence+Nccl)"
+        );
+
+        let training_meta = Some(serde_json::json!({
+            "mode": "cluster-rank Cadence+Nccl",
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+        }));
+
+        // ElChe construction snapshot — mirrors orchestrator main path's
+        // Step 3 (`crate::distributed::ddp::ElChe::new(world_size, anchor)`
+        // + with_overhead_target / with_max_anchor / with_min_anchor /
+        // with_max_batch_diff / cold-start pick). Hoisted out of the
+        // thread closure so the inputs are Send; the ElChe is rebuilt
+        // inside the thread (ElChe is `Clone`-free, simpler to recompute
+        // than to plumb).
+        let anchor = config.anchor.unwrap_or(10);
+        let overhead_target = config.overhead_target;
+        let max_anchor = config.max_anchor;
+        let min_anchor = config.min_anchor;
+        let max_batch_diff = config.max_batch_diff;
+        let partition_ratios = config.partition_ratios.clone();
+        let elche_relax_up = config.elche_relax_up;
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+
+        // CUDA device indices for ElChe cold-start prior (slow-rank pick by
+        // compute capability + VRAM). Empty when this rank isn't on CUDA;
+        // ElChe falls back to rank 0 as the slow rank in that case.
+        let cuda_idx_for_thread: Option<i32> = match device {
+            Device::CUDA(idx) => Some(idx as i32),
+            _ => None,
+        };
+
+        let dataset_sig = [0u8; 32];
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            let rdv = cluster.rendezvous(dataset_sig)?;
+            let nccl_comm = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+
+            // Build tmp model, broadcast initial state from rank 0 via the
+            // raw comm (Ddp::sync_params would do this but Ddp's params
+            // borrow into model fields; doing it before Ddp::from_comm is
+            // simpler and avoids re-grabbing tensor handles).
+            let tmp_model = model_factory(device)?;
+            let initial_params_gpu: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_gpu: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+            if !initial_params_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            if !initial_buffers_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            let initial_params: Vec<Tensor> = initial_params_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Hand comm ownership to Ddp; the cadence loop drives all
+            // collectives through `ddp` (average_params,
+            // all_reduce_per_rank_f64). Borrows tmp_model only for the
+            // parameter/buffer-list extraction; tmp_model is dropped right
+            // after so the rebuilt model inside GpuWorker owns the live
+            // Variables.
+            let ddp = Ddp::from_comm(nccl_comm, &tmp_model, device)?;
+            drop(tmp_model);
+
+            // Build ElChe per the orchestrator main-path recipe. Cold-start
+            // anchor pick: partition_ratios (smallest = slow) > device-
+            // indices prior. Every rank sees the same inputs, so every
+            // ElChe instance starts identically.
+            let mut el_che = ElChe::new(world_size, anchor);
+            if let Some(target) = overhead_target {
+                el_che = el_che.with_overhead_target(target);
+            }
+            if let Some(max) = max_anchor {
+                el_che = el_che.with_max_anchor(max);
+            }
+            if let Some(min) = min_anchor {
+                el_che = el_che.with_min_anchor(min);
+            }
+            if let Some(diff) = max_batch_diff {
+                el_che = el_che.with_max_batch_diff(diff);
+            }
+            if let Some(ratios) = partition_ratios.as_ref() {
+                if ratios.len() == world_size {
+                    if let Some((slow_rank, _)) = ratios
+                        .iter()
+                        .enumerate()
+                        .min_by(|(ra, a), (rb, b)| {
+                            a.partial_cmp(b)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(ra.cmp(rb))
+                        })
+                    {
+                        el_che = el_che.with_initial_anchor(slow_rank);
+                    }
+                }
+            } else if let Some(idx) = cuda_idx_for_thread {
+                // Single-rank device-indices prior: every rank only knows
+                // its own device. The orchestrator main path gathered all
+                // ranks' devices before calling with_device_indices, but
+                // in cluster-rank mode we'd need a cross-rank AllReduce to
+                // reproduce that — deferred. Passing the single-element
+                // slice is a no-op for the prior (with_device_indices
+                // requires len == world_size).
+                let _ = idx; // intentionally unused: see comment above
+            }
+
+            // Partition sizes per orchestrator main-path policy: explicit
+            // partition_ratios > throughput_sizes if calibrated > equal.
+            // First-epoch ElChe is uncalibrated, so this defaults to
+            // equal_sizes — matches old coordinator behavior (Cadence
+            // recomputes per epoch from current ElChe state, but the
+            // inline loop currently uses a single partition for all
+            // epochs; per-epoch rebalance is deferred along with the
+            // metrics/callback wiring).
+            let partition_sizes: Vec<usize> = if let Some(ratios) = partition_ratios.as_ref() {
+                super::coordinator::ratio_to_sizes(ratios, total_samples)
+            } else if el_che.is_calibrated() || el_che.has_speed_hint() {
+                super::coordinator::throughput_sizes(&el_che, total_samples)
+            } else {
+                super::coordinator::equal_sizes(world_size, total_samples)
+            };
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha: None,
+                timeline: timeline_for_thread,
+                policy: ApplyPolicy::Cadence,
+            };
+
+            // Worker channels: nothing drains them in cluster-rank mode.
+            // Held inside the closure so the worker's internal sends
+            // silently buffer until the channel is dropped.
+            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
+            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
+                worker_endpoints;
+
+            // GpuWorker built with `nccl_comm = None`: this slice routes
+            // every NCCL op through `ddp` above. Future Async slice may
+            // need worker-internal NCCL access (divergence-driven early
+            // trigger via `sync_now_nccl`) — at which point the comm
+            // ownership story revisits.
+            let mut worker = GpuWorker::new(
+                &worker_config,
+                model_factory,
+                optim_factory,
+                dataset,
+                None,
+                None,
+                timing_tx,
+                metrics_tx,
+                param_tx,
+                final_param_tx,
+                control_rx,
+            )?;
+
+            worker.run_self_driven_cadence_nccl(
+                &ddp,
+                &mut el_che,
+                &partition_sizes,
+                elche_relax_up,
+                num_epochs,
+                &train_fn,
+            )?;
+            let snap = worker.snapshot_params();
+            Ok(TrainedState {
+                params: snap
+                    .params
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+                buffers: snap
+                    .buffers
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(),
+            final_state: None,
+            metrics_rx: None,
+            architecture_svg: None,
             graph_label: None,
             graph_hash: None,
             training_meta,

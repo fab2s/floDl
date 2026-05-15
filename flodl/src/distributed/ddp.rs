@@ -177,6 +177,57 @@ impl Ddp {
         Ok(Ddp { comms, device, params, buffers })
     }
 
+    /// Build a `Ddp` from an existing per-rank NCCL communicator.
+    ///
+    /// Unlike [`Ddp::wrap`], which initializes a fresh
+    /// [`NcclRankComm`](super::NcclRankComm) via `init_rank`, this constructor
+    /// takes ownership of one that's already joined to the cluster group.
+    /// Use when the rendezvous + `init_rank` are driven externally (e.g. the
+    /// cluster-rank inline loops in
+    /// [`DdpBuilder`](crate::distributed::ddp_run::DdpBuilder), which need
+    /// access to the raw comm for broadcasting initial state before wrapping).
+    ///
+    /// Loud errors: `device` mismatch with the rank's bound CUDA device is
+    /// the caller's responsibility — no runtime check (FFI-level guarantees
+    /// already enforce same-device tensors per AllReduce).
+    pub fn from_comm(
+        comms: NcclRankComm,
+        model: &dyn Module,
+        device: Device,
+    ) -> Result<Self> {
+        let params: Vec<Variable> = model
+            .parameters()
+            .into_iter()
+            .map(|p| p.variable)
+            .collect();
+        let buffers: Vec<Buffer> = model.buffers();
+        Ok(Ddp { comms, device, params, buffers })
+    }
+
+    /// In-place AllReduce-average of parameters across all ranks (Local SGD).
+    ///
+    /// Use this at the cadence boundary of a Local-SGD loop: each rank does
+    /// `forward → backward → optimizer.step()` every batch independently,
+    /// then every K batches the param vectors are averaged across ranks via
+    /// NCCL AllReduce-Avg. Convergence properties match PyTorch's
+    /// `PostLocalSGDOptimizer` family.
+    ///
+    /// Distinct from [`all_reduce_gradients`](Self::all_reduce_gradients),
+    /// which averages **gradients** before the optimizer step (synchronous
+    /// minibatch SGD). The two are different algorithms — choose the one
+    /// matching the cadence policy.
+    ///
+    /// All ranks must call concurrently.
+    pub fn average_params(&self) -> Result<()> {
+        let tensors: Vec<Tensor> = self.params.iter().map(|v| v.data()).collect();
+        if tensors.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<&Tensor> = tensors.iter().collect();
+        self.comms.all_reduce(&refs, ReduceOp::Avg)?;
+        Ok(())
+    }
+
     /// Broadcast parameters and buffers from rank 0 to all ranks.
     pub fn sync_params(&self) -> Result<()> {
         let p_tensors: Vec<Tensor> = self.params.iter().map(|v| v.data()).collect();

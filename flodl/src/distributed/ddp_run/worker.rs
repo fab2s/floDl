@@ -886,6 +886,134 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
+    /// Self-driven inline training loop for `ApplyPolicy::Cadence +
+    /// AverageBackend::Nccl` — heterogeneous Local-SGD with ElChe-driven K.
+    ///
+    /// Mirrors the old threaded coordinator's Cadence behavior (per-batch
+    /// `optimizer.step()`, parameter AllReduce-Avg at the cadence boundary)
+    /// in inline-loop form. The cycle protocol matches what the coordinator
+    /// drove externally via `SyncNow` control messages:
+    ///
+    /// 1. Run `train_step` (forward + backward + optimizer step) until the
+    ///    rank's `local_batch_idx` reaches `el_che.batch_counts()[rank]`.
+    /// 2. Measure wall time for the cycle and AllReduce the per-rank vector
+    ///    via `ddp.all_reduce_per_rank_f64` — deterministic, identical on
+    ///    every rank, no broadcast.
+    /// 3. AllReduce-Avg the parameter vectors via `ddp.average_params` and
+    ///    record the sync wall time.
+    /// 4. Feed `(wall_ms_vec, batch_counts, sync_ms)` into
+    ///    [`ElChe::report_timing`] so every rank advances its cadence state
+    ///    in lockstep.
+    /// 5. Optionally [`ElChe::relax_anchor_up`] if the caller opted in via
+    ///    `elche_relax_up`.
+    ///
+    /// **Behavior preserved:** same `train_step` (CUDA stream pinning,
+    /// per-rank grad clipping, scheduler, optimizer step), same Local-SGD
+    /// param-Avg semantics (matches old `sync_now_nccl` minus the
+    /// divergence telemetry, which is deferred to the Async slice along
+    /// with the rest of the divergence-aware machinery).
+    ///
+    /// **Not yet supported (carried forward through 4b.D.1a.iv / 1b):**
+    /// VRAM-aware prefetch, per-epoch [`MetricsMsg`] aggregation,
+    /// `epoch_fn` / `metrics_fn` / `scheduler_fn` / `checkpoint_every` /
+    /// `convergence_guard` callbacks, divergence-driven early sync
+    /// (Async-only — see 4b.D.1a.iv).
+    pub fn run_self_driven_cadence_nccl(
+        &mut self,
+        ddp: &super::super::ddp::Ddp,
+        el_che: &mut super::super::ddp::ElChe,
+        partition_sizes: &[usize],
+        elche_relax_up: bool,
+        num_epochs: usize,
+        train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
+    ) -> Result<()> {
+        if partition_sizes.len() != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_cadence_nccl: partition_sizes len ({}) \
+                 must equal world_size ({})",
+                partition_sizes.len(), self.world_size,
+            )));
+        }
+        if ddp.world_size() != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_cadence_nccl: ddp world_size ({}) \
+                 must equal worker world_size ({})",
+                ddp.world_size(), self.world_size,
+            )));
+        }
+
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        let total_samples = self.dataset.len();
+        let my_offset: usize = partition_sizes.iter().take(self.rank).sum();
+        let my_size = partition_sizes[self.rank];
+
+        for epoch in 0..num_epochs {
+            self.current_epoch = epoch;
+            self.partition = make_partition(
+                my_offset, my_size, total_samples, epoch, self.base_seed,
+            );
+
+            let num_batches = self.partition.len() / self.batch_size;
+            let mut local_batch_idx: usize = 0;
+            let mut cycle_start: Option<Instant> = None;
+
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * self.batch_size;
+                let end = start + self.batch_size;
+                let indices = &self.partition[start..end];
+                let batch = self.dataset.get_batch(indices)?;
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch
+                        .into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+
+                if cycle_start.is_none() {
+                    cycle_start = Some(Instant::now());
+                }
+                let (_loss, _ms) = self.train_step(&batch, train_fn)?;
+                local_batch_idx += 1;
+
+                let target = el_che.batch_counts()[self.rank];
+                if local_batch_idx >= target {
+                    let cycle_wall_ms = cycle_start
+                        .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+
+                    // Cross-rank timing AllReduce: each rank writes its own
+                    // slot, AllReduce-Sum yields the gathered vector on every
+                    // rank — ElChe::report_timing's input.
+                    let mut wall_ms_vec = vec![0.0f64; self.world_size];
+                    wall_ms_vec[self.rank] = cycle_wall_ms;
+                    ddp.all_reduce_per_rank_f64(&mut wall_ms_vec)?;
+
+                    // Snapshot batch_counts BEFORE averaging — report_timing
+                    // mutates state and a borrow against `el_che` after the
+                    // mutable call would conflict.
+                    let counts: Vec<usize> = el_che.batch_counts().to_vec();
+
+                    let sync_start = Instant::now();
+                    ddp.average_params()?;
+                    let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+
+                    el_che.report_timing(&wall_ms_vec, &counts, sync_ms);
+                    if elche_relax_up {
+                        el_che.relax_anchor_up();
+                    }
+
+                    self.steps_since_avg = 0;
+                    local_batch_idx = 0;
+                    cycle_start = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Process pending control messages (non-blocking).
     ///
     /// Returns `true` if a Shutdown was received.
