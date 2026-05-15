@@ -1176,6 +1176,166 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
+    /// Self-driven inline training loop for `ApplyPolicy::Cadence +
+    /// AverageBackend::Cpu` — CPU-averaging counterpart of
+    /// [`Self::run_self_driven_cadence_nccl`].
+    ///
+    /// Same per-cycle protocol as the NCCL version (timing AllReduce →
+    /// param AllReduce-Avg with weight-space divergence → cross-rank
+    /// gather of `(divergence, pre_norm)` → `ElChe::report_timing` →
+    /// `convergence_guard.report(...)` → [`ConvergenceAction`] applied
+    /// to ElChe), but every collective routes through
+    /// [`CpuReduceClient`] instead of NCCL:
+    ///
+    /// - `cpu_client.all_reduce_per_rank_f64(...)` — gather timing /
+    ///   divergence / pre_norm vectors via the avg-trick
+    /// - `cpu_client.average_params_with_divergence(&params, &scratch)`
+    ///   — TCP round-trip averaging + scratch-based divergence triple
+    ///
+    /// `Async + Cpu` is **not** routed here: genuine async semantics
+    /// require the 3-phase Idle/Collecting/Computing machine that
+    /// lands in 4b.D.1c. Cadence + Cpu is the blocking-reduce variant.
+    ///
+    /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
+    /// [`ConvergenceAction`]: super::convergence::ConvergenceAction
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_self_driven_cadence_cpu(
+        &mut self,
+        cpu_client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
+        el_che: &mut super::super::ddp::ElChe,
+        convergence_guard: &mut dyn super::convergence::ConvergenceGuard,
+        scratch: &[Tensor],
+        partition_sizes: &[usize],
+        elche_relax_up: bool,
+        num_epochs: usize,
+        train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
+    ) -> Result<()> {
+        use super::convergence::{ConvergenceAction, DivergenceReport};
+
+        if partition_sizes.len() != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_cadence_cpu: partition_sizes len ({}) \
+                 must equal world_size ({})",
+                partition_sizes.len(), self.world_size,
+            )));
+        }
+        if (cpu_client.world_size() as usize) != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_cadence_cpu: cpu_client world_size \
+                 ({}) must equal worker world_size ({})",
+                cpu_client.world_size(), self.world_size,
+            )));
+        }
+
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        let total_samples = self.dataset.len();
+        let my_offset: usize = partition_sizes.iter().take(self.rank).sum();
+        let my_size = partition_sizes[self.rank];
+
+        for epoch in 0..num_epochs {
+            self.current_epoch = epoch;
+            self.partition = make_partition(
+                my_offset, my_size, total_samples, epoch, self.base_seed,
+            );
+
+            let num_batches = self.partition.len() / self.batch_size;
+            let mut local_batch_idx: usize = 0;
+            let mut cycle_start: Option<Instant> = None;
+
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * self.batch_size;
+                let end = start + self.batch_size;
+                let indices = &self.partition[start..end];
+                let batch = self.dataset.get_batch(indices)?;
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch
+                        .into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+
+                if cycle_start.is_none() {
+                    cycle_start = Some(Instant::now());
+                }
+                let (_loss, _ms) = self.train_step(&batch, train_fn)?;
+                local_batch_idx += 1;
+
+                let target = el_che.batch_counts()[self.rank];
+                if local_batch_idx >= target {
+                    let cycle_wall_ms = cycle_start
+                        .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+
+                    // Cross-rank timing AllReduce via CPU avg-trick.
+                    let mut wall_ms_vec = vec![0.0f64; self.world_size];
+                    wall_ms_vec[self.rank] = cycle_wall_ms;
+                    cpu_client.all_reduce_per_rank_f64(&mut wall_ms_vec)?;
+
+                    let counts: Vec<usize> = el_che.batch_counts().to_vec();
+
+                    // Param AllReduce-Avg + weight-space divergence triple
+                    // via CPU client. Build the &[&Tensor] view over
+                    // self.param_vars once for this cycle.
+                    let param_tensors: Vec<Tensor> = self
+                        .param_vars
+                        .iter()
+                        .map(|v| v.data())
+                        .collect();
+                    let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
+                    let sync_start = Instant::now();
+                    let (local_div, local_post, local_pre) = cpu_client
+                        .average_params_with_divergence(&param_refs, scratch)?;
+                    let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Gather divergence + pre_norm across ranks.
+                    let mut deltas = vec![0.0f64; self.world_size];
+                    deltas[self.rank] = local_div;
+                    cpu_client.all_reduce_per_rank_f64(&mut deltas)?;
+
+                    let mut pre_norms_vec = vec![0.0f64; self.world_size];
+                    pre_norms_vec[self.rank] = local_pre.unwrap_or(0.0);
+                    cpu_client.all_reduce_per_rank_f64(&mut pre_norms_vec)?;
+                    let pre_norms: Option<Vec<f64>> = if local_pre.is_some() {
+                        Some(pre_norms_vec)
+                    } else {
+                        None
+                    };
+
+                    el_che.report_timing(&wall_ms_vec, &counts, sync_ms);
+
+                    let report = DivergenceReport {
+                        deltas,
+                        pre_norms,
+                        post_norm: local_post,
+                    };
+                    let cycle_batches: usize = counts.iter().sum();
+                    let k_max = counts.iter().copied().max().unwrap_or(0);
+                    let action =
+                        convergence_guard.report(&report, cycle_batches, k_max);
+                    match action {
+                        ConvergenceAction::Stable => {
+                            if elche_relax_up {
+                                el_che.relax_anchor_up();
+                            }
+                        }
+                        ConvergenceAction::SuppressGrowth => {}
+                        ConvergenceAction::NudgeDown { factor } => {
+                            el_che.nudge_anchor_down(factor);
+                        }
+                    }
+
+                    self.steps_since_avg = 0;
+                    local_batch_idx = 0;
+                    cycle_start = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Process pending control messages (non-blocking).
     ///
     /// Returns `true` if a Shutdown was received.

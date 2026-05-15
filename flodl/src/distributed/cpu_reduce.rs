@@ -235,6 +235,135 @@ impl CpuReduceClient {
         let scaled_refs: Vec<&Tensor> = scaled.iter().collect();
         self.all_reduce_tensors(&scaled_refs)
     }
+
+    /// AllReduce-gather a per-rank `f64` measurement vector across the
+    /// cluster via the avg-trick.
+    ///
+    /// `local` must be length `world_size`. Each rank writes its own
+    /// measurement into its own slot (other slots zero). The values are
+    /// scaled by `world_size` before send so the controller's
+    /// divide-by-`world_size` cancels, yielding the gathered vector on
+    /// every rank.
+    ///
+    /// Counterpart to [`Ddp::all_reduce_per_rank_f64`](crate::distributed::Ddp::all_reduce_per_rank_f64)
+    /// — same semantics, CPU-routed. v1 carries f32 over the wire (the
+    /// controller's only supported dtype); precision is preserved at the
+    /// millisecond level for ElChe timing and at f32-mantissa precision
+    /// for divergence aggregation, both within tolerance of the
+    /// downstream consumers.
+    ///
+    /// All ranks must call concurrently.
+    pub fn all_reduce_per_rank_f64(&mut self, local: &mut [f64]) -> Result<()> {
+        let world_size = self.world_size as usize;
+        if local.len() != world_size {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: all_reduce_per_rank_f64: vector len ({}) must \
+                 equal world_size ({})",
+                local.len(),
+                world_size,
+            )));
+        }
+        let n = self.world_size as f32;
+        let scaled: Vec<f32> = local.iter().map(|v| (*v as f32) * n).collect();
+        let tensor = Tensor::from_f32(
+            &scaled,
+            &[world_size as i64],
+            Device::CPU,
+        )?;
+        let avg = self.all_reduce_tensors(&[&tensor])?;
+        let out = avg[0].to_f32_vec()?;
+        for (dst, src) in local.iter_mut().zip(out) {
+            *dst = src as f64;
+        }
+        Ok(())
+    }
+
+    /// AllReduce-average tensors and return this rank's weight-space
+    /// divergence triple `(divergence, post_norm, pre_norm)`.
+    ///
+    /// CPU-routed counterpart to
+    /// [`Ddp::average_params_with_divergence`](crate::distributed::Ddp::average_params_with_divergence).
+    /// Same divergence math (`||W_pre − W_post|| / ||W_post||`,
+    /// `pre_norm = sqrt(Σᵢ ||scratchᵢ||²)`,
+    /// `post_norm = sqrt(Σᵢ ||paramsᵢ||²)`) — only the reduce primitive
+    /// switches from in-place NCCL AllReduce to TCP round-trip via
+    /// [`Self::all_reduce_tensors`].
+    ///
+    /// Unlike NCCL's in-place AllReduce, `all_reduce_tensors` returns
+    /// *new* averaged tensors, so the caller's `params` are mutated via
+    /// a `copy_` step in this method to make the post-AllReduce values
+    /// visible downstream (`foreach_norm` on `params` then reads the
+    /// averaged state).
+    ///
+    /// `scratch` must have the same length as `params` (allocate via the
+    /// cluster-rank helper's pre-loop step, e.g. `zeros_like` per param).
+    ///
+    /// All ranks must call concurrently.
+    pub fn average_params_with_divergence(
+        &mut self,
+        params: &[&Tensor],
+        scratch: &[Tensor],
+    ) -> Result<(f64, Option<f64>, Option<f64>)> {
+        if params.is_empty() {
+            return Ok((0.0, None, None));
+        }
+        if scratch.len() != params.len() {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: average_params_with_divergence: scratch.len() \
+                 ({}) must equal params.len() ({})",
+                scratch.len(),
+                params.len(),
+            )));
+        }
+
+        // Snapshot pre-sync params into scratch.
+        for (dst, src) in scratch.iter().zip(params.iter()) {
+            dst.copy_(src, false)?;
+        }
+
+        // CPU AllReduce-Avg: returns new averaged tensors; copy into
+        // live params so post-AllReduce values are visible to the
+        // foreach_norm pass + downstream training.
+        let averaged = self.all_reduce_tensors(params)?;
+        for (dst, src) in params.iter().zip(&averaged) {
+            dst.copy_(src, false)?;
+        }
+
+        // pre_norm BEFORE the next foreach mutates scratch in place.
+        let pre_norm_tensors = Tensor::foreach_norm(scratch, 2.0)?;
+        let mut pre_sq = 0.0f64;
+        for n in &pre_norm_tensors {
+            let v: f64 = n.item()?;
+            pre_sq += v * v;
+        }
+        let pre_norm = pre_sq.sqrt();
+
+        // scratch[i] += -1 * params[i]  →  scratch[i] = pre - post.
+        let param_owned: Vec<Tensor> = params.iter().map(|t| (*t).clone()).collect();
+        Tensor::foreach_add_list_(scratch, &param_owned, -1.0)?;
+
+        let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
+        let post_norms = Tensor::foreach_norm(&param_owned, 2.0)?;
+
+        let mut diff_sq = 0.0f64;
+        for n in &diff_norms {
+            let v: f64 = n.item()?;
+            diff_sq += v * v;
+        }
+        let mut post_sq = 0.0f64;
+        for n in &post_norms {
+            let v: f64 = n.item()?;
+            post_sq += v * v;
+        }
+        let post_norm = post_sq.sqrt();
+        let divergence = if post_norm > 1e-10 {
+            diff_sq.sqrt() / post_norm
+        } else {
+            0.0
+        };
+
+        Ok((divergence, Some(post_norm), Some(pre_norm)))
+    }
 }
 
 // ---------------------------------------------------------------------------
