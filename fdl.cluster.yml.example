@@ -13,6 +13,11 @@
 #   - One process per host. Each host owns a contiguous (or sparse) set of
 #     ranks listed in `ranks:`, with CUDA devices paired by position in
 #     `local_devices:`. Rank 0's host is the NCCL rendezvous master.
+#   - `local_devices:` accepts either an explicit list (`[0, 1]`) or the
+#     `all` shorthand. With `all`, the host auto-detects CUDA devices at
+#     startup (via cuda_device_count()) and binds indices 0..ranks.len().
+#     The detected count must cover `ranks.len()` or rendezvous errors
+#     loudly. Symmetric for the controller and remote nodes.
 #   - `nccl_socket_ifname:` is required on every host when the cluster
 #     spans multiple machines. NCCL needs it to bind its TCP transport;
 #     auto-detection is brittle so fdl errors loudly if it's missing.
@@ -45,7 +50,8 @@ cluster:
     - name: node-b
       ssh: node-b              # ssh target; defaults to name if omitted
       ranks: [1, 2]
-      local_devices: [0, 1]
+      local_devices: all       # auto-detect at startup; equivalent to [0, 1]
+                               # if this host has 2 visible CUDA devices.
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch

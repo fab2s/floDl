@@ -508,6 +508,87 @@ pub struct ClusterConfig {
     pub hosts: Vec<ClusterHost>,
 }
 
+/// CUDA device indices on a host. Either explicit (a list of indices) or
+/// the `"all"` shorthand (auto-detect at startup on that host).
+///
+/// `local_devices: all` defers device-index resolution to startup on
+/// whichever host the value lives on. The host uses `cuda_device_count()`
+/// and binds devices `0..ranks.len()` (sequential from index 0). The
+/// detected count must be at least as large as `ranks.len()`, otherwise
+/// rendezvous errors loudly.
+///
+/// `local_devices: [0, 1]` is the explicit form; same as before this
+/// shorthand existed.
+///
+/// Symmetric: works for both the controller host and remote nodes. Pair
+/// with explicit `ranks: [N, N+1, ...]` to define the world topology;
+/// `local_devices` only selects which device indices on this host map to
+/// those ranks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalDevices {
+    /// Auto-detect at startup on this host. Indices `0..ranks.len()` bound.
+    All,
+    /// Explicit list of CUDA device indices, paired positionally with ranks.
+    Explicit(Vec<u8>),
+}
+
+impl LocalDevices {
+    /// True for the auto-detect form (unresolved).
+    pub fn is_all(&self) -> bool {
+        matches!(self, LocalDevices::All)
+    }
+
+    /// Explicit indices as a slice, or `None` for `All`.
+    pub fn as_explicit(&self) -> Option<&[u8]> {
+        match self {
+            LocalDevices::All => None,
+            LocalDevices::Explicit(v) => Some(v.as_slice()),
+        }
+    }
+}
+
+impl Serialize for LocalDevices {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            LocalDevices::All => s.serialize_str("all"),
+            LocalDevices::Explicit(v) => v.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalDevices {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = Value::deserialize(d)?;
+        match v {
+            Value::String(s) if s == "all" => Ok(LocalDevices::All),
+            Value::String(s) => Err(D::Error::custom(format!(
+                "local_devices: expected \"all\" or array of device indices, got string {s:?}"
+            ))),
+            Value::Array(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    let n = item.as_u64().ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "local_devices[{i}]: expected integer device index, got {item}"
+                        ))
+                    })?;
+                    let d = u8::try_from(n).map_err(|_| {
+                        D::Error::custom(format!(
+                            "local_devices[{i}]: value {n} does not fit in u8"
+                        ))
+                    })?;
+                    out.push(d);
+                }
+                Ok(LocalDevices::Explicit(out))
+            }
+            _ => Err(D::Error::custom(
+                "local_devices: expected \"all\" or array of device indices",
+            )),
+        }
+    }
+}
+
 /// One physical host in the cluster.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClusterHost {
@@ -516,8 +597,10 @@ pub struct ClusterHost {
     pub name: String,
     /// Global ranks owned by this host.
     pub ranks: Vec<usize>,
-    /// CUDA device indices paired by position with `ranks`.
-    pub local_devices: Vec<u8>,
+    /// CUDA device indices paired by position with `ranks`, or `"all"`
+    /// shorthand for auto-detect at startup. See [`LocalDevices`] for
+    /// semantics.
+    pub local_devices: LocalDevices,
     /// Network interface NCCL binds to (e.g. `virbr0`, `enp1s0`). Becomes
     /// `NCCL_SOCKET_IFNAME` in the spawned process environment.
     pub nccl_socket_ifname: String,
@@ -578,14 +661,18 @@ impl ClusterConfig {
                     h.name
                 ));
             }
-            if h.ranks.len() != h.local_devices.len() {
-                return Err(format!(
-                    "cluster.hosts[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
-                    h.name,
-                    h.ranks.len(),
-                    h.local_devices.len()
-                ));
+            if let Some(devs) = h.local_devices.as_explicit() {
+                if h.ranks.len() != devs.len() {
+                    return Err(format!(
+                        "cluster.hosts[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
+                        h.name,
+                        h.ranks.len(),
+                        devs.len()
+                    ));
+                }
             }
+            // `LocalDevices::All` defers the count check to startup on the
+            // target host (where `cuda_device_count()` is queried).
             if multi_host && h.nccl_socket_ifname.trim().is_empty() {
                 return Err(format!(
                     "cluster.hosts[{i}] ({:?}): nccl_socket_ifname must be \
@@ -643,7 +730,12 @@ impl ClusterConfig {
         );
         host_obj.insert(
             "local_devices".into(),
-            Value::Array(host.local_devices.iter().map(|d| Value::from(*d)).collect()),
+            match &host.local_devices {
+                LocalDevices::All => Value::String("all".into()),
+                LocalDevices::Explicit(v) => {
+                    Value::Array(v.iter().map(|d| Value::from(*d)).collect())
+                }
+            },
         );
         host_obj.insert(
             "nccl_socket_ifname".into(),
@@ -2228,7 +2320,10 @@ commands:
         let worker = &cluster.hosts[1];
         assert_eq!(worker.name, "worker-host");
         assert_eq!(worker.ranks, vec![1, 2]);
-        assert_eq!(worker.local_devices, vec![0, 1]);
+        assert_eq!(
+            worker.local_devices,
+            LocalDevices::Explicit(vec![0, 1])
+        );
         assert_eq!(worker.nccl_socket_ifname, "enp1s0");
         assert_eq!(worker.path, "/srv/flodl");
         assert_eq!(worker.ssh.as_deref(), Some("worker-host"));
@@ -2307,7 +2402,8 @@ commands:
     fn validate_rejects_len_mismatch() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[1].local_devices = vec![0];
+        cfg.cluster.as_mut().unwrap().hosts[1].local_devices =
+            LocalDevices::Explicit(vec![0]);
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("length mismatch"), "got: {err}");
     }
@@ -2385,6 +2481,131 @@ cluster:
         assert_eq!(parsed.hosts.len(), cluster.hosts.len());
         assert_eq!(parsed.world_size(), cluster.world_size());
         assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("worker-host"));
+    }
+
+    #[test]
+    fn local_devices_all_yaml_parses_as_marker() {
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0, 1]
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let host = &cfg.cluster.unwrap().hosts[0];
+        assert_eq!(host.local_devices, LocalDevices::All);
+        assert!(host.local_devices.is_all());
+        assert!(host.local_devices.as_explicit().is_none());
+    }
+
+    #[test]
+    fn local_devices_explicit_parses_as_explicit() {
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: [3]
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let host = &cfg.cluster.unwrap().hosts[0];
+        assert_eq!(host.local_devices, LocalDevices::Explicit(vec![3]));
+        assert!(!host.local_devices.is_all());
+        assert_eq!(host.local_devices.as_explicit(), Some(&[3u8][..]));
+    }
+
+    #[test]
+    fn local_devices_all_skips_length_check_in_validate() {
+        // With `all`, ranks.len() vs local_devices length is NOT checked at
+        // validate-time (resolution is deferred to startup on the target
+        // host). Verifies the controller-side validate passes a config with
+        // 5 ranks + local_devices: all even though no explicit list exists.
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0, 1, 2, 3, 4]
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.cluster
+            .as_ref()
+            .unwrap()
+            .validate()
+            .expect("validate must pass for local_devices: all");
+    }
+
+    #[test]
+    fn local_envelope_for_all_emits_all_string() {
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cluster = cfg.cluster.unwrap();
+        let env = cluster.local_envelope_for(&cluster.hosts[0]);
+        assert_eq!(env["host"]["local_devices"], serde_json::json!("all"));
+    }
+
+    #[test]
+    fn local_devices_all_round_trips_through_canonical_json() {
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cluster = cfg.cluster.unwrap();
+        let json = cluster.canonical_json().unwrap();
+        let parsed: ClusterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.hosts[0].local_devices, LocalDevices::All);
+    }
+
+    #[test]
+    fn local_devices_rejects_unknown_string() {
+        let yaml = "\
+cluster:
+  master_addr: 127.0.0.1
+  master_port: 29500
+  hosts:
+    - name: solo
+      ranks: [0]
+      local_devices: every
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let err = serde_yaml::from_str::<ProjectConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local_devices") && msg.contains("every"),
+            "expected loud error mentioning the bad value, got: {msg}"
+        );
     }
 
     #[test]

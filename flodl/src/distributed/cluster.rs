@@ -373,25 +373,11 @@ fn parse_host(v: &Value) -> Result<HostBlock> {
         )));
     }
 
-    let devs_u64 = parse_u64_array(obj.get("local_devices"), "cluster.host.local_devices")?;
-    let local_devices: Vec<u8> = devs_u64
-        .into_iter()
-        .map(|d| {
-            u8::try_from(d).map_err(|_| {
-                TensorError::new(&format!(
-                    "cluster.host.local_devices: value {d} does not fit in u8"
-                ))
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    if ranks.len() != local_devices.len() {
-        return Err(TensorError::new(&format!(
-            "cluster.host ({name:?}): ranks ({}) and local_devices ({}) length mismatch",
-            ranks.len(),
-            local_devices.len()
-        )));
-    }
+    let local_devices = parse_local_devices(
+        obj.get("local_devices"),
+        &name,
+        ranks.len(),
+    )?;
 
     let nccl_socket_ifname = obj
         .get("nccl_socket_ifname")
@@ -426,6 +412,69 @@ fn parse_host(v: &Value) -> Result<HostBlock> {
         path,
         libtorch_path,
     })
+}
+
+/// Parse the `local_devices` field of a host entry, accepting either:
+///
+/// - An explicit array of CUDA device indices, paired positionally with
+///   `ranks` (length must match).
+/// - The string `"all"`, resolved here via [`crate::tensor::cuda_device_count`]
+///   to indices `0..ranks_len`. The host must have at least `ranks_len`
+///   visible CUDA devices, otherwise loud error.
+///
+/// Symmetric for controller and remote nodes. Each host resolves its own
+/// `"all"` at envelope-parse time, using the GPU count visible to its
+/// running process (CUDA_VISIBLE_DEVICES applies).
+fn parse_local_devices(v: Option<&Value>, host_name: &str, ranks_len: usize) -> Result<Vec<u8>> {
+    let v = v.ok_or_else(|| {
+        TensorError::new("cluster.host.local_devices: required ([..] or \"all\")")
+    })?;
+
+    if let Some(s) = v.as_str() {
+        if s != "all" {
+            return Err(TensorError::new(&format!(
+                "cluster.host.local_devices: expected \"all\" or array, got string {s:?}"
+            )));
+        }
+        let available = crate::tensor::cuda_device_count();
+        if available < 0 {
+            return Err(TensorError::new(
+                "cluster.host.local_devices: \"all\" requires CUDA support; \
+                 cuda_device_count() returned a negative value",
+            ));
+        }
+        let available = available as usize;
+        if available < ranks_len {
+            return Err(TensorError::new(&format!(
+                "cluster.host ({host_name:?}): local_devices: \"all\" \
+                 resolved to {available} visible CUDA device(s), but \
+                 ranks.len() = {ranks_len} requires at least that many. \
+                 Check CUDA_VISIBLE_DEVICES and host GPU inventory."
+            )));
+        }
+        return Ok((0..ranks_len as u8).collect());
+    }
+
+    let devs_u64 = parse_u64_array(Some(v), "cluster.host.local_devices")?;
+    let local_devices: Vec<u8> = devs_u64
+        .into_iter()
+        .map(|d| {
+            u8::try_from(d).map_err(|_| {
+                TensorError::new(&format!(
+                    "cluster.host.local_devices: value {d} does not fit in u8"
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    if ranks_len != local_devices.len() {
+        return Err(TensorError::new(&format!(
+            "cluster.host ({host_name:?}): ranks ({}) and local_devices ({}) length mismatch",
+            ranks_len,
+            local_devices.len()
+        )));
+    }
+    Ok(local_devices)
 }
 
 fn parse_usize_array(v: Option<&Value>, label: &str) -> Result<Vec<usize>> {
@@ -613,6 +662,52 @@ mod tests {
         assert_eq!(c.host.nccl_socket_ifname, "enp1s0");
         assert_eq!(c.host.path, "/srv/flodl");
         assert_eq!(c.host.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
+    }
+
+    #[test]
+    fn rejects_local_devices_all_when_cuda_devices_insufficient() {
+        // `local_devices: "all"` resolves on the host that receives the
+        // envelope, using cuda_device_count(). With ranks of length > visible
+        // CUDA devices (always true in CPU test mode, where count == 0), the
+        // resolver must error loudly mentioning the count.
+        let mut v = worker_envelope();
+        v["host"]["local_devices"] = json!("all");
+        let err = LocalCluster::from_value(&v).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local_devices") && msg.contains("\"all\""),
+            "expected loud error mentioning local_devices: all, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_local_devices_all_when_cuda_sufficient() {
+        // Success path: only meaningful when CUDA is available with enough
+        // devices for the rank count. Self-skip in CPU mode.
+        let avail = crate::tensor::cuda_device_count();
+        if avail < 1 {
+            eprintln!("cuda_device_count() = {avail}; skipping all-shorthand success test");
+            return;
+        }
+        // Build an envelope with ranks_len = 1 (always satisfiable when at
+        // least one CUDA device is visible).
+        let mut v = master_envelope();
+        v["host"]["local_devices"] = json!("all");
+        let c = LocalCluster::from_value(&v).expect("parse with local_devices: all");
+        // Resolved indices are 0..ranks_len; ranks_len = 1 in master_envelope.
+        assert_eq!(c.host.local_devices, vec![0u8]);
+    }
+
+    #[test]
+    fn rejects_local_devices_unknown_string() {
+        let mut v = worker_envelope();
+        v["host"]["local_devices"] = json!("every");
+        let err = LocalCluster::from_value(&v).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local_devices") && msg.contains("every"),
+            "expected loud error mentioning the bad value, got: {msg}"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@
 use std::process::Command;
 
 use crate::cluster::resolve_local_hostname;
-use crate::config::{ClusterConfig, ClusterHost};
+use crate::config::{ClusterConfig, ClusterHost, LocalDevices};
 
 /// Parsed `--gpus` argument value.
 ///
@@ -162,7 +162,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
         hosts: vec![ClusterHost {
             name,
             ranks: (0..devices.len()).collect(),
-            local_devices: devices.to_vec(),
+            local_devices: LocalDevices::Explicit(devices.to_vec()),
             nccl_socket_ifname: "lo".to_string(),
             path,
             libtorch_path: None,
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(c.hosts.len(), 1);
         let h = &c.hosts[0];
         assert_eq!(h.ranks, vec![0, 1]);
-        assert_eq!(h.local_devices, vec![0, 1]);
+        assert_eq!(h.local_devices, LocalDevices::Explicit(vec![0, 1]));
         assert_eq!(h.nccl_socket_ifname, "lo");
         assert!(h.libtorch_path.is_none());
         assert!(h.ssh.is_none());
@@ -301,7 +301,7 @@ mod tests {
         let c = synthesize_local_cluster(&[2]).unwrap();
         c.validate().expect("single-device synthesized config validates");
         assert_eq!(c.hosts[0].ranks, vec![0]);
-        assert_eq!(c.hosts[0].local_devices, vec![2]);
+        assert_eq!(c.hosts[0].local_devices, LocalDevices::Explicit(vec![2]));
     }
 
     #[test]
