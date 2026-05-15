@@ -195,9 +195,18 @@ impl DdpHandle {
                         config,
                     )
                 }
-                (ApplyPolicy::Cadence, AverageBackend::Nccl) => {
+                (ApplyPolicy::Cadence, AverageBackend::Nccl)
+                | (ApplyPolicy::Async, AverageBackend::Nccl) => {
+                    // Under NCCL backend, Cadence and Async share the same
+                    // algorithm: overshoot is the only OLD-coordinator
+                    // distinction, and it's an async/CPU concept (no-op for
+                    // NCCL). Both policies route through the Cadence helper;
+                    // the helper carries policy in WorkerConfig for the
+                    // worker's pre_sync_scratch / metadata-emitting paths
+                    // that branch on it.
                     Self::run_cluster_rank_cadence_nccl(
                         cluster,
+                        policy,
                         model_factory,
                         optim_factory,
                         train_fn,
@@ -205,16 +214,16 @@ impl DdpHandle {
                         batch_size,
                         num_epochs,
                         config,
+                        convergence_guard,
                     )
                 }
                 _ => Err(crate::tensor::TensorError::new(&format!(
-                    "Trainer::builder cluster mode: ApplyPolicy::Sync + \
-                     AverageBackend::Nccl (4b.D.1a.ii) and ApplyPolicy::Cadence + \
-                     AverageBackend::Nccl (4b.D.1a.iii) are implemented. \
-                     Remaining combinations land in: Async+Nccl → 4b.D.1a.iv, \
-                     Cpu backend (all policies) → 4b.D.1b. Requested: \
-                     {policy:?} + {backend:?}. Use Trainer::setup / setup_with \
-                     for cluster-aware training in the meantime (user owns \
+                    "Trainer::builder cluster mode: ApplyPolicy::Sync (4b.D.1a.ii) \
+                     + Cadence / Async (4b.D.1a.iii / iv) on AverageBackend::Nccl \
+                     are implemented. Cpu backend (all policies) lands in \
+                     4b.D.1b. Requested: {policy:?} + {backend:?}. Use \
+                     Trainer::setup / setup_with for cluster-aware training \
+                     in the meantime (user owns \
                      the loop).",
                 ))),
             };
@@ -1064,42 +1073,61 @@ impl DdpHandle {
         })
     }
 
-    /// Cluster-rank entry point for `ApplyPolicy::Cadence + AverageBackend::Nccl`.
+    /// Cluster-rank entry point for `ApplyPolicy::Cadence` /
+    /// `ApplyPolicy::Async` + `AverageBackend::Nccl`.
     ///
-    /// Same shape as [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl)
-    /// but the inline loop runs the heterogeneous Local-SGD cadence protocol
-    /// from [`GpuWorker::run_self_driven_cadence_nccl`]:
+    /// Under NCCL backend, Cadence and Async share the same algorithm:
+    /// overshoot machinery (the only OLD-coordinator distinction) is an
+    /// async/CPU concept (`feedback_overshoot_async_only` /
+    /// `feedback_nccl_no_overshoot_throttle`) — irrelevant for NCCL. Both
+    /// policies route through this helper; [`WorkerConfig::policy`]
+    /// carries the policy enum for the worker's per-policy bookkeeping.
     ///
+    /// Drives [`GpuWorker::run_self_driven_cadence_nccl`] which runs:
     /// - Per-batch `train_step` (Local SGD: each rank advances independently)
-    /// - At ElChe-driven K boundary: cross-rank timing AllReduce → parameter
-    ///   AllReduce-Avg → [`ElChe::report_timing`] keeps every rank's cadence
-    ///   state in lockstep via the deterministic timing vector
+    /// - At ElChe-driven K boundary: cross-rank timing AllReduce →
+    ///   parameter AllReduce-Avg with weight-space divergence → cross-rank
+    ///   AllReduce-gather of `(divergence, pre_norm)` →
+    ///   [`ElChe::report_timing`] → `convergence_guard.report(...)` →
+    ///   [`ConvergenceAction`] applied to ElChe
+    ///   ([`nudge_anchor_down`](super::super::ddp::ElChe::nudge_anchor_down)
+    ///   on NudgeDown, [`relax_anchor_up`](super::super::ddp::ElChe::relax_anchor_up)
+    ///   on Stable+flag).
     ///
     /// **Comm ownership:** the [`NcclRankComm`] is built inside the spawned
-    /// thread (rendezvous lives inside, since `M` isn't `Send`) and handed to
-    /// [`Ddp::from_comm`] after the initial-state broadcast. The
+    /// thread (rendezvous lives inside, since `M` isn't `Send`) and handed
+    /// to [`Ddp::from_comm`] after the initial-state broadcast. The
     /// [`GpuWorker`] is constructed with `nccl_comm = None`; the cadence
     /// loop drives all NCCL collectives through the `Ddp` handle
-    /// (`average_params`, `all_reduce_per_rank_f64`).
+    /// (`average_params_with_divergence`, `all_reduce_per_rank_f64`).
     ///
-    /// **ElChe construction** mirrors the orchestrator's main path:
-    /// `anchor` / `max_anchor` / `min_anchor` / `overhead_target` /
-    /// `max_batch_diff` from [`DdpRunConfig`]; cold-start anchor pick
-    /// follows the same precedence (`partition_ratios` > device-indices
-    /// prior).
+    /// **ElChe construction** mirrors the orchestrator's main path
+    /// (`anchor` / `max_anchor` / `min_anchor` / `overhead_target` /
+    /// `max_batch_diff` from [`DdpRunConfig`]; cold-start anchor pick).
     ///
-    /// **Not yet wired in this slice (4b.D.1a.iii):** progressive chunk
-    /// dispatch, per-epoch metrics aggregation, `epoch_fn` / `metrics_fn` /
-    /// `scheduler_fn` / `checkpoint_every` / `convergence_guard` callbacks,
-    /// divergence-driven early sync (Async-only — 4b.D.1a.iv).
+    /// **ConvergenceGuard construction** mirrors the OLD
+    /// `Coordinator::builder` recipe: user-supplied override > NoGuard
+    /// when `no_divergence_guard` set > `TrendGuard::new(divergence_threshold
+    /// or 0.05)`. Each rank builds its own guard from the same scalars,
+    /// so they stay in lockstep across ranks (deterministic input →
+    /// deterministic verdict).
+    ///
+    /// **Still deferred (carried forward through 4b.D.1b):** progressive
+    /// chunk dispatch, per-epoch metrics aggregation, `epoch_fn` /
+    /// `metrics_fn` / `scheduler_fn` / `checkpoint_every` callbacks,
+    /// LR-aware meta-controller (needs scheduler_fn flow), Timeline
+    /// events for `Divergence` / `SyncEnd` / `AnchorChanged` /
+    /// `GuardTelemetry`.
     ///
     /// [`GpuWorker::run_self_driven_cadence_nccl`]:
     ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_cadence_nccl
     /// [`Ddp::from_comm`]: crate::distributed::Ddp::from_comm
     /// [`ElChe::report_timing`]: crate::distributed::ElChe::report_timing
+    /// [`ConvergenceAction`]: super::convergence::ConvergenceAction
     #[allow(clippy::too_many_arguments)]
     fn run_cluster_rank_cadence_nccl<F, M, G, O, T>(
         cluster: crate::distributed::cluster::LocalCluster,
+        policy: ApplyPolicy,
         model_factory: F,
         optim_factory: G,
         train_fn: T,
@@ -1107,6 +1135,7 @@ impl DdpHandle {
         batch_size: usize,
         num_epochs: usize,
         config: DdpRunConfig,
+        convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1123,12 +1152,18 @@ impl DdpHandle {
         let world_size = cluster.world_size();
         let total_samples = dataset.len();
 
+        let policy_label = match policy {
+            ApplyPolicy::Sync => "Sync",
+            ApplyPolicy::Cadence => "Cadence",
+            ApplyPolicy::Async => "Async",
+        };
         crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Cadence+Nccl)"
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
+             ({policy_label}+Nccl)"
         );
 
         let training_meta = Some(serde_json::json!({
-            "mode": "cluster-rank Cadence+Nccl",
+            "mode": format!("cluster-rank {policy_label}+Nccl"),
             "global_rank": global_rank,
             "world_size": world_size,
             "device": format!("{device:?}"),
@@ -1153,6 +1188,12 @@ impl DdpHandle {
         let elche_relax_up = config.elche_relax_up;
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
+
+        // ConvergenceGuard recipe (mirrors Coordinator::builder default):
+        // user override wins, then NoGuard when no_divergence_guard set,
+        // else TrendGuard::new(divergence_threshold or 0.05).
+        let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
+        let no_divergence_guard = config.no_divergence_guard;
 
         // CUDA device indices for ElChe cold-start prior (slow-rank pick by
         // compute capability + VRAM). Empty when this rank isn't on CUDA;
@@ -1279,7 +1320,7 @@ impl DdpHandle {
                 max_grad_norm,
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
-                policy: ApplyPolicy::Cadence,
+                policy,
             };
 
             // Worker channels: nothing drains them in cluster-rank mode.
@@ -1290,10 +1331,8 @@ impl DdpHandle {
                 worker_endpoints;
 
             // GpuWorker built with `nccl_comm = None`: this slice routes
-            // every NCCL op through `ddp` above. Future Async slice may
-            // need worker-internal NCCL access (divergence-driven early
-            // trigger via `sync_now_nccl`) — at which point the comm
-            // ownership story revisits.
+            // every NCCL op through `ddp` above (including the divergence
+            // measurement). Symmetric with the Sync slice's choice.
             let mut worker = GpuWorker::new(
                 &worker_config,
                 model_factory,
@@ -1308,9 +1347,31 @@ impl DdpHandle {
                 control_rx,
             )?;
 
+            // Build the per-rank ConvergenceGuard. User override consumed
+            // here (each rank-process has its own DdpBuilder + config, so
+            // the user's Box moves into this rank's closure cleanly).
+            let mut guard: Box<dyn super::convergence::ConvergenceGuard> =
+                match convergence_guard {
+                    Some(g) => g,
+                    None => {
+                        if no_divergence_guard {
+                            Box::new(super::convergence::NoGuard)
+                        } else {
+                            Box::new(super::convergence::TrendGuard::new(
+                                divergence_threshold,
+                            ))
+                        }
+                    }
+                };
+
+            // Pre-sync scratch allocated once for the full training session.
+            let scratch = ddp.make_divergence_scratch()?;
+
             worker.run_self_driven_cadence_nccl(
                 &ddp,
                 &mut el_che,
+                guard.as_mut(),
+                &scratch,
                 &partition_sizes,
                 elche_relax_up,
                 num_epochs,

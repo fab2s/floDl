@@ -228,6 +228,103 @@ impl Ddp {
         Ok(())
     }
 
+    /// Allocate the pre-sync scratch buffer used by
+    /// [`average_params_with_divergence`](Self::average_params_with_divergence).
+    ///
+    /// Returns one zero-initialized tensor per parameter, matching shape /
+    /// dtype / device. Caller pins this for the lifetime of the cadence loop
+    /// so divergence measurement avoids per-cycle allocations.
+    pub fn make_divergence_scratch(&self) -> Result<Vec<Tensor>> {
+        self.params
+            .iter()
+            .map(|v| Tensor::zeros_like(&v.data()))
+            .collect()
+    }
+
+    /// AllReduce-average parameters and return this rank's weight-space
+    /// divergence triple `(divergence, post_norm, pre_norm)`.
+    ///
+    /// The same param-Avg primitive as [`average_params`](Self::average_params),
+    /// plus the per-cycle telemetry the convergence-guard pipeline needs:
+    ///
+    /// - `divergence = ||W_pre − W_post|| / ||W_post||` — this rank's
+    ///   transversal weight-space drift across the AllReduce. Fed (after
+    ///   cross-rank AllReduce-gather) into
+    ///   [`ConvergenceGuard::report`](crate::distributed::ddp_run::ConvergenceGuard::report)
+    ///   to drive [`ElChe::nudge_anchor_down`](super::ddp::ElChe::nudge_anchor_down)
+    ///   on rising drift.
+    /// - `post_norm = ||W_post||` — global L2 norm of averaged params.
+    ///   Identical across ranks post-AllReduce (modulo float-rounding
+    ///   noise); the OLD coordinator kept a single scalar from rank 0.
+    /// - `pre_norm = ||W_pre||` — global L2 norm of this rank's pre-sync
+    ///   params. Diverges across ranks pre-sync; gather like `divergence`.
+    ///
+    /// `scratch` is the per-param scratch buffer from
+    /// [`make_divergence_scratch`](Self::make_divergence_scratch), reused
+    /// across cycles. `scratch.len()` must equal the number of parameters.
+    ///
+    /// All ranks must call concurrently.
+    pub fn average_params_with_divergence(
+        &self,
+        scratch: &[Tensor],
+    ) -> Result<(f64, Option<f64>, Option<f64>)> {
+        let param_tensors: Vec<Tensor> = self.params.iter().map(|v| v.data()).collect();
+        if param_tensors.is_empty() {
+            return Ok((0.0, None, None));
+        }
+        if scratch.len() != param_tensors.len() {
+            return Err(TensorError::new(&format!(
+                "average_params_with_divergence: scratch.len() ({}) must equal \
+                 number of parameters ({})",
+                scratch.len(),
+                param_tensors.len(),
+            )));
+        }
+
+        // Snapshot pre-sync params into scratch.
+        for (dst, src) in scratch.iter().zip(&param_tensors) {
+            dst.copy_(src, false)?;
+        }
+
+        // In-place AllReduce-Avg on params.
+        let refs: Vec<&Tensor> = param_tensors.iter().collect();
+        self.comms.all_reduce(&refs, ReduceOp::Avg)?;
+
+        // pre_norm BEFORE the next foreach mutates scratch in place.
+        let pre_norm_tensors = Tensor::foreach_norm(scratch, 2.0)?;
+        let mut pre_sq = 0.0f64;
+        for n in &pre_norm_tensors {
+            let v: f64 = n.item()?;
+            pre_sq += v * v;
+        }
+        let pre_norm = pre_sq.sqrt();
+
+        // scratch[i] += -1 * param_tensors[i]  →  scratch[i] = pre - post.
+        Tensor::foreach_add_list_(scratch, &param_tensors, -1.0)?;
+
+        let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
+        let post_norms = Tensor::foreach_norm(&param_tensors, 2.0)?;
+
+        let mut diff_sq = 0.0f64;
+        for n in &diff_norms {
+            let v: f64 = n.item()?;
+            diff_sq += v * v;
+        }
+        let mut post_sq = 0.0f64;
+        for n in &post_norms {
+            let v: f64 = n.item()?;
+            post_sq += v * v;
+        }
+        let post_norm = post_sq.sqrt();
+        let divergence = if post_norm > 1e-10 {
+            diff_sq.sqrt() / post_norm
+        } else {
+            0.0
+        };
+
+        Ok((divergence, Some(post_norm), Some(pre_norm)))
+    }
+
     /// Broadcast parameters and buffers from rank 0 to all ranks.
     pub fn sync_params(&self) -> Result<()> {
         let p_tensors: Vec<Tensor> = self.params.iter().map(|v| v.data()).collect();

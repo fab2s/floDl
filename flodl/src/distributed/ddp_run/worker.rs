@@ -886,47 +886,78 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
-    /// Self-driven inline training loop for `ApplyPolicy::Cadence +
-    /// AverageBackend::Nccl` — heterogeneous Local-SGD with ElChe-driven K.
+    /// Self-driven inline training loop for `ApplyPolicy::Cadence` /
+    /// `ApplyPolicy::Async` + `AverageBackend::Nccl` — heterogeneous
+    /// Local-SGD with ElChe-driven K and the full convergence-guard
+    /// pipeline.
     ///
-    /// Mirrors the old threaded coordinator's Cadence behavior (per-batch
-    /// `optimizer.step()`, parameter AllReduce-Avg at the cadence boundary)
-    /// in inline-loop form. The cycle protocol matches what the coordinator
-    /// drove externally via `SyncNow` control messages:
+    /// Under NCCL backend, Cadence and Async share the same algorithm: the
+    /// only difference in the old coordinator was Async-mode overshoot
+    /// machinery, which is an async/CPU concept (see
+    /// `feedback_overshoot_async_only` and `feedback_nccl_no_overshoot_throttle`).
+    /// Both policies therefore route through this single loop in cluster-rank
+    /// mode.
+    ///
+    /// Per-cycle protocol (mirrors `Coordinator::finish_averaging_nccl`):
     ///
     /// 1. Run `train_step` (forward + backward + optimizer step) until the
     ///    rank's `local_batch_idx` reaches `el_che.batch_counts()[rank]`.
-    /// 2. Measure wall time for the cycle and AllReduce the per-rank vector
-    ///    via `ddp.all_reduce_per_rank_f64` — deterministic, identical on
-    ///    every rank, no broadcast.
-    /// 3. AllReduce-Avg the parameter vectors via `ddp.average_params` and
-    ///    record the sync wall time.
-    /// 4. Feed `(wall_ms_vec, batch_counts, sync_ms)` into
-    ///    [`ElChe::report_timing`] so every rank advances its cadence state
-    ///    in lockstep.
-    /// 5. Optionally [`ElChe::relax_anchor_up`] if the caller opted in via
-    ///    `elche_relax_up`.
+    /// 2. Measure cycle wall time and AllReduce the per-rank vector via
+    ///    `ddp.all_reduce_per_rank_f64` — deterministic gather, no broadcast.
+    /// 3. AllReduce-Avg parameters with weight-space divergence
+    ///    measurement via `ddp.average_params_with_divergence(&scratch)`.
+    /// 4. AllReduce per-rank `divergence` and per-rank `pre_norm` for the
+    ///    [`DivergenceReport`]; `post_norm` is identical across ranks
+    ///    post-AllReduce so it's used directly from this rank.
+    /// 5. Feed timing into [`ElChe::report_timing`].
+    /// 6. Run the guard: `convergence_guard.report(&report, k_used, k_max)`
+    ///    → [`ConvergenceAction`]:
+    ///    - [`ConvergenceAction::NudgeDown`] `{ factor }` → unconditional
+    ///      [`ElChe::nudge_anchor_down`] (matches old coordinator —
+    ///      applied for all non-Sync policies).
+    ///    - [`ConvergenceAction::Stable`] + `elche_relax_up` →
+    ///      [`ElChe::relax_anchor_up`]. **The old coordinator gated this
+    ///      on `policy == Async` (likely an MSF-arc leftover); the
+    ///      cluster-rank loop lifts the gate so the user-set flag works
+    ///      for Cadence too. `max_anchor` bounds anchor growth.**
+    ///    - [`ConvergenceAction::SuppressGrowth`] → no-op (hold cadence).
     ///
-    /// **Behavior preserved:** same `train_step` (CUDA stream pinning,
-    /// per-rank grad clipping, scheduler, optimizer step), same Local-SGD
-    /// param-Avg semantics (matches old `sync_now_nccl` minus the
-    /// divergence telemetry, which is deferred to the Async slice along
-    /// with the rest of the divergence-aware machinery).
+    /// **Behavior preserved (vs old threaded coordinator):** same
+    /// `train_step` (CUDA stream pinning, per-rank grad clipping,
+    /// scheduler, optimizer step), same Local-SGD param-Avg semantics,
+    /// same divergence math (snapshot → AllReduce-Avg → `||pre - post|| /
+    /// ||post||`), same guard verdict → ElChe action wiring.
     ///
-    /// **Not yet supported (carried forward through 4b.D.1a.iv / 1b):**
-    /// VRAM-aware prefetch, per-epoch [`MetricsMsg`] aggregation,
-    /// `epoch_fn` / `metrics_fn` / `scheduler_fn` / `checkpoint_every` /
-    /// `convergence_guard` callbacks, divergence-driven early sync
-    /// (Async-only — see 4b.D.1a.iv).
+    /// **Still deferred (carried forward through 4b.D.1b):** VRAM-aware
+    /// prefetch, per-epoch [`MetricsMsg`] aggregation, `epoch_fn` /
+    /// `metrics_fn` / `scheduler_fn` / `checkpoint_every` callbacks,
+    /// LR-aware meta-controller (needs scheduler_fn flow), Timeline
+    /// events for `Divergence` / `SyncEnd` / `AnchorChanged` /
+    /// `GuardTelemetry`, per-epoch partition recompute from current
+    /// ElChe ratios, Async-mode overshoot growth (irrelevant for NCCL —
+    /// async/CPU concept).
+    ///
+    /// [`ConvergenceAction`]: super::convergence::ConvergenceAction
+    /// [`ConvergenceAction::NudgeDown`]: super::convergence::ConvergenceAction::NudgeDown
+    /// [`ConvergenceAction::Stable`]: super::convergence::ConvergenceAction::Stable
+    /// [`ConvergenceAction::SuppressGrowth`]: super::convergence::ConvergenceAction::SuppressGrowth
+    /// [`DivergenceReport`]: super::convergence::DivergenceReport
+    /// [`ElChe::nudge_anchor_down`]: super::super::ddp::ElChe::nudge_anchor_down
+    /// [`ElChe::relax_anchor_up`]: super::super::ddp::ElChe::relax_anchor_up
+    #[allow(clippy::too_many_arguments)]
     pub fn run_self_driven_cadence_nccl(
         &mut self,
         ddp: &super::super::ddp::Ddp,
         el_che: &mut super::super::ddp::ElChe,
+        convergence_guard: &mut dyn super::convergence::ConvergenceGuard,
+        scratch: &[Tensor],
         partition_sizes: &[usize],
         elche_relax_up: bool,
         num_epochs: usize,
         train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
     ) -> Result<()> {
+        use super::convergence::{ConvergenceAction, DivergenceReport};
+
         if partition_sizes.len() != self.world_size {
             return Err(TensorError::new(&format!(
                 "GpuWorker::run_self_driven_cadence_nccl: partition_sizes len ({}) \
@@ -992,17 +1023,54 @@ impl<M: Module> GpuWorker<M> {
                     ddp.all_reduce_per_rank_f64(&mut wall_ms_vec)?;
 
                     // Snapshot batch_counts BEFORE averaging — report_timing
-                    // mutates state and a borrow against `el_che` after the
-                    // mutable call would conflict.
+                    // and nudge_anchor_down both mutate ElChe.
                     let counts: Vec<usize> = el_che.batch_counts().to_vec();
 
+                    // Param AllReduce-Avg + weight-space divergence triple
+                    // for this rank.
                     let sync_start = Instant::now();
-                    ddp.average_params()?;
+                    let (local_div, local_post, local_pre) =
+                        ddp.average_params_with_divergence(scratch)?;
                     let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
 
+                    // Gather divergence + pre_norm across ranks for the
+                    // ConvergenceGuard's DivergenceReport. post_norm is
+                    // identical on every rank post-AllReduce (modulo
+                    // float-rounding); use this rank's directly.
+                    let mut deltas = vec![0.0f64; self.world_size];
+                    deltas[self.rank] = local_div;
+                    ddp.all_reduce_per_rank_f64(&mut deltas)?;
+
+                    let mut pre_norms_vec = vec![0.0f64; self.world_size];
+                    pre_norms_vec[self.rank] = local_pre.unwrap_or(0.0);
+                    ddp.all_reduce_per_rank_f64(&mut pre_norms_vec)?;
+                    let pre_norms: Option<Vec<f64>> = if local_pre.is_some() {
+                        Some(pre_norms_vec)
+                    } else {
+                        None
+                    };
+
                     el_che.report_timing(&wall_ms_vec, &counts, sync_ms);
-                    if elche_relax_up {
-                        el_che.relax_anchor_up();
+
+                    let report = DivergenceReport {
+                        deltas,
+                        pre_norms,
+                        post_norm: local_post,
+                    };
+                    let cycle_batches: usize = counts.iter().sum();
+                    let k_max = counts.iter().copied().max().unwrap_or(0);
+                    let action =
+                        convergence_guard.report(&report, cycle_batches, k_max);
+                    match action {
+                        ConvergenceAction::Stable => {
+                            if elche_relax_up {
+                                el_che.relax_anchor_up();
+                            }
+                        }
+                        ConvergenceAction::SuppressGrowth => {}
+                        ConvergenceAction::NudgeDown { factor } => {
+                            el_che.nudge_anchor_down(factor);
+                        }
                     }
 
                     self.steps_since_avg = 0;
