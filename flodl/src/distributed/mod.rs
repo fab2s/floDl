@@ -27,7 +27,7 @@ pub mod rendezvous;
 
 pub use cluster::{HostBlock, LocalCluster};
 pub use controller::{CpuAverager, RoundFrame, TensorPayload, DTYPE_F32};
-pub use cpu_reduce::CpuReduceClient;
+pub use cpu_reduce::{CpuReduceClient, round_frame_to_tensors, tensors_to_round_frame};
 pub use launcher::{FullCluster, FullHost, Role};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};

@@ -199,6 +199,34 @@ fn run_launcher() -> Result<()> {
         );
     }
 
+    // Start the CpuAverager TCP server on master_port + 2 so any rank
+    // using AverageBackend::Cpu can connect. Bound to 0.0.0.0 so remote
+    // ranks reach it; local ranks use the same address via loopback.
+    //
+    // Always started, even on NCCL-only clusters: the accept loop polls
+    // a shutdown flag every 20ms, so an unused CpuAverager exits cleanly
+    // when launcher signals shutdown after children finish. Cost is one
+    // idle thread + one bound port.
+    let cpu_avg_port = full.master_port.saturating_add(2);
+    let cpu_avg_addr: std::net::SocketAddr = format!("0.0.0.0:{cpu_avg_port}")
+        .parse()
+        .map_err(|e| {
+            TensorError::new(&format!(
+                "cluster launcher: invalid CpuAverager bind addr 0.0.0.0:{cpu_avg_port}: {e}"
+            ))
+        })?;
+    let cpu_averager = crate::distributed::controller::CpuAverager::start(
+        cpu_avg_addr,
+        full.world_size(),
+    )?;
+    // Bound port stays the configured value (no kernel auto-assign here);
+    // log it once for diagnostics.
+    eprintln!(
+        "cluster launcher: CpuAverager bound on {} (world_size={})",
+        cpu_averager.port(),
+        full.world_size()
+    );
+
     // For remote hosts, fdl-cli must have passed the original fdl command
     // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent;
     // 4b.C is responsible for setting it.
@@ -312,6 +340,14 @@ fn run_launcher() -> Result<()> {
             }
         }
     }
+    // All children exited; signal CpuAverager shutdown and join.
+    if let Err(e) = cpu_averager.shutdown() {
+        // Don't mask a child-failure error with a CpuAverager shutdown
+        // error; log + continue. The child failure is the load-bearing
+        // diagnostic.
+        eprintln!("cluster launcher: CpuAverager shutdown failed: {e}");
+    }
+
     if let Some(err) = any_failure {
         return Err(err);
     }

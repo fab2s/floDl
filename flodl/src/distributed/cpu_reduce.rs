@@ -30,9 +30,10 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::distributed::controller::{
-    self, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION, RoundFrame,
+    self, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION,
+    RoundFrame, TensorPayload,
 };
-use crate::tensor::{Result, TensorError};
+use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 
 /// Rank-side client for the CPU-averaging controller.
 ///
@@ -170,6 +171,112 @@ impl CpuReduceClient {
             )),
         }
     }
+
+    /// Convenience: build a [`RoundFrame`] from a slice of tensors, call
+    /// [`Self::all_reduce`], and convert the averaged frame back to a
+    /// `Vec<Tensor>` on CPU.
+    ///
+    /// v1 supports f32 only; loud error on other dtypes. Caller is
+    /// responsible for moving averaged tensors back to GPU if needed.
+    pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+        let frame = tensors_to_round_frame(tensors)?;
+        let averaged = self.all_reduce(&frame)?;
+        round_frame_to_tensors(&averaged)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor ↔ RoundFrame conversion
+// ---------------------------------------------------------------------------
+
+/// Build a [`RoundFrame`] from a slice of tensors.
+///
+/// Each tensor is moved to CPU via [`Tensor::to_blob`] (transparently
+/// handles GPU→CPU transfer) and serialized as raw native-byte-order
+/// f32 bytes. Shape is captured as `Vec<u32>` (matches the wire
+/// protocol; loud error if any dim doesn't fit in u32).
+///
+/// v1 dtype support: f32 only. Other dtypes produce a loud error with
+/// a pointer to where to extend (mirrors controller-side reduce_average
+/// restriction; both must lift together when adding f16/bf16).
+pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
+    let mut payloads = Vec::with_capacity(tensors.len());
+    for (i, t) in tensors.iter().enumerate() {
+        if t.dtype() != DType::Float32 {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: tensor[{i}] dtype {:?} not supported in v1 \
+                 (only Float32). Extend cpu_reduce.rs::tensors_to_round_frame \
+                 and controller.rs::reduce_average together to add support.",
+                t.dtype()
+            )));
+        }
+        let shape_i64 = t.shape();
+        let shape: Vec<u32> = shape_i64
+            .iter()
+            .enumerate()
+            .map(|(d_idx, d)| {
+                u32::try_from(*d).map_err(|_| {
+                    TensorError::new(&format!(
+                        "cpu_reduce: tensor[{i}] dim[{d_idx}] = {d} doesn't fit in u32 \
+                         (wire protocol uses u32 shape dims)"
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        let bytes = t.to_blob()?;
+        payloads.push(TensorPayload {
+            dtype: DTYPE_F32,
+            shape,
+            bytes,
+        });
+    }
+    Ok(RoundFrame { tensors: payloads })
+}
+
+/// Build a list of new CPU `Tensor`s from a [`RoundFrame`].
+///
+/// Inverse of [`tensors_to_round_frame`]. Each payload's bytes are
+/// interpreted as little-endian f32 (matches the wire format), reshaped
+/// per the payload's shape, and packed into a fresh CPU tensor. v1
+/// supports f32 only.
+///
+/// The returned tensors live on `Device::CPU`. Callers wanting them on
+/// GPU should follow up with [`Tensor::to_device`].
+pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
+    let mut out = Vec::with_capacity(frame.tensors.len());
+    for (i, p) in frame.tensors.iter().enumerate() {
+        if p.dtype != DTYPE_F32 {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: payload[{i}] dtype {} not supported in v1 \
+                 (only DTYPE_F32 = 0)",
+                p.dtype
+            )));
+        }
+        if p.bytes.len() % 4 != 0 {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: payload[{i}] byte count {} not divisible by 4 \
+                 (f32 element size)",
+                p.bytes.len()
+            )));
+        }
+        let n = p.bytes.len() / 4;
+        let mut data = Vec::with_capacity(n);
+        for j in 0..n {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&p.bytes[j * 4..(j + 1) * 4]);
+            data.push(f32::from_le_bytes(b));
+        }
+        let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+        let numel_from_shape: i64 = shape.iter().product();
+        if numel_from_shape != n as i64 {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: payload[{i}] shape {shape:?} numel {numel_from_shape} \
+                 != bytes-derived numel {n}"
+            )));
+        }
+        out.push(Tensor::from_f32(&data, &shape, Device::CPU)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -337,6 +444,94 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("world_size"), "got: {err}");
+    }
+
+    // --- Tensor ↔ RoundFrame conversion ---
+
+    #[test]
+    fn tensor_round_trip_through_round_frame() {
+        let data: &[f32] = &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = Tensor::from_f32(data, &[2, 3], Device::CPU).unwrap();
+        let refs = vec![&t];
+        let frame = tensors_to_round_frame(&refs).unwrap();
+        assert_eq!(frame.tensors.len(), 1);
+        assert_eq!(frame.tensors[0].dtype, DTYPE_F32);
+        assert_eq!(frame.tensors[0].shape, vec![2u32, 3]);
+        assert_eq!(frame.tensors[0].bytes.len(), 6 * 4);
+
+        let recovered = round_frame_to_tensors(&frame).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].shape(), vec![2i64, 3]);
+        assert_eq!(recovered[0].to_f32_vec().unwrap(), data);
+    }
+
+    #[test]
+    fn tensors_to_round_frame_rejects_non_f32() {
+        let t = Tensor::from_f64(&[1.0, 2.0], &[2], Device::CPU).unwrap();
+        let refs = vec![&t];
+        let err = tensors_to_round_frame(&refs).unwrap_err();
+        assert!(
+            err.to_string().contains("Float64") && err.to_string().contains("Float32"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round_frame_to_tensors_rejects_shape_byte_mismatch() {
+        // shape claims 4 elements but only 2 f32 worth of bytes (8 bytes)
+        let bogus = RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype: DTYPE_F32,
+                shape: vec![4],
+                bytes: vec![0u8; 8],
+            }],
+        };
+        let err = round_frame_to_tensors(&bogus).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("numel") && (msg.contains("!=") || msg.contains("mismatch")),
+            "got: {msg}"
+        );
+    }
+
+    /// End-to-end: two ranks ship Tensor lists through CpuAverager;
+    /// receive averaged Tensor lists back.
+    #[test]
+    fn two_rank_tensor_average() {
+        let avg = crate::distributed::controller::CpuAverager::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            2,
+        )
+        .unwrap();
+        let port = avg.port();
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        let t0 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 0, 2).unwrap();
+            let t = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], Device::CPU).unwrap();
+            let out = c.all_reduce_tensors(&[&t]).unwrap();
+            tx0.send(out).unwrap();
+            drop(c);
+        });
+        let t1 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 1, 2).unwrap();
+            let t = Tensor::from_f32(&[4.0, 8.0, 12.0], &[3], Device::CPU).unwrap();
+            let out = c.all_reduce_tensors(&[&t]).unwrap();
+            tx1.send(out).unwrap();
+            drop(c);
+        });
+
+        let r0 = rx0.recv().unwrap();
+        let r1 = rx1.recv().unwrap();
+        t0.join().unwrap();
+        t1.join().unwrap();
+        avg.shutdown().unwrap();
+
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
+        assert_eq!(r1[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
     }
 
     /// Connect failure (no controller listening) surfaces a clear error.
