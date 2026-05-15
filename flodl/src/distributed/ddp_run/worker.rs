@@ -1336,6 +1336,293 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
+    /// Self-driven inline training loop for `ApplyPolicy::Async +
+    /// AverageBackend::Cpu` — the only **truly** asynchronous combo.
+    ///
+    /// Each rank submits a parameter-snapshot round to the controller
+    /// (non-blocking), keeps training while the round is in flight,
+    /// polls for completion every batch, and on receipt of the
+    /// averaged response performs an EASGD elastic blend with the
+    /// (now-drifted) live params. The convergence-guard pipeline runs
+    /// against `(snapshot_at_submit, averaged_response)` — matching
+    /// OLD coordinator behavior (averaging is on the parameters that
+    /// were submitted, not on the live drifted ones).
+    ///
+    /// **Overshoot bound:** `max_overshoot = 1` for this first pass —
+    /// if a round is still in flight when the K-boundary triggers the
+    /// next, we [`AsyncCpuReduceClient::block_poll`] until the
+    /// previous round completes before submitting the new one. The
+    /// previous round's EASGD-blend + guard verdict still applies
+    /// before the new snapshot is taken.
+    ///
+    /// **EASGD blend formula:** `W := (1-α)·W_local + α·W_avg` when
+    /// `easgd_alpha = Some(α)`; full overwrite (`copy_`) when `None`.
+    /// Matches OLD `worker.load_averaged`'s two cases.
+    ///
+    /// **Local-only guard verdict:** the cross-rank divergence gather
+    /// (NCCL/CPU AllReduce on per-rank divergence vec) is **deferred**
+    /// here. The guard runs with `deltas[rank] = local_div`, others
+    /// zero. Per user direction, this is acceptable: EASGD plus the
+    /// convergence guard (already LR-drop aware) absorb the per-rank
+    /// drift as long as overshoot stays bounded.
+    ///
+    /// **ElChe timing report is deferred** for the same reason —
+    /// without a cross-rank wall_ms gather, ElChe's auto-tune would
+    /// drift across ranks. Static cadence (anchor stays at config
+    /// init) for this first pass.
+    ///
+    /// **Epoch-event semantics:** LR scheduler updates fire per-rank
+    /// locally on epoch crossing (the fast rank applies LR drop for
+    /// epoch E+1 ahead of slow rank still finishing E). Metrics
+    /// reporting fires once all ranks have crossed — deferred to a
+    /// follow-up slice (per-rank epoch-completion tally via async TCP
+    /// channel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_self_driven_async_cpu(
+        &mut self,
+        async_client: &mut crate::distributed::cpu_reduce::AsyncCpuReduceClient,
+        el_che: &mut super::super::ddp::ElChe,
+        convergence_guard: &mut dyn super::convergence::ConvergenceGuard,
+        partition_sizes: &[usize],
+        elche_relax_up: bool,
+        easgd_alpha: Option<f64>,
+        num_epochs: usize,
+        train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
+    ) -> Result<()> {
+        use super::convergence::{ConvergenceAction, DivergenceReport};
+        use crate::distributed::cpu_reduce::round_frame_to_tensors;
+        use crate::distributed::controller::RoundFrame;
+
+        if partition_sizes.len() != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_async_cpu: partition_sizes len ({}) \
+                 must equal world_size ({})",
+                partition_sizes.len(), self.world_size,
+            )));
+        }
+        if (async_client.world_size() as usize) != self.world_size {
+            return Err(TensorError::new(&format!(
+                "GpuWorker::run_self_driven_async_cpu: async_client world_size \
+                 ({}) must equal worker world_size ({})",
+                async_client.world_size(), self.world_size,
+            )));
+        }
+
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        let total_samples = self.dataset.len();
+        let my_offset: usize = partition_sizes.iter().take(self.rank).sum();
+        let my_size = partition_sizes[self.rank];
+
+        // In-flight snapshot: the deep-cloned params at submit time.
+        // Kept alive across batches; consumed when the round completes
+        // (used as the "pre" side of the divergence math).
+        let mut in_flight_snapshot: Option<Vec<Tensor>> = None;
+
+        // Closure-like helper inlined twice (after poll-completion and
+        // after block-poll at max_overshoot=1). Encapsulates: divergence
+        // math, EASGD blend / full-overwrite, local-only guard report,
+        // action → ElChe.
+        let apply_completed_round = |snapshot: Vec<Tensor>,
+                                     avg_frame: RoundFrame,
+                                     el_che: &mut super::super::ddp::ElChe,
+                                     guard: &mut dyn super::convergence::ConvergenceGuard,
+                                     param_vars: &[Variable],
+                                     device: Device,
+                                     rank: usize,
+                                     world_size: usize,
+                                     elche_relax_up: bool,
+                                     easgd_alpha: Option<f64>|
+         -> Result<()> {
+            // Averaged frame comes back as CPU tensors. Move to the
+            // worker's device so foreach math + blending stay on-device.
+            let averaged_cpu = round_frame_to_tensors(&avg_frame)?;
+            let averaged: Vec<Tensor> = averaged_cpu
+                .iter()
+                .map(|t| t.to_device(device))
+                .collect::<Result<Vec<_>>>()?;
+
+            let param_tensors: Vec<Tensor> =
+                param_vars.iter().map(|v| v.data()).collect();
+
+            // Divergence math: pre_norm BEFORE mutating snapshot.
+            let pre_norm_tensors = Tensor::foreach_norm(&snapshot, 2.0)?;
+            let mut pre_sq = 0.0f64;
+            for n in &pre_norm_tensors {
+                let v: f64 = n.item()?;
+                pre_sq += v * v;
+            }
+            let pre_norm = pre_sq.sqrt();
+
+            // snapshot[i] += -1 * averaged[i]  →  snapshot = pre - post.
+            Tensor::foreach_add_list_(&snapshot, &averaged, -1.0)?;
+            let diff_norms = Tensor::foreach_norm(&snapshot, 2.0)?;
+            let post_norms = Tensor::foreach_norm(&averaged, 2.0)?;
+
+            let mut diff_sq = 0.0f64;
+            for n in &diff_norms {
+                let v: f64 = n.item()?;
+                diff_sq += v * v;
+            }
+            let mut post_sq = 0.0f64;
+            for n in &post_norms {
+                let v: f64 = n.item()?;
+                post_sq += v * v;
+            }
+            let post_norm = post_sq.sqrt();
+            let divergence = if post_norm > 1e-10 {
+                diff_sq.sqrt() / post_norm
+            } else {
+                0.0
+            };
+
+            // EASGD blend or full overwrite into live params.
+            match easgd_alpha {
+                Some(alpha) => {
+                    let beta = 1.0 - alpha;
+                    for live in &param_tensors {
+                        live.mul_scalar_(beta)?;
+                    }
+                    Tensor::foreach_add_list_(&param_tensors, &averaged, alpha)?;
+                }
+                None => {
+                    for (live, avg) in param_tensors.iter().zip(averaged.iter()) {
+                        live.copy_(avg, false)?;
+                    }
+                }
+            }
+
+            // Local-only guard: deltas[rank] = local_div, others zero.
+            // Cross-rank gather is deferred (see method doc).
+            let mut deltas = vec![0.0f64; world_size];
+            deltas[rank] = divergence;
+            let mut pre_norms_vec = vec![0.0f64; world_size];
+            pre_norms_vec[rank] = pre_norm;
+            let report = DivergenceReport {
+                deltas,
+                pre_norms: Some(pre_norms_vec),
+                post_norm: Some(post_norm),
+            };
+            // K-used / k-max approximations from this rank's slot only:
+            // local cycle batches. Cross-rank gather deferred.
+            let k_used = el_che.batch_counts()[rank];
+            let k_max = k_used;
+            let action = guard.report(&report, k_used, k_max);
+            match action {
+                ConvergenceAction::Stable => {
+                    if elche_relax_up {
+                        el_che.relax_anchor_up();
+                    }
+                }
+                ConvergenceAction::SuppressGrowth => {}
+                ConvergenceAction::NudgeDown { factor } => {
+                    el_che.nudge_anchor_down(factor);
+                }
+            }
+            Ok(())
+        };
+
+        for epoch in 0..num_epochs {
+            self.current_epoch = epoch;
+            self.partition = make_partition(
+                my_offset, my_size, total_samples, epoch, self.base_seed,
+            );
+
+            let num_batches = self.partition.len() / self.batch_size;
+            let mut local_batch_idx: usize = 0;
+
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * self.batch_size;
+                let end = start + self.batch_size;
+                let indices = &self.partition[start..end];
+                let batch = self.dataset.get_batch(indices)?;
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch
+                        .into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+
+                let (_loss, _ms) = self.train_step(&batch, train_fn)?;
+                local_batch_idx += 1;
+
+                // Drain any completed round non-blocking.
+                if in_flight_snapshot.is_some() {
+                    if let Some(avg_frame) = async_client.poll_round()? {
+                        let snapshot = in_flight_snapshot.take().unwrap();
+                        apply_completed_round(
+                            snapshot, avg_frame,
+                            el_che, convergence_guard,
+                            &self.param_vars, self.device,
+                            self.rank, self.world_size,
+                            elche_relax_up, easgd_alpha,
+                        )?;
+                    }
+                }
+
+                // K-boundary: submit a new round.
+                let target = el_che.batch_counts()[self.rank];
+                if local_batch_idx >= target {
+                    // max_overshoot = 1: if previous round still in
+                    // flight, block until it completes before submitting.
+                    if let Some(snapshot) = in_flight_snapshot.take() {
+                        let avg_frame = async_client.block_poll()?;
+                        apply_completed_round(
+                            snapshot, avg_frame,
+                            el_che, convergence_guard,
+                            &self.param_vars, self.device,
+                            self.rank, self.world_size,
+                            elche_relax_up, easgd_alpha,
+                        )?;
+                    }
+
+                    // Deep-clone the live params as the new snapshot
+                    // (shallow clone shares storage and would drift
+                    // when subsequent train_step mutates params).
+                    let snapshot: Vec<Tensor> = self
+                        .param_vars
+                        .iter()
+                        .map(|v| {
+                            let data = v.data();
+                            let copy = Tensor::zeros_like(&data)?;
+                            copy.copy_(&data, false)?;
+                            Ok(copy)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    // Build the wire frame and submit. The submit_round
+                    // call writes synchronously but doesn't read the
+                    // response — the reader thread does that later.
+                    let snap_refs: Vec<&Tensor> = snapshot.iter().collect();
+                    let frame = crate::distributed::cpu_reduce::tensors_to_round_frame(&snap_refs)?;
+                    async_client.submit_round(&frame)?;
+                    in_flight_snapshot = Some(snapshot);
+
+                    self.steps_since_avg = 0;
+                    local_batch_idx = 0;
+                }
+            }
+        }
+
+        // Drain any in-flight round at end of training so the last
+        // average gets applied before snapshot_params() captures the
+        // final state.
+        if let Some(snapshot) = in_flight_snapshot.take() {
+            let avg_frame = async_client.block_poll()?;
+            apply_completed_round(
+                snapshot, avg_frame,
+                el_che, convergence_guard,
+                &self.param_vars, self.device,
+                self.rank, self.world_size,
+                elche_relax_up, easgd_alpha,
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Process pending control messages (non-blocking).
     ///
     /// Returns `true` if a Shutdown was received.

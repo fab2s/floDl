@@ -27,6 +27,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::distributed::controller::{
@@ -363,6 +365,166 @@ impl CpuReduceClient {
         };
 
         Ok((divergence, Some(post_norm), Some(pre_norm)))
+    }
+
+    /// Transform this blocking client into an asynchronous one that can
+    /// `submit_round` (non-blocking write) and `poll_round` (non-blocking
+    /// try-receive of the averaged response).
+    ///
+    /// Spawns a background reader thread that consumes
+    /// [`RoundFrame`]s from the TCP stream and forwards them through an
+    /// mpsc channel. The main thread keeps writing rounds and polling
+    /// the channel independently, so the training loop never blocks on
+    /// the controller's round-trip — the core of the CPU-Async
+    /// semantics in the cluster-rank model.
+    ///
+    /// Consumes `self`. After this call, the blocking
+    /// [`Self::all_reduce`] / [`Self::all_reduce_tensors`] / etc. APIs
+    /// are no longer available — only the async pair on
+    /// [`AsyncCpuReduceClient`].
+    ///
+    /// Loud error if [`TcpStream::try_clone`] fails.
+    pub fn into_async(self) -> Result<AsyncCpuReduceClient> {
+        let CpuReduceClient { stream, rank_id, world_size } = self;
+
+        // Clone the stream so the background reader and the main-thread
+        // writer have independent handles. TCP reads and writes can
+        // proceed concurrently on Linux when split this way (each
+        // handle owns its own dup'd FD).
+        let mut reader_stream = stream.try_clone().map_err(|e| {
+            TensorError::new(&format!(
+                "cpu_reduce: stream try_clone for async mode failed: {e}"
+            ))
+        })?;
+
+        let (tx, rx) = mpsc::channel::<Result<RoundFrame>>();
+
+        let reader_handle = thread::Builder::new()
+            .name(format!("cpu-async-reader-r{rank_id}"))
+            .spawn(move || {
+                // Read frames until EOF or error. Errors are forwarded
+                // to the main thread (which surfaces them on
+                // poll_round); EOF is a clean shutdown signal.
+                loop {
+                    match controller::read_round_frame(&mut reader_stream) {
+                        Ok(Some(frame)) => {
+                            if tx.send(Ok(frame)).is_err() {
+                                // Main side dropped the receiver.
+                                break;
+                            }
+                        }
+                        Ok(None) => break, // clean EOF
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| TensorError::new(&format!(
+                "cpu_reduce: spawn async reader thread failed: {e}"
+            )))?;
+
+        Ok(AsyncCpuReduceClient {
+            writer: stream,
+            incoming: rx,
+            reader_handle: Some(reader_handle),
+            rank_id,
+            world_size,
+        })
+    }
+}
+
+/// Async CPU-averaging client: split read/write for non-blocking round
+/// dispatch.
+///
+/// Obtained via [`CpuReduceClient::into_async`]. The training loop
+/// submits a round (frame written immediately on the main thread) and
+/// continues training; later polls drain the averaged response from a
+/// background reader thread via an mpsc channel.
+///
+/// **Lifetime**: holds a join handle for the reader thread; on drop,
+/// the reader exits when the receiver side closes (EOF on the TCP
+/// stream, which the launcher's CpuAverager closes when shutdown
+/// signals).
+#[derive(Debug)]
+pub struct AsyncCpuReduceClient {
+    writer: TcpStream,
+    incoming: mpsc::Receiver<Result<RoundFrame>>,
+    reader_handle: Option<JoinHandle<()>>,
+    rank_id: u32,
+    world_size: u32,
+}
+
+impl AsyncCpuReduceClient {
+    /// This rank's id, as told to the controller.
+    pub fn rank_id(&self) -> u32 {
+        self.rank_id
+    }
+
+    /// The world size baked into the handshake.
+    pub fn world_size(&self) -> u32 {
+        self.world_size
+    }
+
+    /// Submit a round's frame to the controller. The training loop
+    /// continues immediately — the controller's averaged response
+    /// arrives asynchronously and is drained later via
+    /// [`Self::poll_round`].
+    ///
+    /// Write is blocking (TCP send buffer typically accepts a round
+    /// without back-pressure). Loud error on wire-level write failure.
+    pub fn submit_round(&mut self, frame: &RoundFrame) -> Result<()> {
+        controller::write_round_frame(&mut self.writer, frame)
+    }
+
+    /// Try to receive the next averaged round from the background
+    /// reader. Non-blocking.
+    ///
+    /// Returns:
+    /// - `Ok(Some(frame))` — a round completed; caller applies EASGD
+    ///   blend / divergence math.
+    /// - `Ok(None)` — no completed round yet; keep training.
+    /// - `Err(...)` — reader thread surfaced a wire-level error, or
+    ///   the channel disconnected (controller closed the stream).
+    pub fn poll_round(&self) -> Result<Option<RoundFrame>> {
+        match self.incoming.try_recv() {
+            Ok(Ok(frame)) => Ok(Some(frame)),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(TensorError::new(
+                "cpu_reduce: async reader thread disconnected \
+                 (controller closed stream or reader hit a wire error \
+                 already surfaced)",
+            )),
+        }
+    }
+
+    /// Block until the next averaged round arrives. Loops
+    /// [`Self::poll_round`] with a short sleep so the OS can schedule
+    /// other ranks' training threads / the reader thread.
+    ///
+    /// Used at K-boundary when the previous round is still in flight
+    /// (`max_overshoot = 1`): submit-and-wait semantics.
+    pub fn block_poll(&self) -> Result<RoundFrame> {
+        loop {
+            match self.poll_round()? {
+                Some(frame) => return Ok(frame),
+                None => thread::sleep(Duration::from_micros(100)),
+            }
+        }
+    }
+}
+
+impl Drop for AsyncCpuReduceClient {
+    fn drop(&mut self) {
+        // Closing writer half EOFs the controller's read side; reader
+        // thread receives EOF on its own clone and exits naturally.
+        // Wait for it to finish to avoid spurious "thread leaked"
+        // diagnostics; best-effort (don't propagate join errors).
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

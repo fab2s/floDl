@@ -242,16 +242,19 @@ impl DdpHandle {
                         convergence_guard,
                     )
                 }
-                _ => Err(crate::tensor::TensorError::new(&format!(
-                    "Trainer::builder cluster mode: Sync+Nccl (4b.D.1a.ii), \
-                     Cadence+Nccl / Async+Nccl (4b.D.1a.iii / iv), Sync+Cpu \
-                     (4b.D.1b.i), and Cadence+Cpu (4b.D.1b.ii) are \
-                     implemented. Remaining: Async+Cpu → 4b.D.1c (genuine \
-                     async needs the 3-phase machine landing in controller.rs). \
-                     Requested: {policy:?} + {backend:?}. Use Trainer::setup / \
-                     setup_with for cluster-aware training in the meantime \
-                     (user owns the loop).",
-                ))),
+                (ApplyPolicy::Async, AverageBackend::Cpu) => {
+                    Self::run_cluster_rank_async_cpu(
+                        cluster,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                        convergence_guard,
+                    )
+                }
             };
         }
 
@@ -1875,6 +1878,278 @@ impl DdpHandle {
                 &scratch,
                 &partition_sizes,
                 elche_relax_up,
+                num_epochs,
+                &train_fn,
+            )?;
+            let snap = worker.snapshot_params();
+            Ok(TrainedState {
+                params: snap
+                    .params
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+                buffers: snap
+                    .buffers
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(),
+            final_state: None,
+            metrics_rx: None,
+            architecture_svg: None,
+            graph_label: None,
+            graph_hash: None,
+            training_meta,
+        })
+    }
+
+    /// Cluster-rank entry point for `ApplyPolicy::Async +
+    /// AverageBackend::Cpu` — the only **truly** asynchronous combo.
+    ///
+    /// Same shape as
+    /// [`run_cluster_rank_cadence_cpu`](Self::run_cluster_rank_cadence_cpu)
+    /// but the rank uses [`AsyncCpuReduceClient`] instead of the
+    /// blocking [`CpuReduceClient`]:
+    ///
+    /// - Connect with [`CpuReduceClient::connect`] (blocking), do the
+    ///   initial-state broadcast via [`broadcast_from_root`](
+    ///     crate::distributed::CpuReduceClient::broadcast_from_root),
+    ///   then [`CpuReduceClient::into_async`] consumes the blocking
+    ///   client and spawns the background reader thread.
+    /// - Worker runs
+    ///   [`GpuWorker::run_self_driven_async_cpu`]: per-batch
+    ///   train_step + non-blocking poll for completed rounds; at
+    ///   K-boundary, snapshot params + submit (block-poll first if a
+    ///   previous round is still in flight under `max_overshoot = 1`).
+    ///
+    /// **EASGD blending** drives the live params on round completion
+    /// (`W := (1-α)·W_local + α·W_avg` when `easgd_alpha` is set; full
+    /// overwrite otherwise). Mirrors OLD `worker.load_averaged`.
+    ///
+    /// **Still deferred (carried into follow-up slices):** cross-rank
+    /// divergence gather (local-only guard verdict per rank — accepted
+    /// per user direction; EASGD + guard compensate), ElChe timing
+    /// report (static cadence in async mode), `max_overshoot > 1`
+    /// (multi-in-flight rounds), metrics-when-all-crossed dispatch.
+    ///
+    /// [`AsyncCpuReduceClient`]: crate::distributed::AsyncCpuReduceClient
+    /// [`CpuReduceClient::connect`]:
+    ///     crate::distributed::CpuReduceClient::connect
+    /// [`CpuReduceClient::into_async`]:
+    ///     crate::distributed::CpuReduceClient::into_async
+    /// [`GpuWorker::run_self_driven_async_cpu`]:
+    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_async_cpu
+    #[allow(clippy::too_many_arguments)]
+    fn run_cluster_rank_async_cpu<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+        convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::cpu_reduce::CpuReduceClient;
+        use crate::distributed::ddp::ElChe;
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Async+Cpu)"
+        );
+
+        let controller_port = cluster.master_port.saturating_add(2);
+        let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
+        let controller_addr: std::net::SocketAddr = controller_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse controller addr '{controller_addr_str}': {e}"
+            )))?;
+
+        let training_meta = Some(serde_json::json!({
+            "mode": "cluster-rank Async+Cpu",
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "controller_addr": controller_addr_str,
+        }));
+
+        // Hoisted-out Send inputs for the thread closure.
+        let anchor = config.anchor.unwrap_or(10);
+        let overhead_target = config.overhead_target;
+        let max_anchor = config.max_anchor;
+        let min_anchor = config.min_anchor;
+        let max_batch_diff = config.max_batch_diff;
+        let partition_ratios = config.partition_ratios.clone();
+        let elche_relax_up = config.elche_relax_up;
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+        let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
+        let no_divergence_guard = config.no_divergence_guard;
+        let easgd_alpha = config.easgd_alpha;
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Blocking connect + handshake.
+            let mut cpu_client = CpuReduceClient::connect(
+                controller_addr,
+                global_rank as u32,
+                world_size as u32,
+            )?;
+
+            // Build tmp model, broadcast initial params from rank 0 via
+            // blocking avg-trick BEFORE switching to async mode. This
+            // is load-bearing for K>>1 cadence and for EASGD (which
+            // smooths but does not replace divergent initial conditions).
+            let tmp_model = model_factory(device)?;
+            let initial_params_local: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_local: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+
+            if !initial_params_local.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_local.iter().collect();
+                let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
+                for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                    dst.copy_(src, false)?;
+                }
+            }
+
+            let initial_params: Vec<Tensor> = initial_params_local
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_local
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            // Switch to async mode: spawns the background reader
+            // thread + mpsc channel. From here on, only submit_round
+            // / poll_round / block_poll are available.
+            let mut async_client = cpu_client.into_async()?;
+
+            // Build ElChe (same recipe as Cadence+Cpu).
+            let mut el_che = ElChe::new(world_size, anchor);
+            if let Some(target) = overhead_target {
+                el_che = el_che.with_overhead_target(target);
+            }
+            if let Some(max) = max_anchor {
+                el_che = el_che.with_max_anchor(max);
+            }
+            if let Some(min) = min_anchor {
+                el_che = el_che.with_min_anchor(min);
+            }
+            if let Some(diff) = max_batch_diff {
+                el_che = el_che.with_max_batch_diff(diff);
+            }
+            if let Some(ratios) = partition_ratios.as_ref() {
+                if ratios.len() == world_size {
+                    if let Some((slow_rank, _)) = ratios
+                        .iter()
+                        .enumerate()
+                        .min_by(|(ra, a), (rb, b)| {
+                            a.partial_cmp(b)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(ra.cmp(rb))
+                        })
+                    {
+                        el_che = el_che.with_initial_anchor(slow_rank);
+                    }
+                }
+            }
+
+            let partition_sizes: Vec<usize> = if let Some(ratios) = partition_ratios.as_ref() {
+                super::coordinator::ratio_to_sizes(ratios, total_samples)
+            } else if el_che.is_calibrated() || el_che.has_speed_hint() {
+                super::coordinator::throughput_sizes(&el_che, total_samples)
+            } else {
+                super::coordinator::equal_sizes(world_size, total_samples)
+            };
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha,
+                timeline: timeline_for_thread,
+                policy: ApplyPolicy::Async,
+            };
+
+            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
+            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
+                worker_endpoints;
+
+            let mut worker = GpuWorker::new(
+                &worker_config,
+                model_factory,
+                optim_factory,
+                dataset,
+                None,
+                None,
+                timing_tx,
+                metrics_tx,
+                param_tx,
+                final_param_tx,
+                control_rx,
+            )?;
+
+            let mut guard: Box<dyn super::convergence::ConvergenceGuard> =
+                match convergence_guard {
+                    Some(g) => g,
+                    None => {
+                        if no_divergence_guard {
+                            Box::new(super::convergence::NoGuard)
+                        } else {
+                            Box::new(super::convergence::TrendGuard::new(
+                                divergence_threshold,
+                            ))
+                        }
+                    }
+                };
+
+            worker.run_self_driven_async_cpu(
+                &mut async_client,
+                &mut el_che,
+                guard.as_mut(),
+                &partition_sizes,
+                elche_relax_up,
+                easgd_alpha,
                 num_epochs,
                 &train_fn,
             )?;
