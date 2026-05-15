@@ -43,6 +43,11 @@ pub struct GpuWorker<M: Module> {
 
     // -- Worker identity --
     rank: usize,
+    /// World size — populated from [`WorkerConfig::world_size`]. Read by
+    /// the self-driven cluster-rank loop to compute its data-partition
+    /// slice; not used by the coordinator-driven path (the coordinator
+    /// owns world topology there).
+    world_size: usize,
     device: Device,
 
     // -- CUDA streams for overlap (None on CPU) --
@@ -362,6 +367,7 @@ impl<M: Module> GpuWorker<M> {
             param_vars,
             buffer_list,
             rank: config.rank,
+            world_size: config.world_size,
             device: config.device,
             compute_stream,
             comm_stream,
@@ -775,6 +781,109 @@ impl<M: Module> GpuWorker<M> {
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         Ok((loss_val, elapsed_ms))
+    }
+
+    /// Trigger an NCCL AllReduce across all ranks on this worker's
+    /// parameters and reset the local steps-since-avg counter.
+    ///
+    /// Self-driven entry point for the cluster-rank inline loop (4b.D.1a.ii
+    /// onwards). Mirrors the SyncNow handler in `dispatch_control` but
+    /// skips the SyncAck — there's no coordinator listening in the new
+    /// process-per-rank model.
+    ///
+    /// All ranks must reach `sync_now` concurrently for the AllReduce
+    /// collective to complete. Caller is responsible for cadence
+    /// decisions (Sync: every batch; Cadence/Async: ElChe-determined K).
+    pub fn sync_now(&mut self) -> Result<()> {
+        let _ = self.sync_now_nccl()?;
+        self.steps_since_avg = 0;
+        self.local_step += 1;
+        Ok(())
+    }
+
+    /// Self-driven inline training loop for `ApplyPolicy::Sync +
+    /// AverageBackend::Nccl` (the simplest cluster-rank case).
+    ///
+    /// Runs for `num_epochs`. For each epoch:
+    /// 1. Compute this rank's slice of the global permutation (via
+    ///    [`make_partition`] — same deterministic shuffle the coordinator
+    ///    used so the cross-rank disjoint-coverage guarantee holds).
+    /// 2. For each batch:
+    ///    - Synchronous data load + H2D transfer
+    ///    - `train_step` (forward + backward + optional grad clipping +
+    ///      scheduler + optimizer step)
+    ///    - `sync_now` (NCCL AllReduce on params)
+    /// 3. Track `total_loss` across batches; caller can read it via
+    ///    [`GpuWorker::current_epoch`] etc.
+    ///
+    /// **Behavior preserved:** same `train_step` (including CUDA stream
+    /// management, AccumulateGrad node pinning, grad clipping, scheduler),
+    /// same `sync_now_nccl` (AllReduce + divergence measurement). The
+    /// orchestration change: no coordinator driving SyncNow control
+    /// messages — this rank decides Sync = every batch internally.
+    ///
+    /// **Not yet supported:**
+    /// - VRAM-aware prefetch (sync data loading only; future slice)
+    /// - Per-batch metrics + per-epoch MetricsMsg (future slice; DdpHandle
+    ///   metrics queue is empty until then)
+    /// - `Cadence` / `Async` policies (loud error in the cluster-rank
+    ///   dispatch — see 4b.D.1a.iii / iv)
+    /// - `epoch_fn` callback (future slice)
+    pub fn run_self_driven_sync_nccl(
+        &mut self,
+        num_epochs: usize,
+        train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
+    ) -> Result<()> {
+        if self.nccl_comm.is_none() {
+            return Err(TensorError::new(
+                "GpuWorker::run_self_driven_sync_nccl requires an NCCL comm; \
+                 caller must build the worker with Some(comm).",
+            ));
+        }
+
+        // Pin CUDA work to compute_stream for the full training session
+        // (same invariant run_epoch_plan relies on; protects AccumulateGrad
+        // node stream-pinning from interleaving with default-stream ops).
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
+        for epoch in 0..num_epochs {
+            self.current_epoch = epoch;
+            let total_samples = self.dataset.len();
+            // Use the same global-permutation slice the coordinator would
+            // have assigned this rank. Equal share — no throughput-based
+            // rebalancing in this slice (future work).
+            let share = total_samples / self.world_size;
+            let offset = self.rank * share;
+            let size = if self.rank == self.world_size - 1 {
+                total_samples - offset // last rank picks up remainder
+            } else {
+                share
+            };
+            self.partition = make_partition(
+                offset, size, total_samples, epoch, self.base_seed,
+            );
+
+            let num_batches = self.partition.len() / self.batch_size;
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * self.batch_size;
+                let end = start + self.batch_size;
+                let indices = &self.partition[start..end];
+                let batch = self.dataset.get_batch(indices)?;
+                let batch: Vec<Tensor> = if self.device.is_cuda() {
+                    batch
+                        .into_iter()
+                        .map(|t| t.to_device(self.device))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+
+                let (_loss, _ms) = self.train_step(&batch, train_fn)?;
+                // ApplyPolicy::Sync: AllReduce after every batch.
+                self.sync_now()?;
+            }
+        }
+        Ok(())
     }
 
     /// Process pending control messages (non-blocking).

@@ -177,27 +177,34 @@ impl DdpHandle {
 
         // Cluster-mode detection: under the process-per-rank model,
         // Trainer::builder runs inside each rank process — one device per
-        // process, no in-process N-thread coordinator. The new inline
-        // rank-loop scaffolding is being staged across 4b.D.1a sub-slices
-        // (one ApplyPolicy × AverageBackend combo per commit). Until the
-        // matching slice lands, fail loudly so users get a clear pointer
-        // instead of a confusing N² worker fan-out that doesn't reflect
-        // the actual cluster topology.
+        // process, no in-process N-thread coordinator. Dispatches to the
+        // matching cluster-rank inline-loop entry by (policy, backend).
+        // Slices land one combo at a time across 4b.D.1a.{ii, iii, iv} +
+        // 4b.D.1b; each combo has its own loud-error pointer until lit.
         if let Some(cluster) = crate::distributed::cluster::LocalCluster::from_env()? {
-            return Err(crate::tensor::TensorError::new(&format!(
-                "Trainer::builder in cluster mode (this rank lives on host \
-                 {:?} with global ranks {:?}, world_size {}) is being \
-                 refactored — the single-rank inline loop lands in 4b.D.1a.ii \
-                 (Sync+Nccl), 4b.D.1a.iii (Cadence+Nccl), 4b.D.1a.iv (Async+Nccl), \
-                 4b.D.1b (Cpu backend), 4b.D.1c (3-phase port), 4b.D.1d (chunk \
-                 dispatch port). Until then, use Trainer::setup / setup_with for \
-                 cluster-aware training (user owns the loop), or invoke \
-                 Trainer::builder outside cluster mode (no FLODL_CLUSTER_JSON, \
-                 e.g. `cargo run` directly).",
-                cluster.host.name,
-                cluster.host.ranks,
-                cluster.world_size(),
-            )));
+            return match (policy, backend) {
+                (ApplyPolicy::Sync, AverageBackend::Nccl) => {
+                    Self::run_cluster_rank_sync_nccl(
+                        cluster,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                    )
+                }
+                _ => Err(crate::tensor::TensorError::new(&format!(
+                    "Trainer::builder cluster mode: only ApplyPolicy::Sync + \
+                     AverageBackend::Nccl is implemented (4b.D.1a.ii). \
+                     Other combinations land in: Cadence+Nccl → 4b.D.1a.iii, \
+                     Async+Nccl → 4b.D.1a.iv, Cpu backend (all policies) → \
+                     4b.D.1b. Requested: {policy:?} + {backend:?}. Use \
+                     Trainer::setup / setup_with for cluster-aware training \
+                     in the meantime (user owns the loop).",
+                ))),
+            };
         }
 
         let devices = crate::tensor::usable_cuda_devices();
@@ -850,6 +857,196 @@ impl DdpHandle {
             architecture_svg,
             graph_label,
             graph_hash,
+            training_meta,
+        })
+    }
+
+    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Nccl`.
+    ///
+    /// This rank reads its slot from [`LocalCluster::from_env`], does the
+    /// NCCL rendezvous, builds the model on its assigned device, syncs
+    /// initial parameters from rank 0 via NCCL broadcast, and spawns a
+    /// single training thread that runs
+    /// [`GpuWorker::run_self_driven_sync_nccl`] — no in-process N-thread
+    /// coordinator, no mpsc orchestration.
+    ///
+    /// **Behavior preserved (vs the old threaded coordinator):**
+    /// - Same `train_step` (forward + backward + optional grad clipping +
+    ///   scheduler + optimizer step + CUDA stream pinning)
+    /// - Same `sync_now_nccl` (in-place AllReduce + divergence measurement)
+    /// - Same dataset shuffle (deterministic global permutation via
+    ///   [`make_partition`])
+    /// - Same initial-state sync (rank 0 broadcasts params + buffers to
+    ///   every rank)
+    ///
+    /// **Not yet wired in this slice (4b.D.1a.ii):** progressive chunk
+    /// dispatch (sync data loading only), per-epoch metrics aggregation
+    /// (`metrics_rx` is `None`), `epoch_fn` / `metrics_fn` / `scheduler` /
+    /// `checkpoint_every` callbacks (silently ignored — future slices wire
+    /// them back in one at a time). The compile gate on the public
+    /// `DdpBuilder` API hides this gap: callers can still chain the
+    /// fluent methods; they just produce no-ops until the supporting
+    /// machinery lands.
+    ///
+    /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
+    /// [`GpuWorker::run_self_driven_sync_nccl`]: crate::distributed::ddp_run::GpuWorker::run_self_driven_sync_nccl
+    /// [`make_partition`]: crate::distributed::ddp_run::make_partition
+    #[allow(clippy::too_many_arguments)]
+    fn run_cluster_rank_sync_nccl<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::nccl::NcclRankComm;
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Sync+Nccl)"
+        );
+
+        let training_meta = Some(serde_json::json!({
+            "mode": "cluster-rank Sync+Nccl",
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+        }));
+
+        // All model/optimizer/CUDA work happens inside the spawned
+        // training thread — M (containing Rc<RefCell<…>>) isn't Send, so
+        // we can't build a GpuWorker on the main thread and move it in.
+        // The thread does: rendezvous → init NcclRankComm → build model
+        // → broadcast initial state from rank 0 → build GpuWorker → run
+        // self-driven Sync loop → snapshot final state.
+        //
+        // dataset_signature isn't yet plumbed through DdpBuilder /
+        // DdpRunConfig (it lives on DdpConfig for Trainer::setup_with).
+        // Default [0u8; 32] — every rank trivially agrees; cluster
+        // rendezvous accepts. Future slice exposes it on the builder
+        // for opt-in shard-divergence detection.
+        let dataset_sig = [0u8; 32];
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            let rdv = cluster.rendezvous(dataset_sig)?;
+            let nccl_comm = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+
+            // Build tmp model, broadcast initial state from rank 0, then
+            // pin to CPU for the WorkerConfig (GpuWorker::new re-creates
+            // the model and copies the pinned params back to GPU).
+            let tmp_model = model_factory(device)?;
+            let initial_params_gpu: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_gpu: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+            if !initial_params_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            if !initial_buffers_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            let initial_params: Vec<Tensor> = initial_params_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha: None,
+                timeline: timeline_for_thread,
+                policy: ApplyPolicy::Sync,
+            };
+
+            // Worker channels: nothing drains them in cluster-rank mode
+            // (no coordinator). Held inside the closure so the worker's
+            // internal sends silently buffer. Future slice wires
+            // metrics_rx back into DdpHandle.
+            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
+            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
+                worker_endpoints;
+
+            let mut worker = GpuWorker::new(
+                &worker_config,
+                model_factory,
+                optim_factory,
+                dataset,
+                Some(nccl_comm),
+                None,
+                timing_tx,
+                metrics_tx,
+                param_tx,
+                final_param_tx,
+                control_rx,
+            )?;
+
+            worker.run_self_driven_sync_nccl(num_epochs, &train_fn)?;
+            let snap = worker.snapshot_params();
+            Ok(TrainedState {
+                params: snap
+                    .params
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+                buffers: snap
+                    .buffers
+                    .iter()
+                    .map(|t| t.to_device(Device::CPU))
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(), // abort plumbing deferred — handle
+                                            // lives inside the thread's NcclRankComm
+            final_state: None,
+            metrics_rx: None, // wired in a follow-up slice
+            architecture_svg: None, // model lives inside thread; metadata deferred
+            graph_label: None,
+            graph_hash: None,
             training_meta,
         })
     }
