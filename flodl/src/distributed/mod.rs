@@ -13,6 +13,7 @@
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
 pub mod cluster;
+pub mod controller;
 pub mod cuda_event;
 pub mod cuda_stream;
 pub mod launcher;
@@ -24,6 +25,7 @@ pub mod lr_event_meta;
 pub mod rendezvous;
 
 pub use cluster::{HostBlock, LocalCluster};
+pub use controller::{CpuAverager, RoundFrame, TensorPayload, DTYPE_F32};
 pub use launcher::{FullCluster, FullHost, Role};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
