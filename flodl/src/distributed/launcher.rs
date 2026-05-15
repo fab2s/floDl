@@ -61,6 +61,9 @@
 //! [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
 
 use std::env;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::thread;
 
 use crate::tensor::{Result, TensorError};
 
@@ -136,22 +139,213 @@ fn on_off(b: bool) -> &'static str {
     if b { "set" } else { "unset" }
 }
 
-/// Launcher-mode orchestration. Read full topology, spawn ranks, start
-/// controller, wait, shut down. Returns when every rank child has exited.
+/// Launcher-mode orchestration. Read full topology, spawn ranks, wait
+/// for them, return when every rank child has exited.
 ///
-/// **Status (4b.B.1):** scaffolding. Reads + parses the full topology
-/// envelope. Fan-out (ssh / fork-exec), controller (TCP byte router), and
-/// log fan-in land in subsequent slices (4b.B.2 — `controller.rs`,
-/// 4b.B.3 — `cpu_reduce.rs`, 4b.B.4 — Trainer wire-in). Until those
-/// land, this function returns an error indicating the unimplemented path.
+/// **4b.B.4a scope: local-only fan-out.** Spawns rank processes for
+/// the host whose name matches this launcher's hostname (fork-exec of
+/// `current_exe`). Errors loudly when the topology lists any other host
+/// (ssh fan-out lands in 4b.B.4b).
+///
+/// **Not yet wired:** during the 4b transition, today's
+/// `flodl-cli/src/cluster.rs` still does its own N-child fan-out, so
+/// `dispatch()` never reaches launcher role in practice — the FLODL_LOCAL_RANK
+/// env var fdl-cli sets pushes role detection straight to `Rank`. 4b.C
+/// flips fdl-cli to spawn a single launcher child instead, at which point
+/// this function gets exercised end-to-end.
 fn run_launcher() -> Result<()> {
-    let _full = FullCluster::from_env()?;
-    Err(TensorError::new(
-        "cluster launcher: fan-out + controller not yet implemented \
-         (4b.B.2/3/4). Full topology parsed; fdl @cluster should still go \
-         through the legacy flodl-cli/src/cluster.rs path during the 4b \
-         transition.",
-    ))
+    let full = FullCluster::from_env()?;
+    let me = crate::distributed::cluster::resolve_hostname()?;
+
+    // Reject ssh-requiring topologies in 4b.B.4a.
+    for host in &full.hosts {
+        if host.name != me && host.ssh.is_some() {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: ssh fan-out to remote host {:?} not yet \
+                 implemented (4b.B.4b). Local-only topologies work in this \
+                 build.",
+                host.name
+            )));
+        }
+        if host.name != me && host.ssh.is_none() {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: host {:?} declared but missing ssh: field \
+                 and hostname doesn't match this launcher ({me:?}). Either \
+                 set ssh: for remote hosts (deferred to 4b.B.4b) or restrict \
+                 the topology to this host.",
+                host.name
+            )));
+        }
+    }
+
+    // Find our host's slice.
+    let my_host = full.hosts.iter().find(|h| h.name == me).ok_or_else(|| {
+        TensorError::new(&format!(
+            "cluster launcher: this host's name {me:?} doesn't appear in \
+             cluster.hosts. Controller-without-rank orchestrator-only mode \
+             isn't supported in 4b.B.4a (no remote hosts to spawn). Add this \
+             host to cluster.hosts or run on a host that's already listed."
+        ))
+    })?;
+
+    let exe = env::current_exe().map_err(|e| {
+        TensorError::new(&format!(
+            "cluster launcher: current_exe() failed: {e}"
+        ))
+    })?;
+    let user_args: Vec<String> = env::args().skip(1).collect();
+
+    // Spawn one child per rank on this host.
+    let mut children: Vec<(usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
+        Vec::with_capacity(my_host.ranks.len());
+    for local_rank in 0..my_host.ranks.len() {
+        let envelope = build_slim_envelope_for(&full, my_host);
+        let envelope_hex = crate::distributed::cluster::hex_encode(
+            serde_json::to_string(&envelope)
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: serialize slim envelope failed: {e}"
+                    ))
+                })?
+                .as_bytes(),
+        );
+
+        let mut cmd = Command::new(&exe);
+        cmd.args(&user_args)
+            .env(
+                crate::distributed::cluster::ENV_CLUSTER_JSON,
+                &envelope_hex,
+            )
+            .env(
+                crate::distributed::cluster::ENV_LOCAL_RANK,
+                local_rank.to_string(),
+            )
+            // FLODL_FULL_CLUSTER_JSON is launcher-only — strip it from
+            // children so they detect Role::Rank, not Role::Launcher.
+            .env_remove(ENV_FULL_CLUSTER_JSON)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            TensorError::new(&format!(
+                "cluster launcher: spawn rank {local_rank} of {} failed: {e}",
+                my_host.name
+            ))
+        })?;
+
+        // Forward stdout/stderr line-by-line with a rank prefix so the
+        // controller's terminal shows interleaved-but-attributable output.
+        let global_rank = my_host.ranks[local_rank];
+        let prefix = format!("[{}:r{global_rank}] ", my_host.name);
+        let mut forwarders = Vec::with_capacity(2);
+        if let Some(out) = child.stdout.take() {
+            let prefix_clone = prefix.clone();
+            forwarders.push(thread::spawn(move || {
+                forward_lines(out, prefix_clone, false);
+            }));
+        }
+        if let Some(err) = child.stderr.take() {
+            let prefix_clone = prefix.clone();
+            forwarders.push(thread::spawn(move || {
+                forward_lines(err, prefix_clone, true);
+            }));
+        }
+        children.push((local_rank, child, forwarders));
+    }
+
+    // Wait for every child + join forwarders. Propagate non-zero exit
+    // codes as a loud error.
+    let mut any_failure: Option<TensorError> = None;
+    for (local_rank, mut child, forwarders) in children {
+        let status = child.wait().map_err(|e| {
+            TensorError::new(&format!(
+                "cluster launcher: wait on rank {local_rank} failed: {e}"
+            ))
+        })?;
+        for f in forwarders {
+            let _ = f.join();
+        }
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            let msg = format!(
+                "cluster launcher: rank {local_rank} of {} exited with status {code}",
+                my_host.name
+            );
+            // Keep the first failure; continue waiting on the rest so
+            // we don't leave zombies if multiple ranks die.
+            if any_failure.is_none() {
+                any_failure = Some(TensorError::new(&msg));
+            } else {
+                eprintln!("{msg}");
+            }
+        }
+    }
+    if let Some(err) = any_failure {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Build the slim per-host envelope JSON the rank process consumes via
+/// [`LocalCluster::from_env`]. Mirrors the shape fdl-cli emits today; the
+/// duplication will go away once 4b.C completes.
+///
+/// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
+fn build_slim_envelope_for(full: &FullCluster, host: &FullHost) -> serde_json::Value {
+    use serde_json::Value;
+    let mut host_obj = serde_json::Map::new();
+    host_obj.insert("name".into(), Value::String(host.name.clone()));
+    host_obj.insert(
+        "ranks".into(),
+        Value::Array(host.ranks.iter().map(|r| Value::from(*r)).collect()),
+    );
+    host_obj.insert(
+        "local_devices".into(),
+        match &host.local_devices {
+            None => Value::String("all".into()),
+            Some(v) => Value::Array(v.iter().map(|d| Value::from(*d)).collect()),
+        },
+    );
+    host_obj.insert(
+        "nccl_socket_ifname".into(),
+        Value::String(host.nccl_socket_ifname.clone()),
+    );
+    host_obj.insert("path".into(), Value::String(host.path.clone()));
+    if let Some(p) = &host.libtorch_path {
+        host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
+    }
+
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        "master_addr".into(),
+        Value::String(full.master_addr.clone()),
+    );
+    envelope.insert("master_port".into(), Value::from(full.master_port));
+    envelope.insert("world_size".into(), Value::from(full.world_size()));
+    envelope.insert("num_hosts".into(), Value::from(full.hosts.len()));
+    envelope.insert("host".into(), Value::Object(host_obj));
+    Value::Object(envelope)
+}
+
+/// Forward a child stream line-by-line with a prefix, mirroring
+/// fdl-cli's launcher behavior. `to_stderr=true` routes to stderr (per
+/// `feedback_docker_stdout_buffering` for debug-level output), else
+/// stdout.
+fn forward_lines<R: std::io::Read>(stream: R, prefix: String, to_stderr: bool) {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                if to_stderr {
+                    eprintln!("{prefix}{l}");
+                } else {
+                    println!("{prefix}{l}");
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,5 +756,53 @@ mod tests {
         v["master_port"] = json!(100_000);
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(err.to_string().contains("u16"), "got: {err}");
+    }
+
+    #[test]
+    fn slim_envelope_strips_ssh_carries_metadata() {
+        // Direct test of the build_slim_envelope_for helper: the slim
+        // shape must round-trip through LocalCluster::from_env on the
+        // rank side, so it has to match that parser's expectations
+        // (master_addr/master_port/world_size/num_hosts/host with no
+        // ssh field).
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let worker = full.hosts.iter().find(|h| h.name == "worker-host").unwrap();
+        let env = build_slim_envelope_for(&full, worker);
+
+        assert_eq!(env["master_addr"], "192.168.122.1");
+        assert_eq!(env["master_port"], 29500);
+        assert_eq!(env["world_size"], 3);
+        assert_eq!(env["num_hosts"], 2);
+        assert_eq!(env["host"]["name"], "worker-host");
+        assert_eq!(env["host"]["ranks"], serde_json::json!([1, 2]));
+        assert_eq!(env["host"]["local_devices"], serde_json::json!("all"));
+        assert_eq!(env["host"]["nccl_socket_ifname"], "enp1s0");
+        // ssh: stripped (launcher-only field; slim envelope is rank-side).
+        assert!(env["host"].get("ssh").is_none(), "ssh must be stripped");
+    }
+
+    #[test]
+    fn slim_envelope_emits_explicit_local_devices_when_present() {
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let env = build_slim_envelope_for(&full, master);
+        assert_eq!(env["host"]["local_devices"], serde_json::json!([0]));
+    }
+
+    #[test]
+    fn slim_envelope_round_trips_through_local_cluster_parser() {
+        // Smoke test: the slim envelope built by the launcher must parse
+        // cleanly via the rank-side LocalCluster::from_value. Same wire
+        // contract, validated end-to-end.
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let env = build_slim_envelope_for(&full, master);
+        let parsed = crate::distributed::cluster::LocalCluster::from_value(&env)
+            .expect("slim envelope must parse via LocalCluster::from_value");
+        assert_eq!(parsed.world_size(), 3);
+        assert_eq!(parsed.master_addr, "192.168.122.1");
+        assert_eq!(parsed.host.name, "master-host");
+        assert_eq!(parsed.host.ranks, vec![0]);
+        assert_eq!(parsed.host.local_devices, vec![0]);
     }
 }

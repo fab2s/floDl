@@ -541,7 +541,13 @@ fn local_rank_index_from_env(local_count: usize, host_name: &str) -> Result<usiz
     Ok(idx)
 }
 
-fn resolve_hostname() -> Result<String> {
+/// Resolve this host's name as the cluster code sees it.
+///
+/// Test override > [`ENV_HOST_OVERRIDE`] env var > `hostname(1)` command.
+/// Trimmed; non-empty guaranteed on success. Used by [`LocalCluster::this_host`]
+/// to match against the envelope and by the launcher to find the matching
+/// entry in [`crate::distributed::launcher::FullCluster::hosts`].
+pub(crate) fn resolve_hostname() -> Result<String> {
     if let Some(s) = THREAD_HOSTNAME_OVERRIDE.with(|c| c.borrow().clone()) {
         return Ok(s);
     }
@@ -595,9 +601,9 @@ fn hex_nibble(b: u8) -> std::result::Result<u8, String> {
     }
 }
 
-/// Hex-encode raw bytes. Companion to [`hex_decode`]; used by tests and by
-/// the matching encoder in `fdl-cli`'s launcher.
-#[cfg(test)]
+/// Hex-encode raw bytes. Companion to [`hex_decode`]; used by the
+/// launcher when building child-process env vars and by test setup
+/// that constructs envelopes inline.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);

@@ -426,6 +426,7 @@ impl Trainer {
         G: Fn(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        dispatch_launcher_or_continue()?;
         Ddp::print_device_summary();
 
         if let Some(cluster) = LocalCluster::from_env()? {
@@ -462,6 +463,7 @@ impl Trainer {
         G: Fn(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        dispatch_launcher_or_continue()?;
         Ddp::print_device_summary();
 
         if let Some(cluster) = LocalCluster::from_env()? {
@@ -571,6 +573,7 @@ impl Trainer {
         G: Fn(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        dispatch_launcher_or_continue()?;
         Ddp::print_device_summary();
         let graph = head.graph();
 
@@ -600,6 +603,7 @@ impl Trainer {
         G: Fn(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        dispatch_launcher_or_continue()?;
         Ddp::print_device_summary();
         let graph = head.graph();
 
@@ -636,6 +640,34 @@ impl Trainer {
 /// Loud errors at every step — silent fallthrough on a misconfigured
 /// cluster is the worst class of bug (data shard divergence, hangs,
 /// silently-wrong gradients).
+/// Cluster-role detection slot-in called from every `Trainer::setup*`.
+///
+/// Three outcomes:
+/// - [`Role::SingleDevice`]: no cluster env → return Ok so caller proceeds.
+/// - [`Role::Rank`]: rank slot env → return Ok so caller's cluster-path
+///   logic ([`LocalCluster::from_env`] + rendezvous + `Ddp::wrap`) runs.
+/// - [`Role::LauncherDone`]: this process was the launcher; fan-out
+///   completed, ranks all exited cleanly. The user's training-loop code
+///   has nothing to do here — exit the program with status 0.
+///
+/// Wrapping the role check in `Trainer::setup*` keeps the user code
+/// transparent: same `Trainer::setup(&model, factory, optim)?` line on
+/// single-host, multi-process single-host, and multi-host invocations.
+/// The launcher branch never returns to user code; everything below the
+/// `setup` call runs only on the rank-side.
+///
+/// [`Role::SingleDevice`]: crate::distributed::launcher::Role::SingleDevice
+/// [`Role::Rank`]: crate::distributed::launcher::Role::Rank
+/// [`Role::LauncherDone`]: crate::distributed::launcher::Role::LauncherDone
+/// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
+fn dispatch_launcher_or_continue() -> Result<()> {
+    match crate::distributed::launcher::dispatch()? {
+        crate::distributed::launcher::Role::LauncherDone => std::process::exit(0),
+        crate::distributed::launcher::Role::Rank
+        | crate::distributed::launcher::Role::SingleDevice => Ok(()),
+    }
+}
+
 fn setup_cluster<F, M, G, O>(
     model: &Graph,
     cluster: &LocalCluster,
