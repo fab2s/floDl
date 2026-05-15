@@ -15,6 +15,7 @@
 pub mod cluster;
 pub mod cuda_event;
 pub mod cuda_stream;
+pub mod launcher;
 pub mod nccl;
 pub mod ddp;
 pub mod ddp_run;
@@ -23,6 +24,7 @@ pub mod lr_event_meta;
 pub mod rendezvous;
 
 pub use cluster::{HostBlock, LocalCluster};
+pub use launcher::{FullCluster, FullHost, Role};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
