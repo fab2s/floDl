@@ -162,6 +162,13 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             rank: rank as u64,
             lr,
         },
+        TimingMsg::Heartbeat { rank, step_count } => TimingMsgWire::Heartbeat {
+            rank: rank as u64,
+            step_count: step_count as u64,
+        },
+        TimingMsg::SnapshotReady { rank } => TimingMsgWire::SnapshotReady {
+            rank: rank as u64,
+        },
     }
 }
 
@@ -189,6 +196,13 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
             partition_offset: plan.partition_offset as usize,
             partition_size: plan.partition_size as usize,
         }))),
+        ControlMsgWire::ExtendPartition {
+            partition_offset,
+            partition_size,
+        } => Ok(Some(ControlMsg::ExtendPartition {
+            partition_offset: partition_offset as usize,
+            partition_size: partition_size as usize,
+        })),
         ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
@@ -315,6 +329,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // param bridge's synthesized ControlMsg::Update).
         let (timing_tx, timing_rx) = mpsc::channel::<TimingMsg>();
         let timing_tx_for_param_bridge = timing_tx.clone();
+        let timing_tx_for_heartbeat = timing_tx.clone();
         let (metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::ddp_run::MetricsMsg>();
         let (param_tx, param_rx) =
             mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
@@ -458,6 +473,30 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 .map_err(|e| {
                     TensorError::new(&format!(
                         "cluster_worker: spawn final discard bridge: {e}"
+                    ))
+                })?,
+        );
+        // Heartbeat thread: fires at HEARTBEAT_CADENCE_MS so the coord
+        // can distinguish "rank alive but blocked at the AllReduce
+        // barrier" from "rank dead." The thread is independent of the
+        // training loop, so a wedged inner GpuWorker still produces
+        // heartbeats (training will stall but cluster doesn't think
+        // the rank is dead — operations signal). Stops on shutdown_flag.
+        let shutdown_for_hb = Arc::clone(&shutdown_flag);
+        let rank_for_hb = rank_id as usize;
+        bridges.push(
+            thread::Builder::new()
+                .name(format!("flodl-worker-heartbeat:r{rank_out}"))
+                .spawn(move || {
+                    heartbeat_loop(
+                        rank_for_hb,
+                        timing_tx_for_heartbeat,
+                        shutdown_for_hb,
+                    );
+                })
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster_worker: spawn heartbeat thread: {e}"
                     ))
                 })?,
         );
@@ -633,6 +672,37 @@ fn inbound_loop(
 
 /// timing_rx → TCP bridge: drain in-process timing reports, encode
 /// each as a [`ControlFrame`] and write to the coordinator.
+/// Heartbeat cadence (ms). Fast enough that the coord's default 30s
+/// staleness threshold catches a wedged rank within ~30 heartbeats,
+/// slow enough that the per-cycle frame overhead is negligible.
+const HEARTBEAT_CADENCE_MS: u64 = 1_000;
+
+/// Worker-side heartbeat emitter. Fires a [`TimingMsg::Heartbeat`]
+/// every [`HEARTBEAT_CADENCE_MS`] until `shutdown` is signalled or the
+/// `timing_tx` channel closes (inner GpuWorker dropped). The heartbeat
+/// flows through the outbound bridge alongside Batch / SyncAck / etc.,
+/// so the coord receives liveness signal even while the inner is
+/// blocked at the AllReduce barrier — distinguishing "alive at
+/// barrier" from "dead."
+fn heartbeat_loop(
+    rank: usize,
+    timing_tx: mpsc::Sender<TimingMsg>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut step_count: usize = 0;
+    while !shutdown.load(Ordering::SeqCst) {
+        step_count = step_count.saturating_add(1);
+        if timing_tx
+            .send(TimingMsg::Heartbeat { rank, step_count })
+            .is_err()
+        {
+            // Inner GpuWorker dropped → channel closed → exit.
+            return;
+        }
+        thread::sleep(Duration::from_millis(HEARTBEAT_CADENCE_MS));
+    }
+}
+
 fn outbound_loop(
     rank: usize,
     stream: &mut TcpStream,
@@ -757,6 +827,16 @@ fn param_bridge_loop(
         if copy_failed {
             return;
         }
+
+        // Emit SnapshotReady BEFORE entering the AllReduce barrier so
+        // the coord's per-rank capacity signal (T_ready - T_request)
+        // measures snapshot + upload only, NOT polluted by slowest-
+        // rank barrier wait. Failure to send is non-fatal — channel
+        // closed means the coord-side bridge is gone, and the next
+        // op will surface the real error.
+        let _ = timing_tx.send(TimingMsg::SnapshotReady {
+            rank: rank as usize,
+        });
 
         // AllReduce-Avg params via the data channel; returns NEW
         // averaged tensors (snapshot.params untouched). f32 only in
@@ -1152,14 +1232,18 @@ mod tests {
         let total_samples = 8usize;
         let batch_size = 4usize;
 
-        // 1. ClusterController on data port. start() is non-blocking;
-        //    accept happens in the spawned reduce thread.
-        let controller = ClusterController::start(
+        // 1. Shared DeadRanks ledger + ClusterController on data port.
+        //    No rank is dead in this smoke test; the ledger is wired
+        //    for API completeness and to prove the dead-rank-aware
+        //    controller path doesn't regress the happy case.
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let controller = ClusterController::start_with_dead_ranks(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             world_size,
             TEST_SALT,
+            Arc::clone(&dead_ranks),
         )
-        .expect("ClusterController::start succeeds");
+        .expect("ClusterController::start_with_dead_ranks succeeds");
         let data_port = controller.port();
         let data_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), data_port);
 
@@ -1179,6 +1263,7 @@ mod tests {
         let captured_deltas: Arc<std::sync::Mutex<Vec<Vec<f64>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_coord = Arc::clone(&captured_deltas);
+        let dead_ranks_for_coord = Arc::clone(&dead_ranks);
         let config_for_coord = move || {
             ClusterCoordinatorConfig::new(
                 ApplyPolicy::Sync,
@@ -1189,6 +1274,7 @@ mod tests {
             .with_convergence_guard(Box::new(RecordingGuard {
                 captured: captured_for_coord,
             }))
+            .dead_ranks(dead_ranks_for_coord)
             .total_samples(total_samples)
             .batch_size(batch_size)
             .num_epochs(1)

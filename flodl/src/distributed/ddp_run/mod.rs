@@ -756,6 +756,23 @@ pub enum TimingMsg {
         /// Current optimizer learning rate.
         lr: f64,
     },
+    /// Periodic liveness signal from a cluster worker's heartbeat
+    /// thread. Cluster-only; OLD threaded path never emits these.
+    /// See [`crate::distributed::wire::TimingMsgWire::Heartbeat`] for
+    /// the failure-detection rationale.
+    Heartbeat {
+        /// Which rank sent this.
+        rank: usize,
+        /// Worker's local step counter at emission time. Diagnostic.
+        step_count: usize,
+    },
+    /// Cluster-mode "snapshot ready, entering AllReduce barrier"
+    /// marker emitted by the worker's CPU-averaging param bridge.
+    /// See [`crate::distributed::wire::TimingMsgWire::SnapshotReady`].
+    SnapshotReady {
+        /// Which rank sent this.
+        rank: usize,
+    },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
@@ -864,6 +881,20 @@ pub enum ControlMsg {
     /// reconstruct their sample indices from the global permutation using the
     /// plan's offset and size.
     StartEpoch(EpochPlan),
+    /// Mid-epoch partition extension. Coord-emitted when redistributing
+    /// a freshly-dead rank's un-processed samples onto survivors so the
+    /// epoch still processes its intended sample count. Worker appends
+    /// the resolved indices to its in-flight `partition` Vec; the
+    /// epoch loop re-checks `partition.len()` each iteration so the
+    /// new batches are processed before declaring the epoch complete.
+    ExtendPartition {
+        /// Offset into the global epoch permutation where the new
+        /// slice starts (resolved via the same `make_partition` call
+        /// the worker would use for `StartEpoch`).
+        partition_offset: usize,
+        /// Number of additional sample indices to append.
+        partition_size: usize,
+    },
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
     Throttle,

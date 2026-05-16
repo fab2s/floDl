@@ -442,6 +442,20 @@ pub enum ControlMsgWire {
     SyncNow,
     /// Begin processing a new epoch with the given partition.
     StartEpoch(EpochPlanWire),
+    /// Extend the worker's current-epoch partition with additional
+    /// indices from the global permutation. Emitted mid-epoch by the
+    /// coord when redistributing a freshly-dead rank's un-processed
+    /// samples onto survivors, preserving the "intended N samples per
+    /// epoch" invariant under rank failure. The worker appends the
+    /// indices (computed via `make_partition` with the new
+    /// `partition_offset` / `partition_size`, the current epoch, and
+    /// the shared seed) to its in-flight partition; its epoch loop
+    /// re-checks the bound each iteration so the appended batches
+    /// are processed before completing the epoch.
+    ExtendPartition {
+        partition_offset: u64,
+        partition_size: u64,
+    },
     /// Worker is too far ahead; block until the next real command.
     Throttle,
     /// Update the worker's global step count after averaging.
@@ -480,6 +494,26 @@ pub enum TimingMsgWire {
         rank: u64,
         lr: f64,
     },
+    /// Periodic worker-emitted liveness signal. Fires on a fixed cadence
+    /// from the cluster worker's heartbeat thread independent of
+    /// training progress, so the coord can distinguish "rank alive but
+    /// blocked at AllReduce barrier" from "rank dead." Stale heartbeat
+    /// triggers dead-rank declaration → elastic averaging path.
+    Heartbeat {
+        rank: u64,
+        /// Worker's local step counter at emission time (diagnostic
+        /// only — staleness detection is purely wall-clock based on
+        /// the coordinator's last-received instant).
+        step_count: u64,
+    },
+    /// Per-rank "snapshot ready, about to enter AllReduce barrier"
+    /// marker. Emitted by the worker's CPU-averaging bridge BEFORE it
+    /// blocks in `cpu_client.all_reduce_tensors`. The wall-time from
+    /// the coord's `RequestParams` broadcast to this frame's arrival
+    /// is honest per-rank capacity — snapshot + upload time only,
+    /// NOT polluted by the slowest-rank barrier wait that contaminates
+    /// `SyncAck` timestamps.
+    SnapshotReady { rank: u64 },
 }
 
 /// Wire-side mirror of [`ddp_run::MetricsMsg`]. All fields plain data.

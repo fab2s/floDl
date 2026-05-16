@@ -232,6 +232,19 @@ pub struct ClusterCoordinatorConfig {
     /// dispatches to [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
     pub meta_controller: bool,
 
+    /// Shared dead-rank ledger (with the cluster controller). When the
+    /// coord declares a rank dead (stale heartbeat), it sets the
+    /// ledger flag and shuts down the rank's controller-side stream
+    /// so any in-flight AllReduce releases with surviving ranks only.
+    /// Pass the same Arc clone to
+    /// [`crate::distributed::controller::ClusterController::start_with_dead_ranks`].
+    /// `None` = elastic-membership disabled.
+    pub dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
+
+    /// Heartbeat staleness threshold (seconds). If a rank's last
+    /// TimingMsg-frame arrival is older than this, the coord declares
+    /// the rank dead. Default 30s. Ignored when `dead_ranks` is None.
+    pub heartbeat_timeout_secs: u64,
 }
 
 impl ClusterCoordinatorConfig {
@@ -258,6 +271,8 @@ impl ClusterCoordinatorConfig {
             num_epochs: 0,
             partition_ratios: None,
             meta_controller: false,
+            dead_ranks: None,
+            heartbeat_timeout_secs: 30,
         }
     }
 
@@ -316,6 +331,24 @@ impl ClusterCoordinatorConfig {
     /// stages).
     pub fn meta_controller(mut self, enabled: bool) -> Self {
         self.meta_controller = enabled;
+        self
+    }
+
+    /// Share a dead-rank ledger with the cluster controller. Required
+    /// for elastic-membership (rank-death-survives-the-run) semantics.
+    /// Pass the same `Arc<DeadRanks>` to
+    /// [`crate::distributed::controller::ClusterController::start_with_dead_ranks`].
+    pub fn dead_ranks(
+        mut self,
+        ledger: Arc<crate::distributed::controller::DeadRanks>,
+    ) -> Self {
+        self.dead_ranks = Some(ledger);
+        self
+    }
+
+    /// Override the heartbeat staleness threshold. Default 30s.
+    pub fn heartbeat_timeout_secs(mut self, secs: u64) -> Self {
+        self.heartbeat_timeout_secs = secs;
         self
     }
 }
@@ -430,6 +463,30 @@ pub struct ClusterCoordinator {
 
     /// CPU-backend averaging state machine. See [`CpuAvgState`].
     cpu_avg_state: CpuAvgState,
+    /// Shared dead-rank ledger with the controller. `None` when
+    /// elastic membership is disabled (legacy / NCCL-only setups).
+    /// Mutating side: [`Self::check_dead_ranks`] calls `declare_dead`
+    /// on heartbeat staleness; reading side: should_average,
+    /// poll_cpu_averaging, and other gates skip dead ranks.
+    dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
+    /// Heartbeat staleness threshold copied from config.
+    heartbeat_timeout_secs: u64,
+    /// Per-rank wall-clock of the last TimingMsg frame received from
+    /// that rank (any TimingMsgWire variant counts as a liveness
+    /// signal — Batch, SyncAck, Heartbeat, SnapshotReady, LrUpdate).
+    /// Initialized to `Instant::now()` at coord start; updated by
+    /// [`Self::process_timing_msg`] before any other per-message work.
+    /// Drives [`Self::check_dead_ranks`].
+    last_heartbeat: Vec<Instant>,
+    /// Per-rank snapshot of `last_step_count[r]` at the moment
+    /// [`Self::dispatch_epoch`] emitted `StartEpoch` to rank `r`.
+    /// Computing `last_step_count[r] - last_step_count_at_epoch_start[r]`
+    /// at dead-rank-declaration time yields the number of batches rank
+    /// `r` has processed in the current epoch, which translates to a
+    /// sample-count offset into its partition for the un-processed
+    /// remainder to redistribute to survivors via `ExtendPartition`.
+    /// Initialized to 0; refreshed every `dispatch_epoch`.
+    last_step_count_at_epoch_start: Vec<usize>,
     /// Per-rank wall-time (ms) from the most recent averaging cycle's
     /// `RequestParams` broadcast to that rank's SyncAck arrival.
     /// Populated by [`Self::process_timing_msg`]'s SyncAck arm.
@@ -667,6 +724,10 @@ impl ClusterCoordinator {
             },
             last_lr_per_rank: vec![None; world_size],
             cpu_avg_state: CpuAvgState::Idle,
+            dead_ranks: config.dead_ranks,
+            heartbeat_timeout_secs: config.heartbeat_timeout_secs,
+            last_heartbeat: vec![Instant::now(); world_size],
+            last_step_count_at_epoch_start: vec![0; world_size],
             last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
@@ -800,6 +861,24 @@ impl ClusterCoordinator {
     /// `Coordinator::process_timing_msg`, modulo the field-name `rank`
     /// being `u64` on the wire vs `usize` in-process.
     fn process_timing_msg(&mut self, msg: TimingMsgWire) {
+        // Liveness tick: every frame from a rank counts as proof-of-
+        // life. Updates `last_heartbeat[rank]` before any per-message
+        // work so even malformed-rank frames (rejected below) at least
+        // refresh the slot. `check_dead_ranks` later compares against
+        // wall-clock.
+        let rank_for_liveness: Option<usize> = match &msg {
+            TimingMsgWire::Batch { rank, .. }
+            | TimingMsgWire::SyncAck { rank, .. }
+            | TimingMsgWire::Exiting { rank }
+            | TimingMsgWire::LrUpdate { rank, .. }
+            | TimingMsgWire::Heartbeat { rank, .. }
+            | TimingMsgWire::SnapshotReady { rank } => Some(*rank as usize),
+        };
+        if let Some(r) = rank_for_liveness {
+            if r < self.last_heartbeat.len() {
+                self.last_heartbeat[r] = Instant::now();
+            }
+        }
         match msg {
             TimingMsgWire::Batch {
                 rank,
@@ -895,6 +974,21 @@ impl ClusterCoordinator {
                 // cycle via `observe_meta`; per-message work is just
                 // recording the latest LR.
             }
+            TimingMsgWire::Heartbeat { .. } => {
+                // Liveness slot already refreshed above; nothing
+                // further to do per-frame. `check_dead_ranks` reads
+                // last_heartbeat each tick.
+            }
+            TimingMsgWire::SnapshotReady { .. } => {
+                // Pure operational telemetry for now: marks the end of
+                // per-rank snapshot+upload (honest per-rank capacity
+                // signal, NOT polluted by the AllReduce barrier wait
+                // that follows). A future slice will feed this into
+                // ElChe's partition rebalancer when we add a per-rank
+                // upload-throughput estimator separate from
+                // wall_ms_accum. For 1d.5 it's enough that the wire
+                // path is in place and liveness is refreshed above.
+            }
         }
     }
 
@@ -939,39 +1033,48 @@ impl ClusterCoordinator {
     /// backend) so the coordinator can gate re-triggering until the
     /// previous round has settled.
     pub fn should_average(&self) -> bool {
-        if !self.nccl_ack.iter().all(|&a| a) {
-            return false;
+        // Every gate skips dead ranks: they won't ack, won't step, and
+        // won't accumulate wall_ms. Treating them as "satisfied" lets
+        // the surviving cohort keep training.
+        for r in 0..self.world_size {
+            if self.is_dead(r) {
+                continue;
+            }
+            if !self.nccl_ack[r] {
+                return false;
+            }
+            if self.steps_since_avg[r] == 0 {
+                return false;
+            }
         }
-        if self.active_count < self.world_size {
-            return false;
-        }
-        if self.steps_since_avg.contains(&0) {
+        // active_count must be > 0 — if every rank is dead, training
+        // is over (caller's responsibility to detect that separately).
+        if self.active_count == 0 {
             return false;
         }
         match self.policy {
-            ApplyPolicy::Sync => self.steps_since_avg.iter().all(|&s| s >= 1),
+            ApplyPolicy::Sync => (0..self.world_size)
+                .filter(|r| !self.is_dead(*r))
+                .all(|r| self.steps_since_avg[r] >= 1),
             ApplyPolicy::Cadence => {
                 let target = self.el_che.anchor_wall_ms();
                 if target > 0.0 {
-                    let min_wall = self
-                        .wall_ms_accum
-                        .iter()
-                        .copied()
+                    let min_wall = (0..self.world_size)
+                        .filter(|r| !self.is_dead(*r))
+                        .map(|r| self.wall_ms_accum[r])
                         .fold(f64::MAX, f64::min);
                     return min_wall >= target;
                 }
                 let counts = self.el_che.batch_counts();
-                self.steps_since_avg
-                    .iter()
-                    .enumerate()
-                    .all(|(r, &s)| s >= counts[r])
+                (0..self.world_size)
+                    .filter(|r| !self.is_dead(*r))
+                    .all(|r| self.steps_since_avg[r] >= counts[r])
             }
             ApplyPolicy::Async => {
                 let counts = self.el_che.batch_counts();
-                self.steps_since_avg
-                    .iter()
-                    .enumerate()
-                    .all(|(r, &s)| s >= counts[r])
+                (0..self.world_size)
+                    .filter(|r| !self.is_dead(*r))
+                    .all(|r| self.steps_since_avg[r] >= counts[r])
             }
         }
     }
@@ -1058,22 +1161,179 @@ impl ClusterCoordinator {
     /// Drive the CPU averaging state machine one tick. No-op when
     /// [`CpuAvgState::Idle`].
     ///
-    /// In [`CpuAvgState::Pending`]: if every rank has acked (i.e.
-    /// `nccl_ack` all-true; the bridge's SyncAck handler in
-    /// [`Self::process_timing_msg`] flipped each slot when its
-    /// divergence triple landed), runs [`Self::finish_averaging_cpu`]
-    /// and returns to `Idle`. Otherwise stays in `Pending` — see
-    /// [`CpuAvgState`] for why dropping a cycle isn't an option and
-    /// where liveness detection belongs.
+    /// In [`CpuAvgState::Pending`]: if every ALIVE rank has acked,
+    /// runs [`Self::finish_averaging_cpu`] and returns to `Idle`.
+    /// Dead ranks (per [`Self::dead_ranks`]) count as "acked" because
+    /// they won't ever ack — the controller has already released the
+    /// in-flight AllReduce with surviving ranks only, so finalizing
+    /// here is correct.
     fn poll_cpu_averaging(&mut self) -> Result<()> {
         if !matches!(self.cpu_avg_state, CpuAvgState::Pending) {
             return Ok(());
         }
-        if self.nccl_ack.iter().all(|&a| a) {
+        let all_alive_acked = (0..self.world_size).all(|r| {
+            if self.is_dead(r) {
+                return true;
+            }
+            self.nccl_ack[r]
+        });
+        if all_alive_acked {
             self.cpu_avg_state = CpuAvgState::Idle;
             return self.finish_averaging_cpu();
         }
         Ok(())
+    }
+
+    /// Scan `last_heartbeat` for stale entries. For each rank whose
+    /// most-recent frame arrival exceeds `heartbeat_timeout_secs` and
+    /// is not already dead, declare it dead via the shared
+    /// [`crate::distributed::controller::DeadRanks`] ledger.
+    ///
+    /// Declaring a rank dead:
+    /// - Sets the rank's flag (shared with controller).
+    /// - Shuts down the rank's controller-side stream, waking any
+    ///   in-flight AllReduce so it releases with surviving ranks.
+    /// - Decrements `active_count` so subsequent `should_average`
+    ///   gates use the smaller quorum.
+    ///
+    /// No-op when `dead_ranks` is `None` (elastic membership not
+    /// configured — rank death is permanently blocking, matching
+    /// pre-1d.5 behavior).
+    fn check_dead_ranks(&mut self) {
+        let Some(ledger) = self.dead_ranks.as_ref().cloned() else {
+            return;
+        };
+        let now = Instant::now();
+        let threshold = Duration::from_secs(self.heartbeat_timeout_secs);
+        for r in 0..self.world_size {
+            if ledger.is_dead(r) {
+                continue;
+            }
+            if now.duration_since(self.last_heartbeat[r]) > threshold {
+                crate::verbose!(
+                    "  ddp: heartbeat stale on rank {} (>{}s), declaring dead",
+                    r,
+                    self.heartbeat_timeout_secs,
+                );
+                // Compute the dead rank's un-processed remainder
+                // BEFORE flipping `active_count` (the survivor count
+                // used by the redistribution formula reads the
+                // pre-decrement value plus the to-die rank).
+                let remainder_plan = self.compute_dead_rank_remainder(r);
+                ledger.declare_dead(r);
+                self.active_count = self.active_count.saturating_sub(1);
+                self.last_heartbeat[r] = now;
+                // Redistribute the dead rank's un-processed samples
+                // onto surviving ranks so the epoch still ingests its
+                // intended sample count. Failures are non-fatal: the
+                // cluster continues either way, and the un-processed
+                // samples come back in the next epoch's reshuffle if
+                // ExtendPartition can't be delivered.
+                if let Some((remainder_offset, remainder_size)) = remainder_plan {
+                    if let Err(e) = self.redistribute_dead_rank_partition(
+                        r,
+                        remainder_offset,
+                        remainder_size,
+                    ) {
+                        crate::verbose!(
+                            "  ddp: ExtendPartition dispatch for dead rank {} \
+                             remainder failed: {} (samples will roll into \
+                             next epoch's reshuffle)",
+                            r,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute the un-processed `(partition_offset, partition_size)`
+    /// inside dead rank `r`'s current-epoch partition. Returns `None`
+    /// when there's nothing to redistribute (rank already finished its
+    /// partition, partition_size was zero, or `epoch_plan_cache` has
+    /// no entry for this rank's epoch).
+    fn compute_dead_rank_remainder(&self, r: usize) -> Option<(u64, u64)> {
+        let epoch = self.rank_epoch[r];
+        let plans = self.epoch_plan_cache.get(&epoch)?;
+        let plan = plans.get(r)?;
+        let processed_batches = self
+            .last_step_count[r]
+            .saturating_sub(self.last_step_count_at_epoch_start[r]);
+        let processed_samples = (processed_batches * self.batch_size) as u64;
+        if processed_samples >= plan.partition_size {
+            return None;
+        }
+        let remainder_offset = plan.partition_offset + processed_samples;
+        let remainder_size = plan.partition_size - processed_samples;
+        Some((remainder_offset, remainder_size))
+    }
+
+    /// Slice the dead rank's un-processed remainder across surviving
+    /// ranks and emit an [`crate::distributed::wire::ControlMsgWire::ExtendPartition`]
+    /// frame to each. Currently splits equally; ElChe-weighted
+    /// distribution (using `partition_ratios` or throughput-derived
+    /// sizes) is a refinement landing alongside SnapshotReady →
+    /// ElChe consumer in a future slice. Per-rank slice sizes that
+    /// don't divide evenly distribute the remainder one sample at a
+    /// time to the first ranks.
+    ///
+    /// `dead_rank` itself is skipped. `world_size - active_count` may
+    /// already include `dead_rank` if the caller decremented
+    /// `active_count` before calling this method — that's fine
+    /// because the filter below uses the live `is_dead` ledger which
+    /// the caller already flipped.
+    fn redistribute_dead_rank_partition(
+        &mut self,
+        dead_rank: usize,
+        remainder_offset: u64,
+        remainder_size: u64,
+    ) -> Result<()> {
+        if remainder_size == 0 {
+            return Ok(());
+        }
+        let survivors: Vec<usize> = (0..self.world_size)
+            .filter(|r| *r != dead_rank && !self.is_dead(*r))
+            .collect();
+        if survivors.is_empty() {
+            return Err(TensorError::new(
+                "cluster_coordinator: redistribute called with no surviving ranks",
+            ));
+        }
+        let n = survivors.len() as u64;
+        let per_size = remainder_size / n;
+        let leftover = remainder_size % n;
+        let mut cursor = remainder_offset;
+        for (i, rank) in survivors.iter().enumerate() {
+            let extra = if (i as u64) < leftover { 1 } else { 0 };
+            let slice_size = per_size + extra;
+            if slice_size == 0 {
+                continue;
+            }
+            let msg = ControlMsgWire::ExtendPartition {
+                partition_offset: cursor,
+                partition_size: slice_size,
+            };
+            self.send_control(*rank, &msg)?;
+            cursor += slice_size;
+        }
+        crate::verbose!(
+            "  ddp: redistributed dead rank {}'s {} un-processed samples \
+             across {} survivors",
+            dead_rank,
+            remainder_size,
+            survivors.len(),
+        );
+        Ok(())
+    }
+
+    /// True iff `rank` is known dead via the shared ledger. Returns
+    /// false when no ledger is configured.
+    fn is_dead(&self, rank: usize) -> bool {
+        self.dead_ranks
+            .as_ref()
+            .map(|d| d.is_dead(rank))
+            .unwrap_or(false)
     }
 
     fn finish_averaging_nccl(&mut self) -> Result<()> {
@@ -1281,10 +1541,16 @@ impl ClusterCoordinator {
     /// has exited so the caller can break its loop.
     pub fn tick(&mut self) -> Result<bool> {
         self.drain_timing();
+        // Heartbeat-driven dead-rank detection. Must run BEFORE
+        // poll_cpu_averaging / should_average so the rest of this
+        // tick already sees the updated active membership; a rank
+        // declared dead this tick won't gate the cycle's finalize.
+        // No-op when elastic membership isn't configured.
+        self.check_dead_ranks();
         self.check_throttle()?;
         // CPU-backend async finalize: if a cycle's `RequestParams` was
         // broadcast in a prior tick and all bridge SyncAcks have now
-        // arrived, finalize it here so the guard reads real divergence.
+        // arrived (alive ranks only), finalize it here.
         // No-op on NCCL backend (state stays `Idle`).
         self.poll_cpu_averaging()?;
         if self.should_average() {
@@ -1396,6 +1662,12 @@ impl ClusterCoordinator {
             let msg = ControlMsgWire::StartEpoch(plan.clone());
             self.send_control(rank, &msg)?;
             self.rank_epoch[rank] = epoch;
+            // Snapshot per-rank monotonic batch counter so a future
+            // dead-rank declaration can compute how many of this
+            // epoch's samples rank `r` had already processed (and
+            // therefore how many remain to redistribute via
+            // `ExtendPartition`).
+            self.last_step_count_at_epoch_start[rank] = self.last_step_count[rank];
         }
         Ok(plans)
     }
@@ -1534,7 +1806,12 @@ fn reader_loop(
                     // 1d.5 wires per-epoch metrics aggregation; drop for now.
                 }
                 MsgKind::Heartbeat => {
-                    // 1d.5 wires heartbeat fault detection; drop now.
+                    // Orphan scaffolding from an earlier protocol draft.
+                    // 1d.5 routes heartbeats through `TimingMsgWire::Heartbeat`
+                    // over `MsgKind::Timing` instead, so this arm is
+                    // intentionally unreached in current builds. Kept for
+                    // wire-format stability (the enum value is part of
+                    // protocol version 2's surface).
                 }
                 MsgKind::Control | MsgKind::ParamSnapshotMeta => {
                     eprintln!(
@@ -2509,6 +2786,288 @@ mod tests {
         r0.join().unwrap().expect("rank 0 path");
         r1.join().unwrap().expect("rank 1 path");
         coord_handle.join().unwrap().expect("coord captures per-rank lags");
+    }
+
+    // -----------------------------------------------------------------
+    // Heartbeat + dead-rank detection (1d.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn heartbeat_stale_declares_rank_dead_and_unblocks_should_average() {
+        // 3 ranks share a DeadRanks ledger with the coord. Ranks 0 and
+        // 1 each send a Batch + SyncAck (a complete averaging cycle).
+        // Rank 2 handshakes the control channel but emits no frames
+        // at all — its `last_heartbeat` slot never updates past the
+        // initial `Instant::now()` from coord construction, so once
+        // the configured `heartbeat_timeout_secs` elapses `check_dead_ranks`
+        // marks rank 2 dead. `should_average`'s `.filter(!is_dead)`
+        // then lets the cycle fire with just ranks 0 & 1, and
+        // `poll_cpu_averaging`'s "all-alive-acked" gate finalizes.
+        let world_size = 3;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Cpu,
+                    world_size,
+                    ElChe::new(world_size, 1),
+                )
+                .no_divergence_guard()
+                .dead_ranks(dead_for_coord)
+                // 1-second window so the test runs in ~1.5s rather than
+                // the 30s production default.
+                .heartbeat_timeout_secs(1)
+            },
+            |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(TensorError::new(
+                            "heartbeat_stale: avg_count never advanced",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                assert!(
+                    coord.avg_count() >= 1,
+                    "cycle finalized with surviving ranks"
+                );
+                Ok(())
+            },
+        );
+
+        // Rank 2: handshake only, then sleep without sending any
+        // frames. Coord's heartbeat-staleness check will trigger.
+        // Keep alive long enough for the cycle to complete.
+        let dead_for_assertion = Arc::clone(&dead_ranks);
+        let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, move |_s, _salt| {
+            thread::sleep(Duration::from_millis(3500));
+            Ok(())
+        });
+
+        let body = |rank: u64| {
+            move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::Batch {
+                        rank,
+                        batch_ms: 10.0,
+                        step_count: 1,
+                        param_norm: None,
+                        batch_loss: 0.5,
+                        sync_divergence: None,
+                    },
+                )?;
+                let _ = recv_control(s, salt)?; // RequestParams
+                send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::SyncAck {
+                        rank,
+                        step_count: 2,
+                        divergence: Some(0.05),
+                        post_norm: Some(1.0),
+                        pre_norm: Some(1.05),
+                    },
+                )?;
+                let _ = recv_control(s, salt)?; // Update
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+                Ok(())
+            }
+        };
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
+        r0.join().unwrap().expect("rank 0 completes averaging");
+        r1.join().unwrap().expect("rank 1 completes averaging");
+        let _ = r2.join();
+        coord_handle.join().unwrap().expect("coord drives clean");
+
+        // Post-hoc invariant: the shared ledger registers rank 2 dead.
+        // Don't assert about ranks 0/1: by the time the test's r2
+        // sleep elapses (3.5s) they've been silent past the 1s
+        // threshold too and may also have been declared dead. That's
+        // not a regression — it's the heartbeat detector doing its
+        // job on what looks like additional dead ranks once the run
+        // is wrapping up. The load-bearing invariant is that rank 2
+        // (the silent one DURING the cycle) was detected as dead.
+        assert!(
+            dead_for_assertion.is_dead(2),
+            "rank 2 must be flagged dead in shared ledger"
+        );
+    }
+
+    #[test]
+    fn dead_rank_remainder_redistributed_via_extend_partition() {
+        // 3-rank Sync+Cpu setup with dispatched epoch + shared
+        // DeadRanks ledger + 1s heartbeat timeout. Ranks 0 + 1 send
+        // ONE Batch each (representing one batch of training before
+        // the failure), then rank 2 goes silent. The coord's
+        // heartbeat-stale check declares rank 2 dead; the
+        // redistribution path computes rank 2's un-processed
+        // remainder (its full partition: 0 batches processed) and
+        // emits one ExtendPartition frame to each survivor. The
+        // survivors receive the frames over the wire.
+        //
+        // Invariant: total samples reshard = rank 2's partition size.
+        // Each survivor's received slice sums with the others to
+        // exactly that count — no samples lost, no samples duplicated.
+        let world_size = 3;
+        let total_samples = 30;
+        let batch_size = 1;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Cpu,
+                    world_size,
+                    ElChe::new(world_size, 1),
+                )
+                .no_divergence_guard()
+                .dead_ranks(dead_for_coord)
+                .heartbeat_timeout_secs(1)
+                .total_samples(total_samples)
+                .batch_size(batch_size)
+                .num_epochs(1)
+            },
+            |coord| {
+                coord.dispatch_epoch(0)?;
+                let start = Instant::now();
+                while !coord.dead_ranks.as_ref().unwrap().is_dead(2) {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "dead_rank_redistribute: rank 2 never declared dead",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            },
+        );
+
+        // Ranks 0 + 1 collect StartEpoch + count any ExtendPartition
+        // they receive (size). Returned through a shared atomic
+        // because fake_rank's body returns Result<()>.
+        use std::sync::atomic::AtomicU64;
+        let r0_extension = Arc::new(AtomicU64::new(0));
+        let r1_extension = Arc::new(AtomicU64::new(0));
+        let r0_acc = Arc::clone(&r0_extension);
+        let r1_acc = Arc::clone(&r1_extension);
+
+        let make_alive = |rank: u64, acc: Arc<AtomicU64>| {
+            move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                let mut received_start_epoch = false;
+                let read_deadline = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < read_deadline {
+                    s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                    match ControlFrame::read_from(s, salt) {
+                        Ok(Some(frame)) => match frame.decode::<ControlMsgWire>() {
+                            Ok(ControlMsgWire::StartEpoch(_)) => {
+                                received_start_epoch = true;
+                                send_timing(
+                                    s,
+                                    salt,
+                                    TimingMsgWire::Batch {
+                                        rank,
+                                        batch_ms: 5.0,
+                                        step_count: 1,
+                                        param_norm: None,
+                                        batch_loss: 0.1,
+                                        sync_divergence: None,
+                                    },
+                                )?;
+                            }
+                            Ok(ControlMsgWire::ExtendPartition {
+                                partition_size,
+                                ..
+                            }) => {
+                                acc.fetch_add(partition_size, Ordering::SeqCst);
+                            }
+                            Ok(_other) => {
+                                // RequestParams / SetGlobalStep / etc.
+                            }
+                            Err(_) => break,
+                        },
+                        Ok(None) => break,
+                        Err(_) => continue,
+                    }
+                }
+                assert!(received_start_epoch, "rank {rank} got StartEpoch");
+                Ok(())
+            }
+        };
+
+        // Rank 2 handshakes then sleeps — coord will declare it dead.
+        let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, |_s, _salt| {
+            thread::sleep(Duration::from_millis(3500));
+            Ok(())
+        });
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, make_alive(0, r0_acc));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, make_alive(1, r1_acc));
+
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        let _ = r2.join();
+        coord_handle.join().unwrap().expect("coord drives clean");
+
+        // Rank 2's partition for a 3-rank, 30-sample equal-split is
+        // 10 samples. Since rank 2 sent no Batch (its
+        // last_step_count stayed at the epoch-start snapshot),
+        // processed_samples = 0, so the entire partition (10) is
+        // redistributed across the 2 survivors. Sum across survivors
+        // must equal 10 exactly.
+        let r0_total = r0_extension.load(Ordering::SeqCst);
+        let r1_total = r1_extension.load(Ordering::SeqCst);
+        let total_redistributed = r0_total + r1_total;
+        assert_eq!(
+            total_redistributed, 10,
+            "dead rank 2's un-processed remainder (10) must be reshared \
+             across survivors; got r0={r0_total}, r1={r1_total}"
+        );
+    }
+
+    #[test]
+    fn dead_ranks_optional_default_disables_elastic_membership() {
+        // When `dead_ranks` is None in the config (default), the
+        // heartbeat-stale check is a no-op and no rank can be
+        // declared dead. Same standard cycle as the basic Sync+CPU
+        // test, just verifying the opt-in semantics: forgetting to
+        // wire the ledger doesn't accidentally declare ranks dead.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                cfg_sync_cpu(world_size).heartbeat_timeout_secs(0)
+                // No `.dead_ranks(...)` — elastic membership disabled.
+            },
+            move |coord| {
+                // Drive a cycle; sleep enough that timeout-0 WOULD
+                // declare every rank dead if elastic membership were
+                // active. Verify nothing fires.
+                thread::sleep(Duration::from_millis(50));
+                coord.tick()?;
+                // Still active; no decrement.
+                assert_eq!(
+                    coord.active_count(),
+                    world_size,
+                    "dead-rank detection must be off without ledger"
+                );
+                Ok(())
+            },
+        );
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        r0.join().unwrap().expect("rank 0 handshake");
+        r1.join().unwrap().expect("rank 1 handshake");
+        coord_handle.join().unwrap().expect("coord drives clean");
     }
 
     #[test]

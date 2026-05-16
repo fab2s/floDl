@@ -67,9 +67,9 @@
 //! [`AverageBackend::Cpu`]: crate::distributed::AverageBackend::Cpu
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -93,11 +93,99 @@ pub(crate) const PROTOCOL_VERSION: u32 = 1;
 /// dtype tag for f32 in the wire protocol. Only dtype supported.
 pub const DTYPE_F32: u8 = 0;
 
+/// Shared dead-rank ledger. Set by the cluster coordinator when it
+/// declares a rank dead (stale heartbeat). Read by the controller's
+/// reduce thread to skip the rank's stream in the current and future
+/// rounds, and by the coord-side `should_average` /
+/// `poll_cpu_averaging` gates to exclude dead ranks from quorum
+/// counting.
+///
+/// The struct also holds per-rank shutdown handles registered by the
+/// controller after accept. `declare_dead` shuts down the dead rank's
+/// stream, which wakes the controller's reduce thread out of any
+/// pending read (so the cycle can release with survivors-only data).
+#[derive(Debug)]
+pub struct DeadRanks {
+    flags: Vec<AtomicBool>,
+    /// Per-rank shutdown handles for the controller-side stream.
+    /// `Some` after accept registers them; `None` until accept or after
+    /// `declare_dead` consumed (takes) the handle to invoke shutdown.
+    stream_handles: Mutex<Vec<Option<TcpStream>>>,
+}
+
+impl DeadRanks {
+    /// Create a fresh dead-rank ledger sized for `world_size`. All
+    /// ranks start alive.
+    pub fn new(world_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            flags: (0..world_size).map(|_| AtomicBool::new(false)).collect(),
+            stream_handles: Mutex::new((0..world_size).map(|_| None).collect()),
+        })
+    }
+
+    /// Declare `rank` permanently dead for the rest of this run.
+    /// Idempotent. Sets the rank's flag, then shuts down its
+    /// controller-side stream so the reduce thread unblocks from any
+    /// pending read on that rank. No-op if `rank >= world_size`.
+    pub fn declare_dead(&self, rank: usize) {
+        if rank >= self.flags.len() {
+            return;
+        }
+        let was_already_dead = self.flags[rank].swap(true, Ordering::SeqCst);
+        if was_already_dead {
+            return;
+        }
+        if let Ok(mut handles) = self.stream_handles.lock() {
+            if let Some(slot) = handles.get_mut(rank) {
+                if let Some(stream) = slot.take() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }
+        }
+    }
+
+    /// Check if `rank` is dead.
+    pub fn is_dead(&self, rank: usize) -> bool {
+        self.flags
+            .get(rank)
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Count of dead ranks.
+    pub fn dead_count(&self) -> usize {
+        self.flags
+            .iter()
+            .filter(|f| f.load(Ordering::SeqCst))
+            .count()
+    }
+
+    /// World size the ledger was sized for.
+    pub fn world_size(&self) -> usize {
+        self.flags.len()
+    }
+
+    /// Controller registers a stream handle for `rank` after the
+    /// accept-side handshake completes. The handle is a `try_clone` of
+    /// the rank's stream — shutting it down affects the underlying OS
+    /// file descriptor, waking any pending read on the original stream
+    /// owned by the reduce thread.
+    pub(crate) fn register_stream_handle(&self, rank: usize, handle: TcpStream) {
+        if let Ok(mut handles) = self.stream_handles.lock() {
+            if let Some(slot) = handles.get_mut(rank) {
+                *slot = Some(handle);
+            }
+        }
+    }
+}
+
 /// Background CPU-averager. Owns a [`TcpListener`] bound to the
 /// controller's address and a worker thread that runs the accept +
 /// reduce loop.
 ///
-/// Constructed via [`ClusterController::start`]; clean shutdown via
+/// Constructed via [`ClusterController::start`] (or
+/// [`ClusterController::start_with_dead_ranks`] to share a dead-rank
+/// ledger with the coordinator); clean shutdown via
 /// [`ClusterController::shutdown`] (signals the worker, then joins).
 #[derive(Debug)]
 pub struct ClusterController {
@@ -129,10 +217,39 @@ impl ClusterController {
         world_size: usize,
         salt: SessionSalt,
     ) -> Result<Self> {
+        // Standalone constructor: world is fixed at startup and no
+        // elastic-membership path. Equivalent to passing a private
+        // ledger that nobody else can declare into.
+        let dead_ranks = DeadRanks::new(world_size);
+        Self::start_with_dead_ranks(bind_addr, world_size, salt, dead_ranks)
+    }
+
+    /// Like [`Self::start`] but shares the dead-rank ledger with the
+    /// coordinator. When the coord declares a rank dead, the
+    /// controller's reduce thread skips its contribution and divides by
+    /// the surviving-rank count instead of `world_size`. Use the
+    /// [`DeadRanks`] returned by [`DeadRanks::new`] (or pass the same
+    /// Arc clone to both this constructor and the
+    /// [`crate::distributed::cluster_coordinator::ClusterCoordinator`]
+    /// via its config).
+    pub fn start_with_dead_ranks(
+        bind_addr: SocketAddr,
+        world_size: usize,
+        salt: SessionSalt,
+        dead_ranks: Arc<DeadRanks>,
+    ) -> Result<Self> {
         if world_size == 0 {
             return Err(TensorError::new(
                 "cluster_controller: world_size must be > 0",
             ));
+        }
+        if dead_ranks.world_size() != world_size {
+            return Err(TensorError::new(&format!(
+                "cluster_controller: dead_ranks world_size ({}) must match \
+                 controller world_size ({})",
+                dead_ranks.world_size(),
+                world_size,
+            )));
         }
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
             TensorError::new(&format!(
@@ -157,7 +274,9 @@ impl ClusterController {
         let shutdown_cloned = Arc::clone(&shutdown);
         let handle = thread::Builder::new()
             .name(format!("flodl-cluster-controller:{bound_port}"))
-            .spawn(move || run_reduce_thread(listener, world_size, salt, shutdown_cloned))
+            .spawn(move || {
+                run_reduce_thread(listener, world_size, salt, shutdown_cloned, dead_ranks)
+            })
             .map_err(|e| {
                 TensorError::new(&format!("cluster_controller: spawn worker failed: {e}"))
             })?;
@@ -209,6 +328,7 @@ fn run_reduce_thread(
     world_size: usize,
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
+    dead_ranks: Arc<DeadRanks>,
 ) -> Result<()> {
     listener
         .set_nonblocking(true)
@@ -246,6 +366,14 @@ fn run_reduce_thread(
                 stream
                     .set_read_timeout(None)
                     .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout(None): {e}")))?;
+                // Register a try_clone with the dead-rank ledger so
+                // the coord can wake the reduce thread out of a
+                // pending read on this rank when declaring it dead.
+                // The cloned handle shares the OS file descriptor —
+                // shutdown on either half affects both.
+                if let Ok(handle) = stream.try_clone() {
+                    dead_ranks.register_stream_handle(rank_id, handle);
+                }
                 streams[rank_id] = Some(stream);
                 connected += 1;
             }
@@ -265,19 +393,20 @@ fn run_reduce_thread(
     let mut streams: Vec<TcpStream> = streams.into_iter().map(|s| s.unwrap()).collect();
 
     // Phase 2: reduce loop. Each round reads a RoundFrame from every
-    // rank, sums the per-tensor data, divides by world_size, writes
-    // the averaged frame back. Terminates when any rank disconnects
-    // cleanly (EOF on read) or when shutdown is signalled.
+    // ALIVE rank, sums the per-tensor data, divides by the alive count,
+    // writes the averaged frame back to alive ranks only. Terminates
+    // when an alive rank disconnects cleanly (EOF on read while NOT
+    // declared dead) or when shutdown is signalled.
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match read_round_from_all(&mut streams, &salt)? {
+        match read_round_from_all(&mut streams, &salt, &dead_ranks)? {
             Some(frames) => {
-                let averaged = reduce_average(&frames)?;
-                write_round_to_all(&mut streams, &averaged, &salt)?;
+                let averaged = reduce_average_alive(&frames)?;
+                write_round_to_all(&mut streams, &averaged, &salt, &dead_ranks)?;
             }
-            None => return Ok(()), // any rank EOFed → clean shutdown
+            None => return Ok(()), // an ALIVE rank EOFed → clean shutdown
         }
     }
 }
@@ -458,20 +587,47 @@ pub(crate) fn read_round_frame(
     Ok(Some(RoundFrame { tensors }))
 }
 
-/// Read a frame from every rank. Returns `Ok(None)` if ANY rank EOFs
-/// (signals shutdown — propagates so the reduce loop exits cleanly).
+/// Read a frame from every alive rank. Returns `Ok(Some(frames))` with
+/// per-rank optional frames (None for dead ranks; Some for alive).
+/// Returns `Ok(None)` only if an ALIVE rank EOFs (signals shutdown).
+///
+/// EOF on a rank whose `dead_ranks` flag is already set is treated as
+/// expected (the coord shut down its stream to release this cycle) and
+/// the rank is silently skipped. A read error on a dead rank similarly
+/// folds into the skip path.
 fn read_round_from_all(
     streams: &mut [TcpStream],
     salt: &SessionSalt,
-) -> Result<Option<Vec<RoundFrame>>> {
-    let mut frames = Vec::with_capacity(streams.len());
+    dead_ranks: &Arc<DeadRanks>,
+) -> Result<Option<Vec<Option<RoundFrame>>>> {
+    let mut frames: Vec<Option<RoundFrame>> = Vec::with_capacity(streams.len());
     for (rank, s) in streams.iter_mut().enumerate() {
-        match read_round_frame(s, salt)? {
-            Some(f) => frames.push(f),
-            None => {
-                // Rank EOF'd. Treat as clean shutdown signal.
-                let _ = rank; // could log "rank {rank} closed"
+        if dead_ranks.is_dead(rank) {
+            frames.push(None);
+            continue;
+        }
+        match read_round_frame(s, salt) {
+            Ok(Some(f)) => frames.push(Some(f)),
+            Ok(None) => {
+                // Rank EOF'd. If it was just declared dead (race
+                // between our `is_dead` check above and the coord's
+                // shutdown), treat as expected skip.
+                if dead_ranks.is_dead(rank) {
+                    frames.push(None);
+                    continue;
+                }
                 return Ok(None);
+            }
+            Err(e) => {
+                // A read error on a freshly-declared-dead rank is the
+                // expected wakeup from `dead_ranks.declare_dead`'s
+                // stream shutdown. Treat as a skip; only propagate
+                // errors when the rank wasn't declared dead.
+                if dead_ranks.is_dead(rank) {
+                    frames.push(None);
+                    continue;
+                }
+                return Err(e);
             }
         }
     }
@@ -544,8 +700,14 @@ fn write_round_to_all(
     streams: &mut [TcpStream],
     frame: &RoundFrame,
     salt: &SessionSalt,
+    dead_ranks: &Arc<DeadRanks>,
 ) -> Result<()> {
-    for s in streams.iter_mut() {
+    for (rank, s) in streams.iter_mut().enumerate() {
+        if dead_ranks.is_dead(rank) {
+            // Dead rank's stream may have been shut down by the coord;
+            // even if it isn't, the rank isn't going to consume.
+            continue;
+        }
         write_round_frame(s, frame, salt)?;
     }
     Ok(())
@@ -555,21 +717,33 @@ fn write_round_to_all(
 // Reduction (CPU sum + divide by world_size)
 // ---------------------------------------------------------------------------
 
-/// Average a list of per-rank frames into a single frame.
+/// Average per-rank frames into a single frame, skipping dead ranks.
 ///
-/// Validates that every rank's frames have identical schema (same
-/// number of tensors, same dtype per tensor, same shape per tensor).
-/// Returns the element-wise mean.
+/// `frames[i] = None` means rank `i` is dead and didn't contribute;
+/// `Some(frame)` means rank `i` is alive. The divisor is the
+/// alive-count (number of `Some`), not `frames.len()` — matching the
+/// avg-trick semantics over the surviving cohort.
+///
+/// Validates that every alive rank's frames have identical schema
+/// (same number of tensors, same dtype per tensor, same shape per
+/// tensor). Returns the element-wise mean.
 ///
 /// v1 supports only [`DTYPE_F32`]; loud error on other dtypes (so a
 /// future user wiring f16 here gets a clear pointer at where to add
 /// support, instead of silent garbage from byte-level summation).
-fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
-    if frames.is_empty() {
-        return Err(TensorError::new("cluster_controller: reduce_average called with no frames"));
+fn reduce_average_alive(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
+    let alive: Vec<&RoundFrame> = frames.iter().filter_map(|f| f.as_ref()).collect();
+    if alive.is_empty() {
+        return Err(TensorError::new(
+            "cluster_controller: reduce_average_alive called with no alive ranks \
+             (all participants dead — caller should not have reached this point)",
+        ));
     }
-    let n = frames.len();
-    let ref_frame = &frames[0];
+    let n = alive.len();
+    let ref_frame = alive[0];
+    // Adapter so the existing schema-validation + reduce code below
+    // can keep using its original variable names.
+    let frames: &[&RoundFrame] = &alive;
     // Schema validation.
     for (i, f) in frames.iter().enumerate().skip(1) {
         if f.tensors.len() != ref_frame.tensors.len() {
@@ -911,24 +1085,24 @@ mod tests {
 
     #[test]
     fn rejects_non_f32_dtype_in_reduce() {
-        // Pure unit test of reduce_average without TCP wiring.
+        // Pure unit test of reduce_average_alive without TCP wiring.
         let frames = vec![
-            RoundFrame {
+            Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: 7, // bogus dtype
                     shape: vec![2],
                     bytes: vec![0; 8],
                 }],
-            },
-            RoundFrame {
+            }),
+            Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: 7,
                     shape: vec![2],
                     bytes: vec![0; 8],
                 }],
-            },
+            }),
         ];
-        let err = reduce_average(&frames).unwrap_err();
+        let err = reduce_average_alive(&frames).unwrap_err();
         assert!(
             err.to_string().contains("dtype 7"),
             "expected dtype-7-not-supported, got: {err}"
@@ -938,23 +1112,60 @@ mod tests {
     #[test]
     fn rejects_shape_mismatch_across_ranks() {
         let frames = vec![
-            RoundFrame {
+            Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: DTYPE_F32,
                     shape: vec![2],
                     bytes: f32_to_bytes(&[1.0, 2.0]),
                 }],
-            },
-            RoundFrame {
+            }),
+            Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: DTYPE_F32,
                     shape: vec![3],
                     bytes: f32_to_bytes(&[1.0, 2.0, 3.0]),
                 }],
-            },
+            }),
         ];
-        let err = reduce_average(&frames).unwrap_err();
+        let err = reduce_average_alive(&frames).unwrap_err();
         assert!(err.to_string().contains("shape"), "got: {err}");
+    }
+
+    #[test]
+    fn reduce_average_alive_skips_none_entries_and_divides_by_alive_count() {
+        // 3-rank world, rank 1 dead (None). Mean over alive = (rank0 + rank2) / 2.
+        let frames = vec![
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![2],
+                    bytes: f32_to_bytes(&[2.0, 4.0]),
+                }],
+            }),
+            None, // rank 1 dead
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![2],
+                    bytes: f32_to_bytes(&[6.0, 8.0]),
+                }],
+            }),
+        ];
+        let out = reduce_average_alive(&frames).unwrap();
+        let avg = bytes_as_f32(&out.tensors[0].bytes).unwrap();
+        // (2 + 6) / 2 = 4.0; (4 + 8) / 2 = 6.0
+        assert!((avg[0] - 4.0).abs() < 1e-6, "got {avg:?}");
+        assert!((avg[1] - 6.0).abs() < 1e-6, "got {avg:?}");
+    }
+
+    #[test]
+    fn reduce_average_alive_rejects_all_dead() {
+        let frames: Vec<Option<RoundFrame>> = vec![None, None];
+        let err = reduce_average_alive(&frames).unwrap_err();
+        assert!(
+            err.to_string().contains("no alive ranks"),
+            "got: {err}"
+        );
     }
 
     #[test]

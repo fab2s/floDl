@@ -1697,6 +1697,36 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
             }
+            ControlMsg::ExtendPartition {
+                partition_offset,
+                partition_size,
+            } => {
+                // Resolve the new slice through `make_partition` keyed
+                // on the SAME (current_epoch, base_seed) the worker
+                // used for its StartEpoch, so the appended indices
+                // align with the rest of the cluster's view of the
+                // permutation. Append in-place; `run_epoch_plan`'s
+                // sync loop re-checks `self.partition.len()` each
+                // iteration so the extension is processed before
+                // declaring the epoch complete.
+                //
+                // Prefetch (CUDA) path note: the prefetch consumer
+                // loop submits all batches at function entry and
+                // doesn't re-poll `partition.len()`, so mid-epoch
+                // extension on that path silently leaves the
+                // appended indices unprocessed. CUDA cluster mode
+                // isn't wired yet (1d.3b); when it lands, the
+                // prefetch path needs a similar dynamic-bound
+                // rework + `prefetch.load_batch` calls here.
+                let extra = make_partition(
+                    partition_offset,
+                    partition_size,
+                    self.dataset.len(),
+                    self.current_epoch,
+                    self.base_seed,
+                );
+                self.partition.extend(extra);
+            }
             ControlMsg::Throttle => {
                 // Worker is ahead of the slowest rank: block until averaging
                 // completes (SyncNow/Update) or Shutdown. Intermediate messages
@@ -1878,6 +1908,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::Checkpoint { .. } => "Checkpoint",
                             ControlMsg::Shutdown => "Shutdown",
                             ControlMsg::StartEpoch(_) => "StartEpoch",
+                            ControlMsg::ExtendPartition { .. } => "ExtendPartition",
                         }
                     );
                     if self.dispatch_control(msg)? {
@@ -2067,9 +2098,18 @@ impl<M: Module> GpuWorker<M> {
         } else {
             // Sync path: load one batch at a time, move to device if needed.
             // Used for CPU devices, or CUDA when VRAM is too tight for prefetch.
+            //
+            // The loop bound is re-evaluated each iteration off
+            // `self.partition.len()` so a mid-epoch
+            // `ControlMsg::ExtendPartition` (cluster-mode reshard
+            // after a rank dies) injects extra batches and they get
+            // processed before the epoch completes. The prefetch
+            // branch above doesn't yet support this — see the comment
+            // in `dispatch_control`'s `ExtendPartition` arm.
             let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
 
-            for batch_idx in 0..num_batches {
+            let mut batch_idx: usize = 0;
+            while batch_idx < self.partition.len() / self.batch_size {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
                 let indices = &self.partition[start..end];
@@ -2119,6 +2159,7 @@ impl<M: Module> GpuWorker<M> {
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
+                batch_idx += 1;
             }
         }
 
@@ -2131,6 +2172,10 @@ impl<M: Module> GpuWorker<M> {
         // (compute_ms_total + data_starve_ms_total), so it tracks the
         // rank's actual capacity, not how long it idles for peers.
         let share_complete_ms = compute_ms_total + data_starve_ms_total;
+        // Recompute batch count from current partition length so an
+        // `ExtendPartition`-driven reshard (cluster-mode dead-rank
+        // recovery) is reflected in `avg_loss` and the report.
+        let num_batches = self.partition.len() / self.batch_size;
         let avg_loss = total_loss / num_batches as f64;
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochEnd {

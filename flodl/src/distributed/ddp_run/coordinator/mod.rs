@@ -1072,6 +1072,11 @@ impl Coordinator {
                     self.last_lr_per_rank[rank] = Some(lr);
                 }
             }
+            // Cluster-mode only; OLD threaded coordinator never sees
+            // these (workers emit them from the cluster-mode heartbeat
+            // thread + CPU param bridge respectively).
+            TimingMsg::Heartbeat { .. } => {}
+            TimingMsg::SnapshotReady { .. } => {}
         }
     }
 
