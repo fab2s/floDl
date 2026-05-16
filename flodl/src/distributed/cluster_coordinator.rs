@@ -207,6 +207,21 @@ pub struct ClusterCoordinatorConfig {
     /// True when the user did not set `max_overshoot` explicitly; lets
     /// `trigger_averaging` adjust the bound on convergence verdicts.
     pub overshoot_auto: bool,
+
+    /// Total samples in the dataset; basis for partition sizing in
+    /// [`ClusterCoordinator::dispatch_epoch`]. Default 0 (caller must
+    /// set via [`Self::total_samples`] before dispatching epochs).
+    pub total_samples: usize,
+    /// Batch size; carried for symmetry with OLD Coordinator (the
+    /// progressive chunk-pool path uses it, slice 1d.6 wiring).
+    pub batch_size: usize,
+    /// Total number of epochs to train; informs `dispatch_epoch`'s
+    /// out-of-range guard. Default 0 = unbounded (caller controls).
+    pub num_epochs: usize,
+    /// User-specified per-rank partition ratios. When `Some`, takes
+    /// precedence over ElChe-derived throughput sizing. Length must
+    /// equal `world_size` if set.
+    pub partition_ratios: Option<Vec<f64>>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -228,7 +243,31 @@ impl ClusterCoordinatorConfig {
             overshoot_initial: 3,
             overshoot_ceiling: 15,
             overshoot_auto: true,
+            total_samples: 0,
+            batch_size: 1,
+            num_epochs: 0,
+            partition_ratios: None,
         }
+    }
+
+    pub fn total_samples(mut self, n: usize) -> Self {
+        self.total_samples = n;
+        self
+    }
+
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n.max(1);
+        self
+    }
+
+    pub fn num_epochs(mut self, n: usize) -> Self {
+        self.num_epochs = n;
+        self
+    }
+
+    pub fn partition_ratios(mut self, ratios: Option<Vec<f64>>) -> Self {
+        self.partition_ratios = ratios;
+        self
     }
 
     pub fn with_convergence_guard(
@@ -313,6 +352,24 @@ pub struct ClusterCoordinator {
     last_nccl_sync_ms: f64,
     /// Instant the most recent SyncNow was emitted.
     nccl_sync_start: Option<Instant>,
+
+    // --- Epoch dispatch ---
+    /// Per-rank current epoch (last StartEpoch dispatched).
+    rank_epoch: Vec<usize>,
+    /// Last globally-aggregated epoch index (all ranks reported).
+    /// `None` until the first aggregation.
+    last_aggregated_epoch: Option<usize>,
+    /// Cached epoch plans: computed once per epoch, consistent across
+    /// ranks regardless of when the StartEpoch frame goes out.
+    epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
+    /// Total samples in the dataset; basis for partition computation.
+    total_samples: usize,
+    /// Batch size; carried for symmetry with OLD Coordinator (1d.6).
+    batch_size: usize,
+    /// Total number of epochs the trainer asked for.
+    num_epochs: usize,
+    /// User-specified per-rank partition ratios, if any.
+    partition_ratios: Option<Vec<f64>>,
 
     // --- Channels / threads ---
     /// Reader threads (one per rank) push decoded timing messages here;
@@ -511,6 +568,13 @@ impl ClusterCoordinator {
             throttled: vec![false; world_size],
             last_nccl_sync_ms: 0.0,
             nccl_sync_start: None,
+            rank_epoch: vec![0; world_size],
+            last_aggregated_epoch: None,
+            epoch_plan_cache: std::collections::HashMap::new(),
+            total_samples: config.total_samples,
+            batch_size: config.batch_size.max(1),
+            num_epochs: config.num_epochs,
+            partition_ratios: config.partition_ratios,
             timing_rx,
             control_streams: streams,
             reader_handles,
@@ -886,6 +950,136 @@ impl ClusterCoordinator {
         let alive = self.active_count > 0
             && self.reader_handles.iter().any(|h| h.is_some());
         Ok(alive)
+    }
+
+    // -----------------------------------------------------------------
+    // Epoch dispatch (ports OLD coordinator/mod.rs compute_partition_sizes
+    // + plans_for_epoch + send_all_plans, with ControlMsgWire frames
+    // replacing the OLD mpsc::Sender<ControlMsg>.)
+    // -----------------------------------------------------------------
+
+    /// Compute per-rank partition sizes for one epoch.
+    ///
+    /// Priority order:
+    /// 1. Explicit `partition_ratios` from the config (test rigs,
+    ///    user override).
+    /// 2. ElChe throughput-derived sizes once calibrated (or once a
+    ///    `with_speed_hint` is set in the config).
+    /// 3. Equal sizes (fallback at startup before ElChe has
+    ///    observations).
+    ///
+    /// Verbatim port of OLD `Coordinator::compute_partition_sizes`.
+    fn compute_partition_sizes(&self) -> Vec<usize> {
+        if let Some(ratios) = &self.partition_ratios {
+            return crate::distributed::ddp_run::ratio_to_sizes(
+                ratios,
+                self.total_samples,
+            );
+        }
+        match self.policy {
+            ApplyPolicy::Sync => crate::distributed::ddp_run::equal_sizes(
+                self.world_size,
+                self.total_samples,
+            ),
+            ApplyPolicy::Cadence | ApplyPolicy::Async => {
+                if self.el_che.is_calibrated() || self.el_che.has_speed_hint() {
+                    crate::distributed::ddp_run::throughput_sizes(
+                        &self.el_che,
+                        self.total_samples,
+                    )
+                } else {
+                    crate::distributed::ddp_run::equal_sizes(
+                        self.world_size,
+                        self.total_samples,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Get (or lazily compute + cache) the per-rank plans for `epoch`.
+    ///
+    /// Caching guarantees every rank receives consistent
+    /// `(partition_offset, partition_size)` even when [`Self::dispatch_epoch`]
+    /// gets called twice for the same epoch (the second call returns
+    /// the cached plans). Verbatim port of OLD
+    /// `Coordinator::plans_for_epoch`.
+    fn plans_for_epoch(
+        &mut self,
+        epoch: usize,
+    ) -> Vec<crate::distributed::wire::EpochPlanWire> {
+        use crate::distributed::wire::EpochPlanWire;
+        if let Some(plans) = self.epoch_plan_cache.get(&epoch) {
+            return plans.clone();
+        }
+        let sizes = self.compute_partition_sizes();
+        let mut plans: Vec<EpochPlanWire> = Vec::with_capacity(self.world_size);
+        let mut offset: u64 = 0;
+        for &size in &sizes {
+            plans.push(EpochPlanWire {
+                epoch: epoch as u64,
+                partition_offset: offset,
+                partition_size: size as u64,
+            });
+            offset += size as u64;
+        }
+        self.epoch_plan_cache.insert(epoch, plans.clone());
+        plans
+    }
+
+    /// Broadcast `StartEpoch(plan)` to every connected rank, updating
+    /// `rank_epoch[r]` to `epoch` for each rank as it goes out.
+    ///
+    /// Mirrors OLD `Coordinator::send_all_plans` minus the progressive
+    /// chunk-pool branch (1d.6 wiring). Returns the plans dispatched
+    /// so callers can pair the call with rank-side acknowledgments in
+    /// tests.
+    pub fn dispatch_epoch(
+        &mut self,
+        epoch: usize,
+    ) -> Result<Vec<crate::distributed::wire::EpochPlanWire>> {
+        if self.total_samples == 0 {
+            return Err(TensorError::new(
+                "cluster_coordinator: dispatch_epoch requires total_samples > 0; \
+                 set ClusterCoordinatorConfig::total_samples before constructing.",
+            ));
+        }
+        let plans = self.plans_for_epoch(epoch);
+        for (rank, plan) in plans.iter().enumerate() {
+            let msg = ControlMsgWire::StartEpoch(plan.clone());
+            self.send_control(rank, &msg)?;
+            self.rank_epoch[rank] = epoch;
+        }
+        Ok(plans)
+    }
+
+    /// Borrow per-rank current-epoch state for diagnostics / tests.
+    pub fn rank_epoch(&self) -> &[usize] {
+        &self.rank_epoch
+    }
+
+    /// Last globally-aggregated epoch (all ranks reported). `None`
+    /// until [`Self::on_epoch_aggregated`] fires the first time
+    /// (deferred to 1d.5 when metrics aggregation lands).
+    pub fn last_aggregated_epoch(&self) -> Option<usize> {
+        self.last_aggregated_epoch
+    }
+
+    /// Batch size carried from config; used by progressive chunk
+    /// dispatch in 1d.6.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Number of epochs the trainer asked for; informs upcoming
+    /// `dispatch_epoch` bounds and 1d.5 metrics aggregation.
+    pub fn num_epochs(&self) -> usize {
+        self.num_epochs
+    }
+
+    /// Total samples across the dataset; basis for partition sizing.
+    pub fn total_samples(&self) -> usize {
+        self.total_samples
     }
 
     // -----------------------------------------------------------------
@@ -1404,5 +1598,203 @@ mod tests {
         // The asserts above guard the no-Throttle invariant.
         let _ = r0.join();
         let _ = r1.join();
+    }
+
+    // -----------------------------------------------------------------
+    // 4b.D.1d.3a — epoch dispatch
+    // -----------------------------------------------------------------
+
+    fn cfg_sync_nccl_with_dataset(world_size: usize, total_samples: usize) -> ClusterCoordinatorConfig {
+        cfg_sync_nccl(world_size)
+            .total_samples(total_samples)
+            .batch_size(2)
+            .num_epochs(1)
+    }
+
+    #[test]
+    fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
+        // 2 ranks, Sync, 10 samples → expect ranks to split (5, 5) by
+        // equal_sizes (Sync ignores ElChe ratios).
+        let world_size = 2;
+        let total_samples = 10;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl_with_dataset(world_size, total_samples),
+            move |coord| {
+                let plans = coord.dispatch_epoch(0)?;
+                // Smoke checks on the returned plans match what the
+                // wire dispatched.
+                assert_eq!(plans.len(), world_size);
+                let total: u64 = plans.iter().map(|p| p.partition_size).sum();
+                assert_eq!(total, total_samples as u64);
+                let mut offset = 0u64;
+                for plan in &plans {
+                    assert_eq!(plan.epoch, 0);
+                    assert_eq!(plan.partition_offset, offset);
+                    offset += plan.partition_size;
+                }
+                // rank_epoch updated.
+                assert_eq!(coord.rank_epoch(), &[0, 0]);
+                Ok(())
+            },
+        );
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            let frame = ControlFrame::read_from(s, salt)?
+                .ok_or_else(|| TensorError::new("rank 0 EOF before StartEpoch"))?;
+            assert_eq!(frame.kind, MsgKind::Control);
+            let msg: ControlMsgWire = frame.decode()?;
+            match msg {
+                ControlMsgWire::StartEpoch(plan) => {
+                    assert_eq!(plan.epoch, 0);
+                    assert_eq!(plan.partition_offset, 0);
+                    assert_eq!(plan.partition_size, 5);
+                    Ok(())
+                }
+                other => Err(TensorError::new(&format!(
+                    "rank 0 expected StartEpoch, got {other:?}"
+                ))),
+            }
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            let frame = ControlFrame::read_from(s, salt)?
+                .ok_or_else(|| TensorError::new("rank 1 EOF before StartEpoch"))?;
+            let msg: ControlMsgWire = frame.decode()?;
+            match msg {
+                ControlMsgWire::StartEpoch(plan) => {
+                    assert_eq!(plan.epoch, 0);
+                    assert_eq!(plan.partition_offset, 5);
+                    assert_eq!(plan.partition_size, 5);
+                    Ok(())
+                }
+                other => Err(TensorError::new(&format!(
+                    "rank 1 expected StartEpoch, got {other:?}"
+                ))),
+            }
+        });
+
+        r0.join().unwrap().expect("rank 0 receives StartEpoch (0, 5)");
+        r1.join().unwrap().expect("rank 1 receives StartEpoch (5, 5)");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    #[test]
+    fn dispatch_epoch_honors_explicit_partition_ratios() {
+        // 2 ranks, Sync, 12 samples, explicit ratios [1.0, 3.0] →
+        // ranks should split (3, 9) — but Sync policy normally uses
+        // equal_sizes; partition_ratios overrides that.
+        let world_size = 2;
+        let total_samples = 12;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                cfg_sync_nccl(world_size)
+                    .total_samples(total_samples)
+                    .partition_ratios(Some(vec![1.0, 3.0]))
+            },
+            move |coord| {
+                let plans = coord.dispatch_epoch(0)?;
+                assert_eq!(plans[0].partition_size, 3);
+                assert_eq!(plans[1].partition_size, 9);
+                let total: u64 = plans.iter().map(|p| p.partition_size).sum();
+                assert_eq!(total, total_samples as u64);
+                Ok(())
+            },
+        );
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            let frame = ControlFrame::read_from(s, salt)?.unwrap();
+            let msg: ControlMsgWire = frame.decode()?;
+            if let ControlMsgWire::StartEpoch(plan) = msg {
+                assert_eq!(plan.partition_size, 3);
+            } else {
+                return Err(TensorError::new("expected StartEpoch"));
+            }
+            Ok(())
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            let frame = ControlFrame::read_from(s, salt)?.unwrap();
+            let msg: ControlMsgWire = frame.decode()?;
+            if let ControlMsgWire::StartEpoch(plan) = msg {
+                assert_eq!(plan.partition_size, 9);
+            } else {
+                return Err(TensorError::new("expected StartEpoch"));
+            }
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 sees ratio[0] partition");
+        r1.join().unwrap().expect("rank 1 sees ratio[1] partition");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    #[test]
+    fn dispatch_epoch_caches_plans_for_same_epoch() {
+        // Calling dispatch_epoch twice for the same epoch must return
+        // identical plans both times (cache hit; rank_epoch reset to
+        // the same value). The wire receives two frames per rank.
+        let world_size = 2;
+        let total_samples = 8;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl_with_dataset(world_size, total_samples),
+            move |coord| {
+                let plans_a = coord.dispatch_epoch(0)?;
+                let plans_b = coord.dispatch_epoch(0)?;
+                assert_eq!(plans_a, plans_b, "epoch plan cache must be deterministic");
+                Ok(())
+            },
+        );
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            for _ in 0..2 {
+                let frame = ControlFrame::read_from(s, salt)?.unwrap();
+                let _: ControlMsgWire = frame.decode()?;
+            }
+            Ok(())
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            for _ in 0..2 {
+                let frame = ControlFrame::read_from(s, salt)?.unwrap();
+                let _: ControlMsgWire = frame.decode()?;
+            }
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 reads 2 frames");
+        r1.join().unwrap().expect("rank 1 reads 2 frames");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    #[test]
+    fn dispatch_epoch_errors_when_total_samples_zero() {
+        // Forgetting to set total_samples on the config must surface
+        // as a loud error, not silently produce empty partitions.
+        let world_size = 2;
+        let (listener, _port) = ClusterCoordinator::bind(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        )
+        .unwrap();
+        let coord_thread = thread::spawn(move || -> Result<()> {
+            let mut coord = ClusterCoordinator::start_from_listener(
+                listener,
+                TEST_SALT,
+                cfg_sync_nccl(world_size),
+            )?;
+            let err = coord.dispatch_epoch(0).unwrap_err();
+            assert!(
+                err.to_string().contains("total_samples > 0"),
+                "expected total_samples guard, got: {err}"
+            );
+            let _ = coord.shutdown();
+            Ok(())
+        });
+        // No real coord port handshake here — bind happened on the
+        // listener that lives inside the coord thread. We need
+        // 2 ranks to handshake before start_from_listener returns.
+        let port = _port;
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        let _ = r0.join();
+        let _ = r1.join();
+        coord_thread.join().unwrap().expect("coord error path");
     }
 }

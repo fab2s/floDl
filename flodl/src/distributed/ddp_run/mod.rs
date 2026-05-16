@@ -68,6 +68,7 @@ pub mod convergence;
 
 pub use worker::*;
 pub use coordinator::*;
+pub(crate) use coordinator::{equal_sizes, ratio_to_sizes, throughput_sizes};
 pub use orchestrator::*;
 pub use convergence::{
     ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample,

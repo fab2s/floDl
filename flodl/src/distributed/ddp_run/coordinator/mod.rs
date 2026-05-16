@@ -1414,7 +1414,7 @@ impl Coordinator {
 // ---------------------------------------------------------------------------
 
 /// Equal partition sizes with remainder distributed to the first ranks.
-pub(super) fn equal_sizes(world_size: usize, total: usize) -> Vec<usize> {
+pub(crate) fn equal_sizes(world_size: usize, total: usize) -> Vec<usize> {
     let base = total / world_size;
     let remainder = total % world_size;
     (0..world_size)
@@ -1426,7 +1426,7 @@ pub(super) fn equal_sizes(world_size: usize, total: usize) -> Vec<usize> {
 ///
 /// Faster ranks (lower ms/batch) get more samples. Remainder distributed
 /// to the fastest ranks.
-pub(super) fn throughput_sizes(
+pub(crate) fn throughput_sizes(
     el_che: &crate::distributed::ddp::ElChe,
     total: usize,
 ) -> Vec<usize> {
@@ -1460,7 +1460,7 @@ pub(super) fn throughput_sizes(
 ///
 /// Ratios are normalized to sum to 1.0. Remainder distributed to the
 /// ranks with the largest ratios.
-pub(super) fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
+pub(crate) fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
     let sum: f64 = ratios.iter().sum();
     let norm: Vec<f64> = if sum > 0.0 {
         ratios.iter().map(|r| r / sum).collect()
