@@ -628,6 +628,29 @@ impl ClusterCoordinator {
         &self.el_che
     }
 
+    /// Test-only peek at the captured per-rank divergence triple from
+    /// the most recent batch of `SyncAck`s (populated by
+    /// [`Self::process_timing_msg`], reset at the next
+    /// `finish_averaging_*`). Use to verify worker-side wiring
+    /// (bridge or sync_now_nccl) is forwarding real divergence values.
+    #[cfg(test)]
+    pub(crate) fn nccl_sync_divergence_for_test(&self) -> &[Option<f64>] {
+        &self.nccl_sync_divergence
+    }
+
+    /// Test-only peek at the captured per-rank pre-norm slot (counterpart
+    /// to [`Self::nccl_sync_divergence_for_test`]).
+    #[cfg(test)]
+    pub(crate) fn nccl_sync_pre_norm_for_test(&self) -> &[Option<f64>] {
+        &self.nccl_sync_pre_norm
+    }
+
+    /// Test-only peek at the captured shared post-norm slot.
+    #[cfg(test)]
+    pub(crate) fn nccl_sync_post_norm_for_test(&self) -> Option<f64> {
+        self.nccl_sync_post_norm
+    }
+
     // -----------------------------------------------------------------
     // State-machine drive
     // -----------------------------------------------------------------

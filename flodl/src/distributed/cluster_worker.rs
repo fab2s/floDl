@@ -683,7 +683,11 @@ fn write_one(
 /// [`crate::distributed::cpu_reduce::CpuReduceClient`], and feeds the
 /// averaged tensors back to the inner as `ControlMsg::Update`. Also
 /// emits `TimingMsg::SyncAck` on the timing channel so the
-/// coordinator's `nccl_ack` gate releases.
+/// coordinator's `nccl_ack` gate releases. The SyncAck carries the
+/// weight-space divergence triple (`||pre - post|| / ||post||`,
+/// `pre_norm`, `post_norm`) so the coord's
+/// [`ConvergenceGuard`](crate::distributed::ddp_run::convergence::ConvergenceGuard)
+/// sees real signal on the CPU averaging path.
 ///
 /// When `cpu_client` is `None`, the bridge degrades to a discard
 /// drainer (NCCL-only worker layout — the inner never emits
@@ -704,6 +708,11 @@ fn param_bridge_loop(
     // Monotonic local version counter; bumped per round so the
     // synthesized AveragedParams.version increases consistently.
     let mut version: u64 = 0;
+    // Pre-sync scratch for weight-space divergence math. Allocated
+    // lazily on the first ParamSnapshot (shapes match the inner
+    // GpuWorker's param tensors; reused unchanged across rounds).
+    let mut pre_scratch: Option<Vec<Tensor>> = None;
+
     while let Ok(snapshot) = param_rx.recv() {
         let ParamSnapshot {
             rank: snap_rank,
@@ -715,9 +724,44 @@ fn param_bridge_loop(
             snap_rank as u64, rank,
             "param bridge: snapshot.rank mismatch with bridge rank"
         );
-        // All-reduce params + buffers via the data channel. f32 only
-        // in v1; CpuReduceClient surfaces a loud error otherwise.
-        let param_refs: Vec<&_> = params.iter().collect();
+
+        // One-time scratch allocation matched to the snapshot shapes.
+        if pre_scratch.is_none() {
+            let allocated: Result<Vec<Tensor>> =
+                params.iter().map(Tensor::zeros_like).collect();
+            match allocated {
+                Ok(s) => pre_scratch = Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "cluster_worker: param bridge r{rank} scratch alloc: {e}"
+                    );
+                    return;
+                }
+            }
+        }
+        let scratch = pre_scratch.as_ref().expect("scratch just allocated");
+
+        // Capture pre-sync params into scratch (deep copy; scratch
+        // never shares storage with snapshot.params, so the math
+        // stays correct regardless of device or ApplyPolicy).
+        let mut copy_failed = false;
+        for (dst, src) in scratch.iter().zip(params.iter()) {
+            if let Err(e) = dst.copy_(src, false) {
+                eprintln!(
+                    "cluster_worker: param bridge r{rank} pre_scratch copy_: {e}"
+                );
+                copy_failed = true;
+                break;
+            }
+        }
+        if copy_failed {
+            return;
+        }
+
+        // AllReduce-Avg params via the data channel; returns NEW
+        // averaged tensors (snapshot.params untouched). f32 only in
+        // v1; CpuReduceClient surfaces a loud error otherwise.
+        let param_refs: Vec<&Tensor> = params.iter().collect();
         let avg_params = match client.all_reduce_tensors(&param_refs) {
             Ok(v) => v,
             Err(e) => {
@@ -727,7 +771,22 @@ fn param_bridge_loop(
                 return;
             }
         };
-        let buffer_refs: Vec<&_> = buffers.iter().collect();
+
+        // Weight-space divergence (||pre - post|| / ||post||, plus
+        // pre_norm / post_norm) computed before the buffer reduce so
+        // a later buffer error path can't mask the params triple.
+        let (divergence, post_norm, pre_norm) =
+            match compute_divergence(scratch, &avg_params) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "cluster_worker: param bridge r{rank} divergence: {e}"
+                    );
+                    return;
+                }
+            };
+
+        let buffer_refs: Vec<&Tensor> = buffers.iter().collect();
         let avg_buffers = if buffer_refs.is_empty() {
             Vec::new()
         } else {
@@ -757,11 +816,75 @@ fn param_bridge_loop(
         let _ = timing_tx.send(TimingMsg::SyncAck {
             rank: rank as usize,
             step_count: usize::MAX / 2,
-            divergence: None,
-            post_norm: None,
-            pre_norm: None,
+            divergence: Some(divergence),
+            post_norm,
+            pre_norm,
         });
     }
+}
+
+/// Compute the weight-space divergence triple
+/// `(||pre - post|| / ||post||, post_norm, pre_norm)`.
+///
+/// Mirrors
+/// [`CpuReduceClient::average_params_with_divergence`](
+/// crate::distributed::cpu_reduce::CpuReduceClient::average_params_with_divergence
+/// ) but accepts pre and post as separate slices — the param bridge
+/// keeps `post` (averaged) in a freshly returned vector rather than
+/// mutating snapshot tensors in place, so the math stays correct
+/// regardless of whether snapshot tensors share storage with the
+/// inner GpuWorker's live params (true on CPU device, false on
+/// CUDA + to_device(CPU) hop).
+///
+/// **Mutates `pre` in place** (subtracts `post`); the caller treats
+/// `pre` as scratch that is overwritten by each round.
+fn compute_divergence(
+    pre: &[Tensor],
+    post: &[Tensor],
+) -> Result<(f64, Option<f64>, Option<f64>)> {
+    if pre.is_empty() {
+        return Ok((0.0, None, None));
+    }
+    if pre.len() != post.len() {
+        return Err(TensorError::new(&format!(
+            "compute_divergence: pre.len() ({}) must equal post.len() ({})",
+            pre.len(),
+            post.len(),
+        )));
+    }
+
+    // pre_norm BEFORE the foreach_add_list_ subtracts post from scratch.
+    let pre_norm_tensors = Tensor::foreach_norm(pre, 2.0)?;
+    let mut pre_sq = 0.0f64;
+    for n in &pre_norm_tensors {
+        let v: f64 = n.item()?;
+        pre_sq += v * v;
+    }
+    let pre_norm = pre_sq.sqrt();
+
+    // scratch[i] += -1 * post[i]  →  scratch[i] = pre - post.
+    Tensor::foreach_add_list_(pre, post, -1.0)?;
+    let diff_norms = Tensor::foreach_norm(pre, 2.0)?;
+    let post_norms = Tensor::foreach_norm(post, 2.0)?;
+
+    let mut diff_sq = 0.0f64;
+    for n in &diff_norms {
+        let v: f64 = n.item()?;
+        diff_sq += v * v;
+    }
+    let mut post_sq = 0.0f64;
+    for n in &post_norms {
+        let v: f64 = n.item()?;
+        post_sq += v * v;
+    }
+    let post_norm = post_sq.sqrt();
+    let divergence = if post_norm > 1e-10 {
+        diff_sq.sqrt() / post_norm
+    } else {
+        0.0
+    };
+
+    Ok((divergence, Some(post_norm), Some(pre_norm)))
 }
 
 // ---------------------------------------------------------------------------
@@ -941,12 +1064,13 @@ mod tests {
     use crate::distributed::cluster_coordinator::ClusterCoordinator as CCoord;
     use crate::distributed::controller::ClusterController;
     use crate::nn::Linear;
-    use crate::tensor::TensorOptions;
-    use crate::tensor::DType;
 
-    /// Mirror of `ddp_run::tests::TestDataset` — random (input, target)
-    /// pairs on CPU. Kept local so we don't have to widen the
-    /// visibility of the OLD test helper.
+    /// Index-deterministic dataset on CPU. Each sample's values are
+    /// derived from its index, so two ranks reading disjoint partitions
+    /// see DIFFERENT samples (and thus DIFFERENT gradients post-SGD).
+    /// `Tensor::randn` would produce shared values across threads under
+    /// libtorch's global RNG, collapsing per-rank divergence to zero
+    /// and defeating the divergence-wire assertion below.
     struct TestDataset {
         n: usize,
     }
@@ -956,13 +1080,25 @@ mod tests {
         }
         fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
             let n = indices.len() as i64;
-            let opts = TensorOptions {
-                dtype: DType::Float32,
-                device: Device::CPU,
-            };
+            // Inputs: each sample is [idx, idx+1, idx+2, idx+3] / 10.
+            // Targets: each sample is [idx * 0.1, idx * 0.2].
+            // Both deterministic in `indices`, so disjoint partitions
+            // → distinct gradients → non-zero post-AllReduce divergence.
+            let mut x_vals: Vec<f32> = Vec::with_capacity(indices.len() * 4);
+            let mut y_vals: Vec<f32> = Vec::with_capacity(indices.len() * 2);
+            for &idx in indices {
+                let f = idx as f32;
+                x_vals.extend_from_slice(&[
+                    f / 10.0,
+                    (f + 1.0) / 10.0,
+                    (f + 2.0) / 10.0,
+                    (f + 3.0) / 10.0,
+                ]);
+                y_vals.extend_from_slice(&[f * 0.1, f * 0.2]);
+            }
             Ok(vec![
-                Tensor::randn(&[n, 4], opts)?,
-                Tensor::randn(&[n, 2], opts)?,
+                Tensor::from_f32(&x_vals, &[n, 4], Device::CPU)?,
+                Tensor::from_f32(&y_vals, &[n, 2], Device::CPU)?,
             ])
         }
     }
@@ -981,7 +1117,11 @@ mod tests {
     /// `ClusterController` (data) and `ClusterCoordinator` (control)
     /// alongside 2 `ClusterWorker` threads with a trivial Linear model
     /// and `TestDataset`, run one averaging cycle via the param bridge,
-    /// assert avg_count fires + workers exit cleanly.
+    /// assert avg_count fires + workers exit cleanly AND the
+    /// coordinator captured non-zero per-rank divergence values from
+    /// the bridge's `SyncAck` payload (validates
+    /// [`compute_divergence`](super::compute_divergence) flowed end-to-
+    /// end through the wire protocol).
     #[test]
     fn end_to_end_sync_cpu_smoke() {
         let world_size = 2usize;
@@ -1107,6 +1247,57 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(coord.avg_count() >= 1, "at least one averaging cycle");
+
+        // 6b. The coord's CPU `trigger_averaging` calls
+        //     `finish_averaging_cpu` synchronously (matching OLD's NCCL
+        //     pattern), so it resets `nccl_sync_divergence` BEFORE the
+        //     worker bridges send their `SyncAck` with the actual
+        //     divergence triple. Drive a few extra ticks here so the
+        //     bridge SyncAcks reach the coord and populate the slots,
+        //     then assert directly that the bridge wired real values.
+        //     Bounded loop with a wall budget so a regression doesn't
+        //     hang the suite.
+        let drain_start = Instant::now();
+        while coord.nccl_sync_divergence_for_test().iter().any(|d| d.is_none()) {
+            if drain_start.elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "end_to_end_sync_cpu_smoke: bridge SyncAcks did not \
+                     populate nccl_sync_divergence within 5s after cycle; \
+                     captured = {:?}",
+                    coord.nccl_sync_divergence_for_test()
+                );
+            }
+            coord.tick().expect("tick");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let captured: Vec<f64> = coord
+            .nccl_sync_divergence_for_test()
+            .iter()
+            .map(|d| d.expect("all slots populated by drain loop"))
+            .collect();
+        assert!(
+            captured.iter().all(|d| d.is_finite() && *d > 0.0),
+            "expected strictly-positive per-rank divergence after one \
+             Local-SGD step, got {captured:?}"
+        );
+        // pre_norm + post_norm should also be populated (and non-zero
+        // for a random-init Linear).
+        let post_norm = coord
+            .nccl_sync_post_norm_for_test()
+            .expect("post_norm captured");
+        assert!(
+            post_norm.is_finite() && post_norm > 0.0,
+            "post_norm should be strictly positive, got {post_norm}"
+        );
+        let pre_norms: Vec<f64> = coord
+            .nccl_sync_pre_norm_for_test()
+            .iter()
+            .map(|p| p.expect("pre_norm slot populated"))
+            .collect();
+        assert!(
+            pre_norms.iter().all(|p| p.is_finite() && *p > 0.0),
+            "pre_norms should be strictly positive per rank, got {pre_norms:?}"
+        );
 
         // 7. Send Shutdown to workers and tear down the coord.
         coord.shutdown_workers().ok();
