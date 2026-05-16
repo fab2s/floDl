@@ -143,6 +143,10 @@ impl Optimizer for Adam {
             g.lr = lr;
         }
     }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
 }
 
 impl Adam {
@@ -349,6 +353,10 @@ impl Optimizer for AdamW {
 
     fn set_group_lr(&mut self, group: usize, lr: f64) {
         self.adam.set_group_lr(group, lr);
+    }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
     }
 }
 

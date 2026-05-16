@@ -42,6 +42,25 @@ pub trait Optimizer {
     fn scale_lr(&mut self, factor: f64) {
         self.set_lr(self.lr() * factor);
     }
+    /// Persist optimizer state (LR + momentum buffers + step counters)
+    /// to `path`. Object-safe wrapper around [`Stateful::save_state_file`]
+    /// — necessary because `Stateful::save_state` is generic in `W: Write`
+    /// and so not dyn-callable. Optimizers that implement [`Stateful`]
+    /// override this method with a one-line delegate; those that do not
+    /// inherit the default impl which returns an explicit "unsupported"
+    /// error so the cluster save flow can log it and move on rather than
+    /// silently producing an empty `.optim` file.
+    ///
+    /// Used by the cluster save-on-unrecoverable-failure flow to write
+    /// `<save_path>.optim` alongside the model + meta sidecars; see
+    /// [`crate::distributed::CheckpointBundle`].
+    fn save_state_to(&self, _path: &str) -> Result<()> {
+        Err(crate::tensor::TensorError::new(
+            "Optimizer::save_state_to: this optimizer does not yet \
+             implement Stateful; optimizer state cannot be persisted. \
+             Open a follow-up to add Stateful for this optimizer.",
+        ))
+    }
 }
 
 /// Per-group learning rate metadata. Private to `optim`; submodules inherit access.

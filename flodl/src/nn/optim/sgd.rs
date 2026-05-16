@@ -184,6 +184,10 @@ impl Optimizer for SGD {
             g.lr = lr;
         }
     }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
 }
 
 impl Stateful for SGD {

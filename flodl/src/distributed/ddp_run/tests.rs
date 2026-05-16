@@ -1740,6 +1740,109 @@ fn test_checkpoint_error_logged_not_propagated() {
 }
 
 #[test]
+fn shutdown_with_save_writes_bundle_to_save_path() {
+    // Rank-0 worker with save_path set. Dispatch ShutdownWithSave;
+    // verify model + optim + meta files exist and meta has the
+    // expected SaveReason + world_size_at_save fields.
+    let dev = test_device();
+    let dir = std::env::temp_dir().join(format!(
+        "flodl_shutdown_with_save_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("ckpt_final");
+    let stem_str = stem.to_str().unwrap().to_string();
+
+    let tmp_model = Linear::on_device(4, 2, dev).unwrap();
+    let tmp_params: Vec<Tensor> =
+        tmp_model.parameters().iter().map(|p| p.variable.data()).collect();
+    let tmp_buffers: Vec<Tensor> =
+        tmp_model.buffers().iter().map(|b| b.get()).collect();
+    drop(tmp_model);
+
+    let config = WorkerConfig {
+        rank: 0,
+        world_size: 3,
+        device: dev,
+        initial_params: tmp_params,
+        initial_buffers: tmp_buffers,
+        total_samples: 16,
+        batch_size: 4,
+        seed: 42,
+        max_grad_norm: None,
+        easgd_alpha: None,
+        timeline: None,
+        policy: ApplyPolicy::Sync,
+        save_path: Some(stem_str.clone()),
+    };
+    let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), ch) =
+        GpuWorker::<Linear>::channels();
+    let dataset: Arc<dyn crate::data::BatchDataSet> =
+        Arc::new(TestDataset { n: 16 });
+    let mut worker = GpuWorker::new(
+        &config,
+        |d| Linear::on_device(4, 2, d),
+        |params| crate::nn::SGD::new(params, 0.01, 0.0),
+        dataset,
+        None,
+        None,
+        timing_tx,
+        metrics_tx,
+        param_tx,
+        final_param_tx,
+        control_rx,
+    )
+    .unwrap();
+
+    ch.control_tx
+        .send(ControlMsg::ShutdownWithSave {
+            reason: crate::distributed::SaveReason::MaxFailureExceeded,
+        })
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(shutdown, "ShutdownWithSave must trigger shutdown");
+
+    // Bundle members present and meta carries the dispatched reason.
+    let model_path =
+        crate::distributed::CheckpointBundle::model_path(&stem_str);
+    let optim_path =
+        crate::distributed::CheckpointBundle::optim_path(&stem_str);
+    let meta_path = crate::distributed::CheckpointBundle::meta_path(&stem_str);
+    assert!(model_path.exists(), "model file missing: {}", model_path.display());
+    assert!(optim_path.exists(), "optim file missing: {}", optim_path.display());
+    assert!(meta_path.exists(), "meta file missing: {}", meta_path.display());
+
+    let meta = crate::distributed::CheckpointMeta::read_from_file(&meta_path)
+        .unwrap();
+    assert_eq!(meta.world_size_at_save, 3);
+    assert_eq!(
+        meta.save_reason,
+        crate::distributed::SaveReason::MaxFailureExceeded,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shutdown_with_save_no_path_exits_without_write() {
+    // Worker with save_path = None still exits on ShutdownWithSave;
+    // no files are written (no path to write to). Guard against a
+    // regression where the save flow panics or short-circuits the
+    // shutdown when save_path is unset.
+    let (mut worker, ch) = make_test_worker();
+    ch.control_tx
+        .send(ControlMsg::ShutdownWithSave {
+            reason: crate::distributed::SaveReason::SingleSurvivor,
+        })
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(
+        shutdown,
+        "ShutdownWithSave must trigger shutdown even without save_path"
+    );
+}
+
+#[test]
 fn test_coordinator_sends_checkpoint_every_n_epochs() {
     use crate::distributed::ddp::ElChe;
 

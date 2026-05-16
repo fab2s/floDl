@@ -114,6 +114,13 @@ pub struct GpuWorker<M: Module> {
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
     pub(super) checkpoint_fn: Option<CheckpointFn<M>>,
+    /// Checkpoint-bundle stem for the cluster save-on-unrecoverable-
+    /// failure flow. Populated from [`WorkerConfig::save_path`]. When
+    /// set, the worker writes a `<save_path>.fdl` / `<save_path>.optim`
+    /// / `<save_path>.meta.json` bundle on
+    /// [`ControlMsg::ShutdownWithSave`] receipt; when unset, the
+    /// shutdown still happens but no save attempt is made.
+    save_path: Option<String>,
 
     // -- Async prefetch (VRAM gauge) --
     /// Background prefetch worker for async H2D transfers (None on CPU).
@@ -393,6 +400,7 @@ impl<M: Module> GpuWorker<M> {
             scheduler: None,
             lr_scale: 1.0,
             checkpoint_fn,
+            save_path: config.save_path.clone(),
             prefetch,
             per_sample_bytes,
             activation_peak_bytes: 0,
@@ -1710,13 +1718,28 @@ impl<M: Module> GpuWorker<M> {
                 // wiring), drop silently — the OLD threaded path
                 // has no comm-replacement surface to act on it.
             }
-            ControlMsg::ShutdownWithSave { reason: _ } => {
-                // Cluster-mode unrecoverable-failure persistence. The
-                // save sequence (model + optimizer + meta) is wired in
-                // a follow-on slice; for now treat as a plain shutdown
-                // so the worker exits cleanly. When the save handler
-                // lands, this arm will write the bundle to save_path
-                // before returning true.
+            ControlMsg::ShutdownWithSave { reason } => {
+                // Cluster-mode unrecoverable-failure persistence.
+                // Write the bundle to `save_path` (rank 0 is the
+                // canonical writer for the model + meta; all ranks
+                // attempt the optimizer save since per-rank momentum
+                // buffers differ — rank 0's `.optim` is the canonical
+                // one to load from, but persisting per-rank files
+                // makes a future "average optimizer state on resume"
+                // path tractable without re-instrumenting).
+                //
+                // Errors during save log loud and don't block exit:
+                // we'd rather surface a disk-full / permission error
+                // than deadlock the cluster on shutdown.
+                if let Some(stem) = self.save_path.clone() {
+                    self.write_checkpoint_bundle(&stem, reason);
+                } else {
+                    crate::verbose!(
+                        "  ddp-worker: rank {} ShutdownWithSave received \
+                         but save_path is unset; exiting without saving",
+                        self.rank,
+                    );
+                }
                 return Ok(true);
             }
             ControlMsg::ExtendPartition {
@@ -2216,5 +2239,115 @@ impl<M: Module> GpuWorker<M> {
         );
 
         Ok(false)
+    }
+
+    /// Write the checkpoint bundle for an unrecoverable-failure save.
+    ///
+    /// Bundle members at `<stem>.{fdl,optim,meta.json}` per
+    /// [`crate::distributed::CheckpointBundle`]. Rank 0 is the
+    /// canonical writer for the model + meta files (all ranks see
+    /// identical post-sync params, so duplicating across ranks is
+    /// wasted I/O); all ranks write their optimizer state, with
+    /// non-zero ranks suffixing `.r<N>` so the canonical `.optim`
+    /// stays as rank 0's (per-rank momentum buffers differ and a
+    /// future resume API may choose to average them).
+    ///
+    /// All save errors are logged + ignored — we'd rather surface a
+    /// disk-full or permission error in the logs than deadlock the
+    /// cluster on shutdown.
+    fn write_checkpoint_bundle(
+        &self,
+        stem: &str,
+        reason: crate::distributed::SaveReason,
+    ) {
+        use crate::distributed::{CheckpointBundle, CheckpointMeta};
+
+        // Rank 0: model file (params + buffers).
+        if self.rank == 0 {
+            let model_path = CheckpointBundle::model_path(stem);
+            let params: Vec<(String, _)> = self
+                .model
+                .parameters()
+                .into_iter()
+                .map(|p| (p.name.clone(), p))
+                .collect();
+            let buffers: Vec<(String, _)> = self
+                .model
+                .buffers()
+                .into_iter()
+                .map(|b| (b.name.clone(), b))
+                .collect();
+            match model_path.to_str() {
+                Some(path_str) => {
+                    if let Err(e) = crate::nn::save_checkpoint_file(
+                        path_str, &params, &buffers, None,
+                    ) {
+                        eprintln!(
+                            "ddp-worker: rank 0 model save to {path_str} failed: {e}",
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "ddp-worker: rank 0 model path is not utf-8: {}",
+                    model_path.display(),
+                ),
+            }
+        }
+
+        // All ranks: optimizer state. Rank 0 uses the canonical
+        // `.optim`; others suffix `.r<N>`.
+        let optim_path = CheckpointBundle::optim_path(stem);
+        let rank_optim_path = if self.rank == 0 {
+            optim_path
+        } else {
+            let mut p = optim_path;
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                let new_name = format!("{name}.r{}", self.rank);
+                p.set_file_name(new_name);
+            }
+            p
+        };
+        match rank_optim_path.to_str() {
+            Some(path_str) => {
+                if let Err(e) = self.optimizer.save_state_to(path_str) {
+                    eprintln!(
+                        "ddp-worker: rank {} optimizer save to {} failed: {}",
+                        self.rank, path_str, e,
+                    );
+                }
+            }
+            None => eprintln!(
+                "ddp-worker: rank {} optim path is not utf-8: {}",
+                self.rank,
+                rank_optim_path.display(),
+            ),
+        }
+
+        // Rank 0: meta JSON.
+        if self.rank == 0 {
+            let meta_path = CheckpointBundle::meta_path(stem);
+            let meta = CheckpointMeta::new(
+                self.current_epoch,
+                self.global_step,
+                self.current_version,
+                self.world_size,
+                reason,
+            );
+            if let Err(e) = meta.write_to_file(&meta_path) {
+                eprintln!(
+                    "ddp-worker: rank 0 meta save to {} failed: {}",
+                    meta_path.display(),
+                    e,
+                );
+            }
+        }
+
+        crate::verbose!(
+            "  ddp-worker: rank {} wrote checkpoint bundle to stem {} \
+             (reason {:?})",
+            self.rank,
+            stem,
+            reason,
+        );
     }
 }

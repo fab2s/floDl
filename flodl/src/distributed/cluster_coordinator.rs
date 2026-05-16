@@ -588,6 +588,16 @@ pub struct ClusterCoordinator {
     /// network rank (Tier 2). Sourced from
     /// [`ClusterCoordinatorConfig::local_ranks`].
     local_ranks: Vec<usize>,
+
+    /// Unrecoverable-failure threshold; copied from
+    /// [`ClusterCoordinatorConfig::max_failure`].
+    max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
+
+    /// `true` once [`Self::dispatch_shutdown_with_save`] has broadcast
+    /// `ShutdownWithSave`. Guards against re-broadcasting on subsequent
+    /// `check_dead_ranks` ticks — once survivors are persisting state,
+    /// repeat broadcasts are noise.
+    shutdown_with_save_dispatched: bool,
     /// Per-rank wall-time (ms) from the most recent averaging cycle's
     /// `RequestParams` broadcast to that rank's SyncAck arrival.
     /// Populated by [`Self::process_timing_msg`]'s SyncAck arm.
@@ -831,6 +841,8 @@ impl ClusterCoordinator {
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
+            max_failure: config.max_failure,
+            shutdown_with_save_dispatched: false,
             last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
@@ -882,6 +894,14 @@ impl ClusterCoordinator {
 
     pub fn active_count(&self) -> usize {
         self.active_count
+    }
+
+    /// `true` after [`Self::dispatch_shutdown_with_save`] has fired
+    /// (max_failure threshold breached or backend hard limit hit).
+    /// Test-only accessor; the flag is internal state.
+    #[cfg(test)]
+    pub(crate) fn shutdown_with_save_dispatched(&self) -> bool {
+        self.shutdown_with_save_dispatched
     }
 
     pub fn max_overshoot(&self) -> usize {
@@ -1398,11 +1418,23 @@ impl ClusterCoordinator {
                 }
             }
         }
-        // After processing all deaths this tick, kick off a single
-        // NCCL re-rendezvous (no-op if backend is CPU or rendezvous
-        // already pending or fewer than 2 survivors).
+        // After processing all deaths this tick, decide whether the
+        // cluster is recoverable. If user-configured max_failure was
+        // breached, or the backend's hard limit is hit (NCCL needs
+        // world_size>=2; CPU needs at least 1 survivor), broadcast
+        // ShutdownWithSave so survivors persist state before exiting.
+        // This MUST come before initiate_nccl_rendezvous_if_needed —
+        // the rendezvous path would silently early-exit at <2
+        // survivors, leaving the lone survivor blocked indefinitely.
         if any_newly_dead {
-            if let Err(e) = self.initiate_nccl_rendezvous_if_needed() {
+            if let Some(reason) = self.unrecoverable_reason() {
+                if let Err(e) = self.dispatch_shutdown_with_save(reason) {
+                    crate::verbose!(
+                        "  ddp: ShutdownWithSave broadcast failed: {}",
+                        e,
+                    );
+                }
+            } else if let Err(e) = self.initiate_nccl_rendezvous_if_needed() {
                 crate::verbose!(
                     "  ddp: NCCL rendezvous initiation failed: {}",
                     e,
@@ -1497,6 +1529,68 @@ impl ClusterCoordinator {
             .as_ref()
             .map(|d| d.is_dead(rank))
             .unwrap_or(false)
+    }
+
+    /// Determine whether the cluster's current state is unrecoverable
+    /// and what [`crate::distributed::SaveReason`] should be recorded.
+    ///
+    /// Returns `None` either when the state is fine OR when a save +
+    /// shutdown has already been dispatched (the flag prevents repeat
+    /// broadcasts on subsequent ticks).
+    ///
+    /// Ordering: user-configured `max_failure` is checked first so that
+    /// a configured threshold takes precedence over the backend's hard
+    /// limit (a user with `MaxFailureThreshold::Absolute(1)` on an NCCL
+    /// cluster gets `MaxFailureExceeded`, not `SingleSurvivor`).
+    fn unrecoverable_reason(&self) -> Option<crate::distributed::SaveReason> {
+        if self.shutdown_with_save_dispatched {
+            return None;
+        }
+        let dead_count = self.world_size.saturating_sub(self.active_count);
+        if let Some(threshold) = self.max_failure {
+            if dead_count >= threshold.limit_for(self.world_size) {
+                return Some(crate::distributed::SaveReason::MaxFailureExceeded);
+            }
+        }
+        match self.backend {
+            AverageBackend::Nccl if self.active_count < 2 => {
+                // NCCL requires world_size >= 2 to form a comm; the
+                // lone survivor cannot continue.
+                Some(crate::distributed::SaveReason::SingleSurvivor)
+            }
+            AverageBackend::Cpu if self.active_count == 0 => {
+                Some(crate::distributed::SaveReason::AllRanksLost)
+            }
+            _ => None,
+        }
+    }
+
+    /// Broadcast `ShutdownWithSave` to all surviving ranks so they
+    /// persist a checkpoint bundle to the configured `save_path` and
+    /// exit, then mark the flag so we don't re-broadcast on subsequent
+    /// `check_dead_ranks` ticks.
+    ///
+    /// Broadcast goes to ALL ranks the wire-side knows about; dead
+    /// ranks have already shut down their stream and the send is a
+    /// no-op (matches the pattern used by `broadcast_control` for
+    /// `DeclareDead`).
+    fn dispatch_shutdown_with_save(
+        &mut self,
+        reason: crate::distributed::SaveReason,
+    ) -> Result<()> {
+        crate::verbose!(
+            "  ddp: unrecoverable cluster state ({:?}); broadcasting \
+             ShutdownWithSave (active={}/{})",
+            reason,
+            self.active_count,
+            self.world_size,
+        );
+        let msg = ControlMsgWire::ShutdownWithSave {
+            reason: reason.to_u8(),
+        };
+        self.broadcast_control(&msg)?;
+        self.shutdown_with_save_dispatched = true;
+        Ok(())
     }
 
     /// NCCL-backend re-rendezvous initiation. Called from
@@ -3430,5 +3524,100 @@ mod tests {
         r0.join().unwrap().expect("rank 0 path");
         r1.join().unwrap().expect("rank 1 path");
         coord_handle.join().unwrap().expect("coord cycle 1 with meta on");
+    }
+
+    #[test]
+    fn max_failure_threshold_breach_dispatches_shutdown_with_save() {
+        // 3-rank CPU cluster, max_failure=Absolute(1). All ranks
+        // handshake then go silent — within heartbeat_timeout_secs the
+        // first stale-heartbeat detection trips the threshold, the
+        // coord broadcasts ShutdownWithSave to every rank, and the
+        // dispatched flag flips.
+        let world_size = 3;
+        let dead_ranks =
+            crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Cpu,
+                    world_size,
+                    ElChe::new(world_size, 1),
+                )
+                .no_divergence_guard()
+                .dead_ranks(dead_for_coord)
+                .heartbeat_timeout_secs(1)
+                .max_failure(
+                    crate::distributed::max_failure::MaxFailureThreshold::Absolute(1),
+                )
+            },
+            |coord| {
+                let start = Instant::now();
+                while !coord.shutdown_with_save_dispatched() {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(TensorError::new(
+                            "max_failure: ShutdownWithSave never dispatched",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            },
+        );
+
+        fn drain_shutdown_with_save(
+            s: &mut TcpStream,
+            salt: &SessionSalt,
+        ) -> Result<()> {
+            // Bound the wait — the coord's heartbeat_timeout=1s means
+            // dispatch lands ~1.0-1.5s after handshake.
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| TensorError::new(&format!("timeout: {e}")))?;
+            let msg = recv_control(s, salt)?;
+            match msg {
+                ControlMsgWire::ShutdownWithSave { reason } => {
+                    let r = crate::distributed::SaveReason::from_u8(reason)
+                        .expect("known SaveReason variant");
+                    if r != crate::distributed::SaveReason::MaxFailureExceeded {
+                        return Err(TensorError::new(&format!(
+                            "expected MaxFailureExceeded, got {r:?}"
+                        )));
+                    }
+                    Ok(())
+                }
+                other => Err(TensorError::new(&format!(
+                    "expected ShutdownWithSave, got {other:?}"
+                ))),
+            }
+        }
+
+        let r0 = fake_rank(
+            port,
+            0,
+            world_size as u32,
+            TEST_SALT,
+            drain_shutdown_with_save,
+        );
+        let r1 = fake_rank(
+            port,
+            1,
+            world_size as u32,
+            TEST_SALT,
+            drain_shutdown_with_save,
+        );
+        let r2 = fake_rank(
+            port,
+            2,
+            world_size as u32,
+            TEST_SALT,
+            drain_shutdown_with_save,
+        );
+        r0.join().unwrap().expect("rank 0 receives ShutdownWithSave");
+        r1.join().unwrap().expect("rank 1 receives ShutdownWithSave");
+        r2.join().unwrap().expect("rank 2 receives ShutdownWithSave");
+        coord_handle.join().unwrap().expect("coord dispatched broadcast");
     }
 }
