@@ -30,6 +30,15 @@
 #     (NAS / SMB / virtiofs / S3-FUSE).
 #   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
 #     bind-mounts it into the Docker container at /usr/local/libtorch.
+#   - `arch:` is the GPU compute capability for this host's devices in
+#     canonical `sm_NN` form (sm_61 Pascal, sm_70 Volta, sm_75 Turing,
+#     sm_80/86/89 Ampere, sm_90 Hopper, sm_120 Blackwell). Optional
+#     today; consumed by the future `fdl deploy` slice to (1) validate
+#     against probed hardware before training starts and (2) select a
+#     compatible libtorch variant from those locally provisioned.
+#     A single libtorch build can support multiple archs (see
+#     `libtorch/builds/<variant>/.arch`); this field declares what
+#     THIS HOST has, not what one libtorch variant covers.
 #
 # Controller participation: if the controller's hostname appears in
 # `hosts:` below, it participates as a rank. If absent, it dispatches and
@@ -44,6 +53,7 @@ cluster:
     - name: node-a             # must match `hostname` on the host
       ranks: [0]
       local_devices: [0]
+      arch: sm_80              # canonical sm_NN form (Ampere A100 here)
       nccl_socket_ifname: virbr0
       path: /opt/flodl                # checkout path on this host
       libtorch_path: /data/ssd/flodl/libtorch
@@ -52,6 +62,7 @@ cluster:
       ranks: [1, 2]
       local_devices: all       # auto-detect at startup; equivalent to [0, 1]
                                # if this host has 2 visible CUDA devices.
+      arch: sm_90              # Hopper H100
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch

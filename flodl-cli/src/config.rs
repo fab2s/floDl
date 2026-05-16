@@ -619,6 +619,21 @@ pub struct ClusterHost {
     /// absent. Library ignores this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
+    /// GPU compute capability for this host's devices, canonical form
+    /// `sm_NN` (e.g. `sm_61` for Pascal GP106, `sm_80` for Ampere
+    /// A100, `sm_120` for Blackwell B100). Optional today; the future
+    /// `fdl deploy` slice consumes this to validate against the
+    /// probed hardware + select a compatible libtorch variant.
+    ///
+    /// A single libtorch build can support multiple architectures
+    /// (see `libtorch/builds/<variant>/.arch`); this field declares
+    /// what THIS HOST has, not what one libtorch variant covers.
+    /// The probe matches host arch ∈ variant's supported set.
+    ///
+    /// Mixed-GPU hosts (rare) can use a list of arches in a future
+    /// schema extension; today this is a single string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
 }
 
 impl ClusterConfig {

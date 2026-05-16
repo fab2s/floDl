@@ -43,6 +43,7 @@ cluster:
       ranks: [0, 1]
       local_devices: all       # auto-detect at startup; equivalent to [0, 1]
                                # if this host has 2 visible CUDA devices.
+      arch: sm_80              # canonical sm_NN form
       nccl_socket_ifname: enp1s0
       path: /opt/flodl                # checkout path on this host
       libtorch_path: /data/ssd/flodl/libtorch
@@ -50,6 +51,7 @@ cluster:
       ssh: node-b              # ssh target; defaults to name if omitted
       ranks: [2, 3]
       local_devices: [0, 1]    # explicit form when you want to skip a device
+      arch: sm_90
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch
@@ -63,6 +65,7 @@ cluster:
 #     - name: my-rig
 #       ranks: [0, 1]
 #       local_devices: all
+#       arch: sm_75              # Turing 20XX-series example
 #       nccl_socket_ifname: lo
 #       path: /home/me/src/flodl
 #       libtorch_path: /home/me/libtorch

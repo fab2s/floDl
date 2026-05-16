@@ -167,6 +167,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             path,
             libtorch_path: None,
             ssh: None,
+            arch: None,
         }],
     })
 }
