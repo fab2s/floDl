@@ -63,6 +63,7 @@
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 
 use crate::tensor::{Result, TensorError};
@@ -219,11 +220,21 @@ fn run_launcher() -> Result<()> {
                 "cluster launcher: invalid ClusterController bind addr 0.0.0.0:{cpu_avg_port}: {e}"
             ))
         })?;
-    let cpu_averager = crate::distributed::controller::ClusterController::start(
-        cpu_avg_addr,
-        full.world_size(),
-        full.salt,
-    )?;
+    // Shared dead-rank ledger between ClusterController (CPU averaging
+    // releases on heartbeat-stale) and ClusterCoordinator (NCCL
+    // elastic-membership rendezvous trigger). Both consumers see the
+    // same source of truth. Always constructed even on legacy NCCL
+    // runs — the cost is negligible (a Vec<AtomicBool>) and the wiring
+    // keeps both backends pluggable.
+    let dead_ranks_shared =
+        crate::distributed::controller::DeadRanks::new(full.world_size());
+    let cpu_averager =
+        crate::distributed::controller::ClusterController::start_with_dead_ranks(
+            cpu_avg_addr,
+            full.world_size(),
+            full.salt,
+            Arc::clone(&dead_ranks_shared),
+        )?;
     // Bound port stays the configured value (no kernel auto-assign here);
     // log it once for diagnostics.
     eprintln!(
@@ -231,6 +242,122 @@ fn run_launcher() -> Result<()> {
         cpu_averager.port(),
         full.world_size()
     );
+
+    // Opt-in ClusterCoordinator spawn at master_port + 3 for the
+    // elastic-membership-aware NCCL path. Gated on `FLODL_DDP_VIA_COORD=1`
+    // so the legacy NCCL routing (no coord) stays the default until the
+    // via-coord routing flip lands in a follow-up. When enabled, ranks
+    // using `run_cluster_rank_sync_nccl_via_coord` connect here over TCP
+    // for control frames; the coord drives elastic-membership detection,
+    // re-rendezvous, ExtendPartition, and the unrecoverable-failure
+    // ShutdownWithSave broadcast.
+    //
+    // The spawned thread blocks on `start_from_listener.accept()` until
+    // `world_size` ranks connect; if the via-coord routing isn't
+    // exercised the thread sits idle until the launcher process exits
+    // (process-exit kills the thread; no graceful shutdown plumbed yet).
+    let via_coord_enabled = env::var("FLODL_DDP_VIA_COORD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if via_coord_enabled {
+        use crate::distributed::cluster_coordinator::{
+            ClusterCoordinator, ClusterCoordinatorConfig,
+        };
+        use crate::distributed::ddp::ElChe;
+        use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+
+        let coord_port = full.master_port.saturating_add(3);
+        let coord_bind_addr: std::net::SocketAddr = format!("0.0.0.0:{coord_port}")
+            .parse()
+            .map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster launcher: invalid ClusterCoordinator bind addr \
+                     0.0.0.0:{coord_port}: {e}"
+                ))
+            })?;
+        let local_ranks: Vec<usize> = my_host_idx
+            .map(|i| full.hosts[i].ranks.clone())
+            .unwrap_or_default();
+        let coord_world = full.world_size();
+        let coord_salt = full.salt;
+        // Share the dead-rank ledger so CPU averaging and NCCL
+        // elastic-membership see the same source of truth.
+        let dead_ranks = Arc::clone(&dead_ranks_shared);
+        eprintln!(
+            "cluster launcher: ClusterCoordinator spawning on {} (world_size={}, \
+             local_ranks={:?}) [FLODL_DDP_VIA_COORD=1]",
+            coord_bind_addr, coord_world, local_ranks,
+        );
+        let _ = thread::Builder::new()
+            .name("flodl-cluster-coord".to_string())
+            .spawn(move || {
+                let mut config = ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Nccl,
+                    coord_world,
+                    ElChe::new(coord_world, 1),
+                )
+                .local_ranks(local_ranks)
+                .dead_ranks(dead_ranks);
+                // max_failure / save_path / heartbeat_timeout_secs
+                // are user-tunable via FLODL_MAX_FAILURE_ABS /
+                // FLODL_SAVE_PATH / FLODL_HEARTBEAT_TIMEOUT_SECS env
+                // vars when the user wants to override coord defaults
+                // without piping through the rank-side DdpRunConfig.
+                if let Ok(s) = env::var("FLODL_HEARTBEAT_TIMEOUT_SECS") {
+                    if let Ok(n) = s.parse::<u64>() {
+                        config = config.heartbeat_timeout_secs(n);
+                    }
+                }
+                if let Ok(s) = env::var("FLODL_SAVE_PATH") {
+                    if !s.is_empty() {
+                        config = config.save_path(s);
+                    }
+                }
+                if let Ok(s) = env::var("FLODL_MAX_FAILURE_ABS") {
+                    if let Ok(n) = s.parse::<usize>() {
+                        config = config.max_failure(
+                            crate::distributed::MaxFailureThreshold::Absolute(n),
+                        );
+                    }
+                } else if let Ok(s) = env::var("FLODL_MAX_FAILURE_PCT") {
+                    if let Ok(f) = s.parse::<f64>() {
+                        config = config.max_failure(
+                            crate::distributed::MaxFailureThreshold::Percent(f),
+                        );
+                    }
+                }
+
+                match ClusterCoordinator::start(coord_bind_addr, coord_salt, config) {
+                    Ok(mut coord) => {
+                        // Drive ticks until shutdown_workers fires (all
+                        // ranks exited) or the process is killed.
+                        loop {
+                            match coord.tick() {
+                                Ok(true) => continue,
+                                Ok(false) => break,
+                                Err(e) => {
+                                    eprintln!(
+                                        "cluster launcher: coord tick error: {e}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cluster launcher: ClusterCoordinator start failed: {e}"
+                        );
+                    }
+                }
+            })
+            .map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster launcher: spawn coord thread failed: {e}"
+                ))
+            })?;
+    }
 
     // For remote hosts, fdl-cli must have passed the original fdl command
     // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent;
@@ -378,6 +505,12 @@ fn build_local_spawn_command(
             crate::distributed::cluster::ENV_LOCAL_RANK,
             local_rank.to_string(),
         )
+        // Defense-in-depth: enable NCCL's own watchdog so stuck
+        // collectives get aborted independently of flodl's
+        // cluster-mode NCCL watchdog (the latter only fires on
+        // peer-death events the coord broadcasts; this catches
+        // wedge cases beyond that surface).
+        .env("NCCL_ASYNC_ERROR_HANDLING", "1")
         .env_remove(ENV_FULL_CLUSTER_JSON);
     cmd
 }
@@ -427,6 +560,10 @@ fn build_remote_bash_command(
     s.push_str(ENV_LOCAL_RANK);
     s.push('=');
     s.push_str(&local_rank.to_string());
+    s.push(' ');
+    // Defense-in-depth for NCCL stuck-collective detection; see the
+    // matching env on the local spawn path.
+    s.push_str("NCCL_ASYNC_ERROR_HANDLING=1");
     if let Some(env) = overlay_env {
         s.push(' ');
         s.push_str(ENV_FDL_ENV);

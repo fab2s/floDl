@@ -1382,6 +1382,67 @@ mod tests {
         // cleanly. Body lands in the Pascal-rig follow-up.
     }
 
+    /// Pascal-rig end-to-end test for the elastic-membership-aware
+    /// `run_cluster_rank_sync_nccl_via_coord` path: spawn 3 ranks on
+    /// 3 GPUs, kill rank 2's heartbeat thread mid-training, verify
+    /// that ranks 0 and 1:
+    ///
+    /// 1. See `DeclareDead { rank: 2 }` on their inbound bridge → the
+    ///    NCCL watchdog aborts the in-flight collective.
+    /// 2. Receive a fresh `NewNcclSession` from the coord (one of the
+    ///    survivors generated the UID).
+    /// 3. Rebuild their NCCL comm with `world_size = 2` and re-issue
+    ///    the failed AllReduce on the survivor cohort — `sync_now_nccl`
+    ///    returns success on the retry.
+    /// 4. Absorb rank 2's un-processed partition via `ExtendPartition`
+    ///    and complete the epoch's intended sample count.
+    /// 5. Sync_round counter reaches the expected post-recovery value.
+    ///
+    /// And a separate path: configure `max_failure = Absolute(2)`,
+    /// kill ranks 1 and 2, verify that rank 0 receives
+    /// `ShutdownWithSave { reason: MaxFailureExceeded }`, writes a
+    /// bundle (model + optimizer + meta) to the configured save_path,
+    /// and exits cleanly.
+    ///
+    /// Marked `#[ignore]` — requires 3 visible GPUs + libnccl. Run
+    /// via `fdl cuda-test-nccl` after rig is online.
+    #[test]
+    #[ignore = "requires CUDA + NCCL + 3 GPUs — run via fdl cuda-test-nccl on the Pascal rig"]
+    fn end_to_end_sync_nccl_via_coord_smoke() {
+        // Body intentionally left as a manual-procedure stub. The
+        // production-correct integration test requires:
+        //  - NCCL libs visible to the test binary.
+        //  - 3 GPUs (or 2 GPUs + the single-survivor edge-case
+        //    coverage exercised separately).
+        //  - A tempdir for the save_path bundle, with cleanup.
+        //  - Coord on a kernel-assigned port (`SocketAddr::new(...,
+        //    0)` + `ClusterCoordinator::bind`).
+        //  - Per-rank threads constructing NCCL comms via
+        //    `NcclComms::new + split()`, attaching the abort handle +
+        //    session mailbox, running through
+        //    `ClusterWorker::connect_and_build` + `run_until_shutdown`.
+        //
+        // The wire-level + state-machine pieces under this test are
+        // already covered by CPU tests:
+        //   - distributed::cluster_coordinator::tests::
+        //       max_failure_threshold_breach_dispatches_shutdown_with_save
+        //   - distributed::cluster_coordinator::tests::
+        //       dead_rank_remainder_redistributed_via_extend_partition
+        //   - distributed::cluster_coordinator::tests::
+        //       heartbeat_stale_declares_rank_dead_and_unblocks_should_average
+        //   - distributed::ddp_run::tests::
+        //       shutdown_with_save_writes_bundle_to_save_path
+        //   - distributed::checkpoint_meta::tests::* (7 tests)
+        //   - distributed::max_failure::tests::* (6 tests)
+        //   - distributed::wire::tests::
+        //       control_frame_round_trip_shutdown_with_save
+        //
+        // What's NOT yet covered: the NCCL abort → comm rebuild →
+        // AllReduce retry happy path, end-to-end across actual GPUs.
+        // That's the Pascal-rig validation gap this test placeholder
+        // tracks; lifting `#[ignore]` requires a working rig.
+    }
+
     // -----------------------------------------------------------------
     // 4b.D.1d.4b — end-to-end Sync+Cpu smoke test scaffolding
     // -----------------------------------------------------------------

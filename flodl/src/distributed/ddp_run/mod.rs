@@ -479,6 +479,24 @@ pub struct DdpRunConfig {
     ///
     /// See [`crate::distributed::lr_event_meta`] for the design.
     pub meta_controller: bool,
+
+    /// Checkpoint bundle stem for the cluster-mode
+    /// save-on-unrecoverable-failure path. When set on a cluster
+    /// run, workers persist a `<save_path>.fdl` / `.optim` /
+    /// `.meta.json` bundle on
+    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`]
+    /// receipt; see [`crate::distributed::CheckpointBundle`].
+    /// Required for the via-coord cluster orchestrator entry;
+    /// optional for non-cluster builds.
+    pub save_path: Option<String>,
+
+    /// Threshold for declaring a cluster run unrecoverable. When the
+    /// dead-rank count reaches this limit, the coord broadcasts
+    /// `ShutdownWithSave` to all survivors. `None` = no user-configured
+    /// threshold; backend hard limits still apply (NCCL needs 2+
+    /// survivors; CPU needs at least 1). Only honored on cluster-mode
+    /// runs; non-cluster builds ignore this field.
+    pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
 }
 
 impl Default for DdpRunConfig {
@@ -509,7 +527,26 @@ impl DdpRunConfig {
             elche_relax_up: false,
             easgd_alpha: None,
             meta_controller: false,
+            save_path: None,
+            max_failure: None,
         }
+    }
+
+    /// Set the checkpoint bundle stem for cluster-mode unrecoverable-
+    /// failure persistence. See
+    /// [`crate::distributed::CheckpointBundle`] for the layout.
+    pub fn with_save_path(mut self, path: impl Into<String>) -> Self {
+        self.save_path = Some(path.into());
+        self
+    }
+
+    /// Set the unrecoverable-failure threshold for cluster mode.
+    pub fn with_max_failure(
+        mut self,
+        threshold: crate::distributed::max_failure::MaxFailureThreshold,
+    ) -> Self {
+        self.max_failure = Some(threshold);
+        self
     }
 
     /// Set the AllReduce overhead target (fraction of compute time).

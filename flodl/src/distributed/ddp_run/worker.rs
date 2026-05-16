@@ -374,9 +374,15 @@ impl<M: Module> GpuWorker<M> {
             (None, 0)
         };
 
-        // Allocate scratch buffers for weight-space divergence measurement.
-        // Skip for Sync mode (AllReduce every batch, divergence near-zero).
-        let pre_sync_scratch = if nccl_comm.is_some() && config.policy != super::ApplyPolicy::Sync {
+        // Allocate scratch buffers for weight-space divergence
+        // measurement AND for cluster-mode NCCL abort recovery (the
+        // retry path in `sync_now_nccl` restores params from this
+        // scratch after a peer-death abort). Allocated whenever an
+        // NCCL comm is attached — the divergence value is near-zero in
+        // Sync mode but the recovery path needs the buffer regardless,
+        // so paying the alloc once is simpler than threading a
+        // `cluster_mode` flag through the constructor.
+        let pre_sync_scratch = if nccl_comm.is_some() {
             let scratch: Result<Vec<Tensor>> = param_vars.iter()
                 .map(|v| Tensor::zeros_like(&v.data()))
                 .collect();

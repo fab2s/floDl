@@ -1105,6 +1105,202 @@ impl DdpHandle {
         })
     }
 
+    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Nccl`
+    /// driven by a [`ClusterCoordinator`] (elastic-membership-aware).
+    ///
+    /// Mirrors [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl)
+    /// but routes through [`ClusterWorker`] talking to a coord on
+    /// `master_addr:master_port + 3` over TCP control frames. The
+    /// `pre_sync_scratch` buffers are allocated unconditionally for
+    /// NCCL workers (see `GpuWorker::new`) so the abort-retry path in
+    /// `sync_now_nccl` can restore params after a peer-death abort
+    /// and re-AllReduce on the survivor cohort.
+    ///
+    /// `save_path` on [`DdpRunConfig`] is REQUIRED for this entry —
+    /// the cluster save-on-unrecoverable-failure flow needs a
+    /// destination. Loud error at startup if unset.
+    ///
+    /// Final params are NOT yet returned via [`TrainedState`] from
+    /// this path (the discard bridge consumes them — 1d.4-deferred).
+    /// Users wanting the trained model can read the bundle written by
+    /// `ShutdownWithSave` if the cluster declared the run
+    /// unrecoverable, or land a final-snapshot capture in a follow-up.
+    ///
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterWorker`]: crate::distributed::cluster_worker::ClusterWorker
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn run_cluster_rank_sync_nccl_via_coord<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::nccl::NcclRankComm;
+
+        // save_path is required for the via_coord path — that's the
+        // "every training must set a save path" rule the user invoked.
+        // Loud at builder.run() time rather than silent (no save) at
+        // failure-time.
+        let save_path = config.save_path.clone().ok_or_else(|| {
+            crate::tensor::TensorError::new(
+                "run_cluster_rank_sync_nccl_via_coord requires `save_path` \
+                 on DdpRunConfig (`.with_save_path(...)`). The cluster \
+                 save-on-unrecoverable-failure path needs a destination."
+            )
+        })?;
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
+             (Sync+Nccl via_coord, save_path={save_path:?})"
+        );
+
+        // Coord control channel at master_port + 3. master_port is
+        // already used by the NCCL rendezvous; +2 is the
+        // ClusterController (CPU averaging, unused in NCCL mode but
+        // still bound by the launcher).
+        let coord_port = cluster.master_port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_addr: std::net::SocketAddr = coord_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse coord addr '{coord_addr_str}': {e}"
+            )))?;
+        let session_salt = cluster.salt;
+        let dataset_sig = [0u8; 32];
+
+        let training_meta = Some(serde_json::json!({
+            "mode": "cluster-rank Sync+Nccl via_coord",
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "coord_addr": coord_addr_str,
+            "save_path": save_path,
+        }));
+
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+        let save_path_for_thread = save_path.clone();
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // NCCL rendezvous on the original master_port (unchanged
+            // from the non-via_coord path).
+            let rdv = cluster.rendezvous(dataset_sig)?;
+            let nccl_comm =
+                NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+
+            // Build tmp model, broadcast initial state, pin to CPU
+            // (GpuWorker::new re-creates the model and copies params
+            // back to GPU on the worker thread).
+            let tmp_model = model_factory(device)?;
+            let initial_params_gpu: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_gpu: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+            if !initial_params_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            if !initial_buffers_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            let initial_params: Vec<Tensor> = initial_params_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha: None,
+                timeline: timeline_for_thread,
+                policy: ApplyPolicy::Sync,
+                save_path: Some(save_path_for_thread),
+            };
+
+            // ClusterWorker connects to the coord, sets up the
+            // inbound/outbound/heartbeat/watchdog bridge threads, and
+            // attaches the session mailbox into the inner GpuWorker.
+            // `data_addr = None` — NCCL backend doesn't use the CPU
+            // reduce client for averaging.
+            let cluster_worker =
+                crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
+                    coord_addr,
+                    None,
+                    global_rank as u32,
+                    session_salt,
+                    worker_config,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    Some(nccl_comm),
+                    None,
+                )?;
+
+            cluster_worker.run_until_shutdown(train_fn)?;
+
+            // Final params are dropped by the discard bridge for now
+            // (1d.4-deferred final-snapshot capture). Cluster mode
+            // users wanting state recovery should consume the bundle
+            // written via ShutdownWithSave.
+            Ok(TrainedState {
+                params: Vec::new(),
+                buffers: Vec::new(),
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(),
+            final_state: None,
+            metrics_rx: None,
+            architecture_svg: None,
+            graph_label: None,
+            graph_hash: None,
+            training_meta,
+        })
+    }
+
     /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Cpu`.
     ///
     /// CPU-averaging counterpart of
