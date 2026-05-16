@@ -231,7 +231,33 @@ pub struct ClusterCoordinatorConfig {
     /// [`ClusterCoordinator::observe_meta`]). `MetaAction::NudgeDown`
     /// dispatches to [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
     pub meta_controller: bool,
+
+    /// CPU-backend SyncAck wait timeout FLOOR, in seconds. Default 10s.
+    ///
+    /// The effective per-cycle deadline is adaptive: the coordinator
+    /// tracks each rank's observed sync lag (wall-time from
+    /// `RequestParams` broadcast to that rank's SyncAck) and uses
+    /// `mean(per-rank lag) * safety_factor + buffer_ms` as the per-
+    /// cycle budget. `snapshot_timeout_secs` is the lower bound applied
+    /// when no history is available (the very first cycle) or when the
+    /// adaptive estimate falls below it. This keeps large-model /
+    /// slow-network cluster runs from soft-aborting prematurely while
+    /// still capping wedged ranks.
+    ///
+    /// NCCL backend finalizes synchronously and ignores this field.
+    pub snapshot_timeout_secs: u64,
 }
+
+/// Multiplier applied to the mean observed per-rank sync lag when
+/// computing the adaptive CPU SyncAck deadline. Lag × this factor
+/// absorbs up to a ~2× slowdown without soft-aborting.
+const CPU_SYNC_LAG_SAFETY_FACTOR: f64 = 2.0;
+
+/// Fixed buffer (milliseconds) added on top of the safety-scaled
+/// observed lag. Soaks up the constant-time overhead that doesn't
+/// scale with model size or fleet width: handshake jitter, OS
+/// scheduler hiccups, monitoring agents stealing a slice on a rank.
+const CPU_SYNC_LAG_BUFFER_MS: f64 = 5_000.0;
 
 impl ClusterCoordinatorConfig {
     /// Construct with sensible defaults: TrendGuard with default
@@ -257,6 +283,7 @@ impl ClusterCoordinatorConfig {
             num_epochs: 0,
             partition_ratios: None,
             meta_controller: false,
+            snapshot_timeout_secs: 10,
         }
     }
 
@@ -317,6 +344,38 @@ impl ClusterCoordinatorConfig {
         self.meta_controller = enabled;
         self
     }
+
+    /// Set the CPU-backend SyncAck wait timeout. Default 5s. See
+    /// [`Self::snapshot_timeout_secs`] for the semantics.
+    pub fn snapshot_timeout_secs(mut self, secs: u64) -> Self {
+        self.snapshot_timeout_secs = secs;
+        self
+    }
+}
+
+/// CPU-backend averaging state machine. Restores cycle-1 guard-verdict
+/// correctness on the CPU path: the worker bridges compute the
+/// AllReduce + weight-space divergence and emit
+/// [`crate::distributed::wire::TimingMsgWire::SyncAck`] with the
+/// divergence triple; the coordinator now waits for all of those
+/// SyncAcks (via this state) before calling
+/// [`ClusterCoordinator::finish_averaging_cpu`], so the guard sees real
+/// divergence instead of the all-Nones sentinel that
+/// [`unwrap_or(0.0)`] collapses to zero.
+///
+/// NCCL backend keeps the synchronous trigger → finish pattern (OLD
+/// `Coordinator::finish_averaging_nccl` parity).
+#[derive(Debug)]
+enum CpuAvgState {
+    /// No averaging cycle in flight.
+    Idle,
+    /// `trigger_averaging` broadcast `RequestParams` and is now waiting
+    /// for every rank's bridge SyncAck to populate
+    /// `nccl_sync_divergence` / `nccl_sync_pre_norm` /
+    /// `nccl_sync_post_norm`. `poll_cpu_averaging` transitions back to
+    /// `Idle` when `nccl_ack` is all-true (finalizes the cycle) or when
+    /// `deadline` elapses (soft abort — drop the cycle, log a warning).
+    Pending { deadline: Instant },
 }
 
 /// Process-model coordinator: ports the OLD threaded
@@ -387,6 +446,24 @@ pub struct ClusterCoordinator {
     /// [`TimingMsgWire::LrUpdate`]. Indexed by rank. `None` until the
     /// first LR update from that rank arrives.
     last_lr_per_rank: Vec<Option<f64>>,
+
+    /// CPU-backend averaging state machine. See [`CpuAvgState`].
+    cpu_avg_state: CpuAvgState,
+    /// Floor for the adaptive CPU SyncAck deadline (seconds). Sourced
+    /// from [`ClusterCoordinatorConfig::snapshot_timeout_secs`].
+    snapshot_timeout_secs: u64,
+    /// Soft-abort counter (incremented each time the CPU averaging
+    /// state machine times out waiting for SyncAcks). Diagnostic.
+    cpu_avg_aborts: u64,
+    /// Per-rank wall-time (ms) from the last successful averaging
+    /// cycle's `RequestParams` broadcast to that rank's SyncAck arrival
+    /// — essentially the rank's effective "ping under load" through the
+    /// bridge + data-channel round trip. Populated by
+    /// [`Self::process_timing_msg`]'s SyncAck arm. Mean across ranks
+    /// drives the adaptive CPU deadline in [`Self::trigger_averaging`].
+    /// `None` for ranks that haven't completed a cycle yet (first
+    /// cycle falls back to `snapshot_timeout_secs`).
+    last_observed_sync_lag_ms: Vec<Option<f64>>,
 
     // --- Epoch dispatch ---
     /// Per-rank current epoch (last StartEpoch dispatched).
@@ -609,6 +686,10 @@ impl ClusterCoordinator {
                 None
             },
             last_lr_per_rank: vec![None; world_size],
+            cpu_avg_state: CpuAvgState::Idle,
+            snapshot_timeout_secs: config.snapshot_timeout_secs,
+            cpu_avg_aborts: 0,
+            last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             epoch_plan_cache: std::collections::HashMap::new(),
@@ -669,29 +750,6 @@ impl ClusterCoordinator {
         &self.el_che
     }
 
-    /// Test-only peek at the captured per-rank divergence triple from
-    /// the most recent batch of `SyncAck`s (populated by
-    /// [`Self::process_timing_msg`], reset at the next
-    /// `finish_averaging_*`). Use to verify worker-side wiring
-    /// (bridge or sync_now_nccl) is forwarding real divergence values.
-    #[cfg(test)]
-    pub(crate) fn nccl_sync_divergence_for_test(&self) -> &[Option<f64>] {
-        &self.nccl_sync_divergence
-    }
-
-    /// Test-only peek at the captured per-rank pre-norm slot (counterpart
-    /// to [`Self::nccl_sync_divergence_for_test`]).
-    #[cfg(test)]
-    pub(crate) fn nccl_sync_pre_norm_for_test(&self) -> &[Option<f64>] {
-        &self.nccl_sync_pre_norm
-    }
-
-    /// Test-only peek at the captured shared post-norm slot.
-    #[cfg(test)]
-    pub(crate) fn nccl_sync_post_norm_for_test(&self) -> Option<f64> {
-        self.nccl_sync_post_norm
-    }
-
     /// Test-only peek at the most-recent per-rank LR snapshot. Mirrors
     /// the OLD coordinator's `last_lr_per_rank`. `None` for ranks that
     /// have not yet sent a [`TimingMsgWire::LrUpdate`].
@@ -706,6 +764,20 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn meta_controller_enabled_for_test(&self) -> bool {
         self.lr_event_meta.is_some()
+    }
+
+    /// Test-only soft-abort counter (incremented each time the CPU
+    /// averaging state machine times out waiting for SyncAcks).
+    #[cfg(test)]
+    pub(crate) fn cpu_avg_aborts_for_test(&self) -> u64 {
+        self.cpu_avg_aborts
+    }
+
+    /// Test-only peek at the per-rank observed sync-lag history (ms)
+    /// driving the adaptive CPU deadline.
+    #[cfg(test)]
+    pub(crate) fn last_observed_sync_lag_ms_for_test(&self) -> &[Option<f64>] {
+        &self.last_observed_sync_lag_ms
     }
 
     /// Feed an averaging-cycle observation to the LR-aware meta-controller
@@ -823,6 +895,19 @@ impl ClusterCoordinator {
                     && step_count > self.nccl_sync_step[rank]
                 {
                     self.nccl_ack[rank] = true;
+                    // Per-rank sync lag (wall time from
+                    // `RequestParams` / `SyncNow` broadcast to this
+                    // rank's SyncAck). Captured BEFORE
+                    // `capture_nccl_sync_elapsed_if_complete` takes
+                    // `nccl_sync_start` on the all-acked transition.
+                    // Feeds the adaptive CPU deadline computed in the
+                    // NEXT `trigger_averaging`.
+                    if let Some(start) = self.nccl_sync_start {
+                        if rank < self.last_observed_sync_lag_ms.len() {
+                            self.last_observed_sync_lag_ms[rank] =
+                                Some(start.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
                     self.capture_nccl_sync_elapsed_if_complete();
                 }
             }
@@ -979,8 +1064,88 @@ impl ClusterCoordinator {
                     self.nccl_sync_step[rank] = self.last_step_count[rank];
                     self.nccl_ack[rank] = false;
                 }
-                self.finish_averaging_cpu()?;
+                // Defer `finish_averaging_cpu` until every rank's
+                // bridge SyncAck has populated `nccl_sync_divergence`
+                // (otherwise the guard reads all-Nones → zero, defeating
+                // the divergence-driven cadence control on the first
+                // cycle and matching OLD's CPU async-finalize behavior).
+                // `poll_cpu_averaging` (called from `tick`) finalizes.
+                //
+                // Adaptive deadline: mean per-rank observed sync lag
+                // (from the previous cycle, populated by the SyncAck
+                // arm of `process_timing_msg`) × safety factor +
+                // fixed buffer, floored by `snapshot_timeout_secs`.
+                // First cycle has no history → floor applies. Tracks
+                // model size + network bandwidth without per-config
+                // tuning, while still capping a wedged rank.
+                let observed: Vec<f64> = self
+                    .last_observed_sync_lag_ms
+                    .iter()
+                    .filter_map(|x| *x)
+                    .collect();
+                let adaptive_ms = if observed.is_empty() {
+                    0.0
+                } else {
+                    let mean = observed.iter().sum::<f64>() / observed.len() as f64;
+                    mean * CPU_SYNC_LAG_SAFETY_FACTOR + CPU_SYNC_LAG_BUFFER_MS
+                };
+                let floor_ms = (self.snapshot_timeout_secs as f64) * 1_000.0;
+                let deadline_ms = floor_ms.max(adaptive_ms);
+                self.cpu_avg_state = CpuAvgState::Pending {
+                    deadline: Instant::now()
+                        + Duration::from_millis(deadline_ms as u64),
+                };
             }
+        }
+        Ok(())
+    }
+
+    /// Drive the CPU averaging state machine one tick. No-op when
+    /// [`CpuAvgState::Idle`].
+    ///
+    /// In [`CpuAvgState::Pending`]: if every rank has acked (i.e.
+    /// `nccl_ack` all-true; the bridge's SyncAck handler in
+    /// [`Self::process_timing_msg`] flipped each slot when its
+    /// divergence triple landed), runs [`Self::finish_averaging_cpu`]
+    /// and returns to `Idle`. On `deadline` elapsed without all acks,
+    /// soft-aborts: logs the missing ranks, clears the pending state,
+    /// re-arms the acks so the next [`Self::should_average`] check can
+    /// fire, and skips the cycle's `finish` entirely (steps /
+    /// wall_ms accumulators left untouched so the cadence isn't
+    /// rewarded for the failed round).
+    fn poll_cpu_averaging(&mut self) -> Result<()> {
+        let CpuAvgState::Pending { deadline } = self.cpu_avg_state else {
+            return Ok(());
+        };
+        if self.nccl_ack.iter().all(|&a| a) {
+            self.cpu_avg_state = CpuAvgState::Idle;
+            return self.finish_averaging_cpu();
+        }
+        if Instant::now() >= deadline {
+            let missing: Vec<usize> = self
+                .nccl_ack
+                .iter()
+                .enumerate()
+                .filter(|(_, ack)| !**ack)
+                .map(|(r, _)| r)
+                .collect();
+            self.cpu_avg_aborts += 1;
+            crate::verbose!(
+                "  ddp: CPU averaging timeout, missing SyncAcks from \
+                 ranks: {:?} (abort #{}, will retry)",
+                missing,
+                self.cpu_avg_aborts,
+            );
+            // Re-arm acks so `should_average` can fire again. Leave
+            // steps_since_avg / wall_ms_accum untouched — the cycle
+            // didn't successfully average, so the next trigger gets
+            // the same backlog. nccl_sync_start cleared so the NEXT
+            // cycle measures its own duration.
+            for ack in &mut self.nccl_ack {
+                *ack = true;
+            }
+            self.nccl_sync_start = None;
+            self.cpu_avg_state = CpuAvgState::Idle;
         }
         Ok(())
     }
@@ -1191,6 +1356,11 @@ impl ClusterCoordinator {
     pub fn tick(&mut self) -> Result<bool> {
         self.drain_timing();
         self.check_throttle()?;
+        // CPU-backend async finalize: if a cycle's `RequestParams` was
+        // broadcast in a prior tick and all bridge SyncAcks have now
+        // arrived, finalize it here so the guard reads real divergence.
+        // No-op on NCCL backend (state stays `Idle`).
+        self.poll_cpu_averaging()?;
         if self.should_average() {
             self.trigger_averaging()?;
         }
@@ -2252,6 +2422,248 @@ mod tests {
         r0.join().unwrap().expect("rank 0 sends LrUpdate");
         r1.join().unwrap().expect("rank 1 sends LrUpdate");
         coord_handle.join().unwrap().expect("coord captures both LRs");
+    }
+
+    // -----------------------------------------------------------------
+    // CPU finalize state machine (1d.4d)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cpu_finalize_defers_until_all_sync_acks_arrived() {
+        // Sync+Cpu cycle: the coord broadcasts RequestParams but must
+        // NOT call finish_averaging_cpu until every rank's SyncAck has
+        // landed and populated `nccl_sync_divergence`. Gate the second
+        // rank's SyncAck behind a barrier; the cycle must stay at
+        // avg_count=0 (and `cpu_avg_pending_for_test=true`) until that
+        // second SyncAck is delivered.
+        let world_size = 2;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size),
+            |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(TensorError::new(
+                            "cpu_finalize_defers: avg_count never advanced",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(coord.avg_count(), 1);
+                Ok(())
+            },
+        );
+
+        let barrier_for_r0 = Arc::clone(&barrier);
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, move |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            })?;
+            let _ = recv_control(s, salt)?; // RequestParams
+            // Rank 0 sends SyncAck immediately so coord goes into Pending
+            // but still has rank 1 outstanding.
+            send_timing(s, salt, TimingMsgWire::SyncAck {
+                rank: 0,
+                step_count: 2,
+                divergence: Some(0.05),
+                post_norm: Some(1.0),
+                pre_norm: Some(1.05),
+            })?;
+            // Wait for the test thread (rank 1) to release the barrier
+            // BEFORE rank 1 sends its SyncAck. Until then, coord must
+            // stay in Pending.
+            barrier_for_r0.wait();
+            let _ = recv_control(s, salt)?; // Update (only after r1 acks)
+            let _ = recv_control(s, salt)?; // SetGlobalStep
+            Ok(())
+        });
+        let barrier_for_r1 = Arc::clone(&barrier);
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, move |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            })?;
+            let _ = recv_control(s, salt)?; // RequestParams
+            // Hold the SyncAck briefly so the test's drive loop observes
+            // `cpu_avg_pending_for_test=true && avg_count=0`. Use the
+            // shared barrier with r0 so timing is deterministic.
+            thread::sleep(Duration::from_millis(200));
+            barrier_for_r1.wait();
+            send_timing(s, salt, TimingMsgWire::SyncAck {
+                rank: 1,
+                step_count: 2,
+                divergence: Some(0.06),
+                post_norm: Some(1.0),
+                pre_norm: Some(1.04),
+            })?;
+            let _ = recv_control(s, salt)?; // Update
+            let _ = recv_control(s, salt)?; // SetGlobalStep
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        coord_handle.join().unwrap().expect("coord finalizes after both acks");
+    }
+
+    #[test]
+    fn cpu_finalize_soft_aborts_when_sync_acks_miss_deadline() {
+        // Set a very short snapshot_timeout_secs floor. Neither rank
+        // sends SyncAck after their Batch. poll_cpu_averaging should
+        // soft-abort the cycle, increment `cpu_avg_aborts`, and clear
+        // the Pending state so `should_average` can fire again. The
+        // cycle's `avg_count` STAYS at 0 because the soft abort drops
+        // the round.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Cpu,
+                    world_size,
+                    ElChe::new(world_size, 1),
+                )
+                .no_divergence_guard()
+                .snapshot_timeout_secs(1)
+            },
+            |coord| {
+                let start = Instant::now();
+                while coord.cpu_avg_aborts_for_test() == 0 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "cpu_finalize_soft_aborts: never aborted within 5s",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                // The cycle didn't finalize — guard never ran, the
+                // round was dropped.
+                assert_eq!(
+                    coord.avg_count(),
+                    0,
+                    "soft abort must NOT finalize the cycle"
+                );
+                // Don't assert `cpu_avg_pending_for_test()` here:
+                // soft-abort clears the Pending state but leaves
+                // `steps_since_avg` untouched (intentional — the
+                // cycle's backlog isn't lost), so the very next tick
+                // can re-trigger and land back in Pending immediately.
+                // The aborts counter is the load-bearing observation.
+                Ok(())
+            },
+        );
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            })?;
+            let _ = recv_control(s, salt)?; // RequestParams arrives
+            // Intentionally do NOT send SyncAck. Wait long enough for
+            // the coord's poll_cpu_averaging to time out + soft-abort.
+            thread::sleep(Duration::from_millis(2500));
+            Ok(())
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            })?;
+            let _ = recv_control(s, salt)?;
+            thread::sleep(Duration::from_millis(2500));
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        coord_handle.join().unwrap().expect("coord soft-aborts cleanly");
+    }
+
+    #[test]
+    fn cpu_finalize_adaptive_deadline_records_per_rank_lag() {
+        // After one successful CPU averaging cycle, every rank's
+        // observed sync-lag slot should be populated and finite — the
+        // adaptive deadline computed on the NEXT trigger reads these
+        // and scales accordingly. Doesn't assert the deadline value
+        // directly (would couple to Instant timing); proves the lag
+        // pipeline is wired.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size),
+            |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "adaptive_deadline: avg_count never advanced",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let lags = coord.last_observed_sync_lag_ms_for_test();
+                assert!(
+                    lags.iter().all(|l| l.is_some()),
+                    "every rank's sync lag populated after cycle 1: {lags:?}"
+                );
+                for l in lags {
+                    let v = l.unwrap();
+                    assert!(
+                        v.is_finite() && v >= 0.0,
+                        "per-rank lag must be finite & non-negative, got {v}"
+                    );
+                }
+                Ok(())
+            },
+        );
+        let body = |rank: u64| {
+            move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                send_timing(s, salt, TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                })?;
+                let _ = recv_control(s, salt)?; // RequestParams
+                send_timing(s, salt, TimingMsgWire::SyncAck {
+                    rank,
+                    step_count: 2,
+                    divergence: Some(0.05),
+                    post_norm: Some(1.0),
+                    pre_norm: Some(1.05),
+                })?;
+                let _ = recv_control(s, salt)?; // Update
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+                Ok(())
+            }
+        };
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        coord_handle.join().unwrap().expect("coord captures per-rank lags");
     }
 
     #[test]

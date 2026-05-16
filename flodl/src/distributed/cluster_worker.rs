@@ -1113,15 +1113,39 @@ mod tests {
         diff.mul(&diff)?.mean()
     }
 
+    /// Records each `report` call's `deltas` into a shared vector so a
+    /// test can verify the param bridge populated the divergence triple
+    /// in its `SyncAck` AND that the coord's CPU finalize state
+    /// machine (1d.4d) deferred `finish_averaging_cpu` until the
+    /// SyncAcks landed. Returns `Stable` so the test's anchor stays
+    /// stable.
+    struct RecordingGuard {
+        captured: Arc<std::sync::Mutex<Vec<Vec<f64>>>>,
+    }
+
+    impl crate::distributed::ddp_run::convergence::ConvergenceGuard for RecordingGuard {
+        fn report(
+            &mut self,
+            report: &crate::distributed::ddp_run::convergence::DivergenceReport,
+            _k_used: usize,
+            _k_max: usize,
+        ) -> crate::distributed::ddp_run::convergence::ConvergenceAction {
+            self.captured.lock().unwrap().push(report.deltas.clone());
+            crate::distributed::ddp_run::convergence::ConvergenceAction::Stable
+        }
+    }
+
     /// End-to-end Sync+Cpu smoke test (CPU device, no NCCL): spawn
     /// `ClusterController` (data) and `ClusterCoordinator` (control)
     /// alongside 2 `ClusterWorker` threads with a trivial Linear model
     /// and `TestDataset`, run one averaging cycle via the param bridge,
-    /// assert avg_count fires + workers exit cleanly AND the
-    /// coordinator captured non-zero per-rank divergence values from
-    /// the bridge's `SyncAck` payload (validates
-    /// [`compute_divergence`](super::compute_divergence) flowed end-to-
-    /// end through the wire protocol).
+    /// assert avg_count fires + workers exit cleanly AND the coord's
+    /// convergence guard received strictly-positive per-rank divergence
+    /// on cycle 1 (validates the bridge's
+    /// [`compute_divergence`](super::compute_divergence) flowed
+    /// end-to-end AND that the CPU finalize state machine deferred the
+    /// guard verdict until the bridge SyncAcks populated the captures
+    /// — 1d.4d).
     #[test]
     fn end_to_end_sync_cpu_smoke() {
         let world_size = 2usize;
@@ -1149,6 +1173,12 @@ mod tests {
         .expect("coord bind succeeds");
         let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
 
+        // RecordingGuard captures the deltas every `finish_averaging_*`
+        // pass — proves both the bridge wire (1d.4c) AND the deferred
+        // finalize (1d.4d) are correct end-to-end on cycle 1.
+        let captured_deltas: Arc<std::sync::Mutex<Vec<Vec<f64>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_coord = Arc::clone(&captured_deltas);
         let config_for_coord = move || {
             ClusterCoordinatorConfig::new(
                 ApplyPolicy::Sync,
@@ -1156,7 +1186,9 @@ mod tests {
                 world_size,
                 crate::distributed::ddp::ElChe::new(world_size, 1),
             )
-            .no_divergence_guard()
+            .with_convergence_guard(Box::new(RecordingGuard {
+                captured: captured_for_coord,
+            }))
             .total_samples(total_samples)
             .batch_size(batch_size)
             .num_epochs(1)
@@ -1248,55 +1280,29 @@ mod tests {
         }
         assert!(coord.avg_count() >= 1, "at least one averaging cycle");
 
-        // 6b. The coord's CPU `trigger_averaging` calls
-        //     `finish_averaging_cpu` synchronously (matching OLD's NCCL
-        //     pattern), so it resets `nccl_sync_divergence` BEFORE the
-        //     worker bridges send their `SyncAck` with the actual
-        //     divergence triple. Drive a few extra ticks here so the
-        //     bridge SyncAcks reach the coord and populate the slots,
-        //     then assert directly that the bridge wired real values.
-        //     Bounded loop with a wall budget so a regression doesn't
-        //     hang the suite.
-        let drain_start = Instant::now();
-        while coord.nccl_sync_divergence_for_test().iter().any(|d| d.is_none()) {
-            if drain_start.elapsed() > Duration::from_secs(5) {
-                panic!(
-                    "end_to_end_sync_cpu_smoke: bridge SyncAcks did not \
-                     populate nccl_sync_divergence within 5s after cycle; \
-                     captured = {:?}",
-                    coord.nccl_sync_divergence_for_test()
-                );
-            }
-            coord.tick().expect("tick");
-            thread::sleep(Duration::from_millis(10));
-        }
-        let captured: Vec<f64> = coord
-            .nccl_sync_divergence_for_test()
-            .iter()
-            .map(|d| d.expect("all slots populated by drain loop"))
-            .collect();
+        // 6b. With 1d.4d's deferred finalize, cycle 1's guard sees REAL
+        //     divergence (the coord waited for every bridge SyncAck to
+        //     land before running `finish_averaging_cpu`). Assert the
+        //     guard captured strictly-positive per-rank deltas on the
+        //     first cycle. A regression to synchronous finalize would
+        //     surface as cycle-1 deltas == [0.0, 0.0] (the all-Nones
+        //     sentinel `unwrap_or(0.0)`).
+        let cycles = captured_deltas.lock().unwrap().clone();
         assert!(
-            captured.iter().all(|d| d.is_finite() && *d > 0.0),
-            "expected strictly-positive per-rank divergence after one \
-             Local-SGD step, got {captured:?}"
+            !cycles.is_empty(),
+            "RecordingGuard saw no averaging cycles despite avg_count >= 1"
         );
-        // pre_norm + post_norm should also be populated (and non-zero
-        // for a random-init Linear).
-        let post_norm = coord
-            .nccl_sync_post_norm_for_test()
-            .expect("post_norm captured");
-        assert!(
-            post_norm.is_finite() && post_norm > 0.0,
-            "post_norm should be strictly positive, got {post_norm}"
+        let first = &cycles[0];
+        assert_eq!(
+            first.len(),
+            world_size,
+            "DivergenceReport.deltas len ({}) must equal world_size ({})",
+            first.len(),
+            world_size,
         );
-        let pre_norms: Vec<f64> = coord
-            .nccl_sync_pre_norm_for_test()
-            .iter()
-            .map(|p| p.expect("pre_norm slot populated"))
-            .collect();
         assert!(
-            pre_norms.iter().all(|p| p.is_finite() && *p > 0.0),
-            "pre_norms should be strictly positive per rank, got {pre_norms:?}"
+            first.iter().all(|d| d.is_finite() && *d > 0.0),
+            "expected strictly-positive per-rank divergence on cycle 1, got {first:?}"
         );
 
         // 7. Send Shutdown to workers and tear down the coord.
