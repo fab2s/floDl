@@ -1404,43 +1404,170 @@ mod tests {
     /// bundle (model + optimizer + meta) to the configured save_path,
     /// and exits cleanly.
     ///
-    /// Marked `#[ignore]` — requires 3 visible GPUs + libnccl. Run
-    /// via `fdl cuda-test-nccl` after rig is online.
+    /// Marked `#[ignore]` — requires 2+ visible GPUs + libnccl. Run
+    /// via `fdl cluster-test cuda-test-nccl` (env overlay defines the
+    /// cluster topology) or with N visible GPUs locally (autodetect).
+    ///
+    /// Smoke test: happy path only. Confirms the via-coord wiring runs
+    /// without crashing on real NCCL. Rank-death / max_failure
+    /// validation lands as separate `#[ignore]` tests once this
+    /// happy-path baseline is green on the rig.
     #[test]
-    #[ignore = "requires CUDA + NCCL + 3 GPUs — run via fdl cuda-test-nccl on the Pascal rig"]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-test cuda-test-nccl"]
     fn end_to_end_sync_nccl_via_coord_smoke() {
-        // Body intentionally left as a manual-procedure stub. The
-        // production-correct integration test requires:
-        //  - NCCL libs visible to the test binary.
-        //  - 3 GPUs (or 2 GPUs + the single-survivor edge-case
-        //    coverage exercised separately).
-        //  - A tempdir for the save_path bundle, with cleanup.
-        //  - Coord on a kernel-assigned port (`SocketAddr::new(...,
-        //    0)` + `ClusterCoordinator::bind`).
-        //  - Per-rank threads constructing NCCL comms via
-        //    `NcclComms::new + split()`, attaching the abort handle +
-        //    session mailbox, running through
-        //    `ClusterWorker::connect_and_build` + `run_until_shutdown`.
-        //
-        // The wire-level + state-machine pieces under this test are
-        // already covered by CPU tests:
-        //   - distributed::cluster_coordinator::tests::
-        //       max_failure_threshold_breach_dispatches_shutdown_with_save
-        //   - distributed::cluster_coordinator::tests::
-        //       dead_rank_remainder_redistributed_via_extend_partition
-        //   - distributed::cluster_coordinator::tests::
-        //       heartbeat_stale_declares_rank_dead_and_unblocks_should_average
-        //   - distributed::ddp_run::tests::
-        //       shutdown_with_save_writes_bundle_to_save_path
-        //   - distributed::checkpoint_meta::tests::* (7 tests)
-        //   - distributed::max_failure::tests::* (6 tests)
-        //   - distributed::wire::tests::
-        //       control_frame_round_trip_shutdown_with_save
-        //
-        // What's NOT yet covered: the NCCL abort → comm rebuild →
-        // AllReduce retry happy path, end-to-end across actual GPUs.
-        // That's the Pascal-rig validation gap this test placeholder
-        // tracks; lifting `#[ignore]` requires a working rig.
+        use crate::distributed::testing::discover_test_cluster;
+        use crate::distributed::nccl::NcclComms;
+
+        // 1. Discover cluster topology. fdl-cli injects the rig topology
+        //    via FLODL_TESTING_CLUSTER_JSON when `fdl cluster-test`
+        //    activates the overlay; locally we fall back to autodetect.
+        let cluster = match discover_test_cluster() {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "end_to_end_sync_nccl_via_coord_smoke: no cluster topology \
+                     available (set FLODL_TESTING_CLUSTER_JSON via \
+                     `fdl cluster-test` or run on a CUDA host)"
+                );
+                return;
+            }
+        };
+        let total_ranks: usize = cluster.hosts.iter().map(|h| h.ranks.len()).sum();
+        if total_ranks < 2 {
+            eprintln!(
+                "end_to_end_sync_nccl_via_coord_smoke: NCCL needs 2+ ranks \
+                 (have {total_ranks}); skipping"
+            );
+            return;
+        }
+
+        // 2. Build a shared DeadRanks ledger + spawn the coord listener
+        //    on a kernel-assigned port (test convention: ignore the
+        //    cluster's master_port = 0 sentinel and bind fresh).
+        let world_size = total_ranks;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let (coord_listener, coord_port) = CCoord::bind(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        )
+        .expect("coord bind succeeds");
+        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let total_samples = 16usize;
+        let batch_size = 4usize;
+        let config_for_coord = move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Sync,
+                AverageBackend::Nccl,
+                world_size,
+                crate::distributed::ddp::ElChe::new(world_size, 1),
+            )
+            .no_divergence_guard()
+            .dead_ranks(dead_for_coord)
+            .total_samples(total_samples)
+            .batch_size(batch_size)
+            .num_epochs(1)
+        };
+        let coord_thread = thread::spawn(move || -> Result<CCoord> {
+            CCoord::start_from_listener(
+                coord_listener,
+                [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
+                config_for_coord(),
+            )
+        });
+
+        // 3. Build NCCL comms via NcclComms::new + split() — single-
+        //    process multi-thread pattern. Each thread will own one
+        //    NcclRankComm and run as a rank.
+        let devices: Vec<Device> = (0..world_size as u8)
+            .map(Device::CUDA)
+            .collect();
+        let group = NcclComms::new(&devices).expect("NcclComms::new succeeds");
+        let rank_comms = group.split().expect("split succeeds");
+
+        // 4. Capture initial params on CPU once so all ranks start
+        //    aligned. Each worker thread re-creates its model on its
+        //    device + overrides with these initial values.
+        let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+        let initial_params: Vec<Tensor> = ref_model
+            .parameters()
+            .iter()
+            .map(|p| p.variable.data())
+            .collect();
+        let initial_buffers: Vec<Tensor> = ref_model
+            .buffers()
+            .iter()
+            .map(|b| b.get())
+            .collect();
+        drop(ref_model);
+
+        // 5. Spawn one worker thread per rank. Each owns its
+        //    NcclRankComm + connects to the coord via ClusterWorker
+        //    + runs to shutdown.
+        let salt = [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
+        let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+        for (rank_id, comm) in rank_comms.into_iter().enumerate() {
+            let initial_params = initial_params.clone();
+            let initial_buffers = initial_buffers.clone();
+            let device = Device::CUDA(rank_id as u8);
+            worker_handles.push(thread::spawn(move || -> Result<()> {
+                let config = WorkerConfig {
+                    rank: rank_id,
+                    world_size,
+                    device,
+                    initial_params,
+                    initial_buffers,
+                    total_samples,
+                    batch_size,
+                    seed: 42,
+                    max_grad_norm: None,
+                    easgd_alpha: None,
+                    timeline: None,
+                    policy: ApplyPolicy::Sync,
+                    save_path: None,
+                };
+                let dataset: Arc<dyn crate::data::BatchDataSet> =
+                    Arc::new(TestDataset { n: total_samples });
+                let worker = ClusterWorker::connect_and_build(
+                    coord_addr,
+                    None, // no CPU data channel; NCCL handles its own
+                    rank_id as u32,
+                    salt,
+                    config,
+                    move |d| Linear::on_device(4, 2, d),
+                    |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                    dataset,
+                    Some(comm),
+                    None,
+                )?;
+                worker.run_until_shutdown(mse_train)
+            }));
+        }
+
+        // 6. Coord thread unblocks after every worker handshakes.
+        let mut coord = coord_thread
+            .join()
+            .expect("coord thread join")
+            .expect("start_from_listener succeeds");
+
+        coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+        let start = Instant::now();
+        while coord.avg_count() == 0 {
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!(
+                    "end_to_end_sync_nccl_via_coord_smoke: avg_count never \
+                     advanced (no NCCL AllReduce observed within 30s)"
+                );
+            }
+            coord.tick().expect("tick");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(coord.avg_count() >= 1, "at least one NCCL averaging cycle");
+
+        coord.shutdown_workers().expect("shutdown_workers");
+        coord.shutdown().expect("coord shutdown");
+        for h in worker_handles {
+            h.join().expect("worker thread join").expect("worker exits clean");
+        }
     }
 
     // -----------------------------------------------------------------

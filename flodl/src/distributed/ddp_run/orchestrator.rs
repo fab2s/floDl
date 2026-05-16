@@ -184,16 +184,35 @@ impl DdpHandle {
         if let Some(cluster) = crate::distributed::cluster::LocalCluster::from_env()? {
             return match (policy, backend) {
                 (ApplyPolicy::Sync, AverageBackend::Nccl) => {
-                    Self::run_cluster_rank_sync_nccl(
-                        cluster,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                    )
+                    // Elastic-membership-aware routing: when save_path is
+                    // set on DdpRunConfig, dispatch through the
+                    // ClusterCoordinator path that survives rank death and
+                    // persists state on unrecoverable failure. When unset,
+                    // fall back to the legacy self-driven inline loop
+                    // (unchanged backward compat).
+                    if config.save_path.is_some() {
+                        Self::run_cluster_rank_sync_nccl_via_coord(
+                            cluster,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                        )
+                    } else {
+                        Self::run_cluster_rank_sync_nccl(
+                            cluster,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                        )
+                    }
                 }
                 (ApplyPolicy::Cadence, AverageBackend::Nccl)
                 | (ApplyPolicy::Async, AverageBackend::Nccl) => {
@@ -1128,7 +1147,7 @@ impl DdpHandle {
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterWorker`]: crate::distributed::cluster_worker::ClusterWorker
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn run_cluster_rank_sync_nccl_via_coord<F, M, G, O, T>(
         cluster: crate::distributed::cluster::LocalCluster,
         model_factory: F,

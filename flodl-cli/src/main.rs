@@ -118,6 +118,23 @@ fn main() -> ExitCode {
         }
     };
 
+    // Propagate the active env name to child processes so they can
+    // discover the overlay-merged config at runtime. Previously only
+    // exported inside `prepare_cluster_env` (cluster-launcher path);
+    // unconditional propagation makes the env name available to any
+    // spawned binary — load-bearing for test discovery (each test
+    // resolves its cluster topology from
+    // `fdl.<FDL_ENV>.yml`) and harmless for non-test commands.
+    // No-op when no env is active (FDL_ENV stays unset).
+    if let Some(env_name) = active_env.as_deref() {
+        // SAFETY: main() has not spawned threads at this point;
+        // matches the invariant documented for
+        // `prepare_cluster_env` and `apply_cuda_visible_devices`.
+        unsafe {
+            env::set_var(cluster::ENV_FDL_ENV, env_name);
+        }
+    }
+
     // Bare `fdl` with no args behaves like `fdl --help`.
     let cmd = args.get(1).map(String::as_str).unwrap_or("--help");
 
@@ -1303,6 +1320,30 @@ fn dispatch_config(
             return ExitCode::FAILURE;
         }
     };
+
+    // Test-cluster envelope export: when an env overlay is active AND
+    // its merged config has a `cluster:` block, surface the canonical
+    // JSON via `FLODL_TESTING_CLUSTER_JSON` so test binaries (and any
+    // other consumer that wants the topology WITHOUT entering launcher
+    // mode) can read it. Distinct from `FLODL_FULL_CLUSTER_JSON` which
+    // is launcher-mode-only and gated on `cluster: true` commands —
+    // this var is purely informational and never triggers fan-out.
+    //
+    // Gated on `env.is_some()` so `fdl <cmd>` (no overlay) leaves the
+    // file inert, matching the convention "presence of fdl.<env>.yml
+    // does nothing until invoked via --env <name>".
+    if env.is_some()
+        && let Some(cluster) = project.cluster.as_ref()
+        && let Ok(json) = cluster.canonical_json()
+    {
+        let hex = cluster::hex_encode(json.as_bytes());
+        // SAFETY: main() has not spawned threads at this point in the
+        // dispatch flow; matches the invariant for
+        // `prepare_cluster_env` and `apply_cuda_visible_devices`.
+        unsafe {
+            env::set_var("FLODL_TESTING_CLUSTER_JSON", hex);
+        }
+    }
 
     let tail: &[String] = args.get(2..).unwrap_or(&[]);
     let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);

@@ -123,7 +123,7 @@ pub fn prepare_cluster_env(
 /// Hex-encode raw bytes (lowercase, no separators). Companion to the
 /// library's `hex_decode` in `flodl::distributed::cluster`. Kept here
 /// so `prepare_cluster_env` doesn't pull in a flodl runtime dep.
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {

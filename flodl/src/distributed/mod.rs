@@ -28,6 +28,7 @@ pub mod ddp_run;
 pub mod el_che;
 pub mod lr_event_meta;
 pub mod rendezvous;
+pub mod testing;
 pub mod wire;
 
 pub use checkpoint_meta::{
@@ -44,6 +45,7 @@ pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use rendezvous::TcpRendezvous;
+pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};
 pub use ddp::{Ddp, DdpConfig, HasGraph, Trainer};
 pub use el_che::{ElChe, Phase};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
