@@ -297,6 +297,10 @@ impl ControlFrame {
 
     /// Parse a frame from the reader, validating magic + version +
     /// `auth_tag`. Returns `Ok(None)` on clean EOF.
+    ///
+    /// Treats `WouldBlock` and `TimedOut` on the initial header read as
+    /// errors. For short-timeout / non-blocking readers, prefer
+    /// [`Self::try_read_from`].
     pub fn read_from<R: Read>(r: &mut R, salt: &SessionSalt) -> Result<Option<Self>> {
         let mut hdr = [0u8; 24];
         match r.read_exact(&mut hdr) {
@@ -315,6 +319,45 @@ impl ControlFrame {
                 )));
             }
         }
+        Self::finish_read_from(hdr, r, salt).map(Some)
+    }
+
+    /// Like [`Self::read_from`] but distinguishes "no data available
+    /// right now" (e.g. `set_read_timeout` fired, or non-blocking
+    /// reader sees no bytes) from clean EOF and from wire errors.
+    /// Used by the cluster coordinator's per-rank reader thread so it
+    /// can re-check its shutdown flag periodically without exiting on
+    /// idle ticks.
+    ///
+    /// Once a single header byte has been consumed the method commits
+    /// to reading the full frame — partial reads beyond that point
+    /// surface as `Err`.
+    pub fn try_read_from<R: Read>(r: &mut R, salt: &SessionSalt) -> Result<FrameRead> {
+        let mut hdr = [0u8; 24];
+        match r.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) => {
+                return match e.kind() {
+                    ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset => {
+                        Ok(FrameRead::Eof)
+                    }
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        Ok(FrameRead::WouldBlock)
+                    }
+                    _ => Err(TensorError::new(&format!(
+                        "wire: ControlFrame header read failed: {e}"
+                    ))),
+                };
+            }
+        }
+        Self::finish_read_from(hdr, r, salt).map(FrameRead::Frame)
+    }
+
+    fn finish_read_from<R: Read>(
+        hdr: [u8; 24],
+        r: &mut R,
+        salt: &SessionSalt,
+    ) -> Result<Self> {
         let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         if magic != CONTROL_FRAME_MAGIC {
             return Err(TensorError::new(&format!(
@@ -346,12 +389,25 @@ impl ControlFrame {
                  (kind={kind:?}, len={payload_len})"
             )));
         }
-        Ok(Some(ControlFrame {
+        Ok(ControlFrame {
             kind,
             auth_tag,
             payload,
-        }))
+        })
     }
+}
+
+/// Outcome of a single [`ControlFrame::try_read_from`] call.
+#[derive(Debug)]
+pub enum FrameRead {
+    /// A frame was decoded and HMAC-verified.
+    Frame(ControlFrame),
+    /// No frame available within the reader's timeout window (or the
+    /// reader is non-blocking and has nothing buffered). Caller should
+    /// keep polling.
+    WouldBlock,
+    /// Peer closed the stream cleanly. No more frames will arrive.
+    Eof,
 }
 
 // ---------------------------------------------------------------------------

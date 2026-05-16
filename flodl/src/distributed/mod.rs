@@ -13,6 +13,7 @@
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
 pub mod cluster;
+pub mod cluster_coordinator;
 pub mod controller;
 pub mod cpu_reduce;
 pub mod cuda_event;
