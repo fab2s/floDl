@@ -89,6 +89,7 @@ fn test_worker_config_clone() {
         easgd_alpha: None,
         timeline: None,
         policy: ApplyPolicy::Sync,
+        save_path: None,
     };
     let cfg2 = cfg.clone();
     assert_eq!(cfg2.rank, 0);
@@ -174,6 +175,7 @@ fn make_test_worker_with(
         easgd_alpha: None,
         timeline: None,
         policy: ApplyPolicy::Sync,
+        save_path: None,
     };
 
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), channels) =

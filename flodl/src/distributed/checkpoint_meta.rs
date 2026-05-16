@@ -1,0 +1,384 @@
+//! Cluster training checkpoint metadata.
+//!
+//! Sidecar JSON file written alongside model + optimizer state when a
+//! cluster training run is terminated (gracefully, by a [`max_failure`]
+//! threshold breach, or because the NCCL cohort fell below the minimum
+//! comm size). Carries the trajectory state a future resume API needs
+//! to restore (epoch, global step, scheduler position).
+//!
+//! Bundle layout written next to `save_path`:
+//!
+//! - `<save_path>.fdl` — model params + buffers ([`crate::nn::save_checkpoint_file`])
+//! - `<save_path>.optim` — optimizer state ([`crate::nn::optim::Stateful::save_state_file`])
+//! - `<save_path>.meta.json` — this file
+//! - `<save_path>.config.json` — Graph architecture sidecar (existing pattern, if applicable)
+//!
+//! All four pieces share a stem so the sidecar pattern matches the
+//! existing `Graph::save_checkpoint` convention.
+//!
+//! [`max_failure`]: crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
+
+use serde::{Deserialize, Serialize};
+
+use crate::tensor::{Result, TensorError};
+
+/// Schema version. Bump when the on-disk layout changes incompatibly.
+///
+/// Readers reject files whose `schema_version` exceeds this constant —
+/// older binaries refuse forward-incompatible bundles loudly rather
+/// than silently misinterpreting fields.
+pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 1;
+
+/// Why the cluster wrote this checkpoint.
+///
+/// Marked `#[non_exhaustive]` so adding variants is a non-breaking
+/// change for downstream code that pattern-matches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum SaveReason {
+    /// Normal cluster shutdown after reaching end-of-training.
+    GracefulShutdown,
+    /// User-configured `max_failure` threshold was breached.
+    MaxFailureExceeded,
+    /// NCCL cohort dropped below 2 ranks; the lone survivor cannot
+    /// form a communicator (NCCL requires world_size >= 2) and saves
+    /// its state before exiting.
+    SingleSurvivor,
+    /// CPU cohort lost its last survivor.
+    AllRanksLost,
+}
+
+impl SaveReason {
+    /// Encode for the wire as a stable single byte.
+    ///
+    /// The mapping is part of the wire-format contract; existing values
+    /// must never change. New variants get the next available byte.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            SaveReason::GracefulShutdown => 0,
+            SaveReason::MaxFailureExceeded => 1,
+            SaveReason::SingleSurvivor => 2,
+            SaveReason::AllRanksLost => 3,
+        }
+    }
+
+    /// Decode a wire byte. Unknown bytes return `None` so peers
+    /// receiving a future variant can log the unknown reason and
+    /// fall back to a conservative default rather than crash.
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(SaveReason::GracefulShutdown),
+            1 => Some(SaveReason::MaxFailureExceeded),
+            2 => Some(SaveReason::SingleSurvivor),
+            3 => Some(SaveReason::AllRanksLost),
+            _ => None,
+        }
+    }
+}
+
+/// Cluster checkpoint metadata sidecar.
+///
+/// Written to `<save_path>.meta.json` next to the model + optimizer
+/// files when training terminates. Schema-versioned for forward compat
+/// (see [`CHECKPOINT_META_SCHEMA_VERSION`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointMeta {
+    /// Schema version of this metadata file. Read first to determine
+    /// compat — readers reject files newer than the supported version.
+    pub schema_version: u32,
+    /// Current epoch index (0-based) at the moment of save.
+    pub epoch: usize,
+    /// Global step count — total batches the cohort has trained against
+    /// the model so far. Used at resume time to feed the user-supplied
+    /// `Scheduler` factory and recover the LR trajectory.
+    pub global_step: usize,
+    /// Sync round counter — how many averaging cycles have completed.
+    /// Useful for sync-cadence telemetry on resume but not load-bearing
+    /// for trajectory restoration.
+    pub sync_round: u64,
+    /// World size at the moment of save. May be smaller than the
+    /// original configured world_size if ranks died before this
+    /// checkpoint (e.g. saved by the lone survivor or by a depleted
+    /// cohort under `max_failure`).
+    pub world_size_at_save: usize,
+    /// Why this checkpoint was written.
+    pub save_reason: SaveReason,
+}
+
+impl CheckpointMeta {
+    /// Build a fresh meta record stamped with the current schema version.
+    pub fn new(
+        epoch: usize,
+        global_step: usize,
+        sync_round: u64,
+        world_size_at_save: usize,
+        save_reason: SaveReason,
+    ) -> Self {
+        Self {
+            schema_version: CHECKPOINT_META_SCHEMA_VERSION,
+            epoch,
+            global_step,
+            sync_round,
+            world_size_at_save,
+            save_reason,
+        }
+    }
+
+    /// Derive the sidecar `.meta.json` path for a checkpoint stem.
+    ///
+    /// Strips any single extension (so `ckpt.fdl` → `ckpt.meta.json`) so
+    /// all bundle members share the same stem. A stem without extension
+    /// (`ckpt_final`) gets `.meta.json` appended directly.
+    pub fn sidecar_path(stem: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(stem);
+        p.set_extension("meta.json");
+        p
+    }
+
+    /// Serialize to JSON and write to `path`. Pretty-printed so the
+    /// file is human-inspectable during recovery debugging.
+    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self).map_err(|e| {
+            TensorError::new(&format!(
+                "CheckpointMeta: serialize JSON for {}: {e}",
+                path.display(),
+            ))
+        })?;
+        std::fs::write(path, content).map_err(|e| {
+            TensorError::new(&format!(
+                "CheckpointMeta: write {}: {e}",
+                path.display(),
+            ))
+        })
+    }
+
+    /// Read JSON from `path` and deserialize. Errors loudly if the
+    /// schema version is newer than this binary supports.
+    pub fn read_from_file(path: &std::path::Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            TensorError::new(&format!(
+                "CheckpointMeta: read {}: {e}",
+                path.display(),
+            ))
+        })?;
+        let meta: Self = serde_json::from_str(&content).map_err(|e| {
+            TensorError::new(&format!(
+                "CheckpointMeta: parse JSON from {}: {e}",
+                path.display(),
+            ))
+        })?;
+        if meta.schema_version > CHECKPOINT_META_SCHEMA_VERSION {
+            return Err(TensorError::new(&format!(
+                "CheckpointMeta: schema version {} in {} is newer than \
+                 the version {} this binary supports",
+                meta.schema_version,
+                path.display(),
+                CHECKPOINT_META_SCHEMA_VERSION,
+            )));
+        }
+        Ok(meta)
+    }
+}
+
+/// Path-derivation helpers for the cluster checkpoint bundle.
+///
+/// Given a `save_path` stem (e.g. `"runs/job_42/ckpt_final"`), produces
+/// the four bundle-member paths that share the stem:
+///
+/// - [`CheckpointBundle::model_path`] — `<stem>.fdl`
+/// - [`CheckpointBundle::optim_path`] — `<stem>.optim`
+/// - [`CheckpointBundle::meta_path`] — `<stem>.meta.json`
+/// - [`CheckpointBundle::config_sidecar_path`] — `<stem>.config.json`
+///
+/// All four use [`std::path::PathBuf::set_extension`] which strips any
+/// single existing extension before appending, so passing
+/// `"ckpt_final.fdl"` as a stem still yields a consistent bundle.
+pub struct CheckpointBundle;
+
+impl CheckpointBundle {
+    /// Model params + buffers path: `<stem>.fdl`.
+    ///
+    /// Written by [`crate::nn::save_checkpoint_file`] /
+    /// [`crate::graph::Graph::save_checkpoint`].
+    pub fn model_path(stem: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(stem);
+        p.set_extension("fdl");
+        p
+    }
+
+    /// Optimizer state path: `<stem>.optim`.
+    ///
+    /// Written by [`crate::nn::optim::Stateful::save_state_file`].
+    pub fn optim_path(stem: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(stem);
+        p.set_extension("optim");
+        p
+    }
+
+    /// Metadata JSON path: `<stem>.meta.json`. Same as
+    /// [`CheckpointMeta::sidecar_path`].
+    pub fn meta_path(stem: &str) -> std::path::PathBuf {
+        CheckpointMeta::sidecar_path(stem)
+    }
+
+    /// Graph architecture sidecar path: `<stem>.config.json`.
+    ///
+    /// Written by [`crate::graph::Graph::save_checkpoint`] when the
+    /// graph was loaded from an HF / ONNX config; recovers the
+    /// architecture description alongside the weights.
+    pub fn config_sidecar_path(stem: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(stem);
+        p.set_extension("config.json");
+        p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flodl_meta_{label}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sidecar_path_from_stem_appends_meta_json() {
+        let p = CheckpointMeta::sidecar_path("/tmp/run/ckpt_final");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_from_fdl_strips_extension() {
+        let p = CheckpointMeta::sidecar_path("/tmp/run/ckpt_final.fdl");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json")
+        );
+    }
+
+    #[test]
+    fn roundtrip_json_preserves_all_fields() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("ckpt.meta.json");
+
+        let meta = CheckpointMeta::new(
+            3,
+            7500,
+            12,
+            4,
+            SaveReason::MaxFailureExceeded,
+        );
+        meta.write_to_file(&path).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.epoch, 3);
+        assert_eq!(loaded.global_step, 7500);
+        assert_eq!(loaded.sync_round, 12);
+        assert_eq!(loaded.world_size_at_save, 4);
+        assert_eq!(loaded.save_reason, SaveReason::MaxFailureExceeded);
+        assert_eq!(loaded.schema_version, CHECKPOINT_META_SCHEMA_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_reason_serializes_snake_case() {
+        let meta = CheckpointMeta::new(0, 0, 0, 1, SaveReason::SingleSurvivor);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"save_reason\":\"single_survivor\""),
+            "expected snake_case save_reason in JSON, got: {json}",
+        );
+    }
+
+    #[test]
+    fn bundle_paths_share_stem() {
+        let stem = "/tmp/run/ckpt_final";
+        assert_eq!(
+            CheckpointBundle::model_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt_final.fdl"),
+        );
+        assert_eq!(
+            CheckpointBundle::optim_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt_final.optim"),
+        );
+        assert_eq!(
+            CheckpointBundle::meta_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json"),
+        );
+        assert_eq!(
+            CheckpointBundle::config_sidecar_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt_final.config.json"),
+        );
+    }
+
+    #[test]
+    fn bundle_paths_strip_existing_extension() {
+        let stem = "/tmp/run/ckpt.fdl";
+        // All four derived paths share the stripped stem.
+        assert_eq!(
+            CheckpointBundle::model_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt.fdl"),
+        );
+        assert_eq!(
+            CheckpointBundle::optim_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt.optim"),
+        );
+        assert_eq!(
+            CheckpointBundle::meta_path(stem),
+            std::path::PathBuf::from("/tmp/run/ckpt.meta.json"),
+        );
+    }
+
+    #[test]
+    fn save_reason_u8_roundtrip_for_all_variants() {
+        for r in [
+            SaveReason::GracefulShutdown,
+            SaveReason::MaxFailureExceeded,
+            SaveReason::SingleSurvivor,
+            SaveReason::AllRanksLost,
+        ] {
+            let byte = r.to_u8();
+            assert_eq!(SaveReason::from_u8(byte), Some(r));
+        }
+    }
+
+    #[test]
+    fn save_reason_from_unknown_byte_is_none() {
+        assert_eq!(SaveReason::from_u8(99), None);
+        assert_eq!(SaveReason::from_u8(255), None);
+    }
+
+    #[test]
+    fn future_schema_version_rejected() {
+        let dir = temp_dir("future");
+        let path = dir.join("ckpt.meta.json");
+
+        let raw_json = r#"{
+            "schema_version": 99999,
+            "epoch": 0,
+            "global_step": 0,
+            "sync_round": 0,
+            "world_size_at_save": 1,
+            "save_reason": "graceful_shutdown"
+        }"#;
+        std::fs::write(&path, raw_json).unwrap();
+
+        let err = CheckpointMeta::read_from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("newer than"),
+            "expected schema-version error, got: {err}",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

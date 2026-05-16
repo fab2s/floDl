@@ -12,6 +12,7 @@
 //! Supporting infrastructure: NCCL bindings, CUDA events/streams, El Che
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
+pub mod checkpoint_meta;
 pub mod cluster;
 pub mod cluster_coordinator;
 pub mod cluster_worker;
@@ -20,6 +21,7 @@ pub mod cpu_reduce;
 pub mod cuda_event;
 pub mod cuda_stream;
 pub mod launcher;
+pub mod max_failure;
 pub mod nccl;
 pub mod ddp;
 pub mod ddp_run;
@@ -28,12 +30,16 @@ pub mod lr_event_meta;
 pub mod rendezvous;
 pub mod wire;
 
+pub use checkpoint_meta::{
+    CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, SaveReason,
+};
 pub use cluster::{HostBlock, LocalCluster};
 pub use controller::{ClusterController, RoundFrame, TensorPayload, DTYPE_F32};
 pub use cpu_reduce::{
     AsyncCpuReduceClient, CpuReduceClient, round_frame_to_tensors, tensors_to_round_frame,
 };
 pub use launcher::{FullCluster, FullHost, Role};
+pub use max_failure::MaxFailureThreshold;
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};

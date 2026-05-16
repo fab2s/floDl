@@ -591,6 +591,7 @@ impl DdpHandle {
                 easgd_alpha: config.easgd_alpha,
                 timeline: worker_tl,
                 policy,
+                save_path: None,
             };
 
             let handle = std::thread::Builder::new()
@@ -801,6 +802,7 @@ impl DdpHandle {
             easgd_alpha: None,
             timeline: None,
             policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
+            save_path: None,
         };
 
         // Keep the worker channels: `run_epoch_plan` calls `worker.report_epoch`
@@ -1046,6 +1048,7 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Sync,
+                save_path: None,
             };
 
             // Worker channels: nothing drains them in cluster-rank mode
@@ -1252,6 +1255,7 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Sync,
+                save_path: None,
             };
 
             let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
@@ -1506,6 +1510,7 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Cadence,
+                save_path: None,
             };
 
             let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
@@ -1829,6 +1834,7 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy,
+                save_path: None,
             };
 
             // Worker channels: nothing drains them in cluster-rank mode.
@@ -2115,6 +2121,7 @@ impl DdpHandle {
                 easgd_alpha,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Async,
+                save_path: None,
             };
 
             let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();

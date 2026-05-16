@@ -256,6 +256,29 @@ pub struct ClusterCoordinatorConfig {
     /// surviving network rank by `wall_ms_accum / steps_since_avg`,
     /// breaking ties by lowest global rank).
     pub local_ranks: Vec<usize>,
+
+    /// Threshold for declaring a cluster run unrecoverable.
+    ///
+    /// When the count of dead ranks reaches this limit, the coord
+    /// broadcasts a save-and-shutdown signal to all survivors so they
+    /// can persist model + optimizer + meta state to disk before
+    /// exiting (rather than hanging indefinitely waiting for a
+    /// re-rendezvous that cannot complete).
+    ///
+    /// `None` = no user-configured threshold; backend hard limits
+    /// still apply (NCCL: lone survivor triggers, since NCCL requires
+    /// `world_size >= 2`; CPU: all-dead triggers). Defaults to `None`.
+    pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
+
+    /// Checkpoint bundle stem for unrecoverable-failure persistence.
+    ///
+    /// When the coord broadcasts `ShutdownWithSave`, workers write a
+    /// bundle (`.fdl` model, `.optim` optimizer state, `.meta.json`
+    /// trajectory) with this stem. See
+    /// [`crate::distributed::CheckpointBundle`] for path derivation.
+    /// `None` in standalone-coord tests; production cluster builders
+    /// require this to be set (loud error at `builder.run()` time).
+    pub save_path: Option<String>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -285,6 +308,8 @@ impl ClusterCoordinatorConfig {
             dead_ranks: None,
             heartbeat_timeout_secs: 30,
             local_ranks: Vec::new(),
+            max_failure: None,
+            save_path: None,
         }
     }
 
@@ -371,6 +396,29 @@ impl ClusterCoordinatorConfig {
     /// rank(s); standalone-coord tests typically leave this empty.
     pub fn local_ranks(mut self, ranks: Vec<usize>) -> Self {
         self.local_ranks = ranks;
+        self
+    }
+
+    /// Set the unrecoverable-failure threshold. When the dead-rank
+    /// count reaches this limit, the coord broadcasts a save-and-
+    /// shutdown signal to survivors so they persist state before exit.
+    ///
+    /// Backend hard limits apply regardless (NCCL needs `world_size >= 2`
+    /// for a comm; CPU needs at least 1 survivor).
+    pub fn max_failure(
+        mut self,
+        threshold: crate::distributed::max_failure::MaxFailureThreshold,
+    ) -> Self {
+        self.max_failure = Some(threshold);
+        self
+    }
+
+    /// Set the checkpoint bundle stem for unrecoverable-failure
+    /// persistence. Workers consult [`crate::distributed::CheckpointBundle`]
+    /// to derive `<save_path>.fdl`, `<save_path>.optim`,
+    /// `<save_path>.meta.json` on `ShutdownWithSave`.
+    pub fn save_path(mut self, path: impl Into<String>) -> Self {
+        self.save_path = Some(path.into());
         self
     }
 }

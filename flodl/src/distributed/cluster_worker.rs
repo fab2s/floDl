@@ -228,6 +228,15 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
         }
         ControlMsgWire::Checkpoint { version } => Ok(Some(ControlMsg::Checkpoint { version })),
         ControlMsgWire::Shutdown => Ok(Some(ControlMsg::Shutdown)),
+        ControlMsgWire::ShutdownWithSave { reason } => {
+            // Forward-compat: unknown reason byte falls back to
+            // GracefulShutdown so a newer coord doesn't crash older
+            // workers. The save still happens; only the recorded
+            // reason loses fidelity.
+            let reason = crate::distributed::checkpoint_meta::SaveReason::from_u8(reason)
+                .unwrap_or(crate::distributed::checkpoint_meta::SaveReason::GracefulShutdown);
+            Ok(Some(ControlMsg::ShutdownWithSave { reason }))
+        }
     }
 }
 
@@ -1392,6 +1401,7 @@ mod tests {
                     easgd_alpha: None,
                     timeline: None,
                     policy: ApplyPolicy::Sync,
+                    save_path: None,
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });

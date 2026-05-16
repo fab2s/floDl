@@ -1710,6 +1710,15 @@ impl<M: Module> GpuWorker<M> {
                 // wiring), drop silently — the OLD threaded path
                 // has no comm-replacement surface to act on it.
             }
+            ControlMsg::ShutdownWithSave { reason: _ } => {
+                // Cluster-mode unrecoverable-failure persistence. The
+                // save sequence (model + optimizer + meta) is wired in
+                // a follow-on slice; for now treat as a plain shutdown
+                // so the worker exits cleanly. When the save handler
+                // lands, this arm will write the bundle to save_path
+                // before returning true.
+                return Ok(true);
+            }
             ControlMsg::ExtendPartition {
                 partition_offset,
                 partition_size,
@@ -1925,6 +1934,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::DeclareDead { .. } => "DeclareDead",
                             ControlMsg::NewNcclSession { .. } => "NewNcclSession",
                             ControlMsg::RequestNewNcclId => "RequestNewNcclId",
+                            ControlMsg::ShutdownWithSave { .. } => "ShutdownWithSave",
                         }
                     );
                     if self.dispatch_control(msg)? {

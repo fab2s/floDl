@@ -511,6 +511,20 @@ pub enum ControlMsgWire {
     Checkpoint { version: u64 },
     /// Shut down this worker.
     Shutdown,
+    /// Coord-emitted directive to persist a checkpoint bundle (model
+    /// params + buffers + optimizer state + meta JSON) to the
+    /// configured `save_path` and then exit. Sent when a cluster run
+    /// is unrecoverable: the `max_failure` threshold was breached, or
+    /// (in NCCL mode) the surviving cohort dropped below 2 ranks and
+    /// no new comm can be formed. Workers consult
+    /// [`crate::distributed::CheckpointBundle`] for bundle paths.
+    ///
+    /// `reason` is the wire-byte encoding of
+    /// [`crate::distributed::SaveReason`]; decoded via
+    /// [`crate::distributed::SaveReason::from_u8`]. Unknown bytes are
+    /// treated as [`crate::distributed::SaveReason::GracefulShutdown`]
+    /// by the receiver (forward-compatible fallback).
+    ShutdownWithSave { reason: u8 },
 }
 
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain
@@ -705,6 +719,24 @@ mod tests {
         match decoded {
             ControlMsgWire::StartEpoch(p) => assert_eq!(p, plan),
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn control_frame_round_trip_shutdown_with_save() {
+        let msg = ControlMsgWire::ShutdownWithSave { reason: 1 };
+        let frame =
+            ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf).unwrap();
+        let mut cur = Cursor::new(buf);
+        let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+            .unwrap()
+            .expect("frame, not EOF");
+        let decoded: ControlMsgWire = got.decode().unwrap();
+        match decoded {
+            ControlMsgWire::ShutdownWithSave { reason } => assert_eq!(reason, 1),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

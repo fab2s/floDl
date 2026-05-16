@@ -949,6 +949,18 @@ pub enum ControlMsg {
     },
     /// Shut down this worker.
     Shutdown,
+    /// Persist a checkpoint bundle to the configured `save_path` then
+    /// shut down. Emitted by the cluster coord when the run is
+    /// unrecoverable (max_failure threshold breached, or NCCL cohort
+    /// below 2 ranks). Workers write
+    /// [`crate::distributed::CheckpointBundle`] members; rank 0 is the
+    /// canonical writer for the model + meta files. See
+    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`].
+    ShutdownWithSave {
+        /// Why the cluster is saving + exiting; recorded in the
+        /// `.meta.json` for post-mortem inspection.
+        reason: crate::distributed::checkpoint_meta::SaveReason,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1003,15 @@ pub struct WorkerConfig {
     /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:
     /// Sync mode skips weight-space divergence (near-zero by construction).
     pub policy: ApplyPolicy,
+    /// Checkpoint bundle stem for unrecoverable-failure persistence.
+    ///
+    /// When set, workers write a bundle (`.fdl` model, `.optim` optimizer
+    /// state, `.meta.json` trajectory) on receipt of
+    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`]; see
+    /// [`crate::distributed::CheckpointBundle`] for path derivation.
+    /// `None` in standalone single-GPU runs and CPU-only tests that
+    /// don't exercise the save path.
+    pub save_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
