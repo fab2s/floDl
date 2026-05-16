@@ -1,0 +1,74 @@
+# Cluster topology for tests -- deep-merges onto fdl.yml.
+#
+# Usage:
+#   cp fdl.cluster-testing.yml.example fdl.cluster-testing.yml
+#   # edit hosts: section to match your rig
+#   fdl cluster-testing <command>   # activates this overlay (first-arg env convention)
+#   FDL_ENV=cluster-testing fdl <cmd>  # equivalent
+#
+# Difference vs fdl.cluster.yml: this overlay does NOT mark any command
+# with `cluster: true`. Production cluster runs (fdl.cluster.yml) fan
+# the user's training command out across hosts and enter the launcher
+# path; `fdl.cluster-testing.yml` is purely a topology source for
+# `flodl::distributed::testing::discover_test_cluster()`. Tests read
+# the topology to set up their own coord + workers; nothing fans out.
+#
+# Activation effects:
+#   - `fdl test` (no overlay): unaffected. Test bodies autodetect local
+#     CUDA devices or fall back to CPU-only.
+#   - `fdl cluster-testing test`: fdl-cli exports
+#     `FLODL_TESTING_CLUSTER_JSON` to the cargo test subprocess.
+#     `discover_test_cluster()` reads it and returns the topology
+#     described below.
+#
+# Conventions (mirror fdl.cluster.yml's schema 1:1):
+#   - `master_addr` + `master_port`: rendezvous endpoint. For
+#     single-host loopback rigs use 127.0.0.1 + a high port; for
+#     multi-host rigs use the controller's NIC address.
+#   - `hosts[]`: one entry per machine. `ranks:` lists the global
+#     rank indices this host owns; `local_devices:` pairs them to
+#     CUDA indices (or `all` for autodetect).
+#   - `nccl_socket_ifname:` required on multi-host runs (NCCL TCP
+#     binding). Use `lo` for single-host loopback.
+#   - `ssh:` is launcher-only; tests ignore it.
+#   - `path:` is the project checkout dir on this host (used by
+#     fdl-cli to cd before remote exec; tests reuse it for path
+#     resolution).
+
+cluster:
+  master_addr: 192.168.122.1
+  master_port: 29501
+  hosts:
+    - name: node-a             # must match `hostname` on the host
+      ranks: [0, 1]
+      local_devices: all       # auto-detect at startup; equivalent to [0, 1]
+                               # if this host has 2 visible CUDA devices.
+      nccl_socket_ifname: enp1s0
+      path: /opt/flodl                # checkout path on this host
+      libtorch_path: /data/ssd/flodl/libtorch
+    - name: node-b
+      ssh: node-b              # ssh target; defaults to name if omitted
+      ranks: [2, 3]
+      local_devices: [0, 1]    # explicit form when you want to skip a device
+      nccl_socket_ifname: enp1s0
+      path: /srv/flodl                # heterogeneous mounts are fine
+      libtorch_path: /mnt/flodl/libtorch
+
+# Single-host loopback variant (most common for a personal rig):
+#
+# cluster:
+#   master_addr: 127.0.0.1
+#   master_port: 29501
+#   hosts:
+#     - name: my-rig
+#       ranks: [0, 1]
+#       local_devices: all
+#       nccl_socket_ifname: lo
+#       path: /home/me/src/flodl
+#       libtorch_path: /home/me/libtorch
+
+# NOTE: do NOT add `cluster: true` to any commands here. That flag
+# triggers the production launcher path (process-per-rank fan-out
+# across hosts). Tests want the topology as DATA, not as a dispatch
+# directive — discover_test_cluster() reads
+# `FLODL_TESTING_CLUSTER_JSON` and constructs its own coord/workers.
