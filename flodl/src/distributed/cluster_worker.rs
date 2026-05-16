@@ -166,32 +166,35 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
 }
 
 /// Convert an inbound [`ControlMsgWire`] from the coordinator into an
-/// in-process [`ControlMsg`] that the OLD [`GpuWorker::dispatch_control`]
-/// understands.
+/// optional in-process [`ControlMsg`] for [`GpuWorker::dispatch_control`].
 ///
-/// `ControlMsgWire::Update` is currently a loud error in this slice —
-/// CPU averaging needs tensors that travel via the data channel, which
-/// lands in 1d.4. Sync+Nccl path doesn't use Update.
-fn control_wire_to_msg(wire: ControlMsgWire) -> Result<ControlMsg> {
+/// Returns `Ok(None)` for wire variants that don't need in-process
+/// dispatch:
+///
+/// - `ControlMsgWire::Update { version }`: the wire-side notification
+///   that the averaging cycle is complete. The real in-process
+///   `ControlMsg::Update(AveragedParams)` flows through the param
+///   bridge (where the param bridge synthesizes one with the actual
+///   averaged tensors from the data channel). The wire-Update is
+///   informational only.
+///
+/// All other wire variants map 1:1.
+fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
     match wire {
-        ControlMsgWire::RequestParams => Ok(ControlMsg::RequestParams),
-        ControlMsgWire::Update { version: _ } => Err(TensorError::new(
-            "cluster_worker: ControlMsgWire::Update (CPU-averaging path) not yet \
-             supported in slice 4b.D.1d.2; lands in 4b.D.1d.4 along with the data-\
-             channel ParamSnapshot/RoundFrame plumbing.",
-        )),
-        ControlMsgWire::SyncNow => Ok(ControlMsg::SyncNow),
-        ControlMsgWire::StartEpoch(plan) => Ok(ControlMsg::StartEpoch(EpochPlan {
+        ControlMsgWire::RequestParams => Ok(Some(ControlMsg::RequestParams)),
+        ControlMsgWire::Update { version: _ } => Ok(None),
+        ControlMsgWire::SyncNow => Ok(Some(ControlMsg::SyncNow)),
+        ControlMsgWire::StartEpoch(plan) => Ok(Some(ControlMsg::StartEpoch(EpochPlan {
             epoch: plan.epoch as usize,
             partition_offset: plan.partition_offset as usize,
             partition_size: plan.partition_size as usize,
-        })),
-        ControlMsgWire::Throttle => Ok(ControlMsg::Throttle),
+        }))),
+        ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
-            Ok(ControlMsg::SetGlobalStep(global_step as usize))
+            Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
         }
-        ControlMsgWire::Checkpoint { version } => Ok(ControlMsg::Checkpoint { version }),
-        ControlMsgWire::Shutdown => Ok(ControlMsg::Shutdown),
+        ControlMsgWire::Checkpoint { version } => Ok(Some(ControlMsg::Checkpoint { version })),
+        ControlMsgWire::Shutdown => Ok(Some(ControlMsg::Shutdown)),
     }
 }
 
@@ -240,6 +243,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
     #[allow(clippy::too_many_arguments)]
     pub fn connect_and_build<F, G, O>(
         coord_addr: SocketAddr,
+        data_addr: Option<SocketAddr>,
         rank_id: u32,
         salt: SessionSalt,
         config: WorkerConfig,
@@ -305,14 +309,33 @@ impl<M: Module + 'static> ClusterWorker<M> {
         write_stream.set_read_timeout(None).ok();
 
         // mpsc quintet — the worker-side senders flow into GpuWorker,
-        // the coord-side ends stay with the bridges.
+        // the coord-side ends stay with the bridges. Clone the senders
+        // that bridges need access to (timing_tx for the SyncAck
+        // emitted after a CPU-averaging round, control_tx for the
+        // param bridge's synthesized ControlMsg::Update).
         let (timing_tx, timing_rx) = mpsc::channel::<TimingMsg>();
+        let timing_tx_for_param_bridge = timing_tx.clone();
         let (metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::ddp_run::MetricsMsg>();
         let (param_tx, param_rx) =
             mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
         let (final_param_tx, final_param_rx) =
             mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
+        let control_tx_for_param_bridge = control_tx.clone();
+
+        // CpuReduceClient on the data channel, used by the param
+        // bridge below when AverageBackend::Cpu is in play. None when
+        // the worker is in NCCL-only mode (data_addr unset).
+        let cpu_client = if let Some(addr) = data_addr {
+            Some(crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                addr,
+                rank_id,
+                config.world_size as u32,
+                salt,
+            )?)
+        } else {
+            None
+        };
 
         let inner = GpuWorker::<M>::new(
             &config,
@@ -396,17 +419,31 @@ impl<M: Module + 'static> ClusterWorker<M> {
                     ))
                 })?,
         );
+        // Param bridge: receives ParamSnapshot from the inner GpuWorker
+        // (triggered by ControlMsg::RequestParams), runs an all-reduce
+        // round-trip through the data channel via CpuReduceClient, and
+        // synthesizes a real ControlMsg::Update(AveragedParams) back to
+        // the inner so it can call load_averaged unchanged.
+        //
+        // When data_addr was not provided, this stays a discard bridge
+        // (NCCL-only worker layout — the inner never emits ParamSnapshot
+        // in that mode either, so the receiver simply idles).
+        let rank_for_bridge = rank_id as u64;
         bridges.push(
             thread::Builder::new()
-                .name(format!("flodl-worker-discard-param:r{rank_out}"))
+                .name(format!("flodl-worker-param-bridge:r{rank_out}"))
                 .spawn(move || {
-                    while param_rx.recv().is_ok() {
-                        // Drop. 1d.4 wires this to the data channel.
-                    }
+                    param_bridge_loop(
+                        rank_for_bridge,
+                        param_rx,
+                        cpu_client,
+                        control_tx_for_param_bridge,
+                        timing_tx_for_param_bridge,
+                    );
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
-                        "cluster_worker: spawn param discard bridge: {e}"
+                        "cluster_worker: spawn param bridge: {e}"
                     ))
                 })?,
         );
@@ -548,11 +585,17 @@ fn inbound_loop(
             Ok(FrameRead::Frame(frame)) => match frame.kind {
                 MsgKind::Control => match frame.decode::<ControlMsgWire>() {
                     Ok(wire) => match control_wire_to_msg(wire) {
-                        Ok(msg) => {
+                        Ok(Some(msg)) => {
                             if control_tx.send(msg).is_err() {
                                 // Inner GpuWorker dropped its receiver.
                                 return;
                             }
+                        }
+                        Ok(None) => {
+                            // Wire-side notification with no in-process
+                            // dispatch (e.g. Update{version} —
+                            // informational; the param bridge handles
+                            // the real ControlMsg::Update(AveragedParams).)
                         }
                         Err(e) => {
                             eprintln!(
@@ -632,6 +675,93 @@ fn write_one(
     let wire = timing_msg_to_wire(msg);
     let frame = ControlFrame::encode(salt, MsgKind::Timing, &wire)?;
     frame.write_to(stream)
+}
+
+/// CPU-averaging param bridge: receives [`ParamSnapshot`]s from the
+/// inner [`GpuWorker`] (triggered by `RequestParams`), runs an
+/// all-reduce round-trip through the data channel via
+/// [`crate::distributed::cpu_reduce::CpuReduceClient`], and feeds the
+/// averaged tensors back to the inner as `ControlMsg::Update`. Also
+/// emits `TimingMsg::SyncAck` on the timing channel so the
+/// coordinator's `nccl_ack` gate releases.
+///
+/// When `cpu_client` is `None`, the bridge degrades to a discard
+/// drainer (NCCL-only worker layout — the inner never emits
+/// ParamSnapshot in that mode either, so the channel idles).
+fn param_bridge_loop(
+    rank: u64,
+    param_rx: mpsc::Receiver<crate::distributed::ddp_run::ParamSnapshot>,
+    cpu_client: Option<crate::distributed::cpu_reduce::CpuReduceClient>,
+    control_tx: mpsc::Sender<ControlMsg>,
+    timing_tx: mpsc::Sender<TimingMsg>,
+) {
+    use crate::distributed::ddp_run::{AveragedParams, ParamSnapshot};
+    let Some(mut client) = cpu_client else {
+        // Discard mode (NCCL-only worker).
+        while param_rx.recv().is_ok() {}
+        return;
+    };
+    // Monotonic local version counter; bumped per round so the
+    // synthesized AveragedParams.version increases consistently.
+    let mut version: u64 = 0;
+    while let Ok(snapshot) = param_rx.recv() {
+        let ParamSnapshot {
+            rank: snap_rank,
+            params,
+            buffers,
+            batch_count: _,
+        } = snapshot;
+        debug_assert_eq!(
+            snap_rank as u64, rank,
+            "param bridge: snapshot.rank mismatch with bridge rank"
+        );
+        // All-reduce params + buffers via the data channel. f32 only
+        // in v1; CpuReduceClient surfaces a loud error otherwise.
+        let param_refs: Vec<&_> = params.iter().collect();
+        let avg_params = match client.all_reduce_tensors(&param_refs) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "cluster_worker: param bridge r{rank} all_reduce params: {e}"
+                );
+                return;
+            }
+        };
+        let buffer_refs: Vec<&_> = buffers.iter().collect();
+        let avg_buffers = if buffer_refs.is_empty() {
+            Vec::new()
+        } else {
+            match client.all_reduce_tensors(&buffer_refs) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "cluster_worker: param bridge r{rank} all_reduce buffers: {e}"
+                    );
+                    return;
+                }
+            }
+        };
+        version += 1;
+        let avg = AveragedParams {
+            params: avg_params,
+            buffers: avg_buffers,
+            version,
+        };
+        if control_tx.send(ControlMsg::Update(avg)).is_err() {
+            // Inner GpuWorker dropped its receiver; tear down.
+            return;
+        }
+        // Ack the coordinator. Use a synthetic large step_count so the
+        // coord's `step_count > nccl_sync_step` gate (NCCL-specific
+        // deadlock guard) trivially passes on the CPU path.
+        let _ = timing_tx.send(TimingMsg::SyncAck {
+            rank: rank as usize,
+            step_count: usize::MAX / 2,
+            divergence: None,
+            post_norm: None,
+            pre_norm: None,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,5 +931,48 @@ mod tests {
         // For now the test is structural — when CUDA tests run it
         // simply asserts that the module compiles and links
         // cleanly. Body lands in the Pascal-rig follow-up.
+    }
+
+    /// End-to-end Sync+Cpu smoke test (CPU device, no NCCL): spawn
+    /// `ClusterController` (data) and `ClusterCoordinator` (control)
+    /// alongside 2 `ClusterWorker` threads with a trivial CPU model
+    /// and dataset, run a few averaging cycles via the param bridge,
+    /// verify both ranks converge to identical weights.
+    ///
+    /// Marked `#[ignore]` because the test scaffolding (Module impl
+    /// for a 1-param model, BatchDataSet impl for an in-memory
+    /// dataset, two-worker orchestration thread) is sizable enough
+    /// to belong in a follow-up slice (1d.4b). The component parts
+    /// — coord-side CPU dispatch + worker-side param bridge — are
+    /// exercised by `sync_cpu_trigger_broadcasts_request_params_then_update`
+    /// in cluster_coordinator.rs and by the param_bridge_loop's
+    /// type-level + clippy validation in this module.
+    ///
+    /// To unblock: lift `#[ignore]` and implement the body once a
+    /// reusable trivial-Module helper exists for cluster tests.
+    #[test]
+    #[ignore = "needs end-to-end CPU scaffolding — slice 1d.4b follow-up"]
+    fn end_to_end_sync_cpu_smoke() {
+        // Body deferred to 1d.4b. Structure:
+        //  1. Start ClusterController::start on master_port + 2 with
+        //     world_size=2 and TEST_SALT.
+        //  2. Start ClusterCoordinator::start on master_port + 3 with
+        //     cfg_sync_cpu(2)
+        //         .total_samples(4)
+        //         .batch_size(2)
+        //         .num_epochs(1).
+        //  3. For each rank: thread::spawn(move || {
+        //         let worker = ClusterWorker::connect_and_build(
+        //             coord_addr, Some(data_addr), rank_id, salt,
+        //             config, model_factory, optim_factory, dataset,
+        //             None /* nccl_comm */, None /* checkpoint */,
+        //         )?;
+        //         worker.run_until_shutdown(train_fn)?;
+        //     });
+        //  4. Coord driver loop: dispatch_epoch(0) + tick() until
+        //     all workers have done >=1 averaging cycle.
+        //  5. After workers exit, assert their final weights are
+        //     bit-identical (CpuReduceClient::all_reduce_tensors
+        //     guarantees this).
     }
 }

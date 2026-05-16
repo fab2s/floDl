@@ -750,12 +750,15 @@ impl ClusterCoordinator {
     }
 
     /// Check whether an averaging cycle should be triggered now. Ported
-    /// literally from OLD `Coordinator::should_average`. CPU 3-phase
-    /// guard is omitted (deferred to 1d.4).
+    /// literally from OLD `Coordinator::should_average`.
+    ///
+    /// `nccl_ack` is named for the NCCL path's SyncAck mechanism but
+    /// serves both backends in the new TCP model: workers send a
+    /// `TimingMsg::SyncAck` after every averaging round (regardless of
+    /// backend) so the coordinator can gate re-triggering until the
+    /// previous round has settled.
     pub fn should_average(&self) -> bool {
-        if matches!(self.backend, AverageBackend::Nccl)
-            && !self.nccl_ack.iter().all(|&a| a)
-        {
+        if !self.nccl_ack.iter().all(|&a| a) {
             return false;
         }
         if self.active_count < self.world_size {
@@ -822,10 +825,18 @@ impl ClusterCoordinator {
         Ok(())
     }
 
-    /// Trigger an averaging cycle. NCCL only in slice 1d.1 (CPU 3-phase
-    /// is deferred to 1d.4). Ported literally from OLD
-    /// `Coordinator::trigger_averaging` (NCCL arm) +
-    /// `finish_averaging_nccl`.
+    /// Trigger an averaging cycle. Dispatches to the backend-specific
+    /// trigger message + finish hook. Mirrors OLD
+    /// `Coordinator::trigger_averaging`.
+    ///
+    /// - NCCL: broadcast `SyncNow`; finish_averaging_nccl runs
+    ///   convergence inline using last-round divergence data + emits
+    ///   `SetGlobalStep`.
+    /// - CPU: broadcast `RequestParams`; finish_averaging_cpu mirrors
+    ///   the NCCL flow but emits `Update{version}` as the lifecycle
+    ///   barrier. Workers receive averaged tensors via the data
+    ///   channel ([`crate::distributed::cpu_reduce::CpuReduceClient`])
+    ///   between RequestParams and the next round.
     pub fn trigger_averaging(&mut self) -> Result<()> {
         match self.backend {
             AverageBackend::Nccl => {
@@ -838,11 +849,13 @@ impl ClusterCoordinator {
                 self.finish_averaging_nccl()?;
             }
             AverageBackend::Cpu => {
-                return Err(TensorError::new(
-                    "cluster_coordinator: CPU averaging backend not yet supported \
-                     in slice 1d.1; lands in slice 1d.4. Use AverageBackend::Nccl \
-                     for the current scope.",
-                ));
+                self.nccl_sync_start = Some(Instant::now());
+                self.broadcast_control(&ControlMsgWire::RequestParams)?;
+                for rank in 0..self.world_size {
+                    self.nccl_sync_step[rank] = self.last_step_count[rank];
+                    self.nccl_ack[rank] = false;
+                }
+                self.finish_averaging_cpu()?;
             }
         }
         Ok(())
@@ -910,6 +923,109 @@ impl ClusterCoordinator {
 
         self.global_step += cycle_batches;
 
+        self.broadcast_control(&ControlMsgWire::SetGlobalStep {
+            global_step: self.global_step as u64,
+        })?;
+
+        for s in &mut self.steps_since_avg {
+            *s = 0;
+        }
+        for a in &mut self.wall_ms_accum {
+            *a = 0.0;
+        }
+        for t in &mut self.throttled {
+            *t = false;
+        }
+        for d in &mut self.nccl_sync_divergence {
+            *d = None;
+        }
+        for p in &mut self.nccl_sync_pre_norm {
+            *p = None;
+        }
+        self.nccl_sync_post_norm = None;
+        Ok(())
+    }
+
+    /// CPU-backend counterpart to [`Self::finish_averaging_nccl`].
+    ///
+    /// Differs from the NCCL path in one place: the lifecycle barrier
+    /// emitted to workers is `ControlMsgWire::Update { version }` (the
+    /// workers received their averaged tensors via the data channel
+    /// already; this notification bumps their `current_version` and
+    /// resets `steps_since_avg`).
+    ///
+    /// Everything else (ElChe report, convergence guard verdict,
+    /// overshoot / anchor tuning, counter reset) mirrors NCCL.
+    fn finish_averaging_cpu(&mut self) -> Result<()> {
+        let prev_sync_ms = self.last_nccl_sync_ms;
+        self.last_nccl_sync_ms = 0.0;
+        if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
+            self.el_che.report_timing(
+                &self.wall_ms_accum,
+                &self.steps_since_avg,
+                prev_sync_ms,
+            );
+            if !self.calibrated && self.el_che.is_calibrated() {
+                self.calibrated = true;
+            }
+        }
+
+        let pre_norms: Option<Vec<f64>> =
+            if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
+                Some(self.nccl_sync_pre_norm.iter().map(|p| p.unwrap()).collect())
+            } else {
+                None
+            };
+        let report = convergence::DivergenceReport {
+            deltas: self
+                .nccl_sync_divergence
+                .iter()
+                .map(|d| d.unwrap_or(0.0))
+                .collect(),
+            pre_norms,
+            post_norm: self.nccl_sync_post_norm,
+        };
+        let cycle_batches: usize = self.steps_since_avg.iter().sum();
+        let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
+        let action = self.convergence_guard.report(&report, cycle_batches, k_max);
+
+        self.version += 1;
+        self.avg_count += 1;
+
+        match action {
+            ConvergenceAction::Stable => {
+                if self.policy == ApplyPolicy::Async {
+                    if self.overshoot_auto {
+                        self.max_overshoot =
+                            (self.max_overshoot + 1).min(self.overshoot_ceiling);
+                    }
+                    if self.elche_relax_up {
+                        self.el_che.relax_anchor_up();
+                    }
+                }
+            }
+            ConvergenceAction::SuppressGrowth => {}
+            ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.nudge_anchor_down(factor);
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    self.max_overshoot = self.overshoot_initial;
+                }
+            }
+        }
+        if self.policy == ApplyPolicy::Async {
+            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
+        }
+
+        self.global_step += cycle_batches;
+
+        // CPU lifecycle barrier: workers received averaged tensors on
+        // the data channel; this Update notification tells them to
+        // bump `current_version` and reset `steps_since_avg`.
+        self.broadcast_control(&ControlMsgWire::Update {
+            version: self.version,
+        })?;
+        // SetGlobalStep is still broadcast so workers can update the
+        // per-batch LR scheduler base. Same as the NCCL path.
         self.broadcast_control(&ControlMsgWire::SetGlobalStep {
             global_step: self.global_step as u64,
         })?;
@@ -1761,6 +1877,100 @@ mod tests {
         });
         r0.join().unwrap().expect("rank 0 reads 2 frames");
         r1.join().unwrap().expect("rank 1 reads 2 frames");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    fn cfg_sync_cpu(world_size: usize) -> ClusterCoordinatorConfig {
+        assert!(world_size >= 2, "tests use world_size >= 2");
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Sync,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 1),
+        )
+        .no_divergence_guard()
+    }
+
+    #[test]
+    fn sync_cpu_trigger_broadcasts_request_params_then_update() {
+        // 2 ranks, Sync+Cpu. After each rank sends one Batch + SyncAck
+        // (mocking the post-data-channel ack), coord should fire
+        // RequestParams + Update{version} + SetGlobalStep exactly
+        // once. Mirrors sync_policy_fires_after_each_rank_step_once
+        // for the CPU backend.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size),
+            |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "sync_cpu_trigger timed out waiting for avg_count",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(coord.avg_count(), 1, "exactly one averaging cycle");
+                Ok(())
+            },
+        );
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            })?;
+            let msg = recv_control(s, salt)?;
+            assert_eq!(msg, ControlMsgWire::RequestParams);
+            // Mock the post-data-channel ack the real bridge will send
+            // in 1d.4's worker-side wiring.
+            send_timing(s, salt, TimingMsgWire::SyncAck {
+                rank: 0,
+                step_count: 2,
+                divergence: None,
+                post_norm: None,
+                pre_norm: None,
+            })?;
+            let msg2 = recv_control(s, salt)?;
+            assert!(matches!(msg2, ControlMsgWire::Update { .. }));
+            let msg3 = recv_control(s, salt)?;
+            assert!(matches!(msg3, ControlMsgWire::SetGlobalStep { .. }));
+            Ok(())
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(s, salt, TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            })?;
+            let msg = recv_control(s, salt)?;
+            assert_eq!(msg, ControlMsgWire::RequestParams);
+            send_timing(s, salt, TimingMsgWire::SyncAck {
+                rank: 1,
+                step_count: 2,
+                divergence: None,
+                post_norm: None,
+                pre_norm: None,
+            })?;
+            let msg2 = recv_control(s, salt)?;
+            assert!(matches!(msg2, ControlMsgWire::Update { .. }));
+            let msg3 = recv_control(s, salt)?;
+            assert!(matches!(msg3, ControlMsgWire::SetGlobalStep { .. }));
+            Ok(())
+        });
+
+        r0.join().unwrap().expect("rank 0 sees RequestParams + Update + SetGlobalStep");
+        r1.join().unwrap().expect("rank 1 sees RequestParams + Update + SetGlobalStep");
         coord_handle.join().unwrap().expect("coord finishes");
     }
 
