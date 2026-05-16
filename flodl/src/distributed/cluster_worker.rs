@@ -778,6 +778,7 @@ mod tests {
     use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
     use crate::distributed::wire::SESSION_SALT_BYTES;
     use std::net::Ipv4Addr;
+    use std::time::Instant;
 
     /// Deterministic non-zero test salt — same value as the
     /// cluster_coordinator / controller test salts so cross-module
@@ -933,46 +934,194 @@ mod tests {
         // cleanly. Body lands in the Pascal-rig follow-up.
     }
 
+    // -----------------------------------------------------------------
+    // 4b.D.1d.4b — end-to-end Sync+Cpu smoke test scaffolding
+    // -----------------------------------------------------------------
+
+    use crate::distributed::cluster_coordinator::ClusterCoordinator as CCoord;
+    use crate::distributed::controller::ClusterController;
+    use crate::nn::Linear;
+    use crate::tensor::TensorOptions;
+    use crate::tensor::DType;
+
+    /// Mirror of `ddp_run::tests::TestDataset` — random (input, target)
+    /// pairs on CPU. Kept local so we don't have to widen the
+    /// visibility of the OLD test helper.
+    struct TestDataset {
+        n: usize,
+    }
+    impl crate::data::BatchDataSet for TestDataset {
+        fn len(&self) -> usize {
+            self.n
+        }
+        fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+            let n = indices.len() as i64;
+            let opts = TensorOptions {
+                dtype: DType::Float32,
+                device: Device::CPU,
+            };
+            Ok(vec![
+                Tensor::randn(&[n, 4], opts)?,
+                Tensor::randn(&[n, 2], opts)?,
+            ])
+        }
+    }
+
+    /// Mirror of `ddp_run::tests::mse_train`. MSE between Linear's
+    /// output and the dataset's target tensor.
+    fn mse_train(model: &Linear, batch: &[Tensor]) -> Result<Variable> {
+        let input = Variable::new(batch[0].clone(), false);
+        let target = Variable::new(batch[1].clone(), false);
+        let output = model.forward(&input)?;
+        let diff = output.sub(&target)?;
+        diff.mul(&diff)?.mean()
+    }
+
     /// End-to-end Sync+Cpu smoke test (CPU device, no NCCL): spawn
     /// `ClusterController` (data) and `ClusterCoordinator` (control)
-    /// alongside 2 `ClusterWorker` threads with a trivial CPU model
-    /// and dataset, run a few averaging cycles via the param bridge,
-    /// verify both ranks converge to identical weights.
-    ///
-    /// Marked `#[ignore]` because the test scaffolding (Module impl
-    /// for a 1-param model, BatchDataSet impl for an in-memory
-    /// dataset, two-worker orchestration thread) is sizable enough
-    /// to belong in a follow-up slice (1d.4b). The component parts
-    /// — coord-side CPU dispatch + worker-side param bridge — are
-    /// exercised by `sync_cpu_trigger_broadcasts_request_params_then_update`
-    /// in cluster_coordinator.rs and by the param_bridge_loop's
-    /// type-level + clippy validation in this module.
-    ///
-    /// To unblock: lift `#[ignore]` and implement the body once a
-    /// reusable trivial-Module helper exists for cluster tests.
+    /// alongside 2 `ClusterWorker` threads with a trivial Linear model
+    /// and `TestDataset`, run one averaging cycle via the param bridge,
+    /// assert avg_count fires + workers exit cleanly.
     #[test]
-    #[ignore = "needs end-to-end CPU scaffolding — slice 1d.4b follow-up"]
     fn end_to_end_sync_cpu_smoke() {
-        // Body deferred to 1d.4b. Structure:
-        //  1. Start ClusterController::start on master_port + 2 with
-        //     world_size=2 and TEST_SALT.
-        //  2. Start ClusterCoordinator::start on master_port + 3 with
-        //     cfg_sync_cpu(2)
-        //         .total_samples(4)
-        //         .batch_size(2)
-        //         .num_epochs(1).
-        //  3. For each rank: thread::spawn(move || {
-        //         let worker = ClusterWorker::connect_and_build(
-        //             coord_addr, Some(data_addr), rank_id, salt,
-        //             config, model_factory, optim_factory, dataset,
-        //             None /* nccl_comm */, None /* checkpoint */,
-        //         )?;
-        //         worker.run_until_shutdown(train_fn)?;
-        //     });
-        //  4. Coord driver loop: dispatch_epoch(0) + tick() until
-        //     all workers have done >=1 averaging cycle.
-        //  5. After workers exit, assert their final weights are
-        //     bit-identical (CpuReduceClient::all_reduce_tensors
-        //     guarantees this).
+        let world_size = 2usize;
+        let total_samples = 8usize;
+        let batch_size = 4usize;
+
+        // 1. ClusterController on data port. start() is non-blocking;
+        //    accept happens in the spawned reduce thread.
+        let controller = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            world_size,
+            TEST_SALT,
+        )
+        .expect("ClusterController::start succeeds");
+        let data_port = controller.port();
+        let data_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), data_port);
+
+        // 2. ClusterCoordinator listener. bind() returns the port
+        //    before any accept blocks; start_from_listener (which
+        //    blocks) runs on a dedicated thread so workers can connect
+        //    in parallel.
+        let (coord_listener, coord_port) = CCoord::bind(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        )
+        .expect("coord bind succeeds");
+        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+
+        let config_for_coord = move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Sync,
+                AverageBackend::Cpu,
+                world_size,
+                crate::distributed::ddp::ElChe::new(world_size, 1),
+            )
+            .no_divergence_guard()
+            .total_samples(total_samples)
+            .batch_size(batch_size)
+            .num_epochs(1)
+        };
+        let coord_thread = thread::spawn(move || -> Result<CCoord> {
+            CCoord::start_from_listener(coord_listener, TEST_SALT, config_for_coord())
+        });
+
+        // 3. Build a reference Linear model on CPU to capture initial
+        //    params/buffers. Each worker thread's model_factory builds
+        //    its own fresh Linear; WorkerConfig.initial_params overrides
+        //    the random init so all ranks align at startup.
+        let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+        let initial_params: Vec<Tensor> = ref_model
+            .parameters()
+            .iter()
+            .map(|p| p.variable.data())
+            .collect();
+        let initial_buffers: Vec<Tensor> = ref_model
+            .buffers()
+            .iter()
+            .map(|b| b.get())
+            .collect();
+        drop(ref_model);
+
+        // 4. Spawn worker threads. Each connects to the coord (control)
+        //    + builds a CpuReduceClient (data). connect_and_build is
+        //    blocking on both handshakes; the coord_thread above
+        //    unblocks once both workers handshake.
+        let salt = TEST_SALT;
+        let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+        for rank_id in 0..world_size {
+            let initial_params = initial_params.clone();
+            let initial_buffers = initial_buffers.clone();
+            worker_handles.push(thread::spawn(move || -> Result<()> {
+                let config = WorkerConfig {
+                    rank: rank_id,
+                    world_size,
+                    device: Device::CPU,
+                    initial_params,
+                    initial_buffers,
+                    total_samples,
+                    batch_size,
+                    seed: 42,
+                    max_grad_norm: None,
+                    easgd_alpha: None,
+                    timeline: None,
+                    policy: ApplyPolicy::Sync,
+                };
+                let dataset: Arc<dyn crate::data::BatchDataSet> =
+                    Arc::new(TestDataset { n: total_samples });
+                let worker = ClusterWorker::connect_and_build(
+                    coord_addr,
+                    Some(data_addr),
+                    rank_id as u32,
+                    salt,
+                    config,
+                    |d| Linear::on_device(4, 2, d),
+                    |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                    dataset,
+                    None, // no NCCL
+                    None, // no checkpoint
+                )?;
+                worker.run_until_shutdown(mse_train)
+            }));
+        }
+
+        // 5. Coord thread unblocks after both worker handshakes; recover
+        //    the configured coord.
+        let mut coord = coord_thread
+            .join()
+            .expect("coord thread join")
+            .expect("start_from_listener succeeds");
+
+        // 6. Dispatch the only epoch + drive ticks until at least one
+        //    averaging cycle fires. Bound the wall budget so a buggy
+        //    coord doesn't hang the suite.
+        coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+        let start = Instant::now();
+        while coord.avg_count() == 0 {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!(
+                    "end_to_end_sync_cpu_smoke: avg_count never advanced \
+                     (no averaging cycle observed within 10s)"
+                );
+            }
+            coord.tick().expect("tick");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(coord.avg_count() >= 1, "at least one averaging cycle");
+
+        // 7. Send Shutdown to workers and tear down the coord.
+        coord.shutdown_workers().ok();
+        coord.shutdown().ok();
+
+        // 8. Join workers. They should exit cleanly after receiving
+        //    Shutdown through the inbound bridge.
+        for (rank_id, h) in worker_handles.into_iter().enumerate() {
+            let r = h.join().expect("worker thread join");
+            r.unwrap_or_else(|e| {
+                panic!("worker rank {rank_id} run_until_shutdown: {e}");
+            });
+        }
+
+        // 9. Shut the controller down.
+        controller.shutdown().ok();
     }
 }
