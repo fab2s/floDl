@@ -1,15 +1,16 @@
 //! GPU worker: thread-local training loop bound to a single device.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::autograd::{Variable, NoGradGuard};
 use crate::data::BatchDataSet;
 use crate::nn::buffer::Buffer;
 use crate::distributed::cuda_event::{CudaEvent, CudaEventFlags};
 use crate::distributed::cuda_stream::{CudaStream, StreamGuard};
-use crate::distributed::nccl::{NcclRankComm, ReduceOp};
+use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm, ReduceOp};
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
@@ -73,6 +74,22 @@ pub struct GpuWorker<M: Module> {
 
     // -- NCCL per-rank communicator (None for CPU averaging or CPU device) --
     nccl_comm: Option<NcclRankComm>,
+    /// Abort handle for the current NCCL comm. Cloned from `nccl_comm`
+    /// at construction time (and re-cloned by [`Self::replace_nccl_comm`]
+    /// after a rebuild). The cluster-mode NCCL watchdog thread holds
+    /// its own clone of this `Arc` and calls `abort()` when the local
+    /// `DeadRanks` ledger registers a newly-dead peer. The main thread
+    /// uses [`NcclAbortHandle::is_aborted`] to distinguish "our abort"
+    /// from other NCCL errors in [`Self::sync_now_nccl`].
+    nccl_abort_handle: Option<Arc<NcclAbortHandle>>,
+    /// Cluster-mode NCCL session mailbox. Populated by the
+    /// cluster_worker inbound bridge on each `NewNcclSession` arrival;
+    /// drained here by `sync_now_nccl` post-abort to rebuild the comm.
+    /// `None` outside cluster mode (standalone single-process NCCL has
+    /// no rendezvous channel).
+    nccl_session_mailbox: Option<
+        Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
+    >,
 
     // -- Channels --
     timing_tx: mpsc::Sender<TimingMsg>,
@@ -381,7 +398,9 @@ impl<M: Module> GpuWorker<M> {
             copy_done,
             pending_param_h2d: false,
             last_h2d_wait_ms: 0.0,
+            nccl_abort_handle: nccl_comm.as_ref().map(|c| c.abort_handle()),
             nccl_comm,
+            nccl_session_mailbox: None,
             timing_tx,
             metrics_tx,
             param_tx,
@@ -435,6 +454,47 @@ impl<M: Module> GpuWorker<M> {
     /// Current epoch number (0-based).
     pub fn current_epoch(&self) -> usize {
         self.current_epoch
+    }
+
+    /// Clone of this worker's current NCCL abort handle, if any.
+    ///
+    /// The cluster-mode watchdog thread holds one of these and calls
+    /// [`NcclAbortHandle::abort`] when a peer rank dies; the main
+    /// thread checks [`NcclAbortHandle::is_aborted`] in the NCCL
+    /// `sync_now_nccl` error path to distinguish "our abort" from
+    /// other failures. Returns `None` for CPU averaging / non-cluster
+    /// setups where no NCCL comm exists.
+    pub fn nccl_abort_handle(&self) -> Option<Arc<NcclAbortHandle>> {
+        self.nccl_abort_handle.clone()
+    }
+
+    /// Attach the cluster-mode NCCL session mailbox. Called by the
+    /// cluster_worker layer between construction and the main loop.
+    /// When set, `sync_now_nccl`'s abort-retry path reads new comm
+    /// bytes from this slot (populated by the inbound bridge on each
+    /// `NewNcclSession` frame from the coord). No-op for standalone
+    /// single-process NCCL setups.
+    pub(crate) fn attach_nccl_session_mailbox(
+        &mut self,
+        mailbox: Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
+    ) {
+        self.nccl_session_mailbox = Some(mailbox);
+    }
+
+    /// Replace this worker's NCCL communicator with `new_comm` after a
+    /// cluster-mode re-rendezvous (peer rank died, surviving cohort
+    /// formed a fresh comm).
+    ///
+    /// `self.rank` and `self.world_size` are STABLE global identity —
+    /// they index per-rank coord-side state (ElChe batch counts,
+    /// wall-ms accumulators, divergence vectors, partition computation,
+    /// `TimingMsg::*.rank` fields) and must not change across a
+    /// rebuild. The NCCL comm tracks its own internal `rank` /
+    /// `world_size` (= position in the shrunken cohort / cohort size)
+    /// for collective dispatch; the worker never reads those.
+    pub fn replace_nccl_comm(&mut self, new_comm: NcclRankComm) {
+        self.nccl_abort_handle = Some(new_comm.abort_handle());
+        self.nccl_comm = Some(new_comm);
     }
 
     /// Set the learning rate on this worker's optimizer.
@@ -587,12 +647,11 @@ impl<M: Module> GpuWorker<M> {
 
     /// Perform in-place NCCL AllReduce(Avg) on this rank's parameters.
     ///
-    /// All ranks must process SyncNow concurrently for the collective to complete.
-    /// Runs on `comm_stream` and records `copy_done` so the compute stream waits
-    /// before the next forward.
+    /// All ranks must process SyncNow concurrently for the collective
+    /// to complete. Runs on `comm_stream` and records `copy_done` so
+    /// the compute stream waits before the next forward.
     ///
-    /// Performs the in-place NCCL AllReduce(Avg) on this rank's parameters
-    /// and returns the divergence triple `(divergence, post_norm, pre_norm)`:
+    /// Returns the divergence triple `(divergence, post_norm, pre_norm)`:
     /// - `divergence = ||pre - post|| / ||post||` (this rank's transversal
     ///   deviation from the post-AllReduce consensus),
     /// - `post_norm = ||post||` (the L2 norm of the consensus weights after
@@ -600,98 +659,220 @@ impl<M: Module> GpuWorker<M> {
     /// - `pre_norm = ||W_i||` (this rank's pre-AllReduce L2 norm; per-rank).
     ///
     /// All three are `None` together when scratch buffers are absent
-    /// (Sync mode or no NCCL comm). With all three available the coordinator
-    /// gets the cosine-similarity / magnitude-shift decomposition for free
-    /// (MSF/SWA directional vs magnitude split) plus the longitudinal
-    /// meta-oscillator state.
-    fn sync_now_nccl(&self) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+    /// (Sync mode or no NCCL comm).
+    ///
+    /// **Cluster-mode abort recovery:** if the in-flight collective
+    /// aborts (the cluster_worker watchdog called `abort()` on this
+    /// comm because a peer died), this function restores params from
+    /// the pre-sync scratch, waits for `NewNcclSession` bytes in the
+    /// mailbox, rebuilds the comm via `replace_nccl_comm`, and retries
+    /// the AllReduce on the survivor cohort. The averaging cycle MUST
+    /// complete (with one fewer rank's contribution) — silently
+    /// skipping it would leave survivors drifted from each other and
+    /// violate the sync semantics. Bounded by `MAX_REBUILD_ATTEMPTS`
+    /// as a safety against cascading-failure pathologies.
+    fn sync_now_nccl(&mut self) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+        const MAX_REBUILD_ATTEMPTS: usize = 32;
+
         let _diag_start = Instant::now();
-        let comm = match &self.nccl_comm {
-            Some(c) => c,
-            None => return Ok((None, None, None)),
-        };
-
-        let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
-        let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
-
-        // Snapshot pre-sync params into scratch buffers for divergence measurement.
-        if let Some(ref scratch) = self.pre_sync_scratch {
-            let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
-            for (dst, src) in scratch.iter().zip(&param_tensors) {
-                dst.copy_(src, true)?; // non-blocking on comm_stream
-            }
+        if self.nccl_comm.is_none() {
+            return Ok((None, None, None));
         }
 
-        if let Some(stream) = &self.comm_stream {
-            // AllReduce on comm_stream (in-place averaging)
-            let nccl_start = Instant::now();
-            comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream)?;
-            // HOST-synchronize: block until AllReduce completes.
-            stream.synchronize()?;
-            let nccl_ms = nccl_start.elapsed().as_secs_f64() * 1000.0;
+        let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
+        let mut nccl_ms_total = 0.0_f64;
 
-            // Compute weight-space divergence: ||pre - post|| / ||post||
-            let divg_start = Instant::now();
-            let divergence = if let Some(ref scratch) = self.pre_sync_scratch {
-                // scratch = pre (from copy above). Compute pre-norm BEFORE
-                // mutating scratch (the next foreach_add_list_ overwrites it
-                // in place to scratch = pre - post).
-                let pre_norm_tensors = Tensor::foreach_norm(scratch, 2.0)?;
-                let mut pre_sq = 0.0f64;
-                for n in &pre_norm_tensors {
-                    let v: f64 = n.item()?;
-                    pre_sq += v * v;
-                }
-                let pre_norm = pre_sq.sqrt();
-
-                // scratch[i] += (-1) * param_tensors[i]  ->  scratch[i] = pre[i] - post[i]
-                Tensor::foreach_add_list_(scratch, &param_tensors, -1.0)?;
-
-                let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
-                let post_norms = Tensor::foreach_norm(&param_tensors, 2.0)?;
-
-                let mut diff_sq = 0.0f64;
-                for n in &diff_norms {
-                    let v: f64 = n.item()?;
-                    diff_sq += v * v;
-                }
-                let mut post_sq = 0.0f64;
-                for n in &post_norms {
-                    let v: f64 = n.item()?;
-                    post_sq += v * v;
-                }
-
-                let post_norm = post_sq.sqrt();
-                let div = if post_norm > 1e-10 {
-                    diff_sq.sqrt() / post_norm
+        for attempt in 0..MAX_REBUILD_ATTEMPTS {
+            // Snapshot or restore params <-> scratch.
+            // First attempt: snapshot params -> scratch (pre-sync state).
+            // Retries: restore params <- scratch because the failed
+            // in-place AllReduce may have left params partially mutated.
+            if let Some(ref scratch) = self.pre_sync_scratch {
+                let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+                if attempt == 0 {
+                    for (dst, src) in scratch.iter().zip(&param_tensors) {
+                        dst.copy_(src, true)?; // scratch <- params
+                    }
                 } else {
-                    0.0
-                };
-
-                crate::verbose!(
-                    "  ddp-worker: rank {} sync divergence={:.6} (||delta||={:.4}, ||pre||={:.4}, ||post||={:.4})",
-                    self.rank, div, diff_sq.sqrt(), pre_norm, post_norm,
-                );
-                (Some(div), Some(post_norm), Some(pre_norm))
-            } else {
-                (None, None, None)
-            };
-
-            // Record event so compute_stream waits before next forward
-            if let Some(ev) = &self.copy_done {
-                ev.record_on(stream)?;
+                    for (dst, src) in param_tensors.iter().zip(scratch.iter()) {
+                        dst.copy_(src, true)?; // params <- scratch
+                    }
+                }
+            } else if attempt > 0 {
+                // No scratch and we need to retry — can't recover param
+                // state cleanly. Cluster NCCL mode must allocate scratch
+                // unconditionally (the orchestrator entry does this).
+                return Err(TensorError::new(
+                    "sync_now_nccl: NCCL aborted but pre_sync_scratch is None; \
+                     cannot restore params for retry. Cluster NCCL mode must \
+                     allocate scratch unconditionally.",
+                ));
             }
-            let divg_ms = divg_start.elapsed().as_secs_f64() * 1000.0;
-            let total_ms = _diag_start.elapsed().as_secs_f64() * 1000.0;
-            crate::verbose!(
-                "  ddp-sync-diag: rank {} sync_total={:.1}ms (nccl={:.1}ms divg={:.1}ms)",
-                self.rank, total_ms, nccl_ms, divg_ms,
-            );
 
-            Ok(divergence)
-        } else {
-            comm.all_reduce(&param_refs, ReduceOp::Avg)?;
-            Ok((None, None, None))
+            let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
+            let comm = self.nccl_comm.as_ref().expect("nccl_comm present");
+
+            let nccl_start = Instant::now();
+            let attempt_result: Result<()> = if let Some(stream) = &self.comm_stream {
+                match comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream) {
+                    Ok(()) => stream.synchronize(),
+                    Err(e) => Err(e),
+                }
+            } else {
+                comm.all_reduce(&param_refs, ReduceOp::Avg)
+            };
+            nccl_ms_total += nccl_start.elapsed().as_secs_f64() * 1000.0;
+
+            match attempt_result {
+                Ok(()) => {
+                    // Successful AllReduce. Compute divergence (if scratch
+                    // is present), record event, log, return.
+                    let divg_start = Instant::now();
+                    let divergence = if let Some(ref scratch) = self.pre_sync_scratch {
+                        // scratch = pre. Compute pre-norm BEFORE mutating
+                        // scratch (next foreach_add_list_ overwrites in
+                        // place to scratch = pre - post).
+                        let pre_norm_tensors = Tensor::foreach_norm(scratch, 2.0)?;
+                        let mut pre_sq = 0.0f64;
+                        for n in &pre_norm_tensors {
+                            let v: f64 = n.item()?;
+                            pre_sq += v * v;
+                        }
+                        let pre_norm = pre_sq.sqrt();
+
+                        Tensor::foreach_add_list_(scratch, &param_tensors, -1.0)?;
+
+                        let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
+                        let post_norms = Tensor::foreach_norm(&param_tensors, 2.0)?;
+
+                        let mut diff_sq = 0.0f64;
+                        for n in &diff_norms {
+                            let v: f64 = n.item()?;
+                            diff_sq += v * v;
+                        }
+                        let mut post_sq = 0.0f64;
+                        for n in &post_norms {
+                            let v: f64 = n.item()?;
+                            post_sq += v * v;
+                        }
+
+                        let post_norm = post_sq.sqrt();
+                        let div = if post_norm > 1e-10 {
+                            diff_sq.sqrt() / post_norm
+                        } else {
+                            0.0
+                        };
+
+                        crate::verbose!(
+                            "  ddp-worker: rank {} sync divergence={:.6} \
+                             (||delta||={:.4}, ||pre||={:.4}, ||post||={:.4})",
+                            self.rank, div, diff_sq.sqrt(), pre_norm, post_norm,
+                        );
+                        (Some(div), Some(post_norm), Some(pre_norm))
+                    } else {
+                        (None, None, None)
+                    };
+
+                    if let (Some(ev), Some(stream)) =
+                        (&self.copy_done, &self.comm_stream)
+                    {
+                        ev.record_on(stream)?;
+                    }
+                    let divg_ms = divg_start.elapsed().as_secs_f64() * 1000.0;
+                    let total_ms = _diag_start.elapsed().as_secs_f64() * 1000.0;
+                    crate::verbose!(
+                        "  ddp-sync-diag: rank {} sync_total={:.1}ms (nccl={:.1}ms divg={:.1}ms attempts={})",
+                        self.rank, total_ms, nccl_ms_total, divg_ms, attempt + 1,
+                    );
+                    return Ok(divergence);
+                }
+                Err(e) => {
+                    let aborted = self
+                        .nccl_abort_handle
+                        .as_ref()
+                        .is_some_and(|h| h.is_aborted());
+                    if !aborted {
+                        // Not our abort — propagate.
+                        return Err(e);
+                    }
+                    if attempt + 1 == MAX_REBUILD_ATTEMPTS {
+                        return Err(TensorError::new(&format!(
+                            "sync_now_nccl: rank {} hit max NCCL rebuild \
+                             attempts ({}) without successful AllReduce",
+                            self.rank, MAX_REBUILD_ATTEMPTS,
+                        )));
+                    }
+                    crate::verbose!(
+                        "  ddp-worker: rank {} NCCL collective aborted on \
+                         attempt {} (err: {}), waiting for new comm and \
+                         retrying",
+                        self.rank,
+                        attempt + 1,
+                        e,
+                    );
+                    // Wait for NewNcclSession bytes in the mailbox + rebuild.
+                    let pending = self.wait_for_nccl_session()?;
+                    let uid_bytes: [u8; crate::distributed::NCCL_UNIQUE_ID_BYTES] =
+                        pending.uid_bytes.as_slice().try_into().map_err(|_| {
+                            TensorError::new(
+                                "sync_now_nccl: NewNcclSession uid_bytes \
+                                 wrong length (expected NCCL_UNIQUE_ID_BYTES)",
+                            )
+                        })?;
+                    let uid =
+                        crate::distributed::nccl::NcclUniqueId::from_bytes(uid_bytes);
+                    let new_comm = crate::distributed::nccl::NcclRankComm::init_rank(
+                        pending.new_rank,
+                        pending.new_world_size,
+                        &uid,
+                    )?;
+                    self.replace_nccl_comm(new_comm);
+                    // Loop continues: retry the AllReduce on the new comm.
+                }
+            }
+        }
+        // Unreachable: every loop iteration either returns or errors
+        // out at the max-attempts edge.
+        Err(TensorError::new(&format!(
+            "sync_now_nccl: rank {} unexpected exit from retry loop",
+            self.rank,
+        )))
+    }
+
+    /// Block until the cluster-mode session mailbox is populated, then
+    /// drain it. Called from [`Self::sync_now_nccl`] after an NCCL
+    /// abort to wait for the coord's `NewNcclSession` broadcast.
+    ///
+    /// 60-second safety cap — production rendezvous typically completes
+    /// in <100ms once the coord receives the generator survivor's UID,
+    /// so a 60s wait surfaces a stuck or misconfigured rendezvous loudly
+    /// rather than hanging indefinitely.
+    fn wait_for_nccl_session(
+        &self,
+    ) -> Result<crate::distributed::cluster_worker::PendingNcclSession> {
+        let mailbox = self.nccl_session_mailbox.as_ref().ok_or_else(|| {
+            TensorError::new(
+                "sync_now_nccl: NCCL aborted but no session mailbox attached; \
+                 cluster_worker must call attach_nccl_session_mailbox before \
+                 run_until_shutdown.",
+            )
+        })?;
+        let start = Instant::now();
+        let max_wait = Duration::from_secs(60);
+        loop {
+            if let Ok(mut g) = mailbox.lock() {
+                if let Some(p) = g.take() {
+                    return Ok(p);
+                }
+            }
+            if start.elapsed() > max_wait {
+                return Err(TensorError::new(&format!(
+                    "sync_now_nccl: rank {} timed out waiting for new \
+                     NCCL session after {:?}",
+                    self.rank, max_wait,
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -1750,19 +1931,13 @@ impl<M: Module> GpuWorker<M> {
                 // on the SAME (current_epoch, base_seed) the worker
                 // used for its StartEpoch, so the appended indices
                 // align with the rest of the cluster's view of the
-                // permutation. Append in-place; `run_epoch_plan`'s
-                // sync loop re-checks `self.partition.len()` each
-                // iteration so the extension is processed before
-                // declaring the epoch complete.
-                //
-                // Prefetch (CUDA) path note: the prefetch consumer
-                // loop submits all batches at function entry and
-                // doesn't re-poll `partition.len()`, so mid-epoch
-                // extension on that path silently leaves the
-                // appended indices unprocessed. CUDA cluster mode
-                // isn't wired yet (1d.3b); when it lands, the
-                // prefetch path needs a similar dynamic-bound
-                // rework + `prefetch.load_batch` calls here.
+                // permutation. Append in-place; both the sync and the
+                // prefetch loop in `run_epoch_plan` re-check
+                // `partition.len()` each iteration so the extension is
+                // processed before declaring the epoch complete. The
+                // prefetch path also gets the newly-completable
+                // batches submitted to its load queue here so the
+                // background worker has work to feed the consumer.
                 let extra = make_partition(
                     partition_offset,
                     partition_size,
@@ -1770,7 +1945,16 @@ impl<M: Module> GpuWorker<M> {
                     self.current_epoch,
                     self.base_seed,
                 );
+                let old_batches = self.partition.len() / self.batch_size;
                 self.partition.extend(extra);
+                let new_batches = self.partition.len() / self.batch_size;
+                if let Some(ref pw) = self.prefetch {
+                    for batch_idx in old_batches..new_batches {
+                        let start = batch_idx * self.batch_size;
+                        let end = start + self.batch_size;
+                        pw.load_batch(self.partition[start..end].to_vec());
+                    }
+                }
             }
             ControlMsg::Throttle => {
                 // Worker is ahead of the slowest rank: block until averaging
@@ -2082,12 +2266,20 @@ impl<M: Module> GpuWorker<M> {
                 prefetch.load_batch(self.partition[start..end].to_vec());
             }
 
-            // Consume prefetched batches as they become ready
+            // Consume prefetched batches as they become ready. Loop
+            // bound is re-evaluated each iteration off
+            // `self.partition.len()` so a mid-epoch
+            // `ControlMsg::ExtendPartition` (cluster-mode reshard
+            // after a rank dies) injects extra batches and they get
+            // processed before the epoch completes. The
+            // `ExtendPartition` arm also submits the new batches to
+            // the prefetch worker's load queue, so the background
+            // worker has work to feed this consumer.
             let mut batch_done = 0usize;
             let chunk_diag_start = Instant::now();
             let mut prefetch_wait_diag = std::time::Duration::ZERO;
             let mut compute_ms_diag = 0.0_f64;
-            for _ in 0..num_batches {
+            while batch_done < self.partition.len() / self.batch_size {
                 // Interleave control message processing with prefetch waiting.
                 // SyncNow can arrive at any time; if we block on batch_rx.recv()
                 // the peer enters AllReduce waiting for us -> deadlock.

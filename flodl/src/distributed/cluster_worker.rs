@@ -71,7 +71,7 @@ use crate::distributed::cluster_coordinator::{write_handshake_rank, CTRL_HS_ACK,
 use crate::distributed::ddp_run::{
     CheckpointFn, ControlMsg, EpochPlan, GpuWorker, TimingMsg, WorkerConfig,
 };
-use crate::distributed::nccl::NcclRankComm;
+use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::distributed::wire::{
     hmac_sha256_64, ControlFrame, ControlMsgWire, FrameRead, MsgKind, SessionSalt,
     TimingMsgWire,
@@ -265,9 +265,8 @@ fn _epoch_plan_to_wire(plan: EpochPlan) -> EpochPlanWire {
 /// NCCL comm. Slot semantics: latest write wins; old values are
 /// silently overwritten on each new session.
 ///
-/// Fields currently unread: the 1d.3b foundation lands the type and
-/// the storage Arc; the main-thread comm-rebuild consumer is 1d.3c
-/// (along with the inbound-bridge plumbing that fills this slot).
+/// Fields are populated by the inbound bridge but currently unread;
+/// the consumer is the sync_now_nccl retry path in a follow-on slice.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct PendingNcclSession {
@@ -392,6 +391,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         let (timing_tx, timing_rx) = mpsc::channel::<TimingMsg>();
         let timing_tx_for_param_bridge = timing_tx.clone();
         let timing_tx_for_heartbeat = timing_tx.clone();
+        let timing_tx_for_inbound = timing_tx.clone();
         let (metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::ddp_run::MetricsMsg>();
         let (param_tx, param_rx) =
             mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
@@ -414,7 +414,16 @@ impl<M: Module + 'static> ClusterWorker<M> {
             None
         };
 
-        let inner = GpuWorker::<M>::new(
+        // Worker-local dead-rank ledger + NCCL session mailbox.
+        // Constructed BEFORE inner so the NCCL watchdog thread (below)
+        // can take an Arc clone. The inbound bridge populates both
+        // when the coord broadcasts `DeclareDead` / `NewNcclSession`.
+        let local_dead_ranks =
+            crate::distributed::controller::DeadRanks::new(config.world_size);
+        let nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let mut inner = GpuWorker::<M>::new(
             &config,
             model_factory,
             optim_factory,
@@ -428,14 +437,33 @@ impl<M: Module + 'static> ClusterWorker<M> {
             control_rx,
         )?;
 
+        // Attach the cluster-mode NCCL session mailbox so the inner's
+        // `sync_now_nccl` retry path can read new comm bytes after a
+        // peer-death abort. The inbound bridge populates the slot on
+        // each `NewNcclSession` arrival from the coord.
+        inner.attach_nccl_session_mailbox(Arc::clone(&nccl_session_mailbox));
+
+        // Grab the initial NCCL abort handle (if any) for the watchdog.
+        // Cluster mode without an NCCL comm (CPU averaging) skips the
+        // watchdog entirely.
+        let initial_abort_handle = inner.nccl_abort_handle();
+
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut bridges: Vec<JoinHandle<()>> = Vec::new();
 
         // Inbound bridge: TCP ControlFrame → ControlMsg → control_tx.
+        // Intercepts the elastic-membership control frames (DeclareDead,
+        // NewNcclSession, RequestNewNcclId) and routes them to the
+        // local ledger / mailbox / UID reply path rather than the inner
+        // GpuWorker — the inner is typically blocked in an in-flight
+        // NCCL collective and can't service control messages until the
+        // watchdog aborts the comm.
         let salt_in = salt;
         let shutdown_in = Arc::clone(&shutdown_flag);
         let rank_in = config.rank;
         let mut read_stream_for_bridge = read_stream;
+        let dead_for_inbound = Arc::clone(&local_dead_ranks);
+        let mailbox_for_inbound = Arc::clone(&nccl_session_mailbox);
         bridges.push(
             thread::Builder::new()
                 .name(format!("flodl-worker-inbound:r{rank_in}"))
@@ -446,6 +474,9 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         &salt_in,
                         &shutdown_in,
                         &control_tx,
+                        &dead_for_inbound,
+                        &mailbox_for_inbound,
+                        &timing_tx_for_inbound,
                     );
                 })
                 .map_err(|e| {
@@ -563,19 +594,44 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 })?,
         );
 
-        // Worker-local dead-rank ledger + NCCL session mailbox.
-        // The ledger drives the (future-slice 1d.3c) NCCL watchdog
-        // thread; the mailbox holds the most-recent NewNcclSession
-        // payload for the (future-slice 1d.3c) main-thread
-        // comm-rebuild path. Both are populated by the inbound bridge
-        // when the coord broadcasts elastic-membership control
-        // frames. For 1d.3b they're staged-but-unconsumed scaffolding;
-        // wire path is in place so the protocol round-trips can be
-        // exercised on the rig.
-        let local_dead_ranks =
-            crate::distributed::controller::DeadRanks::new(config.world_size);
-        let nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        // NCCL watchdog: poll the local ledger for newly-dead peers and
+        // abort the in-flight NCCL collective so the main thread's
+        // `sync_now_nccl` can break out of the AllReduce barrier and
+        // rebuild the comm on the survivor cohort. Only spawned when an
+        // NCCL comm exists — CPU averaging doesn't need this (the
+        // coord's shared DeadRanks ledger shuts down the controller
+        // stream which already releases the blocked AllReduce read).
+        //
+        // Caveat: the watchdog holds the INITIAL abort handle. After
+        // the main thread rebuilds the comm, the watchdog's clone
+        // points at the destroyed comm — `abort()` becomes a no-op
+        // (the handle's `aborted` AtomicBool is already true). For
+        // cascading death scenarios (a second peer dies during the
+        // 2-rank cohort) NCCL's own watchdog handles the second abort
+        // via NCCL_ASYNC_ERROR_HANDLING=1 (set in the launcher env);
+        // see the launcher coord-spawn slice.
+        if let Some(abort_handle) = initial_abort_handle {
+            let shutdown_for_wd = Arc::clone(&shutdown_flag);
+            let dead_for_wd = Arc::clone(&local_dead_ranks);
+            let rank_for_wd = rank_id as usize;
+            bridges.push(
+                thread::Builder::new()
+                    .name(format!("flodl-worker-nccl-watchdog:r{rank_out}"))
+                    .spawn(move || {
+                        nccl_watchdog_loop(
+                            rank_for_wd,
+                            abort_handle,
+                            dead_for_wd,
+                            shutdown_for_wd,
+                        );
+                    })
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster_worker: spawn NCCL watchdog: {e}"
+                        ))
+                    })?,
+            );
+        }
 
         Ok(ClusterWorker {
             inner: Some(inner),
@@ -687,12 +743,34 @@ impl<M: Module> Drop for ClusterWorker<M> {
 
 /// TCP → control_tx bridge: read [`ControlFrame`]s, decode the
 /// payload, push into the in-process control channel.
+///
+/// Elastic-membership frames intercepted here (NOT forwarded to the
+/// inner GpuWorker):
+/// - `DeclareDead { rank }` → `local_dead_ranks.declare_dead(rank)`,
+///   which the NCCL watchdog observes and uses to abort the in-flight
+///   collective.
+/// - `NewNcclSession { uid_bytes, new_rank, new_world_size }` →
+///   `mailbox.replace(Some(PendingNcclSession { … }))`. The main
+///   thread reads this slot after its NCCL collective errors out
+///   (post-abort) to rebuild the comm.
+/// - `RequestNewNcclId` → call `NcclUniqueId::new()` to generate fresh
+///   bytes locally and ship them back to the coord via the timing
+///   channel as `TimingMsg::NewNcclIdGenerated`. Generation happens
+///   here (not on the coord) because the coord process may not link
+///   libnccl while workers always do.
+///
+/// All other frames fall through to `control_wire_to_msg` and the
+/// inner control channel as before.
+#[allow(clippy::too_many_arguments)]
 fn inbound_loop(
     rank: usize,
     stream: &mut TcpStream,
     salt: &SessionSalt,
     shutdown: &Arc<AtomicBool>,
     control_tx: &mpsc::Sender<ControlMsg>,
+    local_dead_ranks: &Arc<crate::distributed::controller::DeadRanks>,
+    nccl_session_mailbox: &Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
+    timing_tx: &mpsc::Sender<TimingMsg>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -701,25 +779,67 @@ fn inbound_loop(
         match ControlFrame::try_read_from(stream, salt) {
             Ok(FrameRead::Frame(frame)) => match frame.kind {
                 MsgKind::Control => match frame.decode::<ControlMsgWire>() {
-                    Ok(wire) => match control_wire_to_msg(wire) {
-                        Ok(Some(msg)) => {
-                            if control_tx.send(msg).is_err() {
-                                // Inner GpuWorker dropped its receiver.
-                                return;
+                    Ok(wire) => match wire {
+                        // Elastic-membership interception (does NOT
+                        // forward to the inner GpuWorker).
+                        ControlMsgWire::DeclareDead { rank: dead_r } => {
+                            local_dead_ranks.declare_dead(dead_r as usize);
+                        }
+                        ControlMsgWire::NewNcclSession {
+                            uid_bytes,
+                            new_rank,
+                            new_world_size,
+                        } => {
+                            let pending = PendingNcclSession {
+                                uid_bytes,
+                                new_rank: new_rank as usize,
+                                new_world_size: new_world_size as usize,
+                            };
+                            if let Ok(mut slot) = nccl_session_mailbox.lock() {
+                                *slot = Some(pending);
                             }
                         }
-                        Ok(None) => {
-                            // Wire-side notification with no in-process
-                            // dispatch (e.g. Update{version} —
-                            // informational; the param bridge handles
-                            // the real ControlMsg::Update(AveragedParams).)
+                        ControlMsgWire::RequestNewNcclId => {
+                            match crate::distributed::nccl::NcclUniqueId::new() {
+                                Ok(uid) => {
+                                    let uid_bytes = uid.as_bytes().to_vec();
+                                    let _ = timing_tx.send(
+                                        TimingMsg::NewNcclIdGenerated {
+                                            rank,
+                                            uid_bytes,
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "cluster_worker: inbound r{rank} \
+                                         NcclUniqueId::new failed: {e}"
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
-                            );
-                            return;
-                        }
+                        // Everything else: existing path through
+                        // control_wire_to_msg → inner control_tx.
+                        other => match control_wire_to_msg(other) {
+                            Ok(Some(msg)) => {
+                                if control_tx.send(msg).is_err() {
+                                    // Inner GpuWorker dropped its receiver.
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                // Wire-side notification with no in-process
+                                // dispatch (e.g. Update{version} —
+                                // informational; the param bridge handles
+                                // the real ControlMsg::Update(AveragedParams).)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
+                                );
+                                return;
+                            }
+                        },
                     },
                     Err(e) => {
                         eprintln!(
@@ -778,6 +898,53 @@ fn heartbeat_loop(
             return;
         }
         thread::sleep(Duration::from_millis(HEARTBEAT_CADENCE_MS));
+    }
+}
+
+/// Poll-cadence for the NCCL watchdog. 100ms keeps detection latency
+/// low (a death registered by the inbound bridge is acted on within
+/// this window) without burning CPU on the polling loop.
+const NCCL_WATCHDOG_POLL_MS: u64 = 100;
+
+/// NCCL watchdog thread body.
+///
+/// Polls `local_dead_ranks.dead_count()` and calls
+/// [`NcclAbortHandle::abort`] each time the count increases. The abort
+/// unblocks the main thread's in-flight NCCL collective with an Err so
+/// the main thread can rebuild the comm on the surviving cohort.
+///
+/// `abort()` is idempotent (the handle's internal `aborted: AtomicBool`
+/// guards against double-aborts), so multiple successive increments
+/// translate into one effective abort per comm lifetime. After the
+/// main thread rebuilds the comm, this handle is stale; cascading
+/// deaths beyond the first are handled by NCCL's own watchdog when
+/// `NCCL_ASYNC_ERROR_HANDLING=1` is set in the worker env.
+fn nccl_watchdog_loop(
+    rank: usize,
+    abort_handle: Arc<NcclAbortHandle>,
+    local_dead_ranks: Arc<crate::distributed::controller::DeadRanks>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut last_dead_count = 0usize;
+    while !shutdown.load(Ordering::SeqCst) {
+        let now_dead = local_dead_ranks.dead_count();
+        if now_dead > last_dead_count {
+            crate::verbose!(
+                "  cluster_worker: rank {} NCCL watchdog: dead_count {} -> {}, \
+                 aborting NCCL comm",
+                rank,
+                last_dead_count,
+                now_dead,
+            );
+            if let Err(e) = abort_handle.abort() {
+                eprintln!(
+                    "cluster_worker: rank {} NCCL watchdog abort error: {}",
+                    rank, e,
+                );
+            }
+            last_dead_count = now_dead;
+        }
+        thread::sleep(Duration::from_millis(NCCL_WATCHDOG_POLL_MS));
     }
 }
 
