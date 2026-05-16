@@ -222,6 +222,15 @@ pub struct ClusterCoordinatorConfig {
     /// precedence over ElChe-derived throughput sizing. Length must
     /// equal `world_size` if set.
     pub partition_ratios: Option<Vec<f64>>,
+    /// Enable the LR-aware meta-controller above ElChe. Default: false
+    /// (off; opt-in). When enabled, a
+    /// [`crate::distributed::lr_event_meta::LrEventMeta`] is constructed
+    /// and held by the coordinator; per-rank LR updates from
+    /// [`TimingMsgWire::LrUpdate`] populate `last_lr_per_rank`, and the
+    /// meta is consulted after every averaging-cycle guard verdict (see
+    /// [`ClusterCoordinator::observe_meta`]). `MetaAction::NudgeDown`
+    /// dispatches to [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
+    pub meta_controller: bool,
 }
 
 impl ClusterCoordinatorConfig {
@@ -247,6 +256,7 @@ impl ClusterCoordinatorConfig {
             batch_size: 1,
             num_epochs: 0,
             partition_ratios: None,
+            meta_controller: false,
         }
     }
 
@@ -292,6 +302,19 @@ impl ClusterCoordinatorConfig {
         self.overshoot_initial = initial;
         self.overshoot_ceiling = ceiling;
         self.overshoot_auto = auto;
+        self
+    }
+
+    /// Enable the LR-aware meta-controller above ElChe. Default: false.
+    ///
+    /// When enabled, a [`crate::distributed::lr_event_meta::LrEventMeta`]
+    /// is constructed by [`ClusterCoordinator::start_from_listener`] and
+    /// observed after every averaging-cycle guard verdict. Ports the
+    /// OLD `CoordinatorBuilder::meta_controller` opt-in (see
+    /// [`crate::distributed::lr_event_meta`] for the design and rollout
+    /// stages).
+    pub fn meta_controller(mut self, enabled: bool) -> Self {
+        self.meta_controller = enabled;
         self
     }
 }
@@ -352,6 +375,18 @@ pub struct ClusterCoordinator {
     last_nccl_sync_ms: f64,
     /// Instant the most recent SyncNow was emitted.
     nccl_sync_start: Option<Instant>,
+
+    /// LR-aware meta-controller above ElChe. `None` when
+    /// [`ClusterCoordinatorConfig::meta_controller`] is `false` (default).
+    /// Observed after every averaging-cycle guard verdict via
+    /// [`Self::observe_meta`]; dispatches
+    /// [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`] to
+    /// [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
+    lr_event_meta: Option<crate::distributed::lr_event_meta::LrEventMeta>,
+    /// Most recent learning rate observed per rank via
+    /// [`TimingMsgWire::LrUpdate`]. Indexed by rank. `None` until the
+    /// first LR update from that rank arrives.
+    last_lr_per_rank: Vec<Option<f64>>,
 
     // --- Epoch dispatch ---
     /// Per-rank current epoch (last StartEpoch dispatched).
@@ -568,6 +603,12 @@ impl ClusterCoordinator {
             throttled: vec![false; world_size],
             last_nccl_sync_ms: 0.0,
             nccl_sync_start: None,
+            lr_event_meta: if config.meta_controller {
+                Some(crate::distributed::lr_event_meta::LrEventMeta::with_default_config())
+            } else {
+                None
+            },
+            last_lr_per_rank: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             epoch_plan_cache: std::collections::HashMap::new(),
@@ -651,6 +692,62 @@ impl ClusterCoordinator {
         self.nccl_sync_post_norm
     }
 
+    /// Test-only peek at the most-recent per-rank LR snapshot. Mirrors
+    /// the OLD coordinator's `last_lr_per_rank`. `None` for ranks that
+    /// have not yet sent a [`TimingMsgWire::LrUpdate`].
+    #[cfg(test)]
+    pub(crate) fn last_lr_per_rank_for_test(&self) -> &[Option<f64>] {
+        &self.last_lr_per_rank
+    }
+
+    /// Test-only peek at whether the LR-aware meta-controller is
+    /// active. Returns `true` when
+    /// [`ClusterCoordinatorConfig::meta_controller`] was set.
+    #[cfg(test)]
+    pub(crate) fn meta_controller_enabled_for_test(&self) -> bool {
+        self.lr_event_meta.is_some()
+    }
+
+    /// Feed an averaging-cycle observation to the LR-aware meta-controller
+    /// (when enabled) and dispatch any returned action to ElChe.
+    ///
+    /// Ported from OLD `Coordinator::observe_meta` (`coordinator/mod.rs`);
+    /// matches behavior including `MetaAction::NudgeDown` dispatch via
+    /// [`crate::distributed::ddp::ElChe::nudge_anchor_down`] (OLD's Stage
+    /// 3 — already landed per `project_06_controller_arc.md`).
+    ///
+    /// No-op when:
+    /// - the meta-controller is disabled (`lr_event_meta` is `None`),
+    /// - no rank has reported its LR yet (cold-start, ≤ 1 cycle).
+    ///
+    /// On [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`]
+    /// the resulting anchor change is captured by the cycle's net
+    /// `AnchorChanged` event in the caller (we don't emit a duplicate
+    /// event here — only a `verbose!` log line, mirroring OLD).
+    fn observe_meta(
+        &mut self,
+        verdict: crate::distributed::ddp_run::convergence::ConvergenceAction,
+    ) {
+        let Some(lr) = self.last_lr_per_rank.iter().copied().find_map(|x| x) else {
+            return;
+        };
+        let anchor = self.el_che.anchor();
+        let phase = self.el_che.phase();
+        let action = match self.lr_event_meta.as_mut() {
+            Some(meta) => meta.observe(lr, anchor, verdict, phase),
+            None => return,
+        };
+        if let crate::distributed::lr_event_meta::MetaAction::NudgeDown { factor } = action {
+            let old = self.el_che.anchor();
+            self.el_che.nudge_anchor_down(factor);
+            let new = self.el_che.anchor();
+            crate::verbose!(
+                "  ddp: meta-controller nudge factor={:.3} anchor {} -> {}",
+                factor, old, new,
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // State-machine drive
     // -----------------------------------------------------------------
@@ -732,10 +829,14 @@ impl ClusterCoordinator {
             TimingMsgWire::Exiting { rank: _ } => {
                 self.active_count = self.active_count.saturating_sub(1);
             }
-            TimingMsgWire::LrUpdate { rank: _, lr: _ } => {
-                // Meta-controller wiring is deferred to 1d.3+; for now
-                // just drop the message. Acknowledging it costs a match
-                // arm; ignoring is intentional.
+            TimingMsgWire::LrUpdate { rank, lr } => {
+                let rank = rank as usize;
+                if rank < self.last_lr_per_rank.len() {
+                    self.last_lr_per_rank[rank] = Some(lr);
+                }
+                // The meta-controller is consulted on every averaging
+                // cycle via `observe_meta`; per-message work is just
+                // recording the latest LR.
             }
         }
     }
@@ -917,6 +1018,13 @@ impl ClusterCoordinator {
         let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
         let action = self.convergence_guard.report(&report, cycle_batches, k_max);
 
+        // LR-aware meta-controller (OLD `observe_meta` parity): consult
+        // the meta after the guard verdict; a `NudgeDown` MetaAction
+        // dispatches to `el_che.nudge_anchor_down` and composes
+        // multiplicatively with the guard's own anchor adjustment
+        // below.
+        self.observe_meta(action);
+
         self.version += 1;
         self.avg_count += 1;
 
@@ -1011,6 +1119,10 @@ impl ClusterCoordinator {
         let cycle_batches: usize = self.steps_since_avg.iter().sum();
         let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
         let action = self.convergence_guard.report(&report, cycle_batches, k_max);
+
+        // LR-aware meta-controller (OLD `observe_meta` parity); see
+        // [`Self::finish_averaging_nccl`] for the rationale.
+        self.observe_meta(action);
 
         self.version += 1;
         self.avg_count += 1;
@@ -2029,5 +2141,196 @@ mod tests {
         let _ = r0.join();
         let _ = r1.join();
         coord_thread.join().unwrap().expect("coord error path");
+    }
+
+    // -----------------------------------------------------------------
+    // LR-aware meta-controller (1d.5a)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn meta_controller_default_is_off() {
+        // Opt-in semantics: a config built without `.meta_controller(true)`
+        // must produce a coordinator with the meta DISABLED. Mirrors OLD
+        // `CoordinatorBuilder` parity (default `meta_controller = false`).
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl(world_size),
+            |coord| {
+                assert!(
+                    !coord.meta_controller_enabled_for_test(),
+                    "meta_controller must default to OFF"
+                );
+                let lrs = coord.last_lr_per_rank_for_test();
+                assert_eq!(lrs.len(), 2);
+                assert!(lrs.iter().all(|x| x.is_none()), "cold-start LRs = None");
+                Ok(())
+            },
+        );
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        r0.join().unwrap().expect("rank 0 handshake");
+        r1.join().unwrap().expect("rank 1 handshake");
+        coord_handle.join().unwrap().expect("coord drives clean");
+    }
+
+    #[test]
+    fn meta_controller_builder_enables_meta() {
+        // `.meta_controller(true)` on the config must produce a
+        // coordinator with `lr_event_meta = Some(_)`.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl(world_size).meta_controller(true),
+            |coord| {
+                assert!(
+                    coord.meta_controller_enabled_for_test(),
+                    "meta_controller(true) must produce an active meta"
+                );
+                Ok(())
+            },
+        );
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |_, _| Ok(()));
+        r0.join().unwrap().expect("rank 0 handshake");
+        r1.join().unwrap().expect("rank 1 handshake");
+        coord_handle.join().unwrap().expect("coord drives clean");
+    }
+
+    #[test]
+    fn lr_update_frame_populates_last_lr_per_rank() {
+        // Worker-side `TimingMsg::LrUpdate` is forwarded as
+        // `TimingMsgWire::LrUpdate` over the control channel. The coord
+        // captures the most-recent LR per rank in `last_lr_per_rank`,
+        // which is what `observe_meta` reads each averaging cycle.
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl(world_size).meta_controller(true),
+            |coord| {
+                // Drain reader threads until both LRs have arrived.
+                let start = Instant::now();
+                while coord
+                    .last_lr_per_rank_for_test()
+                    .iter()
+                    .any(|lr| lr.is_none())
+                {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "lr_update_frame_populates_last_lr_per_rank: \
+                             LRs never arrived from fake ranks within 5s",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let lrs = coord.last_lr_per_rank_for_test();
+                assert_eq!(lrs[0], Some(0.01));
+                assert_eq!(lrs[1], Some(0.02));
+                Ok(())
+            },
+        );
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::LrUpdate { rank: 0, lr: 0.01 },
+            )?;
+            // Stay alive long enough for the coord to drain the frame.
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        });
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::LrUpdate { rank: 1, lr: 0.02 },
+            )?;
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 sends LrUpdate");
+        r1.join().unwrap().expect("rank 1 sends LrUpdate");
+        coord_handle.join().unwrap().expect("coord captures both LRs");
+    }
+
+    #[test]
+    fn observe_meta_runs_during_averaging_cycle_no_anchor_change_in_probe() {
+        // Drive one averaging cycle on Sync+NCCL with meta enabled.
+        // Each rank reports its LR + one Batch; coord triggers cycle 1.
+        // observe_meta runs inside finish_averaging_nccl but the meta
+        // is in Probe phase on the first cycle (no calibration), so
+        // it returns Noop and the ElChe anchor stays at 1.
+        // This guards the wire integrity: enabling the meta must not
+        // crash or spuriously nudge the anchor at startup.
+        let world_size = 2;
+        let initial_anchor = 1usize;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_nccl(world_size).meta_controller(true),
+            move |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "observe_meta_runs: avg_count never advanced",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    coord.el_che().anchor(),
+                    initial_anchor,
+                    "Probe-phase meta must NOT nudge the anchor on first cycle"
+                );
+                // LR was observed even though no MetaAction fired.
+                let lrs = coord.last_lr_per_rank_for_test();
+                assert!(lrs.iter().all(|lr| lr.is_some()), "LRs captured");
+                Ok(())
+            },
+        );
+        let body = |rank: u32| {
+            let rank = rank as u64;
+            move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::LrUpdate { rank, lr: 0.01 },
+                )?;
+                send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::Batch {
+                        rank,
+                        batch_ms: 10.0,
+                        step_count: 1,
+                        param_norm: None,
+                        batch_loss: 1.0,
+                        sync_divergence: None,
+                    },
+                )?;
+                // Wait for SyncNow + SetGlobalStep then ack with SyncAck.
+                let _ = recv_control(s, salt)?;
+                send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::SyncAck {
+                        rank,
+                        step_count: 2,
+                        divergence: Some(0.05),
+                        post_norm: Some(1.0),
+                        pre_norm: Some(1.05),
+                    },
+                )?;
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+                Ok(())
+            }
+        };
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        coord_handle.join().unwrap().expect("coord cycle 1 with meta on");
     }
 }
