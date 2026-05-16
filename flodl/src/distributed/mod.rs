@@ -24,9 +24,10 @@ pub mod ddp_run;
 pub mod el_che;
 pub mod lr_event_meta;
 pub mod rendezvous;
+pub mod wire;
 
 pub use cluster::{HostBlock, LocalCluster};
-pub use controller::{CpuAverager, RoundFrame, TensorPayload, DTYPE_F32};
+pub use controller::{ClusterController, RoundFrame, TensorPayload, DTYPE_F32};
 pub use cpu_reduce::{
     AsyncCpuReduceClient, CpuReduceClient, round_frame_to_tensors, tensors_to_round_frame,
 };

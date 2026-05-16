@@ -7,7 +7,7 @@
 //! invoke the user binary. The user binary's
 //! [`flodl::distributed::launcher::dispatch`] reads the env, detects
 //! launcher role, and fans out (ssh for remote hosts, fork+exec for local
-//! hosts). All log fan-in + CpuAverager + exit-code propagation happen on
+//! hosts). All log fan-in + ClusterController + exit-code propagation happen on
 //! the flodl side.
 //!
 //! ```text

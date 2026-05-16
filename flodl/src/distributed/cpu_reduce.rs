@@ -1,8 +1,8 @@
 //! Rank-side TCP client for the CPU-averaging star topology.
 //!
-//! Pairs with [`controller::CpuAverager`]. Each rank running with
+//! Pairs with [`controller::ClusterController`]. Each rank running with
 //! [`AverageBackend::Cpu`] opens one TCP connection to the launcher's
-//! `CpuAverager`, does the handshake, then drives one `all_reduce` call
+//! `ClusterController`, does the handshake, then drives one `all_reduce` call
 //! per averaging round.
 //!
 //! Protocol mirror of [`controller`]:
@@ -20,7 +20,7 @@
 //! converting between `Tensor` and `RoundFrame` — keeps this transport
 //! file focused on TCP + protocol.
 //!
-//! [`controller::CpuAverager`]: crate::distributed::controller::CpuAverager
+//! [`controller::ClusterController`]: crate::distributed::controller::ClusterController
 //! [`AverageBackend::Cpu`]: crate::distributed::AverageBackend::Cpu
 //! [`controller`]: crate::distributed::controller
 //! [`RoundFrame`]: crate::distributed::controller::RoundFrame
@@ -35,6 +35,7 @@ use crate::distributed::controller::{
     self, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION,
     RoundFrame, TensorPayload,
 };
+use crate::distributed::wire::SessionSalt;
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 
 /// Rank-side client for the CPU-averaging controller.
@@ -48,6 +49,10 @@ pub struct CpuReduceClient {
     stream: TcpStream,
     rank_id: u32,
     world_size: u32,
+    /// Session salt used as the HMAC key on every [`RoundFrame`] body.
+    /// Mismatched salts surface as "HMAC verification failed" on the
+    /// first round-trip.
+    salt: SessionSalt,
 }
 
 impl CpuReduceClient {
@@ -57,14 +62,22 @@ impl CpuReduceClient {
     /// CPU-averaging port reserved alongside `master_port + 1` for the
     /// future log side-channel). `rank_id` must be in `0..world_size`.
     ///
+    /// `salt` is the 128-bit session salt the launcher generated and
+    /// shipped via [`LocalCluster::salt`]; the controller side must use
+    /// the same value, otherwise the first [`RoundFrame`] HMAC check
+    /// fails loudly.
+    ///
     /// Loud error on connect failure, handshake mismatch, or version
     /// disagreement. Connect retries are intentionally not built in;
     /// rendezvous-level retry policy belongs upstream (the launcher
     /// ensures the controller is bound before spawning rank children).
+    ///
+    /// [`LocalCluster::salt`]: crate::distributed::cluster::LocalCluster::salt
     pub fn connect(
         controller_addr: SocketAddr,
         rank_id: u32,
         world_size: u32,
+        salt: SessionSalt,
     ) -> Result<Self> {
         if world_size == 0 {
             return Err(TensorError::new(
@@ -92,6 +105,7 @@ impl CpuReduceClient {
             stream,
             rank_id,
             world_size,
+            salt,
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -163,8 +177,8 @@ impl CpuReduceClient {
     /// The returned frame has the same tensor count, dtypes, and shapes
     /// as the input frame; only the tensor bytes change.
     pub fn all_reduce(&mut self, frame: &RoundFrame) -> Result<RoundFrame> {
-        controller::write_round_frame(&mut self.stream, frame)?;
-        match controller::read_round_frame(&mut self.stream)? {
+        controller::write_round_frame(&mut self.stream, frame, &self.salt)?;
+        match controller::read_round_frame(&mut self.stream, &self.salt)? {
             Some(f) => Ok(f),
             None => Err(TensorError::new(
                 "cpu_reduce: controller closed connection before sending averaged \
@@ -385,7 +399,7 @@ impl CpuReduceClient {
     ///
     /// Loud error if [`TcpStream::try_clone`] fails.
     pub fn into_async(self) -> Result<AsyncCpuReduceClient> {
-        let CpuReduceClient { stream, rank_id, world_size } = self;
+        let CpuReduceClient { stream, rank_id, world_size, salt } = self;
 
         // Clone the stream so the background reader and the main-thread
         // writer have independent handles. TCP reads and writes can
@@ -399,6 +413,7 @@ impl CpuReduceClient {
 
         let (tx, rx) = mpsc::channel::<Result<RoundFrame>>();
 
+        let reader_salt = salt;
         let reader_handle = thread::Builder::new()
             .name(format!("cpu-async-reader-r{rank_id}"))
             .spawn(move || {
@@ -406,7 +421,7 @@ impl CpuReduceClient {
                 // to the main thread (which surfaces them on
                 // poll_round); EOF is a clean shutdown signal.
                 loop {
-                    match controller::read_round_frame(&mut reader_stream) {
+                    match controller::read_round_frame(&mut reader_stream, &reader_salt) {
                         Ok(Some(frame)) => {
                             if tx.send(Ok(frame)).is_err() {
                                 // Main side dropped the receiver.
@@ -431,6 +446,7 @@ impl CpuReduceClient {
             reader_handle: Some(reader_handle),
             rank_id,
             world_size,
+            salt,
         })
     }
 }
@@ -445,7 +461,7 @@ impl CpuReduceClient {
 ///
 /// **Lifetime**: holds a join handle for the reader thread; on drop,
 /// the reader exits when the receiver side closes (EOF on the TCP
-/// stream, which the launcher's CpuAverager closes when shutdown
+/// stream, which the launcher's ClusterController closes when shutdown
 /// signals).
 #[derive(Debug)]
 pub struct AsyncCpuReduceClient {
@@ -454,6 +470,9 @@ pub struct AsyncCpuReduceClient {
     reader_handle: Option<JoinHandle<()>>,
     rank_id: u32,
     world_size: u32,
+    /// Same session salt the originating [`CpuReduceClient`] used; the
+    /// reader thread and the writer (main) thread each hold a copy.
+    salt: SessionSalt,
 }
 
 impl AsyncCpuReduceClient {
@@ -475,7 +494,7 @@ impl AsyncCpuReduceClient {
     /// Write is blocking (TCP send buffer typically accepts a round
     /// without back-pressure). Loud error on wire-level write failure.
     pub fn submit_round(&mut self, frame: &RoundFrame) -> Result<()> {
-        controller::write_round_frame(&mut self.writer, frame)
+        controller::write_round_frame(&mut self.writer, frame, &self.salt)
     }
 
     /// Try to receive the next averaged round from the background
@@ -626,11 +645,19 @@ pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
 mod tests {
     use super::*;
     use crate::distributed::controller::{
-        CpuAverager, DTYPE_F32, RoundFrame, TensorPayload,
+        ClusterController, DTYPE_F32, RoundFrame, TensorPayload,
     };
     use std::net::Ipv4Addr;
     use std::sync::mpsc;
     use std::thread;
+
+    /// Deterministic non-zero test salt; matches the controller-side
+    /// constant in `controller::tests` so the two test modules could
+    /// theoretically interop (they don't today, but they may in 1d.1+).
+    const TEST_SALT: SessionSalt = [
+        0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+        0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    ];
 
     fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len() * 4);
@@ -664,9 +691,10 @@ mod tests {
     /// crate's `CpuReduceClient`; verify the average comes back to each.
     #[test]
     fn two_rank_client_average() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -675,13 +703,13 @@ mod tests {
         let (tx0, rx0) = mpsc::channel();
         let (tx1, rx1) = mpsc::channel();
         let t0 = thread::spawn(move || {
-            let mut c = CpuReduceClient::connect(addr, 0, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
             let avg_frame = c.all_reduce(&frame_with(&[2.0, 4.0, 6.0])).unwrap();
             tx0.send(avg_frame).unwrap();
             drop(c);
         });
         let t1 = thread::spawn(move || {
-            let mut c = CpuReduceClient::connect(addr, 1, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
             let avg_frame = c.all_reduce(&frame_with(&[4.0, 8.0, 12.0])).unwrap();
             tx1.send(avg_frame).unwrap();
             drop(c);
@@ -702,23 +730,24 @@ mod tests {
     /// back. Exercises the persistent-connection path.
     #[test]
     fn client_multi_round_persistence() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
 
         let t0 = thread::spawn(move || -> Vec<RoundFrame> {
-            let mut c = CpuReduceClient::connect(addr, 0, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
             let r1 = c.all_reduce(&frame_with(&[1.0])).unwrap();
             let r2 = c.all_reduce(&frame_with(&[5.0])).unwrap();
             let r3 = c.all_reduce(&frame_with(&[9.0])).unwrap();
             vec![r1, r2, r3]
         });
         let t1 = thread::spawn(move || -> Vec<RoundFrame> {
-            let mut c = CpuReduceClient::connect(addr, 1, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
             let r1 = c.all_reduce(&frame_with(&[3.0])).unwrap();
             let r2 = c.all_reduce(&frame_with(&[7.0])).unwrap();
             let r3 = c.all_reduce(&frame_with(&[11.0])).unwrap();
@@ -744,16 +773,17 @@ mod tests {
     /// then fails).
     #[test]
     fn rejects_world_size_disagreement() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
 
         // Rank claims world_size = 3 but controller is configured for 2.
-        let err = CpuReduceClient::connect(addr, 0, 3).unwrap_err();
+        let err = CpuReduceClient::connect(addr, 0, 3, TEST_SALT).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("ack") || msg.contains("handshake") || msg.contains("read"),
@@ -770,6 +800,7 @@ mod tests {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345),
             5,
             3,
+            TEST_SALT,
         )
         .unwrap_err();
         assert!(
@@ -784,6 +815,7 @@ mod tests {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345),
             0,
             0,
+            TEST_SALT,
         )
         .unwrap_err();
         assert!(err.to_string().contains("world_size"), "got: {err}");
@@ -837,13 +869,14 @@ mod tests {
         );
     }
 
-    /// End-to-end: two ranks ship Tensor lists through CpuAverager;
+    /// End-to-end: two ranks ship Tensor lists through ClusterController;
     /// receive averaged Tensor lists back.
     #[test]
     fn two_rank_tensor_average() {
-        let avg = crate::distributed::controller::CpuAverager::start(
+        let avg = crate::distributed::controller::ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -852,14 +885,14 @@ mod tests {
         let (tx0, rx0) = mpsc::channel();
         let (tx1, rx1) = mpsc::channel();
         let t0 = thread::spawn(move || {
-            let mut c = CpuReduceClient::connect(addr, 0, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
             let t = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], Device::CPU).unwrap();
             let out = c.all_reduce_tensors(&[&t]).unwrap();
             tx0.send(out).unwrap();
             drop(c);
         });
         let t1 = thread::spawn(move || {
-            let mut c = CpuReduceClient::connect(addr, 1, 2).unwrap();
+            let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
             let t = Tensor::from_f32(&[4.0, 8.0, 12.0], &[3], Device::CPU).unwrap();
             let out = c.all_reduce_tensors(&[&t]).unwrap();
             tx1.send(out).unwrap();
@@ -885,6 +918,7 @@ mod tests {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1),
             0,
             1,
+            TEST_SALT,
         )
         .unwrap_err();
         let msg = err.to_string();

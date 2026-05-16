@@ -185,7 +185,11 @@ fn on_off(b: bool) -> &'static str {
 /// flips fdl-cli to spawn a single launcher child instead, at which point
 /// this function gets exercised end-to-end.
 fn run_launcher() -> Result<()> {
-    let full = FullCluster::from_env()?;
+    // Fresh 128-bit session salt per launcher invocation. Becomes the
+    // HMAC key for every cross-process control + data frame; shipped
+    // to ranks via their slim envelope.
+    let salt = crate::distributed::wire::generate_session_salt();
+    let full = FullCluster::from_env()?.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
     // Controller participation is implicit-by-presence in cluster.hosts.
@@ -199,12 +203,12 @@ fn run_launcher() -> Result<()> {
         );
     }
 
-    // Start the CpuAverager TCP server on master_port + 2 so any rank
+    // Start the ClusterController TCP server on master_port + 2 so any rank
     // using AverageBackend::Cpu can connect. Bound to 0.0.0.0 so remote
     // ranks reach it; local ranks use the same address via loopback.
     //
     // Always started, even on NCCL-only clusters: the accept loop polls
-    // a shutdown flag every 20ms, so an unused CpuAverager exits cleanly
+    // a shutdown flag every 20ms, so an unused ClusterController exits cleanly
     // when launcher signals shutdown after children finish. Cost is one
     // idle thread + one bound port.
     let cpu_avg_port = full.master_port.saturating_add(2);
@@ -212,17 +216,18 @@ fn run_launcher() -> Result<()> {
         .parse()
         .map_err(|e| {
             TensorError::new(&format!(
-                "cluster launcher: invalid CpuAverager bind addr 0.0.0.0:{cpu_avg_port}: {e}"
+                "cluster launcher: invalid ClusterController bind addr 0.0.0.0:{cpu_avg_port}: {e}"
             ))
         })?;
-    let cpu_averager = crate::distributed::controller::CpuAverager::start(
+    let cpu_averager = crate::distributed::controller::ClusterController::start(
         cpu_avg_addr,
         full.world_size(),
+        full.salt,
     )?;
     // Bound port stays the configured value (no kernel auto-assign here);
     // log it once for diagnostics.
     eprintln!(
-        "cluster launcher: CpuAverager bound on {} (world_size={})",
+        "cluster launcher: ClusterController bound on {} (world_size={})",
         cpu_averager.port(),
         full.world_size()
     );
@@ -340,12 +345,12 @@ fn run_launcher() -> Result<()> {
             }
         }
     }
-    // All children exited; signal CpuAverager shutdown and join.
+    // All children exited; signal ClusterController shutdown and join.
     if let Err(e) = cpu_averager.shutdown() {
-        // Don't mask a child-failure error with a CpuAverager shutdown
+        // Don't mask a child-failure error with a ClusterController shutdown
         // error; log + continue. The child failure is the load-bearing
         // diagnostic.
-        eprintln!("cluster launcher: CpuAverager shutdown failed: {e}");
+        eprintln!("cluster launcher: ClusterController shutdown failed: {e}");
     }
 
     if let Some(err) = any_failure {
@@ -493,6 +498,10 @@ fn build_slim_envelope_for(full: &FullCluster, host: &FullHost) -> serde_json::V
     envelope.insert("world_size".into(), Value::from(full.world_size()));
     envelope.insert("num_hosts".into(), Value::from(full.hosts.len()));
     envelope.insert("host".into(), Value::Object(host_obj));
+    envelope.insert(
+        "salt".into(),
+        Value::String(crate::distributed::wire::salt_to_hex(&full.salt)),
+    );
     Value::Object(envelope)
 }
 
@@ -538,6 +547,21 @@ pub struct FullCluster {
     pub master_addr: String,
     pub master_port: u16,
     pub hosts: Vec<FullHost>,
+    /// 128-bit session salt the launcher generates fresh per training
+    /// session and propagates to every rank's slim envelope. Used as the
+    /// HMAC key for the cross-process control + data channels. All
+    /// zeros until [`FullCluster::with_session_salt`] (or
+    /// [`run_launcher`]) populates it.
+    pub salt: crate::distributed::wire::SessionSalt,
+}
+
+impl FullCluster {
+    /// Replace the session salt and return self for chaining. Called
+    /// by [`run_launcher`] once it has generated a fresh salt.
+    pub fn with_session_salt(mut self, salt: crate::distributed::wire::SessionSalt) -> Self {
+        self.salt = salt;
+        self
+    }
 }
 
 /// One host's entry in the full topology, launcher-side.
@@ -646,6 +670,10 @@ impl FullCluster {
             master_addr,
             master_port,
             hosts,
+            // ENV_FULL_CLUSTER_JSON is the config snapshot fdl-cli ships;
+            // the session salt is generated freshly by `run_launcher` per
+            // training session (override via [`Self::with_session_salt`]).
+            salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
         })
     }
 
@@ -1047,5 +1075,31 @@ mod tests {
         assert_eq!(parsed.host.name, "master-host");
         assert_eq!(parsed.host.ranks, vec![0]);
         assert_eq!(parsed.host.local_devices, vec![0]);
+        // FullCluster::from_value defaults salt to zeros; the envelope
+        // carries that, and the rank-side parser reads it back.
+        assert_eq!(parsed.salt, [0u8; crate::distributed::wire::SESSION_SALT_BYTES]);
+    }
+
+    #[test]
+    fn slim_envelope_propagates_session_salt() {
+        // The launcher generates a fresh salt and stamps it onto
+        // FullCluster; every slim envelope it builds must carry that
+        // salt unchanged through to the rank-side LocalCluster.
+        let mut full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let salt: crate::distributed::wire::SessionSalt = [
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04,
+            0xfe, 0xed, 0xfa, 0xce, 0x05, 0x06, 0x07, 0x08,
+        ];
+        full = full.with_session_salt(salt);
+        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let env = build_slim_envelope_for(&full, master);
+        // Salt field must be present as a 32-char lowercase hex string.
+        let hex = env
+            .get("salt")
+            .and_then(|v| v.as_str())
+            .expect("envelope.salt is a string");
+        assert_eq!(hex.len(), 32);
+        let parsed = crate::distributed::cluster::LocalCluster::from_value(&env).unwrap();
+        assert_eq!(parsed.salt, salt);
     }
 }

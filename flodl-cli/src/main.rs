@@ -1394,7 +1394,7 @@ fn dispatch_config(
         // (spawned by the normal dispatch below) detects launcher role
         // and fans out via flodl::distributed::launcher. Fall through —
         // no early return. The launcher in the spawned subprocess owns
-        // fan-out, log fan-in, CpuAverager, exit propagation.
+        // fan-out, log fan-in, ClusterController, exit propagation.
         if let Err(e) = cluster::prepare_cluster_env(&cluster, env, cmd) {
             cli_error!("{e}");
             return ExitCode::FAILURE;

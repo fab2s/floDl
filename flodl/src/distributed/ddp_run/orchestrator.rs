@@ -1110,7 +1110,7 @@ impl DdpHandle {
     /// N-thread coordinator. The reduce primitive switches from NCCL
     /// collective to TCP round-trip via [`CpuReduceClient`]:
     ///
-    /// - Connect to the launcher's [`CpuAverager`] at
+    /// - Connect to the launcher's [`ClusterController`] at
     ///   `master_addr:master_port + 2` (convention set in
     ///   [`crate::distributed::launcher`]).
     /// - Broadcast initial params from rank 0 via the avg-trick (see
@@ -1130,7 +1130,7 @@ impl DdpHandle {
     /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
     /// [`CpuReduceClient::broadcast_from_root`]:
     ///     crate::distributed::CpuReduceClient::broadcast_from_root
-    /// [`CpuAverager`]: crate::distributed::CpuAverager
+    /// [`ClusterController`]: crate::distributed::ClusterController
     /// [`GpuWorker::run_self_driven_sync_cpu`]:
     ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_sync_cpu
     #[allow(clippy::too_many_arguments)]
@@ -1172,6 +1172,7 @@ impl DdpHandle {
             .map_err(|e| crate::tensor::TensorError::new(&format!(
                 "ddp: parse controller addr '{controller_addr_str}': {e}"
             )))?;
+        let session_salt = cluster.salt;
 
         let training_meta = Some(serde_json::json!({
             "mode": "cluster-rank Sync+Cpu",
@@ -1188,7 +1189,7 @@ impl DdpHandle {
         let max_grad_norm = config.max_grad_norm;
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Connect to the CpuAverager and complete the handshake. The
+            // Connect to the ClusterController and complete the handshake. The
             // launcher binds before spawning rank children, so the
             // controller is up by the time we get here. Connect failure
             // is a loud error per CpuReduceClient::connect.
@@ -1196,6 +1197,7 @@ impl DdpHandle {
                 controller_addr,
                 global_rank as u32,
                 world_size as u32,
+                session_salt,
             )?;
 
             // Build the local model; extract initial params for the
@@ -1313,7 +1315,7 @@ impl DdpHandle {
     /// primitives switch from NCCL to TCP via [`CpuReduceClient`]:
     ///
     /// - Connect to `master_addr:master_port + 2` (launcher's
-    ///   [`CpuAverager`]).
+    ///   [`ClusterController`]).
     /// - Broadcast initial params from rank 0 via
     ///   [`CpuReduceClient::broadcast_from_root`] (load-bearing for K>>1
     ///   cadence: divergent factory output would produce garbage
@@ -1335,7 +1337,7 @@ impl DdpHandle {
     /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
     /// [`CpuReduceClient::broadcast_from_root`]:
     ///     crate::distributed::CpuReduceClient::broadcast_from_root
-    /// [`CpuAverager`]: crate::distributed::CpuAverager
+    /// [`ClusterController`]: crate::distributed::ClusterController
     /// [`GpuWorker::run_self_driven_cadence_cpu`]:
     ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_cadence_cpu
     #[allow(clippy::too_many_arguments)]
@@ -1402,12 +1404,14 @@ impl DdpHandle {
         let max_grad_norm = config.max_grad_norm;
         let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
         let no_divergence_guard = config.no_divergence_guard;
+        let session_salt = cluster.salt;
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
             let mut cpu_client = CpuReduceClient::connect(
                 controller_addr,
                 global_rank as u32,
                 world_size as u32,
+                session_salt,
             )?;
 
             // Build tmp model + broadcast initial params from rank 0.
@@ -2010,6 +2014,7 @@ impl DdpHandle {
         let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
         let no_divergence_guard = config.no_divergence_guard;
         let easgd_alpha = config.easgd_alpha;
+        let session_salt = cluster.salt;
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
             // Blocking connect + handshake.
@@ -2017,6 +2022,7 @@ impl DdpHandle {
                 controller_addr,
                 global_rank as u32,
                 world_size as u32,
+                session_salt,
             )?;
 
             // Build tmp model, broadcast initial params from rank 0 via

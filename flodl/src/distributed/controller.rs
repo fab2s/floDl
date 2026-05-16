@@ -1,5 +1,11 @@
-//! CPU-averaging controller: TCP byte router for the star-topology
+//! Cluster controller: TCP byte router for the star-topology
 //! cross-process gradient sum that powers [`AverageBackend::Cpu`].
+//!
+//! Slice 4b.D.1d.0 renamed the underlying type from `CpuAverager` to
+//! [`ClusterController`] to reflect its broader role under the
+//! process-model port -- it carries the data channel today and will
+//! own ElChe scheduling + worker control in the following slices. The
+//! data path stays the same star-topology byte router.
 //!
 //! Architecture (star, not collective): every rank ships a `RoundFrame`
 //! containing this round's tensors to a single TCP listener on the
@@ -41,6 +47,9 @@
 //!   u32 dim_0, dim_1, ..., dim_{ndim-1}
 //!   u64 nbytes
 //!   <nbytes> raw bytes (native byte order)
+//! u64 auth_tag    = first 8 bytes of HMAC-SHA256(session_salt, frame_body)
+//!                   (mismatched salts surface as a loud HMAC verification
+//!                   error on the first round-trip)
 //! ```
 //!
 //! Tensor data is native byte order. Cross-arch clusters (x86 + ARM)
@@ -64,30 +73,40 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use hmac_sha256::HMAC;
+
+use crate::distributed::wire::SessionSalt;
 use crate::tensor::{Result, TensorError};
 
 pub(crate) const HANDSHAKE_MAGIC_RANK: u32 = 0xF10D_17C0;
 pub(crate) const HANDSHAKE_MAGIC_CONTROLLER_ACK: u32 = 0xF10D_17C1;
 pub(crate) const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
+
+/// Wire-protocol version for the CPU-averaging data channel.
+///
+/// Every [`RoundFrame`] body is followed by an 8-byte HMAC-SHA256
+/// footer keyed by the session salt; a session-salt disagreement
+/// surfaces as an `HMAC verification failed` error on the first
+/// round-trip.
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
-/// dtype tag for f32 in the wire protocol. Only dtype supported in v1.
+/// dtype tag for f32 in the wire protocol. Only dtype supported.
 pub const DTYPE_F32: u8 = 0;
 
 /// Background CPU-averager. Owns a [`TcpListener`] bound to the
 /// controller's address and a worker thread that runs the accept +
 /// reduce loop.
 ///
-/// Constructed via [`CpuAverager::start`]; clean shutdown via
-/// [`CpuAverager::shutdown`] (signals the worker, then joins).
+/// Constructed via [`ClusterController::start`]; clean shutdown via
+/// [`ClusterController::shutdown`] (signals the worker, then joins).
 #[derive(Debug)]
-pub struct CpuAverager {
+pub struct ClusterController {
     bound_port: u16,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<()>>>,
 }
 
-impl CpuAverager {
+impl ClusterController {
     /// Bind a TCP listener at `bind_addr` and spawn the reduce thread.
     ///
     /// The thread blocks waiting for exactly `world_size` rank
@@ -95,25 +114,36 @@ impl CpuAverager {
     /// reduce loop until ranks disconnect or [`Self::shutdown`] is
     /// called.
     ///
+    /// `salt` is the 128-bit session salt shipped via the cluster
+    /// envelope. Every [`RoundFrame`] body is authenticated with an
+    /// HMAC-SHA256 footer keyed by this value; a rank-side mismatch
+    /// surfaces loudly on the first round-trip. Use
+    /// `[0u8; SESSION_SALT_BYTES]` for in-process tests that pair this
+    /// directly with a matching [`CpuReduceClient`].
+    ///
     /// Use `127.0.0.1:0` for tests (kernel-assigned port; read back via
     /// [`Self::port`]). Use the cluster's `master_addr:master_port+2`
     /// in production.
-    pub fn start(bind_addr: SocketAddr, world_size: usize) -> Result<Self> {
+    pub fn start(
+        bind_addr: SocketAddr,
+        world_size: usize,
+        salt: SessionSalt,
+    ) -> Result<Self> {
         if world_size == 0 {
             return Err(TensorError::new(
-                "cpu_averager: world_size must be > 0",
+                "cluster_controller: world_size must be > 0",
             ));
         }
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: bind {bind_addr} failed: {e}"
+                "cluster_controller: bind {bind_addr} failed: {e}"
             ))
         })?;
         let bound_port = listener
             .local_addr()
             .map_err(|e| {
                 TensorError::new(&format!(
-                    "cpu_averager: local_addr() failed: {e}"
+                    "cluster_controller: local_addr() failed: {e}"
                 ))
             })?
             .port();
@@ -121,18 +151,18 @@ impl CpuAverager {
         // shutdown flag between connections without blocking forever.
         listener
             .set_nonblocking(false)
-            .map_err(|e| TensorError::new(&format!("cpu_averager: set_nonblocking: {e}")))?;
+            .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_cloned = Arc::clone(&shutdown);
         let handle = thread::Builder::new()
-            .name(format!("flodl-cpu-averager:{bound_port}"))
-            .spawn(move || run_reduce_thread(listener, world_size, shutdown_cloned))
+            .name(format!("flodl-cluster-controller:{bound_port}"))
+            .spawn(move || run_reduce_thread(listener, world_size, salt, shutdown_cloned))
             .map_err(|e| {
-                TensorError::new(&format!("cpu_averager: spawn worker failed: {e}"))
+                TensorError::new(&format!("cluster_controller: spawn worker failed: {e}"))
             })?;
 
-        Ok(CpuAverager {
+        Ok(ClusterController {
             bound_port,
             shutdown,
             handle: Some(handle),
@@ -152,13 +182,13 @@ impl CpuAverager {
         if let Some(h) = self.handle.take() {
             return h
                 .join()
-                .map_err(|_| TensorError::new("cpu_averager: worker panicked"))?;
+                .map_err(|_| TensorError::new("cluster_controller: worker panicked"))?;
         }
         Ok(())
     }
 }
 
-impl Drop for CpuAverager {
+impl Drop for ClusterController {
     fn drop(&mut self) {
         // Best-effort shutdown if the caller didn't explicitly call
         // shutdown(). Joins are blocking, which is fine — Drop runs at
@@ -177,11 +207,12 @@ impl Drop for CpuAverager {
 fn run_reduce_thread(
     listener: TcpListener,
     world_size: usize,
+    salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     listener
         .set_nonblocking(true)
-        .map_err(|e| TensorError::new(&format!("cpu_averager: set_nonblocking: {e}")))?;
+        .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
     let mut streams: Vec<Option<TcpStream>> = (0..world_size).map(|_| None).collect();
     let mut connected = 0usize;
 
@@ -196,16 +227,16 @@ fn run_reduce_thread(
             Ok((mut stream, _peer)) => {
                 stream
                     .set_read_timeout(Some(Duration::from_millis(500)))
-                    .map_err(|e| TensorError::new(&format!("cpu_averager: set_read_timeout: {e}")))?;
+                    .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout: {e}")))?;
                 let rank_id = read_handshake(&mut stream, world_size)?;
                 if rank_id >= world_size {
                     return Err(TensorError::new(&format!(
-                        "cpu_averager: handshake rank_id {rank_id} >= world_size {world_size}"
+                        "cluster_controller: handshake rank_id {rank_id} >= world_size {world_size}"
                     )));
                 }
                 if streams[rank_id].is_some() {
                     return Err(TensorError::new(&format!(
-                        "cpu_averager: duplicate rank_id {rank_id} connected"
+                        "cluster_controller: duplicate rank_id {rank_id} connected"
                     )));
                 }
                 write_handshake_ack(&mut stream)?;
@@ -214,7 +245,7 @@ fn run_reduce_thread(
                 // legitimately slow rounds look like failures.
                 stream
                     .set_read_timeout(None)
-                    .map_err(|e| TensorError::new(&format!("cpu_averager: set_read_timeout(None): {e}")))?;
+                    .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout(None): {e}")))?;
                 streams[rank_id] = Some(stream);
                 connected += 1;
             }
@@ -223,7 +254,7 @@ fn run_reduce_thread(
             }
             Err(e) => {
                 return Err(TensorError::new(&format!(
-                    "cpu_averager: accept failed: {e}"
+                    "cluster_controller: accept failed: {e}"
                 )));
             }
         }
@@ -241,10 +272,10 @@ fn run_reduce_thread(
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match read_round_from_all(&mut streams)? {
+        match read_round_from_all(&mut streams, &salt)? {
             Some(frames) => {
                 let averaged = reduce_average(&frames)?;
-                write_round_to_all(&mut streams, &averaged)?;
+                write_round_to_all(&mut streams, &averaged, &salt)?;
             }
             None => return Ok(()), // any rank EOFed → clean shutdown
         }
@@ -258,25 +289,25 @@ fn run_reduce_thread(
 fn read_handshake(stream: &mut TcpStream, expected_world_size: usize) -> Result<usize> {
     let mut buf = [0u8; 16];
     stream.read_exact(&mut buf).map_err(|e| {
-        TensorError::new(&format!("cpu_averager: handshake read failed: {e}"))
+        TensorError::new(&format!("cluster_controller: handshake read failed: {e}"))
     })?;
     let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if magic != HANDSHAKE_MAGIC_RANK {
         return Err(TensorError::new(&format!(
-            "cpu_averager: handshake magic 0x{magic:08x} != 0x{HANDSHAKE_MAGIC_RANK:08x}"
+            "cluster_controller: handshake magic 0x{magic:08x} != 0x{HANDSHAKE_MAGIC_RANK:08x}"
         )));
     }
     let proto_ver = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     if proto_ver != PROTOCOL_VERSION {
         return Err(TensorError::new(&format!(
-            "cpu_averager: handshake protocol_version {proto_ver} != {PROTOCOL_VERSION}"
+            "cluster_controller: handshake protocol_version {proto_ver} != {PROTOCOL_VERSION}"
         )));
     }
     let rank_id = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
     let rank_world_size = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
     if rank_world_size != expected_world_size {
         return Err(TensorError::new(&format!(
-            "cpu_averager: handshake world_size {rank_world_size} != expected {expected_world_size}"
+            "cluster_controller: handshake world_size {rank_world_size} != expected {expected_world_size}"
         )));
     }
     Ok(rank_id)
@@ -287,7 +318,7 @@ fn write_handshake_ack(stream: &mut TcpStream) -> Result<()> {
     buf[0..4].copy_from_slice(&HANDSHAKE_MAGIC_CONTROLLER_ACK.to_le_bytes());
     buf[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("cpu_averager: handshake ack write failed: {e}"))
+        TensorError::new(&format!("cluster_controller: handshake ack write failed: {e}"))
     })?;
     Ok(())
 }
@@ -326,9 +357,19 @@ impl TensorPayload {
 /// Read a RoundFrame from a single rank's stream. Returns `Ok(None)` on
 /// clean EOF (rank closed its end normally — signals shutdown).
 ///
+/// Reads the existing v1 frame body byte-for-byte, then reads the 8-byte
+/// HMAC-SHA256 footer (`PROTOCOL_VERSION = 2`) and authenticates the
+/// body against `salt`. Mismatched salts surface here on the very first
+/// round-trip with a clear, loud error.
+///
 /// `pub(crate)` so the rank-side client in `cpu_reduce` can share the
 /// wire format without duplication.
-pub(crate) fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFrame>> {
+pub(crate) fn read_round_frame(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+) -> Result<Option<RoundFrame>> {
+    let mut mac = HMAC::new(salt.as_slice());
+
     let mut hdr = [0u8; 8];
     match stream.read_exact(&mut hdr) {
         Ok(()) => {}
@@ -337,14 +378,15 @@ pub(crate) fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFra
         }
         Err(e) => {
             return Err(TensorError::new(&format!(
-                "cpu_averager: frame header read failed: {e}"
+                "cluster_controller: frame header read failed: {e}"
             )));
         }
     }
+    mac.update(hdr);
     let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
     if magic != ROUND_FRAME_MAGIC {
         return Err(TensorError::new(&format!(
-            "cpu_averager: frame magic 0x{magic:08x} != 0x{ROUND_FRAME_MAGIC:08x}"
+            "cluster_controller: frame magic 0x{magic:08x} != 0x{ROUND_FRAME_MAGIC:08x}"
         )));
     }
     let num_tensors = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
@@ -354,9 +396,10 @@ pub(crate) fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFra
         let mut meta = [0u8; 2];
         stream.read_exact(&mut meta).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] meta read failed: {e}"
+                "cluster_controller: tensor[{ti}] meta read failed: {e}"
             ))
         })?;
+        mac.update(meta);
         let dtype = meta[0];
         let ndim = meta[1] as usize;
         let mut shape = Vec::with_capacity(ndim);
@@ -364,39 +407,66 @@ pub(crate) fn read_round_frame(stream: &mut TcpStream) -> Result<Option<RoundFra
             let mut d = [0u8; 4];
             stream.read_exact(&mut d).map_err(|e| {
                 TensorError::new(&format!(
-                    "cpu_averager: tensor[{ti}] shape read failed: {e}"
+                    "cluster_controller: tensor[{ti}] shape read failed: {e}"
                 ))
             })?;
+            mac.update(d);
             shape.push(u32::from_le_bytes(d));
         }
         let mut nb = [0u8; 8];
         stream.read_exact(&mut nb).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] nbytes read failed: {e}"
+                "cluster_controller: tensor[{ti}] nbytes read failed: {e}"
             ))
         })?;
+        mac.update(nb);
         let nbytes = u64::from_le_bytes(nb) as usize;
         let mut bytes = vec![0u8; nbytes];
         stream.read_exact(&mut bytes).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] data read failed: {e}"
+                "cluster_controller: tensor[{ti}] data read failed: {e}"
             ))
         })?;
+        mac.update(&bytes);
         tensors.push(TensorPayload {
             dtype,
             shape,
             bytes,
         });
     }
+
+    // HMAC-SHA256-64 footer: 8 bytes, little-endian, equal to the first
+    // 8 bytes of HMAC-SHA256(salt, body). Backwards-incompatible vs
+    // PROTOCOL_VERSION = 1 (which had no footer).
+    let mut footer = [0u8; 8];
+    stream.read_exact(&mut footer).map_err(|e| {
+        TensorError::new(&format!(
+            "cluster_controller: frame HMAC footer read failed: {e} \
+             (sender at PROTOCOL_VERSION < 2, or stream truncated mid-frame)"
+        ))
+    })?;
+    let received = u64::from_le_bytes(footer);
+    let computed_full: [u8; 32] = mac.finalize();
+    let computed = u64::from_le_bytes(computed_full[0..8].try_into().unwrap());
+    if computed != received {
+        return Err(TensorError::new(&format!(
+            "cluster_controller: RoundFrame HMAC verification failed (computed \
+             0x{computed:016x}, wire carried 0x{received:016x}); session salt \
+             disagreement, tampered frame, or payload corruption"
+        )));
+    }
     Ok(Some(RoundFrame { tensors }))
 }
 
 /// Read a frame from every rank. Returns `Ok(None)` if ANY rank EOFs
 /// (signals shutdown — propagates so the reduce loop exits cleanly).
-fn read_round_from_all(streams: &mut [TcpStream]) -> Result<Option<Vec<RoundFrame>>> {
+fn read_round_from_all(
+    streams: &mut [TcpStream],
+    salt: &SessionSalt,
+) -> Result<Option<Vec<RoundFrame>>> {
     let mut frames = Vec::with_capacity(streams.len());
     for (rank, s) in streams.iter_mut().enumerate() {
-        match read_round_frame(s)? {
+        match read_round_frame(s, salt)? {
             Some(f) => frames.push(f),
             None => {
                 // Rank EOF'd. Treat as clean shutdown signal.
@@ -408,50 +478,75 @@ fn read_round_from_all(streams: &mut [TcpStream]) -> Result<Option<Vec<RoundFram
     Ok(Some(frames))
 }
 
-/// Write a RoundFrame to a stream. `pub(crate)` companion to
+/// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
+/// footer keyed by `salt`. `pub(crate)` companion to
 /// [`read_round_frame`]; shared by the rank-side client.
-pub(crate) fn write_round_frame(stream: &mut TcpStream, frame: &RoundFrame) -> Result<()> {
+pub(crate) fn write_round_frame(
+    stream: &mut TcpStream,
+    frame: &RoundFrame,
+    salt: &SessionSalt,
+) -> Result<()> {
+    let mut mac = HMAC::new(salt.as_slice());
+
     let mut hdr = [0u8; 8];
     hdr[0..4].copy_from_slice(&ROUND_FRAME_MAGIC.to_le_bytes());
     hdr[4..8].copy_from_slice(&(frame.tensors.len() as u32).to_le_bytes());
     stream.write_all(&hdr).map_err(|e| {
-        TensorError::new(&format!("cpu_averager: frame header write failed: {e}"))
+        TensorError::new(&format!("cluster_controller: frame header write failed: {e}"))
     })?;
+    mac.update(hdr);
     for (ti, t) in frame.tensors.iter().enumerate() {
-        stream.write_all(&[t.dtype, t.shape.len() as u8]).map_err(|e| {
+        let meta = [t.dtype, t.shape.len() as u8];
+        stream.write_all(&meta).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] meta write failed: {e}"
+                "cluster_controller: tensor[{ti}] meta write failed: {e}"
             ))
         })?;
+        mac.update(meta);
         for d in &t.shape {
-            stream.write_all(&d.to_le_bytes()).map_err(|e| {
+            let d_bytes = d.to_le_bytes();
+            stream.write_all(&d_bytes).map_err(|e| {
                 TensorError::new(&format!(
-                    "cpu_averager: tensor[{ti}] shape write failed: {e}"
+                    "cluster_controller: tensor[{ti}] shape write failed: {e}"
                 ))
             })?;
+            mac.update(d_bytes);
         }
-        stream
-            .write_all(&(t.bytes.len() as u64).to_le_bytes())
-            .map_err(|e| {
-                TensorError::new(&format!(
-                    "cpu_averager: tensor[{ti}] nbytes write failed: {e}"
-                ))
-            })?;
+        let nb_bytes = (t.bytes.len() as u64).to_le_bytes();
+        stream.write_all(&nb_bytes).map_err(|e| {
+            TensorError::new(&format!(
+                "cluster_controller: tensor[{ti}] nbytes write failed: {e}"
+            ))
+        })?;
+        mac.update(nb_bytes);
         stream.write_all(&t.bytes).map_err(|e| {
             TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] data write failed: {e}"
+                "cluster_controller: tensor[{ti}] data write failed: {e}"
             ))
         })?;
+        mac.update(&t.bytes);
     }
+
+    // 8-byte HMAC-SHA256-64 footer, keyed by salt.
+    let computed_full: [u8; 32] = mac.finalize();
+    let mut footer = [0u8; 8];
+    footer.copy_from_slice(&computed_full[0..8]);
+    stream.write_all(&footer).map_err(|e| {
+        TensorError::new(&format!("cluster_controller: frame HMAC footer write failed: {e}"))
+    })?;
     stream
         .flush()
-        .map_err(|e| TensorError::new(&format!("cpu_averager: frame flush failed: {e}")))?;
+        .map_err(|e| TensorError::new(&format!("cluster_controller: frame flush failed: {e}")))?;
     Ok(())
 }
 
-fn write_round_to_all(streams: &mut [TcpStream], frame: &RoundFrame) -> Result<()> {
+fn write_round_to_all(
+    streams: &mut [TcpStream],
+    frame: &RoundFrame,
+    salt: &SessionSalt,
+) -> Result<()> {
     for s in streams.iter_mut() {
-        write_round_frame(s, frame)?;
+        write_round_frame(s, frame, salt)?;
     }
     Ok(())
 }
@@ -471,7 +566,7 @@ fn write_round_to_all(streams: &mut [TcpStream], frame: &RoundFrame) -> Result<(
 /// support, instead of silent garbage from byte-level summation).
 fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
     if frames.is_empty() {
-        return Err(TensorError::new("cpu_averager: reduce_average called with no frames"));
+        return Err(TensorError::new("cluster_controller: reduce_average called with no frames"));
     }
     let n = frames.len();
     let ref_frame = &frames[0];
@@ -479,7 +574,7 @@ fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
     for (i, f) in frames.iter().enumerate().skip(1) {
         if f.tensors.len() != ref_frame.tensors.len() {
             return Err(TensorError::new(&format!(
-                "cpu_averager: rank {i} sent {} tensors; rank 0 sent {}",
+                "cluster_controller: rank {i} sent {} tensors; rank 0 sent {}",
                 f.tensors.len(),
                 ref_frame.tensors.len()
             )));
@@ -487,19 +582,19 @@ fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
         for (ti, (a, b)) in ref_frame.tensors.iter().zip(f.tensors.iter()).enumerate() {
             if a.dtype != b.dtype {
                 return Err(TensorError::new(&format!(
-                    "cpu_averager: rank {i} tensor[{ti}] dtype {} != rank 0 dtype {}",
+                    "cluster_controller: rank {i} tensor[{ti}] dtype {} != rank 0 dtype {}",
                     b.dtype, a.dtype
                 )));
             }
             if a.shape != b.shape {
                 return Err(TensorError::new(&format!(
-                    "cpu_averager: rank {i} tensor[{ti}] shape {:?} != rank 0 shape {:?}",
+                    "cluster_controller: rank {i} tensor[{ti}] shape {:?} != rank 0 shape {:?}",
                     b.shape, a.shape
                 )));
             }
             if a.bytes.len() != b.bytes.len() {
                 return Err(TensorError::new(&format!(
-                    "cpu_averager: rank {i} tensor[{ti}] nbytes {} != rank 0 nbytes {}",
+                    "cluster_controller: rank {i} tensor[{ti}] nbytes {} != rank 0 nbytes {}",
                     b.bytes.len(),
                     a.bytes.len()
                 )));
@@ -513,7 +608,7 @@ fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
         let dtype = ref_frame.tensors[ti].dtype;
         if dtype != DTYPE_F32 {
             return Err(TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] dtype {dtype} not supported in v1 \
+                "cluster_controller: tensor[{ti}] dtype {dtype} not supported in v1 \
                  (only DTYPE_F32 = 0 supported). Add other dtypes in controller.rs::reduce_average."
             )));
         }
@@ -521,7 +616,7 @@ fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
         let numel = ref_frame.tensors[ti].numel();
         if numel * std::mem::size_of::<f32>() != ref_frame.tensors[ti].bytes.len() {
             return Err(TensorError::new(&format!(
-                "cpu_averager: tensor[{ti}] shape {shape:?} numel*sizeof(f32) {} != nbytes {}",
+                "cluster_controller: tensor[{ti}] shape {shape:?} numel*sizeof(f32) {} != nbytes {}",
                 numel * std::mem::size_of::<f32>(),
                 ref_frame.tensors[ti].bytes.len()
             )));
@@ -551,7 +646,7 @@ fn reduce_average(frames: &[RoundFrame]) -> Result<RoundFrame> {
 fn bytes_as_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return Err(TensorError::new(&format!(
-            "cpu_averager: f32 byte count {} not divisible by 4",
+            "cluster_controller: f32 byte count {} not divisible by 4",
             bytes.len()
         )));
     }
@@ -584,6 +679,15 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::mpsc;
 
+    /// Deterministic non-zero test salt: exercises the HMAC path (zero
+    /// salt is degenerate enough that an accidental "skip the HMAC"
+    /// regression could silently still produce all-zero footers and
+    /// "pass" — a non-zero salt catches that).
+    const TEST_SALT: SessionSalt = [
+        0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+        0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    ];
+
     /// Fake rank client: connects to the controller, does the handshake,
     /// and runs `n_rounds` of (send_frame → recv_averaged_frame).
     /// Returns the vector of received averaged frames.
@@ -591,6 +695,7 @@ mod tests {
         port: u16,
         rank_id: u32,
         world_size: u32,
+        salt: SessionSalt,
         send_frames: Vec<RoundFrame>,
     ) -> Result<Vec<RoundFrame>> {
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
@@ -616,8 +721,8 @@ mod tests {
 
         let mut received = Vec::with_capacity(send_frames.len());
         for f in send_frames {
-            write_round_frame(&mut stream, &f)?;
-            let r = read_round_frame(&mut stream)?
+            write_round_frame(&mut stream, &f, &salt)?;
+            let r = read_round_frame(&mut stream, &salt)?
                 .ok_or_else(|| TensorError::new("fake_rank: EOF before averaged frame"))?;
             received.push(r);
         }
@@ -654,9 +759,10 @@ mod tests {
 
     #[test]
     fn two_rank_average_one_round() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -664,11 +770,11 @@ mod tests {
         let (tx0, rx0) = mpsc::channel();
         let (tx1, rx1) = mpsc::channel();
         let t0 = thread::spawn(move || {
-            let r = fake_rank(port, 0, 2, vec![one_tensor_frame(&[1.0, 2.0, 3.0])]);
+            let r = fake_rank(port, 0, 2, TEST_SALT, vec![one_tensor_frame(&[1.0, 2.0, 3.0])]);
             tx0.send(r).unwrap();
         });
         let t1 = thread::spawn(move || {
-            let r = fake_rank(port, 1, 2, vec![one_tensor_frame(&[3.0, 4.0, 5.0])]);
+            let r = fake_rank(port, 1, 2, TEST_SALT, vec![one_tensor_frame(&[3.0, 4.0, 5.0])]);
             tx1.send(r).unwrap();
         });
 
@@ -693,9 +799,10 @@ mod tests {
         //   - multi-round reduce loop (2 rounds)
         //   - multi-tensor frames (2 tensors per frame)
         //   - clean shutdown on rank EOF
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             3,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -719,9 +826,9 @@ mod tests {
         let (tx0, rx0) = mpsc::channel();
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
-        let t0 = thread::spawn(move || tx0.send(fake_rank(port, 0, 3, r0_frames)).unwrap());
-        let t1 = thread::spawn(move || tx1.send(fake_rank(port, 1, 3, r1_frames)).unwrap());
-        let t2 = thread::spawn(move || tx2.send(fake_rank(port, 2, 3, r2_frames)).unwrap());
+        let t0 = thread::spawn(move || tx0.send(fake_rank(port, 0, 3, TEST_SALT, r0_frames)).unwrap());
+        let t1 = thread::spawn(move || tx1.send(fake_rank(port, 1, 3, TEST_SALT, r1_frames)).unwrap());
+        let t2 = thread::spawn(move || tx2.send(fake_rank(port, 2, 3, TEST_SALT, r2_frames)).unwrap());
 
         let r0 = rx0.recv().unwrap().unwrap();
         let r1 = rx1.recv().unwrap().unwrap();
@@ -755,9 +862,10 @@ mod tests {
 
     #[test]
     fn rejects_wrong_handshake_magic() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             1,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -778,9 +886,10 @@ mod tests {
 
     #[test]
     fn rejects_world_size_mismatch() {
-        let avg = CpuAverager::start(
+        let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             2,
+            TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
@@ -850,11 +959,71 @@ mod tests {
 
     #[test]
     fn averager_zero_world_size_errors() {
-        let err = CpuAverager::start(
+        let err = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             0,
+            TEST_SALT,
         )
         .unwrap_err();
         assert!(err.to_string().contains("world_size"), "got: {err}");
+    }
+
+    /// Cross-session safety: a rank using a salt the controller doesn't
+    /// share must fail the first RoundFrame's HMAC check loudly. This
+    /// is the load-bearing test that proves the salt is wired through
+    /// both directions.
+    #[test]
+    fn rejects_round_frame_with_wrong_salt() {
+        use crate::distributed::wire::SESSION_SALT_BYTES;
+        let controller_salt = TEST_SALT;
+        // The "rogue" salt: same length, different bytes.
+        let rogue_salt: SessionSalt = [0xAAu8; SESSION_SALT_BYTES];
+        assert_ne!(controller_salt, rogue_salt);
+
+        let avg = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            1,
+            controller_salt,
+        )
+        .unwrap();
+        let port = avg.port();
+
+        // Single-rank handshake (so the controller proceeds to the
+        // reduce loop), then send one RoundFrame keyed with the wrong
+        // salt. The controller's read_round_frame must error on the
+        // HMAC footer.
+        let send_res = thread::spawn(move || -> Result<()> {
+            let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+            let mut stream = TcpStream::connect(addr).unwrap();
+
+            // Handshake (the salt does not participate in handshake bytes;
+            // any rank with matching world_size + magic + version connects).
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&HANDSHAKE_MAGIC_RANK.to_le_bytes());
+            h[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+            h[8..12].copy_from_slice(&0u32.to_le_bytes());
+            h[12..16].copy_from_slice(&1u32.to_le_bytes());
+            stream.write_all(&h).unwrap();
+            let mut ack = [0u8; 8];
+            stream.read_exact(&mut ack).unwrap();
+
+            // Now send a frame keyed by the rogue salt. The controller's
+            // HMAC over the body will not match → the reduce thread
+            // errors out and shuts down.
+            let frame = one_tensor_frame(&[1.0, 2.0, 3.0]);
+            write_round_frame(&mut stream, &frame, &rogue_salt)?;
+            Ok(())
+        });
+        let _ = send_res.join().unwrap();
+
+        // Drain the controller's status to confirm the loud error path
+        // ran. `shutdown()` joins the thread and propagates its Result.
+        let err = avg.shutdown().expect_err(
+            "controller's reduce thread must propagate a HMAC verification error",
+        );
+        assert!(
+            err.to_string().contains("HMAC verification failed"),
+            "expected HMAC verification failure, got: {err}"
+        );
     }
 }
