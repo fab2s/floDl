@@ -1697,6 +1697,19 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::StartEpoch(plan) => {
                 self.pending_plan = Some(plan);
             }
+            ControlMsg::DeclareDead { .. }
+            | ControlMsg::NewNcclSession { .. }
+            | ControlMsg::RequestNewNcclId => {
+                // Cluster-mode elastic-membership signals. The
+                // cluster_worker layer intercepts these in its
+                // inbound bridge (updates a local DeadRanks ledger,
+                // stages a pending NCCL session, or generates a
+                // fresh UID and replies through the timing
+                // channel); they should not reach the inner
+                // GpuWorker. If one slips through (e.g. via test
+                // wiring), drop silently — the OLD threaded path
+                // has no comm-replacement surface to act on it.
+            }
             ControlMsg::ExtendPartition {
                 partition_offset,
                 partition_size,
@@ -1909,6 +1922,9 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::Shutdown => "Shutdown",
                             ControlMsg::StartEpoch(_) => "StartEpoch",
                             ControlMsg::ExtendPartition { .. } => "ExtendPartition",
+                            ControlMsg::DeclareDead { .. } => "DeclareDead",
+                            ControlMsg::NewNcclSession { .. } => "NewNcclSession",
+                            ControlMsg::RequestNewNcclId => "RequestNewNcclId",
                         }
                     );
                     if self.dispatch_control(msg)? {

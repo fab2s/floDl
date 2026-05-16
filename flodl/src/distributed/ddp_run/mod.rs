@@ -773,6 +773,15 @@ pub enum TimingMsg {
         /// Which rank sent this.
         rank: usize,
     },
+    /// Response from the chosen surviving rank to coord's
+    /// [`ControlMsg::RequestNewNcclId`]: 128 raw bytes of a freshly
+    /// generated `NcclUniqueId`.
+    NewNcclIdGenerated {
+        /// Sender rank (so coord validates against its request).
+        rank: usize,
+        /// 128 bytes of NCCL unique-id.
+        uid_bytes: Vec<u8>,
+    },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
@@ -895,6 +904,35 @@ pub enum ControlMsg {
         /// Number of additional sample indices to append.
         partition_size: usize,
     },
+    /// Coord-emitted notification that a peer rank has been declared
+    /// dead. The cluster-worker's inbound bridge converts this into
+    /// a local-ledger update so the NCCL watchdog thread can react;
+    /// it is NOT dispatched to the inner GpuWorker because the inner
+    /// is typically blocked in an in-flight NCCL collective and
+    /// cannot service control messages until the watchdog aborts the
+    /// comm. See [`crate::distributed::wire::ControlMsgWire::DeclareDead`].
+    DeclareDead {
+        /// Global rank that just died.
+        rank: usize,
+    },
+    /// Coord-emitted directive to rebuild the local NCCL comm with
+    /// the shrunken cohort. Sent after one or more `DeclareDead`s.
+    /// See [`crate::distributed::wire::ControlMsgWire::NewNcclSession`].
+    NewNcclSession {
+        /// 128-byte NCCL unique-id, identical across survivors.
+        uid_bytes: Vec<u8>,
+        /// Recipient's new rank-in-comm (its position among
+        /// survivors ordered by ascending global rank).
+        new_rank: usize,
+        /// Total ranks in the new comm.
+        new_world_size: usize,
+    },
+    /// Coord-emitted request to generate a fresh NCCL unique-id and
+    /// ship its bytes back via the timing channel
+    /// ([`TimingMsg::NewNcclIdGenerated`]). Only one rank receives
+    /// this per re-rendezvous cycle (the lowest-numbered survivor).
+    /// See [`crate::distributed::wire::ControlMsgWire::RequestNewNcclId`].
+    RequestNewNcclId,
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
     Throttle,

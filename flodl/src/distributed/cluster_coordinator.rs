@@ -245,6 +245,17 @@ pub struct ClusterCoordinatorConfig {
     /// TimingMsg-frame arrival is older than this, the coord declares
     /// the rank dead. Default 30s. Ignored when `dead_ranks` is None.
     pub heartbeat_timeout_secs: u64,
+
+    /// Global ranks running on the same host as the coordinator
+    /// process (the launcher's host in production, the test
+    /// process in tests). NCCL re-rendezvous prefers picking the
+    /// UID generator from this set when any are alive — same-host
+    /// rank is same-process latency for the UID hand-off and has
+    /// lower correlated-failure risk than a network peer. Defaults
+    /// to empty (no preference; picker falls back to fastest
+    /// surviving network rank by `wall_ms_accum / steps_since_avg`,
+    /// breaking ties by lowest global rank).
+    pub local_ranks: Vec<usize>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -273,6 +284,7 @@ impl ClusterCoordinatorConfig {
             meta_controller: false,
             dead_ranks: None,
             heartbeat_timeout_secs: 30,
+            local_ranks: Vec::new(),
         }
     }
 
@@ -351,6 +363,16 @@ impl ClusterCoordinatorConfig {
         self.heartbeat_timeout_secs = secs;
         self
     }
+
+    /// Mark ranks running on the same host as the coord process.
+    /// The NCCL re-rendezvous picker prefers these when picking a
+    /// UID generator (local same-process latency + lower correlated
+    /// failure risk). Used by the launcher to pin its local GPU
+    /// rank(s); standalone-coord tests typically leave this empty.
+    pub fn local_ranks(mut self, ranks: Vec<usize>) -> Self {
+        self.local_ranks = ranks;
+        self
+    }
 }
 
 /// CPU-backend averaging state machine. Restores cycle-1 guard-verdict
@@ -390,6 +412,27 @@ enum CpuAvgState {
     /// is all-true (finalizes the cycle). No deadline — see the
     /// type-level docstring above for the rationale.
     Pending,
+}
+
+/// In-flight NCCL re-rendezvous bookkeeping. Created when the coord
+/// declares one or more dead ranks on the NCCL path; cleared when the
+/// chosen generator rank ships back a fresh `NcclUniqueId` and the
+/// coord broadcasts [`crate::distributed::wire::ControlMsgWire::NewNcclSession`]
+/// to every survivor.
+#[derive(Debug)]
+struct NcclRendezvousPending {
+    /// Rank we sent `RequestNewNcclId` to. The coord drops any
+    /// `NewNcclIdGenerated` whose `rank` field doesn't match.
+    generator_rank: usize,
+    /// Survivor ranks ordered by ascending global index, captured at
+    /// initiation time. Currently unread (the broadcast helper
+    /// recomputes the alive set so additional deaths during the
+    /// rendezvous wait are reflected); kept for diagnostics and as
+    /// the seed for the future 1d.3c "rendezvous timeout retry"
+    /// path which would re-pick a generator from this set if the
+    /// chosen one also dies before responding.
+    #[allow(dead_code)]
+    survivors_ordered: Vec<usize>,
 }
 
 /// Process-model coordinator: ports the OLD threaded
@@ -487,6 +530,16 @@ pub struct ClusterCoordinator {
     /// remainder to redistribute to survivors via `ExtendPartition`.
     /// Initialized to 0; refreshed every `dispatch_epoch`.
     last_step_count_at_epoch_start: Vec<usize>,
+    /// In-flight NCCL re-rendezvous (NCCL backend only). `Some` while
+    /// the coord is awaiting a fresh `NcclUniqueId` from the chosen
+    /// generator rank; cleared once the new session has been
+    /// broadcast to survivors. CPU backend always leaves this `None`.
+    nccl_rendezvous_pending: Option<NcclRendezvousPending>,
+    /// Ranks co-located with the coord process. NCCL re-rendezvous
+    /// UID-generator picker prefers these (Tier 1) over fastest
+    /// network rank (Tier 2). Sourced from
+    /// [`ClusterCoordinatorConfig::local_ranks`].
+    local_ranks: Vec<usize>,
     /// Per-rank wall-time (ms) from the most recent averaging cycle's
     /// `RequestParams` broadcast to that rank's SyncAck arrival.
     /// Populated by [`Self::process_timing_msg`]'s SyncAck arm.
@@ -728,6 +781,8 @@ impl ClusterCoordinator {
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
             last_step_count_at_epoch_start: vec![0; world_size],
+            nccl_rendezvous_pending: None,
+            local_ranks: config.local_ranks.clone(),
             last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
@@ -872,7 +927,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::Exiting { rank }
             | TimingMsgWire::LrUpdate { rank, .. }
             | TimingMsgWire::Heartbeat { rank, .. }
-            | TimingMsgWire::SnapshotReady { rank } => Some(*rank as usize),
+            | TimingMsgWire::SnapshotReady { rank }
+            | TimingMsgWire::NewNcclIdGenerated { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -988,6 +1044,41 @@ impl ClusterCoordinator {
                 // upload-throughput estimator separate from
                 // wall_ms_accum. For 1d.5 it's enough that the wire
                 // path is in place and liveness is refreshed above.
+            }
+            TimingMsgWire::NewNcclIdGenerated { rank, uid_bytes } => {
+                let rank = rank as usize;
+                if let Some(state) = self.nccl_rendezvous_pending.take() {
+                    if state.generator_rank != rank {
+                        crate::verbose!(
+                            "  ddp: dropping NewNcclIdGenerated from rank {} \
+                             (expected from generator rank {})",
+                            rank,
+                            state.generator_rank,
+                        );
+                        // Put back so we keep waiting for the real generator.
+                        self.nccl_rendezvous_pending = Some(state);
+                        return;
+                    }
+                    // Broadcast the new uid to each surviving rank
+                    // with its position-in-shrunken-cohort. Survivors
+                    // are ordered by ascending global rank.
+                    if let Err(e) =
+                        self.broadcast_new_nccl_session(uid_bytes)
+                    {
+                        crate::verbose!(
+                            "  ddp: NewNcclSession broadcast failed: {} \
+                             (NCCL elastic membership will not recover \
+                             from this round of deaths; cluster may hang)",
+                            e,
+                        );
+                    }
+                } else {
+                    crate::verbose!(
+                        "  ddp: dropping unexpected NewNcclIdGenerated \
+                         from rank {} (no rendezvous pending)",
+                        rank,
+                    );
+                }
             }
         }
     }
@@ -1205,6 +1296,7 @@ impl ClusterCoordinator {
         };
         let now = Instant::now();
         let threshold = Duration::from_secs(self.heartbeat_timeout_secs);
+        let mut any_newly_dead = false;
         for r in 0..self.world_size {
             if ledger.is_dead(r) {
                 continue;
@@ -1223,12 +1315,24 @@ impl ClusterCoordinator {
                 ledger.declare_dead(r);
                 self.active_count = self.active_count.saturating_sub(1);
                 self.last_heartbeat[r] = now;
-                // Redistribute the dead rank's un-processed samples
-                // onto surviving ranks so the epoch still ingests its
-                // intended sample count. Failures are non-fatal: the
-                // cluster continues either way, and the un-processed
-                // samples come back in the next epoch's reshuffle if
-                // ExtendPartition can't be delivered.
+                any_newly_dead = true;
+                // NCCL backend: notify every surviving worker so they
+                // can update their LOCAL dead-rank ledgers and the
+                // NCCL watchdog can abort the in-flight collective.
+                // CPU backend doesn't need this — the controller-side
+                // stream shutdown via the shared `DeadRanks` ledger
+                // already releases its blocked AllReduce read.
+                if matches!(self.backend, AverageBackend::Nccl) {
+                    if let Err(e) = self.broadcast_control(
+                        &ControlMsgWire::DeclareDead { rank: r as u64 },
+                    ) {
+                        crate::verbose!(
+                            "  ddp: DeclareDead broadcast for rank {} failed: {}",
+                            r,
+                            e,
+                        );
+                    }
+                }
                 if let Some((remainder_offset, remainder_size)) = remainder_plan {
                     if let Err(e) = self.redistribute_dead_rank_partition(
                         r,
@@ -1244,6 +1348,17 @@ impl ClusterCoordinator {
                         );
                     }
                 }
+            }
+        }
+        // After processing all deaths this tick, kick off a single
+        // NCCL re-rendezvous (no-op if backend is CPU or rendezvous
+        // already pending or fewer than 2 survivors).
+        if any_newly_dead {
+            if let Err(e) = self.initiate_nccl_rendezvous_if_needed() {
+                crate::verbose!(
+                    "  ddp: NCCL rendezvous initiation failed: {}",
+                    e,
+                );
             }
         }
     }
@@ -1334,6 +1449,125 @@ impl ClusterCoordinator {
             .as_ref()
             .map(|d| d.is_dead(rank))
             .unwrap_or(false)
+    }
+
+    /// NCCL-backend re-rendezvous initiation. Called from
+    /// [`Self::check_dead_ranks`] once a rank has been declared dead
+    /// on the NCCL path. No-op on CPU backend (the controller-side
+    /// release handles CPU AllReduces). No-op when a rendezvous is
+    /// already pending — additional deaths during the wait will be
+    /// rolled into the same rendezvous when it completes
+    /// (`broadcast_new_nccl_session` reads the *current* alive set,
+    /// not the snapshot from rendezvous-initiation time).
+    fn initiate_nccl_rendezvous_if_needed(&mut self) -> Result<()> {
+        if !matches!(self.backend, AverageBackend::Nccl) {
+            return Ok(());
+        }
+        if self.nccl_rendezvous_pending.is_some() {
+            return Ok(());
+        }
+        let survivors_ordered: Vec<usize> = (0..self.world_size)
+            .filter(|r| !self.is_dead(*r))
+            .collect();
+        if survivors_ordered.len() < 2 {
+            crate::verbose!(
+                "  ddp: NCCL rendezvous skipped — fewer than 2 survivors \
+                 ({} alive of {})",
+                survivors_ordered.len(),
+                self.world_size,
+            );
+            return Ok(());
+        }
+        let generator_rank = self.pick_uid_generator(&survivors_ordered);
+        self.send_control(generator_rank, &ControlMsgWire::RequestNewNcclId)?;
+        self.nccl_rendezvous_pending = Some(NcclRendezvousPending {
+            generator_rank,
+            survivors_ordered,
+        });
+        Ok(())
+    }
+
+    /// Pick the rank that should generate the next NCCL unique-id.
+    ///
+    /// Tier 1: the lowest-numbered SURVIVING rank that's in
+    /// [`Self::local_ranks`] (co-located with the coord process,
+    /// same-process latency, lowest correlated-failure risk).
+    ///
+    /// Tier 2: the surviving rank with the smallest observed
+    /// `wall_ms_accum / steps_since_avg` (per-batch wall, NOT
+    /// barrier-correlated — clean per-rank capacity proxy). Ties
+    /// break by lowest global rank. When no rank has timing
+    /// history yet, this collapses to "lowest surviving global rank"
+    /// (deterministic).
+    fn pick_uid_generator(&self, survivors_ordered: &[usize]) -> usize {
+        // Tier 1: prefer a local survivor.
+        if let Some(&local) = self
+            .local_ranks
+            .iter()
+            .filter(|r| !self.is_dead(**r))
+            .min()
+        {
+            return local;
+        }
+        // Tier 2: fastest network survivor (per-batch wall time,
+        // tiebreak by global rank). `f64::partial_cmp` returns None
+        // on NaN; treat as Equal so the rank tiebreak applies.
+        survivors_ordered
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let ta = self.per_rank_ms_per_batch(a);
+                let tb = self.per_rank_ms_per_batch(b);
+                ta.partial_cmp(&tb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            })
+            .unwrap_or(survivors_ordered[0])
+    }
+
+    /// Average per-batch wall-time (ms) for rank `r` from the current
+    /// cadence-interval accumulators. Returns `f64::INFINITY` when
+    /// the rank has no batches yet (cold start) so it sorts LAST in
+    /// the "fastest" picker — un-calibrated ranks shouldn't be
+    /// preferred as UID generators.
+    fn per_rank_ms_per_batch(&self, r: usize) -> f64 {
+        let steps = self.steps_since_avg.get(r).copied().unwrap_or(0);
+        if steps == 0 {
+            return f64::INFINITY;
+        }
+        let wall = self.wall_ms_accum.get(r).copied().unwrap_or(0.0);
+        wall / steps as f64
+    }
+
+    /// Broadcast `NewNcclSession` to every survivor. Called from the
+    /// `NewNcclIdGenerated` arm of `process_timing_msg` after the
+    /// generator rank ships back its freshly-generated UID. Each
+    /// survivor receives a frame whose `new_rank` reflects its
+    /// position among survivors ordered by ascending global rank.
+    fn broadcast_new_nccl_session(&mut self, uid_bytes: Vec<u8>) -> Result<()> {
+        // Recompute the survivor set from the *current* `is_dead`
+        // ledger — additional deaths during the rendezvous wait must
+        // be reflected in the broadcast so we don't ship a
+        // NewNcclSession to an already-dead rank.
+        let survivors: Vec<usize> = (0..self.world_size)
+            .filter(|r| !self.is_dead(*r))
+            .collect();
+        if survivors.len() < 2 {
+            return Err(TensorError::new(
+                "cluster_coordinator: NewNcclSession broadcast aborted; \
+                 fewer than 2 surviving ranks (NCCL requires world_size >= 2)",
+            ));
+        }
+        let new_world_size = survivors.len() as u64;
+        for (new_rank, &global_rank) in survivors.iter().enumerate() {
+            let msg = ControlMsgWire::NewNcclSession {
+                uid_bytes: uid_bytes.clone(),
+                new_rank: new_rank as u64,
+                new_world_size,
+            };
+            self.send_control(global_rank, &msg)?;
+        }
+        Ok(())
     }
 
     fn finish_averaging_nccl(&mut self) -> Result<()> {

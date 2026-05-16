@@ -169,6 +169,12 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
         TimingMsg::SnapshotReady { rank } => TimingMsgWire::SnapshotReady {
             rank: rank as u64,
         },
+        TimingMsg::NewNcclIdGenerated { rank, uid_bytes } => {
+            TimingMsgWire::NewNcclIdGenerated {
+                rank: rank as u64,
+                uid_bytes,
+            }
+        }
     }
 }
 
@@ -203,6 +209,19 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
             partition_offset: partition_offset as usize,
             partition_size: partition_size as usize,
         })),
+        ControlMsgWire::DeclareDead { rank } => Ok(Some(ControlMsg::DeclareDead {
+            rank: rank as usize,
+        })),
+        ControlMsgWire::NewNcclSession {
+            uid_bytes,
+            new_rank,
+            new_world_size,
+        } => Ok(Some(ControlMsg::NewNcclSession {
+            uid_bytes,
+            new_rank: new_rank as usize,
+            new_world_size: new_world_size as usize,
+        })),
+        ControlMsgWire::RequestNewNcclId => Ok(Some(ControlMsg::RequestNewNcclId)),
         ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
@@ -231,6 +250,23 @@ fn _epoch_plan_to_wire(plan: EpochPlan) -> EpochPlanWire {
 /// bridge threads that translate between the OLD mpsc channels and
 /// the new control-channel [`ControlFrame`] wire protocol.
 ///
+/// Mailbox slot for the most-recent coord-broadcast NCCL session.
+/// Updated by the inbound bridge on each `NewNcclSession` arrival;
+/// consumed by the main thread (post-comm-abort) when rebuilding the
+/// NCCL comm. Slot semantics: latest write wins; old values are
+/// silently overwritten on each new session.
+///
+/// Fields currently unread: the 1d.3b foundation lands the type and
+/// the storage Arc; the main-thread comm-rebuild consumer is 1d.3c
+/// (along with the inbound-bridge plumbing that fills this slot).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct PendingNcclSession {
+    pub uid_bytes: Vec<u8>,
+    pub new_rank: usize,
+    pub new_world_size: usize,
+}
+
 /// NOT Send (the inner [`GpuWorker`] holds `Rc<RefCell<...>>`).
 /// Construct and run on the same thread.
 pub struct ClusterWorker<M: Module> {
@@ -241,6 +277,23 @@ pub struct ClusterWorker<M: Module> {
     /// Cooperative shutdown for bridge threads. Flipped during
     /// `run_until_shutdown` teardown.
     shutdown_flag: Arc<AtomicBool>,
+    /// Per-worker dead-rank ledger. (1d.3c consumer.) Updated by the
+    /// inbound bridge when `ControlMsgWire::DeclareDead` arrives;
+    /// polled by the NCCL watchdog thread to trigger
+    /// `NcclAbortHandle::abort` on the local comm. Distinct from the
+    /// coord-side `Arc<DeadRanks>` because workers in different
+    /// processes can't share Arcs with the coord — each worker holds
+    /// its own copy and the coord drives state via the wire.
+    #[allow(dead_code)]
+    local_dead_ranks: Arc<crate::distributed::controller::DeadRanks>,
+    /// Pending NCCL session mailbox. (1d.3c consumer.) Inbound bridge
+    /// stores the most recent `NewNcclSession` payload; the main-
+    /// thread comm-rebuild path takes from this slot. For 1d.3b
+    /// the slot is allocated but not yet wired into the inbound
+    /// bridge — NCCL rank death currently surfaces as a clean
+    /// training error rather than in-place recovery.
+    #[allow(dead_code)]
+    nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
 }
 
 impl<M: Module + 'static> ClusterWorker<M> {
@@ -501,10 +554,26 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 })?,
         );
 
+        // Worker-local dead-rank ledger + NCCL session mailbox.
+        // The ledger drives the (future-slice 1d.3c) NCCL watchdog
+        // thread; the mailbox holds the most-recent NewNcclSession
+        // payload for the (future-slice 1d.3c) main-thread
+        // comm-rebuild path. Both are populated by the inbound bridge
+        // when the coord broadcasts elastic-membership control
+        // frames. For 1d.3b they're staged-but-unconsumed scaffolding;
+        // wire path is in place so the protocol round-trips can be
+        // exercised on the rig.
+        let local_dead_ranks =
+            crate::distributed::controller::DeadRanks::new(config.world_size);
+        let nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         Ok(ClusterWorker {
             inner: Some(inner),
             bridges,
             shutdown_flag,
+            local_dead_ranks,
+            nccl_session_mailbox,
         })
     }
 

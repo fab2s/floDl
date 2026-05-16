@@ -1074,9 +1074,10 @@ impl Coordinator {
             }
             // Cluster-mode only; OLD threaded coordinator never sees
             // these (workers emit them from the cluster-mode heartbeat
-            // thread + CPU param bridge respectively).
+            // thread + CPU param bridge + NCCL re-rendezvous helper).
             TimingMsg::Heartbeat { .. } => {}
             TimingMsg::SnapshotReady { .. } => {}
+            TimingMsg::NewNcclIdGenerated { .. } => {}
         }
     }
 
