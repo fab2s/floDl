@@ -14,6 +14,7 @@
 
 pub mod cluster;
 pub mod cluster_coordinator;
+pub mod cluster_worker;
 pub mod controller;
 pub mod cpu_reduce;
 pub mod cuda_event;
