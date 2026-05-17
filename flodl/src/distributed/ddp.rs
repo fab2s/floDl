@@ -180,11 +180,11 @@ impl Ddp {
     /// Build a `Ddp` from an existing per-rank NCCL communicator.
     ///
     /// Unlike [`Ddp::wrap`], which initializes a fresh
-    /// [`NcclRankComm`](super::NcclRankComm) via `init_rank`, this constructor
+    /// [`NcclRankComm`] via `init_rank`, this constructor
     /// takes ownership of one that's already joined to the cluster group.
     /// Use when the rendezvous + `init_rank` are driven externally (e.g. the
     /// cluster-rank inline loops in
-    /// [`DdpBuilder`](crate::distributed::ddp_run::DdpBuilder), which need
+    /// [`crate::distributed::ddp_run::DdpBuilder`], which need
     /// access to the raw comm for broadcasting initial state before wrapping).
     ///
     /// Loud errors: `device` mismatch with the rank's bound CUDA device is
@@ -547,8 +547,8 @@ impl Trainer {
     /// One-call setup: auto-detect GPUs, distribute the model, set the
     /// optimizer, and enable training mode.
     ///
-    /// - **Multi-GPU** (2+ usable CUDA devices): replicates via
-    ///   [`Graph::distribute`], creates per-replica optimizers, enables training.
+    /// - **Multi-GPU** (2+ usable CUDA devices): replicates the graph
+    ///   across devices, creates per-replica optimizers, enables training.
     /// - **Single-GPU / CPU**: sets optimizer and training mode only (no DDP
     ///   overhead).
     ///

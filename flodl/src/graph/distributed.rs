@@ -17,7 +17,8 @@ impl Graph {
     /// the launcher has shipped a per-node envelope (detected via
     /// [`LocalCluster::from_env`](crate::distributed::LocalCluster::from_env)).
     /// The caller has already built the local replica on this rank's device
-    /// and joined the cross-process NCCL group via [`Ddp::wrap`].
+    /// and joined the cross-process NCCL group via
+    /// [`crate::distributed::Ddp::wrap`].
     ///
     /// From this point on, the [`Module`] surface (`forward`, `parameters`,
     /// `buffers`, `set_training`) short-circuits to `replica`; `self` acts as

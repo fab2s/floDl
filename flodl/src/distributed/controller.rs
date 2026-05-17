@@ -207,7 +207,7 @@ impl ClusterController {
     /// HMAC-SHA256 footer keyed by this value; a rank-side mismatch
     /// surfaces loudly on the first round-trip. Use
     /// `[0u8; SESSION_SALT_BYTES]` for in-process tests that pair this
-    /// directly with a matching [`CpuReduceClient`].
+    /// directly with a matching [`crate::distributed::CpuReduceClient`].
     ///
     /// Use `127.0.0.1:0` for tests (kernel-assigned port; read back via
     /// [`Self::port`]). Use the cluster's `master_addr:master_port+2`

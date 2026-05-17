@@ -17,9 +17,8 @@
 //!
 //! Use [`LocalCluster::from_env`] at startup -- absent env var returns
 //! `Ok(None)` (single-host mode). [`LocalCluster::rendezvous`] bootstraps
-//! the NCCL communicator, returning a
-//! [`TcpRendezvous`](super::TcpRendezvous) with this host's local ranks,
-//! CUDA devices, and the shared NCCL unique ID.
+//! the NCCL communicator, returning a [`TcpRendezvous`] with this
+//! host's local ranks, CUDA devices, and the shared NCCL unique ID.
 
 use std::cell::RefCell;
 use std::env;
@@ -369,7 +368,7 @@ impl LocalCluster {
 
     /// Bootstrap the NCCL communicator across hosts.
     ///
-    /// Master (rank-0 host) generates an [`NcclUniqueId`](super::NcclUniqueId),
+    /// Master (rank-0 host) generates an [`NcclUniqueId`],
     /// binds [`master_port`](Self::master_port), and distributes the ID to
     /// every other host. The 32-byte `dataset_signature` is exchanged at the
     /// same time -- loud error on mismatch, since silent fan-out into

@@ -6,10 +6,10 @@
 //! - **Cluster-aware commands** (`cluster: true`): N >= 2 GPUs trigger
 //!   synthesis of a single-host cluster envelope (master=127.0.0.1, lo
 //!   transport, one host with N ranks) and spawn-per-rank via the existing
-//!   launcher in [`crate::cluster::dispatch`]. The library inside each
-//!   spawned process reads the envelope from `FLODL_CLUSTER_JSON` and uses
-//!   the same code path as multi-host. N = 1 is degenerate -- no synthesis,
-//!   just runs single-process on that device.
+//!   launcher (see [`crate::cluster::prepare_cluster_env`]). The library
+//!   inside each spawned process reads the envelope from `FLODL_CLUSTER_JSON`
+//!   and uses the same code path as multi-host. N = 1 is degenerate — no
+//!   synthesis, just runs single-process on that device.
 //!
 //! - **Non-cluster commands** (`test`, `clippy`, etc.): `--gpus` sets
 //!   `CUDA_VISIBLE_DEVICES` on the single child process. No envelope, no

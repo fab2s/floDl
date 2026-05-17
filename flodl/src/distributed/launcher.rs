@@ -110,7 +110,7 @@ const SSH_OPTS: &[&str] = &[
 ///
 /// - On [`Role::Launcher`], the caller assembles the controller-scope
 ///   config (typically from the user's `DdpRunConfig` via
-///   [`super::ddp_run::build_coord_config_from_builder`]), then calls
+///   `super::ddp_run::build_coord_config_from_builder`), then calls
 ///   [`run_launcher_with_config`] and `std::process::exit(0)` when it
 ///   returns. This is the "launcher trampoline": the user's `main()`
 ///   ran up to the `Trainer::builder(...).run()` boundary, which gives
@@ -174,16 +174,15 @@ fn on_off(b: bool) -> &'static str {
 /// guard, ElChe knobs, policy, partition ratios — assembled by the
 /// launcher-trampoline caller from the user's `DdpRunConfig`. `None`
 /// preserves the legacy "no coord spawn" path (rank-side via_coord
-/// routing is governed by `save_path` on `DdpRunConfig` per
-/// [`crate::distributed::ddp_run::orchestrator`]'s `auto_with` flip,
-/// not by an env var anymore).
+/// routing is governed by `save_path` on `DdpRunConfig` per the
+/// `DdpHandle::launch` `auto_with` flip, not by an env var anymore).
 ///
 /// Local hosts (`host.name == this_hostname`) get fork+exec of
 /// `current_exe()` with env vars set directly. Remote hosts get
 /// `ssh <target> bash -lc '<remote_cmd>'`, where `<remote_cmd>` exports
 /// env vars and execs `fdl <cmd>` — same shape fdl-cli used to use
 /// before this lift. Both produce identical child semantics (piped
-/// streams, [host:rN] line-prefix on stdout/stderr).
+/// streams, `[host:rN]` line-prefix on stdout/stderr).
 ///
 /// **Not yet wired in production:** during the 4b transition, today's
 /// `flodl-cli/src/cluster.rs` still does its own N-child fan-out, so
@@ -665,13 +664,13 @@ pub struct FullCluster {
     /// session and propagates to every rank's slim envelope. Used as the
     /// HMAC key for the cross-process control + data channels. All
     /// zeros until [`FullCluster::with_session_salt`] (or
-    /// [`run_launcher`]) populates it.
+    /// [`run_launcher_with_config`]) populates it.
     pub salt: crate::distributed::wire::SessionSalt,
 }
 
 impl FullCluster {
     /// Replace the session salt and return self for chaining. Called
-    /// by [`run_launcher`] once it has generated a fresh salt.
+    /// by [`run_launcher_with_config`] once it has generated a fresh salt.
     pub fn with_session_salt(mut self, salt: crate::distributed::wire::SessionSalt) -> Self {
         self.salt = salt;
         self

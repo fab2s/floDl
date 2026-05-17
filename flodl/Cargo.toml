@@ -33,8 +33,13 @@ bincode = { version = "2", features = ["serde"] }
 rand = { version = "0.10", optional = true }
 
 [package.metadata.docs.rs]
-# docs.rs has no libtorch — build with this cfg so the -sys build.rs can skip compilation.
-rustc-args = ["--cfg", "docsrs"]
+# docs.rs has no libtorch — flodl-sys/build.rs gates on env::var("DOCS_RS")
+# (set by docs.rs automatically), so we don't need any rustc-arg here.
+# `--cfg docsrs` is set as a rustdoc-arg ONLY: passing it via rustc-args
+# would propagate to every dep including serde's compile, tripping
+# serde 1.0.228's broken `cfg(all(docsrs, if_docsrs_then_no_serde_core))`
+# path that breaks every `#[derive(Serialize)]` site with
+# "cannot find type Formatter in module _serde::__private228".
 rustdoc-args = ["--cfg", "docsrs"]
 features = ["rng"]
 no-default-features = true

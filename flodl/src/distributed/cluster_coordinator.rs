@@ -35,11 +35,13 @@
 //!   `nccl_sync_divergence` / `pre_norm` / `post_norm`, `throttled`,
 //!   `active_count`, `version`, `avg_count`, `global_step`,
 //!   `last_nccl_sync_ms`.
-//! - Methods: [`Self::process_timing_msg`], [`Self::should_average`],
-//!   [`Self::trigger_averaging`] (NCCL path), [`Self::check_throttle`],
-//!   [`Self::drain_timing`], [`Self::tick`].
-//! - New: [`Self::start`] + [`Self::shutdown`] (TCP accept loop +
-//!   per-rank reader threads).
+//! - Methods: `process_timing_msg` (private),
+//!   [`ClusterCoordinator::should_average`],
+//!   [`ClusterCoordinator::trigger_averaging`] (NCCL path),
+//!   [`ClusterCoordinator::check_throttle`],
+//!   [`ClusterCoordinator::drain_timing`], [`ClusterCoordinator::tick`].
+//! - New: [`ClusterCoordinator::start`] + [`ClusterCoordinator::shutdown`]
+//!   (TCP accept loop + per-rank reader threads).
 //!
 //! Deferred to later slices: epoch dispatch / progressive chunk pools
 //! (1d.3+), CPU 3-phase averaging (1d.4), heartbeat fault detection
@@ -227,9 +229,10 @@ pub struct ClusterCoordinatorConfig {
     /// [`crate::distributed::lr_event_meta::LrEventMeta`] is constructed
     /// and held by the coordinator; per-rank LR updates from
     /// [`TimingMsgWire::LrUpdate`] populate `last_lr_per_rank`, and the
-    /// meta is consulted after every averaging-cycle guard verdict (see
-    /// [`ClusterCoordinator::observe_meta`]). `MetaAction::NudgeDown`
-    /// dispatches to [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
+    /// meta is consulted after every averaging-cycle guard verdict
+    /// (see the coord's private `observe_meta` hook).
+    /// `MetaAction::NudgeDown` dispatches to
+    /// [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
     pub meta_controller: bool,
 
     /// Shared dead-rank ledger (with the cluster controller). When the
@@ -2099,8 +2102,8 @@ impl ClusterCoordinator {
     }
 
     /// Last globally-aggregated epoch (all ranks reported). `None`
-    /// until [`Self::on_epoch_aggregated`] fires the first time
-    /// (deferred to 1d.5 when metrics aggregation lands).
+    /// until the coord's `on_epoch_aggregated` hook fires the first
+    /// time (deferred to 1d.5 when metrics aggregation lands).
     pub fn last_aggregated_epoch(&self) -> Option<usize> {
         self.last_aggregated_epoch
     }

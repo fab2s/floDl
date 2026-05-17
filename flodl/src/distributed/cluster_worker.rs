@@ -1,5 +1,5 @@
 //! Cluster worker: TCP-driven wrapper around the OLD threaded
-//! [`GpuWorker`](crate::distributed::ddp_run::GpuWorker).
+//! [`crate::distributed::ddp_run::GpuWorker`].
 //!
 //! Reuses every OLD GpuWorker method unchanged (`train_step`,
 //! `sync_now_nccl`, `load_averaged`, `run_epoch_plan`,
@@ -51,7 +51,8 @@
 //! # Tests
 //!
 //! - CPU structural test: ClusterWorker handshakes with a real
-//!   [`ClusterCoordinator`], runs a trivial CPU model + dataset through
+//!   [`crate::distributed::cluster_coordinator::ClusterCoordinator`],
+//!   runs a trivial CPU model + dataset through
 //!   one Sync averaging cycle, exits cleanly.
 //! - `#[ignore = "cuda"]` end-to-end NCCL smoke test: two ranks share a
 //!   NcclRankComm, do real AllReduce(Avg) on their parameters after a

@@ -13,14 +13,21 @@ COMPOSE = docker compose
 .PHONY: docs-rs site site-stop test-init release-check clean
 
 # --- docs.rs validation (host-side mkdir + nightly toolchain) ---
-
+#
+# `--cfg docsrs` is set as a rustdoc-arg ONLY, not as a rustc-arg.
+# Setting it via `build.rustflags` would propagate to every dep compile,
+# including serde's. serde 1.0.228's build script gates a path-rewrite
+# on `cfg(all(docsrs, if_docsrs_then_no_serde_core))` that loads an
+# incomplete `private` submodule, breaking every `#[derive(Serialize)]`
+# site with "cannot find type Formatter in module _serde::__private228".
+# Real docs.rs only applies the cfg at doc time, not compile time —
+# match that exactly to keep this gate honest.
 docs-rs:
 	@mkdir -p .cargo-cache-docsrs .cargo-git-docsrs .target-docsrs
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
 		cargo +nightly rustdoc --lib -p flodl \
 			--no-default-features --features rng \
-			--config 'build.rustflags=[\"--cfg\", \"docsrs\"]' \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-cli \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' && \

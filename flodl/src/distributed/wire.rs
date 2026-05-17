@@ -57,6 +57,8 @@
 //!
 //! [`controller`]: crate::distributed::controller
 //! [`RoundFrame`]: crate::distributed::controller::RoundFrame
+//! [`Tensor`]: crate::tensor::Tensor
+//! [`ddp_run`]: crate::distributed::ddp_run
 //! [`ddp_run`]: crate::distributed::ddp_run
 
 use std::collections::HashMap;
@@ -100,8 +102,8 @@ pub enum MsgKind {
     /// Worker → coordinator per-epoch metrics. Payload: [`MetricsMsgWire`].
     Metrics = 0x03,
     /// Worker → coordinator pre-snapshot metadata, paired with a
-    /// matching [`RoundFrame`] on the data channel. Payload:
-    /// [`ParamSnapshotMetaWire`].
+    /// matching [`crate::distributed::controller::RoundFrame`] on the
+    /// data channel. Payload: [`ParamSnapshotMetaWire`].
     ParamSnapshotMeta = 0x04,
     /// Periodic heartbeat (control-channel). Payload: [`HeartbeatWire`].
     Heartbeat = 0x05,
@@ -179,8 +181,8 @@ pub fn generate_session_salt() -> SessionSalt {
 }
 
 /// Hex-encode a 16-byte salt into a 32-char lowercase string for
-/// inclusion in the cluster envelope JSON. Reuses the existing
-/// [`crate::distributed::cluster::hex_encode`] format.
+/// inclusion in the cluster envelope JSON. Reuses the same hex format
+/// the cluster module uses for envelope encoding.
 pub fn salt_to_hex(salt: &SessionSalt) -> String {
     crate::distributed::cluster::hex_encode(salt)
 }

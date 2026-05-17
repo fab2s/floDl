@@ -1001,8 +1001,9 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// Runs for `num_epochs`. For each epoch:
     /// 1. Compute this rank's slice of the global permutation (via
-    ///    [`make_partition`] — same deterministic shuffle the coordinator
-    ///    used so the cross-rank disjoint-coverage guarantee holds).
+    ///    the module-private `make_partition` — same deterministic
+    ///    shuffle the coordinator used so the cross-rank
+    ///    disjoint-coverage guarantee holds).
     /// 2. For each batch:
     ///    - Synchronous data load + H2D transfer
     ///    - `train_step` (forward + backward + optional grad clipping +
@@ -1198,7 +1199,7 @@ impl<M: Module> GpuWorker<M> {
     /// 4. AllReduce per-rank `divergence` and per-rank `pre_norm` for the
     ///    [`DivergenceReport`]; `post_norm` is identical across ranks
     ///    post-AllReduce so it's used directly from this rank.
-    /// 5. Feed timing into [`ElChe::report_timing`].
+    /// 5. Feed timing into [`crate::distributed::ElChe::report_timing`].
     /// 6. Run the guard: `convergence_guard.report(&report, k_used, k_max)`
     ///    → [`ConvergenceAction`]:
     ///    - [`ConvergenceAction::NudgeDown`] `{ factor }` → unconditional
@@ -1545,7 +1546,7 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// **Overshoot bound:** `max_overshoot = 1` for this first pass —
     /// if a round is still in flight when the K-boundary triggers the
-    /// next, we [`AsyncCpuReduceClient::block_poll`] until the
+    /// next, we [`crate::distributed::AsyncCpuReduceClient::block_poll`] until the
     /// previous round completes before submitting the new one. The
     /// previous round's EASGD-blend + guard verdict still applies
     /// before the new snapshot is taken.

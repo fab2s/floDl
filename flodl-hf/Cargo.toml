@@ -103,5 +103,8 @@ required-features = ["hub"]
 
 [package.metadata.docs.rs]
 all-features = true
-rustc-args = ["--cfg", "docsrs"]
+# `--cfg docsrs` as rustdoc-arg ONLY. Passing it via rustc-args
+# propagates to every dep compile including serde, tripping
+# serde 1.0.228's broken `cfg(all(docsrs, if_docsrs_then_no_serde_core))`
+# path. Real docs.rs only applies the cfg at doc time.
 rustdoc-args = ["--cfg", "docsrs"]

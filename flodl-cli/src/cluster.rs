@@ -5,7 +5,7 @@
 //! job here is purely to ship the parsed cluster topology to the launcher
 //! via env vars, then let the normal `RunScript` / `ExecCommand` dispatch
 //! invoke the user binary. The user binary's
-//! [`flodl::distributed::launcher::dispatch`] reads the env, detects
+//! `flodl::distributed::launcher::dispatch` reads the env, detects
 //! launcher role, and fans out (ssh for remote hosts, fork+exec for local
 //! hosts). All log fan-in + ClusterController + exit-code propagation happen on
 //! the flodl side.
@@ -25,10 +25,11 @@
 //!
 //! Recursion guard: the launcher's ssh fan-out invokes `fdl <cmd>` on the
 //! remote, which re-enters fdl-cli with `FLODL_CLUSTER_JSON` set (not
-//! `FLODL_FULL_CLUSTER_JSON`). [`should_dispatch`] returns `false` in that
-//! case so the remote fdl-cli skips cluster setup and just runs the user
-//! binary normally — the user binary's launcher dispatch then detects
-//! `Role::Rank` (because `FLODL_LOCAL_RANK` is also set).
+//! `FLODL_FULL_CLUSTER_JSON`). [`should_dispatch`](crate::cluster::should_dispatch)
+//! returns `false` in that case so the remote fdl-cli skips cluster setup
+//! and just runs the user binary normally — the user binary's launcher
+//! dispatch then detects `Role::Rank` (because `FLODL_LOCAL_RANK` is also
+//! set).
 
 use std::process::Command;
 
