@@ -1123,11 +1123,28 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Render with color forced off. `render_annotated_yaml` colorizes
+    /// keys when `style::color_enabled()` is true; inside Docker that
+    /// fires whenever stderr is a TTY (the docker compose run side),
+    /// which makes text-content assertions on `out` fail with stray
+    /// ANSI bytes. Lock against `style::tests`'s env-mutating tests via
+    /// the shared `TEST_ENV_LOCK` and restore the prior choice on exit.
+    fn render_no_color(node: &AnnotatedNode, source_labels: &[String]) -> String {
+        let _g = crate::style::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = crate::style::color_choice();
+        crate::style::set_color_choice(crate::style::ColorChoice::Never);
+        let out = render_annotated_yaml(node, source_labels);
+        crate::style::set_color_choice(saved);
+        out
+    }
+
     #[test]
     fn render_tags_every_leaf_with_filename() {
         let layers = vec![yaml("ddp:\n  policy: cadence\n  anchor: 3\n")];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         for line in out.lines() {
             if line.contains(':') && !line.trim_end().ends_with(':') {
                 assert!(line.contains("# fdl.yml"), "missing tag on: `{line}`");
@@ -1142,7 +1159,7 @@ mod tests {
             yaml("ddp:\n  anchor: 5\n"),
         ];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
         // policy unchanged → tagged with base.
         let policy_line = out.lines().find(|l| l.contains("policy:")).unwrap();
         assert!(policy_line.contains("# fdl.yml") && !policy_line.contains("# fdl.ci.yml"));
@@ -1155,7 +1172,7 @@ mod tests {
     fn render_aligns_comment_column() {
         let layers = vec![yaml("a: 1\nbb: 22\nccc: 333\n")];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         // All `#` symbols must land in the same column.
         let cols: Vec<usize> = out
             .lines()
@@ -1171,7 +1188,7 @@ mod tests {
         // `serde_yaml::Number::to_string` preserves `1.0` as `1.0`.
         let layers = vec![yaml("ratios: [1.5, 1.0]\n")];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         assert!(out.contains("ratios: [1.5, 1.0]"), "got:\n{out}");
         assert!(out.lines().next().unwrap().contains("# fdl.yml"));
     }
@@ -1183,7 +1200,7 @@ mod tests {
             yaml("ddp:\n  anchor: ~\n"),
         ];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml", "fdl.ci.yml"]));
         assert!(!out.contains("anchor"), "deleted key leaked: {out}");
         assert!(out.contains("policy"));
     }
@@ -1194,7 +1211,7 @@ mod tests {
         // source, so it gets no trailing `# <label>`.
         let layers = vec![yaml("ddp:\n  policy: cadence\n")];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         let header = out.lines().find(|l| l.trim() == "ddp:").unwrap();
         assert!(!header.contains('#'));
     }
@@ -1205,7 +1222,7 @@ mod tests {
         // round-trip as a boolean.
         let layers = vec![yaml("flag: \"true\"\n")];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         assert!(out.contains("flag: \"true\""), "got:\n{out}");
     }
 
@@ -1215,7 +1232,7 @@ mod tests {
         let yaml_src = format!("items: [{}]\n", long.join(", "));
         let layers = vec![yaml(&yaml_src)];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         assert!(out.contains("items:  "), "expected header line with tag");
         assert!(out.contains("- item-number-0"));
     }
@@ -1228,7 +1245,7 @@ mod tests {
             "cluster:\n  hosts:\n    - name: exa\n      ranks: [0, 1]\n      local_devices: [2, 3]\n",
         )];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         assert!(
             out.contains("ranks: [0, 1]"),
             "ranks should inline as `[0, 1]`, got:\n{out}"
@@ -1251,7 +1268,7 @@ mod tests {
             "short: 1\nlong: \"some pretty long shell command with many flags and pipes\"\nshort2: 2\n",
         )];
         let node = merge_layers_annotated(&layers);
-        let out = render_annotated_yaml(&node, &labels(&["fdl.yml"]));
+        let out = render_no_color(&node, &labels(&["fdl.yml"]));
         let short_col = out
             .lines()
             .find(|l| l.starts_with("short:"))
