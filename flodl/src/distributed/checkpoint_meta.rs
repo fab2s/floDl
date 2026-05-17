@@ -41,19 +41,41 @@ pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 2;
 /// Captured on `ShutdownWithSave` so a future resume API can restore the
 /// heterogeneous-cadence trajectory without re-calibrating from scratch.
 /// Wired into [`CheckpointMeta`] as an optional field — None for Sync
-/// (no ElChe state) and for binaries that don't yet populate it.
+/// (no ElChe state) and for binaries that don't populate it.
+///
+/// Fields mirror the controller-side [`crate::distributed::ElChe`]
+/// runtime state. User-set knobs (`overhead_target`, `min_anchor`,
+/// `max_anchor`, `max_batch_diff`) are NOT captured here — they come
+/// from the user's `DdpRunConfig` at controller construction on
+/// resume, so re-binding to a different config is supported by design.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ElCheState {
-    /// Slow-rank index (anchor). The rank running the most batches per
-    /// cycle — every other rank runs `floor(anchor_count * throughput_i /
-    /// throughput_anchor)` batches per cycle.
-    pub anchor_rank: usize,
-    /// Anchor's batches-per-cycle count. The "K" knob ElChe tunes to
-    /// keep AllReduce overhead at `overhead_target`.
-    pub anchor_count: usize,
-    /// Per-rank EMA throughput (batches per millisecond). Length equals
-    /// `world_size_at_save`. Empty when uncalibrated.
-    pub ema_throughput_per_rank: Vec<f64>,
+    /// Anchor batches-per-cycle count. The "K" knob ElChe tunes to keep
+    /// AllReduce overhead at `overhead_target`. The slow-anchor rank
+    /// runs this many batches between syncs; faster ranks run
+    /// proportionally more.
+    pub anchor: usize,
+    /// Currently elected slow-anchor rank, `None` until ElChe has run
+    /// at least one calibration (`Phase::Probe` → `Phase::Warmup`
+    /// transition). Resume restores anchor selection without re-running
+    /// the cold-start election cycle.
+    pub anchor_rank: Option<usize>,
+    /// Per-rank smoothed `ms_per_batch` — mean over ElChe's trust
+    /// window (5 most recent readings). Length equals
+    /// `world_size_at_save`. `0.0` for ranks that haven't produced a
+    /// positive reading yet. NOT throughput — directly `ms_per_batch`
+    /// (the inverse). Resume seeds the trust window so cadence ratios
+    /// settle without re-measurement.
+    pub smoothed_ms_per_batch: Vec<f64>,
+    /// Lifecycle phase. Election + anchor-swap behavior depends on
+    /// phase: Probe disables election entirely, Warmup gates swaps on
+    /// `MIN_REPORTS_BEFORE_SWAP`, Stable runs hysteresis, Mature is the
+    /// long-run steady state. Resume in the wrong phase causes
+    /// mis-behavior in the first few cycles.
+    pub phase: crate::distributed::el_che::Phase,
+    /// Number of successful `report_timing` calls. Drives the
+    /// phase-transition logic (Warmup → Stable → Mature) on resume.
+    pub calibration_count: u64,
 }
 
 /// Why the cluster wrote this checkpoint.
@@ -433,9 +455,11 @@ mod tests {
         let path = dir.join("ckpt.meta.json");
 
         let state = ElCheState {
-            anchor_rank: 1,
-            anchor_count: 12,
-            ema_throughput_per_rank: vec![0.5, 1.0, 0.75],
+            anchor: 12,
+            anchor_rank: Some(1),
+            smoothed_ms_per_batch: vec![5.0, 2.5, 4.0],
+            phase: crate::distributed::el_che::Phase::Stable,
+            calibration_count: 42,
         };
         let meta = CheckpointMeta::new(
             3,

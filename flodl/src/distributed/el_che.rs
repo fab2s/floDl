@@ -106,7 +106,11 @@ impl RingBuffer {
 /// until `MIN_REPORTS_BEFORE_SWAP`), Stable = normal operation including
 /// overhead auto-tune, Mature = long-running steady state. Phase ordering
 /// is monotonic and supports `>=` comparisons for gating logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+    serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Initial fixed-size measurement period before any averaging-driven
     /// calibration. Same code path as the legacy "uncalibrated" branch;
@@ -208,6 +212,37 @@ impl ElChe {
     /// Currently elected slow-anchor rank (None until first calibration).
     pub fn anchor_rank(&self) -> Option<usize> {
         self.anchor_rank
+    }
+
+    /// Snapshot this ElChe's trajectory state for checkpoint persistence.
+    ///
+    /// Captures the fields a resume API needs to restore cadence
+    /// behavior without re-calibrating from scratch: anchor, elected
+    /// anchor rank, per-rank smoothed `ms_per_batch` (trust-window
+    /// mean), phase, calibration count. User-set knobs
+    /// (`overhead_target`, `min_anchor`, `max_anchor`, `max_batch_diff`)
+    /// are NOT captured — they come from the user's `DdpRunConfig` at
+    /// controller construction on resume, so a re-bind to different
+    /// knobs is supported.
+    ///
+    /// Called by [`ClusterCoordinator`] when broadcasting
+    /// `ShutdownWithSave`; the produced state is written to
+    /// `<save_path>.meta.json` via [`CheckpointMeta::with_elche_state`].
+    ///
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`CheckpointMeta::with_elche_state`]:
+    ///     crate::distributed::CheckpointMeta::with_elche_state
+    pub fn to_state(&self) -> crate::distributed::ElCheState {
+        let smoothed_ms_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| self.smoothed_ms(r))
+            .collect();
+        crate::distributed::ElCheState {
+            anchor: self.anchor,
+            anchor_rank: self.anchor_rank,
+            smoothed_ms_per_batch,
+            phase: self.phase,
+            calibration_count: self.calibration_count,
+        }
     }
 
     /// Smoothed ms_per_batch for `rank` — mean over the trust window.

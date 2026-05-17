@@ -100,6 +100,9 @@ pub(super) fn build_coord_config_from_builder(
     if let Some(ref stem) = config.save_path {
         coord_config = coord_config.save_path(stem.clone());
     }
+    if let Some(secs) = config.heartbeat_timeout_secs {
+        coord_config = coord_config.heartbeat_timeout_secs(secs);
+    }
 
     coord_config
 }
@@ -3297,6 +3300,42 @@ where
     /// Save a checkpoint every N global epochs.
     pub fn checkpoint_every(mut self, n: usize) -> Self {
         self.config = self.config.with_checkpoint_every(n);
+        self
+    }
+
+    /// Set the cluster-mode checkpoint bundle stem. Setting this also
+    /// flips NCCL routing to the controller-driven via_coord path
+    /// (elastic membership + persistence on unrecoverable failure).
+    ///
+    /// On unrecoverable failure, the controller writes
+    /// `<stem>.meta.json` (trajectory + ElChe state) and each rank
+    /// writes `<stem>.fdl` (model, rank 0) + `<stem>.optim`
+    /// (per-rank optimizer state) before exiting. See
+    /// [`crate::distributed::CheckpointBundle`].
+    pub fn save_path(mut self, path: impl Into<String>) -> Self {
+        self.config = self.config.with_save_path(path);
+        self
+    }
+
+    /// Cluster-mode threshold for declaring a run unrecoverable. When
+    /// the dead-rank count reaches this limit, the controller
+    /// broadcasts `ShutdownWithSave` to survivors and writes the
+    /// `.meta.json` sidecar. Backend hard limits still apply (NCCL
+    /// needs 2+ survivors; CPU needs at least 1).
+    pub fn max_failure(
+        mut self,
+        threshold: crate::distributed::max_failure::MaxFailureThreshold,
+    ) -> Self {
+        self.config = self.config.with_max_failure(threshold);
+        self
+    }
+
+    /// Cluster-mode heartbeat staleness threshold (seconds). If a
+    /// rank's last `TimingMsg` frame is older than this, the
+    /// controller declares the rank dead. Default: controller's
+    /// built-in (currently 30s).
+    pub fn heartbeat_timeout_secs(mut self, secs: u64) -> Self {
+        self.config = self.config.with_heartbeat_timeout_secs(secs);
         self
     }
 

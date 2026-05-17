@@ -613,6 +613,15 @@ pub struct ClusterCoordinator {
     /// upload-completion marker planned alongside heartbeat (1d.5+).
     last_observed_sync_lag_ms: Vec<Option<f64>>,
 
+    /// Checkpoint bundle stem for the controller-side `.meta.json`
+    /// write on `ShutdownWithSave`. Mirrors
+    /// [`ClusterCoordinatorConfig::save_path`] — populated at
+    /// construction, never mutated. `None` skips the meta write (and
+    /// the worker side skips its own bundle write since
+    /// `save_path` flows through `WorkerConfig` from the rank-side
+    /// `DdpRunConfig` independently).
+    save_path: Option<String>,
+
     // --- Epoch dispatch ---
     /// Per-rank current epoch (last StartEpoch dispatched).
     rank_epoch: Vec<usize>,
@@ -842,6 +851,7 @@ impl ClusterCoordinator {
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
             max_failure: config.max_failure,
+            save_path: config.save_path.clone(),
             shutdown_with_save_dispatched: false,
             last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
@@ -1566,14 +1576,19 @@ impl ClusterCoordinator {
     }
 
     /// Broadcast `ShutdownWithSave` to all surviving ranks so they
-    /// persist a checkpoint bundle to the configured `save_path` and
-    /// exit, then mark the flag so we don't re-broadcast on subsequent
-    /// `check_dead_ranks` ticks.
+    /// persist `.fdl` (model) + `.optim` (per-rank optimizer) files to
+    /// the configured `save_path`. The controller writes the
+    /// `.meta.json` sidecar itself before broadcasting — only the
+    /// controller has the live ElChe trajectory + the cluster-wide
+    /// epoch/step/sync-round counters, so the meta is its job. Workers
+    /// own the model bytes (their GPU memory) and per-rank optimizer
+    /// state, so those stay rank-side.
     ///
-    /// Broadcast goes to ALL ranks the wire-side knows about; dead
-    /// ranks have already shut down their stream and the send is a
-    /// no-op (matches the pattern used by `broadcast_control` for
-    /// `DeclareDead`).
+    /// After broadcasting, mark the flag so we don't re-broadcast on
+    /// subsequent `check_dead_ranks` ticks. Broadcast goes to ALL
+    /// ranks the wire-side knows about; dead ranks have already shut
+    /// down their stream and the send is a no-op (matches the pattern
+    /// used by `broadcast_control` for `DeclareDead`).
     fn dispatch_shutdown_with_save(
         &mut self,
         reason: crate::distributed::SaveReason,
@@ -1585,6 +1600,36 @@ impl ClusterCoordinator {
             self.active_count,
             self.world_size,
         );
+
+        // Controller-side meta.json write. Only fires when save_path is
+        // configured (no destination = no meta). Errors log loud but
+        // don't block the broadcast — losing the meta sidecar is bad
+        // but not as bad as hanging the cluster on an unrecoverable
+        // failure.
+        if let Some(ref stem) = self.save_path {
+            let meta_path =
+                crate::distributed::CheckpointBundle::meta_path(stem);
+            // Cluster-wide epoch: take the max across all known ranks.
+            // Each rank's `rank_epoch[r]` reflects the last StartEpoch
+            // dispatched to that rank, so max is the highest epoch any
+            // rank reached.
+            let epoch = self.rank_epoch.iter().copied().max().unwrap_or(0);
+            let meta = crate::distributed::CheckpointMeta::new(
+                epoch,
+                self.global_step,
+                self.avg_count,
+                self.world_size,
+                reason,
+            )
+            .with_elche_state(self.el_che.to_state());
+            if let Err(e) = meta.write_to_file(&meta_path) {
+                eprintln!(
+                    "  ddp: controller meta write to {} failed: {e}",
+                    meta_path.display(),
+                );
+            }
+        }
+
         let msg = ControlMsgWire::ShutdownWithSave {
             reason: reason.to_u8(),
         };
@@ -3619,5 +3664,126 @@ mod tests {
         r1.join().unwrap().expect("rank 1 receives ShutdownWithSave");
         r2.join().unwrap().expect("rank 2 receives ShutdownWithSave");
         coord_handle.join().unwrap().expect("coord dispatched broadcast");
+    }
+
+    #[test]
+    fn controller_writes_meta_json_on_shutdown_with_save() {
+        // 3-rank cluster with `save_path` configured. Force a
+        // max_failure breach so the coord calls
+        // `dispatch_shutdown_with_save`. Assert the controller wrote
+        // `<save_path>.meta.json` with the expected reason +
+        // world_size + ElCheState present. The `.fdl` + `.optim`
+        // bundle members are the workers' responsibility (covered by
+        // the worker-side `shutdown_with_save_writes_model_and_optim_*`
+        // test) — only `.meta.json` is asserted here.
+        let world_size = 3;
+        let dir = std::env::temp_dir().join(format!(
+            "flodl_coord_meta_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("coord_ckpt");
+        let stem_str = stem.to_str().unwrap().to_string();
+
+        let dead_ranks =
+            crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let stem_for_coord = stem_str.clone();
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                ClusterCoordinatorConfig::new(
+                    ApplyPolicy::Sync,
+                    AverageBackend::Cpu,
+                    world_size,
+                    ElChe::new(world_size, 3),
+                )
+                .no_divergence_guard()
+                .dead_ranks(dead_for_coord)
+                .heartbeat_timeout_secs(1)
+                .max_failure(
+                    crate::distributed::max_failure::MaxFailureThreshold::Absolute(1),
+                )
+                .save_path(stem_for_coord.clone())
+            },
+            |coord| {
+                let start = Instant::now();
+                while !coord.shutdown_with_save_dispatched() {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(TensorError::new(
+                            "coord meta: ShutdownWithSave never dispatched",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            },
+        );
+
+        // Fake ranks: handshake, then go silent. Coord's heartbeat
+        // timeout (1s) trips max_failure (1) → dispatch_shutdown_with_save
+        // fires → meta.json gets written.
+        let r0 = fake_rank(
+            port,
+            0,
+            world_size as u32,
+            TEST_SALT,
+            |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let _ = recv_control(s, salt)?; // ShutdownWithSave
+                Ok(())
+            },
+        );
+        let r1 = fake_rank(
+            port,
+            1,
+            world_size as u32,
+            TEST_SALT,
+            |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let _ = recv_control(s, salt)?;
+                Ok(())
+            },
+        );
+        let r2 = fake_rank(
+            port,
+            2,
+            world_size as u32,
+            TEST_SALT,
+            |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let _ = recv_control(s, salt)?;
+                Ok(())
+            },
+        );
+        r0.join().unwrap().expect("rank 0 path");
+        r1.join().unwrap().expect("rank 1 path");
+        r2.join().unwrap().expect("rank 2 path");
+        coord_handle.join().unwrap().expect("coord dispatched");
+
+        let meta_path =
+            crate::distributed::CheckpointBundle::meta_path(&stem_str);
+        assert!(
+            meta_path.exists(),
+            "controller meta.json missing at {}",
+            meta_path.display(),
+        );
+        let meta =
+            crate::distributed::CheckpointMeta::read_from_file(&meta_path)
+                .expect("controller-written meta parses");
+        assert_eq!(meta.world_size_at_save, world_size);
+        assert_eq!(
+            meta.save_reason,
+            crate::distributed::SaveReason::MaxFailureExceeded,
+        );
+        // ElCheState present and reflects coord's ElChe trajectory.
+        let state = meta
+            .elche_state
+            .expect("controller writes elche_state into meta");
+        assert_eq!(state.anchor, 3);
+        assert_eq!(state.smoothed_ms_per_batch.len(), world_size);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

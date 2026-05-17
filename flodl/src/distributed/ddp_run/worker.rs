@@ -2458,7 +2458,7 @@ impl<M: Module> GpuWorker<M> {
         stem: &str,
         reason: crate::distributed::SaveReason,
     ) {
-        use crate::distributed::{CheckpointBundle, CheckpointMeta};
+        use crate::distributed::CheckpointBundle;
 
         // Rank 0: model file (params + buffers).
         if self.rank == 0 {
@@ -2521,24 +2521,9 @@ impl<M: Module> GpuWorker<M> {
             ),
         }
 
-        // Rank 0: meta JSON.
-        if self.rank == 0 {
-            let meta_path = CheckpointBundle::meta_path(stem);
-            let meta = CheckpointMeta::new(
-                self.current_epoch,
-                self.global_step,
-                self.current_version,
-                self.world_size,
-                reason,
-            );
-            if let Err(e) = meta.write_to_file(&meta_path) {
-                eprintln!(
-                    "ddp-worker: rank 0 meta save to {} failed: {}",
-                    meta_path.display(),
-                    e,
-                );
-            }
-        }
+        // Meta JSON is the controller's job (only it has the live
+        // ElChe trajectory + cluster-wide epoch/step/sync-round
+        // counters). Worker writes only model + per-rank optimizer.
 
         crate::verbose!(
             "  ddp-worker: rank {} wrote checkpoint bundle to stem {} \

@@ -497,6 +497,14 @@ pub struct DdpRunConfig {
     /// survivors; CPU needs at least 1). Only honored on cluster-mode
     /// runs; non-cluster builds ignore this field.
     pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
+
+    /// Cluster-mode heartbeat staleness threshold (seconds). If a
+    /// rank's last `TimingMsg` frame is older than this, the
+    /// controller declares the rank dead and triggers the
+    /// elastic-membership / max_failure flow. `None` = use the
+    /// controller's built-in default (currently 30s). Only honored on
+    /// cluster-mode via_coord runs.
+    pub heartbeat_timeout_secs: Option<u64>,
 }
 
 impl Default for DdpRunConfig {
@@ -529,7 +537,15 @@ impl DdpRunConfig {
             meta_controller: false,
             save_path: None,
             max_failure: None,
+            heartbeat_timeout_secs: None,
         }
+    }
+
+    /// Set the cluster-mode heartbeat staleness threshold (seconds).
+    /// See [`Self::heartbeat_timeout_secs`].
+    pub fn with_heartbeat_timeout_secs(mut self, secs: u64) -> Self {
+        self.heartbeat_timeout_secs = Some(secs);
+        self
     }
 
     /// Set the checkpoint bundle stem for cluster-mode unrecoverable-

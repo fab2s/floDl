@@ -292,14 +292,8 @@ pub fn run_launcher_with_config(
         config = config
             .local_ranks(local_ranks.clone())
             .dead_ranks(dead_ranks);
-        // Heartbeat timeout: no `DdpRunConfig` field for this yet, so
-        // the env-var override remains as the user-tunable knob.
-        // Future cleanup: add it to `DdpRunConfig` (1d.3e-B or later).
-        if let Ok(s) = env::var("FLODL_HEARTBEAT_TIMEOUT_SECS") {
-            if let Ok(n) = s.parse::<u64>() {
-                config = config.heartbeat_timeout_secs(n);
-            }
-        }
+        // Heartbeat timeout: now flows from `DdpRunConfig.heartbeat_timeout_secs`
+        // through `build_coord_config_from_builder` — no env var override.
 
         let coord_salt = full.salt;
         let coord_world = full.world_size();

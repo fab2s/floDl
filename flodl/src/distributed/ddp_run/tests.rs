@@ -1740,10 +1740,14 @@ fn test_checkpoint_error_logged_not_propagated() {
 }
 
 #[test]
-fn shutdown_with_save_writes_bundle_to_save_path() {
+fn shutdown_with_save_writes_model_and_optim_to_save_path() {
     // Rank-0 worker with save_path set. Dispatch ShutdownWithSave;
-    // verify model + optim + meta files exist and meta has the
-    // expected SaveReason + world_size_at_save fields.
+    // verify the WORKER writes the `.fdl` (model) and `.optim` (per-
+    // rank optimizer) files. The `.meta.json` is the CONTROLLER's
+    // job (only it has the live ElChe trajectory + cluster-wide
+    // counters); in this isolated-worker test the meta is not
+    // expected to be written. Controller-side meta-write coverage
+    // lives in cluster_coordinator tests.
     let dev = test_device();
     let dir = std::env::temp_dir().join(format!(
         "flodl_shutdown_with_save_{}",
@@ -1802,7 +1806,10 @@ fn shutdown_with_save_writes_bundle_to_save_path() {
     let shutdown = worker.handle_control().unwrap();
     assert!(shutdown, "ShutdownWithSave must trigger shutdown");
 
-    // Bundle members present and meta carries the dispatched reason.
+    // Worker-side: `.fdl` (model) + `.optim` (per-rank optimizer)
+    // present at save_path. `.meta.json` is NOT written here —
+    // that's the controller's responsibility (see
+    // `cluster_coordinator::dispatch_shutdown_with_save`).
     let model_path =
         crate::distributed::CheckpointBundle::model_path(&stem_str);
     let optim_path =
@@ -1810,14 +1817,10 @@ fn shutdown_with_save_writes_bundle_to_save_path() {
     let meta_path = crate::distributed::CheckpointBundle::meta_path(&stem_str);
     assert!(model_path.exists(), "model file missing: {}", model_path.display());
     assert!(optim_path.exists(), "optim file missing: {}", optim_path.display());
-    assert!(meta_path.exists(), "meta file missing: {}", meta_path.display());
-
-    let meta = crate::distributed::CheckpointMeta::read_from_file(&meta_path)
-        .unwrap();
-    assert_eq!(meta.world_size_at_save, 3);
-    assert_eq!(
-        meta.save_reason,
-        crate::distributed::SaveReason::MaxFailureExceeded,
+    assert!(
+        !meta_path.exists(),
+        "meta file should NOT be written by worker (controller's job): {}",
+        meta_path.display(),
     );
 
     std::fs::remove_dir_all(&dir).ok();
