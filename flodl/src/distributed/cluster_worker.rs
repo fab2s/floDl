@@ -476,6 +476,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // peer-death abort. The inbound bridge populates the slot on
         // each `NewNcclSession` arrival from the coord.
         inner.attach_nccl_session_mailbox(Arc::clone(&nccl_session_mailbox));
+        // Attach the local dead-rank ledger so the inner's
+        // `wait_for_nccl_session` can short-circuit when this rank is
+        // the lone NCCL survivor (no peer to rendezvous with). Without
+        // this, the worker waits 60s for a `NewNcclSession` that the
+        // coord will never send.
+        inner.attach_local_dead_ranks(Arc::clone(&local_dead_ranks));
 
         // Grab the initial NCCL abort handle (if any) for the watchdog.
         // Cluster mode without an NCCL comm (CPU averaging) skips the
@@ -764,6 +770,16 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 }
             }
         })();
+
+        // On error exit (e.g. lone NCCL survivor bailing out of
+        // `wait_for_nccl_session`), the coord may have queued
+        // `Shutdown` / `ShutdownWithSave` frames in `control_rx` that
+        // never reached `handle_control` because the main loop already
+        // returned. Drain those now so the rank-side checkpoint bundle
+        // gets written before we exit (the controller-side
+        // `.meta.json` was already written by `dispatch_shutdown_with_save`).
+        // Clean-exit paths see no queued shutdown and this is a no-op.
+        let _ = inner.drain_pending_shutdown();
 
         // Even on error, try to gracefully report exit + drop senders
         // so the coordinator side cleans up. send_final_snapshot uses

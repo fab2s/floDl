@@ -1823,6 +1823,38 @@ fn test_eval_fn_error_surfaces_in_timing_msg() {
     assert!(metric.is_nan());
 }
 
+/// `drain_pending_shutdown` consumes queued `Shutdown` /
+/// `ShutdownWithSave` frames and returns `true` when one was seen.
+/// Non-shutdown frames in the queue are dropped silently. Used by
+/// `ClusterWorker::run_until_shutdown`'s error-exit path so a lone
+/// NCCL survivor can still write its bundle.
+#[test]
+fn test_drain_pending_shutdown_consumes_queued_shutdown() {
+    let (mut worker, ch) = make_test_worker();
+
+    // No queued frames → returns false, no-op.
+    assert!(!worker.drain_pending_shutdown());
+
+    // Queue a Shutdown → handled = true.
+    ch.control_tx.send(ControlMsg::Shutdown).unwrap();
+    assert!(worker.drain_pending_shutdown());
+
+    // Queue a ShutdownWithSave with save_path unset → handled = true
+    // (write skipped with a verbose log).
+    ch.control_tx
+        .send(ControlMsg::ShutdownWithSave {
+            reason: crate::distributed::SaveReason::SingleSurvivor,
+        })
+        .unwrap();
+    assert!(worker.drain_pending_shutdown());
+
+    // Queue a non-shutdown frame → returns false, frame dropped.
+    ch.control_tx
+        .send(ControlMsg::SetGlobalStep(42))
+        .unwrap();
+    assert!(!worker.drain_pending_shutdown());
+}
+
 /// `ControlMsg::ExecuteEvalCallback` on a worker with `eval_fn = None`
 /// (non-chosen rank) is a quiet no-op: no `EvalResult` emitted, no
 /// shutdown signaled.

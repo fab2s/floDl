@@ -90,6 +90,13 @@ pub struct GpuWorker<M: Module> {
     nccl_session_mailbox: Option<
         Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
     >,
+    /// Cluster-mode local dead-rank ledger (a clone of the
+    /// `cluster_worker`'s ledger). Polled by `wait_for_nccl_session` to
+    /// detect the lone-survivor case (NCCL needs `world_size >= 2`); in
+    /// that case the rendezvous is impossible and we bail fast instead
+    /// of waiting 60s for a `NewNcclSession` that will never arrive.
+    /// `None` outside cluster mode.
+    local_dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
 
     // -- Channels --
     timing_tx: mpsc::Sender<TimingMsg>,
@@ -422,6 +429,7 @@ impl<M: Module> GpuWorker<M> {
             nccl_abort_handle: nccl_comm.as_ref().map(|c| c.abort_handle()),
             nccl_comm,
             nccl_session_mailbox: None,
+            local_dead_ranks: None,
             timing_tx,
             metrics_tx,
             param_tx,
@@ -502,6 +510,17 @@ impl<M: Module> GpuWorker<M> {
         mailbox: Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
     ) {
         self.nccl_session_mailbox = Some(mailbox);
+    }
+
+    /// Attach the cluster-mode local dead-rank ledger. Polled by
+    /// [`Self::wait_for_nccl_session`] to detect the lone-survivor case
+    /// (NCCL needs `world_size >= 2`); in that case the rendezvous is
+    /// impossible and we bail fast. No-op for standalone NCCL setups.
+    pub(crate) fn attach_local_dead_ranks(
+        &mut self,
+        dead_ranks: Arc<crate::distributed::controller::DeadRanks>,
+    ) {
+        self.local_dead_ranks = Some(dead_ranks);
     }
 
     /// Replace this worker's NCCL communicator with `new_comm` after a
@@ -886,6 +905,27 @@ impl<M: Module> GpuWorker<M> {
             if let Ok(mut g) = mailbox.lock() {
                 if let Some(p) = g.take() {
                     return Ok(p);
+                }
+            }
+            // Lone-NCCL-survivor early exit: NCCL requires `world_size
+            // >= 2`. When the local dead-rank ledger reports `dead_count
+            // >= world_size - 1`, no surviving peer can rendezvous with
+            // us — the coord will broadcast `ShutdownWithSave` (or
+            // already has) instead of `NewNcclSession`. Bail fast so
+            // the worker terminates within one poll tick rather than
+            // sitting in the 60s timeout. The coord-side ShutdownWithSave
+            // dispatch is still authoritative for `.meta.json`; the
+            // rank-side bundle write fires from `handle_control` once
+            // we exit this wait and the main loop drains the queued
+            // `ShutdownWithSave` frame.
+            if let Some(ref dead_ranks) = self.local_dead_ranks {
+                let dead = dead_ranks.dead_count();
+                if dead >= self.world_size.saturating_sub(1) {
+                    return Err(TensorError::new(&format!(
+                        "sync_now_nccl: rank {} is lone NCCL survivor \
+                         ({} of {} ranks dead); no rendezvous possible",
+                        self.rank, dead, self.world_size,
+                    )));
                 }
             }
             if start.elapsed() > max_wait {
@@ -2054,6 +2094,44 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::Shutdown => return Ok(true),
         }
         Ok(false)
+    }
+
+    /// Drain any queued `Shutdown` / `ShutdownWithSave` messages from
+    /// `control_rx` and process them. Called from `ClusterWorker`'s
+    /// teardown path so that — when the worker exits the main loop
+    /// with an error (e.g. lone NCCL survivor bailing out of
+    /// `wait_for_nccl_session`) — any pending coord-sent
+    /// `ShutdownWithSave` still gets handled and the rank-side
+    /// checkpoint bundle gets written. Non-shutdown messages in the
+    /// queue are dropped (the worker is on its way out).
+    ///
+    /// Returns `true` if a shutdown frame was processed.
+    pub fn drain_pending_shutdown(&mut self) -> bool {
+        let mut handled = false;
+        while let Ok(msg) = self.control_rx.try_recv() {
+            match msg {
+                ControlMsg::ShutdownWithSave { reason } => {
+                    if let Some(stem) = self.save_path.clone() {
+                        self.write_checkpoint_bundle(&stem, reason);
+                    } else {
+                        crate::verbose!(
+                            "  ddp-worker: rank {} drain_pending_shutdown saw \
+                             ShutdownWithSave but save_path is unset; \
+                             exiting without saving",
+                            self.rank,
+                        );
+                    }
+                    handled = true;
+                }
+                ControlMsg::Shutdown => {
+                    handled = true;
+                }
+                _ => {
+                    // Drop — worker is exiting, other messages are stale.
+                }
+            }
+        }
+        handled
     }
 
     /// Send a timing report to the coordinator.
