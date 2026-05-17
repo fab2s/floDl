@@ -2443,14 +2443,14 @@ impl ClusterCoordinator {
     ///
     /// In **non-progressive** mode, sends one `StartEpoch` per rank
     /// carrying that rank's full per-epoch partition; returns the
-    /// plans dispatched. In **progressive** mode (see [`Self::progressive`])
-    /// creates a [`crate::distributed::chunk_pool::ChunkPool`] for the
-    /// epoch and dispatches the first chunk to every rank; subsequent
-    /// chunks are dispatched from
-    /// [`Self::drain_metrics_and_aggregate`] as ranks report
-    /// chunk completion. The returned `Vec` reflects only the FIRST
-    /// chunk per rank in progressive mode (callers should consume it
-    /// as such).
+    /// plans dispatched. In **progressive** mode (set on the coord
+    /// config) creates a
+    /// [`crate::distributed::chunk_pool::ChunkPool`] for the epoch
+    /// and dispatches the first chunk to every rank; subsequent
+    /// chunks are dispatched from `drain_metrics_and_aggregate` as
+    /// ranks report chunk completion. The returned `Vec` reflects only
+    /// the FIRST chunk per rank in progressive mode (callers should
+    /// consume it as such).
     pub fn dispatch_epoch(
         &mut self,
         epoch: usize,
@@ -2516,10 +2516,11 @@ impl ClusterCoordinator {
     /// Start a new epoch in progressive mode: create a
     /// [`crate::distributed::chunk_pool::ChunkPool`] and dispatch the
     /// first chunk to every rank. Returns the per-rank
-    /// [`EpochPlanWire`] of those first chunks so callers can pair
-    /// the call with rank-side acknowledgments in tests. Subsequent
-    /// chunks are dispatched from `drain_metrics_and_aggregate` on
-    /// receipt of each rank's per-chunk MetricsMsg.
+    /// [`crate::distributed::wire::EpochPlanWire`] of those first chunks
+    /// so callers can pair the call with rank-side acknowledgments in
+    /// tests. Subsequent chunks are dispatched from
+    /// `drain_metrics_and_aggregate` on receipt of each rank's per-chunk
+    /// MetricsMsg.
     ///
     /// Aligns the pool total to a batch boundary. Sub-batch remainders
     /// can't form a full batch and are dropped (standard DataLoader

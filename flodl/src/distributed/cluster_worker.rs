@@ -327,6 +327,14 @@ pub struct ClusterWorker<M: Module> {
     /// `wait_for_epoch_plan` and `run_epoch_plan` on each epoch
     /// transition (matches the threaded path's fire-point).
     epoch_fn: Option<EpochFn<M>>,
+    /// Receiver for the final parameter snapshot the inner GpuWorker
+    /// emits via [`crate::distributed::ddp_run::GpuWorker::send_final_snapshot`]
+    /// at end-of-training. Taken in `run_until_shutdown` and drained
+    /// after the snapshot send so the returned [`crate::distributed::ddp_run::ParamSnapshot`]
+    /// can be ferried up the via_coord stack into a `TrainedState`.
+    /// Replaces the prior discard bridge — the receiver is now drained
+    /// on the calling thread instead of consumed by a background thread.
+    final_param_rx: Option<mpsc::Receiver<crate::distributed::ddp_run::ParamSnapshot>>,
 }
 
 impl<M: Module + 'static> ClusterWorker<M> {
@@ -603,23 +611,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
                     ))
                 })?,
         );
-        bridges.push(
-            thread::Builder::new()
-                .name(format!("flodl-worker-discard-final:r{rank_out}"))
-                .spawn(move || {
-                    while final_param_rx.recv().is_ok() {
-                        // Drop. Final-snapshot egress via the data
-                        // channel is a planned follow-up; today this
-                        // bridge silently consumes the snapshot so the
-                        // worker can shut down cleanly.
-                    }
-                })
-                .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_worker: spawn final discard bridge: {e}"
-                    ))
-                })?,
-        );
+        // `final_param_rx` is parked on `ClusterWorker` (instead of being
+        // drained by a background bridge) so `run_until_shutdown` can
+        // ferry the inner's end-of-training `send_final_snapshot()` back
+        // up the call stack into a real `TrainedState` rather than
+        // silently discarding it.
+        let final_param_rx_for_handle = Some(final_param_rx);
         // Heartbeat thread: fires at HEARTBEAT_CADENCE_MS so the coord
         // can distinguish "rank alive but blocked at the AllReduce
         // barrier" from "rank dead." The thread is independent of the
@@ -691,6 +688,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             local_dead_ranks,
             nccl_session_mailbox,
             epoch_fn,
+            final_param_rx: final_param_rx_for_handle,
         })
     }
 
@@ -729,7 +727,17 @@ impl<M: Module + 'static> ClusterWorker<M> {
     /// metrics / param channel senders to disconnect), the shutdown
     /// flag is flipped to signal the bridges, and all bridge threads
     /// are joined.
-    pub fn run_until_shutdown<T>(mut self, train_fn: T) -> Result<()>
+    ///
+    /// Returns the rank's end-of-training [`crate::distributed::ddp_run::ParamSnapshot`]
+    /// when one was successfully received from the inner GpuWorker before
+    /// teardown; `None` when the inner errored out before reaching
+    /// `send_final_snapshot` (best-effort: snapshot is opportunistic, not
+    /// load-bearing for the shutdown path). The via_coord callers in
+    /// `orchestrator.rs` convert it into a `TrainedState`.
+    pub fn run_until_shutdown<T>(
+        mut self,
+        train_fn: T,
+    ) -> Result<Option<crate::distributed::ddp_run::ParamSnapshot>>
     where
         T: Fn(&M, &[Tensor]) -> Result<Variable>,
     {
@@ -787,10 +795,30 @@ impl<M: Module + 'static> ClusterWorker<M> {
 
         // Even on error, try to gracefully report exit + drop senders
         // so the coordinator side cleans up. send_final_snapshot uses
-        // the dedicated final_param channel which the discard bridge
-        // consumes; report_exiting goes through the outbound bridge.
+        // the dedicated final_param channel; the receiver now lives on
+        // `self.final_param_rx` (no background discard bridge), so the
+        // send + receive happen sequentially on this thread.
+        // report_exiting goes through the outbound bridge.
         inner.send_final_snapshot();
         inner.report_exiting();
+
+        // Drain the final snapshot before dropping inner (otherwise the
+        // mpsc Sender disconnects and the recv() races with the channel
+        // emptying). `try_recv` first to pick up the just-sent value;
+        // fall back to a short recv_timeout to catch any rare scheduler
+        // delay between send_final_snapshot and the receiver becoming
+        // ready. Best-effort: an error from snapshot_params (e.g. CUDA
+        // pinned-memory failure inside send_final_snapshot) leaves the
+        // channel empty and we surface `None` up to the caller.
+        let final_snapshot = self.final_param_rx.take().and_then(|rx| {
+            match rx.try_recv() {
+                Ok(snap) => Some(snap),
+                Err(mpsc::TryRecvError::Empty) => rx
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .ok(),
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        });
 
         // Drop inner → all mpsc::Sender clones held by the inner
         // disconnect → bridges see Disconnected on their Receivers and
@@ -804,7 +832,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             let _ = handle.join();
         }
 
-        exit_clean.map(|_| ())
+        exit_clean.map(|_| final_snapshot)
     }
 }
 
@@ -1715,7 +1743,7 @@ mod tests {
                     None, // no eval_fn
                     None, // no eval_dataset
                 )?;
-                worker.run_until_shutdown(mse_train)
+                worker.run_until_shutdown(mse_train).map(|_| ())
             }));
         }
 
@@ -1900,7 +1928,7 @@ mod tests {
                     None, // no eval_fn
                     None, // no eval_dataset
                 )?;
-                worker.run_until_shutdown(mse_train)
+                worker.run_until_shutdown(mse_train).map(|_| ())
             }));
         }
 
@@ -2158,7 +2186,7 @@ mod tests {
                     None, // no eval_fn
                     None, // no eval_dataset
                 )?;
-                worker.run_until_shutdown(mse_train)
+                worker.run_until_shutdown(mse_train).map(|_| ())
             }));
         }
 

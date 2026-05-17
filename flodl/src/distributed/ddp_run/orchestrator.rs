@@ -1228,12 +1228,14 @@ impl DdpHandle {
     /// and just skips save activity (legitimate for tests and
     /// inference-style usage).
     ///
-    /// Final params are not yet returned via [`TrainedState`] from
-    /// this path (the discard bridge consumes them — final-snapshot
-    /// egress over the data channel is planned). Users wanting the
-    /// trained model can read the bundle written by
-    /// `ShutdownWithSave`, or wait for the final-snapshot capture
-    /// follow-up.
+    /// Final params + buffers ARE returned via [`TrainedState`] on
+    /// this path: the inner GpuWorker's end-of-training
+    /// `send_final_snapshot` is captured in
+    /// [`crate::distributed::cluster_worker::ClusterWorker::run_until_shutdown`]
+    /// and ferried into a `TrainedState` here. The
+    /// `ShutdownWithSave`-written bundle remains the resume vehicle
+    /// for the unrecoverable-failure case (rank crashed before the
+    /// snapshot path ran).
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterWorker`]: crate::distributed::cluster_worker::ClusterWorker
@@ -1409,16 +1411,24 @@ impl DdpHandle {
                 cluster_worker.inner_mut().set_scheduler(f(world_size));
             }
 
-            cluster_worker.run_until_shutdown(train_fn)?;
+            let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
 
-            // Final params are dropped by the discard bridge for now;
-            // final-snapshot egress over the data channel is planned.
-            // Cluster mode users wanting state recovery today should
-            // consume the bundle written via `ShutdownWithSave`.
-            Ok(TrainedState {
-                params: Vec::new(),
-                buffers: Vec::new(),
-            })
+            // Final snapshot captured from the inner GpuWorker before
+            // teardown. `None` means snapshot_params didn't run (worker
+            // errored before send_final_snapshot or the channel
+            // disconnected); fall back to an empty TrainedState so
+            // callers can still consume the bundle written via
+            // `ShutdownWithSave`. Tensors land on CPU per
+            // `snapshot_params`'s contract.
+            Ok(final_snapshot
+                .map(|snap| TrainedState {
+                    params: snap.params,
+                    buffers: snap.buffers,
+                })
+                .unwrap_or(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                }))
         });
 
         Ok(DdpHandle {
@@ -1662,14 +1672,21 @@ impl DdpHandle {
                 cluster_worker.inner_mut().set_scheduler(f(world_size));
             }
 
-            cluster_worker.run_until_shutdown(train_fn)?;
+            let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
 
-            // Final params discarded — final-snapshot egress is
-            // planned. Resume goes through the ShutdownWithSave bundle.
-            Ok(TrainedState {
-                params: Vec::new(),
-                buffers: Vec::new(),
-            })
+            // Final snapshot captured from the inner GpuWorker before
+            // teardown. `None` falls back to an empty TrainedState; the
+            // ShutdownWithSave bundle remains the canonical resume path
+            // for the unrecoverable-failure case.
+            Ok(final_snapshot
+                .map(|snap| TrainedState {
+                    params: snap.params,
+                    buffers: snap.buffers,
+                })
+                .unwrap_or(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                }))
         });
 
         Ok(DdpHandle {
@@ -1885,14 +1902,21 @@ impl DdpHandle {
                 cluster_worker.inner_mut().set_scheduler(f(world_size));
             }
 
-            cluster_worker.run_until_shutdown(train_fn)?;
+            let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
 
-            // Final params discarded — resume goes through the
-            // ShutdownWithSave bundle.
-            Ok(TrainedState {
-                params: Vec::new(),
-                buffers: Vec::new(),
-            })
+            // Final snapshot captured from the inner GpuWorker before
+            // teardown. `None` falls back to an empty TrainedState; the
+            // ShutdownWithSave bundle remains the canonical resume path
+            // for the unrecoverable-failure case.
+            Ok(final_snapshot
+                .map(|snap| TrainedState {
+                    params: snap.params,
+                    buffers: snap.buffers,
+                })
+                .unwrap_or(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                }))
         });
 
         Ok(DdpHandle {
@@ -2117,12 +2141,19 @@ impl DdpHandle {
                 cluster_worker.inner_mut().set_scheduler(f(world_size));
             }
 
-            cluster_worker.run_until_shutdown(train_fn)?;
+            let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
 
-            Ok(TrainedState {
-                params: Vec::new(),
-                buffers: Vec::new(),
-            })
+            // Final snapshot captured from the inner GpuWorker before
+            // teardown. `None` falls back to an empty TrainedState.
+            Ok(final_snapshot
+                .map(|snap| TrainedState {
+                    params: snap.params,
+                    buffers: snap.buffers,
+                })
+                .unwrap_or(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                }))
         });
 
         Ok(DdpHandle {
@@ -2258,10 +2289,12 @@ impl DdpHandle {
         // Cluster mode launcher: wait on the launcher driver thread.
         // The driver runs `run_launcher_with_config` which spawns
         // ranks, drives the ClusterCoordinator until completion, and
-        // tears down. Final-snapshot capture from via_coord is
-        // deferred (#8); return an empty `TrainedState` once the
-        // driver finishes — matches `run_cluster_rank_*_via_coord`
-        // semantics.
+        // tears down. The launcher process holds no rank state — final
+        // params live in the rank subprocesses where each rank's own
+        // `DdpHandle::join` returns them via the via_coord coordinator
+        // thread; cross-process snapshot egress to the launcher is a
+        // follow-up. Return an empty `TrainedState` here so the
+        // launcher's `.join()` still completes cleanly.
         if let Some(driver) = self.launcher_driver.take() {
             return match driver.join() {
                 Ok(Ok(())) => Ok(TrainedState {
