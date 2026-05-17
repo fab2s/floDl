@@ -187,8 +187,7 @@ pub enum EvalCadence {
 /// the model + dataset and consumes the result.
 ///
 /// Framework guarantees:
-/// - Fires on the rank selected by
-///   [`EpochCallbackPolicy`](crate::distributed::ddp_run::EpochCallbackPolicy).
+/// - Fires on the rank selected by [`EpochCallbackPolicy`].
 /// - Sync-aligned: the chosen rank's model is at its post-AllReduce /
 ///   post-EASGD-blend state when invoked.
 /// - `model.eval()` is called before and `model.train()` after the

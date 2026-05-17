@@ -406,7 +406,7 @@ fn test_worker_handle_control_shutdown() {
 fn test_worker_handle_control_sync_now_noop() {
     let (mut worker, ch) = make_test_worker();
 
-    // SyncNow is a no-op without NCCL (Phase 4)
+    // SyncNow is a no-op without NCCL.
     ch.control_tx.send(ControlMsg::SyncNow).unwrap();
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
@@ -2194,7 +2194,7 @@ fn test_async_ddp_ab_cpu_vs_nccl() {
 }
 
 // -----------------------------------------------------------------------
-// ElChe cadence + adaptive K tests (Phase 6)
+// ElChe cadence + adaptive K tests
 // -----------------------------------------------------------------------
 
 #[test]
@@ -2582,7 +2582,7 @@ fn test_config_builder() {
 }
 
 // -----------------------------------------------------------------------
-// Partition + data iteration tests (Phase 5)
+// Partition + data iteration tests
 // -----------------------------------------------------------------------
 
 #[test]
@@ -2731,7 +2731,7 @@ fn test_cpu_averaging_end_to_end() {
 }
 
 // -----------------------------------------------------------------------
-// Proportional epoch sharding tests (Phase 7)
+// Proportional epoch sharding tests
 // -----------------------------------------------------------------------
 
 #[test]

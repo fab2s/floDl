@@ -287,9 +287,8 @@ impl LocalCluster {
         }
 
         // Session salt is optional in the envelope: the launcher fills
-        // it in for cluster runs, but it is absent for single-host /
-        // legacy code paths that build envelopes manually (tests, the
-        // old fdl-cli code path before 4b.D.1d landed). Default to all
+        // it in for cluster runs, but it is absent for envelopes built
+        // manually (tests, single-host code paths). Default to all
         // zeros in that case -- equivalent to the prior "no salt"
         // behavior, and HMACs against an all-zero key still authenticate
         // intra-cluster as long as every participant agrees.

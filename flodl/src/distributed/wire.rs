@@ -650,7 +650,9 @@ pub struct ParamSnapshotMetaWire {
 }
 
 /// Periodic worker-emitted heartbeat. Coordinator uses last-heard time
-/// per rank for fault detection (slice 1d.5).
+/// per rank for fault detection (drives `check_dead_ranks` /
+/// rank-death dispatch in
+/// [`crate::distributed::cluster_coordinator::ClusterCoordinator`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatWire {
     pub rank: u64,

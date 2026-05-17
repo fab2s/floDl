@@ -26,27 +26,23 @@
 //!                  // trigger_averaging
 //! ```
 //!
-//! # Scope of 4b.D.1d.1
+//! # Responsibilities
 //!
-//! Ports the load-bearing subset from the OLD coordinator:
-//!
-//! - State fields: ElChe, ConvergenceGuard, `steps_since_avg`,
-//!   `wall_ms_accum`, `last_step_count`, `nccl_sync_step` / `nccl_ack`,
-//!   `nccl_sync_divergence` / `pre_norm` / `post_norm`, `throttled`,
-//!   `active_count`, `version`, `avg_count`, `global_step`,
-//!   `last_nccl_sync_ms`.
-//! - Methods: `process_timing_msg` (private),
-//!   [`ClusterCoordinator::should_average`],
-//!   [`ClusterCoordinator::trigger_averaging`] (NCCL path),
+//! - Owns per-cluster scheduling state: ElChe, [`ConvergenceGuard`],
+//!   `steps_since_avg`, `wall_ms_accum`, `last_step_count`,
+//!   `nccl_sync_step` / `nccl_ack`, `nccl_sync_divergence` /
+//!   `pre_norm` / `post_norm`, `throttled`, `active_count`,
+//!   `version`, `avg_count`, `global_step`, `last_nccl_sync_ms`.
+//! - Drives averaging decisions: [`ClusterCoordinator::should_average`],
+//!   [`ClusterCoordinator::trigger_averaging`] (NCCL),
 //!   [`ClusterCoordinator::check_throttle`],
 //!   [`ClusterCoordinator::drain_timing`], [`ClusterCoordinator::tick`].
-//! - New: [`ClusterCoordinator::start`] + [`ClusterCoordinator::shutdown`]
-//!   (TCP accept loop + per-rank reader threads).
-//!
-//! Deferred to later slices: epoch dispatch / progressive chunk pools
-//! (1d.3+), CPU 3-phase averaging (1d.4), heartbeat fault detection
-//! (1d.5), metrics aggregation (1d.5+), meta-controller observe wiring
-//! (1d.3+).
+//! - Owns TCP lifecycle: [`ClusterCoordinator::start`] +
+//!   [`ClusterCoordinator::shutdown`] (accept loop + per-rank reader
+//!   threads).
+//! - Drives epoch dispatch (with progressive chunk-pool support),
+//!   CPU 3-phase averaging, heartbeat fault detection, metrics
+//!   aggregation, and meta-controller observe wiring.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -113,8 +109,7 @@ fn hmac_first8(salt: &SessionSalt, bytes: &[u8]) -> [u8; 8] {
 }
 
 /// Worker-side companion to [`read_handshake_rank`]. Exported at
-/// crate visibility for the upcoming `cluster_worker` slice (1d.2);
-/// the slice 1d.1 tests are the only current callers.
+/// crate visibility for use by [`crate::distributed::cluster_worker`].
 #[allow(dead_code)]
 pub(crate) fn write_handshake_rank(
     stream: &mut TcpStream,
@@ -189,9 +184,16 @@ fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()>
 // ClusterCoordinator
 // ---------------------------------------------------------------------------
 
-/// Configuration for [`ClusterCoordinator::start`]. Subset of OLD
-/// `CoordinatorBuilder`: only the fields needed for the slice 1d.1
-/// scope (NCCL averaging + ElChe ownership + ConvergenceGuard).
+/// Configuration for [`ClusterCoordinator::start`]. Carries the
+/// fields the controller needs to drive NCCL/CPU averaging, ElChe
+/// ownership, ConvergenceGuard, dispatch, and the user-callback
+/// surface ([`epoch_fn`], [`checkpoint_fn`], [`metrics_fn`],
+/// [`eval_fn`], etc.).
+///
+/// [`epoch_fn`]: crate::distributed::ddp_run::EpochFn
+/// [`checkpoint_fn`]: crate::distributed::ddp_run::CheckpointFn
+/// [`metrics_fn`]: crate::distributed::ddp_run::MetricsFn
+/// [`eval_fn`]: crate::distributed::ddp_run::EvalFn
 pub struct ClusterCoordinatorConfig {
     pub policy: ApplyPolicy,
     pub backend: AverageBackend,
@@ -214,8 +216,8 @@ pub struct ClusterCoordinatorConfig {
     /// [`ClusterCoordinator::dispatch_epoch`]. Default 0 (caller must
     /// set via [`Self::total_samples`] before dispatching epochs).
     pub total_samples: usize,
-    /// Batch size; carried for symmetry with OLD Coordinator (the
-    /// progressive chunk-pool path uses it, slice 1d.6 wiring).
+    /// Batch size; consumed by the progressive chunk-pool dispatch
+    /// path to size per-chunk batches.
     pub batch_size: usize,
     /// Total number of epochs to train; informs `dispatch_epoch`'s
     /// out-of-range guard. Default 0 = unbounded (caller controls).
@@ -300,7 +302,8 @@ pub struct ClusterCoordinatorConfig {
     /// the elastic-balancer + future polling surfaces).
     pub metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,
 
-    /// Optional sink for aggregated [`EpochMetrics`]. Populated by the
+    /// Optional sink for aggregated
+    /// [`crate::distributed::ddp_run::EpochMetrics`]. Populated by the
     /// launcher trampoline so the user's
     /// [`crate::distributed::DdpHandle::next_metrics`] polling loop
     /// drains aggregates as they're produced. Fed in parallel with
@@ -521,14 +524,14 @@ impl ClusterCoordinatorConfig {
 /// violation for Local SGD (per-rank drift accumulates super-linearly
 /// across missed rendezvous points), so the only safe response to a
 /// stalled rank is to keep waiting. **Liveness detection lives outside
-/// the averaging path**: heartbeats (planned 1d.5) feed the coordinator
-/// independently and surface dead ranks as fatal training errors. Slow
-/// (but live) ranks are absorbed by ElChe on the next cycle, which
-/// rebalances [`crate::distributed::ddp::ElChe::batch_counts`] from the
-/// observed wall-time. **Elastic averaging on confirmed rank death**
-/// (rebuild [`crate::distributed::cpu_reduce::CpuReduceClient`] with a
-/// shrunken world, reshard the dead rank's remaining partition onto the
-/// fastest survivors) is a separate later slice.
+/// the averaging path**: heartbeats feed the coordinator independently
+/// and surface dead ranks as fatal training errors. Slow (but live)
+/// ranks are absorbed by ElChe on the next cycle, which rebalances
+/// [`crate::distributed::ddp::ElChe::batch_counts`] from the observed
+/// wall-time. Confirmed rank death triggers elastic averaging via
+/// rendezvous rebuild on the shrunken survivor cohort; the dead rank's
+/// remaining partition is resharded onto survivors via
+/// [`ControlMsgWire::ExtendPartition`].
 ///
 /// NCCL backend keeps the synchronous trigger → finish pattern (OLD
 /// `Coordinator::finish_averaging_nccl` parity).
@@ -559,9 +562,9 @@ struct NcclRendezvousPending {
     /// initiation time. Currently unread (the broadcast helper
     /// recomputes the alive set so additional deaths during the
     /// rendezvous wait are reflected); kept for diagnostics and as
-    /// the seed for the future 1d.3c "rendezvous timeout retry"
-    /// path which would re-pick a generator from this set if the
-    /// chosen one also dies before responding.
+    /// the seed for a future rendezvous-timeout-retry path that
+    /// would re-pick a generator from this set if the chosen one
+    /// also dies before responding.
     #[allow(dead_code)]
     survivors_ordered: Vec<usize>,
 }
@@ -692,8 +695,8 @@ pub struct ClusterCoordinator {
     /// only — do NOT feed it into ElChe or partition-balancing logic
     /// as a per-rank throughput proxy. Honest per-rank capacity
     /// instead comes from `wall_ms_accum` / `steps_since_avg` (already
-    /// excludes the barrier wait) and the future per-rank
-    /// upload-completion marker planned alongside heartbeat (1d.5+).
+    /// excludes the barrier wait) and a planned per-rank
+    /// upload-completion marker on the data channel.
     last_observed_sync_lag_ms: Vec<Option<f64>>,
 
     /// Checkpoint bundle stem for the controller-side `.meta.json`
@@ -725,7 +728,8 @@ pub struct ClusterCoordinator {
     epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
     /// Total samples in the dataset; basis for partition computation.
     total_samples: usize,
-    /// Batch size; carried for symmetry with OLD Coordinator (1d.6).
+    /// Batch size; consumed by the progressive chunk-pool dispatch
+    /// path to size per-chunk batches.
     batch_size: usize,
     /// Total number of epochs the trainer asked for.
     num_epochs: usize,
@@ -737,9 +741,10 @@ pub struct ClusterCoordinator {
     /// the coordinator thread drains via [`Self::drain_timing`].
     timing_rx: mpsc::Receiver<TimingMsgWire>,
     /// Reader threads also push decoded per-epoch metrics here;
-    /// the coordinator thread drains via [`Self::drain_metrics`] and
-    /// aggregates into [`super::EpochMetrics`] once each epoch has
-    /// reports from every alive rank.
+    /// the coordinator thread drains via
+    /// [`Self::drain_metrics_and_aggregate`] and aggregates into
+    /// [`crate::distributed::ddp_run::EpochMetrics`] once each epoch
+    /// has reports from every alive rank.
     metrics_rx: mpsc::Receiver<crate::distributed::wire::MetricsMsgWire>,
     /// Per-rank, per-epoch buffer of arrived MetricsMsg reports. Keyed
     /// by `(epoch, rank)`; aggregation fires once `rank_count(epoch) ==
@@ -1256,11 +1261,11 @@ impl ClusterCoordinator {
                 // Pure operational telemetry for now: marks the end of
                 // per-rank snapshot+upload (honest per-rank capacity
                 // signal, NOT polluted by the AllReduce barrier wait
-                // that follows). A future slice will feed this into
-                // ElChe's partition rebalancer when we add a per-rank
-                // upload-throughput estimator separate from
-                // wall_ms_accum. For 1d.5 it's enough that the wire
-                // path is in place and liveness is refreshed above.
+                // that follows). A future enhancement will feed this
+                // into ElChe's partition rebalancer when we add a
+                // per-rank upload-throughput estimator separate from
+                // `wall_ms_accum`. Today the wire path is in place
+                // and liveness is refreshed above.
             }
             TimingMsgWire::NewNcclIdGenerated { rank, uid_bytes } => {
                 let rank = rank as usize;
@@ -1411,9 +1416,9 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Throttle fast workers. Ported literally from OLD
-    /// `Coordinator::check_throttle`. NCCL backend is a no-op (collective
-    /// already coordinates), CPU backend not yet supported in 1d.1.
+    /// Throttle fast workers. NCCL backend is a no-op (the collective
+    /// itself coordinates pacing); CPU backend defers to ElChe's
+    /// rebalancer instead of explicit throttle frames.
     pub fn check_throttle(&mut self) -> Result<()> {
         if matches!(self.backend, AverageBackend::Nccl) {
             return Ok(());
@@ -1481,8 +1486,8 @@ impl ClusterCoordinator {
                 // correctness violation for Local SGD (per-rank drift
                 // accumulates super-linearly across missed rendezvous
                 // points). Liveness is a SEPARATE concern handled by
-                // heartbeats (1d.5+); slow-but-alive ranks are
-                // absorbed by ElChe's per-rank `wall_ms_accum` /
+                // the heartbeat fault detector; slow-but-alive ranks
+                // are absorbed by ElChe's per-rank `wall_ms_accum` /
                 // `batch_counts` rebalance on the next cycle.
                 self.cpu_avg_state = CpuAvgState::Pending;
             }
@@ -1529,8 +1534,7 @@ impl ClusterCoordinator {
     ///   gates use the smaller quorum.
     ///
     /// No-op when `dead_ranks` is `None` (elastic membership not
-    /// configured — rank death is permanently blocking, matching
-    /// pre-1d.5 behavior).
+    /// configured — rank death is permanently blocking).
     fn check_dead_ranks(&mut self) {
         let Some(ledger) = self.dead_ranks.as_ref().cloned() else {
             return;
@@ -2154,9 +2158,10 @@ impl ClusterCoordinator {
         Ok(alive)
     }
 
-    /// Drain pending [`MetricsMsgWire`] frames from the reader threads
-    /// and, for any epoch where every alive rank has reported, build
-    /// an [`crate::distributed::ddp_run::EpochMetrics`] and fire the
+    /// Drain pending [`crate::distributed::wire::MetricsMsgWire`]
+    /// frames from the reader threads and, for any epoch where every
+    /// alive rank has reported, build an
+    /// [`crate::distributed::ddp_run::EpochMetrics`] and fire the
     /// user-supplied `metrics_fn` (when configured).
     ///
     /// Per-epoch buffers are dropped on aggregation. Late frames from
@@ -2324,10 +2329,10 @@ impl ClusterCoordinator {
     /// Broadcast `StartEpoch(plan)` to every connected rank, updating
     /// `rank_epoch[r]` to `epoch` for each rank as it goes out.
     ///
-    /// Mirrors OLD `Coordinator::send_all_plans` minus the progressive
-    /// chunk-pool branch (1d.6 wiring). Returns the plans dispatched
-    /// so callers can pair the call with rank-side acknowledgments in
-    /// tests.
+    /// Returns the plans dispatched so callers can pair the call with
+    /// rank-side acknowledgments in tests. Progressive chunk-pool
+    /// dispatch (streaming work in small chunks instead of full
+    /// per-epoch partitions) is a planned refinement of this path.
     pub fn dispatch_epoch(
         &mut self,
         epoch: usize,
@@ -2393,20 +2398,19 @@ impl ClusterCoordinator {
     }
 
     /// Last globally-aggregated epoch (all ranks reported). `None`
-    /// until the coord's `on_epoch_aggregated` hook fires the first
-    /// time (deferred to 1d.5 when metrics aggregation lands).
+    /// until the coord's metrics aggregator fires the first time.
     pub fn last_aggregated_epoch(&self) -> Option<usize> {
         self.last_aggregated_epoch
     }
 
     /// Batch size carried from config; used by progressive chunk
-    /// dispatch in 1d.6.
+    /// dispatch to size per-chunk batches.
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
 
-    /// Number of epochs the trainer asked for; informs upcoming
-    /// `dispatch_epoch` bounds and 1d.5 metrics aggregation.
+    /// Number of epochs the trainer asked for; informs
+    /// `dispatch_epoch` bounds and metrics aggregation.
     pub fn num_epochs(&self) -> usize {
         self.num_epochs
     }
@@ -2535,11 +2539,11 @@ fn reader_loop(
                 }
                 MsgKind::Heartbeat => {
                     // Orphan scaffolding from an earlier protocol draft.
-                    // 1d.5 routes heartbeats through `TimingMsgWire::Heartbeat`
-                    // over `MsgKind::Timing` instead, so this arm is
-                    // intentionally unreached in current builds. Kept for
-                    // wire-format stability (the enum value is part of
-                    // protocol version 2's surface).
+                    // Heartbeats now flow through `TimingMsgWire::Heartbeat`
+                    // over `MsgKind::Timing`, so this arm is intentionally
+                    // unreached in current builds. Kept for wire-format
+                    // stability (the enum value is part of protocol
+                    // version 2's surface).
                 }
                 MsgKind::Control | MsgKind::ParamSnapshotMeta => {
                     eprintln!(
@@ -2865,12 +2869,11 @@ mod tests {
 
     // Throttle is an Async/CPU-backend concept; NCCL backend uses
     // AllReduce as the coordination mechanism (sending Throttle there
-    // would deadlock with the collective). Slice 1d.1 only wires the
-    // NCCL backend, so a Throttle behavioral test belongs to 1d.4 when
-    // AverageBackend::Cpu lands. The path is structurally exercised
-    // here by `cfg_async_nccl`, which goes through `check_throttle`
-    // and confirms the NCCL early-return guard (the function returns
-    // without sending a frame to any rank).
+    // would deadlock with the collective). This test structurally
+    // exercises that path via `cfg_async_nccl`, which goes through
+    // `check_throttle` and confirms the NCCL early-return guard (the
+    // function returns without sending a frame to any rank).
+    // Behavioral throttle tests live in the CPU-backend test module.
     #[test]
     fn check_throttle_nccl_backend_is_no_op() {
         // Construct a coord with Async+Nccl; tick once with both ranks
@@ -2957,7 +2960,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 4b.D.1d.3a — epoch dispatch
+    // Epoch dispatch
     // -----------------------------------------------------------------
 
     fn cfg_sync_nccl_with_dataset(world_size: usize, total_samples: usize) -> ClusterCoordinatorConfig {
@@ -3169,8 +3172,8 @@ mod tests {
             })?;
             let msg = recv_control(s, salt)?;
             assert_eq!(msg, ControlMsgWire::RequestParams);
-            // Mock the post-data-channel ack the real bridge will send
-            // in 1d.4's worker-side wiring.
+            // Mock the post-data-channel ack the worker-side bridge
+            // emits after the CPU averaging round-trip completes.
             send_timing(s, salt, TimingMsgWire::SyncAck {
                 rank: 0,
                 step_count: 2,
@@ -3249,7 +3252,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // LR-aware meta-controller (1d.5a)
+    // LR-aware meta-controller
     // -----------------------------------------------------------------
 
     #[test]
@@ -3360,7 +3363,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // CPU finalize state machine (1d.4d)
+    // CPU finalize state machine
     // -----------------------------------------------------------------
 
     #[test]
@@ -3521,7 +3524,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Heartbeat + dead-rank detection (1d.5)
+    // Heartbeat + dead-rank detection
     // -----------------------------------------------------------------
 
     #[test]

@@ -653,7 +653,8 @@ mod tests {
 
     /// Deterministic non-zero test salt; matches the controller-side
     /// constant in `controller::tests` so the two test modules could
-    /// theoretically interop (they don't today, but they may in 1d.1+).
+    /// theoretically interop (they don't today, but might be wired
+    /// together in future cross-component tests).
     const TEST_SALT: SessionSalt = [
         0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
         0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,

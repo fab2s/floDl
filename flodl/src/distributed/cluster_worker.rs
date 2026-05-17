@@ -36,17 +36,19 @@
 //!     join bridges
 //! ```
 //!
-//! # Scope of 4b.D.1d.2
+//! # Wire surface
 //!
-//! - **In scope**: Sync+Nccl path end-to-end. ControlMsgWire variants
-//!   `SyncNow`, `Throttle`, `SetGlobalStep`, `StartEpoch`, `Shutdown`,
-//!   `Checkpoint` translate to in-process `ControlMsg`. TimingMsgWire
-//!   variants all four directions.
-//! - **Out of scope (1d.4 follow-up)**: `ControlMsgWire::Update` (CPU
-//!   averaging path — needs tensors via the data channel), `RequestParams`
-//!   (CPU averaging), final-snapshot data channel egress, metrics
-//!   aggregation. These bridges either drop messages with a debug log or
-//!   surface a loud error.
+//! `ControlMsgWire` variants `SyncNow`, `Throttle`, `SetGlobalStep`,
+//! `StartEpoch`, `Shutdown`, `Checkpoint`, `ExecuteEvalCallback`,
+//! `ExtendPartition`, `DeclareDead`, `NewNcclSession`,
+//! `RequestNewNcclId`, `Update`, `RequestParams`, and
+//! `ShutdownWithSave` all flow through `control_wire_to_msg` into
+//! the in-process `ControlMsg` channel (some are intercepted at the
+//! inbound bridge for elastic-membership / NCCL-rebuild handling
+//! rather than forwarded to the inner `GpuWorker`). `TimingMsgWire`
+//! variants flow rank→coord in the opposite direction; the param
+//! bridge synthesises a real `ControlMsg::Update(AveragedParams)` on
+//! the CPU averaging path via `CpuReduceClient`.
 //!
 //! # Tests
 //!
@@ -302,21 +304,20 @@ pub struct ClusterWorker<M: Module> {
     /// Cooperative shutdown for bridge threads. Flipped during
     /// `run_until_shutdown` teardown.
     shutdown_flag: Arc<AtomicBool>,
-    /// Per-worker dead-rank ledger. (1d.3c consumer.) Updated by the
-    /// inbound bridge when `ControlMsgWire::DeclareDead` arrives;
-    /// polled by the NCCL watchdog thread to trigger
-    /// `NcclAbortHandle::abort` on the local comm. Distinct from the
-    /// coord-side `Arc<DeadRanks>` because workers in different
-    /// processes can't share Arcs with the coord — each worker holds
-    /// its own copy and the coord drives state via the wire.
+    /// Per-worker dead-rank ledger. Updated by the inbound bridge when
+    /// `ControlMsgWire::DeclareDead` arrives; polled by the NCCL
+    /// watchdog thread to trigger `NcclAbortHandle::abort` on the
+    /// local comm. Distinct from the coord-side `Arc<DeadRanks>`
+    /// because workers in different processes can't share Arcs with
+    /// the coord — each worker holds its own copy and the coord
+    /// drives state via the wire.
     #[allow(dead_code)]
     local_dead_ranks: Arc<crate::distributed::controller::DeadRanks>,
-    /// Pending NCCL session mailbox. (1d.3c consumer.) Inbound bridge
-    /// stores the most recent `NewNcclSession` payload; the main-
-    /// thread comm-rebuild path takes from this slot. For 1d.3b
-    /// the slot is allocated but not yet wired into the inbound
-    /// bridge — NCCL rank death currently surfaces as a clean
-    /// training error rather than in-place recovery.
+    /// Pending NCCL session mailbox. Inbound bridge stores the most
+    /// recent `NewNcclSession` payload from the coord; the main-thread
+    /// comm-rebuild path inside `sync_now_nccl::wait_for_nccl_session`
+    /// takes from this slot to rebuild the comm on the survivor
+    /// cohort after a peer-death abort.
     #[allow(dead_code)]
     nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
     /// User-supplied per-epoch callback. Populated only on the rank
@@ -607,7 +608,10 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 .name(format!("flodl-worker-discard-final:r{rank_out}"))
                 .spawn(move || {
                     while final_param_rx.recv().is_ok() {
-                        // Drop. 1d.4 wires this to the data channel.
+                        // Drop. Final-snapshot egress via the data
+                        // channel is a planned follow-up; today this
+                        // bridge silently consumes the snapshot so the
+                        // worker can shut down cleanly.
                     }
                 })
                 .map_err(|e| {
@@ -1077,8 +1081,9 @@ fn write_one(
     frame.write_to(stream)
 }
 
-/// Convert in-process [`MetricsMsg`] into wire-compatible
-/// [`MetricsMsgWire`] for transit over the metrics-channel TCP frame.
+/// Convert in-process [`crate::distributed::ddp_run::MetricsMsg`]
+/// into wire-compatible [`crate::distributed::wire::MetricsMsgWire`]
+/// for transit over the metrics-channel TCP frame.
 fn metrics_msg_to_wire(msg: crate::distributed::ddp_run::MetricsMsg)
     -> crate::distributed::wire::MetricsMsgWire
 {
@@ -1100,10 +1105,12 @@ fn metrics_msg_to_wire(msg: crate::distributed::ddp_run::MetricsMsg)
 }
 
 /// Outbound metrics bridge: drains `metrics_rx` (per-epoch
-/// [`MetricsMsg`] from the inner [`GpuWorker`]), wraps each into
-/// [`MetricsMsgWire`], and ships over its own write half of the
-/// rank→coord control stream. Mirrors [`outbound_loop`] but on the
-/// metrics channel + `MsgKind::Metrics` framing.
+/// [`crate::distributed::ddp_run::MetricsMsg`] from the inner
+/// [`GpuWorker`]), wraps each into
+/// [`crate::distributed::wire::MetricsMsgWire`], and ships over its
+/// own write half of the rank→coord control stream. Mirrors
+/// [`outbound_loop`] but on the metrics channel + `MsgKind::Metrics`
+/// framing.
 ///
 /// Holds its own `TcpStream` (a `try_clone` of the read/write split
 /// from `connect_and_build`) so it can write concurrently with the
@@ -1538,9 +1545,9 @@ mod tests {
         //     ClusterWorker::run_until_shutdown(train_fn).
         //  4. After workers exit, assert the two ranks' final
         //     parameters are bit-identical (collected via the
-        //     final_param channel, even though it discards by
-        //     default in 1d.2 — this test can attach a non-discard
-        //     final bridge for validation).
+        //     final_param channel — this test can attach a
+        //     non-discard final bridge for validation, even though
+        //     the production bridge currently discards).
         //
         // For now the test is structural — when CUDA tests run it
         // simply asserts that the module compiles and links
@@ -1943,7 +1950,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 4b.D.1d.4b — end-to-end Sync+Cpu smoke test scaffolding
+    // End-to-end Sync+Cpu smoke test scaffolding
     // -----------------------------------------------------------------
 
     use crate::distributed::cluster_coordinator::ClusterCoordinator as CCoord;
@@ -2001,9 +2008,8 @@ mod tests {
     /// Records each `report` call's `deltas` into a shared vector so a
     /// test can verify the param bridge populated the divergence triple
     /// in its `SyncAck` AND that the coord's CPU finalize state
-    /// machine (1d.4d) deferred `finish_averaging_cpu` until the
-    /// SyncAcks landed. Returns `Stable` so the test's anchor stays
-    /// stable.
+    /// machine deferred `finish_averaging_cpu` until the SyncAcks
+    /// landed. Returns `Stable` so the test's anchor stays stable.
     struct RecordingGuard {
         captured: Arc<std::sync::Mutex<Vec<Vec<f64>>>>,
     }
@@ -2029,8 +2035,7 @@ mod tests {
     /// on cycle 1 (validates the bridge's
     /// [`compute_divergence`](super::compute_divergence) flowed
     /// end-to-end AND that the CPU finalize state machine deferred the
-    /// guard verdict until the bridge SyncAcks populated the captures
-    /// — 1d.4d).
+    /// guard verdict until the bridge SyncAcks populated the captures).
     #[test]
     fn end_to_end_sync_cpu_smoke() {
         let world_size = 2usize;
@@ -2063,8 +2068,8 @@ mod tests {
         let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
 
         // RecordingGuard captures the deltas every `finish_averaging_*`
-        // pass — proves both the bridge wire (1d.4c) AND the deferred
-        // finalize (1d.4d) are correct end-to-end on cycle 1.
+        // pass — proves both the bridge wire AND the deferred
+        // finalize are correct end-to-end on cycle 1.
         let captured_deltas: Arc<std::sync::Mutex<Vec<Vec<f64>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_coord = Arc::clone(&captured_deltas);
@@ -2181,7 +2186,7 @@ mod tests {
         }
         assert!(coord.avg_count() >= 1, "at least one averaging cycle");
 
-        // 6b. With 1d.4d's deferred finalize, cycle 1's guard sees REAL
+        // 6b. With the deferred finalize, cycle 1's guard sees REAL
         //     divergence (the coord waited for every bridge SyncAck to
         //     land before running `finish_averaging_cpu`). Assert the
         //     guard captured strictly-positive per-rank deltas on the

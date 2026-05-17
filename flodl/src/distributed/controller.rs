@@ -1,11 +1,12 @@
 //! Cluster controller: TCP byte router for the star-topology
 //! cross-process gradient sum that powers [`AverageBackend::Cpu`].
 //!
-//! Slice 4b.D.1d.0 renamed the underlying type from `CpuAverager` to
-//! [`ClusterController`] to reflect its broader role under the
-//! process-model port -- it carries the data channel today and will
-//! own ElChe scheduling + worker control in the following slices. The
-//! data path stays the same star-topology byte router.
+//! [`ClusterController`] owns the data channel for CPU averaging
+//! under the process-model design. ElChe scheduling + worker control
+//! live on the companion
+//! [`crate::distributed::cluster_coordinator::ClusterCoordinator`]
+//! (control channel). The data path here is a star-topology byte
+//! router; the control path is connection-per-rank.
 //!
 //! Architecture (star, not collective): every rank ships a `RoundFrame`
 //! containing this round's tensors to a single TCP listener on the

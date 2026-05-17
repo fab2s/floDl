@@ -1211,23 +1211,26 @@ impl DdpHandle {
     /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Nccl`
     /// driven by a [`ClusterCoordinator`] (elastic-membership-aware).
     ///
-    /// Mirrors [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl)
-    /// but routes through [`ClusterWorker`] talking to a coord on
+    /// Routes through [`ClusterWorker`] talking to a coord on
     /// `master_addr:master_port + 3` over TCP control frames. The
     /// `pre_sync_scratch` buffers are allocated unconditionally for
     /// NCCL workers (see `GpuWorker::new`) so the abort-retry path in
     /// `sync_now_nccl` can restore params after a peer-death abort
     /// and re-AllReduce on the survivor cohort.
     ///
-    /// `save_path` on [`DdpRunConfig`] is REQUIRED for this entry —
-    /// the cluster save-on-unrecoverable-failure flow needs a
-    /// destination. Loud error at startup if unset.
+    /// `save_path` on [`DdpRunConfig`] is optional. When set, the
+    /// controller writes `<save_path>.meta.json` and workers write
+    /// `<save_path>.fdl` / `.optim` on unrecoverable failure (via
+    /// `ShutdownWithSave`). When unset, the run executes normally
+    /// and just skips save activity (legitimate for tests and
+    /// inference-style usage).
     ///
-    /// Final params are NOT yet returned via [`TrainedState`] from
-    /// this path (the discard bridge consumes them — 1d.4-deferred).
-    /// Users wanting the trained model can read the bundle written by
-    /// `ShutdownWithSave` if the cluster declared the run
-    /// unrecoverable, or land a final-snapshot capture in a follow-up.
+    /// Final params are not yet returned via [`TrainedState`] from
+    /// this path (the discard bridge consumes them — final-snapshot
+    /// egress over the data channel is planned). Users wanting the
+    /// trained model can read the bundle written by
+    /// `ShutdownWithSave`, or wait for the final-snapshot capture
+    /// follow-up.
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterWorker`]: crate::distributed::cluster_worker::ClusterWorker
@@ -1405,10 +1408,10 @@ impl DdpHandle {
 
             cluster_worker.run_until_shutdown(train_fn)?;
 
-            // Final params are dropped by the discard bridge for now
-            // (1d.4-deferred final-snapshot capture). Cluster mode
-            // users wanting state recovery should consume the bundle
-            // written via ShutdownWithSave.
+            // Final params are dropped by the discard bridge for now;
+            // final-snapshot egress over the data channel is planned.
+            // Cluster mode users wanting state recovery today should
+            // consume the bundle written via `ShutdownWithSave`.
             Ok(TrainedState {
                 params: Vec::new(),
                 buffers: Vec::new(),
@@ -1658,8 +1661,8 @@ impl DdpHandle {
 
             cluster_worker.run_until_shutdown(train_fn)?;
 
-            // Final params discarded (1d.4-deferred final-snapshot
-            // capture). Resume goes through the ShutdownWithSave bundle.
+            // Final params discarded — final-snapshot egress is
+            // planned. Resume goes through the ShutdownWithSave bundle.
             Ok(TrainedState {
                 params: Vec::new(),
                 buffers: Vec::new(),

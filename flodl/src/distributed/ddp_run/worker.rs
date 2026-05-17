@@ -1038,9 +1038,9 @@ impl<M: Module> GpuWorker<M> {
     /// Trigger an NCCL AllReduce across all ranks on this worker's
     /// parameters and reset the local steps-since-avg counter.
     ///
-    /// Self-driven entry point for the cluster-rank inline loop (4b.D.1a.ii
-    /// onwards). Mirrors the SyncNow handler in `dispatch_control` but
-    /// skips the SyncAck — there's no coordinator listening in the new
+    /// Self-driven entry point for the cluster-rank inline loop.
+    /// Mirrors the SyncNow handler in `dispatch_control` but skips
+    /// the SyncAck — there's no coordinator listening in the
     /// process-per-rank model.
     ///
     /// All ranks must reach `sync_now` concurrently for the AllReduce
@@ -1075,13 +1075,14 @@ impl<M: Module> GpuWorker<M> {
     /// orchestration change: no coordinator driving SyncNow control
     /// messages — this rank decides Sync = every batch internally.
     ///
-    /// **Not yet supported:**
-    /// - VRAM-aware prefetch (sync data loading only; future slice)
-    /// - Per-batch metrics + per-epoch MetricsMsg (future slice; DdpHandle
-    ///   metrics queue is empty until then)
+    /// **Not supported by this self-driven entry:**
+    /// - VRAM-aware prefetch (sync data loading only)
+    /// - Per-batch metrics + per-epoch MetricsMsg (DdpHandle metrics
+    ///   queue is empty on the self-driven path)
     /// - `Cadence` / `Async` policies (loud error in the cluster-rank
-    ///   dispatch — see 4b.D.1a.iii / iv)
-    /// - `epoch_fn` callback (future slice)
+    ///   dispatch — those policies go through the controller-driven
+    ///   `via_coord` paths instead)
+    /// - `epoch_fn` callback (controller-driven path only)
     pub fn run_self_driven_sync_nccl(
         &mut self,
         num_epochs: usize,
@@ -1159,11 +1160,11 @@ impl<M: Module> GpuWorker<M> {
     /// semantics every batch, same `param_vars` set being averaged. The
     /// orchestration switch (TCP rather than NCCL) is the only change.
     ///
-    /// **Not yet supported (carried forward through later slices):**
+    /// **Not supported by this self-driven entry:**
     /// VRAM-aware prefetch, per-epoch [`MetricsMsg`] aggregation,
     /// `epoch_fn` / `metrics_fn` / `scheduler_fn` / `checkpoint_every`
-    /// callbacks, EASGD blending (the CPU-async slice's α-mixing —
-    /// 4b.D.1c).
+    /// callbacks, EASGD blending. Use the controller-driven via_coord
+    /// paths for the full callback + persistence surface.
     ///
     /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
     pub fn run_self_driven_sync_cpu(
@@ -1275,7 +1276,7 @@ impl<M: Module> GpuWorker<M> {
     /// same divergence math (snapshot → AllReduce-Avg → `||pre - post|| /
     /// ||post||`), same guard verdict → ElChe action wiring.
     ///
-    /// **Still deferred (carried forward through 4b.D.1b):** VRAM-aware
+    /// **Not supported by this self-driven entry:** VRAM-aware
     /// prefetch, per-epoch [`MetricsMsg`] aggregation, `epoch_fn` /
     /// `metrics_fn` / `scheduler_fn` / `checkpoint_every` callbacks,
     /// LR-aware meta-controller (needs scheduler_fn flow), Timeline
@@ -1447,7 +1448,8 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// `Async + Cpu` is **not** routed here: genuine async semantics
     /// require the 3-phase Idle/Collecting/Computing machine that
-    /// lands in 4b.D.1c. Cadence + Cpu is the blocking-reduce variant.
+    /// lives on the controller-driven `via_coord` path. Cadence + Cpu
+    /// is the blocking-reduce variant.
     ///
     /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
     /// [`ConvergenceAction`]: super::convergence::ConvergenceAction
