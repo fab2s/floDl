@@ -11,13 +11,12 @@ use super::{
     ParamSnapshot, ControlMsg, EpochPlan, TrainedState,
 };
 
-mod chunk_pool;
 mod cpu_avg;
 
 // Re-exported at `pub(super)` so `super::coordinator::ChunkPool` works in
-// `ddp_run::tests`. ChunkPool is `pub` inside its (private) module — the
-// effective visibility is set by this re-export, not by chunk_pool.rs.
-pub(super) use chunk_pool::ChunkPool;
+// `ddp_run::tests`. ChunkPool lives at `crate::distributed::chunk_pool`
+// (shared between the threaded coordinator and `ClusterCoordinator`).
+pub(super) use crate::distributed::chunk_pool::ChunkPool;
 use cpu_avg::CpuAvgState;
 
 // ---------------------------------------------------------------------------

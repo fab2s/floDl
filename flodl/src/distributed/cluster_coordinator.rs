@@ -320,6 +320,15 @@ pub struct ClusterCoordinatorConfig {
     /// Eval cadence (in epochs). `Some(n)` triggers an eval dispatch
     /// every `n` epochs from `dispatch_epoch`. `None` or `0` disables.
     pub eval_every_epochs: Option<usize>,
+
+    /// Progressive dispatch toggle. `None` = auto (true for
+    /// `Cadence` / `Async`, false for `Sync`). `Some(true)` or
+    /// `Some(false)` is the explicit user override from
+    /// [`super::ddp_run::DdpRunConfig::progressive_dispatch`]. When
+    /// enabled, the coordinator streams work in small chunks
+    /// adapting to measured throughput instead of dispatching one
+    /// full per-rank partition per epoch.
+    pub progressive: Option<bool>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -356,6 +365,7 @@ impl ClusterCoordinatorConfig {
             metrics_sink_tx: None,
             eval_result_fn: None,
             eval_every_epochs: None,
+            progressive: None,
         }
     }
 
@@ -371,6 +381,15 @@ impl ClusterCoordinatorConfig {
     /// Eval cadence in epochs. `0` disables.
     pub fn eval_every_epochs(mut self, n: usize) -> Self {
         self.eval_every_epochs = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Override progressive-dispatch mode. `None` (default) follows
+    /// the auto rule: true for `Cadence` / `Async`, false for `Sync`.
+    /// `Some(true)` / `Some(false)` is an explicit override. See
+    /// [`Self::progressive`].
+    pub fn progressive(mut self, enabled: bool) -> Self {
+        self.progressive = Some(enabled);
         self
     }
 
@@ -746,13 +765,41 @@ pub struct ClusterCoordinator {
     /// [`crate::distributed::ddp_run::EpochMetrics`] once each epoch
     /// has reports from every alive rank.
     metrics_rx: mpsc::Receiver<crate::distributed::wire::MetricsMsgWire>,
-    /// Per-rank, per-epoch buffer of arrived MetricsMsg reports. Keyed
-    /// by `(epoch, rank)`; aggregation fires once `rank_count(epoch) ==
-    /// active_count`. Cleared after aggregation.
-    metrics_buffer: std::collections::HashMap<
+    /// Per-epoch buffer of arrived MetricsMsg reports. Keyed by epoch.
+    /// In non-progressive dispatch each alive rank emits exactly one
+    /// message per epoch; in progressive dispatch each rank emits one
+    /// per chunk (so many messages per rank per epoch). Aggregation
+    /// fires once the readiness condition is met (every alive rank has
+    /// reported at least once for non-progressive, or the epoch's
+    /// `ChunkPool::is_epoch_done()` returns true for progressive).
+    /// `BTreeMap` rather than `HashMap` so progressive aggregation
+    /// walks epochs in ascending order, matching the threaded
+    /// coordinator's ordering invariant.
+    metrics_buffer: std::collections::BTreeMap<
         u64,
-        Vec<Option<crate::distributed::ddp_run::MetricsMsg>>,
+        Vec<crate::distributed::ddp_run::MetricsMsg>,
     >,
+    /// Per-epoch progressive chunk pools. Created on `dispatch_epoch`
+    /// when [`Self::progressive`] is set, drained by
+    /// `drain_metrics_and_aggregate` on epoch completion. `BTreeMap`
+    /// keeps cross-epoch streaming in ascending order so a fast rank
+    /// streaming ahead doesn't aggregate before slower ranks finish
+    /// earlier epochs.
+    chunk_pools: std::collections::BTreeMap<usize, crate::distributed::chunk_pool::ChunkPool>,
+    /// When true, dispatch streams work in small chunks (one
+    /// `StartEpoch` per chunk) adapting to measured throughput. When
+    /// false, dispatch sends the full per-rank partition once per
+    /// epoch (the legacy behaviour). Derived at construction time
+    /// from
+    /// [`ClusterCoordinatorConfig::progressive`] /
+    /// [`super::ddp_run::DdpRunConfig::progressive_dispatch`] /
+    /// [`ApplyPolicy`] (auto: true for Cadence/Async, false for Sync).
+    progressive: bool,
+    /// Minimum chunk size in batches. After calibration, the
+    /// throughput-proportional chunk sizer floors at this value so a
+    /// rank doesn't get a one-batch chunk that pays per-chunk overhead
+    /// without amortising it.
+    min_chunk_batches: usize,
     /// User-supplied per-epoch metrics callback (controller-side). Fires
     /// after each successful aggregation. `None` = no callback wired.
     metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,
@@ -999,7 +1046,17 @@ impl ClusterCoordinator {
             partition_ratios: config.partition_ratios,
             timing_rx,
             metrics_rx,
-            metrics_buffer: std::collections::HashMap::new(),
+            metrics_buffer: std::collections::BTreeMap::new(),
+            chunk_pools: std::collections::BTreeMap::new(),
+            // Resolve progressive: explicit override wins, otherwise
+            // auto-on for Cadence/Async, off for Sync (matches the
+            // threaded coordinator's default).
+            progressive: config.progressive.unwrap_or(
+                !matches!(config.policy, ApplyPolicy::Sync),
+            ),
+            // Floor for proportional chunk sizing after calibration —
+            // matches the threaded coordinator's default.
+            min_chunk_batches: 4,
             metrics_fn: config.metrics_fn.clone(),
             metrics_sink_tx: config.metrics_sink_tx.clone(),
             eval_result_fn: config.eval_result_fn.clone(),
@@ -2159,24 +2216,30 @@ impl ClusterCoordinator {
     }
 
     /// Drain pending [`crate::distributed::wire::MetricsMsgWire`]
-    /// frames from the reader threads and, for any epoch where every
-    /// alive rank has reported, build an
-    /// [`crate::distributed::ddp_run::EpochMetrics`] and fire the
-    /// user-supplied `metrics_fn` (when configured).
+    /// frames from the reader threads. In non-progressive mode,
+    /// aggregate once every alive rank has reported for the same
+    /// epoch. In progressive mode, accumulate per-chunk reports per
+    /// epoch + dispatch the next chunk to the reporting rank, then
+    /// aggregate when the epoch's `ChunkPool::is_epoch_done()` fires
+    /// (and only in ascending epoch order — a fast rank streaming
+    /// ahead can't aggregate while earlier epochs still have
+    /// in-flight chunks on the slow rank).
     ///
+    /// In all paths: build [`crate::distributed::ddp_run::EpochMetrics`]
+    /// and fire the user-supplied `metrics_fn` + `metrics_sink_tx`.
     /// Per-epoch buffers are dropped on aggregation. Late frames from
     /// a dead rank are ignored.
     fn drain_metrics_and_aggregate(&mut self) {
+        // Track ranks that received a chunk-complete report so we can
+        // dispatch the next chunk after the borrow on `chunk_pools` /
+        // `metrics_buffer` is released.
+        let mut progressive_completions: Vec<(usize, usize)> = Vec::new();
         while let Ok(wire) = self.metrics_rx.try_recv() {
             let rank = wire.rank as usize;
             if rank >= self.world_size {
                 continue;
             }
-            let epoch_key = wire.epoch;
-            let slot = self.metrics_buffer
-                .entry(epoch_key)
-                .or_insert_with(|| (0..self.world_size).map(|_| None).collect());
-            slot[rank] = Some(crate::distributed::ddp_run::MetricsMsg {
+            let msg = crate::distributed::ddp_run::MetricsMsg {
                 rank,
                 epoch: wire.epoch as usize,
                 avg_loss: wire.avg_loss,
@@ -2190,54 +2253,103 @@ impl ClusterCoordinator {
                     .into_iter()
                     .map(|(k, (sum, count))| (k, (sum, count as usize)))
                     .collect(),
-            });
+            };
+            if self.progressive {
+                if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
+                    pool.mark_completed(rank, msg.samples_processed);
+                }
+                progressive_completions.push((rank, msg.epoch));
+            }
+            self.metrics_buffer
+                .entry(wire.epoch)
+                .or_default()
+                .push(msg);
         }
 
-        // Find any epoch whose slots cover every alive rank, aggregate,
-        // and fire metrics_fn. Iterating with collected keys to avoid
-        // holding a borrow across the mutation.
+        // Progressive: dispatch the next chunk to every rank that just
+        // reported a chunk completion. Done after the drain loop so
+        // we're not borrowing chunk_pools / metrics_buffer.
+        if self.progressive {
+            for (rank, _epoch) in progressive_completions {
+                self.dispatch_next_chunk(rank);
+            }
+        }
+
+        // Resolve readiness per dispatch mode.
         let alive: Vec<usize> = (0..self.world_size)
             .filter(|r| !self.is_rank_dead(*r))
             .collect();
-        let ready_epochs: Vec<u64> = self.metrics_buffer
-            .iter()
-            .filter_map(|(&epoch, slots)| {
-                if alive.iter().all(|&r| slots[r].is_some()) {
-                    Some(epoch)
+        let ready_epochs: Vec<u64> = if self.progressive {
+            // BTreeMap order: walk chunk_pools in ascending epoch
+            // order, collecting done ones, STOPPING at the first
+            // not-done (so a fast rank streaming ahead can't aggregate
+            // before slower ranks finish earlier epochs).
+            let mut ready: Vec<u64> = Vec::new();
+            for (&epoch, pool) in &self.chunk_pools {
+                if pool.is_epoch_done() {
+                    ready.push(epoch as u64);
                 } else {
-                    None
+                    break;
                 }
-            })
-            .collect();
-        for epoch_key in ready_epochs {
-            if let Some(slots) = self.metrics_buffer.remove(&epoch_key) {
-                let msgs: Vec<crate::distributed::ddp_run::MetricsMsg> =
-                    slots.into_iter().flatten().collect();
-                // bc_share: equal share across alive ranks. Future
-                // refinement could use `el_che.recent_batch_share()`
-                // when calibrated; equal is fine for the aggregate
-                // surfacing and never produces NaN.
-                let bc_share = vec![1.0_f64 / alive.len().max(1) as f64; self.world_size];
-                let metrics = crate::distributed::ddp_run::aggregate_epoch_metrics(
-                    epoch_key as usize,
-                    &msgs,
-                    &self.metrics_device_indices,
-                    &bc_share,
-                );
-                self.last_aggregated_epoch = Some(epoch_key as usize);
-                if let Some(ref f) = self.metrics_fn {
-                    if let Err(e) = f(&metrics) {
-                        eprintln!(
-                            "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
-                        );
+            }
+            ready
+        } else {
+            // Non-progressive: every alive rank emits exactly one
+            // MetricsMsg per epoch. Epoch is ready when each alive
+            // rank appears at least once in the Vec.
+            self.metrics_buffer
+                .iter()
+                .filter_map(|(&epoch, msgs)| {
+                    if alive.iter().all(|&r| msgs.iter().any(|m| m.rank == r)) {
+                        Some(epoch)
+                    } else {
+                        None
                     }
+                })
+                .collect()
+        };
+
+        for epoch_key in ready_epochs {
+            let msgs = match self.metrics_buffer.remove(&epoch_key) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Pool-derived epoch wall-time wins in progressive mode
+            // (the pool's `epoch_start` is the only authority); in
+            // non-progressive the worker-reported max stands.
+            let epoch_ms_override = if self.progressive {
+                self.chunk_pools.remove(&(epoch_key as usize))
+                    .map(|p| p.epoch_elapsed_ms())
+            } else {
+                None
+            };
+            // bc_share: equal share across alive ranks. Future
+            // refinement could use `el_che.recent_batch_share()`
+            // when calibrated; equal is fine for the aggregate
+            // surfacing and never produces NaN.
+            let bc_share = vec![1.0_f64 / alive.len().max(1) as f64; self.world_size];
+            let mut metrics = crate::distributed::ddp_run::aggregate_epoch_metrics(
+                epoch_key as usize,
+                &msgs,
+                &self.metrics_device_indices,
+                &bc_share,
+            );
+            if let Some(ms) = epoch_ms_override {
+                metrics.epoch_ms = ms;
+            }
+            self.last_aggregated_epoch = Some(epoch_key as usize);
+            if let Some(ref f) = self.metrics_fn {
+                if let Err(e) = f(&metrics) {
+                    eprintln!(
+                        "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
+                    );
                 }
-                if let Some(ref tx) = self.metrics_sink_tx {
-                    // Sink receiver dropped is benign — handle was
-                    // dropped before training finished. Don't surface
-                    // as an error.
-                    let _ = tx.send(metrics);
-                }
+            }
+            if let Some(ref tx) = self.metrics_sink_tx {
+                // Sink receiver dropped is benign — handle was
+                // dropped before training finished. Don't surface
+                // as an error.
+                let _ = tx.send(metrics);
             }
         }
     }
@@ -2329,10 +2441,16 @@ impl ClusterCoordinator {
     /// Broadcast `StartEpoch(plan)` to every connected rank, updating
     /// `rank_epoch[r]` to `epoch` for each rank as it goes out.
     ///
-    /// Returns the plans dispatched so callers can pair the call with
-    /// rank-side acknowledgments in tests. Progressive chunk-pool
-    /// dispatch (streaming work in small chunks instead of full
-    /// per-epoch partitions) is a planned refinement of this path.
+    /// In **non-progressive** mode, sends one `StartEpoch` per rank
+    /// carrying that rank's full per-epoch partition; returns the
+    /// plans dispatched. In **progressive** mode (see [`Self::progressive`])
+    /// creates a [`crate::distributed::chunk_pool::ChunkPool`] for the
+    /// epoch and dispatches the first chunk to every rank; subsequent
+    /// chunks are dispatched from
+    /// [`Self::drain_metrics_and_aggregate`] as ranks report
+    /// chunk completion. The returned `Vec` reflects only the FIRST
+    /// chunk per rank in progressive mode (callers should consume it
+    /// as such).
     pub fn dispatch_epoch(
         &mut self,
         epoch: usize,
@@ -2377,6 +2495,9 @@ impl ClusterCoordinator {
                 }
             }
         }
+        if self.progressive {
+            return self.start_epoch_progressive(epoch);
+        }
         let plans = self.plans_for_epoch(epoch);
         for (rank, plan) in plans.iter().enumerate() {
             let msg = ControlMsgWire::StartEpoch(plan.clone());
@@ -2390,6 +2511,206 @@ impl ClusterCoordinator {
             self.last_step_count_at_epoch_start[rank] = self.last_step_count[rank];
         }
         Ok(plans)
+    }
+
+    /// Start a new epoch in progressive mode: create a
+    /// [`crate::distributed::chunk_pool::ChunkPool`] and dispatch the
+    /// first chunk to every rank. Returns the per-rank
+    /// [`EpochPlanWire`] of those first chunks so callers can pair
+    /// the call with rank-side acknowledgments in tests. Subsequent
+    /// chunks are dispatched from `drain_metrics_and_aggregate` on
+    /// receipt of each rank's per-chunk MetricsMsg.
+    ///
+    /// Aligns the pool total to a batch boundary. Sub-batch remainders
+    /// can't form a full batch and are dropped (standard DataLoader
+    /// behaviour) — without this `is_epoch_done` never fires when
+    /// `total_samples % batch_size != 0`.
+    fn start_epoch_progressive(
+        &mut self,
+        epoch: usize,
+    ) -> Result<Vec<crate::distributed::wire::EpochPlanWire>> {
+        let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        self.chunk_pools.insert(
+            epoch,
+            crate::distributed::chunk_pool::ChunkPool::new(
+                epoch,
+                batch_total,
+                self.world_size,
+            ),
+        );
+        let sizes: Vec<usize> = (0..self.world_size)
+            .map(|r| self.compute_chunk_batches(r, epoch))
+            .collect();
+        crate::verbose!(
+            "  ddp: epoch {epoch} progressive | initial chunks (batches) {sizes:?}"
+        );
+        let mut plans: Vec<crate::distributed::wire::EpochPlanWire> =
+            Vec::with_capacity(self.world_size);
+        for (rank, &batch_count) in sizes.iter().enumerate() {
+            if let Some(plan) = self.dispatch_next_chunk_with_batches(
+                rank, epoch, batch_count,
+            )? {
+                plans.push(plan);
+            } else {
+                // Rank received no work (e.g. world_size > batch_total).
+                // Push an empty plan so the returned Vec has world_size
+                // entries (callers / tests expect that shape).
+                plans.push(crate::distributed::wire::EpochPlanWire {
+                    epoch: epoch as u64,
+                    partition_offset: 0,
+                    partition_size: 0,
+                });
+            }
+            self.last_step_count_at_epoch_start[rank] = self.last_step_count[rank];
+        }
+        Ok(plans)
+    }
+
+    /// Dispatch the next chunk to `rank` from the active pool. Called
+    /// after a rank reports a chunk-complete MetricsMsg in progressive
+    /// mode.
+    ///
+    /// Tries the rank's current epoch's pool first. If exhausted,
+    /// streams ahead into the next epoch's pool (subject to the
+    /// overshoot gate on CPU backends — NCCL backends skip the gate
+    /// because overshoot is an async/CPU concept; NCCL coordinates via
+    /// the AllReduce barrier itself).
+    fn dispatch_next_chunk(&mut self, rank: usize) {
+        let epoch = self.rank_epoch[rank];
+        if self.chunk_pools.get(&epoch).is_some_and(|p| p.remaining() > 0) {
+            let batches = self.compute_chunk_batches(rank, epoch);
+            if let Err(e) = self.dispatch_next_chunk_with_batches(
+                rank, epoch, batches,
+            ) {
+                crate::verbose!(
+                    "  ddp: dispatch_next_chunk(rank={rank}, epoch={epoch}) error: {e}"
+                );
+            }
+            return;
+        }
+
+        // Current pool exhausted for this rank: stream ahead. Skip
+        // past already-aggregated epochs (their pools were removed by
+        // `drain_metrics_and_aggregate`); re-creating them here would
+        // produce an orphan pool that blocks all future aggregation
+        // (BTreeMap walk stops at the first incomplete pool).
+        let first_live = self.last_aggregated_epoch.map_or(0, |agg| agg + 1);
+        let next_epoch = (epoch + 1).max(first_live);
+        if next_epoch >= self.num_epochs {
+            return;
+        }
+
+        // Overshoot gate (CPU backend only): don't dispatch into a
+        // future epoch when the rank has streamed too far past its
+        // planned batch count since the last averaging. NCCL backend
+        // skips: blocking the fast GPU here would force it into
+        // `wait_for_epoch_plan` where it can't send timing messages,
+        // leaving nccl_ack permanently false and deadlocking
+        // `should_average` + `check_throttle`.
+        if !matches!(self.backend, AverageBackend::Nccl) {
+            let current_aggregated = self.last_aggregated_epoch
+                .is_some_and(|agg| epoch <= agg);
+            if !current_aggregated {
+                let planned = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+                if planned > 0
+                    && self.steps_since_avg[rank] >= planned + self.max_overshoot
+                {
+                    crate::debug!(
+                        "  ddp: overshoot gate BLOCKED rank {rank} | steps={} planned={} overshoot={}",
+                        self.steps_since_avg[rank], planned, self.max_overshoot,
+                    );
+                    return;
+                }
+            }
+        }
+
+        if !self.chunk_pools.contains_key(&next_epoch) {
+            let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+            self.chunk_pools.insert(
+                next_epoch,
+                crate::distributed::chunk_pool::ChunkPool::new(
+                    next_epoch,
+                    batch_total,
+                    self.world_size,
+                ),
+            );
+            crate::verbose!("  ddp: streaming -> epoch {next_epoch} pool created");
+        }
+        let batches = self.compute_chunk_batches(rank, next_epoch);
+        if let Err(e) = self.dispatch_next_chunk_with_batches(
+            rank, next_epoch, batches,
+        ) {
+            crate::verbose!(
+                "  ddp: dispatch_next_chunk(rank={rank}, next_epoch={next_epoch}) error: {e}"
+            );
+        }
+    }
+
+    /// Take `batches * batch_size` samples from the epoch's pool and
+    /// dispatch a `StartEpoch` carrying the chunk slice. Returns the
+    /// dispatched plan wire (for test callers) or `None` if the pool
+    /// is exhausted / batches == 0.
+    fn dispatch_next_chunk_with_batches(
+        &mut self,
+        rank: usize,
+        epoch: usize,
+        batches: usize,
+    ) -> Result<Option<crate::distributed::wire::EpochPlanWire>> {
+        let samples = batches * self.batch_size;
+        if samples == 0 {
+            return Ok(None);
+        }
+        let (offset, actual_size) = match self.chunk_pools.get_mut(&epoch) {
+            Some(pool) => match pool.take_chunk(samples, rank) {
+                Some(v) => v,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        self.rank_epoch[rank] = epoch;
+        let plan = crate::distributed::wire::EpochPlanWire {
+            epoch: epoch as u64,
+            partition_offset: offset as u64,
+            partition_size: actual_size as u64,
+        };
+        let msg = ControlMsgWire::StartEpoch(plan.clone());
+        self.send_control(rank, &msg)?;
+        Ok(Some(plan))
+    }
+
+    /// Compute how many batches the next chunk for `rank` in `epoch`
+    /// should contain. Cold-start (pre-calibration) uses a small probe
+    /// chunk (~10% of dataset per rank, floored at 4 batches) so
+    /// ElChe gets enough averaging events to stabilise quickly.
+    /// Post-calibration uses throughput-proportional sizing with a
+    /// `min_chunk_batches` floor.
+    fn compute_chunk_batches(&self, rank: usize, epoch: usize) -> usize {
+        let pool = match self.chunk_pools.get(&epoch) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let remaining_batches = pool.remaining() / self.batch_size;
+        if remaining_batches == 0 {
+            return 0;
+        }
+        if !self.el_che.is_calibrated() && !self.el_che.has_speed_hint() {
+            // Probe: small equal chunks for fast calibration (~10%
+            // per rank, min 4 batches).
+            let probe = (self.total_samples
+                / (self.world_size * 10 * self.batch_size))
+                .max(4);
+            return probe.min(remaining_batches);
+        }
+        // Calibrated: proportional to ElChe's throughput-derived batch counts.
+        let counts = self.el_che.batch_counts();
+        let total_counts: usize = counts.iter().sum();
+        if total_counts == 0 {
+            return remaining_batches.min(self.min_chunk_batches);
+        }
+        let ratio = counts.get(rank).copied().unwrap_or(0) as f64
+            / total_counts as f64;
+        let target = (remaining_batches as f64 * ratio).ceil() as usize;
+        target.max(self.min_chunk_batches).min(remaining_batches)
     }
 
     /// Borrow per-rank current-epoch state for diagnostics / tests.

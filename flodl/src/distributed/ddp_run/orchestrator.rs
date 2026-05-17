@@ -118,6 +118,9 @@ pub(super) fn build_coord_config_from_builder(
     if let Some(f) = eval_result_fn {
         coord_config = coord_config.eval_result_fn(f);
     }
+    if let Some(enabled) = config.progressive_dispatch {
+        coord_config = coord_config.progressive(enabled);
+    }
 
     coord_config
 }
