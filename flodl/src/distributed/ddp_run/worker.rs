@@ -1997,6 +1997,14 @@ impl<M: Module> GpuWorker<M> {
                     }
                 }
             }
+            ControlMsg::ExecuteEvalCallback { schedule_id, epoch } => {
+                // Cluster-mode eval dispatch lives at the
+                // [`crate::distributed::cluster_worker::ClusterWorker`]
+                // layer (eval_fn + eval_dataset live alongside
+                // epoch_fn there, fired between epoch plans). GpuWorker
+                // sees the frame for protocol completeness — drop here.
+                let _ = (schedule_id, epoch);
+            }
             ControlMsg::Shutdown => return Ok(true),
         }
         Ok(false)
@@ -2149,6 +2157,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::NewNcclSession { .. } => "NewNcclSession",
                             ControlMsg::RequestNewNcclId => "RequestNewNcclId",
                             ControlMsg::ShutdownWithSave { .. } => "ShutdownWithSave",
+                            ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
                         }
                     );
                     if self.dispatch_control(msg)? {

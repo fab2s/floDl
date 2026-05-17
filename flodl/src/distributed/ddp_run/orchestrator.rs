@@ -45,6 +45,7 @@ pub(super) fn build_coord_config_from_builder(
     backend: AverageBackend,
     config: &DdpRunConfig,
     convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+    metrics_fn: Option<super::MetricsFn>,
     world_size: usize,
 ) -> crate::distributed::cluster_coordinator::ClusterCoordinatorConfig {
     use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
@@ -103,8 +104,47 @@ pub(super) fn build_coord_config_from_builder(
     if let Some(secs) = config.heartbeat_timeout_secs {
         coord_config = coord_config.heartbeat_timeout_secs(secs);
     }
+    if let Some(every) = config.checkpoint_every {
+        coord_config = coord_config.checkpoint_every(every);
+    }
+    if let Some(f) = metrics_fn {
+        coord_config = coord_config.metrics_fn(f);
+    }
 
     coord_config
+}
+
+/// Resolve [`super::EpochCallbackPolicy`] for a given rank in the
+/// cluster. Returns `Ok(true)` if this rank should fire user-supplied
+/// per-epoch callbacks (`epoch_fn` today; `checkpoint_fn` / `eval_fn`
+/// in follow-ups), `Ok(false)` otherwise.
+///
+/// Loud-errors on out-of-bounds `Rank(n)` or on `Fastest` (the latter
+/// is not yet implemented; dispatcher-resolved fastest-rank wiring
+/// arrives with `eval_fn` work in a follow-up task).
+fn rank_fires_callbacks(
+    policy: super::EpochCallbackPolicy,
+    global_rank: usize,
+    world_size: usize,
+) -> Result<bool> {
+    match policy {
+        super::EpochCallbackPolicy::Rank(n) => {
+            if n >= world_size {
+                return Err(crate::tensor::TensorError::new(&format!(
+                    "EpochCallbackPolicy::Rank({n}) out of bounds (world_size={world_size}). \
+                     Pick a rank in 0..{world_size}."
+                )));
+            }
+            Ok(global_rank == n)
+        }
+        super::EpochCallbackPolicy::Fastest => {
+            Err(crate::tensor::TensorError::new(
+                "EpochCallbackPolicy::Fastest is not yet implemented. \
+                 Use EpochCallbackPolicy::Rank(n) for now; Fastest will be \
+                 supported once eval_fn dispatch ships."
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +206,12 @@ pub struct DdpHandle {
     final_state: Option<TrainedState>,
     /// Receiver for aggregated epoch metrics from the coordinator.
     metrics_rx: Option<mpsc::Receiver<super::EpochMetrics>>,
+    /// Launcher driver thread (cluster mode, Role::Launcher). The
+    /// trampoline spawns `run_launcher_with_config` here instead of
+    /// running it inline + exiting; [`Self::join`] awaits it so user
+    /// code can poll [`Self::next_metrics`] between `run()` and
+    /// `join()`. `None` outside launcher mode.
+    launcher_driver: Option<std::thread::JoinHandle<Result<()>>>,
     /// Graph architecture SVG captured from the model (if it implements as_graph).
     architecture_svg: Option<String>,
     /// Graph label (from as_graph().label()).
@@ -252,7 +298,7 @@ impl DdpHandle {
         checkpoint_fn: Option<CheckpointFn<M>>,
         epoch_fn: Option<EpochFn<M>>,
         metrics_fn: Option<super::MetricsFn>,
-        scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
+        scheduler_fn: Option<super::SchedulerFn>,
         convergence_guard: Option<Box<dyn super::ConvergenceGuard>>,
     ) -> Result<Self>
     where
@@ -283,19 +329,54 @@ impl DdpHandle {
             crate::distributed::launcher::Role::Launcher => {
                 let full = crate::distributed::launcher::FullCluster::from_env()?;
                 let world_size = full.world_size();
-                let coord_config = if config.save_path.is_some() {
-                    Some(build_coord_config_from_builder(
-                        policy,
-                        backend,
-                        &config,
-                        convergence_guard,
-                        world_size,
-                    ))
-                } else {
-                    None
-                };
-                crate::distributed::launcher::run_launcher_with_config(full, coord_config)?;
-                std::process::exit(0);
+                // Sink for aggregated EpochMetrics. The coord pushes
+                // each completed epoch's metrics here; the user's
+                // `DdpHandle::next_metrics()` polls them off. Wired
+                // alongside `metrics_fn` (both fire on aggregation).
+                let (sink_tx, sink_rx) =
+                    mpsc::channel::<super::EpochMetrics>();
+                let mut coord_config = build_coord_config_from_builder(
+                    policy,
+                    backend,
+                    &config,
+                    convergence_guard,
+                    metrics_fn,
+                    world_size,
+                );
+                coord_config = coord_config.metrics_sink_tx(sink_tx);
+                // Spawn the launcher driver on a dedicated thread.
+                // Previously this called `run_launcher_with_config`
+                // inline then `process::exit(0)` — user's main() never
+                // returned past `.run()`. Returning a `DdpHandle` here
+                // lets user code poll metrics + call `.join()` to
+                // await completion.
+                let driver = std::thread::Builder::new()
+                    .name("flodl-launcher-driver".to_string())
+                    .spawn(move || {
+                        crate::distributed::launcher::run_launcher_with_config(
+                            full,
+                            Some(coord_config),
+                        )
+                    })
+                    .map_err(|e| {
+                        crate::tensor::TensorError::new(&format!(
+                            "spawn launcher driver thread: {e}"
+                        ))
+                    })?;
+                return Ok(DdpHandle {
+                    worker_handles: Vec::new(),
+                    coordinator_handle: None,
+                    devices: Vec::new(),
+                    shutdown: Arc::new(AtomicBool::new(false)),
+                    nccl_abort_handles: Vec::new(),
+                    final_state: None,
+                    metrics_rx: Some(sink_rx),
+                    launcher_driver: Some(driver),
+                    architecture_svg: None,
+                    graph_label: None,
+                    graph_hash: None,
+                    training_meta: None,
+                });
             }
             crate::distributed::launcher::Role::Rank
             | crate::distributed::launcher::Role::SingleDevice => {}
@@ -304,88 +385,53 @@ impl DdpHandle {
         // Cluster-mode detection: under the process-per-rank model,
         // Trainer::builder runs inside each rank process — one device per
         // process, no in-process N-thread coordinator. Dispatches to the
-        // matching cluster-rank inline-loop entry by (policy, backend).
-        // Slices land one combo at a time across 4b.D.1a.{ii, iii, iv} +
-        // 4b.D.1b; each combo has its own loud-error pointer until lit.
+        // matching cluster-rank entry by (policy, backend). All entries
+        // route through `ClusterCoordinator` (singleton-ElChe-on-controller).
+        // `save_path` is optional: when set, the cluster persists a
+        // bundle on unrecoverable failure; when unset, the run executes
+        // normally and just skips save activity (legitimate for tests
+        // and inference-style usage).
         if let Some(cluster) = crate::distributed::cluster::LocalCluster::from_env()? {
             return match (policy, backend) {
                 (ApplyPolicy::Sync, AverageBackend::Nccl) => {
-                    // Elastic-membership-aware routing: when save_path is
-                    // set on DdpRunConfig, dispatch through the
-                    // ClusterCoordinator path that survives rank death and
-                    // persists state on unrecoverable failure. When unset,
-                    // fall back to the legacy self-driven inline loop
-                    // (unchanged backward compat).
-                    if config.save_path.is_some() {
-                        Self::run_cluster_rank_sync_nccl_via_coord(
-                            cluster,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                        )
-                    } else {
-                        Self::run_cluster_rank_sync_nccl(
-                            cluster,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                        )
-                    }
+                    Self::run_cluster_rank_sync_nccl_via_coord(
+                        cluster,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                        scheduler_fn,
+                        epoch_fn,
+                        checkpoint_fn,
+                    )
                 }
                 (ApplyPolicy::Cadence, AverageBackend::Nccl)
                 | (ApplyPolicy::Async, AverageBackend::Nccl) => {
-                    // Under NCCL backend, Cadence and Async share the same
-                    // algorithm: overshoot is the only OLD-coordinator
-                    // distinction, and it's an async/CPU concept (no-op for
-                    // NCCL). Both policies route through the Cadence helper;
-                    // the helper carries policy in WorkerConfig for the
-                    // worker's pre_sync_scratch / metadata-emitting paths
-                    // that branch on it.
-                    //
-                    // Elastic-membership-aware routing mirrors the Sync arm
-                    // above: when save_path is set on DdpRunConfig, dispatch
-                    // through the via_coord path that survives rank death
-                    // and persists state on unrecoverable failure. When
-                    // unset, fall back to the legacy self-driven inline
-                    // loop (unchanged backward compat).
-                    if config.save_path.is_some() {
-                        Self::run_cluster_rank_cadence_nccl_via_coord(
-                            cluster,
-                            policy,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            convergence_guard,
-                        )
-                    } else {
-                        Self::run_cluster_rank_cadence_nccl(
-                            cluster,
-                            policy,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            convergence_guard,
-                        )
-                    }
+                    // Cadence and Async share the same NCCL algorithm:
+                    // overshoot is an async/CPU concept (no-op for NCCL).
+                    // `policy` is carried in `WorkerConfig` for the
+                    // worker's pre_sync_scratch / metadata branching.
+                    Self::run_cluster_rank_cadence_nccl_via_coord(
+                        cluster,
+                        policy,
+                        model_factory,
+                        optim_factory,
+                        train_fn,
+                        dataset,
+                        batch_size,
+                        num_epochs,
+                        config,
+                        convergence_guard,
+                        scheduler_fn,
+                        epoch_fn,
+                        checkpoint_fn,
+                    )
                 }
                 (ApplyPolicy::Sync, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_sync_cpu(
+                    Self::run_cluster_rank_sync_cpu_via_coord(
                         cluster,
                         model_factory,
                         optim_factory,
@@ -394,11 +440,15 @@ impl DdpHandle {
                         batch_size,
                         num_epochs,
                         config,
+                        scheduler_fn,
+                        epoch_fn,
+                        checkpoint_fn,
                     )
                 }
                 (ApplyPolicy::Cadence, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_cadence_cpu(
+                    Self::run_cluster_rank_cadence_cpu_via_coord(
                         cluster,
+                        ApplyPolicy::Cadence,
                         model_factory,
                         optim_factory,
                         train_fn,
@@ -407,11 +457,15 @@ impl DdpHandle {
                         num_epochs,
                         config,
                         convergence_guard,
+                        scheduler_fn,
+                        epoch_fn,
+                        checkpoint_fn,
                     )
                 }
                 (ApplyPolicy::Async, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_async_cpu(
+                    Self::run_cluster_rank_cadence_cpu_via_coord(
                         cluster,
+                        ApplyPolicy::Async,
                         model_factory,
                         optim_factory,
                         train_fn,
@@ -420,6 +474,9 @@ impl DdpHandle {
                         num_epochs,
                         config,
                         convergence_guard,
+                        scheduler_fn,
+                        epoch_fn,
+                        checkpoint_fn,
                     )
                 }
             };
@@ -887,6 +944,7 @@ impl DdpHandle {
             nccl_abort_handles,
             final_state: None,
             metrics_rx: Some(epoch_metrics_rx),
+            launcher_driver: None,
             architecture_svg,
             graph_label,
             graph_hash,
@@ -1074,200 +1132,10 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: Some(final_state),
             metrics_rx: Some(epoch_metrics_rx),
+            launcher_driver: None,
             architecture_svg,
             graph_label,
             graph_hash,
-            training_meta,
-        })
-    }
-
-    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Nccl`.
-    ///
-    /// This rank reads its slot from [`LocalCluster::from_env`], does the
-    /// NCCL rendezvous, builds the model on its assigned device, syncs
-    /// initial parameters from rank 0 via NCCL broadcast, and spawns a
-    /// single training thread that runs
-    /// [`GpuWorker::run_self_driven_sync_nccl`] — no in-process N-thread
-    /// coordinator, no mpsc orchestration.
-    ///
-    /// **Behavior preserved (vs the old threaded coordinator):**
-    /// - Same `train_step` (forward + backward + optional grad clipping +
-    ///   scheduler + optimizer step + CUDA stream pinning)
-    /// - Same `sync_now_nccl` (in-place AllReduce + divergence measurement)
-    /// - Same dataset shuffle (deterministic global permutation via
-    ///   [`make_partition`])
-    /// - Same initial-state sync (rank 0 broadcasts params + buffers to
-    ///   every rank)
-    ///
-    /// **Not yet wired in this slice (4b.D.1a.ii):** progressive chunk
-    /// dispatch (sync data loading only), per-epoch metrics aggregation
-    /// (`metrics_rx` is `None`), `epoch_fn` / `metrics_fn` / `scheduler` /
-    /// `checkpoint_every` callbacks (silently ignored — future slices wire
-    /// them back in one at a time). The compile gate on the public
-    /// `DdpBuilder` API hides this gap: callers can still chain the
-    /// fluent methods; they just produce no-ops until the supporting
-    /// machinery lands.
-    ///
-    /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
-    /// [`GpuWorker::run_self_driven_sync_nccl`]: crate::distributed::ddp_run::GpuWorker::run_self_driven_sync_nccl
-    /// [`make_partition`]: crate::distributed::ddp_run::make_partition
-    #[allow(clippy::too_many_arguments)]
-    fn run_cluster_rank_sync_nccl<F, M, G, O, T>(
-        cluster: crate::distributed::cluster::LocalCluster,
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-        dataset: Arc<dyn BatchDataSet>,
-        batch_size: usize,
-        num_epochs: usize,
-        config: DdpRunConfig,
-    ) -> Result<Self>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        use std::sync::atomic::AtomicBool;
-        use crate::distributed::nccl::NcclRankComm;
-
-        let (global_rank, device) = cluster.my_rank()?;
-        let world_size = cluster.world_size();
-        let total_samples = dataset.len();
-
-        crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Sync+Nccl)"
-        );
-
-        let training_meta = Some(serde_json::json!({
-            "mode": "cluster-rank Sync+Nccl",
-            "global_rank": global_rank,
-            "world_size": world_size,
-            "device": format!("{device:?}"),
-            "batch_size": batch_size,
-            "num_epochs": num_epochs,
-            "total_samples": total_samples,
-        }));
-
-        // All model/optimizer/CUDA work happens inside the spawned
-        // training thread — M (containing Rc<RefCell<…>>) isn't Send, so
-        // we can't build a GpuWorker on the main thread and move it in.
-        // The thread does: rendezvous → init NcclRankComm → build model
-        // → broadcast initial state from rank 0 → build GpuWorker → run
-        // self-driven Sync loop → snapshot final state.
-        //
-        // dataset_signature isn't yet plumbed through DdpBuilder /
-        // DdpRunConfig (it lives on DdpConfig for Trainer::setup_with).
-        // Default [0u8; 32] — every rank trivially agrees; cluster
-        // rendezvous accepts. Future slice exposes it on the builder
-        // for opt-in shard-divergence detection.
-        let dataset_sig = [0u8; 32];
-        let timeline_for_thread = config.timeline.clone();
-        let max_grad_norm = config.max_grad_norm;
-
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            let rdv = cluster.rendezvous(dataset_sig)?;
-            let nccl_comm = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
-
-            // Build tmp model, broadcast initial state from rank 0, then
-            // pin to CPU for the WorkerConfig (GpuWorker::new re-creates
-            // the model and copies the pinned params back to GPU).
-            let tmp_model = model_factory(device)?;
-            let initial_params_gpu: Vec<Tensor> = tmp_model
-                .parameters()
-                .iter()
-                .map(|p| p.variable.data())
-                .collect();
-            let initial_buffers_gpu: Vec<Tensor> = tmp_model
-                .buffers()
-                .iter()
-                .map(|b| b.get())
-                .collect();
-            if !initial_params_gpu.is_empty() {
-                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
-                nccl_comm.broadcast(&refs, 0)?;
-            }
-            if !initial_buffers_gpu.is_empty() {
-                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
-                nccl_comm.broadcast(&refs, 0)?;
-            }
-            let initial_params: Vec<Tensor> = initial_params_gpu
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-            drop(tmp_model);
-
-            let worker_config = WorkerConfig {
-                rank: global_rank,
-                world_size,
-                device,
-                initial_params,
-                initial_buffers,
-                total_samples,
-                batch_size,
-                seed: 42,
-                max_grad_norm,
-                easgd_alpha: None,
-                timeline: timeline_for_thread,
-                policy: ApplyPolicy::Sync,
-                save_path: None,
-            };
-
-            // Worker channels: nothing drains them in cluster-rank mode
-            // (no coordinator). Held inside the closure so the worker's
-            // internal sends silently buffer. Future slice wires
-            // metrics_rx back into DdpHandle.
-            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
-            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
-                worker_endpoints;
-
-            let mut worker = GpuWorker::new(
-                &worker_config,
-                model_factory,
-                optim_factory,
-                dataset,
-                Some(nccl_comm),
-                None,
-                timing_tx,
-                metrics_tx,
-                param_tx,
-                final_param_tx,
-                control_rx,
-            )?;
-
-            worker.run_self_driven_sync_nccl(num_epochs, &train_fn)?;
-            let snap = worker.snapshot_params();
-            Ok(TrainedState {
-                params: snap
-                    .params
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-                buffers: snap
-                    .buffers
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-            })
-        });
-
-        Ok(DdpHandle {
-            worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
-            devices: vec![device],
-            shutdown: Arc::new(AtomicBool::new(false)),
-            nccl_abort_handles: Vec::new(), // abort plumbing deferred — handle
-                                            // lives inside the thread's NcclRankComm
-            final_state: None,
-            metrics_rx: None, // wired in a follow-up slice
-            architecture_svg: None, // model lives inside thread; metadata deferred
-            graph_label: None,
-            graph_hash: None,
             training_meta,
         })
     }
@@ -1305,6 +1173,9 @@ impl DdpHandle {
         batch_size: usize,
         num_epochs: usize,
         config: DdpRunConfig,
+        scheduler_fn: Option<super::SchedulerFn>,
+        epoch_fn: Option<EpochFn<M>>,
+        checkpoint_fn: Option<CheckpointFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1316,21 +1187,25 @@ impl DdpHandle {
         use std::sync::atomic::AtomicBool;
         use crate::distributed::nccl::NcclRankComm;
 
-        // save_path is required for the via_coord path — that's the
-        // "every training must set a save path" rule the user invoked.
-        // Loud at builder.run() time rather than silent (no save) at
-        // failure-time.
-        let save_path = config.save_path.clone().ok_or_else(|| {
-            crate::tensor::TensorError::new(
-                "run_cluster_rank_sync_nccl_via_coord requires `save_path` \
-                 on DdpRunConfig (`.with_save_path(...)`). The cluster \
-                 save-on-unrecoverable-failure path needs a destination."
-            )
-        })?;
+        // `save_path` is optional. When set, the cluster persists a
+        // bundle on unrecoverable failure (and on the worker side at
+        // checkpoint events). When unset, the run executes normally
+        // and just skips all save activity — legitimate for tests and
+        // inference-style runs.
+        let save_path = config.save_path.clone();
 
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
         let total_samples = dataset.len();
+
+        // Resolve callback policy: only the chosen rank gets `epoch_fn`;
+        // others see `None`, so the fire-site in
+        // `ClusterWorker::run_until_shutdown` is a cheap no-op.
+        let fires_callbacks =
+            rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
+        let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
+        let checkpoint_fn_for_thread =
+            if fires_callbacks { checkpoint_fn } else { None };
 
         crate::verbose!(
             "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
@@ -1419,15 +1294,17 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Sync,
-                save_path: Some(save_path_for_thread),
+                save_path: save_path_for_thread,
             };
 
             // ClusterWorker connects to the coord, sets up the
             // inbound/outbound/heartbeat/watchdog bridge threads, and
             // attaches the session mailbox into the inner GpuWorker.
-            // `data_addr = None` — NCCL backend doesn't use the CPU
-            // reduce client for averaging.
-            let cluster_worker =
+            // `cpu_client = None` — NCCL backend doesn't use the CPU
+            // reduce client for averaging. `epoch_fn_for_thread` is
+            // `Some(...)` only on the rank chosen by
+            // `EpochCallbackPolicy`; other ranks see `None`.
+            let mut cluster_worker =
                 crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
                     coord_addr,
                     None,
@@ -1438,8 +1315,19 @@ impl DdpHandle {
                     optim_factory,
                     dataset,
                     Some(nccl_comm),
-                    None,
+                    checkpoint_fn_for_thread,
+                    epoch_fn_for_thread,
                 )?;
+
+            // Per-batch LR scheduler: stateless pure function attached
+            // to the worker. Per-batch invocation reads
+            // `global_step + steps_since_avg`, where `global_step` is
+            // controller-broadcast via `SetGlobalStep` after every
+            // averaging cycle. Workers stay in lockstep without an
+            // explicit per-LR broadcast.
+            if let Some(f) = scheduler_fn {
+                cluster_worker.inner_mut().set_scheduler(f(world_size));
+            }
 
             cluster_worker.run_until_shutdown(train_fn)?;
 
@@ -1461,6 +1349,7 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: None,
             metrics_rx: None,
+            launcher_driver: None,
             architecture_svg: None,
             graph_label: None,
             graph_hash: None,
@@ -1533,6 +1422,9 @@ impl DdpHandle {
         num_epochs: usize,
         config: DdpRunConfig,
         convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+        scheduler_fn: Option<super::SchedulerFn>,
+        epoch_fn: Option<EpochFn<M>>,
+        checkpoint_fn: Option<CheckpointFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1546,13 +1438,9 @@ impl DdpHandle {
 
         // save_path is required: the via_coord path' save-on-failure
         // flow needs a destination.
-        let save_path = config.save_path.clone().ok_or_else(|| {
-            crate::tensor::TensorError::new(
-                "run_cluster_rank_cadence_nccl_via_coord requires `save_path` \
-                 on DdpRunConfig (`.with_save_path(...)`). The cluster \
-                 save-on-unrecoverable-failure path needs a destination."
-            )
-        })?;
+        // `save_path` optional: persistence on unrecoverable failure
+        // is opt-in. Unset = run normally, skip saves.
+        let save_path = config.save_path.clone();
 
         // The controller owns ElChe + guard. `convergence_guard` is
         // threaded through here so the call site stays honest (the
@@ -1564,6 +1452,12 @@ impl DdpHandle {
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
         let total_samples = dataset.len();
+
+        let fires_callbacks =
+            rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
+        let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
+        let checkpoint_fn_for_thread =
+            if fires_callbacks { checkpoint_fn } else { None };
 
         let policy_label = match policy {
             ApplyPolicy::Sync => "Sync",
@@ -1654,15 +1548,16 @@ impl DdpHandle {
                 easgd_alpha,
                 timeline: timeline_for_thread,
                 policy,
-                save_path: Some(save_path_for_thread),
+                save_path: save_path_for_thread,
             };
 
             // ClusterWorker bridges set up heartbeat + NCCL watchdog +
             // inbound (DeclareDead / NewNcclSession / ShutdownWithSave)
             // / outbound timing. The worker's `handle_control` responds
             // to coord-issued `SyncNow` via `sync_now_nccl` — identical
-            // semantics to the Sync via_coord path.
-            let cluster_worker =
+            // semantics to the Sync via_coord path. `cpu_client = None`
+            // because NCCL handles all collectives.
+            let mut cluster_worker =
                 crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
                     coord_addr,
                     None,
@@ -1673,8 +1568,13 @@ impl DdpHandle {
                     optim_factory,
                     dataset,
                     Some(nccl_comm),
-                    None,
+                    checkpoint_fn_for_thread,
+                    epoch_fn_for_thread,
                 )?;
+
+            if let Some(f) = scheduler_fn {
+                cluster_worker.inner_mut().set_scheduler(f(world_size));
+            }
 
             cluster_worker.run_until_shutdown(train_fn)?;
 
@@ -1694,6 +1594,7 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: None,
             metrics_rx: None,
+            launcher_driver: None,
             architecture_svg: None,
             graph_label: None,
             graph_hash: None,
@@ -1701,39 +1602,38 @@ impl DdpHandle {
         })
     }
 
-    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Cpu`.
+    /// Cluster-rank entry point for `ApplyPolicy::Sync + AverageBackend::Cpu`
+    /// driven by a [`ClusterCoordinator`] (singleton-ElChe-on-controller,
+    /// elastic-membership-aware).
     ///
     /// CPU-averaging counterpart of
-    /// [`run_cluster_rank_sync_nccl`](Self::run_cluster_rank_sync_nccl).
-    /// Same shape: one training thread per rank-process, no in-process
-    /// N-thread coordinator. The reduce primitive switches from NCCL
-    /// collective to TCP round-trip via [`CpuReduceClient`]:
+    /// [`run_cluster_rank_sync_nccl_via_coord`](Self::run_cluster_rank_sync_nccl_via_coord).
+    /// The worker connects to the controller for CPU averaging
+    /// (`master_port + 2`) and to the coordinator for control frames
+    /// (`master_port + 3`). The coordinator owns ElChe, ConvergenceGuard,
+    /// per-rank divergence aggregation, anchor adjustment, and
+    /// `max_overshoot` auto-tune via
+    /// [`ClusterCoordinator::finish_averaging_cpu`].
     ///
-    /// - Connect to the launcher's [`ClusterController`] at
-    ///   `master_addr:master_port + 2` (convention set in
-    ///   [`crate::distributed::launcher`]).
-    /// - Broadcast initial params from rank 0 via the avg-trick (see
-    ///   [`CpuReduceClient::broadcast_from_root`]) so all ranks start
-    ///   with identical weights, even when the user's model factory
-    ///   isn't deterministic across ranks.
-    /// - Spawn the training thread which runs
-    ///   [`GpuWorker::run_self_driven_sync_cpu`]: per batch `train_step`
-    ///   then `cpu_client.all_reduce_tensors(&params)` → averaged back
-    ///   into live params.
+    /// Initial params are broadcast from rank 0 via
+    /// [`CpuReduceClient::broadcast_from_root`] BEFORE the client is
+    /// handed to [`ClusterWorker::connect_and_build`]. The controller's
+    /// accept loop is one-shot, so the same client must serve both the
+    /// initial broadcast and the per-cycle averaging that follows.
     ///
-    /// **Not yet wired in this slice (4b.D.1b.i):** per-epoch metrics
-    /// aggregation, `epoch_fn` / `metrics_fn` / `scheduler_fn` /
-    /// `checkpoint_every` callbacks, EASGD blending, divergence /
-    /// guard pipeline (CPU-Cadence ships in 4b.D.1b.ii).
+    /// `save_path` on [`DdpRunConfig`] is REQUIRED — the cluster
+    /// save-on-unrecoverable-failure path needs a destination. Loud
+    /// error at startup if unset.
     ///
-    /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterCoordinator::finish_averaging_cpu`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterWorker::connect_and_build`]:
+    ///     crate::distributed::cluster_worker::ClusterWorker::connect_and_build
     /// [`CpuReduceClient::broadcast_from_root`]:
     ///     crate::distributed::CpuReduceClient::broadcast_from_root
-    /// [`ClusterController`]: crate::distributed::ClusterController
-    /// [`GpuWorker::run_self_driven_sync_cpu`]:
-    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_sync_cpu
     #[allow(clippy::too_many_arguments)]
-    fn run_cluster_rank_sync_cpu<F, M, G, O, T>(
+    fn run_cluster_rank_sync_cpu_via_coord<F, M, G, O, T>(
         cluster: crate::distributed::cluster::LocalCluster,
         model_factory: F,
         optim_factory: G,
@@ -1742,6 +1642,9 @@ impl DdpHandle {
         batch_size: usize,
         num_epochs: usize,
         config: DdpRunConfig,
+        scheduler_fn: Option<super::SchedulerFn>,
+        epoch_fn: Option<EpochFn<M>>,
+        checkpoint_fn: Option<CheckpointFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1753,17 +1656,25 @@ impl DdpHandle {
         use std::sync::atomic::AtomicBool;
         use crate::distributed::cpu_reduce::CpuReduceClient;
 
+        // `save_path` optional: persistence on unrecoverable failure
+        // is opt-in. Unset = run normally, skip saves.
+        let save_path = config.save_path.clone();
+
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
         let total_samples = dataset.len();
 
+        let fires_callbacks =
+            rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
+        let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
+        let checkpoint_fn_for_thread =
+            if fires_callbacks { checkpoint_fn } else { None };
+
         crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Sync+Cpu)"
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
+             (Sync+Cpu via_coord, save_path={save_path:?})"
         );
 
-        // Controller address convention: master_addr:master_port + 2.
-        // master_port + 1 is reserved for the log side-channel
-        // (see CpuReduceClient::connect doc + launcher.rs).
         let controller_port = cluster.master_port.saturating_add(2);
         let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
         let controller_addr: std::net::SocketAddr = controller_addr_str
@@ -1771,10 +1682,17 @@ impl DdpHandle {
             .map_err(|e| crate::tensor::TensorError::new(&format!(
                 "ddp: parse controller addr '{controller_addr_str}': {e}"
             )))?;
+        let coord_port = cluster.master_port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_addr: std::net::SocketAddr = coord_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse coord addr '{coord_addr_str}': {e}"
+            )))?;
         let session_salt = cluster.salt;
 
         let training_meta = Some(serde_json::json!({
-            "mode": "cluster-rank Sync+Cpu",
+            "mode": "cluster-rank Sync+Cpu via_coord",
             "global_rank": global_rank,
             "world_size": world_size,
             "device": format!("{device:?}"),
@@ -1782,16 +1700,18 @@ impl DdpHandle {
             "num_epochs": num_epochs,
             "total_samples": total_samples,
             "controller_addr": controller_addr_str,
+            "coord_addr": coord_addr_str,
+            "save_path": save_path,
         }));
 
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
+        let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Connect to the ClusterController and complete the handshake. The
-            // launcher binds before spawning rank children, so the
-            // controller is up by the time we get here. Connect failure
-            // is a loud error per CpuReduceClient::connect.
+            // Connect to the ClusterController for CPU averaging. Same
+            // client serves initial broadcast and the per-cycle reduce
+            // loop (controller's accept is one-shot).
             let mut cpu_client = CpuReduceClient::connect(
                 controller_addr,
                 global_rank as u32,
@@ -1799,8 +1719,9 @@ impl DdpHandle {
                 session_salt,
             )?;
 
-            // Build the local model; extract initial params for the
-            // root-broadcast then pin to CPU for the WorkerConfig.
+            // Build tmp model, broadcast initial params from rank 0 via
+            // the avg-trick so all ranks start with identical weights
+            // even when the user's factory isn't deterministic.
             let tmp_model = model_factory(device)?;
             let initial_params_local: Vec<Tensor> = tmp_model
                 .parameters()
@@ -1813,13 +1734,6 @@ impl DdpHandle {
                 .map(|b| b.get())
                 .collect();
 
-            // Broadcast initial params from rank 0 via the avg-trick.
-            // Each rank ends up with rank 0's values. Buffers (e.g.
-            // BatchNorm running stats) typically don't need broadcast at
-            // step 0 — they're either zero-initialized identically per
-            // factory determinism, or get rewritten by training before
-            // any first inference. Skip for now; reintroduce in a polish
-            // pass if a real workload surfaces the gap.
             if !initial_params_local.is_empty() {
                 let refs: Vec<&Tensor> = initial_params_local.iter().collect();
                 let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
@@ -1851,43 +1765,41 @@ impl DdpHandle {
                 easgd_alpha: None,
                 timeline: timeline_for_thread,
                 policy: ApplyPolicy::Sync,
-                save_path: None,
+                save_path: save_path_for_thread,
             };
 
-            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
-            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
-                worker_endpoints;
+            // ClusterWorker takes ownership of cpu_client for the
+            // per-cycle CPU averaging path. The coordinator drives
+            // averaging via control frames; the param bridge ships
+            // ParamSnapshots back through `cpu_client` and synthesises
+            // `TimingMsg::SyncAck` (with divergence/pre_norm/post_norm)
+            // for the coord's `finish_averaging_cpu` pipeline.
+            let mut cluster_worker =
+                crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
+                    coord_addr,
+                    Some(cpu_client),
+                    global_rank as u32,
+                    session_salt,
+                    worker_config,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    None,
+                    checkpoint_fn_for_thread,
+                    epoch_fn_for_thread,
+                )?;
 
-            // GpuWorker built with nccl_comm = None: this slice uses the
-            // CPU client for all collectives. Worker channels held
-            // inside the closure so its internal sends silently buffer.
-            let mut worker = GpuWorker::new(
-                &worker_config,
-                model_factory,
-                optim_factory,
-                dataset,
-                None,
-                None,
-                timing_tx,
-                metrics_tx,
-                param_tx,
-                final_param_tx,
-                control_rx,
-            )?;
+            if let Some(f) = scheduler_fn {
+                cluster_worker.inner_mut().set_scheduler(f(world_size));
+            }
 
-            worker.run_self_driven_sync_cpu(&mut cpu_client, num_epochs, &train_fn)?;
-            let snap = worker.snapshot_params();
+            cluster_worker.run_until_shutdown(train_fn)?;
+
+            // Final params discarded — resume goes through the
+            // ShutdownWithSave bundle.
             Ok(TrainedState {
-                params: snap
-                    .params
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-                buffers: snap
-                    .buffers
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
+                params: Vec::new(),
+                buffers: Vec::new(),
             })
         });
 
@@ -1899,282 +1811,7 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: None,
             metrics_rx: None,
-            architecture_svg: None,
-            graph_label: None,
-            graph_hash: None,
-            training_meta,
-        })
-    }
-
-    /// Cluster-rank entry point for `ApplyPolicy::Cadence +
-    /// AverageBackend::Cpu`.
-    ///
-    /// CPU-averaging counterpart of
-    /// [`run_cluster_rank_cadence_nccl`](Self::run_cluster_rank_cadence_nccl).
-    /// Same shape and same per-cycle protocol — only the reduce
-    /// primitives switch from NCCL to TCP via [`CpuReduceClient`]:
-    ///
-    /// - Connect to `master_addr:master_port + 2` (launcher's
-    ///   [`ClusterController`]).
-    /// - Broadcast initial params from rank 0 via
-    ///   [`CpuReduceClient::broadcast_from_root`] (load-bearing for K>>1
-    ///   cadence: divergent factory output would produce garbage
-    ///   gradients across the first K-batch cycle).
-    /// - Allocate divergence scratch as `zeros_like` per parameter,
-    ///   reused across cycles for snapshot + diff-norm math.
-    /// - Build per-rank ConvergenceGuard with the same recipe as the
-    ///   NCCL path (user override > NoGuard if `no_divergence_guard` >
-    ///   `TrendGuard::new(divergence_threshold or 0.05)`).
-    /// - Spawn the training thread that runs
-    ///   [`GpuWorker::run_self_driven_cadence_cpu`] with all of these.
-    ///
-    /// `ApplyPolicy::Async + AverageBackend::Cpu` is **not** routed
-    /// here. Genuine async semantics require the 3-phase
-    /// Idle/Collecting/Computing machine landing in
-    /// [`crate::distributed::controller`] under 4b.D.1c; Cadence+Cpu
-    /// covers the blocking-reduce variant.
-    ///
-    /// [`CpuReduceClient`]: crate::distributed::CpuReduceClient
-    /// [`CpuReduceClient::broadcast_from_root`]:
-    ///     crate::distributed::CpuReduceClient::broadcast_from_root
-    /// [`ClusterController`]: crate::distributed::ClusterController
-    /// [`GpuWorker::run_self_driven_cadence_cpu`]:
-    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_cadence_cpu
-    #[allow(clippy::too_many_arguments)]
-    fn run_cluster_rank_cadence_cpu<F, M, G, O, T>(
-        cluster: crate::distributed::cluster::LocalCluster,
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-        dataset: Arc<dyn BatchDataSet>,
-        batch_size: usize,
-        num_epochs: usize,
-        config: DdpRunConfig,
-        convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
-    ) -> Result<Self>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        use std::sync::atomic::AtomicBool;
-        use crate::distributed::cpu_reduce::CpuReduceClient;
-        use crate::distributed::ddp::ElChe;
-
-        let (global_rank, device) = cluster.my_rank()?;
-        let world_size = cluster.world_size();
-        let total_samples = dataset.len();
-
-        crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Cadence+Cpu)"
-        );
-
-        let controller_port = cluster.master_port.saturating_add(2);
-        let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
-        let controller_addr: std::net::SocketAddr = controller_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse controller addr '{controller_addr_str}': {e}"
-            )))?;
-
-        let training_meta = Some(serde_json::json!({
-            "mode": "cluster-rank Cadence+Cpu",
-            "global_rank": global_rank,
-            "world_size": world_size,
-            "device": format!("{device:?}"),
-            "batch_size": batch_size,
-            "num_epochs": num_epochs,
-            "total_samples": total_samples,
-            "controller_addr": controller_addr_str,
-        }));
-
-        // ElChe + guard inputs hoisted out of the thread closure (Send
-        // scalars + the optional Box<dyn ConvergenceGuard> which is
-        // Send + Sync per the trait bound).
-        let anchor = config.anchor.unwrap_or(10);
-        let overhead_target = config.overhead_target;
-        let max_anchor = config.max_anchor;
-        let min_anchor = config.min_anchor;
-        let max_batch_diff = config.max_batch_diff;
-        let partition_ratios = config.partition_ratios.clone();
-        let elche_relax_up = config.elche_relax_up;
-        let timeline_for_thread = config.timeline.clone();
-        let max_grad_norm = config.max_grad_norm;
-        let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
-        let no_divergence_guard = config.no_divergence_guard;
-        let session_salt = cluster.salt;
-
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            let mut cpu_client = CpuReduceClient::connect(
-                controller_addr,
-                global_rank as u32,
-                world_size as u32,
-                session_salt,
-            )?;
-
-            // Build tmp model + broadcast initial params from rank 0.
-            // Load broadcast result back into live params before pinning
-            // to CPU for WorkerConfig (the worker re-creates the model
-            // and copies pinned params back).
-            let tmp_model = model_factory(device)?;
-            let initial_params_local: Vec<Tensor> = tmp_model
-                .parameters()
-                .iter()
-                .map(|p| p.variable.data())
-                .collect();
-            let initial_buffers_local: Vec<Tensor> = tmp_model
-                .buffers()
-                .iter()
-                .map(|b| b.get())
-                .collect();
-
-            if !initial_params_local.is_empty() {
-                let refs: Vec<&Tensor> = initial_params_local.iter().collect();
-                let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
-                for (dst, src) in initial_params_local.iter().zip(&broadcast) {
-                    dst.copy_(src, false)?;
-                }
-            }
-
-            let initial_params: Vec<Tensor> = initial_params_local
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-            let initial_buffers: Vec<Tensor> = initial_buffers_local
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-            // Allocate divergence scratch BEFORE dropping tmp_model so
-            // the scratch shapes match the live params (the worker's
-            // rebuilt model produces identical shapes from the factory).
-            let scratch: Vec<Tensor> = initial_params_local
-                .iter()
-                .map(Tensor::zeros_like)
-                .collect::<Result<Vec<_>>>()?;
-            drop(tmp_model);
-
-            // Build ElChe (same recipe as Cadence+Nccl).
-            let mut el_che = ElChe::new(world_size, anchor);
-            if let Some(target) = overhead_target {
-                el_che = el_che.with_overhead_target(target);
-            }
-            if let Some(max) = max_anchor {
-                el_che = el_che.with_max_anchor(max);
-            }
-            if let Some(min) = min_anchor {
-                el_che = el_che.with_min_anchor(min);
-            }
-            if let Some(diff) = max_batch_diff {
-                el_che = el_che.with_max_batch_diff(diff);
-            }
-            if let Some(ratios) = partition_ratios.as_ref() {
-                if ratios.len() == world_size {
-                    if let Some((slow_rank, _)) = ratios
-                        .iter()
-                        .enumerate()
-                        .min_by(|(ra, a), (rb, b)| {
-                            a.partial_cmp(b)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(ra.cmp(rb))
-                        })
-                    {
-                        el_che = el_che.with_initial_anchor(slow_rank);
-                    }
-                }
-            }
-
-            let partition_sizes: Vec<usize> = if let Some(ratios) = partition_ratios.as_ref() {
-                super::coordinator::ratio_to_sizes(ratios, total_samples)
-            } else if el_che.is_calibrated() || el_che.has_speed_hint() {
-                super::coordinator::throughput_sizes(&el_che, total_samples)
-            } else {
-                super::coordinator::equal_sizes(world_size, total_samples)
-            };
-
-            let worker_config = WorkerConfig {
-                rank: global_rank,
-                world_size,
-                device,
-                initial_params,
-                initial_buffers,
-                total_samples,
-                batch_size,
-                seed: 42,
-                max_grad_norm,
-                easgd_alpha: None,
-                timeline: timeline_for_thread,
-                policy: ApplyPolicy::Cadence,
-                save_path: None,
-            };
-
-            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
-            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
-                worker_endpoints;
-
-            let mut worker = GpuWorker::new(
-                &worker_config,
-                model_factory,
-                optim_factory,
-                dataset,
-                None,
-                None,
-                timing_tx,
-                metrics_tx,
-                param_tx,
-                final_param_tx,
-                control_rx,
-            )?;
-
-            // ConvergenceGuard: same recipe as Cadence+Nccl.
-            let mut guard: Box<dyn super::convergence::ConvergenceGuard> =
-                match convergence_guard {
-                    Some(g) => g,
-                    None => {
-                        if no_divergence_guard {
-                            Box::new(super::convergence::NoGuard)
-                        } else {
-                            Box::new(super::convergence::TrendGuard::new(
-                                divergence_threshold,
-                            ))
-                        }
-                    }
-                };
-
-            worker.run_self_driven_cadence_cpu(
-                &mut cpu_client,
-                &mut el_che,
-                guard.as_mut(),
-                &scratch,
-                &partition_sizes,
-                elche_relax_up,
-                num_epochs,
-                &train_fn,
-            )?;
-            let snap = worker.snapshot_params();
-            Ok(TrainedState {
-                params: snap
-                    .params
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-                buffers: snap
-                    .buffers
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-            })
-        });
-
-        Ok(DdpHandle {
-            worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
-            devices: vec![device],
-            shutdown: Arc::new(AtomicBool::new(false)),
-            nccl_abort_handles: Vec::new(),
-            final_state: None,
-            metrics_rx: None,
+            launcher_driver: None,
             architecture_svg: None,
             graph_label: None,
             graph_hash: None,
@@ -2183,61 +1820,44 @@ impl DdpHandle {
     }
 
     /// Cluster-rank entry point for `ApplyPolicy::Cadence` /
-    /// `ApplyPolicy::Async` + `AverageBackend::Nccl`.
+    /// `ApplyPolicy::Async` + `AverageBackend::Cpu` driven by a
+    /// [`ClusterCoordinator`] (singleton-ElChe-on-controller).
     ///
-    /// Under NCCL backend, Cadence and Async share the same algorithm:
-    /// overshoot machinery (the only OLD-coordinator distinction) is an
-    /// async/CPU concept (`feedback_overshoot_async_only` /
-    /// `feedback_nccl_no_overshoot_throttle`) — irrelevant for NCCL. Both
-    /// policies route through this helper; [`WorkerConfig::policy`]
-    /// carries the policy enum for the worker's per-policy bookkeeping.
+    /// CPU counterpart of
+    /// [`run_cluster_rank_cadence_nccl_via_coord`](Self::run_cluster_rank_cadence_nccl_via_coord).
+    /// Under via_coord routing the worker is policy-agnostic: it
+    /// responds to coord-issued averaging triggers and EASGD-blends the
+    /// returned tensors. The Cadence-vs-Async distinction lives on the
+    /// controller (cadence broadcast in
+    /// [`ClusterCoordinator::trigger_averaging`] + overshoot / anchor /
+    /// guard pipeline in
+    /// [`ClusterCoordinator::finish_averaging_cpu`]).
     ///
-    /// Drives [`GpuWorker::run_self_driven_cadence_nccl`] which runs:
-    /// - Per-batch `train_step` (Local SGD: each rank advances independently)
-    /// - At ElChe-driven K boundary: cross-rank timing AllReduce →
-    ///   parameter AllReduce-Avg with weight-space divergence → cross-rank
-    ///   AllReduce-gather of `(divergence, pre_norm)` →
-    ///   [`ElChe::report_timing`] → `convergence_guard.report(...)` →
-    ///   [`ConvergenceAction`] applied to ElChe
-    ///   ([`nudge_anchor_down`](super::super::ddp::ElChe::nudge_anchor_down)
-    ///   on NudgeDown, [`relax_anchor_up`](super::super::ddp::ElChe::relax_anchor_up)
-    ///   on Stable+flag).
+    /// Initial params are broadcast from rank 0 via
+    /// [`CpuReduceClient::broadcast_from_root`] BEFORE the client is
+    /// handed to [`ClusterWorker::connect_and_build`] — the same client
+    /// must serve both the initial broadcast and the per-cycle
+    /// averaging (controller accept loop is one-shot).
     ///
-    /// **Comm ownership:** the
-    /// [`NcclRankComm`](crate::distributed::nccl::NcclRankComm) is built
-    /// inside the spawned thread (rendezvous lives inside, since `M`
-    /// isn't `Send`) and handed to
-    /// [`Ddp::from_comm`](crate::distributed::Ddp::from_comm) after the
-    /// initial-state broadcast. The [`GpuWorker`] is constructed with
-    /// `nccl_comm = None`; the cadence loop drives all NCCL collectives
-    /// through the `Ddp` handle
-    /// (`average_params_with_divergence`, `all_reduce_per_rank_f64`).
+    /// `save_path` on [`DdpRunConfig`] is REQUIRED.
     ///
-    /// **ElChe construction** mirrors the orchestrator's main path
-    /// (`anchor` / `max_anchor` / `min_anchor` / `overhead_target` /
-    /// `max_batch_diff` from [`DdpRunConfig`]; cold-start anchor pick).
+    /// `convergence_guard` is threaded through for API symmetry with
+    /// the NCCL via_coord entry; the controller-side install is
+    /// deferred to the launcher-trampoline pass (see
+    /// [`run_cluster_rank_cadence_nccl_via_coord`](Self::run_cluster_rank_cadence_nccl_via_coord)
+    /// for the rationale).
     ///
-    /// **ConvergenceGuard construction** mirrors the OLD
-    /// `Coordinator::builder` recipe: user-supplied override > NoGuard
-    /// when `no_divergence_guard` set > `TrendGuard::new(divergence_threshold
-    /// or 0.05)`. Each rank builds its own guard from the same scalars,
-    /// so they stay in lockstep across ranks (deterministic input →
-    /// deterministic verdict).
-    ///
-    /// **Still deferred (carried forward through 4b.D.1b):** progressive
-    /// chunk dispatch, per-epoch metrics aggregation, `epoch_fn` /
-    /// `metrics_fn` / `scheduler_fn` / `checkpoint_every` callbacks,
-    /// LR-aware meta-controller (needs scheduler_fn flow), Timeline
-    /// events for `Divergence` / `SyncEnd` / `AnchorChanged` /
-    /// `GuardTelemetry`.
-    ///
-    /// [`GpuWorker::run_self_driven_cadence_nccl`]:
-    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_cadence_nccl
-    /// [`Ddp::from_comm`]: crate::distributed::Ddp::from_comm
-    /// [`ElChe::report_timing`]: crate::distributed::ElChe::report_timing
-    /// [`ConvergenceAction`]: super::convergence::ConvergenceAction
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterCoordinator::trigger_averaging`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator::trigger_averaging
+    /// [`ClusterCoordinator::finish_averaging_cpu`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterWorker::connect_and_build`]:
+    ///     crate::distributed::cluster_worker::ClusterWorker::connect_and_build
+    /// [`CpuReduceClient::broadcast_from_root`]:
+    ///     crate::distributed::CpuReduceClient::broadcast_from_root
     #[allow(clippy::too_many_arguments)]
-    fn run_cluster_rank_cadence_nccl<F, M, G, O, T>(
+    fn run_cluster_rank_cadence_cpu_via_coord<F, M, G, O, T>(
         cluster: crate::distributed::cluster::LocalCluster,
         policy: ApplyPolicy,
         model_factory: F,
@@ -2248,327 +1868,9 @@ impl DdpHandle {
         num_epochs: usize,
         config: DdpRunConfig,
         convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
-    ) -> Result<Self>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        use std::sync::atomic::AtomicBool;
-        use crate::distributed::nccl::NcclRankComm;
-        use crate::distributed::ddp::{Ddp, ElChe};
-
-        let (global_rank, device) = cluster.my_rank()?;
-        let world_size = cluster.world_size();
-        let total_samples = dataset.len();
-
-        let policy_label = match policy {
-            ApplyPolicy::Sync => "Sync",
-            ApplyPolicy::Cadence => "Cadence",
-            ApplyPolicy::Async => "Async",
-        };
-        crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
-             ({policy_label}+Nccl)"
-        );
-
-        let training_meta = Some(serde_json::json!({
-            "mode": format!("cluster-rank {policy_label}+Nccl"),
-            "global_rank": global_rank,
-            "world_size": world_size,
-            "device": format!("{device:?}"),
-            "batch_size": batch_size,
-            "num_epochs": num_epochs,
-            "total_samples": total_samples,
-        }));
-
-        // ElChe construction snapshot — mirrors orchestrator main path's
-        // Step 3 (`crate::distributed::ddp::ElChe::new(world_size, anchor)`
-        // + with_overhead_target / with_max_anchor / with_min_anchor /
-        // with_max_batch_diff / cold-start pick). Hoisted out of the
-        // thread closure so the inputs are Send; the ElChe is rebuilt
-        // inside the thread (ElChe is `Clone`-free, simpler to recompute
-        // than to plumb).
-        let anchor = config.anchor.unwrap_or(10);
-        let overhead_target = config.overhead_target;
-        let max_anchor = config.max_anchor;
-        let min_anchor = config.min_anchor;
-        let max_batch_diff = config.max_batch_diff;
-        let partition_ratios = config.partition_ratios.clone();
-        let elche_relax_up = config.elche_relax_up;
-        let timeline_for_thread = config.timeline.clone();
-        let max_grad_norm = config.max_grad_norm;
-
-        // ConvergenceGuard recipe (mirrors Coordinator::builder default):
-        // user override wins, then NoGuard when no_divergence_guard set,
-        // else TrendGuard::new(divergence_threshold or 0.05).
-        let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
-        let no_divergence_guard = config.no_divergence_guard;
-
-        // CUDA device indices for ElChe cold-start prior (slow-rank pick by
-        // compute capability + VRAM). Empty when this rank isn't on CUDA;
-        // ElChe falls back to rank 0 as the slow rank in that case.
-        let cuda_idx_for_thread: Option<i32> = match device {
-            Device::CUDA(idx) => Some(idx as i32),
-            _ => None,
-        };
-
-        let dataset_sig = [0u8; 32];
-
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            let rdv = cluster.rendezvous(dataset_sig)?;
-            let nccl_comm = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
-
-            // Build tmp model, broadcast initial state from rank 0 via the
-            // raw comm (Ddp::sync_params would do this but Ddp's params
-            // borrow into model fields; doing it before Ddp::from_comm is
-            // simpler and avoids re-grabbing tensor handles).
-            let tmp_model = model_factory(device)?;
-            let initial_params_gpu: Vec<Tensor> = tmp_model
-                .parameters()
-                .iter()
-                .map(|p| p.variable.data())
-                .collect();
-            let initial_buffers_gpu: Vec<Tensor> = tmp_model
-                .buffers()
-                .iter()
-                .map(|b| b.get())
-                .collect();
-            if !initial_params_gpu.is_empty() {
-                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
-                nccl_comm.broadcast(&refs, 0)?;
-            }
-            if !initial_buffers_gpu.is_empty() {
-                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
-                nccl_comm.broadcast(&refs, 0)?;
-            }
-            let initial_params: Vec<Tensor> = initial_params_gpu
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
-                .iter()
-                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
-                .collect::<Result<Vec<_>>>()?;
-
-            // Hand comm ownership to Ddp; the cadence loop drives all
-            // collectives through `ddp` (average_params,
-            // all_reduce_per_rank_f64). Borrows tmp_model only for the
-            // parameter/buffer-list extraction; tmp_model is dropped right
-            // after so the rebuilt model inside GpuWorker owns the live
-            // Variables.
-            let ddp = Ddp::from_comm(nccl_comm, &tmp_model, device)?;
-            drop(tmp_model);
-
-            // Build ElChe per the orchestrator main-path recipe. Cold-start
-            // anchor pick: partition_ratios (smallest = slow) > device-
-            // indices prior. Every rank sees the same inputs, so every
-            // ElChe instance starts identically.
-            let mut el_che = ElChe::new(world_size, anchor);
-            if let Some(target) = overhead_target {
-                el_che = el_che.with_overhead_target(target);
-            }
-            if let Some(max) = max_anchor {
-                el_che = el_che.with_max_anchor(max);
-            }
-            if let Some(min) = min_anchor {
-                el_che = el_che.with_min_anchor(min);
-            }
-            if let Some(diff) = max_batch_diff {
-                el_che = el_che.with_max_batch_diff(diff);
-            }
-            if let Some(ratios) = partition_ratios.as_ref() {
-                if ratios.len() == world_size {
-                    if let Some((slow_rank, _)) = ratios
-                        .iter()
-                        .enumerate()
-                        .min_by(|(ra, a), (rb, b)| {
-                            a.partial_cmp(b)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(ra.cmp(rb))
-                        })
-                    {
-                        el_che = el_che.with_initial_anchor(slow_rank);
-                    }
-                }
-            } else if let Some(idx) = cuda_idx_for_thread {
-                // Single-rank device-indices prior: every rank only knows
-                // its own device. The orchestrator main path gathered all
-                // ranks' devices before calling with_device_indices, but
-                // in cluster-rank mode we'd need a cross-rank AllReduce to
-                // reproduce that — deferred. Passing the single-element
-                // slice is a no-op for the prior (with_device_indices
-                // requires len == world_size).
-                let _ = idx; // intentionally unused: see comment above
-            }
-
-            // Partition sizes per orchestrator main-path policy: explicit
-            // partition_ratios > throughput_sizes if calibrated > equal.
-            // First-epoch ElChe is uncalibrated, so this defaults to
-            // equal_sizes — matches old coordinator behavior (Cadence
-            // recomputes per epoch from current ElChe state, but the
-            // inline loop currently uses a single partition for all
-            // epochs; per-epoch rebalance is deferred along with the
-            // metrics/callback wiring).
-            let partition_sizes: Vec<usize> = if let Some(ratios) = partition_ratios.as_ref() {
-                super::coordinator::ratio_to_sizes(ratios, total_samples)
-            } else if el_che.is_calibrated() || el_che.has_speed_hint() {
-                super::coordinator::throughput_sizes(&el_che, total_samples)
-            } else {
-                super::coordinator::equal_sizes(world_size, total_samples)
-            };
-
-            let worker_config = WorkerConfig {
-                rank: global_rank,
-                world_size,
-                device,
-                initial_params,
-                initial_buffers,
-                total_samples,
-                batch_size,
-                seed: 42,
-                max_grad_norm,
-                easgd_alpha: None,
-                timeline: timeline_for_thread,
-                policy,
-                save_path: None,
-            };
-
-            // Worker channels: nothing drains them in cluster-rank mode.
-            // Held inside the closure so the worker's internal sends
-            // silently buffer until the channel is dropped.
-            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
-            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
-                worker_endpoints;
-
-            // GpuWorker built with `nccl_comm = None`: this slice routes
-            // every NCCL op through `ddp` above (including the divergence
-            // measurement). Symmetric with the Sync slice's choice.
-            let mut worker = GpuWorker::new(
-                &worker_config,
-                model_factory,
-                optim_factory,
-                dataset,
-                None,
-                None,
-                timing_tx,
-                metrics_tx,
-                param_tx,
-                final_param_tx,
-                control_rx,
-            )?;
-
-            // Build the per-rank ConvergenceGuard. User override consumed
-            // here (each rank-process has its own DdpBuilder + config, so
-            // the user's Box moves into this rank's closure cleanly).
-            let mut guard: Box<dyn super::convergence::ConvergenceGuard> =
-                match convergence_guard {
-                    Some(g) => g,
-                    None => {
-                        if no_divergence_guard {
-                            Box::new(super::convergence::NoGuard)
-                        } else {
-                            Box::new(super::convergence::TrendGuard::new(
-                                divergence_threshold,
-                            ))
-                        }
-                    }
-                };
-
-            // Pre-sync scratch allocated once for the full training session.
-            let scratch = ddp.make_divergence_scratch()?;
-
-            worker.run_self_driven_cadence_nccl(
-                &ddp,
-                &mut el_che,
-                guard.as_mut(),
-                &scratch,
-                &partition_sizes,
-                elche_relax_up,
-                num_epochs,
-                &train_fn,
-            )?;
-            let snap = worker.snapshot_params();
-            Ok(TrainedState {
-                params: snap
-                    .params
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-                buffers: snap
-                    .buffers
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-            })
-        });
-
-        Ok(DdpHandle {
-            worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
-            devices: vec![device],
-            shutdown: Arc::new(AtomicBool::new(false)),
-            nccl_abort_handles: Vec::new(),
-            final_state: None,
-            metrics_rx: None,
-            architecture_svg: None,
-            graph_label: None,
-            graph_hash: None,
-            training_meta,
-        })
-    }
-
-    /// Cluster-rank entry point for `ApplyPolicy::Async +
-    /// AverageBackend::Cpu` — the only **truly** asynchronous combo.
-    ///
-    /// Same shape as
-    /// [`run_cluster_rank_cadence_cpu`](Self::run_cluster_rank_cadence_cpu)
-    /// but the rank uses
-    /// [`AsyncCpuReduceClient`](crate::distributed::AsyncCpuReduceClient)
-    /// instead of the blocking
-    /// [`CpuReduceClient`](crate::distributed::CpuReduceClient):
-    ///
-    /// - Connect with [`CpuReduceClient::connect`] (blocking), do the
-    ///   initial-state broadcast via [`broadcast_from_root`](
-    ///     crate::distributed::CpuReduceClient::broadcast_from_root),
-    ///   then [`CpuReduceClient::into_async`] consumes the blocking
-    ///   client and spawns the background reader thread.
-    /// - Worker runs
-    ///   [`GpuWorker::run_self_driven_async_cpu`]: per-batch
-    ///   train_step + non-blocking poll for completed rounds; at
-    ///   K-boundary, snapshot params + submit (block-poll first if a
-    ///   previous round is still in flight under `max_overshoot = 1`).
-    ///
-    /// **EASGD blending** drives the live params on round completion
-    /// (`W := (1-α)·W_local + α·W_avg` when `easgd_alpha` is set; full
-    /// overwrite otherwise). Mirrors OLD `worker.load_averaged`.
-    ///
-    /// **Still deferred (carried into follow-up slices):** cross-rank
-    /// divergence gather (local-only guard verdict per rank — accepted
-    /// per user direction; EASGD + guard compensate), ElChe timing
-    /// report (static cadence in async mode), `max_overshoot > 1`
-    /// (multi-in-flight rounds), metrics-when-all-crossed dispatch.
-    ///
-    /// [`AsyncCpuReduceClient`]: crate::distributed::AsyncCpuReduceClient
-    /// [`CpuReduceClient::connect`]:
-    ///     crate::distributed::CpuReduceClient::connect
-    /// [`CpuReduceClient::into_async`]:
-    ///     crate::distributed::CpuReduceClient::into_async
-    /// [`GpuWorker::run_self_driven_async_cpu`]:
-    ///     crate::distributed::ddp_run::GpuWorker::run_self_driven_async_cpu
-    #[allow(clippy::too_many_arguments)]
-    fn run_cluster_rank_async_cpu<F, M, G, O, T>(
-        cluster: crate::distributed::cluster::LocalCluster,
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-        dataset: Arc<dyn BatchDataSet>,
-        batch_size: usize,
-        num_epochs: usize,
-        config: DdpRunConfig,
-        convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+        scheduler_fn: Option<super::SchedulerFn>,
+        epoch_fn: Option<EpochFn<M>>,
+        checkpoint_fn: Option<CheckpointFn<M>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -2579,14 +1881,33 @@ impl DdpHandle {
     {
         use std::sync::atomic::AtomicBool;
         use crate::distributed::cpu_reduce::CpuReduceClient;
-        use crate::distributed::ddp::ElChe;
+
+        // `save_path` optional: persistence on unrecoverable failure
+        // is opt-in. Unset = run normally, skip saves.
+        let save_path = config.save_path.clone();
+
+        // Threaded through for API symmetry; controller-side install is
+        // the trampoline pass's job. See the NCCL via_coord doc.
+        let _ = convergence_guard;
 
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
         let total_samples = dataset.len();
 
+        let fires_callbacks =
+            rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
+        let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
+        let checkpoint_fn_for_thread =
+            if fires_callbacks { checkpoint_fn } else { None };
+
+        let policy_label = match policy {
+            ApplyPolicy::Sync => "Sync",
+            ApplyPolicy::Cadence => "Cadence",
+            ApplyPolicy::Async => "Async",
+        };
         crate::verbose!(
-            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} (Async+Cpu)"
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
+             ({policy_label}+Cpu via_coord, save_path={save_path:?})"
         );
 
         let controller_port = cluster.master_port.saturating_add(2);
@@ -2596,9 +1917,17 @@ impl DdpHandle {
             .map_err(|e| crate::tensor::TensorError::new(&format!(
                 "ddp: parse controller addr '{controller_addr_str}': {e}"
             )))?;
+        let coord_port = cluster.master_port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_addr: std::net::SocketAddr = coord_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse coord addr '{coord_addr_str}': {e}"
+            )))?;
+        let session_salt = cluster.salt;
 
         let training_meta = Some(serde_json::json!({
-            "mode": "cluster-rank Async+Cpu",
+            "mode": format!("cluster-rank {policy_label}+Cpu via_coord"),
             "global_rank": global_rank,
             "world_size": world_size,
             "device": format!("{device:?}"),
@@ -2606,25 +1935,16 @@ impl DdpHandle {
             "num_epochs": num_epochs,
             "total_samples": total_samples,
             "controller_addr": controller_addr_str,
+            "coord_addr": coord_addr_str,
+            "save_path": save_path,
         }));
 
-        // Hoisted-out Send inputs for the thread closure.
-        let anchor = config.anchor.unwrap_or(10);
-        let overhead_target = config.overhead_target;
-        let max_anchor = config.max_anchor;
-        let min_anchor = config.min_anchor;
-        let max_batch_diff = config.max_batch_diff;
-        let partition_ratios = config.partition_ratios.clone();
-        let elche_relax_up = config.elche_relax_up;
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
-        let divergence_threshold = config.divergence_threshold.unwrap_or(0.05);
-        let no_divergence_guard = config.no_divergence_guard;
         let easgd_alpha = config.easgd_alpha;
-        let session_salt = cluster.salt;
+        let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Blocking connect + handshake.
             let mut cpu_client = CpuReduceClient::connect(
                 controller_addr,
                 global_rank as u32,
@@ -2632,10 +1952,6 @@ impl DdpHandle {
                 session_salt,
             )?;
 
-            // Build tmp model, broadcast initial params from rank 0 via
-            // blocking avg-trick BEFORE switching to async mode. This
-            // is load-bearing for K>>1 cadence and for EASGD (which
-            // smooths but does not replace divergent initial conditions).
             let tmp_model = model_factory(device)?;
             let initial_params_local: Vec<Tensor> = tmp_model
                 .parameters()
@@ -2648,6 +1964,8 @@ impl DdpHandle {
                 .map(|b| b.get())
                 .collect();
 
+            // Initial broadcast load-bearing for K>>1 cadence and EASGD
+            // (which smooths but does not erase divergent initial state).
             if !initial_params_local.is_empty() {
                 let refs: Vec<&Tensor> = initial_params_local.iter().collect();
                 let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
@@ -2666,49 +1984,6 @@ impl DdpHandle {
                 .collect::<Result<Vec<_>>>()?;
             drop(tmp_model);
 
-            // Switch to async mode: spawns the background reader
-            // thread + mpsc channel. From here on, only submit_round
-            // / poll_round / block_poll are available.
-            let mut async_client = cpu_client.into_async()?;
-
-            // Build ElChe (same recipe as Cadence+Cpu).
-            let mut el_che = ElChe::new(world_size, anchor);
-            if let Some(target) = overhead_target {
-                el_che = el_che.with_overhead_target(target);
-            }
-            if let Some(max) = max_anchor {
-                el_che = el_che.with_max_anchor(max);
-            }
-            if let Some(min) = min_anchor {
-                el_che = el_che.with_min_anchor(min);
-            }
-            if let Some(diff) = max_batch_diff {
-                el_che = el_che.with_max_batch_diff(diff);
-            }
-            if let Some(ratios) = partition_ratios.as_ref() {
-                if ratios.len() == world_size {
-                    if let Some((slow_rank, _)) = ratios
-                        .iter()
-                        .enumerate()
-                        .min_by(|(ra, a), (rb, b)| {
-                            a.partial_cmp(b)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(ra.cmp(rb))
-                        })
-                    {
-                        el_che = el_che.with_initial_anchor(slow_rank);
-                    }
-                }
-            }
-
-            let partition_sizes: Vec<usize> = if let Some(ratios) = partition_ratios.as_ref() {
-                super::coordinator::ratio_to_sizes(ratios, total_samples)
-            } else if el_che.is_calibrated() || el_che.has_speed_hint() {
-                super::coordinator::throughput_sizes(&el_che, total_samples)
-            } else {
-                super::coordinator::equal_sizes(world_size, total_samples)
-            };
-
             let worker_config = WorkerConfig {
                 rank: global_rank,
                 world_size,
@@ -2721,64 +1996,34 @@ impl DdpHandle {
                 max_grad_norm,
                 easgd_alpha,
                 timeline: timeline_for_thread,
-                policy: ApplyPolicy::Async,
-                save_path: None,
+                policy,
+                save_path: save_path_for_thread,
             };
 
-            let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
-            let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) =
-                worker_endpoints;
+            let mut cluster_worker =
+                crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
+                    coord_addr,
+                    Some(cpu_client),
+                    global_rank as u32,
+                    session_salt,
+                    worker_config,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    None,
+                    checkpoint_fn_for_thread,
+                    epoch_fn_for_thread,
+                )?;
 
-            let mut worker = GpuWorker::new(
-                &worker_config,
-                model_factory,
-                optim_factory,
-                dataset,
-                None,
-                None,
-                timing_tx,
-                metrics_tx,
-                param_tx,
-                final_param_tx,
-                control_rx,
-            )?;
+            if let Some(f) = scheduler_fn {
+                cluster_worker.inner_mut().set_scheduler(f(world_size));
+            }
 
-            let mut guard: Box<dyn super::convergence::ConvergenceGuard> =
-                match convergence_guard {
-                    Some(g) => g,
-                    None => {
-                        if no_divergence_guard {
-                            Box::new(super::convergence::NoGuard)
-                        } else {
-                            Box::new(super::convergence::TrendGuard::new(
-                                divergence_threshold,
-                            ))
-                        }
-                    }
-                };
+            cluster_worker.run_until_shutdown(train_fn)?;
 
-            worker.run_self_driven_async_cpu(
-                &mut async_client,
-                &mut el_che,
-                guard.as_mut(),
-                &partition_sizes,
-                elche_relax_up,
-                easgd_alpha,
-                num_epochs,
-                &train_fn,
-            )?;
-            let snap = worker.snapshot_params();
             Ok(TrainedState {
-                params: snap
-                    .params
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
-                buffers: snap
-                    .buffers
-                    .iter()
-                    .map(|t| t.to_device(Device::CPU))
-                    .collect::<Result<Vec<_>>>()?,
+                params: Vec::new(),
+                buffers: Vec::new(),
             })
         });
 
@@ -2790,6 +2035,7 @@ impl DdpHandle {
             nccl_abort_handles: Vec::new(),
             final_state: None,
             metrics_rx: None,
+            launcher_driver: None,
             architecture_svg: None,
             graph_label: None,
             graph_hash: None,
@@ -2909,6 +2155,26 @@ impl DdpHandle {
         // Single-GPU: state was captured in run_single()
         if let Some(state) = self.final_state.take() {
             return Ok(state);
+        }
+
+        // Cluster mode launcher: wait on the launcher driver thread.
+        // The driver runs `run_launcher_with_config` which spawns
+        // ranks, drives the ClusterCoordinator until completion, and
+        // tears down. Final-snapshot capture from via_coord is
+        // deferred (#8); return an empty `TrainedState` once the
+        // driver finishes — matches `run_cluster_rank_*_via_coord`
+        // semantics.
+        if let Some(driver) = self.launcher_driver.take() {
+            return match driver.join() {
+                Ok(Ok(())) => Ok(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(TensorError::new(
+                    "join: launcher driver thread panicked",
+                )),
+            };
         }
 
         // Join ALL workers, even if some fail. A failed worker already
@@ -3125,7 +2391,7 @@ where
     epoch_fn: Option<EpochFn<M>>,
     metrics_fn: Option<super::MetricsFn>,
     /// Factory receives `world_size`, returns the scheduler.
-    scheduler_fn: Option<Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>>,
+    scheduler_fn: Option<super::SchedulerFn>,
     /// Pluggable convergence guard. When set, takes precedence over the
     /// legacy `divergence_threshold` / `no_divergence_guard` fields on
     /// [`DdpRunConfig`]. Boxed because trait-object guards aren't `Clone`.

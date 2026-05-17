@@ -70,7 +70,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::cluster_coordinator::{write_handshake_rank, CTRL_HS_ACK, CTRL_HS_VERSION};
 use crate::distributed::ddp_run::{
-    CheckpointFn, ControlMsg, EpochPlan, GpuWorker, TimingMsg, WorkerConfig,
+    CheckpointFn, ControlMsg, EpochFn, EpochPlan, GpuWorker, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::distributed::wire::{
@@ -176,6 +176,19 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
                 uid_bytes,
             }
         }
+        TimingMsg::EvalResult {
+            rank,
+            schedule_id,
+            epoch,
+            metric,
+            error,
+        } => TimingMsgWire::EvalResult {
+            rank: rank as u64,
+            schedule_id,
+            epoch,
+            metric,
+            error,
+        },
     }
 }
 
@@ -228,6 +241,9 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
         }
         ControlMsgWire::Checkpoint { version } => Ok(Some(ControlMsg::Checkpoint { version })),
+        ControlMsgWire::ExecuteEvalCallback { schedule_id, epoch } => {
+            Ok(Some(ControlMsg::ExecuteEvalCallback { schedule_id, epoch }))
+        }
         ControlMsgWire::Shutdown => Ok(Some(ControlMsg::Shutdown)),
         ControlMsgWire::ShutdownWithSave { reason } => {
             // Forward-compat: unknown reason byte falls back to
@@ -303,6 +319,13 @@ pub struct ClusterWorker<M: Module> {
     /// training error rather than in-place recovery.
     #[allow(dead_code)]
     nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
+    /// User-supplied per-epoch callback. Populated only on the rank
+    /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`];
+    /// non-chosen ranks receive `None` so they skip the firing cost.
+    /// Invoked from [`Self::run_until_shutdown`] between
+    /// `wait_for_epoch_plan` and `run_epoch_plan` on each epoch
+    /// transition (matches the threaded path's fire-point).
+    epoch_fn: Option<EpochFn<M>>,
 }
 
 impl<M: Module + 'static> ClusterWorker<M> {
@@ -319,7 +342,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
     #[allow(clippy::too_many_arguments)]
     pub fn connect_and_build<F, G, O>(
         coord_addr: SocketAddr,
-        data_addr: Option<SocketAddr>,
+        cpu_client: Option<crate::distributed::cpu_reduce::CpuReduceClient>,
         rank_id: u32,
         salt: SessionSalt,
         config: WorkerConfig,
@@ -328,6 +351,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         dataset: Arc<dyn BatchDataSet>,
         nccl_comm: Option<NcclRankComm>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        epoch_fn: Option<EpochFn<M>>,
     ) -> Result<Self>
     where
         F: FnOnce(Device) -> Result<M>,
@@ -383,6 +407,17 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // the write half just to be explicit (writes use TCP send buffer
         // back-pressure, not timeouts).
         write_stream.set_read_timeout(None).ok();
+        // Second write handle for the metrics outbound bridge — runs
+        // concurrently with the timing outbound bridge over the same
+        // TCP connection. TCP handles per-handle thread safety; we
+        // serialize at the frame level by giving each bridge its own
+        // mpsc receiver, not by sharing a write handle.
+        let mut metrics_write_stream = read_stream.try_clone().map_err(|e| {
+            TensorError::new(&format!(
+                "cluster_worker: stream try_clone for metrics outbound bridge: {e}"
+            ))
+        })?;
+        metrics_write_stream.set_read_timeout(None).ok();
 
         // mpsc quintet — the worker-side senders flow into GpuWorker,
         // the coord-side ends stay with the bridges. Clone the senders
@@ -402,18 +437,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
         let control_tx_for_param_bridge = control_tx.clone();
 
         // CpuReduceClient on the data channel, used by the param
-        // bridge below when AverageBackend::Cpu is in play. None when
-        // the worker is in NCCL-only mode (data_addr unset).
-        let cpu_client = if let Some(addr) = data_addr {
-            Some(crate::distributed::cpu_reduce::CpuReduceClient::connect(
-                addr,
-                rank_id,
-                config.world_size as u32,
-                salt,
-            )?)
-        } else {
-            None
-        };
+        // bridge below when AverageBackend::Cpu is in play. `None` when
+        // the worker is in NCCL-only mode. Caller-built so the same
+        // client can be used for an initial broadcast on the spawning
+        // thread before being handed off here (the controller's accept
+        // loop is one-shot — a connect/disconnect/reconnect dance would
+        // fail handshake).
 
         // Worker-local dead-rank ledger + NCCL session mailbox.
         // Constructed BEFORE inner so the NCCL watchdog thread (below)
@@ -510,21 +539,28 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 })?,
         );
 
-        // Discard bridges: metrics + param + final_param egress paths.
-        // 1d.5 wires metrics aggregation; 1d.4 wires CPU-averaging
-        // param snapshot data-channel egress. Until then, drain to keep
-        // the inner GpuWorker's sends from blocking.
+        // Outbound metrics bridge: drains the inner GpuWorker's
+        // `report_epoch` MetricsMsg emissions, ships each as a
+        // `MsgKind::Metrics` ControlFrame to the coordinator. The coord
+        // aggregates per-rank into [`super::EpochMetrics`] and fires
+        // `metrics_fn` once an epoch's per-rank reports are complete.
+        let salt_metrics = salt;
+        let shutdown_metrics = Arc::clone(&shutdown_flag);
         bridges.push(
             thread::Builder::new()
-                .name(format!("flodl-worker-discard-metrics:r{rank_out}"))
+                .name(format!("flodl-worker-metrics-outbound:r{rank_out}"))
                 .spawn(move || {
-                    while metrics_rx.recv().is_ok() {
-                        // Drop. 1d.5 wires this to the data channel.
-                    }
+                    metrics_outbound_loop(
+                        rank_out,
+                        &mut metrics_write_stream,
+                        &salt_metrics,
+                        &shutdown_metrics,
+                        metrics_rx,
+                    );
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
-                        "cluster_worker: spawn metrics discard bridge: {e}"
+                        "cluster_worker: spawn metrics outbound bridge: {e}"
                     ))
                 })?,
         );
@@ -640,6 +676,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             shutdown_flag,
             local_dead_ranks,
             nccl_session_mailbox,
+            epoch_fn,
         })
     }
 
@@ -689,10 +726,31 @@ impl<M: Module + 'static> ClusterWorker<M> {
             .take()
             .expect("inner GpuWorker present at run_until_shutdown");
 
+        // `epoch_fn` is populated only on the rank selected by
+        // [`crate::distributed::ddp_run::EpochCallbackPolicy`]; non-chosen
+        // ranks have `None` and skip firing. Move it out of `self` so the
+        // loop body can borrow it without colliding with `self.bridges`
+        // teardown below.
+        let epoch_fn = self.epoch_fn.take();
+        // `usize::MAX` sentinel so the first plan (epoch 0) always
+        // triggers a fire — mirrors the threaded path's behavior.
+        let mut last_epoch_fired: usize = usize::MAX;
+
         let exit_clean = (|| -> Result<bool> {
             loop {
                 match inner.wait_for_epoch_plan()? {
                     Some(plan) => {
+                        // Fire `epoch_fn` once per epoch transition (not
+                        // per-chunk in progressive dispatch). Sync-aligned
+                        // by construction: `StartEpoch` arrives after the
+                        // controller's `finish_averaging_*` completes the
+                        // prior cycle's bookkeeping.
+                        if plan.epoch != last_epoch_fired {
+                            last_epoch_fired = plan.epoch;
+                            if let Some(ref f) = epoch_fn {
+                                f(plan.epoch, &mut inner);
+                            }
+                        }
                         let shutdown = inner.run_epoch_plan(&plan, &train_fn)?;
                         if shutdown {
                             return Ok(true);
@@ -862,7 +920,10 @@ fn inbound_loop(
             Ok(FrameRead::WouldBlock) => continue,
             Ok(FrameRead::Eof) => return,
             Err(e) => {
-                eprintln!("cluster_worker: inbound r{rank} wire error: {e}");
+                // Exit-time broken-pipe / EOF is the common case here:
+                // the coord closed its end during shutdown. Downgrade
+                // to verbose so steady-state logs stay clean.
+                crate::verbose!("cluster_worker: inbound r{rank} wire error: {e}");
                 return;
             }
         }
@@ -969,7 +1030,10 @@ fn outbound_loop(
         match timing_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(msg) => {
                 if let Err(e) = write_one(stream, salt, msg) {
-                    eprintln!("cluster_worker: outbound r{rank} write error: {e}");
+                    // Exit-time BrokenPipe is the common case: coord
+                    // dropped its end during shutdown. Downgrade so it
+                    // doesn't drown steady-state logs.
+                    crate::verbose!("cluster_worker: outbound r{rank} write error: {e}");
                     return;
                 }
             }
@@ -991,6 +1055,85 @@ fn write_one(
     let wire = timing_msg_to_wire(msg);
     let frame = ControlFrame::encode(salt, MsgKind::Timing, &wire)?;
     frame.write_to(stream)
+}
+
+/// Convert in-process [`MetricsMsg`] into wire-compatible
+/// [`MetricsMsgWire`] for transit over the metrics-channel TCP frame.
+fn metrics_msg_to_wire(msg: crate::distributed::ddp_run::MetricsMsg)
+    -> crate::distributed::wire::MetricsMsgWire
+{
+    crate::distributed::wire::MetricsMsgWire {
+        rank: msg.rank as u64,
+        epoch: msg.epoch as u64,
+        avg_loss: msg.avg_loss,
+        batches_processed: msg.batches_processed as u64,
+        epoch_ms: msg.epoch_ms,
+        samples_processed: msg.samples_processed as u64,
+        share_complete_ms: msg.share_complete_ms,
+        compute_only_ms: msg.compute_only_ms,
+        data_starve_ms: msg.data_starve_ms,
+        scalars: msg.scalars
+            .into_iter()
+            .map(|(k, (sum, count))| (k, (sum, count as u64)))
+            .collect(),
+    }
+}
+
+/// Outbound metrics bridge: drains `metrics_rx` (per-epoch
+/// [`MetricsMsg`] from the inner [`GpuWorker`]), wraps each into
+/// [`MetricsMsgWire`], and ships over its own write half of the
+/// rank→coord control stream. Mirrors [`outbound_loop`] but on the
+/// metrics channel + `MsgKind::Metrics` framing.
+///
+/// Holds its own `TcpStream` (a `try_clone` of the read/write split
+/// from `connect_and_build`) so it can write concurrently with the
+/// timing outbound bridge without locking.
+fn metrics_outbound_loop(
+    rank: usize,
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    shutdown: &Arc<AtomicBool>,
+    metrics_rx: mpsc::Receiver<crate::distributed::ddp_run::MetricsMsg>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            // Drain remaining metrics so the final epoch's report
+            // doesn't get lost on exit.
+            while let Ok(msg) = metrics_rx.try_recv() {
+                let wire = metrics_msg_to_wire(msg);
+                if let Ok(frame) = ControlFrame::encode(salt, MsgKind::Metrics, &wire) {
+                    let _ = frame.write_to(stream);
+                }
+            }
+            return;
+        }
+        match metrics_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(msg) => {
+                let wire = metrics_msg_to_wire(msg);
+                match ControlFrame::encode(salt, MsgKind::Metrics, &wire) {
+                    Ok(frame) => {
+                        if let Err(e) = frame.write_to(stream) {
+                            // BrokenPipe at exit is expected.
+                            crate::verbose!(
+                                "cluster_worker: metrics-outbound r{rank} write error: {e}"
+                            );
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        // Encode errors are protocol bugs, not exit
+                        // noise — keep loud.
+                        eprintln!(
+                            "cluster_worker: metrics-outbound r{rank} encode error: {e}"
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// CPU-averaging param bridge: receives
@@ -1541,6 +1684,7 @@ mod tests {
                     dataset,
                     Some(comm),
                     None,
+                    None,
                 )?;
                 worker.run_until_shutdown(mse_train)
             }));
@@ -1722,6 +1866,7 @@ mod tests {
                     |params| crate::nn::SGD::new(params, 0.01, 0.0),
                     dataset,
                     Some(comm),
+                    None,
                     None,
                 )?;
                 worker.run_until_shutdown(mse_train)
@@ -1963,9 +2108,15 @@ mod tests {
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });
+                let cpu_client = crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                    data_addr,
+                    rank_id as u32,
+                    world_size as u32,
+                    salt,
+                )?;
                 let worker = ClusterWorker::connect_and_build(
                     coord_addr,
-                    Some(data_addr),
+                    Some(cpu_client),
                     rank_id as u32,
                     salt,
                     config,
@@ -1974,6 +2125,7 @@ mod tests {
                     dataset,
                     None, // no NCCL
                     None, // no checkpoint
+                    None, // no epoch_fn
                 )?;
                 worker.run_until_shutdown(mse_train)
             }));

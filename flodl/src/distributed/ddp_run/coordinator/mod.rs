@@ -1078,6 +1078,7 @@ impl Coordinator {
             TimingMsg::Heartbeat { .. } => {}
             TimingMsg::SnapshotReady { .. } => {}
             TimingMsg::NewNcclIdGenerated { .. } => {}
+            TimingMsg::EvalResult { .. } => {}
         }
     }
 
@@ -1505,7 +1506,7 @@ pub(crate) fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
 /// share, which conflated cadence allocation with progressive dispatch
 /// tail-balance dynamics. Caller is expected to pass `world_size` entries
 /// summing to ~1.0; degenerate input falls back to equal shares.
-pub(super) fn aggregate_epoch_metrics(
+pub(crate) fn aggregate_epoch_metrics(
     epoch: usize,
     msgs: &[MetricsMsg],
     device_indices: &[u8],

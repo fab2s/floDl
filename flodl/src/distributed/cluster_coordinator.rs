@@ -282,6 +282,41 @@ pub struct ClusterCoordinatorConfig {
     /// `None` in standalone-coord tests; production cluster builders
     /// require this to be set (loud error at `builder.run()` time).
     pub save_path: Option<String>,
+
+    /// Cadence for `epoch_fn`-equivalent user checkpoint callback. When
+    /// set, the coord emits
+    /// [`crate::distributed::wire::ControlMsgWire::Checkpoint`] every
+    /// `checkpoint_every` epochs (right before dispatching the next
+    /// epoch plan). Workers handle this on the rank chosen by
+    /// [`crate::distributed::ddp_run::EpochCallbackPolicy`]; others see
+    /// no-op. `None` or `0` = disabled.
+    pub checkpoint_every: Option<usize>,
+
+    /// User-supplied per-epoch metrics callback. Fires on the
+    /// coordinator after [`crate::distributed::wire::MetricsMsgWire`]
+    /// frames from every alive rank have been aggregated into
+    /// [`crate::distributed::ddp_run::EpochMetrics`]. `None` = no
+    /// callback wired; aggregation still happens (used internally by
+    /// the elastic-balancer + future polling surfaces).
+    pub metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,
+
+    /// Optional sink for aggregated [`EpochMetrics`]. Populated by the
+    /// launcher trampoline so the user's
+    /// [`crate::distributed::DdpHandle::next_metrics`] polling loop
+    /// drains aggregates as they're produced. Fed in parallel with
+    /// `metrics_fn` — both callbacks/sinks receive the same value.
+    /// `None` skips the sink emit.
+    pub metrics_sink_tx: Option<mpsc::Sender<crate::distributed::ddp_run::EpochMetrics>>,
+
+    /// User-supplied eval-result callback (controller-side). Fires
+    /// when the chosen rank's eval pass returns a scalar metric over
+    /// the wire. `None` = no callback wired; result is logged to
+    /// stderr instead.
+    pub eval_result_fn: Option<crate::distributed::ddp_run::EvalResultFn>,
+
+    /// Eval cadence (in epochs). `Some(n)` triggers an eval dispatch
+    /// every `n` epochs from `dispatch_epoch`. `None` or `0` disables.
+    pub eval_every_epochs: Option<usize>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -313,7 +348,52 @@ impl ClusterCoordinatorConfig {
             local_ranks: Vec::new(),
             max_failure: None,
             save_path: None,
+            checkpoint_every: None,
+            metrics_fn: None,
+            metrics_sink_tx: None,
+            eval_result_fn: None,
+            eval_every_epochs: None,
         }
+    }
+
+    /// Attach the user-supplied eval-result callback (controller-side).
+    pub fn eval_result_fn(
+        mut self,
+        f: crate::distributed::ddp_run::EvalResultFn,
+    ) -> Self {
+        self.eval_result_fn = Some(f);
+        self
+    }
+
+    /// Eval cadence in epochs. `0` disables.
+    pub fn eval_every_epochs(mut self, n: usize) -> Self {
+        self.eval_every_epochs = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Attach the user-supplied per-epoch metrics callback.
+    pub fn metrics_fn(mut self, f: crate::distributed::ddp_run::MetricsFn) -> Self {
+        self.metrics_fn = Some(f);
+        self
+    }
+
+    /// Attach an `EpochMetrics` sink. The coord clones each aggregated
+    /// metric into both this sink and the optional `metrics_fn`
+    /// callback. Used by the launcher trampoline to wire the user's
+    /// `DdpHandle::next_metrics()` polling loop.
+    pub fn metrics_sink_tx(
+        mut self,
+        tx: mpsc::Sender<crate::distributed::ddp_run::EpochMetrics>,
+    ) -> Self {
+        self.metrics_sink_tx = Some(tx);
+        self
+    }
+
+    /// Cadence (in epochs) for user-supplied `checkpoint_fn` invocation.
+    /// `None` or `0` disables. See [`Self::checkpoint_every`].
+    pub fn checkpoint_every(mut self, every: usize) -> Self {
+        self.checkpoint_every = if every == 0 { None } else { Some(every) };
+        self
     }
 
     pub fn total_samples(mut self, n: usize) -> Self {
@@ -625,6 +705,15 @@ pub struct ClusterCoordinator {
     /// `DdpRunConfig` independently).
     save_path: Option<String>,
 
+    /// Cadence (in epochs) for user-supplied `checkpoint_fn`. When
+    /// `Some(n)` and `n > 0`, [`Self::dispatch_epoch`] emits
+    /// [`crate::distributed::wire::ControlMsgWire::Checkpoint`] right
+    /// before broadcasting the next `StartEpoch` whenever the epoch
+    /// boundary lines up with `n`. Workers receive the frame; only the
+    /// rank chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`]
+    /// has `checkpoint_fn = Some(...)`, others no-op.
+    checkpoint_every: Option<usize>,
+
     // --- Epoch dispatch ---
     /// Per-rank current epoch (last StartEpoch dispatched).
     rank_epoch: Vec<usize>,
@@ -647,6 +736,40 @@ pub struct ClusterCoordinator {
     /// Reader threads (one per rank) push decoded timing messages here;
     /// the coordinator thread drains via [`Self::drain_timing`].
     timing_rx: mpsc::Receiver<TimingMsgWire>,
+    /// Reader threads also push decoded per-epoch metrics here;
+    /// the coordinator thread drains via [`Self::drain_metrics`] and
+    /// aggregates into [`super::EpochMetrics`] once each epoch has
+    /// reports from every alive rank.
+    metrics_rx: mpsc::Receiver<crate::distributed::wire::MetricsMsgWire>,
+    /// Per-rank, per-epoch buffer of arrived MetricsMsg reports. Keyed
+    /// by `(epoch, rank)`; aggregation fires once `rank_count(epoch) ==
+    /// active_count`. Cleared after aggregation.
+    metrics_buffer: std::collections::HashMap<
+        u64,
+        Vec<Option<crate::distributed::ddp_run::MetricsMsg>>,
+    >,
+    /// User-supplied per-epoch metrics callback (controller-side). Fires
+    /// after each successful aggregation. `None` = no callback wired.
+    metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,
+    /// Sink for aggregated `EpochMetrics` consumed by
+    /// `DdpHandle::next_metrics()`. Populated alongside `metrics_fn`;
+    /// both fire on each aggregation. `None` skips the sink emit
+    /// (handle either doesn't poll or isn't owned by this process).
+    metrics_sink_tx: Option<mpsc::Sender<crate::distributed::ddp_run::EpochMetrics>>,
+    /// User-supplied eval-result callback. Fires in
+    /// `process_timing_msg` when a `TimingMsgWire::EvalResult` arrives.
+    /// `None` = no callback; error path still logs to stderr.
+    eval_result_fn: Option<crate::distributed::ddp_run::EvalResultFn>,
+    /// Eval cadence (in epochs). `Some(n)` triggers
+    /// `ControlMsgWire::ExecuteEvalCallback` every `n` epochs from
+    /// `dispatch_epoch`. `None` = disabled.
+    eval_every_epochs: Option<usize>,
+    /// CUDA device indices per rank, captured at construction for the
+    /// `EpochMetrics::device_indices` field. Currently `0..world_size`
+    /// (one device per rank, assigned by global_rank); the
+    /// `EpochCallbackPolicy` design assumes process-per-rank with one
+    /// device per process.
+    metrics_device_indices: Vec<u8>,
     /// Outbound control streams (one per rank, write half held here).
     /// Reader thread holds a try-cloned read half.
     control_streams: Vec<TcpStream>,
@@ -776,6 +899,8 @@ impl ClusterCoordinator {
         // half. ControlFrame::read_from handles HMAC validation per frame.
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let (timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
+        let (metrics_tx, metrics_rx) =
+            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
 
         let mut reader_handles: Vec<Option<JoinHandle<()>>> = Vec::with_capacity(world_size);
         for (rank, stream) in streams.iter_mut().enumerate() {
@@ -793,12 +918,13 @@ impl ClusterCoordinator {
                     ))
                 })?;
             let tx = timing_tx.clone();
+            let mtx = metrics_tx.clone();
             let salt_for_reader = salt;
             let shutdown_for_reader = Arc::clone(&shutdown_flag);
             let handle = thread::Builder::new()
                 .name(format!("flodl-coord-reader:r{rank}"))
                 .spawn(move || {
-                    reader_loop(rank, &mut read_half, &salt_for_reader, &shutdown_for_reader, &tx);
+                    reader_loop(rank, &mut read_half, &salt_for_reader, &shutdown_for_reader, &tx, &mtx);
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
@@ -807,10 +933,11 @@ impl ClusterCoordinator {
                 })?;
             reader_handles.push(Some(handle));
         }
-        // Drop the extra sender we cloned for the closures; loop exit
+        // Drop the extra senders we cloned for the closures; loop exit
         // depends on every cloned sender being dropped, but that happens
         // automatically when reader threads exit.
         drop(timing_tx);
+        drop(metrics_tx);
 
         Ok(ClusterCoordinator {
             policy: config.policy,
@@ -855,6 +982,7 @@ impl ClusterCoordinator {
             local_ranks: config.local_ranks.clone(),
             max_failure: config.max_failure,
             save_path: config.save_path.clone(),
+            checkpoint_every: config.checkpoint_every,
             shutdown_with_save_dispatched: false,
             last_observed_sync_lag_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
@@ -865,6 +993,13 @@ impl ClusterCoordinator {
             num_epochs: config.num_epochs,
             partition_ratios: config.partition_ratios,
             timing_rx,
+            metrics_rx,
+            metrics_buffer: std::collections::HashMap::new(),
+            metrics_fn: config.metrics_fn.clone(),
+            metrics_sink_tx: config.metrics_sink_tx.clone(),
+            eval_result_fn: config.eval_result_fn.clone(),
+            eval_every_epochs: config.eval_every_epochs,
+            metrics_device_indices: (0..world_size as u8).collect(),
             control_streams: streams,
             reader_handles,
             shutdown_flag,
@@ -1009,7 +1144,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::LrUpdate { rank, .. }
             | TimingMsgWire::Heartbeat { rank, .. }
             | TimingMsgWire::SnapshotReady { rank }
-            | TimingMsgWire::NewNcclIdGenerated { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::NewNcclIdGenerated { rank, .. }
+            | TimingMsgWire::EvalResult { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -1159,6 +1295,30 @@ impl ClusterCoordinator {
                          from rank {} (no rendezvous pending)",
                         rank,
                     );
+                }
+            }
+            TimingMsgWire::EvalResult {
+                rank: _,
+                schedule_id: _,
+                epoch,
+                metric,
+                error,
+            } => {
+                // Eval result from the chosen rank flowing back. Fire
+                // the user's `eval_result_fn` on the controller side
+                // (no &M needed). Errors from the closure are logged
+                // and training continues, matching `metrics_fn`'s
+                // SkipAndContinue default.
+                if let Some(err_msg) = error {
+                    eprintln!(
+                        "cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}"
+                    );
+                } else if let Some(ref f) = self.eval_result_fn {
+                    if let Err(e) = f(epoch as usize, metric) {
+                        eprintln!(
+                            "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
+                        );
+                    }
                 }
             }
         }
@@ -1986,7 +2146,104 @@ impl ClusterCoordinator {
         // current message and the channel is healthy. Probe explicitly.
         let alive = self.active_count > 0
             && self.reader_handles.iter().any(|h| h.is_some());
+        // Drain metrics + try to aggregate completed epochs every tick.
+        // Cheap: most ticks see an empty channel; on tick where every
+        // alive rank has reported the same epoch, one `EpochMetrics`
+        // is built and `metrics_fn` fires.
+        self.drain_metrics_and_aggregate();
         Ok(alive)
+    }
+
+    /// Drain pending [`MetricsMsgWire`] frames from the reader threads
+    /// and, for any epoch where every alive rank has reported, build
+    /// an [`crate::distributed::ddp_run::EpochMetrics`] and fire the
+    /// user-supplied `metrics_fn` (when configured).
+    ///
+    /// Per-epoch buffers are dropped on aggregation. Late frames from
+    /// a dead rank are ignored.
+    fn drain_metrics_and_aggregate(&mut self) {
+        while let Ok(wire) = self.metrics_rx.try_recv() {
+            let rank = wire.rank as usize;
+            if rank >= self.world_size {
+                continue;
+            }
+            let epoch_key = wire.epoch;
+            let slot = self.metrics_buffer
+                .entry(epoch_key)
+                .or_insert_with(|| (0..self.world_size).map(|_| None).collect());
+            slot[rank] = Some(crate::distributed::ddp_run::MetricsMsg {
+                rank,
+                epoch: wire.epoch as usize,
+                avg_loss: wire.avg_loss,
+                batches_processed: wire.batches_processed as usize,
+                epoch_ms: wire.epoch_ms,
+                samples_processed: wire.samples_processed as usize,
+                share_complete_ms: wire.share_complete_ms,
+                compute_only_ms: wire.compute_only_ms,
+                data_starve_ms: wire.data_starve_ms,
+                scalars: wire.scalars
+                    .into_iter()
+                    .map(|(k, (sum, count))| (k, (sum, count as usize)))
+                    .collect(),
+            });
+        }
+
+        // Find any epoch whose slots cover every alive rank, aggregate,
+        // and fire metrics_fn. Iterating with collected keys to avoid
+        // holding a borrow across the mutation.
+        let alive: Vec<usize> = (0..self.world_size)
+            .filter(|r| !self.is_rank_dead(*r))
+            .collect();
+        let ready_epochs: Vec<u64> = self.metrics_buffer
+            .iter()
+            .filter_map(|(&epoch, slots)| {
+                if alive.iter().all(|&r| slots[r].is_some()) {
+                    Some(epoch)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for epoch_key in ready_epochs {
+            if let Some(slots) = self.metrics_buffer.remove(&epoch_key) {
+                let msgs: Vec<crate::distributed::ddp_run::MetricsMsg> =
+                    slots.into_iter().flatten().collect();
+                // bc_share: equal share across alive ranks. Future
+                // refinement could use `el_che.recent_batch_share()`
+                // when calibrated; equal is fine for the aggregate
+                // surfacing and never produces NaN.
+                let bc_share = vec![1.0_f64 / alive.len().max(1) as f64; self.world_size];
+                let metrics = crate::distributed::ddp_run::aggregate_epoch_metrics(
+                    epoch_key as usize,
+                    &msgs,
+                    &self.metrics_device_indices,
+                    &bc_share,
+                );
+                self.last_aggregated_epoch = Some(epoch_key as usize);
+                if let Some(ref f) = self.metrics_fn {
+                    if let Err(e) = f(&metrics) {
+                        eprintln!(
+                            "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
+                        );
+                    }
+                }
+                if let Some(ref tx) = self.metrics_sink_tx {
+                    // Sink receiver dropped is benign — handle was
+                    // dropped before training finished. Don't surface
+                    // as an error.
+                    let _ = tx.send(metrics);
+                }
+            }
+        }
+    }
+
+    /// True when `rank` is in the shared dead-rank ledger. `false` when
+    /// elastic membership isn't configured (`dead_ranks` is `None`).
+    fn is_rank_dead(&self, rank: usize) -> bool {
+        self.dead_ranks
+            .as_ref()
+            .map(|d| d.is_dead(rank))
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------
@@ -2080,6 +2337,40 @@ impl ClusterCoordinator {
                 "cluster_coordinator: dispatch_epoch requires total_samples > 0; \
                  set ClusterCoordinatorConfig::total_samples before constructing.",
             ));
+        }
+        // User checkpoint cadence: when entering epoch N (N > 0) and
+        // `N % checkpoint_every == 0`, broadcast a `Checkpoint(N)` frame
+        // before `StartEpoch`. Workers fire `checkpoint_fn(N, &model)`
+        // on the rank selected by [`EpochCallbackPolicy`]; others have
+        // `checkpoint_fn = None` and treat the frame as a no-op. The
+        // version reflects "model state at the end of epoch N-1", which
+        // matches the threaded-path semantic `(epoch + 1) % every == 0`
+        // (where the `+1` is the same off-by-one as treating epoch as
+        // a 0-indexed counter).
+        if epoch > 0 {
+            if let Some(every) = self.checkpoint_every {
+                if every > 0 && epoch % every == 0 {
+                    let msg = ControlMsgWire::Checkpoint { version: epoch as u64 };
+                    self.broadcast_control(&msg)?;
+                }
+            }
+            // Eval cadence: broadcast `ExecuteEvalCallback` when the
+            // boundary aligns with `eval_every_epochs`. Workers handle
+            // on the rank chosen by `EpochCallbackPolicy`; others
+            // no-op (eval_fn = None).
+            if let Some(every) = self.eval_every_epochs {
+                if every > 0 && epoch % every == 0 {
+                    // schedule_id derived from epoch for now (one eval
+                    // per cadence); a richer scheduler would mint a
+                    // monotonic counter to disambiguate concurrent
+                    // dispatches.
+                    let msg = ControlMsgWire::ExecuteEvalCallback {
+                        schedule_id: epoch as u64,
+                        epoch: epoch as u64,
+                    };
+                    self.broadcast_control(&msg)?;
+                }
+            }
         }
         let plans = self.plans_for_epoch(epoch);
         for (rank, plan) in plans.iter().enumerate() {
@@ -2205,6 +2496,7 @@ fn reader_loop(
     salt: &SessionSalt,
     shutdown: &Arc<AtomicBool>,
     tx: &mpsc::Sender<TimingMsgWire>,
+    metrics_tx: &mpsc::Sender<crate::distributed::wire::MetricsMsgWire>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -2227,7 +2519,19 @@ fn reader_loop(
                     }
                 },
                 MsgKind::Metrics => {
-                    // 1d.5 wires per-epoch metrics aggregation; drop for now.
+                    match frame.decode::<crate::distributed::wire::MetricsMsgWire>() {
+                        Ok(msg) => {
+                            if metrics_tx.send(msg).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "cluster_coordinator: reader r{rank} decode MetricsMsg: {e}"
+                            );
+                            return;
+                        }
+                    }
                 }
                 MsgKind::Heartbeat => {
                     // Orphan scaffolding from an earlier protocol draft.
@@ -2254,7 +2558,11 @@ fn reader_loop(
                 return;
             }
             Err(e) => {
-                eprintln!(
+                // Wire errors at exit (rank closed connection mid-frame,
+                // BrokenPipe on read) are the common case. Real
+                // protocol violations are rare and would also show up
+                // as decode errors above, which stay loud.
+                crate::verbose!(
                     "cluster_coordinator: reader r{rank} wire error: {e}"
                 );
                 return;

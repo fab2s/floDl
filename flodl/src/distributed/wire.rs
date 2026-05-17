@@ -511,6 +511,16 @@ pub enum ControlMsgWire {
     SetGlobalStep { global_step: u64 },
     /// Save a checkpoint from rank 0 after averaging.
     Checkpoint { version: u64 },
+    /// Run the user's [`EvalFn`] against `eval_dataset`. Handled only
+    /// by the rank chosen via [`EpochCallbackPolicy`]; other ranks
+    /// receive the frame and no-op (their `eval_fn` is `None`).
+    /// The result flows back via [`TimingMsgWire::EvalResult`] with
+    /// the same `schedule_id`.
+    ///
+    /// [`EvalFn`]: crate::distributed::ddp_run::EvalFn
+    /// [`EpochCallbackPolicy`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy
+    ExecuteEvalCallback { schedule_id: u64, epoch: u64 },
     /// Shut down this worker.
     Shutdown,
     /// Coord-emitted directive to persist a checkpoint bundle (model
@@ -577,6 +587,19 @@ pub enum TimingMsgWire {
     /// NOT polluted by the slowest-rank barrier wait that contaminates
     /// `SyncAck` timestamps.
     SnapshotReady { rank: u64 },
+    /// Worker → coord eval result. Carries the scalar metric returned
+    /// by the user's [`crate::distributed::ddp_run::EvalFn`] (or an
+    /// error string when the closure failed). Result-bearing per
+    /// `feedback_loud_errors_over_silent.md`: success path carries
+    /// `error = None`; failures carry the error message and `metric =
+    /// 0.0`.
+    EvalResult {
+        rank: u64,
+        schedule_id: u64,
+        epoch: u64,
+        metric: f64,
+        error: Option<String>,
+    },
     /// Response to [`ControlMsgWire::RequestNewNcclId`]: the chosen
     /// surviving rank generated a fresh `NcclUniqueId` and ships its
     /// raw bytes back to the coord. Coord then broadcasts

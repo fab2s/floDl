@@ -169,6 +169,88 @@ pub type EpochFn<M> = Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>;
 /// async with, so this is the natural shape, not a limitation.
 pub type MetricsFn = Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>;
 
+/// Cadence for invoking the user-supplied [`EvalFn`].
+///
+/// Controls how often the framework dispatches an eval pass to the
+/// rank chosen by [`EpochCallbackPolicy`]. Triggered from the
+/// controller's `dispatch_epoch` (Epochs variant); finer cadences
+/// (per-batch) may land in a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalCadence {
+    /// Fire eval every `n` epochs. `n == 0` is treated as "never".
+    Epochs(usize),
+}
+
+/// Eval callback: receives `&model` and the held-out `&dyn BatchDataSet`,
+/// returns the aggregated scalar metric for the eval pass. The user
+/// implements the batch iteration loop — framework just hands over
+/// the model + dataset and consumes the result.
+///
+/// Framework guarantees:
+/// - Fires on the rank selected by
+///   [`EpochCallbackPolicy`](crate::distributed::ddp_run::EpochCallbackPolicy).
+/// - Sync-aligned: the chosen rank's model is at its post-AllReduce /
+///   post-EASGD-blend state when invoked.
+/// - `model.eval()` is called before and `model.train()` after the
+///   user's closure; no explicit mode flip needed inside.
+pub type EvalFn<M> = std::sync::Arc<
+    dyn Fn(&M, &dyn crate::data::BatchDataSet) -> Result<f64> + Send + Sync,
+>;
+
+/// Receiver for the [`EvalFn`] scalar result on the controller side.
+/// Mirrors [`MetricsFn`]'s shape — fires after the chosen rank's eval
+/// metric flows back over [`crate::distributed::wire::TimingMsgWire::EvalResult`].
+pub type EvalResultFn = std::sync::Arc<
+    dyn Fn(usize, f64) -> Result<()> + Send + Sync,
+>;
+
+/// Scheduler factory type: `(world_size) -> Arc<dyn Scheduler>`.
+///
+/// Called once per rank-process (or once per worker thread in the threaded
+/// path) to construct the per-batch LR scheduler. The `world_size` argument
+/// is provided so user-supplied factories can scale base LR by replica
+/// count (Goyal et al. linear-scaling) without re-implementing the math.
+///
+/// In cluster mode, every rank builds an identical scheduler from this
+/// factory; the controller drives synchronization by broadcasting
+/// `SetGlobalStep` after each averaging cycle. Schedulers are pure
+/// functions of step (`fn lr(&self, step: usize) -> f64`), so every rank
+/// computes the same LR for the same input — equivalent to broadcasting
+/// LR directly but with one `u64` per averaging cycle instead of one
+/// `Vec<f64>` per param group.
+pub type SchedulerFn = Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>;
+
+/// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
+/// `checkpoint_fn`, and future `eval_fn`).
+///
+/// One logical epoch transition produces one callback invocation, on
+/// the rank selected by this policy. The cluster looks like a single
+/// meta-GPU from the user's perspective; firing the same callback on
+/// every rank would multiply side effects (N file writes, N eval
+/// passes, etc.) for no benefit.
+///
+/// Default is `Rank(0)`, matching the common research convention of
+/// running eval / save / log on rank 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochCallbackPolicy {
+    /// Fire on the explicitly-named rank. Loud-errors at builder
+    /// validation if `n >= world_size`.
+    Rank(usize),
+    /// Fire on the rank with the lowest `smoothed_ms_per_batch`
+    /// (controller-resolved via ElChe). Sticky within a run: the
+    /// chosen rank is re-selected only on rank death. Honors
+    /// heterogeneous-DDP intuition — fastest rank has the most idle
+    /// time at sync barriers, so callbacks are "free compute". Only
+    /// supported on the via_coord cluster path; loud-errors otherwise.
+    Fastest,
+}
+
+impl Default for EpochCallbackPolicy {
+    fn default() -> Self {
+        Self::Rank(0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deprecated aliases (backward compatibility)
 // ---------------------------------------------------------------------------
@@ -505,6 +587,11 @@ pub struct DdpRunConfig {
     /// controller's built-in default (currently 30s). Only honored on
     /// cluster-mode via_coord runs.
     pub heartbeat_timeout_secs: Option<u64>,
+
+    /// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
+    /// `checkpoint_fn`, future `eval_fn`). See
+    /// [`EpochCallbackPolicy`] for the variants. Default `Rank(0)`.
+    pub epoch_callback_policy: EpochCallbackPolicy,
 }
 
 impl Default for DdpRunConfig {
@@ -538,7 +625,15 @@ impl DdpRunConfig {
             save_path: None,
             max_failure: None,
             heartbeat_timeout_secs: None,
+            epoch_callback_policy: EpochCallbackPolicy::default(),
         }
+    }
+
+    /// Override which rank fires user-supplied per-epoch callbacks.
+    /// See [`EpochCallbackPolicy`]. Default is `Rank(0)`.
+    pub fn with_epoch_callback_policy(mut self, policy: EpochCallbackPolicy) -> Self {
+        self.epoch_callback_policy = policy;
+        self
     }
 
     /// Set the cluster-mode heartbeat staleness threshold (seconds).
@@ -835,6 +930,15 @@ pub enum TimingMsg {
         /// 128 bytes of NCCL unique-id.
         uid_bytes: Vec<u8>,
     },
+    /// Eval result from the chosen rank back to the coord. See
+    /// [`crate::distributed::wire::TimingMsgWire::EvalResult`].
+    EvalResult {
+        rank: usize,
+        schedule_id: u64,
+        epoch: u64,
+        metric: f64,
+        error: Option<String>,
+    },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
@@ -999,6 +1103,14 @@ pub enum ControlMsg {
     Checkpoint {
         /// Version number (averaging event count in multi-GPU, epoch in single-GPU).
         version: u64,
+    },
+    /// Run the user's [`EvalFn`] on the rank's current model + eval
+    /// dataset. Handled only by the rank chosen via
+    /// [`EpochCallbackPolicy`]; other ranks no-op (their `eval_fn` is
+    /// `None`).
+    ExecuteEvalCallback {
+        schedule_id: u64,
+        epoch: u64,
     },
     /// Shut down this worker.
     Shutdown,
