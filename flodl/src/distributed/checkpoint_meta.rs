@@ -27,7 +27,34 @@ use crate::tensor::{Result, TensorError};
 /// Readers reject files whose `schema_version` exceeds this constant —
 /// older binaries refuse forward-incompatible bundles loudly rather
 /// than silently misinterpreting fields.
-pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - 1: initial layout (epoch, global_step, sync_round, world_size_at_save,
+///   save_reason)
+/// - 2: adds optional `elche_state` field for Cadence/Async resume
+///   (anchor + per-rank EMA throughput). v1 files still parse — the field
+///   defaults to `None` via serde's `default`.
+pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 2;
+
+/// ElChe trajectory snapshot for Cadence/Async resume.
+///
+/// Captured on `ShutdownWithSave` so a future resume API can restore the
+/// heterogeneous-cadence trajectory without re-calibrating from scratch.
+/// Wired into [`CheckpointMeta`] as an optional field — None for Sync
+/// (no ElChe state) and for binaries that don't yet populate it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElCheState {
+    /// Slow-rank index (anchor). The rank running the most batches per
+    /// cycle — every other rank runs `floor(anchor_count * throughput_i /
+    /// throughput_anchor)` batches per cycle.
+    pub anchor_rank: usize,
+    /// Anchor's batches-per-cycle count. The "K" knob ElChe tunes to
+    /// keep AllReduce overhead at `overhead_target`.
+    pub anchor_count: usize,
+    /// Per-rank EMA throughput (batches per millisecond). Length equals
+    /// `world_size_at_save`. Empty when uncalibrated.
+    pub ema_throughput_per_rank: Vec<f64>,
+}
 
 /// Why the cluster wrote this checkpoint.
 ///
@@ -104,10 +131,19 @@ pub struct CheckpointMeta {
     pub world_size_at_save: usize,
     /// Why this checkpoint was written.
     pub save_reason: SaveReason,
+    /// ElChe trajectory snapshot for Cadence/Async resume. `None` for
+    /// Sync (no per-rank cadence state) and for v1 files (defaulted on
+    /// deserialize via serde).
+    #[serde(default)]
+    pub elche_state: Option<ElCheState>,
 }
 
 impl CheckpointMeta {
     /// Build a fresh meta record stamped with the current schema version.
+    ///
+    /// `elche_state` defaults to `None`; use [`Self::with_elche_state`] to
+    /// attach it. Sync runs never have ElChe state to capture; Cadence /
+    /// Async runs may populate it from the coord's ElChe at save time.
     pub fn new(
         epoch: usize,
         global_step: usize,
@@ -122,7 +158,15 @@ impl CheckpointMeta {
             sync_round,
             world_size_at_save,
             save_reason,
+            elche_state: None,
         }
+    }
+
+    /// Attach an [`ElCheState`] snapshot. Builder-style for chaining at
+    /// construction sites that have the ElChe trajectory available.
+    pub fn with_elche_state(mut self, state: ElCheState) -> Self {
+        self.elche_state = Some(state);
+        self
     }
 
     /// Derive the sidecar `.meta.json` path for a checkpoint stem.
@@ -356,6 +400,57 @@ mod tests {
     fn save_reason_from_unknown_byte_is_none() {
         assert_eq!(SaveReason::from_u8(99), None);
         assert_eq!(SaveReason::from_u8(255), None);
+    }
+
+    #[test]
+    fn v1_file_loads_with_elche_state_defaulted_to_none() {
+        let dir = temp_dir("v1_forward_compat");
+        let path = dir.join("ckpt.meta.json");
+
+        // v1 layout: no `elche_state` field. Schema bump to v2 added it
+        // as #[serde(default)] so v1 files still parse.
+        let raw_json = r#"{
+            "schema_version": 1,
+            "epoch": 5,
+            "global_step": 10000,
+            "sync_round": 25,
+            "world_size_at_save": 2,
+            "save_reason": "graceful_shutdown"
+        }"#;
+        std::fs::write(&path, raw_json).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.epoch, 5);
+        assert_eq!(loaded.elche_state, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roundtrip_preserves_elche_state() {
+        let dir = temp_dir("elche_roundtrip");
+        let path = dir.join("ckpt.meta.json");
+
+        let state = ElCheState {
+            anchor_rank: 1,
+            anchor_count: 12,
+            ema_throughput_per_rank: vec![0.5, 1.0, 0.75],
+        };
+        let meta = CheckpointMeta::new(
+            3,
+            7500,
+            12,
+            3,
+            SaveReason::GracefulShutdown,
+        )
+        .with_elche_state(state.clone());
+        meta.write_to_file(&path).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.elche_state, Some(state));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

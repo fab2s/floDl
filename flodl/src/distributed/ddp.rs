@@ -794,9 +794,13 @@ impl Trainer {
 /// - [`Role::SingleDevice`]: no cluster env → return Ok so caller proceeds.
 /// - [`Role::Rank`]: rank slot env → return Ok so caller's cluster-path
 ///   logic ([`LocalCluster::from_env`] + rendezvous + `Ddp::wrap`) runs.
-/// - [`Role::LauncherDone`]: this process was the launcher; fan-out
-///   completed, ranks all exited cleanly. The user's training-loop code
-///   has nothing to do here — exit the program with status 0.
+/// - [`Role::Launcher`]: this process is the launcher. Run the fan-out
+///   with default controller config (Trainer::setup has no
+///   `DdpRunConfig` to draw from; the [`run_launcher_with_config`]
+///   call uses `None` for the coord_config which preserves the
+///   legacy "no controller spawn" behavior). After the fan-out
+///   returns, exit the program with status 0 — the launcher process
+///   has no training body to run.
 ///
 /// Wrapping the role check in `Trainer::setup*` keeps the user code
 /// transparent: same `Trainer::setup(&model, factory, optim)?` line on
@@ -806,11 +810,22 @@ impl Trainer {
 ///
 /// [`Role::SingleDevice`]: crate::distributed::launcher::Role::SingleDevice
 /// [`Role::Rank`]: crate::distributed::launcher::Role::Rank
-/// [`Role::LauncherDone`]: crate::distributed::launcher::Role::LauncherDone
+/// [`Role::Launcher`]: crate::distributed::launcher::Role::Launcher
 /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
+/// [`run_launcher_with_config`]: crate::distributed::launcher::run_launcher_with_config
 fn dispatch_launcher_or_continue() -> Result<()> {
     match crate::distributed::launcher::dispatch()? {
-        crate::distributed::launcher::Role::LauncherDone => std::process::exit(0),
+        crate::distributed::launcher::Role::Launcher => {
+            // Trainer::setup has no `DdpRunConfig` to source controller
+            // config from. Run the launcher with `coord_config = None`
+            // — the legacy NCCL routing (no controller spawn) preserves
+            // backward compat for simple-entry callers. Users wanting
+            // a controller-driven cluster run pick `Trainer::builder`
+            // which has the trampoline at `DdpHandle::launch`.
+            let full = crate::distributed::launcher::FullCluster::from_env()?;
+            crate::distributed::launcher::run_launcher_with_config(full, None)?;
+            std::process::exit(0);
+        }
         crate::distributed::launcher::Role::Rank
         | crate::distributed::launcher::Role::SingleDevice => Ok(()),
     }

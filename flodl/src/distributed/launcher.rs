@@ -45,7 +45,7 @@
 //! |---|---|---|---|
 //! | unset | unset | unset | [`Role::SingleDevice`] |
 //! | unset | set | set | [`Role::Rank`] |
-//! | set | unset | unset | [`Role::Launcher`] (dispatch fans out) |
+//! | set | unset | unset | [`Role::Launcher`] (caller drives the fan-out) |
 //! | other combinations | | | loud error |
 //!
 //! # Design notes
@@ -105,9 +105,19 @@ const SSH_OPTS: &[&str] = &[
 
 /// Role this process plays in the cluster, decided by [`dispatch`].
 ///
-/// Returned to the caller so it can either continue with training
-/// (`Rank`/`SingleDevice`) or unwind cleanly (`LauncherDone` — the
-/// launcher has already finished fan-out + controller wait).
+/// `dispatch` is a pure role detector — it never runs the launcher or
+/// the rank loop itself. The caller drives both:
+///
+/// - On [`Role::Launcher`], the caller assembles the controller-scope
+///   config (typically from the user's `DdpRunConfig` via
+///   [`super::ddp_run::build_coord_config_from_builder`]), then calls
+///   [`run_launcher_with_config`] and `std::process::exit(0)` when it
+///   returns. This is the "launcher trampoline": the user's `main()`
+///   ran up to the `Trainer::builder(...).run()` boundary, which gives
+///   the dispatch site native access to `Box<dyn ConvergenceGuard>` and
+///   ElChe knobs that can't cross process boundaries.
+/// - On [`Role::Rank`] / [`Role::SingleDevice`], the caller proceeds
+///   with the training body.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Role {
     /// No cluster envelope in env. Continue with today's single-device
@@ -116,23 +126,14 @@ pub enum Role {
     /// This process is a rank. Continue with cluster-mode training
     /// (`Trainer::setup` will read the slim envelope and rendezvous).
     Rank,
-    /// This process was the launcher. Fan-out completed, all ranks
-    /// finished, controller shut down cleanly. Caller should propagate
-    /// and exit the program (process is done).
-    LauncherDone,
+    /// This process is the launcher. Caller must run the fan-out via
+    /// [`run_launcher_with_config`] and exit the program when it returns.
+    Launcher,
 }
 
-/// Detect role from env and run launcher orchestration if applicable.
-///
-/// Called by [`Trainer::setup`] and the other entry points at the very
-/// top of the cluster-init path. Three outcomes:
-///
-/// - [`Role::SingleDevice`] — env has no cluster markers. Caller proceeds.
-/// - [`Role::Rank`] — env identifies this process as a rank. Caller
-///   proceeds (existing cluster-path code handles rendezvous, etc.).
-/// - [`Role::LauncherDone`] — env identified this process as the
-///   launcher; this call ran fan-out + waited for ranks. Caller should
-///   propagate up and exit (`std::process::exit(0)` or equivalent).
+/// Detect this process's role from env vars. Pure function — no I/O,
+/// no thread spawns, no process forks. The caller drives whatever
+/// action the role demands (see [`Role`]).
 ///
 /// Loud error on inconsistent env (e.g. both full-cluster and rank-slot
 /// vars set — silently winning one over the other costs hours of
@@ -147,10 +148,7 @@ pub fn dispatch() -> Result<Role> {
     match (full_set, slim_set, slot_set) {
         (false, false, false) => Ok(Role::SingleDevice),
         (false, true, true) => Ok(Role::Rank),
-        (true, false, false) => {
-            run_launcher()?;
-            Ok(Role::LauncherDone)
-        }
+        (true, false, false) => Ok(Role::Launcher),
         // Any other combination is a misconfiguration. Loud error with
         // every bit named so the operator can see what's off.
         _ => Err(TensorError::new(&format!(
@@ -169,8 +167,16 @@ fn on_off(b: bool) -> &'static str {
     if b { "set" } else { "unset" }
 }
 
-/// Launcher-mode orchestration. Read full topology, spawn ranks, wait
-/// for them, return when every rank child has exited.
+/// Launcher-mode orchestration. Spawn the [`ClusterController`], optionally
+/// spawn a [`ClusterCoordinator`], fork rank children, wait for them to exit.
+///
+/// `coord_config` carries the user's controller-scope configuration — the
+/// guard, ElChe knobs, policy, partition ratios — assembled by the
+/// launcher-trampoline caller from the user's `DdpRunConfig`. `None`
+/// preserves the legacy "no coord spawn" path (rank-side via_coord
+/// routing is governed by `save_path` on `DdpRunConfig` per
+/// [`crate::distributed::ddp_run::orchestrator`]'s `auto_with` flip,
+/// not by an env var anymore).
 ///
 /// Local hosts (`host.name == this_hostname`) get fork+exec of
 /// `current_exe()` with env vars set directly. Remote hosts get
@@ -179,18 +185,24 @@ fn on_off(b: bool) -> &'static str {
 /// before this lift. Both produce identical child semantics (piped
 /// streams, [host:rN] line-prefix on stdout/stderr).
 ///
-/// **Not yet wired:** during the 4b transition, today's
+/// **Not yet wired in production:** during the 4b transition, today's
 /// `flodl-cli/src/cluster.rs` still does its own N-child fan-out, so
-/// `dispatch()` never reaches launcher role in practice — the FLODL_LOCAL_RANK
-/// env var fdl-cli sets pushes role detection straight to `Rank`. 4b.C
-/// flips fdl-cli to spawn a single launcher child instead, at which point
-/// this function gets exercised end-to-end.
-fn run_launcher() -> Result<()> {
+/// `dispatch()` never reaches launcher role in practice — the
+/// FLODL_LOCAL_RANK env var fdl-cli sets pushes role detection straight
+/// to `Rank`. 4b.C flips fdl-cli to spawn a single launcher child
+/// instead, at which point this function gets exercised end-to-end.
+///
+/// [`ClusterController`]: crate::distributed::controller::ClusterController
+/// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+pub fn run_launcher_with_config(
+    full: FullCluster,
+    coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
+) -> Result<()> {
     // Fresh 128-bit session salt per launcher invocation. Becomes the
     // HMAC key for every cross-process control + data frame; shipped
     // to ranks via their slim envelope.
     let salt = crate::distributed::wire::generate_session_salt();
-    let full = FullCluster::from_env()?.with_session_salt(salt);
+    let full = full.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
     // Controller participation is implicit-by-presence in cluster.hosts.
@@ -243,28 +255,20 @@ fn run_launcher() -> Result<()> {
         full.world_size()
     );
 
-    // Opt-in ClusterCoordinator spawn at master_port + 3 for the
-    // elastic-membership-aware NCCL path. Gated on `FLODL_DDP_VIA_COORD=1`
-    // so the legacy NCCL routing (no coord) stays the default until the
-    // via-coord routing flip lands in a follow-up. When enabled, ranks
-    // using `run_cluster_rank_sync_nccl_via_coord` connect here over TCP
-    // for control frames; the coord drives elastic-membership detection,
-    // re-rendezvous, ExtendPartition, and the unrecoverable-failure
-    // ShutdownWithSave broadcast.
+    // ClusterCoordinator spawn at master_port + 3 for the elastic-
+    // membership-aware NCCL path. `coord_config = Some(...)` means the
+    // caller (the trampoline at `DdpHandle::launch`) built the
+    // controller-scope config from the user's `DdpRunConfig` and wants
+    // a coord spawned. `None` skips the coord — legacy NCCL routing
+    // (worker self-driven ElChe, no elastic membership) handles that
+    // path entirely on the rank side.
     //
     // The spawned thread blocks on `start_from_listener.accept()` until
     // `world_size` ranks connect; if the via-coord routing isn't
     // exercised the thread sits idle until the launcher process exits
     // (process-exit kills the thread; no graceful shutdown plumbed yet).
-    let via_coord_enabled = env::var("FLODL_DDP_VIA_COORD")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if via_coord_enabled {
-        use crate::distributed::cluster_coordinator::{
-            ClusterCoordinator, ClusterCoordinatorConfig,
-        };
-        use crate::distributed::ddp::ElChe;
-        use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+    if let Some(mut config) = coord_config {
+        use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
         let coord_port = full.master_port.saturating_add(3);
         let coord_bind_addr: std::net::SocketAddr = format!("0.0.0.0:{coord_port}")
@@ -275,59 +279,38 @@ fn run_launcher() -> Result<()> {
                      0.0.0.0:{coord_port}: {e}"
                 ))
             })?;
+        // Launcher-side fields layered on top of the caller's config:
+        // `local_ranks` (host-dependent: which global ranks are on the
+        // launcher's host) and `dead_ranks` (shared ledger with the
+        // ClusterController already started above). The caller built
+        // the controller-scope fields (policy, ElChe, guard, etc.) but
+        // can't know these two — only the launcher does.
         let local_ranks: Vec<usize> = my_host_idx
             .map(|i| full.hosts[i].ranks.clone())
             .unwrap_or_default();
-        let coord_world = full.world_size();
-        let coord_salt = full.salt;
-        // Share the dead-rank ledger so CPU averaging and NCCL
-        // elastic-membership see the same source of truth.
         let dead_ranks = Arc::clone(&dead_ranks_shared);
+        config = config
+            .local_ranks(local_ranks.clone())
+            .dead_ranks(dead_ranks);
+        // Heartbeat timeout: no `DdpRunConfig` field for this yet, so
+        // the env-var override remains as the user-tunable knob.
+        // Future cleanup: add it to `DdpRunConfig` (1d.3e-B or later).
+        if let Ok(s) = env::var("FLODL_HEARTBEAT_TIMEOUT_SECS") {
+            if let Ok(n) = s.parse::<u64>() {
+                config = config.heartbeat_timeout_secs(n);
+            }
+        }
+
+        let coord_salt = full.salt;
+        let coord_world = full.world_size();
         eprintln!(
             "cluster launcher: ClusterCoordinator spawning on {} (world_size={}, \
-             local_ranks={:?}) [FLODL_DDP_VIA_COORD=1]",
+             local_ranks={:?})",
             coord_bind_addr, coord_world, local_ranks,
         );
         let _ = thread::Builder::new()
             .name("flodl-cluster-coord".to_string())
             .spawn(move || {
-                let mut config = ClusterCoordinatorConfig::new(
-                    ApplyPolicy::Sync,
-                    AverageBackend::Nccl,
-                    coord_world,
-                    ElChe::new(coord_world, 1),
-                )
-                .local_ranks(local_ranks)
-                .dead_ranks(dead_ranks);
-                // max_failure / save_path / heartbeat_timeout_secs
-                // are user-tunable via FLODL_MAX_FAILURE_ABS /
-                // FLODL_SAVE_PATH / FLODL_HEARTBEAT_TIMEOUT_SECS env
-                // vars when the user wants to override coord defaults
-                // without piping through the rank-side DdpRunConfig.
-                if let Ok(s) = env::var("FLODL_HEARTBEAT_TIMEOUT_SECS") {
-                    if let Ok(n) = s.parse::<u64>() {
-                        config = config.heartbeat_timeout_secs(n);
-                    }
-                }
-                if let Ok(s) = env::var("FLODL_SAVE_PATH") {
-                    if !s.is_empty() {
-                        config = config.save_path(s);
-                    }
-                }
-                if let Ok(s) = env::var("FLODL_MAX_FAILURE_ABS") {
-                    if let Ok(n) = s.parse::<usize>() {
-                        config = config.max_failure(
-                            crate::distributed::MaxFailureThreshold::Absolute(n),
-                        );
-                    }
-                } else if let Ok(s) = env::var("FLODL_MAX_FAILURE_PCT") {
-                    if let Ok(f) = s.parse::<f64>() {
-                        config = config.max_failure(
-                            crate::distributed::MaxFailureThreshold::Percent(f),
-                        );
-                    }
-                }
-
                 match ClusterCoordinator::start(coord_bind_addr, coord_salt, config) {
                     Ok(mut coord) => {
                         // Drive ticks until shutdown_workers fires (all

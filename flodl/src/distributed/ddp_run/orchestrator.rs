@@ -18,6 +18,92 @@ use super::{
 use super::worker::GpuWorker;
 use super::coordinator::Coordinator;
 
+/// Build a [`ClusterCoordinatorConfig`] from the user's
+/// builder-side controller-scope fields.
+///
+/// The launcher trampoline (`DdpHandle::launch` on `Role::Launcher`)
+/// runs the user's `main()` up to `Trainer::builder(...).run()`,
+/// which gives `.run()` native access to the user's `DdpRunConfig`,
+/// `policy`, `backend`, and `convergence_guard` (boxed trait object).
+/// This helper threads those fields into a [`ClusterCoordinatorConfig`]
+/// that the launcher hands to [`crate::distributed::launcher::run_launcher_with_config`].
+///
+/// Mirrors the guard-construction precedence used by the legacy
+/// `run_cluster_rank_cadence_nccl` worker-side path: user-supplied
+/// [`ConvergenceGuard`] wins, otherwise [`NoGuard`] when
+/// `no_divergence_guard` is set, otherwise
+/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`].
+///
+/// [`ClusterCoordinatorConfig`]:
+///     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
+/// [`ConvergenceGuard`]: super::convergence::ConvergenceGuard
+/// [`NoGuard`]: super::convergence::NoGuard
+/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`]:
+///     super::convergence::TrendGuard::new
+pub(super) fn build_coord_config_from_builder(
+    policy: ApplyPolicy,
+    backend: AverageBackend,
+    config: &DdpRunConfig,
+    convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+    world_size: usize,
+) -> crate::distributed::cluster_coordinator::ClusterCoordinatorConfig {
+    use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
+    use crate::distributed::ddp::ElChe;
+
+    // ElChe construction: anchor (default 10 matches DdpRunConfig docs)
+    // plus optional max/min/overhead_target/max_batch_diff knobs.
+    let anchor = config.anchor.unwrap_or(10);
+    let mut el_che = ElChe::new(world_size, anchor);
+    if let Some(target) = config.overhead_target {
+        el_che = el_che.with_overhead_target(target);
+    }
+    if let Some(max) = config.max_anchor {
+        el_che = el_che.with_max_anchor(max);
+    }
+    if let Some(min) = config.min_anchor {
+        el_che = el_che.with_min_anchor(min);
+    }
+    if let Some(diff) = config.max_batch_diff {
+        el_che = el_che.with_max_batch_diff(diff);
+    }
+
+    let mut coord_config = ClusterCoordinatorConfig::new(
+        policy,
+        backend,
+        world_size,
+        el_che,
+    )
+    .elche_relax_up(config.elche_relax_up)
+    .meta_controller(config.meta_controller)
+    .partition_ratios(config.partition_ratios.clone());
+
+    // Guard precedence: user override > NoGuard (if flagged) > TrendGuard
+    // with user threshold or 0.05 default. Matches the legacy
+    // worker-side path; same recipe, different ownership site.
+    let guard: Box<dyn super::convergence::ConvergenceGuard> = match convergence_guard {
+        Some(g) => g,
+        None => {
+            if config.no_divergence_guard {
+                Box::new(super::convergence::NoGuard)
+            } else {
+                Box::new(super::convergence::TrendGuard::new(
+                    config.divergence_threshold.unwrap_or(0.05),
+                ))
+            }
+        }
+    };
+    coord_config = coord_config.with_convergence_guard(guard);
+
+    if let Some(threshold) = config.max_failure {
+        coord_config = coord_config.max_failure(threshold);
+    }
+    if let Some(ref stem) = config.save_path {
+        coord_config = coord_config.save_path(stem.clone());
+    }
+
+    coord_config
+}
+
 // ---------------------------------------------------------------------------
 // DDP run-mode orchestrator
 // ---------------------------------------------------------------------------
@@ -175,6 +261,43 @@ impl DdpHandle {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        // Launcher trampoline. In launcher mode this process is the
+        // fan-out orchestrator — no training body to run here. Build
+        // the controller-scope config from the user's `DdpRunConfig`
+        // and `convergence_guard` (native trait object, same process),
+        // hand it to `run_launcher_with_config`, exit when ranks
+        // finish. The `Box<dyn ConvergenceGuard>` flows straight into
+        // the spawned controller thread on the same host — the
+        // cross-process gap that previously forced env-var workarounds
+        // is dissolved.
+        //
+        // `coord_config = None` when `save_path` is unset: that signals
+        // the user does NOT want the elastic-membership / persistence
+        // path, so the launcher skips the coord spawn entirely. The
+        // legacy rank-side self-driven NCCL routing takes care of
+        // those runs (per the `auto_with` flip below).
+        match crate::distributed::launcher::dispatch()? {
+            crate::distributed::launcher::Role::Launcher => {
+                let full = crate::distributed::launcher::FullCluster::from_env()?;
+                let world_size = full.world_size();
+                let coord_config = if config.save_path.is_some() {
+                    Some(build_coord_config_from_builder(
+                        policy,
+                        backend,
+                        &config,
+                        convergence_guard,
+                        world_size,
+                    ))
+                } else {
+                    None
+                };
+                crate::distributed::launcher::run_launcher_with_config(full, coord_config)?;
+                std::process::exit(0);
+            }
+            crate::distributed::launcher::Role::Rank
+            | crate::distributed::launcher::Role::SingleDevice => {}
+        }
+
         // Cluster-mode detection: under the process-per-rank model,
         // Trainer::builder runs inside each rank process — one device per
         // process, no in-process N-thread coordinator. Dispatches to the
@@ -223,18 +346,40 @@ impl DdpHandle {
                     // the helper carries policy in WorkerConfig for the
                     // worker's pre_sync_scratch / metadata-emitting paths
                     // that branch on it.
-                    Self::run_cluster_rank_cadence_nccl(
-                        cluster,
-                        policy,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        convergence_guard,
-                    )
+                    //
+                    // Elastic-membership-aware routing mirrors the Sync arm
+                    // above: when save_path is set on DdpRunConfig, dispatch
+                    // through the via_coord path that survives rank death
+                    // and persists state on unrecoverable failure. When
+                    // unset, fall back to the legacy self-driven inline
+                    // loop (unchanged backward compat).
+                    if config.save_path.is_some() {
+                        Self::run_cluster_rank_cadence_nccl_via_coord(
+                            cluster,
+                            policy,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            convergence_guard,
+                        )
+                    } else {
+                        Self::run_cluster_rank_cadence_nccl(
+                            cluster,
+                            policy,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            convergence_guard,
+                        )
+                    }
                 }
                 (ApplyPolicy::Sync, AverageBackend::Cpu) => {
                     Self::run_cluster_rank_sync_cpu(
@@ -1299,6 +1444,239 @@ impl DdpHandle {
             // (1d.4-deferred final-snapshot capture). Cluster mode
             // users wanting state recovery should consume the bundle
             // written via ShutdownWithSave.
+            Ok(TrainedState {
+                params: Vec::new(),
+                buffers: Vec::new(),
+            })
+        });
+
+        Ok(DdpHandle {
+            worker_handles: Vec::new(),
+            coordinator_handle: Some(coordinator_handle),
+            devices: vec![device],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            nccl_abort_handles: Vec::new(),
+            final_state: None,
+            metrics_rx: None,
+            architecture_svg: None,
+            graph_label: None,
+            graph_hash: None,
+            training_meta,
+        })
+    }
+
+    /// Cluster-rank entry point for `ApplyPolicy::Cadence` /
+    /// `ApplyPolicy::Async` + `AverageBackend::Nccl` driven by a
+    /// [`ClusterCoordinator`] (elastic-membership + persistence aware).
+    ///
+    /// Mirrors [`run_cluster_rank_sync_nccl_via_coord`](Self::run_cluster_rank_sync_nccl_via_coord)
+    /// — the worker side is identical between Sync and Cadence under the
+    /// via-coord routing because the
+    /// [`ClusterCoordinator`](crate::distributed::cluster_coordinator::ClusterCoordinator)
+    /// owns ElChe + ConvergenceGuard for all three policies (see
+    /// [`ClusterCoordinator::trigger_averaging`] for the cadence broadcast
+    /// and [`ClusterCoordinator::finish_averaging_nccl`] for the guard /
+    /// `report_timing` / `nudge_anchor_down` / `relax_anchor_up`
+    /// pipeline). The worker just trains batches and responds to coord-
+    /// issued `SyncNow` via `handle_control` → `sync_now_nccl`.
+    ///
+    /// Cadence and Async NCCL collapse to the same entry: overshoot
+    /// machinery (the only old-coordinator Cadence/Async distinction)
+    /// is an async/CPU concept (see `feedback_overshoot_async_only` and
+    /// `feedback_nccl_no_overshoot_throttle`). [`WorkerConfig::policy`]
+    /// carries the user's chosen policy for log lines + future-policy
+    /// metadata but does not branch the algorithm.
+    ///
+    /// `save_path` on [`DdpRunConfig`] is REQUIRED — the cluster
+    /// save-on-unrecoverable-failure flow needs a destination. Loud
+    /// error at startup if unset.
+    ///
+    /// # Controller-scope config flow (in flight)
+    ///
+    /// `policy`, `convergence_guard`, and the ElChe knobs on
+    /// [`DdpRunConfig`] are CONTROLLER-scope configuration. The
+    /// controller is a singleton scheduler (lives in the launcher
+    /// process, decoupled from any rank), so it cannot read trait
+    /// objects (`Box<dyn ConvergenceGuard>`) constructed in the
+    /// user's rank-side `main()` without a wire-protocol or
+    /// process-trampoline. The launcher-trampoline slice closes
+    /// this gap by running the user's `main()` up to the
+    /// `Trainer::builder(...).run()` boundary in launcher mode,
+    /// extracting controller-scope fields from the builder, then
+    /// forking rank children. Until that lands, the controller uses
+    /// hardwired defaults (Sync policy, anchor=1, default
+    /// `TrendGuard`).
+    ///
+    /// The user's `convergence_guard` is **threaded through** to this
+    /// entry for API symmetry and to keep the call site honest. It is
+    /// not yet wired into the controller — the controller-side install
+    /// happens in the trampoline slice when the same `DdpRunConfig`
+    /// is visible to both controller and rank dispatch.
+    ///
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterCoordinator::trigger_averaging`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator::trigger_averaging
+    /// [`ClusterCoordinator::finish_averaging_nccl`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator
+    #[allow(clippy::too_many_arguments)]
+    fn run_cluster_rank_cadence_nccl_via_coord<F, M, G, O, T>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        policy: ApplyPolicy,
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        config: DdpRunConfig,
+        convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
+    ) -> Result<Self>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::AtomicBool;
+        use crate::distributed::nccl::NcclRankComm;
+
+        // save_path is required: the via_coord path' save-on-failure
+        // flow needs a destination.
+        let save_path = config.save_path.clone().ok_or_else(|| {
+            crate::tensor::TensorError::new(
+                "run_cluster_rank_cadence_nccl_via_coord requires `save_path` \
+                 on DdpRunConfig (`.with_save_path(...)`). The cluster \
+                 save-on-unrecoverable-failure path needs a destination."
+            )
+        })?;
+
+        // The controller owns ElChe + guard. `convergence_guard` is
+        // threaded through here so the call site stays honest (the
+        // builder accepts it; this entry receives it), but the
+        // controller-side install is deferred to the launcher-
+        // trampoline slice — see this method's doc comment.
+        let _ = convergence_guard;
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len();
+
+        let policy_label = match policy {
+            ApplyPolicy::Sync => "Sync",
+            ApplyPolicy::Cadence => "Cadence",
+            ApplyPolicy::Async => "Async",
+        };
+        crate::verbose!(
+            "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
+             ({policy_label}+Nccl via_coord, save_path={save_path:?})"
+        );
+
+        // Coord control channel at master_port + 3 (same convention as
+        // the Sync via_coord entry).
+        let coord_port = cluster.master_port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_addr: std::net::SocketAddr = coord_addr_str
+            .parse()
+            .map_err(|e| crate::tensor::TensorError::new(&format!(
+                "ddp: parse coord addr '{coord_addr_str}': {e}"
+            )))?;
+        let session_salt = cluster.salt;
+        let dataset_sig = [0u8; 32];
+
+        let training_meta = Some(serde_json::json!({
+            "mode": format!("cluster-rank {policy_label}+Nccl via_coord"),
+            "global_rank": global_rank,
+            "world_size": world_size,
+            "device": format!("{device:?}"),
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "total_samples": total_samples,
+            "coord_addr": coord_addr_str,
+            "save_path": save_path,
+        }));
+
+        let timeline_for_thread = config.timeline.clone();
+        let max_grad_norm = config.max_grad_norm;
+        let easgd_alpha = config.easgd_alpha;
+        let save_path_for_thread = save_path.clone();
+
+        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            let rdv = cluster.rendezvous(dataset_sig)?;
+            let nccl_comm =
+                NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+
+            // Build tmp model, broadcast initial state, pin to CPU.
+            // GpuWorker::new re-creates the model + copies params back to
+            // GPU on the worker thread.
+            let tmp_model = model_factory(device)?;
+            let initial_params_gpu: Vec<Tensor> = tmp_model
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data())
+                .collect();
+            let initial_buffers_gpu: Vec<Tensor> = tmp_model
+                .buffers()
+                .iter()
+                .map(|b| b.get())
+                .collect();
+            if !initial_params_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_params_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            if !initial_buffers_gpu.is_empty() {
+                let refs: Vec<&Tensor> = initial_buffers_gpu.iter().collect();
+                nccl_comm.broadcast(&refs, 0)?;
+            }
+            let initial_params: Vec<Tensor> = initial_params_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_gpu
+                .iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                seed: 42,
+                max_grad_norm,
+                easgd_alpha,
+                timeline: timeline_for_thread,
+                policy,
+                save_path: Some(save_path_for_thread),
+            };
+
+            // ClusterWorker bridges set up heartbeat + NCCL watchdog +
+            // inbound (DeclareDead / NewNcclSession / ShutdownWithSave)
+            // / outbound timing. The worker's `handle_control` responds
+            // to coord-issued `SyncNow` via `sync_now_nccl` — identical
+            // semantics to the Sync via_coord path.
+            let cluster_worker =
+                crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
+                    coord_addr,
+                    None,
+                    global_rank as u32,
+                    session_salt,
+                    worker_config,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    Some(nccl_comm),
+                    None,
+                )?;
+
+            cluster_worker.run_until_shutdown(train_fn)?;
+
+            // Final params discarded (1d.4-deferred final-snapshot
+            // capture). Resume goes through the ShutdownWithSave bundle.
             Ok(TrainedState {
                 params: Vec::new(),
                 buffers: Vec::new(),

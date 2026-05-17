@@ -1571,6 +1571,206 @@ mod tests {
         }
     }
 
+    /// End-to-end Cadence+Nccl via_coord smoke test — heterogeneous
+    /// Local-SGD with ElChe-driven cadence and a real
+    /// [`ClusterCoordinator`] driving the guard pipeline.
+    ///
+    /// Cadence and Sync share the worker-side code path under
+    /// via_coord: the coord owns ElChe + ConvergenceGuard and broadcasts
+    /// `SyncNow` at K-batch boundaries (see
+    /// [`ClusterCoordinator::should_average`] +
+    /// [`ClusterCoordinator::trigger_averaging`]). This test confirms
+    /// that the routing flip in
+    /// [`DdpHandle::run_cluster_rank_cadence_nccl_via_coord`] connects
+    /// up correctly end-to-end: coord with `ApplyPolicy::Cadence`,
+    /// workers with `WorkerConfig.policy = Cadence`, multiple AllReduce
+    /// cycles complete cleanly, all ranks exit on `Shutdown`.
+    ///
+    /// Acceptance: at least two `coord.avg_count()` cycles fire
+    /// (multi-cycle Cadence proven). Final params converge to
+    /// bit-identical across ranks via NCCL AllReduce-Avg invariant.
+    ///
+    /// Marked `#[ignore]` — requires CUDA + NCCL + 2+ GPUs. Run via
+    /// `fdl cluster-testing cuda-test-nccl` on the Pascal rig.
+    ///
+    /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterCoordinator::should_average`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator
+    /// [`ClusterCoordinator::trigger_averaging`]:
+    ///     crate::distributed::cluster_coordinator::ClusterCoordinator::trigger_averaging
+    #[test]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-testing cuda-test-nccl"]
+    fn end_to_end_cadence_nccl_via_coord_smoke() {
+        use crate::distributed::testing::discover_test_cluster;
+        use crate::distributed::nccl::NcclComms;
+
+        let cluster = match discover_test_cluster() {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "end_to_end_cadence_nccl_via_coord_smoke: no cluster topology \
+                     available (set FLODL_TESTING_CLUSTER_JSON via \
+                     `fdl cluster-testing` or run on a CUDA host)"
+                );
+                return;
+            }
+        };
+        let total_ranks: usize = cluster.hosts.iter().map(|h| h.ranks.len()).sum();
+        if total_ranks < 2 {
+            eprintln!(
+                "end_to_end_cadence_nccl_via_coord_smoke: NCCL needs 2+ ranks \
+                 (have {total_ranks}); skipping"
+            );
+            return;
+        }
+
+        let world_size = total_ranks;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let (coord_listener, coord_port) = CCoord::bind(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        )
+        .expect("coord bind succeeds");
+        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+
+        // Anchor=2 batches per rank between syncs (uncalibrated ElChe;
+        // first cycle reports timing, subsequent cycles may rebalance).
+        // 16 samples / batch=4 / partition split = 2 batches per rank for
+        // ws=2 with equal partition → exactly one sync per epoch per
+        // rank's K; running 4 epochs guarantees multiple cycles.
+        let total_samples = 32usize;
+        let batch_size = 4usize;
+        let elche_anchor = 2usize;
+        let num_epochs = 4usize;
+        let config_for_coord = move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Cadence,
+                AverageBackend::Nccl,
+                world_size,
+                crate::distributed::ddp::ElChe::new(world_size, elche_anchor),
+            )
+            .no_divergence_guard()
+            .dead_ranks(dead_for_coord)
+            .total_samples(total_samples)
+            .batch_size(batch_size)
+            .num_epochs(num_epochs)
+        };
+        let coord_thread = thread::spawn(move || -> Result<CCoord> {
+            CCoord::start_from_listener(
+                coord_listener,
+                [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
+                config_for_coord(),
+            )
+        });
+
+        let devices: Vec<Device> = (0..world_size as u8)
+            .map(Device::CUDA)
+            .collect();
+        let group = NcclComms::new(&devices).expect("NcclComms::new succeeds");
+        let rank_comms = group.split().expect("split succeeds");
+
+        let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+        let initial_params: Vec<Tensor> = ref_model
+            .parameters()
+            .iter()
+            .map(|p| p.variable.data())
+            .collect();
+        let initial_buffers: Vec<Tensor> = ref_model
+            .buffers()
+            .iter()
+            .map(|b| b.get())
+            .collect();
+        drop(ref_model);
+
+        let salt = [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
+        let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+        for (rank_id, comm) in rank_comms.into_iter().enumerate() {
+            let initial_params = initial_params.clone();
+            let initial_buffers = initial_buffers.clone();
+            let device = Device::CUDA(rank_id as u8);
+            worker_handles.push(thread::spawn(move || -> Result<()> {
+                let config = WorkerConfig {
+                    rank: rank_id,
+                    world_size,
+                    device,
+                    initial_params,
+                    initial_buffers,
+                    total_samples,
+                    batch_size,
+                    seed: 42,
+                    max_grad_norm: None,
+                    easgd_alpha: None,
+                    timeline: None,
+                    policy: ApplyPolicy::Cadence,
+                    // save_path is None in this smoke — we're testing
+                    // the via_coord protocol path, not persistence.
+                    // Production callers using auto_with auto-route here
+                    // when save_path is set on DdpRunConfig.
+                    save_path: None,
+                };
+                let dataset: Arc<dyn crate::data::BatchDataSet> =
+                    Arc::new(TestDataset { n: total_samples });
+                let worker = ClusterWorker::connect_and_build(
+                    coord_addr,
+                    None,
+                    rank_id as u32,
+                    salt,
+                    config,
+                    move |d| Linear::on_device(4, 2, d),
+                    |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                    dataset,
+                    Some(comm),
+                    None,
+                )?;
+                worker.run_until_shutdown(mse_train)
+            }));
+        }
+
+        let mut coord = coord_thread
+            .join()
+            .expect("coord thread join")
+            .expect("start_from_listener succeeds");
+
+        coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+
+        // Drive ticks until >= 2 Cadence sync cycles fire, or timeout.
+        // Cadence's `should_average` decides cycle boundaries (every
+        // anchor batches per rank, uncalibrated mode). Two cycles
+        // confirms the coord drives the cadence loop, not just a
+        // single-shot SyncNow.
+        let start = Instant::now();
+        while coord.avg_count() < 2 {
+            if start.elapsed() > Duration::from_secs(60) {
+                panic!(
+                    "end_to_end_cadence_nccl_via_coord_smoke: avg_count={} \
+                     never reached 2 within 60s",
+                    coord.avg_count(),
+                );
+            }
+            coord.tick().expect("tick");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            coord.avg_count() >= 2,
+            "Cadence drives multiple AllReduce cycles: avg_count={}",
+            coord.avg_count(),
+        );
+
+        // Sanity: ElChe anchor stayed in a valid range (NoGuard never
+        // emits NudgeDown so anchor should equal the initial value).
+        let coord_anchor = coord.el_che().anchor();
+        assert_eq!(
+            coord_anchor, elche_anchor,
+            "NoGuard: anchor stable at initial value ({elche_anchor}), got {coord_anchor}",
+        );
+
+        coord.shutdown_workers().expect("shutdown_workers");
+        coord.shutdown().expect("coord shutdown");
+        for h in worker_handles {
+            h.join().expect("worker thread join").expect("worker exits clean");
+        }
+    }
+
     // -----------------------------------------------------------------
     // 4b.D.1d.4b — end-to-end Sync+Cpu smoke test scaffolding
     // -----------------------------------------------------------------
