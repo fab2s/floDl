@@ -29,18 +29,31 @@ COMPOSE = docker compose
 # warnings and CI fails on the same crate with `-D warnings` in
 # RUSTDOCFLAGS — defeating the "gate locally first" purpose.
 #
-# Two passes for flodl: one with `--no-default-features --features rng`
-# (mirrors `[package.metadata.docs.rs]` for the published docs.rs page)
-# and one with `--all-features` (catches doc-link breakage in every
-# feature-gated path — CI doesn't have cuda runtime but rustdoc only
-# parses, so all feature gates surface here, matching what CI catches
-# and then some). flodl-sys's build.rs gates libtorch on DOCS_RS=1
-# (set by docker-compose), so cuda-feature builds work in the docs-rs
-# container without an actual GPU.
+# Three pass layers, each with `-D warnings`:
+#
+# 1. **CI parity pass** — `cargo doc --no-deps --document-private-items`
+#    with stable toolchain, no `--cfg docsrs`. Mirrors the CI workflow
+#    (.github/workflows/ci.yml) verbatim. `--document-private-items`
+#    catches warnings rustdoc skips by default (e.g. redundant explicit
+#    links inside private-item docs). The CI gate fails if this fails;
+#    we must catch it locally first.
+#
+# 2. **docs.rs hosting pass (flodl)** — nightly + `--cfg docsrs` +
+#    `--no-default-features --features rng`, mirroring
+#    `[package.metadata.docs.rs]`. This is what the published docs.rs
+#    page would generate. Catches docsrs-specific breakage.
+#
+# 3. **docs.rs hosting pass (per-crate)** — flodl-sys, flodl-cli,
+#    flodl-cli-macros, flodl-hf each documented with `--cfg docsrs`
+#    and their docs.rs feature set. Plus a flodl `--all-features` pass
+#    to catch any cuda-gated breakage CI's default-feature build
+#    wouldn't see (rustdoc parses without GPU; flodl-sys's libtorch
+#    skip is gated on DOCS_RS=1, set in docker-compose).
 docs-rs:
 	@mkdir -p .cargo-cache-docsrs .cargo-git-docsrs .target-docsrs
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
+		RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items && \
 		cargo +nightly rustdoc --lib -p flodl-sys \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl \
