@@ -15,7 +15,7 @@ use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use super::{
-    CheckpointFn, WorkerConfig, TimingMsg, MetricsMsg,
+    CheckpointFn, EvalFn, WorkerConfig, TimingMsg, MetricsMsg,
     ParamSnapshot, AveragedParams, ControlMsg, EpochPlan, make_partition,
 };
 
@@ -131,6 +131,19 @@ pub struct GpuWorker<M: Module> {
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
     pub(super) checkpoint_fn: Option<CheckpointFn<M>>,
+    /// User-supplied eval callback. Fires from [`Self::handle_control`]
+    /// on [`ControlMsg::ExecuteEvalCallback`] receipt, only on the rank
+    /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`]
+    /// (other ranks see `None`). The framework flips
+    /// [`Module::eval`]/[`Module::train`] around the closure and ships
+    /// the scalar result back to the controller via
+    /// [`TimingMsg::EvalResult`].
+    pub(super) eval_fn: Option<EvalFn<M>>,
+    /// Held-out eval dataset paired with `eval_fn`. Required when
+    /// `eval_fn` is set (the framework loud-errors if absent at eval
+    /// firing time). `Arc<dyn BatchDataSet>` matches the training
+    /// `dataset` shape; user iterates batches inside the closure.
+    pub(super) eval_dataset: Option<Arc<dyn BatchDataSet>>,
     /// Checkpoint-bundle stem for the cluster save-on-unrecoverable-
     /// failure flow. Populated from [`WorkerConfig::save_path`]. When
     /// set, the worker writes a `<save_path>.fdl` / `<save_path>.optim`
@@ -234,6 +247,8 @@ impl<M: Module> GpuWorker<M> {
         dataset: Arc<dyn BatchDataSet>,
         nccl_comm: Option<NcclRankComm>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        eval_fn: Option<EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
         timing_tx: mpsc::Sender<TimingMsg>,
         metrics_tx: mpsc::Sender<MetricsMsg>,
         param_tx: mpsc::Sender<ParamSnapshot>,
@@ -425,6 +440,8 @@ impl<M: Module> GpuWorker<M> {
             scheduler: None,
             lr_scale: 1.0,
             checkpoint_fn,
+            eval_fn,
+            eval_dataset,
             save_path: config.save_path.clone(),
             prefetch,
             per_sample_bytes,
@@ -1998,12 +2015,41 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
             ControlMsg::ExecuteEvalCallback { schedule_id, epoch } => {
-                // Cluster-mode eval dispatch lives at the
-                // [`crate::distributed::cluster_worker::ClusterWorker`]
-                // layer (eval_fn + eval_dataset live alongside
-                // epoch_fn there, fired between epoch plans). GpuWorker
-                // sees the frame for protocol completeness — drop here.
-                let _ = (schedule_id, epoch);
+                // Fire only on the rank chosen by
+                // `EpochCallbackPolicy` (others have `eval_fn = None`
+                // populated and silently skip). Flip the model into
+                // eval mode for BN/Dropout/etc. correctness, run the
+                // user closure against the held-out dataset, then
+                // restore train mode. The scalar metric (or error)
+                // flows back to the controller via
+                // `TimingMsg::EvalResult`; the controller's
+                // `eval_result_fn` fires on receipt.
+                if let Some(ref f) = self.eval_fn {
+                    let result = match self.eval_dataset.as_ref() {
+                        Some(ds) => {
+                            self.model.eval();
+                            let r = f(&self.model, ds.as_ref());
+                            self.model.train();
+                            r
+                        }
+                        None => Err(TensorError::new(
+                            "ddp: eval_fn set without eval_dataset; \
+                             attach a held-out dataset via \
+                             DdpBuilder::eval_dataset(...)",
+                        )),
+                    };
+                    let (metric, error) = match result {
+                        Ok(m) => (m, None),
+                        Err(e) => (f64::NAN, Some(e.to_string())),
+                    };
+                    let _ = self.timing_tx.send(TimingMsg::EvalResult {
+                        rank: self.rank,
+                        schedule_id,
+                        epoch,
+                        metric,
+                        error,
+                    });
+                }
             }
             ControlMsg::Shutdown => return Ok(true),
         }

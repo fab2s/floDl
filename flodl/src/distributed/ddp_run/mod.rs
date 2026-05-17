@@ -589,9 +589,15 @@ pub struct DdpRunConfig {
     pub heartbeat_timeout_secs: Option<u64>,
 
     /// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
-    /// `checkpoint_fn`, future `eval_fn`). See
-    /// [`EpochCallbackPolicy`] for the variants. Default `Rank(0)`.
+    /// `checkpoint_fn`, `eval_fn`). See [`EpochCallbackPolicy`] for the
+    /// variants. Default `Rank(0)`.
     pub epoch_callback_policy: EpochCallbackPolicy,
+
+    /// Cadence (in epochs) for the user-supplied `eval_fn`. `Some(n)`
+    /// triggers an eval dispatch every `n` epochs from the controller's
+    /// `dispatch_epoch`. `None` or `0` disables. Builder sugar:
+    /// [`DdpBuilder::eval_every`] (accepts [`EvalCadence`]).
+    pub eval_every_epochs: Option<usize>,
 }
 
 impl Default for DdpRunConfig {
@@ -626,6 +632,7 @@ impl DdpRunConfig {
             max_failure: None,
             heartbeat_timeout_secs: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
+            eval_every_epochs: None,
         }
     }
 
@@ -731,6 +738,15 @@ impl DdpRunConfig {
     /// Errors from the checkpoint function are logged but do not stop training.
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
         self.checkpoint_every = Some(n);
+        self
+    }
+
+    /// Fire the user-supplied `eval_fn` every `n` epochs from the
+    /// controller's `dispatch_epoch`. `n == 0` disables. Builder
+    /// sugar [`DdpBuilder::eval_every`] takes the [`EvalCadence`]
+    /// enum and forwards the integer here.
+    pub fn with_eval_every_epochs(mut self, n: usize) -> Self {
+        self.eval_every_epochs = if n == 0 { None } else { Some(n) };
         self
     }
 

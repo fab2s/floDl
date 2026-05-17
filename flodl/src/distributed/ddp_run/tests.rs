@@ -191,6 +191,8 @@ fn make_test_worker_with(
         dataset,
         None, // no NCCL in unit tests
         None, // no checkpoint in unit tests
+        None, // no eval_fn
+        None, // no eval_dataset
         timing_tx,
         metrics_tx,
         param_tx,
@@ -1739,6 +1741,118 @@ fn test_checkpoint_error_logged_not_propagated() {
     assert!(!shutdown);
 }
 
+/// `ControlMsg::ExecuteEvalCallback` fires the worker's `eval_fn`
+/// against `eval_dataset` and emits a [`TimingMsg::EvalResult`] back
+/// to the coordinator. Mirrors the checkpoint test pattern.
+#[test]
+fn test_eval_fn_called_on_dispatch_and_emits_result() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (mut worker, ch) = make_test_worker();
+    let called_epoch = Arc::new(AtomicU64::new(u64::MAX));
+    let ce = called_epoch.clone();
+    worker.eval_fn = Some(Arc::new(move |_model, _ds| {
+        ce.store(7, Ordering::Relaxed);
+        Ok(0.42)
+    }));
+    worker.eval_dataset = Some(Arc::new(TestDataset { n: 4 }));
+
+    ch.control_tx
+        .send(ControlMsg::ExecuteEvalCallback {
+            schedule_id: 99,
+            epoch: 7,
+        })
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(!shutdown);
+    assert_eq!(called_epoch.load(Ordering::Relaxed), 7);
+
+    // Drain TimingMsgs and find the EvalResult.
+    let mut got = None;
+    while let Ok(m) = ch.timing_rx.try_recv() {
+        if let TimingMsg::EvalResult {
+            schedule_id,
+            epoch,
+            metric,
+            error,
+            rank,
+        } = m
+        {
+            got = Some((rank, schedule_id, epoch, metric, error));
+            break;
+        }
+    }
+    let (rank, schedule_id, epoch, metric, error) =
+        got.expect("EvalResult should be emitted");
+    assert_eq!(rank, 0);
+    assert_eq!(schedule_id, 99);
+    assert_eq!(epoch, 7);
+    assert!((metric - 0.42).abs() < 1e-9);
+    assert!(error.is_none());
+}
+
+/// `eval_fn` errors flow back as a `TimingMsg::EvalResult` with
+/// `error = Some(...)` and `metric = NaN`. Training continues
+/// (no shutdown).
+#[test]
+fn test_eval_fn_error_surfaces_in_timing_msg() {
+    let (mut worker, ch) = make_test_worker();
+    worker.eval_fn = Some(Arc::new(|_model, _ds| {
+        Err(TensorError::new("eval blew up"))
+    }));
+    worker.eval_dataset = Some(Arc::new(TestDataset { n: 4 }));
+
+    ch.control_tx
+        .send(ControlMsg::ExecuteEvalCallback {
+            schedule_id: 1,
+            epoch: 2,
+        })
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(!shutdown);
+
+    let mut got_err = None;
+    while let Ok(m) = ch.timing_rx.try_recv() {
+        if let TimingMsg::EvalResult { error, metric, .. } = m {
+            got_err = Some((error, metric));
+            break;
+        }
+    }
+    let (error, metric) = got_err.expect("EvalResult should be emitted");
+    assert!(error.unwrap().contains("eval blew up"));
+    assert!(metric.is_nan());
+}
+
+/// `ControlMsg::ExecuteEvalCallback` on a worker with `eval_fn = None`
+/// (non-chosen rank) is a quiet no-op: no `EvalResult` emitted, no
+/// shutdown signaled.
+#[test]
+fn test_eval_fn_none_is_noop() {
+    let (mut worker, ch) = make_test_worker();
+    // eval_fn intentionally not set.
+
+    ch.control_tx
+        .send(ControlMsg::ExecuteEvalCallback {
+            schedule_id: 1,
+            epoch: 2,
+        })
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(!shutdown);
+
+    let mut found_eval_result = false;
+    while let Ok(m) = ch.timing_rx.try_recv() {
+        if matches!(m, TimingMsg::EvalResult { .. }) {
+            found_eval_result = true;
+            break;
+        }
+    }
+    assert!(
+        !found_eval_result,
+        "non-chosen rank should not emit EvalResult"
+    );
+}
+
 #[test]
 fn shutdown_with_save_writes_model_and_optim_to_save_path() {
     // Rank-0 worker with save_path set. Dispatch ShutdownWithSave;
@@ -1790,6 +1904,8 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         dataset,
         None,
         None,
+        None, // no eval_fn
+        None, // no eval_dataset
         timing_tx,
         metrics_tx,
         param_tx,

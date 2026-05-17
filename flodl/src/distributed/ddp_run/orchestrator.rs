@@ -40,12 +40,14 @@ use super::coordinator::Coordinator;
 /// [`NoGuard`]: super::convergence::NoGuard
 /// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`]:
 ///     super::convergence::TrendGuard::new
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_coord_config_from_builder(
     policy: ApplyPolicy,
     backend: AverageBackend,
     config: &DdpRunConfig,
     convergence_guard: Option<Box<dyn super::convergence::ConvergenceGuard>>,
     metrics_fn: Option<super::MetricsFn>,
+    eval_result_fn: Option<super::EvalResultFn>,
     world_size: usize,
 ) -> crate::distributed::cluster_coordinator::ClusterCoordinatorConfig {
     use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
@@ -109,6 +111,12 @@ pub(super) fn build_coord_config_from_builder(
     }
     if let Some(f) = metrics_fn {
         coord_config = coord_config.metrics_fn(f);
+    }
+    if let Some(every) = config.eval_every_epochs {
+        coord_config = coord_config.eval_every_epochs(every);
+    }
+    if let Some(f) = eval_result_fn {
+        coord_config = coord_config.eval_result_fn(f);
     }
 
     coord_config
@@ -280,6 +288,7 @@ impl DdpHandle {
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
             policy, backend, config, None, None, None, None, None,
+            None, None, None,
         )
     }
 
@@ -300,6 +309,9 @@ impl DdpHandle {
         metrics_fn: Option<super::MetricsFn>,
         scheduler_fn: Option<super::SchedulerFn>,
         convergence_guard: Option<Box<dyn super::ConvergenceGuard>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
+        eval_result_fn: Option<super::EvalResultFn>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -341,6 +353,7 @@ impl DdpHandle {
                     &config,
                     convergence_guard,
                     metrics_fn,
+                    eval_result_fn,
                     world_size,
                 );
                 coord_config = coord_config.metrics_sink_tx(sink_tx);
@@ -406,6 +419,8 @@ impl DdpHandle {
                         scheduler_fn,
                         epoch_fn,
                         checkpoint_fn,
+                        eval_fn,
+                        eval_dataset,
                     )
                 }
                 (ApplyPolicy::Cadence, AverageBackend::Nccl)
@@ -428,6 +443,8 @@ impl DdpHandle {
                         scheduler_fn,
                         epoch_fn,
                         checkpoint_fn,
+                        eval_fn,
+                        eval_dataset,
                     )
                 }
                 (ApplyPolicy::Sync, AverageBackend::Cpu) => {
@@ -443,6 +460,8 @@ impl DdpHandle {
                         scheduler_fn,
                         epoch_fn,
                         checkpoint_fn,
+                        eval_fn,
+                        eval_dataset,
                     )
                 }
                 (ApplyPolicy::Cadence, AverageBackend::Cpu) => {
@@ -460,6 +479,8 @@ impl DdpHandle {
                         scheduler_fn,
                         epoch_fn,
                         checkpoint_fn,
+                        eval_fn,
+                        eval_dataset,
                     )
                 }
                 (ApplyPolicy::Async, AverageBackend::Cpu) => {
@@ -477,6 +498,8 @@ impl DdpHandle {
                         scheduler_fn,
                         epoch_fn,
                         checkpoint_fn,
+                        eval_fn,
+                        eval_dataset,
                     )
                 }
             };
@@ -497,6 +520,10 @@ impl DdpHandle {
                 metrics_fn,
                 config.max_grad_norm,
                 scheduler,
+                eval_fn,
+                eval_dataset,
+                config.eval_every_epochs,
+                eval_result_fn,
             );
         }
 
@@ -839,6 +866,8 @@ impl DdpHandle {
                             ds,
                             worker_nccl,
                             ckpt_fn,
+                            None, // eval_fn: threaded path, not yet wired
+                            None, // eval_dataset
                             t_tx,
                             m_tx,
                             p_tx,
@@ -974,6 +1003,10 @@ impl DdpHandle {
         metrics_fn: Option<super::MetricsFn>,
         max_grad_norm: Option<f64>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
+        eval_every_epochs: Option<usize>,
+        eval_result_fn: Option<super::EvalResultFn>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M>,
@@ -1044,6 +1077,8 @@ impl DdpHandle {
             dataset,
             None, // no NCCL for single-GPU
             checkpoint_fn.clone(),
+            eval_fn.clone(),
+            eval_dataset.clone(),
             timing_tx,
             metrics_tx,
             param_tx,
@@ -1106,6 +1141,39 @@ impl DdpHandle {
                 if every > 0 && (epoch + 1) % every == 0 {
                     if let Err(e) = f((epoch + 1) as u64, worker.model()) {
                         eprintln!("  ddp: checkpoint failed (epoch {}): {e}", epoch + 1);
+                    }
+                }
+            }
+
+            // Single-GPU eval cadence: mirrors the cluster controller's
+            // dispatch. Fire after epoch N at (N+1) % every == 0 so the
+            // semantic matches "evaluate the model at end of this epoch".
+            // The framework flips train/eval mode; user supplies the
+            // batch iteration inside the closure.
+            if let (Some(every), Some(efn), Some(ds)) =
+                (eval_every_epochs, &eval_fn, &eval_dataset)
+            {
+                if every > 0 && (epoch + 1) % every == 0 {
+                    worker.model().eval();
+                    let result = efn(worker.model(), ds.as_ref());
+                    worker.model().train();
+                    match result {
+                        Ok(metric) => {
+                            if let Some(rf) = &eval_result_fn {
+                                if let Err(e) = rf(epoch + 1, metric) {
+                                    eprintln!(
+                                        "  ddp: eval_result_fn returned error (epoch {}): {e}",
+                                        epoch + 1,
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  ddp: eval_fn returned error (epoch {}): {e}",
+                                epoch + 1,
+                            );
+                        }
                     }
                 }
             }
@@ -1176,6 +1244,8 @@ impl DdpHandle {
         scheduler_fn: Option<super::SchedulerFn>,
         epoch_fn: Option<EpochFn<M>>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1206,6 +1276,8 @@ impl DdpHandle {
         let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
         let checkpoint_fn_for_thread =
             if fires_callbacks { checkpoint_fn } else { None };
+        let eval_fn_for_thread = if fires_callbacks { eval_fn } else { None };
+        let eval_dataset_for_thread = if fires_callbacks { eval_dataset } else { None };
 
         crate::verbose!(
             "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
@@ -1317,6 +1389,8 @@ impl DdpHandle {
                     Some(nccl_comm),
                     checkpoint_fn_for_thread,
                     epoch_fn_for_thread,
+                    eval_fn_for_thread,
+                    eval_dataset_for_thread,
                 )?;
 
             // Per-batch LR scheduler: stateless pure function attached
@@ -1425,6 +1499,8 @@ impl DdpHandle {
         scheduler_fn: Option<super::SchedulerFn>,
         epoch_fn: Option<EpochFn<M>>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1458,6 +1534,8 @@ impl DdpHandle {
         let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
         let checkpoint_fn_for_thread =
             if fires_callbacks { checkpoint_fn } else { None };
+        let eval_fn_for_thread = if fires_callbacks { eval_fn } else { None };
+        let eval_dataset_for_thread = if fires_callbacks { eval_dataset } else { None };
 
         let policy_label = match policy {
             ApplyPolicy::Sync => "Sync",
@@ -1570,6 +1648,8 @@ impl DdpHandle {
                     Some(nccl_comm),
                     checkpoint_fn_for_thread,
                     epoch_fn_for_thread,
+                    eval_fn_for_thread,
+                    eval_dataset_for_thread,
                 )?;
 
             if let Some(f) = scheduler_fn {
@@ -1645,6 +1725,8 @@ impl DdpHandle {
         scheduler_fn: Option<super::SchedulerFn>,
         epoch_fn: Option<EpochFn<M>>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1669,6 +1751,8 @@ impl DdpHandle {
         let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
         let checkpoint_fn_for_thread =
             if fires_callbacks { checkpoint_fn } else { None };
+        let eval_fn_for_thread = if fires_callbacks { eval_fn } else { None };
+        let eval_dataset_for_thread = if fires_callbacks { eval_dataset } else { None };
 
         crate::verbose!(
             "  ddp: cluster rank {global_rank}/{world_size} on {device:?} \
@@ -1787,6 +1871,8 @@ impl DdpHandle {
                     None,
                     checkpoint_fn_for_thread,
                     epoch_fn_for_thread,
+                    eval_fn_for_thread,
+                    eval_dataset_for_thread,
                 )?;
 
             if let Some(f) = scheduler_fn {
@@ -1871,6 +1957,8 @@ impl DdpHandle {
         scheduler_fn: Option<super::SchedulerFn>,
         epoch_fn: Option<EpochFn<M>>,
         checkpoint_fn: Option<CheckpointFn<M>>,
+        eval_fn: Option<super::EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -1899,6 +1987,8 @@ impl DdpHandle {
         let epoch_fn_for_thread = if fires_callbacks { epoch_fn } else { None };
         let checkpoint_fn_for_thread =
             if fires_callbacks { checkpoint_fn } else { None };
+        let eval_fn_for_thread = if fires_callbacks { eval_fn } else { None };
+        let eval_dataset_for_thread = if fires_callbacks { eval_dataset } else { None };
 
         let policy_label = match policy {
             ApplyPolicy::Sync => "Sync",
@@ -2013,6 +2103,8 @@ impl DdpHandle {
                     None,
                     checkpoint_fn_for_thread,
                     epoch_fn_for_thread,
+                    eval_fn_for_thread,
+                    eval_dataset_for_thread,
                 )?;
 
             if let Some(f) = scheduler_fn {
@@ -2396,6 +2488,16 @@ where
     /// legacy `divergence_threshold` / `no_divergence_guard` fields on
     /// [`DdpRunConfig`]. Boxed because trait-object guards aren't `Clone`.
     convergence_guard: Option<Box<dyn super::ConvergenceGuard>>,
+    /// Rank-side eval callback. Fires on the rank chosen by
+    /// `EpochCallbackPolicy` against `eval_dataset`; the framework flips
+    /// `Module::eval`/`train` around the closure and ships the scalar
+    /// result back to the controller.
+    eval_fn: Option<super::EvalFn<M>>,
+    /// Held-out dataset paired with `eval_fn`.
+    eval_dataset: Option<Arc<dyn BatchDataSet>>,
+    /// Controller-side callback receiving `(epoch, metric)` once the
+    /// chosen rank's `eval_fn` result arrives over the wire.
+    eval_result_fn: Option<super::EvalResultFn>,
     _phantom: PhantomData<(M, O)>,
 }
 
@@ -2741,6 +2843,58 @@ where
         self
     }
 
+    /// Attach a held-out eval dataset paired with [`Self::eval_fn`].
+    ///
+    /// The framework hands `&dyn BatchDataSet` to the eval closure each
+    /// time it fires; the user iterates batches inside. Shared-storage
+    /// baseline (NAS/SMB/NFS) means the same Arc can be cloned across
+    /// ranks and still resolve to the same on-disk data.
+    pub fn eval_dataset(mut self, dataset: Arc<dyn BatchDataSet>) -> Self {
+        self.eval_dataset = Some(dataset);
+        self
+    }
+
+    /// Eval cadence. Currently only [`super::EvalCadence::Epochs`] is
+    /// honored; per-batch cadences may land in a follow-up.
+    pub fn eval_every(mut self, cadence: super::EvalCadence) -> Self {
+        let super::EvalCadence::Epochs(n) = cadence;
+        self.config = self.config.with_eval_every_epochs(n);
+        self
+    }
+
+    /// Rank-side eval callback. Fires on the rank chosen by
+    /// [`super::EpochCallbackPolicy`] at the cadence set by
+    /// [`Self::eval_every`].
+    ///
+    /// Receives `(&model, &dyn BatchDataSet)` and returns
+    /// `Result<f64>` — the aggregated scalar metric. The framework
+    /// flips `Module::eval` / `Module::train` around the closure and
+    /// ships the result back to the controller, where
+    /// [`Self::eval_result_fn`] fires.
+    ///
+    /// Errors propagate to the controller as a string and surface in
+    /// the per-epoch log (no early stop today; configurable failure
+    /// policy lands in a follow-up).
+    pub fn eval_fn<E>(mut self, f: E) -> Self
+    where
+        E: Fn(&M, &dyn BatchDataSet) -> Result<f64> + Send + Sync + 'static,
+    {
+        self.eval_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// Controller-side callback receiving `(epoch, metric)` once the
+    /// chosen rank's eval result arrives. Mirrors [`Self::metrics_fn`]
+    /// in placement — controller-side, post-aggregation. Use it to
+    /// record eval curves, gate early stopping, etc.
+    pub fn eval_result_fn<E>(mut self, f: E) -> Self
+    where
+        E: Fn(usize, f64) -> Result<()> + Send + Sync + 'static,
+    {
+        self.eval_result_fn = Some(Arc::new(f));
+        self
+    }
+
     /// Launch training. Non-blocking: spawns threads and returns immediately.
     ///
     /// Call [`DdpHandle::join`] to block until training completes and retrieve
@@ -2769,6 +2923,9 @@ where
             self.metrics_fn,
             self.scheduler_fn,
             self.convergence_guard,
+            self.eval_fn,
+            self.eval_dataset,
+            self.eval_result_fn,
         )
     }
 }
@@ -2822,6 +2979,9 @@ impl DdpHandle {
             metrics_fn: None,
             scheduler_fn: None,
             convergence_guard: None,
+            eval_fn: None,
+            eval_dataset: None,
+            eval_result_fn: None,
             _phantom: PhantomData,
         }
     }

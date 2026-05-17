@@ -70,7 +70,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::cluster_coordinator::{write_handshake_rank, CTRL_HS_ACK, CTRL_HS_VERSION};
 use crate::distributed::ddp_run::{
-    CheckpointFn, ControlMsg, EpochFn, EpochPlan, GpuWorker, TimingMsg, WorkerConfig,
+    CheckpointFn, ControlMsg, EpochFn, EpochPlan, EvalFn, GpuWorker, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::distributed::wire::{
@@ -352,6 +352,8 @@ impl<M: Module + 'static> ClusterWorker<M> {
         nccl_comm: Option<NcclRankComm>,
         checkpoint_fn: Option<CheckpointFn<M>>,
         epoch_fn: Option<EpochFn<M>>,
+        eval_fn: Option<EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
     ) -> Result<Self>
     where
         F: FnOnce(Device) -> Result<M>,
@@ -460,6 +462,8 @@ impl<M: Module + 'static> ClusterWorker<M> {
             dataset,
             nccl_comm,
             checkpoint_fn,
+            eval_fn,
+            eval_dataset,
             timing_tx,
             metrics_tx,
             param_tx,
@@ -1685,6 +1689,8 @@ mod tests {
                     Some(comm),
                     None,
                     None,
+                    None, // no eval_fn
+                    None, // no eval_dataset
                 )?;
                 worker.run_until_shutdown(mse_train)
             }));
@@ -1868,6 +1874,8 @@ mod tests {
                     Some(comm),
                     None,
                     None,
+                    None, // no eval_fn
+                    None, // no eval_dataset
                 )?;
                 worker.run_until_shutdown(mse_train)
             }));
@@ -2126,6 +2134,8 @@ mod tests {
                     None, // no NCCL
                     None, // no checkpoint
                     None, // no epoch_fn
+                    None, // no eval_fn
+                    None, // no eval_dataset
                 )?;
                 worker.run_until_shutdown(mse_train)
             }));
