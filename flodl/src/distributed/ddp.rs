@@ -959,7 +959,7 @@ impl HasGraph for Graph {
 }
 
 /// Internal Module adapter used by [`Trainer::setup_head`] to feed a
-/// `HasGraph` replica through [`Graph::distribute`].
+/// `HasGraph` replica through the graph-replication path.
 ///
 /// `distribute` boxes each replica as `Box<dyn Module>`. Task-head
 /// wrappers don't implement `Module` directly (their true forward is

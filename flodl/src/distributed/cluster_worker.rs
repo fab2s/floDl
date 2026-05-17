@@ -993,8 +993,10 @@ fn write_one(
     frame.write_to(stream)
 }
 
-/// CPU-averaging param bridge: receives [`ParamSnapshot`]s from the
-/// inner [`GpuWorker`] (triggered by `RequestParams`), runs an
+/// CPU-averaging param bridge: receives
+/// [`ParamSnapshot`](crate::distributed::ddp_run::ParamSnapshot)s from the
+/// inner [`GpuWorker`](crate::distributed::ddp_run::GpuWorker)
+/// (triggered by `RequestParams`), runs an
 /// all-reduce round-trip through the data channel via
 /// [`crate::distributed::cpu_reduce::CpuReduceClient`], and feeds the
 /// averaged tensors back to the inner as `ControlMsg::Update`. Also

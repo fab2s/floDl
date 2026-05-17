@@ -2203,11 +2203,14 @@ impl DdpHandle {
     ///   on NudgeDown, [`relax_anchor_up`](super::super::ddp::ElChe::relax_anchor_up)
     ///   on Stable+flag).
     ///
-    /// **Comm ownership:** the [`NcclRankComm`] is built inside the spawned
-    /// thread (rendezvous lives inside, since `M` isn't `Send`) and handed
-    /// to [`Ddp::from_comm`] after the initial-state broadcast. The
-    /// [`GpuWorker`] is constructed with `nccl_comm = None`; the cadence
-    /// loop drives all NCCL collectives through the `Ddp` handle
+    /// **Comm ownership:** the
+    /// [`NcclRankComm`](crate::distributed::nccl::NcclRankComm) is built
+    /// inside the spawned thread (rendezvous lives inside, since `M`
+    /// isn't `Send`) and handed to
+    /// [`Ddp::from_comm`](crate::distributed::Ddp::from_comm) after the
+    /// initial-state broadcast. The [`GpuWorker`] is constructed with
+    /// `nccl_comm = None`; the cadence loop drives all NCCL collectives
+    /// through the `Ddp` handle
     /// (`average_params_with_divergence`, `all_reduce_per_rank_f64`).
     ///
     /// **ElChe construction** mirrors the orchestrator's main path
@@ -2522,8 +2525,10 @@ impl DdpHandle {
     ///
     /// Same shape as
     /// [`run_cluster_rank_cadence_cpu`](Self::run_cluster_rank_cadence_cpu)
-    /// but the rank uses [`AsyncCpuReduceClient`] instead of the
-    /// blocking [`CpuReduceClient`]:
+    /// but the rank uses
+    /// [`AsyncCpuReduceClient`](crate::distributed::AsyncCpuReduceClient)
+    /// instead of the blocking
+    /// [`CpuReduceClient`](crate::distributed::CpuReduceClient):
     ///
     /// - Connect with [`CpuReduceClient::connect`] (blocking), do the
     ///   initial-state broadcast via [`broadcast_from_root`](

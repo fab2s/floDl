@@ -72,7 +72,7 @@ use crate::tensor::{Result, TensorError};
 // ---------------------------------------------------------------------------
 
 /// Rank → coordinator handshake magic (mirrors
-/// [`wire::CONTROL_HANDSHAKE_MAGIC_RANK`]).
+/// [`crate::distributed::wire::CONTROL_HANDSHAKE_MAGIC_RANK`]).
 pub(crate) const CTRL_HS_RANK: u32 = crate::distributed::wire::CONTROL_HANDSHAKE_MAGIC_RANK;
 
 /// Coordinator → rank handshake-ack magic.
@@ -434,7 +434,7 @@ impl ClusterCoordinatorConfig {
 /// SyncAcks (via this state) before calling
 /// [`ClusterCoordinator::finish_averaging_cpu`], so the guard sees real
 /// divergence instead of the all-Nones sentinel that
-/// [`unwrap_or(0.0)`] collapses to zero.
+/// `unwrap_or(0.0)` collapses to zero.
 ///
 /// **Wait policy:** the coordinator waits **indefinitely** for every
 /// rank's SyncAck. Dropping a CPU averaging cycle is a correctness

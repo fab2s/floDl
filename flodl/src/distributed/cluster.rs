@@ -533,8 +533,9 @@ fn parse_u64_array(v: Option<&Value>, label: &str) -> Result<Vec<u64>> {
 
 /// Read and validate the local-rank index.
 ///
-/// Priority: thread-local override (test seam, [`set_thread_local_rank_override`])
-/// first, then [`ENV_LOCAL_RANK`]. `local_count` is `this_host().ranks.len()`;
+/// Priority: thread-local override (test seam, via the private
+/// `set_thread_local_rank_override`) first, then [`ENV_LOCAL_RANK`].
+/// `local_count` is `this_host().ranks.len()`;
 /// `host_name` surfaces in error messages to disambiguate which host the
 /// launcher targeted. Loud errors on env-unset (when no thread override),
 /// unparseable, or out-of-bounds.

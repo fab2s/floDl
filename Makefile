@@ -22,20 +22,40 @@ COMPOSE = docker compose
 # site with "cannot find type Formatter in module _serde::__private228".
 # Real docs.rs only applies the cfg at doc time, not compile time —
 # match that exactly to keep this gate honest.
+#
+# `-D warnings` promotes rustdoc warnings (broken intra-doc-links,
+# private-item leaks, etc.) to hard errors so this target catches
+# anything CI would catch. Without it, broken doc-links emit silent
+# warnings and CI fails on the same crate with `-D warnings` in
+# RUSTDOCFLAGS — defeating the "gate locally first" purpose.
+#
+# Two passes for flodl: one with `--no-default-features --features rng`
+# (mirrors `[package.metadata.docs.rs]` for the published docs.rs page)
+# and one with `--all-features` (catches doc-link breakage in every
+# feature-gated path — CI doesn't have cuda runtime but rustdoc only
+# parses, so all feature gates surface here, matching what CI catches
+# and then some). flodl-sys's build.rs gates libtorch on DOCS_RS=1
+# (set by docker-compose), so cuda-feature builds work in the docs-rs
+# container without an actual GPU.
 docs-rs:
 	@mkdir -p .cargo-cache-docsrs .cargo-git-docsrs .target-docsrs
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
+		cargo +nightly rustdoc --lib -p flodl-sys \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl \
 			--no-default-features --features rng \
-			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' && \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
+		cargo +nightly rustdoc --lib -p flodl \
+			--all-features \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-cli \
-			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' && \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-cli-macros \
-			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]' && \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-hf \
 			--all-features \
-			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\"]'"
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]'"
 
 # --- Site (host python + docker compose up/down) ---
 

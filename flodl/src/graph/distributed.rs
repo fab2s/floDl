@@ -35,7 +35,8 @@ impl Graph {
     /// Attach cluster-mode El Che cadence state.
     ///
     /// Called from [`Trainer::setup`](crate::distributed::Trainer::setup) /
-    /// [`Trainer::setup_with`] when heterogeneous cluster DDP is in play.
+    /// [`Trainer::setup_with`](crate::distributed::Trainer::setup_with) when
+    /// heterogeneous cluster DDP is in play.
     /// From this point on, [`Graph::step`] defers the actual sync +
     /// optimizer step until the local cadence target is reached; cross-rank
     /// timing AllReduce keeps every rank's anchor in lockstep.
@@ -188,7 +189,8 @@ impl Graph {
     /// 3. Normalize accumulated gradients by local count.
     /// 4. Weighted AllReduce on gradients (scale-by-count then Sum).
     /// 5. Buffer broadcast.
-    /// 6. [`ElChe::report_timing`] — anchor + ratios adapt deterministically
+    /// 6. [`crate::distributed::ElChe::report_timing`] — anchor + ratios
+    ///    adapt deterministically
     ///    on every rank from the same input vector, so all ranks agree on
     ///    next-cycle counts without a separate broadcast.
     /// 7. Optimizer step + zero-grad.
