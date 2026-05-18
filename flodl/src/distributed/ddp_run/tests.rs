@@ -1860,6 +1860,7 @@ fn test_eval_fn_called_on_dispatch_and_emits_result() {
         .send(ControlMsg::ExecuteEvalCallback {
             schedule_id: 99,
             epoch: 7,
+            target_rank: 0,
         })
         .unwrap();
     let shutdown = worker.handle_control().unwrap();
@@ -1905,6 +1906,7 @@ fn test_eval_fn_error_surfaces_in_timing_msg() {
         .send(ControlMsg::ExecuteEvalCallback {
             schedule_id: 1,
             epoch: 2,
+            target_rank: 0,
         })
         .unwrap();
     let shutdown = worker.handle_control().unwrap();
@@ -1966,6 +1968,7 @@ fn test_eval_fn_none_is_noop() {
         .send(ControlMsg::ExecuteEvalCallback {
             schedule_id: 1,
             epoch: 2,
+            target_rank: 0,
         })
         .unwrap();
     let shutdown = worker.handle_control().unwrap();

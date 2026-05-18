@@ -145,6 +145,10 @@ pub(super) fn build_coord_config_from_builder(
     if let Some(enabled) = config.progressive_dispatch {
         coord_config = coord_config.progressive(enabled);
     }
+    // #28b: thread the user's epoch_callback_policy through to the
+    // coord so the controller can resolve Fastest at runtime + push
+    // SetEpochCallbackRole to workers.
+    coord_config = coord_config.epoch_callback_policy(config.epoch_callback_policy);
 
     // Resume trajectory: applies after every other field so the loaded
     // meta cleanly overrides the fresh defaults
@@ -160,17 +164,29 @@ pub(super) fn build_coord_config_from_builder(
     Ok(coord_config)
 }
 
-/// Resolve [`super::EpochCallbackPolicy`] for a given rank in the
-/// cluster. Returns `Ok(true)` if this rank should fire user-supplied
-/// per-epoch callbacks (`epoch_fn` today; `checkpoint_fn` / `eval_fn`
-/// in follow-ups), `Ok(false)` otherwise.
+/// Decide whether this cluster-mode rank should receive a copy of the
+/// user-supplied per-epoch closures (`epoch_fn` / `checkpoint_fn` /
+/// `eval_fn`) at GpuWorker construction time. With #28b's controller-
+/// driven role assignment, the answer is **always `true` in cluster
+/// mode** — every rank holds the closure compiled in, and the
+/// coord's runtime-pushed role state (sticky `checkpoint_role`,
+/// `eval_role`, `epoch_callback_role` on `ClusterCoordinator`) gates
+/// actual execution per-message (`Checkpoint`/`ExecuteEvalCallback`
+/// carry `target_rank`; `epoch_fn` reads
+/// `GpuWorker::epoch_callback_role()` at each epoch transition).
 ///
-/// Loud-errors on out-of-bounds `Rank(n)` or on `Fastest` (the latter
-/// is not yet implemented; dispatcher-resolved fastest-rank wiring
-/// arrives with `eval_fn` work in a follow-up task).
+/// This fixes a pre-existing latent bug surfaced by #29's checkpoint
+/// failover: if only `Rank(n)` had `Some(checkpoint_fn)` and the role
+/// rotated to a different rank (death or `CheckpointResult.error`),
+/// the new rank's worker would loud-error with "checkpoint dispatched
+/// to rank X but checkpoint_fn is None". All-Some makes coord-driven
+/// rotation work as designed.
+///
+/// Validates the policy itself loud-errors on out-of-bounds
+/// `Rank(n)`; `Fastest` is now fully supported.
 fn rank_fires_callbacks(
     policy: super::EpochCallbackPolicy,
-    global_rank: usize,
+    _global_rank: usize,
     world_size: usize,
 ) -> Result<bool> {
     match policy {
@@ -181,15 +197,12 @@ fn rank_fires_callbacks(
                      Pick a rank in 0..{world_size}."
                 )));
             }
-            Ok(global_rank == n)
+            // Every rank holds the closure; coord's targeted dispatch
+            // + `epoch_callback_role` wire-pushed state gates which
+            // rank actually fires per-event.
+            Ok(true)
         }
-        super::EpochCallbackPolicy::Fastest => {
-            Err(crate::tensor::TensorError::new(
-                "EpochCallbackPolicy::Fastest is not yet implemented. \
-                 Use EpochCallbackPolicy::Rank(n) for now; Fastest will be \
-                 supported once eval_fn dispatch ships."
-            ))
-        }
+        super::EpochCallbackPolicy::Fastest => Ok(true),
     }
 }
 

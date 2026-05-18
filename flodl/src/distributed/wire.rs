@@ -538,16 +538,50 @@ pub enum ControlMsgWire {
     /// (was `{ version }` only); no external wire users at the time
     /// of the cut.
     Checkpoint { version: u64, target_rank: u64 },
-    /// Run the user's [`EvalFn`] against `eval_dataset`. Handled only
-    /// by the rank chosen via [`EpochCallbackPolicy`]; other ranks
-    /// receive the frame and no-op (their `eval_fn` is `None`).
-    /// The result flows back via [`TimingMsgWire::EvalResult`] with
-    /// the same `schedule_id`.
+    /// Coord-emitted directive to run the user's [`EvalFn`] against
+    /// `eval_dataset` on `target_rank`. Targeted (parallels
+    /// [`Self::Checkpoint`]): only the rank whose `rank == target_rank`
+    /// executes; every other rank receiving this frame no-ops. The
+    /// coord owns the role assignment (`eval_role`, resolved per
+    /// [`EpochCallbackPolicy`]); the worker never decides.
+    ///
+    /// Wire format change from v0.5.3 (was `{ schedule_id, epoch }`);
+    /// no external wire users at the time of the cut. `target_rank ==
+    /// u64::MAX` reserved for "controller executes" (future) — v1
+    /// rejects it via the same loud error as
+    /// [`Self::Checkpoint`].
+    ///
+    /// Result flows back via [`TimingMsgWire::EvalResult`] with the
+    /// same `schedule_id`.
     ///
     /// [`EvalFn`]: crate::distributed::ddp_run::EvalFn
     /// [`EpochCallbackPolicy`]:
     ///     crate::distributed::ddp_run::EpochCallbackPolicy
-    ExecuteEvalCallback { schedule_id: u64, epoch: u64 },
+    ExecuteEvalCallback {
+        schedule_id: u64,
+        epoch: u64,
+        target_rank: u64,
+    },
+    /// Coord-emitted notification that the rank designated to fire the
+    /// user-supplied `epoch_fn` has been resolved (or re-resolved on
+    /// rank death). Broadcast to every worker; each worker updates
+    /// its local `epoch_callback_role` state and fires `epoch_fn`
+    /// only on epoch transitions where `epoch_callback_role ==
+    /// self.rank`.
+    ///
+    /// Unlike `Checkpoint` / `ExecuteEvalCallback`, the `epoch_fn` is
+    /// not coord-dispatched — it fires autonomously inside the
+    /// worker's main loop at every epoch transition. The role
+    /// assignment must therefore live in worker state, not be encoded
+    /// per-message.
+    ///
+    /// Used for [`EpochCallbackPolicy::Fastest`] runtime resolution
+    /// (ElChe-derived) and also fires for `Rank(n)` at startup so the
+    /// worker has a definite role before the first epoch transition.
+    ///
+    /// [`EpochCallbackPolicy::Fastest`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
+    SetEpochCallbackRole { rank: u64 },
     /// Shut down this worker.
     Shutdown,
     /// Coord-emitted directive to persist a checkpoint bundle (model
@@ -956,6 +990,54 @@ mod tests {
             // the wire encodes it fine, the coord rejects it loudly
             // on dispatch.
             ControlMsgWire::Checkpoint { version: 5, target_rank: u64::MAX },
+        ];
+        for msg in cases {
+            let frame =
+                ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+            let mut buf = Vec::new();
+            frame.write_to(&mut buf).unwrap();
+            let mut cur = Cursor::new(buf);
+            let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+                .unwrap()
+                .unwrap();
+            let back: ControlMsgWire = got.decode().unwrap();
+            assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
+    fn control_frame_round_trip_eval_targeted() {
+        let cases = [
+            ControlMsgWire::ExecuteEvalCallback {
+                schedule_id: 10,
+                epoch: 5,
+                target_rank: 0,
+            },
+            ControlMsgWire::ExecuteEvalCallback {
+                schedule_id: 11,
+                epoch: 6,
+                target_rank: 2,
+            },
+        ];
+        for msg in cases {
+            let frame =
+                ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+            let mut buf = Vec::new();
+            frame.write_to(&mut buf).unwrap();
+            let mut cur = Cursor::new(buf);
+            let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+                .unwrap()
+                .unwrap();
+            let back: ControlMsgWire = got.decode().unwrap();
+            assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
+    fn control_frame_round_trip_set_epoch_callback_role() {
+        let cases = [
+            ControlMsgWire::SetEpochCallbackRole { rank: 0 },
+            ControlMsgWire::SetEpochCallbackRole { rank: 3 },
         ];
         for msg in cases {
             let frame =

@@ -271,8 +271,28 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
                 target_rank: target_rank as usize,
             }))
         }
-        ControlMsgWire::ExecuteEvalCallback { schedule_id, epoch } => {
-            Ok(Some(ControlMsg::ExecuteEvalCallback { schedule_id, epoch }))
+        ControlMsgWire::ExecuteEvalCallback {
+            schedule_id,
+            epoch,
+            target_rank,
+        } => {
+            if target_rank == u64::MAX {
+                return Err(crate::tensor::TensorError::new(
+                    "cluster_worker: ExecuteEvalCallback target_rank=u64::MAX \
+                     is reserved (controller-as-evaluator, future); v1 must \
+                     dispatch to a worker rank ID",
+                ));
+            }
+            Ok(Some(ControlMsg::ExecuteEvalCallback {
+                schedule_id,
+                epoch,
+                target_rank: target_rank as usize,
+            }))
+        }
+        ControlMsgWire::SetEpochCallbackRole { rank } => {
+            Ok(Some(ControlMsg::SetEpochCallbackRole {
+                rank: rank as usize,
+            }))
         }
         ControlMsgWire::Shutdown => Ok(Some(ControlMsg::Shutdown)),
         ControlMsgWire::ShutdownWithSave { reason } => {
@@ -779,14 +799,19 @@ impl<M: Module + 'static> ClusterWorker<M> {
             .take()
             .expect("inner GpuWorker present at run_until_shutdown");
 
-        // `epoch_fn` is populated only on the rank selected by
-        // [`crate::distributed::ddp_run::EpochCallbackPolicy`]; non-chosen
-        // ranks have `None` and skip firing. Move it out of `self` so the
-        // loop body can borrow it without colliding with `self.bridges`
-        // teardown below.
+        // With #28b's controller-driven role assignment, every cluster
+        // worker can have `epoch_fn = Some(...)` regardless of policy
+        // — the runtime gate is `inner.epoch_callback_role() ==
+        // Some(inner.rank())`, set by the coord's wire-pushed
+        // `ControlMsg::SetEpochCallbackRole`. Workers without the role
+        // skip the fire; on `EpochCallbackPolicy::Fastest` re-resolve
+        // (e.g. after rank death), the coord broadcasts a fresh role
+        // and the worker picks it up before the next epoch boundary.
+        // Move epoch_fn out of `self` so the loop body can borrow it
+        // without colliding with `self.bridges` teardown below.
         let epoch_fn = self.epoch_fn.take();
         // `usize::MAX` sentinel so the first plan (epoch 0) always
-        // triggers a fire — mirrors the threaded path's behavior.
+        // triggers a fire-check — mirrors the threaded path's behavior.
         let mut last_epoch_fired: usize = usize::MAX;
 
         let exit_clean = (|| -> Result<bool> {
@@ -800,8 +825,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         // prior cycle's bookkeeping.
                         if plan.epoch != last_epoch_fired {
                             last_epoch_fired = plan.epoch;
-                            if let Some(ref f) = epoch_fn {
-                                f(plan.epoch, &mut inner);
+                            let is_role = inner.epoch_callback_role()
+                                == Some(inner.rank());
+                            if is_role {
+                                if let Some(ref f) = epoch_fn {
+                                    f(plan.epoch, &mut inner);
+                                }
                             }
                         }
                         let shutdown = inner.run_epoch_plan(&plan, &train_fn)?;

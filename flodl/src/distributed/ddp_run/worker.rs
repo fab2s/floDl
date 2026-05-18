@@ -147,6 +147,20 @@ pub struct GpuWorker<M: Module> {
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
     pub(super) checkpoint_fn: Option<CheckpointFn<M>>,
+    /// Sticky rank designated by the controller to fire `epoch_fn` at
+    /// epoch transitions. `None` until the coord broadcasts the first
+    /// [`ControlMsg::SetEpochCallbackRole`]; while `None`, the
+    /// autonomous epoch-transition fire in the cluster worker's main
+    /// loop is gated off (no rank fires until the controller has
+    /// chosen). Coord resolves the value at startup
+    /// ([`crate::distributed::ddp_run::EpochCallbackPolicy::Rank`]) or
+    /// runtime ([`EpochCallbackPolicy::Fastest`]) and updates this
+    /// state via wire-pushed
+    /// [`crate::distributed::wire::ControlMsgWire::SetEpochCallbackRole`].
+    ///
+    /// [`EpochCallbackPolicy::Fastest`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
+    pub(super) epoch_callback_role: Option<usize>,
     /// User-supplied eval callback. Fires from [`Self::handle_control`]
     /// on [`ControlMsg::ExecuteEvalCallback`] receipt, only on the rank
     /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`]
@@ -438,6 +452,7 @@ impl<M: Module> GpuWorker<M> {
             rank: config.rank,
             world_size: config.world_size,
             device: config.device,
+            epoch_callback_role: None,
             compute_stream,
             comm_stream,
             copy_done,
@@ -483,6 +498,16 @@ impl<M: Module> GpuWorker<M> {
     /// This worker's rank.
     pub fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The rank designated by the controller to fire `epoch_fn` at
+    /// each epoch transition. `None` until the coord has resolved
+    /// [`crate::distributed::ddp_run::EpochCallbackPolicy`] and
+    /// broadcast [`ControlMsg::SetEpochCallbackRole`]; while `None`
+    /// the autonomous fire is gated off. The cluster worker's main
+    /// loop consults this via the public accessor.
+    pub fn epoch_callback_role(&self) -> Option<usize> {
+        self.epoch_callback_role
     }
 
     /// This worker's device.
@@ -2096,16 +2121,22 @@ impl<M: Module> GpuWorker<M> {
                     error: err,
                 });
             }
-            ControlMsg::ExecuteEvalCallback { schedule_id, epoch } => {
-                // Fire only on the rank chosen by
-                // `EpochCallbackPolicy` (others have `eval_fn = None`
-                // populated and silently skip). Flip the model into
-                // eval mode for BN/Dropout/etc. correctness, run the
-                // user closure against the held-out dataset, then
-                // restore train mode. The scalar metric (or error)
-                // flows back to the controller via
-                // `TimingMsg::EvalResult`; the controller's
-                // `eval_result_fn` fires on receipt.
+            ControlMsg::ExecuteEvalCallback { schedule_id, epoch, target_rank } => {
+                // Targeted: only the rank named by the coord runs.
+                // Mirrors the `Checkpoint` arm — worker never decides
+                // whether it is the evaluator. With #28b's all-Some
+                // cluster-mode policy, every rank has `eval_fn`
+                // available so coord-driven role rotation works
+                // without loud errors.
+                if target_rank != self.rank {
+                    return Ok(false);
+                }
+                // Flip the model into eval mode for BN/Dropout/etc.
+                // correctness, run the user closure against the
+                // held-out dataset, then restore train mode. The
+                // scalar metric (or error) flows back to the
+                // controller via `TimingMsg::EvalResult`; the
+                // controller's `eval_result_fn` fires on receipt.
                 if let Some(ref f) = self.eval_fn {
                     let result = match self.eval_dataset.as_ref() {
                         Some(ds) => {
@@ -2132,6 +2163,13 @@ impl<M: Module> GpuWorker<M> {
                         error,
                     });
                 }
+            }
+            ControlMsg::SetEpochCallbackRole { rank } => {
+                // Controller resolved (or re-resolved) the rank that
+                // should fire `epoch_fn` at each epoch transition.
+                // Worker just stores it — the autonomous fire-check
+                // in the cluster worker's main loop reads this.
+                self.epoch_callback_role = Some(rank);
             }
             ControlMsg::Shutdown => return Ok(true),
             ControlMsg::EpochAggregated(metrics) => {
@@ -2346,6 +2384,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::RequestNewNcclId => "RequestNewNcclId",
                             ControlMsg::ShutdownWithSave { .. } => "ShutdownWithSave",
                             ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
+                            ControlMsg::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
                             ControlMsg::EpochAggregated(_) => "EpochAggregated",
                         }
                     );

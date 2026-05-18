@@ -180,6 +180,30 @@ fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()>
     })
 }
 
+/// Initial value for the coord's three role-rank fields
+/// (`checkpoint_role`, `eval_role`, `epoch_callback_role`) at startup.
+/// Resolves [`crate::distributed::ddp_run::EpochCallbackPolicy`] using
+/// only the information available at construction time:
+/// - `Rank(n)` → `n` (clamped to `0..world_size`).
+/// - `Fastest` → 0 (lowest rank as an uncalibrated default; the coord
+///   re-resolves to the actual smoothed-ms_per_batch winner once the
+///   first ElChe sample lands, and on every subsequent rank death).
+///
+/// World-size 0 is treated as a config bug elsewhere; this helper
+/// returns 0 in that case rather than panicking — `start_from_listener`
+/// gates on `world_size >= 1` before reaching here in production.
+fn initial_callback_role(
+    policy: crate::distributed::ddp_run::EpochCallbackPolicy,
+    world_size: usize,
+) -> usize {
+    match policy {
+        crate::distributed::ddp_run::EpochCallbackPolicy::Rank(n) => {
+            if world_size == 0 { 0 } else { n.min(world_size - 1) }
+        }
+        crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ClusterCoordinator
 // ---------------------------------------------------------------------------
@@ -330,6 +354,20 @@ pub struct ClusterCoordinatorConfig {
     /// every `n` epochs from `dispatch_epoch`. `None` or `0` disables.
     pub eval_every_epochs: Option<usize>,
 
+    /// Which rank should fire user-supplied per-epoch callbacks
+    /// (`epoch_fn` / `checkpoint_fn` / `eval_fn`). Default
+    /// [`EpochCallbackPolicy::Rank(0)`]; setting
+    /// [`EpochCallbackPolicy::Fastest`] makes the coord runtime-
+    /// resolve the role from ElChe's per-rank smoothed throughput,
+    /// with sticky retention across cadences and re-resolution only
+    /// on rank death. See `#28b` design notes.
+    ///
+    /// [`EpochCallbackPolicy::Rank(0)`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank
+    /// [`EpochCallbackPolicy::Fastest`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
+    pub epoch_callback_policy: crate::distributed::ddp_run::EpochCallbackPolicy,
+
     /// Progressive dispatch toggle. `None` = auto (true for
     /// `Cadence` / `Async`, false for `Sync`). `Some(true)` or
     /// `Some(false)` is the explicit user override from
@@ -403,6 +441,8 @@ impl ClusterCoordinatorConfig {
             metrics_sink_tx: None,
             eval_result_fn: None,
             eval_every_epochs: None,
+            epoch_callback_policy:
+                crate::distributed::ddp_run::EpochCallbackPolicy::default(),
             progressive: None,
             start_epoch: 0,
             start_global_step: 0,
@@ -443,6 +483,22 @@ impl ClusterCoordinatorConfig {
     /// Eval cadence in epochs. `0` disables.
     pub fn eval_every_epochs(mut self, n: usize) -> Self {
         self.eval_every_epochs = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Set the [`EpochCallbackPolicy`] that decides which rank fires
+    /// per-epoch user callbacks (`epoch_fn`, `checkpoint_fn`,
+    /// `eval_fn`). Default [`EpochCallbackPolicy::Rank(0)`].
+    ///
+    /// [`EpochCallbackPolicy`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy
+    /// [`EpochCallbackPolicy::Rank(0)`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank
+    pub fn epoch_callback_policy(
+        mut self,
+        policy: crate::distributed::ddp_run::EpochCallbackPolicy,
+    ) -> Self {
+        self.epoch_callback_policy = policy;
         self
     }
 
@@ -789,13 +845,35 @@ pub struct ClusterCoordinator {
     /// [`ClusterCoordinatorConfig::max_failure`].
     max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
 
-    /// Sticky assignee for `ControlMsgWire::Checkpoint`. Initialized to
-    /// 0; the controller picks the next live rank on (a) the role's
+    /// [`EpochCallbackPolicy`] copied from config; drives Fastest
+    /// resolution (vs. static `Rank(n)` resolution at startup).
+    ///
+    /// [`EpochCallbackPolicy`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy
+    epoch_callback_policy: crate::distributed::ddp_run::EpochCallbackPolicy,
+    /// Sticky assignee for `ControlMsgWire::Checkpoint`. Initial value
+    /// resolved from `epoch_callback_policy` at construction
+    /// (`Rank(n)` → n; `Fastest` → lowest live rank as a uncalibrated
+    /// default; ElChe smoothed values take over once the run reaches
+    /// the first averaging cycle). Failover on (a) the role's
     /// `CheckpointResult.error` or (b) the role's rank death. v1
     /// dispatches every checkpoint to this rank (rather than
     /// broadcasting + filtering rank-side) so the worker never has to
     /// decide whether it is the checkpointer.
     checkpoint_role: usize,
+    /// Sticky assignee for `ControlMsgWire::ExecuteEvalCallback`.
+    /// Same resolution + failover semantics as `checkpoint_role`.
+    eval_role: usize,
+    /// Sticky assignee for `epoch_fn` (worker fires autonomously at
+    /// each epoch transition; this is pushed to workers via
+    /// `ControlMsgWire::SetEpochCallbackRole` rather than per-event
+    /// dispatch because there is no per-epoch event to attach).
+    epoch_callback_role: usize,
+    /// `true` when the epoch_callback_role value has not yet been
+    /// broadcast to workers since the last change. Set on
+    /// construction + on every Fastest re-resolution. Cleared after
+    /// the next successful broadcast.
+    epoch_role_dirty: bool,
     /// Per-version set of ranks that have already attempted +
     /// reported failure for that version. Used to (a) pick the next
     /// untried live rank on retry, and (b) detect exhaustion (all
@@ -1180,7 +1258,20 @@ impl ClusterCoordinator {
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
             max_failure: config.max_failure,
-            checkpoint_role: 0,
+            epoch_callback_policy: config.epoch_callback_policy,
+            checkpoint_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            eval_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            epoch_callback_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
@@ -1634,6 +1725,98 @@ impl ClusterCoordinator {
     ///
     /// S2 lands the stub so the wire propagation compiles; the
     /// post-S4 behavior is documented at the call site.
+    /// Resolve the current "fastest" rank — the live rank with the
+    /// lowest smoothed ms-per-batch reading from ElChe. Returns
+    /// `usize::MAX` only when every rank is dead (caller should treat
+    /// as no-op). Fallback when ElChe is uncalibrated (no sample yet
+    /// from any rank): lowest-index live rank.
+    ///
+    /// Sticky semantics: callers retain the previously-resolved value
+    /// across cadences and consult this method only on (a) initial
+    /// resolution and (b) re-resolution after a role rank dies. ElChe
+    /// drift between resolutions does not bounce the role around — by
+    /// design, since checkpoint / eval / epoch_fn want a stable
+    /// assignee (callbacks may stash thread-local state).
+    fn resolve_fastest_role(&self) -> usize {
+        let mut best: Option<(usize, f64)> = None;
+        for r in 0..self.world_size {
+            if self.is_dead(r) {
+                continue;
+            }
+            let smoothed = self.el_che.smoothed_ms_per_batch(r);
+            if let Some(ms) = smoothed {
+                match best {
+                    None => best = Some((r, ms)),
+                    Some((_, prev)) if ms < prev => best = Some((r, ms)),
+                    _ => {}
+                }
+            }
+        }
+        if let Some((r, _)) = best {
+            return r;
+        }
+        // No ElChe samples yet: fall back to lowest live rank.
+        for r in 0..self.world_size {
+            if !self.is_dead(r) {
+                return r;
+            }
+        }
+        usize::MAX
+    }
+
+    /// Re-resolve all three role-rank fields against the current live-
+    /// rank set + ElChe state, marking the epoch role dirty if it
+    /// changed so the next dispatch broadcasts the update. Called on
+    /// rank death + after the first calibrated ElChe sample. No-op for
+    /// `Rank(n)` policy — the static rank stays put even after death
+    /// (the rank-targeted dispatch to a dead rank will fail loudly
+    /// rather than silently re-route, matching the user's "controller
+    /// decides" principle).
+    fn re_resolve_callback_roles_on_death(&mut self, dead_rank: usize) {
+        if !matches!(
+            self.epoch_callback_policy,
+            crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
+        ) {
+            return;
+        }
+        let prev_epoch = self.epoch_callback_role;
+        if dead_rank == self.checkpoint_role {
+            self.checkpoint_role = self.resolve_fastest_role();
+        }
+        if dead_rank == self.eval_role {
+            self.eval_role = self.resolve_fastest_role();
+        }
+        if dead_rank == self.epoch_callback_role {
+            self.epoch_callback_role = self.resolve_fastest_role();
+        }
+        if self.epoch_callback_role != prev_epoch
+            && self.epoch_callback_role != usize::MAX
+        {
+            self.epoch_role_dirty = true;
+        }
+    }
+
+    /// Broadcast `SetEpochCallbackRole { rank }` to every live worker
+    /// if `epoch_role_dirty`. Clears the flag on successful broadcast.
+    /// Called at the top of `dispatch_epoch` so workers always have
+    /// a definite role before they receive their first `StartEpoch`.
+    fn broadcast_epoch_callback_role_if_dirty(&mut self) -> Result<()> {
+        if !self.epoch_role_dirty {
+            return Ok(());
+        }
+        if self.epoch_callback_role == usize::MAX {
+            // No live rank to designate; defer until at least one is
+            // alive. (Unlikely in practice — world_size >= 1 invariant.)
+            return Ok(());
+        }
+        let msg = ControlMsgWire::SetEpochCallbackRole {
+            rank: self.epoch_callback_role as u64,
+        };
+        self.broadcast_control(&msg)?;
+        self.epoch_role_dirty = false;
+        Ok(())
+    }
+
     fn handle_checkpoint_result(
         &mut self,
         rank: usize,
@@ -1964,23 +2147,42 @@ impl ClusterCoordinator {
                 self.active_count = self.active_count.saturating_sub(1);
                 self.last_heartbeat[r] = now;
                 any_newly_dead = true;
-                // Checkpoint-role failover: if the just-dead rank was
-                // the sticky `checkpoint_role`, pick the lowest live
-                // rank as the next role. Next cadence boundary will
-                // dispatch to the new role; no immediate redispatch
-                // here (the dead rank had no in-flight checkpoint to
-                // recover — that path is `handle_checkpoint_result`'s
-                // job when an error report comes back).
-                if r == self.checkpoint_role {
-                    if let Some(next) =
-                        (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
-                    {
-                        self.checkpoint_role = next;
+                // Callback-role failover. For `Rank(n)` policy the
+                // role stays put — a static rank that died will surface
+                // as a loud send_control error at the next dispatch
+                // (matches the "controller decides" principle: no
+                // silent re-routing of a user-pinned rank). For
+                // `Fastest` policy, re-resolve all three roles
+                // against the new live set + ElChe smoothed values.
+                match self.epoch_callback_policy {
+                    crate::distributed::ddp_run::EpochCallbackPolicy::Rank(_) => {
+                        // Legacy #29 failover: if Rank(n) policy and
+                        // the dead rank happens to be the checkpoint
+                        // role, fall over to lowest live as a best-
+                        // effort. Eval/epoch roles stay pinned.
+                        if r == self.checkpoint_role {
+                            if let Some(next) =
+                                (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
+                            {
+                                self.checkpoint_role = next;
+                                crate::verbose!(
+                                    "  ddp: checkpoint_role failover {} -> {} \
+                                     (prior role declared dead)",
+                                    r,
+                                    next,
+                                );
+                            }
+                        }
+                    }
+                    crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => {
+                        self.re_resolve_callback_roles_on_death(r);
                         crate::verbose!(
-                            "  ddp: checkpoint_role failover {} -> {} \
-                             (prior role declared dead)",
+                            "  ddp: Fastest re-resolve after rank {} death \
+                             — checkpoint={}, eval={}, epoch_fn={}",
                             r,
-                            next,
+                            self.checkpoint_role,
+                            self.eval_role,
+                            self.epoch_callback_role,
                         );
                     }
                 }
@@ -2961,6 +3163,12 @@ impl ClusterCoordinator {
                  set ClusterCoordinatorConfig::total_samples before constructing.",
             ));
         }
+        // Push the current epoch-callback role to workers BEFORE
+        // StartEpoch arrives, so the worker's autonomous epoch_fn
+        // fire-check sees a definite role on the first transition.
+        // No-op on subsequent calls until `epoch_role_dirty` flips
+        // (Fastest re-resolve on rank death).
+        self.broadcast_epoch_callback_role_if_dirty()?;
         // User checkpoint cadence: when entering epoch N (N > 0) and
         // `N % checkpoint_every == 0`, broadcast a `Checkpoint(N)` frame
         // before `StartEpoch`. Workers fire `checkpoint_fn(N, &model)`
@@ -2987,21 +3195,25 @@ impl ClusterCoordinator {
                     self.send_control(target, &msg)?;
                 }
             }
-            // Eval cadence: broadcast `ExecuteEvalCallback` when the
-            // boundary aligns with `eval_every_epochs`. Workers handle
-            // on the rank chosen by `EpochCallbackPolicy`; others
-            // no-op (eval_fn = None).
+            // Eval cadence: dispatch `ExecuteEvalCallback` to the
+            // current `eval_role` when the boundary aligns with
+            // `eval_every_epochs`. Targeted (parallels #29's
+            // `Checkpoint` dispatch): the role is sticky across
+            // cadences, re-resolved only on rank death when policy
+            // is `Fastest`.
             if let Some(every) = self.eval_every_epochs {
                 if every > 0 && epoch % every == 0 {
                     // schedule_id derived from epoch for now (one eval
                     // per cadence); a richer scheduler would mint a
                     // monotonic counter to disambiguate concurrent
                     // dispatches.
+                    let target = self.eval_role;
                     let msg = ControlMsgWire::ExecuteEvalCallback {
                         schedule_id: epoch as u64,
                         epoch: epoch as u64,
+                        target_rank: target as u64,
                     };
-                    self.broadcast_control(&msg)?;
+                    self.send_control(target, &msg)?;
                 }
             }
         }
@@ -3344,7 +3556,20 @@ impl ClusterCoordinator {
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
             max_failure: config.max_failure,
-            checkpoint_role: 0,
+            epoch_callback_policy: config.epoch_callback_policy,
+            checkpoint_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            eval_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            epoch_callback_role: initial_callback_role(
+                config.epoch_callback_policy,
+                world_size,
+            ),
+            epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
@@ -3418,6 +3643,46 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn check_dead_ranks_for_test(&mut self) {
         self.check_dead_ranks();
+    }
+
+    /// Test-only wrappers exposing #28b's private Fastest-resolution
+    /// helpers to the test module. The role accessors mirror the
+    /// `checkpoint_role` public accessor for the other two roles
+    /// (intentionally test-only since the public API surfaces are
+    /// covered by the role-bearing wire messages workers see).
+    #[cfg(test)]
+    pub(crate) fn resolve_fastest_role_for_test(&self) -> usize {
+        self.resolve_fastest_role()
+    }
+    #[cfg(test)]
+    pub(crate) fn re_resolve_callback_roles_on_death_for_test(
+        &mut self,
+        dead_rank: usize,
+    ) {
+        self.re_resolve_callback_roles_on_death(dead_rank);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_callback_roles_for_test(
+        &mut self,
+        checkpoint: usize,
+        eval: usize,
+        epoch_cb: usize,
+    ) {
+        self.checkpoint_role = checkpoint;
+        self.eval_role = eval;
+        self.epoch_callback_role = epoch_cb;
+    }
+    #[cfg(test)]
+    pub(crate) fn eval_role_for_test(&self) -> usize {
+        self.eval_role
+    }
+    #[cfg(test)]
+    pub(crate) fn epoch_callback_role_for_test(&self) -> usize {
+        self.epoch_callback_role
+    }
+    #[cfg(test)]
+    pub(crate) fn epoch_role_dirty_for_test(&self) -> bool {
+        self.epoch_role_dirty
     }
 
     // -----------------------------------------------------------------

@@ -1213,12 +1213,21 @@ pub enum ControlMsg {
         target_rank: usize,
     },
     /// Run the user's [`EvalFn`] on the rank's current model + eval
-    /// dataset. Handled only by the rank chosen via
-    /// [`EpochCallbackPolicy`]; other ranks no-op (their `eval_fn` is
-    /// `None`).
+    /// dataset. Targeted: only the rank whose `rank == target_rank`
+    /// runs; others silently no-op. Mirrors
+    /// [`crate::distributed::wire::ControlMsgWire::ExecuteEvalCallback`].
     ExecuteEvalCallback {
         schedule_id: u64,
         epoch: u64,
+        target_rank: usize,
+    },
+    /// Coord-pushed notification that the rank designated to fire the
+    /// user-supplied `epoch_fn` has been resolved. Worker stores this
+    /// in its local `epoch_callback_role` and consults it at every
+    /// epoch transition. Mirrors
+    /// [`crate::distributed::wire::ControlMsgWire::SetEpochCallbackRole`].
+    SetEpochCallbackRole {
+        rank: usize,
     },
     /// Shut down this worker.
     Shutdown,

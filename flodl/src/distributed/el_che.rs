@@ -96,6 +96,10 @@ impl RingBuffer {
         self.samples.iter().sum::<f64>() / self.samples.len() as f64
     }
 
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
     fn clear(&mut self) {
         self.samples.clear();
     }
@@ -646,6 +650,21 @@ impl ElChe {
     /// vec directly.
     pub fn ms_per_batch(&self) -> Vec<f64> {
         (0..self.world_size).map(|r| self.smoothed_ms(r)).collect()
+    }
+
+    /// Per-rank smoothed ms-per-batch as an `Option<f64>` — `None` when
+    /// the trust window for that rank is empty (no positive reading
+    /// has landed yet), `Some(ms)` when a calibrated value is
+    /// available. Distinguishes "uncalibrated" from a legitimate
+    /// `0.0` better than [`Self::ms_per_batch`], which collapses both
+    /// into 0.0. Used by `ClusterCoordinator::resolve_fastest_role`
+    /// to pick the live rank with the lowest calibrated ms-per-batch
+    /// (Fastest policy).
+    pub fn smoothed_ms_per_batch(&self, rank: usize) -> Option<f64> {
+        self.ms_per_batch_window
+            .get(rank)
+            .filter(|w| !w.is_empty())
+            .map(|w| w.mean())
     }
 
     /// Report timing after a cadence step completes.
