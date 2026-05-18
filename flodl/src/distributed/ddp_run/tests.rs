@@ -1466,6 +1466,105 @@ fn test_builder_missing_num_epochs_panics() {
 }
 
 // -----------------------------------------------------------------------
+// Trainer::resume_from end-to-end: write a meta sidecar to disk, build
+// the orchestrator's coord config via the resume_from path, and
+// confirm the trajectory + ElChe state + TrendGuard history all
+// transit cleanly.
+// -----------------------------------------------------------------------
+
+#[test]
+fn resume_from_loads_meta_and_seeds_coord_config() {
+    use crate::distributed::{
+        CheckpointBundle, CheckpointMeta, ElCheState, SaveReason,
+    };
+    use crate::distributed::el_che::Phase;
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let dir = std::env::temp_dir().join(format!(
+        "flodl_resume_e2e_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("ckpt").to_string_lossy().into_owned();
+
+    // Write a meta sidecar that the orchestrator must reload.
+    let elche_state = ElCheState {
+        anchor: 14,
+        anchor_rank: Some(1),
+        smoothed_ms_per_batch: vec![3.5, 5.5],
+        phase: Phase::Stable,
+        calibration_count: 17,
+        trend_history: Some(vec![0.005, 0.01, 0.02, 0.025]),
+    };
+    let meta = CheckpointMeta::new(
+        4, 9_876, 33, 2, SaveReason::GracefulShutdown,
+    )
+    .with_elche_state(elche_state.clone());
+    let meta_path = CheckpointBundle::meta_path(&stem);
+    meta.write_to_file(&meta_path).unwrap();
+
+    let user_config = DdpRunConfig::new().with_resume_from(stem.clone());
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        &user_config,
+        None,
+        None,
+        None,
+        2,
+    )
+    .expect("resume meta loads cleanly");
+
+    // Trajectory plumbed through.
+    assert_eq!(coord_config.start_epoch, 4);
+    assert_eq!(coord_config.start_global_step, 9_876);
+    assert_eq!(coord_config.start_avg_count, 33);
+    assert_eq!(
+        coord_config.start_elche_state.as_ref(),
+        Some(&elche_state),
+        "ElCheState carries through resume_from"
+    );
+
+    // Guard rebuilt with restored trend history (default TrendGuard
+    // path: user did NOT supply an explicit guard).
+    let history = coord_config
+        .convergence_guard
+        .trend_history()
+        .expect("TrendGuard surfaces a non-empty history after resume");
+    assert_eq!(history, vec![0.005, 0.01, 0.02, 0.025]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Missing meta file must surface loudly — silent fallback to fresh
+// state would mask a misconfigured resume.
+#[test]
+fn resume_from_missing_meta_errors() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let user_config = DdpRunConfig::new()
+        .with_resume_from("/nonexistent/path/that/cannot/exist/ckpt");
+    let result = build_coord_config_from_builder(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        &user_config,
+        None,
+        None,
+        None,
+        2,
+    );
+    let err = match result {
+        Ok(_) => panic!("missing meta file must error, got Ok"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read") || msg.contains("CheckpointMeta"),
+        "expected read-error message, got: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // epoch_fn tests
 // -----------------------------------------------------------------------
 

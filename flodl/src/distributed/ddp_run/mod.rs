@@ -597,6 +597,23 @@ pub struct DdpRunConfig {
     /// `dispatch_epoch`. `None` or `0` disables. Builder sugar:
     /// [`DdpBuilder::eval_every`] (accepts [`EvalCadence`]).
     pub eval_every_epochs: Option<usize>,
+
+    /// Checkpoint bundle stem for resume. When set, the cluster
+    /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
+    /// the controller with the saved trajectory state (epoch,
+    /// global_step, sync_round, ElChe state including TrendGuard
+    /// history), and kicks the launcher off at `meta.epoch` instead of
+    /// `0`.
+    ///
+    /// Model parameters and optimizer state are NOT auto-loaded from
+    /// the bundle by this field — the user's `model_factory` /
+    /// `optim_factory` closures are the right place for that (call
+    /// [`crate::nn::load_checkpoint_file`] /
+    /// [`crate::nn::optim::Stateful::load_state_file`] inside them).
+    /// This field carries the controller-side trajectory only.
+    ///
+    /// `None` = fresh run. Builder sugar: [`DdpBuilder::resume_from`].
+    pub resume_from: Option<String>,
 }
 
 impl Default for DdpRunConfig {
@@ -632,7 +649,20 @@ impl DdpRunConfig {
             heartbeat_timeout_secs: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             eval_every_epochs: None,
+            resume_from: None,
         }
+    }
+
+    /// Resume a cluster run from a previously-saved checkpoint bundle.
+    ///
+    /// `stem` is the path stem used at save time (the value passed to
+    /// [`Self::with_save_path`] / [`DdpBuilder::save_path`]). The
+    /// orchestrator reads `<stem>.meta.json` at `.run()` time and seeds
+    /// the controller with the saved trajectory state. See
+    /// [`Self::resume_from`] for details on what is and isn't restored.
+    pub fn with_resume_from(mut self, stem: impl Into<String>) -> Self {
+        self.resume_from = Some(stem.into());
+        self
     }
 
     /// Override which rank fires user-supplied per-epoch callbacks.

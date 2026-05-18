@@ -531,6 +531,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ElChe roundtrip: capture a calibrated state, build a fresh ElChe
+    // with different user knobs, restore the snapshot onto it, and
+    // verify the dynamic fields match while the user knobs are
+    // preserved.
+    #[test]
+    fn elche_restore_from_state_roundtrip() {
+        use crate::distributed::ElChe;
+
+        let mut original = ElChe::new(3, 8).with_overhead_target(0.05);
+        // Calibrate with three rounds of measurements so anchor + phase
+        // + ms_per_batch_window all get populated.
+        for _ in 0..3 {
+            original.report_timing(&[5.0, 7.0, 6.0], &[8, 8, 8], 0.5);
+        }
+        let snap = original.to_state();
+        assert!(snap.anchor_rank.is_some(), "calibrated run elects an anchor");
+        assert!(
+            snap.smoothed_ms_per_batch.iter().any(|&v| v > 0.0),
+            "calibrated run has positive smoothed readings"
+        );
+
+        // Fresh ElChe with DIFFERENT user knobs (different overhead
+        // target). Restore must preserve those knobs while seeding the
+        // saved trajectory state.
+        let mut restored = ElChe::new(3, 8).with_overhead_target(0.20);
+        restored.restore_from_state(&snap).unwrap();
+
+        assert_eq!(restored.to_state().anchor, snap.anchor);
+        assert_eq!(restored.to_state().anchor_rank, snap.anchor_rank);
+        assert_eq!(restored.to_state().phase, snap.phase);
+        assert_eq!(
+            restored.to_state().calibration_count,
+            snap.calibration_count
+        );
+        assert_eq!(
+            restored.to_state().smoothed_ms_per_batch,
+            snap.smoothed_ms_per_batch
+        );
+        assert!(restored.is_calibrated(), "restored from positive-reading snap");
+    }
+
+    // Cross-size resume is a config-coherence bug, not a soft case —
+    // restore_from_state must reject it loudly.
+    #[test]
+    fn elche_restore_from_state_rejects_world_size_mismatch() {
+        use crate::distributed::ElChe;
+
+        let mut three_rank = ElChe::new(3, 8);
+        for _ in 0..3 {
+            three_rank.report_timing(&[5.0, 6.0, 7.0], &[8, 8, 8], 0.5);
+        }
+        let snap = three_rank.to_state();
+
+        let mut two_rank = ElChe::new(2, 8);
+        let err = two_rank.restore_from_state(&snap).unwrap_err();
+        assert!(
+            err.to_string().contains("world_size"),
+            "expected world_size mismatch error, got: {err}"
+        );
+    }
+
+    // `CheckpointMeta` consumer-side: `resume_from_meta` on the coord
+    // config stamps every trajectory field across.
+    #[test]
+    fn coord_config_resume_from_meta_applies_all_fields() {
+        use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
+        use crate::distributed::ddp::ElChe;
+        use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+
+        let elche_state = ElCheState {
+            anchor: 16,
+            anchor_rank: Some(2),
+            smoothed_ms_per_batch: vec![4.0, 5.0, 6.0],
+            phase: crate::distributed::el_che::Phase::Mature,
+            calibration_count: 99,
+            trend_history: Some(vec![0.01, 0.02, 0.03]),
+        };
+        let meta = CheckpointMeta::new(
+            7,
+            42_000,
+            201,
+            3,
+            SaveReason::GracefulShutdown,
+        )
+        .with_elche_state(elche_state.clone());
+
+        let config = ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            3,
+            ElChe::new(3, 8),
+        )
+        .resume_from_meta(&meta);
+
+        assert_eq!(config.start_epoch, 7);
+        assert_eq!(config.start_global_step, 42_000);
+        assert_eq!(config.start_avg_count, 201);
+        assert_eq!(config.start_elche_state, Some(elche_state));
+    }
+
     #[test]
     fn future_schema_version_rejected() {
         let dir = temp_dir("future");

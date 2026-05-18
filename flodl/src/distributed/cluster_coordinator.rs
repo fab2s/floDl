@@ -329,6 +329,34 @@ pub struct ClusterCoordinatorConfig {
     /// adapting to measured throughput instead of dispatching one
     /// full per-rank partition per epoch.
     pub progressive: Option<bool>,
+
+    /// Resume kickoff: starting epoch for the launcher's initial
+    /// `dispatch_epoch(start_epoch)` call. Default `0` (fresh run).
+    /// Set to `meta.epoch` from a loaded
+    /// [`crate::distributed::CheckpointMeta`] sidecar to resume at the
+    /// epoch a prior run was saved at. Carried separately from
+    /// `start_elche_state` because the launcher reads it before
+    /// `ClusterCoordinator::start` consumes the config.
+    pub start_epoch: usize,
+
+    /// Resume kickoff: initial `global_step` value. Default `0`. The
+    /// scheduler's batch-position offset; preserved across resume so
+    /// LR-warmup curves and decay schedules pick up where they left off.
+    pub start_global_step: usize,
+
+    /// Resume kickoff: initial `avg_count` value. Default `0`. The sync
+    /// round counter; preserved across resume for telemetry continuity.
+    /// Not load-bearing for trajectory math.
+    pub start_avg_count: u64,
+
+    /// Resume kickoff: optional [`crate::distributed::ElCheState`]
+    /// snapshot from a prior run's `.meta.json`. When `Some`, the coord
+    /// constructor calls `ElChe::restore_from_state(...)` on the
+    /// user-built `el_che` after applying user knobs, layering saved
+    /// trajectory state (anchor, anchor_rank, phase, calibration_count,
+    /// trust-window seed) on top of the user's config. `None` =
+    /// fresh-start (no ElChe state to restore).
+    pub start_elche_state: Option<crate::distributed::ElCheState>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -366,7 +394,31 @@ impl ClusterCoordinatorConfig {
             eval_result_fn: None,
             eval_every_epochs: None,
             progressive: None,
+            start_epoch: 0,
+            start_global_step: 0,
+            start_avg_count: 0,
+            start_elche_state: None,
         }
+    }
+
+    /// Resume builder: stamp the loaded
+    /// [`crate::distributed::CheckpointMeta`] trajectory (epoch +
+    /// global_step + sync_round + optional ElChe state) onto this
+    /// config. The launcher reads `start_epoch` to drive its kickoff
+    /// `dispatch_epoch(start_epoch)`; the coord constructor consumes
+    /// the rest. `trend_history` inside the ElCheState is consumed by
+    /// the convergence-guard build path in the orchestrator (the coord
+    /// itself doesn't carry guard state — the boxed guard is already
+    /// rebuilt with restored history before reaching this config).
+    pub fn resume_from_meta(
+        mut self,
+        meta: &crate::distributed::CheckpointMeta,
+    ) -> Self {
+        self.start_epoch = meta.epoch;
+        self.start_global_step = meta.global_step;
+        self.start_avg_count = meta.sync_round;
+        self.start_elche_state = meta.elche_state.clone();
+        self
     }
 
     /// Attach the user-supplied eval-result callback (controller-side).
@@ -991,6 +1043,19 @@ impl ClusterCoordinator {
         drop(timing_tx);
         drop(metrics_tx);
 
+        // Resume: layer saved trajectory state on top of the user-built
+        // ElChe (which carries the user's knobs from this run's
+        // DdpRunConfig). When `start_elche_state` is None, the ElChe
+        // stays fresh.
+        let mut el_che = config.el_che;
+        if let Some(ref state) = config.start_elche_state {
+            el_che.restore_from_state(state)?;
+        }
+        // `calibrated` mirrors the post-restore ElChe state: true when
+        // any rank has a positive smoothed reading. Matches the
+        // invariant the snapshot was taken under.
+        let calibrated = config.start_elche_state.is_some()
+            && el_che.is_calibrated();
         Ok(ClusterCoordinator {
             policy: config.policy,
             backend: config.backend,
@@ -999,12 +1064,12 @@ impl ClusterCoordinator {
             overshoot_ceiling: config.overshoot_ceiling,
             overshoot_auto: config.overshoot_auto,
             elche_relax_up: config.elche_relax_up,
-            el_che: config.el_che,
+            el_che,
             convergence_guard: config.convergence_guard,
             version: 0,
-            avg_count: 0,
-            global_step: 0,
-            calibrated: false,
+            avg_count: config.start_avg_count,
+            global_step: config.start_global_step,
+            calibrated,
             active_count: world_size,
             max_overshoot: config.overshoot_initial,
             steps_since_avg: vec![0; world_size],

@@ -250,6 +250,62 @@ impl ElChe {
         }
     }
 
+    /// Restore the dynamic trajectory fields from a previously-captured
+    /// [`crate::distributed::ElCheState`] snapshot. Inverse of
+    /// [`Self::to_state`].
+    ///
+    /// Restored: `anchor`, `anchor_rank`, `phase`, `calibration_count`,
+    /// `calibrated` (true when any rank had a positive smoothed reading),
+    /// and the per-rank trust window seeded with the saved
+    /// `smoothed_ms_per_batch`. The user-set knobs (`overhead_target`,
+    /// `min_anchor`, `max_anchor`, `max_batch_diff`) are left as-is on
+    /// `self` — the caller already configured those from the user's
+    /// `DdpRunConfig` at construction time, and resume by design
+    /// supports re-binding to different knobs.
+    ///
+    /// `state.world_size` must match `self.world_size`; the saved
+    /// `smoothed_ms_per_batch` length is the authoritative check. A
+    /// mismatch surfaces loudly so callers don't silently resume a
+    /// 3-rank snapshot into a 2-rank cluster (a config-coherence bug).
+    ///
+    /// Window seeding is lossy by design: the snapshot only carries the
+    /// trust-window mean, not the raw samples. We seed each rank's
+    /// window with one sample equal to the mean. The first few
+    /// post-resume `report_timing` calls re-populate raw samples and
+    /// the smoothed signal converges back to actual conditions within
+    /// `TRUST_WINDOW_CAP` calibrations.
+    pub fn restore_from_state(
+        &mut self,
+        state: &crate::distributed::ElCheState,
+    ) -> crate::tensor::Result<()> {
+        if state.smoothed_ms_per_batch.len() != self.world_size {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "ElChe::restore_from_state: snapshot world_size {} != \
+                 current world_size {}; resume must use the same world \
+                 size as the saved run",
+                state.smoothed_ms_per_batch.len(),
+                self.world_size,
+            )));
+        }
+        self.anchor = state.anchor;
+        self.anchor_rank = state.anchor_rank;
+        self.phase = state.phase;
+        self.calibration_count = state.calibration_count;
+        for (rank, &smoothed) in state.smoothed_ms_per_batch.iter().enumerate() {
+            self.ms_per_batch_window[rank].clear();
+            if smoothed > 0.0 {
+                self.ms_per_batch_window[rank].push(smoothed);
+            }
+        }
+        // `calibrated` is true iff any rank had a real reading — matches
+        // the post-`report_timing` invariant the snapshot was taken under.
+        self.calibrated = state
+            .smoothed_ms_per_batch
+            .iter()
+            .any(|&v| v > 0.0);
+        Ok(())
+    }
+
     /// Smoothed ms_per_batch for `rank` — mean over the trust window.
     /// 0.0 when window is empty (rank hasn't produced a positive reading yet).
     fn smoothed_ms(&self, rank: usize) -> f64 {

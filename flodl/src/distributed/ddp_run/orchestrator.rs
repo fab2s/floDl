@@ -49,9 +49,21 @@ pub(super) fn build_coord_config_from_builder(
     metrics_fn: Option<super::MetricsFn>,
     eval_result_fn: Option<super::EvalResultFn>,
     world_size: usize,
-) -> crate::distributed::cluster_coordinator::ClusterCoordinatorConfig {
+) -> Result<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig> {
     use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
     use crate::distributed::ddp::ElChe;
+
+    // Resume: read the meta sidecar before anything else so the saved
+    // ElChe / TrendGuard / trajectory state can feed the constructors
+    // below. Missing file or schema mismatch surfaces loudly here
+    // rather than partially seeding the controller.
+    let resume_meta: Option<crate::distributed::CheckpointMeta> = match config.resume_from {
+        Some(ref stem) => {
+            let path = crate::distributed::CheckpointBundle::meta_path(stem);
+            Some(crate::distributed::CheckpointMeta::read_from_file(&path)?)
+        }
+        None => None,
+    };
 
     // ElChe construction: anchor (default 10 matches DdpRunConfig docs)
     // plus optional max/min/overhead_target/max_batch_diff knobs.
@@ -80,18 +92,30 @@ pub(super) fn build_coord_config_from_builder(
     .meta_controller(config.meta_controller)
     .partition_ratios(config.partition_ratios.clone());
 
-    // Guard precedence: user override > NoGuard (if flagged) > TrendGuard
-    // with user threshold or 0.05 default. Matches the legacy
-    // worker-side path; same recipe, different ownership site.
+    // Guard precedence: user override > NoGuard (if flagged) >
+    // TrendGuard with user threshold or 0.05 default. On resume, the
+    // default-built TrendGuard absorbs the saved divergence ring
+    // buffer so the first 3 cycles after resume don't silently emit
+    // `Stable` regardless of live trajectory. User-supplied guards are
+    // passed through unchanged — the caller owns their guard's resume
+    // story.
+    let resume_trend_history: Option<Vec<f64>> = resume_meta
+        .as_ref()
+        .and_then(|m| m.elche_state.as_ref())
+        .and_then(|s| s.trend_history.clone());
     let guard: Box<dyn super::convergence::ConvergenceGuard> = match convergence_guard {
         Some(g) => g,
         None => {
             if config.no_divergence_guard {
                 Box::new(super::convergence::NoGuard)
             } else {
-                Box::new(super::convergence::TrendGuard::new(
+                let mut tg = super::convergence::TrendGuard::new(
                     config.divergence_threshold.unwrap_or(0.05),
-                ))
+                );
+                if let Some(history) = resume_trend_history {
+                    tg = tg.with_history(history);
+                }
+                Box::new(tg)
             }
         }
     };
@@ -122,7 +146,18 @@ pub(super) fn build_coord_config_from_builder(
         coord_config = coord_config.progressive(enabled);
     }
 
-    coord_config
+    // Resume trajectory: applies after every other field so the loaded
+    // meta cleanly overrides the fresh defaults
+    // (start_epoch/start_global_step/start_avg_count/start_elche_state).
+    // The `trend_history` inside elche_state has already been consumed
+    // above for the guard; we still hand the whole state to the coord
+    // so `ElChe::restore_from_state` can seed the ms_per_batch trust
+    // window.
+    if let Some(meta) = resume_meta {
+        coord_config = coord_config.resume_from_meta(&meta);
+    }
+
+    Ok(coord_config)
 }
 
 /// Resolve [`super::EpochCallbackPolicy`] for a given rank in the
@@ -358,7 +393,7 @@ impl DdpHandle {
                     metrics_fn,
                     eval_result_fn,
                     world_size,
-                );
+                )?;
                 coord_config = coord_config.metrics_sink_tx(sink_tx);
                 // Spawn the launcher driver on a dedicated thread.
                 // Previously this called `run_launcher_with_config`
@@ -2726,6 +2761,49 @@ where
     /// [`crate::distributed::CheckpointBundle`].
     pub fn save_path(mut self, path: impl Into<String>) -> Self {
         self.config = self.config.with_save_path(path);
+        self
+    }
+
+    /// Resume a prior cluster run from a checkpoint bundle.
+    ///
+    /// `stem` is the bundle stem used at the original save (the value
+    /// passed to [`Self::save_path`] then). At `.run()`, the orchestrator
+    /// reads `<stem>.meta.json` and seeds the controller with the saved
+    /// trajectory:
+    /// - starting epoch (the launcher kicks off `dispatch_epoch(meta.epoch)`
+    ///   instead of `0`),
+    /// - `global_step` and `sync_round` so the LR scheduler picks up where
+    ///   it left off,
+    /// - the [`crate::distributed::ElCheState`] snapshot including
+    ///   [`crate::distributed::ddp_run::convergence::TrendGuard`] history,
+    ///   so cadence + divergence trajectories don't re-warm from scratch.
+    ///
+    /// Model parameters and optimizer state are NOT auto-loaded here —
+    /// load them inside `model_factory` / `optim_factory` so each rank's
+    /// freshly-built model/optimizer reflects the saved weights:
+    ///
+    /// ```ignore
+    /// Trainer::builder(
+    ///     |dev| {
+    ///         let model = build_model(dev)?;
+    ///         flodl::nn::load_checkpoint_file("ckpt.fdl", &model, dev)?;
+    ///         Ok(model)
+    ///     },
+    ///     |params| {
+    ///         let mut opt = Adam::new(params, lr);
+    ///         opt.load_state_file("ckpt.optim").ok();
+    ///         opt
+    ///     },
+    ///     train_fn,
+    /// )
+    ///     .save_path("ckpt")
+    ///     .resume_from("ckpt")
+    ///     .dataset(dataset).batch_size(32).num_epochs(N)
+    ///     .run()?
+    ///     .join()?;
+    /// ```
+    pub fn resume_from(mut self, stem: impl Into<String>) -> Self {
+        self.config = self.config.with_resume_from(stem);
         self
     }
 

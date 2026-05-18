@@ -301,11 +301,30 @@ pub fn run_launcher_with_config(
              local_ranks={:?})",
             coord_bind_addr, coord_world, local_ranks,
         );
+        // Capture the resume kickoff epoch before moving `config` into
+        // `start()`. `start_epoch == 0` for fresh runs; resume runs
+        // populate it from `CheckpointMeta::epoch` via
+        // `ClusterCoordinatorConfig::resume_from_meta`.
+        let start_epoch = config.start_epoch;
         let _ = thread::Builder::new()
             .name("flodl-cluster-coord".to_string())
             .spawn(move || {
                 match ClusterCoordinator::start(coord_bind_addr, coord_salt, config) {
                     Ok(mut coord) => {
+                        // Kickoff the first epoch dispatch. Without this,
+                        // `tick()` never broadcasts `StartEpoch` to any
+                        // rank and workers idle indefinitely in
+                        // `wait_for_epoch_plan`. Mirrors the threaded
+                        // coordinator's `coord.send_all_plans(0)` in
+                        // `orchestrator.rs`; resume runs pass
+                        // `start_epoch = meta.epoch` to continue from
+                        // the saved trajectory point.
+                        if let Err(e) = coord.dispatch_epoch(start_epoch) {
+                            eprintln!(
+                                "cluster launcher: dispatch_epoch({start_epoch}) failed: {e}"
+                            );
+                            return;
+                        }
                         // Drive ticks until shutdown_workers fires (all
                         // ranks exited) or the process is killed.
                         loop {
