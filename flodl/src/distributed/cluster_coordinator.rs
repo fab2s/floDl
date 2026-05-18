@@ -789,6 +789,26 @@ pub struct ClusterCoordinator {
     /// [`ClusterCoordinatorConfig::max_failure`].
     max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
 
+    /// Sticky assignee for `ControlMsgWire::Checkpoint`. Initialized to
+    /// 0; the controller picks the next live rank on (a) the role's
+    /// `CheckpointResult.error` or (b) the role's rank death. v1
+    /// dispatches every checkpoint to this rank (rather than
+    /// broadcasting + filtering rank-side) so the worker never has to
+    /// decide whether it is the checkpointer.
+    checkpoint_role: usize,
+    /// Per-version set of ranks that have already attempted +
+    /// reported failure for that version. Used to (a) pick the next
+    /// untried live rank on retry, and (b) detect exhaustion (all
+    /// live ranks tried + failed → give up on this version; existing
+    /// `MaxFailureThreshold` governs the longer-term run health).
+    checkpoint_tried_ranks:
+        std::collections::HashMap<u64, std::collections::HashSet<usize>>,
+    /// EWMA of recent successful checkpoint wall-times (ms). Reserved
+    /// for v2 rendezvous-aware scheduling (controller aligns
+    /// checkpoint dispatch with AllReduce barriers so the cost
+    /// overlaps with idle barrier-wait). v1 just records.
+    last_checkpoint_elapsed_ms_ewma: Option<f64>,
+
     /// `true` once [`Self::dispatch_shutdown_with_save`] has broadcast
     /// `ShutdownWithSave`. Guards against re-broadcasting on subsequent
     /// `check_dead_ranks` ticks — once survivors are persisting state,
@@ -1160,6 +1180,9 @@ impl ClusterCoordinator {
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
             max_failure: config.max_failure,
+            checkpoint_role: 0,
+            checkpoint_tried_ranks: std::collections::HashMap::new(),
+            last_checkpoint_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
             checkpoint_every: config.checkpoint_every,
             shutdown_with_save_dispatched: false,
@@ -1398,7 +1421,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::Heartbeat { rank, .. }
             | TimingMsgWire::SnapshotReady { rank }
             | TimingMsgWire::NewNcclIdGenerated { rank, .. }
-            | TimingMsgWire::EvalResult { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::EvalResult { rank, .. }
+            | TimingMsgWire::CheckpointResult { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -1585,6 +1609,104 @@ impl ClusterCoordinator {
                         eprintln!(
                             "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
                         );
+                    }
+                }
+            }
+            TimingMsgWire::CheckpointResult {
+                rank,
+                version,
+                elapsed_ms,
+                error,
+            } => {
+                self.handle_checkpoint_result(
+                    rank as usize,
+                    version,
+                    elapsed_ms,
+                    error,
+                );
+            }
+        }
+    }
+
+    /// Handle a `TimingMsgWire::CheckpointResult` from a worker
+    /// (S4 fleshes this out: time exclusion + role failover + retry
+    /// across live untried ranks + EWMA update).
+    ///
+    /// S2 lands the stub so the wire propagation compiles; the
+    /// post-S4 behavior is documented at the call site.
+    fn handle_checkpoint_result(
+        &mut self,
+        rank: usize,
+        version: u64,
+        elapsed_ms: f64,
+        error: Option<String>,
+    ) {
+        // Time exclusion: subtract checkpoint elapsed from this rank's
+        // wall_ms_accum so ElChe's rebalancer does not see checkpoint
+        // cost as compute slowness. Clamp at 0 to handle EWMA noise.
+        if rank < self.wall_ms_accum.len() {
+            self.wall_ms_accum[rank] =
+                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
+        match error {
+            None => {
+                // Success path: update the EWMA (alpha=0.3 — same
+                // shape the rest of the framework uses for recent-
+                // value smoothing), clear this version's tried set.
+                let alpha = 0.3_f64;
+                self.last_checkpoint_elapsed_ms_ewma =
+                    Some(match self.last_checkpoint_elapsed_ms_ewma {
+                        Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
+                        None => elapsed_ms,
+                    });
+                self.checkpoint_tried_ranks.remove(&version);
+                self.checkpoint_role = rank;
+                crate::verbose!(
+                    "  ddp: checkpoint v{version} succeeded on rank {rank} \
+                     ({elapsed_ms:.1} ms)",
+                );
+            }
+            Some(err_msg) => {
+                eprintln!(
+                    "cluster_coordinator: checkpoint v{version} failed on \
+                     rank {rank}: {err_msg}"
+                );
+                // Record this rank as tried, then release the mut-
+                // borrow before calling `is_dead` (which needs &self).
+                self.checkpoint_tried_ranks
+                    .entry(version)
+                    .or_default()
+                    .insert(rank);
+                let tried_snapshot: std::collections::HashSet<usize> = self
+                    .checkpoint_tried_ranks
+                    .get(&version)
+                    .cloned()
+                    .unwrap_or_default();
+                let next = (0..self.world_size).find(|&r| {
+                    r != rank && !self.is_dead(r) && !tried_snapshot.contains(&r)
+                });
+                match next {
+                    Some(r) => {
+                        self.checkpoint_role = r;
+                        let msg = ControlMsgWire::Checkpoint {
+                            version,
+                            target_rank: r as u64,
+                        };
+                        if let Err(e) = self.send_control(r, &msg) {
+                            eprintln!(
+                                "cluster_coordinator: checkpoint v{version} \
+                                 retry-dispatch to rank {r} failed: {e}"
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "cluster_coordinator: checkpoint v{version} \
+                             exhausted all live ranks; giving up (existing \
+                             MaxFailureThreshold continues to govern run \
+                             health). tried={tried_snapshot:?}"
+                        );
+                        self.checkpoint_tried_ranks.remove(&version);
                     }
                 }
             }
@@ -1842,6 +1964,26 @@ impl ClusterCoordinator {
                 self.active_count = self.active_count.saturating_sub(1);
                 self.last_heartbeat[r] = now;
                 any_newly_dead = true;
+                // Checkpoint-role failover: if the just-dead rank was
+                // the sticky `checkpoint_role`, pick the lowest live
+                // rank as the next role. Next cadence boundary will
+                // dispatch to the new role; no immediate redispatch
+                // here (the dead rank had no in-flight checkpoint to
+                // recover — that path is `handle_checkpoint_result`'s
+                // job when an error report comes back).
+                if r == self.checkpoint_role {
+                    if let Some(next) =
+                        (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
+                    {
+                        self.checkpoint_role = next;
+                        crate::verbose!(
+                            "  ddp: checkpoint_role failover {} -> {} \
+                             (prior role declared dead)",
+                            r,
+                            next,
+                        );
+                    }
+                }
                 // NCCL backend: notify every surviving worker so they
                 // can update their LOCAL dead-rank ledgers and the
                 // NCCL watchdog can abort the in-flight collective.
@@ -2831,8 +2973,18 @@ impl ClusterCoordinator {
         if epoch > 0 {
             if let Some(every) = self.checkpoint_every {
                 if every > 0 && epoch % every == 0 {
-                    let msg = ControlMsgWire::Checkpoint { version: epoch as u64 };
-                    self.broadcast_control(&msg)?;
+                    // Targeted dispatch (S4 in #29): the coord's
+                    // `checkpoint_role` is the sticky assignee; the
+                    // worker no-ops unless `target_rank == self.rank`.
+                    // Stays addressed to the SAME live rank across
+                    // checkpoints until that rank fails or dies, at
+                    // which point the controller fails over.
+                    let target = self.checkpoint_role;
+                    let msg = ControlMsgWire::Checkpoint {
+                        version: epoch as u64,
+                        target_rank: target as u64,
+                    };
+                    self.send_control(target, &msg)?;
                 }
             }
             // Eval cadence: broadcast `ExecuteEvalCallback` when the
@@ -3079,6 +3231,31 @@ impl ClusterCoordinator {
 
     /// Last globally-aggregated epoch (all ranks reported). `None`
     /// until the coord's metrics aggregator fires the first time.
+    /// Current sticky `checkpoint_role` (rank ID). Test/diagnostic
+    /// accessor; the role updates on success (stays put) or failure
+    /// (failover to next live untried rank) or rank death.
+    pub fn checkpoint_role(&self) -> usize {
+        self.checkpoint_role
+    }
+
+    /// EWMA of recent successful checkpoint wall-times (ms). `None`
+    /// until the first success lands. Reserved for v2 rendezvous-
+    /// aware scheduling; test/diagnostic accessor for v1.
+    pub fn last_checkpoint_elapsed_ms_ewma(&self) -> Option<f64> {
+        self.last_checkpoint_elapsed_ms_ewma
+    }
+
+    /// Number of ranks recorded as having tried + failed for a given
+    /// checkpoint `version`. Empty/zero on a clean run; populated by
+    /// `handle_checkpoint_result` when an error arrives. Test
+    /// accessor used to verify retry / exhaustion behavior.
+    pub fn checkpoint_tried_count(&self, version: u64) -> usize {
+        self.checkpoint_tried_ranks
+            .get(&version)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
     pub fn last_aggregated_epoch(&self) -> Option<usize> {
         self.last_aggregated_epoch
     }
@@ -3100,6 +3277,149 @@ impl ClusterCoordinator {
         self.total_samples
     }
 
+    /// Build a headless ClusterCoordinator for unit-testing internal
+    /// state-machine logic without spinning up TCP listeners or
+    /// reader threads. `control_streams` and `reader_handles` are
+    /// empty — calls into [`Self::send_control`] return a benign
+    /// `TensorError` instead of panicking, so the
+    /// retry-redispatch path in
+    /// [`Self::handle_checkpoint_result`] surfaces as a log line
+    /// rather than crashing the test. Test fixtures that need to
+    /// drive the full wire path should use `spawn_coord` /
+    /// `start_from_listener` instead.
+    #[cfg(test)]
+    pub(crate) fn for_test(mut config: ClusterCoordinatorConfig) -> Self {
+        let world_size = config.world_size;
+        let salt: SessionSalt =
+            [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
+        let (_timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
+        let (_metrics_tx, metrics_rx) =
+            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
+        let el_che = std::mem::replace(
+            &mut config.el_che,
+            crate::distributed::ddp::ElChe::new(world_size.max(1), 1),
+        );
+        let calibrated = config.start_elche_state.is_some()
+            && el_che.is_calibrated();
+        ClusterCoordinator {
+            policy: config.policy,
+            backend: config.backend,
+            world_size,
+            overshoot_initial: config.overshoot_initial,
+            overshoot_ceiling: config.overshoot_ceiling,
+            overshoot_auto: config.overshoot_auto,
+            elche_relax_up: config.elche_relax_up,
+            el_che,
+            convergence_guard: config.convergence_guard,
+            version: 0,
+            avg_count: config.start_avg_count,
+            global_step: config.start_global_step,
+            calibrated,
+            active_count: world_size,
+            max_overshoot: config.overshoot_initial,
+            steps_since_avg: vec![0; world_size],
+            wall_ms_accum: vec![0.0; world_size],
+            last_batch_ms: vec![0.0; world_size],
+            last_step_count: vec![0; world_size],
+            nccl_sync_step: vec![0; world_size],
+            nccl_ack: vec![true; world_size],
+            nccl_sync_divergence: vec![None; world_size],
+            nccl_sync_pre_norm: vec![None; world_size],
+            nccl_sync_post_norm: None,
+            throttled: vec![false; world_size],
+            last_nccl_sync_ms: 0.0,
+            nccl_sync_start: None,
+            lr_event_meta: if config.meta_controller {
+                Some(crate::distributed::lr_event_meta::LrEventMeta::with_default_config())
+            } else {
+                None
+            },
+            last_lr_per_rank: vec![None; world_size],
+            cpu_avg_state: CpuAvgState::Idle,
+            dead_ranks: config.dead_ranks,
+            heartbeat_timeout_secs: config.heartbeat_timeout_secs,
+            rendezvous_timeout_secs: config.rendezvous_timeout_secs,
+            last_heartbeat: vec![Instant::now(); world_size],
+            last_step_count_at_epoch_start: vec![0; world_size],
+            nccl_rendezvous_pending: None,
+            local_ranks: config.local_ranks.clone(),
+            max_failure: config.max_failure,
+            checkpoint_role: 0,
+            checkpoint_tried_ranks: std::collections::HashMap::new(),
+            last_checkpoint_elapsed_ms_ewma: None,
+            save_path: config.save_path.clone(),
+            checkpoint_every: config.checkpoint_every,
+            shutdown_with_save_dispatched: false,
+            last_observed_sync_lag_ms: vec![None; world_size],
+            last_observed_upload_ms: vec![None; world_size],
+            rank_epoch: vec![0; world_size],
+            last_aggregated_epoch: None,
+            epoch_plan_cache: std::collections::HashMap::new(),
+            total_samples: config.total_samples,
+            batch_size: config.batch_size.max(1),
+            num_epochs: config.num_epochs,
+            partition_ratios: config.partition_ratios,
+            timing_rx,
+            metrics_rx,
+            metrics_buffer: std::collections::BTreeMap::new(),
+            chunk_pools: std::collections::BTreeMap::new(),
+            progressive: config.progressive.unwrap_or(
+                !matches!(config.policy, ApplyPolicy::Sync),
+            ),
+            min_chunk_batches: 4,
+            metrics_fn: config.metrics_fn.clone(),
+            metrics_sink_tx: config.metrics_sink_tx.clone(),
+            eval_result_fn: config.eval_result_fn.clone(),
+            eval_every_epochs: config.eval_every_epochs,
+            metrics_device_indices: (0..world_size as u8).collect(),
+            control_streams: Vec::new(),
+            reader_handles: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            bound_port: 0,
+            salt,
+        }
+    }
+
+    /// Test-only mutator for `wall_ms_accum[rank]`. Used by
+    /// `checkpoint_time_excluded_from_wall_ms_accum` to set a known
+    /// starting state before invoking `handle_checkpoint_result`.
+    #[cfg(test)]
+    pub(crate) fn set_wall_ms_accum_for_test(&mut self, rank: usize, ms: f64) {
+        self.wall_ms_accum[rank] = ms;
+    }
+
+    /// Test-only accessor for `wall_ms_accum[rank]`.
+    #[cfg(test)]
+    pub(crate) fn wall_ms_accum_for_test(&self, rank: usize) -> f64 {
+        self.wall_ms_accum[rank]
+    }
+
+    /// Test-only accessor for `heartbeat_timeout_secs`.
+    #[cfg(test)]
+    pub(crate) fn heartbeat_timeout_secs(&self) -> u64 {
+        self.heartbeat_timeout_secs
+    }
+
+    /// Test-only mutator: force a rank's `last_heartbeat` to an
+    /// arbitrary `Instant`. Used by
+    /// `checkpoint_role_failover_on_rank_death` to age out a rank.
+    #[cfg(test)]
+    pub(crate) fn set_last_heartbeat_for_test(
+        &mut self,
+        rank: usize,
+        when: Instant,
+    ) {
+        self.last_heartbeat[rank] = when;
+    }
+
+    /// Test-only wrapper around the private `check_dead_ranks` so
+    /// tests can drive the heartbeat-stale path directly without
+    /// spinning up the tick loop.
+    #[cfg(test)]
+    pub(crate) fn check_dead_ranks_for_test(&mut self) {
+        self.check_dead_ranks();
+    }
+
     // -----------------------------------------------------------------
     // Outbound control frame I/O
     // -----------------------------------------------------------------
@@ -3109,6 +3429,18 @@ impl ClusterCoordinator {
             return Err(TensorError::new(&format!(
                 "cluster_coordinator: send_control rank {rank} >= world_size {}",
                 self.world_size
+            )));
+        }
+        if rank >= self.control_streams.len() {
+            // Headless coord (test fixtures via `for_test`) has no
+            // streams populated. Return Err so callers that
+            // tolerate transient send failures (e.g.
+            // `handle_checkpoint_result`'s retry-dispatch path) can
+            // log + continue rather than panic the test process.
+            return Err(TensorError::new(&format!(
+                "cluster_coordinator: send_control(rank={rank}): no stream \
+                 (headless coord; index {rank} out of streams len {})",
+                self.control_streams.len()
             )));
         }
         let frame = ControlFrame::encode(&self.salt, MsgKind::Control, msg)?;
@@ -4220,6 +4552,296 @@ mod tests {
             sink_rx.try_recv().is_err(),
             "sink should not receive extra events",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #29 — Checkpoint dispatch (targeted), result reporting, retry,
+    // time exclusion, and role-failover on rank death. The coord is
+    // the sole decider; the worker is a pure executor that reports
+    // back via `TimingMsgWire::CheckpointResult` and never decides
+    // policy locally. See `drawer_wing_rdl_decisions_8053ff4b...` for
+    // the architectural principles these tests encode.
+    // -----------------------------------------------------------------
+
+    /// Pure unit test: `handle_checkpoint_result` subtracts the
+    /// reported `elapsed_ms` from `wall_ms_accum[rank]` so ElChe's
+    /// rebalancer does not interpret checkpoint time as compute
+    /// slowness. Clamps at 0 to absorb fp drift.
+    #[test]
+    fn checkpoint_time_excluded_from_wall_ms_accum() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        // Pre-load wall time: rank 0 has 100 ms of training; rank 1
+        // has 50 ms. After CheckpointResult(rank=0, elapsed_ms=30),
+        // rank 0 should drop to 70 ms; rank 1 untouched.
+        coord.set_wall_ms_accum_for_test(0, 100.0);
+        coord.set_wall_ms_accum_for_test(1, 50.0);
+        coord.handle_checkpoint_result(0, 7, 30.0, None);
+        assert!(
+            (coord.wall_ms_accum_for_test(0) - 70.0).abs() < 1e-9,
+            "wall_ms_accum[0] = {} (expected 70.0)",
+            coord.wall_ms_accum_for_test(0),
+        );
+        assert!(
+            (coord.wall_ms_accum_for_test(1) - 50.0).abs() < 1e-9,
+            "wall_ms_accum[1] = {} (expected 50.0 untouched)",
+            coord.wall_ms_accum_for_test(1),
+        );
+        // EWMA seeded by first success.
+        assert_eq!(coord.last_checkpoint_elapsed_ms_ewma(), Some(30.0));
+        // Role stays put on success.
+        assert_eq!(coord.checkpoint_role(), 0);
+        // No tried entries on success.
+        assert_eq!(coord.checkpoint_tried_count(7), 0);
+    }
+
+    /// Pure unit test: failure path adds rank to `tried_ranks[version]`,
+    /// picks next live untried rank, fails over `checkpoint_role`.
+    /// The actual send_control to the new role would fail under
+    /// for_test (no streams attached); we observe state, not network.
+    #[test]
+    fn checkpoint_failure_records_tried_and_failovers_role() {
+        let world_size = 3usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        assert_eq!(coord.checkpoint_role(), 0);
+
+        // Rank 0 reports failure: tried={0}, role moves to next live
+        // (rank 1). send_control to rank 1 fails under for_test
+        // (no streams) — that's fine; the test asserts state, not IO.
+        coord.handle_checkpoint_result(
+            0, 5, 12.0, Some("disk full".into()),
+        );
+        assert_eq!(coord.checkpoint_role(), 1, "role should fail over to rank 1");
+        assert_eq!(coord.checkpoint_tried_count(5), 1);
+
+        // Rank 1 also fails: tried={0,1}, role moves to rank 2.
+        coord.handle_checkpoint_result(
+            1, 5, 8.0, Some("io error".into()),
+        );
+        assert_eq!(coord.checkpoint_role(), 2);
+        assert_eq!(coord.checkpoint_tried_count(5), 2);
+
+        // Rank 2 also fails: no more live untried ranks → exhaust +
+        // clear tried_ranks (the next cadence boundary starts fresh).
+        coord.handle_checkpoint_result(
+            2, 5, 5.0, Some("permission denied".into()),
+        );
+        assert_eq!(
+            coord.checkpoint_tried_count(5),
+            0,
+            "exhaustion should clear tried_ranks[version]"
+        );
+    }
+
+    /// Pure unit test: success after a failure clears tried_ranks +
+    /// updates the sticky role to the successful rank.
+    #[test]
+    fn checkpoint_success_after_failure_clears_tried() {
+        let world_size = 3usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+
+        coord.handle_checkpoint_result(0, 4, 10.0, Some("oom".into()));
+        assert_eq!(coord.checkpoint_tried_count(4), 1);
+        assert_eq!(coord.checkpoint_role(), 1);
+
+        // Rank 1 succeeds: tried[4] is cleared; role stays at 1.
+        coord.handle_checkpoint_result(1, 4, 7.0, None);
+        assert_eq!(coord.checkpoint_tried_count(4), 0);
+        assert_eq!(coord.checkpoint_role(), 1);
+        assert_eq!(coord.last_checkpoint_elapsed_ms_ewma(), Some(7.0));
+    }
+
+    /// Pure unit test: EWMA blends successive successes with alpha=0.3
+    /// (the framework's standard recent-value smoother).
+    #[test]
+    fn checkpoint_ewma_blends_successive_successes() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+
+        coord.handle_checkpoint_result(0, 1, 100.0, None);
+        assert_eq!(coord.last_checkpoint_elapsed_ms_ewma(), Some(100.0));
+
+        // alpha=0.3: 0.3 * 50 + 0.7 * 100 = 15 + 70 = 85
+        coord.handle_checkpoint_result(0, 2, 50.0, None);
+        let ewma = coord.last_checkpoint_elapsed_ms_ewma().unwrap();
+        assert!(
+            (ewma - 85.0).abs() < 1e-9,
+            "EWMA after 100 then 50 (alpha=0.3): got {ewma}, expected 85.0"
+        );
+    }
+
+    /// Integration test: dispatch is targeted — only the role rank
+    /// receives the `Checkpoint` frame; non-role ranks never see it.
+    #[test]
+    fn checkpoint_dispatched_to_role_only() {
+        let world_size = 2;
+        let r0_got = Arc::new(AtomicBool::new(false));
+        let r1_got = Arc::new(AtomicBool::new(false));
+        let r0_flag = Arc::clone(&r0_got);
+        let r1_flag = Arc::clone(&r1_got);
+
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(2)
+                .checkpoint_every(1),
+            move |coord| {
+                coord.dispatch_epoch(0)?;
+                coord.dispatch_epoch(1)?;
+                // Pump ticks so frames flush.
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(2) {
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            },
+        );
+
+        fn drain_until_shutdown(
+            saw_checkpoint: Arc<AtomicBool>,
+            send_ack_for: u64,
+        ) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
+            move |s, salt| {
+                loop {
+                    let msg = recv_control(s, salt)?;
+                    match msg {
+                        ControlMsgWire::Checkpoint { version, target_rank } => {
+                            saw_checkpoint.store(true, Ordering::Relaxed);
+                            if target_rank == send_ack_for {
+                                send_metrics(s, salt, MetricsMsgWire::default()).ok();
+                                send_timing(s, salt, TimingMsgWire::CheckpointResult {
+                                    rank: send_ack_for,
+                                    version,
+                                    elapsed_ms: 1.0,
+                                    error: None,
+                                })?;
+                            }
+                        }
+                        ControlMsgWire::Shutdown
+                        | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT,
+            drain_until_shutdown(r0_flag, 0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT,
+            drain_until_shutdown(r1_flag, u64::MAX /* never matches */));
+
+        r0.join().unwrap().expect("rank 0 drained cleanly");
+        r1.join().unwrap().expect("rank 1 drained cleanly");
+        coord_handle.join().unwrap().expect("coord finishes");
+
+        assert!(r0_got.load(Ordering::Relaxed),
+            "rank 0 (role) must receive Checkpoint frame");
+        assert!(!r1_got.load(Ordering::Relaxed),
+            "rank 1 (non-role) must NOT receive Checkpoint frame");
+    }
+
+    /// Role failover on rank death: when the heartbeat detector
+    /// declares the sticky `checkpoint_role` rank dead, the coord
+    /// picks the lowest live rank as the new role. The next cadence
+    /// boundary will dispatch there; no immediate redispatch fires
+    /// (the dead rank had no in-flight checkpoint to recover).
+    #[test]
+    fn checkpoint_role_failover_on_rank_death() {
+        let world_size = 3usize;
+        let dead_ranks =
+            crate::distributed::controller::DeadRanks::new(world_size);
+        let cfg = cfg_sync_cpu(world_size).dead_ranks(Arc::clone(&dead_ranks));
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        assert_eq!(coord.checkpoint_role(), 0);
+
+        // Force rank 0's last_heartbeat to be older than the
+        // heartbeat_timeout_secs threshold, then drive
+        // check_dead_ranks. heartbeat_timeout_secs default ~ 30s;
+        // setting last_heartbeat[0] to (now - 60s) is a safe margin.
+        let stale = Instant::now()
+            - Duration::from_secs(coord.heartbeat_timeout_secs() * 2 + 5);
+        coord.set_last_heartbeat_for_test(0, stale);
+        coord.check_dead_ranks_for_test();
+
+        assert!(dead_ranks.is_dead(0), "rank 0 must be declared dead");
+        assert_eq!(
+            coord.checkpoint_role(),
+            1,
+            "checkpoint_role must fail over to next live rank (1)"
+        );
+    }
+
+    /// Integration test: a full success round-trip — rank reports
+    /// CheckpointResult{ok}; coord updates EWMA + clears tried set.
+    #[test]
+    fn checkpoint_success_round_trip_updates_ewma() {
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(2)
+                .checkpoint_every(1),
+            move |coord| {
+                coord.dispatch_epoch(0)?;
+                coord.dispatch_epoch(1)?;
+                let start = Instant::now();
+                while coord.last_checkpoint_elapsed_ms_ewma().is_none() {
+                    if start.elapsed() > Duration::from_secs(2) {
+                        return Err(TensorError::new(
+                            "checkpoint_success_round_trip: no EWMA seeded",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    (coord.last_checkpoint_elapsed_ms_ewma().unwrap() - 12.5).abs()
+                        < 1e-9,
+                    "EWMA = {:?} (expected 12.5)",
+                    coord.last_checkpoint_elapsed_ms_ewma(),
+                );
+                assert_eq!(coord.checkpoint_tried_count(1), 0);
+                assert_eq!(coord.checkpoint_role(), 0);
+                Ok(())
+            },
+        );
+
+        fn rank_body(rank: u64) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
+            move |s, salt| {
+                loop {
+                    let msg = recv_control(s, salt)?;
+                    match msg {
+                        ControlMsgWire::Checkpoint { version, target_rank }
+                            if target_rank == rank =>
+                        {
+                            send_timing(s, salt, TimingMsgWire::CheckpointResult {
+                                rank,
+                                version,
+                                elapsed_ms: 12.5,
+                                error: None,
+                            })?;
+                        }
+                        ControlMsgWire::Shutdown
+                        | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, rank_body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, rank_body(1));
+        r0.join().unwrap().expect("rank 0 success round-trip");
+        r1.join().unwrap().expect("rank 1 drains cleanly");
+        coord_handle.join().unwrap().expect("coord finishes");
     }
 
     #[test]

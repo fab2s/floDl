@@ -514,8 +514,30 @@ pub enum ControlMsgWire {
     Throttle,
     /// Update the worker's global step count after averaging.
     SetGlobalStep { global_step: u64 },
-    /// Save a checkpoint from rank 0 after averaging.
-    Checkpoint { version: u64 },
+    /// Coord-emitted directive to persist a checkpoint bundle for the
+    /// given `version` (epoch index at the cadence boundary). Targeted:
+    /// only the rank whose `rank == target_rank` runs its
+    /// `checkpoint_fn`; every other rank receiving this frame no-ops.
+    /// The coord owns the role assignment (sticky `checkpoint_role`
+    /// with failover on rank death or `CheckpointResult.error`); the
+    /// worker never decides whether it is the checkpointer.
+    ///
+    /// `target_rank` semantics:
+    /// - `0..world_size` → the rank ID that should execute. Other
+    ///   ranks receiving the frame silently ignore it.
+    /// - `u64::MAX` → reserved for "controller executes" (CPU-async
+    ///   mode where the controller already holds the canonical
+    ///   averaged tensors post `finish_averaging_cpu`). v1 emits a
+    ///   loud error if this sentinel is dispatched; v2 will add a
+    ///   `coord_checkpoint_fn` builder method.
+    ///
+    /// Execution result flows back via
+    /// [`TimingMsgWire::CheckpointResult`] (success or failure) so the
+    /// controller can retry on a different live rank when the
+    /// assigned rank reports an error. Wire format change from v0.5.3
+    /// (was `{ version }` only); no external wire users at the time
+    /// of the cut.
+    Checkpoint { version: u64, target_rank: u64 },
     /// Run the user's [`EvalFn`] against `eval_dataset`. Handled only
     /// by the rank chosen via [`EpochCallbackPolicy`]; other ranks
     /// receive the frame and no-op (their `eval_fn` is `None`).
@@ -617,6 +639,23 @@ pub enum TimingMsgWire {
         schedule_id: u64,
         epoch: u64,
         metric: f64,
+        error: Option<String>,
+    },
+    /// Result of a `checkpoint_fn` invocation by `rank` for the given
+    /// `version`. Parallels [`Self::EvalResult`] for the checkpoint
+    /// task: workers never decide on retry; they always report
+    /// (success or failure) and let the controller pick the next
+    /// action. `elapsed_ms` is the wall-time the closure took (used
+    /// by the coord to (a) subtract from `wall_ms_accum[rank]` so
+    /// ElChe does not mis-attribute checkpoint cost as training
+    /// slowness, and (b) feed a `last_checkpoint_elapsed_ms_ewma`
+    /// reserved for v2 rendezvous-aware scheduling). Success carries
+    /// `error = None`; failure carries the closure's `TensorError`
+    /// rendered as a String (`feedback_loud_errors_over_silent.md`).
+    CheckpointResult {
+        rank: u64,
+        version: u64,
+        elapsed_ms: f64,
         error: Option<String>,
     },
     /// Response to [`ControlMsgWire::RequestNewNcclId`]: the chosen
@@ -881,6 +920,18 @@ mod tests {
             },
             TimingMsgWire::Exiting { rank: 3 },
             TimingMsgWire::LrUpdate { rank: 0, lr: 1e-3 },
+            TimingMsgWire::CheckpointResult {
+                rank: 1,
+                version: 7,
+                elapsed_ms: 12.5,
+                error: None,
+            },
+            TimingMsgWire::CheckpointResult {
+                rank: 2,
+                version: 8,
+                elapsed_ms: 5.0,
+                error: Some("disk full".to_string()),
+            },
         ];
         for c in cases {
             let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Timing, &c).unwrap();
@@ -893,6 +944,30 @@ mod tests {
             assert_eq!(got.kind, MsgKind::Timing);
             let back: TimingMsgWire = got.decode().unwrap();
             assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn control_frame_round_trip_checkpoint_targeted() {
+        let cases = [
+            ControlMsgWire::Checkpoint { version: 3, target_rank: 0 },
+            ControlMsgWire::Checkpoint { version: 4, target_rank: 7 },
+            // u64::MAX is reserved for v2 controller-as-checkpointer;
+            // the wire encodes it fine, the coord rejects it loudly
+            // on dispatch.
+            ControlMsgWire::Checkpoint { version: 5, target_rank: u64::MAX },
+        ];
+        for msg in cases {
+            let frame =
+                ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+            let mut buf = Vec::new();
+            frame.write_to(&mut buf).unwrap();
+            let mut cur = Cursor::new(buf);
+            let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+                .unwrap()
+                .unwrap();
+            let back: ControlMsgWire = got.decode().unwrap();
+            assert_eq!(back, msg);
         }
     }
 

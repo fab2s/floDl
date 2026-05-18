@@ -191,6 +191,17 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             metric,
             error,
         },
+        TimingMsg::CheckpointResult {
+            rank,
+            version,
+            elapsed_ms,
+            error,
+        } => TimingMsgWire::CheckpointResult {
+            rank: rank as u64,
+            version,
+            elapsed_ms,
+            error,
+        },
     }
 }
 
@@ -242,7 +253,24 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
         ControlMsgWire::SetGlobalStep { global_step } => {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
         }
-        ControlMsgWire::Checkpoint { version } => Ok(Some(ControlMsg::Checkpoint { version })),
+        ControlMsgWire::Checkpoint { version, target_rank } => {
+            // `u64::MAX` is reserved for v2 controller-as-checkpointer
+            // (CPU-async mode where the coord holds the canonical
+            // averaged tensors). In v1 the coord must never dispatch
+            // it; if a buggy/future coord does, surface loudly so we
+            // don't silently fall through to "no-op for every rank".
+            if target_rank == u64::MAX {
+                return Err(crate::tensor::TensorError::new(
+                    "cluster_worker: Checkpoint target_rank=u64::MAX is reserved \
+                     for controller-as-checkpointer (v2); v1 must dispatch to a \
+                     worker rank ID",
+                ));
+            }
+            Ok(Some(ControlMsg::Checkpoint {
+                version,
+                target_rank: target_rank as usize,
+            }))
+        }
         ControlMsgWire::ExecuteEvalCallback { schedule_id, epoch } => {
             Ok(Some(ControlMsg::ExecuteEvalCallback { schedule_id, epoch }))
         }

@@ -951,10 +951,17 @@ impl Coordinator {
         }
 
         // Checkpoint on global epoch boundaries (1-based for file naming).
+        // Threaded DDP sends only to rank 0's channel, so target_rank=0 is
+        // both correct semantically (rank 0 is the only recipient) and
+        // matches the v1 cluster-mode invariant (worker no-ops unless
+        // target_rank == self.rank).
         if let Some(every) = self.checkpoint_every {
             if every > 0 && (epoch + 1) % every == 0 {
                 if let Some(tx) = self.control_txs.first() {
-                    let _ = tx.send(ControlMsg::Checkpoint { version: (epoch + 1) as u64 });
+                    let _ = tx.send(ControlMsg::Checkpoint {
+                        version: (epoch + 1) as u64,
+                        target_rank: 0,
+                    });
                 }
             }
         }
@@ -1078,6 +1085,19 @@ impl Coordinator {
             TimingMsg::SnapshotReady { .. } => {}
             TimingMsg::NewNcclIdGenerated { .. } => {}
             TimingMsg::EvalResult { .. } => {}
+            // Threaded DDP does not retry checkpoints (single-process,
+            // shared address space, no failure-on-write expected
+            // beyond what `eprintln!` already surfaces). Cluster mode
+            // owns the retry policy; the threaded path drops the
+            // frame intentionally.
+            TimingMsg::CheckpointResult { rank: _, version, elapsed_ms: _, error } => {
+                if let Some(e) = error {
+                    eprintln!(
+                        "ddp (threaded): checkpoint v{version} reported \
+                         failure: {e}"
+                    );
+                }
+            }
         }
     }
 

@@ -27,7 +27,7 @@ fn test_control_msg_variants() {
     let _start = ControlMsg::StartEpoch(EpochPlan {
         epoch: 0, partition_offset: 0, partition_size: 1000,
     });
-    let _ckpt = ControlMsg::Checkpoint { version: 42 };
+    let _ckpt = ControlMsg::Checkpoint { version: 42, target_rank: 0 };
     let _shutdown = ControlMsg::Shutdown;
     let _update = ControlMsg::Update(AveragedParams {
         params: vec![],
@@ -1821,7 +1821,7 @@ fn test_checkpoint_fn_called_on_dispatch() {
         Ok(())
     }));
 
-    ch.control_tx.send(ControlMsg::Checkpoint { version: 7 }).unwrap();
+    ch.control_tx.send(ControlMsg::Checkpoint { version: 7, target_rank: 0 }).unwrap();
     worker.handle_control().unwrap();
 
     assert_eq!(called_version.load(Ordering::Relaxed), 7);
@@ -1834,7 +1834,7 @@ fn test_checkpoint_error_logged_not_propagated() {
         Err(TensorError::new("disk full"))
     }));
 
-    ch.control_tx.send(ControlMsg::Checkpoint { version: 1 }).unwrap();
+    ch.control_tx.send(ControlMsg::Checkpoint { version: 1, target_rank: 0 }).unwrap();
     // Should not return an error: log-and-continue
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
@@ -2133,7 +2133,7 @@ fn test_coordinator_sends_checkpoint_every_n_epochs() {
     let mut checkpoint_versions = Vec::new();
     for rx in &control_rxs {
         while let Ok(msg) = rx.try_recv() {
-            if let ControlMsg::Checkpoint { version } = msg {
+            if let ControlMsg::Checkpoint { version, .. } = msg {
                 checkpoint_versions.push(version);
             }
         }
@@ -3208,7 +3208,7 @@ fn test_drain_until_shutdown_handles_interleaved_messages() {
     let (mut worker, ch) = make_test_worker();
 
     ch.control_tx.send(ControlMsg::SyncNow).unwrap();
-    ch.control_tx.send(ControlMsg::Checkpoint { version: 99 }).unwrap();
+    ch.control_tx.send(ControlMsg::Checkpoint { version: 99, target_rank: 0 }).unwrap();
     ch.control_tx.send(ControlMsg::StartEpoch(EpochPlan {
         epoch: 5, partition_offset: 0, partition_size: 100,
     })).unwrap();

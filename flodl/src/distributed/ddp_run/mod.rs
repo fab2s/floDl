@@ -1020,6 +1020,17 @@ pub enum TimingMsg {
         metric: f64,
         error: Option<String>,
     },
+    /// Checkpoint result from the role rank back to the coord. See
+    /// [`crate::distributed::wire::TimingMsgWire::CheckpointResult`].
+    /// Reported on success and failure; the coord decides the next
+    /// action (retry on different live rank, give up + exhaust, time
+    /// exclusion from `wall_ms_accum`).
+    CheckpointResult {
+        rank: usize,
+        version: u64,
+        elapsed_ms: f64,
+        error: Option<String>,
+    },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
@@ -1180,10 +1191,26 @@ pub enum ControlMsg {
     /// sync point. Workers use this to compute per-batch LR:
     /// `scheduler.lr(global_step + steps_since_avg)`.
     SetGlobalStep(usize),
-    /// Save a checkpoint from rank 0 after averaging.
+    /// Coord-emitted directive to persist a checkpoint bundle for the
+    /// given `version`. Targeted: only the rank whose `rank ==
+    /// target_rank` runs its `checkpoint_fn`; other ranks receiving
+    /// this frame silently no-op. The coord owns role assignment
+    /// (sticky `checkpoint_role` with failover on rank death or
+    /// `CheckpointResult.error`); the worker never decides whether
+    /// it is the checkpointer.
+    ///
+    /// Mirrors [`crate::distributed::wire::ControlMsgWire::Checkpoint`].
+    /// In threaded DDP, the coord still broadcasts to every worker's
+    /// mpsc channel (same as before) — the `target_rank` field tells
+    /// each worker to no-op unless it matches its own rank, preserving
+    /// the single-checkpointer semantic without per-worker dispatch.
     Checkpoint {
-        /// Version number (averaging event count in multi-GPU, epoch in single-GPU).
+        /// Version (averaging event count in multi-GPU, epoch in single-GPU).
         version: u64,
+        /// Rank that should execute `checkpoint_fn`. `usize::MAX` is
+        /// reserved for v2 controller-as-checkpointer (CPU-async
+        /// mode); the worker treats it as "not me" and no-ops.
+        target_rank: usize,
     },
     /// Run the user's [`EvalFn`] on the rank's current model + eval
     /// dataset. Handled only by the rank chosen via

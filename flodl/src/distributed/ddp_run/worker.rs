@@ -2067,12 +2067,34 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::SetGlobalStep(step) => {
                 self.global_step = step;
             }
-            ControlMsg::Checkpoint { version } => {
-                if let Some(ref f) = self.checkpoint_fn {
-                    if let Err(e) = f(version, &self.model) {
-                        eprintln!("  ddp: checkpoint failed (v{version}): {e}");
-                    }
+            ControlMsg::Checkpoint { version, target_rank } => {
+                // Targeted: only the rank named by the coord runs.
+                // Other ranks silently ignore the frame (in cluster
+                // mode the broadcast is already targeted by the
+                // coord; in threaded DDP the coord sends only to
+                // rank 0's channel — both paths converge on
+                // `target_rank == self.rank` being the only run gate).
+                // Worker never decides retry / abort — it reports
+                // and lets the coord decide (see `#29` design).
+                if target_rank != self.rank {
+                    return Ok(false);
                 }
+                let start = std::time::Instant::now();
+                let err = match self.checkpoint_fn.as_ref() {
+                    Some(f) => f(version, &self.model).err().map(|e| e.to_string()),
+                    None => Some(format!(
+                        "checkpoint dispatched to rank {} but checkpoint_fn \
+                         is None (config bug or stale role assignment)",
+                        self.rank
+                    )),
+                };
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let _ = self.timing_tx.send(TimingMsg::CheckpointResult {
+                    rank: self.rank,
+                    version,
+                    elapsed_ms,
+                    error: err,
+                });
             }
             ControlMsg::ExecuteEvalCallback { schedule_id, epoch } => {
                 // Fire only on the rank chosen by
