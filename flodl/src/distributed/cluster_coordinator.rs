@@ -2673,6 +2673,25 @@ impl ClusterCoordinator {
                     );
                 }
             }
+            // Broadcast the aggregated view back to every rank so the
+            // user-owned `Trainer::setup` training loop's
+            // `monitor.log(&model)` sees the cross-rank picture
+            // (global scalars + per-rank GPU tabs). The
+            // `Trainer::builder` path already had this via the sink
+            // tx; this broadcast gives the same UX to setup-mode
+            // users in process-per-rank cluster runs. Broadcast
+            // failures are non-fatal — a rank's stream may have
+            // already closed during shutdown; surface as verbose.
+            let wire_metrics: crate::distributed::wire::EpochMetricsWire =
+                metrics.clone().into();
+            if let Err(e) = self.broadcast_control(
+                &ControlMsgWire::EpochAggregated(wire_metrics),
+            ) {
+                crate::verbose!(
+                    "  ddp: EpochAggregated broadcast (epoch {epoch_key}) failed: {}",
+                    e,
+                );
+            }
             if let Some(ref tx) = self.metrics_sink_tx {
                 // Sink receiver dropped is benign — handle was
                 // dropped before training finished. Don't surface

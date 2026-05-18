@@ -156,6 +156,19 @@ pub struct Graph {
     // the caller (e.g. `flodl-hf`'s `AutoModel::from_pretrained` sets
     // this to the HF `config.json` it loaded).
     pub(crate) source_config: RefCell<Option<String>>,
+    // Shared slot for the most recent coord-broadcast
+    // [`crate::distributed::EpochMetrics`]. Writers live on the
+    // cluster-worker bridge thread (`dispatch_control` for
+    // `ControlMsg::EpochAggregated`); readers live on the user's
+    // main training-loop thread (`latest_metrics`,
+    // `aggregated_gpu_tabs`). `Arc<Mutex<...>>` so writes from one
+    // thread are visible to reads on another. Empty until the coord
+    // pushes the first aggregated view (single-GPU runs that never
+    // hit the coord-side aggregation keep this `None` forever and
+    // fall back to local epoch_history).
+    pub(crate) aggregated_metrics: std::sync::Arc<
+        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+    >,
 }
 
 /// Binding between a `DataLoader` and a [`Graph`] for integrated training.
@@ -432,6 +445,7 @@ impl Graph {
             loss_fn: RefCell::new(None),
             traces_validated: Cell::new(false),
             source_config: RefCell::new(None),
+            aggregated_metrics: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
 
         if verbose {
@@ -1079,6 +1093,19 @@ impl Module for Graph {
     fn name(&self) -> &str { "graph" }
 
     fn as_graph(&self) -> Option<&Graph> { Some(self) }
+
+    /// Expose Graph's shared aggregated-metrics slot to the cluster-
+    /// rank worker setup. The worker stores an `Arc` clone of THIS
+    /// slot so its bridge-thread writes for `ControlMsg::EpochAggregated`
+    /// become visible to the user's main-thread reads through
+    /// [`Graph::latest_metrics`] / [`Graph::aggregated_gpu_tabs`].
+    fn aggregated_metrics_slot(
+        &self,
+    ) -> Option<std::sync::Arc<
+        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+    >> {
+        Some(std::sync::Arc::clone(&self.aggregated_metrics))
+    }
 
     fn structural_hash(&self) -> Option<String> {
         Some(self.structural_hash().to_string())

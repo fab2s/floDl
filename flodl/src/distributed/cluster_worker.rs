@@ -256,6 +256,9 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
                 .unwrap_or(crate::distributed::checkpoint_meta::SaveReason::GracefulShutdown);
             Ok(Some(ControlMsg::ShutdownWithSave { reason }))
         }
+        ControlMsgWire::EpochAggregated(metrics_wire) => {
+            Ok(Some(ControlMsg::EpochAggregated(metrics_wire.into())))
+        }
     }
 }
 

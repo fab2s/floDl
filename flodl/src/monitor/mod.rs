@@ -70,10 +70,21 @@ pub struct EpochRecord {
 /// This lets `log` accept plain `&[("loss", val)]` slices, a `&Graph` reference
 /// (which pulls the latest observation epoch), or a `(&Graph, &[...])` tuple
 /// that appends extra metrics to the graph's own.
+///
+/// For multi-GPU / cluster training, log against
+/// [`crate::distributed::EpochMetrics`] — that impl carries the
+/// per-rank view aggregated by the coordinator and surfaces it
+/// through [`Self::gpu_metrics`]. Graph-backed sources are
+/// single-device by construction so their `gpu_metrics` returns
+/// empty.
 pub trait Metrics {
     /// Convert into owned `(name, value)` pairs for recording.
     fn into_metrics(self) -> Vec<(String, f64)>;
-    /// Per-GPU DDP metrics. Default: empty (single-GPU or non-graph sources).
+    /// Per-rank [`GpuMetrics`] for cluster / multi-GPU training.
+    /// Default: empty. The `&EpochMetrics` impl populates this from
+    /// the coordinator's aggregated per-rank view; Graph-backed
+    /// sources stay empty because a Graph reference only ever names
+    /// a single device.
     fn gpu_metrics(&self) -> Vec<GpuMetrics> { Vec::new() }
 }
 
@@ -91,13 +102,24 @@ impl<const N: usize> Metrics for &[(&str, f64); N] {
     }
 }
 
-/// Build per-GPU DDP metrics from a Graph.
-///
-/// In process-per-rank cluster mode, each process only sees its own rank;
-/// per-rank telemetry surfacing across ranks needs the cross-process
-/// observability protocol (deferred). Returns empty for now.
-fn graph_gpu_metrics(_graph: &Graph) -> Vec<GpuMetrics> {
-    Vec::new()
+/// Per-GPU metrics surfaced from a `&Graph` source. In cluster mode
+/// the framework populates the graph's aggregated-metrics slot via a
+/// coord broadcast (see
+/// [`crate::distributed::wire::ControlMsgWire::EpochAggregated`]);
+/// this function reads that slot to produce the per-GPU tabs the
+/// dashboard renders. Returns empty in single-GPU runs (no per-rank
+/// dimension) and pre-first-aggregation cluster runs.
+fn graph_gpu_metrics(graph: &Graph) -> Vec<GpuMetrics> {
+    graph
+        .aggregated_gpu_tabs()
+        .into_iter()
+        .map(|(device_index, throughput, chunk_ratio)| GpuMetrics {
+            device_index,
+            throughput,
+            chunk_ratio,
+            shard_size: 0,
+        })
+        .collect()
 }
 
 /// Graph only: `&model` -- reads latest epoch history.
@@ -182,11 +204,32 @@ pub struct Monitor {
     graph_label: Option<String>,
     graph_hash: Option<String>,
     hardware: String,
+    /// `true` when this rank should serve the dashboard + persist
+    /// log entries (single-GPU runs, cluster rank 0). `false` on
+    /// non-primary cluster ranks — their `serve`, `log`, and
+    /// `save_html` calls no-op so the user can keep one `Monitor`
+    /// construction at the top of their training loop, running the
+    /// same code on every rank, and get exactly one dashboard
+    /// rendering the global cross-rank view (via the user's
+    /// `Graph::latest_metrics()` reading from the coord-broadcast
+    /// aggregated slot — see
+    /// [`crate::distributed::wire::ControlMsgWire::EpochAggregated`]).
+    is_primary: bool,
 }
 
 impl Monitor {
     /// Create a new monitor for `total_epochs` epochs.
+    ///
+    /// In cluster mode (process-per-rank), only rank 0 fully
+    /// activates the monitor (dashboard server, epoch records, HTML
+    /// export); other ranks construct a no-op monitor so the
+    /// user-facing training-loop code stays identical across single-
+    /// GPU and cluster runs. The user calls `Monitor::new` /
+    /// `monitor.serve` / `monitor.log` exactly once, and the
+    /// framework routes the visible side effects to the primary
+    /// rank only.
     pub fn new(total_epochs: usize) -> Self {
+        let is_primary = Self::detect_is_primary();
         Self {
             total_epochs,
             epochs: Vec::with_capacity(total_epochs),
@@ -199,7 +242,31 @@ impl Monitor {
             graph_label: None,
             graph_hash: None,
             hardware: crate::tensor::hardware_summary(),
+            is_primary,
         }
+    }
+
+    /// Detect whether this process is the dashboard-serving rank.
+    /// Returns `true` for single-GPU / non-cluster runs (no rank
+    /// envelope in env) and for cluster rank 0; `false` for other
+    /// cluster ranks.
+    fn detect_is_primary() -> bool {
+        // `LocalCluster::from_env` is the same env probe the rest of
+        // the framework uses to detect cluster-rank mode. Errors and
+        // missing env both surface as "not in cluster" → primary.
+        match crate::distributed::LocalCluster::from_env() {
+            Ok(Some(cluster)) => match cluster.my_rank() {
+                Ok((rank, _)) => rank == 0,
+                Err(_) => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// `true` when this monitor will serve the dashboard / persist
+    /// records. Test-friendly accessor.
+    pub fn is_primary(&self) -> bool {
+        self.is_primary
     }
 
     /// Start a live dashboard HTTP server on the given port.
@@ -207,6 +274,13 @@ impl Monitor {
     /// The dashboard is accessible at `http://localhost:{port}` and updates
     /// in real time as training progresses.
     pub fn serve(&mut self, port: u16) -> std::io::Result<()> {
+        if !self.is_primary {
+            // Non-primary cluster ranks skip the bind: only one
+            // dashboard per cluster (rank 0). Returning Ok keeps the
+            // user's `monitor.serve(3000)?` line working identically
+            // across single-GPU and cluster runs.
+            return Ok(());
+        }
         let srv = server::DashboardServer::start(port)?;
         crate::msg!("  dashboard: http://localhost:{}", port);
         srv.set_hardware(self.hardware.clone());
@@ -372,6 +446,15 @@ impl Monitor {
     /// history is up to date. `log` does **not** flush — this keeps
     /// observation and monitoring decoupled.
     pub fn log(&mut self, epoch: usize, duration: Duration, metrics: impl Metrics) {
+        if !self.is_primary {
+            // Non-primary cluster ranks no-op so user code stays
+            // identical: only rank 0 records / prints / pushes to
+            // the dashboard. The aggregated view this `log` would
+            // surface is identical across ranks anyway (the coord's
+            // broadcast lands on every rank), so dropping non-primary
+            // calls loses no information.
+            return;
+        }
         let gpu_metrics = metrics.gpu_metrics();
         let metrics = metrics.into_metrics();
         let duration_secs = duration.as_secs_f64();
@@ -473,6 +556,12 @@ impl Monitor {
     }
 
     fn finish_inner(&mut self) {
+        if !self.is_primary {
+            // Non-primary cluster ranks have no records / no server /
+            // no HTML to write. Skip the summary print + export so
+            // user-level `monitor.finish()` is a clean no-op there.
+            return;
+        }
         let total_time = self.start_time.elapsed().as_secs_f64();
         let mut line = format!("  training complete in {}", format_eta(total_time));
 

@@ -432,8 +432,13 @@ pub struct EpochPlanWire {
 /// carries only a version stamp; the matching tensors travel via the
 /// data channel.
 ///
+/// Note: `PartialEq` only (not `Eq`) because the `EpochAggregated`
+/// variant carries float fields via [`EpochMetricsWire`]. All test
+/// asserts use `assert_eq!` / `assert_ne!` / `matches!` which need
+/// only `PartialEq`.
+///
 /// [`ddp_run::ControlMsg`]: crate::distributed::ddp_run::ControlMsg
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsgWire {
     /// CPU path: ask the worker to send its current ParamSnapshot.
     RequestParams,
@@ -537,6 +542,20 @@ pub enum ControlMsgWire {
     /// treated as [`crate::distributed::SaveReason::GracefulShutdown`]
     /// by the receiver (forward-compatible fallback).
     ShutdownWithSave { reason: u8 },
+    /// Aggregated per-epoch metrics broadcast from coord to every
+    /// rank after `drain_metrics_and_aggregate` has built an
+    /// [`EpochMetricsWire`] from all alive ranks' per-rank reports.
+    ///
+    /// Lets each rank's local `Graph` surface the GLOBAL aggregated
+    /// view (user-defined scalars + per-rank GPU tabs) under
+    /// `latest_metrics()` / `graph_gpu_metrics()`. The framework-
+    /// managed `Trainer::builder` path already had this view via
+    /// `DdpHandle::next_metrics()`; this broadcast gives the same
+    /// view to the user-owned `Trainer::setup` training loop in
+    /// process-per-rank cluster mode. User code stays identical:
+    /// `monitor.log(epoch, dur, &model)` sees the aggregated view
+    /// regardless of single-GPU / local-multi-GPU / cluster.
+    EpochAggregated(EpochMetricsWire),
 }
 
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain
@@ -630,6 +649,35 @@ pub struct MetricsMsgWire {
     pub compute_only_ms: f64,
     pub data_starve_ms: f64,
     pub scalars: HashMap<String, (f64, u64)>,
+}
+
+/// Wire-side mirror of [`ddp_run::EpochMetrics`]. Carries the
+/// aggregated cross-rank view the coord builds in
+/// [`ClusterCoordinator::drain_metrics_and_aggregate`] back to every
+/// rank via [`ControlMsgWire::EpochAggregated`], so each rank's
+/// `Graph` can surface the global metric view + per-rank GPU tabs to
+/// user code without the user needing to think about ranks.
+///
+/// Field shapes mirror [`crate::distributed::ddp_run::EpochMetrics`]
+/// exactly; `usize` widens to `u64` on the wire for stability across
+/// 32/64-bit hosts.
+///
+/// [`ddp_run::EpochMetrics`]: crate::distributed::ddp_run::EpochMetrics
+/// [`ClusterCoordinator::drain_metrics_and_aggregate`]:
+///     crate::distributed::cluster_coordinator::ClusterCoordinator
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct EpochMetricsWire {
+    pub epoch: u64,
+    pub scalars: HashMap<String, f64>,
+    pub per_rank: Vec<HashMap<String, f64>>,
+    pub avg_loss: f64,
+    pub epoch_ms: f64,
+    pub per_rank_throughput: Vec<f64>,
+    pub per_rank_batch_share: Vec<f64>,
+    pub per_rank_share_complete_ms: Vec<f64>,
+    pub per_rank_compute_only_ms: Vec<f64>,
+    pub per_rank_data_starve_ms: Vec<f64>,
+    pub device_indices: Vec<u8>,
 }
 
 /// Metadata header paired with a [`RoundFrame`] on the data channel when

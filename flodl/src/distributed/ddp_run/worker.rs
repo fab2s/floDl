@@ -15,7 +15,7 @@ use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use super::{
-    CheckpointFn, EvalFn, WorkerConfig, TimingMsg, MetricsMsg,
+    CheckpointFn, EpochMetrics, EvalFn, WorkerConfig, TimingMsg, MetricsMsg,
     ParamSnapshot, AveragedParams, ControlMsg, EpochPlan, make_partition,
 };
 
@@ -134,6 +134,15 @@ pub struct GpuWorker<M: Module> {
     /// When no scheduler is attached, the scaling is baked into the optimizer
     /// once at startup via [`Self::scale_lr`]. Default: 1.0 (no scaling).
     lr_scale: f64,
+    /// Most recent aggregated [`EpochMetrics`] broadcast from the coord
+    /// (via [`crate::distributed::wire::ControlMsgWire::EpochAggregated`]).
+    /// Shared with the user's `Graph` (when running setup-mode training)
+    /// so `Graph::latest_metrics()` and `graph_gpu_metrics()` surface
+    /// the global cross-rank view to user code without the user needing
+    /// to think about ranks. `None` until the first aggregation lands
+    /// (cold-start, single-GPU runs that never trigger coord-side
+    /// aggregation).
+    aggregated_metrics: Arc<Mutex<Option<EpochMetrics>>>,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.
@@ -413,6 +422,14 @@ impl<M: Module> GpuWorker<M> {
             None
         };
 
+        // Adopt the model's shared aggregated-metrics slot (Graph
+        // exposes one; other Modules default to None and get a
+        // private slot). Captured BEFORE the `model` move into
+        // `GpuWorker` below so the slot lookup still has a reference
+        // to read from.
+        let aggregated_slot = model
+            .aggregated_metrics_slot()
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
         Ok(GpuWorker {
             model,
             optimizer: Box::new(optimizer),
@@ -447,6 +464,7 @@ impl<M: Module> GpuWorker<M> {
             global_step: 0,
             scheduler: None,
             lr_scale: 1.0,
+            aggregated_metrics: aggregated_slot,
             checkpoint_fn,
             eval_fn,
             eval_dataset,
@@ -2094,8 +2112,30 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
             ControlMsg::Shutdown => return Ok(true),
+            ControlMsg::EpochAggregated(metrics) => {
+                // Coord-pushed cross-rank aggregated view. Stash the
+                // latest snapshot under `aggregated_metrics` so the
+                // user's `Graph` (sharing the same Arc<Mutex<...>>
+                // via setup-mode wiring) surfaces the global view
+                // under `latest_metrics()` and `graph_gpu_metrics()`.
+                // Cluster-builder runs that drive the training loop
+                // inside the framework's closure can also reach this
+                // via `GpuWorker::aggregated_metrics()`.
+                if let Ok(mut slot) = self.aggregated_metrics.lock() {
+                    *slot = Some(metrics);
+                }
+            }
         }
         Ok(false)
+    }
+
+    /// Shared handle to the most recent aggregated [`EpochMetrics`]
+    /// broadcast from the coord. Clone this `Arc` so the user's
+    /// `Graph` (or any other reader) sees updates as they arrive
+    /// without coupling through the worker. Returns `None` inside the
+    /// mutex until the coord has aggregated at least one epoch.
+    pub fn aggregated_metrics(&self) -> Arc<Mutex<Option<EpochMetrics>>> {
+        Arc::clone(&self.aggregated_metrics)
     }
 
     /// Drain any queued `Shutdown` / `ShutdownWithSave` messages from
@@ -2284,6 +2324,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::RequestNewNcclId => "RequestNewNcclId",
                             ControlMsg::ShutdownWithSave { .. } => "ShutdownWithSave",
                             ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
+                            ControlMsg::EpochAggregated(_) => "EpochAggregated",
                         }
                     );
                     if self.dispatch_control(msg)? {

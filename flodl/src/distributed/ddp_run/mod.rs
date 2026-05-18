@@ -355,6 +355,42 @@ pub struct EpochMetrics {
     pub device_indices: Vec<u8>,
 }
 
+impl From<EpochMetrics> for crate::distributed::wire::EpochMetricsWire {
+    fn from(m: EpochMetrics) -> Self {
+        crate::distributed::wire::EpochMetricsWire {
+            epoch: m.epoch as u64,
+            scalars: m.scalars,
+            per_rank: m.per_rank,
+            avg_loss: m.avg_loss,
+            epoch_ms: m.epoch_ms,
+            per_rank_throughput: m.per_rank_throughput,
+            per_rank_batch_share: m.per_rank_batch_share,
+            per_rank_share_complete_ms: m.per_rank_share_complete_ms,
+            per_rank_compute_only_ms: m.per_rank_compute_only_ms,
+            per_rank_data_starve_ms: m.per_rank_data_starve_ms,
+            device_indices: m.device_indices,
+        }
+    }
+}
+
+impl From<crate::distributed::wire::EpochMetricsWire> for EpochMetrics {
+    fn from(w: crate::distributed::wire::EpochMetricsWire) -> Self {
+        EpochMetrics {
+            epoch: w.epoch as usize,
+            scalars: w.scalars,
+            per_rank: w.per_rank,
+            avg_loss: w.avg_loss,
+            epoch_ms: w.epoch_ms,
+            per_rank_throughput: w.per_rank_throughput,
+            per_rank_batch_share: w.per_rank_batch_share,
+            per_rank_share_complete_ms: w.per_rank_share_complete_ms,
+            per_rank_compute_only_ms: w.per_rank_compute_only_ms,
+            per_rank_data_starve_ms: w.per_rank_data_starve_ms,
+            device_indices: w.device_indices,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration enums
 // ---------------------------------------------------------------------------
@@ -1171,6 +1207,14 @@ pub enum ControlMsg {
         /// `.meta.json` for post-mortem inspection.
         reason: crate::distributed::checkpoint_meta::SaveReason,
     },
+    /// Coord-broadcast aggregated [`EpochMetrics`] for the just-completed
+    /// epoch. Each rank's worker absorbs this into its local `Graph` so
+    /// `latest_metrics()` / `graph_gpu_metrics()` surface the global
+    /// cross-rank view (user-facing UX parity: `monitor.log(&model)`
+    /// shows the same aggregated view regardless of single-GPU /
+    /// local-multi-GPU / cluster). See
+    /// [`crate::distributed::wire::ControlMsgWire::EpochAggregated`].
+    EpochAggregated(EpochMetrics),
 }
 
 // ---------------------------------------------------------------------------

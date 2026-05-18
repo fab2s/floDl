@@ -136,6 +136,25 @@ impl Graph {
     /// Use [`latest_metrics_local()`](Self::latest_metrics_local) if you
     /// only want this graph's own metrics.
     pub fn latest_metrics(&self) -> Vec<(String, f64)> {
+        // Cluster-mode short-circuit: when the framework has populated
+        // the aggregated-metrics slot (`Trainer::builder` or
+        // `Trainer::setup` via_coord paths), surface the coord's
+        // cross-rank view instead of this rank's local epoch history.
+        // User code stays identical (`monitor.log(epoch, dur, &model)`);
+        // single-GPU / standalone runs fall through to the local
+        // history below.
+        if let Ok(slot) = self.aggregated_metrics.lock() {
+            if let Some(ref m) = *slot {
+                let mut out = Vec::with_capacity(m.scalars.len() + 1);
+                out.push(("loss".to_string(), m.avg_loss));
+                let mut keys: Vec<&String> = m.scalars.keys().collect();
+                keys.sort();
+                for k in keys {
+                    out.push((k.clone(), m.scalars[k]));
+                }
+                return out;
+            }
+        }
         let mut metrics = self.latest_metrics_local();
         // Collect from labeled children with dotted prefixes
         for (label, &ni) in &self.children {
@@ -148,6 +167,33 @@ impl Graph {
             }
         }
         metrics
+    }
+
+    /// Per-rank GPU tabs from the coord-broadcast aggregated view.
+    /// Each tuple is `(device_index, throughput_samples_per_ms,
+    /// batch_share_fraction)` — matches the fields the dashboard's
+    /// per-GPU tabs already consume via
+    /// [`crate::monitor::GpuMetrics`]. Empty when the framework
+    /// hasn't populated the slot yet (single-GPU runs, pre-first-
+    /// aggregation cluster mode).
+    pub fn aggregated_gpu_tabs(&self) -> Vec<(u8, f64, f64)> {
+        let Ok(slot) = self.aggregated_metrics.lock() else {
+            return Vec::new();
+        };
+        let Some(ref m) = *slot else {
+            return Vec::new();
+        };
+        m.device_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &dev)| {
+                (
+                    dev,
+                    m.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                    m.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
     }
 
     /// Return latest epoch values for this graph only, without child metrics.
