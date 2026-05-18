@@ -86,6 +86,11 @@ pub mod dispatch;
 /// Hardware and compatibility diagnostics (`fdl diagnose`).
 pub mod diagnose;
 
+/// Cluster readiness probe (`fdl probe`): GPU + libtorch arch +
+/// shared-data path + NCCL discovery. Pre-training gate; the
+/// foundation for `fdl deploy` and the transparent launcher dispatch.
+pub mod probe;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

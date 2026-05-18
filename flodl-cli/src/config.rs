@@ -634,6 +634,28 @@ pub struct ClusterHost {
     /// schema extension; today this is a single string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
+    /// Shared-storage path visible to this host. flodl assumes a
+    /// shared filesystem (NAS / SMB / virtiofs / S3-FUSE / SSHFS)
+    /// reachable at the same logical path on every node — training
+    /// data, model checkpoints, and per-rank logs all live here. When
+    /// absent, the convention default [`DEFAULT_DATA_PATH`] applies.
+    /// `fdl probe` verifies the path exists + is readable on each
+    /// host before training can fan out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_path: Option<String>,
+}
+
+/// Convention default for [`ClusterHost::data_path`] when the host
+/// does not declare one. Maps to the cross-node mount that holds
+/// training data + checkpoints + per-rank logs.
+pub const DEFAULT_DATA_PATH: &str = "/flodl/data";
+
+impl ClusterHost {
+    /// Effective shared-data path: `data_path` if set, else
+    /// [`DEFAULT_DATA_PATH`].
+    pub fn effective_data_path(&self) -> &str {
+        self.data_path.as_deref().unwrap_or(DEFAULT_DATA_PATH)
+    }
 }
 
 impl ClusterConfig {
@@ -760,6 +782,14 @@ impl ClusterConfig {
         if let Some(p) = &host.libtorch_path {
             host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
         }
+        // Shared-data path: always serialize the effective value
+        // (declared or convention default) so the rank-side envelope
+        // surfaces a non-ambiguous path. Library validates existence
+        // via `fdl probe` before training; ship the path verbatim.
+        host_obj.insert(
+            "data_path".into(),
+            Value::String(host.effective_data_path().into()),
+        );
 
         let mut envelope = serde_json::Map::new();
         envelope.insert(

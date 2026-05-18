@@ -37,6 +37,37 @@ pub struct DiagnoseArgs {
     pub json: bool,
 }
 
+/// Cluster readiness probe.
+///
+/// Default (single-host): probes the local box for GPU + libtorch arch
+/// match + shared-data path + NCCL availability. Cluster context
+/// (`fdl cluster probe` / `FDL_ENV=cluster`): probes every host in
+/// `fdl.cluster.yml` via SSH and aggregates the report.
+///
+/// Exit code: 0 when every checked component is green; 1 when any
+/// issue was surfaced. `fdl deploy` and CI consume the `--json` shape.
+#[derive(crate::FdlArgs, Debug)]
+pub struct ProbeArgs {
+    /// Emit machine-readable JSON.
+    #[option]
+    pub json: bool,
+    /// Skip the shared-data-mount visibility check. Useful for
+    /// single-host setups without a shared filesystem configured.
+    #[option]
+    pub skip_mount: bool,
+    /// Override the shared-data path (default: cluster.yml's
+    /// per-host `data_path:`, or the convention default
+    /// `/flodl/data` when unset).
+    #[option]
+    pub data_path: Option<std::path::PathBuf>,
+    /// Override the libtorch directory. Default walks up from cwd
+    /// for `libtorch/.active`. Use this when the libtorch install
+    /// lives outside the project tree (e.g. a separate virtiofs
+    /// share mounted at a known path on a worker node).
+    #[option]
+    pub libtorch_path: Option<std::path::PathBuf>,
+}
+
 /// Generate flodl API reference.
 #[derive(crate::FdlArgs, Debug)]
 pub struct ApiRefArgs {
@@ -287,6 +318,13 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(DiagnoseArgs::schema),
         },
         BuiltinSpec {
+            path: &["probe"],
+            description: Some(
+                "Cluster readiness probe (GPU + libtorch + data mount)",
+            ),
+            schema_fn: Some(ProbeArgs::schema),
+        },
+        BuiltinSpec {
             path: &["install"],
             description: Some("Install or update fdl globally"),
             schema_fn: Some(InstallArgs::schema),
@@ -438,7 +476,7 @@ mod tests {
         // here. Keeping the list local (rather than introspecting main.rs)
         // documents the coupling explicitly.
         let dispatched = [
-            "setup", "libtorch", "diagnose", "api-ref", "init", "add",
+            "setup", "libtorch", "diagnose", "probe", "api-ref", "init", "add",
             "install", "skill", "schema", "completions", "autocomplete",
             "config", "version",
         ];
@@ -458,9 +496,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "setup", "libtorch", "init", "add", "diagnose", "install",
-                "skill", "api-ref", "config", "schema", "completions",
-                "autocomplete",
+                "setup", "libtorch", "init", "add", "diagnose", "probe",
+                "install", "skill", "api-ref", "config", "schema",
+                "completions", "autocomplete",
             ]
         );
     }

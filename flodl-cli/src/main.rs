@@ -8,12 +8,12 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, context, diagnose, dispatch,
-    gpus, init, libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill,
-    style, update_check, util,
+    gpus, init, libtorch, overlay, parse_or_schema_from, probe, run, schema, schema_cache, setup,
+    skill, style, update_check, util,
 };
 
 use builtins::{
-    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, LibtorchActivateArgs,
+    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, LibtorchActivateArgs, ProbeArgs,
     LibtorchBuildArgs, LibtorchDownloadArgs, LibtorchListArgs, LibtorchRemoveArgs, SchemaClearArgs,
     SchemaListArgs, SchemaRefreshArgs, SetupArgs, SkillInstallArgs,
 };
@@ -158,6 +158,16 @@ fn main() -> ExitCode {
             let cli: DiagnoseArgs = parse_sub("fdl diagnose", &args[1..]);
             diagnose::run(cli.json);
             ExitCode::SUCCESS
+        }
+        "probe" => {
+            let cli: ProbeArgs = parse_sub("fdl probe", &args[1..]);
+            let code = probe::run(
+                cli.json,
+                cli.skip_mount,
+                cli.data_path,
+                cli.libtorch_path,
+            );
+            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "api-ref" => {
             let cli: ApiRefArgs = parse_sub("fdl api-ref", &args[1..]);
