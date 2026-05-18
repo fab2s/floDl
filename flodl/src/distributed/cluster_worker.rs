@@ -2199,21 +2199,46 @@ mod tests {
 
         // 6. Dispatch the only epoch + drive ticks until at least one
         //    averaging cycle fires. Bound the wall budget so a buggy
-        //    coord doesn't hang the suite — 30s matches the NCCL
-        //    smokes' budget (the test isn't a timing assertion, only
-        //    a coord-progress probe; the 10s budget flaked under
-        //    full-suite parallel CPU load).
+        //    coord doesn't hang the suite. The test runs in ~1s in
+        //    isolation; under heavy parallel CPU contention (full
+        //    `fdl test` suite, ~1400 tests in flight) the libtorch
+        //    forward/backward + CpuReduceClient round-trip can stretch
+        //    well past the NCCL smokes' 30s budget. Pick 60s with
+        //    explicit cleanup below so a hit still terminates the test
+        //    process promptly instead of leaving orphan worker
+        //    threads.
         coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
         let start = Instant::now();
-        while coord.avg_count() == 0 {
-            if start.elapsed() > Duration::from_secs(30) {
-                panic!(
-                    "end_to_end_sync_cpu_smoke: avg_count never advanced \
-                     (no averaging cycle observed within 30s)"
-                );
+        let timed_out = loop {
+            if coord.avg_count() > 0 {
+                break false;
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                break true;
             }
             coord.tick().expect("tick");
             thread::sleep(Duration::from_millis(10));
+        };
+        if timed_out {
+            // Workers are blocked inside `wait_for_epoch_plan` on the
+            // inbound bridge's mpsc — without an explicit Shutdown
+            // broadcast they idle forever, and the panic below would
+            // leave orphan threads + bridge sockets around, hanging
+            // the test harness for a further heartbeat-timeout window
+            // (and racking up cargo's "test has been running for over
+            // 60 seconds" warning unnecessarily). Wake them, join
+            // them, then panic so the failure surfaces immediately.
+            coord.shutdown_workers().ok();
+            coord.shutdown().ok();
+            for h in worker_handles {
+                let _ = h.join();
+            }
+            controller.shutdown().ok();
+            panic!(
+                "end_to_end_sync_cpu_smoke: avg_count never advanced \
+                 (no averaging cycle observed within 60s — likely \
+                 parallel-load CPU starvation, see test comment)"
+            );
         }
         assert!(coord.avg_count() >= 1, "at least one averaging cycle");
 

@@ -804,10 +804,32 @@ pub struct ClusterCoordinator {
     /// rank's contribution. Use this as a *cycle latency* indicator
     /// only — do NOT feed it into ElChe or partition-balancing logic
     /// as a per-rank throughput proxy. Honest per-rank capacity
-    /// instead comes from `wall_ms_accum` / `steps_since_avg` (already
-    /// excludes the barrier wait) and a planned per-rank
-    /// upload-completion marker on the data channel.
+    /// comes from `wall_ms_accum` / `steps_since_avg` (already excludes
+    /// the barrier wait) and [`Self::last_observed_upload_ms`] (the
+    /// pre-barrier snapshot+upload marker).
     last_observed_sync_lag_ms: Vec<Option<f64>>,
+
+    /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
+    /// rank's [`crate::distributed::wire::TimingMsgWire::SnapshotReady`]
+    /// arrival — captured by the SnapshotReady handler in
+    /// [`Self::process_timing_msg`].
+    ///
+    /// Honest per-rank capacity signal: the rank emits SnapshotReady
+    /// AFTER snapshot+upload but BEFORE entering the AllReduce barrier
+    /// (see the param bridge in `cluster_worker.rs`), so this lag is
+    /// not contaminated by the slowest-rank barrier wait that pollutes
+    /// `last_observed_sync_lag_ms`.
+    ///
+    /// Cleared (per-rank slot reset to `None`) at the start of every
+    /// new cycle by [`Self::trigger_averaging`] so the values reflect
+    /// the in-flight cycle only. `None` means the rank never reported
+    /// SnapshotReady this cycle (NCCL backend — there's no
+    /// snapshot+upload step — or a dead rank that exited mid-cycle).
+    ///
+    /// Currently exposed via [`Self::last_observed_upload_ms`] for
+    /// telemetry + planned ElChe consumption; the rebalancer is not
+    /// yet wired to read this.
+    last_observed_upload_ms: Vec<Option<f64>>,
 
     /// Checkpoint bundle stem for the controller-side `.meta.json`
     /// write on `ShutdownWithSave`. Mirrors
@@ -1142,6 +1164,7 @@ impl ClusterCoordinator {
             checkpoint_every: config.checkpoint_every,
             shutdown_with_save_dispatched: false,
             last_observed_sync_lag_ms: vec![None; world_size],
+            last_observed_upload_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             epoch_plan_cache: std::collections::HashMap::new(),
@@ -1295,6 +1318,23 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn last_observed_sync_lag_ms_for_test(&self) -> &[Option<f64>] {
         &self.last_observed_sync_lag_ms
+    }
+
+    /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
+    /// rank's
+    /// [`crate::distributed::wire::TimingMsgWire::SnapshotReady`].
+    /// Honest per-rank capacity signal — measured BEFORE the AllReduce
+    /// barrier so it's clean of slowest-rank contamination (unlike
+    /// the internal `last_observed_sync_lag_ms` field which records
+    /// the post-barrier round-trip). Suitable as a per-rank
+    /// upload-throughput proxy for ElChe's partition rebalancer.
+    ///
+    /// `None` for ranks that haven't reported SnapshotReady this cycle
+    /// (NCCL backend has no SnapshotReady, dead ranks, or
+    /// late-arriving stragglers). Reset at the start of every
+    /// averaging cycle.
+    pub fn last_observed_upload_ms(&self) -> &[Option<f64>] {
+        &self.last_observed_upload_ms
     }
 
     /// Feed an averaging-cycle observation to the LR-aware meta-controller
@@ -1465,15 +1505,29 @@ impl ClusterCoordinator {
                 // further to do per-frame. `check_dead_ranks` reads
                 // last_heartbeat each tick.
             }
-            TimingMsgWire::SnapshotReady { .. } => {
-                // Pure operational telemetry for now: marks the end of
-                // per-rank snapshot+upload (honest per-rank capacity
-                // signal, NOT polluted by the AllReduce barrier wait
-                // that follows). A future enhancement will feed this
-                // into ElChe's partition rebalancer when we add a
-                // per-rank upload-throughput estimator separate from
-                // `wall_ms_accum`. Today the wire path is in place
-                // and liveness is refreshed above.
+            TimingMsgWire::SnapshotReady { rank } => {
+                // Capture honest per-rank upload latency: T(now) -
+                // T(RequestParams broadcast). The rank emitted this
+                // BEFORE entering the AllReduce barrier (see param
+                // bridge in cluster_worker.rs), so the measurement is
+                // clean of slowest-rank barrier contamination — the
+                // exact "honest per-rank capacity" signal flagged on
+                // `last_observed_sync_lag_ms` as "planned upload-
+                // completion marker".
+                //
+                // `nccl_sync_start` is the broadcast anchor; if the
+                // cycle has already finalized (all SyncAcks in,
+                // `capture_nccl_sync_elapsed_if_complete` took the
+                // anchor), this frame is a late-arriving stragger
+                // and we drop it — `last_observed_upload_ms[rank]`
+                // keeps the prior value or None.
+                let rank = rank as usize;
+                if rank < self.last_observed_upload_ms.len() {
+                    if let Some(start) = self.nccl_sync_start {
+                        self.last_observed_upload_ms[rank] =
+                            Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
             }
             TimingMsgWire::NewNcclIdGenerated { rank, uid_bytes } => {
                 let rank = rank as usize;
@@ -1683,6 +1737,14 @@ impl ClusterCoordinator {
                 for rank in 0..self.world_size {
                     self.nccl_sync_step[rank] = self.last_step_count[rank];
                     self.nccl_ack[rank] = false;
+                }
+                // Reset per-rank upload markers so the new cycle's
+                // measurements aren't read against a stale prior cycle.
+                // NCCL path skips this — there's no SnapshotReady on
+                // the in-place collective so the slots stay None
+                // throughout.
+                for slot in &mut self.last_observed_upload_ms {
+                    *slot = None;
                 }
                 // Defer `finish_averaging_cpu` until every rank's
                 // bridge SyncAck has populated `nccl_sync_divergence`
@@ -3802,6 +3864,178 @@ mod tests {
 
         r0.join().unwrap().expect("rank 0 sees RequestParams + Update + SetGlobalStep");
         r1.join().unwrap().expect("rank 1 sees RequestParams + Update + SetGlobalStep");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    // Upload-completion marker: SnapshotReady frames arriving between
+    // `RequestParams` broadcast and `SyncAck` populate
+    // `last_observed_upload_ms[rank]` with a strictly positive,
+    // pre-barrier lag. NCCL never emits SnapshotReady so its slots
+    // stay None (asserted by a sibling check below).
+    #[test]
+    fn snapshot_ready_populates_upload_marker_cpu_only() {
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size),
+            move |coord| {
+                let start = Instant::now();
+                while coord.avg_count() == 0 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "snapshot_ready test timed out waiting for avg_count",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let uploads = coord.last_observed_upload_ms();
+                assert_eq!(uploads.len(), world_size);
+                // Both ranks emitted SnapshotReady → both slots populated.
+                for (r, slot) in uploads.iter().enumerate() {
+                    let ms = slot
+                        .unwrap_or_else(|| panic!("rank {r} missing upload marker"));
+                    assert!(
+                        ms >= 0.0,
+                        "rank {r} upload_ms ({ms}) must be >= 0"
+                    );
+                }
+                Ok(())
+            },
+        );
+
+        // Both ranks send Batch → RequestParams arrives → emit
+        // SnapshotReady BEFORE the SyncAck (mimicking the param
+        // bridge's pre-barrier marker), then SyncAck closes the
+        // cycle.
+        fn rank_body(rank: u64) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
+            move |s, salt| {
+                send_timing(s, salt, TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                })?;
+                let _ = recv_control(s, salt)?; // RequestParams
+                // Inject a tiny delay so the captured upload_ms is
+                // strictly positive on every clock (some CI clocks
+                // return 0 for sub-microsecond elapseds).
+                thread::sleep(Duration::from_millis(2));
+                send_timing(s, salt, TimingMsgWire::SnapshotReady { rank })?;
+                send_timing(s, salt, TimingMsgWire::SyncAck {
+                    rank,
+                    step_count: 2,
+                    divergence: None,
+                    post_norm: None,
+                    pre_norm: None,
+                })?;
+                let _ = recv_control(s, salt)?; // Update
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+                Ok(())
+            }
+        }
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, rank_body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, rank_body(1));
+        r0.join().unwrap().expect("rank 0 cycle");
+        r1.join().unwrap().expect("rank 1 cycle");
+        coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    // Second-cycle invariant: upload markers reset at the start of
+    // every new cycle, so a rank that emitted SnapshotReady in cycle 1
+    // but not cycle 2 surfaces None in cycle 2 — preventing the
+    // rebalancer from reading a stale prior-cycle value as live data.
+    #[test]
+    fn snapshot_ready_resets_between_cycles() {
+        let world_size = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size),
+            move |coord| {
+                let start = Instant::now();
+                while coord.avg_count() < 2 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "reset test timed out waiting for two cycles",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // After cycle 2: rank 0 sent SnapshotReady in cycle 2,
+                // rank 1 did NOT. Cycle 1's values must NOT bleed
+                // through.
+                let uploads = coord.last_observed_upload_ms();
+                assert!(
+                    uploads[0].is_some(),
+                    "rank 0 emitted SnapshotReady in cycle 2 → slot is Some"
+                );
+                assert!(
+                    uploads[1].is_none(),
+                    "rank 1 skipped SnapshotReady in cycle 2 → slot reset to None"
+                );
+                Ok(())
+            },
+        );
+
+        // Rank 0 emits SnapshotReady on BOTH cycles.
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
+            for cycle in 0..2 {
+                send_timing(s, salt, TimingMsgWire::Batch {
+                    rank: 0,
+                    batch_ms: 10.0,
+                    step_count: (cycle + 1) as u64,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                })?;
+                let _ = recv_control(s, salt)?; // RequestParams
+                thread::sleep(Duration::from_millis(2));
+                send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 0 })?;
+                send_timing(s, salt, TimingMsgWire::SyncAck {
+                    rank: 0,
+                    step_count: ((cycle + 1) * 2) as u64,
+                    divergence: None,
+                    post_norm: None,
+                    pre_norm: None,
+                })?;
+                let _ = recv_control(s, salt)?; // Update
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+            }
+            Ok(())
+        });
+        // Rank 1 emits SnapshotReady ONLY on cycle 1.
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
+            for cycle in 0..2 {
+                send_timing(s, salt, TimingMsgWire::Batch {
+                    rank: 1,
+                    batch_ms: 12.0,
+                    step_count: (cycle + 1) as u64,
+                    param_norm: None,
+                    batch_loss: 0.4,
+                    sync_divergence: None,
+                })?;
+                let _ = recv_control(s, salt)?; // RequestParams
+                thread::sleep(Duration::from_millis(2));
+                if cycle == 0 {
+                    send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 1 })?;
+                }
+                send_timing(s, salt, TimingMsgWire::SyncAck {
+                    rank: 1,
+                    step_count: ((cycle + 1) * 2) as u64,
+                    divergence: None,
+                    post_norm: None,
+                    pre_norm: None,
+                })?;
+                let _ = recv_control(s, salt)?; // Update
+                let _ = recv_control(s, salt)?; // SetGlobalStep
+            }
+            Ok(())
+        });
+        r0.join().unwrap().expect("rank 0 two cycles");
+        r1.join().unwrap().expect("rank 1 two cycles");
         coord_handle.join().unwrap().expect("coord finishes");
     }
 
