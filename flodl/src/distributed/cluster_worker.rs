@@ -2199,14 +2199,17 @@ mod tests {
 
         // 6. Dispatch the only epoch + drive ticks until at least one
         //    averaging cycle fires. Bound the wall budget so a buggy
-        //    coord doesn't hang the suite.
+        //    coord doesn't hang the suite — 30s matches the NCCL
+        //    smokes' budget (the test isn't a timing assertion, only
+        //    a coord-progress probe; the 10s budget flaked under
+        //    full-suite parallel CPU load).
         coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
         let start = Instant::now();
         while coord.avg_count() == 0 {
-            if start.elapsed() > Duration::from_secs(10) {
+            if start.elapsed() > Duration::from_secs(30) {
                 panic!(
                     "end_to_end_sync_cpu_smoke: avg_count never advanced \
-                     (no averaging cycle observed within 10s)"
+                     (no averaging cycle observed within 30s)"
                 );
             }
             coord.tick().expect("tick");

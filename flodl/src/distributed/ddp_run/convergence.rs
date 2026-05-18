@@ -146,6 +146,21 @@ pub trait ConvergenceGuard: Send + Sync {
     /// Reset guard state (clear history / estimator). Called at mode/run
     /// boundaries. Default no-op for stateless guards.
     fn reset(&mut self) {}
+
+    /// Snapshot the guard's resume-relevant state for cluster
+    /// checkpointing. Returned by the coordinator from
+    /// `dispatch_shutdown_with_save` and written into
+    /// [`crate::distributed::ElCheState::trend_history`]; a future resume
+    /// API rebuilds the guard with this history so the first 3 cycles
+    /// after resume don't silently emit `Stable` regardless of the live
+    /// divergence trajectory (the `history.len() < 3` warm-up window).
+    ///
+    /// Default `None`: guards without persisted state (`NoGuard`,
+    /// `MsfGuard` — its EMA + streak counters re-warm from scratch).
+    /// `TrendGuard` returns its divergence ring buffer.
+    fn trend_history(&self) -> Option<Vec<f64>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +331,25 @@ impl TrendGuard {
         self
     }
 
+    /// Builder: pre-populate the divergence ring buffer.
+    ///
+    /// Used by the resume API to restore a previously-checkpointed
+    /// trajectory (see [`crate::distributed::ElCheState::trend_history`]).
+    /// Truncates the front of `history` if it exceeds the ring's
+    /// capacity (5 entries) so a longer-than-cap input gracefully keeps
+    /// the most recent observations rather than overflowing.
+    pub fn with_history<I>(mut self, history: I) -> Self
+    where
+        I: IntoIterator<Item = f64>,
+    {
+        let mut ring: VecDeque<f64> = history.into_iter().collect();
+        while ring.len() > 5 {
+            ring.pop_front();
+        }
+        self.history = ring;
+        self
+    }
+
     /// Direct access to divergence history for testing and monitoring.
     pub fn history(&self) -> &VecDeque<f64> {
         &self.history
@@ -362,6 +396,14 @@ impl ConvergenceGuard for TrendGuard {
 
     fn reset(&mut self) {
         self.history.clear();
+    }
+
+    fn trend_history(&self) -> Option<Vec<f64>> {
+        if self.history.is_empty() {
+            None
+        } else {
+            Some(self.history.iter().copied().collect())
+        }
     }
 }
 
@@ -673,6 +715,77 @@ mod tests {
         }
         g.reset();
         assert!(g.history().is_empty());
+    }
+
+    // Snapshot + restore round-trip: `trend_history` reflects the live
+    // ring, and `with_history` rehydrates an equivalent guard.
+    #[test]
+    fn trend_history_snapshot_roundtrip() {
+        let mut g = TrendGuard::new(0.01);
+        for v in [0.01, 0.02, 0.03, 0.04, 0.05] {
+            g.report(&make_report(&[v]), 8, 4);
+        }
+        let snap = g.trend_history().expect("non-empty history");
+        assert_eq!(snap, vec![0.01, 0.02, 0.03, 0.04, 0.05]);
+
+        let restored = TrendGuard::new(0.01).with_history(snap);
+        assert_eq!(g.history(), restored.history());
+    }
+
+    // The whole point of #11: resume without `with_history` means the
+    // first 3 cycles after restore can't fire SuppressGrowth (history
+    // < 3). Restoring history skips that warm-up window.
+    #[test]
+    fn trend_with_history_skips_warmup_after_restore() {
+        // Pre-rising trajectory captured before a crash.
+        let pre_crash = vec![0.02, 0.03, 0.04];
+
+        // Without restore: first observation can't fire (only 1 entry).
+        let mut cold = TrendGuard::new(0.01);
+        assert_eq!(
+            cold.report(&make_report(&[0.05]), 8, 4),
+            ConvergenceAction::Stable
+        );
+
+        // With restore: the saved history + the single new rising
+        // observation now form a 4-long ring, the last 3 of which are
+        // strictly rising and above threshold → SuppressGrowth fires
+        // immediately on the first post-resume cycle.
+        let mut warm = TrendGuard::new(0.01).with_history(pre_crash);
+        assert_eq!(
+            warm.report(&make_report(&[0.05]), 8, 4),
+            ConvergenceAction::SuppressGrowth
+        );
+    }
+
+    // Capacity guard: feeding > 5 entries truncates the front so the
+    // ring stays at its 5-element cap (most recent wins).
+    #[test]
+    fn trend_with_history_truncates_oversize_input() {
+        let oversize: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let g = TrendGuard::new(0.01).with_history(oversize);
+        assert_eq!(g.history().len(), 5);
+        // Front-truncate keeps the most recent observations.
+        let restored: Vec<f64> = g.history().iter().copied().collect();
+        assert_eq!(restored, vec![5.0, 6.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn trend_history_empty_returns_none() {
+        let g = TrendGuard::default();
+        assert!(g.trend_history().is_none());
+    }
+
+    #[test]
+    fn no_guard_trend_history_is_none() {
+        let g = NoGuard;
+        assert!(g.trend_history().is_none());
+    }
+
+    #[test]
+    fn msf_guard_trend_history_is_none() {
+        let g = MsfGuard::default();
+        assert!(g.trend_history().is_none());
     }
 
     // --- LambdaEstimator ---

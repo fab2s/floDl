@@ -34,7 +34,11 @@ use crate::tensor::{Result, TensorError};
 /// - 2: adds optional `elche_state` field for Cadence/Async resume
 ///   (anchor + per-rank EMA throughput). v1 files still parse — the field
 ///   defaults to `None` via serde's `default`.
-pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 2;
+/// - 3: adds `ElCheState.trend_history` for full-fidelity resume of
+///   [`crate::distributed::ddp_run::convergence::ConvergenceGuard`] state (currently just the
+///   `TrendGuard` divergence ring buffer; other guards return `None`).
+///   v2 files still parse — the field defaults to `None`.
+pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 3;
 
 /// ElChe trajectory snapshot for Cadence/Async resume.
 ///
@@ -76,6 +80,21 @@ pub struct ElCheState {
     /// Number of successful `report_timing` calls. Drives the
     /// phase-transition logic (Warmup → Stable → Mature) on resume.
     pub calibration_count: u64,
+    /// [`crate::distributed::ddp_run::convergence::ConvergenceGuard`] resume buffer (currently
+    /// `TrendGuard`'s divergence ring). Captured from the controller's
+    /// boxed guard via
+    /// [`crate::distributed::ddp_run::convergence::ConvergenceGuard::trend_history`] on
+    /// `ShutdownWithSave`; rebuilt via
+    /// [`crate::distributed::ddp_run::convergence::TrendGuard::with_history`] on resume so the
+    /// first 3 cycles after resume don't silently emit `Stable` while
+    /// waiting for the ring to refill (the `history.len() < 3` warm-up
+    /// window inside `TrendGuard::check_trend`).
+    ///
+    /// `None` for guards without persisted state (`NoGuard`, `MsfGuard`)
+    /// and for empty-ring snapshots (guard never observed a divergence
+    /// event). v2 files default this to `None` via serde.
+    #[serde(default)]
+    pub trend_history: Option<Vec<f64>>,
 }
 
 /// Why the cluster wrote this checkpoint.
@@ -460,6 +479,7 @@ mod tests {
             smoothed_ms_per_batch: vec![5.0, 2.5, 4.0],
             phase: crate::distributed::el_che::Phase::Stable,
             calibration_count: 42,
+            trend_history: Some(vec![0.01, 0.015, 0.02, 0.025, 0.03]),
         };
         let meta = CheckpointMeta::new(
             3,
@@ -473,6 +493,40 @@ mod tests {
 
         let loaded = CheckpointMeta::read_from_file(&path).unwrap();
         assert_eq!(loaded.elche_state, Some(state));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_file_loads_with_trend_history_defaulted_to_none() {
+        // v2 layout: `elche_state` exists but no `trend_history` inside.
+        // Schema bump to v3 added it as #[serde(default)] so v2 files
+        // still parse. Mirror of the v1→v2 forward-compat case above.
+        let dir = temp_dir("v2_forward_compat");
+        let path = dir.join("ckpt.meta.json");
+
+        let raw_json = r#"{
+            "schema_version": 2,
+            "epoch": 5,
+            "global_step": 10000,
+            "sync_round": 25,
+            "world_size_at_save": 2,
+            "save_reason": "graceful_shutdown",
+            "elche_state": {
+                "anchor": 8,
+                "anchor_rank": 0,
+                "smoothed_ms_per_batch": [3.0, 5.0],
+                "phase": "stable",
+                "calibration_count": 17
+            }
+        }"#;
+        std::fs::write(&path, raw_json).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        let elche = loaded.elche_state.expect("v2 file carries elche_state");
+        assert_eq!(elche.anchor, 8);
+        assert_eq!(elche.trend_history, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

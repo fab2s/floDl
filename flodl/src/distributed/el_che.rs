@@ -242,6 +242,11 @@ impl ElChe {
             smoothed_ms_per_batch,
             phase: self.phase,
             calibration_count: self.calibration_count,
+            // `trend_history` is convergence-guard state, not ElChe
+            // state — the coordinator populates it from
+            // `convergence_guard.trend_history()` after this call (see
+            // `ClusterCoordinator::dispatch_shutdown_with_save`).
+            trend_history: None,
         }
     }
 

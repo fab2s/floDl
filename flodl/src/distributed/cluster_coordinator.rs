@@ -1838,6 +1838,12 @@ impl ClusterCoordinator {
             // dispatched to that rank, so max is the highest epoch any
             // rank reached.
             let epoch = self.rank_epoch.iter().copied().max().unwrap_or(0);
+            // Stitch the guard's divergence ring buffer into the ElChe
+            // state snapshot. `to_state` defaults `trend_history` to
+            // None because ElChe doesn't own the guard; we own both
+            // sides here so we can finish the picture.
+            let mut elche_state = self.el_che.to_state();
+            elche_state.trend_history = self.convergence_guard.trend_history();
             let meta = crate::distributed::CheckpointMeta::new(
                 epoch,
                 self.global_step,
@@ -1845,7 +1851,7 @@ impl ClusterCoordinator {
                 self.world_size,
                 reason,
             )
-            .with_elche_state(self.el_che.to_state());
+            .with_elche_state(elche_state);
             if let Err(e) = meta.write_to_file(&meta_path) {
                 eprintln!(
                     "  ddp: controller meta write to {} failed: {e}",
