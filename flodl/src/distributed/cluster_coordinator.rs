@@ -251,6 +251,15 @@ pub struct ClusterCoordinatorConfig {
     /// the rank dead. Default 30s. Ignored when `dead_ranks` is None.
     pub heartbeat_timeout_secs: u64,
 
+    /// Wall-budget (seconds) for an in-flight NCCL re-rendezvous to
+    /// complete. Default 5s. On expiry, the coord retries from the
+    /// next survivor in the rendezvous's `survivors_ordered`
+    /// (excluding already-tried + now-dead ranks). When the candidate
+    /// pool is exhausted the fallback is `dispatch_shutdown_with_save`.
+    /// Tunable so tests can trigger the retry in well under 1s instead
+    /// of waiting the production default.
+    pub rendezvous_timeout_secs: u64,
+
     /// Global ranks running on the same host as the coordinator
     /// process (the launcher's host in production, the test
     /// process in tests). NCCL re-rendezvous prefers picking the
@@ -385,6 +394,7 @@ impl ClusterCoordinatorConfig {
             meta_controller: false,
             dead_ranks: None,
             heartbeat_timeout_secs: 30,
+            rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
             local_ranks: Vec::new(),
             max_failure: None,
             save_path: None,
@@ -546,6 +556,13 @@ impl ClusterCoordinatorConfig {
         self
     }
 
+    /// Override the NCCL re-rendezvous wall-budget. See
+    /// [`Self::rendezvous_timeout_secs`].
+    pub fn rendezvous_timeout_secs(mut self, secs: u64) -> Self {
+        self.rendezvous_timeout_secs = secs;
+        self
+    }
+
     /// Mark ranks running on the same host as the coord process.
     /// The NCCL re-rendezvous picker prefers these when picking a
     /// UID generator (local same-process latency + lower correlated
@@ -619,6 +636,18 @@ enum CpuAvgState {
     Pending,
 }
 
+/// Hard wall-budget for an in-flight NCCL re-rendezvous to complete.
+/// On expiry, [`ClusterCoordinator::check_rendezvous_timeout`] retries
+/// from the next survivor in `survivors_ordered` (excluding now-dead +
+/// already-tried generators); when the candidate pool is exhausted the
+/// coord falls back to `dispatch_shutdown_with_save`.
+///
+/// 5s sits well above any realistic `ncclGetUniqueId` + TCP round-trip
+/// (sub-second in practice) while staying well below the 30s heartbeat
+/// timeout that catches the "generator silently dies" case via a
+/// different path.
+const NCCL_RENDEZVOUS_TIMEOUT_SECS: u64 = 5;
+
 /// In-flight NCCL re-rendezvous bookkeeping. Created when the coord
 /// declares one or more dead ranks on the NCCL path; cleared when the
 /// chosen generator rank ships back a fresh `NcclUniqueId` and the
@@ -630,14 +659,21 @@ struct NcclRendezvousPending {
     /// `NewNcclIdGenerated` whose `rank` field doesn't match.
     generator_rank: usize,
     /// Survivor ranks ordered by ascending global index, captured at
-    /// initiation time. Currently unread (the broadcast helper
-    /// recomputes the alive set so additional deaths during the
-    /// rendezvous wait are reflected); kept for diagnostics and as
-    /// the seed for a future rendezvous-timeout-retry path that
-    /// would re-pick a generator from this set if the chosen one
-    /// also dies before responding.
-    #[allow(dead_code)]
+    /// initiation time. Consumed by
+    /// [`ClusterCoordinator::check_rendezvous_timeout`] when the chosen
+    /// generator dies or stops responding: the retry path picks the
+    /// next candidate from this set after filtering out dead ranks
+    /// and `tried_generators`.
     survivors_ordered: Vec<usize>,
+    /// When the current `RequestNewNcclId` went out. Refreshed every
+    /// retry. `check_rendezvous_timeout` triggers a retry when
+    /// `initiated_at.elapsed() > NCCL_RENDEZVOUS_TIMEOUT_SECS`.
+    initiated_at: Instant,
+    /// Ranks we already asked and that did NOT respond within the
+    /// timeout (or that died before responding). Excluded from the
+    /// candidate pool on subsequent retries so a single slow rank
+    /// doesn't loop.
+    tried_generators: Vec<usize>,
 }
 
 /// Process-model coordinator: ports the OLD threaded
@@ -719,6 +755,9 @@ pub struct ClusterCoordinator {
     dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
     /// Heartbeat staleness threshold copied from config.
     heartbeat_timeout_secs: u64,
+    /// NCCL re-rendezvous wall-budget copied from config. Consumed by
+    /// [`Self::check_rendezvous_timeout`].
+    rendezvous_timeout_secs: u64,
     /// Per-rank wall-clock of the last TimingMsg frame received from
     /// that rank (any TimingMsgWire variant counts as a liveness
     /// signal — Batch, SyncAck, Heartbeat, SnapshotReady, LrUpdate).
@@ -1093,6 +1132,7 @@ impl ClusterCoordinator {
             cpu_avg_state: CpuAvgState::Idle,
             dead_ranks: config.dead_ranks,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
+            rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
@@ -1177,6 +1217,52 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn shutdown_with_save_dispatched(&self) -> bool {
         self.shutdown_with_save_dispatched
+    }
+
+    /// Test-only peek at the current rendezvous-pending generator
+    /// rank. `None` when no rendezvous is in flight (steady-state OR
+    /// after exhaustion → ShutdownWithSave). Drives the retry-path
+    /// tests that need to observe generator-rank transitions across
+    /// successive ticks.
+    #[cfg(test)]
+    pub(crate) fn rendezvous_pending_generator(&self) -> Option<usize> {
+        self.nccl_rendezvous_pending
+            .as_ref()
+            .map(|p| p.generator_rank)
+    }
+
+    /// Test-only peek at the list of generators already tried in the
+    /// current rendezvous. Empty on the first attempt; grows by one
+    /// each time [`Self::check_rendezvous_timeout`] retries.
+    #[cfg(test)]
+    pub(crate) fn rendezvous_tried_generators(&self) -> Vec<usize> {
+        self.nccl_rendezvous_pending
+            .as_ref()
+            .map(|p| p.tried_generators.clone())
+            .unwrap_or_default()
+    }
+
+    /// Test-only seam: install a synthetic pending rendezvous so the
+    /// retry path can be unit-tested without a live NCCL setup.
+    /// `initiated_offset_secs` shifts `initiated_at` into the past so
+    /// `check_rendezvous_timeout` trips immediately on the next tick
+    /// without sleeping.
+    #[cfg(test)]
+    pub(crate) fn test_seed_rendezvous_pending(
+        &mut self,
+        generator_rank: usize,
+        survivors_ordered: Vec<usize>,
+        initiated_offset_secs: u64,
+    ) {
+        let initiated_at = Instant::now()
+            .checked_sub(Duration::from_secs(initiated_offset_secs))
+            .unwrap_or_else(Instant::now);
+        self.nccl_rendezvous_pending = Some(NcclRendezvousPending {
+            generator_rank,
+            survivors_ordered,
+            initiated_at,
+            tried_generators: Vec::new(),
+        });
     }
 
     pub fn max_overshoot(&self) -> usize {
@@ -1965,8 +2051,108 @@ impl ClusterCoordinator {
         self.nccl_rendezvous_pending = Some(NcclRendezvousPending {
             generator_rank,
             survivors_ordered,
+            initiated_at: Instant::now(),
+            tried_generators: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Retry an in-flight NCCL re-rendezvous when the chosen generator
+    /// has died or has not responded within
+    /// [`NCCL_RENDEZVOUS_TIMEOUT_SECS`]. Picks the next candidate from
+    /// the rendezvous's `survivors_ordered` after filtering out dead
+    /// ranks and already-tried generators. When the candidate pool is
+    /// exhausted, falls back to
+    /// [`Self::dispatch_shutdown_with_save`] so the cluster doesn't
+    /// hang forever on a dead-on-arrival generator chain.
+    ///
+    /// No-op when no rendezvous is pending, when the backend isn't
+    /// NCCL, or when the generator is still alive and inside its
+    /// timeout window.
+    fn check_rendezvous_timeout(&mut self) {
+        if !matches!(self.backend, AverageBackend::Nccl) {
+            return;
+        }
+        let timeout = Duration::from_secs(self.rendezvous_timeout_secs);
+        let Some(pending) = self.nccl_rendezvous_pending.as_ref() else {
+            return;
+        };
+        let generator_dead = self.is_dead(pending.generator_rank);
+        let timed_out = pending.initiated_at.elapsed() > timeout;
+        if !generator_dead && !timed_out {
+            return;
+        }
+
+        let previous_generator = pending.generator_rank;
+        let survivors = pending.survivors_ordered.clone();
+        let mut tried = pending.tried_generators.clone();
+        tried.push(previous_generator);
+
+        // Filter: alive AND not previously tried. Preserve
+        // `survivors_ordered`'s order (ascending global rank) so the
+        // retry sequence is deterministic.
+        let next: Option<usize> = survivors
+            .iter()
+            .copied()
+            .find(|r| !self.is_dead(*r) && !tried.contains(r));
+
+        crate::verbose!(
+            "  ddp: NCCL rendezvous retry — previous generator {} {} (elapsed={:?}); \
+             {} candidates remain",
+            previous_generator,
+            if generator_dead { "DIED" } else { "TIMED OUT" },
+            pending.initiated_at.elapsed(),
+            survivors
+                .iter()
+                .filter(|r| !self.is_dead(**r) && !tried.contains(r))
+                .count(),
+        );
+
+        match next {
+            Some(new_generator) => {
+                // Send before mutating state so a send failure leaves
+                // the previous pending entry intact for another retry
+                // on the next tick.
+                if let Err(e) = self
+                    .send_control(new_generator, &ControlMsgWire::RequestNewNcclId)
+                {
+                    crate::verbose!(
+                        "  ddp: NCCL rendezvous retry send to rank {} failed: {} \
+                         (will try again next tick)",
+                        new_generator,
+                        e,
+                    );
+                    return;
+                }
+                if let Some(pending) = self.nccl_rendezvous_pending.as_mut() {
+                    pending.generator_rank = new_generator;
+                    pending.initiated_at = Instant::now();
+                    pending.tried_generators = tried;
+                }
+            }
+            None => {
+                // Exhausted the candidate pool: every survivor at
+                // initiation time has been asked and either died or
+                // timed out. Clear the pending state and fall back to
+                // ShutdownWithSave so survivors persist state instead
+                // of hanging on an un-completable rendezvous.
+                crate::verbose!(
+                    "  ddp: NCCL rendezvous candidate pool exhausted; \
+                     dispatching ShutdownWithSave"
+                );
+                self.nccl_rendezvous_pending = None;
+                if let Some(reason) = self.unrecoverable_reason().or(Some(
+                    crate::distributed::SaveReason::SingleSurvivor,
+                )) {
+                    if let Err(e) = self.dispatch_shutdown_with_save(reason) {
+                        crate::verbose!(
+                            "  ddp: ShutdownWithSave after rendezvous exhaustion failed: {}",
+                            e,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Pick the rank that should generate the next NCCL unique-id.
@@ -2263,6 +2449,15 @@ impl ClusterCoordinator {
         // declared dead this tick won't gate the cycle's finalize.
         // No-op when elastic membership isn't configured.
         self.check_dead_ranks();
+        // Cascading-death + slow-generator guard: an in-flight NCCL
+        // rendezvous whose generator died (or stopped responding) would
+        // hang the cohort indefinitely. Retries from the next survivor
+        // candidate, or falls back to ShutdownWithSave when exhausted.
+        // Runs independently of the dead-ranks ledger so a synthetic
+        // pending state (test seam) is also exercised; production-side
+        // pending only ever comes from `initiate_nccl_rendezvous_if_needed`
+        // which already requires the ledger.
+        self.check_rendezvous_timeout();
         self.check_throttle()?;
         // CPU-backend async finalize: if a cycle's `RequestParams` was
         // broadcast in a prior tick and all bridge SyncAcks have now
@@ -4490,6 +4685,190 @@ mod tests {
             .expect("controller writes elche_state into meta");
         assert_eq!(state.anchor, 3);
         assert_eq!(state.smoothed_ms_per_batch.len(), world_size);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Rendezvous retry: the seeded generator (rank 0) is marked dead
+    // via the shared DeadRanks ledger, so `check_rendezvous_timeout`
+    // fires on the next tick and the coord retries from rank 1. Both
+    // the wire frame (rank 1 receives RequestNewNcclId) and the
+    // internal state (pending.generator_rank == 1, tried_generators ==
+    // [0]) are exercised.
+    #[test]
+    fn rendezvous_retry_picks_next_survivor_on_generator_death() {
+        let world_size = 3;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let dead_for_test = Arc::clone(&dead_ranks);
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                cfg_sync_nccl(world_size)
+                    .dead_ranks(dead_for_coord)
+                    .heartbeat_timeout_secs(60)
+                    .rendezvous_timeout_secs(60)
+            },
+            move |coord| {
+                // Seed a pending rendezvous where rank 0 was the
+                // initially-picked generator; the retry path must skip
+                // it (dead) and reach rank 1 next.
+                coord.test_seed_rendezvous_pending(0, vec![0, 1, 2], 0);
+                dead_for_test.declare_dead(0);
+                coord.tick()?; // fires check_rendezvous_timeout
+                assert_eq!(
+                    coord.rendezvous_pending_generator(),
+                    Some(1),
+                    "retry must pick rank 1 (next ascending survivor)"
+                );
+                assert_eq!(
+                    coord.rendezvous_tried_generators(),
+                    vec![0],
+                    "rank 0 recorded as tried"
+                );
+                Ok(())
+            },
+        );
+
+        // Rank 0 mimics having died — handshakes (so the coord's
+        // accept loop unblocks) then exits. Coord's send to rank 0
+        // happens at seed time, which is before this rank exits; the
+        // RETRY send (to rank 1) is what we observe.
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, move |s, salt| {
+            // Expect the retry's RequestNewNcclId from the coord.
+            let msg = recv_control(s, salt)?;
+            match msg {
+                ControlMsgWire::RequestNewNcclId => Ok(()),
+                other => Err(TensorError::new(&format!(
+                    "rank 1 expected RequestNewNcclId, got {other:?}"
+                ))),
+            }
+        });
+        let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
+
+        r0.join().unwrap().expect("rank 0 handshake");
+        r1.join().unwrap().expect("rank 1 receives RequestNewNcclId");
+        r2.join().unwrap().expect("rank 2 handshake");
+        coord_handle.join().unwrap().expect("coord drives clean");
+    }
+
+    // Slow-generator case: the seeded rendezvous's `initiated_at` is
+    // shifted into the past (10s) beyond a 1s timeout, no rank is
+    // declared dead. The retry fires on timeout alone.
+    #[test]
+    fn rendezvous_retry_fires_on_timeout_without_death() {
+        let world_size = 3;
+        let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+        let dead_for_coord = Arc::clone(&dead_ranks);
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                cfg_sync_nccl(world_size)
+                    .dead_ranks(dead_for_coord)
+                    .heartbeat_timeout_secs(60)
+                    .rendezvous_timeout_secs(1)
+            },
+            move |coord| {
+                coord.test_seed_rendezvous_pending(0, vec![0, 1, 2], 10);
+                coord.tick()?; // timeout > 1s elapsed → retry
+                assert_eq!(
+                    coord.rendezvous_pending_generator(),
+                    Some(1),
+                    "timeout retry must pick the next ascending survivor (rank 0 timed out)"
+                );
+                assert_eq!(
+                    coord.rendezvous_tried_generators(),
+                    vec![0],
+                    "rank 0 recorded as tried on timeout"
+                );
+                Ok(())
+            },
+        );
+
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, move |s, salt| {
+            let msg = recv_control(s, salt)?;
+            match msg {
+                ControlMsgWire::RequestNewNcclId => Ok(()),
+                other => Err(TensorError::new(&format!(
+                    "rank 1 expected RequestNewNcclId on timeout retry, got {other:?}"
+                ))),
+            }
+        });
+        let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
+
+        r0.join().unwrap().expect("rank 0 handshake");
+        r1.join().unwrap().expect("rank 1 receives RequestNewNcclId on timeout");
+        r2.join().unwrap().expect("rank 2 handshake");
+        coord_handle.join().unwrap().expect("coord drives clean");
+    }
+
+    // Exhaustion: the rendezvous's survivor pool is empty (manufactured
+    // via the test seam to short-circuit the cohort-filter logic), so
+    // `check_rendezvous_timeout` falls into the no-candidates branch
+    // and dispatches `ShutdownWithSave` instead of hanging the cohort
+    // on a rendezvous that can never complete. All three ranks remain
+    // alive in TCP for the broadcast to land cleanly.
+    #[test]
+    fn rendezvous_exhaustion_dispatches_shutdown_with_save() {
+        let world_size = 3;
+
+        let dir = std::env::temp_dir().join(format!(
+            "flodl_rdv_exhaust_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("ckpt").to_string_lossy().into_owned();
+
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || {
+                cfg_sync_nccl_with_dataset(world_size, 12)
+                    .heartbeat_timeout_secs(60)
+                    .rendezvous_timeout_secs(1)
+                    .save_path(stem.clone())
+            },
+            move |coord| {
+                // initiated 10s ago → timed_out=true; empty survivor
+                // pool → no next candidate → exhaustion branch fires.
+                coord.test_seed_rendezvous_pending(
+                    0,
+                    Vec::new(),
+                    10,
+                );
+                coord.tick()?;
+                assert!(
+                    coord.rendezvous_pending_generator().is_none(),
+                    "exhausted pool must clear pending"
+                );
+                assert!(
+                    coord.shutdown_with_save_dispatched(),
+                    "exhausted pool must dispatch ShutdownWithSave"
+                );
+                Ok(())
+            },
+        );
+
+        // Fake ranks must drain the ShutdownWithSave broadcast — otherwise
+        // the coord's send into a closed socket trips a broken-pipe error.
+        fn drain_shutdown(s: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| TensorError::new(&format!("timeout: {e}")))?;
+            match recv_control(s, salt)? {
+                ControlMsgWire::ShutdownWithSave { .. } => Ok(()),
+                other => Err(TensorError::new(&format!(
+                    "expected ShutdownWithSave, got {other:?}"
+                ))),
+            }
+        }
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, drain_shutdown);
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, drain_shutdown);
+        let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, drain_shutdown);
+        r0.join().unwrap().expect("rank 0 receives ShutdownWithSave");
+        r1.join().unwrap().expect("rank 1 receives ShutdownWithSave");
+        r2.join().unwrap().expect("rank 2 receives ShutdownWithSave");
+        coord_handle.join().unwrap().expect("coord drives clean");
 
         std::fs::remove_dir_all(&dir).ok();
     }
