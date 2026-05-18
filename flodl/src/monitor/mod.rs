@@ -1046,4 +1046,110 @@ mod tests {
         assert!(html.contains("meta-test"));
         assert!(html.contains("batch_size"));
     }
+
+    // -----------------------------------------------------------------
+    // is_primary cluster-detection: shares `cluster::ENV_MUTEX` with
+    // other env-mutating tests in the crate (cluster::tests touches
+    // the same vars). Uses `set_thread_local_rank_override` to avoid
+    // touching `ENV_LOCAL_RANK` from a multi-test runner.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_primary_defaults_true_when_no_cluster_env() {
+        let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        // Safety: holding the env-mutex serialises every in-crate test
+        // that touches ENV_CLUSTER_JSON; no concurrent reader can race.
+        unsafe {
+            std::env::remove_var(crate::distributed::cluster::ENV_CLUSTER_JSON);
+        }
+        let monitor = Monitor::new(1);
+        assert!(
+            monitor.is_primary(),
+            "no cluster envelope -> single-host mode -> primary",
+        );
+    }
+
+    #[test]
+    fn is_primary_true_for_cluster_rank_zero() {
+        let envelope = serde_json::json!({
+            "master_addr": "127.0.0.1",
+            "master_port": 29500,
+            "world_size": 1,
+            "num_hosts": 1,
+            "host": {
+                "name": "master",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/tmp",
+                "libtorch_path": null,
+            }
+        });
+        let hex = crate::distributed::cluster::hex_encode(
+            &serde_json::to_vec(&envelope).unwrap(),
+        );
+        let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        crate::distributed::cluster::set_thread_local_rank_override(Some(0));
+        crate::distributed::cluster::set_thread_hostname_override(Some("master"));
+        unsafe {
+            std::env::set_var(
+                crate::distributed::cluster::ENV_CLUSTER_JSON,
+                &hex,
+            );
+        }
+        let is_primary = Monitor::new(1).is_primary();
+        // Clean up before asserting so a failing test doesn't leak
+        // env into siblings that share the mutex.
+        unsafe {
+            std::env::remove_var(crate::distributed::cluster::ENV_CLUSTER_JSON);
+        }
+        crate::distributed::cluster::set_thread_local_rank_override(None);
+        crate::distributed::cluster::set_thread_hostname_override(None);
+        assert!(
+            is_primary,
+            "host owns rank 0 -> Monitor is the primary (dashboard) rank",
+        );
+    }
+
+    #[test]
+    fn is_primary_false_for_cluster_rank_nonzero() {
+        // Worker host owns rank 1 only. Local-index 0 of this host
+        // resolves to global rank 1 (per `LocalCluster::my_rank`).
+        let envelope = serde_json::json!({
+            "master_addr": "127.0.0.1",
+            "master_port": 29500,
+            "world_size": 2,
+            "num_hosts": 2,
+            "host": {
+                "name": "worker",
+                "ranks": [1],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/tmp",
+                "libtorch_path": null,
+            }
+        });
+        let hex = crate::distributed::cluster::hex_encode(
+            &serde_json::to_vec(&envelope).unwrap(),
+        );
+        let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        crate::distributed::cluster::set_thread_local_rank_override(Some(0));
+        crate::distributed::cluster::set_thread_hostname_override(Some("worker"));
+        unsafe {
+            std::env::set_var(
+                crate::distributed::cluster::ENV_CLUSTER_JSON,
+                &hex,
+            );
+        }
+        let is_primary = Monitor::new(1).is_primary();
+        unsafe {
+            std::env::remove_var(crate::distributed::cluster::ENV_CLUSTER_JSON);
+        }
+        crate::distributed::cluster::set_thread_local_rank_override(None);
+        crate::distributed::cluster::set_thread_hostname_override(None);
+        assert!(
+            !is_primary,
+            "host does not own rank 0 -> Monitor must no-op on serve/log/finish",
+        );
+    }
 }

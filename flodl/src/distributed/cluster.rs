@@ -640,6 +640,16 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Shared mutex used by all in-crate tests that mutate process env vars
+/// touched by [`LocalCluster`] (e.g. [`ENV_CLUSTER_JSON`],
+/// [`ENV_LOCAL_RANK`], [`ENV_HOST_OVERRIDE`]). Two test modules in the
+/// same crate (e.g. `cluster::tests` + `monitor::tests`) can both touch
+/// these vars; without a single shared lock they race in the parallel
+/// test harness even when each test uses a unique name internally,
+/// because env-var visibility is process-wide.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,8 +1139,4 @@ mod tests {
         assert_eq!(device, Device::CUDA(0));
     }
 
-    // Env-mutating tests need a module-level Mutex; "unique env var name" is
-    // not enough when multiple tests touch the same var.
-    use std::sync::Mutex;
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 }

@@ -2245,45 +2245,75 @@ mod tests {
         }
         assert!(coord.avg_count() >= 1, "at least one averaging cycle");
 
-        // 6b. With the deferred finalize, cycle 1's guard sees REAL
-        //     divergence (the coord waited for every bridge SyncAck to
-        //     land before running `finish_averaging_cpu`). Assert the
-        //     guard captured strictly-positive per-rank deltas on the
-        //     first cycle. A regression to synchronous finalize would
-        //     surface as cycle-1 deltas == [0.0, 0.0] (the all-Nones
-        //     sentinel `unwrap_or(0.0)`).
+        // 6b. With the deferred finalize gated on `nccl_sync_divergence`
+        //     (not `nccl_ack`), cycle 1's guard sees REAL divergence:
+        //     the coord waits for every bridge SyncAck to populate the
+        //     divergence slot before running `finish_averaging_cpu`.
+        //     The test asserts at-least-one rank reported a strictly-
+        //     positive delta — sufficient evidence the bridge wire
+        //     propagated `compute_divergence` end-to-end. A single 0.0
+        //     is permitted because `compute_divergence` legitimately
+        //     returns 0.0 when `post_norm <= 1e-10` (degenerate avg).
+        //     A regression to gating on `nccl_ack` would surface as
+        //     cycle-1 deltas == [0.0, 0.0] (all-Nones sentinel
+        //     `unwrap_or(0.0)`) — `any` still catches that.
+        //
+        //     Failure path: capture into booleans, drive the full
+        //     teardown sequence (steps 7–9) unconditionally, then
+        //     panic at the end. Bare `assert!` in this position would
+        //     unwind with worker threads still parked inside
+        //     `wait_for_epoch_plan`, leaving orphan mpsc receivers
+        //     and dangling sockets in the cargo test harness.
         let cycles = captured_deltas.lock().unwrap().clone();
-        assert!(
-            !cycles.is_empty(),
-            "RecordingGuard saw no averaging cycles despite avg_count >= 1"
-        );
-        let first = &cycles[0];
-        assert_eq!(
-            first.len(),
-            world_size,
-            "DivergenceReport.deltas len ({}) must equal world_size ({})",
-            first.len(),
-            world_size,
-        );
-        assert!(
-            first.iter().all(|d| d.is_finite() && *d > 0.0),
-            "expected strictly-positive per-rank divergence on cycle 1, got {first:?}"
-        );
+        let no_cycles = cycles.is_empty();
+        let (first_len, has_positive, first_dump) = if no_cycles {
+            (0, false, Vec::new())
+        } else {
+            let f = &cycles[0];
+            (
+                f.len(),
+                f.iter().any(|d| d.is_finite() && *d > 0.0),
+                f.clone(),
+            )
+        };
+        let len_ok = first_len == world_size;
+        let div_check_passed = !no_cycles && len_ok && has_positive;
 
-        // 7. Send Shutdown to workers and tear down the coord.
+        // 7. Send Shutdown to workers and tear down the coord (always).
         coord.shutdown_workers().ok();
         coord.shutdown().ok();
 
-        // 8. Join workers. They should exit cleanly after receiving
-        //    Shutdown through the inbound bridge.
-        for (rank_id, h) in worker_handles.into_iter().enumerate() {
-            let r = h.join().expect("worker thread join");
+        // 8. Collect worker join results without panicking; we want
+        //    every thread joined before either the divergence-check
+        //    panic or the worker-failure panic fires.
+        let worker_results: Vec<(usize, std::thread::Result<Result<()>>)> =
+            worker_handles
+                .into_iter()
+                .enumerate()
+                .map(|(rank_id, h)| (rank_id, h.join()))
+                .collect();
+
+        // 9. Shut the controller down.
+        controller.shutdown().ok();
+
+        // Now panic if the divergence check failed.
+        assert!(
+            div_check_passed,
+            "smoke divergence check failed: cycles_seen={} first_len={} \
+             (expected {}) any_positive={} first_deltas={:?}",
+            cycles.len(),
+            first_len,
+            world_size,
+            has_positive,
+            first_dump,
+        );
+
+        // Surface worker errors AFTER divergence + teardown succeeded.
+        for (rank_id, r) in worker_results {
+            let r = r.expect("worker thread join");
             r.unwrap_or_else(|e| {
                 panic!("worker rank {rank_id} run_until_shutdown: {e}");
             });
         }
-
-        // 9. Shut the controller down.
-        controller.shutdown().ok();
     }
 }

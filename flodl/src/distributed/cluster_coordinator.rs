@@ -1768,12 +1768,23 @@ impl ClusterCoordinator {
     /// Drive the CPU averaging state machine one tick. No-op when
     /// [`CpuAvgState::Idle`].
     ///
-    /// In [`CpuAvgState::Pending`]: if every ALIVE rank has acked,
+    /// In [`CpuAvgState::Pending`]: if every ALIVE rank's bridge
+    /// `SyncAck` has landed (i.e. `nccl_sync_divergence[r].is_some()`),
     /// runs [`Self::finish_averaging_cpu`] and returns to `Idle`.
     /// Dead ranks (per [`Self::dead_ranks`]) count as "acked" because
-    /// they won't ever ack — the controller has already released the
-    /// in-flight AllReduce with surviving ranks only, so finalizing
-    /// here is correct.
+    /// their bridge SyncAck will never arrive — the controller has
+    /// already released the in-flight AllReduce with surviving ranks
+    /// only, so finalizing here is correct.
+    ///
+    /// The gate is on `nccl_sync_divergence`, not `nccl_ack`. `nccl_ack`
+    /// can flip from an in-flight `Batch` whose `step_count` exceeds
+    /// `nccl_sync_step` (set at trigger time) — that path is correct
+    /// for the NCCL backend (no separate bridge; the post-AllReduce
+    /// Batch IS the sync evidence) but not for the CPU backend, where
+    /// the bridge's `SyncAck` is the only signal that the AllReduce
+    /// round-trip actually finished. Gating on `nccl_sync_divergence`
+    /// ensures the next `finish_averaging_cpu` reads real per-rank
+    /// divergence rather than the all-Nones sentinel.
     fn poll_cpu_averaging(&mut self) -> Result<()> {
         if !matches!(self.cpu_avg_state, CpuAvgState::Pending) {
             return Ok(());
@@ -1782,7 +1793,7 @@ impl ClusterCoordinator {
             if self.is_dead(r) {
                 return true;
             }
-            self.nccl_ack[r]
+            self.nccl_sync_divergence[r].is_some()
         });
         if all_alive_acked {
             self.cpu_avg_state = CpuAvgState::Idle;
@@ -3251,7 +3262,7 @@ fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributed::wire::TimingMsgWire;
+    use crate::distributed::wire::{MetricsMsgWire, TimingMsgWire};
     use std::net::Ipv4Addr;
 
     /// Deterministic non-zero test salt (mirrors controller.rs::tests).
@@ -3337,6 +3348,16 @@ mod tests {
         msg: TimingMsgWire,
     ) -> Result<()> {
         let frame = ControlFrame::encode(salt, MsgKind::Timing, &msg)?;
+        frame.write_to(stream)
+    }
+
+    /// Send a Metrics-kind ControlFrame on a fake-rank stream.
+    fn send_metrics(
+        stream: &mut TcpStream,
+        salt: &SessionSalt,
+        msg: MetricsMsgWire,
+    ) -> Result<()> {
+        let frame = ControlFrame::encode(salt, MsgKind::Metrics, &msg)?;
         frame.write_to(stream)
     }
 
@@ -3846,7 +3867,7 @@ mod tests {
             send_timing(s, salt, TimingMsgWire::SyncAck {
                 rank: 0,
                 step_count: 2,
-                divergence: None,
+                divergence: Some(0.05),
                 post_norm: None,
                 pre_norm: None,
             })?;
@@ -3870,7 +3891,7 @@ mod tests {
             send_timing(s, salt, TimingMsgWire::SyncAck {
                 rank: 1,
                 step_count: 2,
-                divergence: None,
+                divergence: Some(0.05),
                 post_norm: None,
                 pre_norm: None,
             })?;
@@ -3946,7 +3967,7 @@ mod tests {
                 send_timing(s, salt, TimingMsgWire::SyncAck {
                     rank,
                     step_count: 2,
-                    divergence: None,
+                    divergence: Some(0.05),
                     post_norm: None,
                     pre_norm: None,
                 })?;
@@ -4016,7 +4037,7 @@ mod tests {
                 send_timing(s, salt, TimingMsgWire::SyncAck {
                     rank: 0,
                     step_count: ((cycle + 1) * 2) as u64,
-                    divergence: None,
+                    divergence: Some(0.05),
                     post_norm: None,
                     pre_norm: None,
                 })?;
@@ -4044,7 +4065,7 @@ mod tests {
                 send_timing(s, salt, TimingMsgWire::SyncAck {
                     rank: 1,
                     step_count: ((cycle + 1) * 2) as u64,
-                    divergence: None,
+                    divergence: Some(0.05),
                     post_norm: None,
                     pre_norm: None,
                 })?;
@@ -4056,6 +4077,149 @@ mod tests {
         r0.join().unwrap().expect("rank 0 two cycles");
         r1.join().unwrap().expect("rank 1 two cycles");
         coord_handle.join().unwrap().expect("coord finishes");
+    }
+
+    /// `EpochAggregated` round-trip: each alive rank emits a
+    /// `MetricsMsgWire` for the same epoch with a custom scalar; the
+    /// coord aggregates (mean over per-rank values, per
+    /// `aggregate_epoch_metrics`), pushes the result to
+    /// `metrics_sink_tx`, AND broadcasts `ControlMsgWire::EpochAggregated`
+    /// back to every rank. Validates the wire path from rank-MetricsMsg
+    /// → coord-aggregate → both sinks (mpsc + broadcast) end-to-end.
+    /// Aggregation is independent of averaging — no Batch / SyncAck
+    /// frames are sent, so `avg_count` stays zero throughout.
+    #[test]
+    fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
+        let world_size = 2;
+        let (sink_tx, sink_rx) =
+            mpsc::channel::<crate::distributed::ddp_run::EpochMetrics>();
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size).metrics_sink_tx(sink_tx),
+            move |coord| {
+                let start = Instant::now();
+                while coord.last_aggregated_epoch().is_none() {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(TensorError::new(
+                            "epoch_aggregated: no aggregation within 5s",
+                        ));
+                    }
+                    coord.tick()?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // Aggregation fired; no averaging cycle should have
+                // run (no Batch / SyncAck frames sent by ranks).
+                assert_eq!(
+                    coord.avg_count(),
+                    0,
+                    "aggregation must not trigger averaging",
+                );
+                Ok(())
+            },
+        );
+
+        // Each rank ships one MetricsMsg for epoch 0 with a
+        // rank-distinguishable `custom_metric` scalar. The aggregator
+        // computes the mean across alive ranks: (10 + 11) / 2 = 10.5.
+        fn rank_body(rank: u64) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
+            move |s, salt| {
+                let mut scalars = std::collections::HashMap::new();
+                scalars.insert(
+                    "custom_metric".to_string(),
+                    (10.0 + rank as f64, 1u64),
+                );
+                send_metrics(s, salt, MetricsMsgWire {
+                    rank,
+                    epoch: 0,
+                    avg_loss: 0.5 + 0.1 * rank as f64,
+                    batches_processed: 4,
+                    epoch_ms: 100.0,
+                    samples_processed: 16,
+                    share_complete_ms: 5.0,
+                    compute_only_ms: 90.0,
+                    data_starve_ms: 5.0,
+                    scalars,
+                })?;
+                // Block on the broadcast — coord will send
+                // `EpochAggregated` once every alive rank has reported.
+                let msg = recv_control(s, salt)?;
+                match msg {
+                    ControlMsgWire::EpochAggregated(wire) => {
+                        if wire.epoch != 0 {
+                            return Err(TensorError::new(&format!(
+                                "rank {rank}: EpochAggregated epoch={} (expected 0)",
+                                wire.epoch
+                            )));
+                        }
+                        let got = wire
+                            .scalars
+                            .get("custom_metric")
+                            .copied()
+                            .ok_or_else(|| TensorError::new(
+                                "rank: custom_metric missing from broadcast scalars",
+                            ))?;
+                        if (got - 10.5).abs() > 1e-9 {
+                            return Err(TensorError::new(&format!(
+                                "rank {rank}: broadcast custom_metric={got} (expected 10.5)",
+                            )));
+                        }
+                        // per_rank vector preserves the per-rank
+                        // submissions; rank R's slot contains rank R's
+                        // original value (10 + R), not the mean.
+                        let per_rank = wire
+                            .per_rank
+                            .get(rank as usize)
+                            .ok_or_else(|| TensorError::new(
+                                "rank: per_rank slot missing",
+                            ))?;
+                        let per_rank_val = per_rank
+                            .get("custom_metric")
+                            .copied()
+                            .ok_or_else(|| TensorError::new(
+                                "rank: per_rank custom_metric missing",
+                            ))?;
+                        if (per_rank_val - (10.0 + rank as f64)).abs() > 1e-9 {
+                            return Err(TensorError::new(&format!(
+                                "rank {rank}: per_rank custom_metric={per_rank_val} \
+                                 (expected {})",
+                                10.0 + rank as f64
+                            )));
+                        }
+                        Ok(())
+                    }
+                    other => Err(TensorError::new(&format!(
+                        "rank {rank}: expected EpochAggregated, got {other:?}",
+                    ))),
+                }
+            }
+        }
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, rank_body(0));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, rank_body(1));
+        r0.join().unwrap().expect("rank 0 EpochAggregated");
+        r1.join().unwrap().expect("rank 1 EpochAggregated");
+        coord_handle.join().unwrap().expect("coord finishes");
+
+        // The mpsc sink received the same aggregated metrics the
+        // broadcast carried; validates the sink path the launcher /
+        // builder wires for `DdpHandle::next_metrics`.
+        let metrics = sink_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("metrics_sink_tx received EpochMetrics");
+        assert_eq!(metrics.epoch, 0);
+        let mean = metrics
+            .scalars
+            .get("custom_metric")
+            .copied()
+            .expect("sink custom_metric present");
+        assert!(
+            (mean - 10.5).abs() < 1e-9,
+            "sink custom_metric mean: {mean} (expected 10.5)",
+        );
+        // Sink channel should be empty after the one event.
+        assert!(
+            sink_rx.try_recv().is_err(),
+            "sink should not receive extra events",
+        );
     }
 
     #[test]
