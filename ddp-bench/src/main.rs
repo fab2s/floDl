@@ -543,11 +543,15 @@ fn run() -> flodl::tensor::Result<()> {
             .collect()
     };
 
-    // Check GPU availability for multi-GPU modes
-    #[cfg(feature = "cuda")]
-    let gpu_count = flodl::tensor::cuda_device_count() as usize;
-    #[cfg(not(feature = "cuda"))]
-    let gpu_count = 0usize;
+    // CUDA-FREE GPU detection (uses `nvidia-smi`, no libtorch init).
+    // Critical for cluster mode: the launcher process must not touch
+    // libtorch's CUDA context before the launcher trampoline fans out;
+    // touching CUDA in the launcher corrupts the spawned children's
+    // context on heterogeneous-GPU rigs. See `flodl::sys::detect_gpus`
+    // docs + the "no CUDA before Trainer::run" invariant in
+    // `flodl::Trainer::run`.
+    let detected_gpus = flodl::sys::detect_gpus();
+    let gpu_count = detected_gpus.len();
 
     eprintln!(
         "ddp-bench: {} models x {} modes, {} GPUs available",
@@ -555,12 +559,13 @@ fn run() -> flodl::tensor::Result<()> {
         modes.len(),
         gpu_count
     );
-    #[cfg(feature = "cuda")]
-    for dev in flodl::tensor::cuda_devices() {
+    for g in &detected_gpus {
         eprintln!(
-            "  gpu{}: {} ({}GB, sm_{}{})",
-            dev.index, dev.name, dev.total_memory / (1024 * 1024 * 1024),
-            dev.sm_major, dev.sm_minor,
+            "  gpu{}: {} ({}GB, {})",
+            g.index,
+            g.short_name(),
+            g.vram_bytes() / (1024 * 1024 * 1024),
+            g.sm_version(),
         );
     }
 

@@ -3025,6 +3025,64 @@ where
         self
     }
 
+    /// Override the epoch-callback policy (which rank fires user
+    /// callbacks). Default: `Rank(0)`. Mirrors
+    /// [`super::DdpRunConfig::with_epoch_callback_policy`].
+    pub fn epoch_callback_policy(
+        mut self,
+        policy: super::EpochCallbackPolicy,
+    ) -> Self {
+        self.config = self.config.with_epoch_callback_policy(policy);
+        self
+    }
+
+    // -- Internal pre-wrapped setters used by `Trainer::run` --------------
+    //
+    // The public closure-form setters wrap callbacks in `Arc`/`Box` for
+    // storage. When the source is `TrainerConfig` (which already stores
+    // them in their final wrapper), these pass them through unchanged
+    // so we don't have to round-trip through a fresh closure.
+
+    /// Pass-through for a pre-wrapped checkpoint callback. Internal —
+    /// public users call [`Self::checkpoint_fn`].
+    pub(crate) fn checkpoint_fn_arc(mut self, f: CheckpointFn<M>) -> Self {
+        self.checkpoint_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-wrapped epoch callback.
+    pub(crate) fn epoch_fn_arc(mut self, f: EpochFn<M>) -> Self {
+        self.epoch_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-wrapped metrics callback.
+    pub(crate) fn metrics_fn_arc(mut self, f: super::MetricsFn) -> Self {
+        self.metrics_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-wrapped scheduler factory.
+    pub(crate) fn scheduler_fn_boxed(mut self, f: super::SchedulerFn) -> Self {
+        self.scheduler_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-wrapped eval callback.
+    pub(crate) fn eval_fn_arc(mut self, f: super::EvalFn<M>) -> Self {
+        self.eval_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-wrapped eval-result callback.
+    pub(crate) fn eval_result_fn_arc(mut self, f: super::EvalResultFn) -> Self {
+        self.eval_result_fn = Some(f);
+        self
+    }
+    /// Pass-through for a pre-boxed convergence guard.
+    pub(crate) fn convergence_guard_boxed(
+        mut self,
+        guard: Box<dyn super::ConvergenceGuard>,
+    ) -> Self {
+        self.convergence_guard = Some(guard);
+        self
+    }
+
     /// Launch training. Non-blocking: spawns threads and returns immediately.
     ///
     /// Call [`DdpHandle::join`] to block until training completes and retrieve

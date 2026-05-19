@@ -53,6 +53,7 @@ use crate::nn::{Buffer, Module, Optimizer, Parameter};
 use super::cluster::LocalCluster;
 use super::nccl::{NcclRankComm, ReduceOp};
 use super::rendezvous::TcpRendezvous;
+use super::config::TrainerConfig;
 use super::ddp_run::{DdpBuilder, DdpHandle};
 pub use super::el_che::ElChe;
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -680,6 +681,123 @@ impl Trainer {
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
         DdpHandle::new_builder(model_factory, optim_factory, train_fn)
+    }
+
+    /// Run training from a single [`TrainerConfig`].
+    ///
+    /// The canonical entry for framework-managed training. Takes the
+    /// three factory closures (`model_factory`, `optim_factory`,
+    /// `train_fn`) and one config bag — no chained setters, no
+    /// top-of-main bootstrap, no separate launcher entry. Cluster
+    /// dispatch happens INSIDE this call (via the existing launcher
+    /// trampoline), so the launcher process never executes user code
+    /// past `Trainer::run`.
+    ///
+    /// # Invariant — no CUDA before `Trainer::run`
+    ///
+    /// User code MUST NOT touch libtorch's CUDA context before this
+    /// call. That means: no [`crate::tensor::cuda_device_count`] /
+    /// [`crate::tensor::cuda_devices`] / `Tensor` construction on a
+    /// CUDA device / `Module::on_device(Device::CUDA(_))`. Pre-run GPU
+    /// queries must go through [`crate::sys::detect_gpus`] (which uses
+    /// `nvidia-smi` and does NOT init libtorch).
+    ///
+    /// Why: on cluster fan-out the parent (launcher) process exits
+    /// without running training, and on heterogeneous GPUs touching
+    /// CUDA in the launcher corrupts the spawned children's CUDA
+    /// context (see `feedback_nccl_exclusive_gpu`).
+    ///
+    /// # Composition with the builder
+    ///
+    /// `Trainer::builder(...).chain().run()` continues to work
+    /// unchanged. Internally both surfaces drive the same launch
+    /// path; pick whichever style fits the call-site better.
+    pub fn run<F, M, G, O, T>(
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        cfg: TrainerConfig<M>,
+    ) -> Result<DdpHandle>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        let (policy, backend) = cfg.elche.mode.split();
+
+        let mut b = DdpHandle::new_builder(model_factory, optim_factory, train_fn)
+            .dataset(cfg.dataset)
+            .batch_size(cfg.batch_size)
+            .num_epochs(cfg.num_epochs)
+            .policy(policy)
+            .backend(backend)
+            .anchor(cfg.elche.anchor)
+            .elche_relax_up(cfg.elche.relax_up)
+            .meta_controller(cfg.elche.meta_controller);
+
+        if let Some(n) = cfg.elche.max_anchor {
+            b = b.max_anchor(n);
+        }
+        if let Some(n) = cfg.elche.min_anchor {
+            b = b.min_anchor(n);
+        }
+        if let Some(t) = cfg.elche.overhead_target {
+            b = b.overhead_target(t);
+        }
+        if let Some(n) = cfg.elche.max_batch_diff {
+            b = b.max_batch_diff(n);
+        }
+        if let Some(ratios) = cfg.elche.partition_ratios {
+            b = b.partition_ratios(&ratios);
+        }
+        if let Some(alpha) = cfg.elche.easgd_alpha {
+            b = b.easgd_alpha(alpha);
+        }
+        if let Some(guard) = cfg.elche.convergence_guard {
+            b = b.convergence_guard_boxed(guard);
+        }
+
+        if let Some(n) = cfg.max_grad_norm {
+            b = b.max_grad_norm(n);
+        }
+        if let Some(n) = cfg.checkpoint_every {
+            b = b.checkpoint_every(n);
+        }
+        if let Some(p) = cfg.save_path {
+            b = b.save_path(p);
+        }
+        if let Some(p) = cfg.resume_from {
+            b = b.resume_from(p);
+        }
+        if let Some(f) = cfg.checkpoint_fn {
+            b = b.checkpoint_fn_arc(f);
+        }
+        if let Some(f) = cfg.epoch_fn {
+            b = b.epoch_fn_arc(f);
+        }
+        if let Some(f) = cfg.metrics_fn {
+            b = b.metrics_fn_arc(f);
+        }
+        if let Some(f) = cfg.scheduler_fn {
+            b = b.scheduler_fn_boxed(f);
+        }
+        if let Some(f) = cfg.eval_fn {
+            b = b.eval_fn_arc(f);
+        }
+        if let Some(ds) = cfg.eval_dataset {
+            b = b.eval_dataset(ds);
+        }
+        if let Some(f) = cfg.eval_result_fn {
+            b = b.eval_result_fn_arc(f);
+        }
+        if let Some(t) = cfg.timeline {
+            b = b.timeline(t);
+        }
+        b = b.epoch_callback_policy(cfg.epoch_callback_policy);
+
+        b.run()
     }
 
     /// One-call setup for a task-head wrapper (e.g. `flodl-hf`'s
