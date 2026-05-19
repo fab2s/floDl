@@ -31,6 +31,10 @@
 #   - `nccl_socket_ifname:` required on multi-host runs (NCCL TCP
 #     binding). Use `lo` for single-host loopback.
 #   - `ssh:` is launcher-only; tests ignore it.
+#   - `docker:` (optional) names the docker-compose service this host
+#     runs training inside (e.g. `cuda`). Per-host. Consumed by
+#     `fdl probe` to skip host-level NCCL scanning (NCCL ships in the
+#     container image). Tests ignore it.
 #   - `path:` is the project checkout dir on this host (used by
 #     fdl-cli to cd before remote exec; tests reuse it for path
 #     resolution).

@@ -66,6 +66,13 @@ pub struct ProbeArgs {
     /// share mounted at a known path on a worker node).
     #[option]
     pub libtorch_path: Option<std::path::PathBuf>,
+    /// Treat NCCL as provided by a Docker image (compose service name
+    /// from `fdl.yml`, e.g. `cuda`). Suppresses host-level NCCL
+    /// discovery and reports "via Docker image `<svc>`" instead. In
+    /// cluster mode, this is auto-derived from each host's `docker:`
+    /// field in `fdl.cluster.yml`.
+    #[option]
+    pub docker: Option<String>,
 }
 
 /// Generate flodl API reference.

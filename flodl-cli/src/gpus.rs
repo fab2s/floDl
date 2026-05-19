@@ -169,6 +169,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             ssh: None,
             arch: None,
             data_path: None,
+            docker: None,
         }],
     })
 }

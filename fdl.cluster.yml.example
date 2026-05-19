@@ -30,6 +30,13 @@
 #     (NAS / SMB / virtiofs / S3-FUSE).
 #   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
 #     bind-mounts it into the Docker container at /usr/local/libtorch.
+#   - `docker:` (optional) names the docker-compose service this host
+#     runs training inside (e.g. `cuda`, `dev`). Per-host, NOT global:
+#     mixed deployments (controller in Docker, worker bare-metal) are
+#     common. `fdl probe` uses it to skip host-level NCCL scanning
+#     (NCCL ships in the container image) and reports "via Docker
+#     image <svc>" instead of erroring on a missing libnccl.so on the
+#     host. Omit when the host runs flodl natively.
 #   - `arch:` is the GPU compute capability for this host's devices in
 #     canonical `sm_NN` form (sm_61 Pascal, sm_70 Volta, sm_75 Turing,
 #     sm_80/86/89 Ampere, sm_90 Hopper, sm_120 Blackwell). Optional
@@ -57,6 +64,8 @@ cluster:
       nccl_socket_ifname: virbr0
       path: /opt/flodl                # checkout path on this host
       libtorch_path: /data/ssd/flodl/libtorch
+      docker: cuda             # training runs in the `cuda` compose service;
+                               # omit when this host runs flodl natively.
     - name: node-b
       ssh: node-b              # ssh target; defaults to name if omitted
       ranks: [1, 2]
@@ -66,6 +75,7 @@ cluster:
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch
+                               # no `docker:` here → bare-metal flodl install.
 
 # Mark which commands fan out across cluster.hosts. Commands without
 # `cluster: true` continue to run locally on whichever host invoked fdl.

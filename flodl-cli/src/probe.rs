@@ -54,6 +54,7 @@ pub fn run(
     skip_mount: bool,
     data_path_override: Option<PathBuf>,
     libtorch_path_override: Option<PathBuf>,
+    via_docker: Option<String>,
 ) -> i32 {
     let ctx = Context::resolve();
     // Cluster fan-out only applies when no explicit libtorch override
@@ -66,12 +67,17 @@ pub fn run(
             }
         }
     }
-    // Single-host (local OR remote-being-probed).
+    // Single-host (local OR remote-being-probed). When `--data-path` is
+    // passed explicitly, treat a missing path as an error; when absent
+    // (falling back to DEFAULT_DATA_PATH), treat it as a warning.
+    let data_path_explicit = data_path_override.is_some();
     let report = probe_local(
         &ctx,
         skip_mount,
         data_path_override,
         libtorch_path_override,
+        via_docker,
+        data_path_explicit,
     );
     if json {
         print_json(&report);
@@ -96,16 +102,22 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
     let mut reports: Vec<ProbeReport> = Vec::with_capacity(cluster.hosts.len());
     for host in &cluster.hosts {
         let r = if host.name == local {
-            // Local rank: probe in-process, honor the host's data_path
-            // and libtorch_path (if set in cluster.yml). Matches the
-            // remote-probe path so the local rank's report shape is
-            // identical to the SSH-probed remotes.
+            // Local rank: probe in-process, honor the host's data_path,
+            // libtorch_path, and docker service (if set in cluster.yml).
+            // Matches the remote-probe path so the local rank's report
+            // shape is identical to the SSH-probed remotes. Only pass an
+            // explicit data_path_override when the host declared one;
+            // omitting it preserves the "default = warning, not error"
+            // semantics in [`check_data_path`].
             let ctx = Context::resolve();
+            let data_path_explicit = host.data_path.is_some();
             probe_local(
                 &ctx,
                 skip_mount,
-                Some(PathBuf::from(host.effective_data_path())),
+                host.data_path.as_ref().map(PathBuf::from),
                 host.libtorch_path.as_ref().map(PathBuf::from),
+                host.docker.clone(),
+                data_path_explicit,
             )
         } else {
             probe_remote_via_ssh(host, skip_mount)
@@ -135,14 +147,19 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     // PATH the SSH command returns "fdl: command not found" exit
     // 127, which the probe-result parser surfaces as an SSH error
     // for that host.
-    let data_path = host.effective_data_path().to_string();
     let mut remote_args: Vec<String> = vec![
         "fdl".into(),
         "probe".into(),
         "--json".into(),
-        "--data-path".into(),
-        data_path,
     ];
+    // Only forward --data-path when the host declared one. Without it,
+    // the remote falls back to DEFAULT_DATA_PATH and the probe treats a
+    // missing path as a WARNING (convention default) rather than an
+    // ERROR (explicit promise the user made in cluster.yml).
+    if let Some(dp) = &host.data_path {
+        remote_args.push("--data-path".into());
+        remote_args.push(dp.clone());
+    }
     if skip_mount {
         remote_args.push("--skip-mount".into());
     }
@@ -154,6 +171,13 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     if let Some(lt) = &host.libtorch_path {
         remote_args.push("--libtorch-path".into());
         remote_args.push(lt.clone());
+    }
+    // Pass the host's docker: compose service. Tells the remote probe
+    // that NCCL ships inside the container image, so it should report
+    // "via Docker image <svc>" instead of scanning host library paths.
+    if let Some(svc) = &host.docker {
+        remote_args.push("--docker".into());
+        remote_args.push(svc.clone());
     }
     // Quote each remote arg into a single shell-safe command string;
     // remote PATH may not have `fdl`, hence the absolute path.
@@ -208,8 +232,10 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
         nccl: NcclStatus {
             library_path: None,
             all_found: Vec::new(),
+            via_docker: host.docker.clone(),
         },
         issues: Vec::new(),
+        warnings: Vec::new(),
     };
     match output {
         Err(e) => {
@@ -272,8 +298,10 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
         nccl: NcclStatus {
             library_path: None,
             all_found: Vec::new(),
+            via_docker: host.docker.clone(),
         },
         issues: Vec::new(),
+        warnings: Vec::new(),
     };
 
     if let Some(gpus) = v.get("gpus").and_then(|g| g.as_array()) {
@@ -345,6 +373,14 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
             if let Some(p) = p {
                 report.nccl.all_found.push(p);
             }
+            // Prefer the remote's reported via_docker over the
+            // cluster.yml field — the controller already passed it in
+            // via --docker so the remote echo confirms what was used;
+            // they should match, and using the remote's keeps the
+            // round-trip a single source of truth.
+            if let Some(svc) = nccl.get("via_docker").and_then(|v| v.as_str()) {
+                report.nccl.via_docker = Some(svc.to_string());
+            }
         }
     }
 
@@ -352,6 +388,13 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
         for i in issues {
             if let Some(s) = i.as_str() {
                 report.issues.push(s.to_string());
+            }
+        }
+    }
+    if let Some(warnings) = v.get("warnings").and_then(|v| v.as_array()) {
+        for w in warnings {
+            if let Some(s) = w.as_str() {
+                report.warnings.push(s.to_string());
             }
         }
     }
@@ -393,14 +436,19 @@ fn print_cluster_report(reports: &[ProbeReport]) {
     }
     println!();
     let red = reports.iter().filter(|r| !r.green()).count();
-    if red == 0 {
-        println!("CLUSTER VERDICT: READY (all {} hosts green)", reports.len());
-    } else {
-        println!(
-            "CLUSTER VERDICT: ISSUES ({}/{} hosts have issues)",
-            red,
-            reports.len()
-        );
+    let yellow = reports
+        .iter()
+        .filter(|r| r.green() && !r.warnings.is_empty())
+        .count();
+    let total = reports.len();
+    match (red, yellow) {
+        (0, 0) => println!("CLUSTER VERDICT: READY (all {total} hosts green)"),
+        (0, y) => println!("CLUSTER VERDICT: READY ({y}/{total} hosts have warnings)"),
+        (r, 0) => println!("CLUSTER VERDICT: ISSUES ({r}/{total} hosts have errors)"),
+        (r, y) => println!(
+            "CLUSTER VERDICT: ISSUES ({r}/{total} hosts have errors, \
+             {y} also have warnings)"
+        ),
     }
 }
 
@@ -428,6 +476,12 @@ fn print_cluster_json(reports: &[ProbeReport]) {
 
 /// Top-level probe verdict for one host. `green()` is the aggregate
 /// gate.
+///
+/// `issues` are blocking errors (exit non-zero); `warnings` are advisory
+/// (exit zero, surfaced in the report). The split matters because
+/// "/flodl/data missing" on a single-host rig that doesn't use shared
+/// storage is informational, while a worker host that declared an
+/// explicit `data_path:` in cluster.yml and can't see it is broken.
 pub struct ProbeReport {
     pub host: String,
     pub gpus: Vec<GpuInfo>,
@@ -435,12 +489,14 @@ pub struct ProbeReport {
     pub data_path: DataPathStatus,
     pub nccl: NcclStatus,
     pub issues: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 impl ProbeReport {
     /// `true` when no issues were collected — every checked component
-    /// passed. Callers may still want to inspect individual statuses
-    /// for diagnostic detail.
+    /// passed (warnings do NOT flip this). Callers may still want to
+    /// inspect individual statuses for diagnostic detail; the exit
+    /// code follows this flag.
     pub fn green(&self) -> bool {
         self.issues.is_empty()
     }
@@ -475,7 +531,9 @@ pub struct DataPathStatus {
 }
 
 /// NCCL discovery result. NCCL is loaded dynamically by libtorch, so
-/// the probe just hunts for `libnccl.so*` on the usual library paths.
+/// the probe just hunts for `libnccl.so*` on the usual library paths
+/// — unless [`Self::via_docker`] is set, in which case NCCL ships
+/// inside the container image and the host scan is skipped.
 pub struct NcclStatus {
     /// First `libnccl.so*` found, if any. Used in the report to show
     /// the user which install will be picked up.
@@ -483,6 +541,11 @@ pub struct NcclStatus {
     /// All discovered `libnccl.so*` paths (informational; multiple
     /// versions in different prefixes is a misconfiguration source).
     pub all_found: Vec<PathBuf>,
+    /// Docker compose service that owns NCCL on this host. When set,
+    /// the probe records "via Docker image `<svc>`" instead of scanning
+    /// the host filesystem. `None` means the host runs flodl natively
+    /// and NCCL must live on it.
+    pub via_docker: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -495,16 +558,27 @@ pub struct NcclStatus {
 /// configured); `libtorch_path_override` (from `--libtorch-path`)
 /// points at a libtorch install outside the project tree (used by
 /// cluster-mode remote probes where libtorch lives on a dedicated
-/// share like `/mnt/libtorch`).
+/// share like `/mnt/libtorch`). `via_docker` (from `--docker <svc>` or
+/// the cluster.yml host's `docker:` field) tells the probe NCCL ships
+/// inside a container image, so host-level NCCL scanning is replaced
+/// by an informational "via Docker image <svc>" line.
+///
+/// `data_path_explicit`: when `true`, a missing shared-data path is an
+/// ERROR (the user/cluster.yml promised it); when `false`, it's a
+/// WARNING (the convention default was used). Internal flag — callers
+/// must derive it from "did the caller pass an explicit data_path".
 pub fn probe_local(
     ctx: &Context,
     skip_mount: bool,
     data_path_override: Option<PathBuf>,
     libtorch_path_override: Option<PathBuf>,
+    via_docker: Option<String>,
+    data_path_explicit: bool,
 ) -> ProbeReport {
     let host = resolve_local_hostname();
     let gpus = system::detect_gpus();
     let mut issues: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     let libtorch = match libtorch_path_override {
         Some(p) => check_libtorch_at(&p, &gpus, &mut issues),
@@ -513,9 +587,11 @@ pub fn probe_local(
     let data_path = check_data_path(
         data_path_override.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_PATH)),
         skip_mount,
+        data_path_explicit,
         &mut issues,
+        &mut warnings,
     );
-    let nccl = check_nccl(&mut issues);
+    let nccl = check_nccl(via_docker, &mut issues);
 
     if gpus.is_empty() {
         issues.push(
@@ -533,6 +609,7 @@ pub fn probe_local(
         data_path,
         nccl,
         issues,
+        warnings,
     }
 }
 
@@ -718,7 +795,9 @@ fn check_libtorch(
 fn check_data_path(
     path: PathBuf,
     skip_mount: bool,
+    explicit: bool,
     issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> DataPathStatus {
     if skip_mount {
         return DataPathStatus {
@@ -734,13 +813,31 @@ fn check_data_path(
     let fs_type = detect_fs_type(&path);
 
     if !exists {
-        issues.push(format!(
-            "shared data path `{}` does not exist on this host. flodl \
-             assumes a shared filesystem (NAS / SMB / virtiofs / SSHFS) \
-             mounted at the same logical path on every node. Mount the \
-             shared storage or set `data_path:` per-host in cluster.yml.",
-            path.display()
-        ));
+        if explicit {
+            // The user (or cluster.yml) promised this path. Missing it
+            // is a launch-breaking error — training fan-out would
+            // discover this mid-run when a checkpoint write hangs.
+            issues.push(format!(
+                "shared data path `{}` does not exist on this host. flodl \
+                 assumes a shared filesystem (NAS / SMB / virtiofs / SSHFS) \
+                 mounted at the same logical path on every node. Mount the \
+                 shared storage or correct `data_path:` in cluster.yml.",
+                path.display()
+            ));
+        } else {
+            // No explicit path was declared — the convention default
+            // `/flodl/data` was tried. Missing it is fine for users who
+            // don't use shared storage; surface it as a warning so they
+            // know the default isn't wired up.
+            warnings.push(format!(
+                "convention shared-data path `{}` not present on this host \
+                 (no `data_path:` declared in cluster.yml). Ignore if you \
+                 don't use shared storage; otherwise set `data_path:` per \
+                 host or mount `{}`.",
+                path.display(),
+                path.display()
+            ));
+        }
     } else if !readable {
         issues.push(format!(
             "shared data path `{}` exists but is not readable by the \
@@ -752,7 +849,20 @@ fn check_data_path(
     DataPathStatus { path, exists, readable, fs_type, skipped: false }
 }
 
-fn check_nccl(issues: &mut Vec<String>) -> NcclStatus {
+fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatus {
+    // Docker-served host: NCCL lives inside the container image, not
+    // on the host. Skip the host scan entirely — scanning would
+    // false-positive on the false-error path that motivated the docker
+    // field (host shows "no libnccl.so" while training actually runs
+    // fine inside the cuda/dev image). Report as informational.
+    if via_docker.is_some() {
+        return NcclStatus {
+            library_path: None,
+            all_found: Vec::new(),
+            via_docker,
+        };
+    }
+
     let mut found: Vec<PathBuf> = Vec::new();
     // Common search locations. Order matters — first match wins for
     // the diagnostic `library_path` field.
@@ -800,12 +910,14 @@ fn check_nccl(issues: &mut Vec<String>) -> NcclStatus {
             "no `libnccl.so` found on standard library paths or \
              $LD_LIBRARY_PATH. Multi-rank NCCL training will fail at \
              collective init. Install libnccl matching your CUDA \
-             version or set LD_LIBRARY_PATH to a custom build."
+             version or set LD_LIBRARY_PATH to a custom build (or \
+             declare `docker:` on this host in cluster.yml if NCCL \
+             ships inside the container image)."
                 .into(),
         );
     }
 
-    NcclStatus { library_path: found.first().cloned(), all_found: found }
+    NcclStatus { library_path: found.first().cloned(), all_found: found, via_docker: None }
 }
 
 /// Best-effort filesystem-type lookup via `/proc/mounts`. Walks toward
@@ -898,25 +1010,55 @@ fn print_report(r: &ProbeReport) {
     println!();
 
     println!("NCCL:");
-    match &r.nccl.library_path {
-        Some(p) => {
-            println!("  found    : {}", p.display());
-            if r.nccl.all_found.len() > 1 {
-                println!("  others   : {} more (check for version skew)", r.nccl.all_found.len() - 1);
+    if let Some(svc) = &r.nccl.via_docker {
+        println!("  via Docker image `{}` (host check skipped)", svc);
+    } else {
+        match &r.nccl.library_path {
+            Some(p) => {
+                println!("  found    : {}", p.display());
+                if r.nccl.all_found.len() > 1 {
+                    println!("  others   : {} more (check for version skew)", r.nccl.all_found.len() - 1);
+                }
             }
+            None => println!("  (no libnccl.so* discovered)"),
         }
-        None => println!("  (no libnccl.so* discovered)"),
     }
     println!();
 
-    if r.issues.is_empty() {
-        println!("verdict: READY");
-    } else {
-        println!("verdict: ISSUES ({})", r.issues.len());
-        for (i, msg) in r.issues.iter().enumerate() {
+    print_verdict_lines(&r.issues, &r.warnings);
+}
+
+/// Render the three-tier verdict + numbered errors/warnings.
+fn print_verdict_lines(issues: &[String], warnings: &[String]) {
+    let n_err = issues.len();
+    let n_warn = warnings.len();
+    let line = match (n_err, n_warn) {
+        (0, 0) => "verdict: READY".to_string(),
+        (0, m) => format!("verdict: READY ({m} warning{})", plural(m)),
+        (n, 0) => format!("verdict: ISSUES ({n} error{})", plural(n)),
+        (n, m) => format!(
+            "verdict: ISSUES ({n} error{}, {m} warning{})",
+            plural(n),
+            plural(m)
+        ),
+    };
+    println!("{line}");
+    if !issues.is_empty() {
+        println!("errors:");
+        for (i, msg) in issues.iter().enumerate() {
             println!("  {}. {}", i + 1, msg);
         }
     }
+    if !warnings.is_empty() {
+        println!("warnings:");
+        for (i, msg) in warnings.iter().enumerate() {
+            println!("  {}. {}", i + 1, msg);
+        }
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn yn(b: bool) -> &'static str {
@@ -999,23 +1141,42 @@ fn report_to_json_object(r: &ProbeReport) -> String {
         b.push('}');
     }
 
-    // NCCL
+    // NCCL — always emit an object now (even when host scan was
+    // skipped via Docker), so consumers can read `via_docker` without
+    // null-checking.
     b.push_str(",\"nccl\":");
-    match &r.nccl.library_path {
-        Some(p) => {
+    if r.nccl.library_path.is_none() && r.nccl.via_docker.is_none() {
+        b.push_str("null");
+    } else {
+        b.push('{');
+        let mut first = true;
+        if let Some(p) = &r.nccl.library_path {
             let _ = write!(
                 b,
-                "{{\"library_path\":\"{}\",\"count\":{}}}",
+                "\"library_path\":\"{}\",\"count\":{}",
                 system::escape_json(&p.display().to_string()),
                 r.nccl.all_found.len()
             );
+            first = false;
         }
-        None => b.push_str("null"),
+        if let Some(svc) = &r.nccl.via_docker {
+            if !first {
+                b.push(',');
+            }
+            let _ = write!(b, "\"via_docker\":\"{}\"", system::escape_json(svc));
+        }
+        b.push('}');
     }
 
-    // Issues + verdict
+    // Issues (errors) + warnings + verdict.
     b.push_str(",\"issues\":[");
     for (i, msg) in r.issues.iter().enumerate() {
+        if i > 0 { b.push(','); }
+        let _ = write!(b, "\"{}\"", system::escape_json(msg));
+    }
+    b.push(']');
+    b.push_str(",\"warnings\":[");
+    for (i, msg) in r.warnings.iter().enumerate() {
         if i > 0 { b.push(','); }
         let _ = write!(b, "\"{}\"", system::escape_json(msg));
     }
@@ -1036,33 +1197,153 @@ mod tests {
     #[test]
     fn data_path_check_skipped_when_flag_set() {
         let mut issues = Vec::new();
-        let status = check_data_path(PathBuf::from("/nonexistent"), true, &mut issues);
+        let mut warnings = Vec::new();
+        let status = check_data_path(
+            PathBuf::from("/nonexistent"),
+            true,
+            false,
+            &mut issues,
+            &mut warnings,
+        );
         assert!(status.skipped);
         assert!(issues.is_empty(), "skip_mount must suppress missing-path issue");
+        assert!(warnings.is_empty(), "skip_mount must suppress missing-path warning");
     }
 
     #[test]
-    fn data_path_check_flags_missing_path() {
+    fn data_path_check_explicit_missing_is_error() {
         let mut issues = Vec::new();
+        let mut warnings = Vec::new();
         let status = check_data_path(
             PathBuf::from("/this/should/never/exist/flodl-probe-test"),
             false,
+            true, // explicit
             &mut issues,
+            &mut warnings,
         );
         assert!(!status.exists);
         assert!(!status.readable);
-        assert!(!issues.is_empty(), "missing path must produce an issue");
+        assert_eq!(issues.len(), 1, "explicit missing path → error");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn data_path_check_default_missing_is_warning() {
+        let mut issues = Vec::new();
+        let mut warnings = Vec::new();
+        let status = check_data_path(
+            PathBuf::from("/this/should/never/exist/flodl-probe-test"),
+            false,
+            false, // convention default — not explicit
+            &mut issues,
+            &mut warnings,
+        );
+        assert!(!status.exists);
+        assert!(issues.is_empty(), "default missing path must NOT error");
+        assert_eq!(warnings.len(), 1, "default missing path → warning");
     }
 
     #[test]
     fn data_path_check_reports_readable_tmp() {
         let mut issues = Vec::new();
-        let status = check_data_path(PathBuf::from("/tmp"), false, &mut issues);
+        let mut warnings = Vec::new();
+        let status = check_data_path(
+            PathBuf::from("/tmp"),
+            false,
+            false,
+            &mut issues,
+            &mut warnings,
+        );
         // /tmp is virtually always readable on Linux; if not we'd see
         // it in `issues` and the test would surface the surprise.
         assert!(status.exists);
         assert!(status.readable);
         assert!(issues.is_empty(), "issues = {:?}", issues);
+        assert!(warnings.is_empty(), "warnings = {:?}", warnings);
+    }
+
+    #[test]
+    fn nccl_via_docker_skips_host_scan() {
+        let mut issues = Vec::new();
+        let status = check_nccl(Some("cuda".into()), &mut issues);
+        assert!(issues.is_empty(), "docker-served NCCL must not produce errors");
+        assert!(status.library_path.is_none());
+        assert!(status.all_found.is_empty());
+        assert_eq!(status.via_docker.as_deref(), Some("cuda"));
+    }
+
+    #[test]
+    fn verdict_format_three_tier() {
+        // No errors, no warnings → READY.
+        let r0 = ProbeReport {
+            host: "h".into(),
+            gpus: vec![],
+            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
+            data_path: DataPathStatus {
+                path: PathBuf::new(), exists: false, readable: false, fs_type: None, skipped: true,
+            },
+            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            issues: vec![],
+            warnings: vec![],
+        };
+        assert!(r0.green());
+
+        // Warning-only is still green (exit 0).
+        let r1 = ProbeReport { warnings: vec!["w".into()], ..clone_report(&r0) };
+        assert!(r1.green());
+
+        // Error flips green to false.
+        let r2 = ProbeReport { issues: vec!["e".into()], ..clone_report(&r0) };
+        assert!(!r2.green());
+    }
+
+    // Local clone helper — ProbeReport intentionally not Clone (Vec<GpuInfo>
+    // has its own ownership).
+    fn clone_report(r: &ProbeReport) -> ProbeReport {
+        ProbeReport {
+            host: r.host.clone(),
+            gpus: vec![],
+            libtorch: LibtorchStatus {
+                info: None,
+                valid_dir: r.libtorch.valid_dir,
+                archs_match: vec![],
+            },
+            data_path: DataPathStatus {
+                path: r.data_path.path.clone(),
+                exists: r.data_path.exists,
+                readable: r.data_path.readable,
+                fs_type: r.data_path.fs_type.clone(),
+                skipped: r.data_path.skipped,
+            },
+            nccl: NcclStatus {
+                library_path: r.nccl.library_path.clone(),
+                all_found: r.nccl.all_found.clone(),
+                via_docker: r.nccl.via_docker.clone(),
+            },
+            issues: r.issues.clone(),
+            warnings: r.warnings.clone(),
+        }
+    }
+
+    #[test]
+    fn json_emits_warnings_array() {
+        let r = ProbeReport {
+            host: "h".into(),
+            gpus: vec![],
+            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
+            data_path: DataPathStatus {
+                path: PathBuf::new(), exists: false, readable: false, fs_type: None, skipped: true,
+            },
+            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: Some("cuda".into()) },
+            issues: vec![],
+            warnings: vec!["data-path missing".into()],
+        };
+        let j = report_to_json_object(&r);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("emit valid JSON");
+        assert!(v["ready"].as_bool().unwrap());
+        let warns = v["warnings"].as_array().expect("warnings: []");
+        assert_eq!(warns.len(), 1);
+        assert_eq!(v["nccl"]["via_docker"].as_str(), Some("cuda"));
     }
 
     #[test]

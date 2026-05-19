@@ -166,6 +166,7 @@ fn main() -> ExitCode {
                 cli.skip_mount,
                 cli.data_path,
                 cli.libtorch_path,
+                cli.docker,
             );
             if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
