@@ -655,6 +655,27 @@ pub struct ClusterHost {
     /// deploy paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<String>,
+    /// SSH port (default: 22). Carried into the launcher's SSH command
+    /// as `-p <port>`. Useful when the cluster yml needs to be
+    /// self-contained — no `~/.ssh/config` to maintain. Library reads
+    /// it via the propagated envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+    /// SSH login user (default: current user). Carried into the
+    /// launcher's SSH command as `-l <user>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
+    /// SSH identity file (private key) path. Carried into the
+    /// launcher's SSH command as `-i <path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_identity_file: Option<String>,
+    /// Pass-through `-o Key=Value` SSH options (e.g.
+    /// `"ProxyJump=bastion"`, `"StrictHostKeyChecking=no"`). Same
+    /// syntax as `~/.ssh/config` directives. Each entry becomes one
+    /// `-o ...` arg on the spawned `ssh` command, in the order
+    /// declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_options: Vec<String>,
 }
 
 /// Convention default for [`ClusterHost::data_path`] when the host
@@ -794,6 +815,11 @@ impl ClusterConfig {
         if let Some(p) = &host.libtorch_path {
             host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
         }
+        // SSH fields (port/user/identity_file/options) are launcher-only.
+        // The slim per-rank envelope read by `LocalCluster::from_env`
+        // doesn't need them — the rank-side library has nothing to do
+        // with SSH. They're already on the FULL envelope via serde on
+        // `ClusterConfig` so the launcher picks them up there.
         // Shared-data path: always serialize the effective value
         // (declared or convention default) so the rank-side envelope
         // surfaces a non-ambiguous path. Library validates existence

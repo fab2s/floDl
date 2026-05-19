@@ -115,6 +115,10 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             path: String::new(),
             libtorch_path: None,
             ssh: None,
+            ssh_port: None,
+            ssh_user: None,
+            ssh_identity_file: None,
+            ssh_options: Vec::new(),
         }],
         salt: [0u8; SESSION_SALT_BYTES],
     }

@@ -170,6 +170,10 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             arch: None,
             data_path: None,
             docker: None,
+            ssh_port: None,
+            ssh_user: None,
+            ssh_identity_file: None,
+            ssh_options: Vec::new(),
         }],
     })
 }

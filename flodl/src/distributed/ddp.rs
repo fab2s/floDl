@@ -725,6 +725,29 @@ impl Trainer {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
+        // Programmatic cluster: convert to the same FLODL_FULL_CLUSTER_JSON
+        // env-var contract fdl-cli uses, so the downstream
+        // `DdpHandle::launch` dispatch path sees Role::Launcher exactly
+        // as if fdl-cli had set it. Single launcher contract; two
+        // construction paths (yml via fdl-cli, programmatic via cfg).
+        //
+        // Env precedence: an already-set `FLODL_FULL_CLUSTER_JSON`
+        // (from fdl-cli) wins — we don't overwrite. That way a user
+        // running `fdl @cluster <bin>` whose binary also sets
+        // `cfg.cluster` gets fdl-cli's overlay-resolved view, which
+        // matches the cluster yml on disk.
+        if let Some(full) = &cfg.cluster {
+            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
+            if std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none() {
+                let json = full.to_json().to_string();
+                let hex = crate::distributed::cluster::hex_encode(json.as_bytes());
+                // SAFETY: Trainer::run is called from main() before
+                // any thread spawning — matches the same invariant
+                // documented for fdl-cli's `prepare_cluster_env`.
+                unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, hex); }
+            }
+        }
+
         let (policy, backend) = cfg.elche.mode.split();
 
         let mut b = DdpHandle::new_builder(model_factory, optim_factory, train_fn)

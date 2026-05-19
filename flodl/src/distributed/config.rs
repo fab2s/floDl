@@ -33,6 +33,7 @@ use super::ddp_run::{
     EpochCallbackPolicy, EpochFn, EvalFn, EvalResultFn,
     MetricsFn, SchedulerFn,
 };
+use super::launcher::FullCluster;
 
 // ---------------------------------------------------------------------------
 // ElCheMode
@@ -341,6 +342,26 @@ pub struct TrainerConfig<M: Module> {
 
     /// Optional high-frequency system timeline for profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
+
+    /// Programmatic cluster topology. When `Some`, [`Trainer::run`]
+    /// promotes this process to launcher role with the given cluster
+    /// (same effect as setting `FLODL_FULL_CLUSTER_JSON` via fdl-cli's
+    /// overlay parsing — the launcher contract is single-shape).
+    ///
+    /// Three precedence cases at `Trainer::run` time:
+    /// - `FLODL_FULL_CLUSTER_JSON` already set in env (fdl-cli set
+    ///   it before invoking the user binary) → that wins; this field
+    ///   is ignored.
+    /// - `cfg.cluster = Some(...)` and env unset → field wins; serializes
+    ///   into `FLODL_FULL_CLUSTER_JSON` and dispatch fires Launcher.
+    /// - Neither set + 2+ visible GPUs → auto-promote synthesizes a
+    ///   localhost cluster via [`super::ClusterBuilder::all_local_gpus`].
+    /// - Neither set + ≤1 GPU → single-device path.
+    ///
+    /// Construct via [`super::ClusterBuilder`].
+    ///
+    /// [`Trainer::run`]: crate::distributed::Trainer::run
+    pub cluster: Option<FullCluster>,
 }
 
 impl<M: Module> TrainerConfig<M> {
@@ -365,6 +386,7 @@ impl<M: Module> TrainerConfig<M> {
             eval_result_fn: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,
+            cluster: None,
         }
     }
 
@@ -407,6 +429,14 @@ impl<M: Module> TrainerConfig<M> {
     /// Attach a profiling timeline.
     pub fn timeline(mut self, t: Arc<crate::monitor::Timeline>) -> Self {
         self.timeline = Some(t);
+        self
+    }
+
+    /// Attach a programmatic cluster topology. See the field docs for
+    /// precedence with `FLODL_FULL_CLUSTER_JSON` env-var and the
+    /// auto-promote path.
+    pub fn cluster(mut self, c: FullCluster) -> Self {
+        self.cluster = Some(c);
         self
     }
 }

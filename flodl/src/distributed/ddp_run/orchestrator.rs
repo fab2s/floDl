@@ -373,6 +373,67 @@ impl DdpHandle {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        // Auto-promote: when this process would otherwise enter
+        // `Role::SingleDevice` (no cluster envelope in env) but
+        // 2+ visible GPUs are present, synthesize a localhost cluster
+        // and set `FLODL_FULL_CLUSTER_JSON` so the dispatch below
+        // returns `Role::Launcher`. This makes `Trainer::run` /
+        // `Trainer::builder().run()` "just work" for single-host
+        // multi-GPU without any cluster yml or programmatic config —
+        // matching the UX of the legacy in-process threaded path
+        // while running on the canonical process-per-rank path.
+        //
+        // Skips auto-promote when:
+        //   - Any cluster envelope env var is already set (user opted
+        //     in via fdl-cli overlay or `cfg.cluster`).
+        //   - `detect_gpus()` returns <2 (no DDP to do; single-device
+        //     path will run).
+        //   - Compiled with `cfg(test)` (flodl's own test builds; tests
+        //     that exercise multi-GPU should use `Ddp::wrap` for the
+        //     thread-based path. External crates depending on flodl
+        //     always see auto-promote in production builds, including
+        //     `cargo run` and release binaries.)
+        //
+        // `detect_gpus()` respects `CUDA_VISIBLE_DEVICES`, so production
+        // callers that want to scope down also have that lever.
+        #[cfg(not(test))]
+        {
+            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
+            use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_LOCAL_RANK};
+            let env_pristine = std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none()
+                && std::env::var_os(ENV_CLUSTER_JSON).is_none()
+                && std::env::var_os(ENV_LOCAL_RANK).is_none();
+            if env_pristine {
+                let gpus = crate::sys::detect_gpus();
+                if gpus.len() >= 2 {
+                    match crate::distributed::ClusterBuilder::all_local_gpus() {
+                        Ok(full) => {
+                            let hex = crate::distributed::cluster::hex_encode(
+                                full.to_json().to_string().as_bytes(),
+                            );
+                            // SAFETY: DdpHandle::launch is called from
+                            // main() before any user-spawned threads;
+                            // matches the invariant documented for
+                            // fdl-cli's `prepare_cluster_env`.
+                            unsafe {
+                                std::env::set_var(ENV_FULL_CLUSTER_JSON, hex);
+                            }
+                        }
+                        Err(e) => {
+                            // `all_local_gpus` errors when no GPUs are
+                            // visible — but we just checked >=2. The
+                            // only realistic failure is `hostname(1)`
+                            // failing; surface it loudly rather than
+                            // silently falling back to single-device.
+                            return Err(crate::tensor::TensorError::new(&format!(
+                                "auto-promote multi-GPU failed: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         // Launcher trampoline. In launcher mode this process is the
         // fan-out orchestrator — no training body to run here. Build
         // the controller-scope config from the user's `DdpRunConfig`
@@ -382,12 +443,6 @@ impl DdpHandle {
         // the spawned controller thread on the same host — the
         // cross-process gap that previously forced env-var workarounds
         // is dissolved.
-        //
-        // `coord_config = None` when `save_path` is unset: that signals
-        // the user does NOT want the elastic-membership / persistence
-        // path, so the launcher skips the coord spawn entirely. The
-        // legacy rank-side self-driven NCCL routing takes care of
-        // those runs (per the `auto_with` flip below).
         match crate::distributed::launcher::dispatch()? {
             crate::distributed::launcher::Role::Launcher => {
                 let full = crate::distributed::launcher::FullCluster::from_env()?;

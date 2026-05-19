@@ -65,7 +65,46 @@ impl GpuInfo {
 /// [`crate::tensor::cuda_device_count`] would prematurely init libtorch
 /// and break the cluster launcher's "no CUDA touch before fan-out"
 /// invariant on heterogeneous rigs.
+///
+/// # `CUDA_VISIBLE_DEVICES`
+///
+/// `nvidia-smi` reports every physical GPU regardless of
+/// `CUDA_VISIBLE_DEVICES`. To match what the libtorch runtime would
+/// actually see (and to keep the auto-promote logic in
+/// `DdpHandle::launch` consistent), this function filters the raw
+/// `nvidia-smi` output by `CUDA_VISIBLE_DEVICES` when set:
+///
+/// - `CUDA_VISIBLE_DEVICES=0,2` → returns only the GPUs with indices
+///   0 and 2 from the physical enumeration.
+/// - `CUDA_VISIBLE_DEVICES=` (empty) → returns an empty `Vec`
+///   (matches libtorch behavior: "explicitly no CUDA").
+/// - Unset → returns every physical GPU.
+///
+/// This lets tests scope down to single-GPU view via
+/// `CUDA_VISIBLE_DEVICES=0 cargo test` and prevents auto-promote from
+/// surprising the test harness on a multi-GPU box.
 pub fn detect_gpus() -> Vec<GpuInfo> {
+    let all = detect_gpus_raw();
+    let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") else {
+        return all;
+    };
+    let trimmed = visible.trim();
+    if trimmed.is_empty() {
+        // Explicit "no CUDA" — libtorch treats this as zero devices.
+        return Vec::new();
+    }
+    let allowed: std::collections::HashSet<u8> = trimmed
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    all.into_iter()
+        .filter(|g| allowed.contains(&g.index))
+        .collect()
+}
+
+/// Unfiltered nvidia-smi enumeration. Internal — public callers go
+/// through [`detect_gpus`] which honors `CUDA_VISIBLE_DEVICES`.
+fn detect_gpus_raw() -> Vec<GpuInfo> {
     let output = match Command::new("nvidia-smi")
         .args([
             "--query-gpu=index,name,compute_cap,memory.total",
@@ -105,9 +144,51 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env mutations must be serialized — cargo test runs in parallel
+    // and `CUDA_VISIBLE_DEVICES` is process-global.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII helper that snapshots `CUDA_VISIBLE_DEVICES` on construction
+    /// and restores it on drop. Pair with `ENV_LOCK` to make env tests
+    /// thread-safe in the parallel harness.
+    struct CudaVisibleGuard {
+        prev: Option<String>,
+    }
+
+    impl CudaVisibleGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+            // SAFETY: `ENV_LOCK` serializes env mutations across tests
+            // in this module. Outside-module readers may still race,
+            // but cargo test in flodl doesn't read this env var
+            // outside the GPU path which doesn't run under `fdl test`.
+            unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", value); }
+            Self { prev }
+        }
+        fn unset() -> Self {
+            let prev = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+            unsafe { std::env::remove_var("CUDA_VISIBLE_DEVICES"); }
+            Self { prev }
+        }
+    }
+
+    impl Drop for CudaVisibleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("CUDA_VISIBLE_DEVICES", v),
+                    None => std::env::remove_var("CUDA_VISIBLE_DEVICES"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn detect_gpus_returns_empty_or_valid() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = CudaVisibleGuard::unset();
         // On CI without GPUs: empty Vec. On a GPU box: parseable info.
         // Either is fine — function must NOT panic and must NOT touch libtorch.
         let gpus = detect_gpus();
@@ -130,5 +211,42 @@ mod tests {
         assert_eq!(g.sm_version(), "sm_120");
         assert_eq!(g.short_name(), "Test");
         assert_eq!(g.vram_bytes(), 16000 * 1024 * 1024);
+    }
+
+    #[test]
+    fn detect_gpus_empty_cuda_visible_devices_returns_empty() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = CudaVisibleGuard::set("");
+        // Empty CUDA_VISIBLE_DEVICES means "explicitly no CUDA" — libtorch
+        // treats it as zero devices, so detect_gpus must match.
+        assert!(detect_gpus().is_empty());
+    }
+
+    #[test]
+    fn detect_gpus_cuda_visible_devices_filters_by_index() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_unset = CudaVisibleGuard::unset();
+        // Get the physical baseline (whatever this host has).
+        let physical = detect_gpus();
+        if physical.is_empty() {
+            // No GPUs on this CI box — nothing to filter. Test is a no-op.
+            return;
+        }
+        drop(_g_unset);
+        // Pick an index that exists; restrict to just that one.
+        let pick = physical[0].index;
+        let _g_set = CudaVisibleGuard::set(&pick.to_string());
+        let filtered = detect_gpus();
+        assert_eq!(filtered.len(), 1, "single-index filter narrows to one");
+        assert_eq!(filtered[0].index, pick);
+    }
+
+    #[test]
+    fn detect_gpus_cuda_visible_devices_excludes_nonexistent_index() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Index 99 should never exist on any realistic rig — verify filter
+        // drops missing indices instead of inventing them.
+        let _g = CudaVisibleGuard::set("99");
+        assert!(detect_gpus().is_empty());
     }
 }

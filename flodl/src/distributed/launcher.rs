@@ -409,7 +409,7 @@ pub fn run_launcher_with_config(
                         .expect("ENV_FDL_CMD presence enforced above when has_remote"),
                     &user_args,
                 );
-                build_ssh_spawn_command(host.ssh.as_deref().unwrap_or(&host.name), &remote_cmd)
+                build_ssh_spawn_command(host, &remote_cmd)
             };
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -511,10 +511,36 @@ fn build_local_spawn_command(
 }
 
 /// Build the `Command` that ssh's into a remote host and runs the given
-/// bash command string. Matches fdl-cli's existing ssh shape verbatim.
-fn build_ssh_spawn_command(ssh_target: &str, remote_cmd: &str) -> Command {
+/// bash command string.
+///
+/// Reads connection details from the host:
+/// - `host.ssh_port` → `-p <port>` (default: system ssh's 22)
+/// - `host.ssh_user` → `-l <user>` (default: current user)
+/// - `host.ssh_identity_file` → `-i <path>` (default: `~/.ssh/config` rules)
+/// - `host.ssh_options` → `-o Key=Value ...` (pass-through, in order)
+/// - `host.ssh.as_deref().unwrap_or(&host.name)` → the connect target
+///
+/// All fields are optional; when absent, the corresponding flag is
+/// omitted and system ssh's defaults / `~/.ssh/config` rules apply —
+/// preserving backward compat for configs that pre-date the new
+/// fields.
+fn build_ssh_spawn_command(host: &FullHost, remote_cmd: &str) -> Command {
+    let ssh_target = host.ssh.as_deref().unwrap_or(&host.name);
     let mut c = Command::new("ssh");
-    c.args(SSH_OPTS).arg(ssh_target).arg(remote_cmd);
+    c.args(SSH_OPTS);
+    if let Some(p) = host.ssh_port {
+        c.arg("-p").arg(p.to_string());
+    }
+    if let Some(u) = &host.ssh_user {
+        c.arg("-l").arg(u);
+    }
+    if let Some(i) = &host.ssh_identity_file {
+        c.arg("-i").arg(i);
+    }
+    for opt in &host.ssh_options {
+        c.arg("-o").arg(opt);
+    }
+    c.arg(ssh_target).arg(remote_cmd);
     c
 }
 
@@ -716,6 +742,18 @@ pub struct FullHost {
     /// SSH target for remote dispatch. `None` means the host runs on
     /// the same machine as the launcher (fork/exec path, no ssh).
     pub ssh: Option<String>,
+    /// SSH port (default: 22). Maps to `ssh -p <port>`.
+    pub ssh_port: Option<u16>,
+    /// SSH login user. Maps to `ssh -l <user>`. Falls back to the
+    /// current user when `None` (system ssh's default behavior).
+    pub ssh_user: Option<String>,
+    /// Identity file path for SSH key-based auth. Maps to `ssh -i <path>`.
+    pub ssh_identity_file: Option<String>,
+    /// Pass-through `-o Key=Value` SSH options. Same syntax as
+    /// `~/.ssh/config` directives (e.g. `"ProxyJump=bastion"`,
+    /// `"StrictHostKeyChecking=no"`). Each entry is shipped as a
+    /// separate `-o ...` arg, in the order given.
+    pub ssh_options: Vec<String>,
 }
 
 impl FullCluster {
@@ -817,6 +855,83 @@ impl FullCluster {
     /// Whether the cluster spans more than one physical host.
     pub fn spans_multiple_hosts(&self) -> bool {
         self.hosts.len() > 1
+    }
+
+    /// Serialize to the JSON shape [`Self::from_value`] parses. Symmetric
+    /// round-trip: `FullCluster::from_value(&cluster.to_json()) == cluster`.
+    /// Used by [`crate::distributed::Trainer::run`] to convert a
+    /// programmatic [`super::ClusterBuilder`] result into the
+    /// `FLODL_FULL_CLUSTER_JSON` env-var contract the launcher path
+    /// reads. `salt` is intentionally NOT serialized — the launcher
+    /// generates a fresh session salt per run.
+    pub fn to_json(&self) -> serde_json::Value {
+        let hosts: Vec<serde_json::Value> = self
+            .hosts
+            .iter()
+            .map(|h| {
+                let mut o = serde_json::Map::new();
+                o.insert("name".into(), serde_json::Value::String(h.name.clone()));
+                o.insert(
+                    "ranks".into(),
+                    serde_json::Value::Array(
+                        h.ranks.iter().map(|r| serde_json::Value::from(*r)).collect(),
+                    ),
+                );
+                let ld = match &h.local_devices {
+                    None => serde_json::Value::String("all".into()),
+                    Some(v) => serde_json::Value::Array(
+                        v.iter().map(|d| serde_json::Value::from(*d)).collect(),
+                    ),
+                };
+                o.insert("local_devices".into(), ld);
+                o.insert(
+                    "nccl_socket_ifname".into(),
+                    serde_json::Value::String(h.nccl_socket_ifname.clone()),
+                );
+                o.insert("path".into(), serde_json::Value::String(h.path.clone()));
+                if let Some(p) = &h.libtorch_path {
+                    o.insert("libtorch_path".into(), serde_json::Value::String(p.clone()));
+                }
+                if let Some(s) = &h.ssh {
+                    o.insert("ssh".into(), serde_json::Value::String(s.clone()));
+                }
+                if let Some(p) = h.ssh_port {
+                    o.insert("ssh_port".into(), serde_json::Value::from(p));
+                }
+                if let Some(u) = &h.ssh_user {
+                    o.insert("ssh_user".into(), serde_json::Value::String(u.clone()));
+                }
+                if let Some(i) = &h.ssh_identity_file {
+                    o.insert(
+                        "ssh_identity_file".into(),
+                        serde_json::Value::String(i.clone()),
+                    );
+                }
+                if !h.ssh_options.is_empty() {
+                    o.insert(
+                        "ssh_options".into(),
+                        serde_json::Value::Array(
+                            h.ssh_options
+                                .iter()
+                                .map(|s| serde_json::Value::String(s.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                serde_json::Value::Object(o)
+            })
+            .collect();
+        let mut top = serde_json::Map::new();
+        top.insert(
+            "master_addr".into(),
+            serde_json::Value::String(self.master_addr.clone()),
+        );
+        top.insert(
+            "master_port".into(),
+            serde_json::Value::from(self.master_port),
+        );
+        top.insert("hosts".into(), serde_json::Value::Array(hosts));
+        serde_json::Value::Object(top)
     }
 }
 
@@ -955,6 +1070,53 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let ssh_port = match obj.get("ssh_port") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                TensorError::new(&format!(
+                    "cluster launcher: hosts[{i}] ({name:?}): ssh_port must be integer"
+                ))
+            })?;
+            Some(u16::try_from(n).map_err(|_| {
+                TensorError::new(&format!(
+                    "cluster launcher: hosts[{i}] ({name:?}): ssh_port {n} does not fit in u16"
+                ))
+            })?)
+        }
+    };
+
+    let ssh_user = obj
+        .get("ssh_user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let ssh_identity_file = obj
+        .get("ssh_identity_file")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let ssh_options: Vec<String> = match obj.get("ssh_options") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .enumerate()
+            .map(|(j, e)| {
+                e.as_str().map(String::from).ok_or_else(|| {
+                    TensorError::new(&format!(
+                        "cluster launcher: hosts[{i}].ssh_options[{j}]: must be string"
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: hosts[{i}] ({name:?}): ssh_options must be array of \
+                 strings, got {other}"
+            )));
+        }
+    };
+
     Ok(FullHost {
         name,
         ranks,
@@ -963,6 +1125,10 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         path,
         libtorch_path,
         ssh,
+        ssh_port,
+        ssh_user,
+        ssh_identity_file,
+        ssh_options,
     })
 }
 
