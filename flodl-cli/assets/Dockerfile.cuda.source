@@ -71,8 +71,17 @@ ENV BUILD_CAFFE2=OFF
 # Output lands in /pytorch/torch/{lib,include,share}.
 RUN python3 tools/build_libtorch.py
 
-# Package into the standard libtorch directory layout
+# Package into the standard libtorch directory layout. cuDNN libs
+# from the base image's `cudnn-devel` layer (`/usr/lib/x86_64-linux-gnu/
+# libcudnn*.so*` — libcudnn.so.9 + sub-libs libcudnn_{adv,cnn,graph,
+# heuristic,ops,engines_precompiled,engines_runtime_compiled}.so.9)
+# are bundled alongside libtorch so deploys are self-contained and
+# target hosts don't need a system cuDNN install. `cp -a` preserves
+# the SONAME symlinks PyTorch's runtime loader looks for. Match
+# pattern resolves at shell-expansion time inside the RUN; quoting
+# blocks globbing so we use shell glob via `bash -c`.
 RUN mkdir -p /usr/local/libtorch && \
     cp -a /pytorch/torch/lib /usr/local/libtorch/lib && \
     cp -a /pytorch/torch/include /usr/local/libtorch/include && \
-    cp -a /pytorch/torch/share /usr/local/libtorch/share 2>/dev/null || true
+    cp -a /pytorch/torch/share /usr/local/libtorch/share 2>/dev/null || true && \
+    bash -c 'cp -a /usr/lib/x86_64-linux-gnu/libcudnn*.so* /usr/local/libtorch/lib/'
