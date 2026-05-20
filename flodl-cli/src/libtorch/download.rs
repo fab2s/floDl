@@ -69,6 +69,12 @@ pub struct DownloadOpts {
     pub custom_path: Option<PathBuf>,
     pub activate: bool,
     pub dry_run: bool,
+    /// Force the Linux x86_64 build regardless of host OS. Set when the
+    /// libtorch will be consumed inside a Linux Docker container rather
+    /// than linked against host cargo — without this, macOS hosts pick
+    /// `libtorch-macos-arm64-*.zip` (Mach-O dylibs) which then fail to
+    /// load inside the Linux container that bind-mounts the directory.
+    pub force_linux: bool,
 }
 
 impl Default for DownloadOpts {
@@ -78,6 +84,7 @@ impl Default for DownloadOpts {
             custom_path: None,
             activate: true,
             dry_run: false,
+            force_linux: false,
         }
     }
 }
@@ -86,9 +93,15 @@ impl Default for DownloadOpts {
 // URL construction
 // ---------------------------------------------------------------------------
 
-fn download_url(spec: &VariantSpec) -> Result<String, String> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String> {
+    // `force_linux` short-circuits host detection: the binary is destined
+    // for a Linux Docker container, so we always want the Linux x86_64
+    // build regardless of what the host is.
+    let (os, arch) = if force_linux {
+        ("linux", "x86_64")
+    } else {
+        (std::env::consts::OS, std::env::consts::ARCH)
+    };
 
     match (os, arch) {
         ("linux", "x86_64") => {}
@@ -197,7 +210,7 @@ pub fn run(opts: DownloadOpts) -> Result<(), String> {
 /// Run with an explicit context (used by `setup` which has its own context).
 pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String> {
     let spec = resolve_variant(&opts.variant);
-    let url = download_url(spec)?;
+    let url = download_url(spec, opts.force_linux)?;
 
     // Determine install path
     let install_path = if let Some(ref p) = opts.custom_path {

@@ -105,12 +105,29 @@ fn pick_mode_interactively() -> Mode {
     if !prompt::ask_yn("Use Docker for builds?", true) {
         return Mode::Native;
     }
+
+    // On macOS, Docker runs Linux containers under Rosetta/QEMU emulation.
+    // Builds and training are substantially slower than native cargo on the
+    // host. Warn once and offer a chance to drop to Native before the user
+    // commits to a Docker scaffold.
+    if cfg!(target_os = "macos") {
+        println!();
+        println!("  Heads up: on macOS, Docker runs Linux containers under emulation");
+        println!("  (Rosetta / QEMU). Builds and training will be substantially slower");
+        println!("  than running cargo natively on the host. Native mode keeps");
+        println!("  everything on the Mac and uses macOS libtorch directly.");
+        println!();
+        if !prompt::ask_yn("Continue with Docker?", true) {
+            return Mode::Native;
+        }
+    }
+
     // 1-based: 1 = mounted (default), 2 = baked-in.
     let choice = prompt::ask_choice(
-        "libtorch location",
+        "How should libtorch be provided to the container?",
         &[
-            "Mounted from host (recommended: lighter image, swap CUDA variants)",
-            "Baked into the Docker image (zero host dependencies)",
+            "Mount it from the host (recommended: lighter image, swap CUDA variants)",
+            "Bake it into the image at build time (zero host setup)",
         ],
         1,
     );

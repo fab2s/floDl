@@ -875,6 +875,7 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
         custom_path: cli.path.map(PathBuf::from),
         activate: !cli.no_activate,
         dry_run: cli.dry_run,
+        force_linux: false,
     };
 
     match libtorch::download::run(opts) {
