@@ -172,6 +172,20 @@ pub struct ElChe {
     /// Number of successful `report_timing` calls (each one a calibration).
     /// Drives phase transitions Warmup→Stable→Mature.
     calibration_count: u64,
+    /// Per-rank ms of wall-time to subtract from the next batch-count
+    /// recompute, consumed once then auto-cleared. Set by the
+    /// coordinator before the LAST sync cycle of an epoch that fires a
+    /// user callback (`eval_fn` / `epoch_fn` / `checkpoint_fn`) so the
+    /// firing rank's quota shrinks just enough to absorb the callback
+    /// wall-time inside its compute slack instead of bloating the
+    /// sync-barrier wait. Zero entries are no-ops.
+    ///
+    /// Consumed in [`Self::recompute_batch_counts`]: rank `r`'s
+    /// computed target drops by `ceil(slack_ms[r] / smoothed_ms[r])`
+    /// (clamped at 1) on the next recompute. The vector is zeroed in
+    /// the same call so the effect lands exactly once per
+    /// `apply_callback_slack` invocation.
+    pending_callback_slack_ms: Vec<f64>,
 }
 
 impl ElChe {
@@ -205,6 +219,7 @@ impl ElChe {
             phase: Phase::Probe,
             anchor_rank: None,
             calibration_count: 0,
+            pending_callback_slack_ms: vec![0.0; world_size],
         }
     }
 
@@ -543,6 +558,45 @@ impl ElChe {
         &self.batch_counts
     }
 
+    /// Stage per-rank callback wall-time (ms) to absorb on the next
+    /// [`Self::recompute_batch_counts`] call. The coord sets this just
+    /// before the last sync cycle of an epoch that fires a user
+    /// callback on a known rank, so the firing rank's quota for that
+    /// cycle drops by `ceil(slack_ms / smoothed_ms_per_batch)` batches
+    /// — leaving compute slack to run the callback without bloating
+    /// the barrier wait.
+    ///
+    /// Inputs:
+    /// - `slack_ms`: length-`world_size` vector. Index `r` is the
+    ///   callback budget for rank `r` (zero = no slack, the typical
+    ///   case for non-firing ranks).
+    ///
+    /// Silently no-ops when `slack_ms.len() != self.world_size` to
+    /// match the rest of the ElChe builder/setter shape (callers
+    /// constructed off-by-one inputs would otherwise crash a running
+    /// training cluster, not what we want; recompute-without-slack is
+    /// a safe fallback).
+    ///
+    /// The slack is consumed exactly once per
+    /// [`Self::recompute_batch_counts`] call: after the per-rank
+    /// targets are computed with the slack subtracted, the pending
+    /// vector is zeroed. The caller can re-set the vector before each
+    /// recompute, or leave it zeroed for cycles where no callback
+    /// fires.
+    pub fn apply_callback_slack(&mut self, slack_ms: &[f64]) {
+        if slack_ms.len() != self.world_size {
+            return;
+        }
+        self.pending_callback_slack_ms.clone_from_slice(slack_ms);
+    }
+
+    /// Read the currently-staged callback slack (ms per rank). Returns
+    /// all-zero by default. Test/diagnostic accessor; production code
+    /// goes through [`Self::apply_callback_slack`].
+    pub fn pending_callback_slack_ms(&self) -> &[f64] {
+        &self.pending_callback_slack_ms
+    }
+
     /// Total batches across all devices for this cadence step.
     pub fn total_batches(&self) -> usize {
         self.batch_counts.iter().sum()
@@ -875,18 +929,41 @@ impl ElChe {
     fn recompute_batch_counts(&mut self, slow_ms: f64) {
         for rank in 0..self.world_size {
             let ms = self.smoothed_ms(rank);
-            let target = if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
+            let target_no_slack = if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
                 self.anchor
             } else {
                 let ratio = slow_ms / ms;
                 (self.anchor as f64 * ratio).round().max(1.0) as usize
             };
 
+            // Callback slack: when the coord staged ms of wall-time for
+            // this rank to absorb (eval_fn / epoch_fn / checkpoint_fn
+            // firing on this rank for the upcoming cycle), subtract the
+            // equivalent batch count so the rank finishes its quota
+            // early and runs the callback in the freed slack instead of
+            // bloating the sync-barrier wait. Skipped when slack is
+            // zero (the typical case) or when the rank has no
+            // calibrated ms-per-batch reading. Clamps target at 1 so
+            // even a heavy callback doesn't starve the rank of training
+            // work.
+            let slack_ms = self.pending_callback_slack_ms[rank];
+            let slack_batches = if slack_ms > 0.0 && ms > 0.0 {
+                (slack_ms / ms).ceil() as usize
+            } else {
+                0
+            };
+            let target = target_no_slack.saturating_sub(slack_batches).max(1);
+
             let current = self.batch_counts[rank];
             let diff = (target as f64 - current as f64).abs();
             // Dead zone: only update if change exceeds 5% of current count.
             // Always update on first calibration (current == anchor for all).
-            if diff > current as f64 * 0.05 || !self.calibrated {
+            // Slack-driven changes bypass the dead zone — the slack vector
+            // is set explicitly per-cycle by the coord, so silently
+            // ignoring it because the delta is small would defeat the
+            // point.
+            let slack_active = slack_batches > 0;
+            if diff > current as f64 * 0.05 || !self.calibrated || slack_active {
                 // Clamp per-update change to max_batch_diff (if set).
                 // Without this, a sudden speed change (thermal throttle, power
                 // limit) can cause the batch count to jump far beyond the
@@ -904,6 +981,13 @@ impl ElChe {
                 };
                 self.batch_counts[rank] = clamped;
             }
+        }
+        // Slack is consumed exactly once per recompute. Zeroing here
+        // (rather than letting the caller manage) avoids the
+        // double-application bug where two back-to-back recomputes both
+        // subtract the same slack.
+        for s in &mut self.pending_callback_slack_ms {
+            *s = 0.0;
         }
     }
 }

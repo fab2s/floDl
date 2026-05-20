@@ -1874,21 +1874,26 @@ fn test_eval_fn_called_on_dispatch_and_emits_result() {
             schedule_id,
             epoch,
             metric,
+            elapsed_ms,
             error,
             rank,
         } = m
         {
-            got = Some((rank, schedule_id, epoch, metric, error));
+            got = Some((rank, schedule_id, epoch, metric, elapsed_ms, error));
             break;
         }
     }
-    let (rank, schedule_id, epoch, metric, error) =
+    let (rank, schedule_id, epoch, metric, elapsed_ms, error) =
         got.expect("EvalResult should be emitted");
     assert_eq!(rank, 0);
     assert_eq!(schedule_id, 99);
     assert_eq!(epoch, 7);
     assert!((metric - 0.42).abs() < 1e-9);
     assert!(error.is_none());
+    assert!(
+        elapsed_ms >= 0.0,
+        "elapsed_ms should be non-negative, got {elapsed_ms}",
+    );
 }
 
 /// `eval_fn` errors flow back as a `TimingMsg::EvalResult` with

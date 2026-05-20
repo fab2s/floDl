@@ -2137,7 +2137,13 @@ impl<M: Module> GpuWorker<M> {
                 // scalar metric (or error) flows back to the
                 // controller via `TimingMsg::EvalResult`; the
                 // controller's `eval_result_fn` fires on receipt.
+                //
+                // `elapsed_ms` is measured around the closure (eval
+                // + train-mode flip) so the coord can time-exclude
+                // it from `wall_ms_accum[rank]` — symmetric with the
+                // checkpoint path.
                 if let Some(ref f) = self.eval_fn {
+                    let start = std::time::Instant::now();
                     let result = match self.eval_dataset.as_ref() {
                         Some(ds) => {
                             self.model.eval();
@@ -2151,6 +2157,7 @@ impl<M: Module> GpuWorker<M> {
                              DdpBuilder::eval_dataset(...)",
                         )),
                     };
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                     let (metric, error) = match result {
                         Ok(m) => (m, None),
                         Err(e) => (f64::NAN, Some(e.to_string())),
@@ -2160,6 +2167,7 @@ impl<M: Module> GpuWorker<M> {
                         schedule_id,
                         epoch,
                         metric,
+                        elapsed_ms,
                         error,
                     });
                 }
@@ -2234,6 +2242,20 @@ impl<M: Module> GpuWorker<M> {
             }
         }
         handled
+    }
+
+    /// Report the wall-time the rank just spent inside `epoch_fn`. Called
+    /// by the cluster worker's main loop on the role rank after firing
+    /// the user closure, so the coord can time-exclude callback cost from
+    /// `wall_ms_accum[rank]` and update `last_epoch_fn_elapsed_ms_ewma`.
+    /// Fire-and-forget: a disconnected timing channel is non-fatal here
+    /// (the loop is exiting anyway).
+    pub fn report_epoch_fn_elapsed(&self, epoch: usize, elapsed_ms: f64) {
+        let _ = self.timing_tx.send(TimingMsg::EpochFnElapsed {
+            rank: self.rank,
+            epoch,
+            elapsed_ms,
+        });
     }
 
     /// Send a timing report to the coordinator.

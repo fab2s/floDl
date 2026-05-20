@@ -1018,6 +1018,7 @@ pub enum TimingMsg {
         schedule_id: u64,
         epoch: u64,
         metric: f64,
+        elapsed_ms: f64,
         error: Option<String>,
     },
     /// Checkpoint result from the role rank back to the coord. See
@@ -1030,6 +1031,16 @@ pub enum TimingMsg {
         version: u64,
         elapsed_ms: f64,
         error: Option<String>,
+    },
+    /// Post-fire notice from the rank that ran `epoch_fn`. See
+    /// [`crate::distributed::wire::TimingMsgWire::EpochFnElapsed`].
+    /// Reported once per `epoch_fn` invocation; the coord time-excludes
+    /// it from `wall_ms_accum[rank]` and updates
+    /// `last_epoch_fn_elapsed_ms_ewma` for callback-aware scheduling.
+    EpochFnElapsed {
+        rank: usize,
+        epoch: usize,
+        elapsed_ms: f64,
     },
 }
 

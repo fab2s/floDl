@@ -668,11 +668,19 @@ pub enum TimingMsgWire {
     /// `feedback_loud_errors_over_silent.md`: success path carries
     /// `error = None`; failures carry the error message and `metric =
     /// 0.0`.
+    ///
+    /// `elapsed_ms` is the wall-time the eval closure took on the rank.
+    /// Mirrors [`Self::CheckpointResult`] for symmetry: the coord
+    /// subtracts it from `wall_ms_accum[rank]` so ElChe does not
+    /// mis-attribute eval cost as compute slowness, and feeds it into
+    /// `last_eval_elapsed_ms_ewma` for callback-aware partition
+    /// scheduling.
     EvalResult {
         rank: u64,
         schedule_id: u64,
         epoch: u64,
         metric: f64,
+        elapsed_ms: f64,
         error: Option<String>,
     },
     /// Result of a `checkpoint_fn` invocation by `rank` for the given
@@ -704,6 +712,23 @@ pub enum TimingMsgWire {
         /// 128-byte NCCL unique-id, as produced by
         /// `crate::distributed::nccl::NcclUniqueId::new()`.
         uid_bytes: Vec<u8>,
+    },
+    /// Worker → coord notice: this rank just finished firing the
+    /// user-supplied `epoch_fn` for the given `epoch`. `elapsed_ms` is
+    /// the wall-time the closure took. Symmetric counterpart to
+    /// [`Self::EvalResult`] / [`Self::CheckpointResult`] for the
+    /// autonomously-fired `epoch_fn` path (the worker fires `epoch_fn`
+    /// inside its main loop on epoch boundaries; there is no
+    /// coord-dispatched directive, only this post-fire report).
+    ///
+    /// The coord subtracts `elapsed_ms` from `wall_ms_accum[rank]` so
+    /// ElChe does not mis-attribute epoch_fn cost as compute slowness,
+    /// and feeds it into `last_epoch_fn_elapsed_ms_ewma` for
+    /// callback-aware partition scheduling.
+    EpochFnElapsed {
+        rank: u64,
+        epoch: u64,
+        elapsed_ms: f64,
     },
 }
 

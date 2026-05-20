@@ -183,12 +183,14 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             schedule_id,
             epoch,
             metric,
+            elapsed_ms,
             error,
         } => TimingMsgWire::EvalResult {
             rank: rank as u64,
             schedule_id,
             epoch,
             metric,
+            elapsed_ms,
             error,
         },
         TimingMsg::CheckpointResult {
@@ -201,6 +203,15 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             version,
             elapsed_ms,
             error,
+        },
+        TimingMsg::EpochFnElapsed {
+            rank,
+            epoch,
+            elapsed_ms,
+        } => TimingMsgWire::EpochFnElapsed {
+            rank: rank as u64,
+            epoch: epoch as u64,
+            elapsed_ms,
         },
     }
 }
@@ -829,7 +840,14 @@ impl<M: Module + 'static> ClusterWorker<M> {
                                 == Some(inner.rank());
                             if is_role {
                                 if let Some(ref f) = epoch_fn {
+                                    let start = std::time::Instant::now();
                                     f(plan.epoch, &mut inner);
+                                    let elapsed_ms =
+                                        start.elapsed().as_secs_f64() * 1000.0;
+                                    inner.report_epoch_fn_elapsed(
+                                        plan.epoch,
+                                        elapsed_ms,
+                                    );
                                 }
                             }
                         }

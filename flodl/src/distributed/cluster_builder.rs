@@ -149,7 +149,12 @@ impl ClusterBuilder {
         let ranks: Vec<usize> = (0..n).collect();
         let local_devices: Vec<u8> = gpus.iter().map(|g| g.index).collect();
         Ok(FullCluster {
-            master_addr: "localhost".to_string(),
+            // "127.0.0.1" rather than "localhost": Rust's
+            // `SocketAddr::from_str` requires a numeric IP — passing
+            // the hostname string downstream fails the coord-addr
+            // parse in orchestrator.rs's `*_via_coord` entries with
+            // "invalid socket address syntax".
+            master_addr: "127.0.0.1".to_string(),
             master_port: 29500,
             hosts: vec![FullHost {
                 name: hostname,

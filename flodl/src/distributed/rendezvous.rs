@@ -1,10 +1,15 @@
 //! TCP rendezvous for multi-host DDP startup.
 //!
-//! One process per host. The host owning rank 0 is the **master**: it
-//! generates the [`NcclUniqueId`] and listens on
+//! One process per rank (process-per-rank topology). The process running
+//! global rank 0 is the **master**: it generates the [`NcclUniqueId`] and
+//! listens on
 //! [`LocalCluster::master_port`](super::LocalCluster::master_port). Every
-//! other host is a **worker** that connects to the master, swaps a dataset
-//! signature for verification, and receives the unique ID.
+//! other rank is a **worker** that connects to the master, swaps a
+//! dataset signature for verification, and receives the unique ID.
+//!
+//! The same protocol covers multi-host (master is on the rank-0 host)
+//! and single-host process-per-rank (auto-promote — master + workers
+//! all on `127.0.0.1`).
 //!
 //! Wire protocol (one TCP connection per worker host):
 //!
@@ -94,7 +99,12 @@ impl TcpRendezvous {
             .iter()
             .map(|&d| Device::CUDA(d))
             .collect();
-        let is_master = local_ranks.contains(&0);
+        // Process-level master detection: only the process running global
+        // rank 0 is the master. Host-level "contains rank 0" fails for
+        // single-host process-per-rank (every process on the only host
+        // owns rank 0 in the host's rank list).
+        let (my_global_rank, _) = cluster.my_rank()?;
+        let is_master = my_global_rank == 0;
 
         let uid_bytes = if is_master {
             let uid = gen_uid()?;
@@ -124,7 +134,11 @@ fn run_master(
     uid_bytes: &[u8; NCCL_UNIQUE_ID_BYTES],
     expected_sig: &[u8; 32],
 ) -> Result<()> {
-    let n_workers = cluster.num_hosts.saturating_sub(1);
+    // Process-per-rank: serve UID to every non-zero rank, regardless of
+    // host. Single-host PPR with 2 ranks → 1 worker connection from the
+    // other process on `127.0.0.1`. Multi-host PPR → one connection per
+    // non-zero rank across all hosts.
+    let n_workers = cluster.world_size().saturating_sub(1);
     if n_workers == 0 {
         return Ok(());
     }
@@ -433,12 +447,16 @@ mod tests {
 
         let master_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("master-host"));
+            // Master host has one rank (index 0 within its host).
+            crate::distributed::cluster::set_thread_local_rank_override(Some(0));
             TcpRendezvous::establish(&master_env, sig, || {
                 Ok(NcclUniqueId::from_bytes(stub_uid_bytes))
             })
         });
         let worker_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("worker-host"));
+            // Worker host has one rank (index 0 within its host, global 1).
+            crate::distributed::cluster::set_thread_local_rank_override(Some(0));
             TcpRendezvous::establish(&worker_env, sig, || {
                 panic!("worker must never invoke the uid-generator closure")
             })
@@ -459,6 +477,79 @@ mod tests {
         assert_eq!(worker_rdv.local_ranks(), &[1usize]);
         assert_eq!(master_rdv.local_devices(), &[Device::CUDA(0)]);
         assert_eq!(worker_rdv.local_devices(), &[Device::CUDA(0)]);
+        assert_eq!(master_rdv.unique_id().as_bytes(), &stub_uid_bytes);
+        assert_eq!(worker_rdv.unique_id().as_bytes(), &stub_uid_bytes);
+    }
+
+    /// Single-host process-per-rank (the auto-promote shape on a 2-GPU
+    /// host). Both processes share the same host name but have
+    /// different local-rank indices. Master is the process whose
+    /// global rank is 0 (NOT every process on a host that owns rank 0).
+    /// Workers count = `world_size - 1`, so for 2 ranks on the only
+    /// host the master accepts 1 connection from the other process on
+    /// `127.0.0.1`. Regression test for the deadlock previously caused
+    /// by the host-level master check.
+    #[test]
+    fn single_host_process_per_rank_round_trip() {
+        let port = next_port();
+        // Both processes see the SAME slim envelope (one host owning
+        // ranks [0, 1] with devices [0, 1]). They differ only in their
+        // local-rank thread override.
+        let envelope = || -> LocalCluster {
+            let v = json!({
+                "master_addr": "127.0.0.1",
+                "master_port": port,
+                "world_size": 2,
+                "num_hosts": 1,
+                "host": {
+                    "name": "single-host",
+                    "ranks": [0, 1],
+                    "local_devices": [0, 1],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/tmp/test-single-host",
+                }
+            });
+            LocalCluster::from_value(&v).expect("single-host envelope")
+        };
+        let sig = [0x42u8; 32];
+        let stub_uid_bytes = [0xcdu8; NCCL_UNIQUE_ID_BYTES];
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let master_env = envelope();
+        let worker_env = envelope();
+        let master_handle = thread::spawn(move || {
+            crate::distributed::cluster::set_thread_hostname_override(Some("single-host"));
+            crate::distributed::cluster::set_thread_local_rank_override(Some(0));
+            TcpRendezvous::establish(&master_env, sig, || {
+                Ok(NcclUniqueId::from_bytes(stub_uid_bytes))
+            })
+        });
+        let worker_handle = thread::spawn(move || {
+            crate::distributed::cluster::set_thread_hostname_override(Some("single-host"));
+            crate::distributed::cluster::set_thread_local_rank_override(Some(1));
+            TcpRendezvous::establish(&worker_env, sig, || {
+                panic!("non-zero rank must never invoke the uid-generator closure")
+            })
+        });
+
+        let master_rdv = master_handle
+            .join()
+            .expect("master thread")
+            .expect("master ok");
+        let worker_rdv = worker_handle
+            .join()
+            .expect("worker thread")
+            .expect("worker ok");
+
+        assert_eq!(master_rdv.world_size(), 2);
+        assert_eq!(worker_rdv.world_size(), 2);
+        // Both processes see the same host's full rank list, that's
+        // fine — local_ranks is the host's slice, not the process's.
+        assert_eq!(master_rdv.local_ranks(), &[0usize, 1]);
+        assert_eq!(worker_rdv.local_ranks(), &[0usize, 1]);
+        // Critical: both processes ended up with the SAME unique ID
+        // (master generated it; worker received via TCP from master).
         assert_eq!(master_rdv.unique_id().as_bytes(), &stub_uid_bytes);
         assert_eq!(worker_rdv.unique_id().as_bytes(), &stub_uid_bytes);
     }

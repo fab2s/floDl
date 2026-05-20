@@ -1426,6 +1426,17 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Pin this thread to the rank's assigned CUDA device BEFORE
+            // NCCL init. `cudaSetDevice` is thread-local, so setting it
+            // on `main()` doesn't propagate to spawned threads. Without
+            // this, every rank's NCCL thread defaults to CUDA(0) and
+            // NCCL aborts with "Duplicate GPU detected" on multi-rank-
+            // per-host topologies (single-host PPR or cluster fan-out
+            // with multiple ranks per host).
+            #[cfg(feature = "cuda")]
+            if let crate::tensor::Device::CUDA(idx) = device {
+                crate::tensor::set_current_cuda_device(idx);
+            }
             // NCCL rendezvous on the original master_port (unchanged
             // from the non-via_coord path).
             let rdv = cluster.rendezvous(dataset_sig)?;
@@ -1696,6 +1707,13 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Pin this thread to the rank's assigned CUDA device BEFORE
+            // NCCL init (cudaSetDevice is thread-local; see the
+            // Sync+Nccl entry above for the full rationale).
+            #[cfg(feature = "cuda")]
+            if let crate::tensor::Device::CUDA(idx) = device {
+                crate::tensor::set_current_cuda_device(idx);
+            }
             let rdv = cluster.rendezvous(dataset_sig)?;
             let nccl_comm =
                 NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;

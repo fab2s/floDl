@@ -886,6 +886,18 @@ pub struct ClusterCoordinator {
     /// checkpoint dispatch with AllReduce barriers so the cost
     /// overlaps with idle barrier-wait). v1 just records.
     last_checkpoint_elapsed_ms_ewma: Option<f64>,
+    /// EWMA of recent successful `eval_fn` wall-times (ms). Consumed by
+    /// ElChe's last-batch slack reservation: the firing rank's share
+    /// of the trailing batches is reduced so the eval pass absorbs
+    /// into the rank's idle slack instead of overrunning the next
+    /// sync barrier. Updated on every successful eval result. None
+    /// until the first eval reports.
+    last_eval_elapsed_ms_ewma: Option<f64>,
+    /// EWMA of recent `epoch_fn` wall-times (ms) on the role rank.
+    /// Mirrors [`Self::last_eval_elapsed_ms_ewma`] for the
+    /// autonomously-fired `epoch_fn` path. Used by the same last-batch
+    /// slack reservation mechanism.
+    last_epoch_fn_elapsed_ms_ewma: Option<f64>,
 
     /// `true` once [`Self::dispatch_shutdown_with_save`] has broadcast
     /// `ShutdownWithSave`. Guards against re-broadcasting on subsequent
@@ -1274,6 +1286,8 @@ impl ClusterCoordinator {
             epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
+            last_eval_elapsed_ms_ewma: None,
+            last_epoch_fn_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
             checkpoint_every: config.checkpoint_every,
             shutdown_with_save_dispatched: false,
@@ -1513,7 +1527,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::SnapshotReady { rank }
             | TimingMsgWire::NewNcclIdGenerated { rank, .. }
             | TimingMsgWire::EvalResult { rank, .. }
-            | TimingMsgWire::CheckpointResult { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::CheckpointResult { rank, .. }
+            | TimingMsgWire::EpochFnElapsed { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -1680,28 +1695,20 @@ impl ClusterCoordinator {
                 }
             }
             TimingMsgWire::EvalResult {
-                rank: _,
+                rank,
                 schedule_id: _,
                 epoch,
                 metric,
+                elapsed_ms,
                 error,
             } => {
-                // Eval result from the chosen rank flowing back. Fire
-                // the user's `eval_result_fn` on the controller side
-                // (no &M needed). Errors from the closure are logged
-                // and training continues, matching `metrics_fn`'s
-                // SkipAndContinue default.
-                if let Some(err_msg) = error {
-                    eprintln!(
-                        "cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}"
-                    );
-                } else if let Some(ref f) = self.eval_result_fn {
-                    if let Err(e) = f(epoch as usize, metric) {
-                        eprintln!(
-                            "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
-                        );
-                    }
-                }
+                self.handle_eval_result(
+                    rank as usize,
+                    epoch as usize,
+                    metric,
+                    elapsed_ms,
+                    error,
+                );
             }
             TimingMsgWire::CheckpointResult {
                 rank,
@@ -1715,6 +1722,13 @@ impl ClusterCoordinator {
                     elapsed_ms,
                     error,
                 );
+            }
+            TimingMsgWire::EpochFnElapsed {
+                rank,
+                epoch: _,
+                elapsed_ms,
+            } => {
+                self.handle_epoch_fn_elapsed(rank as usize, elapsed_ms);
             }
         }
     }
@@ -1894,6 +1908,175 @@ impl ClusterCoordinator {
                 }
             }
         }
+    }
+
+    /// Process an eval result from a worker. Mirrors
+    /// [`Self::handle_checkpoint_result`] for the eval callback: fires
+    /// the user's `eval_result_fn` (success path), time-excludes the
+    /// closure's wall-time from `wall_ms_accum[rank]` so ElChe does not
+    /// see eval cost as compute slowness, and updates
+    /// `last_eval_elapsed_ms_ewma` for callback-aware partition
+    /// scheduling. Unlike checkpoint, eval has no retry path — failed
+    /// evals are logged and training continues, matching `metrics_fn`'s
+    /// SkipAndContinue default. Time exclusion + EWMA fire regardless
+    /// of success / failure: the wall-time was spent either way.
+    fn handle_eval_result(
+        &mut self,
+        rank: usize,
+        epoch: usize,
+        metric: f64,
+        elapsed_ms: f64,
+        error: Option<String>,
+    ) {
+        // Time exclusion (parallel to checkpoint): subtract from this
+        // rank's wall_ms_accum so ElChe's rebalancer does not interpret
+        // eval cost as compute slowness. Clamp at 0 to absorb fp drift.
+        if rank < self.wall_ms_accum.len() {
+            self.wall_ms_accum[rank] =
+                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
+        // EWMA blend (alpha=0.3, same as checkpoint). Fires on every
+        // report regardless of error: the closure wall-time is honest
+        // even when the metric is not.
+        let alpha = 0.3_f64;
+        self.last_eval_elapsed_ms_ewma =
+            Some(match self.last_eval_elapsed_ms_ewma {
+                Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
+                None => elapsed_ms,
+            });
+        // User-facing dispatch: fire `eval_result_fn` on success; log
+        // and continue on failure. Errors from the closure are logged
+        // and training continues, matching `metrics_fn`'s
+        // SkipAndContinue default.
+        if let Some(err_msg) = error {
+            eprintln!(
+                "cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}"
+            );
+        } else if let Some(ref f) = self.eval_result_fn {
+            if let Err(e) = f(epoch, metric) {
+                eprintln!(
+                    "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
+                );
+            }
+        }
+    }
+
+    /// Process an `epoch_fn` post-fire report from a worker. Mirrors
+    /// [`Self::handle_eval_result`] minus the user-facing dispatch:
+    /// `epoch_fn` has no return value, the worker fires it
+    /// autonomously, and the only coord-side bookkeeping is time
+    /// exclusion + EWMA.
+    fn handle_epoch_fn_elapsed(&mut self, rank: usize, elapsed_ms: f64) {
+        if rank < self.wall_ms_accum.len() {
+            self.wall_ms_accum[rank] =
+                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
+        let alpha = 0.3_f64;
+        self.last_epoch_fn_elapsed_ms_ewma =
+            Some(match self.last_epoch_fn_elapsed_ms_ewma {
+                Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
+                None => elapsed_ms,
+            });
+    }
+
+    /// Detect "next cycle is the last cycle of the current epoch" and,
+    /// when true, stage per-rank callback wall-time on ElChe so the
+    /// recompute in [`Self::finish_averaging_nccl`] /
+    /// [`Self::finish_averaging_cpu`] shrinks the firing rank's quota
+    /// for the next chunk. Workers absorb the callback inside the
+    /// freed compute slack instead of bloating the AllReduce barrier
+    /// wait.
+    ///
+    /// Conditions checked:
+    /// - There's a pool for the current epoch and it's not empty.
+    /// - The pool's remaining batches fit in one more cycle (≤ sum of
+    ///   ElChe's `batch_counts`).
+    /// - At least one callback fires on the upcoming epoch boundary:
+    ///   * `epoch_fn` always fires on `epoch_callback_role`.
+    ///   * `checkpoint_fn` fires on `checkpoint_role` if
+    ///     `(current_epoch + 1) % checkpoint_every == 0`.
+    ///   * `eval_fn` fires on `eval_role` if
+    ///     `(current_epoch + 1) % eval_every_epochs == 0`.
+    /// - The total slack per rank passes the
+    ///   `max(0.05 * anchor_wall_ms, 100 ms)` guard.
+    ///
+    /// Silent no-op when any precondition fails. Slack is consumed
+    /// exactly once on the next ElChe recompute (see
+    /// [`ElChe::apply_callback_slack`]).
+    fn maybe_apply_callback_slack_for_next_cycle(&mut self) {
+        // Need a calibrated ElChe to translate ms → batches; pre-
+        // calibration the partition is uniform anyway.
+        if !self.el_che.is_calibrated() {
+            return;
+        }
+        // Find the in-flight epoch (rank_epoch[0] — all ranks are sync-
+        // aligned at finish_averaging time; any rank's view works).
+        let epoch = self.rank_epoch.first().copied().unwrap_or(0);
+        let remaining_batches = match self.chunk_pools.get(&epoch) {
+            Some(pool) if pool.remaining() >= self.batch_size => {
+                pool.remaining() / self.batch_size
+            }
+            _ => return,
+        };
+        let total_counts: usize = self.el_che.batch_counts().iter().sum();
+        if total_counts == 0 || remaining_batches > total_counts {
+            // Not the last cycle of the epoch yet.
+            return;
+        }
+        // Compute per-rank callback wall-time for the upcoming epoch
+        // boundary (epoch → epoch+1).
+        let next_epoch = epoch.saturating_add(1);
+        let mut slack_ms = vec![0.0_f64; self.world_size];
+        // epoch_fn fires every epoch transition on epoch_callback_role.
+        if let Some(ewma) = self.last_epoch_fn_elapsed_ms_ewma {
+            let role = self.epoch_callback_role;
+            if role < self.world_size {
+                slack_ms[role] += ewma;
+            }
+        }
+        // checkpoint_fn cadence: same `epoch > 0 && epoch % every == 0`
+        // shape the dispatch site uses.
+        if let Some(every) = self.checkpoint_every {
+            if every > 0 && next_epoch > 0 && next_epoch % every == 0 {
+                if let Some(ewma) = self.last_checkpoint_elapsed_ms_ewma {
+                    let role = self.checkpoint_role;
+                    if role < self.world_size {
+                        slack_ms[role] += ewma;
+                    }
+                }
+            }
+        }
+        // eval_fn cadence: mirror of checkpoint cadence.
+        if let Some(every) = self.eval_every_epochs {
+            if every > 0 && next_epoch > 0 && next_epoch % every == 0 {
+                if let Some(ewma) = self.last_eval_elapsed_ms_ewma {
+                    let role = self.eval_role;
+                    if role < self.world_size {
+                        slack_ms[role] += ewma;
+                    }
+                }
+            }
+        }
+        // Guard: drop sub-threshold per-rank entries. Both an absolute
+        // floor (100 ms — below noise on any realistic sync cycle) and
+        // a relative floor (5 % of anchor wall-time — sub-noise on
+        // long cycles regardless of absolute scale). Keep the larger
+        // of the two so neither domain (small models on fast hardware,
+        // large models on slow hardware) sees the wrong threshold.
+        let cycle_ms = self.el_che.anchor_wall_ms();
+        let threshold = (0.05 * cycle_ms).max(100.0);
+        let mut any_meaningful = false;
+        for s in slack_ms.iter_mut() {
+            if *s < threshold {
+                *s = 0.0;
+            } else {
+                any_meaningful = true;
+            }
+        }
+        if !any_meaningful {
+            return;
+        }
+        self.el_che.apply_callback_slack(&slack_ms);
     }
 
     fn capture_nccl_sync_elapsed_if_complete(&mut self) {
@@ -2658,6 +2841,11 @@ impl ClusterCoordinator {
     fn finish_averaging_nccl(&mut self) -> Result<()> {
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
+        // Stage per-rank callback slack BEFORE report_timing so the
+        // recompute inside ElChe applies it to the next cycle's
+        // batch_counts (when the next cycle is the LAST cycle of the
+        // current epoch).
+        self.maybe_apply_callback_slack_for_next_cycle();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(
                 &self.wall_ms_accum,
@@ -2760,6 +2948,10 @@ impl ClusterCoordinator {
     fn finish_averaging_cpu(&mut self) -> Result<()> {
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
+        // Mirror of `finish_averaging_nccl`: stage slack before
+        // `report_timing` so the next-cycle batch_counts shrink on the
+        // callback-firing rank.
+        self.maybe_apply_callback_slack_for_next_cycle();
         if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(
                 &self.wall_ms_accum,
@@ -3457,6 +3649,22 @@ impl ClusterCoordinator {
         self.last_checkpoint_elapsed_ms_ewma
     }
 
+    /// EWMA of recent `eval_fn` wall-times (ms). `None` until the first
+    /// eval report lands. Consumed by ElChe's last-batch slack
+    /// reservation: the firing rank's trailing-batch share is reduced
+    /// so the eval pass absorbs into idle slack.
+    pub fn last_eval_elapsed_ms_ewma(&self) -> Option<f64> {
+        self.last_eval_elapsed_ms_ewma
+    }
+
+    /// EWMA of recent `epoch_fn` wall-times (ms) on the role rank.
+    /// `None` until the first `epoch_fn` post-fire report lands.
+    /// Mirrors [`Self::last_eval_elapsed_ms_ewma`] for the autonomous
+    /// `epoch_fn` path.
+    pub fn last_epoch_fn_elapsed_ms_ewma(&self) -> Option<f64> {
+        self.last_epoch_fn_elapsed_ms_ewma
+    }
+
     /// Number of ranks recorded as having tried + failed for a given
     /// checkpoint `version`. Empty/zero on a clean run; populated by
     /// `handle_checkpoint_result` when an error arrives. Test
@@ -3572,6 +3780,8 @@ impl ClusterCoordinator {
             epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
+            last_eval_elapsed_ms_ewma: None,
+            last_epoch_fn_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
             checkpoint_every: config.checkpoint_every,
             shutdown_with_save_dispatched: false,
@@ -3683,6 +3893,59 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn epoch_role_dirty_for_test(&self) -> bool {
         self.epoch_role_dirty
+    }
+
+    /// Test-only: install a `ChunkPool` for the given epoch so the
+    /// `maybe_apply_callback_slack_for_next_cycle` path can read a
+    /// known `remaining()`. Production code creates pools in
+    /// `dispatch_epoch`; tests skip that scaffold.
+    #[cfg(test)]
+    pub(crate) fn install_chunk_pool_for_test(
+        &mut self,
+        epoch: usize,
+        total_samples: usize,
+    ) {
+        self.chunk_pools.insert(
+            epoch,
+            crate::distributed::chunk_pool::ChunkPool::new(
+                epoch,
+                total_samples,
+                self.world_size,
+            ),
+        );
+    }
+
+    /// Test-only: drive `rank_epoch[rank]` directly. Production sets
+    /// it inside `dispatch_next_chunk_with_batches`.
+    #[cfg(test)]
+    pub(crate) fn set_rank_epoch_for_test(&mut self, rank: usize, epoch: usize) {
+        self.rank_epoch[rank] = epoch;
+    }
+
+    /// Test-only wrapper around the private producer-side slack
+    /// staging so tests can verify its effect on
+    /// `el_che.pending_callback_slack_ms()` without driving an entire
+    /// `finish_averaging_*` cycle.
+    #[cfg(test)]
+    pub(crate) fn maybe_apply_callback_slack_for_test(&mut self) {
+        self.maybe_apply_callback_slack_for_next_cycle();
+    }
+
+    /// Test-only mutable accessor for the embedded `ElChe`. Used by
+    /// slack-producer tests to drive `report_timing` calibrate the
+    /// el_che before invoking the producer.
+    #[cfg(test)]
+    pub(crate) fn el_che_mut_for_test(
+        &mut self,
+    ) -> &mut crate::distributed::ddp::ElChe {
+        &mut self.el_che
+    }
+
+    /// Test-only accessor for the embedded `ElChe`. Used by
+    /// slack-producer tests to verify the pending slack vector was set.
+    #[cfg(test)]
+    pub(crate) fn el_che_for_test(&self) -> &crate::distributed::ddp::ElChe {
+        &self.el_che
     }
 
     // -----------------------------------------------------------------

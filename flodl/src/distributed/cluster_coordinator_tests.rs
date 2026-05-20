@@ -1107,6 +1107,269 @@
         );
     }
 
+    // -----------------------------------------------------------------
+    // Eval callback — time exclusion + EWMA. Mirrors the checkpoint
+    // tests above. The user-facing `eval_result_fn` dispatch is covered
+    // by integration tests elsewhere; these tests pin the bookkeeping
+    // contract that ElChe's last-batch slack reservation will consume.
+    // -----------------------------------------------------------------
+
+    /// `handle_eval_result` subtracts the reported `elapsed_ms` from
+    /// `wall_ms_accum[rank]` so ElChe's rebalancer does not interpret
+    /// eval cost as compute slowness. Clamps at 0 to absorb fp drift.
+    #[test]
+    fn eval_time_excluded_from_wall_ms_accum() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        coord.set_wall_ms_accum_for_test(0, 100.0);
+        coord.set_wall_ms_accum_for_test(1, 50.0);
+        coord.handle_eval_result(0, 3, 0.42, 30.0, None);
+        assert!(
+            (coord.wall_ms_accum_for_test(0) - 70.0).abs() < 1e-9,
+            "wall_ms_accum[0] = {} (expected 70.0)",
+            coord.wall_ms_accum_for_test(0),
+        );
+        assert!(
+            (coord.wall_ms_accum_for_test(1) - 50.0).abs() < 1e-9,
+            "wall_ms_accum[1] = {} (expected 50.0 untouched)",
+            coord.wall_ms_accum_for_test(1),
+        );
+        assert_eq!(coord.last_eval_elapsed_ms_ewma(), Some(30.0));
+    }
+
+    /// Eval EWMA blends successive samples with alpha=0.3.
+    #[test]
+    fn eval_ewma_blends_successive_results() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+
+        coord.handle_eval_result(0, 1, 0.1, 100.0, None);
+        assert_eq!(coord.last_eval_elapsed_ms_ewma(), Some(100.0));
+
+        // alpha=0.3: 0.3 * 50 + 0.7 * 100 = 85
+        coord.handle_eval_result(0, 2, 0.2, 50.0, None);
+        let ewma = coord.last_eval_elapsed_ms_ewma().unwrap();
+        assert!(
+            (ewma - 85.0).abs() < 1e-9,
+            "EWMA after 100 then 50 (alpha=0.3): got {ewma}, expected 85.0"
+        );
+    }
+
+    /// Eval errors still update the time-exclusion bookkeeping: the
+    /// closure ate wall time even when it returned an error. EWMA + the
+    /// `wall_ms_accum` subtract both fire; the user-facing
+    /// `eval_result_fn` is skipped (just logged).
+    #[test]
+    fn eval_error_still_excludes_time_and_updates_ewma() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        coord.set_wall_ms_accum_for_test(0, 100.0);
+        coord.handle_eval_result(0, 7, f64::NAN, 30.0, Some("boom".into()));
+        assert!(
+            (coord.wall_ms_accum_for_test(0) - 70.0).abs() < 1e-9,
+            "wall_ms_accum[0] = {} (expected 70.0 even on error)",
+            coord.wall_ms_accum_for_test(0),
+        );
+        assert_eq!(coord.last_eval_elapsed_ms_ewma(), Some(30.0));
+    }
+
+    // -----------------------------------------------------------------
+    // epoch_fn callback — time exclusion + EWMA. Same bookkeeping shape
+    // as eval / checkpoint; no user-facing dispatch (epoch_fn fires
+    // autonomously on the role rank, the coord only sees the post-fire
+    // wall-time report).
+    // -----------------------------------------------------------------
+
+    /// `handle_epoch_fn_elapsed` subtracts the reported `elapsed_ms`
+    /// from `wall_ms_accum[rank]` and updates
+    /// `last_epoch_fn_elapsed_ms_ewma`.
+    #[test]
+    fn epoch_fn_time_excluded_from_wall_ms_accum() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        coord.set_wall_ms_accum_for_test(0, 100.0);
+        coord.set_wall_ms_accum_for_test(1, 50.0);
+        coord.handle_epoch_fn_elapsed(0, 20.0);
+        assert!(
+            (coord.wall_ms_accum_for_test(0) - 80.0).abs() < 1e-9,
+            "wall_ms_accum[0] = {} (expected 80.0)",
+            coord.wall_ms_accum_for_test(0),
+        );
+        assert!(
+            (coord.wall_ms_accum_for_test(1) - 50.0).abs() < 1e-9,
+            "wall_ms_accum[1] = {} (expected 50.0 untouched)",
+            coord.wall_ms_accum_for_test(1),
+        );
+        assert_eq!(coord.last_epoch_fn_elapsed_ms_ewma(), Some(20.0));
+    }
+
+    /// epoch_fn EWMA blends successive samples with alpha=0.3.
+    #[test]
+    fn epoch_fn_ewma_blends_successive_reports() {
+        let world_size = 2usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+
+        coord.handle_epoch_fn_elapsed(0, 100.0);
+        assert_eq!(coord.last_epoch_fn_elapsed_ms_ewma(), Some(100.0));
+
+        // alpha=0.3: 0.3 * 50 + 0.7 * 100 = 85
+        coord.handle_epoch_fn_elapsed(0, 50.0);
+        let ewma = coord.last_epoch_fn_elapsed_ms_ewma().unwrap();
+        assert!(
+            (ewma - 85.0).abs() < 1e-9,
+            "EWMA after 100 then 50 (alpha=0.3): got {ewma}, expected 85.0"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Last-cycle slack producer — `maybe_apply_callback_slack_for_next_cycle`
+    // tests. These pin the coord-side trigger that stages per-rank
+    // callback wall-time on ElChe just before the recompute that
+    // shapes the LAST cycle of an epoch.
+    // -----------------------------------------------------------------
+
+    /// Helper: build a 2-rank coord with anchor=10 ElChe, calibrate it
+    /// (rank 0 50ms/batch, rank 1 100ms/batch), set rank 0 as the
+    /// callback role for every kind, and install a chunk pool sized so
+    /// the next cycle exhausts the epoch.
+    fn build_coord_for_slack(remaining_batches: usize) -> ClusterCoordinator {
+        let world_size = 2;
+        let cfg = ClusterCoordinatorConfig::new(
+            ApplyPolicy::Sync,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 10),
+        )
+        .no_divergence_guard();
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        // Calibrate ElChe: rank 0 fast, rank 1 slow → batch_counts [20, 10].
+        coord.el_che_mut_for_test().report_timing(
+            &[500.0, 1000.0],
+            &[10, 10],
+            10.0,
+        );
+        // Rank 0 fires all callbacks.
+        coord.set_callback_roles_for_test(0, 0, 0);
+        // Install pool for the current epoch (epoch 0 by default).
+        // batch_size defaults to 1, so total_samples == remaining batches.
+        coord.install_chunk_pool_for_test(0, remaining_batches);
+        coord.set_rank_epoch_for_test(0, 0);
+        coord.set_rank_epoch_for_test(1, 0);
+        coord
+    }
+
+    /// Happy path: epoch_fn EWMA known, next cycle is the last (pool
+    /// remaining ≤ sum batch_counts), guard passes. Slack lands on the
+    /// firing rank, no slack on the other.
+    #[test]
+    fn callback_slack_stages_on_firing_rank_for_last_cycle() {
+        // sum(batch_counts) = 30 → remaining=25 is "next cycle is last".
+        let mut coord = build_coord_for_slack(25);
+        // Drive last_epoch_fn_elapsed_ms_ewma to 1000ms (well above
+        // both the 100ms absolute floor and 5% * anchor_wall_ms = 50ms).
+        coord.handle_epoch_fn_elapsed(0, 1000.0);
+        coord.maybe_apply_callback_slack_for_test();
+        let slack = coord.el_che_for_test().pending_callback_slack_ms();
+        assert!(
+            (slack[0] - 1000.0).abs() < 1e-9,
+            "rank 0 should have staged epoch_fn slack of 1000ms; got {slack:?}",
+        );
+        assert_eq!(slack[1], 0.0, "non-firing rank slack must stay zero");
+    }
+
+    /// Pool still has plenty of batches → not the last cycle → no slack.
+    #[test]
+    fn callback_slack_skips_when_not_last_cycle() {
+        // sum(batch_counts) = 30. remaining=100 means many cycles ahead.
+        let mut coord = build_coord_for_slack(100);
+        coord.handle_epoch_fn_elapsed(0, 1000.0);
+        coord.maybe_apply_callback_slack_for_test();
+        let slack = coord.el_che_for_test().pending_callback_slack_ms();
+        assert_eq!(
+            slack,
+            &[0.0, 0.0],
+            "slack must not stage when next cycle is not the last",
+        );
+    }
+
+    /// Slack below the `max(0.05 * cycle_ms, 100ms)` floor must NOT be
+    /// staged — sub-threshold callbacks are noise relative to cycle
+    /// wall-time and shifting work for them adds churn without payoff.
+    #[test]
+    fn callback_slack_guard_filters_sub_threshold() {
+        let mut coord = build_coord_for_slack(25);
+        // 50ms < 100ms absolute floor (and < 50ms = 5% of anchor_wall_ms).
+        coord.handle_epoch_fn_elapsed(0, 50.0);
+        coord.maybe_apply_callback_slack_for_test();
+        let slack = coord.el_che_for_test().pending_callback_slack_ms();
+        assert_eq!(
+            slack,
+            &[0.0, 0.0],
+            "sub-threshold slack must be filtered out (50ms < max(50, 100))",
+        );
+    }
+
+    /// Empty pool → epoch already exhausted → no slack (the in-flight
+    /// cycle isn't "last", there's no next cycle in this epoch).
+    #[test]
+    fn callback_slack_skips_when_pool_empty() {
+        let mut coord = build_coord_for_slack(0);
+        coord.handle_epoch_fn_elapsed(0, 1000.0);
+        coord.maybe_apply_callback_slack_for_test();
+        let slack = coord.el_che_for_test().pending_callback_slack_ms();
+        assert_eq!(slack, &[0.0, 0.0]);
+    }
+
+    /// Without a calibrated ElChe, the partition is uniform anyway and
+    /// the slack would have no meaningful reduction effect. Producer
+    /// short-circuits.
+    #[test]
+    fn callback_slack_skips_when_elche_uncalibrated() {
+        // Build a coord without calibration scaffold.
+        let world_size = 2;
+        let cfg = ClusterCoordinatorConfig::new(
+            ApplyPolicy::Sync,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 10),
+        )
+        .no_divergence_guard();
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        coord.set_callback_roles_for_test(0, 0, 0);
+        coord.install_chunk_pool_for_test(0, 5);
+        coord.handle_epoch_fn_elapsed(0, 1000.0);
+        coord.maybe_apply_callback_slack_for_test();
+        let slack = coord.el_che_for_test().pending_callback_slack_ms();
+        assert_eq!(
+            slack,
+            &[0.0, 0.0],
+            "uncalibrated ElChe → no slack staging (partition is uniform anyway)",
+        );
+    }
+
+    /// Per-rank isolation: `handle_epoch_fn_elapsed` on rank 1 should
+    /// not touch rank 0's `wall_ms_accum` even when the rank index is
+    /// the second slot. Defensive check against an off-by-one in the
+    /// rank → slot mapping.
+    #[test]
+    fn epoch_fn_per_rank_isolation() {
+        let world_size = 3usize;
+        let cfg = cfg_sync_cpu(world_size);
+        let mut coord = ClusterCoordinator::for_test(cfg);
+        coord.set_wall_ms_accum_for_test(0, 100.0);
+        coord.set_wall_ms_accum_for_test(1, 200.0);
+        coord.set_wall_ms_accum_for_test(2, 300.0);
+        coord.handle_epoch_fn_elapsed(1, 25.0);
+        assert!((coord.wall_ms_accum_for_test(0) - 100.0).abs() < 1e-9);
+        assert!((coord.wall_ms_accum_for_test(1) - 175.0).abs() < 1e-9);
+        assert!((coord.wall_ms_accum_for_test(2) - 300.0).abs() < 1e-9);
+    }
+
     /// Integration test: dispatch is targeted — only the role rank
     /// receives the `Checkpoint` frame; non-role ranks never see it.
     #[test]

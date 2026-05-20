@@ -594,6 +594,111 @@
     }
 
     #[test]
+    fn test_callback_slack_reduces_firing_rank_count() {
+        // Calibrate: rank 0 fast (50 ms/batch), rank 1 slow (100 ms/batch).
+        // Ratio 2:1 → rank 0 gets 20 batches, rank 1 gets 10 (anchor).
+        // wall_ms must scale with `bc` to keep ms-per-batch stable in
+        // the trust window (50 vs 25 with different bc → different
+        // smoothed ratio, which is fine in production but obscures
+        // slack arithmetic in a unit test).
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+
+        // Stage 200 ms of callback slack on rank 0. At 50 ms/batch
+        // that is 4 batches' worth.
+        c.apply_callback_slack(&[200.0, 0.0]);
+
+        // Recompute with timings that keep ms/batch at 50/100:
+        // rank 0 doing 20 batches in 1000ms; rank 1 doing 10 in 1000ms.
+        c.report_timing(&[1000.0, 1000.0], &[20, 10], 10.0);
+        assert_eq!(c.batches(0), 16);
+        assert_eq!(c.batches(1), 10);
+
+        // Slack auto-clears: next recompute returns rank 0 to 20 (the
+        // un-slacked target). Dead-zone hysteresis allows the jump from
+        // 16 to 20 since the delta is > 5% of 16.
+        c.report_timing(&[800.0, 1000.0], &[16, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_callback_slack_clamps_at_one() {
+        // Pathologically large slack must not starve the rank entirely.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        assert_eq!(c.batches(0), 20);
+
+        // 10s of slack on a 50ms/batch rank = 200 batches, far above
+        // the rank's 20-batch quota. Target should clamp at 1.
+        c.apply_callback_slack(&[10_000.0, 0.0]);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        assert_eq!(c.batches(0), 1, "slack must clamp at 1, not starve to 0");
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_callback_slack_size_mismatch_is_noop() {
+        // Wrong-length slack vectors are silently ignored — a misconfig
+        // should never crash a running cluster, just leave behavior at
+        // the unslacked baseline.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+
+        // Length 3 on a 2-rank cluster: rejected.
+        c.apply_callback_slack(&[200.0, 0.0, 0.0]);
+        assert_eq!(c.pending_callback_slack_ms(), &[0.0, 0.0]);
+
+        // Length 0: also rejected.
+        c.apply_callback_slack(&[]);
+        assert_eq!(c.pending_callback_slack_ms(), &[0.0, 0.0]);
+
+        // Behavior unchanged after the no-op set. Use stable timings.
+        c.report_timing(&[1000.0, 1000.0], &[20, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+    }
+
+    #[test]
+    fn test_callback_slack_multi_rank() {
+        // Slack on multiple ranks simultaneously: each rank's reduction
+        // is independent. ms/batch: rank 0 = 33.3ms, rank 1 = 50ms,
+        // rank 2 = 100ms (anchor). Targets: rank 0 = 10 * (100/33.3) ≈ 30,
+        // rank 1 = 10 * (100/50) = 20, rank 2 = 10.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        c.report_timing(&[333.0, 500.0, 1000.0], &[10, 10, 10], 10.0);
+        let baseline_0 = c.batches(0);
+        let baseline_1 = c.batches(1);
+        let baseline_2 = c.batches(2);
+
+        // 100ms slack on rank 0 (= 4 batches @ ceil(100/33) = 4)
+        // 100ms slack on rank 1 (= 2 batches @ 50ms)
+        c.apply_callback_slack(&[100.0, 100.0, 0.0]);
+        // Keep ms/batch stable: wall_ms = bc * ms_per_batch.
+        // rank 0: 30 * 33.3 ≈ 999; rank 1: 20 * 50 = 1000; rank 2: 10 * 100 = 1000.
+        c.report_timing(
+            &[baseline_0 as f64 * 33.3, baseline_1 as f64 * 50.0, 1000.0],
+            &[baseline_0, baseline_1, baseline_2],
+            10.0,
+        );
+
+        // Rank 0 drops by 3-4 (33ms/batch → ceil(100/33) = 4).
+        assert!(
+            c.batches(0) == baseline_0 - 4 || c.batches(0) == baseline_0 - 3,
+            "rank 0 expected baseline-3 or baseline-4, got {} (baseline {baseline_0})",
+            c.batches(0),
+        );
+        // Rank 1 drops by 2.
+        assert_eq!(c.batches(1), baseline_1 - 2);
+        // Rank 2 (no slack) unchanged.
+        assert_eq!(c.batches(2), baseline_2);
+    }
+
+    #[test]
     fn test_cadence_clamp_total() {
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.50);

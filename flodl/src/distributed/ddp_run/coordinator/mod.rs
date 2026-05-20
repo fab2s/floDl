@@ -1098,6 +1098,9 @@ impl Coordinator {
                     );
                 }
             }
+            // Threaded DDP does not exercise the cluster_coordinator
+            // EWMA / time-exclusion path. Frame is dropped intentionally.
+            TimingMsg::EpochFnElapsed { .. } => {}
         }
     }
 
