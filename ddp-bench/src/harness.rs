@@ -527,6 +527,13 @@ fn run_unified(
         builder = builder.partition_ratios(ratios);
     }
 
+    // Epoch-callback policy: user-selected via `--epoch-callback-policy`.
+    // `None` leaves the framework default (`Rank(0)`); `Some(Fastest)` lets
+    // ElChe pick the lowest-ms-per-batch rank, sticky thereafter.
+    if let Some(policy) = config.epoch_callback_policy {
+        builder = builder.epoch_callback_policy(policy);
+    }
+
     if config.elche_relax_up {
         builder = builder.elche_relax_up(true);
     }

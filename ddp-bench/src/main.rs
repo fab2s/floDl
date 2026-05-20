@@ -212,6 +212,21 @@ struct Cli {
     #[option]
     guard_alpha: Option<f64>,
 
+    /// Which rank fires per-epoch user callbacks (`epoch_fn`,
+    /// `checkpoint_fn`, `eval_fn`). Accepts:
+    ///
+    /// - `rank-N`: explicit rank index (e.g. `rank-0`, `rank-1`).
+    ///   Loud-errors at framework validation if `N >= world_size`.
+    /// - `fastest`: ElChe picks the rank with the lowest
+    ///   smoothed-ms-per-batch at run start, sticky thereafter
+    ///   (re-resolved only on rank death). Only supported on the
+    ///   process-per-rank cluster path (auto-promote or cluster
+    ///   fan-out).
+    ///
+    /// Default: framework default (`Rank(0)`). Solo modes ignore this.
+    #[option]
+    epoch_callback_policy: Option<String>,
+
     /// Per-stage block count for `resnet-graph` (He et al. 2015 CIFAR family,
     /// total depth = 6n+2). Default 3 = ResNet-20.
     ///
@@ -237,6 +252,32 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Parse `--epoch-callback-policy` value into an `EpochCallbackPolicy`.
+/// Accepts case-insensitive `rank-N` (any non-negative integer) or
+/// `fastest`. Loud-errors with a hint on every other input.
+fn parse_epoch_callback_policy(
+    spec: &str,
+) -> flodl::tensor::Result<flodl::distributed::ddp_run::EpochCallbackPolicy> {
+    use flodl::distributed::ddp_run::EpochCallbackPolicy;
+    let lower = spec.trim().to_ascii_lowercase();
+    if lower == "fastest" {
+        return Ok(EpochCallbackPolicy::Fastest);
+    }
+    if let Some(rest) = lower.strip_prefix("rank-") {
+        let n: usize = rest.parse().map_err(|_| {
+            flodl::tensor::TensorError::new(&format!(
+                "invalid --epoch-callback-policy '{spec}': \
+                 expected 'rank-N' (N >= 0) or 'fastest'"
+            ))
+        })?;
+        return Ok(EpochCallbackPolicy::Rank(n));
+    }
+    Err(flodl::tensor::TensorError::new(&format!(
+        "invalid --epoch-callback-policy '{spec}': \
+         expected 'rank-N' (e.g. rank-0) or 'fastest'"
+    )))
 }
 
 /// Parse `--partition-ratios "0.55,0.225,0.225"` into a Vec<f64>.
@@ -372,6 +413,11 @@ fn run() -> flodl::tensor::Result<()> {
         }
         models::resnet_graph::set_depth_n(n);
     }
+
+    let epoch_callback_policy = match cli.epoch_callback_policy.as_deref() {
+        None => None,
+        Some(spec) => Some(parse_epoch_callback_policy(spec)?),
+    };
 
     let partition_ratios = match cli.partition_ratios.as_deref() {
         None => None,
@@ -621,6 +667,7 @@ fn run() -> flodl::tensor::Result<()> {
                 easgd_alpha: cli.easgd_alpha,
                 per_epoch_eval: cli.per_epoch_eval,
                 guard: guard_choice.clone(),
+                epoch_callback_policy,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

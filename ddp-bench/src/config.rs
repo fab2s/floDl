@@ -185,4 +185,14 @@ pub struct RunConfig {
     /// Convergence-guard configuration. Default = `GuardChoice::Trend`
     /// with production threshold 0.01.
     pub guard: GuardChoice,
+    /// Which rank fires user epoch callbacks (`epoch_fn`,
+    /// `checkpoint_fn`, `eval_fn`). When `None`, the framework default
+    /// (`Rank(0)`) is used. Set to `Fastest` to let ElChe pick the
+    /// rank with the lowest `smoothed_ms_per_batch` at run start
+    /// (re-resolved on rank death).
+    ///
+    /// Only meaningful for multi-rank cluster paths (the framework
+    /// loud-errors if `Fastest` is configured on a non-via_coord run).
+    /// Solo modes ignore this field.
+    pub epoch_callback_policy: Option<flodl::distributed::ddp_run::EpochCallbackPolicy>,
 }
