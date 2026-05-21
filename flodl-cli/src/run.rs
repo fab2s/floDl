@@ -254,7 +254,8 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
 }
 
 /// Resolve libtorch env vars from the project root, matching the Makefile logic:
-///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>
+///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>  (standalone)
+///                      = <cluster.hosts[me].libtorch_path resolved> (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
 fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
@@ -266,9 +267,7 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
         "./libtorch/precompiled/cpu".into(),
     ));
 
-    // Active variant for CUDA.
-    if let Some(info) = libtorch::detect::read_active(project_root) {
-        let host_path = format!("./libtorch/{}", info.path);
+    if let Some((info, host_path)) = resolve_libtorch(project_root) {
         env.push(("LIBTORCH_HOST_PATH".into(), host_path));
 
         // CUDA version from .arch metadata.
@@ -291,6 +290,109 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
     }
 
     env
+}
+
+/// Resolve `(LibtorchInfo, host_path)` for `libtorch_env`.
+///
+/// Priority:
+///   1. Cluster overlay's per-host `libtorch_path:` (when `FDL_ENV` is
+///      set, the merged config has a `cluster:` block, AND the current
+///      hostname matches an entry). Lets each host in a shared-checkout
+///      heterogeneous rig pick its own libtorch without flipping the
+///      global `.active`.
+///   2. `project_root/libtorch/.active` (or `.active.<case>` via the
+///      `FDL_LIBTORCH_CASE` env var). Standalone single-host default.
+///
+/// Returns `None` only when neither path resolves — the caller (env
+/// builder) then omits `LIBTORCH_HOST_PATH`, which surfaces as a
+/// libtorch-missing error from the downstream cargo/Docker invocation.
+fn resolve_libtorch(
+    project_root: &Path,
+) -> Option<(libtorch::detect::LibtorchInfo, String)> {
+    if let Some(resolved) = resolve_libtorch_from_overlay(project_root) {
+        return Some(resolved);
+    }
+    let info = libtorch::detect::read_active(project_root)?;
+    let host_path = format!("./libtorch/{}", info.path);
+    Some((info, host_path))
+}
+
+/// Try to resolve libtorch from the active cluster overlay's current-
+/// host entry. Returns `None` if no overlay is active, the overlay has
+/// no `cluster:` block, the current host isn't listed, or the entry's
+/// `libtorch_path:` is unset.
+fn resolve_libtorch_from_overlay(
+    project_root: &Path,
+) -> Option<(libtorch::detect::LibtorchInfo, String)> {
+    let env_name = std::env::var("FDL_ENV").ok()?;
+    if env_name.trim().is_empty() {
+        return None;
+    }
+    let cfg = config::load_project_with_env(
+        &project_root.join("fdl.yml"),
+        Some(env_name.trim()),
+    ).ok()?;
+    let cluster = cfg.cluster?;
+    let host = crate::cluster::resolve_local_hostname();
+    let entry = cluster.hosts.iter().find(|h| h.name == host)?;
+    let libtorch_path = entry.libtorch_path.as_ref()?;
+    resolve_libtorch_at(Path::new(libtorch_path))
+}
+
+/// Resolve a `libtorch_path:` value (from cluster.yml) into
+/// `(LibtorchInfo, absolute host path for Docker bind mount)`. Accepts
+/// the same three shapes as `probe::check_libtorch_at`:
+///   1. Pointer file `.active*` — read pointer, resolve variant against
+///      the file's parent dir.
+///   2. Directory containing `.active` — read its `.active`.
+///   3. Direct variant dir (has `lib/`) — use as-is, parse `.arch` if
+///      present.
+pub(crate) fn resolve_libtorch_at(
+    path: &Path,
+) -> Option<(libtorch::detect::LibtorchInfo, String)> {
+    if path.is_file()
+        && path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".active"))
+    {
+        let libtorch_root = path.parent()?;
+        let info = libtorch::detect::read_active_from(path, libtorch_root)?;
+        let host_path = libtorch_root.join(&info.path).display().to_string();
+        return Some((info, host_path));
+    }
+    if path.join(".active").exists() {
+        let info = libtorch::detect::read_active_from(
+            &path.join(".active"),
+            path,
+        )?;
+        let host_path = path.join(&info.path).display().to_string();
+        return Some((info, host_path));
+    }
+    if path.join("lib").is_dir() {
+        let mut info = libtorch::detect::LibtorchInfo {
+            path: path.display().to_string(),
+            torch_version: None,
+            cuda_version: None,
+            archs: None,
+            source: None,
+        };
+        if let Ok(content) = std::fs::read_to_string(path.join(".arch")) {
+            for line in content.lines() {
+                if let Some(v) = line.strip_prefix("torch=") {
+                    info.torch_version = Some(v.into());
+                } else if let Some(v) = line.strip_prefix("cuda=") {
+                    info.cuda_version = Some(v.into());
+                } else if let Some(v) = line.strip_prefix("archs=") {
+                    info.archs = Some(v.into());
+                } else if let Some(v) = line.strip_prefix("source=") {
+                    info.source = Some(v.into());
+                }
+            }
+        }
+        let host_path = path.display().to_string();
+        return Some((info, host_path));
+    }
+    None
 }
 
 /// Spawn a shell command with libtorch env vars set.
@@ -1080,6 +1182,10 @@ pub fn print_project_help(
         "    {}  Drop a run command's `append:` suffix",
         style::green(&format!("{:<18}", "--no-append"))
     );
+    eprintln!(
+        "    {}  Skip the cluster pre-flight build",
+        style::green(&format!("{:<18}", "--no-prebuild"))
+    );
 
     // Built-in commands.
     eprintln!();
@@ -1496,5 +1602,106 @@ mod tests {
             split_append_dashdash(""),
             (String::new(), String::new())
         );
+    }
+
+    // ── resolve_libtorch_at: 3-shape libtorch_path: resolution ──────────
+    //
+    // Each test builds a synthetic libtorch dir under a per-test scratch
+    // path (zero-deps policy precludes `tempfile`) and feeds the path
+    // through `resolve_libtorch_at`. Variant names (`precompiled/v1`,
+    // `builds/v2`) are deliberately abstract — the resolver is structural,
+    // not rig-aware.
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0);
+            let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("fdl-resolve-libtorch-{}-{}", nanos, seq));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn populate_lt_root(root: &std::path::Path) {
+        for (sub, torch, archs) in [
+            ("precompiled/v1", "1.0", "0.0"),
+            ("builds/v2", "2.0", "1.0"),
+        ] {
+            let d = root.join(sub);
+            std::fs::create_dir_all(d.join("lib")).unwrap();
+            std::fs::write(
+                d.join(".arch"),
+                format!("torch={torch}\ncuda=1.0\narchs={archs}\nsource=test\n"),
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_libtorch_at_pointer_file() {
+        let s = Scratch::new();
+        let lt = s.path().join("libtorch");
+        populate_lt_root(&lt);
+        let pointer = lt.join(".active.alt");
+        std::fs::write(&pointer, "precompiled/v1\n").unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&pointer)
+            .expect("pointer file resolves");
+        assert_eq!(info.path, "precompiled/v1");
+        assert_eq!(info.torch_version.as_deref(), Some("1.0"));
+        assert_eq!(host_path, lt.join("precompiled/v1").display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_libtorch_root_dir() {
+        let s = Scratch::new();
+        let lt = s.path().join("libtorch");
+        populate_lt_root(&lt);
+        std::fs::write(lt.join(".active"), "builds/v2\n").unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&lt)
+            .expect("libtorch-root dir resolves");
+        assert_eq!(info.path, "builds/v2");
+        assert_eq!(info.torch_version.as_deref(), Some("2.0"));
+        assert_eq!(host_path, lt.join("builds/v2").display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_direct_variant_dir() {
+        let s = Scratch::new();
+        let variant = s.path().join("standalone-libtorch");
+        std::fs::create_dir_all(variant.join("lib")).unwrap();
+        std::fs::write(
+            variant.join(".arch"),
+            "torch=3.0\ncuda=2.0\narchs=1.0\nsource=test\n",
+        ).unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&variant)
+            .expect("direct variant dir resolves");
+        assert_eq!(info.path, variant.display().to_string());
+        assert_eq!(info.torch_version.as_deref(), Some("3.0"));
+        assert_eq!(host_path, variant.display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_bogus_path_returns_none() {
+        let s = Scratch::new();
+        let bogus = s.path().join("no-lib-no-active-no-pointer");
+        std::fs::create_dir_all(&bogus).unwrap();
+        assert!(resolve_libtorch_at(&bogus).is_none(),
+            "dir without lib/, .active, or pointer-shape filename → None");
     }
 }

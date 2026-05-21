@@ -112,6 +112,13 @@ pub mod overlay;
 /// mapping exit codes through `fdl`.
 pub mod run;
 
+/// Pre-flight build for cluster commands. Builds the target binary
+/// locally (in Docker on the controller) for each remote host's
+/// libtorch ABI before fan-out, delivering it via the shared
+/// project-root mount so the remote can exec it directly without a
+/// cargo / rustc toolchain.
+pub mod prebuild;
+
 /// `fdl schema` sub-command: discover every cache under the project,
 /// report fresh / stale / orphan states, and clear or refresh on
 /// demand. The [`Schema`] type itself lives in [`config`].

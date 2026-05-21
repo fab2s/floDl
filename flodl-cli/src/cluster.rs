@@ -134,10 +134,11 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Resolve the local OS hostname for `gpus::synthesize_local_cluster`
-/// (the `--gpus` single-host shorthand). Test/override seam via
+/// Resolve the local OS hostname. Used by `gpus::synthesize_local_cluster`
+/// (the `--gpus` single-host shorthand) and by `prebuild` to skip the
+/// controller from the remote-host fan-out. Test/override seam via
 /// [`ENV_HOST_OVERRIDE`]; falls back to the `hostname(1)` command.
-pub(crate) fn resolve_local_hostname() -> String {
+pub fn resolve_local_hostname() -> String {
     if let Ok(s) = std::env::var(ENV_HOST_OVERRIDE) {
         let s = s.trim().to_string();
         if !s.is_empty() {

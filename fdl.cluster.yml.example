@@ -116,6 +116,27 @@ cluster:
 # env:
 #   SOME_TUNING_KNOB: "value"
 
+# Pre-flight build:
+#   `fdl @cluster <cmd>` auto-builds the binary locally (on the
+#   controller, in Docker) for every remote host before fan-out:
+#     - per-host `CARGO_TARGET_DIR=target/cluster/<host>/`
+#     - per-host `LIBTORCH_HOST_PATH=` resolved from `libtorch_path:`
+#     - features = `cuda` when the host's libtorch `.arch` has
+#       `cuda=<version>` (non-`none`), else no features
+#     - binary name = command name (`fdl @cluster ddp-bench` builds
+#       `--bin ddp-bench`)
+#   The shared project-root mount delivers the binary to the remote;
+#   the remote execs it directly via:
+#     ssh <host> "cd <path> && LD_LIBRARY_PATH=<libtorch>/lib \
+#                            <env-vars> exec ./target/cluster/<host>/release/<cmd>"
+#   No cargo / rustc on remote required.
+#   Pass `--no-prebuild` to skip the pre-flight phase (binaries known
+#   fresh, or iterating on a build-only failure).
+#   To extend `LD_LIBRARY_PATH` per host (e.g. bare-metal libnccl at
+#   `/usr/local/lib` alongside libtorch), set `env: { LD_LIBRARY_PATH: ... }`
+#   on the host; user-set `LD_LIBRARY_PATH` overrides the auto-derived
+#   prebuild default.
+#
 # Mark which commands fan out across cluster.hosts. Commands without
 # `cluster: true` continue to run locally on whichever host invoked fdl.
 #

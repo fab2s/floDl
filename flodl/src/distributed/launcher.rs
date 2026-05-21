@@ -60,13 +60,49 @@
 //! [`Trainer::setup`]: crate::distributed::Trainer::setup
 //! [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
+use serde::Deserialize;
+
 use crate::tensor::{Result, TensorError};
+
+/// Per-host pre-flight build artifact, as published by fdl-cli's
+/// prebuild phase in [`ENV_PREBUILD_PER_HOST`]. The launcher reads
+/// the env var, parses it as `BTreeMap<String, PerHostPrebuild>`
+/// keyed by host name, and substitutes the direct-binary form on the
+/// remote dispatch path for any matching host. Mirrors
+/// `flodl_cli::prebuild::PerHostEnvelope`.
+#[derive(Clone, Debug, Deserialize)]
+struct PerHostPrebuild {
+    /// Path to the compiled binary, relative to `host.path`.
+    bin: String,
+    /// Absolute `LD_LIBRARY_PATH` for the libtorch the binary was
+    /// linked against. The launcher emits this verbatim before exec
+    /// so the binary finds its shared libs at runtime.
+    ld_library_path: String,
+}
+
+/// Load and parse [`ENV_PREBUILD_PER_HOST`] from the current process
+/// env. Returns an empty map when the env var is absent (legacy
+/// fan-out via `fdl <cmd>` re-entry), or a `TensorError` on JSON
+/// parse failure (loud — bad JSON masks a real misconfiguration in
+/// the controller's prebuild step).
+fn load_prebuild_envelope() -> Result<BTreeMap<String, PerHostPrebuild>> {
+    let raw = match env::var(ENV_PREBUILD_PER_HOST) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(BTreeMap::new()),
+    };
+    serde_json::from_str(&raw).map_err(|e| {
+        TensorError::new(&format!(
+            "cluster launcher: parse {ENV_PREBUILD_PER_HOST} JSON: {e}",
+        ))
+    })
+}
 
 /// Environment variable carrying the *full* cluster topology to the
 /// launcher process. Set by fdl-cli; consumed only by [`dispatch`]. Not
@@ -86,6 +122,18 @@ pub const ENV_FDL_CMD: &str = "FLODL_FDL_CMD";
 /// `fdl.<env>.yml` view the controller did. Optional; absent means no
 /// overlay (base `fdl.yml` only).
 pub const ENV_FDL_ENV: &str = "FDL_ENV";
+
+/// Environment variable carrying the per-host pre-flight build
+/// envelope (a JSON map; format mirrors `flodl_cli::prebuild::
+/// ENV_PREBUILD_PER_HOST`). When set, the launcher's remote dispatch
+/// substitutes the direct-binary form for any host with an entry —
+/// `ssh <host> "cd <path> && LD_LIBRARY_PATH=… exec <bin> <args>"`.
+/// Hosts absent from the map fall back to the legacy `fdl <cmd>`
+/// re-entry (requires cargo on the remote).
+///
+/// JSON shape per host: `{ "bin": "<path-relative-to-host.path>",
+/// "ld_library_path": "<absolute path>" }`.
+pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
 
 /// SSH options shared by every remote host invocation. Match fdl-cli's
 /// existing flodl-cli/src/cluster.rs constants verbatim:
@@ -378,6 +426,11 @@ pub fn run_launcher_with_config(
             "cluster launcher: current_exe() failed: {e}"
         ))
     })?;
+    // Per-host pre-flight build envelope from fdl-cli. When a remote
+    // host has an entry, the remote dispatch substitutes the direct
+    // binary exec (no cargo on remote). Missing entry ⇒ legacy
+    // `fdl <cmd>` fallback (requires cargo on the remote).
+    let prebuild_envelope = load_prebuild_envelope()?;
 
     // Spawn one child per rank across every host.
     let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
@@ -432,6 +485,7 @@ pub fn run_launcher_with_config(
                     &full.env,
                     &host.env,
                     local_phys,
+                    prebuild_envelope.get(&host.name),
                 );
                 build_ssh_spawn_command(host, &remote_cmd)
             };
@@ -609,8 +663,16 @@ fn build_remote_bash_command(
     cluster_env: &std::collections::BTreeMap<String, String>,
     host_env: &std::collections::BTreeMap<String, String>,
     local_phys_device: Option<u8>,
+    prebuild: Option<&PerHostPrebuild>,
 ) -> String {
     use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_HOST_OVERRIDE, ENV_LOCAL_RANK};
+
+    // host_env's LD_LIBRARY_PATH (if user-set) wins over the prebuild
+    // default; lets the user augment with bare-metal libnccl paths
+    // (e.g. `/usr/local/lib`) without losing the auto-derived libtorch
+    // entry. Detected up-front so the LD_LIBRARY_PATH= emission can
+    // skip itself when host_env already provides one.
+    let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
 
     let mut s = String::with_capacity(
         256 + cluster_json_hex.len() + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
@@ -638,6 +700,17 @@ fn build_remote_bash_command(
         s.push_str("CUDA_VISIBLE_DEVICES=");
         s.push_str(&phys.to_string());
     }
+    // Auto-prepend the prebuild's LD_LIBRARY_PATH (if any) BEFORE
+    // host_env / cluster_env, so the user can override it via
+    // host.env: { LD_LIBRARY_PATH: ... } when they need a custom
+    // value (e.g. bare-metal libnccl at /usr/local/lib).
+    if let Some(pb) = prebuild {
+        if !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
+            s.push(' ');
+            s.push_str("LD_LIBRARY_PATH=");
+            s.push_str(&shell_quote(&pb.ld_library_path));
+        }
+    }
     // Apply user-declared env: cluster-scope first, host-scope second
     // (host overrides cluster for matching keys). Built-in env vars
     // above are not overridable here — the launcher owns those.
@@ -659,8 +732,16 @@ fn build_remote_bash_command(
         s.push('=');
         s.push_str(&shell_quote(env));
     }
-    s.push_str(" exec fdl ");
-    s.push_str(&shell_quote(fdl_cmd));
+    if let Some(pb) = prebuild {
+        // Direct binary exec — no cargo, no rustc, no fdl re-entry on
+        // the remote. The binary's path is relative to `cd <path>`
+        // already issued at the head of this command string.
+        s.push_str(" exec ./");
+        s.push_str(&shell_quote(&pb.bin));
+    } else {
+        s.push_str(" exec fdl ");
+        s.push_str(&shell_quote(fdl_cmd));
+    }
     for a in user_args {
         s.push(' ');
         s.push_str(&shell_quote(a));
@@ -1457,6 +1538,7 @@ mod tests {
             &cluster_env,
             &host_env,
             None,
+            None,
         );
         assert!(s.starts_with("cd '/srv/flodl' && "));
         assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"));
@@ -1481,6 +1563,7 @@ mod tests {
             &cluster_env,
             &host_env,
             None,
+            None,
         );
         assert!(
             !s.contains("FDL_ENV"),
@@ -1497,7 +1580,7 @@ mod tests {
         let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv", "ff", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, None,
+            &cluster_env, &host_env, None, None,
         );
         assert!(s.contains(" exec fdl "), "missing `exec` prefix: {s}");
     }
@@ -1510,12 +1593,87 @@ mod tests {
         let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/it's", "ff", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, None,
+            &cluster_env, &host_env, None, None,
         );
         assert!(
             s.contains("cd '/srv/it'\\''s'"),
             "path with single quote not properly escaped: {s}"
         );
+    }
+
+    #[test]
+    fn build_remote_bash_command_uses_prebuild_binary_and_ld_path() {
+        // When the prebuild envelope provides an entry for this host,
+        // the remote dispatch must (a) emit LD_LIBRARY_PATH, (b)
+        // exec the binary directly via `./<bin>`, (c) skip the `fdl`
+        // re-entry entirely.
+        let cluster_env = empty_env();
+        let host_env = empty_env();
+        let pb = PerHostPrebuild {
+            bin: "target/cluster/worker/release/ddp-bench".into(),
+            ld_library_path: "/opt/libtorch/lib".into(),
+        };
+        let s = build_remote_bash_command(
+            "/srv/flodl",
+            "abcd",
+            "worker",
+            0,
+            None,
+            "ddp-bench",
+            &["--mode".into(), "nccl-sync".into()],
+            &cluster_env,
+            &host_env,
+            None,
+            Some(&pb),
+        );
+        assert!(
+            s.contains("LD_LIBRARY_PATH='/opt/libtorch/lib'"),
+            "missing prebuild LD_LIBRARY_PATH: {s}",
+        );
+        assert!(
+            s.contains(" exec ./'target/cluster/worker/release/ddp-bench'"),
+            "missing direct-binary exec: {s}",
+        );
+        assert!(
+            !s.contains("exec fdl"),
+            "prebuild path must NOT re-enter fdl on remote: {s}",
+        );
+        assert!(
+            s.ends_with("'--mode' 'nccl-sync'"),
+            "user args must be appended: {s}",
+        );
+    }
+
+    #[test]
+    fn build_remote_bash_command_prebuild_yields_to_host_env_ld_path() {
+        // If the user sets LD_LIBRARY_PATH via host.env, the
+        // auto-derived prebuild LD_LIBRARY_PATH must yield (the user's
+        // value is the source of truth; e.g. they need extra paths
+        // for bare-metal libnccl alongside libtorch).
+        let cluster_env = empty_env();
+        let mut host_env = empty_env();
+        host_env.insert(
+            "LD_LIBRARY_PATH".into(),
+            "/opt/libtorch/lib:/usr/local/lib".into(),
+        );
+        let pb = PerHostPrebuild {
+            bin: "target/cluster/worker/release/ddp-bench".into(),
+            ld_library_path: "/opt/libtorch/lib".into(),
+        };
+        let s = build_remote_bash_command(
+            "/srv", "ff", "w", 0, None, "ddp-bench", &[],
+            &cluster_env, &host_env, None, Some(&pb),
+        );
+        // Only the host_env value should be present; the auto-derived
+        // prebuild-only LD_LIBRARY_PATH must be suppressed.
+        let host_pos = s.find("LD_LIBRARY_PATH='/opt/libtorch/lib:/usr/local/lib'").unwrap();
+        // The auto-derived entry would have emitted exactly this
+        // substring; assert it's absent.
+        assert!(
+            !s.contains(" LD_LIBRARY_PATH='/opt/libtorch/lib' "),
+            "auto-derived LD_LIBRARY_PATH should yield to host_env: {s}",
+        );
+        let _ = host_pos;
     }
 
     #[test]
@@ -1531,7 +1689,7 @@ mod tests {
         host_env.insert("SHARED_FLAG".into(), "host-wins".into());
         let s = build_remote_bash_command(
             "/srv", "ff", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, Some(1),
+            &cluster_env, &host_env, Some(1), None,
         );
         assert!(s.contains("NCCL_P2P_DISABLE='1'"));
         assert!(s.contains("HOST_FLAG='host-val'"));

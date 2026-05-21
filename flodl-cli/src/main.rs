@@ -8,8 +8,8 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, context, diagnose, dispatch,
-    gpus, init, libtorch, overlay, parse_or_schema_from, probe, run, schema, schema_cache, setup,
-    skill, style, update_check, util,
+    gpus, init, libtorch, overlay, parse_or_schema_from, prebuild, probe, run, schema,
+    schema_cache, setup, skill, style, update_check, util,
 };
 
 use builtins::{
@@ -88,6 +88,12 @@ fn main() -> ExitCode {
     // `append:` suffix declared by a run-kind command. Scoped to this
     // invocation only — nested `fdl` calls re-evaluate their own flags.
     let (args, no_append) = extract_no_append(&args);
+
+    // Extract `--no-prebuild`, which opts a single invocation out of
+    // the cluster-mode pre-flight build (see [`prebuild`]). Lets users
+    // skip the per-remote build phase when they know the binaries are
+    // fresh (or when working around a build-only issue).
+    let (args, no_prebuild) = extract_no_prebuild(&args);
 
     // Extract `--gpus` (global; accepted at any position). Cluster-aware
     // commands with N>=2 GPUs trigger single-host envelope synthesis and
@@ -238,6 +244,7 @@ fn main() -> ExitCode {
             &args,
             active_env.as_deref(),
             no_append,
+            no_prebuild,
             gpus_spec.as_ref(),
         ),
     }
@@ -1320,6 +1327,7 @@ fn dispatch_config(
     args: &[String],
     env: Option<&str>,
     no_append: bool,
+    no_prebuild: bool,
     gpus_spec: Option<&gpus::GpusSpec>,
 ) -> ExitCode {
     let cwd = env::current_dir().unwrap_or_default();
@@ -1443,6 +1451,22 @@ fn dispatch_config(
     };
 
     if let Some(cluster) = cluster_to_dispatch {
+        // Pre-flight build (see flodl-cli::prebuild). Runs `cargo
+        // build` locally for each remote host with that host's
+        // libtorch + a per-host CARGO_TARGET_DIR, delivering the
+        // binary via the shared project-root mount. Skipped when
+        // `--no-prebuild` is set. The controller's own build is
+        // handled by the normal dispatch path below (cargo run in
+        // Docker against the local `.active`).
+        if !no_prebuild {
+            let controller = cluster::resolve_local_hostname();
+            if let Err(e) = prebuild::prebuild_remotes(
+                &project_root, &cluster, cmd, &controller,
+            ) {
+                cli_error!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
         // Cluster mode: set env vars on this process so the user binary
         // (spawned by the normal dispatch below) detects launcher role
         // and fans out via flodl::distributed::launcher. Fall through —
@@ -1680,6 +1704,7 @@ fn print_usage() {
     println!("    -vvv               Trace output (maximum detail)");
     println!("    -q, --quiet        Suppress all non-error output");
     println!("    --no-append        Drop a run command's `append:` suffix (cargo / runner defaults)");
+    println!("    --no-prebuild      Skip the cluster pre-flight build (assumes binaries are fresh)");
     println!();
     println!("COMMANDS:");
     println!("    setup              Interactive guided setup");
@@ -1769,6 +1794,35 @@ fn extract_no_append(args: &[String]) -> (Vec<String>, bool) {
             continue;
         }
         if arg == "--no-append" {
+            found = true;
+            continue;
+        }
+        filtered.push(arg.clone());
+    }
+
+    (filtered, found)
+}
+
+/// Strip `--no-prebuild` from `args`, returning a bool that's true
+/// when the flag was present. Symmetric with [`extract_no_append`];
+/// stops scanning at the first standalone `--` so a literal
+/// `--no-prebuild` after the user's `--` reaches the inner script.
+fn extract_no_prebuild(args: &[String]) -> (Vec<String>, bool) {
+    let mut found = false;
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
+
+    for arg in args {
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--no-prebuild" {
             found = true;
             continue;
         }
@@ -2184,6 +2238,34 @@ mod tests {
         let (out, found) =
             extract_no_append(&args(&["fdl", "test", "--", "--no-append"]));
         assert_eq!(out, args(&["fdl", "test", "--", "--no-append"]));
+        assert!(!found);
+    }
+
+    #[test]
+    fn extract_no_prebuild_strips_flag_from_anywhere_before_dashdash() {
+        let (out, found) = extract_no_prebuild(&args(&[
+            "fdl", "@cluster", "ddp-bench", "--no-prebuild", "--mode", "nccl-sync",
+        ]));
+        assert_eq!(
+            out,
+            args(&["fdl", "@cluster", "ddp-bench", "--mode", "nccl-sync"]),
+        );
+        assert!(found);
+    }
+
+    #[test]
+    fn extract_no_prebuild_preserves_flag_after_dashdash() {
+        let (out, found) = extract_no_prebuild(&args(&[
+            "fdl", "ddp-bench", "--", "--no-prebuild",
+        ]));
+        assert_eq!(out, args(&["fdl", "ddp-bench", "--", "--no-prebuild"]));
+        assert!(!found);
+    }
+
+    #[test]
+    fn extract_no_prebuild_returns_false_when_absent() {
+        let (out, found) = extract_no_prebuild(&args(&["fdl", "@cluster", "train"]));
+        assert_eq!(out, args(&["fdl", "@cluster", "train"]));
         assert!(!found);
     }
 }
