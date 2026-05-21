@@ -37,6 +37,24 @@
 #     (NAS / SMB / virtiofs / S3-FUSE).
 #   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
 #     bind-mounts it into the Docker container at /usr/local/libtorch.
+#     Accepts THREE shapes:
+#       (a) directory containing `.active` + `builds/` / `precompiled/`
+#           — fdl walks `.active` to find the variant (single-host
+#           default; shape used by every fdl.yml-only setup).
+#       (b) pointer file (path ending in `.active.<case>`, e.g.
+#           `/home/me/rdl/libtorch/.active.blackwell`) — fdl reads the
+#           pointer's contents (a relative path like `precompiled/cu128`)
+#           and resolves the variant against the file's parent dir.
+#           Use this on heterogeneous rigs where one shared checkout
+#           is mounted on hosts that need different libtorch variants
+#           (e.g. a Blackwell host on PT 2.10 + a Pascal host on PT 2.7
+#           reading from the same virtiofs-shared `libtorch/`). Each
+#           host points at its own `.active.<case>` file; the cases
+#           coexist in the shared `libtorch/`.
+#       (c) direct variant dir (the libtorch install itself, with
+#           `lib/libtorch.so` + optional `.arch`) — fdl uses as-is.
+#           Used when the variant dir is shared directly (e.g. Pascal
+#           sees `/mnt/libtorch` = the `builds/sm61-sm120` dir).
 #   - `docker:` (optional) names the docker-compose service this host
 #     runs training inside (e.g. `cuda`, `dev`). Per-host, NOT global:
 #     mixed deployments (controller in Docker, worker bare-metal) are

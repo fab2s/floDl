@@ -613,25 +613,91 @@ pub fn probe_local(
     }
 }
 
-/// Variant that takes an explicit libtorch DIRECTORY (e.g.
-/// `/mnt/libtorch`) instead of walking from the project root. The
-/// directory should be a libtorch install (has `lib/`, `include/`)
-/// or a `.active` pointer file. When the directory is a libtorch
-/// install directly, it has no `.arch` file at the parent level —
-/// the `.arch` file should be inside this directory.
-fn check_libtorch_at(
-    dir: &Path,
+/// Build a [`LibtorchStatus`] from a resolved [`LibtorchInfo`] (or
+/// `None` when the pointer could not be resolved). Used by the
+/// pointer-file shape of [`check_libtorch_at`]; mirrors the
+/// arch-check and valid-dir logic from [`check_libtorch`] without
+/// duplicating its `.active` walk.
+fn libtorch_status_from_info(
+    info: Option<LibtorchInfo>,
+    libtorch_root: &Path,
     gpus: &[GpuInfo],
     issues: &mut Vec<String>,
 ) -> LibtorchStatus {
-    // `--libtorch-path` accepts two shapes:
-    //   1. A libtorch ROOT (has `.active` + `builds/` / `precompiled/`).
-    //      Delegate to `check_libtorch` which walks .active.
-    //   2. A direct variant dir (has `lib/libtorch.so` + optional
-    //      `.arch` file). Use as-is.
-    if dir.join(".active").exists() {
-        return check_libtorch(dir, gpus, issues);
+    let valid_dir = match &info {
+        Some(i) => libtorch_root.join(&i.path).join("lib").is_dir(),
+        None => false,
+    };
+    let mut archs_match: Vec<(u8, bool)> = Vec::new();
+    if let Some(i) = &info {
+        if let Some(archs) = &i.archs {
+            for g in gpus {
+                archs_match.push((g.index, detect::arch_compatible(g, archs)));
+            }
+            for g in gpus {
+                if !detect::arch_compatible(g, archs) {
+                    issues.push(format!(
+                        "GPU {} ({}, {}) not covered by libtorch archs `{}`.",
+                        g.index,
+                        g.short_name(),
+                        g.sm_version(),
+                        archs
+                    ));
+                }
+            }
+        } else {
+            issues.push(
+                "libtorch is present but `.arch` metadata is missing — \
+                 cannot verify GPU compatibility."
+                    .into(),
+            );
+        }
+    } else {
+        issues.push(
+            "libtorch pointer file did not resolve to a configured \
+             variant (file empty or missing). Check the `.active*` \
+             content names a real subdir under `libtorch/`."
+                .into(),
+        );
     }
+    LibtorchStatus { info, valid_dir, archs_match }
+}
+
+/// Variant that takes an explicit libtorch path instead of walking
+/// from the project root. Accepts three shapes:
+///
+/// 1. **Libtorch ROOT** (dir containing `.active` + `builds/` /
+///    `precompiled/`) — delegates to [`check_libtorch`] which walks
+///    `.active`.
+/// 2. **Pointer file** (file path ending in `.active*`, e.g.
+///    `libtorch/.active.blackwell`) — reads the pointer and resolves
+///    the variant relative to the file's parent directory. Used for
+///    heterogeneous rigs where each host's `cluster.yml` entry sets
+///    `libtorch_path:` to a different case file.
+/// 3. **Direct variant dir** (has `lib/libtorch.so` + optional
+///    `.arch`) — used as-is.
+fn check_libtorch_at(
+    path: &Path,
+    gpus: &[GpuInfo],
+    issues: &mut Vec<String>,
+) -> LibtorchStatus {
+    // Shape 2: a regular file whose name starts with `.active` is a
+    // pointer to a variant subdir. Resolve relative to the file's
+    // parent (the libtorch root). Note: `.active` itself is also a
+    // file but Shape 1 catches it via dir-containing-.active above.
+    if path.is_file()
+        && path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".active"))
+    {
+        let libtorch_root = path.parent().unwrap_or(path);
+        let info = detect::read_active_from(path, libtorch_root);
+        return libtorch_status_from_info(info, libtorch_root, gpus, issues);
+    }
+    if path.join(".active").exists() {
+        return check_libtorch(path, gpus, issues);
+    }
+    let dir = path;
     let valid_dir = dir.join("lib").is_dir();
     if !valid_dir {
         issues.push(format!(

@@ -38,6 +38,11 @@
 #   - `path:` is the project checkout dir on this host (used by
 #     fdl-cli to cd before remote exec; tests reuse it for path
 #     resolution).
+#   - `libtorch_path:` accepts three shapes (full docs in
+#     fdl.cluster.yml.example): a libtorch ROOT dir, a `.active.<case>`
+#     POINTER FILE (for heterogeneous rigs where hosts share one
+#     checkout but need different libtorch variants — each host
+#     points at its own case file), or a DIRECT VARIANT DIR.
 
 cluster:
   master_addr: 192.168.122.1
