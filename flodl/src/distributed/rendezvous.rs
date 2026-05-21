@@ -91,7 +91,7 @@ impl TcpRendezvous {
         F: FnOnce() -> Result<NcclUniqueId>,
     {
         let this_host = cluster.this_host()?;
-        validate_socket_ifname(cluster)?;
+        validate_socket_ifname(cluster, this_host)?;
 
         let local_ranks = this_host.ranks.clone();
         let local_devices: Vec<Device> = this_host
@@ -264,15 +264,33 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream> {
     )))
 }
 
-fn validate_socket_ifname(cluster: &LocalCluster) -> Result<()> {
-    if cluster.spans_multiple_hosts() && env::var(ENV_NCCL_SOCKET_IFNAME).is_err() {
-        return Err(TensorError::new(&format!(
-            "rendezvous: {ENV_NCCL_SOCKET_IFNAME} must be set when the cluster spans \
-             multiple hosts (auto-detection rejected -- interface naming is \
-             config-specific and silent fallthrough costs hours)"
-        )));
+fn validate_socket_ifname(cluster: &LocalCluster, this_host: &HostBlock) -> Result<()> {
+    if !cluster.spans_multiple_hosts() {
+        return Ok(());
     }
-    Ok(())
+    if env::var(ENV_NCCL_SOCKET_IFNAME).is_ok() {
+        return Ok(());
+    }
+    // Auto-export from cluster.yml's hosts[].nccl_socket_ifname so the
+    // user declares the interface once (in YAML) instead of also having
+    // to set the env var explicitly. The yml field is non-decorative:
+    // fdl-cli's config validation already requires it non-empty on
+    // multi-host clusters, so we expect a value here in the normal path.
+    // The loud error remains for programmatic LocalCluster constructions
+    // that skip fdl-cli's validation and leave the field empty.
+    if !this_host.nccl_socket_ifname.trim().is_empty() {
+        // SAFETY: rank process is single-threaded at this point (pre-NCCL,
+        // pre-worker-spawn); no concurrent env::var readers.
+        unsafe {
+            env::set_var(ENV_NCCL_SOCKET_IFNAME, &this_host.nccl_socket_ifname);
+        }
+        return Ok(());
+    }
+    Err(TensorError::new(&format!(
+        "rendezvous: {ENV_NCCL_SOCKET_IFNAME} must be set when the cluster spans \
+         multiple hosts (auto-detection rejected -- interface naming is \
+         config-specific and silent fallthrough costs hours)"
+    )))
 }
 
 fn cluster_mapping(cluster: &LocalCluster) -> String {
@@ -398,7 +416,11 @@ mod tests {
         unsafe {
             env::remove_var(ENV_NCCL_SOCKET_IFNAME);
         }
-        assert!(validate_socket_ifname(&c).is_ok(), "single-host must not require ifname");
+        let this_host = c.host.clone();
+        assert!(
+            validate_socket_ifname(&c, &this_host).is_ok(),
+            "single-host must not require ifname"
+        );
         if let Some(v) = prev_ifname {
             unsafe {
                 env::set_var(ENV_NCCL_SOCKET_IFNAME, v);
@@ -407,14 +429,54 @@ mod tests {
     }
 
     #[test]
-    fn multi_host_loud_error_when_socket_ifname_unset() {
+    fn multi_host_auto_exports_socket_ifname_from_cluster_config() {
+        // Cluster yml declared `nccl_socket_ifname: "lo"` in envelope_for;
+        // validate must auto-export so the user does not also have to set
+        // the env var by hand. The yml field is the single source of truth.
         let cluster = envelope_for("master-host", next_port());
+        let this_host = cluster.host.clone();
         let _guard = ENV_MUTEX.lock().unwrap();
         let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
         unsafe {
             env::remove_var(ENV_NCCL_SOCKET_IFNAME);
         }
-        let err = validate_socket_ifname(&cluster).expect_err("must require ifname");
+        let result = validate_socket_ifname(&cluster, &this_host);
+        let exported = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
+        // Restore env before assertions so a failure does not corrupt
+        // sibling tests sharing ENV_MUTEX.
+        unsafe {
+            env::remove_var(ENV_NCCL_SOCKET_IFNAME);
+            if let Some(v) = prev_ifname {
+                env::set_var(ENV_NCCL_SOCKET_IFNAME, v);
+            }
+        }
+        assert!(result.is_ok(), "auto-export must succeed: {result:?}");
+        assert_eq!(exported.as_deref(), Some("lo"));
+    }
+
+    #[test]
+    fn multi_host_loud_error_when_cluster_config_ifname_empty() {
+        // Programmatic LocalCluster construction may bypass fdl-cli's
+        // non-empty check and end up with `nccl_socket_ifname: ""` on a
+        // multi-host cluster. validate must still loud-fail in that case.
+        let v = json!({
+            "master_addr": "127.0.0.1",
+            "master_port": next_port(),
+            "world_size": 2,
+            "num_hosts": 2,
+            "host": {
+                "name": "a", "ranks": [0], "local_devices": [0],
+                "nccl_socket_ifname": "", "path": "/tmp/test-a"
+            }
+        });
+        let cluster = LocalCluster::from_value(&v).expect("parse");
+        let this_host = cluster.host.clone();
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
+        unsafe {
+            env::remove_var(ENV_NCCL_SOCKET_IFNAME);
+        }
+        let err = validate_socket_ifname(&cluster, &this_host).expect_err("empty ifname must error");
         if let Some(v) = prev_ifname {
             unsafe {
                 env::set_var(ENV_NCCL_SOCKET_IFNAME, v);

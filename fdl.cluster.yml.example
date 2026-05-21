@@ -35,26 +35,23 @@
 #     (e.g. /opt/flodl on the controller, /srv/flodl in a VM); training
 #     data is the user's responsibility to mount identically across hosts
 #     (NAS / SMB / virtiofs / S3-FUSE).
-#   - `libtorch_path:` is the host-side libtorch directory; fdl-cli
-#     bind-mounts it into the Docker container at /usr/local/libtorch.
-#     Accepts THREE shapes:
-#       (a) directory containing `.active` + `builds/` / `precompiled/`
-#           — fdl walks `.active` to find the variant (single-host
-#           default; shape used by every fdl.yml-only setup).
-#       (b) pointer file (path ending in `.active.<case>`, e.g.
-#           `/home/me/rdl/libtorch/.active.blackwell`) — fdl reads the
-#           pointer's contents (a relative path like `precompiled/cu128`)
-#           and resolves the variant against the file's parent dir.
-#           Use this on heterogeneous rigs where one shared checkout
-#           is mounted on hosts that need different libtorch variants
-#           (e.g. a Blackwell host on PT 2.10 + a Pascal host on PT 2.7
-#           reading from the same virtiofs-shared `libtorch/`). Each
-#           host points at its own `.active.<case>` file; the cases
-#           coexist in the shared `libtorch/`.
-#       (c) direct variant dir (the libtorch install itself, with
-#           `lib/libtorch.so` + optional `.arch`) — fdl uses as-is.
-#           Used when the variant dir is shared directly (e.g. Pascal
-#           sees `/mnt/libtorch` = the `builds/sm61-sm120` dir).
+#   - `arch:` is the libtorch variant subpath under `<path>/libtorch/`
+#     on this host. E.g. `precompiled/cu128` (PT cu128 wheels) or
+#     `builds/sm61-sm120` (a from-source build). The convention path
+#     `<path>/libtorch/<arch>` is what the rank reads at runtime;
+#     the controller-side build (pre-flight) mirrors it via
+#     `<controller_path>/libtorch/<arch>`. Both point at the same
+#     physical libtorch via the shared project-root mount.
+#
+#     For heterogeneous rigs, each host's `arch:` selects a different
+#     variant (e.g. Blackwell host on `precompiled/cu128`, Pascal host
+#     on `builds/sm61-sm120`) — the convention keeps the path stable
+#     while the variant differs per host.
+#
+#     `fdl probe`'s GPU compat check derives supported sm architectures
+#     by basename parsing (e.g. `builds/sm61-sm120` → `6.1 12.0`) plus
+#     reading the variant's `.arch` metadata file at
+#     `<path>/libtorch/<arch>/.arch`.
 #   - `docker:` (optional) names the docker-compose service this host
 #     runs training inside (e.g. `cuda`, `dev`). Per-host, NOT global:
 #     mixed deployments (controller in Docker, worker bare-metal) are
@@ -62,15 +59,11 @@
 #     (NCCL ships in the container image) and reports "via Docker
 #     image <svc>" instead of erroring on a missing libnccl.so on the
 #     host. Omit when the host runs flodl natively.
-#   - `arch:` is the GPU compute capability for this host's devices in
-#     canonical `sm_NN` form (sm_61 Pascal, sm_70 Volta, sm_75 Turing,
-#     sm_80/86/89 Ampere, sm_90 Hopper, sm_120 Blackwell). Optional
-#     today; consumed by the future `fdl deploy` slice to (1) validate
-#     against probed hardware before training starts and (2) select a
-#     compatible libtorch variant from those locally provisioned.
-#     A single libtorch build can support multiple archs (see
-#     `libtorch/builds/<variant>/.arch`); this field declares what
-#     THIS HOST has, not what one libtorch variant covers.
+#
+# Cluster-level `controller_path:` (optional) is the controller's view
+# of the shared project root. Defaults to the controller host's `path:`
+# when unset. Set explicitly only when the controller's filesystem path
+# diverges from every host's local path (rare; usually they coincide).
 #
 # Controller participation: if the controller's hostname appears in
 # `hosts:` below, it participates as a rank. If absent, it dispatches and
@@ -81,14 +74,14 @@
 cluster:
   master_addr: 192.168.122.1
   master_port: 29500
+  # controller_path: /opt/flodl    # optional, defaults to controller host's path
   hosts:
     - name: node-a             # must match `hostname` on the host
       ranks: [0]
       local_devices: [0]
-      arch: sm_80              # canonical sm_NN form (Ampere A100 here)
       nccl_socket_ifname: virbr0
       path: /opt/flodl                # checkout path on this host
-      libtorch_path: /data/ssd/flodl/libtorch
+      arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
       docker: cuda             # training runs in the `cuda` compose service;
                                # omit when this host runs flodl natively.
     - name: node-b
@@ -96,10 +89,9 @@ cluster:
       ranks: [1, 2]
       local_devices: all       # auto-detect at startup; equivalent to [0, 1]
                                # if this host has 2 visible CUDA devices.
-      arch: sm_90              # Hopper H100
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
-      libtorch_path: /mnt/flodl/libtorch
+      arch: builds/sm61-sm120         # different variant per host is OK
                                # no `docker:` here → bare-metal flodl install.
       # Optional per-host env vars exported into every rank child
       # spawned on this host. Overrides cluster-scope `env:` for
@@ -120,7 +112,7 @@ cluster:
 #   `fdl @cluster <cmd>` auto-builds the binary locally (on the
 #   controller, in Docker) for every remote host before fan-out:
 #     - per-host `CARGO_TARGET_DIR=target/cluster/<host>/`
-#     - per-host `LIBTORCH_HOST_PATH=` resolved from `libtorch_path:`
+#     - per-host `LIBTORCH_HOST_PATH=` resolved via convention from `<controller_path>/libtorch/<arch>`
 #     - features = `cuda` when the host's libtorch `.arch` has
 #       `cuda=<version>` (non-`none`), else no features
 #     - binary name = command name (`fdl @cluster ddp-bench` builds

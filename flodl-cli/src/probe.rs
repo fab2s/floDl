@@ -115,7 +115,12 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
                 &ctx,
                 skip_mount,
                 host.data_path.as_ref().map(PathBuf::from),
-                host.libtorch_path.as_ref().map(PathBuf::from),
+                // Convention: libtorch lives at `<host.path>/libtorch/<host.arch>`
+                // when the host declares an arch; else probe walks
+                // `<host.path>/libtorch/.active` (single-host default).
+                host.arch
+                    .as_ref()
+                    .map(|a| PathBuf::from(&host.path).join("libtorch").join(a)),
                 host.docker.clone(),
                 data_path_explicit,
             )
@@ -163,14 +168,17 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     if skip_mount {
         remote_args.push("--skip-mount".into());
     }
-    // Pass the host's libtorch_path: directly to the remote probe so
-    // the worker doesn't have to discover libtorch from its filesystem
-    // (the project tree's `libtorch/` symlink typically points outside
-    // the shared mount; libtorch is shared as a SEPARATE mount with
-    // its own path).
-    if let Some(lt) = &host.libtorch_path {
+    // Pass the host's libtorch path to the remote probe so the worker
+    // doesn't have to discover libtorch from its filesystem. Derived
+    // from the convention `<host.path>/libtorch/<host.arch>` when
+    // arch is declared; otherwise omitted, and the remote probe walks
+    // `<host.path>/libtorch/.active` (single-host default).
+    if let Some(arch) = &host.arch {
         remote_args.push("--libtorch-path".into());
-        remote_args.push(lt.clone());
+        remote_args.push(format!(
+            "{path}/libtorch/{arch}",
+            path = host.path.trim_end_matches('/'),
+        ));
     }
     // Pass the host's docker: compose service. Tells the remote probe
     // that NCCL ships inside the container image, so it should report

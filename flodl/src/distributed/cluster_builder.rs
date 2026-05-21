@@ -166,7 +166,7 @@ impl ClusterBuilder {
                     .ok()
                     .and_then(|p| p.to_str().map(String::from))
                     .unwrap_or_default(),
-                libtorch_path: None,
+                arch: None,
                 ssh: None,
                 ssh_port: None,
                 ssh_user: None,
@@ -194,7 +194,7 @@ pub struct HostBuilder {
     local_devices: Option<Option<Vec<u8>>>, // outer None=unset, inner None="all"
     nccl_socket_ifname: Option<String>,
     path: Option<String>,
-    libtorch_path: Option<String>,
+    arch: Option<String>,
     ssh: Option<String>,
     ssh_port: Option<u16>,
     ssh_user: Option<String>,
@@ -211,7 +211,7 @@ impl HostBuilder {
             local_devices: None,
             nccl_socket_ifname: None,
             path: None,
-            libtorch_path: None,
+            arch: None,
             ssh: None,
             ssh_port: None,
             ssh_user: None,
@@ -256,10 +256,11 @@ impl HostBuilder {
         self
     }
 
-    /// libtorch install path on this host (bind-mount target for
-    /// containerized hosts; informational otherwise).
-    pub fn libtorch_path(mut self, p: impl Into<String>) -> Self {
-        self.libtorch_path = Some(p.into());
+    /// libtorch variant subpath under `<path>/libtorch/` on this host
+    /// (e.g. `"precompiled/cu128"`, `"builds/sm61-sm120"`). Convention
+    /// resolves the runtime libtorch at `<path>/libtorch/<arch>/`.
+    pub fn arch(mut self, p: impl Into<String>) -> Self {
+        self.arch = Some(p.into());
         self
     }
 
@@ -316,7 +317,7 @@ impl HostBuilder {
                 .nccl_socket_ifname
                 .expect("HostBuilder: nccl_socket_ifname(...) required"),
             path: self.path.expect("HostBuilder: path(...) required"),
-            libtorch_path: self.libtorch_path,
+            arch: self.arch,
             ssh: self.ssh,
             ssh_port: self.ssh_port,
             ssh_user: self.ssh_user,

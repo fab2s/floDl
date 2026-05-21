@@ -14,8 +14,27 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
     environment:
       - FLODL_VERBOSITY
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_FDL_CMD
+      - FDL_ENV
+      - FLODL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh_user:` is unset — bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_HOST_USER
       # Share the hf-hub cache with the hf-parity service so `fdl test-live`
       # reuses fixtures downloaded by `fdl flodl-hf parity bert*`. Repo-local,
       # gitignored, survives container rebuild.
@@ -35,6 +54,11 @@ services:
       - ./.cargo-git-cuda:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
       - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
+      # SSH-agent socket forwarded so the launcher can ssh into remote
+      # cluster hosts. Falls back to /dev/null when the user has no
+      # agent running — ssh then errors loudly inside the container,
+      # which is the right signal for non-cluster runs.
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -43,8 +67,42 @@ services:
     # any non-trivial model exhausts Docker's default 64 MB /dev/shm. 2 GB is
     # generous headroom for ResNet-class workspaces.
     shm_size: 2gb
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
+    # Share the host's network namespace so the cluster controller +
+    # coord (bound on exa-side ports) are reachable from remote rank
+    # VMs. Docker's default bridge isolates the container from the
+    # host's other networks (virbr0, enp1s0, etc.); with
+    # `network_mode: host` the container sees every interface the
+    # host has, and `master_addr` resolves identically inside and
+    # outside the container.
+    network_mode: host
     environment:
       - FLODL_VERBOSITY
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_FDL_CMD
+      - FDL_ENV
+      - FLODL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh_user:` is unset — bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_HOST_USER
+      # SSH-agent forwarding: launcher SSHes into remote cluster hosts
+      # from inside this container. The host's agent socket is bind-
+      # mounted at /ssh-agent (see volumes:) and re-exposed via
+      # SSH_AUTH_SOCK so ssh-add'ed keys work without copying private
+      # material into the image. Run `eval $(ssh-agent) && ssh-add` on
+      # the host before `fdl @cluster ...`.
+      - SSH_AUTH_SOCK=/ssh-agent
     deploy:
       resources:
         reservations:
@@ -70,8 +128,35 @@ services:
     # See `cuda` service: NCCL SHM transport on multi-GPU heterogeneous setups
     # exhausts the 64 MB Docker default /dev/shm.
     shm_size: 2gb
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
+    # Share the host's network namespace so the cluster controller +
+    # coord (bound on exa-side ports) are reachable from remote rank
+    # VMs. Docker's default bridge isolates the container from the
+    # host's other networks (virbr0, enp1s0, etc.); with
+    # `network_mode: host` the container sees every interface the
+    # host has, and `master_addr` resolves identically inside and
+    # outside the container.
+    network_mode: host
     environment:
       - FLODL_VERBOSITY
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_FDL_CMD
+      - FDL_ENV
+      - FLODL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh_user:` is unset — bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_HOST_USER
     deploy:
       resources:
         reservations:

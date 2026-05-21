@@ -1082,7 +1082,7 @@ mod tests {
                 "local_devices": [0],
                 "nccl_socket_ifname": "lo",
                 "path": "/tmp",
-                "libtorch_path": null,
+                "arch": null,
             }
         });
         let hex = crate::distributed::cluster::hex_encode(
@@ -1126,7 +1126,7 @@ mod tests {
                 "local_devices": [0],
                 "nccl_socket_ifname": "lo",
                 "path": "/tmp",
-                "libtorch_path": null,
+                "arch": null,
             }
         });
         let hex = crate::distributed::cluster::hex_encode(

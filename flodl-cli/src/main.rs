@@ -1368,6 +1368,18 @@ fn dispatch_config(
     let tail: &[String] = args.get(2..).unwrap_or(&[]);
     let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);
 
+    // The actual cwd the command would run from (per the walk into
+    // sub-fdl.yml chains). Used by the pre-flight build below so
+    // cargo runs from the right crate root for sub-command path
+    // entries (e.g. `ddp-bench` is workspace-excluded — `cargo
+    // build --bin ddp-bench` from project root fails; from
+    // `ddp-bench/` it succeeds).
+    let cmd_cwd: std::path::PathBuf = match &outcome {
+        WalkOutcome::RunScript { cwd, .. } => cwd.clone(),
+        WalkOutcome::ExecCommand { cmd_dir, .. } => cmd_dir.clone(),
+        _ => project_root.clone(),
+    };
+
     // Cluster dispatch sources: YAML `cluster:` block, or synthesized from
     // `--gpus` on a cluster-aware command (loopback, one host, N ranks).
     // Recursion guard skips both paths when `FLODL_CLUSTER_JSON` is already
@@ -1461,7 +1473,7 @@ fn dispatch_config(
         if !no_prebuild {
             let controller = cluster::resolve_local_hostname();
             if let Err(e) = prebuild::prebuild_remotes(
-                &project_root, &cluster, cmd, &controller,
+                &project_root, &cmd_cwd, &cluster, cmd, &controller,
             ) {
                 cli_error!("{e}");
                 return ExitCode::FAILURE;

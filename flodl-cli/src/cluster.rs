@@ -31,6 +31,7 @@
 //! dispatch then detects `Role::Rank` (because `FLODL_LOCAL_RANK` is also
 //! set).
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::config::{self, ClusterConfig, ProjectConfig};
@@ -56,6 +57,23 @@ pub const ENV_FDL_ENV: &str = "FDL_ENV";
 /// recursion guard can reference it by name. Mirrors
 /// `flodl::distributed::cluster::ENV_CLUSTER_JSON`.
 pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
+
+/// Pre-resolved `name:ip` pairs (space-separated) for every cluster
+/// host, written by [`prepare_cluster_env`] using the controller's NSS
+/// resolution. Consumed by run/prebuild/schema-cache when they build
+/// `docker compose run --rm` commands: each pair is injected as a
+/// `--add-host name:ip` flag so the containerized launcher can SSH
+/// into cluster hosts without depending on the container's own
+/// resolver (which lacks `libnss-libvirt` etc.).
+pub const ENV_CLUSTER_EXTRA_HOSTS: &str = "FLODL_CLUSTER_EXTRA_HOSTS";
+
+/// Controller's OS user name (resolved on the host by fdl-cli, before
+/// any docker spawn). The launcher in the container reads it as the
+/// default `ssh -l` target when the per-host `ssh_user:` is unset.
+/// Bridges the container-vs-host user mismatch (containers ship a
+/// stock `ubuntu` UID-1000 user, but `ubuntu@<remote>` is rarely the
+/// account the user actually uses on cluster hosts).
+pub const ENV_HOST_USER: &str = "FLODL_HOST_USER";
 
 /// Env var name overriding the OS hostname for cluster lookups.
 /// Mirrors `flodl::distributed::cluster::ENV_HOST_OVERRIDE`.
@@ -103,8 +121,22 @@ pub fn prepare_cluster_env(
     cmd: &str,
 ) -> Result<(), String> {
     cluster.validate()?;
-    let json = cluster.canonical_json()?;
+    // Pre-resolve `master_addr` on the controller (where NSS knows
+    // names declared in `/etc/hosts`, `libnss-libvirt`, mDNS, etc.)
+    // and ship the resolved IP in the envelope to remote ranks. Remote
+    // VMs that don't share the controller's NSS view (a Pascal VM on
+    // libvirt's virbr0 has no plugin to resolve "exa") then connect
+    // by numeric IP without needing their own resolver to know cluster
+    // hostnames. If resolution fails on the controller, ship the
+    // original string and let the remote try its own NSS as a last
+    // resort.
+    let mut shippable = cluster.clone();
+    if let Some(ip) = resolve_host_to_ip(&shippable.master_addr) {
+        shippable.master_addr = ip;
+    }
+    let json = shippable.canonical_json()?;
     let hex = hex_encode(json.as_bytes());
+    let extra_hosts = resolve_cluster_extra_hosts(cluster);
 
     // SAFETY: main() has not spawned threads at this point in the
     // dispatch flow (mirrors gpus::apply_cuda_visible_devices's
@@ -112,6 +144,10 @@ pub fn prepare_cluster_env(
     unsafe {
         std::env::set_var(ENV_FULL_CLUSTER_JSON, &hex);
         std::env::set_var(ENV_FDL_CMD, cmd);
+        std::env::set_var(ENV_HOST_USER, resolve_local_user());
+        if !extra_hosts.is_empty() {
+            std::env::set_var(ENV_CLUSTER_EXTRA_HOSTS, extra_hosts.join(" "));
+        }
         if let Some(e) = overlay_env {
             if !e.trim().is_empty() {
                 std::env::set_var(ENV_FDL_ENV, e);
@@ -119,6 +155,107 @@ pub fn prepare_cluster_env(
         }
     }
     Ok(())
+}
+
+/// Resolve each cluster host's `name` to an IP via the controller's
+/// NSS (which on Linux includes static `/etc/hosts`, `libnss-libvirt`,
+/// `libnss-mdns`, and DNS — anything `getaddrinfo` knows about).
+/// Returns `Vec<"name:ip">` strings suitable for `--add-host`
+/// injection into `docker compose run`.
+///
+/// Hosts that fail to resolve are skipped with a stderr warning; the
+/// caller still gets the partial list (better-than-nothing semantics
+/// for the launcher inside the container).
+fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> Vec<String> {
+    cluster
+        .hosts
+        .iter()
+        .filter_map(|h| resolve_host_to_ip(&h.name).map(|ip| format!("{}:{ip}", h.name)))
+        .collect()
+}
+
+/// Resolve a hostname to an IP string via `getaddrinfo`. Returns
+/// `None` (with a stderr warning) when resolution fails on the
+/// controller — caller decides whether to fall back to shipping the
+/// original string or hard-fail.
+fn resolve_host_to_ip(host: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    // Already a numeric address? Skip the lookup, return as-is.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Some(host.to_string());
+    }
+    match (host, 0u16).to_socket_addrs() {
+        Ok(mut iter) => iter.next().map(|sa| sa.ip().to_string()),
+        Err(e) => {
+            eprintln!(
+                "fdl: warning: host {host:?} did not resolve on controller: {e} \
+                 (remote ranks will retry via their own NSS — fix host-side \
+                 resolution if they also fail)"
+            );
+            None
+        }
+    }
+}
+
+/// Write a temporary docker-compose overlay (under `project_root`)
+/// that populates `extra_hosts:` for the cluster-capable services
+/// (`cuda`, `dev`, `bench`) from the controller-resolved cluster
+/// hosts in [`ENV_CLUSTER_EXTRA_HOSTS`], then return the `-f` flag
+/// sequence to splice in front of `docker compose run`.
+///
+/// `docker compose run` itself does not accept `--add-host` (that's
+/// `docker run` only), but compose merges multiple `-f` files, so the
+/// overlay extends the base config without mutating it.
+///
+/// Returns the empty string (and writes nothing) when not in cluster
+/// mode — non-cluster runs keep their existing `docker compose run`
+/// invocation unchanged.
+pub fn cluster_compose_overlay_arg(project_root: &Path) -> String {
+    let raw = match std::env::var(ENV_CLUSTER_EXTRA_HOSTS) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let pairs: Vec<&str> = raw.split_whitespace().filter(|p| !p.is_empty()).collect();
+    if pairs.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = String::new();
+    for pair in &pairs {
+        entries.push_str("      - \"");
+        entries.push_str(pair);
+        entries.push_str("\"\n");
+    }
+
+    // extra_hosts is per-service in compose; apply to every
+    // cluster-capable service so the same override file works
+    // regardless of which one the dispatch lands on.
+    let overlay = format!(
+        "# Generated by fdl-cli (cluster mode) — DO NOT EDIT BY HAND.\n\
+         # Regenerated on every `fdl @cluster ...` invocation.\n\
+         services:\n\
+         \x20\x20cuda:\n\
+         \x20\x20\x20\x20extra_hosts:\n{entries}\
+         \x20\x20dev:\n\
+         \x20\x20\x20\x20extra_hosts:\n{entries}\
+         \x20\x20bench:\n\
+         \x20\x20\x20\x20extra_hosts:\n{entries}",
+    );
+
+    let overlay_path = project_root.join(".fdl-cluster-overlay.yml");
+    if let Err(e) = std::fs::write(&overlay_path, overlay) {
+        eprintln!(
+            "fdl: warning: failed to write cluster compose overlay at {:?}: {e} \
+             (continuing without --add-host injection — remote hostnames \
+             may not resolve inside the container)",
+            overlay_path
+        );
+        return String::new();
+    }
+
+    // base docker-compose.yml first, then our overlay second, so the
+    // overlay's extra_hosts merges into the base service definitions.
+    format!(" -f docker-compose.yml -f {}", overlay_path.display())
 }
 
 /// Hex-encode raw bytes (lowercase, no separators). Companion to the
@@ -132,6 +269,33 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         s.push(TABLE[(b & 0x0F) as usize] as char);
     }
     s
+}
+
+/// Resolve the controller's OS user name. Used to pre-populate
+/// [`ENV_HOST_USER`] before docker spawn, so the launcher inside the
+/// container can default `ssh -l <user>` to the host's identity.
+/// Falls through `USER` then `whoami` then `"unknown-user"`.
+pub fn resolve_local_user() -> String {
+    if let Ok(s) = std::env::var("USER") {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    Command::new("whoami")
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown-user".to_string())
 }
 
 /// Resolve the local OS hostname. Used by `gpus::synthesize_local_cluster`

@@ -165,10 +165,11 @@ pub struct HostBlock {
     /// consume this field.
     pub path: String,
 
-    /// Path to the libtorch install for `fdl-cli` to bind-mount into the
-    /// Docker container on this host. Hint for the launcher only; the
-    /// library does not consume this field.
-    pub libtorch_path: Option<String>,
+    /// libtorch variant subpath under `<path>/libtorch/` on this host.
+    /// The runtime libtorch lives at `<path>/libtorch/<arch>/` by
+    /// convention. Hint for the launcher only; the library does not
+    /// consume this field.
+    pub arch: Option<String>,
 }
 
 impl LocalCluster {
@@ -442,8 +443,8 @@ fn parse_host(v: &Value) -> Result<HostBlock> {
         })?
         .to_string();
 
-    let libtorch_path = obj
-        .get("libtorch_path")
+    let arch = obj
+        .get("arch")
         .and_then(Value::as_str)
         .map(String::from);
 
@@ -453,7 +454,7 @@ fn parse_host(v: &Value) -> Result<HostBlock> {
         local_devices,
         nccl_socket_ifname,
         path,
-        libtorch_path,
+        arch,
     })
 }
 
@@ -685,7 +686,7 @@ mod tests {
                 "local_devices": [0, 1],
                 "nccl_socket_ifname": "enp1s0",
                 "path": "/srv/flodl",
-                "libtorch_path": "/mnt/flodl/libtorch"
+                "arch": "builds/sm61-sm120"
             }
         })
     }
@@ -702,7 +703,7 @@ mod tests {
                 "local_devices": [0],
                 "nccl_socket_ifname": "virbr0",
                 "path": "/opt/flodl",
-                "libtorch_path": "/data/ssd/flodl/libtorch"
+                "arch": "precompiled/cu128"
             }
         })
     }
@@ -721,7 +722,7 @@ mod tests {
         assert_eq!(c.host.local_devices, vec![0, 1]);
         assert_eq!(c.host.nccl_socket_ifname, "enp1s0");
         assert_eq!(c.host.path, "/srv/flodl");
-        assert_eq!(c.host.libtorch_path.as_deref(), Some("/mnt/flodl/libtorch"));
+        assert_eq!(c.host.arch.as_deref(), Some("builds/sm61-sm120"));
     }
 
     #[test]

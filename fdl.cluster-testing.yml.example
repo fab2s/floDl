@@ -38,32 +38,29 @@
 #   - `path:` is the project checkout dir on this host (used by
 #     fdl-cli to cd before remote exec; tests reuse it for path
 #     resolution).
-#   - `libtorch_path:` accepts three shapes (full docs in
-#     fdl.cluster.yml.example): a libtorch ROOT dir, a `.active.<case>`
-#     POINTER FILE (for heterogeneous rigs where hosts share one
-#     checkout but need different libtorch variants — each host
-#     points at its own case file), or a DIRECT VARIANT DIR.
+#   - `arch:` is the libtorch variant subpath under `<path>/libtorch/`
+#     (full docs in fdl.cluster.yml.example). Convention: the runtime
+#     libtorch lives at `<path>/libtorch/<arch>` on every host.
 
 cluster:
   master_addr: 192.168.122.1
   master_port: 29501
+  # controller_path: /opt/flodl  # optional; defaults to controller host's path
   hosts:
     - name: node-a             # must match `hostname` on the host
       ranks: [0, 1]
       local_devices: all       # auto-detect at startup; equivalent to [0, 1]
                                # if this host has 2 visible CUDA devices.
-      arch: sm_80              # canonical sm_NN form
       nccl_socket_ifname: enp1s0
       path: /opt/flodl                # checkout path on this host
-      libtorch_path: /data/ssd/flodl/libtorch
+      arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
     - name: node-b
       ssh: node-b              # ssh target; defaults to name if omitted
       ranks: [2, 3]
       local_devices: [0, 1]    # explicit form when you want to skip a device
-      arch: sm_90
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
-      libtorch_path: /mnt/flodl/libtorch
+      arch: builds/sm61-sm120         # different variant per host is OK
       # Optional per-host env vars exported to every rank child on
       # this host. Overrides cluster-scope `env:` for matching keys.
       # Example: an older consumer-grade GPU under VFIO that needs
@@ -88,10 +85,9 @@ cluster:
 #     - name: my-rig
 #       ranks: [0, 1]
 #       local_devices: all
-#       arch: sm_75              # Turing 20XX-series example
 #       nccl_socket_ifname: lo
 #       path: /home/me/src/flodl
-#       libtorch_path: /home/me/libtorch
+#       arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
 
 # NOTE: do NOT add `cluster: true` to any commands here. That flag
 # triggers the production launcher path (process-per-rank fan-out

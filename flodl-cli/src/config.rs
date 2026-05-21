@@ -506,6 +506,22 @@ pub struct ClusterConfig {
     pub master_addr: String,
     pub master_port: u16,
     pub hosts: Vec<ClusterHost>,
+    /// Controller's view of the shared project root. Used by the pre-
+    /// flight build phase to drive cargo invocations from the
+    /// controller's filesystem perspective; the remote-side path
+    /// (each host's [`ClusterHost::path`]) is used at runtime via SSH.
+    ///
+    /// On homogeneous-mount rigs the controller's view of the project
+    /// equals every other host's view (same mount path on every node),
+    /// so this field is unnecessary — when unset, fdl-cli falls back
+    /// to the controller host's own `path:` entry.
+    ///
+    /// On heterogeneous-mount rigs (different mount points per host),
+    /// set this explicitly so the pre-flight build cd's into the
+    /// right directory on the controller (e.g. exa:
+    /// `/home/me/src/.../rdl` while Pascal sees it as `/mnt/rdl`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_path: Option<String>,
     /// Cluster-scope env vars exported into every rank child on every
     /// host. Mapping `NAME: VALUE` (string→string). Use for tuning the
     /// launcher itself shouldn't hardcode — e.g. on the Pascal-under-
@@ -619,28 +635,32 @@ pub struct ClusterHost {
     /// data is the user's responsibility to mount identically across hosts
     /// (NAS / SMB / virtiofs / S3-FUSE).
     pub path: String,
-    /// libtorch install path on this host. `fdl-cli` bind-mounts it into
-    /// the Docker container. Library ignores this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub libtorch_path: Option<String>,
     /// SSH target for `fdl-cli`'s launcher (e.g. a short hostname, a
     /// `user@host`, or anything `ssh` accepts). Defaults to `name` when
     /// absent. Library ignores this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
-    /// GPU compute capability for this host's devices, canonical form
-    /// `sm_NN` (e.g. `sm_61` for Pascal GP106, `sm_80` for Ampere
-    /// A100, `sm_120` for Blackwell B100). Optional today; the future
-    /// `fdl deploy` slice consumes this to validate against the
-    /// probed hardware + select a compatible libtorch variant.
+    /// libtorch variant subpath under `<path>/libtorch/` on this host.
+    /// E.g. `precompiled/cu128` for a Blackwell host on PT 2.10 cu128,
+    /// `builds/sm61-sm120` for a Pascal host on a from-source build.
+    /// Convention: the convention path
+    /// `<host.path>/libtorch/<arch>` is what the rank exec reads at
+    /// runtime; the controller-side build mirrors it via
+    /// `<cluster.controller_path or controller-host.path>/libtorch/<arch>`.
+    /// Both paths point at the same physical libtorch via the shared
+    /// project-root mount.
     ///
-    /// A single libtorch build can support multiple architectures
-    /// (see `libtorch/builds/<variant>/.arch`); this field declares
-    /// what THIS HOST has, not what one libtorch variant covers.
-    /// The probe matches host arch ∈ variant's supported set.
+    /// Optional; when unset, fdl-cli falls back to the host's
+    /// project-root `.active` file (single-host default behaviour
+    /// for non-cluster runs).
     ///
-    /// Mixed-GPU hosts (rare) can use a list of arches in a future
-    /// schema extension; today this is a single string.
+    /// `fdl probe`'s GPU compat check derives the supported sm
+    /// architectures by parsing the basename of this value (e.g.
+    /// `builds/sm61-sm120` → `6.1 12.0`) AND/OR reading the variant's
+    /// `.arch` metadata file at
+    /// `<path>/libtorch/<arch>/.arch`. The former wins when the
+    /// basename encodes archs; the latter covers `precompiled/cuXXX`
+    /// where the basename names the CUDA version, not GPU archs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
     /// Shared-storage path visible to this host. flodl assumes a
@@ -656,9 +676,10 @@ pub struct ClusterHost {
     /// `cuda`, `dev`). When set, `fdl probe` skips host-level NCCL
     /// discovery — NCCL ships inside the image, not on the host — and
     /// reports "provided via Docker image `<svc>`" instead of erroring
-    /// on a missing `libnccl.so`. The host's `libtorch_path:` is still
-    /// validated because it's the bind-mount target, not container
-    /// state. Per-host (not global) because mixed deployments are
+    /// on a missing `libnccl.so`. The host's libtorch (resolved via
+    /// the `<path>/libtorch/<arch>` convention) is still validated
+    /// because it's the bind-mount target, not container state.
+    /// Per-host (not global) because mixed deployments are
     /// common: controller in Docker, worker bare-metal (or vice-versa).
     /// Library ignores this field; consumed only by fdl-cli's probe /
     /// deploy paths.
@@ -830,8 +851,8 @@ impl ClusterConfig {
             Value::String(host.nccl_socket_ifname.clone()),
         );
         host_obj.insert("path".into(), Value::String(host.path.clone()));
-        if let Some(p) = &host.libtorch_path {
-            host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
+        if let Some(a) = &host.arch {
+            host_obj.insert("arch".into(), Value::String(a.clone()));
         }
         // SSH fields (port/user/identity_file/options) are launcher-only.
         // The slim per-rank envelope read by `LocalCluster::from_env`
@@ -2389,14 +2410,14 @@ cluster:
       local_devices: [0]
       nccl_socket_ifname: virbr0
       path: /opt/flodl
-      libtorch_path: /data/ssd/flodl/libtorch
+      arch: precompiled/cu128
     - name: worker-host
       ssh: worker-host
       ranks: [1, 2]
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
-      libtorch_path: /mnt/flodl/libtorch
+      arch: builds/sm61-sm120
 
 commands:
   cuda-test:
@@ -2730,22 +2751,22 @@ cluster:
         assert_eq!(h["local_devices"], serde_json::json!([0, 1]));
         assert_eq!(h["nccl_socket_ifname"], "enp1s0");
         assert_eq!(h["path"], "/srv/flodl");
-        assert_eq!(h["libtorch_path"], "/mnt/flodl/libtorch");
+        assert_eq!(h["arch"], "builds/sm61-sm120");
 
         // ssh: stripped (launcher-only).
         assert!(h.get("ssh").is_none(), "ssh must not appear in envelope");
     }
 
     #[test]
-    fn local_envelope_omits_optional_libtorch_path() {
+    fn local_envelope_omits_optional_arch() {
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let mut cluster = cfg.cluster.unwrap();
-        cluster.hosts[0].libtorch_path = None;
+        cluster.hosts[0].arch = None;
         let env = cluster.local_envelope_for(&cluster.hosts[0]);
         assert!(
-            env["host"].get("libtorch_path").is_none(),
-            "libtorch_path should be omitted when None"
+            env["host"].get("arch").is_none(),
+            "arch should be omitted when None"
         );
     }
 

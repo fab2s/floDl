@@ -18,6 +18,24 @@ use super::{
 use super::worker::GpuWorker;
 use super::coordinator::Coordinator;
 
+/// Parse `host:port`, falling back to DNS / `/etc/hosts` resolution.
+///
+/// `SocketAddr::from_str` only accepts numeric IPs. In cluster mode the
+/// user's `master_addr` is often a short hostname (e.g. `exa`) that
+/// resolves through the host's `/etc/hosts` under `network_mode: host`.
+fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    if let Ok(s) = addr.parse::<std::net::SocketAddr>() {
+        return Ok(s);
+    }
+    let mut iter = addr.to_socket_addrs().map_err(|e| {
+        TensorError::new(&format!("ddp: resolve addr '{addr}': {e}"))
+    })?;
+    iter.next().ok_or_else(|| {
+        TensorError::new(&format!("ddp: resolve addr '{addr}': no addresses returned"))
+    })
+}
+
 /// Build a [`ClusterCoordinatorConfig`] from the user's
 /// builder-side controller-scope fields.
 ///
@@ -1410,11 +1428,7 @@ impl DdpHandle {
         // still bound by the launcher).
         let coord_port = cluster.master_port.saturating_add(3);
         let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
-        let coord_addr: std::net::SocketAddr = coord_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse coord addr '{coord_addr_str}': {e}"
-            )))?;
+        let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
 
@@ -1690,11 +1704,7 @@ impl DdpHandle {
         // the Sync via_coord entry).
         let coord_port = cluster.master_port.saturating_add(3);
         let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
-        let coord_addr: std::net::SocketAddr = coord_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse coord addr '{coord_addr_str}': {e}"
-            )))?;
+        let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
 
@@ -1914,18 +1924,10 @@ impl DdpHandle {
 
         let controller_port = cluster.master_port.saturating_add(2);
         let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
-        let controller_addr: std::net::SocketAddr = controller_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse controller addr '{controller_addr_str}': {e}"
-            )))?;
+        let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
         let coord_port = cluster.master_port.saturating_add(3);
         let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
-        let coord_addr: std::net::SocketAddr = coord_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse coord addr '{coord_addr_str}': {e}"
-            )))?;
+        let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 
         let training_meta = Some(serde_json::json!({
@@ -2162,18 +2164,10 @@ impl DdpHandle {
 
         let controller_port = cluster.master_port.saturating_add(2);
         let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
-        let controller_addr: std::net::SocketAddr = controller_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse controller addr '{controller_addr_str}': {e}"
-            )))?;
+        let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
         let coord_port = cluster.master_port.saturating_add(3);
         let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
-        let coord_addr: std::net::SocketAddr = coord_addr_str
-            .parse()
-            .map_err(|e| crate::tensor::TensorError::new(&format!(
-                "ddp: parse coord addr '{coord_addr_str}': {e}"
-            )))?;
+        let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 
         let training_meta = Some(serde_json::json!({

@@ -255,6 +255,16 @@ fn shakespeare_split(
 // ---------------------------------------------------------------------------
 
 fn ensure_dir(dir: &Path) -> Result<()> {
+    // Fast-path when the dir already exists. `fs::create_dir_all` on
+    // Linux issues `mkdir(2)` first and only catches `EEXIST` — on a
+    // read-only mount it fails with `EROFS` even when the dir is
+    // already populated. Workers running off a ro project share (e.g.
+    // a libvirt virtiofs export marked `<readonly/>`) hit this when
+    // the dataset cache is already there: the controller populated it
+    // long ago, no actual write is needed, but the syscall fails.
+    if dir.is_dir() {
+        return Ok(());
+    }
     fs::create_dir_all(dir)
         .map_err(|e| TensorError::new(&format!("mkdir {}: {e}", dir.display())))
 }

@@ -34,7 +34,6 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ClusterConfig, ClusterHost};
-use crate::libtorch::detect::LibtorchInfo;
 
 /// Env var carrying the per-host pre-flight build envelope (a JSON
 /// map) from fdl-cli's prebuild phase to flodl's launcher. The
@@ -68,6 +67,7 @@ pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
 /// would leave the per-host target dir in a half-baked state.
 pub fn prebuild_remotes(
     project_root: &Path,
+    cmd_cwd: &Path,
     cluster: &ClusterConfig,
     cmd_name: &str,
     controller_host: &str,
@@ -81,14 +81,45 @@ pub fn prebuild_remotes(
         return Ok(());
     }
 
+    // Whether the controller runs builds inside Docker. Sourced from
+    // the controller's own `docker:` field in cluster.yml (if listed)
+    // or `None` when absent — native-Rust controllers (no docker
+    // installed) get the bare cargo invocation. Falls back to None
+    // when the controller isn't listed in cluster.hosts (e.g.
+    // orchestrator-only mode); the bare path is the safe default.
+    let controller_docker_svc: Option<String> = cluster
+        .hosts
+        .iter()
+        .find(|h| h.name == controller_host)
+        .and_then(|h| h.docker.clone());
+
     eprintln!(
         "fdl: pre-flight build for {} remote host(s): {}",
         remotes.len(),
         remotes.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", "),
     );
 
+    // Controller's view of the shared project root. Falls back to the
+    // controller host's own `path:` when `cluster.controller_path` is
+    // unset (homogeneous-mount rigs, the common case).
+    let controller_path: std::path::PathBuf = cluster
+        .controller_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            cluster
+                .hosts
+                .iter()
+                .find(|h| h.name == controller_host)
+                .map(|h| std::path::PathBuf::from(&h.path))
+        })
+        .unwrap_or_else(|| project_root.to_path_buf());
+
     let project_root = Arc::new(project_root.to_path_buf());
+    let cmd_cwd = Arc::new(cmd_cwd.to_path_buf());
     let cmd_name = Arc::new(cmd_name.to_string());
+    let controller_path = Arc::new(controller_path);
+    let controller_docker_svc = Arc::new(controller_docker_svc);
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let envelope: Arc<Mutex<BTreeMap<String, PerHostEnvelope>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
@@ -97,11 +128,18 @@ pub fn prebuild_remotes(
     for host in remotes {
         let host = host.clone();
         let project_root = Arc::clone(&project_root);
+        let cmd_cwd = Arc::clone(&cmd_cwd);
         let cmd_name = Arc::clone(&cmd_name);
+        let controller_path = Arc::clone(&controller_path);
+        let controller_docker_svc = Arc::clone(&controller_docker_svc);
         let errors = Arc::clone(&errors);
         let envelope = Arc::clone(&envelope);
         handles.push(thread::spawn(move || {
-            match prebuild_one_host(&project_root, &host, &cmd_name) {
+            match prebuild_one_host(
+                &project_root, &cmd_cwd, &controller_path,
+                &host, &cmd_name,
+                controller_docker_svc.as_deref(),
+            ) {
                 Ok(env_entry) => {
                     eprintln!("fdl: pre-flight OK ({})", host.name);
                     envelope.lock().unwrap().insert(host.name.clone(), env_entry);
@@ -161,6 +199,15 @@ pub struct PerHostEnvelope {
     /// append host-specific extras (e.g. `:/usr/local/lib` for bare-
     /// metal libnccl) via `host.env: { LD_LIBRARY_PATH: ... }`.
     pub ld_library_path: String,
+    /// Subdirectory under the host's project checkout to `cd` into
+    /// before exec — the relative offset of the command's filesystem
+    /// cwd from `project_root`. Mirrors the cwd the controller-side
+    /// build used (e.g. `ddp-bench` for `fdl ddp-bench`). Empty string
+    /// means execute from `host.path` directly. Relative-path defaults
+    /// the binary expects (e.g. `--data-dir data`, `--output runs/`)
+    /// only resolve correctly when the remote cwd matches.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd_subpath: String,
 }
 
 /// Build `cmd_name` for one host. Picks docker service + cargo
@@ -168,104 +215,222 @@ pub struct PerHostEnvelope {
 /// [`PerHostEnvelope`] describing where the resulting binary lives
 /// (so the launcher can substitute it on the remote-dispatch path)
 /// and what `LD_LIBRARY_PATH` the remote should set.
+///
+/// `controller_path` is the controller's view of the shared project
+/// root. The libtorch convention says the variant lives at
+/// `<controller_path>/libtorch/<host.arch>` for the build (controller
+/// view) and `<host.path>/libtorch/<host.arch>` for the runtime
+/// (remote view). Both point at the same physical libtorch via the
+/// shared mount; the two paths differ only when controller and remote
+/// see the project at different filesystem locations.
 fn prebuild_one_host(
     project_root: &Path,
+    cmd_cwd: &Path,
+    controller_path: &Path,
     host: &ClusterHost,
     cmd_name: &str,
+    controller_docker_svc: Option<&str>,
 ) -> Result<PerHostEnvelope, String> {
-    let libtorch_path = host.libtorch_path.as_ref().ok_or_else(|| {
+    let arch = host.arch.as_ref().ok_or_else(|| {
         format!(
-            "host {:?} has no `libtorch_path:` set in cluster.yml — \
-             pre-flight build needs one to resolve the host's libtorch",
+            "host {:?} has no `arch:` set in cluster.yml — \
+             pre-flight build needs the libtorch variant subpath \
+             (e.g. `arch: precompiled/cu128` or `arch: builds/sm61-sm120`)",
             host.name,
         )
     })?;
-    let (info, host_path) = crate::run::resolve_libtorch_at(Path::new(libtorch_path))
-        .ok_or_else(|| {
-            format!(
-                "host {:?}: `libtorch_path: {libtorch_path}` did not resolve \
-                 to a valid libtorch (pointer file, libtorch root with .active, \
-                 or direct variant dir with lib/)",
-                host.name,
-            )
-        })?;
-    let (features_arg, docker_svc) = features_and_service(&info);
-    let target_dir = format!("target/cluster/{}", host.name);
+    // Controller-side libtorch variant dir, resolved via convention.
+    let controller_variant_dir = controller_path.join("libtorch").join(arch);
+    if !controller_variant_dir.join("lib").is_dir() {
+        return Err(format!(
+            "host {:?}: controller-side libtorch at `{}` (resolved from \
+             `<controller_path>/libtorch/<arch>`) does not look like a \
+             valid libtorch install (missing `lib/`?)",
+            host.name,
+            controller_variant_dir.display(),
+        ));
+    }
+    let host_path = controller_variant_dir.display().to_string();
+    // Derive features + docker service from the YAML-declared `arch:`
+    // basename — single source of truth, no `.arch` metadata file
+    // required. `cpu` is the only non-CUDA variant by convention; every
+    // other basename (`cuNN`, `sm<NN>-sm<NN>`, etc.) is a GPU build.
+    let (features_arg, feature_docker_svc) = features_and_service_from_arch(arch);
+    let cuda_version_for_image = cuda_version_from_arch(arch);
+    let target_dir_relative = format!("target/cluster/{}", host.name);
 
-    let build_cmd = if features_arg.is_empty() {
-        format!(
-            "cargo build --release --bin {bin}",
-            bin = posix_quote(cmd_name),
-        )
-    } else {
-        format!(
-            "cargo build --release --features {feat} --bin {bin}",
-            feat = posix_quote(features_arg),
-            bin = posix_quote(cmd_name),
-        )
-    };
-
-    let docker_cmd = format!(
-        "docker compose run --rm {svc} bash -c {inner}",
-        svc = docker_svc,
-        inner = posix_quote(&build_cmd),
-    );
+    // Two execution modes — docker-backed (controller has `docker:`
+    // set in cluster.yml) or native cargo on the host filesystem.
+    //
+    // Docker mode: the project root mounts at `/workspace`; cwd +
+    // CARGO_TARGET_DIR are in the `/workspace/...` namespace. The
+    // service to use is the controller's `docker:` value when
+    // present (it owns the toolchain), falling back to the libtorch-
+    // derived `cuda` / `dev` choice (matches the existing
+    // `fdl cuda-build` / `fdl build` split).
+    //
+    // Native mode: cwd is the cmd's filesystem cwd, CARGO_TARGET_DIR
+    // is the same project-root-relative path on the host, and
+    // LIBTORCH_PATH is set directly on the cargo process (no Docker
+    // bind-mount indirection).
+    let (sh_cmd, cwd_for_spawn, extra_envs): (String, &Path, Vec<(&str, String)>) =
+        if let Some(_svc) = controller_docker_svc {
+            // Docker-backed build.
+            let target_dir_in_container = format!("/workspace/{target_dir_relative}");
+            let sub_path = cmd_cwd
+                .strip_prefix(project_root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cwd_in_container = if sub_path.is_empty() {
+                "/workspace".to_string()
+            } else {
+                format!("/workspace/{sub_path}")
+            };
+            let build_cmd = if features_arg.is_empty() {
+                format!(
+                    "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --bin {bin}",
+                    cwd = posix_quote(&cwd_in_container),
+                    tgt = posix_quote(&target_dir_in_container),
+                    bin = posix_quote(cmd_name),
+                )
+            } else {
+                format!(
+                    "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --features {feat} --bin {bin}",
+                    cwd = posix_quote(&cwd_in_container),
+                    tgt = posix_quote(&target_dir_in_container),
+                    feat = posix_quote(features_arg),
+                    bin = posix_quote(cmd_name),
+                )
+            };
+            let svc = feature_docker_svc;
+            let docker_cmd = format!(
+                "docker compose run --rm {svc} bash -c {inner}",
+                svc = svc,
+                inner = posix_quote(&build_cmd),
+            );
+            (docker_cmd, project_root, vec![
+                ("LIBTORCH_HOST_PATH", host_path.clone()),
+                ("LIBTORCH_CPU_PATH", "./libtorch/precompiled/cpu".into()),
+            ])
+        } else {
+            // Native build (no docker on controller).
+            let target_dir_abs = project_root.join(&target_dir_relative);
+            let bash_cmd = if features_arg.is_empty() {
+                format!(
+                    "cargo build --release --bin {bin}",
+                    bin = posix_quote(cmd_name),
+                )
+            } else {
+                format!(
+                    "cargo build --release --features {feat} --bin {bin}",
+                    feat = posix_quote(features_arg),
+                    bin = posix_quote(cmd_name),
+                )
+            };
+            (bash_cmd, cmd_cwd, vec![
+                ("LIBTORCH_PATH", host_path.clone()),
+                (
+                    "CARGO_TARGET_DIR",
+                    target_dir_abs.to_string_lossy().into_owned(),
+                ),
+            ])
+        };
 
     let mut cmd = Command::new("sh");
-    cmd.args(["-c", &docker_cmd])
-        .current_dir(project_root)
-        .env("LIBTORCH_HOST_PATH", &host_path)
-        .env(
-            "LIBTORCH_CPU_PATH",
-            "./libtorch/precompiled/cpu",
-        )
-        .env("CARGO_TARGET_DIR", &target_dir)
+    cmd.args(["-c", &sh_cmd])
+        .current_dir(cwd_for_spawn)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .stdin(Stdio::null());
+    for (k, v) in &extra_envs {
+        cmd.env(k, v);
+    }
 
-    if let Some(cuda_version) = &info.cuda_version {
-        if cuda_version != "none" {
-            let normalised = if cuda_version.matches('.').count() < 2 {
-                format!("{cuda_version}.0")
-            } else {
-                cuda_version.clone()
-            };
-            let cuda_tag = normalised
-                .splitn(3, '.')
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(".");
-            cmd.env("CUDA_VERSION", &normalised);
-            cmd.env("CUDA_TAG", &cuda_tag);
-        }
+    if let Some(cuda_version) = &cuda_version_for_image {
+        let normalised = if cuda_version.matches('.').count() < 2 {
+            format!("{cuda_version}.0")
+        } else {
+            cuda_version.clone()
+        };
+        let cuda_tag = normalised
+            .splitn(3, '.')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(".");
+        cmd.env("CUDA_VERSION", &normalised);
+        cmd.env("CUDA_TAG", &cuda_tag);
     }
 
     let status = cmd
         .status()
-        .map_err(|e| format!("spawn `{docker_cmd}`: {e}"))?;
+        .map_err(|e| format!("spawn `{sh_cmd}`: {e}"))?;
     if !status.success() {
         return Err(format!(
-            "cargo build exited {} (libtorch={host_path}, target={target_dir}, \
+            "cargo build exited {} (libtorch={host_path}, target={target_dir_relative}, \
              features={feat})",
             status.code().unwrap_or(-1),
             feat = if features_arg.is_empty() { "(none)" } else { features_arg },
         ));
     }
+    // Runtime LD_LIBRARY_PATH uses the REMOTE-side view: the rank
+    // exec's the binary on the remote, where libtorch is at
+    // `<host.path>/libtorch/<arch>/lib` per the convention.
+    let runtime_lib = format!(
+        "{path}/libtorch/{arch}/lib",
+        path = host.path.trim_end_matches('/'),
+    );
+    let _ = host_path; // controller-side path used only for the build above
+    // cwd_subpath: the cmd's filesystem cwd relative to project_root.
+    // For `fdl ddp-bench` invoked from the repo, cmd_cwd is
+    // `<repo>/ddp-bench`, so subpath is `ddp-bench`. The remote
+    // launcher uses this to cd into the matching subdir before exec.
+    let cwd_subpath = cmd_cwd
+        .strip_prefix(project_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     Ok(PerHostEnvelope {
-        bin: format!("{target_dir}/release/{cmd_name}"),
-        ld_library_path: format!("{host_path}/lib"),
+        bin: format!("{target_dir_relative}/release/{cmd_name}"),
+        ld_library_path: runtime_lib,
+        cwd_subpath,
     })
 }
 
 /// Pick cargo features + docker compose service from the host's
 /// libtorch `.arch` metadata. `cuda=12.x` → (`cuda`, `cuda`); anything
 /// else → (`""`, `dev`).
-fn features_and_service(info: &LibtorchInfo) -> (&'static str, &'static str) {
-    match info.cuda_version.as_deref() {
-        Some(v) if v != "none" => ("cuda", "cuda"),
-        _ => ("", "dev"),
+/// Derive `(cargo --features arg, docker-compose service name)` from
+/// the YAML `arch:` path basename. The yml `arch:` IS the single
+/// source of truth (no `.arch` metadata file required) — `cpu` is the
+/// only non-CUDA convention; everything else is a GPU variant.
+fn features_and_service_from_arch(arch: &str) -> (&'static str, &'static str) {
+    let basename = std::path::Path::new(arch)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if basename == "cpu" {
+        ("", "dev")
+    } else {
+        ("cuda", "cuda")
     }
+}
+
+/// Extract a CUDA major.minor string from a `precompiled/cuNN` arch
+/// path basename (e.g. `cu128` → `"12.8"`). Returns `None` for source
+/// builds (`builds/sm…`) where the arch alone does not encode a CUDA
+/// version — the caller falls back to the `CUDA_VERSION` env var (or
+/// docker-compose's own default) for the toolkit image tag.
+fn cuda_version_from_arch(arch: &str) -> Option<String> {
+    let basename = std::path::Path::new(arch)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let rest = basename.strip_prefix("cu")?;
+    if rest.len() < 2 || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let major = &rest[..rest.len() - 1];
+    let minor = &rest[rest.len() - 1..];
+    Some(format!("{major}.{minor}"))
 }
 
 /// Single-quote a string for `sh -c` so embedded spaces/quotes don't
@@ -299,39 +464,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn features_and_service_cuda_present_picks_cuda() {
-        let info = LibtorchInfo {
-            path: "precompiled/cu128".into(),
-            torch_version: Some("2.10.0".into()),
-            cuda_version: Some("12.8".into()),
-            archs: Some("8.0".into()),
-            source: Some("precompiled".into()),
-        };
-        assert_eq!(features_and_service(&info), ("cuda", "cuda"));
+    fn features_and_service_precompiled_cuda_picks_cuda() {
+        assert_eq!(
+            features_and_service_from_arch("precompiled/cu128"),
+            ("cuda", "cuda")
+        );
     }
 
     #[test]
-    fn features_and_service_cuda_none_picks_dev() {
-        let info = LibtorchInfo {
-            path: "precompiled/cpu".into(),
-            torch_version: Some("2.10.0".into()),
-            cuda_version: Some("none".into()),
-            archs: None,
-            source: Some("precompiled".into()),
-        };
-        assert_eq!(features_and_service(&info), ("", "dev"));
+    fn features_and_service_precompiled_cpu_picks_dev() {
+        assert_eq!(
+            features_and_service_from_arch("precompiled/cpu"),
+            ("", "dev")
+        );
     }
 
     #[test]
-    fn features_and_service_no_arch_defaults_to_dev() {
-        let info = LibtorchInfo {
-            path: "unknown".into(),
-            torch_version: None,
-            cuda_version: None,
-            archs: None,
-            source: None,
-        };
-        assert_eq!(features_and_service(&info), ("", "dev"));
+    fn features_and_service_source_build_picks_cuda() {
+        // Source builds under `builds/<gpu-arch>` are CUDA by
+        // convention; only `cpu` basename is non-CUDA.
+        assert_eq!(
+            features_and_service_from_arch("builds/sm61-sm120"),
+            ("cuda", "cuda")
+        );
+        assert_eq!(
+            features_and_service_from_arch("builds/sm80"),
+            ("cuda", "cuda")
+        );
+    }
+
+    #[test]
+    fn cuda_version_from_arch_extracts_precompiled_version() {
+        assert_eq!(cuda_version_from_arch("precompiled/cu128"), Some("12.8".into()));
+        assert_eq!(cuda_version_from_arch("precompiled/cu126"), Some("12.6".into()));
+        assert_eq!(cuda_version_from_arch("precompiled/cu118"), Some("11.8".into()));
+    }
+
+    #[test]
+    fn cuda_version_from_arch_none_for_source_builds_and_cpu() {
+        assert_eq!(cuda_version_from_arch("builds/sm61-sm120"), None);
+        assert_eq!(cuda_version_from_arch("builds/sm80"), None);
+        assert_eq!(cuda_version_from_arch("precompiled/cpu"), None);
     }
 
     #[test]
@@ -355,6 +528,7 @@ mod tests {
             PerHostEnvelope {
                 bin: "target/cluster/host-b/release/bench".into(),
                 ld_library_path: "/opt/lt-b/lib".into(),
+                cwd_subpath: String::new(),
             },
         );
         env.insert(
@@ -362,6 +536,7 @@ mod tests {
             PerHostEnvelope {
                 bin: "target/cluster/host-a/release/bench".into(),
                 ld_library_path: "/opt/lt-a/lib".into(),
+                cwd_subpath: String::new(),
             },
         );
         let json = serde_json::to_string(&env).unwrap();
@@ -381,6 +556,7 @@ mod tests {
             PerHostEnvelope {
                 bin: "t/c/h1/release/x".into(),
                 ld_library_path: "/opt/lt/lib".into(),
+                cwd_subpath: "ddp-bench".into(),
             },
         );
         let json = serde_json::to_string(&env).unwrap();

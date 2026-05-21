@@ -85,6 +85,13 @@ struct PerHostPrebuild {
     /// linked against. The launcher emits this verbatim before exec
     /// so the binary finds its shared libs at runtime.
     ld_library_path: String,
+    /// Subdirectory under `host.path` to `cd` into before exec — the
+    /// controller's view of the command's filesystem cwd, relative to
+    /// the project root. Mirrors the cwd the controller-side build /
+    /// invocation used (`docker compose run … bash -c "cd /workspace/<sub> && …"`).
+    /// Empty string means "stay at `host.path`".
+    #[serde(default)]
+    cwd_subpath: String,
 }
 
 /// Load and parse [`ENV_PREBUILD_PER_HOST`] from the current process
@@ -141,6 +148,14 @@ pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
 /// - `ServerAliveInterval=10` + `ServerAliveCountMax=3`: client gives up
 ///   after ~30s of silence so a dead remote doesn't hang the controller
 /// - `BatchMode=yes`: fail fast on auth issues; no interactive prompts
+/// - `StrictHostKeyChecking=accept-new`: trust-on-first-use for hosts
+///   the user listed in `cluster.yml`. Cluster mode is batch and
+///   `BatchMode=yes` blocks the interactive "yes/no" host-key prompt;
+///   without accept-new, the first connection from a fresh container
+///   (no `known_hosts`) hard-fails with "Host key verification
+///   failed". `accept-new` writes the key to known_hosts on first
+///   contact and still errors loudly on subsequent mismatches, so
+///   MITM detection survives.
 const SSH_OPTS: &[&str] = &[
     "-T",
     "-o",
@@ -149,6 +164,8 @@ const SSH_OPTS: &[&str] = &[
     "ServerAliveCountMax=3",
     "-o",
     "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
 ];
 
 /// Role this process plays in the cluster, decided by [`dispatch`].
@@ -631,6 +648,15 @@ fn build_ssh_spawn_command(host: &FullHost, remote_cmd: &str) -> Command {
     }
     if let Some(u) = &host.ssh_user {
         c.arg("-l").arg(u);
+    } else if let Ok(host_user) = std::env::var("FLODL_HOST_USER") {
+        // When the per-host ssh_user is unset, fall back to the
+        // controller's OS user (set by fdl-cli via FLODL_HOST_USER).
+        // Bridges the docker container's stock `ubuntu` UID-1000 user
+        // vs. the user's actual remote account on cluster hosts.
+        let trimmed = host_user.trim();
+        if !trimmed.is_empty() {
+            c.arg("-l").arg(trimmed);
+        }
     }
     if let Some(i) = &host.ssh_identity_file {
         c.arg("-i").arg(i);
@@ -677,8 +703,22 @@ fn build_remote_bash_command(
     let mut s = String::with_capacity(
         256 + cluster_json_hex.len() + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
     );
+    // Pick the remote cwd. With a prebuild envelope, the controller
+    // built the command from `<project_root>/<cwd_subpath>` (e.g.
+    // `ddp-bench/`) so the remote should execute from the same offset
+    // — relative paths the binary expects (`data/cifar10/`, default
+    // `--output runs/`) only resolve correctly under that subpath.
+    // Without a prebuild envelope (legacy `fdl <cmd>` re-entry path)
+    // we cd to `host.path` and let the remote `fdl` walk the same
+    // overlay-resolved cmd cwd itself.
     s.push_str("cd ");
-    s.push_str(&shell_quote(path));
+    let remote_cwd: String = match prebuild {
+        Some(pb) if !pb.cwd_subpath.is_empty() => {
+            format!("{}/{}", path.trim_end_matches('/'), pb.cwd_subpath)
+        }
+        _ => path.to_string(),
+    };
+    s.push_str(&shell_quote(&remote_cwd));
     s.push_str(" && ");
     s.push_str(ENV_CLUSTER_JSON);
     s.push('=');
@@ -734,10 +774,13 @@ fn build_remote_bash_command(
     }
     if let Some(pb) = prebuild {
         // Direct binary exec — no cargo, no rustc, no fdl re-entry on
-        // the remote. The binary's path is relative to `cd <path>`
-        // already issued at the head of this command string.
-        s.push_str(" exec ./");
-        s.push_str(&shell_quote(&pb.bin));
+        // the remote. `pb.bin` is relative to `host.path` (the project
+        // root on the remote); we issued `cd <host.path>/<cwd_subpath>`
+        // above, so use the absolute form to find the binary
+        // independent of the current cwd offset.
+        s.push_str(" exec ");
+        let abs_bin = format!("{}/{}", path.trim_end_matches('/'), pb.bin);
+        s.push_str(&shell_quote(&abs_bin));
     } else {
         s.push_str(" exec fdl ");
         s.push_str(&shell_quote(fdl_cmd));
@@ -792,8 +835,8 @@ fn build_slim_envelope_for(full: &FullCluster, host: &FullHost) -> serde_json::V
         Value::String(host.nccl_socket_ifname.clone()),
     );
     host_obj.insert("path".into(), Value::String(host.path.clone()));
-    if let Some(p) = &host.libtorch_path {
-        host_obj.insert("libtorch_path".into(), Value::String(p.clone()));
+    if let Some(a) = &host.arch {
+        host_obj.insert("arch".into(), Value::String(a.clone()));
     }
 
     let mut envelope = serde_json::Map::new();
@@ -898,7 +941,11 @@ pub struct FullHost {
     pub local_devices: Option<Vec<u8>>,
     pub nccl_socket_ifname: String,
     pub path: String,
-    pub libtorch_path: Option<String>,
+    /// libtorch variant subpath under `<path>/libtorch/`. The runtime
+    /// libtorch lives at `<path>/libtorch/<arch>/` by convention; the
+    /// launcher uses this to build the remote-side LD_LIBRARY_PATH
+    /// when no pre-flight envelope overrides it.
+    pub arch: Option<String>,
     /// SSH target for remote dispatch. `None` means the host runs on
     /// the same machine as the launcher (fork/exec path, no ssh).
     pub ssh: Option<String>,
@@ -1059,8 +1106,8 @@ impl FullCluster {
                     serde_json::Value::String(h.nccl_socket_ifname.clone()),
                 );
                 o.insert("path".into(), serde_json::Value::String(h.path.clone()));
-                if let Some(p) = &h.libtorch_path {
-                    o.insert("libtorch_path".into(), serde_json::Value::String(p.clone()));
+                if let Some(a) = &h.arch {
+                    o.insert("arch".into(), serde_json::Value::String(a.clone()));
                 }
                 if let Some(s) = &h.ssh {
                     o.insert("ssh".into(), serde_json::Value::String(s.clone()));
@@ -1244,8 +1291,8 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         )));
     }
 
-    let libtorch_path = obj
-        .get("libtorch_path")
+    let arch = obj
+        .get("arch")
         .and_then(|v| v.as_str())
         .map(String::from);
 
@@ -1312,7 +1359,7 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         local_devices,
         nccl_socket_ifname,
         path,
-        libtorch_path,
+        arch,
         ssh,
         ssh_port,
         ssh_user,
@@ -1369,7 +1416,7 @@ mod tests {
                     "local_devices": [0],
                     "nccl_socket_ifname": "virbr0",
                     "path": "/opt/flodl",
-                    "libtorch_path": "/data/ssd/flodl/libtorch"
+                    "arch": "precompiled/cu128"
                 },
                 {
                     "name": "worker-host",
@@ -1612,6 +1659,7 @@ mod tests {
         let pb = PerHostPrebuild {
             bin: "target/cluster/worker/release/ddp-bench".into(),
             ld_library_path: "/opt/libtorch/lib".into(),
+            cwd_subpath: "ddp-bench".into(),
         };
         let s = build_remote_bash_command(
             "/srv/flodl",
@@ -1631,8 +1679,12 @@ mod tests {
             "missing prebuild LD_LIBRARY_PATH: {s}",
         );
         assert!(
-            s.contains(" exec ./'target/cluster/worker/release/ddp-bench'"),
-            "missing direct-binary exec: {s}",
+            s.contains("cd '/srv/flodl/ddp-bench'"),
+            "remote cwd must cd into <host.path>/<cwd_subpath>: {s}",
+        );
+        assert!(
+            s.contains(" exec '/srv/flodl/target/cluster/worker/release/ddp-bench'"),
+            "binary path must be absolute (independent of cwd offset): {s}",
         );
         assert!(
             !s.contains("exec fdl"),
@@ -1659,6 +1711,7 @@ mod tests {
         let pb = PerHostPrebuild {
             bin: "target/cluster/worker/release/ddp-bench".into(),
             ld_library_path: "/opt/libtorch/lib".into(),
+            cwd_subpath: String::new(),
         };
         let s = build_remote_bash_command(
             "/srv", "ff", "w", 0, None, "ddp-bench", &[],

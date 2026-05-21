@@ -40,8 +40,19 @@ pub struct RunResult {
 pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Result<RunResult> {
     let mode_str = mode.to_string();
     let run_dir = format!("{}/{}/{}", config.output_dir, model_def.name, mode_str);
-    std::fs::create_dir_all(&run_dir)
-        .map_err(|e| TensorError::new(&format!("failed to create {run_dir}: {e}")))?;
+    // Shared-storage directory setup is the controller's job. The
+    // launcher / single-host process creates `run_dir` once; worker
+    // ranks (FLODL_CLUSTER_JSON set by the launcher on each spawned
+    // rank child) find it ready and skip the create. Workers that
+    // later write into the same tree (e.g. checkpoint files) operate
+    // on dirs the controller already provisioned, so a worker's
+    // shared mount can stay read-only-friendly without breaking
+    // setup.
+    let is_worker_rank = std::env::var_os("FLODL_CLUSTER_JSON").is_some();
+    if !is_worker_rank {
+        std::fs::create_dir_all(&run_dir)
+            .map_err(|e| TensorError::new(&format!("failed to create {run_dir}: {e}")))?;
+    }
 
     let lr_note = if (config.lr - model_def.defaults.lr).abs() > 1e-10 {
         format!(", lr={:.1e} ({:.2}x)", config.lr, config.lr / model_def.defaults.lr)

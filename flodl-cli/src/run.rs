@@ -254,8 +254,8 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
 }
 
 /// Resolve libtorch env vars from the project root, matching the Makefile logic:
-///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>  (standalone)
-///                      = <cluster.hosts[me].libtorch_path resolved> (overlay)
+///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>          (standalone)
+///                      = <host.path>/libtorch/<host.arch>     (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
 fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
@@ -320,7 +320,13 @@ fn resolve_libtorch(
 /// Try to resolve libtorch from the active cluster overlay's current-
 /// host entry. Returns `None` if no overlay is active, the overlay has
 /// no `cluster:` block, the current host isn't listed, or the entry's
-/// `libtorch_path:` is unset.
+/// `arch:` is unset.
+///
+/// Convention: libtorch lives at `<host.path>/libtorch/<host.arch>`
+/// on every host. The controller's view uses `<host.path>` directly
+/// here because this function is the controller-side (local) path
+/// resolver — when fdl runs locally as the current host, that host's
+/// own `path:` IS the controller's view.
 fn resolve_libtorch_from_overlay(
     project_root: &Path,
 ) -> Option<(libtorch::detect::LibtorchInfo, String)> {
@@ -333,10 +339,13 @@ fn resolve_libtorch_from_overlay(
         Some(env_name.trim()),
     ).ok()?;
     let cluster = cfg.cluster?;
-    let host = crate::cluster::resolve_local_hostname();
-    let entry = cluster.hosts.iter().find(|h| h.name == host)?;
-    let libtorch_path = entry.libtorch_path.as_ref()?;
-    resolve_libtorch_at(Path::new(libtorch_path))
+    let host_name = crate::cluster::resolve_local_hostname();
+    let entry = cluster.hosts.iter().find(|h| h.name == host_name)?;
+    let arch = entry.arch.as_ref()?;
+    let variant_dir = std::path::PathBuf::from(&entry.path)
+        .join("libtorch")
+        .join(arch);
+    resolve_libtorch_at(&variant_dir)
 }
 
 /// Resolve a `libtorch_path:` value (from cluster.yml) into
@@ -406,6 +415,14 @@ fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", command])
         .current_dir(project_root)
+        // Export HOSTNAME so docker-compose's `hostname: ${HOSTNAME}`
+        // interpolation resolves to the host's hostname. bash sets
+        // HOSTNAME as a shell built-in but doesn't export it; docker
+        // compose only reads exported env vars.
+        .env(
+            "HOSTNAME",
+            crate::cluster::resolve_local_hostname(),
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .stdin(Stdio::inherit());
@@ -581,8 +598,9 @@ pub fn exec_script(
             // Quote the whole composed command for the outer
             // `bash -c` so user args containing shell metacharacters
             // don't escape the inner shell.
+            let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
             let docker_cmd = format!(
-                "docker compose run --rm {service} bash -c {}",
+                "docker compose{overlay} run --rm {service} bash -c {}",
                 posix_quote(&inner_cmd)
             );
             spawn_docker_shell(&docker_cmd, cwd)
@@ -720,8 +738,9 @@ pub fn exec_command(
         // the env, the binary just reads it. Without this, a user
         // typing `flodl-hf/tests/.exports/bert` from the host repo
         // root resolves against the wrong cwd inside the container.
+        let overlay = crate::cluster::cluster_compose_overlay_arg(project_root);
         let docker_cmd = format!(
-            "docker compose run --rm -e FDL_PROJECT_ROOT={container_root} {service} bash -c \"{inner}\"",
+            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root} {service} bash -c \"{inner}\"",
         );
         spawn_docker_shell(&docker_cmd, project_root)
     } else {

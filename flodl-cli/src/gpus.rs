@@ -159,13 +159,13 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
     Ok(ClusterConfig {
         master_addr: "127.0.0.1".to_string(),
         master_port,
+        controller_path: None,
         hosts: vec![ClusterHost {
             name,
             ranks: (0..devices.len()).collect(),
             local_devices: LocalDevices::Explicit(devices.to_vec()),
             nccl_socket_ifname: "lo".to_string(),
             path,
-            libtorch_path: None,
             ssh: None,
             arch: None,
             data_path: None,
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(h.ranks, vec![0, 1]);
         assert_eq!(h.local_devices, LocalDevices::Explicit(vec![0, 1]));
         assert_eq!(h.nccl_socket_ifname, "lo");
-        assert!(h.libtorch_path.is_none());
+        assert!(h.arch.is_none());
         assert!(h.ssh.is_none());
         assert!(!h.name.trim().is_empty(), "hostname must be non-empty");
         assert!(!h.path.trim().is_empty(), "path must be non-empty");
