@@ -965,6 +965,18 @@ pub struct ClusterCoordinator {
     /// Last globally-aggregated epoch index (all ranks reported).
     /// `None` until the first aggregation.
     last_aggregated_epoch: Option<usize>,
+    /// Last epoch index for which `dispatch_epoch` was driven by the
+    /// post-aggregate advance hook (see
+    /// [`Self::try_advance_or_shutdown_after_aggregate`]). Used to
+    /// keep the hook idempotent across ticks — without this, every
+    /// tick after aggregation would re-dispatch the next epoch.
+    /// `None` for fresh runs; the initial `dispatch_epoch(0)` kickoff
+    /// is the launcher's responsibility and does not set this field.
+    last_dispatched_epoch: Option<usize>,
+    /// Set once [`Self::shutdown_workers`] has been broadcast from the
+    /// post-aggregate hook so the broadcast does not fire on every
+    /// subsequent tick before the readers observe stream close.
+    shutdown_initiated: bool,
     /// Cached epoch plans: computed once per epoch, consistent across
     /// ranks regardless of when the StartEpoch frame goes out.
     epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
@@ -1295,6 +1307,8 @@ impl ClusterCoordinator {
             last_observed_upload_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
+            last_dispatched_epoch: None,
+            shutdown_initiated: false,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
             batch_size: config.batch_size.max(1),
@@ -3080,13 +3094,34 @@ impl ClusterCoordinator {
         // dropped (every reader thread has exited). drain_timing alone
         // can't see that — try_recv just returns Empty if there's no
         // current message and the channel is healthy. Probe explicitly.
-        let alive = self.active_count > 0
-            && self.reader_handles.iter().any(|h| h.is_some());
+        //
+        // The reader-handle check uses `is_finished()` (not just
+        // `is_some()`) because handles are never taken during the tick
+        // loop — they only get taken in `shutdown()` / `Drop`. So
+        // `is_some()` alone reduces the alive check to
+        // `active_count > 0`, and if a rank exits without the coord
+        // receiving its `Exiting` frame (TCP RST during teardown, or
+        // any other lossy close), `active_count` never decrements and
+        // the coord runs forever — hanging the bench's metrics_rx.
+        // `is_finished()` reflects the reader thread's actual exit:
+        // when the worker closes its stream, the reader sees EOF and
+        // returns, and the coord then shuts down regardless of whether
+        // Exiting was received.
+        let any_reader_running = self.reader_handles.iter().any(|h| {
+            h.as_ref().is_some_and(|j| !j.is_finished())
+        });
+        let alive = self.active_count > 0 && any_reader_running;
         // Drain metrics + try to aggregate completed epochs every tick.
         // Cheap: most ticks see an empty channel; on tick where every
         // alive rank has reported the same epoch, one `EpochMetrics`
         // is built and `metrics_fn` fires.
         self.drain_metrics_and_aggregate();
+        // Post-aggregate epoch transition: dispatch the next epoch's
+        // `StartEpoch` plan (non-progressive, non-Async), or broadcast
+        // `Shutdown` when the final epoch has aggregated. Deferred
+        // until any pending CPU averaging cycle has finalized so the
+        // bridge SyncAck round-trip can complete (see method docs).
+        self.try_advance_or_shutdown_after_aggregate();
         Ok(alive)
     }
 
@@ -3244,6 +3279,69 @@ impl ClusterCoordinator {
                 // dropped before training finished. Don't surface
                 // as an error.
                 let _ = tx.send(metrics);
+            }
+        }
+
+        // Epoch transition is handled by `try_advance_or_shutdown_after_aggregate`
+        // which is invoked from `tick()` after `poll_cpu_averaging` has had
+        // a chance to drive a still-pending CPU averaging cycle to Idle.
+        // Calling it here directly would race with bridge SyncAcks: the
+        // worker batch loop is async in cluster mode (Batch send and
+        // MetricsMsg are not serialized against RequestParams/SyncAck),
+        // so MetricsMsg can land while `cpu_avg_state == Pending` and
+        // shutting workers down at that point would drop the in-flight
+        // cycle.
+    }
+
+    /// Post-aggregation epoch transition. Once an epoch has aggregated
+    /// AND any in-flight averaging cycle has finalized
+    /// (`cpu_avg_state == Idle`), either dispatch the next epoch
+    /// (non-progressive, non-Async) or broadcast `Shutdown` (final
+    /// epoch). Idempotent: tracks `last_dispatched_epoch` so repeated
+    /// ticks past the final aggregate don't re-broadcast `Shutdown`,
+    /// and a still-pending CPU cycle simply defers the call until the
+    /// next tick once the cycle finalizes.
+    ///
+    /// Mirrors threaded `Coordinator::on_epoch_aggregated` (see
+    /// `ddp_run/coordinator/mod.rs:924`) but split from
+    /// `drain_metrics_and_aggregate` because the cluster path is
+    /// async: workers can post-send `MetricsMsg` while the previous
+    /// batch's bridge SyncAck is still in transit.
+    fn try_advance_or_shutdown_after_aggregate(&mut self) {
+        if self.shutdown_initiated {
+            return;
+        }
+        let Some(latest) = self.last_aggregated_epoch else {
+            return;
+        };
+        // Wait for any in-flight CPU averaging cycle to finalize before
+        // either dispatching a new epoch (which would race with the
+        // pending SyncAck round-trip) or shutting workers down (which
+        // would drop the cycle and leave the divergence guard with
+        // all-Nones — see `end_to_end_sync_cpu_smoke` regression).
+        if !matches!(self.cpu_avg_state, CpuAvgState::Idle) {
+            return;
+        }
+        let next = latest + 1;
+        if next >= self.num_epochs {
+            self.shutdown_initiated = true;
+            if let Err(e) = self.shutdown_workers() {
+                crate::verbose!(
+                    "  ddp: shutdown_workers after final aggregate failed: {}",
+                    e,
+                );
+            }
+        } else if !self.progressive
+            && !matches!(self.policy, ApplyPolicy::Async)
+            && self.last_dispatched_epoch.is_none_or(|d| d < next)
+        {
+            self.last_dispatched_epoch = Some(next);
+            if let Err(e) = self.dispatch_epoch(next) {
+                crate::verbose!(
+                    "  ddp: dispatch_epoch({}) after aggregate failed: {}",
+                    next,
+                    e,
+                );
             }
         }
     }
@@ -3789,6 +3887,8 @@ impl ClusterCoordinator {
             last_observed_upload_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
+            last_dispatched_epoch: None,
+            shutdown_initiated: false,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
             batch_size: config.batch_size.max(1),

@@ -2861,3 +2861,99 @@
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Regression for the epoch-transition stall: after aggregating
+    /// epoch N (non-progressive Sync), the coord must dispatch epoch
+    /// N+1; once N+1 == num_epochs it must broadcast `Shutdown`.
+    /// Without this, workers idle in `wait_for_epoch_plan` after the
+    /// final `EpochAggregated` and the launcher hangs.
+    #[test]
+    fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
+        let world_size = 2;
+        let num_epochs = 2;
+        let (port, coord_handle) = spawn_coord(
+            world_size,
+            move || cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(num_epochs),
+            move |coord| {
+                coord.dispatch_epoch(0)?;
+                let start = Instant::now();
+                // Drive ticks until the coord observes both ranks have
+                // closed (tick returns false). The fix in
+                // `drain_metrics_and_aggregate` broadcasts `Shutdown`
+                // after the final epoch aggregates; readers see EOF
+                // when ranks exit, `is_finished()` flips, alive=false.
+                loop {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(TensorError::new(
+                            "coord did not drain within 10s",
+                        ));
+                    }
+                    if !coord.tick()? {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(
+                    coord.last_aggregated_epoch(),
+                    Some(num_epochs - 1),
+                    "both epochs must have aggregated",
+                );
+                Ok(())
+            },
+        );
+
+        fn rank_body(
+            rank: u64,
+            num_epochs: usize,
+        ) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
+            move |s, salt| {
+                let mut completed = 0usize;
+                let mut saw_shutdown = false;
+                while !saw_shutdown {
+                    let msg = recv_control(s, salt)?;
+                    match msg {
+                        ControlMsgWire::StartEpoch(plan) => {
+                            send_metrics(s, salt, MetricsMsgWire {
+                                rank,
+                                epoch: plan.epoch,
+                                avg_loss: 0.5,
+                                batches_processed: 2,
+                                epoch_ms: 50.0,
+                                samples_processed: 4,
+                                share_complete_ms: 0.0,
+                                compute_only_ms: 50.0,
+                                data_starve_ms: 0.0,
+                                scalars: std::collections::HashMap::new(),
+                            })?;
+                            completed += 1;
+                        }
+                        ControlMsgWire::Shutdown
+                        | ControlMsgWire::ShutdownWithSave { .. } => {
+                            saw_shutdown = true;
+                        }
+                        // SetEpochCallbackRole / EpochAggregated / any
+                        // unrelated control frames are observed but
+                        // don't drive state in this regression test.
+                        _ => {}
+                    }
+                }
+                if completed != num_epochs {
+                    return Err(TensorError::new(&format!(
+                        "rank {rank}: received Shutdown after {completed} epochs \
+                         (expected {num_epochs})",
+                    )));
+                }
+                Ok(())
+            }
+        }
+        let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT,
+            rank_body(0, num_epochs));
+        let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT,
+            rank_body(1, num_epochs));
+        r0.join().unwrap().expect("rank 0 completed all epochs");
+        r1.join().unwrap().expect("rank 1 completed all epochs");
+        coord_handle.join().unwrap().expect("coord finishes cleanly");
+    }
