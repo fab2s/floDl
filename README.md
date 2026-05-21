@@ -129,6 +129,8 @@ cargo add flodl && cargo build
 
 For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
 
+For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
+
 > **Using tch-rs or PyTorch C++?** `fdl` also works as a standalone
 > libtorch manager outside of flodl: download any CPU/CUDA variant,
 > switch between installs, compile from source for mixed GPU

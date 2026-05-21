@@ -193,7 +193,7 @@ pub fn cuda_device_name_idx(device: i32) -> Option<String> {
     let mut buf = [0 as std::ffi::c_char; 256];
     let err = unsafe { ffi::flodl_cuda_device_name(device, buf.as_mut_ptr(), 256) };
     if err.is_null() {
-        let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        let name = unsafe { CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char) }
             .to_string_lossy()
             .into_owned();
         Some(name)

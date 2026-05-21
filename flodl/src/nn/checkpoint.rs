@@ -857,7 +857,7 @@ fn check_err_raw(err: *mut std::ffi::c_char) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {
-        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+        let msg = unsafe { std::ffi::CStr::from_ptr(err as *const std::ffi::c_char) }
             .to_string_lossy()
             .into_owned();
         unsafe { flodl_sys::flodl_free_string(err) };

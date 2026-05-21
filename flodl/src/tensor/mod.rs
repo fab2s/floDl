@@ -168,7 +168,7 @@ pub(crate) fn check_err(err: *mut std::ffi::c_char) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {
-        let msg = unsafe { CStr::from_ptr(err) }
+        let msg = unsafe { CStr::from_ptr(err as *const std::ffi::c_char) }
             .to_string_lossy()
             .into_owned();
         unsafe { ffi::flodl_free_string(err) };
@@ -302,7 +302,7 @@ impl Clone for Tensor {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_shallow_clone(self.handle, &mut handle) };
         if !err.is_null() {
-            let msg = unsafe { CStr::from_ptr(err) }
+            let msg = unsafe { CStr::from_ptr(err as *const std::ffi::c_char) }
                 .to_string_lossy()
                 .into_owned();
             unsafe { ffi::flodl_free_string(err) };

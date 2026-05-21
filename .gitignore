@@ -44,5 +44,9 @@ fdl.*.yml
 # host names the same way the controller does.
 .fdl-cluster-overlay.yml
 
+# Local docker-compose env (per-machine: UID/GID, libtorch variant override,
+# cargo job throttle). See docs/mac-apple-silicon.md for Mac users.
+.env
+
 mempalace.yaml
 entities.json
