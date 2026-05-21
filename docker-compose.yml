@@ -40,6 +40,11 @@ services:
       # reuses fixtures downloaded by `fdl flodl-hf parity bert*`. Repo-local,
       # gitignored, survives container rebuild.
       - HF_HOME=/workspace/.hf-cache
+      # Throttle cargo's link parallelism. Required on macOS Docker (OrbStack)
+      # where the virtiofs-mounted libtorch directory cannot serve many
+      # concurrent `ld` lookups — the linker reports `cannot find -ltorch`
+      # spuriously. Unset on Linux native (CARGO_BUILD_JOBS empty → default).
+      - CARGO_BUILD_JOBS
 
   cuda:
     build:
