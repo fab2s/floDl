@@ -83,6 +83,20 @@ cluster:
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch
                                # no `docker:` here → bare-metal flodl install.
+      # Optional per-host env vars exported into every rank child
+      # spawned on this host. Overrides cluster-scope `env:` for
+      # matching keys. Example: older consumer-grade GPUs under VFIO
+      # that need NCCL fallback transport.
+      #   env:
+      #     NCCL_P2P_DISABLE: "1"
+      #     NCCL_SHM_DISABLE: "1"
+
+# Optional cluster-scope env vars exported into every rank child on
+# every host. Use for tuning the launcher itself shouldn't hardcode.
+# Per-host `env:` blocks override matching keys.
+#
+# env:
+#   SOME_TUNING_KNOB: "value"
 
 # Mark which commands fan out across cluster.hosts. Commands without
 # `cluster: true` continue to run locally on whichever host invoked fdl.

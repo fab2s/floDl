@@ -622,8 +622,16 @@ fn run() -> flodl::tensor::Result<()> {
         let mut model_results = Vec::new();
 
         for mode in &modes {
-            // Skip multi-GPU modes if only 1 GPU
-            if mode.requires_multi_gpu() && gpu_count < 2 {
+            // Skip multi-GPU modes when only 1 GPU is visible AND
+            // we're not running as a rank inside a cluster. In PPR
+            // mode (auto-promote or cluster fan-out), each rank child
+            // sees only one GPU via `CUDA_VISIBLE_DEVICES` scoping; the
+            // cluster as a whole has the multi-GPU world. Detect the
+            // rank-in-cluster case via `FLODL_CLUSTER_JSON` and skip
+            // the guard there.
+            let in_cluster_rank =
+                std::env::var_os("FLODL_CLUSTER_JSON").is_some();
+            if mode.requires_multi_gpu() && gpu_count < 2 && !in_cluster_rank {
                 eprintln!("  skipping {} (requires 2+ GPUs, have {})", mode, gpu_count);
                 continue;
             }

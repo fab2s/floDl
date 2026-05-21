@@ -506,6 +506,15 @@ pub struct ClusterConfig {
     pub master_addr: String,
     pub master_port: u16,
     pub hosts: Vec<ClusterHost>,
+    /// Cluster-scope env vars exported into every rank child on every
+    /// host. Mapping `NAME: VALUE` (string→string). Use for tuning the
+    /// launcher itself shouldn't hardcode — e.g. on the Pascal-under-
+    /// VFIO rig, set `NCCL_P2P_DISABLE: "1"` + `NCCL_SHM_DISABLE: "1"`
+    /// so NCCL falls back to socket transport (the direct-IPC
+    /// transports fail under VFIO on consumer Pascal). Host-scope
+    /// [`ClusterHost::env`] takes precedence for matching keys.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// CUDA device indices on a host. Either explicit (a list of indices) or
@@ -676,6 +685,15 @@ pub struct ClusterHost {
     /// declared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_options: Vec<String>,
+    /// Host-scoped env vars exported into every rank child spawned on
+    /// this host. Mapping `NAME: VALUE` (string→string). Useful for
+    /// host-specific tuning that doesn't belong at cluster scope
+    /// (e.g. one host needs a different `NCCL_SOCKET_IFNAME` override,
+    /// or a custom `LD_LIBRARY_PATH` due to a non-standard CUDA
+    /// install). Overrides matching keys from
+    /// [`ClusterConfig::env`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Convention default for [`ClusterHost::data_path`] when the host

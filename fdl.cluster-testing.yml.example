@@ -59,6 +59,20 @@ cluster:
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       libtorch_path: /mnt/flodl/libtorch
+      # Optional per-host env vars exported to every rank child on
+      # this host. Overrides cluster-scope `env:` for matching keys.
+      # Example: an older consumer-grade GPU under VFIO that needs
+      # NCCL fallback transport.
+      #   env:
+      #     NCCL_P2P_DISABLE: "1"
+      #     NCCL_SHM_DISABLE: "1"
+
+  # Optional cluster-scope env vars exported to every rank child on
+  # every host. Use for tuning the launcher itself shouldn't hardcode.
+  # Per-host `env:` blocks override matching keys.
+  #
+  # env:
+  #   SOME_TUNING_KNOB: "value"
 
 # Single-host loopback variant (most common for a personal rig):
 #

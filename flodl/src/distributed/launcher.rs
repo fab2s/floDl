@@ -395,8 +395,29 @@ pub fn run_launcher_with_config(
                     .as_bytes(),
             );
 
+            // Scope each rank's child to its assigned physical GPU
+            // via `CUDA_VISIBLE_DEVICES=<phys>`. Standard torchrun-
+            // style recipe: the child sees only one GPU, addresses it
+            // as CUDA(0). Required for multi-process CUDA on older CCs
+            // (Pascal/sm_61 surfaced this: dual-process where both
+            // ranks see both GPUs hits `cudaErrorNoKernelImageForDevice`
+            // sticky on the first allocation, even though kernels are
+            // present for sm_61 — the lazy module load picks the wrong
+            // context). `cluster::my_rank` honors the scoping by
+            // returning CUDA(0) when CUDA_VISIBLE_DEVICES is single-
+            // valued.
+            let local_phys = host
+                .local_devices
+                .as_ref()
+                .and_then(|d| d.get(local_rank).copied());
             let mut cmd = if host.name == me {
-                build_local_spawn_command(&exe, &user_args, &envelope_hex, local_rank)
+                build_local_spawn_command(
+                    &exe,
+                    &user_args,
+                    &envelope_hex,
+                    local_rank,
+                    local_phys,
+                )
             } else {
                 let remote_cmd = build_remote_bash_command(
                     &host.path,
@@ -408,12 +429,31 @@ pub fn run_launcher_with_config(
                         .as_deref()
                         .expect("ENV_FDL_CMD presence enforced above when has_remote"),
                     &user_args,
+                    &full.env,
+                    &host.env,
+                    local_phys,
                 );
                 build_ssh_spawn_command(host, &remote_cmd)
             };
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+
+            // Apply user-declared env from `full.env` (cluster-scope)
+            // first, then `host.env` (per-host override). Built-in env
+            // vars set later by build_local_spawn_command (e.g.
+            // FLODL_LOCAL_RANK, CUDA_VISIBLE_DEVICES, FLODL_CLUSTER_JSON)
+            // are not overridable here — the launcher owns those. SSH
+            // path: env propagation is bash-level inside
+            // build_remote_bash_command and not affected here.
+            if host.name == me {
+                for (k, v) in &full.env {
+                    cmd.env(k, v);
+                }
+                for (k, v) in &host.env {
+                    cmd.env(k, v);
+                }
+            }
 
             let mut child = cmd.spawn().map_err(|e| {
                 let kind = if host.name == me { "local bash/exec" } else { "ssh" };
@@ -489,6 +529,7 @@ fn build_local_spawn_command(
     user_args: &[String],
     envelope_hex: &str,
     local_rank: usize,
+    local_phys_device: Option<u8>,
 ) -> Command {
     let mut cmd = Command::new(exe);
     cmd.args(user_args)
@@ -507,6 +548,9 @@ fn build_local_spawn_command(
         // wedge cases beyond that surface).
         .env("NCCL_ASYNC_ERROR_HANDLING", "1")
         .env_remove(ENV_FULL_CLUSTER_JSON);
+    if let Some(phys) = local_phys_device {
+        cmd.env("CUDA_VISIBLE_DEVICES", phys.to_string());
+    }
     cmd
 }
 
@@ -553,6 +597,7 @@ fn build_ssh_spawn_command(host: &FullHost, remote_cmd: &str) -> Command {
 ///
 /// Mirrors fdl-cli's `build_remote_command` exactly (this is the move
 /// of that logic into flodl proper, per the 4b boundary lift).
+#[allow(clippy::too_many_arguments)]
 fn build_remote_bash_command(
     path: &str,
     cluster_json_hex: &str,
@@ -561,6 +606,9 @@ fn build_remote_bash_command(
     overlay_env: Option<&str>,
     fdl_cmd: &str,
     user_args: &[String],
+    cluster_env: &std::collections::BTreeMap<String, String>,
+    host_env: &std::collections::BTreeMap<String, String>,
+    local_phys_device: Option<u8>,
 ) -> String {
     use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_HOST_OVERRIDE, ENV_LOCAL_RANK};
 
@@ -585,6 +633,26 @@ fn build_remote_bash_command(
     // Defense-in-depth for NCCL stuck-collective detection; see the
     // matching env on the local spawn path.
     s.push_str("NCCL_ASYNC_ERROR_HANDLING=1");
+    if let Some(phys) = local_phys_device {
+        s.push(' ');
+        s.push_str("CUDA_VISIBLE_DEVICES=");
+        s.push_str(&phys.to_string());
+    }
+    // Apply user-declared env: cluster-scope first, host-scope second
+    // (host overrides cluster for matching keys). Built-in env vars
+    // above are not overridable here — the launcher owns those.
+    for (k, v) in cluster_env {
+        s.push(' ');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&shell_quote(v));
+    }
+    for (k, v) in host_env {
+        s.push(' ');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&shell_quote(v));
+    }
     if let Some(env) = overlay_env {
         s.push(' ');
         s.push_str(ENV_FDL_ENV);
@@ -711,6 +779,17 @@ pub struct FullCluster {
     /// zeros until [`FullCluster::with_session_salt`] (or
     /// [`run_launcher_with_config`]) populates it.
     pub salt: crate::distributed::wire::SessionSalt,
+    /// Cluster-scope env vars exported into every rank child's
+    /// environment. Cluster-yml `env:` block (mapping
+    /// `NAME: VALUE`). Used for cluster-specific tuning that the
+    /// launcher itself shouldn't hardcode — e.g. setting
+    /// `NCCL_P2P_DISABLE=1` + `NCCL_SHM_DISABLE=1` for the Pascal-
+    /// under-VFIO rig where NCCL's direct-IPC transports fail but
+    /// socket transport works.
+    ///
+    /// Empty by default. Per-host envs (see [`FullHost::env`])
+    /// override per-cluster ones for the matching host.
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl FullCluster {
@@ -754,6 +833,11 @@ pub struct FullHost {
     /// `"StrictHostKeyChecking=no"`). Each entry is shipped as a
     /// separate `-o ...` arg, in the order given.
     pub ssh_options: Vec<String>,
+    /// Per-host env vars exported into this host's rank children.
+    /// Override the cluster-scope [`FullCluster::env`] for matching
+    /// keys. Use for host-specific tuning (e.g. an interface override
+    /// only one host needs).
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl FullCluster {
@@ -836,6 +920,10 @@ impl FullCluster {
             )));
         }
 
+        // Optional cluster-scope `env:` block: mapping of NAME → VALUE
+        // exported into every rank child. Missing → empty map.
+        let env = parse_env_block(obj.get("env"), "cluster.env")?;
+
         Ok(FullCluster {
             master_addr,
             master_port,
@@ -844,6 +932,7 @@ impl FullCluster {
             // the session salt is generated freshly by `run_launcher` per
             // training session (override via [`Self::with_session_salt`]).
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
+            env,
         })
     }
 
@@ -918,6 +1007,13 @@ impl FullCluster {
                         ),
                     );
                 }
+                if !h.env.is_empty() {
+                    let mut env_obj = serde_json::Map::new();
+                    for (k, v) in &h.env {
+                        env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    o.insert("env".into(), serde_json::Value::Object(env_obj));
+                }
                 serde_json::Value::Object(o)
             })
             .collect();
@@ -931,6 +1027,13 @@ impl FullCluster {
             serde_json::Value::from(self.master_port),
         );
         top.insert("hosts".into(), serde_json::Value::Array(hosts));
+        if !self.env.is_empty() {
+            let mut env_obj = serde_json::Map::new();
+            for (k, v) in &self.env {
+                env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
+            top.insert("env".into(), serde_json::Value::Object(env_obj));
+        }
         serde_json::Value::Object(top)
     }
 }
@@ -1117,6 +1220,11 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         }
     };
 
+    let env = parse_env_block(
+        obj.get("env"),
+        &format!("hosts[{i}] ({name:?}).env"),
+    )?;
+
     Ok(FullHost {
         name,
         ranks,
@@ -1129,7 +1237,39 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         ssh_user,
         ssh_identity_file,
         ssh_options,
+        env,
     })
+}
+
+/// Parse an `env:` block from either a launcher-level or host-level
+/// position. Expects a JSON object whose values are all strings
+/// (`{"NAME": "value", ...}`); missing/null produces an empty map.
+/// Loud-errors on anything else so a typo can't silently produce an
+/// empty env that hides a real config error.
+fn parse_env_block(
+    v: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    use std::collections::BTreeMap;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(BTreeMap::new()),
+        Some(serde_json::Value::Object(map)) => {
+            let mut out = BTreeMap::new();
+            for (k, val) in map {
+                let s = val.as_str().ok_or_else(|| {
+                    TensorError::new(&format!(
+                        "cluster launcher: {label}[{k:?}] must be a string, got {val}"
+                    ))
+                })?;
+                out.insert(k.clone(), s.to_string());
+            }
+            Ok(out)
+        }
+        Some(other) => Err(TensorError::new(&format!(
+            "cluster launcher: {label} must be an object (NAME → string VALUE), \
+             got {other}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1298,8 +1438,14 @@ mod tests {
         assert_eq!(shell_quote("don't"), "'don'\\''t'");
     }
 
+    fn empty_env() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
+
     #[test]
     fn build_remote_bash_command_shape() {
+        let cluster_env = empty_env();
+        let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/flodl",
             "abcd1234",
@@ -1308,6 +1454,9 @@ mod tests {
             Some("cluster"),
             "train",
             &["--epochs".to_string(), "10".to_string()],
+            &cluster_env,
+            &host_env,
+            None,
         );
         assert!(s.starts_with("cd '/srv/flodl' && "));
         assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"));
@@ -1319,6 +1468,8 @@ mod tests {
 
     #[test]
     fn build_remote_bash_command_omits_fdl_env_when_none() {
+        let cluster_env = empty_env();
+        let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/flodl",
             "abcd",
@@ -1327,6 +1478,9 @@ mod tests {
             None,
             "train",
             &[],
+            &cluster_env,
+            &host_env,
+            None,
         );
         assert!(
             !s.contains("FDL_ENV"),
@@ -1339,8 +1493,11 @@ mod tests {
         // `exec` is load-bearing: it replaces the bash process so the
         // remote returns fdl's exit code directly. Catching this
         // explicitly so a future refactor doesn't silently drop it.
+        let cluster_env = empty_env();
+        let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv", "ff", "w", 0, None, "train", &[],
+            &cluster_env, &host_env, None,
         );
         assert!(s.contains(" exec fdl "), "missing `exec` prefix: {s}");
     }
@@ -1349,13 +1506,42 @@ mod tests {
     fn build_remote_bash_command_quotes_dangerous_path() {
         // Single quotes in the path must round-trip through the
         // single-quote-escape idiom.
+        let cluster_env = empty_env();
+        let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/it's", "ff", "w", 0, None, "train", &[],
+            &cluster_env, &host_env, None,
         );
         assert!(
             s.contains("cd '/srv/it'\\''s'"),
             "path with single quote not properly escaped: {s}"
         );
+    }
+
+    #[test]
+    fn build_remote_bash_command_exports_cluster_and_host_env() {
+        // Cluster-scope and host-scope env vars round-trip into the
+        // exported shell command. Host overrides cluster on key
+        // collisions.
+        let mut cluster_env = empty_env();
+        cluster_env.insert("NCCL_P2P_DISABLE".into(), "1".into());
+        cluster_env.insert("SHARED_FLAG".into(), "cluster-wins".into());
+        let mut host_env = empty_env();
+        host_env.insert("HOST_FLAG".into(), "host-val".into());
+        host_env.insert("SHARED_FLAG".into(), "host-wins".into());
+        let s = build_remote_bash_command(
+            "/srv", "ff", "w", 0, None, "train", &[],
+            &cluster_env, &host_env, Some(1),
+        );
+        assert!(s.contains("NCCL_P2P_DISABLE='1'"));
+        assert!(s.contains("HOST_FLAG='host-val'"));
+        // Host SHARED_FLAG export comes after cluster's; the shell
+        // takes the last value when env vars are assigned multiple
+        // times in a `K=V K=V ...` prefix.
+        let cluster_pos = s.find("SHARED_FLAG='cluster-wins'").unwrap();
+        let host_pos = s.find("SHARED_FLAG='host-wins'").unwrap();
+        assert!(cluster_pos < host_pos, "host env must export after cluster env");
+        assert!(s.contains("CUDA_VISIBLE_DEVICES=1"));
     }
 
     #[test]

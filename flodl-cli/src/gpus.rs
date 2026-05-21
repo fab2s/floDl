@@ -174,7 +174,9 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             ssh_user: None,
             ssh_identity_file: None,
             ssh_options: Vec::new(),
+            env: std::collections::BTreeMap::new(),
         }],
+        env: std::collections::BTreeMap::new(),
     })
 }
 

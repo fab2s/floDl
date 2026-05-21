@@ -1512,6 +1512,12 @@ fn resume_from_loads_meta_and_seeds_coord_config() {
         None,
         None,
         2,
+        // Trivial test values for the new total_samples / batch_size /
+        // num_epochs args; the test asserts resume-meta plumbing, not
+        // dataset arithmetic.
+        100,
+        4,
+        1,
     )
     .expect("resume meta loads cleanly");
 
@@ -1552,6 +1558,9 @@ fn resume_from_missing_meta_errors() {
         None,
         None,
         2,
+        100,
+        4,
+        1,
     );
     let err = match result {
         Ok(_) => panic!("missing meta file must error, got Ok"),

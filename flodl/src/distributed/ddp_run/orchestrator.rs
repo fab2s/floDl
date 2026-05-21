@@ -49,6 +49,9 @@ pub(super) fn build_coord_config_from_builder(
     metrics_fn: Option<super::MetricsFn>,
     eval_result_fn: Option<super::EvalResultFn>,
     world_size: usize,
+    total_samples: usize,
+    batch_size: usize,
+    num_epochs: usize,
 ) -> Result<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig> {
     use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
     use crate::distributed::ddp::ElChe;
@@ -88,6 +91,9 @@ pub(super) fn build_coord_config_from_builder(
         world_size,
         el_che,
     )
+    .total_samples(total_samples)
+    .batch_size(batch_size)
+    .num_epochs(num_epochs)
     .elche_relax_up(config.elche_relax_up)
     .meta_controller(config.meta_controller)
     .partition_ratios(config.partition_ratios.clone());
@@ -461,6 +467,9 @@ impl DdpHandle {
                     metrics_fn,
                     eval_result_fn,
                     world_size,
+                    dataset.len(),
+                    batch_size,
+                    num_epochs,
                 )?;
                 coord_config = coord_config.metrics_sink_tx(sink_tx);
                 // Spawn the launcher driver on a dedicated thread.

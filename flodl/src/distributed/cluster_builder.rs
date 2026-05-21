@@ -115,6 +115,7 @@ impl ClusterBuilder {
             master_port: self.master_port,
             hosts: self.hosts,
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
+            env: std::collections::BTreeMap::new(),
         })
     }
 
@@ -171,8 +172,10 @@ impl ClusterBuilder {
                 ssh_user: None,
                 ssh_identity_file: None,
                 ssh_options: Vec::new(),
+                env: std::collections::BTreeMap::new(),
             }],
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
+            env: std::collections::BTreeMap::new(),
         })
     }
 }
@@ -319,6 +322,7 @@ impl HostBuilder {
             ssh_user: self.ssh_user,
             ssh_identity_file: self.ssh_identity_file,
             ssh_options: std::mem::take(&mut self.ssh_options),
+            env: std::collections::BTreeMap::new(),
         };
         self.parent.hosts.push(host);
         self.parent

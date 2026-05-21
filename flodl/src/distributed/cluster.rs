@@ -357,6 +357,24 @@ impl LocalCluster {
     pub fn my_rank(&self) -> Result<(usize, Device)> {
         let host = self.this_host()?;
         let idx = local_rank_index_from_env(host.ranks.len(), &host.name)?;
+        // When the launcher per-child scopes the rank via
+        // `CUDA_VISIBLE_DEVICES=<phys>` (the standard torchrun-style
+        // multi-process-CUDA recipe), the child sees only one GPU, and
+        // libtorch addresses it as `CUDA(0)` regardless of the
+        // physical index. Returning the envelope's
+        // `local_devices[idx]` (the physical index) would point at a
+        // device the child can't see and yield `cudaErrorInvalidDevice`
+        // (or worse, sticky `cudaErrorNoKernelImageForDevice` when
+        // first allocation triggers module load on the wrong CC).
+        // Detect the single-value form (`CUDA_VISIBLE_DEVICES=N`) and
+        // return `CUDA(0)`; fall back to the envelope when unset or
+        // when multi-value (in which case the child sees the same
+        // physical layout as the cluster spec).
+        if let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
+            if !visible.is_empty() && !visible.contains(',') {
+                return Ok((host.ranks[idx], Device::CUDA(0)));
+            }
+        }
         Ok((host.ranks[idx], Device::CUDA(host.local_devices[idx])))
     }
 

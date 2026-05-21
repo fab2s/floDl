@@ -119,8 +119,10 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             ssh_user: None,
             ssh_identity_file: None,
             ssh_options: Vec::new(),
+            env: std::collections::BTreeMap::new(),
         }],
         salt: [0u8; SESSION_SALT_BYTES],
+        env: std::collections::BTreeMap::new(),
     }
 }
 
