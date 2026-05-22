@@ -2614,24 +2614,29 @@ impl DdpHandle {
     }
 
     /// Print device summary to stderr (same style as Trainer::setup).
+    ///
+    /// Uses [`crate::sys::detect_gpus`] (nvidia-smi based) instead of
+    /// libtorch's `cuda_device_name_idx` / `cuda_memory_info_idx` so it
+    /// can run on the controller's main thread without violating the
+    /// "no CUDA touch before fan-out" invariant.
     fn print_summary(devices: &[Device], policy: &ApplyPolicy, backend: &AverageBackend) {
-        use crate::tensor::{cuda_device_name_idx, cuda_memory_info_idx};
         use crate::monitor::format_bytes;
 
+        let gpus = crate::sys::detect_gpus();
         let mut parts = Vec::with_capacity(devices.len());
         let mut names = Vec::with_capacity(devices.len());
 
         for &dev in devices {
             if let Device::CUDA(idx) = dev {
-                let raw_name = cuda_device_name_idx(idx as i32)
+                let gpu = gpus.iter().find(|g| g.index == idx);
+                let raw_name = gpu
+                    .map(|g| g.name.clone())
                     .unwrap_or_else(|| format!("CUDA({})", idx));
-                let short = raw_name
-                    .strip_prefix("NVIDIA ")
-                    .unwrap_or(&raw_name)
-                    .to_string();
-                let vram = cuda_memory_info_idx(idx as i32)
-                    .ok()
-                    .map(|(_, total)| format!(" ({})", format_bytes(total)))
+                let short = gpu
+                    .map(|g| g.short_name())
+                    .unwrap_or_else(|| raw_name.clone());
+                let vram = gpu
+                    .map(|g| format!(" ({})", format_bytes(g.vram_bytes())))
                     .unwrap_or_default();
                 parts.push(format!("{}{}", short, vram));
                 names.push(raw_name);

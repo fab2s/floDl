@@ -455,37 +455,27 @@ impl Ddp {
     }
 
     /// Print a diagnostic summary of detected CUDA devices to stderr.
+    ///
+    /// Uses [`crate::sys::detect_gpus`] (nvidia-smi based) instead of
+    /// libtorch's `cuda_device_count` so this can run before
+    /// `Trainer::run` without violating the "no CUDA touch before
+    /// fan-out" invariant on heterogeneous rigs.
     fn print_device_summary() {
-        use crate::tensor::{
-            cuda_available, cuda_device_count,
-            cuda_device_name_idx, cuda_memory_info_idx,
-        };
         use crate::monitor::format_bytes;
 
-        if !cuda_available() || cuda_device_count() == 0 {
+        let gpus = crate::sys::detect_gpus();
+        let n = gpus.len();
+
+        if n == 0 {
             crate::verbose!("  ddp: no CUDA available | CPU mode");
             return;
         }
 
-        let n = cuda_device_count();
-        let mut names = Vec::with_capacity(n as usize);
-        let mut parts = Vec::with_capacity(n as usize);
-
-        for i in 0..n {
-            let raw_name = cuda_device_name_idx(i)
-                .unwrap_or_else(|| format!("CUDA({})", i));
-            let short = raw_name
-                .strip_prefix("NVIDIA ")
-                .unwrap_or(&raw_name)
-                .to_string();
-            let vram = cuda_memory_info_idx(i)
-                .map(|(_, total)| format!(" ({})", format_bytes(total)))
-                .unwrap_or_default();
-            parts.push(format!("{}{}", short, vram));
-            names.push(raw_name);
-        }
-
-        let heterogeneous = names.windows(2).any(|w| w[0] != w[1]);
+        let parts: Vec<String> = gpus
+            .iter()
+            .map(|g| format!("{} ({})", g.short_name(), format_bytes(g.vram_bytes())))
+            .collect();
+        let heterogeneous = gpus.windows(2).any(|w| w[0].name != w[1].name);
 
         if n == 1 {
             crate::verbose!("  ddp: 1 GPU | {} | single-device mode", parts[0]);

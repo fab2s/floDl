@@ -1005,23 +1005,26 @@ impl ElChe {
 mod spec_prior {
     /// Ordinal "spec score" for a CUDA device. Higher = better spec.
     /// Returns `None` when device-property queries fail (e.g. CUDA absent).
-    fn score(device_index: i32) -> Option<f64> {
-        let (sm_major, sm_minor) =
-            crate::tensor::cuda_compute_capability(device_index)?;
-        let (_free, total) =
-            crate::tensor::cuda_memory_info_idx(device_index).ok()?;
-        let vram_gb = total as f64 / 1_073_741_824.0;
-        Some((sm_major as f64) * 100.0 + (sm_minor as f64) * 10.0 + vram_gb)
+    ///
+    /// Uses [`crate::sys::detect_gpus`] (nvidia-smi based) instead of
+    /// libtorch's `cuda_compute_capability` / `cuda_memory_info_idx` so
+    /// this can run on the controller's main thread without violating
+    /// the "no CUDA touch before fan-out" invariant.
+    fn score(device_index: i32, gpus: &[crate::sys::GpuInfo]) -> Option<f64> {
+        let gpu = gpus.iter().find(|g| g.index as i32 == device_index)?;
+        let vram_gb = gpu.vram_bytes() as f64 / 1_073_741_824.0;
+        Some((gpu.sm_major as f64) * 100.0 + (gpu.sm_minor as f64) * 10.0 + vram_gb)
     }
 
     /// Rank with the lowest spec score across `device_indices`. Lowest-rank
     /// tiebreak when two ranks score equal. Returns `None` when any device
     /// query fails — caller falls back to current behavior.
     pub(super) fn slowest_rank(device_indices: &[i32]) -> Option<usize> {
+        let gpus = crate::sys::detect_gpus();
         let scores: Option<Vec<(usize, f64)>> = device_indices
             .iter()
             .enumerate()
-            .map(|(rank, &idx)| score(idx).map(|s| (rank, s)))
+            .map(|(rank, &idx)| score(idx, &gpus).map(|s| (rank, s)))
             .collect();
         let scores = scores?;
         scores
