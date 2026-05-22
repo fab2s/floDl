@@ -1314,11 +1314,13 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
                 "cluster launcher: hosts[{i}] ({name:?}): ranks (array) required"
             ))
         })?;
-    if ranks_arr.is_empty() {
-        return Err(TensorError::new(&format!(
-            "cluster launcher: hosts[{i}] ({name:?}): ranks must be non-empty"
-        )));
-    }
+    // Empty ranks: orchestrator-only host entry. Declared in cluster.yml
+    // solely so fdl-cli's pre-flight build can read its `docker:` /
+    // `arch:` for controller-side build context; the launcher itself
+    // skips it (no rank spawn for this host). Distinct from "host
+    // absent from cluster.hosts" — both result in orchestrator-only
+    // launcher behavior, but the explicit entry surfaces config to
+    // fdl-cli.
     let ranks: Vec<usize> = ranks_arr
         .iter()
         .enumerate()

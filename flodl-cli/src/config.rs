@@ -764,14 +764,12 @@ impl ClusterConfig {
             if h.name.trim().is_empty() {
                 return Err(format!("cluster.hosts[{i}].name must be non-empty"));
             }
-            if h.ranks.is_empty() {
-                return Err(format!(
-                    "cluster.hosts[{i}] ({:?}): ranks must be non-empty",
-                    h.name
-                ));
-            }
+            // Empty ranks: orchestrator-only host entry (see launcher.rs's
+            // matching relaxation). Declared so fdl-cli pre-flight reads
+            // its `docker:` / `arch:` for build context without making
+            // the host a NCCL participant.
             if let Some(devs) = h.local_devices.as_explicit() {
-                if h.ranks.len() != devs.len() {
+                if !h.ranks.is_empty() && h.ranks.len() != devs.len() {
                     return Err(format!(
                         "cluster.hosts[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
                         h.name,
