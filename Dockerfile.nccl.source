@@ -1,0 +1,71 @@
+# flodl NCCL builder -- compiles libnccl from NVIDIA's NCCL source.
+#
+# Use this when libtorch's bundled NCCL (its third_party submodule
+# version) doesn't match across a heterogeneous-rig cluster, e.g.
+# precompiled PyTorch on one host ships NCCL 2.27.x while the
+# bi-compat source build on another ships 2.26.x. NCCL refuses
+# handshake across major.minor skew, so the easier side rebuilds.
+#
+# Build:  fdl nccl build  (future — mirrors `fdl libtorch build`)
+#         OR ad-hoc:
+#           docker build -f Dockerfile.nccl.source \
+#               --build-arg NCCL_VERSION=v2.27.5-1 \
+#               --build-arg NVCC_GENCODE="-gencode=arch=compute_61,code=sm_61" \
+#               -t flodl-nccl-build:v2.27.5-sm61 .
+#
+# Time:   5-15 minutes depending on CPU cores and arch count.
+#
+# The NVCC_GENCODE arg controls which GPU architectures get SASS.
+# Multiple -gencode flags can be chained for multi-arch builds:
+#   --build-arg NVCC_GENCODE="-gencode=arch=compute_61,code=sm_61 \
+#                              -gencode=arch=compute_120,code=sm_120"
+#
+# This is a builder-only image. fdl extracts the built libnccl to
+# libtorch/nccl/builds/<version>-<archs>/ via `docker cp` (or via a
+# bind-mount on ad-hoc runs).
+
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    make \
+    g++ \
+    python3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# python3 is required by NCCL's build: src/device/generate.py emits
+# the device function table (ncclDevFuncTable). Without it, kernels
+# compile but nvlink fails with "Undefined reference to ncclDevFuncTable"
+# during device_glue linking.
+
+# Clone NCCL at the specified version. BuildKit cache mount keeps
+# the checkout across builds so version bumps don't re-download.
+ARG NCCL_VERSION=v2.27.5-1
+RUN --mount=type=cache,target=/tmp/nccl-cache \
+    if [ ! -d "/tmp/nccl-cache/nccl-${NCCL_VERSION}" ]; then \
+        git clone --depth 1 --branch ${NCCL_VERSION} \
+            https://github.com/NVIDIA/nccl.git /tmp/nccl-cache/nccl-${NCCL_VERSION}; \
+    fi && \
+    cp -a /tmp/nccl-cache/nccl-${NCCL_VERSION} /nccl
+
+WORKDIR /nccl
+
+# Build configuration. Default targets Pascal sm_61 (Pascal GP106
+# is the common heterogeneous-rig minority). Override at build time
+# for other archs or multi-arch builds.
+ARG NVCC_GENCODE="-gencode=arch=compute_61,code=sm_61"
+ENV CUDA_HOME=/usr/local/cuda
+ARG MAX_JOBS=6
+
+RUN make -j${MAX_JOBS} src.build \
+        NVCC_GENCODE="${NVCC_GENCODE}" \
+        CUDA_HOME=${CUDA_HOME}
+
+# Package into the standard layout fdl extracts from.
+# /usr/local/nccl/{lib,include} mirrors libtorch's packaging
+# (/usr/local/libtorch/{lib,include,share} in Dockerfile.cuda.source).
+RUN mkdir -p /usr/local/nccl && \
+    cp -a /nccl/build/lib /usr/local/nccl/lib && \
+    cp -a /nccl/build/include /usr/local/nccl/include

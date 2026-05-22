@@ -178,6 +178,16 @@ fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> Vec<String> {
 /// `None` (with a stderr warning) when resolution fails on the
 /// controller — caller decides whether to fall back to shipping the
 /// original string or hard-fail.
+///
+/// Prefers a non-loopback address when `getaddrinfo` returns several
+/// candidates. Debian/Ubuntu install `/etc/hosts` with a
+/// `127.0.1.1 <hostname>` line by default, which `getaddrinfo` returns
+/// FIRST — that IP works for the local host but is unreachable from
+/// any peer (a libvirt VM, another rig). Skipping loopback in the
+/// iterator picks the bridge / LAN address remote ranks can actually
+/// dial. If ONLY loopback resolves, return it with a loud warning
+/// (likely misconfig — better to surface than to silently ship an
+/// unreachable IP).
 fn resolve_host_to_ip(host: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
     // Already a numeric address? Skip the lookup, return as-is.
@@ -185,7 +195,22 @@ fn resolve_host_to_ip(host: &str) -> Option<String> {
         return Some(host.to_string());
     }
     match (host, 0u16).to_socket_addrs() {
-        Ok(mut iter) => iter.next().map(|sa| sa.ip().to_string()),
+        Ok(iter) => {
+            let (ip, only_loopback) = select_preferred_ip(iter.map(|sa| sa.ip()));
+            if only_loopback {
+                if let Some(ip) = &ip {
+                    eprintln!(
+                        "fdl: warning: host {host:?} only resolves to loopback \
+                         {ip} on the controller — remote ranks will fail to \
+                         connect. Set `master_addr` (or the host's `name`) in \
+                         fdl.cluster.yml to a non-loopback IP reachable from \
+                         peer nodes (e.g. the libvirt bridge IP 192.168.122.1 \
+                         for virbr0)."
+                    );
+                }
+            }
+            ip
+        }
         Err(e) => {
             eprintln!(
                 "fdl: warning: host {host:?} did not resolve on controller: {e} \
@@ -195,6 +220,24 @@ fn resolve_host_to_ip(host: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Pick the best IP from a `getaddrinfo` iterator: first non-loopback
+/// wins; if every candidate is loopback, return the first loopback
+/// with `only_loopback=true` so the caller can warn. Pure function,
+/// no NSS dependency — exists so the selection rule is unit-testable.
+fn select_preferred_ip<I: IntoIterator<Item = std::net::IpAddr>>(
+    iter: I,
+) -> (Option<String>, bool) {
+    let mut loopback_fallback: Option<String> = None;
+    for ip in iter {
+        if !ip.is_loopback() {
+            return (Some(ip.to_string()), false);
+        }
+        loopback_fallback.get_or_insert_with(|| ip.to_string());
+    }
+    let only_loopback = loopback_fallback.is_some();
+    (loopback_fallback, only_loopback)
 }
 
 /// Write a temporary docker-compose overlay (under `project_root`)
@@ -476,6 +519,49 @@ commands:
             std::env::remove_var(ENV_FULL_CLUSTER_JSON);
             std::env::remove_var(ENV_FDL_CMD);
         }
+    }
+
+    #[test]
+    fn select_preferred_ip_prefers_non_loopback() {
+        use std::net::IpAddr;
+        // The Debian/Ubuntu /etc/hosts shape we have to handle:
+        // 127.0.1.1 comes back FIRST, the routable LAN/bridge IP second.
+        let ips: Vec<IpAddr> = vec![
+            "127.0.1.1".parse().unwrap(),
+            "192.168.122.1".parse().unwrap(),
+        ];
+        let (ip, only_loopback) = select_preferred_ip(ips);
+        assert_eq!(ip.as_deref(), Some("192.168.122.1"));
+        assert!(!only_loopback);
+    }
+
+    #[test]
+    fn select_preferred_ip_falls_back_to_loopback_with_flag() {
+        use std::net::IpAddr;
+        // Misconfig case: only loopback resolves. Return it so the
+        // caller still has SOMETHING, but flip the flag so the caller
+        // warns.
+        let ips: Vec<IpAddr> = vec!["127.0.1.1".parse().unwrap(), "::1".parse().unwrap()];
+        let (ip, only_loopback) = select_preferred_ip(ips);
+        assert_eq!(ip.as_deref(), Some("127.0.1.1"));
+        assert!(only_loopback);
+    }
+
+    #[test]
+    fn select_preferred_ip_empty_iterator() {
+        let (ip, only_loopback) = select_preferred_ip(std::iter::empty());
+        assert!(ip.is_none());
+        assert!(!only_loopback);
+    }
+
+    #[test]
+    fn select_preferred_ip_skips_ipv6_loopback() {
+        use std::net::IpAddr;
+        // IPv6 loopback (::1) must be skipped just like 127.x.
+        let ips: Vec<IpAddr> = vec!["::1".parse().unwrap(), "10.0.0.5".parse().unwrap()];
+        let (ip, only_loopback) = select_preferred_ip(ips);
+        assert_eq!(ip.as_deref(), Some("10.0.0.5"));
+        assert!(!only_loopback);
     }
 
     #[test]

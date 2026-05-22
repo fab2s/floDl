@@ -63,8 +63,9 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 use serde::Deserialize;
@@ -554,30 +555,15 @@ pub fn run_launcher_with_config(
     }
     let _ = my_host_idx; // currently unused but kept for parity with future logic
 
-    // Wait for every child + join forwarders. Propagate first non-zero
-    // exit; keep waiting on the rest so we don't leave zombies.
-    let mut any_failure: Option<TensorError> = None;
-    for (host_name, local_rank, mut child, forwarders) in children {
-        let status = child.wait().map_err(|e| {
-            TensorError::new(&format!(
-                "cluster launcher: wait on rank {local_rank} of {host_name} failed: {e}"
-            ))
-        })?;
-        for f in forwarders {
-            let _ = f.join();
-        }
-        if !status.success() {
-            let code = status.code().unwrap_or(-1);
-            let msg = format!(
-                "cluster launcher: rank {local_rank} of {host_name} exited with status {code}"
-            );
-            if any_failure.is_none() {
-                any_failure = Some(TensorError::new(&msg));
-            } else {
-                eprintln!("{msg}");
-            }
-        }
-    }
+    // Concurrent supervision: watch every child on its own thread and
+    // collect exit events on an mpsc channel. The first non-zero exit
+    // triggers SIGTERM on every other still-running child. Without this,
+    // a peer that dies pre-rendezvous (e.g. SSH-spawned rank fails
+    // before NCCL init completes) leaves the surviving ranks blocked in
+    // NCCL's connect-retry loop forever, and the launcher's old
+    // sequential `wait()` never even reached the dead peer's status to
+    // react.
+    let any_failure = supervise_children(children);
     // All children exited; signal ClusterController shutdown and join.
     if let Err(e) = cpu_averager.shutdown() {
         // Don't mask a child-failure error with a ClusterController shutdown
@@ -586,10 +572,144 @@ pub fn run_launcher_with_config(
         eprintln!("cluster launcher: ClusterController shutdown failed: {e}");
     }
 
+    // Process-exit the launcher unconditionally after all ranks have
+    // completed. The ClusterCoordinator thread spawned above (around
+    // line 376) is detached and holds the metrics-sink tx end; without
+    // process exit, the user binary's main thread blocks on
+    // `handle.next_metrics()` waiting for a channel that the coord
+    // thread won't close until `shutdown_workers` fires (which
+    // requires rendezvous to complete). Pre-rendezvous failures leave
+    // the coord ticking indefinitely and keep the launcher process
+    // alive after every rank child has exited, and with it the docker
+    // container.
+    //
+    // The launcher process holds no post-completion state: rank-side
+    // params live in rank processes, and the launcher driver thread
+    // returns an empty `TrainedState` per `DdpHandle::join`. Process
+    // exit here is therefore a clean termination, not a destructor
+    // bypass. A graceful coord-thread shutdown (capture its `JoinHandle`,
+    // signal+join before returning) would be cleaner if any post-launcher
+    // reporting becomes meaningful on this path.
     if let Some(err) = any_failure {
-        return Err(err);
+        eprintln!("cluster launcher: {err}");
+        std::process::exit(1);
     }
-    Ok(())
+    std::process::exit(0);
+}
+
+/// Drain `children` concurrently and return the first failure (if any).
+///
+/// One watcher thread per child blocks on `wait()` and posts the exit
+/// status on an mpsc channel. The main loop receives events in
+/// completion order; on the first non-zero exit it sends SIGTERM to
+/// every still-running peer so NCCL-blocked ranks abort their retry
+/// loop and exit instead of hanging. Forwarder threads (one for each
+/// child's stdout / stderr) are joined after the corresponding child's
+/// pipes close. Returns `None` when every child exits cleanly,
+/// `Some(err)` attributing to the first failure otherwise.
+///
+/// `terminate_pid` shells out to `kill -TERM <pid>` rather than pulling
+/// `libc` in, which keeps `flodl`'s direct deps unchanged. The child
+/// `Child` value is owned by its watcher thread for the duration of
+/// `wait()`, so we capture the PID up front and signal by PID.
+fn supervise_children(
+    children: Vec<(
+        String,
+        usize,
+        std::process::Child,
+        Vec<thread::JoinHandle<()>>,
+    )>,
+) -> Option<TensorError> {
+    if children.is_empty() {
+        return None;
+    }
+    // Snapshot identity + PID for every child up front. Used both to
+    // attribute incoming events and to signal still-running peers when
+    // any one of them fails.
+    let pids: Vec<(String, usize, u32)> = children
+        .iter()
+        .map(|(host, lr, c, _)| (host.clone(), *lr, c.id()))
+        .collect();
+
+    let (tx, rx) = mpsc::channel::<(String, usize, std::io::Result<ExitStatus>)>();
+    let mut watchers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(children.len());
+    let mut all_forwarders: Vec<thread::JoinHandle<()>> = Vec::new();
+    for (host, lr, mut child, fwd) in children {
+        all_forwarders.extend(fwd);
+        let txc = tx.clone();
+        watchers.push(thread::spawn(move || {
+            let st = child.wait();
+            // Channel send only fails if the receiver was dropped, which
+            // only happens after the main loop has finished collecting
+            // every expected event. Treat as best-effort.
+            let _ = txc.send((host, lr, st));
+        }));
+    }
+    // Drop the producer handle held by main so `rx.recv()` terminates
+    // when every watcher has finished.
+    drop(tx);
+
+    let mut any_failure: Option<TensorError> = None;
+    let mut finished: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    let mut terminated_peers = false;
+    while let Ok((host, lr, st)) = rx.recv() {
+        finished.insert((host.clone(), lr));
+        let failure_msg: Option<String> = match st {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(format!(
+                "cluster launcher: rank {lr} of {host} exited with status {}",
+                s.code().unwrap_or(-1)
+            )),
+            Err(e) => Some(format!(
+                "cluster launcher: wait on rank {lr} of {host} failed: {e}"
+            )),
+        };
+        if let Some(msg) = failure_msg {
+            if any_failure.is_none() {
+                any_failure = Some(TensorError::new(&msg));
+                if !terminated_peers {
+                    terminated_peers = true;
+                    for (h, l, pid) in &pids {
+                        if !finished.contains(&(h.clone(), *l)) {
+                            eprintln!(
+                                "cluster launcher: terminating rank {l} of {h:?} (pid {pid}) \
+                                 after peer failure"
+                            );
+                            terminate_pid(*pid);
+                        }
+                    }
+                }
+            } else {
+                eprintln!("{msg}");
+            }
+        }
+    }
+
+    for w in watchers {
+        let _ = w.join();
+    }
+    for f in all_forwarders {
+        let _ = f.join();
+    }
+    any_failure
+}
+
+/// Send SIGTERM to `pid` via the `kill` binary (PATH-resolved). The
+/// child `Child` value is owned by its watcher thread for the duration
+/// of `wait()`, so calling `Child::kill()` is not available on main;
+/// shelling out by PID is the simplest portable path and avoids
+/// pulling `libc` into `flodl`'s direct deps. Best-effort: silently
+/// continue if the kill itself fails (caller is mid-error already, the
+/// peer might have just exited, etc.).
+fn terminate_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Build the `Command` that fork+execs a local rank child. Sets all the
@@ -1796,5 +1916,67 @@ mod tests {
         assert_eq!(hex.len(), 32);
         let parsed = crate::distributed::cluster::LocalCluster::from_value(&env).unwrap();
         assert_eq!(parsed.salt, salt);
+    }
+
+    #[test]
+    fn supervise_children_clean_exit_returns_none() {
+        // Both children exit cleanly. supervise_children should return
+        // None without sending any kill signals.
+        let mut children: Vec<(
+            String,
+            usize,
+            std::process::Child,
+            Vec<std::thread::JoinHandle<()>>,
+        )> = Vec::new();
+        for lr in 0..2 {
+            let child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn `true`");
+            children.push(("host".to_string(), lr, child, Vec::new()));
+        }
+        assert!(supervise_children(children).is_none());
+    }
+
+    #[test]
+    fn supervise_children_failure_terminates_peers() {
+        // One child exits immediately with status 1; the other would
+        // sleep for 60s. Concurrent supervision must detect the failure
+        // and SIGTERM the sleeper so the call returns promptly. The
+        // assertion is the wall-clock budget: significantly less than
+        // the sleeper's 60s argument.
+        let fail_child = Command::new("sh")
+            .args(["-c", "exit 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `sh -c 'exit 1'`");
+        let sleep_child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `sleep 60`");
+        let children = vec![
+            ("host-fail".to_string(), 0, fail_child, Vec::new()),
+            ("host-sleep".to_string(), 1, sleep_child, Vec::new()),
+        ];
+
+        let start = std::time::Instant::now();
+        let err = supervise_children(children).expect("expected failure attribution");
+        let elapsed = start.elapsed();
+
+        assert!(
+            err.to_string().contains("host-fail"),
+            "attribution should name the first failed rank: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "SIGTERM-on-failure must reap the sleeper well before its 60s budget; took {elapsed:?}"
+        );
     }
 }

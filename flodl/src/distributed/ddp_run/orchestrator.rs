@@ -537,105 +537,143 @@ impl DdpHandle {
         // bundle on unrecoverable failure; when unset, the run executes
         // normally and just skips save activity (legitimate for tests
         // and inference-style usage).
-        if let Some(cluster) = crate::distributed::cluster::LocalCluster::from_env()? {
-            return match (policy, backend) {
-                (ApplyPolicy::Sync, AverageBackend::Nccl) => {
-                    Self::run_cluster_rank_sync_nccl_via_coord(
-                        cluster,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        scheduler_fn,
-                        epoch_fn,
-                        checkpoint_fn,
-                        eval_fn,
-                        eval_dataset,
-                    )
-                }
-                (ApplyPolicy::Cadence, AverageBackend::Nccl)
-                | (ApplyPolicy::Async, AverageBackend::Nccl) => {
-                    // Cadence and Async share the same NCCL algorithm:
-                    // overshoot is an async/CPU concept (no-op for NCCL).
-                    // `policy` is carried in `WorkerConfig` for the
-                    // worker's pre_sync_scratch / metadata branching.
-                    Self::run_cluster_rank_cadence_nccl_via_coord(
-                        cluster,
-                        policy,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        convergence_guard,
-                        scheduler_fn,
-                        epoch_fn,
-                        checkpoint_fn,
-                        eval_fn,
-                        eval_dataset,
-                    )
-                }
-                (ApplyPolicy::Sync, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_sync_cpu_via_coord(
-                        cluster,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        scheduler_fn,
-                        epoch_fn,
-                        checkpoint_fn,
-                        eval_fn,
-                        eval_dataset,
-                    )
-                }
-                (ApplyPolicy::Cadence, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_cadence_cpu_via_coord(
-                        cluster,
-                        ApplyPolicy::Cadence,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        convergence_guard,
-                        scheduler_fn,
-                        epoch_fn,
-                        checkpoint_fn,
-                        eval_fn,
-                        eval_dataset,
-                    )
-                }
-                (ApplyPolicy::Async, AverageBackend::Cpu) => {
-                    Self::run_cluster_rank_cadence_cpu_via_coord(
-                        cluster,
-                        ApplyPolicy::Async,
-                        model_factory,
-                        optim_factory,
-                        train_fn,
-                        dataset,
-                        batch_size,
-                        num_epochs,
-                        config,
-                        convergence_guard,
-                        scheduler_fn,
-                        epoch_fn,
-                        checkpoint_fn,
-                        eval_fn,
-                        eval_dataset,
-                    )
-                }
-            };
+        //
+        // Pre-rendezvous failures (envelope parse, GPU placement, NCCL
+        // init before coordinator handshake) are fatal at the rank-process
+        // level: the rank has no path to recovery because
+        // `ClusterCoordinator` only sees ranks that registered, and a
+        // `Result::Err` returned to the user binary risks being swallowed
+        // as a per-combo failure (e.g. ddp-bench's `run_combo` Err arm
+        // prints and continues). Peers blocked at NCCL init then hang the
+        // launcher. Exit non-zero from here instead so the launcher's
+        // `supervise_children` SIGTERMs survivors. Post-rendezvous
+        // failures stay under `ClusterCoordinator`'s `max_fail` policy
+        // (heartbeat staleness drops dead ranks; cohort continues if
+        // under threshold) and never reach this site.
+        //
+        // `LocalCluster::from_env` returns `Ok(None)` ONLY when
+        // `FLODL_CLUSTER_JSON` is unset, so any `Err` here unambiguously
+        // identifies a cluster-rank context with a fatal parse failure.
+        match crate::distributed::cluster::LocalCluster::from_env() {
+            Ok(Some(cluster)) => {
+                let dispatch_result: Result<Self> = match (policy, backend) {
+                    (ApplyPolicy::Sync, AverageBackend::Nccl) => {
+                        Self::run_cluster_rank_sync_nccl_via_coord(
+                            cluster,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            scheduler_fn,
+                            epoch_fn,
+                            checkpoint_fn,
+                            eval_fn,
+                            eval_dataset,
+                        )
+                    }
+                    (ApplyPolicy::Cadence, AverageBackend::Nccl)
+                    | (ApplyPolicy::Async, AverageBackend::Nccl) => {
+                        // Cadence and Async share the same NCCL algorithm:
+                        // overshoot is an async/CPU concept (no-op for NCCL).
+                        // `policy` is carried in `WorkerConfig` for the
+                        // worker's pre_sync_scratch / metadata branching.
+                        Self::run_cluster_rank_cadence_nccl_via_coord(
+                            cluster,
+                            policy,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            convergence_guard,
+                            scheduler_fn,
+                            epoch_fn,
+                            checkpoint_fn,
+                            eval_fn,
+                            eval_dataset,
+                        )
+                    }
+                    (ApplyPolicy::Sync, AverageBackend::Cpu) => {
+                        Self::run_cluster_rank_sync_cpu_via_coord(
+                            cluster,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            scheduler_fn,
+                            epoch_fn,
+                            checkpoint_fn,
+                            eval_fn,
+                            eval_dataset,
+                        )
+                    }
+                    (ApplyPolicy::Cadence, AverageBackend::Cpu) => {
+                        Self::run_cluster_rank_cadence_cpu_via_coord(
+                            cluster,
+                            ApplyPolicy::Cadence,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            convergence_guard,
+                            scheduler_fn,
+                            epoch_fn,
+                            checkpoint_fn,
+                            eval_fn,
+                            eval_dataset,
+                        )
+                    }
+                    (ApplyPolicy::Async, AverageBackend::Cpu) => {
+                        Self::run_cluster_rank_cadence_cpu_via_coord(
+                            cluster,
+                            ApplyPolicy::Async,
+                            model_factory,
+                            optim_factory,
+                            train_fn,
+                            dataset,
+                            batch_size,
+                            num_epochs,
+                            config,
+                            convergence_guard,
+                            scheduler_fn,
+                            epoch_fn,
+                            checkpoint_fn,
+                            eval_fn,
+                            eval_dataset,
+                        )
+                    }
+                };
+                return match dispatch_result {
+                    Ok(h) => Ok(h),
+                    Err(e) => {
+                        eprintln!(
+                            "flodl cluster rank: pre-rendezvous setup failed: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
+            Ok(None) => {
+                // Not a cluster rank (FLODL_CLUSTER_JSON unset). Fall
+                // through to the single-host path below.
+            }
+            Err(e) => {
+                eprintln!(
+                    "flodl cluster rank: envelope parse failed: {e}"
+                );
+                std::process::exit(1);
+            }
         }
 
         let devices = crate::tensor::usable_cuda_devices();
@@ -1449,6 +1487,21 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Wrap the rank's work in a fast-exit-on-Err guard. Any
+            // `Err` escaping the inner closure means the rank can't
+            // continue (pre-rendezvous bootstrap failure, NCCL init
+            // failure, mid-training CUDA error, etc.). Returning Err from
+            // this thread alone is futile: the user binary's run loop
+            // typically logs and continues, exiting status 0 — the
+            // launcher's child-supervision then sees no failure, and
+            // blocked peers hang forever.
+            //
+            // Process-exit non-zero so the launcher's supervisor
+            // SIGTERMs local peers; for remote ranks the coord's
+            // heartbeat-staleness detector drops them post-registration
+            // (`max_failure` applies) or the SSH client's broken
+            // connection propagates pre-registration.
+            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Pin this thread to the rank's assigned CUDA device BEFORE
             // NCCL init. `cudaSetDevice` is thread-local, so setting it
             // on `main()` doesn't propagate to spawned threads. Without
@@ -1566,6 +1619,14 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
+            })();
+            match worker_result {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         });
 
         Ok(DdpHandle {
@@ -1726,6 +1787,21 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Wrap the rank's work in a fast-exit-on-Err guard. Any
+            // `Err` escaping the inner closure means the rank can't
+            // continue (pre-rendezvous bootstrap failure, NCCL init
+            // failure, mid-training CUDA error, etc.). Returning Err from
+            // this thread alone is futile: the user binary's run loop
+            // typically logs and continues, exiting status 0 — the
+            // launcher's child-supervision then sees no failure, and
+            // blocked peers hang forever.
+            //
+            // Process-exit non-zero so the launcher's supervisor
+            // SIGTERMs local peers; for remote ranks the coord's
+            // heartbeat-staleness detector drops them post-registration
+            // (`max_failure` applies) or the SSH client's broken
+            // connection propagates pre-registration.
+            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Pin this thread to the rank's assigned CUDA device BEFORE
             // NCCL init (cudaSetDevice is thread-local; see the
             // Sync+Nccl entry above for the full rationale).
@@ -1827,6 +1903,14 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
+            })();
+            match worker_result {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         });
 
         Ok(DdpHandle {
@@ -1948,6 +2032,21 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Wrap the rank's work in a fast-exit-on-Err guard. Any
+            // `Err` escaping the inner closure means the rank can't
+            // continue (pre-rendezvous bootstrap failure, NCCL init
+            // failure, mid-training CUDA error, etc.). Returning Err from
+            // this thread alone is futile: the user binary's run loop
+            // typically logs and continues, exiting status 0 — the
+            // launcher's child-supervision then sees no failure, and
+            // blocked peers hang forever.
+            //
+            // Process-exit non-zero so the launcher's supervisor
+            // SIGTERMs local peers; for remote ranks the coord's
+            // heartbeat-staleness detector drops them post-registration
+            // (`max_failure` applies) or the SSH client's broken
+            // connection propagates pre-registration.
+            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Connect to the ClusterController for CPU averaging. Same
             // client serves initial broadcast and the per-cycle reduce
             // loop (controller's accept is one-shot).
@@ -2049,6 +2148,14 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
+            })();
+            match worker_result {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         });
 
         Ok(DdpHandle {
@@ -2189,6 +2296,21 @@ impl DdpHandle {
         let save_path_for_thread = save_path.clone();
 
         let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
+            // Wrap the rank's work in a fast-exit-on-Err guard. Any
+            // `Err` escaping the inner closure means the rank can't
+            // continue (pre-rendezvous bootstrap failure, NCCL init
+            // failure, mid-training CUDA error, etc.). Returning Err from
+            // this thread alone is futile: the user binary's run loop
+            // typically logs and continues, exiting status 0 — the
+            // launcher's child-supervision then sees no failure, and
+            // blocked peers hang forever.
+            //
+            // Process-exit non-zero so the launcher's supervisor
+            // SIGTERMs local peers; for remote ranks the coord's
+            // heartbeat-staleness detector drops them post-registration
+            // (`max_failure` applies) or the SSH client's broken
+            // connection propagates pre-registration.
+            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             let mut cpu_client = CpuReduceClient::connect(
                 controller_addr,
                 global_rank as u32,
@@ -2278,6 +2400,14 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
+            })();
+            match worker_result {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         });
 
         Ok(DdpHandle {
