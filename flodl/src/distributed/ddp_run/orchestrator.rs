@@ -1486,39 +1486,44 @@ impl DdpHandle {
         let max_grad_norm = config.max_grad_norm;
         let save_path_for_thread = save_path.clone();
 
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Wrap the rank's work in a fast-exit-on-Err guard. Any
-            // `Err` escaping the inner closure means the rank can't
-            // continue (pre-rendezvous bootstrap failure, NCCL init
-            // failure, mid-training CUDA error, etc.). Returning Err from
-            // this thread alone is futile: the user binary's run loop
-            // typically logs and continues, exiting status 0 — the
-            // launcher's child-supervision then sees no failure, and
-            // blocked peers hang forever.
-            //
-            // Process-exit non-zero so the launcher's supervisor
-            // SIGTERMs local peers; for remote ranks the coord's
-            // heartbeat-staleness detector drops them post-registration
-            // (`max_failure` applies) or the SSH client's broken
-            // connection propagates pre-registration.
-            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
-            // Pin this thread to the rank's assigned CUDA device BEFORE
-            // NCCL init. `cudaSetDevice` is thread-local, so setting it
-            // on `main()` doesn't propagate to spawned threads. Without
-            // this, every rank's NCCL thread defaults to CUDA(0) and
-            // NCCL aborts with "Duplicate GPU detected" on multi-rank-
-            // per-host topologies (single-host PPR or cluster fan-out
-            // with multiple ranks per host).
-            #[cfg(feature = "cuda")]
-            if let crate::tensor::Device::CUDA(idx) = device {
-                crate::tensor::set_current_cuda_device(idx);
-            }
-            // NCCL rendezvous on the original master_port (unchanged
-            // from the non-via_coord path).
-            let rdv = cluster.rendezvous(dataset_sig)?;
-            let nccl_comm =
-                NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+        // Pin device + init NCCL on the rank process's main thread.
+        // `ncclCommInitRank` MUST run on a thread that already owns
+        // the CUDA context — calling it from a freshly spawned thread
+        // corrupts the CUDA context on heterogeneous GPUs. Matches
+        // the documented "NCCL init-on-main + split() pattern
+        // required" (CLAUDE.md) and the legacy `NcclComms::new+split`
+        // discipline at orchestrator.rs:765-777. The spawn closure
+        // below re-pins the device thread-locally and uses the comm
+        // moved in via closure capture.
+        #[cfg(feature = "cuda")]
+        if let crate::tensor::Device::CUDA(idx) = device {
+            crate::tensor::set_current_cuda_device(idx);
+        }
+        let rdv = cluster.rendezvous(dataset_sig)?;
+        let nccl_comm =
+            NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+        drop(rdv);
 
+        // Run the rank body synchronously on the rank process's main
+        // thread. Process-per-rank model: each rank is its own process
+        // with one GPU, so there's no in-process N-worker coordination
+        // — the legacy `std::thread::spawn` here was vestigial shape
+        // from the threaded Coordinator path. Keeping NCCL init AND
+        // collectives on the same thread also avoids the per-thread
+        // CUDA-context-inheritance issue observed with NCCL 2.27.5 +
+        // precompiled cu128 libtorch + sm_120 on Blackwell.
+        //
+        // Wrap in a fast-exit-on-Err guard: `Err` escaping here means
+        // the rank can't continue. Returning Err to the caller's
+        // run-loop risks being swallowed (e.g. ddp-bench's `run_combo`
+        // Err arm prints and continues — the launcher's child-
+        // supervision then sees exit status 0 and blocked peers hang
+        // forever). Process-exit non-zero so the launcher SIGTERMs
+        // local peers; for remote ranks the coord's heartbeat-
+        // staleness detector drops them post-registration
+        // (`max_failure` applies) or the SSH client's broken
+        // connection propagates pre-registration.
+        let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Build tmp model, broadcast initial state, pin to CPU
             // (GpuWorker::new re-creates the model and copies params
             // back to GPU on the worker thread).
@@ -1619,23 +1624,22 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
-            })();
-            match worker_result {
-                Ok(state) => Ok(state),
-                Err(e) => {
-                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
-                    std::process::exit(1);
-                }
+        })();
+        let final_state = match worker_result {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("flodl cluster rank: rank failed: {e}");
+                std::process::exit(1);
             }
-        });
+        };
 
         Ok(DdpHandle {
             worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
+            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(false)),
             nccl_abort_handles: Vec::new(),
-            final_state: None,
+            final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,
             architecture_svg: None,
@@ -1786,33 +1790,26 @@ impl DdpHandle {
         let easgd_alpha = config.easgd_alpha;
         let save_path_for_thread = save_path.clone();
 
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Wrap the rank's work in a fast-exit-on-Err guard. Any
-            // `Err` escaping the inner closure means the rank can't
-            // continue (pre-rendezvous bootstrap failure, NCCL init
-            // failure, mid-training CUDA error, etc.). Returning Err from
-            // this thread alone is futile: the user binary's run loop
-            // typically logs and continues, exiting status 0 — the
-            // launcher's child-supervision then sees no failure, and
-            // blocked peers hang forever.
-            //
-            // Process-exit non-zero so the launcher's supervisor
-            // SIGTERMs local peers; for remote ranks the coord's
-            // heartbeat-staleness detector drops them post-registration
-            // (`max_failure` applies) or the SSH client's broken
-            // connection propagates pre-registration.
-            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
-            // Pin this thread to the rank's assigned CUDA device BEFORE
-            // NCCL init (cudaSetDevice is thread-local; see the
-            // Sync+Nccl entry above for the full rationale).
-            #[cfg(feature = "cuda")]
-            if let crate::tensor::Device::CUDA(idx) = device {
-                crate::tensor::set_current_cuda_device(idx);
-            }
-            let rdv = cluster.rendezvous(dataset_sig)?;
-            let nccl_comm =
-                NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+        // Pin device + init NCCL on the rank process's main thread.
+        // See `run_cluster_rank_sync_nccl_via_coord` above for the
+        // full rationale (NCCL init-on-main + split() pattern; spawn
+        // closure re-pins device thread-locally and uses moved-in
+        // comm; CUDA module warm-up before NCCL init for sm_120
+        // precompiled-cu128 stacks).
+        #[cfg(feature = "cuda")]
+        if let crate::tensor::Device::CUDA(idx) = device {
+            crate::tensor::set_current_cuda_device(idx);
+        }
+        let rdv = cluster.rendezvous(dataset_sig)?;
+        let nccl_comm =
+            NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
+        drop(rdv);
 
+        // Run synchronously on rank's main thread. See
+        // `run_cluster_rank_sync_nccl_via_coord` for the full rationale
+        // (process-per-rank model: no in-rank workers to coordinate,
+        // legacy spawn was vestigial).
+        let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Build tmp model, broadcast initial state, pin to CPU.
             // GpuWorker::new re-creates the model + copies params back to
             // GPU on the worker thread.
@@ -1903,23 +1900,22 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
-            })();
-            match worker_result {
-                Ok(state) => Ok(state),
-                Err(e) => {
-                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
-                    std::process::exit(1);
-                }
+        })();
+        let final_state = match worker_result {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("flodl cluster rank: rank failed: {e}");
+                std::process::exit(1);
             }
-        });
+        };
 
         Ok(DdpHandle {
             worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
+            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(false)),
             nccl_abort_handles: Vec::new(),
-            final_state: None,
+            final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,
             architecture_svg: None,
@@ -2031,22 +2027,11 @@ impl DdpHandle {
         let max_grad_norm = config.max_grad_norm;
         let save_path_for_thread = save_path.clone();
 
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Wrap the rank's work in a fast-exit-on-Err guard. Any
-            // `Err` escaping the inner closure means the rank can't
-            // continue (pre-rendezvous bootstrap failure, NCCL init
-            // failure, mid-training CUDA error, etc.). Returning Err from
-            // this thread alone is futile: the user binary's run loop
-            // typically logs and continues, exiting status 0 — the
-            // launcher's child-supervision then sees no failure, and
-            // blocked peers hang forever.
-            //
-            // Process-exit non-zero so the launcher's supervisor
-            // SIGTERMs local peers; for remote ranks the coord's
-            // heartbeat-staleness detector drops them post-registration
-            // (`max_failure` applies) or the SSH client's broken
-            // connection propagates pre-registration.
-            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
+        // Run synchronously on rank's main thread. See
+        // `run_cluster_rank_sync_nccl_via_coord` for the full rationale
+        // (process-per-rank model, no in-rank coordination, legacy
+        // spawn was vestigial).
+        let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             // Connect to the ClusterController for CPU averaging. Same
             // client serves initial broadcast and the per-cycle reduce
             // loop (controller's accept is one-shot).
@@ -2148,23 +2133,22 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
-            })();
-            match worker_result {
-                Ok(state) => Ok(state),
-                Err(e) => {
-                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
-                    std::process::exit(1);
-                }
+        })();
+        let final_state = match worker_result {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("flodl cluster rank: rank failed: {e}");
+                std::process::exit(1);
             }
-        });
+        };
 
         Ok(DdpHandle {
             worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
+            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(false)),
             nccl_abort_handles: Vec::new(),
-            final_state: None,
+            final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,
             architecture_svg: None,
@@ -2295,22 +2279,9 @@ impl DdpHandle {
         let easgd_alpha = config.easgd_alpha;
         let save_path_for_thread = save_path.clone();
 
-        let coordinator_handle = std::thread::spawn(move || -> Result<TrainedState> {
-            // Wrap the rank's work in a fast-exit-on-Err guard. Any
-            // `Err` escaping the inner closure means the rank can't
-            // continue (pre-rendezvous bootstrap failure, NCCL init
-            // failure, mid-training CUDA error, etc.). Returning Err from
-            // this thread alone is futile: the user binary's run loop
-            // typically logs and continues, exiting status 0 — the
-            // launcher's child-supervision then sees no failure, and
-            // blocked peers hang forever.
-            //
-            // Process-exit non-zero so the launcher's supervisor
-            // SIGTERMs local peers; for remote ranks the coord's
-            // heartbeat-staleness detector drops them post-registration
-            // (`max_failure` applies) or the SSH client's broken
-            // connection propagates pre-registration.
-            let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
+        // Run synchronously on rank's main thread. See
+        // `run_cluster_rank_sync_nccl_via_coord` for the full rationale.
+        let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
             let mut cpu_client = CpuReduceClient::connect(
                 controller_addr,
                 global_rank as u32,
@@ -2400,23 +2371,22 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
-            })();
-            match worker_result {
-                Ok(state) => Ok(state),
-                Err(e) => {
-                    eprintln!("flodl cluster rank: worker-thread failed: {e}");
-                    std::process::exit(1);
-                }
+        })();
+        let final_state = match worker_result {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("flodl cluster rank: rank failed: {e}");
+                std::process::exit(1);
             }
-        });
+        };
 
         Ok(DdpHandle {
             worker_handles: Vec::new(),
-            coordinator_handle: Some(coordinator_handle),
+            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(false)),
             nccl_abort_handles: Vec::new(),
-            final_state: None,
+            final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,
             architecture_svg: None,
