@@ -22,7 +22,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     graphviz \
     openssh-client \
+    openssh-server \
     && rm -rf /var/lib/apt/lists/*
+
+# --- sshd setup for the `cuda-rank` compose service ---
+# Used only when the launcher dispatches into this container as a remote
+# host (treating the container as a VM-equivalent — own SSH endpoint,
+# fresh process tree, no fork+exec inheritance from a co-resident
+# launcher). The base `cuda` compose service is unaffected; only
+# `cuda-rank` boots sshd via its `command:`.
+#
+# Listen on 2222 (avoids clash with the host's sshd on 22 when
+# `network_mode: host`). Key auth only. Host keys live in a volume so
+# they persist across container restarts.
+RUN mkdir -p /var/run/sshd /home/ubuntu/.ssh \
+    && chown ubuntu:ubuntu /home/ubuntu/.ssh \
+    && chmod 700 /home/ubuntu/.ssh \
+    && sed -i 's/^#\?Port .*/Port 2222/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config \
+    && echo 'AllowUsers ubuntu' >> /etc/ssh/sshd_config \
+    && echo 'AcceptEnv FLODL_* FDL_ENV LD_LIBRARY_PATH' >> /etc/ssh/sshd_config
 
 # --- Rust ---
 ENV CARGO_HOME="/usr/local/cargo"
