@@ -1322,6 +1322,6 @@ fn topological_levels(
 
 
 #[cfg(test)]
-#[path = "graph_tests.rs"]
+#[path = "tests/mod.rs"]
 mod tests;
 
