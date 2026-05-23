@@ -1,11 +1,16 @@
-//! Tests for [`cluster_coordinator`]. Extracted to a sibling file via
-//! `#[path]` to keep the impl file navigable; the test module body
-//! has full access to private items via `use super::*` (the `mod tests`
-//! attribute lives back in cluster_coordinator.rs).
+//! Tests for [`super`]. Live in a sibling file (`tests.rs`) to keep the
+//! `mod.rs` navigable; the body uses `use super::*` to access private
+//! items defined in `mod.rs` and brings in the rest with explicit
+//! `use` statements below.
 
     use super::*;
-    use crate::distributed::wire::{MetricsMsgWire, TimingMsgWire};
-    use std::net::Ipv4Addr;
+    use crate::distributed::ddp_run::ApplyPolicy;
+    use crate::distributed::wire::{ControlMsgWire, MetricsMsgWire, TimingMsgWire};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+    use std::time::Duration;
 
     /// Deterministic non-zero test salt (mirrors controller.rs::tests).
     const TEST_SALT: SessionSalt = [
