@@ -115,12 +115,19 @@ pub fn is_recursive_invocation() -> bool {
 ///
 /// Returns `Err` if the cluster config is invalid or JSON serialization
 /// fails — surfaces the error before the user binary even starts.
+///
+/// On success returns a `Vec<String>` of non-fatal resolution warnings
+/// (one entry per host whose NSS lookup failed or yielded only loopback
+/// addresses). The cluster-dispatch site in `main.rs` is the one that
+/// chooses to print them. Tests that exercise this function for its
+/// env-setting behavior simply ignore the returned Vec.
 pub fn prepare_cluster_env(
     cluster: &ClusterConfig,
     overlay_env: Option<&str>,
     cmd: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     cluster.validate()?;
+    let mut warnings: Vec<String> = Vec::new();
     // Pre-resolve `master_addr` on the controller (where NSS knows
     // names declared in `/etc/hosts`, `libnss-libvirt`, mDNS, etc.)
     // and ship the resolved IP in the envelope to remote ranks. Remote
@@ -131,12 +138,17 @@ pub fn prepare_cluster_env(
     // original string and let the remote try its own NSS as a last
     // resort.
     let mut shippable = cluster.clone();
-    if let Some(ip) = resolve_host_to_ip(&shippable.master_addr) {
+    let (master_ip, master_warning) = resolve_host_to_ip(&shippable.master_addr);
+    if let Some(ip) = master_ip {
         shippable.master_addr = ip;
+    }
+    if let Some(w) = master_warning {
+        warnings.push(w);
     }
     let json = shippable.canonical_json()?;
     let hex = hex_encode(json.as_bytes());
-    let extra_hosts = resolve_cluster_extra_hosts(cluster);
+    let (extra_hosts, host_warnings) = resolve_cluster_extra_hosts(cluster);
+    warnings.extend(host_warnings);
 
     // SAFETY: main() has not spawned threads at this point in the
     // dispatch flow (mirrors gpus::apply_cuda_visible_devices's
@@ -154,30 +166,39 @@ pub fn prepare_cluster_env(
             }
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Resolve each cluster host's `name` to an IP via the controller's
 /// NSS (which on Linux includes static `/etc/hosts`, `libnss-libvirt`,
 /// `libnss-mdns`, and DNS — anything `getaddrinfo` knows about).
-/// Returns `Vec<"name:ip">` strings suitable for `--add-host`
-/// injection into `docker compose run`.
-///
-/// Hosts that fail to resolve are skipped with a stderr warning; the
-/// caller still gets the partial list (better-than-nothing semantics
-/// for the launcher inside the container).
-fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> Vec<String> {
-    cluster
-        .hosts
-        .iter()
-        .filter_map(|h| resolve_host_to_ip(&h.name).map(|ip| format!("{}:{ip}", h.name)))
-        .collect()
+/// Returns `(Vec<"name:ip">, Vec<warning>)`: the first list is suitable
+/// for `--add-host` injection into `docker compose run`; the second is
+/// human-readable warnings the cluster-dispatch site can surface to the
+/// user. Hosts that fail to resolve are skipped from the `name:ip`
+/// list (better-than-nothing semantics for the launcher inside the
+/// container — the unresolved host will retry via its own NSS).
+fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> (Vec<String>, Vec<String>) {
+    let mut hosts = Vec::new();
+    let mut warnings = Vec::new();
+    for h in &cluster.hosts {
+        let (ip, warning) = resolve_host_to_ip(&h.name);
+        if let Some(ip) = ip {
+            hosts.push(format!("{}:{ip}", h.name));
+        }
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+    }
+    (hosts, warnings)
 }
 
 /// Resolve a hostname to an IP string via `getaddrinfo`. Returns
-/// `None` (with a stderr warning) when resolution fails on the
-/// controller — caller decides whether to fall back to shipping the
-/// original string or hard-fail.
+/// `(Option<ip>, Option<warning>)` — both are independently optional so
+/// the caller can ship the resolved IP AND surface the warning, or
+/// either alone. The function itself is silent; warnings are returned
+/// for the cluster-dispatch site to emit (or ignore in non-dispatch
+/// contexts like unit tests that exercise the env-setting paths).
 ///
 /// Prefers a non-loopback address when `getaddrinfo` returns several
 /// candidates. Debian/Ubuntu install `/etc/hosts` with a
@@ -185,40 +206,38 @@ fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> Vec<String> {
 /// FIRST — that IP works for the local host but is unreachable from
 /// any peer (a libvirt VM, another rig). Skipping loopback in the
 /// iterator picks the bridge / LAN address remote ranks can actually
-/// dial. If ONLY loopback resolves, return it with a loud warning
+/// dial. If ONLY loopback resolves, return it WITH a warning string
 /// (likely misconfig — better to surface than to silently ship an
 /// unreachable IP).
-fn resolve_host_to_ip(host: &str) -> Option<String> {
+fn resolve_host_to_ip(host: &str) -> (Option<String>, Option<String>) {
     use std::net::ToSocketAddrs;
     // Already a numeric address? Skip the lookup, return as-is.
     if host.parse::<std::net::IpAddr>().is_ok() {
-        return Some(host.to_string());
+        return (Some(host.to_string()), None);
     }
     match (host, 0u16).to_socket_addrs() {
         Ok(iter) => {
             let (ip, only_loopback) = select_preferred_ip(iter.map(|sa| sa.ip()));
-            if only_loopback {
-                if let Some(ip) = &ip {
-                    eprintln!(
-                        "fdl: warning: host {host:?} only resolves to loopback \
-                         {ip} on the controller — remote ranks will fail to \
-                         connect. Set `master_addr` (or the host's `name`) in \
-                         fdl.cluster.yml to a non-loopback IP reachable from \
-                         peer nodes (e.g. the libvirt bridge IP 192.168.122.1 \
-                         for virbr0)."
-                    );
-                }
-            }
-            ip
+            let warning = match (&ip, only_loopback) {
+                (Some(ip), true) => Some(format!(
+                    "host {host:?} only resolves to loopback {ip} on the controller \
+                     — remote ranks will fail to connect. Set `master_addr` (or the \
+                     host's `name`) in fdl.cluster.yml to a non-loopback IP reachable \
+                     from peer nodes (e.g. the libvirt bridge IP 192.168.122.1 for \
+                     virbr0)."
+                )),
+                _ => None,
+            };
+            (ip, warning)
         }
-        Err(e) => {
-            eprintln!(
-                "fdl: warning: host {host:?} did not resolve on controller: {e} \
-                 (remote ranks will retry via their own NSS — fix host-side \
-                 resolution if they also fail)"
-            );
-            None
-        }
+        Err(e) => (
+            None,
+            Some(format!(
+                "host {host:?} did not resolve on controller: {e} (remote ranks \
+                 will retry via their own NSS — fix host-side resolution if they \
+                 also fail)"
+            )),
+        ),
     }
 }
 

@@ -1484,9 +1484,21 @@ fn dispatch_config(
         // and fans out via flodl::distributed::launcher. Fall through —
         // no early return. The launcher in the spawned subprocess owns
         // fan-out, log fan-in, ClusterController, exit propagation.
-        if let Err(e) = cluster::prepare_cluster_env(&cluster, env, cmd) {
-            cli_error!("{e}");
-            return ExitCode::FAILURE;
+        match cluster::prepare_cluster_env(&cluster, env, cmd) {
+            Ok(warnings) => {
+                // Emit at the cluster-dispatch site (this branch only
+                // runs when fdl really is fanning out via cluster mode).
+                // Unit tests of prepare_cluster_env never reach here, so
+                // their fixture hostnames stay silent without needing a
+                // cfg!(test) gate inside the resolver.
+                for w in warnings {
+                    eprintln!("fdl: warning: {w}");
+                }
+            }
+            Err(e) => {
+                cli_error!("{e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
