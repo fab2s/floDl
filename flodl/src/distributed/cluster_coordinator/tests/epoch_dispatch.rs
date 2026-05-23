@@ -36,9 +36,9 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
     );
 
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
-        // #28b: every rank receives a leading SetEpochCallbackRole
-        // before StartEpoch (coord broadcasts it once on first
-        // dispatch). Consume + verify, then expect StartEpoch.
+        // Every rank receives a leading SetEpochCallbackRole before
+        // StartEpoch (coord broadcasts it once on first dispatch).
+        // Consume + verify, then expect StartEpoch.
         let pre = ControlFrame::read_from(s, salt)?.unwrap();
         assert!(matches!(
             pre.decode::<ControlMsgWire>()?,

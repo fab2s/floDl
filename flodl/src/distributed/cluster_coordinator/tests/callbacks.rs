@@ -10,8 +10,7 @@ use super::*;
 // time exclusion, and role-failover on rank death. The coord is
 // the sole decider; the worker is a pure executor that reports
 // back via `TimingMsgWire::CheckpointResult` and never decides
-// policy locally. See `drawer_wing_rdl_decisions_8053ff4b...` for
-// the architectural principles these tests encode.
+// policy locally.
 // -----------------------------------------------------------------
 
 /// Pure unit test: `handle_checkpoint_result` subtracts the

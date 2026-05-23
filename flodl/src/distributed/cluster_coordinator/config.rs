@@ -167,7 +167,7 @@ pub struct ClusterCoordinatorConfig {
     /// [`EpochCallbackPolicy::Fastest`] makes the coord runtime-
     /// resolve the role from ElChe's per-rank smoothed throughput,
     /// with sticky retention across cadences and re-resolution only
-    /// on rank death. See `#28b` design notes.
+    /// on rank death.
     ///
     /// [`EpochCallbackPolicy::Rank(0)`]:
     ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank

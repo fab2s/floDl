@@ -188,8 +188,8 @@ impl<M: Module> GpuWorker<M> {
                 // coord; in threaded DDP the coord sends only to
                 // rank 0's channel — both paths converge on
                 // `target_rank == self.rank` being the only run gate).
-                // Worker never decides retry / abort — it reports
-                // and lets the coord decide (see `#29` design).
+                // Worker never decides retry / abort; it reports
+                // and lets the coord decide.
                 if target_rank != self.rank {
                     return Ok(false);
                 }
@@ -212,11 +212,10 @@ impl<M: Module> GpuWorker<M> {
             }
             ControlMsg::ExecuteEvalCallback { schedule_id, epoch, target_rank } => {
                 // Targeted: only the rank named by the coord runs.
-                // Mirrors the `Checkpoint` arm — worker never decides
-                // whether it is the evaluator. With #28b's all-Some
-                // cluster-mode policy, every rank has `eval_fn`
-                // available so coord-driven role rotation works
-                // without loud errors.
+                // Mirrors the `Checkpoint` arm; worker never decides
+                // whether it is the evaluator. Every rank has
+                // `eval_fn` available in cluster mode so coord-driven
+                // role rotation works without loud errors.
                 if target_rank != self.rank {
                     return Ok(false);
                 }

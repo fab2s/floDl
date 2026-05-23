@@ -111,9 +111,9 @@ fn fastest_re_resolve_on_role_rank_death() {
 }
 
 /// Pure unit test: under `Rank(n)` policy (the default), rank
-/// death does NOT trigger a Fastest re-resolve — the eval and
-/// epoch_callback roles stay pinned. (The legacy #29 checkpoint-
-/// role-only failover still applies for Rank policy; covered by
+/// death does NOT trigger a Fastest re-resolve; the eval and
+/// epoch_callback roles stay pinned. (The checkpoint-role-only
+/// failover still applies for Rank policy; covered by
 /// `checkpoint_role_failover_on_rank_death`.)
 #[test]
 fn rank_policy_skips_fastest_re_resolve() {

@@ -16,9 +16,9 @@
 //!    loop sees it and shuts down.
 //!
 //! The client works on `RoundFrame` directly (no flodl `Tensor` coupling
-//! at this layer). Trainer-side integration (4b.B.4) is responsible for
-//! converting between `Tensor` and `RoundFrame` — keeps this transport
-//! file focused on TCP + protocol.
+//! at this layer). Trainer-side integration converts between `Tensor`
+//! and `RoundFrame`, keeping this transport file focused on TCP +
+//! protocol.
 //!
 //! [`controller::ClusterController`]: crate::distributed::controller::ClusterController
 //! [`AverageBackend::Cpu`]: crate::distributed::AverageBackend::Cpu

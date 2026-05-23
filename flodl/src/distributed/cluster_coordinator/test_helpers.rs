@@ -253,7 +253,7 @@ impl ClusterCoordinator {
         self.check_dead_ranks();
     }
 
-    /// Test-only wrappers exposing #28b's private Fastest-resolution
+    /// Test-only wrappers exposing the private Fastest-resolution
     /// helpers to the test module. The role accessors mirror the
     /// `checkpoint_role` public accessor for the other two roles
     /// (intentionally test-only since the public API surfaces are

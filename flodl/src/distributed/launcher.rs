@@ -250,13 +250,6 @@ fn on_off(b: bool) -> &'static str {
 /// before this lift. Both produce identical child semantics (piped
 /// streams, `[host:rN]` line-prefix on stdout/stderr).
 ///
-/// **Not yet wired in production:** during the 4b transition, today's
-/// `flodl-cli/src/cluster.rs` still does its own N-child fan-out, so
-/// `dispatch()` never reaches launcher role in practice — the
-/// FLODL_LOCAL_RANK env var fdl-cli sets pushes role detection straight
-/// to `Rank`. 4b.C flips fdl-cli to spawn a single launcher child
-/// instead, at which point this function gets exercised end-to-end.
-///
 /// [`ClusterController`]: crate::distributed::controller::ClusterController
 /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
 pub fn run_launcher_with_config(
@@ -421,17 +414,14 @@ pub fn run_launcher_with_config(
     }
 
     // For remote hosts, fdl-cli must have passed the original fdl command
-    // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent;
-    // 4b.C is responsible for setting it.
+    // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent.
     let has_remote = full.workers.iter().any(|h| h.host != me);
     let fdl_cmd = if has_remote {
         Some(env::var(ENV_FDL_CMD).map_err(|_| {
             TensorError::new(&format!(
                 "cluster launcher: topology has remote hosts but {ENV_FDL_CMD} \
                  is not set in env. fdl-cli must export the fdl command name \
-                 (e.g. {ENV_FDL_CMD}=train) when invoking the launcher; this is \
-                 expected to land in 4b.C alongside the single-launcher-child \
-                 flip in flodl-cli/src/cluster.rs."
+                 (e.g. {ENV_FDL_CMD}=train) when invoking the launcher."
             ))
         })?)
     } else {
@@ -1032,8 +1022,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build the slim per-host envelope JSON the rank process consumes via
-/// [`LocalCluster::from_env`]. Mirrors the shape fdl-cli emits today; the
-/// duplication will go away once 4b.C completes.
+/// [`LocalCluster::from_env`].
 ///
 /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
 fn build_slim_envelope_for(full: &FullCluster, worker: &FullWorker) -> serde_json::Value {

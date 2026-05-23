@@ -124,12 +124,12 @@ impl ClusterCoordinator {
         if epoch > 0 {
             if let Some(every) = self.checkpoint_every {
                 if every > 0 && epoch % every == 0 {
-                    // Targeted dispatch (S4 in #29): the coord's
-                    // `checkpoint_role` is the sticky assignee; the
-                    // worker no-ops unless `target_rank == self.rank`.
-                    // Stays addressed to the SAME live rank across
-                    // checkpoints until that rank fails or dies, at
-                    // which point the controller fails over.
+                    // Targeted dispatch: the coord's `checkpoint_role`
+                    // is the sticky assignee; the worker no-ops unless
+                    // `target_rank == self.rank`. Stays addressed to
+                    // the SAME live rank across checkpoints until that
+                    // rank fails or dies, at which point the
+                    // controller fails over.
                     let target = self.checkpoint_role;
                     let msg = ControlMsgWire::Checkpoint {
                         version: epoch as u64,
@@ -140,8 +140,8 @@ impl ClusterCoordinator {
             }
             // Eval cadence: dispatch `ExecuteEvalCallback` to the
             // current `eval_role` when the boundary aligns with
-            // `eval_every_epochs`. Targeted (parallels #29's
-            // `Checkpoint` dispatch): the role is sticky across
+            // `eval_every_epochs`. Targeted (parallels the
+            // `Checkpoint` dispatch above): the role is sticky across
             // cadences, re-resolved only on rank death when policy
             // is `Fastest`.
             if let Some(every) = self.eval_every_epochs {

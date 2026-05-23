@@ -46,24 +46,25 @@ fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
 
 /// Decide whether this cluster-mode rank should receive a copy of the
 /// user-supplied per-epoch closures (`epoch_fn` / `checkpoint_fn` /
-/// `eval_fn`) at GpuWorker construction time. With #28b's controller-
-/// driven role assignment, the answer is **always `true` in cluster
-/// mode** — every rank holds the closure compiled in, and the
-/// coord's runtime-pushed role state (sticky `checkpoint_role`,
-/// `eval_role`, `epoch_callback_role` on `ClusterCoordinator`) gates
-/// actual execution per-message (`Checkpoint`/`ExecuteEvalCallback`
-/// carry `target_rank`; `epoch_fn` reads
-/// `GpuWorker::epoch_callback_role()` at each epoch transition).
+/// `eval_fn`) at GpuWorker construction time.
 ///
-/// This fixes a pre-existing latent bug surfaced by #29's checkpoint
-/// failover: if only `Rank(n)` had `Some(checkpoint_fn)` and the role
-/// rotated to a different rank (death or `CheckpointResult.error`),
-/// the new rank's worker would loud-error with "checkpoint dispatched
-/// to rank X but checkpoint_fn is None". All-Some makes coord-driven
+/// Under controller-driven role assignment the answer is **always
+/// `true` in cluster mode**: every rank holds the closure compiled
+/// in, and the coord's runtime-pushed role state (sticky
+/// `checkpoint_role`, `eval_role`, `epoch_callback_role` on
+/// `ClusterCoordinator`) gates actual execution per-message
+/// (`Checkpoint` / `ExecuteEvalCallback` carry `target_rank`;
+/// `epoch_fn` reads `GpuWorker::epoch_callback_role()` at each epoch
+/// transition).
+///
+/// Without all-Some, role rotation on rank death (or `Fastest`
+/// re-resolve) would land a `Checkpoint` / `ExecuteEvalCallback`
+/// frame on a worker whose `*_fn = None`, loud-erroring with
+/// "dispatched to rank X but fn is None". All-Some makes coord-driven
 /// rotation work as designed.
 ///
 /// Validates the policy itself loud-errors on out-of-bounds
-/// `Rank(n)`; `Fastest` is now fully supported.
+/// `Rank(n)`. `Fastest` is fully supported.
 fn rank_fires_callbacks(
     policy: EpochCallbackPolicy,
     _global_rank: usize,

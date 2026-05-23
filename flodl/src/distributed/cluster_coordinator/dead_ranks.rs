@@ -59,10 +59,10 @@ impl ClusterCoordinator {
                 // against the new live set + ElChe smoothed values.
                 match self.epoch_callback_policy {
                     crate::distributed::ddp_run::EpochCallbackPolicy::Rank(_) => {
-                        // Legacy #29 failover: if Rank(n) policy and
-                        // the dead rank happens to be the checkpoint
-                        // role, fall over to lowest live as a best-
-                        // effort. Eval/epoch roles stay pinned.
+                        // Checkpoint-role failover: if Rank(n) policy
+                        // and the dead rank happens to be the
+                        // checkpoint role, fall over to lowest live as
+                        // a best-effort. Eval/epoch roles stay pinned.
                         if r == self.checkpoint_role {
                             if let Some(next) =
                                 (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))

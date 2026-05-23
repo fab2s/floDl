@@ -810,14 +810,14 @@ impl<M: Module + 'static> ClusterWorker<M> {
             .take()
             .expect("inner GpuWorker present at run_until_shutdown");
 
-        // With #28b's controller-driven role assignment, every cluster
-        // worker can have `epoch_fn = Some(...)` regardless of policy
-        // — the runtime gate is `inner.epoch_callback_role() ==
-        // Some(inner.rank())`, set by the coord's wire-pushed
-        // `ControlMsg::SetEpochCallbackRole`. Workers without the role
-        // skip the fire; on `EpochCallbackPolicy::Fastest` re-resolve
-        // (e.g. after rank death), the coord broadcasts a fresh role
-        // and the worker picks it up before the next epoch boundary.
+        // Controller-driven role assignment: every cluster worker can
+        // have `epoch_fn = Some(...)` regardless of policy. The runtime
+        // gate is `inner.epoch_callback_role() == Some(inner.rank())`,
+        // set by the coord's wire-pushed `ControlMsg::SetEpochCallbackRole`.
+        // Workers without the role skip the fire; on
+        // `EpochCallbackPolicy::Fastest` re-resolve (e.g. after rank
+        // death), the coord broadcasts a fresh role and the worker
+        // picks it up before the next epoch boundary.
         // Move epoch_fn out of `self` so the loop body can borrow it
         // without colliding with `self.bridges` teardown below.
         let epoch_fn = self.epoch_fn.take();
