@@ -450,6 +450,35 @@ pub fn run_launcher_with_config(
     // `fdl <cmd>` fallback (requires cargo on the remote).
     let prebuild_envelope = load_prebuild_envelope()?;
 
+    // Collect (host, abs_bin) for every remote host that has a prebuild
+    // envelope entry. Used for both pre-spawn cleanup (clear orphans
+    // from a previous botched session before ranks come up) and post-
+    // exit cleanup (catch any rank whose remote-side trap wrapper
+    // didn't fire). Legacy `fdl <cmd>` re-entry path has no
+    // well-defined process signature to pkill on, so it's excluded.
+    let remote_cleanup_targets: Vec<(FullWorker, String)> = full
+        .workers
+        .iter()
+        .filter(|h| h.host != me)
+        .filter_map(|h| {
+            prebuild_envelope.get(&h.host).map(|pb| {
+                let abs_bin = format!(
+                    "{}/{}",
+                    h.path.trim_end_matches('/'),
+                    pb.bin,
+                );
+                (h.clone(), abs_bin)
+            })
+        })
+        .collect();
+
+    // Pre-spawn cleanup: SIGTERM/SIGKILL any leftover instance of this
+    // run's binary on each remote host. Self-heals across sessions:
+    // a previous launcher that died hard (SIGKILL, OOM, kernel panic)
+    // can leave orphans the trap wrapper couldn't reap. This pass
+    // guarantees a fresh start regardless.
+    cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
+
     // Spawn one child per rank across every host.
     let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
         Vec::with_capacity(full.world_size());
@@ -564,6 +593,15 @@ pub fn run_launcher_with_config(
     // sequential `wait()` never even reached the dead peer's status to
     // react.
     let any_failure = supervise_children(children);
+
+    // Post-exit cleanup: belt-and-braces ssh-pkill on every remote host.
+    // The remote-side trap wrapper handles SIGHUP-on-disconnect, but
+    // that path waits for sshd's keepalive timeout (~30s) and only
+    // triggers if SIGHUP is actually delivered (varies by sshd config).
+    // This explicit pass fires immediately, so the user sees no leftover
+    // process on the remote when the launcher returns.
+    cleanup_remote_hosts_parallel(remote_cleanup_targets);
+
     // All children exited; signal ClusterController shutdown and join.
     if let Err(e) = cpu_averager.shutdown() {
         // Don't mask a child-failure error with a ClusterController shutdown
@@ -788,6 +826,54 @@ fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
     c
 }
 
+/// Best-effort SSH pkill of any leftover `abs_bin` process on `host`.
+///
+/// Fired twice per remote host:
+/// - **Pre-spawn**: clears orphans from a previous botched session before
+///   this run's ranks come up. Guarantees a fresh start.
+/// - **Post-exit**: belt-and-braces cleanup after the launcher's main
+///   supervise loop returns. Catches the case where the remote bash trap
+///   wrapper didn't fire (binary SIGKILL'd by itself, etc.).
+///
+/// Silent on failure: pkill returns 1 when nothing matches (the no-orphan
+/// case, expected on most calls), and we explicitly mask that with the
+/// trailing `true`. The remote bash trap wrapper is the additional
+/// backstop on connection-drop, so this helper failing is non-fatal.
+///
+/// Sends SIGTERM first, sleeps briefly to let cooperative shutdown run,
+/// then SIGKILL for anything that ignored SIGTERM (wedged in a syscall,
+/// etc.).
+fn cleanup_remote_host(host: &FullWorker, abs_bin: &str) {
+    let q = shell_quote(abs_bin);
+    let payload = format!(
+        "pkill -TERM -f {q} >/dev/null 2>&1; sleep 1; \
+         pkill -KILL -f {q} >/dev/null 2>&1; true",
+    );
+    let _ = build_ssh_spawn_command(host, &payload)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Fire [`cleanup_remote_host`] on every entry in parallel and join.
+///
+/// Sequential SSH would add ~1-2s of handshake per host. Parallel keeps
+/// the pre-spawn / post-exit cleanup near-constant in host count.
+fn cleanup_remote_hosts_parallel(remotes: Vec<(FullWorker, String)>) {
+    let handles: Vec<thread::JoinHandle<()>> = remotes
+        .into_iter()
+        .map(|(host, abs_bin)| {
+            thread::spawn(move || {
+                cleanup_remote_host(&host, &abs_bin);
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Build the bash command shipped via ssh to the remote.
 ///
 /// Single level of shell quoting: ssh delivers the string verbatim to
@@ -893,22 +979,37 @@ fn build_remote_bash_command(
         s.push_str(&shell_quote(env));
     }
     if let Some(pb) = prebuild {
-        // Direct binary exec — no cargo, no rustc, no fdl re-entry on
-        // the remote. `pb.bin` is relative to `host.path` (the project
+        // Direct binary launch (no cargo, no rustc, no fdl re-entry on
+        // the remote). `pb.bin` is relative to `host.path` (the project
         // root on the remote); we issued `cd <host.path>/<cwd_subpath>`
         // above, so use the absolute form to find the binary
         // independent of the current cwd offset.
-        s.push_str(" exec ");
+        s.push(' ');
         let abs_bin = format!("{}/{}", path.trim_end_matches('/'), pb.bin);
         s.push_str(&shell_quote(&abs_bin));
     } else {
-        s.push_str(" exec fdl ");
+        s.push_str(" fdl ");
         s.push_str(&shell_quote(fdl_cmd));
     }
     for a in user_args {
         s.push(' ');
         s.push_str(&shell_quote(a));
     }
+    // Trap wrapper: background the binary, set a signal trap that
+    // forwards SIGHUP/SIGTERM/SIGINT to the child, wait for it, and
+    // propagate the exit code. Replaces the previous bare `exec`,
+    // which left no shell on the remote to react to a connection
+    // drop, orphaning the binary on launcher death. With this
+    // wrapper, sshd's SIGHUP-on-disconnect (delivered within
+    // ServerAliveInterval * ServerAliveCountMax) reaches bash, which
+    // then signals the binary cleanly.
+    s.push_str(" &\n");
+    s.push_str("__flodl_pid=$!\n");
+    s.push_str(
+        "trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT\n",
+    );
+    s.push_str("wait \"$__flodl_pid\"\n");
+    s.push_str("exit $?\n");
     s
 }
 
@@ -1790,7 +1891,11 @@ mod tests {
         assert!(s.contains("FLODL_HOST_NAME='worker-host'"));
         assert!(s.contains("FLODL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
-        assert!(s.contains("exec fdl 'train' '--epochs' '10'"));
+        assert!(s.contains("fdl 'train' '--epochs' '10' &\n"));
+        assert!(s.contains("trap 'kill -TERM \"$__flodl_pid\"' HUP TERM INT") ||
+                s.contains("trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT"));
+        assert!(s.contains("wait \"$__flodl_pid\""));
+        assert!(s.ends_with("exit $?\n"));
     }
 
     #[test]
@@ -1817,17 +1922,31 @@ mod tests {
     }
 
     #[test]
-    fn build_remote_bash_command_uses_exec() {
-        // `exec` is load-bearing: it replaces the bash process so the
-        // remote returns fdl's exit code directly. Catching this
-        // explicitly so a future refactor doesn't silently drop it.
+    fn build_remote_bash_command_uses_trap_wrapper() {
+        // The trap wrapper is load-bearing: it keeps a bash process
+        // alive on the remote after launch so that a connection-drop
+        // SIGHUP from sshd reaches a shell that can signal the binary,
+        // instead of being lost to a bare `exec`'d binary that ignores
+        // SIGHUP. Without this, every cluster smoke leaves an orphan
+        // ddp-bench on the remote until manual pkill.
         let cluster_env = empty_env();
         let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv", "ff", "w", 0, None, "train", &[],
             &cluster_env, &host_env, None, None,
         );
-        assert!(s.contains(" exec fdl "), "missing `exec` prefix: {s}");
+        assert!(s.contains(" fdl "), "missing `fdl` invocation: {s}");
+        assert!(s.contains(" &\n"), "missing background `&`: {s}");
+        assert!(
+            s.contains("__flodl_pid=$!"),
+            "missing `__flodl_pid=$!`: {s}"
+        );
+        assert!(
+            s.contains("trap 'kill -TERM \"$__flodl_pid\""),
+            "missing trap line: {s}"
+        );
+        assert!(s.contains("wait \"$__flodl_pid\""), "missing wait: {s}");
+        assert!(s.ends_with("exit $?\n"), "missing exit prop: {s}");
     }
 
     #[test]
@@ -1849,9 +1968,10 @@ mod tests {
     #[test]
     fn build_remote_bash_command_uses_prebuild_binary_and_ld_path() {
         // When the prebuild envelope provides an entry for this host,
-        // the remote dispatch must (a) emit LD_LIBRARY_PATH, (b)
-        // exec the binary directly via `./<bin>`, (c) skip the `fdl`
-        // re-entry entirely.
+        // the remote dispatch must (a) emit LD_LIBRARY_PATH, (b) launch
+        // the binary directly via `<bin>` (no `fdl` re-entry), and (c)
+        // close with the trap wrapper so the binary can be cleaned up
+        // via SIGHUP on connection drop.
         let cluster_env = empty_env();
         let host_env = empty_env();
         let pb = PerHostPrebuild {
@@ -1881,17 +2001,18 @@ mod tests {
             "remote cwd must cd into <host.path>/<cwd_subpath>: {s}",
         );
         assert!(
-            s.contains(" exec '/srv/flodl/target/cluster/worker/release/ddp-bench'"),
+            s.contains(" '/srv/flodl/target/cluster/worker/release/ddp-bench'"),
             "binary path must be absolute (independent of cwd offset): {s}",
         );
         assert!(
-            !s.contains("exec fdl"),
+            !s.contains("fdl 'ddp-bench'"),
             "prebuild path must NOT re-enter fdl on remote: {s}",
         );
         assert!(
-            s.ends_with("'--mode' 'nccl-sync'"),
-            "user args must be appended: {s}",
+            s.contains("'--mode' 'nccl-sync' &\n"),
+            "user args must be appended ahead of the trap wrapper: {s}",
         );
+        assert!(s.ends_with("exit $?\n"), "trap wrapper must end the cmd: {s}");
     }
 
     #[test]
