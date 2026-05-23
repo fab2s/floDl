@@ -870,6 +870,120 @@ mod tests {
         );
     }
 
+    /// End-to-end: three ranks call `broadcast_from_root(root=0)` with
+    /// distinct local tensors. Every rank must receive rank 0's values.
+    ///
+    /// This is the bootstrap-time path used by cluster-rank entry points
+    /// to align initial parameter state before training. Regressing this
+    /// would let ranks start with divergent weights even when the user's
+    /// factory is non-deterministic — the exact "initial broadcast not
+    /// transferring root's params" failure mode flagged for B1.
+    #[test]
+    fn three_rank_broadcast_from_root_delivers_root_values() {
+        let avg = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            3,
+            TEST_SALT,
+        )
+        .unwrap();
+        let port = avg.port();
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+
+        let root_vals: [f32; 3] = [1.5, 2.5, 3.5];
+        let r1_vals: [f32; 3] = [10.0, 20.0, 30.0];
+        let r2_vals: [f32; 3] = [100.0, 200.0, 300.0];
+
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let t0 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 0, 3, TEST_SALT).unwrap();
+            let t = Tensor::from_f32(&root_vals, &[3], Device::CPU).unwrap();
+            let out = c.broadcast_from_root(&[&t], 0).unwrap();
+            tx0.send(out).unwrap();
+        });
+        let t1 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 1, 3, TEST_SALT).unwrap();
+            let t = Tensor::from_f32(&r1_vals, &[3], Device::CPU).unwrap();
+            let out = c.broadcast_from_root(&[&t], 0).unwrap();
+            tx1.send(out).unwrap();
+        });
+        let t2 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 2, 3, TEST_SALT).unwrap();
+            let t = Tensor::from_f32(&r2_vals, &[3], Device::CPU).unwrap();
+            let out = c.broadcast_from_root(&[&t], 0).unwrap();
+            tx2.send(out).unwrap();
+        });
+
+        let r0 = rx0.recv().unwrap();
+        let r1 = rx1.recv().unwrap();
+        let r2 = rx2.recv().unwrap();
+        t0.join().unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+        avg.shutdown().unwrap();
+
+        let expected = root_vals.to_vec();
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].to_f32_vec().unwrap(), expected, "rank 0 (root)");
+        assert_eq!(r1[0].to_f32_vec().unwrap(), expected, "rank 1");
+        assert_eq!(r2[0].to_f32_vec().unwrap(), expected, "rank 2");
+    }
+
+    /// Multi-tensor broadcast: a small "parameter list" of two tensors
+    /// with distinct shapes. Mirrors the orchestrator call site, which
+    /// passes the full `parameters()` Vec at once.
+    #[test]
+    fn broadcast_from_root_multi_tensor_distinct_shapes() {
+        let avg = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            2,
+            TEST_SALT,
+        )
+        .unwrap();
+        let port = avg.port();
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+
+        // Root tensors: a [2,3] "weight" and a [4] "bias".
+        let root_w: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let root_b: [f32; 4] = [-1.0, -2.0, -3.0, -4.0];
+        // Non-root sends garbage; broadcast must overwrite it.
+        let r1_w: [f32; 6] = [9.0; 6];
+        let r1_b: [f32; 4] = [9.0; 4];
+
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        let t0 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
+            let w = Tensor::from_f32(&root_w, &[2, 3], Device::CPU).unwrap();
+            let b = Tensor::from_f32(&root_b, &[4], Device::CPU).unwrap();
+            let out = c.broadcast_from_root(&[&w, &b], 0).unwrap();
+            tx0.send(out).unwrap();
+        });
+        let t1 = thread::spawn(move || {
+            let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
+            let w = Tensor::from_f32(&r1_w, &[2, 3], Device::CPU).unwrap();
+            let b = Tensor::from_f32(&r1_b, &[4], Device::CPU).unwrap();
+            let out = c.broadcast_from_root(&[&w, &b], 0).unwrap();
+            tx1.send(out).unwrap();
+        });
+
+        let r0 = rx0.recv().unwrap();
+        let r1 = rx1.recv().unwrap();
+        t0.join().unwrap();
+        t1.join().unwrap();
+        avg.shutdown().unwrap();
+
+        assert_eq!(r0.len(), 2);
+        assert_eq!(r1.len(), 2);
+        assert_eq!(r0[0].shape(), vec![2_i64, 3]);
+        assert_eq!(r0[1].shape(), vec![4_i64]);
+        assert_eq!(r0[0].to_f32_vec().unwrap(), root_w.to_vec());
+        assert_eq!(r0[1].to_f32_vec().unwrap(), root_b.to_vec());
+        assert_eq!(r1[0].to_f32_vec().unwrap(), root_w.to_vec());
+        assert_eq!(r1[1].to_f32_vec().unwrap(), root_b.to_vec());
+    }
+
     /// End-to-end: two ranks ship Tensor lists through ClusterController;
     /// receive averaged Tensor lists back.
     #[test]
