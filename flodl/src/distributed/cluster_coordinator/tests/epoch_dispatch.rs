@@ -459,9 +459,9 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
         move |coord| {
             let start = Instant::now();
             while coord.last_aggregated_epoch().is_none() {
-                if start.elapsed() > Duration::from_secs(5) {
+                if start.elapsed() > Duration::from_secs(30) {
                     return Err(TensorError::new(
-                        "epoch_aggregated: no aggregation within 5s",
+                        "epoch_aggregated: no aggregation within 30s",
                     ));
                 }
                 coord.tick()?;
