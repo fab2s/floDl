@@ -1,0 +1,162 @@
+//! Builder → [`ClusterCoordinatorConfig`] translation for cluster mode.
+//!
+//! The launcher trampoline (`DdpHandle::launch` on `Role::Launcher`)
+//! runs the user's `main()` up to `Trainer::builder(...).run()`. Inside
+//! `.run()`, the live builder state holds the controller-scope fields
+//! (policy / backend / convergence guard / resume_from / etc.) that the
+//! cluster coord needs at construction time. This helper threads those
+//! fields into a [`ClusterCoordinatorConfig`] that the launcher hands to
+//! [`crate::distributed::launcher::run_launcher_with_config`].
+//!
+//! [`ClusterCoordinatorConfig`]:
+//!     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
+
+use crate::distributed::ddp_run::{
+    convergence, ApplyPolicy, AverageBackend, DdpRunConfig, EvalResultFn, MetricsFn,
+};
+use crate::tensor::Result;
+
+/// Build a [`ClusterCoordinatorConfig`] from the user's
+/// builder-side controller-scope fields.
+///
+/// Mirrors the guard-construction precedence used by the legacy
+/// `run_cluster_rank_cadence_nccl` worker-side path: user-supplied
+/// [`ConvergenceGuard`] wins, otherwise [`NoGuard`] when
+/// `no_divergence_guard` is set, otherwise
+/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`].
+///
+/// [`ClusterCoordinatorConfig`]:
+///     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
+/// [`ConvergenceGuard`]: convergence::ConvergenceGuard
+/// [`NoGuard`]: convergence::NoGuard
+/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`]:
+///     convergence::TrendGuard::new
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_coord_config_from_builder(
+    policy: ApplyPolicy,
+    backend: AverageBackend,
+    config: &DdpRunConfig,
+    convergence_guard: Option<Box<dyn convergence::ConvergenceGuard>>,
+    metrics_fn: Option<MetricsFn>,
+    eval_result_fn: Option<EvalResultFn>,
+    world_size: usize,
+    total_samples: usize,
+    batch_size: usize,
+    num_epochs: usize,
+) -> Result<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig> {
+    use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
+    use crate::distributed::ddp::ElChe;
+
+    // Resume: read the meta sidecar before anything else so the saved
+    // ElChe / TrendGuard / trajectory state can feed the constructors
+    // below. Missing file or schema mismatch surfaces loudly here
+    // rather than partially seeding the controller.
+    let resume_meta: Option<crate::distributed::CheckpointMeta> = match config.resume_from {
+        Some(ref stem) => {
+            let path = crate::distributed::CheckpointBundle::meta_path(stem);
+            Some(crate::distributed::CheckpointMeta::read_from_file(&path)?)
+        }
+        None => None,
+    };
+
+    // ElChe construction: anchor (default 10 matches DdpRunConfig docs)
+    // plus optional max/min/overhead_target/max_batch_diff knobs.
+    let anchor = config.anchor.unwrap_or(10);
+    let mut el_che = ElChe::new(world_size, anchor);
+    if let Some(target) = config.overhead_target {
+        el_che = el_che.with_overhead_target(target);
+    }
+    if let Some(max) = config.max_anchor {
+        el_che = el_che.with_max_anchor(max);
+    }
+    if let Some(min) = config.min_anchor {
+        el_che = el_che.with_min_anchor(min);
+    }
+    if let Some(diff) = config.max_batch_diff {
+        el_che = el_che.with_max_batch_diff(diff);
+    }
+
+    let mut coord_config = ClusterCoordinatorConfig::new(
+        policy,
+        backend,
+        world_size,
+        el_che,
+    )
+    .total_samples(total_samples)
+    .batch_size(batch_size)
+    .num_epochs(num_epochs)
+    .elche_relax_up(config.elche_relax_up)
+    .meta_controller(config.meta_controller)
+    .partition_ratios(config.partition_ratios.clone());
+
+    // Guard precedence: user override > NoGuard (if flagged) >
+    // TrendGuard with user threshold or 0.05 default. On resume, the
+    // default-built TrendGuard absorbs the saved divergence ring
+    // buffer so the first 3 cycles after resume don't silently emit
+    // `Stable` regardless of live trajectory. User-supplied guards are
+    // passed through unchanged — the caller owns their guard's resume
+    // story.
+    let resume_trend_history: Option<Vec<f64>> = resume_meta
+        .as_ref()
+        .and_then(|m| m.elche_state.as_ref())
+        .and_then(|s| s.trend_history.clone());
+    let guard: Box<dyn convergence::ConvergenceGuard> = match convergence_guard {
+        Some(g) => g,
+        None => {
+            if config.no_divergence_guard {
+                Box::new(convergence::NoGuard)
+            } else {
+                let mut tg = convergence::TrendGuard::new(
+                    config.divergence_threshold.unwrap_or(0.05),
+                );
+                if let Some(history) = resume_trend_history {
+                    tg = tg.with_history(history);
+                }
+                Box::new(tg)
+            }
+        }
+    };
+    coord_config = coord_config.with_convergence_guard(guard);
+
+    if let Some(threshold) = config.max_failure {
+        coord_config = coord_config.max_failure(threshold);
+    }
+    if let Some(ref stem) = config.save_path {
+        coord_config = coord_config.save_path(stem.clone());
+    }
+    if let Some(secs) = config.heartbeat_timeout_secs {
+        coord_config = coord_config.heartbeat_timeout_secs(secs);
+    }
+    if let Some(every) = config.checkpoint_every {
+        coord_config = coord_config.checkpoint_every(every);
+    }
+    if let Some(f) = metrics_fn {
+        coord_config = coord_config.metrics_fn(f);
+    }
+    if let Some(every) = config.eval_every_epochs {
+        coord_config = coord_config.eval_every_epochs(every);
+    }
+    if let Some(f) = eval_result_fn {
+        coord_config = coord_config.eval_result_fn(f);
+    }
+    if let Some(enabled) = config.progressive_dispatch {
+        coord_config = coord_config.progressive(enabled);
+    }
+    // Thread the user's epoch_callback_policy through to the coord so
+    // the controller can resolve Fastest at runtime + push
+    // SetEpochCallbackRole to workers.
+    coord_config = coord_config.epoch_callback_policy(config.epoch_callback_policy);
+
+    // Resume trajectory: applies after every other field so the loaded
+    // meta cleanly overrides the fresh defaults
+    // (start_epoch/start_global_step/start_avg_count/start_elche_state).
+    // The `trend_history` inside elche_state has already been consumed
+    // above for the guard; we still hand the whole state to the coord
+    // so `ElChe::restore_from_state` can seed the ms_per_batch trust
+    // window.
+    if let Some(meta) = resume_meta {
+        coord_config = coord_config.resume_from_meta(&meta);
+    }
+
+    Ok(coord_config)
+}
