@@ -2060,9 +2060,19 @@ impl DdpHandle {
             if !initial_params_local.is_empty() {
                 let refs: Vec<&Tensor> = initial_params_local.iter().collect();
                 let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
-                for (dst, src) in initial_params_local.iter().zip(&broadcast) {
-                    dst.copy_(src, false)?;
-                }
+                // copy_ into the parameter's underlying tensor (a leaf
+                // with requires_grad=True) must go through a no_grad
+                // guard. Without it, libtorch's autograd validates:
+                // "a leaf Variable that requires grad is being used in
+                // an in-place operation" and aborts. Mirrors PyTorch's
+                // `with torch.no_grad(): dst.copy_(src)` convention for
+                // bootstrap-time parameter sync.
+                crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+                    for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                        dst.copy_(src, false)?;
+                    }
+                    Ok(())
+                })?;
             }
 
             let initial_params: Vec<Tensor> = initial_params_local
@@ -2306,9 +2316,19 @@ impl DdpHandle {
             if !initial_params_local.is_empty() {
                 let refs: Vec<&Tensor> = initial_params_local.iter().collect();
                 let broadcast = cpu_client.broadcast_from_root(&refs, 0)?;
-                for (dst, src) in initial_params_local.iter().zip(&broadcast) {
-                    dst.copy_(src, false)?;
-                }
+                // copy_ into the parameter's underlying tensor (a leaf
+                // with requires_grad=True) must go through a no_grad
+                // guard. Without it, libtorch's autograd validates:
+                // "a leaf Variable that requires grad is being used in
+                // an in-place operation" and aborts. Mirrors PyTorch's
+                // `with torch.no_grad(): dst.copy_(src)` convention for
+                // bootstrap-time parameter sync.
+                crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+                    for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                        dst.copy_(src, false)?;
+                    }
+                    Ok(())
+                })?;
             }
 
             let initial_params: Vec<Tensor> = initial_params_local
