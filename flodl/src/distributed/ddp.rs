@@ -1017,7 +1017,7 @@ fn enable_cluster_el_che(
     // No explicit config: auto-enable only when the cluster spans hosts.
     // Single-host multi-process clusters skip El Che by default; users can
     // opt in via `Trainer::setup_with`.
-    if cluster.spans_multiple_hosts() {
+    if cluster.spans_multiple_workers() {
         model.set_cluster_el_che(ClusterElCheState::from_config(
             world_size,
             &DdpConfig::new(),

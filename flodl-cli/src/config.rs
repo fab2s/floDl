@@ -22,8 +22,8 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
     /// Multi-host cluster topology. When present, commands marked
-    /// `cluster: true` are dispatched across every host in
-    /// [`ClusterConfig::hosts`]. Lives at the project root because the
+    /// `cluster: true` are dispatched across every worker in
+    /// [`ClusterConfig::workers`]. Lives at the project root because the
     /// topology is shared across all sub-command fdl.yml files; the
     /// canonical author pattern is to put the cluster block in a
     /// `fdl.<env>.yml` overlay (e.g. `fdl.vm.yml`) that deep-merges over
@@ -493,44 +493,105 @@ pub struct OutputConfig {
 
 // ── Cluster topology (multi-host DDP) ───────────────────────────────────
 
-/// Multi-host cluster topology, parsed from the `cluster:` block at the
-/// project root. This is the controller-side full topology; per-host slim
+/// Default port for the controller's rendezvous bind. Overridable via
+/// `cluster.controller.port:` in fdl.cluster.yml.
+pub const DEFAULT_CONTROLLER_PORT: u16 = 1337;
+
+fn default_controller_port() -> u16 {
+    DEFAULT_CONTROLLER_PORT
+}
+
+/// Cluster topology, parsed from the `cluster:` block at the project
+/// root. Two role-separated sub-blocks:
+///
+/// - `controller`: the orchestrator host fdl-cli runs on. Holds the
+///   rendezvous bind point (`host`/`port`) plus the controller-local
+///   fields needed for pre-flight build and the ClusterController TCP
+///   listener. The controller is NOT a NCCL rank.
+/// - `workers`: every rank-carrying host. Each entry binds one or more
+///   global ranks and their CUDA device indices.
+///
+/// This is the controller-side full topology; per-worker slim
 /// envelopes are derived from it and shipped to each node, where the
 /// library reads them via `flodl::distributed::LocalCluster::from_env`.
 /// Launcher-only fields (`ssh:`) are not propagated to the envelope.
 ///
-/// The library re-validates after reading; this validation runs earlier so
-/// errors surface before `fdl-cli` opens any SSH connection.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// The library re-validates after reading; this validation runs earlier
+/// so errors surface before `fdl-cli` opens any SSH connection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClusterConfig {
-    pub master_addr: String,
-    pub master_port: u16,
-    pub hosts: Vec<ClusterHost>,
-    /// Controller's view of the shared project root. Used by the pre-
-    /// flight build phase to drive cargo invocations from the
-    /// controller's filesystem perspective; the remote-side path
-    /// (each host's [`ClusterHost::path`]) is used at runtime via SSH.
-    ///
-    /// On homogeneous-mount rigs the controller's view of the project
-    /// equals every other host's view (same mount path on every node),
-    /// so this field is unnecessary — when unset, fdl-cli falls back
-    /// to the controller host's own `path:` entry.
-    ///
-    /// On heterogeneous-mount rigs (different mount points per host),
-    /// set this explicitly so the pre-flight build cd's into the
-    /// right directory on the controller (e.g. exa:
-    /// `/home/me/src/.../rdl` while Pascal sees it as `/mnt/rdl`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller_path: Option<String>,
+    pub controller: ClusterController,
+    pub workers: Vec<ClusterWorker>,
     /// Cluster-scope env vars exported into every rank child on every
-    /// host. Mapping `NAME: VALUE` (string→string). Use for tuning the
-    /// launcher itself shouldn't hardcode — e.g. on the Pascal-under-
-    /// VFIO rig, set `NCCL_P2P_DISABLE: "1"` + `NCCL_SHM_DISABLE: "1"`
-    /// so NCCL falls back to socket transport (the direct-IPC
-    /// transports fail under VFIO on consumer Pascal). Host-scope
-    /// [`ClusterHost::env`] takes precedence for matching keys.
+    /// worker. Mapping `NAME: VALUE` (string→string). Use for tuning
+    /// the launcher itself shouldn't hardcode — e.g. on the Pascal-
+    /// under-VFIO rig, set `NCCL_P2P_DISABLE: "1"` +
+    /// `NCCL_SHM_DISABLE: "1"` so NCCL falls back to socket transport
+    /// (the direct-IPC transports fail under VFIO on consumer Pascal).
+    /// Worker-scope [`ClusterWorker::env`] takes precedence for matching
+    /// keys.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Controller-side cluster config. Holds the rendezvous bind point and
+/// pre-flight build context. The controller is the orchestrator host
+/// fdl-cli runs on; it is NOT a NCCL rank itself.
+///
+/// Rejected fields (validator-enforced): `ranks`, `local_devices`,
+/// `ssh*` (controller is local to fdl-cli), per-controller `env` (use
+/// cluster-scope `env:` instead).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterController {
+    /// Bind address. Used as the rendezvous endpoint workers dial.
+    /// What was `cluster.controller.host` in the pre-Refactor-2 schema.
+    pub host: String,
+    /// Bind port. What was `cluster.controller.port` in the pre-Refactor-2
+    /// schema. Defaults to [`DEFAULT_CONTROLLER_PORT`] when omitted.
+    #[serde(default = "default_controller_port")]
+    pub port: u16,
+    /// Controller's view of the shared project root. Used by the pre-
+    /// flight build phase to drive cargo invocations from the
+    /// controller's filesystem perspective; the remote-side path (each
+    /// worker's [`ClusterWorker::path`]) is used at runtime via SSH.
+    ///
+    /// On homogeneous-mount rigs the controller's view equals every
+    /// worker's view; on heterogeneous rigs (different mount points
+    /// per host), the controller's value diverges (e.g. exa:
+    /// `/home/me/src/.../rdl` while Pascal sees `/mnt/rdl`).
+    pub path: String,
+    /// Network interface NCCL binds to for the ClusterController TCP
+    /// listener (e.g. `virbr0`, `enp1s0`). Required when more than one
+    /// worker is declared (single-worker setups don't need a controller
+    /// bind beyond loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nccl_socket_ifname: Option<String>,
+    /// Docker compose service the controller runs the pre-flight build
+    /// inside (e.g. `cuda`, `dev`). Optional; affects build context
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<String>,
+    /// libtorch variant subpath under `<path>/libtorch/` for the
+    /// pre-flight build (e.g. `precompiled/cu128`,
+    /// `builds/sm61-sm120`). When unset, fdl-cli falls back to the
+    /// controller's project-root `.active` file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// Shared-storage path visible to the controller. flodl assumes a
+    /// shared filesystem reachable at the same logical path on every
+    /// node — training data, model checkpoints, and per-rank logs all
+    /// live here. When absent, the convention default
+    /// [`DEFAULT_DATA_PATH`] applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_path: Option<String>,
+}
+
+impl ClusterController {
+    /// Effective shared-data path: `data_path` if set, else
+    /// [`DEFAULT_DATA_PATH`].
+    pub fn effective_data_path(&self) -> &str {
+        self.data_path.as_deref().unwrap_or(DEFAULT_DATA_PATH)
+    }
 }
 
 /// CUDA device indices on a host. Either explicit (a list of indices) or
@@ -614,13 +675,16 @@ impl<'de> Deserialize<'de> for LocalDevices {
     }
 }
 
-/// One physical host in the cluster.
+/// One worker (a physical host running one or more NCCL ranks).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClusterHost {
-    /// Hostname as reported by `hostname` on the host (or
+pub struct ClusterWorker {
+    /// Hostname / identifier (was `name:` in the pre-Refactor-2 schema).
+    /// Used for /etc/hosts resolution, `--add-host` injection, and as
+    /// the default SSH target (override via `ssh:`). On the worker
+    /// itself, this is the value `hostname` returns (or the
     /// `FLODL_HOST_NAME`-overridden value).
-    pub name: String,
-    /// Global ranks owned by this host.
+    pub host: String,
+    /// Global ranks owned by this worker.
     pub ranks: Vec<usize>,
     /// CUDA device indices paired by position with `ranks`, or `"all"`
     /// shorthand for auto-detect at startup. See [`LocalDevices`] for
@@ -646,7 +710,7 @@ pub struct ClusterHost {
     /// Convention: the convention path
     /// `<host.path>/libtorch/<arch>` is what the rank exec reads at
     /// runtime; the controller-side build mirrors it via
-    /// `<cluster.controller_path or controller-host.path>/libtorch/<arch>`.
+    /// `<cluster.controller.path or controller-host.path>/libtorch/<arch>`.
     /// Both paths point at the same physical libtorch via the shared
     /// project-root mount.
     ///
@@ -717,12 +781,13 @@ pub struct ClusterHost {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
-/// Convention default for [`ClusterHost::data_path`] when the host
-/// does not declare one. Maps to the cross-node mount that holds
-/// training data + checkpoints + per-rank logs.
+/// Convention default for [`ClusterWorker::data_path`] /
+/// [`ClusterController::data_path`] when the entry does not declare
+/// one. Maps to the cross-node mount that holds training data +
+/// checkpoints + per-rank logs.
 pub const DEFAULT_DATA_PATH: &str = "/flodl/data";
 
-impl ClusterHost {
+impl ClusterWorker {
     /// Effective shared-data path: `data_path` if set, else
     /// [`DEFAULT_DATA_PATH`].
     pub fn effective_data_path(&self) -> &str {
@@ -733,79 +798,104 @@ impl ClusterHost {
 impl ClusterConfig {
     /// Total ranks across the cluster.
     pub fn world_size(&self) -> usize {
-        self.hosts.iter().map(|h| h.ranks.len()).sum()
+        self.workers.iter().map(|w| w.ranks.len()).sum()
     }
 
-    /// Whether the cluster spans more than one physical host. Single-host
-    /// clusters don't require `NCCL_SOCKET_IFNAME`.
+    /// Whether the cluster spans more than one physical worker.
+    /// Single-worker clusters don't require `NCCL_SOCKET_IFNAME`.
     pub fn spans_multiple_hosts(&self) -> bool {
-        self.hosts.len() > 1
+        self.workers.len() > 1
     }
 
-    /// Pre-flight validation. Mirrors the library check so failures surface
-    /// before SSH dispatch instead of from a stack trace on a remote host:
+    /// Pre-flight validation. Mirrors the library check so failures
+    /// surface before SSH dispatch instead of from a stack trace on a
+    /// remote host:
     ///
-    /// - `master_addr` non-empty
-    /// - at least one host
-    /// - per host: `ranks` non-empty, equal length to `local_devices`,
-    ///   `nccl_socket_ifname` non-empty (when cluster spans multiple hosts),
-    ///   `path` non-empty
-    /// - across hosts: ranks form exactly `0..world_size` with no duplicates
-    ///   or gaps
+    /// - `controller.host` non-empty, `controller.path` non-empty
+    /// - `controller.nccl_socket_ifname` non-empty when more than one
+    ///   worker is declared
+    /// - `workers` non-empty
+    /// - per worker: `host` non-empty, `ranks` non-empty and equal
+    ///   length to `local_devices`, `nccl_socket_ifname` non-empty
+    ///   (when cluster spans multiple workers), `path` non-empty
+    /// - across workers: ranks form exactly `0..world_size` with no
+    ///   duplicates or gaps
     pub fn validate(&self) -> Result<(), String> {
-        if self.master_addr.trim().is_empty() {
-            return Err("cluster.master_addr must be non-empty".into());
+        if self.controller.host.trim().is_empty() {
+            return Err("cluster.controller.host must be non-empty".into());
         }
-        if self.hosts.is_empty() {
-            return Err("cluster.hosts must be non-empty".into());
+        if self.controller.path.trim().is_empty() {
+            return Err("cluster.controller.path must be non-empty".into());
+        }
+        if self.workers.is_empty() {
+            return Err("cluster.workers must be non-empty".into());
         }
         let multi_host = self.spans_multiple_hosts();
-        for (i, h) in self.hosts.iter().enumerate() {
-            if h.name.trim().is_empty() {
-                return Err(format!("cluster.hosts[{i}].name must be non-empty"));
+        if multi_host
+            && self
+                .controller
+                .nccl_socket_ifname
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            return Err(
+                "cluster.controller.nccl_socket_ifname must be non-empty when \
+                 more than one worker is declared"
+                    .into(),
+            );
+        }
+        for (i, w) in self.workers.iter().enumerate() {
+            if w.host.trim().is_empty() {
+                return Err(format!("cluster.workers[{i}].host must be non-empty"));
             }
-            // Empty ranks: orchestrator-only host entry (see launcher.rs's
-            // matching relaxation). Declared so fdl-cli pre-flight reads
-            // its `docker:` / `arch:` for build context without making
-            // the host a NCCL participant.
-            if let Some(devs) = h.local_devices.as_explicit() {
-                if !h.ranks.is_empty() && h.ranks.len() != devs.len() {
+            if w.ranks.is_empty() {
+                return Err(format!(
+                    "cluster.workers[{i}] ({:?}): ranks must be non-empty \
+                     (a worker entry without ranks is a controller — declare \
+                     it under `controller:` instead)",
+                    w.host
+                ));
+            }
+            if let Some(devs) = w.local_devices.as_explicit() {
+                if w.ranks.len() != devs.len() {
                     return Err(format!(
-                        "cluster.hosts[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
-                        h.name,
-                        h.ranks.len(),
+                        "cluster.workers[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
+                        w.host,
+                        w.ranks.len(),
                         devs.len()
                     ));
                 }
             }
-            // `LocalDevices::All` defers the count check to startup on the
-            // target host (where `cuda_device_count()` is queried).
-            if multi_host && h.nccl_socket_ifname.trim().is_empty() {
+            // `LocalDevices::All` defers the count check to startup on
+            // the target host (where `cuda_device_count()` is queried).
+            if multi_host && w.nccl_socket_ifname.trim().is_empty() {
                 return Err(format!(
-                    "cluster.hosts[{i}] ({:?}): nccl_socket_ifname must be \
-                     non-empty when the cluster spans multiple hosts",
-                    h.name
+                    "cluster.workers[{i}] ({:?}): nccl_socket_ifname must be \
+                     non-empty when the cluster spans multiple workers",
+                    w.host
                 ));
             }
-            if h.path.trim().is_empty() {
+            if w.path.trim().is_empty() {
                 return Err(format!(
-                    "cluster.hosts[{i}] ({:?}): path (project checkout dir) \
+                    "cluster.workers[{i}] ({:?}): path (project checkout dir) \
                      must be non-empty",
-                    h.name
+                    w.host
                 ));
             }
         }
         let mut all: Vec<usize> = self
-            .hosts
+            .workers
             .iter()
-            .flat_map(|h| h.ranks.iter().copied())
+            .flat_map(|w| w.ranks.iter().copied())
             .collect();
         let ws = all.len();
         all.sort_unstable();
         let expected: Vec<usize> = (0..ws).collect();
         if all != expected {
             return Err(format!(
-                "cluster: ranks across hosts must be exactly 0..{ws} with no \
+                "cluster: ranks across workers must be exactly 0..{ws} with no \
                  duplicates or gaps, got sorted-unique sequence {all:?}"
             ));
         }
@@ -813,44 +903,45 @@ impl ClusterConfig {
     }
 
     /// Canonical JSON of the full topology. Used for debug-dumping the
-    /// controller-side view; per-host envelopes go through
+    /// controller-side view; per-worker envelopes go through
     /// [`Self::local_envelope_for`] instead.
     pub fn canonical_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self)
             .map_err(|e| format!("cluster: JSON serialization failed: {e}"))
     }
 
-    /// Build the slim per-host envelope the library reads via
+    /// Build the slim per-worker envelope the library reads via
     /// `flodl::distributed::LocalCluster::from_env`.
     ///
-    /// The envelope strips launcher-only fields (`ssh`), embeds derived
-    /// world metadata (`world_size`, `num_hosts`), and carries only the
-    /// requested host's slice. The launcher hex-encodes the resulting JSON
-    /// into `FLODL_CLUSTER_JSON` per ssh invocation, so each remote process
-    /// sees only itself + the master coordinates.
-    pub fn local_envelope_for(&self, host: &ClusterHost) -> Value {
-        let mut host_obj = serde_json::Map::new();
-        host_obj.insert("name".into(), Value::String(host.name.clone()));
-        host_obj.insert(
+    /// The envelope strips launcher-only fields (`ssh*`), embeds derived
+    /// world metadata (`world_size`, `num_workers`), and carries only
+    /// the requested worker's slice. The launcher hex-encodes the
+    /// resulting JSON into `FLODL_CLUSTER_JSON` per ssh invocation, so
+    /// each remote process sees only itself + the controller
+    /// coordinates.
+    pub fn local_envelope_for(&self, worker: &ClusterWorker) -> Value {
+        let mut worker_obj = serde_json::Map::new();
+        worker_obj.insert("host".into(), Value::String(worker.host.clone()));
+        worker_obj.insert(
             "ranks".into(),
-            Value::Array(host.ranks.iter().map(|r| Value::from(*r)).collect()),
+            Value::Array(worker.ranks.iter().map(|r| Value::from(*r)).collect()),
         );
-        host_obj.insert(
+        worker_obj.insert(
             "local_devices".into(),
-            match &host.local_devices {
+            match &worker.local_devices {
                 LocalDevices::All => Value::String("all".into()),
                 LocalDevices::Explicit(v) => {
                     Value::Array(v.iter().map(|d| Value::from(*d)).collect())
                 }
             },
         );
-        host_obj.insert(
+        worker_obj.insert(
             "nccl_socket_ifname".into(),
-            Value::String(host.nccl_socket_ifname.clone()),
+            Value::String(worker.nccl_socket_ifname.clone()),
         );
-        host_obj.insert("path".into(), Value::String(host.path.clone()));
-        if let Some(a) = &host.arch {
-            host_obj.insert("arch".into(), Value::String(a.clone()));
+        worker_obj.insert("path".into(), Value::String(worker.path.clone()));
+        if let Some(a) = &worker.arch {
+            worker_obj.insert("arch".into(), Value::String(a.clone()));
         }
         // SSH fields (port/user/identity_file/options) are launcher-only.
         // The slim per-rank envelope read by `LocalCluster::from_env`
@@ -861,27 +952,28 @@ impl ClusterConfig {
         // (declared or convention default) so the rank-side envelope
         // surfaces a non-ambiguous path. Library validates existence
         // via `fdl probe` before training; ship the path verbatim.
-        host_obj.insert(
+        worker_obj.insert(
             "data_path".into(),
-            Value::String(host.effective_data_path().into()),
+            Value::String(worker.effective_data_path().into()),
         );
 
+        let mut controller_obj = serde_json::Map::new();
+        controller_obj.insert("host".into(), Value::String(self.controller.host.clone()));
+        controller_obj.insert("port".into(), Value::from(self.controller.port));
+
         let mut envelope = serde_json::Map::new();
-        envelope.insert(
-            "master_addr".into(),
-            Value::String(self.master_addr.clone()),
-        );
-        envelope.insert("master_port".into(), Value::from(self.master_port));
+        envelope.insert("controller".into(), Value::Object(controller_obj));
         envelope.insert("world_size".into(), Value::from(self.world_size()));
-        envelope.insert("num_hosts".into(), Value::from(self.hosts.len()));
-        envelope.insert("host".into(), Value::Object(host_obj));
+        envelope.insert("num_workers".into(), Value::from(self.workers.len()));
+        envelope.insert("worker".into(), Value::Object(worker_obj));
         Value::Object(envelope)
     }
 
-    /// Look up the SSH target for a host, defaulting to `name` if `ssh:` is
-    /// not set. Used by the launcher; library callers don't need this.
-    pub fn ssh_target<'a>(&'a self, host: &'a ClusterHost) -> &'a str {
-        host.ssh.as_deref().unwrap_or(&host.name)
+    /// Look up the SSH target for a worker, defaulting to `host` if
+    /// `ssh:` is not set. Used by the launcher; library callers don't
+    /// need this.
+    pub fn ssh_target<'a>(&'a self, worker: &'a ClusterWorker) -> &'a str {
+        worker.ssh.as_deref().unwrap_or(&worker.host)
     }
 }
 
@@ -904,7 +996,7 @@ impl ClusterConfig {
 ///     .map(|spec| spec.cluster)
 ///     .collect();
 /// if cluster_dispatch_enabled(&project, &chain) {
-///     // fan out across project.cluster.hosts
+///     // fan out across project.cluster.workers
 /// }
 /// ```
 ///
@@ -2400,16 +2492,19 @@ mod tests {
     fn canonical_cluster_yaml() -> &'static str {
         "\
 cluster:
-  master_addr: 192.168.122.1
-  master_port: 29500
-  hosts:
-    - name: master-host
+  controller:
+    host: 192.168.122.1
+    port: 29500
+    path: /opt/flodl
+    nccl_socket_ifname: virbr0
+  workers:
+    - host: master-host
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: virbr0
       path: /opt/flodl
       arch: precompiled/cu128
-    - name: worker-host
+    - host: worker-host
       ssh: worker-host
       ranks: [1, 2]
       local_devices: [0, 1]
@@ -2431,14 +2526,14 @@ commands:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).expect("parse cluster overlay");
         let cluster = cfg.cluster.as_ref().expect("cluster: block present");
-        assert_eq!(cluster.master_addr, "192.168.122.1");
-        assert_eq!(cluster.master_port, 29500);
+        assert_eq!(cluster.controller.host, "192.168.122.1");
+        assert_eq!(cluster.controller.port, 29500);
         assert_eq!(cluster.world_size(), 3);
-        assert_eq!(cluster.hosts.len(), 2);
+        assert_eq!(cluster.workers.len(), 2);
         assert!(cluster.spans_multiple_hosts());
 
-        let worker = &cluster.hosts[1];
-        assert_eq!(worker.name, "worker-host");
+        let worker = &cluster.workers[1];
+        assert_eq!(worker.host, "worker-host");
         assert_eq!(worker.ranks, vec![1, 2]);
         assert_eq!(
             worker.local_devices,
@@ -2472,10 +2567,12 @@ commands:
         let base_yaml = "commands:\n  train:\n    run: cargo run --release\n";
         let overlay_yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/test-solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
@@ -2492,7 +2589,7 @@ commands:
             serde_yaml::from_str(&merged_yaml).expect("merged config parses");
         let cluster = cfg.cluster.as_ref().expect("cluster: from overlay");
         assert_eq!(cluster.world_size(), 1);
-        assert_eq!(cluster.hosts[0].name, "solo");
+        assert_eq!(cluster.workers[0].host, "solo");
         // Overlay added `cluster: true` to the train command; the base's
         // `run:` survived the merge.
         let train = cfg.commands.get("train").expect("train command");
@@ -2504,7 +2601,7 @@ commands:
     fn validate_rejects_duplicate_ranks() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[1].ranks = vec![1, 1];
+        cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![1, 1];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("duplicates or gaps"), "got: {err}");
     }
@@ -2513,7 +2610,7 @@ commands:
     fn validate_rejects_rank_gap() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[1].ranks = vec![2, 3];
+        cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![2, 3];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("duplicates or gaps"), "got: {err}");
     }
@@ -2522,7 +2619,7 @@ commands:
     fn validate_rejects_len_mismatch() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[1].local_devices =
+        cfg.cluster.as_mut().unwrap().workers[1].local_devices =
             LocalDevices::Explicit(vec![0]);
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("length mismatch"), "got: {err}");
@@ -2532,7 +2629,7 @@ commands:
     fn validate_rejects_empty_hosts() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts.clear();
+        cfg.cluster.as_mut().unwrap().workers.clear();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("non-empty"), "got: {err}");
     }
@@ -2541,17 +2638,17 @@ commands:
     fn validate_rejects_missing_socket_ifname_when_multi_host() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[0].nccl_socket_ifname = String::new();
+        cfg.cluster.as_mut().unwrap().workers[0].nccl_socket_ifname = String::new();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("nccl_socket_ifname"), "got: {err}");
-        assert!(err.contains("multiple hosts"), "got: {err}");
+        assert!(err.contains("multiple workers"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_empty_path() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
-        cfg.cluster.as_mut().unwrap().hosts[0].path = String::new();
+        cfg.cluster.as_mut().unwrap().workers[0].path = String::new();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("path"), "got: {err}");
         assert!(err.contains("master-host"), "got: {err}");
@@ -2563,10 +2660,12 @@ commands:
         // requirement doesn't apply.
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/test-solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: \"\"
@@ -2596,28 +2695,30 @@ cluster:
 
         // Round-trip: parsing back gives the same observable state.
         let parsed: ClusterConfig = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(parsed.master_addr, cluster.master_addr);
-        assert_eq!(parsed.master_port, cluster.master_port);
-        assert_eq!(parsed.hosts.len(), cluster.hosts.len());
+        assert_eq!(parsed.controller.host, cluster.controller.host);
+        assert_eq!(parsed.controller.port, cluster.controller.port);
+        assert_eq!(parsed.workers.len(), cluster.workers.len());
         assert_eq!(parsed.world_size(), cluster.world_size());
-        assert_eq!(parsed.hosts[1].ssh.as_deref(), Some("worker-host"));
+        assert_eq!(parsed.workers[1].ssh.as_deref(), Some("worker-host"));
     }
 
     #[test]
     fn local_devices_all_yaml_parses_as_marker() {
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0, 1]
       local_devices: all
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
-        let host = &cfg.cluster.unwrap().hosts[0];
+        let host = &cfg.cluster.unwrap().workers[0];
         assert_eq!(host.local_devices, LocalDevices::All);
         assert!(host.local_devices.is_all());
         assert!(host.local_devices.as_explicit().is_none());
@@ -2627,17 +2728,19 @@ cluster:
     fn local_devices_explicit_parses_as_explicit() {
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [3]
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
-        let host = &cfg.cluster.unwrap().hosts[0];
+        let host = &cfg.cluster.unwrap().workers[0];
         assert_eq!(host.local_devices, LocalDevices::Explicit(vec![3]));
         assert!(!host.local_devices.is_all());
         assert_eq!(host.local_devices.as_explicit(), Some(&[3u8][..]));
@@ -2651,10 +2754,12 @@ cluster:
         // 5 ranks + local_devices: all even though no explicit list exists.
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0, 1, 2, 3, 4]
       local_devices: all
       nccl_socket_ifname: lo
@@ -2672,10 +2777,12 @@ cluster:
     fn local_envelope_for_all_emits_all_string() {
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: all
       nccl_socket_ifname: lo
@@ -2683,18 +2790,20 @@ cluster:
 ";
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         let cluster = cfg.cluster.unwrap();
-        let env = cluster.local_envelope_for(&cluster.hosts[0]);
-        assert_eq!(env["host"]["local_devices"], serde_json::json!("all"));
+        let env = cluster.local_envelope_for(&cluster.workers[0]);
+        assert_eq!(env["worker"]["local_devices"], serde_json::json!("all"));
     }
 
     #[test]
     fn local_devices_all_round_trips_through_canonical_json() {
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: all
       nccl_socket_ifname: lo
@@ -2704,17 +2813,19 @@ cluster:
         let cluster = cfg.cluster.unwrap();
         let json = cluster.canonical_json().unwrap();
         let parsed: ClusterConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.hosts[0].local_devices, LocalDevices::All);
+        assert_eq!(parsed.workers[0].local_devices, LocalDevices::All);
     }
 
     #[test]
     fn local_devices_rejects_unknown_string() {
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: every
       nccl_socket_ifname: lo
@@ -2733,26 +2844,26 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
-        let worker = &cluster.hosts[1];
+        let worker = &cluster.workers[1];
         let env = cluster.local_envelope_for(worker);
 
-        // Top-level: master coords + world metadata.
-        assert_eq!(env["master_addr"], "192.168.122.1");
-        assert_eq!(env["master_port"], 29500);
+        // Top-level: controller coords + world metadata.
+        assert_eq!(env["controller"]["host"], "192.168.122.1");
+        assert_eq!(env["controller"]["port"], 29500);
         assert_eq!(env["world_size"], 3); // 1 + 2 ranks
-        assert_eq!(env["num_hosts"], 2);
+        assert_eq!(env["num_workers"], 2);
 
-        // Host slice: only this host's fields.
-        let h = &env["host"];
-        assert_eq!(h["name"], "worker-host");
-        assert_eq!(h["ranks"], serde_json::json!([1, 2]));
-        assert_eq!(h["local_devices"], serde_json::json!([0, 1]));
-        assert_eq!(h["nccl_socket_ifname"], "enp1s0");
-        assert_eq!(h["path"], "/srv/flodl");
-        assert_eq!(h["arch"], "builds/sm61-sm120");
+        // Worker slice: only this worker's fields.
+        let w = &env["worker"];
+        assert_eq!(w["host"], "worker-host");
+        assert_eq!(w["ranks"], serde_json::json!([1, 2]));
+        assert_eq!(w["local_devices"], serde_json::json!([0, 1]));
+        assert_eq!(w["nccl_socket_ifname"], "enp1s0");
+        assert_eq!(w["path"], "/srv/flodl");
+        assert_eq!(w["arch"], "builds/sm61-sm120");
 
         // ssh: stripped (launcher-only).
-        assert!(h.get("ssh").is_none(), "ssh must not appear in envelope");
+        assert!(w.get("ssh").is_none(), "ssh must not appear in envelope");
     }
 
     #[test]
@@ -2760,10 +2871,10 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let mut cluster = cfg.cluster.unwrap();
-        cluster.hosts[0].arch = None;
-        let env = cluster.local_envelope_for(&cluster.hosts[0]);
+        cluster.workers[0].arch = None;
+        let env = cluster.local_envelope_for(&cluster.workers[0]);
         assert!(
-            env["host"].get("arch").is_none(),
+            env["worker"].get("arch").is_none(),
             "arch should be omitted when None"
         );
     }
@@ -2773,12 +2884,12 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
-        let master = &cluster.hosts[0];
+        let master = &cluster.workers[0];
         let env = cluster.local_envelope_for(master);
-        let ranks = env["host"]["ranks"].as_array().unwrap();
+        let ranks = env["worker"]["ranks"].as_array().unwrap();
         assert!(
             ranks.iter().any(|r| r.as_u64() == Some(0)),
-            "master host's envelope must include rank 0"
+            "master worker's envelope must include rank 0"
         );
     }
 
@@ -2787,8 +2898,8 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
-        assert_eq!(cluster.ssh_target(&cluster.hosts[0]), "master-host"); // no ssh: → name
-        assert_eq!(cluster.ssh_target(&cluster.hosts[1]), "worker-host"); // explicit
+        assert_eq!(cluster.ssh_target(&cluster.workers[0]), "master-host"); // no ssh: → name
+        assert_eq!(cluster.ssh_target(&cluster.workers[1]), "worker-host"); // explicit
     }
 
     // ── Path-inheritance cluster-dispatch resolver ──────────────────

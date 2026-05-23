@@ -1,9 +1,9 @@
 //! TCP rendezvous for multi-host DDP startup.
 //!
-//! One process per rank (process-per-rank topology). The process running
-//! global rank 0 is the **master**: it generates the [`NcclUniqueId`] and
-//! listens on
-//! [`LocalCluster::master_port`](super::LocalCluster::master_port). Every
+//! One process per rank (process-per-rank topology). The process
+//! running global rank 0 is the **master**: it generates the
+//! [`NcclUniqueId`] and listens on
+//! [`controller.port`](super::cluster::ControllerBlock::port). Every
 //! other rank is a **worker** that connects to the master, swaps a
 //! dataset signature for verification, and receives the unique ID.
 //!
@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::{Device, Result, TensorError};
 
-use super::{HostBlock, LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId};
+use super::{WorkerBlock, LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId};
 
 const HOSTNAME_MAX_LEN: usize = 255;
 const CONNECT_RETRIES: usize = 60;
@@ -90,7 +90,7 @@ impl TcpRendezvous {
     where
         F: FnOnce() -> Result<NcclUniqueId>,
     {
-        let this_host = cluster.this_host()?;
+        let this_host = cluster.this_worker()?;
         validate_socket_ifname(cluster, this_host)?;
 
         let local_ranks = this_host.ranks.clone();
@@ -112,7 +112,7 @@ impl TcpRendezvous {
             run_master(cluster, &bytes, &dataset_signature)?;
             bytes
         } else {
-            run_worker(cluster, &this_host.name, &dataset_signature)?
+            run_worker(cluster, &this_host.host, &dataset_signature)?
         };
 
         crate::msg!("cluster: {}", cluster_mapping(cluster));
@@ -143,7 +143,7 @@ fn run_master(
         return Ok(());
     }
 
-    let bind_addr = format!("{}:{}", cluster.master_addr, cluster.master_port);
+    let bind_addr = format!("{}:{}", cluster.controller.host, cluster.controller.port);
     let listener = TcpListener::bind(&bind_addr).map_err(|e| {
         TensorError::new(&format!(
             "rendezvous: failed to bind {bind_addr}: {e}"
@@ -196,7 +196,7 @@ fn run_worker(
         )));
     }
 
-    let addr = format!("{}:{}", cluster.master_addr, cluster.master_port);
+    let addr = format!("{}:{}", cluster.controller.host, cluster.controller.port);
     let mut stream = connect_with_retry(&addr)?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
@@ -264,8 +264,8 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream> {
     )))
 }
 
-fn validate_socket_ifname(cluster: &LocalCluster, this_host: &HostBlock) -> Result<()> {
-    if !cluster.spans_multiple_hosts() {
+fn validate_socket_ifname(cluster: &LocalCluster, this_host: &WorkerBlock) -> Result<()> {
+    if !cluster.spans_multiple_workers() {
         return Ok(());
     }
     if env::var(ENV_NCCL_SOCKET_IFNAME).is_ok() {
@@ -294,12 +294,12 @@ fn validate_socket_ifname(cluster: &LocalCluster, this_host: &HostBlock) -> Resu
 }
 
 fn cluster_mapping(cluster: &LocalCluster) -> String {
-    let h: &HostBlock = &cluster.host;
+    let h: &WorkerBlock = &cluster.worker;
     let parts: Vec<String> = h
         .ranks
         .iter()
         .zip(h.local_devices.iter())
-        .map(|(r, d)| format!("{}:{} -> r{}", h.name, d, r))
+        .map(|(r, d)| format!("{}:{} -> r{}", h.host, d, r))
         .collect();
     parts.join(", ")
 }
@@ -336,12 +336,11 @@ mod tests {
             other => panic!("unknown test host {other:?}"),
         };
         let v = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": port,
+            "controller": { "host": "127.0.0.1", "port": port },
             "world_size": 2,
-            "num_hosts": 2,
-            "host": {
-                "name": host_name,
+            "num_workers": 2,
+            "worker": {
+                "host": host_name,
                 "ranks": ranks,
                 "local_devices": devices,
                 "nccl_socket_ifname": "lo",
@@ -401,12 +400,15 @@ mod tests {
         // num_hosts = 1: single-host envelope does not require
         // NCCL_SOCKET_IFNAME. validate_socket_ifname should let it through.
         let v = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": next_port(),
+            "controller": { "host": "127.0.0.1", "port": next_port() },
+
             "world_size": 1,
-            "num_hosts": 1,
-            "host": {
-                "name": "solo", "ranks": [0], "local_devices": [0],
+
+            "num_workers": 1,
+
+            "worker": {
+
+                "host": "solo", "ranks": [0], "local_devices": [0],
                 "nccl_socket_ifname": "lo", "path": "/tmp/test-solo"
             }
         });
@@ -416,7 +418,7 @@ mod tests {
         unsafe {
             env::remove_var(ENV_NCCL_SOCKET_IFNAME);
         }
-        let this_host = c.host.clone();
+        let this_host = c.worker.clone();
         assert!(
             validate_socket_ifname(&c, &this_host).is_ok(),
             "single-host must not require ifname"
@@ -434,7 +436,7 @@ mod tests {
         // validate must auto-export so the user does not also have to set
         // the env var by hand. The yml field is the single source of truth.
         let cluster = envelope_for("master-host", next_port());
-        let this_host = cluster.host.clone();
+        let this_host = cluster.worker.clone();
         let _guard = ENV_MUTEX.lock().unwrap();
         let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
         unsafe {
@@ -460,17 +462,20 @@ mod tests {
         // non-empty check and end up with `nccl_socket_ifname: ""` on a
         // multi-host cluster. validate must still loud-fail in that case.
         let v = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": next_port(),
+            "controller": { "host": "127.0.0.1", "port": next_port() },
+
             "world_size": 2,
-            "num_hosts": 2,
-            "host": {
-                "name": "a", "ranks": [0], "local_devices": [0],
+
+            "num_workers": 2,
+
+            "worker": {
+
+                "host": "a", "ranks": [0], "local_devices": [0],
                 "nccl_socket_ifname": "", "path": "/tmp/test-a"
             }
         });
         let cluster = LocalCluster::from_value(&v).expect("parse");
-        let this_host = cluster.host.clone();
+        let this_host = cluster.worker.clone();
         let _guard = ENV_MUTEX.lock().unwrap();
         let prev_ifname = env::var(ENV_NCCL_SOCKET_IFNAME).ok();
         unsafe {
@@ -559,13 +564,15 @@ mod tests {
         // local-rank thread override.
         let envelope = || -> LocalCluster {
             let v = json!({
-                "master_addr": "127.0.0.1",
-                "master_port": port,
+                "controller": { "host": "127.0.0.1", "port": port },
+
                 "world_size": 2,
-                "num_hosts": 1,
-                "host": {
-                    "name": "single-host",
-                    "ranks": [0, 1],
+
+                "num_workers": 1,
+
+                "worker": {
+
+                    "host": "single-host", "ranks": [0, 1],
                     "local_devices": [0, 1],
                     "nccl_socket_ifname": "lo",
                     "path": "/tmp/test-single-host",
@@ -621,22 +628,28 @@ mod tests {
         // cluster_mapping now shows only THIS host's slice -- each node
         // logs its own ranks/devices banner, not a cross-cluster summary.
         let single_rank = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 29500,
+            "controller": { "host": "127.0.0.1", "port": 29500 },
+
             "world_size": 3,
-            "num_hosts": 2,
-            "host": {
-                "name": "node-a", "ranks": [0], "local_devices": [0],
+
+            "num_workers": 2,
+
+            "worker": {
+
+                "host": "node-a", "ranks": [0], "local_devices": [0],
                 "nccl_socket_ifname": "virbr0", "path": "/tmp/test-a"
             }
         });
         let multi_rank = json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 29500,
+            "controller": { "host": "127.0.0.1", "port": 29500 },
+
             "world_size": 3,
-            "num_hosts": 2,
-            "host": {
-                "name": "node-b", "ranks": [1, 2], "local_devices": [0, 1],
+
+            "num_workers": 2,
+
+            "worker": {
+
+                "host": "node-b", "ranks": [1, 2], "local_devices": [0, 1],
                 "nccl_socket_ifname": "enp1s0", "path": "/tmp/test-b"
             }
         });

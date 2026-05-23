@@ -37,12 +37,12 @@ pub mod wire;
 pub use checkpoint_meta::{
     CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, ElCheState, SaveReason,
 };
-pub use cluster::{HostBlock, LocalCluster};
+pub use cluster::{WorkerBlock, LocalCluster};
 pub use controller::{ClusterController, RoundFrame, TensorPayload, DTYPE_F32};
 pub use cpu_reduce::{
     AsyncCpuReduceClient, CpuReduceClient, round_frame_to_tensors, tensors_to_round_frame,
 };
-pub use launcher::{FullCluster, FullHost, Role};
+pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use cuda_stream::{CudaStream, StreamGuard};

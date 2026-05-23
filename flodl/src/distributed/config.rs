@@ -290,8 +290,8 @@ impl std::fmt::Debug for ElCheConfig {
 /// - Rank-scope knobs: `max_grad_norm`, checkpointing,
 ///   user callbacks, eval setup.
 ///
-/// Use [`TrainerConfig::new(dataset)`] to start with sensible defaults,
-/// or build via struct literal with `..Default::default()`.
+/// Use [`TrainerConfig::new`] to start with sensible defaults, or
+/// build via struct literal with `..Default::default()`.
 ///
 /// Generic over the model type `M` to keep user-supplied callbacks
 /// (`checkpoint_fn`, `epoch_fn`, `eval_fn`) statically typed.

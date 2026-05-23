@@ -340,7 +340,7 @@ fn resolve_libtorch_from_overlay(
     ).ok()?;
     let cluster = cfg.cluster?;
     let host_name = crate::cluster::resolve_local_hostname();
-    let entry = cluster.hosts.iter().find(|h| h.name == host_name)?;
+    let entry = cluster.workers.iter().find(|w| w.host == host_name)?;
     let arch = entry.arch.as_ref()?;
     let variant_dir = std::path::PathBuf::from(&entry.path)
         .join("libtorch")

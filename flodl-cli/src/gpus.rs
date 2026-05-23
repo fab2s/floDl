@@ -22,7 +22,10 @@
 use std::process::Command;
 
 use crate::cluster::resolve_local_hostname;
-use crate::config::{ClusterConfig, ClusterHost, LocalDevices};
+use crate::config::{
+    ClusterConfig, ClusterController, ClusterWorker, LocalDevices,
+    DEFAULT_CONTROLLER_PORT,
+};
 
 /// Parsed `--gpus` argument value.
 ///
@@ -138,30 +141,37 @@ pub fn count_visible_gpus_via_nvidia_smi() -> Result<usize, String> {
 /// block is in YAML. Returns a config with one host (this machine), N ranks
 /// (`0..devices.len()`), NCCL loopback transport (`lo`).
 ///
-/// `master_port` defaults to 29500, overridable via `FLODL_MASTER_PORT`.
-/// Concurrent `fdl` cluster commands on the same host must use distinct
-/// ports to avoid rendezvous collisions.
+/// `controller.port` defaults to [`DEFAULT_CONTROLLER_PORT`] (1337),
+/// overridable via `FLODL_MASTER_PORT`. Concurrent `fdl` cluster
+/// commands on the same host must use distinct ports to avoid
+/// rendezvous collisions.
 pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String> {
     if devices.is_empty() {
         return Err("synthesize_local_cluster: device list is empty".to_string());
     }
-    let name = resolve_local_hostname();
+    let hostname = resolve_local_hostname();
     let path = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| {
             format!("synthesize_local_cluster: cannot read current_dir: {e}")
         })?;
-    let master_port = std::env::var("FLODL_MASTER_PORT")
+    let port = std::env::var("FLODL_MASTER_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(29500);
+        .unwrap_or(DEFAULT_CONTROLLER_PORT);
 
     Ok(ClusterConfig {
-        master_addr: "127.0.0.1".to_string(),
-        master_port,
-        controller_path: None,
-        hosts: vec![ClusterHost {
-            name,
+        controller: ClusterController {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: path.clone(),
+            nccl_socket_ifname: None,
+            docker: None,
+            arch: None,
+            data_path: None,
+        },
+        workers: vec![ClusterWorker {
+            host: hostname,
             ranks: (0..devices.len()).collect(),
             local_devices: LocalDevices::Explicit(devices.to_vec()),
             nccl_socket_ifname: "lo".to_string(),
@@ -283,16 +293,16 @@ mod tests {
     fn synthesize_local_cluster_basic_shape() {
         // We don't control hostname/cwd here, so just assert structural invariants.
         let c = synthesize_local_cluster(&[0, 1]).unwrap();
-        assert_eq!(c.master_addr, "127.0.0.1");
-        assert_eq!(c.hosts.len(), 1);
-        let h = &c.hosts[0];
-        assert_eq!(h.ranks, vec![0, 1]);
-        assert_eq!(h.local_devices, LocalDevices::Explicit(vec![0, 1]));
-        assert_eq!(h.nccl_socket_ifname, "lo");
-        assert!(h.arch.is_none());
-        assert!(h.ssh.is_none());
-        assert!(!h.name.trim().is_empty(), "hostname must be non-empty");
-        assert!(!h.path.trim().is_empty(), "path must be non-empty");
+        assert_eq!(c.controller.host, "127.0.0.1");
+        assert_eq!(c.workers.len(), 1);
+        let w = &c.workers[0];
+        assert_eq!(w.ranks, vec![0, 1]);
+        assert_eq!(w.local_devices, LocalDevices::Explicit(vec![0, 1]));
+        assert_eq!(w.nccl_socket_ifname, "lo");
+        assert!(w.arch.is_none());
+        assert!(w.ssh.is_none());
+        assert!(!w.host.trim().is_empty(), "hostname must be non-empty");
+        assert!(!w.path.trim().is_empty(), "path must be non-empty");
     }
 
     #[test]
@@ -309,8 +319,8 @@ mod tests {
         // ranks=[0], devices=[0]). Caller decides whether to use it.
         let c = synthesize_local_cluster(&[2]).unwrap();
         c.validate().expect("single-device synthesized config validates");
-        assert_eq!(c.hosts[0].ranks, vec![0]);
-        assert_eq!(c.hosts[0].local_devices, LocalDevices::Explicit(vec![2]));
+        assert_eq!(c.workers[0].ranks, vec![0]);
+        assert_eq!(c.workers[0].local_devices, LocalDevices::Explicit(vec![2]));
     }
 
     #[test]
@@ -333,6 +343,6 @@ mod tests {
         unsafe {
             std::env::remove_var("FLODL_MASTER_PORT");
         }
-        assert_eq!(c.master_port, 31415);
+        assert_eq!(c.controller.port, 31415);
     }
 }

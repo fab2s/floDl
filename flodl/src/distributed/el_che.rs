@@ -180,7 +180,7 @@ pub struct ElChe {
     /// wall-time inside its compute slack instead of bloating the
     /// sync-barrier wait. Zero entries are no-ops.
     ///
-    /// Consumed in [`Self::recompute_batch_counts`]: rank `r`'s
+    /// Consumed in `recompute_batch_counts`: rank `r`'s
     /// computed target drops by `ceil(slack_ms[r] / smoothed_ms[r])`
     /// (clamped at 1) on the next recompute. The vector is zeroed in
     /// the same call so the effect lands exactly once per
@@ -559,7 +559,7 @@ impl ElChe {
     }
 
     /// Stage per-rank callback wall-time (ms) to absorb on the next
-    /// [`Self::recompute_batch_counts`] call. The coord sets this just
+    /// `recompute_batch_counts` call. The coord sets this just
     /// before the last sync cycle of an epoch that fires a user
     /// callback on a known rank, so the firing rank's quota for that
     /// cycle drops by `ceil(slack_ms / smoothed_ms_per_batch)` batches
@@ -578,7 +578,7 @@ impl ElChe {
     /// a safe fallback).
     ///
     /// The slack is consumed exactly once per
-    /// [`Self::recompute_batch_counts`] call: after the per-rank
+    /// `recompute_batch_counts` call: after the per-rank
     /// targets are computed with the slack subtracted, the pending
     /// vector is zeroed. The caller can re-set the vector before each
     /// recompute, or leave it zeroed for cycles where no callback

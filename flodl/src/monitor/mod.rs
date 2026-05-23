@@ -1072,12 +1072,11 @@ mod tests {
     #[test]
     fn is_primary_true_for_cluster_rank_zero() {
         let envelope = serde_json::json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 29500,
+            "controller": { "host": "127.0.0.1", "port": 29500 },
             "world_size": 1,
-            "num_hosts": 1,
-            "host": {
-                "name": "master",
+            "num_workers": 1,
+            "worker": {
+                "host": "master",
                 "ranks": [0],
                 "local_devices": [0],
                 "nccl_socket_ifname": "lo",
@@ -1116,12 +1115,11 @@ mod tests {
         // Worker host owns rank 1 only. Local-index 0 of this host
         // resolves to global rank 1 (per `LocalCluster::my_rank`).
         let envelope = serde_json::json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 29500,
+            "controller": { "host": "127.0.0.1", "port": 29500 },
             "world_size": 2,
-            "num_hosts": 2,
-            "host": {
-                "name": "worker",
+            "num_workers": 2,
+            "worker": {
+                "host": "worker",
                 "ranks": [1],
                 "local_devices": [0],
                 "nccl_socket_ifname": "lo",

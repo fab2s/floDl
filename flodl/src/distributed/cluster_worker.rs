@@ -1711,7 +1711,7 @@ mod tests {
                 return;
             }
         };
-        let total_ranks: usize = cluster.hosts.iter().map(|h| h.ranks.len()).sum();
+        let total_ranks: usize = cluster.workers.iter().map(|h| h.ranks.len()).sum();
         if total_ranks < 2 {
             eprintln!(
                 "end_to_end_sync_nccl_via_coord_smoke: NCCL needs 2+ ranks \
@@ -1896,7 +1896,7 @@ mod tests {
                 return;
             }
         };
-        let total_ranks: usize = cluster.hosts.iter().map(|h| h.ranks.len()).sum();
+        let total_ranks: usize = cluster.workers.iter().map(|h| h.ranks.len()).sum();
         if total_ranks < 2 {
             eprintln!(
                 "end_to_end_cadence_nccl_via_coord_smoke: NCCL needs 2+ ranks \

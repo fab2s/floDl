@@ -33,7 +33,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ClusterConfig, ClusterHost};
+use crate::config::{ClusterConfig, ClusterWorker};
 
 /// Env var carrying the per-host pre-flight build envelope (a JSON
 /// map) from fdl-cli's prebuild phase to flodl's launcher. The
@@ -42,7 +42,7 @@ use crate::config::{ClusterConfig, ClusterHost};
 /// present.
 ///
 /// Map shape: `{ "<host-name>": { "bin": "<relative path under
-/// host.path>", "ld_library_path": "<absolute LD_LIBRARY_PATH>" }, ...
+/// worker.path>", "ld_library_path": "<absolute LD_LIBRARY_PATH>" }, ...
 /// }`. Hosts absent from the map fall back to the launcher's existing
 /// `fdl <cmd>` re-entry on the remote.
 pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
@@ -72,48 +72,33 @@ pub fn prebuild_remotes(
     cmd_name: &str,
     controller_host: &str,
 ) -> Result<(), String> {
-    let remotes: Vec<&ClusterHost> = cluster
-        .hosts
+    // Workers whose `host` matches the controller's local hostname are
+    // skipped — they share the local cargo target dir via the
+    // controller's build, no remote step needed.
+    let remotes: Vec<&ClusterWorker> = cluster
+        .workers
         .iter()
-        .filter(|h| h.name != controller_host)
+        .filter(|w| w.host != controller_host)
         .collect();
     if remotes.is_empty() {
         return Ok(());
     }
 
     // Whether the controller runs builds inside Docker. Sourced from
-    // the controller's own `docker:` field in cluster.yml (if listed)
-    // or `None` when absent — native-Rust controllers (no docker
-    // installed) get the bare cargo invocation. Falls back to None
-    // when the controller isn't listed in cluster.hosts (e.g.
-    // orchestrator-only mode); the bare path is the safe default.
-    let controller_docker_svc: Option<String> = cluster
-        .hosts
-        .iter()
-        .find(|h| h.name == controller_host)
-        .and_then(|h| h.docker.clone());
+    // the `controller.docker:` field in cluster.yml; `None` when
+    // absent (native-Rust controllers get the bare cargo invocation).
+    let controller_docker_svc: Option<String> = cluster.controller.docker.clone();
 
     eprintln!(
-        "fdl: pre-flight build for {} remote host(s): {}",
+        "fdl: pre-flight build for {} remote worker(s): {}",
         remotes.len(),
-        remotes.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", "),
+        remotes.iter().map(|w| w.host.as_str()).collect::<Vec<_>>().join(", "),
     );
 
-    // Controller's view of the shared project root. Falls back to the
-    // controller host's own `path:` when `cluster.controller_path` is
-    // unset (homogeneous-mount rigs, the common case).
-    let controller_path: std::path::PathBuf = cluster
-        .controller_path
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            cluster
-                .hosts
-                .iter()
-                .find(|h| h.name == controller_host)
-                .map(|h| std::path::PathBuf::from(&h.path))
-        })
-        .unwrap_or_else(|| project_root.to_path_buf());
+    // Controller's view of the shared project root (required field
+    // per validator).
+    let controller_path: std::path::PathBuf =
+        std::path::PathBuf::from(&cluster.controller.path);
 
     let project_root = Arc::new(project_root.to_path_buf());
     let cmd_cwd = Arc::new(cmd_cwd.to_path_buf());
@@ -125,8 +110,8 @@ pub fn prebuild_remotes(
         Arc::new(Mutex::new(BTreeMap::new()));
 
     let mut handles = Vec::with_capacity(remotes.len());
-    for host in remotes {
-        let host = host.clone();
+    for worker in remotes {
+        let worker = worker.clone();
         let project_root = Arc::clone(&project_root);
         let cmd_cwd = Arc::clone(&cmd_cwd);
         let cmd_name = Arc::clone(&cmd_name);
@@ -135,18 +120,18 @@ pub fn prebuild_remotes(
         let errors = Arc::clone(&errors);
         let envelope = Arc::clone(&envelope);
         handles.push(thread::spawn(move || {
-            match prebuild_one_host(
+            match prebuild_one_worker(
                 &project_root, &cmd_cwd, &controller_path,
-                &host, &cmd_name,
+                &worker, &cmd_name,
                 controller_docker_svc.as_deref(),
             ) {
                 Ok(env_entry) => {
-                    eprintln!("fdl: pre-flight OK ({})", host.name);
-                    envelope.lock().unwrap().insert(host.name.clone(), env_entry);
+                    eprintln!("fdl: pre-flight OK ({})", worker.host);
+                    envelope.lock().unwrap().insert(worker.host.clone(), env_entry);
                 }
                 Err(e) => {
-                    eprintln!("fdl: pre-flight FAILED ({}): {}", host.name, e);
-                    errors.lock().unwrap().push(format!("{}: {}", host.name, e));
+                    eprintln!("fdl: pre-flight FAILED ({}): {}", worker.host, e);
+                    errors.lock().unwrap().push(format!("{}: {}", worker.host, e));
                 }
             }
         }));
@@ -190,27 +175,27 @@ pub fn prebuild_remotes(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PerHostEnvelope {
     /// Path to the compiled binary, relative to the host's project
-    /// checkout (`host.path`). e.g.
+    /// checkout (`worker.path`). e.g.
     /// `target/cluster/flodl-pascal/release/ddp-bench`.
     pub bin: String,
     /// Absolute path the launcher should set as `LD_LIBRARY_PATH` so
     /// the binary finds its libtorch at runtime. e.g.
     /// `/home/me/rdl/libtorch/builds/sm61-sm120/lib`. The launcher may
     /// append host-specific extras (e.g. `:/usr/local/lib` for bare-
-    /// metal libnccl) via `host.env: { LD_LIBRARY_PATH: ... }`.
+    /// metal libnccl) via `worker.env: { LD_LIBRARY_PATH: ... }`.
     pub ld_library_path: String,
     /// Subdirectory under the host's project checkout to `cd` into
     /// before exec — the relative offset of the command's filesystem
     /// cwd from `project_root`. Mirrors the cwd the controller-side
     /// build used (e.g. `ddp-bench` for `fdl ddp-bench`). Empty string
-    /// means execute from `host.path` directly. Relative-path defaults
+    /// means execute from `worker.path` directly. Relative-path defaults
     /// the binary expects (e.g. `--data-dir data`, `--output runs/`)
     /// only resolve correctly when the remote cwd matches.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cwd_subpath: String,
 }
 
-/// Build `cmd_name` for one host. Picks docker service + cargo
+/// Build `cmd_name` for one worker. Picks docker service + cargo
 /// features from the host's libtorch metadata. Returns a
 /// [`PerHostEnvelope`] describing where the resulting binary lives
 /// (so the launcher can substitute it on the remote-dispatch path)
@@ -218,25 +203,25 @@ pub struct PerHostEnvelope {
 ///
 /// `controller_path` is the controller's view of the shared project
 /// root. The libtorch convention says the variant lives at
-/// `<controller_path>/libtorch/<host.arch>` for the build (controller
-/// view) and `<host.path>/libtorch/<host.arch>` for the runtime
+/// `<controller_path>/libtorch/<worker.arch>` for the build (controller
+/// view) and `<worker.path>/libtorch/<worker.arch>` for the runtime
 /// (remote view). Both point at the same physical libtorch via the
 /// shared mount; the two paths differ only when controller and remote
 /// see the project at different filesystem locations.
-fn prebuild_one_host(
+fn prebuild_one_worker(
     project_root: &Path,
     cmd_cwd: &Path,
     controller_path: &Path,
-    host: &ClusterHost,
+    worker: &ClusterWorker,
     cmd_name: &str,
     controller_docker_svc: Option<&str>,
 ) -> Result<PerHostEnvelope, String> {
-    let arch = host.arch.as_ref().ok_or_else(|| {
+    let arch = worker.arch.as_ref().ok_or_else(|| {
         format!(
             "host {:?} has no `arch:` set in cluster.yml — \
              pre-flight build needs the libtorch variant subpath \
              (e.g. `arch: precompiled/cu128` or `arch: builds/sm61-sm120`)",
-            host.name,
+            worker.host,
         )
     })?;
     // Controller-side libtorch variant dir, resolved via convention.
@@ -246,7 +231,7 @@ fn prebuild_one_host(
             "host {:?}: controller-side libtorch at `{}` (resolved from \
              `<controller_path>/libtorch/<arch>`) does not look like a \
              valid libtorch install (missing `lib/`?)",
-            host.name,
+            worker.host,
             controller_variant_dir.display(),
         ));
     }
@@ -257,7 +242,7 @@ fn prebuild_one_host(
     // other basename (`cuNN`, `sm<NN>-sm<NN>`, etc.) is a GPU build.
     let (features_arg, feature_docker_svc) = features_and_service_from_arch(arch);
     let cuda_version_for_image = cuda_version_from_arch(arch);
-    let target_dir_relative = format!("target/cluster/{}", host.name);
+    let target_dir_relative = format!("target/cluster/{}", worker.host);
 
     // Two execution modes — docker-backed (controller has `docker:`
     // set in cluster.yml) or native cargo on the host filesystem.
@@ -374,10 +359,10 @@ fn prebuild_one_host(
     }
     // Runtime LD_LIBRARY_PATH uses the REMOTE-side view: the rank
     // exec's the binary on the remote, where libtorch is at
-    // `<host.path>/libtorch/<arch>/lib` per the convention.
+    // `<worker.path>/libtorch/<arch>/lib` per the convention.
     let runtime_lib = format!(
         "{path}/libtorch/{arch}/lib",
-        path = host.path.trim_end_matches('/'),
+        path = worker.path.trim_end_matches('/'),
     );
     let _ = host_path; // controller-side path used only for the build above
     // cwd_subpath: the cmd's filesystem cwd relative to project_root.

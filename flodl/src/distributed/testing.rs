@@ -30,11 +30,11 @@
 //!             return;
 //!         }
 //!     };
-//!     // ... use cluster.master_addr, cluster.master_port, cluster.hosts ...
+//!     // ... use cluster.controller.host, cluster.controller.port, cluster.hosts ...
 //! }
 //! ```
 
-use crate::distributed::launcher::{FullCluster, FullHost};
+use crate::distributed::launcher::{FullCluster, FullWorker};
 use crate::distributed::wire::SESSION_SALT_BYTES;
 
 /// Env var carrying the canonical-JSON cluster topology when `fdl-cli`
@@ -105,10 +105,17 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
     let ranks: Vec<usize> = (0..n_gpus).collect();
     let local_devices: Vec<u8> = (0..n_gpus as u8).collect();
     FullCluster {
-        master_addr: "127.0.0.1".to_string(),
-        master_port: 0,
-        hosts: vec![FullHost {
-            name: "localhost".to_string(),
+        controller: super::launcher::FullController {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            path: String::new(),
+            nccl_socket_ifname: None,
+            docker: None,
+            arch: None,
+            data_path: None,
+        },
+        workers: vec![FullWorker {
+            host: "localhost".to_string(),
             ranks,
             local_devices: Some(local_devices),
             nccl_socket_ifname: "lo".to_string(),
@@ -162,10 +169,9 @@ mod tests {
 
         // Build a minimal canonical cluster JSON and inject it.
         let canonical = serde_json::json!({
-            "master_addr": "127.0.0.1",
-            "master_port": 8888,
-            "hosts": [{
-                "name": "test-host",
+            "controller": { "host": "127.0.0.1", "port": 8888, "path": "/tmp" },
+            "workers": [{
+                "host": "test-host",
                 "ranks": [0, 1],
                 "local_devices": [0, 1],
                 "nccl_socket_ifname": "lo",
@@ -185,11 +191,11 @@ mod tests {
         unsafe { std::env::set_var(ENV_TESTING_CLUSTER_JSON, &hex) };
 
         let cluster = discover_test_cluster().expect("env-driven topology");
-        assert_eq!(cluster.master_addr, "127.0.0.1");
-        assert_eq!(cluster.master_port, 8888);
-        assert_eq!(cluster.hosts.len(), 1);
-        assert_eq!(cluster.hosts[0].name, "test-host");
-        assert_eq!(cluster.hosts[0].ranks, vec![0, 1]);
+        assert_eq!(cluster.controller.host, "127.0.0.1");
+        assert_eq!(cluster.controller.port, 8888);
+        assert_eq!(cluster.workers.len(), 1);
+        assert_eq!(cluster.workers[0].host, "test-host");
+        assert_eq!(cluster.workers[0].ranks, vec![0, 1]);
 
         unset();
     }
@@ -197,16 +203,16 @@ mod tests {
     #[test]
     fn synthesize_local_cluster_shape() {
         let c = synthesize_local_cluster(3);
-        assert_eq!(c.master_addr, "127.0.0.1");
-        assert_eq!(c.master_port, 0);
-        assert_eq!(c.hosts.len(), 1);
-        assert_eq!(c.hosts[0].name, "localhost");
-        assert_eq!(c.hosts[0].ranks, vec![0, 1, 2]);
+        assert_eq!(c.controller.host, "127.0.0.1");
+        assert_eq!(c.controller.port, 0);
+        assert_eq!(c.workers.len(), 1);
+        assert_eq!(c.workers[0].host, "localhost");
+        assert_eq!(c.workers[0].ranks, vec![0, 1, 2]);
         assert_eq!(
-            c.hosts[0].local_devices.as_deref().unwrap(),
+            c.workers[0].local_devices.as_deref().unwrap(),
             &[0u8, 1, 2][..]
         );
-        assert!(c.hosts[0].ssh.is_none());
+        assert!(c.workers[0].ssh.is_none());
         assert_eq!(c.salt, [0u8; SESSION_SALT_BYTES]);
     }
 

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cluster::resolve_local_hostname;
-use crate::config::{self, ClusterHost, DEFAULT_DATA_PATH};
+use crate::config::{self, ClusterWorker, DEFAULT_DATA_PATH};
 use crate::context::Context;
 use crate::libtorch::detect::{self, LibtorchInfo};
 use crate::util::system::{self, GpuInfo};
@@ -42,9 +42,9 @@ use crate::util::system::{self, GpuInfo};
 /// short-circuits the shared-data check.
 ///
 /// **Cluster** (FDL_ENV=cluster / `fdl cluster probe`): loads
-/// `fdl.<env>.yml`'s `cluster.hosts:` list. For each host: if it's
+/// `fdl.<env>.yml`'s `cluster.workers:` list. For each host: if it's
 /// the local host, probes in-process; otherwise SSHes to it and runs
-/// `<host.path>/target/release/fdl probe --json` remotely. Per-host
+/// `<worker.path>/target/release/fdl probe --json` remotely. Per-host
 /// JSON is parsed back into [`ProbeReport`] and aggregated.
 ///
 /// Exit code: `0` when every probed host is green; `1` when any
@@ -99,9 +99,9 @@ fn load_cluster_for_env(ctx: &Context, env_name: &str) -> Option<config::Cluster
 
 fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) -> i32 {
     let local = resolve_local_hostname();
-    let mut reports: Vec<ProbeReport> = Vec::with_capacity(cluster.hosts.len());
-    for host in &cluster.hosts {
-        let r = if host.name == local {
+    let mut reports: Vec<ProbeReport> = Vec::with_capacity(cluster.workers.len());
+    for worker in &cluster.workers {
+        let r = if worker.host == local {
             // Local rank: probe in-process, honor the host's data_path,
             // libtorch_path, and docker service (if set in cluster.yml).
             // Matches the remote-probe path so the local rank's report
@@ -110,22 +110,22 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
             // omitting it preserves the "default = warning, not error"
             // semantics in [`check_data_path`].
             let ctx = Context::resolve();
-            let data_path_explicit = host.data_path.is_some();
+            let data_path_explicit = worker.data_path.is_some();
             probe_local(
                 &ctx,
                 skip_mount,
-                host.data_path.as_ref().map(PathBuf::from),
-                // Convention: libtorch lives at `<host.path>/libtorch/<host.arch>`
+                worker.data_path.as_ref().map(PathBuf::from),
+                // Convention: libtorch lives at `<worker.path>/libtorch/<worker.arch>`
                 // when the host declares an arch; else probe walks
-                // `<host.path>/libtorch/.active` (single-host default).
-                host.arch
+                // `<worker.path>/libtorch/.active` (single-host default).
+                worker.arch
                     .as_ref()
-                    .map(|a| PathBuf::from(&host.path).join("libtorch").join(a)),
-                host.docker.clone(),
+                    .map(|a| PathBuf::from(&worker.path).join("libtorch").join(a)),
+                worker.docker.clone(),
                 data_path_explicit,
             )
         } else {
-            probe_remote_via_ssh(host, skip_mount)
+            probe_remote_via_ssh(worker, skip_mount)
         };
         reports.push(r);
     }
@@ -139,12 +139,12 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
 }
 
 /// SSH to `host` and run `fdl probe --json` there. The remote `fdl`
-/// is resolved as `{host.path}/target/release/fdl` (release build on
+/// is resolved as `{worker.path}/target/release/fdl` (release build on
 /// shared storage). Returns a synthetic `ProbeReport` carrying any
 /// SSH/parse failure in `issues` when the remote call fails — caller
 /// treats those as red verdicts.
-fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
-    let ssh_target = host.ssh.as_deref().unwrap_or(&host.name).to_string();
+fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport {
+    let ssh_target = worker.ssh.as_deref().unwrap_or(&worker.host).to_string();
     // Invoke bare `fdl` and rely on the remote shell's PATH. Each
     // host owns its fdl install (typically `cargo install flodl-cli`
     // into ~/.cargo/bin or ~/.local/bin); the controller does not
@@ -161,7 +161,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     // the remote falls back to DEFAULT_DATA_PATH and the probe treats a
     // missing path as a WARNING (convention default) rather than an
     // ERROR (explicit promise the user made in cluster.yml).
-    if let Some(dp) = &host.data_path {
+    if let Some(dp) = &worker.data_path {
         remote_args.push("--data-path".into());
         remote_args.push(dp.clone());
     }
@@ -170,20 +170,20 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     }
     // Pass the host's libtorch path to the remote probe so the worker
     // doesn't have to discover libtorch from its filesystem. Derived
-    // from the convention `<host.path>/libtorch/<host.arch>` when
+    // from the convention `<worker.path>/libtorch/<worker.arch>` when
     // arch is declared; otherwise omitted, and the remote probe walks
-    // `<host.path>/libtorch/.active` (single-host default).
-    if let Some(arch) = &host.arch {
+    // `<worker.path>/libtorch/.active` (single-host default).
+    if let Some(arch) = &worker.arch {
         remote_args.push("--libtorch-path".into());
         remote_args.push(format!(
             "{path}/libtorch/{arch}",
-            path = host.path.trim_end_matches('/'),
+            path = worker.path.trim_end_matches('/'),
         ));
     }
     // Pass the host's docker: compose service. Tells the remote probe
     // that NCCL ships inside the container image, so it should report
     // "via Docker image <svc>" instead of scanning host library paths.
-    if let Some(svc) = &host.docker {
+    if let Some(svc) = &worker.docker {
         remote_args.push("--docker".into());
         remote_args.push(svc.clone());
     }
@@ -205,7 +205,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
     // resolves a stale local fdl install.
     let remote_cmd = format!(
         "cd '{}' && {quoted}",
-        host.path.replace('\'', "'\\''"),
+        worker.path.replace('\'', "'\\''"),
     );
 
     let output = Command::new("ssh")
@@ -223,7 +223,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
         .output();
 
     let mut report = ProbeReport {
-        host: host.name.clone(),
+        host: worker.host.clone(),
         gpus: Vec::new(),
         libtorch: LibtorchStatus {
             info: None,
@@ -231,7 +231,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
             archs_match: Vec::new(),
         },
         data_path: DataPathStatus {
-            path: PathBuf::from(host.effective_data_path()),
+            path: PathBuf::from(worker.effective_data_path()),
             exists: false,
             readable: false,
             fs_type: None,
@@ -240,7 +240,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
         nccl: NcclStatus {
             library_path: None,
             all_found: Vec::new(),
-            via_docker: host.docker.clone(),
+            via_docker: worker.docker.clone(),
         },
         issues: Vec::new(),
         warnings: Vec::new(),
@@ -258,7 +258,7 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
             // try to parse stdout regardless. Only fall back to a
             // synthetic SSH-error report when parse actually fails.
             let stdout = String::from_utf8_lossy(&out.stdout);
-            match parse_remote_json(&stdout, host) {
+            match parse_remote_json(&stdout, worker) {
                 Ok(r) => report = r,
                 Err(parse_err) => {
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -284,12 +284,12 @@ fn probe_remote_via_ssh(host: &ClusterHost, skip_mount: bool) -> ProbeReport {
 /// `hostname(1)`, which may differ from the cluster.yml name and is
 /// the more common source of "probe says host X but cluster.yml says
 /// host Y" diagnostics).
-fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, String> {
+fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, String> {
     let v: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("JSON parse: {e}"))?;
 
     let mut report = ProbeReport {
-        host: host.name.clone(),
+        host: worker.host.clone(),
         gpus: Vec::new(),
         libtorch: LibtorchStatus {
             info: None,
@@ -297,7 +297,7 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
             archs_match: Vec::new(),
         },
         data_path: DataPathStatus {
-            path: PathBuf::from(host.effective_data_path()),
+            path: PathBuf::from(worker.effective_data_path()),
             exists: false,
             readable: false,
             fs_type: None,
@@ -306,7 +306,7 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
         nccl: NcclStatus {
             library_path: None,
             all_found: Vec::new(),
-            via_docker: host.docker.clone(),
+            via_docker: worker.docker.clone(),
         },
         issues: Vec::new(),
         warnings: Vec::new(),
@@ -358,7 +358,7 @@ fn parse_remote_json(json: &str, host: &ClusterHost) -> Result<ProbeReport, Stri
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(host.effective_data_path()));
+                .unwrap_or_else(|| PathBuf::from(worker.effective_data_path()));
             let exists = dp.get("exists").and_then(|v| v.as_bool()).unwrap_or(false);
             let readable = dp.get("readable").and_then(|v| v.as_bool()).unwrap_or(false);
             let fs_type = dp.get("fs_type").and_then(|v| v.as_str()).map(String::from);
@@ -569,7 +569,7 @@ pub struct NcclStatus {
 /// share like `/mnt/libtorch`). `via_docker` (from `--docker <svc>` or
 /// the cluster.yml host's `docker:` field) tells the probe NCCL ships
 /// inside a container image, so host-level NCCL scanning is replaced
-/// by an informational "via Docker image <svc>" line.
+/// by an informational "via Docker image `<svc>`" line.
 ///
 /// `data_path_explicit`: when `true`, a missing shared-data path is an
 /// ERROR (the user/cluster.yml promised it); when `false`, it's a

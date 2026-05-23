@@ -172,8 +172,8 @@ impl DdpHandle {
         // already used by the NCCL rendezvous; +2 is the
         // ClusterController (CPU averaging, unused in NCCL mode but
         // still bound by the launcher).
-        let coord_port = cluster.master_port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_port = cluster.controller.port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
@@ -475,8 +475,8 @@ impl DdpHandle {
 
         // Coord control channel at master_port + 3 (same convention as
         // the Sync via_coord entry).
-        let coord_port = cluster.master_port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_port = cluster.controller.port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
@@ -710,11 +710,11 @@ impl DdpHandle {
              (Sync+Cpu via_coord, save_path={save_path:?})"
         );
 
-        let controller_port = cluster.master_port.saturating_add(2);
-        let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
+        let controller_port = cluster.controller.port.saturating_add(2);
+        let controller_addr_str = format!("{}:{controller_port}", cluster.controller.host);
         let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
-        let coord_port = cluster.master_port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_port = cluster.controller.port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 
@@ -971,11 +971,11 @@ impl DdpHandle {
              ({policy_label}+Cpu via_coord, save_path={save_path:?})"
         );
 
-        let controller_port = cluster.master_port.saturating_add(2);
-        let controller_addr_str = format!("{}:{controller_port}", cluster.master_addr);
+        let controller_port = cluster.controller.port.saturating_add(2);
+        let controller_addr_str = format!("{}:{controller_port}", cluster.controller.host);
         let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
-        let coord_port = cluster.master_port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.master_addr);
+        let coord_port = cluster.controller.port.saturating_add(3);
+        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 

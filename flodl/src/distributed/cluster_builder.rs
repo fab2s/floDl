@@ -1,4 +1,4 @@
-//! Programmatic construction of [`FullCluster`] / [`FullHost`].
+//! Programmatic construction of [`FullCluster`] / [`FullWorker`].
 //!
 //! Mirrors the yml schema 1:1 — same fields, same validation, same
 //! launcher consumption. Two construction paths exist (yml via
@@ -15,11 +15,11 @@
 //!   round-trip overhead.
 //!
 //! [`FullCluster`]: super::launcher::FullCluster
-//! [`FullHost`]: super::launcher::FullHost
+//! [`FullWorker`]: super::launcher::FullWorker
 
 use crate::tensor::{Result, TensorError};
 
-use super::launcher::{FullCluster, FullHost};
+use super::launcher::{FullCluster, FullWorker};
 
 // ---------------------------------------------------------------------------
 // FullCluster builder
@@ -31,7 +31,7 @@ use super::launcher::{FullCluster, FullHost};
 ///
 /// ```ignore
 /// let cluster = ClusterBuilder::new("192.168.122.1")
-///     .master_port(29500)
+///     .controller_port(29500)
 ///     .host("exa")
 ///         .ranks([0])
 ///         .devices([0])
@@ -49,71 +49,109 @@ use super::launcher::{FullCluster, FullHost};
 ///     .build()?;
 /// ```
 pub struct ClusterBuilder {
-    master_addr: String,
-    master_port: u16,
-    hosts: Vec<FullHost>,
+    controller: super::launcher::FullController,
+    workers: Vec<FullWorker>,
 }
 
 impl ClusterBuilder {
-    /// Begin construction with the rendezvous master address. Accepts
-    /// hostname or IP — DNS resolution happens at TCP-connect time. Use
-    /// `"localhost"` (or `"127.0.0.1"`) when every host is local.
-    /// `master_port` defaults to `29500`; override with
-    /// [`Self::master_port`].
-    pub fn new(master_addr: impl Into<String>) -> Self {
+    /// Begin construction with the controller's rendezvous bind host.
+    /// Accepts hostname or IP — DNS resolution happens at TCP-connect
+    /// time. Use `"localhost"` (or `"127.0.0.1"`) when every worker is
+    /// local. `controller.port` defaults to 1337 (matches
+    /// `flodl-cli`'s `DEFAULT_CONTROLLER_PORT`); override with
+    /// [`Self::controller_port`]. `controller.path` defaults to the
+    /// current working directory; override with
+    /// [`Self::controller_path`].
+    pub fn new(controller_host: impl Into<String>) -> Self {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
         Self {
-            master_addr: master_addr.into(),
-            master_port: 29500,
-            hosts: Vec::new(),
+            controller: super::launcher::FullController {
+                host: controller_host.into(),
+                port: 1337,
+                path: cwd,
+                nccl_socket_ifname: None,
+                docker: None,
+                arch: None,
+                data_path: None,
+            },
+            workers: Vec::new(),
         }
     }
 
-    /// Override the rendezvous master port. Default `29500`.
-    pub fn master_port(mut self, port: u16) -> Self {
-        self.master_port = port;
+    /// Override the controller's rendezvous port. Default 1337.
+    pub fn controller_port(mut self, port: u16) -> Self {
+        self.controller.port = port;
         self
     }
 
-    /// Start configuring a new host. Returns a [`HostBuilder`]; call
+    /// Set the controller's project-root path (defaults to current
+    /// working directory at builder construction time). Override when
+    /// the controller's view of the shared project root differs from
+    /// each worker's view (heterogeneous-mount rigs).
+    pub fn controller_path(mut self, path: impl Into<String>) -> Self {
+        self.controller.path = path.into();
+        self
+    }
+
+    /// Set the network interface NCCL binds to on the controller side.
+    /// Required when more than one worker is declared.
+    pub fn controller_nccl_socket_ifname(
+        mut self,
+        ifname: impl Into<String>,
+    ) -> Self {
+        self.controller.nccl_socket_ifname = Some(ifname.into());
+        self
+    }
+
+    /// Start configuring a new worker. Returns a [`HostBuilder`]; call
     /// [`HostBuilder::done`] to finalize and return to the cluster
-    /// builder.
+    /// builder. (Method name `host` is kept for source-compat; the
+    /// argument names the worker.)
     pub fn host(self, name: impl Into<String>) -> HostBuilder {
         HostBuilder::new(self, name.into())
     }
 
-    /// Finalize. Validates that ranks across hosts form `0..world_size`
-    /// with no duplicates or gaps; validates non-empty master_addr,
-    /// non-empty hosts list, non-empty per-host fields.
+    /// Finalize. Validates that ranks across workers form
+    /// `0..world_size` with no duplicates or gaps; validates non-empty
+    /// controller.host / controller.path, non-empty workers list,
+    /// non-empty per-worker fields.
     pub fn build(self) -> Result<FullCluster> {
-        if self.master_addr.trim().is_empty() {
+        if self.controller.host.trim().is_empty() {
             return Err(TensorError::new(
-                "ClusterBuilder: master_addr must be non-empty",
+                "ClusterBuilder: controller.host must be non-empty",
             ));
         }
-        if self.hosts.is_empty() {
+        if self.controller.path.trim().is_empty() {
             return Err(TensorError::new(
-                "ClusterBuilder: at least one host required",
+                "ClusterBuilder: controller.path must be non-empty",
             ));
         }
-        // Cross-host rank check: union must be exactly 0..world_size.
+        if self.workers.is_empty() {
+            return Err(TensorError::new(
+                "ClusterBuilder: at least one worker required",
+            ));
+        }
+        // Cross-worker rank check: union must be exactly 0..world_size.
         let mut all: Vec<usize> = self
-            .hosts
+            .workers
             .iter()
-            .flat_map(|h| h.ranks.iter().copied())
+            .flat_map(|w| w.ranks.iter().copied())
             .collect();
         let ws = all.len();
         all.sort_unstable();
         let expected: Vec<usize> = (0..ws).collect();
         if all != expected {
             return Err(TensorError::new(&format!(
-                "ClusterBuilder: ranks across hosts must form 0..{ws} with no \
+                "ClusterBuilder: ranks across workers must form 0..{ws} with no \
                  duplicates or gaps, got sorted-unique sequence {all:?}"
             )));
         }
         Ok(FullCluster {
-            master_addr: self.master_addr,
-            master_port: self.master_port,
-            hosts: self.hosts,
+            controller: self.controller,
+            workers: self.workers,
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
             env: std::collections::BTreeMap::new(),
         })
@@ -149,23 +187,31 @@ impl ClusterBuilder {
         let n = gpus.len();
         let ranks: Vec<usize> = (0..n).collect();
         let local_devices: Vec<u8> = gpus.iter().map(|g| g.index).collect();
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
         Ok(FullCluster {
-            // "127.0.0.1" rather than "localhost": Rust's
-            // `SocketAddr::from_str` requires a numeric IP — passing
-            // the hostname string downstream fails the coord-addr
-            // parse in orchestrator.rs's `*_via_coord` entries with
-            // "invalid socket address syntax".
-            master_addr: "127.0.0.1".to_string(),
-            master_port: 29500,
-            hosts: vec![FullHost {
-                name: hostname,
+            controller: super::launcher::FullController {
+                // "127.0.0.1" rather than "localhost": Rust's
+                // `SocketAddr::from_str` requires a numeric IP —
+                // passing the hostname string downstream fails the
+                // coord-addr parse in orchestrator with "invalid
+                // socket address syntax".
+                host: "127.0.0.1".to_string(),
+                port: 1337,
+                path: cwd.clone(),
+                nccl_socket_ifname: None,
+                docker: None,
+                arch: None,
+                data_path: None,
+            },
+            workers: vec![FullWorker {
+                host: hostname,
                 ranks,
                 local_devices: Some(local_devices),
                 nccl_socket_ifname: "lo".to_string(),
-                path: std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(String::from))
-                    .unwrap_or_default(),
+                path: cwd,
                 arch: None,
                 ssh: None,
                 ssh_port: None,
@@ -181,10 +227,10 @@ impl ClusterBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// FullHost builder
+// FullWorker builder
 // ---------------------------------------------------------------------------
 
-/// Fluent builder for one [`FullHost`]. Borrows the parent
+/// Fluent builder for one [`FullWorker`]. Borrows the parent
 /// [`ClusterBuilder`] so [`Self::done`] can return to chaining
 /// additional hosts.
 pub struct HostBuilder {
@@ -307,8 +353,8 @@ impl HostBuilder {
     /// `nccl_socket_ifname`, `path`) were not set. Validate via
     /// [`ClusterBuilder::build`].
     pub fn done(mut self) -> ClusterBuilder {
-        let host = FullHost {
-            name: self.name,
+        let host = FullWorker {
+            host: self.name,
             ranks: self.ranks.expect("HostBuilder: ranks(...) required"),
             local_devices: self
                 .local_devices
@@ -325,7 +371,7 @@ impl HostBuilder {
             ssh_options: std::mem::take(&mut self.ssh_options),
             env: std::collections::BTreeMap::new(),
         };
-        self.parent.hosts.push(host);
+        self.parent.workers.push(host);
         self.parent
     }
 }
@@ -341,7 +387,7 @@ mod tests {
     #[test]
     fn build_two_host_cluster() {
         let cluster = ClusterBuilder::new("192.168.122.1")
-            .master_port(29500)
+            .controller_port(29500)
             .host("exa")
                 .ranks([0])
                 .devices([0])
@@ -360,16 +406,16 @@ mod tests {
             .build()
             .expect("build succeeds");
 
-        assert_eq!(cluster.master_addr, "192.168.122.1");
-        assert_eq!(cluster.master_port, 29500);
-        assert_eq!(cluster.hosts.len(), 2);
+        assert_eq!(cluster.controller.host, "192.168.122.1");
+        assert_eq!(cluster.controller.port, 29500);
+        assert_eq!(cluster.workers.len(), 2);
         assert_eq!(cluster.world_size(), 3);
 
-        let exa = &cluster.hosts[0];
-        assert_eq!(exa.name, "exa");
+        let exa = &cluster.workers[0];
+        assert_eq!(exa.host, "exa");
         assert_eq!(exa.local_devices.as_deref(), Some(&[0u8][..]));
 
-        let pascal = &cluster.hosts[1];
+        let pascal = &cluster.workers[1];
         assert!(pascal.local_devices.is_none(), "all_devices() → None");
         assert_eq!(pascal.ssh_port, Some(2222));
         assert_eq!(pascal.ssh_identity_file.as_deref(), Some("/keys/cluster"));
@@ -391,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_empty_master_addr() {
+    fn build_rejects_empty_controller_host() {
         let err = ClusterBuilder::new("")
             .host("h0")
                 .ranks([0])
@@ -400,15 +446,15 @@ mod tests {
                 .path("/tmp")
             .done()
             .build()
-            .expect_err("empty master_addr must error");
-        assert!(err.to_string().contains("master_addr"), "err: {err}");
+            .expect_err("empty controller.host must error");
+        assert!(err.to_string().contains("controller.host"), "err: {err}");
     }
 
     #[test]
-    fn build_rejects_no_hosts() {
+    fn build_rejects_no_workers() {
         let err = ClusterBuilder::new("localhost")
             .build()
-            .expect_err("no hosts must error");
-        assert!(err.to_string().contains("host"), "err: {err}");
+            .expect_err("no workers must error");
+        assert!(err.to_string().contains("worker"), "err: {err}");
     }
 }

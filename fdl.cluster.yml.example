@@ -2,55 +2,65 @@
 #
 # Usage:
 #   cp fdl.cluster.yml.example fdl.cluster.yml
-#   # edit hosts: section to match your rig
+#   # edit `controller:` + `workers:` sections to match your rig
 #   fdl cluster <command>      # activates this overlay (first-arg env convention)
 #   FDL_ENV=cluster fdl <cmd>  # equivalent
 #
+# Schema (Refactor 2): strict separation of `controller:` (the
+# orchestrator host fdl-cli runs on, NEVER a NCCL rank) and `workers:`
+# (every rank-carrying host).
+#
 # Conventions:
-#   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism picks
-#     it up when invoked as `fdl cluster <cmd>` (first arg = overlay name)
-#     or with `FDL_ENV=cluster` set in the environment.
-#   - One process per host. Each host owns a contiguous (or sparse) set of
-#     ranks listed in `ranks:`, with CUDA devices paired by position in
-#     `local_devices:`. Rank 0's host is the NCCL rendezvous master.
-#   - `local_devices:` accepts either an explicit list (`[0, 1]`) or the
-#     `all` shorthand. With `all`, the host auto-detects CUDA devices at
-#     startup (via cuda_device_count()) and binds indices 0..ranks.len().
-#     The detected count must cover `ranks.len()` or rendezvous errors
-#     loudly. Symmetric for the controller and remote nodes.
-#   - `nccl_socket_ifname:` is required on every host when the cluster
-#     spans multiple machines. NCCL needs it to bind its TCP transport;
-#     auto-detection is brittle so fdl errors loudly if it's missing.
-#   - `ssh:` is launcher-only -- fdl-cli uses it to connect; flodl itself
-#     ignores it. Defaults to `name:` when absent.
-#   - `ssh_port:` / `ssh_user:` / `ssh_identity_file:` / `ssh_options:` are
-#     optional launcher-only knobs that propagate as `-p`, `-l`, `-i`, and
-#     `-o Key=Value` flags on the spawned `ssh` command. Use these when you
-#     can't (or don't want to) maintain a `~/.ssh/config` on every box that
-#     runs `fdl @cluster`. All optional; when absent, system SSH defaults
-#     and `~/.ssh/config` rules apply. `ssh_options:` is a YAML list of
-#     `-o`-style directives (e.g. `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`).
-#   - `path:` is the project checkout dir on this host. fdl-cli cd's here
-#     before invoking the remote command. Heterogeneous mounts are fine
-#     (e.g. /opt/flodl on the controller, /srv/flodl in a VM); training
-#     data is the user's responsibility to mount identically across hosts
-#     (NAS / SMB / virtiofs / S3-FUSE).
+#   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism
+#     picks it up when invoked as `fdl cluster <cmd>` (first arg =
+#     overlay name) or with `FDL_ENV=cluster` set in the environment.
+#   - One process per rank. Each worker owns a contiguous (or sparse)
+#     set of ranks listed in `ranks:`, with CUDA devices paired by
+#     position in `local_devices:`.
+#   - `local_devices:` accepts either an explicit list (`[0, 1]`) or
+#     the `all` shorthand. With `all`, the host auto-detects CUDA
+#     devices at startup (via cuda_device_count()) and binds indices
+#     `0..ranks.len()`. The detected count must cover `ranks.len()` or
+#     rendezvous errors loudly.
+#   - `nccl_socket_ifname:` is required on every worker when the
+#     cluster spans multiple machines. NCCL needs it to bind its TCP
+#     transport; auto-detection is brittle so fdl errors loudly if
+#     missing. Required on the controller too when >1 worker is
+#     declared (for the ClusterController TCP listener).
+#   - `host:` is the worker identifier (was `name:` pre-Refactor 2).
+#     Used for /etc/hosts resolution, `--add-host` injection, and as
+#     the default SSH target. Override SSH-only via `ssh:`.
+#   - `ssh:` is launcher-only -- fdl-cli uses it to connect; flodl
+#     itself ignores it. Defaults to `host:` when absent.
+#   - `ssh_port:` / `ssh_user:` / `ssh_identity_file:` / `ssh_options:`
+#     are optional launcher-only knobs that propagate as `-p`, `-l`,
+#     `-i`, and `-o Key=Value` flags on the spawned `ssh` command. Use
+#     these when you can't (or don't want to) maintain a
+#     `~/.ssh/config` on every box that runs `fdl cluster`. All
+#     optional; when absent, system SSH defaults and `~/.ssh/config`
+#     rules apply. `ssh_options:` is a YAML list of `-o`-style
+#     directives (e.g. `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`).
+#   - `path:` is the project checkout dir on this host. fdl-cli cd's
+#     here before invoking the remote command. Heterogeneous mounts
+#     are fine (e.g. `/opt/flodl` on the controller, `/srv/flodl` in a
+#     VM); training data is the user's responsibility to mount
+#     identically across hosts (NAS / SMB / virtiofs / S3-FUSE).
 #   - `arch:` is the libtorch variant subpath under `<path>/libtorch/`
 #     on this host. E.g. `precompiled/cu128` (PT cu128 wheels) or
 #     `builds/sm61-sm120` (a from-source build). The convention path
-#     `<path>/libtorch/<arch>` is what the rank reads at runtime;
-#     the controller-side build (pre-flight) mirrors it via
-#     `<controller_path>/libtorch/<arch>`. Both point at the same
-#     physical libtorch via the shared project-root mount.
+#     `<path>/libtorch/<arch>` is what the rank reads at runtime; the
+#     controller-side build (pre-flight) mirrors it via
+#     `<controller.path>/libtorch/<controller.arch>`. Both point at
+#     the same physical libtorch via the shared project-root mount.
 #
-#     For heterogeneous rigs, each host's `arch:` selects a different
-#     variant (e.g. Blackwell host on `precompiled/cu128`, Pascal host
-#     on `builds/sm61-sm120`) — the convention keeps the path stable
-#     while the variant differs per host.
+#     For heterogeneous rigs, each worker's `arch:` selects a
+#     different variant (e.g. Blackwell host on `precompiled/cu128`,
+#     Pascal host on `builds/sm61-sm120`) -- the convention keeps the
+#     path stable while the variant differs per host.
 #
-#     `fdl probe`'s GPU compat check derives supported sm architectures
-#     by basename parsing (e.g. `builds/sm61-sm120` → `6.1 12.0`) plus
-#     reading the variant's `.arch` metadata file at
+#     `fdl probe`'s GPU compat check derives supported sm
+#     architectures by basename parsing (e.g. `builds/sm61-sm120` ->
+#     `6.1 12.0`) plus reading the variant's `.arch` metadata file at
 #     `<path>/libtorch/<arch>/.arch`.
 #   - `docker:` (optional) names the docker-compose service this host
 #     runs training inside (e.g. `cuda`, `dev`). Per-host, NOT global:
@@ -60,94 +70,48 @@
 #     image <svc>" instead of erroring on a missing libnccl.so on the
 #     host. Omit when the host runs flodl natively.
 #
-# Cluster-level `controller_path:` (optional) is the controller's view
-# of the shared project root. Defaults to the controller host's `path:`
-# when unset. Set explicitly only when the controller's filesystem path
-# diverges from every host's local path (rare; usually they coincide).
-#
-# Controller participation: if the controller's hostname appears in
-# `hosts:` below, it participates as a rank. If absent, it dispatches and
-# tails logs but takes no NCCL role -- "orchestrator-only" mode. A typo'd
-# hostname silently switches between modes, so fdl-cli emits a warning
-# (not an error) when the controller's hostname doesn't match any entry.
+# `controller.port:` defaults to 1337 when omitted (replaces
+# PyTorch's MASTER_PORT default of 29500). Port `+1` is reserved for
+# the dashboard side-channel; `+2` / `+3` host ClusterController /
+# ClusterCoordinator. Pick a base port that leaves the `+3` slot free.
 
 cluster:
-  master_addr: 192.168.122.1
-  master_port: 29500
-  # controller_path: /opt/flodl    # optional, defaults to controller host's path
-  hosts:
-    - name: node-a             # must match `hostname` on the host
+  controller:
+    host: 192.168.122.1               # rendezvous bind address (was `master_addr`)
+    port: 1337                        # rendezvous port (was `master_port`); default 1337
+    path: /opt/flodl                  # controller's view of the shared project root
+    nccl_socket_ifname: virbr0        # required when >1 worker is declared
+    # docker: cuda                    # optional pre-flight build context
+    # arch: precompiled/cu128         # optional libtorch variant for pre-flight
+
+  workers:
+    - host: node-a                    # worker identifier; default SSH target
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: virbr0
-      path: /opt/flodl                # checkout path on this host
+      path: /opt/flodl                # checkout path on this worker
       arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
-      docker: cuda             # training runs in the `cuda` compose service;
-                               # omit when this host runs flodl natively.
-    - name: node-b
-      ssh: node-b              # ssh target; defaults to name if omitted
+      docker: cuda                    # training runs in the `cuda` compose service;
+                                      # omit when this worker runs flodl natively.
+
+    - host: node-b
+      ssh: node-b                     # explicit SSH target; defaults to host: if omitted
       ranks: [1, 2]
-      local_devices: all       # auto-detect at startup; equivalent to [0, 1]
-                               # if this host has 2 visible CUDA devices.
+      local_devices: all              # auto-detect at startup; equivalent to [0, 1]
+                                      # if this worker has 2 visible CUDA devices.
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
-      arch: builds/sm61-sm120         # different variant per host is OK
-                               # no `docker:` here → bare-metal flodl install.
-      # Optional per-host env vars exported into every rank child
-      # spawned on this host. Overrides cluster-scope `env:` for
+      arch: builds/sm61-sm120         # different variant per worker is OK
+                                      # no `docker:` here -> bare-metal flodl install.
+      # Optional per-worker env vars exported into every rank child
+      # spawned on this worker. Overrides cluster-scope `env:` for
       # matching keys. Example: older consumer-grade GPUs under VFIO
       # that need NCCL fallback transport.
-      #   env:
-      #     NCCL_P2P_DISABLE: "1"
-      #     NCCL_SHM_DISABLE: "1"
+      # env:
+      #   NCCL_P2P_DISABLE: "1"
+      #   NCCL_SHM_DISABLE: "1"
 
-# Optional cluster-scope env vars exported into every rank child on
-# every host. Use for tuning the launcher itself shouldn't hardcode.
-# Per-host `env:` blocks override matching keys.
-#
-# env:
-#   SOME_TUNING_KNOB: "value"
-
-# Pre-flight build:
-#   `fdl @cluster <cmd>` auto-builds the binary locally (on the
-#   controller, in Docker) for every remote host before fan-out:
-#     - per-host `CARGO_TARGET_DIR=target/cluster/<host>/`
-#     - per-host `LIBTORCH_HOST_PATH=` resolved via convention from `<controller_path>/libtorch/<arch>`
-#     - features = `cuda` when the host's libtorch `.arch` has
-#       `cuda=<version>` (non-`none`), else no features
-#     - binary name = command name (`fdl @cluster ddp-bench` builds
-#       `--bin ddp-bench`)
-#   The shared project-root mount delivers the binary to the remote;
-#   the remote execs it directly via:
-#     ssh <host> "cd <path> && LD_LIBRARY_PATH=<libtorch>/lib \
-#                            <env-vars> exec ./target/cluster/<host>/release/<cmd>"
-#   No cargo / rustc on remote required.
-#   Pass `--no-prebuild` to skip the pre-flight phase (binaries known
-#   fresh, or iterating on a build-only failure).
-#   To extend `LD_LIBRARY_PATH` per host (e.g. bare-metal libnccl at
-#   `/usr/local/lib` alongside libtorch), set `env: { LD_LIBRARY_PATH: ... }`
-#   on the host; user-set `LD_LIBRARY_PATH` overrides the auto-derived
-#   prebuild default.
-#
-# Mark which commands fan out across cluster.hosts. Commands without
-# `cluster: true` continue to run locally on whichever host invoked fdl.
-#
-# `cluster:` on a Path-kind command (one that routes to a sub-fdl.yml,
-# e.g. ddp-bench/) propagates as the default for every command inside that
-# subtree, recursively. Sub-commands can still opt out individually with
-# `cluster: false`. Resolution walks leaf → root; the deepest `cluster:`
-# value wins. This means one root overlay can mark a whole subtree
-# cluster-capable in one line, without touching the sub-fdl.yml files.
-#
-# Example: `ddp-bench: { cluster: true }` below makes every command inside
-# ddp-bench/fdl.yml (and nested fdl.yml files under it) fan out by default.
-# Override with a sibling `ddp-bench/fdl.cluster.yml` if a specific command
-# should stay local.
-commands:
-  cuda-test:
-    cluster: true
-  ddp-bench:
-    cluster: true            # inherited by every command under ddp-bench/
-  train:
-    cluster: true
-    run: cargo run --release --bin my-training-app
+  # Cluster-scope env: applied to every rank child on every worker.
+  # Per-worker `env:` blocks override matching keys.
+  # env:
+  #   NCCL_DEBUG: INFO

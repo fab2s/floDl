@@ -243,7 +243,7 @@ fn on_off(b: bool) -> &'static str {
 /// routing is governed by `save_path` on `DdpRunConfig` per the
 /// `DdpHandle::launch` `auto_with` flip, not by an env var anymore).
 ///
-/// Local hosts (`host.name == this_hostname`) get fork+exec of
+/// Local hosts (`host.host == this_hostname`) get fork+exec of
 /// `current_exe()` with env vars set directly. Remote hosts get
 /// `ssh <target> bash -lc '<remote_cmd>'`, where `<remote_cmd>` exports
 /// env vars and execs `fdl <cmd>` — same shape fdl-cli used to use
@@ -270,13 +270,13 @@ pub fn run_launcher_with_config(
     let full = full.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
-    // Controller participation is implicit-by-presence in cluster.hosts.
+    // Controller participation is implicit-by-presence in cluster.workers.
     // Orchestrator-only mode (controller not in hosts) is valid; spawn
     // remote ranks but no local rank for this host.
-    let my_host_idx = full.hosts.iter().position(|h| h.name == me);
+    let my_host_idx = full.workers.iter().position(|h| h.host == me);
     if my_host_idx.is_none() {
         eprintln!(
-            "cluster launcher: controller hostname {me:?} not in cluster.hosts; \
+            "cluster launcher: controller hostname {me:?} not in cluster.workers; \
              running orchestrator-only (no rank on this host)."
         );
     }
@@ -289,7 +289,7 @@ pub fn run_launcher_with_config(
     // a shutdown flag every 20ms, so an unused ClusterController exits cleanly
     // when launcher signals shutdown after children finish. Cost is one
     // idle thread + one bound port.
-    let cpu_avg_port = full.master_port.saturating_add(2);
+    let cpu_avg_port = full.controller.port.saturating_add(2);
     let cpu_avg_addr: std::net::SocketAddr = format!("0.0.0.0:{cpu_avg_port}")
         .parse()
         .map_err(|e| {
@@ -335,7 +335,7 @@ pub fn run_launcher_with_config(
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
-        let coord_port = full.master_port.saturating_add(3);
+        let coord_port = full.controller.port.saturating_add(3);
         let coord_bind_addr: std::net::SocketAddr = format!("0.0.0.0:{coord_port}")
             .parse()
             .map_err(|e| {
@@ -351,7 +351,7 @@ pub fn run_launcher_with_config(
         // the controller-scope fields (policy, ElChe, guard, etc.) but
         // can't know these two — only the launcher does.
         let local_ranks: Vec<usize> = my_host_idx
-            .map(|i| full.hosts[i].ranks.clone())
+            .map(|i| full.workers[i].ranks.clone())
             .unwrap_or_default();
         let dead_ranks = Arc::clone(&dead_ranks_shared);
         config = config
@@ -423,7 +423,7 @@ pub fn run_launcher_with_config(
     // For remote hosts, fdl-cli must have passed the original fdl command
     // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent;
     // 4b.C is responsible for setting it.
-    let has_remote = full.hosts.iter().any(|h| h.name != me);
+    let has_remote = full.workers.iter().any(|h| h.host != me);
     let fdl_cmd = if has_remote {
         Some(env::var(ENV_FDL_CMD).map_err(|_| {
             TensorError::new(&format!(
@@ -453,7 +453,7 @@ pub fn run_launcher_with_config(
     // Spawn one child per rank across every host.
     let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
         Vec::with_capacity(full.world_size());
-    for host in &full.hosts {
+    for host in &full.workers {
         for local_rank in 0..host.ranks.len() {
             let envelope = build_slim_envelope_for(&full, host);
             let envelope_hex = crate::distributed::cluster::hex_encode(
@@ -481,7 +481,7 @@ pub fn run_launcher_with_config(
                 .local_devices
                 .as_ref()
                 .and_then(|d| d.get(local_rank).copied());
-            let mut cmd = if host.name == me {
+            let mut cmd = if host.host == me {
                 build_local_spawn_command(
                     &exe,
                     &user_args,
@@ -493,7 +493,7 @@ pub fn run_launcher_with_config(
                 let remote_cmd = build_remote_bash_command(
                     &host.path,
                     &envelope_hex,
-                    &host.name,
+                    &host.host,
                     local_rank,
                     overlay_env.as_deref(),
                     fdl_cmd
@@ -503,7 +503,7 @@ pub fn run_launcher_with_config(
                     &full.env,
                     &host.env,
                     local_phys,
-                    prebuild_envelope.get(&host.name),
+                    prebuild_envelope.get(&host.host),
                 );
                 build_ssh_spawn_command(host, &remote_cmd)
             };
@@ -518,7 +518,7 @@ pub fn run_launcher_with_config(
             // are not overridable here — the launcher owns those. SSH
             // path: env propagation is bash-level inside
             // build_remote_bash_command and not affected here.
-            if host.name == me {
+            if host.host == me {
                 for (k, v) in &full.env {
                     cmd.env(k, v);
                 }
@@ -528,15 +528,15 @@ pub fn run_launcher_with_config(
             }
 
             let mut child = cmd.spawn().map_err(|e| {
-                let kind = if host.name == me { "local bash/exec" } else { "ssh" };
+                let kind = if host.host == me { "local bash/exec" } else { "ssh" };
                 TensorError::new(&format!(
                     "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
-                    host.name
+                    host.host
                 ))
             })?;
 
             let global_rank = host.ranks[local_rank];
-            let prefix = format!("[{}:r{global_rank}] ", host.name);
+            let prefix = format!("[{}:r{global_rank}] ", host.host);
             let mut forwarders = Vec::with_capacity(2);
             if let Some(out) = child.stdout.take() {
                 let prefix_clone = prefix.clone();
@@ -550,7 +550,7 @@ pub fn run_launcher_with_config(
                     forward_lines(err, prefix_clone, true);
                 }));
             }
-            children.push((host.name.clone(), local_rank, child, forwarders));
+            children.push((host.host.clone(), local_rank, child, forwarders));
         }
     }
     let _ = my_host_idx; // currently unused but kept for parity with future logic
@@ -753,14 +753,14 @@ fn build_local_spawn_command(
 /// - `host.ssh_user` → `-l <user>` (default: current user)
 /// - `host.ssh_identity_file` → `-i <path>` (default: `~/.ssh/config` rules)
 /// - `host.ssh_options` → `-o Key=Value ...` (pass-through, in order)
-/// - `host.ssh.as_deref().unwrap_or(&host.name)` → the connect target
+/// - `host.ssh.as_deref().unwrap_or(&host.host)` → the connect target
 ///
 /// All fields are optional; when absent, the corresponding flag is
 /// omitted and system ssh's defaults / `~/.ssh/config` rules apply —
 /// preserving backward compat for configs that pre-date the new
 /// fields.
-fn build_ssh_spawn_command(host: &FullHost, remote_cmd: &str) -> Command {
-    let ssh_target = host.ssh.as_deref().unwrap_or(&host.name);
+fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
+    let ssh_target = host.ssh.as_deref().unwrap_or(&host.host);
     let mut c = Command::new("ssh");
     c.args(SSH_OPTS);
     if let Some(p) = host.ssh_port {
@@ -935,39 +935,39 @@ fn shell_quote(s: &str) -> String {
 /// duplication will go away once 4b.C completes.
 ///
 /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
-fn build_slim_envelope_for(full: &FullCluster, host: &FullHost) -> serde_json::Value {
+fn build_slim_envelope_for(full: &FullCluster, worker: &FullWorker) -> serde_json::Value {
     use serde_json::Value;
     let mut host_obj = serde_json::Map::new();
-    host_obj.insert("name".into(), Value::String(host.name.clone()));
+    host_obj.insert("host".into(), Value::String(worker.host.clone()));
     host_obj.insert(
         "ranks".into(),
-        Value::Array(host.ranks.iter().map(|r| Value::from(*r)).collect()),
+        Value::Array(worker.ranks.iter().map(|r| Value::from(*r)).collect()),
     );
     host_obj.insert(
         "local_devices".into(),
-        match &host.local_devices {
+        match &worker.local_devices {
             None => Value::String("all".into()),
             Some(v) => Value::Array(v.iter().map(|d| Value::from(*d)).collect()),
         },
     );
     host_obj.insert(
         "nccl_socket_ifname".into(),
-        Value::String(host.nccl_socket_ifname.clone()),
+        Value::String(worker.nccl_socket_ifname.clone()),
     );
-    host_obj.insert("path".into(), Value::String(host.path.clone()));
-    if let Some(a) = &host.arch {
+    host_obj.insert("path".into(), Value::String(worker.path.clone()));
+    if let Some(a) = &worker.arch {
         host_obj.insert("arch".into(), Value::String(a.clone()));
     }
 
+    let mut controller_obj = serde_json::Map::new();
+    controller_obj.insert("host".into(), Value::String(full.controller.host.clone()));
+    controller_obj.insert("port".into(), Value::from(full.controller.port));
+
     let mut envelope = serde_json::Map::new();
-    envelope.insert(
-        "master_addr".into(),
-        Value::String(full.master_addr.clone()),
-    );
-    envelope.insert("master_port".into(), Value::from(full.master_port));
+    envelope.insert("controller".into(), Value::Object(controller_obj));
     envelope.insert("world_size".into(), Value::from(full.world_size()));
-    envelope.insert("num_hosts".into(), Value::from(full.hosts.len()));
-    envelope.insert("host".into(), Value::Object(host_obj));
+    envelope.insert("num_workers".into(), Value::from(full.workers.len()));
+    envelope.insert("worker".into(), Value::Object(host_obj));
     envelope.insert(
         "salt".into(),
         Value::String(crate::distributed::wire::salt_to_hex(&full.salt)),
@@ -1014,9 +1014,10 @@ fn forward_lines<R: std::io::Read>(stream: R, prefix: String, to_stderr: bool) {
 /// [`LocalCluster`]: crate::distributed::cluster::LocalCluster
 #[derive(Debug, Clone)]
 pub struct FullCluster {
-    pub master_addr: String,
-    pub master_port: u16,
-    pub hosts: Vec<FullHost>,
+    /// Controller's rendezvous bind point + pre-flight build context.
+    pub controller: FullController,
+    /// All rank-carrying entries.
+    pub workers: Vec<FullWorker>,
     /// 128-bit session salt the launcher generates fresh per training
     /// session and propagates to every rank's slim envelope. Used as the
     /// HMAC key for the cross-process control + data channels. All
@@ -1024,16 +1025,27 @@ pub struct FullCluster {
     /// [`run_launcher_with_config`]) populates it.
     pub salt: crate::distributed::wire::SessionSalt,
     /// Cluster-scope env vars exported into every rank child's
-    /// environment. Cluster-yml `env:` block (mapping
-    /// `NAME: VALUE`). Used for cluster-specific tuning that the
-    /// launcher itself shouldn't hardcode — e.g. setting
-    /// `NCCL_P2P_DISABLE=1` + `NCCL_SHM_DISABLE=1` for the Pascal-
-    /// under-VFIO rig where NCCL's direct-IPC transports fail but
-    /// socket transport works.
+    /// environment. Cluster-yml `env:` block (mapping `NAME: VALUE`).
+    /// Used for cluster-specific tuning that the launcher itself
+    /// shouldn't hardcode — e.g. setting `NCCL_P2P_DISABLE=1` +
+    /// `NCCL_SHM_DISABLE=1` for the Pascal-under-VFIO rig where NCCL's
+    /// direct-IPC transports fail but socket transport works.
     ///
-    /// Empty by default. Per-host envs (see [`FullHost::env`])
-    /// override per-cluster ones for the matching host.
+    /// Empty by default. Per-worker envs (see [`FullWorker::env`])
+    /// override per-cluster ones for the matching worker.
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Controller-side fields, launcher view.
+#[derive(Debug, Clone)]
+pub struct FullController {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub nccl_socket_ifname: Option<String>,
+    pub docker: Option<String>,
+    pub arch: Option<String>,
+    pub data_path: Option<String>,
 }
 
 impl FullCluster {
@@ -1045,16 +1057,16 @@ impl FullCluster {
     }
 }
 
-/// One host's entry in the full topology, launcher-side.
+/// One worker's entry in the full topology, launcher-side.
 ///
-/// Differs from [`HostBlock`] by carrying `ssh:` (launcher-only field
+/// Differs from [`WorkerBlock`] by carrying `ssh:` (launcher-only field
 /// stripped from slim envelopes) and the unresolved `local_devices:
 /// "all"` form (which is only resolved on the host that will use it).
 ///
-/// [`HostBlock`]: crate::distributed::cluster::HostBlock
+/// [`WorkerBlock`]: crate::distributed::cluster::WorkerBlock
 #[derive(Debug, Clone)]
-pub struct FullHost {
-    pub name: String,
+pub struct FullWorker {
+    pub host: String,
     pub ranks: Vec<usize>,
     /// Either an explicit list of CUDA indices or `None` for the `"all"`
     /// shorthand (resolved at startup on the host that owns this entry).
@@ -1119,51 +1131,83 @@ impl FullCluster {
             TensorError::new("cluster launcher: top-level JSON must be an object")
         })?;
 
-        let master_addr = obj
-            .get("master_addr")
+        let controller_val = obj
+            .get("controller")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                TensorError::new("cluster launcher: controller (object) required")
+            })?;
+        let controller_host = controller_val
+            .get("host")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| TensorError::new("cluster launcher: master_addr (string) required"))?
+            .ok_or_else(|| {
+                TensorError::new("cluster launcher: controller.host (string) required")
+            })?
             .to_string();
-        if master_addr.trim().is_empty() {
+        if controller_host.trim().is_empty() {
             return Err(TensorError::new(
-                "cluster launcher: master_addr must be non-empty",
+                "cluster launcher: controller.host must be non-empty",
             ));
         }
-
-        let master_port_u64 = obj
-            .get("master_port")
+        let controller_port_u64 = controller_val
+            .get("port")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| TensorError::new("cluster launcher: master_port (u16) required"))?;
-        let master_port = u16::try_from(master_port_u64).map_err(|_| {
+            .ok_or_else(|| {
+                TensorError::new("cluster launcher: controller.port (u16) required")
+            })?;
+        let controller_port = u16::try_from(controller_port_u64).map_err(|_| {
             TensorError::new(&format!(
-                "cluster launcher: master_port must fit in u16 (got {master_port_u64})"
+                "cluster launcher: controller.port must fit in u16 (got {controller_port_u64})"
             ))
         })?;
+        let controller_path = controller_val
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TensorError::new("cluster launcher: controller.path (string) required")
+            })?
+            .to_string();
+        let controller_nccl_socket_ifname = controller_val
+            .get("nccl_socket_ifname")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let controller_docker = controller_val
+            .get("docker")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let controller_arch = controller_val
+            .get("arch")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let controller_data_path = controller_val
+            .get("data_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
-        let hosts_val = obj
-            .get("hosts")
+        let workers_val = obj
+            .get("workers")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| TensorError::new("cluster launcher: hosts (array) required"))?;
-        if hosts_val.is_empty() {
+            .ok_or_else(|| TensorError::new("cluster launcher: workers (array) required"))?;
+        if workers_val.is_empty() {
             return Err(TensorError::new(
-                "cluster launcher: hosts must be non-empty",
+                "cluster launcher: workers must be non-empty",
             ));
         }
 
-        let hosts: Vec<FullHost> = hosts_val
+        let workers: Vec<FullWorker> = workers_val
             .iter()
             .enumerate()
-            .map(|(i, h)| parse_full_host(h, i))
+            .map(|(i, w)| parse_full_worker(w, i))
             .collect::<Result<_>>()?;
 
-        // Cross-host rank check: union must be exactly 0..world_size.
-        let mut all: Vec<usize> = hosts.iter().flat_map(|h| h.ranks.iter().copied()).collect();
+        // Cross-worker rank check: union must be exactly 0..world_size.
+        let mut all: Vec<usize> = workers.iter().flat_map(|w| w.ranks.iter().copied()).collect();
         let ws = all.len();
         all.sort_unstable();
         let expected: Vec<usize> = (0..ws).collect();
         if all != expected {
             return Err(TensorError::new(&format!(
-                "cluster launcher: ranks across hosts must be exactly 0..{ws} \
+                "cluster launcher: ranks across workers must be exactly 0..{ws} \
                  with no duplicates or gaps, got sorted-unique sequence {all:?}"
             )));
         }
@@ -1173,9 +1217,16 @@ impl FullCluster {
         let env = parse_env_block(obj.get("env"), "cluster.env")?;
 
         Ok(FullCluster {
-            master_addr,
-            master_port,
-            hosts,
+            controller: FullController {
+                host: controller_host,
+                port: controller_port,
+                path: controller_path,
+                nccl_socket_ifname: controller_nccl_socket_ifname,
+                docker: controller_docker,
+                arch: controller_arch,
+                data_path: controller_data_path,
+            },
+            workers,
             // ENV_FULL_CLUSTER_JSON is the config snapshot fdl-cli ships;
             // the session salt is generated freshly by `run_launcher` per
             // training session (override via [`Self::with_session_salt`]).
@@ -1186,12 +1237,12 @@ impl FullCluster {
 
     /// Total ranks across the cluster.
     pub fn world_size(&self) -> usize {
-        self.hosts.iter().map(|h| h.ranks.len()).sum()
+        self.workers.iter().map(|w| w.ranks.len()).sum()
     }
 
-    /// Whether the cluster spans more than one physical host.
-    pub fn spans_multiple_hosts(&self) -> bool {
-        self.hosts.len() > 1
+    /// Whether the cluster spans more than one physical worker.
+    pub fn spans_multiple_workers(&self) -> bool {
+        self.workers.len() > 1
     }
 
     /// Serialize to the JSON shape [`Self::from_value`] parses. Symmetric
@@ -1202,12 +1253,12 @@ impl FullCluster {
     /// reads. `salt` is intentionally NOT serialized — the launcher
     /// generates a fresh session salt per run.
     pub fn to_json(&self) -> serde_json::Value {
-        let hosts: Vec<serde_json::Value> = self
-            .hosts
+        let workers: Vec<serde_json::Value> = self
+            .workers
             .iter()
             .map(|h| {
                 let mut o = serde_json::Map::new();
-                o.insert("name".into(), serde_json::Value::String(h.name.clone()));
+                o.insert("host".into(), serde_json::Value::String(h.host.clone()));
                 o.insert(
                     "ranks".into(),
                     serde_json::Value::Array(
@@ -1266,15 +1317,36 @@ impl FullCluster {
             })
             .collect();
         let mut top = serde_json::Map::new();
-        top.insert(
-            "master_addr".into(),
-            serde_json::Value::String(self.master_addr.clone()),
+        let mut controller_obj = serde_json::Map::new();
+        controller_obj.insert(
+            "host".into(),
+            serde_json::Value::String(self.controller.host.clone()),
         );
-        top.insert(
-            "master_port".into(),
-            serde_json::Value::from(self.master_port),
+        controller_obj.insert(
+            "port".into(),
+            serde_json::Value::from(self.controller.port),
         );
-        top.insert("hosts".into(), serde_json::Value::Array(hosts));
+        controller_obj.insert(
+            "path".into(),
+            serde_json::Value::String(self.controller.path.clone()),
+        );
+        if let Some(s) = &self.controller.nccl_socket_ifname {
+            controller_obj.insert(
+                "nccl_socket_ifname".into(),
+                serde_json::Value::String(s.clone()),
+            );
+        }
+        if let Some(s) = &self.controller.docker {
+            controller_obj.insert("docker".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.controller.arch {
+            controller_obj.insert("arch".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.controller.data_path {
+            controller_obj.insert("data_path".into(), serde_json::Value::String(s.clone()));
+        }
+        top.insert("controller".into(), serde_json::Value::Object(controller_obj));
+        top.insert("workers".into(), serde_json::Value::Array(workers));
         if !self.env.is_empty() {
             let mut env_obj = serde_json::Map::new();
             for (k, v) in &self.env {
@@ -1286,39 +1358,40 @@ impl FullCluster {
     }
 }
 
-fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
+fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
     let obj = v.as_object().ok_or_else(|| {
-        TensorError::new(&format!("cluster launcher: hosts[{i}] must be an object"))
+        TensorError::new(&format!("cluster launcher: workers[{i}] must be an object"))
     })?;
 
-    let name = obj
-        .get("name")
+    let host = obj
+        .get("host")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster launcher: hosts[{i}].name (string) required"
+                "cluster launcher: workers[{i}].host (string) required"
             ))
         })?
         .to_string();
-    if name.trim().is_empty() {
+    if host.trim().is_empty() {
         return Err(TensorError::new(&format!(
-            "cluster launcher: hosts[{i}].name must be non-empty"
+            "cluster launcher: workers[{i}].host must be non-empty"
         )));
     }
+    let name = host;
 
     let ranks_arr = obj
         .get("ranks")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): ranks (array) required"
+                "cluster launcher: workers[{i}] ({name:?}): ranks (array) required"
             ))
         })?;
     // Empty ranks: orchestrator-only host entry. Declared in cluster.yml
     // solely so fdl-cli's pre-flight build can read its `docker:` /
     // `arch:` for controller-side build context; the launcher itself
     // skips it (no rank spawn for this host). Distinct from "host
-    // absent from cluster.hosts" — both result in orchestrator-only
+    // absent from cluster.workers" — both result in orchestrator-only
     // launcher behavior, but the explicit entry surfaces config to
     // fdl-cli.
     let ranks: Vec<usize> = ranks_arr
@@ -1327,12 +1400,12 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         .map(|(j, e)| {
             let n = e.as_u64().ok_or_else(|| {
                 TensorError::new(&format!(
-                    "cluster launcher: hosts[{i}].ranks[{j}]: non-integer entry"
+                    "cluster launcher: workers[{i}].ranks[{j}]: non-integer entry"
                 ))
             })?;
             usize::try_from(n).map_err(|_| {
                 TensorError::new(&format!(
-                    "cluster launcher: hosts[{i}].ranks[{j}]: value {n} out of range"
+                    "cluster launcher: workers[{i}].ranks[{j}]: value {n} out of range"
                 ))
             })
         })
@@ -1341,13 +1414,13 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
     let local_devices = match obj.get("local_devices") {
         None => {
             return Err(TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): local_devices required"
+                "cluster launcher: workers[{i}] ({name:?}): local_devices required"
             )));
         }
         Some(serde_json::Value::String(s)) if s == "all" => None,
         Some(serde_json::Value::String(s)) => {
             return Err(TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): local_devices: \
+                "cluster launcher: workers[{i}] ({name:?}): local_devices: \
                  expected \"all\" or array, got string {s:?}"
             )));
         }
@@ -1358,13 +1431,13 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
                 .map(|(j, e)| {
                     let n = e.as_u64().ok_or_else(|| {
                         TensorError::new(&format!(
-                            "cluster launcher: hosts[{i}].local_devices[{j}]: \
+                            "cluster launcher: workers[{i}].local_devices[{j}]: \
                              non-integer entry"
                         ))
                     })?;
                     u8::try_from(n).map_err(|_| {
                         TensorError::new(&format!(
-                            "cluster launcher: hosts[{i}].local_devices[{j}]: \
+                            "cluster launcher: workers[{i}].local_devices[{j}]: \
                              value {n} does not fit in u8"
                         ))
                     })
@@ -1372,7 +1445,7 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
                 .collect::<Result<_>>()?;
             if v.len() != ranks.len() {
                 return Err(TensorError::new(&format!(
-                    "cluster launcher: hosts[{i}] ({name:?}): ranks ({}) and \
+                    "cluster launcher: workers[{i}] ({name:?}): ranks ({}) and \
                      local_devices ({}) length mismatch",
                     ranks.len(),
                     v.len()
@@ -1382,7 +1455,7 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         }
         Some(other) => {
             return Err(TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): local_devices: \
+                "cluster launcher: workers[{i}] ({name:?}): local_devices: \
                  expected \"all\" or array, got {other}"
             )));
         }
@@ -1393,7 +1466,7 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): nccl_socket_ifname (string) required"
+                "cluster launcher: workers[{i}] ({name:?}): nccl_socket_ifname (string) required"
             ))
         })?
         .to_string();
@@ -1403,13 +1476,13 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): path (string) required"
+                "cluster launcher: workers[{i}] ({name:?}): path (string) required"
             ))
         })?
         .to_string();
     if path.trim().is_empty() {
         return Err(TensorError::new(&format!(
-            "cluster launcher: hosts[{i}] ({name:?}): path must be non-empty"
+            "cluster launcher: workers[{i}] ({name:?}): path must be non-empty"
         )));
     }
 
@@ -1428,12 +1501,12 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
         Some(v) => {
             let n = v.as_u64().ok_or_else(|| {
                 TensorError::new(&format!(
-                    "cluster launcher: hosts[{i}] ({name:?}): ssh_port must be integer"
+                    "cluster launcher: workers[{i}] ({name:?}): ssh_port must be integer"
                 ))
             })?;
             Some(u16::try_from(n).map_err(|_| {
                 TensorError::new(&format!(
-                    "cluster launcher: hosts[{i}] ({name:?}): ssh_port {n} does not fit in u16"
+                    "cluster launcher: workers[{i}] ({name:?}): ssh_port {n} does not fit in u16"
                 ))
             })?)
         }
@@ -1457,14 +1530,14 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
             .map(|(j, e)| {
                 e.as_str().map(String::from).ok_or_else(|| {
                     TensorError::new(&format!(
-                        "cluster launcher: hosts[{i}].ssh_options[{j}]: must be string"
+                        "cluster launcher: workers[{i}].ssh_options[{j}]: must be string"
                     ))
                 })
             })
             .collect::<Result<_>>()?,
         Some(other) => {
             return Err(TensorError::new(&format!(
-                "cluster launcher: hosts[{i}] ({name:?}): ssh_options must be array of \
+                "cluster launcher: workers[{i}] ({name:?}): ssh_options must be array of \
                  strings, got {other}"
             )));
         }
@@ -1472,11 +1545,11 @@ fn parse_full_host(v: &serde_json::Value, i: usize) -> Result<FullHost> {
 
     let env = parse_env_block(
         obj.get("env"),
-        &format!("hosts[{i}] ({name:?}).env"),
+        &format!("workers[{i}] ({name:?}).env"),
     )?;
 
-    Ok(FullHost {
-        name,
+    Ok(FullWorker {
+        host: name,
         ranks,
         local_devices,
         nccl_socket_ifname,
@@ -1529,11 +1602,15 @@ mod tests {
 
     fn canonical_full_json() -> serde_json::Value {
         json!({
-            "master_addr": "192.168.122.1",
-            "master_port": 29500,
-            "hosts": [
+            "controller": {
+                "host": "192.168.122.1",
+                "port": 29500,
+                "path": "/opt/flodl",
+                "nccl_socket_ifname": "virbr0"
+            },
+            "workers": [
                 {
-                    "name": "master-host",
+                    "host": "master-host",
                     "ranks": [0],
                     "local_devices": [0],
                     "nccl_socket_ifname": "virbr0",
@@ -1541,7 +1618,7 @@ mod tests {
                     "arch": "precompiled/cu128"
                 },
                 {
-                    "name": "worker-host",
+                    "host": "worker-host",
                     "ssh": "worker-host",
                     "ranks": [1, 2],
                     "local_devices": "all",
@@ -1555,37 +1632,37 @@ mod tests {
     #[test]
     fn parses_full_topology() {
         let c = FullCluster::from_value(&canonical_full_json()).unwrap();
-        assert_eq!(c.master_addr, "192.168.122.1");
-        assert_eq!(c.master_port, 29500);
+        assert_eq!(c.controller.host, "192.168.122.1");
+        assert_eq!(c.controller.port, 29500);
         assert_eq!(c.world_size(), 3);
-        assert!(c.spans_multiple_hosts());
+        assert!(c.spans_multiple_workers());
 
-        assert_eq!(c.hosts.len(), 2);
-        assert_eq!(c.hosts[0].name, "master-host");
-        assert_eq!(c.hosts[0].ranks, vec![0]);
-        assert_eq!(c.hosts[0].local_devices, Some(vec![0]));
-        assert_eq!(c.hosts[0].ssh, None);
+        assert_eq!(c.workers.len(), 2);
+        assert_eq!(c.workers[0].host, "master-host");
+        assert_eq!(c.workers[0].ranks, vec![0]);
+        assert_eq!(c.workers[0].local_devices, Some(vec![0]));
+        assert_eq!(c.workers[0].ssh, None);
 
-        assert_eq!(c.hosts[1].name, "worker-host");
-        assert_eq!(c.hosts[1].ranks, vec![1, 2]);
+        assert_eq!(c.workers[1].host, "worker-host");
+        assert_eq!(c.workers[1].ranks, vec![1, 2]);
         // "all" stays unresolved at launcher-parse time; each host resolves
         // its own at startup.
-        assert_eq!(c.hosts[1].local_devices, None);
-        assert_eq!(c.hosts[1].ssh.as_deref(), Some("worker-host"));
+        assert_eq!(c.workers[1].local_devices, None);
+        assert_eq!(c.workers[1].ssh.as_deref(), Some("worker-host"));
     }
 
     #[test]
-    fn rejects_empty_hosts() {
+    fn rejects_empty_workers() {
         let mut v = canonical_full_json();
-        v["hosts"] = json!([]);
+        v["workers"] = json!([]);
         let err = FullCluster::from_value(&v).unwrap_err();
-        assert!(err.to_string().contains("hosts must be non-empty"), "got: {err}");
+        assert!(err.to_string().contains("workers must be non-empty"), "got: {err}");
     }
 
     #[test]
     fn rejects_rank_gap_across_hosts() {
         let mut v = canonical_full_json();
-        v["hosts"][1]["ranks"] = json!([2, 3]); // gap: 0 + (2,3) misses rank 1
+        v["workers"][1]["ranks"] = json!([2, 3]); // gap: 0 + (2,3) misses rank 1
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(
             err.to_string().contains("duplicates or gaps"),
@@ -1596,7 +1673,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_ranks() {
         let mut v = canonical_full_json();
-        v["hosts"][1]["ranks"] = json!([0, 1]); // collides with master-host's [0]
+        v["workers"][1]["ranks"] = json!([0, 1]); // collides with master-host's [0]
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(
             err.to_string().contains("duplicates or gaps"),
@@ -1607,7 +1684,7 @@ mod tests {
     #[test]
     fn rejects_local_devices_length_mismatch_for_explicit() {
         let mut v = canonical_full_json();
-        v["hosts"][1]["local_devices"] = json!([0]); // ranks: [1, 2] needs 2 devices
+        v["workers"][1]["local_devices"] = json!([0]); // ranks: [1, 2] needs 2 devices
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(err.to_string().contains("length mismatch"), "got: {err}");
     }
@@ -1617,15 +1694,15 @@ mod tests {
         // "all" stays symbolic; resolution is deferred to startup on the
         // host that ends up parsing the slim envelope.
         let mut v = canonical_full_json();
-        v["hosts"][0]["local_devices"] = json!("all");
+        v["workers"][0]["local_devices"] = json!("all");
         let c = FullCluster::from_value(&v).unwrap();
-        assert_eq!(c.hosts[0].local_devices, None);
+        assert_eq!(c.workers[0].local_devices, None);
     }
 
     #[test]
     fn rejects_unknown_local_devices_string() {
         let mut v = canonical_full_json();
-        v["hosts"][0]["local_devices"] = json!("every");
+        v["workers"][0]["local_devices"] = json!("every");
         let err = FullCluster::from_value(&v).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1637,7 +1714,7 @@ mod tests {
     #[test]
     fn rejects_master_port_overflow() {
         let mut v = canonical_full_json();
-        v["master_port"] = json!(100_000);
+        v["controller"]["port"] = json!(100_000);
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(err.to_string().contains("u16"), "got: {err}");
     }
@@ -1647,30 +1724,29 @@ mod tests {
         // Direct test of the build_slim_envelope_for helper: the slim
         // shape must round-trip through LocalCluster::from_env on the
         // rank side, so it has to match that parser's expectations
-        // (master_addr/master_port/world_size/num_hosts/host with no
-        // ssh field).
+        // (controller/world_size/num_workers/worker with no ssh field).
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let worker = full.hosts.iter().find(|h| h.name == "worker-host").unwrap();
+        let worker = full.workers.iter().find(|h| h.host == "worker-host").unwrap();
         let env = build_slim_envelope_for(&full, worker);
 
-        assert_eq!(env["master_addr"], "192.168.122.1");
-        assert_eq!(env["master_port"], 29500);
+        assert_eq!(env["controller"]["host"], "192.168.122.1");
+        assert_eq!(env["controller"]["port"], 29500);
         assert_eq!(env["world_size"], 3);
-        assert_eq!(env["num_hosts"], 2);
-        assert_eq!(env["host"]["name"], "worker-host");
-        assert_eq!(env["host"]["ranks"], serde_json::json!([1, 2]));
-        assert_eq!(env["host"]["local_devices"], serde_json::json!("all"));
-        assert_eq!(env["host"]["nccl_socket_ifname"], "enp1s0");
+        assert_eq!(env["num_workers"], 2);
+        assert_eq!(env["worker"]["host"], "worker-host");
+        assert_eq!(env["worker"]["ranks"], serde_json::json!([1, 2]));
+        assert_eq!(env["worker"]["local_devices"], serde_json::json!("all"));
+        assert_eq!(env["worker"]["nccl_socket_ifname"], "enp1s0");
         // ssh: stripped (launcher-only field; slim envelope is rank-side).
-        assert!(env["host"].get("ssh").is_none(), "ssh must be stripped");
+        assert!(env["worker"].get("ssh").is_none(), "ssh must be stripped");
     }
 
     #[test]
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
         let env = build_slim_envelope_for(&full, master);
-        assert_eq!(env["host"]["local_devices"], serde_json::json!([0]));
+        assert_eq!(env["worker"]["local_devices"], serde_json::json!([0]));
     }
 
     #[test]
@@ -1883,15 +1959,15 @@ mod tests {
         // cleanly via the rank-side LocalCluster::from_value. Same wire
         // contract, validated end-to-end.
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
         let env = build_slim_envelope_for(&full, master);
         let parsed = crate::distributed::cluster::LocalCluster::from_value(&env)
             .expect("slim envelope must parse via LocalCluster::from_value");
         assert_eq!(parsed.world_size(), 3);
-        assert_eq!(parsed.master_addr, "192.168.122.1");
-        assert_eq!(parsed.host.name, "master-host");
-        assert_eq!(parsed.host.ranks, vec![0]);
-        assert_eq!(parsed.host.local_devices, vec![0]);
+        assert_eq!(parsed.controller.host, "192.168.122.1");
+        assert_eq!(parsed.worker.host, "master-host");
+        assert_eq!(parsed.worker.ranks, vec![0]);
+        assert_eq!(parsed.worker.local_devices, vec![0]);
         // FullCluster::from_value defaults salt to zeros; the envelope
         // carries that, and the rank-side parser reads it back.
         assert_eq!(parsed.salt, [0u8; crate::distributed::wire::SESSION_SALT_BYTES]);
@@ -1908,7 +1984,7 @@ mod tests {
             0xfe, 0xed, 0xfa, 0xce, 0x05, 0x06, 0x07, 0x08,
         ];
         full = full.with_session_salt(salt);
-        let master = full.hosts.iter().find(|h| h.name == "master-host").unwrap();
+        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
         let env = build_slim_envelope_for(&full, master);
         // Salt field must be present as a 32-char lowercase hex string.
         let hex = env

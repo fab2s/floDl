@@ -128,7 +128,7 @@ pub fn prepare_cluster_env(
 ) -> Result<Vec<String>, String> {
     cluster.validate()?;
     let mut warnings: Vec<String> = Vec::new();
-    // Pre-resolve `master_addr` on the controller (where NSS knows
+    // Pre-resolve `controller.host` on the controller (where NSS knows
     // names declared in `/etc/hosts`, `libnss-libvirt`, mDNS, etc.)
     // and ship the resolved IP in the envelope to remote ranks. Remote
     // VMs that don't share the controller's NSS view (a Pascal VM on
@@ -138,11 +138,12 @@ pub fn prepare_cluster_env(
     // original string and let the remote try its own NSS as a last
     // resort.
     let mut shippable = cluster.clone();
-    let (master_ip, master_warning) = resolve_host_to_ip(&shippable.master_addr);
-    if let Some(ip) = master_ip {
-        shippable.master_addr = ip;
+    let (controller_ip, controller_warning) =
+        resolve_host_to_ip(&shippable.controller.host);
+    if let Some(ip) = controller_ip {
+        shippable.controller.host = ip;
     }
-    if let Some(w) = master_warning {
+    if let Some(w) = controller_warning {
         warnings.push(w);
     }
     let json = shippable.canonical_json()?;
@@ -169,22 +170,22 @@ pub fn prepare_cluster_env(
     Ok(warnings)
 }
 
-/// Resolve each cluster host's `name` to an IP via the controller's
+/// Resolve each cluster worker's `host` to an IP via the controller's
 /// NSS (which on Linux includes static `/etc/hosts`, `libnss-libvirt`,
 /// `libnss-mdns`, and DNS — anything `getaddrinfo` knows about).
-/// Returns `(Vec<"name:ip">, Vec<warning>)`: the first list is suitable
+/// Returns `(Vec<"host:ip">, Vec<warning>)`: the first list is suitable
 /// for `--add-host` injection into `docker compose run`; the second is
 /// human-readable warnings the cluster-dispatch site can surface to the
-/// user. Hosts that fail to resolve are skipped from the `name:ip`
+/// user. Workers that fail to resolve are skipped from the `host:ip`
 /// list (better-than-nothing semantics for the launcher inside the
 /// container — the unresolved host will retry via its own NSS).
 fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> (Vec<String>, Vec<String>) {
     let mut hosts = Vec::new();
     let mut warnings = Vec::new();
-    for h in &cluster.hosts {
-        let (ip, warning) = resolve_host_to_ip(&h.name);
+    for w in &cluster.workers {
+        let (ip, warning) = resolve_host_to_ip(&w.host);
         if let Some(ip) = ip {
-            hosts.push(format!("{}:{ip}", h.name));
+            hosts.push(format!("{}:{ip}", w.host));
         }
         if let Some(w) = warning {
             warnings.push(w);
@@ -407,10 +408,12 @@ mod tests {
         }
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /opt/flodl
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
@@ -436,10 +439,12 @@ commands:
         }
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /opt/flodl
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
@@ -474,10 +479,12 @@ commands:
         }
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /opt/flodl
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
@@ -513,10 +520,12 @@ commands:
         }
         let yaml = "\
 cluster:
-  master_addr: 127.0.0.1
-  master_port: 29500
-  hosts:
-    - name: solo
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /opt/flodl
+  workers:
+    - host: solo
       ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
@@ -586,12 +595,21 @@ commands:
     #[test]
     fn prepare_cluster_env_validates_cluster() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        // Empty master_addr → validate() fails → prepare_cluster_env errors.
+        // Empty controller.host → validate() fails → prepare_cluster_env errors.
         let cluster = ClusterConfig {
-            master_port: 29500,
-            ..Default::default()
+            controller: crate::config::ClusterController {
+                host: String::new(),
+                port: 1337,
+                path: String::new(),
+                nccl_socket_ifname: None,
+                docker: None,
+                arch: None,
+                data_path: None,
+            },
+            workers: Vec::new(),
+            env: std::collections::BTreeMap::new(),
         };
         let err = prepare_cluster_env(&cluster, None, "train").unwrap_err();
-        assert!(err.contains("master_addr"), "got: {err}");
+        assert!(err.contains("controller.host"), "got: {err}");
     }
 }
