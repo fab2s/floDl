@@ -1346,5 +1346,4 @@ fn make_partition(
 
 #[cfg(test)]
 #[allow(deprecated)]
-#[path = "tests.rs"]
 mod tests;
