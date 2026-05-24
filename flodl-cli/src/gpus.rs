@@ -142,7 +142,7 @@ pub fn count_visible_gpus_via_nvidia_smi() -> Result<usize, String> {
 /// (`0..devices.len()`), NCCL loopback transport (`lo`).
 ///
 /// `controller.port` defaults to [`DEFAULT_CONTROLLER_PORT`] (1337),
-/// overridable via `FLODL_MASTER_PORT`. Concurrent `fdl` cluster
+/// overridable via `FLODL_CONTROLLER_PORT`. Concurrent `fdl` cluster
 /// commands on the same host must use distinct ports to avoid
 /// rendezvous collisions.
 pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String> {
@@ -155,7 +155,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
         .map_err(|e| {
             format!("synthesize_local_cluster: cannot read current_dir: {e}")
         })?;
-    let port = std::env::var("FLODL_MASTER_PORT")
+    let port = std::env::var("FLODL_CONTROLLER_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_CONTROLLER_PORT);
@@ -325,18 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_local_cluster_respects_master_port_env() {
+    fn synthesize_local_cluster_respects_controller_port_env() {
         // SAFETY: cargo test parallelism. Use a unique env var name probe
-        // pattern instead of FLODL_MASTER_PORT to avoid clobbering other
+        // pattern instead of FLODL_CONTROLLER_PORT to avoid clobbering other
         // tests -- but here we DO want to test the env reading path, so we
         // accept the race. Single-threaded mod tests would be cleaner.
         // For now, accept that this test runs serially-enough.
         unsafe {
-            std::env::set_var("FLODL_MASTER_PORT", "31415");
+            std::env::set_var("FLODL_CONTROLLER_PORT", "31415");
         }
         let c = synthesize_local_cluster(&[0]).unwrap();
         unsafe {
-            std::env::remove_var("FLODL_MASTER_PORT");
+            std::env::remove_var("FLODL_CONTROLLER_PORT");
         }
         assert_eq!(c.controller.port, 31415);
     }

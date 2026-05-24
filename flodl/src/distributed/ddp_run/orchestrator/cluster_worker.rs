@@ -29,7 +29,7 @@ use super::DdpHandle;
 /// Parse `host:port`, falling back to DNS / `/etc/hosts` resolution.
 ///
 /// `SocketAddr::from_str` only accepts numeric IPs. In cluster mode the
-/// user's `master_addr` is often a short hostname (e.g. `exa`) that
+/// user's `controller_addr` is often a short hostname (e.g. `exa`) that
 /// resolves through the host's `/etc/hosts` under `network_mode: host`.
 fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
@@ -92,7 +92,7 @@ impl DdpHandle {
     /// driven by a [`ClusterCoordinator`] (elastic-membership-aware).
     ///
     /// Routes through [`ClusterWorker`] talking to a coord on
-    /// `master_addr:master_port + 3` over TCP control frames. The
+    /// `controller_addr:controller_port + 3` over TCP control frames. The
     /// `pre_sync_scratch` buffers are allocated unconditionally for
     /// NCCL workers (see `GpuWorker::new`) so the abort-retry path in
     /// `sync_now_nccl` can restore params after a peer-death abort
@@ -169,7 +169,7 @@ impl DdpHandle {
              (Sync+Nccl via_coord, save_path={save_path:?})"
         );
 
-        // Coord control channel at master_port + 3. master_port is
+        // Coord control channel at controller_port + 3. controller_port is
         // already used by the NCCL rendezvous; +2 is the
         // ClusterController (CPU averaging, unused in NCCL mode but
         // still bound by the launcher).
@@ -474,7 +474,7 @@ impl DdpHandle {
              ({policy_label}+Nccl via_coord, save_path={save_path:?})"
         );
 
-        // Coord control channel at master_port + 3 (same convention as
+        // Coord control channel at controller_port + 3 (same convention as
         // the Sync via_coord entry).
         let coord_port = cluster.controller.port.saturating_add(3);
         let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
@@ -641,8 +641,8 @@ impl DdpHandle {
     /// CPU-averaging counterpart of
     /// [`run_cluster_rank_sync_nccl_via_coord`](Self::run_cluster_rank_sync_nccl_via_coord).
     /// The worker connects to the controller for CPU averaging
-    /// (`master_port + 2`) and to the coordinator for control frames
-    /// (`master_port + 3`). The coordinator owns ElChe, ConvergenceGuard,
+    /// (`controller_port + 2`) and to the coordinator for control frames
+    /// (`controller_port + 3`). The coordinator owns ElChe, ConvergenceGuard,
     /// per-rank divergence aggregation, anchor adjustment, and
     /// `max_overshoot` auto-tune via
     /// [`ClusterCoordinator::finish_averaging_cpu`].

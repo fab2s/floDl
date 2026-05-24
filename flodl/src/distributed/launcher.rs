@@ -274,7 +274,7 @@ pub fn run_launcher_with_config(
         );
     }
 
-    // Start the ClusterController TCP server on master_port + 2 so any rank
+    // Start the ClusterController TCP server on controller_port + 2 so any rank
     // using AverageBackend::Cpu can connect. Bound to 0.0.0.0 so remote
     // ranks reach it; local ranks use the same address via loopback.
     //
@@ -313,7 +313,7 @@ pub fn run_launcher_with_config(
         full.world_size()
     );
 
-    // ClusterCoordinator spawn at master_port + 3 for the elastic-
+    // ClusterCoordinator spawn at controller_port + 3 for the elastic-
     // membership-aware NCCL path. `coord_config = Some(...)` means the
     // caller (the trampoline at `DdpHandle::launch`) built the
     // controller-scope config from the user's `DdpRunConfig` and wants
@@ -412,6 +412,34 @@ pub fn run_launcher_with_config(
                 ))
             })?;
     }
+
+    // Bootstrap rendezvous server (port +0). Controller binds, every rank
+    // dials in, the controller designates one rank as NCCL-UID generator
+    // (default: a local-host worker's first rank if any, else
+    // `workers[0].ranks[0]`), then broadcasts the UID. The controller
+    // cannot call `ncclGetUniqueId` itself — its process is
+    // orchestration-only — so it delegates to a rank, same pattern as
+    // elastic resize's `RequestNewNcclId` path.
+    //
+    // Spawned as a short-lived thread that exits once every rank has
+    // its UID. If it errors, ranks fail to rendezvous and surface their
+    // own loud errors; we eprintln any failure here for diagnostics.
+    let rdv_full = full.clone();
+    let rdv_me = me.clone();
+    let _ = thread::Builder::new()
+        .name("flodl-cluster-rendezvous".to_string())
+        .spawn(move || {
+            if let Err(e) =
+                crate::distributed::rendezvous::run_controller_rendezvous(&rdv_full, &rdv_me)
+            {
+                eprintln!("cluster launcher: rendezvous server error: {e}");
+            }
+        })
+        .map_err(|e| {
+            TensorError::new(&format!(
+                "cluster launcher: spawn rendezvous thread failed: {e}"
+            ))
+        })?;
 
     // For remote hosts, fdl-cli must have passed the original fdl command
     // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent.
@@ -1767,7 +1795,7 @@ mod tests {
             },
             "workers": [
                 {
-                    "host": "master-host",
+                    "host": "host-a",
                     "ranks": [0],
                     "local_devices": [0],
                     "nccl_socket_ifname": "virbr0",
@@ -1775,8 +1803,8 @@ mod tests {
                     "arch": "precompiled/cu128"
                 },
                 {
-                    "host": "worker-host",
-                    "ssh": { "target": "worker-host" },
+                    "host": "host-b",
+                    "ssh": { "target": "host-b" },
                     "ranks": [1, 2],
                     "local_devices": "all",
                     "nccl_socket_ifname": "enp1s0",
@@ -1795,17 +1823,17 @@ mod tests {
         assert!(c.spans_multiple_workers());
 
         assert_eq!(c.workers.len(), 2);
-        assert_eq!(c.workers[0].host, "master-host");
+        assert_eq!(c.workers[0].host, "host-a");
         assert_eq!(c.workers[0].ranks, vec![0]);
         assert_eq!(c.workers[0].local_devices, Some(vec![0]));
         assert_eq!(c.workers[0].ssh, None);
 
-        assert_eq!(c.workers[1].host, "worker-host");
+        assert_eq!(c.workers[1].host, "host-b");
         assert_eq!(c.workers[1].ranks, vec![1, 2]);
         // "all" stays unresolved at launcher-parse time; each host resolves
         // its own at startup.
         assert_eq!(c.workers[1].local_devices, None);
-        assert_eq!(c.workers[1].ssh_target(), "worker-host");
+        assert_eq!(c.workers[1].ssh_target(), "host-b");
     }
 
     #[test]
@@ -1830,7 +1858,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_ranks() {
         let mut v = canonical_full_json();
-        v["workers"][1]["ranks"] = json!([0, 1]); // collides with master-host's [0]
+        v["workers"][1]["ranks"] = json!([0, 1]); // collides with host-a's [0]
         let err = FullCluster::from_value(&v).unwrap_err();
         assert!(
             err.to_string().contains("duplicates or gaps"),
@@ -1869,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_master_port_overflow() {
+    fn rejects_controller_port_overflow() {
         let mut v = canonical_full_json();
         v["controller"]["port"] = json!(100_000);
         let err = FullCluster::from_value(&v).unwrap_err();
@@ -1883,14 +1911,14 @@ mod tests {
         // rank side, so it has to match that parser's expectations
         // (controller/world_size/num_workers/worker with no ssh field).
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let worker = full.workers.iter().find(|h| h.host == "worker-host").unwrap();
+        let worker = full.workers.iter().find(|h| h.host == "host-b").unwrap();
         let env = build_slim_envelope_for(&full, worker);
 
         assert_eq!(env["controller"]["host"], "192.168.122.1");
         assert_eq!(env["controller"]["port"], 29500);
         assert_eq!(env["world_size"], 3);
         assert_eq!(env["num_workers"], 2);
-        assert_eq!(env["worker"]["host"], "worker-host");
+        assert_eq!(env["worker"]["host"], "host-b");
         assert_eq!(env["worker"]["ranks"], serde_json::json!([1, 2]));
         assert_eq!(env["worker"]["local_devices"], serde_json::json!("all"));
         assert_eq!(env["worker"]["nccl_socket_ifname"], "enp1s0");
@@ -1901,8 +1929,8 @@ mod tests {
     #[test]
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
-        let env = build_slim_envelope_for(&full, master);
+        let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
+        let env = build_slim_envelope_for(&full, host_a);
         assert_eq!(env["worker"]["local_devices"], serde_json::json!([0]));
     }
 
@@ -1932,7 +1960,7 @@ mod tests {
         let s = build_remote_bash_command(
             "/srv/flodl",
             "abcd1234",
-            "worker-host",
+            "host-b",
             0,
             Some("cluster"),
             "train",
@@ -1944,7 +1972,7 @@ mod tests {
         );
         assert!(s.starts_with("cd '/srv/flodl' && "));
         assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"));
-        assert!(s.contains("FLODL_HOST_NAME='worker-host'"));
+        assert!(s.contains("FLODL_HOST_NAME='host-b'"));
         assert!(s.contains("FLODL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
         assert!(s.contains("fdl 'train' '--epochs' '10' &\n"));
@@ -2136,13 +2164,13 @@ mod tests {
         // cleanly via the rank-side LocalCluster::from_value. Same wire
         // contract, validated end-to-end.
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
-        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
-        let env = build_slim_envelope_for(&full, master);
+        let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
+        let env = build_slim_envelope_for(&full, host_a);
         let parsed = crate::distributed::cluster::LocalCluster::from_value(&env)
             .expect("slim envelope must parse via LocalCluster::from_value");
         assert_eq!(parsed.world_size(), 3);
         assert_eq!(parsed.controller.host, "192.168.122.1");
-        assert_eq!(parsed.worker.host, "master-host");
+        assert_eq!(parsed.worker.host, "host-a");
         assert_eq!(parsed.worker.ranks, vec![0]);
         assert_eq!(parsed.worker.local_devices, vec![0]);
         // FullCluster::from_value defaults salt to zeros; the envelope
@@ -2161,8 +2189,8 @@ mod tests {
             0xfe, 0xed, 0xfa, 0xce, 0x05, 0x06, 0x07, 0x08,
         ];
         full = full.with_session_salt(salt);
-        let master = full.workers.iter().find(|h| h.host == "master-host").unwrap();
-        let env = build_slim_envelope_for(&full, master);
+        let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
+        let env = build_slim_envelope_for(&full, host_a);
         // Salt field must be present as a 32-char lowercase hex string.
         let hex = env
             .get("salt")

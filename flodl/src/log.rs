@@ -134,7 +134,7 @@ fn build_thread_prefix(host: &str, local_dev: u8, global_rank: Option<usize>) ->
     }
 }
 
-/// Register the cluster-wide host label (e.g. `"master-host"`, `"worker-host"`).
+/// Register the cluster-wide host label (e.g. `"host-a"`, `"host-b"`).
 ///
 /// MUST run before worker threads spawn. The label is read by
 /// [`set_thread_device`] when computing each worker's prefix. Idempotent:

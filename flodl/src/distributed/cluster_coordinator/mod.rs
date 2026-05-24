@@ -868,7 +868,7 @@ fn reader_loop(
                     // stability (the enum value is part of protocol
                     // version 2's surface).
                 }
-                MsgKind::Control | MsgKind::ParamSnapshotMeta => {
+                MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous => {
                     eprintln!(
                         "cluster_coordinator: reader r{rank} got unexpected \
                          MsgKind {:?} on rank→coord path; dropping",

@@ -7,7 +7,7 @@
 //!
 //! Protocol mirror of [`controller`]:
 //!
-//! 1. Connect to the controller's `master_addr:cpu_avg_port`.
+//! 1. Connect to the controller's `controller_addr:cpu_avg_port`.
 //! 2. Send handshake: `(magic, version, rank_id, world_size)`.
 //! 3. Wait for handshake ack from controller.
 //! 4. Per averaging round: send [`RoundFrame`] (this rank's tensors),
@@ -58,8 +58,8 @@ pub struct CpuReduceClient {
 impl CpuReduceClient {
     /// Connect to the controller and complete the handshake.
     ///
-    /// `controller_addr` is typically `master_addr:master_port + 2` (the
-    /// CPU-averaging port reserved alongside `master_port + 1` for the
+    /// `controller_addr` is typically `controller_addr:controller_port + 2` (the
+    /// CPU-averaging port reserved alongside `controller_port + 1` for the
     /// future log side-channel). `rank_id` must be in `0..world_size`.
     ///
     /// `salt` is the 128-bit session salt the launcher generated and

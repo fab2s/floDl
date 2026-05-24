@@ -119,14 +119,14 @@ cluster:
     port: 29500
     path: /opt/flodl
   workers:
-    - host: master-host
+    - host: host-a
       local_devices: [0]
       nccl_socket_ifname: virbr0
       path: /opt/flodl
       arch: precompiled/cu128
-    - host: worker-host
+    - host: host-b
       ssh:
-        target: worker-host
+        target: host-b
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
@@ -146,7 +146,7 @@ commands:
 /// from device counts via `populate_ranks` before envelope emission.
 /// Tests that depend on the post-probe shape (envelopes, world_size,
 /// rank-shape validation) call this to simulate that step. Counts
-/// match `canonical_cluster_yaml`: master-host has 1 device, worker-host
+/// match `canonical_cluster_yaml`: host-a has 1 device, host-b
 /// has 2; resulting ranks are `[0]` and `[1, 2]`.
 pub(super) fn populate_canonical_ranks(cluster: &mut super::ClusterConfig) {
     cluster.populate_ranks(&[1, 2]).expect("populate_ranks for canonical fixture");

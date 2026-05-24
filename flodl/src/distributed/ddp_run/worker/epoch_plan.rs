@@ -352,13 +352,19 @@ impl<M: Module> GpuWorker<M> {
     /// Write the checkpoint bundle for an unrecoverable-failure save.
     ///
     /// Bundle members at `<stem>.{fdl,optim,meta.json}` per
-    /// [`crate::distributed::CheckpointBundle`]. Rank 0 is the
-    /// canonical writer for the model + meta files (all ranks see
-    /// identical post-sync params, so duplicating across ranks is
-    /// wasted I/O); all ranks write their optimizer state, with
-    /// non-zero ranks suffixing `.r<N>` so the canonical `.optim`
-    /// stays as rank 0's (per-rank momentum buffers differ and a
-    /// future resume API may choose to average them).
+    /// [`crate::distributed::CheckpointBundle`]. The controller-
+    /// designated callback rank (carried by `epoch_callback_role`,
+    /// set via `ControlMsg::SetEpochCallbackRole`) is the canonical
+    /// writer for the model + meta files — all ranks see identical
+    /// post-sync params so duplicating across ranks is wasted I/O.
+    /// All ranks write their optimizer state; the callback rank uses
+    /// the canonical `.optim` filename, others suffix `.r<N>` (per-
+    /// rank momentum buffers differ and a future resume API may
+    /// choose to average them).
+    ///
+    /// Falls back to rank 0 as primary if the controller has not yet
+    /// pushed a callback role (cold-failure path before the first
+    /// epoch transition).
     ///
     /// All save errors are logged + ignored — we'd rather surface a
     /// disk-full or permission error in the logs than deadlock the
@@ -370,8 +376,10 @@ impl<M: Module> GpuWorker<M> {
     ) {
         use crate::distributed::CheckpointBundle;
 
-        // Rank 0: model file (params + buffers).
-        if self.rank == 0 {
+        let primary_rank = self.epoch_callback_role.unwrap_or(0);
+
+        // Primary rank: model file (params + buffers).
+        if self.rank == primary_rank {
             let model_path = CheckpointBundle::model_path(stem);
             let params: Vec<(String, _)> = self
                 .model
@@ -391,21 +399,22 @@ impl<M: Module> GpuWorker<M> {
                         path_str, &params, &buffers, None,
                     ) {
                         eprintln!(
-                            "ddp-worker: rank 0 model save to {path_str} failed: {e}",
+                            "ddp-worker: primary rank {primary_rank} model save \
+                             to {path_str} failed: {e}",
                         );
                     }
                 }
                 None => eprintln!(
-                    "ddp-worker: rank 0 model path is not utf-8: {}",
+                    "ddp-worker: primary rank {primary_rank} model path is not utf-8: {}",
                     model_path.display(),
                 ),
             }
         }
 
-        // All ranks: optimizer state. Rank 0 uses the canonical
+        // All ranks: optimizer state. Primary rank uses the canonical
         // `.optim`; others suffix `.r<N>`.
         let optim_path = CheckpointBundle::optim_path(stem);
-        let rank_optim_path = if self.rank == 0 {
+        let rank_optim_path = if self.rank == primary_rank {
             optim_path
         } else {
             let mut p = optim_path;

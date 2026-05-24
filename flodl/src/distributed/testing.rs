@@ -93,7 +93,7 @@ fn autodetect_local_gpus() -> Option<usize> {
 }
 
 /// Build a single-host loopback cluster with `n_gpus` ranks, one rank
-/// per visible CUDA device. `master_port = 0` signals
+/// per visible CUDA device. `controller_port = 0` signals
 /// "kernel-assigned" — tests bind a listener first and read the
 /// assigned port; production launcher invocations would set a fixed
 /// port via the cluster envelope.

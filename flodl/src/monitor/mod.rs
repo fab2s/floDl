@@ -246,17 +246,37 @@ impl Monitor {
         }
     }
 
-    /// Detect whether this process is the dashboard-serving rank.
-    /// Returns `true` for single-GPU / non-cluster runs (no rank
-    /// envelope in env) and for cluster rank 0; `false` for other
-    /// cluster ranks.
+    /// Detect whether this process serves the dashboard.
+    ///
+    /// Per the controller-active / workers-passive principle, the
+    /// controller designates which rank serves the dashboard via its
+    /// [`EpochCallbackPolicy`] resolution. The launcher can export
+    /// the resolved initial callback rank via the
+    /// `FLODL_INITIAL_CALLBACK_RANK` env var; this method reads it as
+    /// the source of truth.
+    ///
+    /// Fallback: when the env var is unset (single-GPU runs, legacy
+    /// launchers, tests), defaults to rank 0 — matching the
+    /// historical convention and keeping single-process runs serving
+    /// the dashboard unconditionally.
+    ///
+    /// Note: this is the *initial* dashboard role at Monitor
+    /// construction. A full migration to controller-aggregated
+    /// metrics + dashboard-on-controller is a separate effort; today
+    /// the per-rank Monitor remains and only the role-selection
+    /// framing is fixed.
+    ///
+    /// [`EpochCallbackPolicy`]: crate::distributed::ddp_run::EpochCallbackPolicy
     fn detect_is_primary() -> bool {
-        // `LocalCluster::from_env` is the same env probe the rest of
-        // the framework uses to detect cluster-rank mode. Errors and
-        // missing env both surface as "not in cluster" → primary.
         match crate::distributed::LocalCluster::from_env() {
             Ok(Some(cluster)) => match cluster.my_rank() {
-                Ok((rank, _)) => rank == 0,
+                Ok((rank, _)) => {
+                    let designated = std::env::var("FLODL_INITIAL_CALLBACK_RANK")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    rank == designated
+                }
                 Err(_) => true,
             },
             _ => true,

@@ -211,7 +211,7 @@ impl ClusterController {
     /// directly with a matching [`crate::distributed::CpuReduceClient`].
     ///
     /// Use `127.0.0.1:0` for tests (kernel-assigned port; read back via
-    /// [`Self::port`]). Use the cluster's `master_addr:master_port+2`
+    /// [`Self::port`]). Use the cluster's `controller_addr:controller_port+2`
     /// in production.
     pub fn start(
         bind_addr: SocketAddr,

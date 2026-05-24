@@ -107,6 +107,10 @@ pub enum MsgKind {
     ParamSnapshotMeta = 0x04,
     /// Periodic heartbeat (control-channel). Payload: [`HeartbeatWire`].
     Heartbeat = 0x05,
+    /// Bootstrap rendezvous frame: worker → controller hello, controller →
+    /// worker role assignment, and either-direction NCCL unique-id
+    /// transport. Payload: [`RendezvousMsgWire`].
+    Rendezvous = 0x06,
 }
 
 impl MsgKind {
@@ -118,6 +122,7 @@ impl MsgKind {
             0x03 => Ok(MsgKind::Metrics),
             0x04 => Ok(MsgKind::ParamSnapshotMeta),
             0x05 => Ok(MsgKind::Heartbeat),
+            0x06 => Ok(MsgKind::Rendezvous),
             _ => Err(TensorError::new(&format!(
                 "wire: unknown MsgKind tag 0x{v:08x}"
             ))),
@@ -804,6 +809,72 @@ pub struct HeartbeatWire {
     pub rank: u64,
     /// Monotonic-ish step count at heartbeat time. Diagnostic.
     pub step_count: u64,
+}
+
+/// Per-rank role assignment for the bootstrap rendezvous.
+///
+/// The controller (orchestrator on the launcher host) decides which rank
+/// generates the NCCL unique ID via `ncclGetUniqueId`. The controller
+/// itself cannot make that call — its process may not link libnccl, and
+/// even when it does, the controller's role is strictly orchestration.
+/// Same constraint as elastic-resize ([`ControlMsgWire::RequestNewNcclId`]).
+///
+/// Default policy: the first rank of the local-host worker if any, else
+/// `workers[0].ranks[0]`. Future: routable via [`EpochCallbackPolicy`]
+/// once timing data exists (cannot apply at bootstrap — no data yet).
+///
+/// [`EpochCallbackPolicy`]: crate::distributed::ddp_run::EpochCallbackPolicy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RendezvousRole {
+    /// You generate `NcclUniqueId::new()` and send it back to the controller.
+    Generate,
+    /// Wait — the controller will send you the unique ID after collecting
+    /// it from the designated generator.
+    Wait,
+}
+
+/// Wire-side bootstrap rendezvous message. Carried inside a
+/// [`ControlFrame`] tagged with [`MsgKind::Rendezvous`]; HMAC-signed
+/// with the session salt like every other control frame.
+///
+/// Three-message protocol per worker connection (all controller-driven):
+///
+/// 1. worker → controller: [`Self::Hello`] (dataset-sig check + identity)
+/// 2. controller → worker: [`Self::Role`] (Generate or Wait)
+/// 3. UID transport:
+///    - if Generate: worker → controller: [`Self::Uid`]
+///    - if Wait:     controller → worker: [`Self::Uid`] (broadcast after collection)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RendezvousMsgWire {
+    /// Worker introduces itself to the controller after dialing in.
+    ///
+    /// The `dataset_sig` lets the controller verify all ranks agree on
+    /// the same dataset shard layout — silent divergence across ranks is
+    /// the worst class of bug. The `global_rank` is the value the
+    /// controller assigned at probe time (lives in the cluster
+    /// envelope); the worker echoes it so the controller can index the
+    /// accepted stream by rank for the subsequent [`Self::Role`] target.
+    Hello {
+        /// 32-byte signature of the dataset shard configuration. Same
+        /// value across every rank when shards are consistent.
+        dataset_sig: [u8; 32],
+        /// Rank the controller assigned via worker-order × device-count
+        /// probe. Read from `FLODL_LOCAL_RANK` × envelope `worker.ranks`.
+        global_rank: u32,
+        /// Worker host name (diagnostic; controller logs it in error
+        /// messages).
+        host_name: String,
+    },
+    /// Controller's role assignment to a worker. Sent after every Hello
+    /// has been validated.
+    Role(RendezvousRole),
+    /// NCCL unique-id bytes. Generator rank writes this to the
+    /// controller after receiving [`RendezvousRole::Generate`]; the
+    /// controller broadcasts it to every Wait rank.
+    Uid {
+        /// Raw 128-byte `NcclUniqueId` value.
+        uid_bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------

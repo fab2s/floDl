@@ -20,7 +20,7 @@ use super::*;
         assert!(cluster.spans_multiple_hosts());
 
         let worker = &cluster.workers[1];
-        assert_eq!(worker.host, "worker-host");
+        assert_eq!(worker.host, "host-b");
         assert_eq!(worker.ranks, vec![1, 2]);
         assert_eq!(
             worker.local_devices,
@@ -30,7 +30,7 @@ use super::*;
         assert_eq!(worker.path, "/srv/flodl");
         assert_eq!(
             worker.ssh.as_ref().and_then(|s| s.target.as_deref()),
-            Some("worker-host"),
+            Some("host-b"),
         );
 
         // CommandSpec cluster: true survives the custom Deserialize.
@@ -150,7 +150,7 @@ commands:
         cfg.cluster.as_mut().unwrap().workers[0].path = String::new();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("path"), "got: {err}");
-        assert!(err.contains("master-host"), "got: {err}");
+        assert!(err.contains("host-a"), "got: {err}");
     }
 
     #[test]
@@ -200,7 +200,7 @@ cluster:
         assert_eq!(parsed.world_size(), cluster.world_size());
         assert_eq!(
             parsed.workers[1].ssh.as_ref().and_then(|s| s.target.as_deref()),
-            Some("worker-host"),
+            Some("host-b"),
         );
     }
 
@@ -358,7 +358,7 @@ cluster:
 
         // Worker slice: only this worker's fields.
         let w = &env["worker"];
-        assert_eq!(w["host"], "worker-host");
+        assert_eq!(w["host"], "host-b");
         assert_eq!(w["ranks"], serde_json::json!([1, 2]));
         assert_eq!(w["local_devices"], serde_json::json!([0, 1]));
         assert_eq!(w["nccl_socket_ifname"], "enp1s0");
@@ -383,17 +383,17 @@ cluster:
     }
 
     #[test]
-    fn local_envelope_master_host_carries_rank_zero() {
+    fn local_envelope_first_worker_carries_rank_zero() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().unwrap();
-        let master = &cluster.workers[0];
-        let env = cluster.local_envelope_for(master);
+        let host_a = &cluster.workers[0];
+        let env = cluster.local_envelope_for(host_a);
         let ranks = env["worker"]["ranks"].as_array().unwrap();
         assert!(
             ranks.iter().any(|r| r.as_u64() == Some(0)),
-            "master worker's envelope must include rank 0"
+            "first worker's envelope must include rank 0"
         );
     }
 
@@ -402,8 +402,8 @@ cluster:
         let cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
-        assert_eq!(cluster.ssh_target(&cluster.workers[0]), "master-host"); // no ssh: → name
-        assert_eq!(cluster.ssh_target(&cluster.workers[1]), "worker-host"); // explicit
+        assert_eq!(cluster.ssh_target(&cluster.workers[0]), "host-a"); // no ssh: → name
+        assert_eq!(cluster.ssh_target(&cluster.workers[1]), "host-b"); // explicit
     }
 
     // ── Path-inheritance cluster-dispatch resolver ──────────────────

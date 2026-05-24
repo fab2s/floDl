@@ -1643,7 +1643,7 @@ mod tests {
         // The full body is left for the next slice's bring-up on the
         // Pascal rig. Once the rig is online we'll:
         //  1. Build a 2-rank NCCL communicator via NcclComms + split().
-        //  2. Spawn ClusterCoordinator on master_port + 3 with
+        //  2. Spawn ClusterCoordinator on controller_port + 3 with
         //     coord_config_sync_nccl(2).
         //  3. For each rank: in a thread, construct a tiny model
         //     (Linear with a few params), a small in-memory dataset,
@@ -1722,7 +1722,7 @@ mod tests {
 
         // 2. Build a shared DeadRanks ledger + spawn the coord listener
         //    on a kernel-assigned port (test convention: ignore the
-        //    cluster's master_port = 0 sentinel and bind fresh).
+        //    cluster's controller_port = 0 sentinel and bind fresh).
         let world_size = total_ranks;
         let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
         let (coord_listener, coord_port) = CCoord::bind(

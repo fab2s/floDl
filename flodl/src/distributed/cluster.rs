@@ -4,8 +4,8 @@
 //! by `fdl-cli` to each host via the `FLODL_CLUSTER_JSON` environment
 //! variable (hex-encoded JSON). It carries:
 //!
-//! - Master coordinates (`master_addr`, `master_port`) so non-master ranks
-//!   know where to phone home.
+//! - Controller coordinates (`controller.host`, `controller.port`) so every
+//!   rank knows where to dial in to the orchestrator.
 //! - World metadata (`world_size`, `num_hosts`) needed by NCCL bootstrap.
 //! - This host's slice (`host`) -- its ranks, CUDA devices, NCCL socket
 //!   interface, project path, libtorch path.
@@ -352,11 +352,6 @@ impl LocalCluster {
         Ok(&self.worker)
     }
 
-    /// Whether this host owns rank 0 (the rendezvous master).
-    pub fn is_master_host(&self) -> Result<bool> {
-        Ok(self.worker.ranks.contains(&0))
-    }
-
     /// Pick this process's `(global_rank, device)` out of the envelope.
     ///
     /// Reads [`ENV_LOCAL_RANK`] and indexes into `this_worker().ranks` /
@@ -699,7 +694,7 @@ mod tests {
             "world_size": 3,
             "num_workers": 2,
             "worker": {
-                "host": "worker-host",
+                "host": "host-b",
                 "ranks": [1, 2],
                 "local_devices": [0, 1],
                 "nccl_socket_ifname": "enp1s0",
@@ -715,7 +710,7 @@ mod tests {
             "world_size": 3,
             "num_workers": 2,
             "worker": {
-                "host": "master-host",
+                "host": "host-a",
                 "ranks": [0],
                 "local_devices": [0],
                 "nccl_socket_ifname": "virbr0",
@@ -734,7 +729,7 @@ mod tests {
         assert_eq!(c.num_workers, 2);
         assert!(c.spans_multiple_workers());
 
-        assert_eq!(c.worker.host, "worker-host");
+        assert_eq!(c.worker.host, "host-b");
         assert_eq!(c.worker.ranks, vec![1, 2]);
         assert_eq!(c.worker.local_devices, vec![0, 1]);
         assert_eq!(c.worker.nccl_socket_ifname, "enp1s0");
@@ -795,7 +790,7 @@ mod tests {
         let err = LocalCluster::from_value(&v).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("path"), "got: {msg}");
-        assert!(msg.contains("worker-host"), "got: {msg}");
+        assert!(msg.contains("host-b"), "got: {msg}");
     }
 
     #[test]
@@ -841,23 +836,15 @@ mod tests {
     }
 
     #[test]
-    fn is_master_host_works() {
-        let worker = LocalCluster::from_value(&worker_envelope()).unwrap();
-        let master = LocalCluster::from_value(&master_envelope()).unwrap();
-        assert!(!worker.is_master_host().unwrap());
-        assert!(master.is_master_host().unwrap());
-    }
-
-    #[test]
     fn this_worker_matches_envelope() {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: ENV_MUTEX serializes env-mutating tests in this module.
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
         }
         let h = c.this_worker().expect("hostname matches");
-        assert_eq!(h.host, "worker-host");
+        assert_eq!(h.host, "host-b");
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
         }
@@ -876,7 +863,7 @@ mod tests {
         }
         let msg = err.to_string();
         assert!(msg.contains("wrong-host"), "got: {msg}");
-        assert!(msg.contains("worker-host"), "got: {msg}");
+        assert!(msg.contains("host-b"), "got: {msg}");
         assert!(msg.contains(ENV_HOST_OVERRIDE), "got: {msg}");
     }
 
@@ -888,10 +875,10 @@ mod tests {
             env::set_var(ENV_HOST_OVERRIDE, "wrong-host");
         }
         // Thread-local takes precedence; even though env says "wrong-host",
-        // the thread-local says "worker-host" which matches the envelope.
-        set_thread_hostname_override(Some("worker-host"));
+        // the thread-local says "host-b" which matches the envelope.
+        set_thread_hostname_override(Some("host-b"));
         let h = c.this_worker().expect("thread-local wins");
-        assert_eq!(h.host, "worker-host");
+        assert_eq!(h.host, "host-b");
         set_thread_hostname_override(None);
         unsafe {
             env::remove_var(ENV_HOST_OVERRIDE);
@@ -921,7 +908,7 @@ mod tests {
         unsafe {
             env::remove_var(ENV_CLUSTER_JSON);
         }
-        assert_eq!(c.worker.host, "worker-host");
+        assert_eq!(c.worker.host, "host-b");
         assert_eq!(c.world_size, 3);
         assert_eq!(c.num_workers, 2);
     }
@@ -964,7 +951,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "0");
         }
         let (global_rank, device) = c.my_rank().expect("my_rank ok");
@@ -982,7 +969,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "1");
         }
         let (global_rank, device) = c.my_rank().expect("my_rank ok");
@@ -1000,7 +987,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::remove_var(ENV_LOCAL_RANK);
         }
         let err = c.my_rank().unwrap_err();
@@ -1017,7 +1004,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "not-a-number");
         }
         let err = c.my_rank().unwrap_err();
@@ -1035,7 +1022,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "5"); // host owns 2 ranks (indexes 0,1)
         }
         let err = c.my_rank().unwrap_err();
@@ -1045,7 +1032,7 @@ mod tests {
         }
         let msg = err.to_string();
         assert!(msg.contains("out of bounds"), "got: {msg}");
-        assert!(msg.contains("worker-host"), "got: {msg}");
+        assert!(msg.contains("host-b"), "got: {msg}");
         // The error names the valid range so the user can fix the launcher.
         assert!(msg.contains("0..2"), "got: {msg}");
     }
@@ -1057,7 +1044,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "  1  ");
         }
         let (gr, _) = c.my_rank().expect("trimmed parse ok");
@@ -1076,7 +1063,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::set_var(ENV_LOCAL_RANK, "0"); // env says 0, override says 1
         }
         set_thread_local_rank_override(Some(1));
@@ -1098,7 +1085,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::remove_var(ENV_LOCAL_RANK);
         }
         set_thread_local_rank_override(Some(0));
@@ -1118,7 +1105,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::remove_var(ENV_LOCAL_RANK);
         }
         set_thread_local_rank_override(Some(0));
@@ -1141,7 +1128,7 @@ mod tests {
         let c = LocalCluster::from_value(&worker_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "worker-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-b");
             env::remove_var(ENV_LOCAL_RANK);
         }
         set_thread_local_rank_override(Some(99)); // host owns 2 ranks
@@ -1163,7 +1150,7 @@ mod tests {
         let c = LocalCluster::from_value(&master_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe {
-            env::set_var(ENV_HOST_OVERRIDE, "master-host");
+            env::set_var(ENV_HOST_OVERRIDE, "host-a");
             env::set_var(ENV_LOCAL_RANK, "0");
         }
         let (global_rank, device) = c.my_rank().expect("single-rank ok");

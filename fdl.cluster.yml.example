@@ -114,11 +114,19 @@ cluster:
                                       # no `docker:` here -> bare-metal flodl install.
       # Optional per-worker env vars exported into every rank child
       # spawned on this worker. Overrides cluster-scope `env:` for
-      # matching keys. Example: older consumer-grade GPUs under VFIO
-      # that need NCCL fallback transport.
+      # matching keys. Example: pin a host-built libnccl version so
+      # libtorch's dlopen resolves to the same NCCL bytes as the
+      # other ranks on the cluster.
       # env:
-      #   NCCL_P2P_DISABLE: "1"
-      #   NCCL_SHM_DISABLE: "1"
+      #   LD_PRELOAD: /opt/flodl/libtorch/nccl/builds/v2.27.5-sm61/lib/libnccl.so.2
+      #
+      # NCCL_P2P_DISABLE / NCCL_SHM_DISABLE used to be required on
+      # consumer GPUs under VFIO passthrough (older libnccl
+      # versions hung the VM at ncclCommInitRank). Verified obsolete
+      # 2026-05 with libnccl 2.27.5 + driver 580.142 — NCCL detects
+      # P2P unavailability and falls back to socket transport on its
+      # own. Restore only if a future driver/libnccl regression
+      # reintroduces the failure mode.
 
   # Cluster-scope env: applied to every rank child on every worker.
   # Per-worker `env:` blocks override matching keys.

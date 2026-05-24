@@ -421,7 +421,7 @@ fn resolve_host_to_ip(host: &str) -> (Option<String>, Option<String>) {
             let warning = match (&ip, only_loopback) {
                 (Some(ip), true) => Some(format!(
                     "host {host:?} only resolves to loopback {ip} on the controller \
-                     — remote ranks will fail to connect. Set `master_addr` (or the \
+                     — remote ranks will fail to connect. Set `controller_addr` (or the \
                      host's `name`) in fdl.cluster.yml to a non-loopback IP reachable \
                      from peer nodes (e.g. the libvirt bridge IP 192.168.122.1 for \
                      virbr0)."
