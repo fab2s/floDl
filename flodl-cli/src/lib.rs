@@ -104,6 +104,11 @@ pub mod add;
 /// info) used by both `fdl libtorch` and the standalone-manager flow.
 pub mod libtorch;
 
+/// NCCL source builds (`fdl nccl build`). Drops a standalone libnccl.so
+/// into `libtorch/nccl/builds/<ver>-<archs>/` for the LD_PRELOAD bridge
+/// pattern used by cross-host heterogeneous-arch clusters.
+pub mod nccl;
+
 /// Environment overlay loader (`--env`, `FDL_ENV`, first-arg convention)
 /// with per-field origin annotations for `fdl config show`.
 pub mod overlay;

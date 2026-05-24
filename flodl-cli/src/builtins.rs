@@ -210,6 +210,26 @@ pub struct LibtorchBuildArgs {
     pub dry_run: bool,
 }
 
+/// Build NCCL from NVIDIA source for a heterogeneous-arch rig.
+#[derive(crate::FdlArgs, Debug)]
+pub struct NcclBuildArgs {
+    /// NCCL git tag to build (e.g. "v2.27.5-1"). Default: infer from the
+    /// active libtorch's bundled NCCL version string (the version we must
+    /// match for cross-rank handshake).
+    #[option]
+    pub tag: Option<String>,
+    /// Override CUDA architectures (semicolon-separated, e.g. "6.1;12.0").
+    /// Default: auto-detect from local GPUs.
+    #[option]
+    pub archs: Option<String>,
+    /// Parallel compilation jobs.
+    #[option(default = "6")]
+    pub jobs: usize,
+    /// Show what would happen without building.
+    #[option]
+    pub dry_run: bool,
+}
+
 /// Install AI coding assistant skills.
 #[derive(crate::FdlArgs, Debug)]
 pub struct SkillInstallArgs {
@@ -308,6 +328,16 @@ pub fn registry() -> &'static [BuiltinSpec] {
             path: &["libtorch", "info"],
             description: Some("Show active variant details"),
             schema_fn: None,
+        },
+        BuiltinSpec {
+            path: &["nccl"],
+            description: Some("Build NCCL from source (heterogeneous-arch bridge)"),
+            schema_fn: None,
+        },
+        BuiltinSpec {
+            path: &["nccl", "build"],
+            description: Some("Compile libnccl for the local GPU arch"),
+            schema_fn: Some(NcclBuildArgs::schema),
         },
         BuiltinSpec {
             path: &["init"],
