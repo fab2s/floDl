@@ -72,7 +72,6 @@ impl ClusterBuilder {
                 host: controller_host.into(),
                 port: 1337,
                 path: cwd,
-                nccl_socket_ifname: None,
                 docker: None,
                 arch: None,
                 data_path: None,
@@ -93,16 +92,6 @@ impl ClusterBuilder {
     /// each worker's view (heterogeneous-mount rigs).
     pub fn controller_path(mut self, path: impl Into<String>) -> Self {
         self.controller.path = path.into();
-        self
-    }
-
-    /// Set the network interface NCCL binds to on the controller side.
-    /// Required when more than one worker is declared.
-    pub fn controller_nccl_socket_ifname(
-        mut self,
-        ifname: impl Into<String>,
-    ) -> Self {
-        self.controller.nccl_socket_ifname = Some(ifname.into());
         self
     }
 
@@ -201,7 +190,6 @@ impl ClusterBuilder {
                 host: "127.0.0.1".to_string(),
                 port: 1337,
                 path: cwd.clone(),
-                nccl_socket_ifname: None,
                 docker: None,
                 arch: None,
                 data_path: None,

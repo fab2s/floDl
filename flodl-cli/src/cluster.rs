@@ -146,6 +146,16 @@ pub fn prepare_cluster_env(
     if let Some(w) = controller_warning {
         warnings.push(w);
     }
+    // Probe device counts per worker, then populate global ranks by
+    // sequential assignment. `ranks` is not user-facing in the YAML
+    // schema (see `ClusterWorker::ranks` — `skip_deserializing`); the
+    // probe result is authoritative. Probing only SSHes for workers
+    // that use `local_devices: all`; explicit lists carry their own
+    // count. After populate_ranks the cluster shape on the wire is
+    // identical to the legacy explicit form.
+    let counts = probe_worker_device_counts(&shippable)?;
+    shippable.populate_ranks(&counts)?;
+    shippable.validate()?;
     let json = shippable.canonical_json()?;
     let hex = hex_encode(json.as_bytes());
     let (extra_hosts, host_warnings) = resolve_cluster_extra_hosts(cluster);
@@ -170,6 +180,180 @@ pub fn prepare_cluster_env(
     Ok(warnings)
 }
 
+/// Local-only sibling of [`probe_worker_device_counts`], used by the
+/// testing-envelope export path in [`prepare_test_cluster_env`].
+///
+/// Testing-mode cluster invocations (`fdl cluster-test <cmd>`) run the
+/// test binary in-process on one host; there's no SSH fan-out, so any
+/// worker declaring `local_devices: all` is by definition referring to
+/// the local machine's visible GPUs. Use `nvidia-smi -L` locally
+/// instead of SSHing back to ourselves.
+///
+/// - `LocalDevices::Explicit(v)` → `v.len()`
+/// - `LocalDevices::All` → [`crate::gpus::count_visible_gpus_via_nvidia_smi`]
+///   (result cached across workers since they all resolve to the same
+///   local box in testing mode).
+///
+/// Errors loudly on nvidia-smi failure or a 0 count (caller treats 0
+/// as misconfiguration — no GPUs visible to the test).
+fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, String> {
+    let mut counts = Vec::with_capacity(cluster.workers.len());
+    let mut cached_local: Option<usize> = None;
+    for (i, w) in cluster.workers.iter().enumerate() {
+        let count = match &w.local_devices {
+            config::LocalDevices::Explicit(v) => v.len(),
+            config::LocalDevices::All => {
+                if cached_local.is_none() {
+                    cached_local = Some(
+                        crate::gpus::count_visible_gpus_via_nvidia_smi().map_err(|e| {
+                            format!(
+                                "cluster.workers[{i}] ({:?}): local nvidia-smi \
+                                 probe failed: {e}",
+                                w.host,
+                            )
+                        })?,
+                    );
+                }
+                cached_local.unwrap()
+            }
+        };
+        if count == 0 {
+            return Err(format!(
+                "cluster.workers[{i}] ({:?}): 0 CUDA devices visible \
+                 (local_devices: all). Run `fdl cluster-test <cmd>` on a \
+                 host with visible GPUs, or use an explicit \
+                 `local_devices: [...]` list.",
+                w.host,
+            ));
+        }
+        counts.push(count);
+    }
+    Ok(counts)
+}
+
+/// Prepare the testing-cluster envelope (`FLODL_TESTING_CLUSTER_JSON`).
+///
+/// Mirrors [`prepare_cluster_env`] for the testing path: clones the
+/// cluster, probes device counts LOCALLY (no SSH — tests run
+/// in-process on the local host), populates ranks by sequential
+/// assignment, then serializes for shipping.
+///
+/// Returns the hex-encoded envelope ready to set in the env. Errors
+/// surface from `cluster.validate()` (structural), the local probe,
+/// or `populate_ranks` (count/worker mismatch).
+pub fn prepare_test_cluster_env(cluster: &ClusterConfig) -> Result<String, String> {
+    cluster.validate()?;
+    let mut shippable = cluster.clone();
+    let counts = probe_local_device_counts(&shippable)?;
+    shippable.populate_ranks(&counts)?;
+    shippable.validate()?;
+    let json = shippable.canonical_json()?;
+    Ok(hex_encode(json.as_bytes()))
+}
+
+/// Probe each worker's CUDA device count.
+///
+/// - `LocalDevices::Explicit(v)` → `v.len()` (no SSH, no remote call)
+/// - `LocalDevices::All` → SSH to the worker and run
+///   `nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l`,
+///   parse as `usize`. Errors loudly on SSH failure, parse failure, or
+///   a 0 count (caller treats 0 as misconfiguration).
+///
+/// Returns one count per worker, in worker-declaration order. Used by
+/// [`prepare_cluster_env`] before envelope emission so global rank
+/// assignment can be sequential without requiring users to enumerate
+/// `ranks:` in YAML.
+fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, String> {
+    let mut counts = Vec::with_capacity(cluster.workers.len());
+    for (i, w) in cluster.workers.iter().enumerate() {
+        let count = match &w.local_devices {
+            config::LocalDevices::Explicit(v) => v.len(),
+            config::LocalDevices::All => ssh_query_gpu_count(w).map_err(|e| {
+                format!(
+                    "cluster.workers[{i}] ({:?}): probe failed: {e}",
+                    w.host,
+                )
+            })?,
+        };
+        if count == 0 {
+            return Err(format!(
+                "cluster.workers[{i}] ({:?}): probed 0 CUDA devices \
+                 (local_devices: all). Either the host has no GPUs visible \
+                 (check nvidia-smi + CUDA_VISIBLE_DEVICES) or it's a \
+                 misconfiguration — provide an explicit `local_devices: [...]` \
+                 list instead.",
+                w.host,
+            ));
+        }
+        counts.push(count);
+    }
+    Ok(counts)
+}
+
+/// SSH to a worker and count visible CUDA devices via `nvidia-smi`.
+///
+/// Honors the worker's `ssh:` sub-block (target / port / user /
+/// identity_file / options). Falls back to `host` as the ssh target
+/// when no `ssh:` block is provided; system ssh resolves the rest via
+/// `~/.ssh/config`.
+///
+/// Times out after 5s on connect to keep cluster startup snappy when a
+/// host is unreachable. Uses `BatchMode=yes` so a passphrase prompt
+/// doesn't hang the dispatch.
+fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> {
+    let target = worker
+        .ssh
+        .as_ref()
+        .and_then(|s| s.target.as_deref())
+        .unwrap_or(&worker.host);
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+    ]);
+    if let Some(ssh) = worker.ssh.as_ref() {
+        if let Some(port) = ssh.port {
+            cmd.arg("-p").arg(port.to_string());
+        }
+        if let Some(user) = ssh.user.as_deref() {
+            cmd.arg("-l").arg(user);
+        }
+        if let Some(id) = ssh.identity_file.as_deref() {
+            cmd.arg("-i").arg(id);
+        }
+        for opt in &ssh.options {
+            cmd.arg("-o").arg(opt);
+        }
+    }
+    cmd.arg(target);
+    // Pipe to wc -l for a one-line numeric output; nvidia-smi's
+    // error stream is silenced so a missing driver produces "0" cleanly
+    // rather than a parse failure on stderr noise.
+    cmd.arg("nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l");
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "ssh to {target:?} exited {} (stderr: {stderr})",
+            output.status,
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let count_str = stdout.trim();
+    count_str.parse::<usize>().map_err(|e| {
+        format!(
+            "could not parse nvidia-smi output as device count: {e:?} \
+             (got {count_str:?})"
+        )
+    })
+}
+
 /// Resolve each cluster worker's `host` to an IP via the controller's
 /// NSS (which on Linux includes static `/etc/hosts`, `libnss-libvirt`,
 /// `libnss-mdns`, and DNS — anything `getaddrinfo` knows about).
@@ -187,8 +371,23 @@ fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> (Vec<String>, Vec<Str
         if let Some(ip) = ip {
             hosts.push(format!("{}:{ip}", w.host));
         }
-        if let Some(w) = warning {
-            warnings.push(w);
+        // Suppress the warning when the worker carries an explicit
+        // `ssh.target`. The `host:` value is then just a label — the
+        // actual connection uses ssh.target (or `host:` only as the
+        // default ssh target, which is itself a system-ssh lookup, not
+        // a process-controller-side NSS lookup). Workers reached via
+        // ~/.ssh/config aliases (e.g. `exa-cuda` mapping to
+        // 127.0.0.1:2222) routinely don't resolve via host NSS, and
+        // surfacing the warning every run is noise.
+        let has_explicit_ssh_target = w
+            .ssh
+            .as_ref()
+            .and_then(|s| s.target.as_deref())
+            .is_some();
+        if let Some(msg) = warning
+            && !has_explicit_ssh_target
+        {
+            warnings.push(msg);
         }
     }
     (hosts, warnings)
@@ -601,7 +800,6 @@ commands:
                 host: String::new(),
                 port: 1337,
                 path: String::new(),
-                nccl_socket_ifname: None,
                 docker: None,
                 arch: None,
                 data_path: None,
@@ -611,5 +809,89 @@ commands:
         };
         let err = prepare_cluster_env(&cluster, None, "train").unwrap_err();
         assert!(err.contains("controller.host"), "got: {err}");
+    }
+
+    /// Workers reached via `~/.ssh/config` aliases (or any setup where
+    /// the YAML's `host:` is just a label, not a DNS-resolvable name)
+    /// carry an explicit `ssh.target` in the worker block. In that case
+    /// the controller's NSS does not need to know the `host:` value —
+    /// the connection uses `ssh.target` — so the "did not resolve"
+    /// warning is noise and gets suppressed.
+    ///
+    /// Uses `nonexistent.invalid.` (RFC 2606 reserved) to guarantee
+    /// `getaddrinfo` returns Err on any system regardless of local DNS
+    /// or /etc/hosts content.
+    #[test]
+    fn resolve_cluster_extra_hosts_suppresses_warning_when_ssh_target_explicit() {
+        use crate::config::{
+            ClusterController, ClusterWorker, LocalDevices, SshConfig,
+        };
+        let cluster = ClusterConfig {
+            controller: ClusterController {
+                host: "127.0.0.1".into(),
+                port: 1337,
+                path: "/tmp".into(),
+                docker: None,
+                arch: None,
+                data_path: None,
+            },
+            workers: vec![ClusterWorker {
+                host: "nonexistent.invalid.".into(),
+                ranks: vec![0],
+                local_devices: LocalDevices::Explicit(vec![0]),
+                nccl_socket_ifname: "lo".into(),
+                path: "/tmp".into(),
+                ssh: Some(SshConfig {
+                    target: Some("127.0.0.1".into()),
+                    ..SshConfig::default()
+                }),
+                arch: None,
+                data_path: None,
+                docker: None,
+                env: std::collections::BTreeMap::new(),
+            }],
+            env: std::collections::BTreeMap::new(),
+        };
+        let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
+        assert!(
+            warnings.is_empty(),
+            "explicit ssh.target should suppress the resolution warning, \
+             got warnings: {warnings:?}"
+        );
+    }
+
+    /// Mirror of the suppression test: without `ssh.target` the warning
+    /// must still fire (so legitimate misconfigurations stay visible).
+    #[test]
+    fn resolve_cluster_extra_hosts_warns_when_ssh_target_absent() {
+        use crate::config::{ClusterController, ClusterWorker, LocalDevices};
+        let cluster = ClusterConfig {
+            controller: ClusterController {
+                host: "127.0.0.1".into(),
+                port: 1337,
+                path: "/tmp".into(),
+                docker: None,
+                arch: None,
+                data_path: None,
+            },
+            workers: vec![ClusterWorker {
+                host: "nonexistent.invalid.".into(),
+                ranks: vec![0],
+                local_devices: LocalDevices::Explicit(vec![0]),
+                nccl_socket_ifname: "lo".into(),
+                path: "/tmp".into(),
+                ssh: None,
+                arch: None,
+                data_path: None,
+                docker: None,
+                env: std::collections::BTreeMap::new(),
+            }],
+            env: std::collections::BTreeMap::new(),
+        };
+        let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
+        assert!(
+            warnings.iter().any(|w| w.contains("did not resolve")),
+            "missing ssh.target should keep the warning, got warnings: {warnings:?}"
+        );
     }
 }

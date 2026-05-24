@@ -1352,16 +1352,33 @@ fn dispatch_config(
     // Gated on `env.is_some()` so `fdl <cmd>` (no overlay) leaves the
     // file inert, matching the convention "presence of fdl.<env>.yml
     // does nothing until invoked via --env <name>".
+    //
+    // Uses `prepare_test_cluster_env` (NOT the production
+    // `prepare_cluster_env`) so the probe stays local (no SSH); tests
+    // run in-process on whichever host the cluster-test invocation
+    // lives on, and the local `nvidia-smi -L` is authoritative for
+    // any worker declaring `local_devices: all`.
     if env.is_some()
         && let Some(cluster) = project.cluster.as_ref()
-        && let Ok(json) = cluster.canonical_json()
     {
-        let hex = cluster::hex_encode(json.as_bytes());
-        // SAFETY: main() has not spawned threads at this point in the
-        // dispatch flow; matches the invariant for
-        // `prepare_cluster_env` and `apply_cuda_visible_devices`.
-        unsafe {
-            env::set_var("FLODL_TESTING_CLUSTER_JSON", hex);
+        match cluster::prepare_test_cluster_env(cluster) {
+            Ok(hex) => {
+                // SAFETY: main() has not spawned threads at this point
+                // in the dispatch flow; matches the invariant for
+                // `prepare_cluster_env` and `apply_cuda_visible_devices`.
+                unsafe {
+                    env::set_var("FLODL_TESTING_CLUSTER_JSON", hex);
+                }
+            }
+            Err(e) => {
+                // Don't abort the command — the test binary may not
+                // need the topology (e.g. running a non-cluster test
+                // command under a cluster-aware overlay). Surface as a
+                // warning so misconfigurations stay visible.
+                eprintln!(
+                    "warning: cluster-test envelope export failed: {e}"
+                );
+            }
         }
     }
 

@@ -123,12 +123,6 @@ pub struct ClusterController {
     /// per host), the controller's value diverges (e.g. exa:
     /// `/home/me/src/.../rdl` while Pascal sees `/mnt/rdl`).
     pub path: String,
-    /// Network interface NCCL binds to for the ClusterController TCP
-    /// listener (e.g. `virbr0`, `enp1s0`). Required when more than one
-    /// worker is declared (single-worker setups don't need a controller
-    /// bind beyond loopback).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nccl_socket_ifname: Option<String>,
     /// Docker compose service the controller runs the pre-flight build
     /// inside (e.g. `cuda`, `dev`). Optional; affects build context
     /// only.
@@ -278,6 +272,19 @@ pub struct ClusterWorker {
     /// `FLODL_HOST_NAME`-overridden value).
     pub host: String,
     /// Global ranks owned by this worker.
+    ///
+    /// NOT part of the user YAML schema — populated internally by
+    /// [`ClusterConfig::populate_ranks`] from probed device counts
+    /// (called by `prepare_cluster_env` before envelope emission).
+    /// Sequential assignment by worker order: worker 0 owns
+    /// `[0..counts[0])`, worker 1 owns
+    /// `[counts[0]..counts[0]+counts[1])`, etc.
+    ///
+    /// Serialized into the wire format so the rank-side library reads
+    /// the post-probe assignment via `FullCluster::from_value`. Marked
+    /// `skip_deserializing` so any stale `ranks:` left over in older
+    /// YAML files is silently ignored (probe is authoritative).
+    #[serde(default, skip_deserializing)]
     pub ranks: Vec<usize>,
     /// CUDA device indices paired by position with `ranks`, or `"all"`
     /// shorthand for auto-detect at startup. See [`LocalDevices`] for
@@ -398,14 +405,16 @@ impl ClusterConfig {
     /// remote host:
     ///
     /// - `controller.host` non-empty, `controller.path` non-empty
-    /// - `controller.nccl_socket_ifname` non-empty when more than one
-    ///   worker is declared
     /// - `workers` non-empty
-    /// - per worker: `host` non-empty, `ranks` non-empty and equal
-    ///   length to `local_devices`, `nccl_socket_ifname` non-empty
+    /// - per worker: `host` non-empty, `nccl_socket_ifname` non-empty
     ///   (when cluster spans multiple workers), `path` non-empty
-    /// - across workers: ranks form exactly `0..world_size` with no
-    ///   duplicates or gaps
+    ///
+    /// Ranks are NOT user input — they're computed by
+    /// [`Self::populate_ranks`] from probed device counts. When this
+    /// runs pre-probe (ranks empty), the rank-shape check is skipped;
+    /// when called post-probe (ranks populated), the
+    /// `0..world_size` + length-match-vs-local_devices invariant is
+    /// enforced.
     pub fn validate(&self) -> Result<(), String> {
         if self.controller.host.trim().is_empty() {
             return Err("cluster.controller.host must be non-empty".into());
@@ -417,45 +426,10 @@ impl ClusterConfig {
             return Err("cluster.workers must be non-empty".into());
         }
         let multi_host = self.spans_multiple_hosts();
-        if multi_host
-            && self
-                .controller
-                .nccl_socket_ifname
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-        {
-            return Err(
-                "cluster.controller.nccl_socket_ifname must be non-empty when \
-                 more than one worker is declared"
-                    .into(),
-            );
-        }
         for (i, w) in self.workers.iter().enumerate() {
             if w.host.trim().is_empty() {
                 return Err(format!("cluster.workers[{i}].host must be non-empty"));
             }
-            if w.ranks.is_empty() {
-                return Err(format!(
-                    "cluster.workers[{i}] ({:?}): ranks must be non-empty \
-                     (a worker entry without ranks is a controller — declare \
-                     it under `controller:` instead)",
-                    w.host
-                ));
-            }
-            if let Some(devs) = w.local_devices.as_explicit() {
-                if w.ranks.len() != devs.len() {
-                    return Err(format!(
-                        "cluster.workers[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
-                        w.host,
-                        w.ranks.len(),
-                        devs.len()
-                    ));
-                }
-            }
-            // `LocalDevices::All` defers the count check to startup on
-            // the target host (where `cuda_device_count()` is queried).
             if multi_host && w.nccl_socket_ifname.trim().is_empty() {
                 return Err(format!(
                     "cluster.workers[{i}] ({:?}): nccl_socket_ifname must be \
@@ -471,19 +445,74 @@ impl ClusterConfig {
                 ));
             }
         }
-        let mut all: Vec<usize> = self
-            .workers
-            .iter()
-            .flat_map(|w| w.ranks.iter().copied())
-            .collect();
-        let ws = all.len();
-        all.sort_unstable();
-        let expected: Vec<usize> = (0..ws).collect();
-        if all != expected {
+        // Post-probe shape checks: only when ranks have been populated.
+        // Pre-probe (all empty) skips this branch.
+        if self.workers.iter().all(|w| !w.ranks.is_empty()) {
+            for (i, w) in self.workers.iter().enumerate() {
+                if let Some(devs) = w.local_devices.as_explicit() {
+                    if w.ranks.len() != devs.len() {
+                        return Err(format!(
+                            "cluster.workers[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
+                            w.host,
+                            w.ranks.len(),
+                            devs.len()
+                        ));
+                    }
+                }
+            }
+            let mut all: Vec<usize> = self
+                .workers
+                .iter()
+                .flat_map(|w| w.ranks.iter().copied())
+                .collect();
+            let ws = all.len();
+            all.sort_unstable();
+            let expected: Vec<usize> = (0..ws).collect();
+            if all != expected {
+                return Err(format!(
+                    "cluster: ranks across workers must be exactly 0..{ws} with no \
+                     duplicates or gaps, got sorted-unique sequence {all:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Populate `workers[i].ranks` from probed device counts.
+    /// Sequential assignment by worker order: worker 0 owns
+    /// `[0..counts[0])`, worker 1 owns
+    /// `[counts[0]..counts[0]+counts[1])`, etc.
+    ///
+    /// Errors when `device_counts.len() != workers.len()` or any
+    /// count is 0. Workers' existing `ranks` are unconditionally
+    /// overwritten — they're not user input, the probe is
+    /// authoritative.
+    ///
+    /// Caller orchestration (see `prepare_cluster_env`):
+    /// 1. parse YAML → ClusterConfig (ranks empty by serde default)
+    /// 2. probe device counts per worker
+    /// 3. call `populate_ranks` to fill in
+    /// 4. validate (now ranks are non-empty → shape checks run)
+    /// 5. serialize and ship via FLODL_FULL_CLUSTER_JSON
+    pub fn populate_ranks(&mut self, device_counts: &[usize]) -> Result<(), String> {
+        if device_counts.len() != self.workers.len() {
             return Err(format!(
-                "cluster: ranks across workers must be exactly 0..{ws} with no \
-                 duplicates or gaps, got sorted-unique sequence {all:?}"
+                "populate_ranks: device_counts len {} != workers len {}",
+                device_counts.len(),
+                self.workers.len(),
             ));
+        }
+        let mut next_rank = 0usize;
+        for (i, w) in self.workers.iter_mut().enumerate() {
+            let count = device_counts[i];
+            if count == 0 {
+                return Err(format!(
+                    "populate_ranks: worker[{i}] ({:?}) reported 0 devices",
+                    w.host,
+                ));
+            }
+            w.ranks = (next_rank..next_rank + count).collect();
+            next_rank += count;
         }
         Ok(())
     }

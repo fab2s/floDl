@@ -7,8 +7,11 @@ use super::*;
 
     #[test]
     fn cluster_overlay_parses() {
-        let cfg: ProjectConfig =
+        let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).expect("parse cluster overlay");
+        // Simulate fdl-cli's post-probe rank population. Ranks aren't in the
+        // user YAML schema anymore — see `ClusterWorker::ranks` doc.
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().expect("cluster: block present");
         assert_eq!(cluster.controller.host, "192.168.122.1");
         assert_eq!(cluster.controller.port, 29500);
@@ -60,7 +63,6 @@ cluster:
     path: /tmp/test-solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
       path: /tmp/test-solo
@@ -72,8 +74,10 @@ commands:
         let overlay: serde_yaml::Value = serde_yaml::from_str(overlay_yaml).unwrap();
         let merged = crate::overlay::deep_merge(base, overlay);
         let merged_yaml = serde_yaml::to_string(&merged).unwrap();
-        let cfg: ProjectConfig =
+        let mut cfg: ProjectConfig =
             serde_yaml::from_str(&merged_yaml).expect("merged config parses");
+        // Post-probe: solo has 1 device → 1 rank.
+        cfg.cluster.as_mut().unwrap().populate_ranks(&[1]).unwrap();
         let cluster = cfg.cluster.as_ref().expect("cluster: from overlay");
         assert_eq!(cluster.world_size(), 1);
         assert_eq!(cluster.workers[0].host, "solo");
@@ -86,8 +90,12 @@ commands:
 
     #[test]
     fn validate_rejects_duplicate_ranks() {
+        // Post-probe shape: corrupt to a duplicate to exercise the
+        // cross-worker `0..world_size` check. Pre-probe (all empty) skips
+        // this branch; the corruption simulates a populate_ranks bug.
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![1, 1];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("duplicates or gaps"), "got: {err}");
@@ -97,6 +105,7 @@ commands:
     fn validate_rejects_rank_gap() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![2, 3];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("duplicates or gaps"), "got: {err}");
@@ -104,8 +113,11 @@ commands:
 
     #[test]
     fn validate_rejects_len_mismatch() {
+        // Post-probe: shrink local_devices to mismatch the populated ranks
+        // count. Real-world this would surface a populate_ranks bug.
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].local_devices =
             LocalDevices::Explicit(vec![0]);
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
@@ -331,8 +343,9 @@ cluster:
 
     #[test]
     fn local_envelope_strips_ssh_adds_world_metadata() {
-        let cfg: ProjectConfig =
+        let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().unwrap();
         let worker = &cluster.workers[1];
         let env = cluster.local_envelope_for(worker);
@@ -371,8 +384,9 @@ cluster:
 
     #[test]
     fn local_envelope_master_host_carries_rank_zero() {
-        let cfg: ProjectConfig =
+        let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().unwrap();
         let master = &cluster.workers[0];
         let env = cluster.local_envelope_for(master);

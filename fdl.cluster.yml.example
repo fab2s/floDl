@@ -14,19 +14,21 @@
 #   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism
 #     picks it up when invoked as `fdl cluster <cmd>` (first arg =
 #     overlay name) or with `FDL_ENV=cluster` set in the environment.
-#   - One process per rank. Each worker owns a contiguous (or sparse)
-#     set of ranks listed in `ranks:`, with CUDA devices paired by
-#     position in `local_devices:`.
+#   - One process per rank. Each worker owns one rank per visible CUDA
+#     device. Global rank IDs are NOT user input — fdl probes each host
+#     for its device count before fan-out and assigns ranks sequentially
+#     by worker order: worker 0 owns [0..N0), worker 1 owns [N0..N0+N1),
+#     etc. The probe queries `nvidia-smi --query-gpu=index --format=csv,noheader`
+#     via SSH for workers using `local_devices: all`.
 #   - `local_devices:` accepts either an explicit list (`[0, 1]`) or
-#     the `all` shorthand. With `all`, the host auto-detects CUDA
-#     devices at startup (via cuda_device_count()) and binds indices
-#     `0..ranks.len()`. The detected count must cover `ranks.len()` or
-#     rendezvous errors loudly.
+#     the `all` shorthand. With `all`, fdl probes the host's GPU count
+#     before dispatch; explicit lists carry their own count. A 0-GPU
+#     result on a worker using `all` aborts dispatch with a clear error
+#     (likely misconfig — switch to an explicit `[0, 1, ...]` list).
 #   - `nccl_socket_ifname:` is required on every worker when the
 #     cluster spans multiple machines. NCCL needs it to bind its TCP
 #     transport; auto-detection is brittle so fdl errors loudly if
-#     missing. Required on the controller too when >1 worker is
-#     declared (for the ClusterController TCP listener).
+#     missing.
 #   - `host:` is the worker identifier (was `name:` pre-Refactor 2).
 #     Used for /etc/hosts resolution, `--add-host` injection, and as
 #     the default SSH target.
@@ -82,14 +84,12 @@ cluster:
     host: 192.168.122.1               # rendezvous bind address (was `master_addr`)
     port: 1337                        # rendezvous port (was `master_port`); default 1337
     path: /opt/flodl                  # controller's view of the shared project root
-    nccl_socket_ifname: virbr0        # required when >1 worker is declared
     # docker: cuda                    # optional pre-flight build context
     # arch: precompiled/cu128         # optional libtorch variant for pre-flight
 
   workers:
     - host: node-a                    # worker identifier; default SSH target
-      ranks: [0]
-      local_devices: [0]
+      local_devices: [0]              # 1 device -> 1 rank, assigned [0]
       nccl_socket_ifname: virbr0
       path: /opt/flodl                # checkout path on this worker
       arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
@@ -105,9 +105,9 @@ cluster:
         # options:
         #   - ProxyJump=bastion
         #   - StrictHostKeyChecking=no
-      ranks: [1, 2]
-      local_devices: all              # auto-detect at startup; equivalent to [0, 1]
+      local_devices: all              # probed pre-dispatch; equivalent to [0, 1]
                                       # if this worker has 2 visible CUDA devices.
+                                      # Resulting ranks: [1, 2] (sequential after node-a's [0]).
       nccl_socket_ifname: enp1s0
       path: /srv/flodl                # heterogeneous mounts are fine
       arch: builds/sm61-sm120         # different variant per worker is OK

@@ -109,7 +109,6 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             host: "127.0.0.1".to_string(),
             port: 0,
             path: String::new(),
-            nccl_socket_ifname: None,
             docker: None,
             arch: None,
             data_path: None,

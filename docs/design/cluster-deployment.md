@@ -228,6 +228,6 @@ on each, separately). No auto-probe, no auto-deploy, no
 controller/averager separation, no shared-storage abstraction in
 the cluster topology — these are deferred.
 
-Test rig with `fdl cluster-testing <cmd>`: **works** with virtiofs or
+Test rig with `fdl cluster-test <cmd>`: **works** with virtiofs or
 sshfs shared mount. The end-to-end NCCL via-coord smoke test passed
 on a 2-rank Pascal rig validating the elasticity + persistence work.

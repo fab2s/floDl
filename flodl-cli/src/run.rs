@@ -584,6 +584,27 @@ pub(crate) fn compose_run_command(
 /// between `command` and `append`, so a script like `cargo test live`
 /// with `append: -- --nocapture --ignored` still receives its libtest
 /// flags after a user-supplied `-p flodl-hf`.
+/// Forward the testing-cluster envelope into a docker-compose run
+/// invocation. When `fdl cluster-test-{nccl,cpu} <cmd>` activates an
+/// overlay with a `cluster:` block, the dispatcher sets
+/// `FLODL_TESTING_CLUSTER_JSON` in fdl-cli's own env (see
+/// `dispatch_config` in main.rs). This helper reads that variable and
+/// returns a ` -e NAME=VALUE` fragment so the inner cargo process can
+/// see it; without it, the env var dies at the docker boundary and
+/// `discover_test_cluster()` inside the container silently falls back
+/// to local autodetect.
+///
+/// The hex-encoded value contains only [0-9a-f] so no shell quoting is
+/// needed. Source of truth for the env-var name lives in
+/// `flodl::distributed::testing::ENV_TESTING_CLUSTER_JSON`; mirrored
+/// here as a literal because flodl-cli is zero-dep by policy.
+fn testing_cluster_env_arg() -> String {
+    match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
+        Ok(v) => format!(" -e FLODL_TESTING_CLUSTER_JSON={v}"),
+        Err(_) => String::new(),
+    }
+}
+
 pub fn exec_script(
     command: &str,
     append: Option<&str>,
@@ -599,8 +620,9 @@ pub fn exec_script(
             // `bash -c` so user args containing shell metacharacters
             // don't escape the inner shell.
             let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
+            let testing_env_arg = testing_cluster_env_arg();
             let docker_cmd = format!(
-                "docker compose{overlay} run --rm {service} bash -c {}",
+                "docker compose{overlay} run --rm{testing_env_arg} {service} bash -c {}",
                 posix_quote(&inner_cmd)
             );
             spawn_docker_shell(&docker_cmd, cwd)
@@ -739,8 +761,9 @@ pub fn exec_command(
         // typing `flodl-hf/tests/.exports/bert` from the host repo
         // root resolves against the wrong cwd inside the container.
         let overlay = crate::cluster::cluster_compose_overlay_arg(project_root);
+        let testing_env_arg = testing_cluster_env_arg();
         let docker_cmd = format!(
-            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root} {service} bash -c \"{inner}\"",
+            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root}{testing_env_arg} {service} bash -c \"{inner}\"",
         );
         spawn_docker_shell(&docker_cmd, project_root)
     } else {

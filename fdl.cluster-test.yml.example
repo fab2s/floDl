@@ -1,0 +1,64 @@
+# Cluster topology for testing -- deep-merges onto fdl.yml.
+#
+# Usage:
+#   cp fdl.cluster-test.yml.example fdl.cluster-test.yml
+#   # edit `workers:` to describe your rig (controller stays loopback)
+#   fdl cluster-test <command>      # activates this overlay
+#   FDL_ENV=cluster-test fdl <cmd>  # equivalent
+#
+# Controller is implicit-local: tests run in-process on whichever host
+# invokes `fdl cluster-test <cmd>`, and the rank-side coord binds
+# 127.0.0.1 regardless of what's in this file. Keep `controller.host:
+# 127.0.0.1` and your config stays portable to any rig with visible
+# GPUs — no bridge address, no NIC config, no cross-host setup.
+#
+# Difference vs fdl.cluster.yml: this overlay does NOT mark any command
+# with `cluster: true`. Production cluster runs (fdl.cluster.yml) fan
+# the user's training command out across hosts and enter the launcher
+# path; this overlay is purely a topology source for
+# `flodl::distributed::testing::discover_test_cluster()`. Tests read
+# the topology to set up their own coord + worker threads in-process;
+# nothing fans out across SSH.
+#
+# Activation effects:
+#   - `fdl test` (no overlay): unaffected. Test bodies autodetect local
+#     CUDA devices or fall back to CPU-only.
+#   - `fdl cluster-test <test-runner>`: fdl-cli exports
+#     `FLODL_TESTING_CLUSTER_JSON` to the cargo test subprocess.
+#     `discover_test_cluster()` reads it and returns the topology
+#     described below.
+#
+# Schema (mirrors fdl.cluster.yml; full docs there):
+#   - `controller:` orchestrator view. Fields: `host`/`port` (rendezvous
+#     bind), `path` (controller's project root). Not a rank itself.
+#   - `workers[]`: one entry per host that owns ranks. Each worker owns
+#     one rank per visible CUDA device; global rank IDs are assigned
+#     sequentially by worker order at dispatch time (fdl probes
+#     `nvidia-smi` per host for the `local_devices: all` case).
+#   - `local_devices:` either an explicit list (`[0, 1]`) or `all`
+#     (probed at dispatch). Drives rank assignment.
+#   - `nccl_socket_ifname:` required on each worker when the cluster
+#     spans multiple machines. Use `lo` for a single-host loopback test.
+#   - `ssh:` launcher-only sub-block; tests ignore it.
+#   - `path:` project checkout dir on this host.
+#   - `arch:` libtorch variant subpath under `<path>/libtorch/`.
+
+cluster:
+  controller:
+    host: 127.0.0.1                 # rendezvous bind address
+    port: 1337
+    path: /opt/flodl                # controller's view of the shared project root
+
+  workers:
+    - host: node-a                  # must match `hostname` on the host
+      local_devices: all            # probed pre-dispatch; one rank per visible GPU
+      nccl_socket_ifname: lo        # use `lo` for single-host loopback;
+                                    # use bridge/LAN iface for multi-host
+      path: /opt/flodl              # checkout path on this host
+      arch: precompiled/cu128       # libtorch variant under <path>/libtorch/
+
+# NOTE: do NOT add `cluster: true` to any commands here. That flag
+# triggers the production launcher path (process-per-rank fan-out
+# across hosts). Tests want the topology as DATA, not as a dispatch
+# directive -- `discover_test_cluster()` reads
+# `FLODL_TESTING_CLUSTER_JSON` and constructs its own coord/workers.

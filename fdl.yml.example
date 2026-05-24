@@ -51,26 +51,32 @@ commands:
     description: Build with CUDA feature
     run: cargo build --features cuda
     docker: cuda
+  # Scoping: -p flodl -p flodl-hf — only crates that carry the `cuda`
+  # feature have CUDA tests. flodl-cli / flodl-cli-macros are config +
+  # dispatch (no GPU code, no CUDA tests); flodl-sys has no tests at
+  # all. Without `-p` cargo would still compile + invoke their test
+  # binaries on every pass, filter everything out, and dump hundreds
+  # of `running 0 tests` lines into the output.
   cuda-test:
     description: Run CUDA tests (parallel, excludes NCCL/Graph)
-    run: cargo test --features cuda
+    run: cargo test -p flodl -p flodl-hf --features cuda
     append: -- --nocapture
     docker: cuda
   cuda-test-all:
     description: Full CUDA suite (parallel + NCCL isolated + serial)
-    run: cargo test --features cuda -- --nocapture && cargo test --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: cuda
   cuda-test-nccl:
     description: NCCL/DDP tests only (isolated processes)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
     docker: cuda
   cuda-test-serial:
     description: Serial CUDA tests (Graphs, manual_seed, probes)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: cuda
   cuda-test-graph:
     description: CUDA Graph tests only (exclusive GPU, single-threaded)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
     docker: cuda
   cuda-clippy:
     description: Lint with CUDA feature (including tests, workspace + ddp-bench)

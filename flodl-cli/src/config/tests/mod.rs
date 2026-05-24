@@ -118,10 +118,8 @@ cluster:
     host: 192.168.122.1
     port: 29500
     path: /opt/flodl
-    nccl_socket_ifname: virbr0
   workers:
     - host: master-host
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: virbr0
       path: /opt/flodl
@@ -129,7 +127,6 @@ cluster:
     - host: worker-host
       ssh:
         target: worker-host
-      ranks: [1, 2]
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
@@ -142,5 +139,16 @@ commands:
     cluster: true
     run: cargo run --release --bin my-training-app
 "
+}
+
+/// Populate `cluster.workers[].ranks` for the canonical fixture. Ranks
+/// aren't user-input in the post-probe schema — fdl-cli computes them
+/// from device counts via `populate_ranks` before envelope emission.
+/// Tests that depend on the post-probe shape (envelopes, world_size,
+/// rank-shape validation) call this to simulate that step. Counts
+/// match `canonical_cluster_yaml`: master-host has 1 device, worker-host
+/// has 2; resulting ranks are `[0]` and `[1, 2]`.
+pub(super) fn populate_canonical_ranks(cluster: &mut super::ClusterConfig) {
+    cluster.populate_ranks(&[1, 2]).expect("populate_ranks for canonical fixture");
 }
 

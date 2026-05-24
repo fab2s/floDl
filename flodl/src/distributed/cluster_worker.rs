@@ -1683,7 +1683,7 @@ mod tests {
     /// and exits cleanly.
     ///
     /// Marked `#[ignore]` — requires 2+ visible GPUs + libnccl. Run
-    /// via `fdl cluster-testing cuda-test-nccl` (env overlay defines
+    /// via `fdl cluster-test cuda-test-nccl` (env overlay defines
     /// the cluster topology) or with N visible GPUs locally
     /// (autodetect).
     ///
@@ -1692,13 +1692,13 @@ mod tests {
     /// validation lands as separate `#[ignore]` tests once this
     /// happy-path baseline is green on the rig.
     #[test]
-    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-testing cuda-test-nccl"]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-test cuda-test-nccl"]
     fn end_to_end_sync_nccl_via_coord_smoke() {
         use crate::distributed::testing::discover_test_cluster;
         use crate::distributed::nccl::NcclComms;
 
         // 1. Discover cluster topology. fdl-cli injects the rig topology
-        //    via FLODL_TESTING_CLUSTER_JSON when `fdl cluster-testing`
+        //    via FLODL_TESTING_CLUSTER_JSON when `fdl cluster-test`
         //    activates the overlay; locally we fall back to autodetect.
         let cluster = match discover_test_cluster() {
             Some(c) => c,
@@ -1872,7 +1872,7 @@ mod tests {
     /// bit-identical across ranks via NCCL AllReduce-Avg invariant.
     ///
     /// Marked `#[ignore]` — requires CUDA + NCCL + 2+ GPUs. Run via
-    /// `fdl cluster-testing cuda-test-nccl` on the Pascal rig.
+    /// `fdl cluster-test cuda-test-nccl` on the Pascal rig.
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterCoordinator::should_average`]:
@@ -1880,7 +1880,7 @@ mod tests {
     /// [`ClusterCoordinator::trigger_averaging`]:
     ///     crate::distributed::cluster_coordinator::ClusterCoordinator::trigger_averaging
     #[test]
-    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-testing cuda-test-nccl"]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl cluster-test cuda-test-nccl"]
     fn end_to_end_cadence_nccl_via_coord_smoke() {
         use crate::distributed::testing::discover_test_cluster;
         use crate::distributed::nccl::NcclComms;
@@ -1891,7 +1891,7 @@ mod tests {
                 eprintln!(
                     "end_to_end_cadence_nccl_via_coord_smoke: no cluster topology \
                      available (set FLODL_TESTING_CLUSTER_JSON via \
-                     `fdl cluster-testing` or run on a CUDA host)"
+                     `fdl cluster-test` or run on a CUDA host)"
                 );
                 return;
             }
@@ -2392,3 +2392,4 @@ mod tests {
         }
     }
 }
+

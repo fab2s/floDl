@@ -1182,7 +1182,6 @@ pub struct FullController {
     pub host: String,
     pub port: u16,
     pub path: String,
-    pub nccl_socket_ifname: Option<String>,
     pub docker: Option<String>,
     pub arch: Option<String>,
     pub data_path: Option<String>,
@@ -1309,10 +1308,6 @@ impl FullCluster {
                 TensorError::new("cluster launcher: controller.path (string) required")
             })?
             .to_string();
-        let controller_nccl_socket_ifname = controller_val
-            .get("nccl_socket_ifname")
-            .and_then(|v| v.as_str())
-            .map(String::from);
         let controller_docker = controller_val
             .get("docker")
             .and_then(|v| v.as_str())
@@ -1363,7 +1358,6 @@ impl FullCluster {
                 host: controller_host,
                 port: controller_port,
                 path: controller_path,
-                nccl_socket_ifname: controller_nccl_socket_ifname,
                 docker: controller_docker,
                 arch: controller_arch,
                 data_path: controller_data_path,
@@ -1476,12 +1470,6 @@ impl FullCluster {
             "path".into(),
             serde_json::Value::String(self.controller.path.clone()),
         );
-        if let Some(s) = &self.controller.nccl_socket_ifname {
-            controller_obj.insert(
-                "nccl_socket_ifname".into(),
-                serde_json::Value::String(s.clone()),
-            );
-        }
         if let Some(s) = &self.controller.docker {
             controller_obj.insert("docker".into(), serde_json::Value::String(s.clone()));
         }
@@ -1775,8 +1763,7 @@ mod tests {
             "controller": {
                 "host": "192.168.122.1",
                 "port": 29500,
-                "path": "/opt/flodl",
-                "nccl_socket_ifname": "virbr0"
+                "path": "/opt/flodl"
             },
             "workers": [
                 {

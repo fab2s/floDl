@@ -165,7 +165,6 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             host: "127.0.0.1".to_string(),
             port,
             path: path.clone(),
-            nccl_socket_ifname: None,
             docker: None,
             arch: None,
             data_path: None,
