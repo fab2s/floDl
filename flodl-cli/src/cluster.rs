@@ -69,7 +69,7 @@ pub const ENV_CLUSTER_EXTRA_HOSTS: &str = "FLODL_CLUSTER_EXTRA_HOSTS";
 
 /// Controller's OS user name (resolved on the host by fdl-cli, before
 /// any docker spawn). The launcher in the container reads it as the
-/// default `ssh -l` target when the per-host `ssh_user:` is unset.
+/// default `ssh -l` target when the per-host `ssh.user:` is unset.
 /// Bridges the container-vs-host user mismatch (containers ship a
 /// stock `ubuntu` UID-1000 user, but `ubuntu@<remote>` is rarely the
 /// account the user actually uses on cluster hosts).

@@ -25,7 +25,10 @@ use super::*;
         );
         assert_eq!(worker.nccl_socket_ifname, "enp1s0");
         assert_eq!(worker.path, "/srv/flodl");
-        assert_eq!(worker.ssh.as_deref(), Some("worker-host"));
+        assert_eq!(
+            worker.ssh.as_ref().and_then(|s| s.target.as_deref()),
+            Some("worker-host"),
+        );
 
         // CommandSpec cluster: true survives the custom Deserialize.
         let test_cmd = cfg.commands.get("cuda-test").expect("cuda-test command");
@@ -183,7 +186,10 @@ cluster:
         assert_eq!(parsed.controller.port, cluster.controller.port);
         assert_eq!(parsed.workers.len(), cluster.workers.len());
         assert_eq!(parsed.world_size(), cluster.world_size());
-        assert_eq!(parsed.workers[1].ssh.as_deref(), Some("worker-host"));
+        assert_eq!(
+            parsed.workers[1].ssh.as_ref().and_then(|s| s.target.as_deref()),
+            Some("worker-host"),
+        );
     }
 
     #[test]

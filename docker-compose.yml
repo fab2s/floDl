@@ -31,7 +31,7 @@ services:
       - FLODL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
-      # per-host `ssh_user:` is unset — bridges container's stock
+      # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
       - FLODL_HOST_USER
@@ -92,7 +92,7 @@ services:
       - FLODL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
-      # per-host `ssh_user:` is unset — bridges container's stock
+      # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
       - FLODL_HOST_USER
@@ -134,17 +134,18 @@ services:
   #       -o StrictHostKeyChecking=accept-new ubuntu@127.0.0.1 whoami
   #
   #   # 4. In fdl.cluster.yml, replace the exa host entry with:
-  #   #   - name: exa-cuda
+  #   #   - host: exa-cuda
   #   #     ranks: [0]
   #   #     local_devices: [0]
   #   #     nccl_socket_ifname: virbr0
   #   #     path: /workspace                # in-container project path
-  #   #     ssh: 127.0.0.1
-  #   #     ssh_port: 2222
-  #   #     ssh_user: ubuntu
-  #   #     ssh_identity_file: /home/fab2s/src/fab2s/ai/rdl/.ssh-cuda-rank/cuda_rank_key
+  #   #     ssh:
+  #   #       target: 127.0.0.1
+  #   #       port: 2222
+  #   #       user: ubuntu
+  #   #       identity_file: /home/fab2s/src/fab2s/ai/rdl/.ssh-cuda-rank/cuda_rank_key
   #   #     arch: precompiled/cu128
-  #   # (drop `docker: cuda` — launcher dispatches via SSH, not via docker)
+  #   # (drop `docker: cuda` -- launcher dispatches via SSH, not via docker)
   cuda-rank:
     image: flodl-cuda:${CUDA_TAG:-12.8}
     build:
@@ -272,7 +273,7 @@ services:
       - FLODL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
-      # per-host `ssh_user:` is unset — bridges container's stock
+      # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
       - FLODL_HOST_USER

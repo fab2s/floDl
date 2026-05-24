@@ -127,7 +127,8 @@ cluster:
       path: /opt/flodl
       arch: precompiled/cu128
     - host: worker-host
-      ssh: worker-host
+      ssh:
+        target: worker-host
       ranks: [1, 2]
       local_devices: [0, 1]
       nccl_socket_ifname: enp1s0

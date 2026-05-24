@@ -214,10 +214,6 @@ impl ClusterBuilder {
                 path: cwd,
                 arch: None,
                 ssh: None,
-                ssh_port: None,
-                ssh_user: None,
-                ssh_identity_file: None,
-                ssh_options: Vec::new(),
                 env: std::collections::BTreeMap::new(),
             }],
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
@@ -241,11 +237,7 @@ pub struct HostBuilder {
     nccl_socket_ifname: Option<String>,
     path: Option<String>,
     arch: Option<String>,
-    ssh: Option<String>,
-    ssh_port: Option<u16>,
-    ssh_user: Option<String>,
-    ssh_identity_file: Option<String>,
-    ssh_options: Vec<String>,
+    ssh: Option<crate::distributed::launcher::SshConfig>,
 }
 
 impl HostBuilder {
@@ -259,11 +251,16 @@ impl HostBuilder {
             path: None,
             arch: None,
             ssh: None,
-            ssh_port: None,
-            ssh_user: None,
-            ssh_identity_file: None,
-            ssh_options: Vec::new(),
         }
+    }
+
+    /// Lazily materialize the inner `SshConfig` so the per-field
+    /// setters can mutate it without `Option`-juggling at each call
+    /// site. Calling any of the `ssh_*` methods promotes the worker
+    /// to "remote with overrides" even if no other field is set.
+    fn ssh_mut(&mut self) -> &mut crate::distributed::launcher::SshConfig {
+        self.ssh
+            .get_or_insert_with(crate::distributed::launcher::SshConfig::default)
     }
 
     /// Global rank indices owned by this host.
@@ -313,35 +310,38 @@ impl HostBuilder {
     /// SSH target (e.g. `"user@host"` or a short alias from
     /// `~/.ssh/config`). Default: the host's `name`. Set to a
     /// different value when the SSH connect string differs from the
-    /// cluster name (e.g. `~/.ssh/config` host aliases).
+    /// cluster name (e.g. `~/.ssh/config` host aliases). Mirrors the
+    /// YAML field `ssh.target`.
     pub fn ssh(mut self, target: impl Into<String>) -> Self {
-        self.ssh = Some(target.into());
+        self.ssh_mut().target = Some(target.into());
         self
     }
 
-    /// SSH port (`-p <port>`). Default: 22.
+    /// SSH port (`-p <port>`). Default: 22. Mirrors `ssh.port`.
     pub fn ssh_port(mut self, port: u16) -> Self {
-        self.ssh_port = Some(port);
+        self.ssh_mut().port = Some(port);
         self
     }
 
-    /// SSH login user (`-l <user>`). Default: current user.
+    /// SSH login user (`-l <user>`). Default: current user. Mirrors
+    /// `ssh.user`.
     pub fn ssh_user(mut self, user: impl Into<String>) -> Self {
-        self.ssh_user = Some(user.into());
+        self.ssh_mut().user = Some(user.into());
         self
     }
 
-    /// SSH identity file (`-i <path>`).
+    /// SSH identity file (`-i <path>`). Mirrors `ssh.identity_file`.
     pub fn ssh_identity_file(mut self, path: impl Into<String>) -> Self {
-        self.ssh_identity_file = Some(path.into());
+        self.ssh_mut().identity_file = Some(path.into());
         self
     }
 
     /// Append one `-o Key=Value` SSH option. Call multiple times to
     /// accumulate options in order (e.g. `.ssh_option("ProxyJump=bastion")`,
-    /// `.ssh_option("StrictHostKeyChecking=no")`).
+    /// `.ssh_option("StrictHostKeyChecking=no")`). Mirrors
+    /// `ssh.options[]`.
     pub fn ssh_option(mut self, opt: impl Into<String>) -> Self {
-        self.ssh_options.push(opt.into());
+        self.ssh_mut().options.push(opt.into());
         self
     }
 
@@ -352,7 +352,7 @@ impl HostBuilder {
     /// Panics if required fields (`ranks`, `local_devices`,
     /// `nccl_socket_ifname`, `path`) were not set. Validate via
     /// [`ClusterBuilder::build`].
-    pub fn done(mut self) -> ClusterBuilder {
+    pub fn done(self) -> ClusterBuilder {
         let host = FullWorker {
             host: self.name,
             ranks: self.ranks.expect("HostBuilder: ranks(...) required"),
@@ -365,14 +365,11 @@ impl HostBuilder {
             path: self.path.expect("HostBuilder: path(...) required"),
             arch: self.arch,
             ssh: self.ssh,
-            ssh_port: self.ssh_port,
-            ssh_user: self.ssh_user,
-            ssh_identity_file: self.ssh_identity_file,
-            ssh_options: std::mem::take(&mut self.ssh_options),
             env: std::collections::BTreeMap::new(),
         };
-        self.parent.workers.push(host);
-        self.parent
+        let mut parent = self.parent;
+        parent.workers.push(host);
+        parent
     }
 }
 
@@ -417,9 +414,10 @@ mod tests {
 
         let pascal = &cluster.workers[1];
         assert!(pascal.local_devices.is_none(), "all_devices() → None");
-        assert_eq!(pascal.ssh_port, Some(2222));
-        assert_eq!(pascal.ssh_identity_file.as_deref(), Some("/keys/cluster"));
-        assert_eq!(pascal.ssh_options, vec!["StrictHostKeyChecking=no".to_string()]);
+        let ssh = pascal.ssh.as_ref().expect("ssh fields set the sub-block");
+        assert_eq!(ssh.port, Some(2222));
+        assert_eq!(ssh.identity_file.as_deref(), Some("/keys/cluster"));
+        assert_eq!(ssh.options, vec!["StrictHostKeyChecking=no".to_string()]);
     }
 
     #[test]

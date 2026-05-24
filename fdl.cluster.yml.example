@@ -29,17 +29,19 @@
 #     declared (for the ClusterController TCP listener).
 #   - `host:` is the worker identifier (was `name:` pre-Refactor 2).
 #     Used for /etc/hosts resolution, `--add-host` injection, and as
-#     the default SSH target. Override SSH-only via `ssh:`.
-#   - `ssh:` is launcher-only -- fdl-cli uses it to connect; flodl
-#     itself ignores it. Defaults to `host:` when absent.
-#   - `ssh_port:` / `ssh_user:` / `ssh_identity_file:` / `ssh_options:`
-#     are optional launcher-only knobs that propagate as `-p`, `-l`,
-#     `-i`, and `-o Key=Value` flags on the spawned `ssh` command. Use
-#     these when you can't (or don't want to) maintain a
-#     `~/.ssh/config` on every box that runs `fdl cluster`. All
-#     optional; when absent, system SSH defaults and `~/.ssh/config`
-#     rules apply. `ssh_options:` is a YAML list of `-o`-style
-#     directives (e.g. `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`).
+#     the default SSH target.
+#   - `ssh:` is a launcher-only sub-block that groups all SSH knobs for
+#     this worker. fdl-cli uses it to connect; flodl itself only reads
+#     `ssh.target` to know the network endpoint. Omit the whole block
+#     to skip overrides (default target = `host:`, defaults for
+#     port/user/identity/options come from system ssh +
+#     `~/.ssh/config`). Sub-fields:
+#       target:        ssh hostname/IP/alias (default: `host:`)
+#       port:          maps to `ssh -p <port>`
+#       user:          maps to `ssh -l <user>`
+#       identity_file: maps to `ssh -i <path>`
+#       options:       list of `-o Key=Value` directives, e.g.
+#                      `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`
 #   - `path:` is the project checkout dir on this host. fdl-cli cd's
 #     here before invoking the remote command. Heterogeneous mounts
 #     are fine (e.g. `/opt/flodl` on the controller, `/srv/flodl` in a
@@ -95,7 +97,14 @@ cluster:
                                       # omit when this worker runs flodl natively.
 
     - host: node-b
-      ssh: node-b                     # explicit SSH target; defaults to host: if omitted
+      ssh:                            # optional sub-block; omit entirely to use defaults
+        target: node-b                # ssh target; defaults to host: if omitted
+        # port: 2222
+        # user: fab2s
+        # identity_file: /home/fab2s/.ssh/cluster_key
+        # options:
+        #   - ProxyJump=bastion
+        #   - StrictHostKeyChecking=no
       ranks: [1, 2]
       local_devices: all              # auto-detect at startup; equivalent to [0, 1]
                                       # if this worker has 2 visible CUDA devices.

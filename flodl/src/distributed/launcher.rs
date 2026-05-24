@@ -788,16 +788,16 @@ fn build_local_spawn_command(
 /// preserving backward compat for configs that pre-date the new
 /// fields.
 fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
-    let ssh_target = host.ssh.as_deref().unwrap_or(&host.host);
+    let ssh_target = host.ssh_target();
     let mut c = Command::new("ssh");
     c.args(SSH_OPTS);
-    if let Some(p) = host.ssh_port {
+    if let Some(p) = host.ssh.as_ref().and_then(|s| s.port) {
         c.arg("-p").arg(p.to_string());
     }
-    if let Some(u) = &host.ssh_user {
+    if let Some(u) = host.ssh.as_ref().and_then(|s| s.user.as_deref()) {
         c.arg("-l").arg(u);
     } else if let Ok(host_user) = std::env::var("FLODL_HOST_USER") {
-        // When the per-host ssh_user is unset, fall back to the
+        // When the per-host ssh.user is unset, fall back to the
         // controller's OS user (set by fdl-cli via FLODL_HOST_USER).
         // Bridges the docker container's stock `ubuntu` UID-1000 user
         // vs. the user's actual remote account on cluster hosts.
@@ -806,11 +806,13 @@ fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
             c.arg("-l").arg(trimmed);
         }
     }
-    if let Some(i) = &host.ssh_identity_file {
+    if let Some(i) = host.ssh.as_ref().and_then(|s| s.identity_file.as_deref()) {
         c.arg("-i").arg(i);
     }
-    for opt in &host.ssh_options {
-        c.arg("-o").arg(opt);
+    if let Some(opts) = host.ssh.as_ref().map(|s| &s.options) {
+        for opt in opts {
+            c.arg("-o").arg(opt);
+        }
     }
     c.arg(ssh_target).arg(remote_cmd);
     c
@@ -1086,6 +1088,54 @@ fn forward_lines<R: std::io::Read>(stream: R, prefix: String, to_stderr: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// SshConfig: per-worker SSH endpoint knobs.
+// ---------------------------------------------------------------------------
+
+/// SSH endpoint configuration for a remote worker host.
+///
+/// Carries the per-host SSH knobs used by the launcher when fanning
+/// out to remote ranks. All fields are optional; when absent, the
+/// corresponding flag is omitted from the spawned `ssh` command and
+/// system ssh defaults (or `~/.ssh/config` rules) apply.
+///
+/// In YAML, this lives under each worker's `ssh:` sub-block, e.g.:
+///
+/// ```yaml
+/// workers:
+///   - host: flodl-pascal
+///     ssh:
+///       target: flodl-pascal.lan
+///       port: 2222
+///       user: fab2s
+///       identity_file: ~/.ssh/id_ed25519
+///       options:
+///         - ProxyJump=bastion
+/// ```
+///
+/// The `host:` (logical name) and `ssh.target:` (network endpoint)
+/// split lets the worker's logical identity differ from its SSH
+/// target. When `target` is unset, the launcher falls back to the
+/// worker's `host` name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshConfig {
+    /// SSH target hostname / IP / alias. Defaults to the worker's
+    /// `host` when `None`.
+    pub target: Option<String>,
+    /// SSH port. Maps to `ssh -p <port>`.
+    pub port: Option<u16>,
+    /// SSH login user. Maps to `ssh -l <user>`. Falls back to the
+    /// current user (or `FLODL_HOST_USER` from env) when `None`.
+    pub user: Option<String>,
+    /// Identity file (private key) path. Maps to `ssh -i <path>`.
+    pub identity_file: Option<String>,
+    /// Pass-through `-o Key=Value` SSH options (e.g.
+    /// `"ProxyJump=bastion"`, `"StrictHostKeyChecking=no"`). Each
+    /// entry becomes one `-o ...` arg on the spawned `ssh` command,
+    /// in the order declared.
+    pub options: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // FullCluster: launcher-side parser for the multi-host topology.
 // ---------------------------------------------------------------------------
 
@@ -1168,26 +1218,28 @@ pub struct FullWorker {
     /// launcher uses this to build the remote-side LD_LIBRARY_PATH
     /// when no pre-flight envelope overrides it.
     pub arch: Option<String>,
-    /// SSH target for remote dispatch. `None` means the host runs on
-    /// the same machine as the launcher (fork/exec path, no ssh).
-    pub ssh: Option<String>,
-    /// SSH port (default: 22). Maps to `ssh -p <port>`.
-    pub ssh_port: Option<u16>,
-    /// SSH login user. Maps to `ssh -l <user>`. Falls back to the
-    /// current user when `None` (system ssh's default behavior).
-    pub ssh_user: Option<String>,
-    /// Identity file path for SSH key-based auth. Maps to `ssh -i <path>`.
-    pub ssh_identity_file: Option<String>,
-    /// Pass-through `-o Key=Value` SSH options. Same syntax as
-    /// `~/.ssh/config` directives (e.g. `"ProxyJump=bastion"`,
-    /// `"StrictHostKeyChecking=no"`). Each entry is shipped as a
-    /// separate `-o ...` arg, in the order given.
-    pub ssh_options: Vec<String>,
+    /// SSH endpoint for remote dispatch. `None` means the host runs
+    /// on the same machine as the launcher (fork/exec path, no ssh).
+    /// When `Some`, all fields inside are optional and fall back to
+    /// system ssh defaults (or `~/.ssh/config` rules) when unset.
+    pub ssh: Option<SshConfig>,
     /// Per-host env vars exported into this host's rank children.
     /// Override the cluster-scope [`FullCluster::env`] for matching
     /// keys. Use for host-specific tuning (e.g. an interface override
     /// only one host needs).
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl FullWorker {
+    /// SSH target for this worker, defaulting to `host` when
+    /// `ssh.target` is unset or `ssh` itself is `None`. Used by the
+    /// launcher's `build_ssh_spawn_command` and by `fdl probe`.
+    pub fn ssh_target(&self) -> &str {
+        self.ssh
+            .as_ref()
+            .and_then(|s| s.target.as_deref())
+            .unwrap_or(&self.host)
+    }
 }
 
 impl FullCluster {
@@ -1371,30 +1423,34 @@ impl FullCluster {
                     o.insert("arch".into(), serde_json::Value::String(a.clone()));
                 }
                 if let Some(s) = &h.ssh {
-                    o.insert("ssh".into(), serde_json::Value::String(s.clone()));
-                }
-                if let Some(p) = h.ssh_port {
-                    o.insert("ssh_port".into(), serde_json::Value::from(p));
-                }
-                if let Some(u) = &h.ssh_user {
-                    o.insert("ssh_user".into(), serde_json::Value::String(u.clone()));
-                }
-                if let Some(i) = &h.ssh_identity_file {
-                    o.insert(
-                        "ssh_identity_file".into(),
-                        serde_json::Value::String(i.clone()),
-                    );
-                }
-                if !h.ssh_options.is_empty() {
-                    o.insert(
-                        "ssh_options".into(),
-                        serde_json::Value::Array(
-                            h.ssh_options
-                                .iter()
-                                .map(|s| serde_json::Value::String(s.clone()))
-                                .collect(),
-                        ),
-                    );
+                    let mut ssh_obj = serde_json::Map::new();
+                    if let Some(t) = &s.target {
+                        ssh_obj.insert("target".into(), serde_json::Value::String(t.clone()));
+                    }
+                    if let Some(p) = s.port {
+                        ssh_obj.insert("port".into(), serde_json::Value::from(p));
+                    }
+                    if let Some(u) = &s.user {
+                        ssh_obj.insert("user".into(), serde_json::Value::String(u.clone()));
+                    }
+                    if let Some(i) = &s.identity_file {
+                        ssh_obj.insert(
+                            "identity_file".into(),
+                            serde_json::Value::String(i.clone()),
+                        );
+                    }
+                    if !s.options.is_empty() {
+                        ssh_obj.insert(
+                            "options".into(),
+                            serde_json::Value::Array(
+                                s.options
+                                    .iter()
+                                    .map(|opt| serde_json::Value::String(opt.clone()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    o.insert("ssh".into(), serde_json::Value::Object(ssh_obj));
                 }
                 if !h.env.is_empty() {
                     let mut env_obj = serde_json::Map::new();
@@ -1581,57 +1637,10 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let ssh = obj
-        .get("ssh")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let ssh_port = match obj.get("ssh_port") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(v) => {
-            let n = v.as_u64().ok_or_else(|| {
-                TensorError::new(&format!(
-                    "cluster launcher: workers[{i}] ({name:?}): ssh_port must be integer"
-                ))
-            })?;
-            Some(u16::try_from(n).map_err(|_| {
-                TensorError::new(&format!(
-                    "cluster launcher: workers[{i}] ({name:?}): ssh_port {n} does not fit in u16"
-                ))
-            })?)
-        }
-    };
-
-    let ssh_user = obj
-        .get("ssh_user")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let ssh_identity_file = obj
-        .get("ssh_identity_file")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let ssh_options: Vec<String> = match obj.get("ssh_options") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .enumerate()
-            .map(|(j, e)| {
-                e.as_str().map(String::from).ok_or_else(|| {
-                    TensorError::new(&format!(
-                        "cluster launcher: workers[{i}].ssh_options[{j}]: must be string"
-                    ))
-                })
-            })
-            .collect::<Result<_>>()?,
-        Some(other) => {
-            return Err(TensorError::new(&format!(
-                "cluster launcher: workers[{i}] ({name:?}): ssh_options must be array of \
-                 strings, got {other}"
-            )));
-        }
-    };
+    let ssh = parse_ssh_block(
+        obj.get("ssh"),
+        &format!("workers[{i}] ({name:?})"),
+    )?;
 
     let env = parse_env_block(
         obj.get("env"),
@@ -1646,12 +1655,83 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         path,
         arch,
         ssh,
-        ssh_port,
-        ssh_user,
-        ssh_identity_file,
-        ssh_options,
         env,
     })
+}
+
+/// Parse an `ssh:` sub-block. Expects a JSON object with optional
+/// `target`, `port`, `user`, `identity_file`, and `options` fields;
+/// missing/null produces `None` (meaning "no SSH overrides, fall back
+/// to host name + system ssh defaults"). Loud errors on type
+/// mismatches per field so typos surface immediately rather than
+/// silently dropping a value.
+fn parse_ssh_block(
+    v: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<Option<SshConfig>> {
+    let obj = match v {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(m)) => m,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: {label}.ssh must be a map (target, port, \
+                 user, identity_file, options), got {other}"
+            )));
+        }
+    };
+
+    let target = obj
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let port = match obj.get("port") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                TensorError::new(&format!(
+                    "cluster launcher: {label}.ssh.port must be integer"
+                ))
+            })?;
+            Some(u16::try_from(n).map_err(|_| {
+                TensorError::new(&format!(
+                    "cluster launcher: {label}.ssh.port {n} does not fit in u16"
+                ))
+            })?)
+        }
+    };
+
+    let user = obj
+        .get("user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let identity_file = obj
+        .get("identity_file")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let options: Vec<String> = match obj.get("options") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .enumerate()
+            .map(|(j, e)| {
+                e.as_str().map(String::from).ok_or_else(|| {
+                    TensorError::new(&format!(
+                        "cluster launcher: {label}.ssh.options[{j}]: must be string"
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: {label}.ssh.options must be array of strings, got {other}"
+            )));
+        }
+    };
+
+    Ok(Some(SshConfig { target, port, user, identity_file, options }))
 }
 
 /// Parse an `env:` block from either a launcher-level or host-level
@@ -1709,7 +1789,7 @@ mod tests {
                 },
                 {
                     "host": "worker-host",
-                    "ssh": "worker-host",
+                    "ssh": { "target": "worker-host" },
                     "ranks": [1, 2],
                     "local_devices": "all",
                     "nccl_socket_ifname": "enp1s0",
@@ -1738,7 +1818,7 @@ mod tests {
         // "all" stays unresolved at launcher-parse time; each host resolves
         // its own at startup.
         assert_eq!(c.workers[1].local_devices, None);
-        assert_eq!(c.workers[1].ssh.as_deref(), Some("worker-host"));
+        assert_eq!(c.workers[1].ssh_target(), "worker-host");
     }
 
     #[test]

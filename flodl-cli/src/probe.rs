@@ -144,7 +144,12 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
 /// SSH/parse failure in `issues` when the remote call fails — caller
 /// treats those as red verdicts.
 fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport {
-    let ssh_target = worker.ssh.as_deref().unwrap_or(&worker.host).to_string();
+    let ssh_target = worker
+        .ssh
+        .as_ref()
+        .and_then(|s| s.target.as_deref())
+        .unwrap_or(&worker.host)
+        .to_string();
     // Invoke bare `fdl` and rely on the remote shell's PATH. Each
     // host owns its fdl install (typically `cargo install flodl-cli`
     // into ~/.cargo/bin or ~/.local/bin); the controller does not

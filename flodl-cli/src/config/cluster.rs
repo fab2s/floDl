@@ -238,6 +238,36 @@ impl<'de> Deserialize<'de> for LocalDevices {
     }
 }
 
+/// SSH endpoint configuration for a remote worker host.
+///
+/// fdl-cli parser side; mirrors `flodl::distributed::launcher::SshConfig`
+/// shape so the slim envelope round-trips cleanly into the launcher. All
+/// fields optional; absent fields fall back to system ssh defaults or
+/// `~/.ssh/config` rules.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SshConfig {
+    /// SSH target hostname / IP / alias. Defaults to the worker's
+    /// `host` field when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// SSH port (`ssh -p <port>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// SSH login user (`ssh -l <user>`). Defaults to the current user
+    /// (or `FLODL_HOST_USER` from the controller env).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Identity file / private key (`ssh -i <path>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    /// Pass-through `-o Key=Value` SSH options (e.g.
+    /// `"ProxyJump=bastion"`, `"StrictHostKeyChecking=no"`). Each entry
+    /// becomes one `-o ...` arg on the spawned `ssh` command, in the
+    /// declared order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
 /// One worker (a physical host running one or more NCCL ranks).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClusterWorker {
@@ -262,11 +292,25 @@ pub struct ClusterWorker {
     /// data is the user's responsibility to mount identically across hosts
     /// (NAS / SMB / virtiofs / S3-FUSE).
     pub path: String,
-    /// SSH target for `fdl-cli`'s launcher (e.g. a short hostname, a
-    /// `user@host`, or anything `ssh` accepts). Defaults to `name` when
-    /// absent. Library ignores this field.
+    /// SSH endpoint for `fdl-cli`'s launcher. `None` means the host
+    /// runs on the same machine as the launcher (fork/exec, no ssh).
+    /// When `Some`, all fields inside are optional and fall back to
+    /// system ssh defaults (or `~/.ssh/config` rules) when unset.
+    ///
+    /// In YAML, the sub-block accepts:
+    ///
+    /// ```yaml
+    /// ssh:
+    ///   target: flodl-pascal.lan   # ssh hostname/IP, default: host
+    ///   port: 2222                  # -p <port>
+    ///   user: fab2s                 # -l <user>
+    ///   identity_file: ~/.ssh/key   # -i <path>
+    ///   options:                    # -o <opt> (repeatable)
+    ///     - ProxyJump=bastion
+    ///     - StrictHostKeyChecking=no
+    /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh: Option<String>,
+    pub ssh: Option<SshConfig>,
     /// libtorch variant subpath under `<path>/libtorch/` on this host.
     /// E.g. `precompiled/cu128` for a Blackwell host on PT 2.10 cu128,
     /// `builds/sm61-sm120` for a Pascal host on a from-source build.
@@ -312,27 +356,6 @@ pub struct ClusterWorker {
     /// deploy paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<String>,
-    /// SSH port (default: 22). Carried into the launcher's SSH command
-    /// as `-p <port>`. Useful when the cluster yml needs to be
-    /// self-contained — no `~/.ssh/config` to maintain. Library reads
-    /// it via the propagated envelope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_port: Option<u16>,
-    /// SSH login user (default: current user). Carried into the
-    /// launcher's SSH command as `-l <user>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_user: Option<String>,
-    /// SSH identity file (private key) path. Carried into the
-    /// launcher's SSH command as `-i <path>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_identity_file: Option<String>,
-    /// Pass-through `-o Key=Value` SSH options (e.g.
-    /// `"ProxyJump=bastion"`, `"StrictHostKeyChecking=no"`). Same
-    /// syntax as `~/.ssh/config` directives. Each entry becomes one
-    /// `-o ...` arg on the spawned `ssh` command, in the order
-    /// declared.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ssh_options: Vec<String>,
     /// Host-scoped env vars exported into every rank child spawned on
     /// this host. Mapping `NAME: VALUE` (string→string). Useful for
     /// host-specific tuning that doesn't belong at cluster scope
@@ -536,6 +559,10 @@ impl ClusterConfig {
     /// `ssh:` is not set. Used by the launcher; library callers don't
     /// need this.
     pub fn ssh_target<'a>(&'a self, worker: &'a ClusterWorker) -> &'a str {
-        worker.ssh.as_deref().unwrap_or(&worker.host)
+        worker
+            .ssh
+            .as_ref()
+            .and_then(|s| s.target.as_deref())
+            .unwrap_or(&worker.host)
     }
 }
