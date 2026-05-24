@@ -263,16 +263,11 @@ pub fn run_launcher_with_config(
     let full = full.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
-    // Controller participation is implicit-by-presence in cluster.workers.
-    // Orchestrator-only mode (controller not in hosts) is valid; spawn
-    // remote ranks but no local rank for this host.
+    // Controller-not-in-workers is the canonical pattern post controller-active
+    // refactor: the controller drives orchestration, workers carry ranks.
+    // Co-locating the controller with a worker host is still supported (via
+    // hostname match below), it is just no longer the expected default.
     let my_host_idx = full.workers.iter().position(|h| h.host == me);
-    if my_host_idx.is_none() {
-        eprintln!(
-            "cluster launcher: controller hostname {me:?} not in cluster.workers; \
-             running orchestrator-only (no rank on this host)."
-        );
-    }
 
     // Start the ClusterController TCP server on controller_port + 2 so any rank
     // using AverageBackend::Cpu can connect. Bound to 0.0.0.0 so remote
@@ -628,29 +623,26 @@ pub fn run_launcher_with_config(
         eprintln!("cluster launcher: ClusterController shutdown failed: {e}");
     }
 
-    // Process-exit the launcher unconditionally after all ranks have
-    // completed. The ClusterCoordinator thread spawned above (around
-    // line 376) is detached and holds the metrics-sink tx end; without
-    // process exit, the user binary's main thread blocks on
-    // `handle.next_metrics()` waiting for a channel that the coord
-    // thread won't close until `shutdown_workers` fires (which
-    // requires rendezvous to complete). Pre-rendezvous failures leave
-    // the coord ticking indefinitely and keep the launcher process
-    // alive after every rank child has exited, and with it the docker
-    // container.
+    // Success path returns to the launcher_driver thread, which posts
+    // Ok(()) through DdpHandle::join so the caller's main thread reaches
+    // its end-of-run summary (e.g. ddp-bench's `done: loss=...` line)
+    // before the process terminates. Post-rendezvous + post-training the
+    // ClusterCoordinator shutdown closes its metrics-sink end, so
+    // next_metrics() drains cleanly without a hard process::exit.
     //
-    // The launcher process holds no post-completion state: rank-side
-    // params live in rank processes, and the launcher driver thread
-    // returns an empty `TrainedState` per `DdpHandle::join`. Process
-    // exit here is therefore a clean termination, not a destructor
-    // bypass. A graceful coord-thread shutdown (capture its `JoinHandle`,
-    // signal+join before returning) would be cleaner if any post-launcher
-    // reporting becomes meaningful on this path.
+    // Failure path keeps process::exit(1): pre-rendezvous failures leave
+    // the coord ticking indefinitely (shutdown_workers never fires),
+    // which would otherwise keep the launcher process alive after every
+    // rank child has exited, and with it the docker container.
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    let _ = std::io::stdout().flush();
     if let Some(err) = any_failure {
         eprintln!("cluster launcher: {err}");
+        let _ = std::io::stderr().flush();
         std::process::exit(1);
     }
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Drain `children` concurrently and return the first failure (if any).

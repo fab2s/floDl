@@ -257,19 +257,26 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     }
 
     let summary = timeline.summary();
-    eprintln!(
-        "  done: loss={:.6}, total={:.1}s, syncs={}, idle=[{}]",
-        final_loss,
-        total_ms / 1000.0,
-        summary.sync_count,
-        summary
-            .gpu_idle_pct
-            .iter()
-            .enumerate()
-            .map(|(i, p)| format!("gpu{i}:{p:.1}%"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
+    // Cluster-mode workers (rank child processes) don't see aggregated
+    // metrics — those flow to the controller. Their local `final_loss`
+    // stays at its init value and the line would always read 0.0. The
+    // controller-active principle says the controller is the canonical
+    // narrator; let it own the end-of-run summary.
+    if !is_worker_rank {
+        eprintln!(
+            "  done: loss={:.6}, total={:.1}s, syncs={}, idle=[{}]",
+            final_loss,
+            total_ms / 1000.0,
+            summary.sync_count,
+            summary
+                .gpu_idle_pct
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("gpu{i}:{p:.1}%"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
 
     Ok(RunResult {
         model_name: model_def.name.to_string(),
