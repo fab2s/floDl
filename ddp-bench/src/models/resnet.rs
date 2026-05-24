@@ -27,6 +27,7 @@ pub fn def() -> ModelDef {
         description: "ResNet-20 on CIFAR-10 (~91% acc, He et al. 2015)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(50_000),
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
         test_dataset: Some(make_test_dataset),

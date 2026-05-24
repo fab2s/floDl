@@ -27,6 +27,15 @@ pub fn def() -> ModelDef {
         description: "Char-RNN on Shakespeare (Karpathy 2015, loss ~1.5)",
         build: build_model,
         dataset: make_dataset,
+        // Shakespeare corpus is ~1MB; parsing is cheap, so the hint
+        // calls the same factory + reports `.len()`. Avoids hardcoding
+        // a sequence count that depends on `SEQ_LEN` + train_fraction.
+        dataset_size_hint: |cfg| {
+            let shakespeare = crate::download::ensure_shakespeare_train(
+                &cfg.data_dir, SEQ_LEN,
+            )?;
+            Ok(shakespeare.len())
+        },
         train_fn: train_step,
         eval_fn: Some(eval_loss),
         test_dataset: Some(make_test_dataset),

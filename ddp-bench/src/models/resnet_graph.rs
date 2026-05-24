@@ -82,6 +82,7 @@ pub fn def() -> ModelDef {
         description,
         build: build_model,
         dataset: super::resnet::make_dataset,
+        dataset_size_hint: |_| Ok(50_000),
         train_fn: train_step,
         eval_fn: Some(super::resnet::eval_accuracy),
         test_dataset: Some(super::resnet::make_test_dataset),

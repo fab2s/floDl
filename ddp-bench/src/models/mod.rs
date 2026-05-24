@@ -42,6 +42,16 @@ pub struct ModelDef {
     pub build: fn(Device) -> Result<Box<dyn Module>>,
     /// Create the dataset for this model.
     pub dataset: fn(&DatasetConfig) -> Result<Arc<dyn BatchDataSet>>,
+    /// Report `dataset.len()` without actually constructing the dataset.
+    ///
+    /// Launcher processes in cluster mode call this in place of `dataset`
+    /// to skip the heavy load (the launcher fans out to rank children
+    /// and never reads training data itself, but the framework needs
+    /// `total_samples` to compute per-rank partition sizes). For real-
+    /// data datasets that's typically a known constant (MNIST = 60000
+    /// train, CIFAR-10 = 50000 train); for synthetic datasets the hint
+    /// can return `cfg.virtual_len`.
+    pub dataset_size_hint: fn(&DatasetConfig) -> Result<usize>,
     /// Training step: forward + loss. Returns the loss Variable.
     pub train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
     /// Optional evaluation metric (e.g. accuracy). Called after each epoch.

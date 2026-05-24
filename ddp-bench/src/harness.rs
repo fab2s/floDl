@@ -12,6 +12,51 @@ use flodl::tensor::{Device, Result, Tensor, TensorError};
 use crate::config::{DdpMode, GuardChoice, RunConfig};
 use crate::models::ModelDef;
 
+/// Whether this process is the cluster-mode launcher (full topology
+/// envelope set, no slim envelope) and so should skip dataset
+/// construction. The launcher fans out to rank children and never
+/// reads training data itself; the framework only needs
+/// `total_samples` to compute per-rank partition sizes, served via
+/// [`StubDataset`] backed by each model's `dataset_size_hint`.
+///
+/// On rank processes (slim envelope set) and standalone single-host
+/// runs (neither set), this returns false and the real datasets are
+/// constructed as usual.
+fn is_cluster_launcher() -> bool {
+    std::env::var_os("FLODL_FULL_CLUSTER_JSON").is_some()
+        && std::env::var_os("FLODL_CLUSTER_JSON").is_none()
+}
+
+/// Reports a fixed `len()` and refuses `get_batch`. Substituted for the
+/// real dataset on the cluster-mode launcher process, where the
+/// framework needs `total_samples` to build the coord config but never
+/// reads training data (the launcher fans out, ranks train). A
+/// `get_batch` call here is a programming error: it means the launcher
+/// reached the training body, which it never should.
+struct StubDataset {
+    len: usize,
+}
+
+impl StubDataset {
+    fn new(len: usize) -> Self {
+        Self { len }
+    }
+}
+
+impl flodl::data::BatchDataSet for StubDataset {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get_batch(&self, _indices: &[usize]) -> Result<Vec<Tensor>> {
+        Err(TensorError::new(
+            "ddp-bench StubDataset::get_batch called on cluster-mode \
+             launcher process. The launcher should not read training \
+             data; it fans out to rank children. This is a bug in the \
+             harness's launcher/rank role detection.",
+        ))
+    }
+}
+
 /// Wrapper so `Box<dyn Optimizer>` satisfies the `O: Optimizer` bound
 /// in DDP generic closures.
 struct DynOptimizer(Box<dyn Optimizer>);
@@ -70,13 +115,26 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         virtual_len,
         pool_size,
     };
-    let dataset = (model_def.dataset)(&dataset_cfg)?;
-    let test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>> =
-        if let Some(test_fn) = model_def.test_dataset {
-            Some(test_fn(&dataset_cfg)?)
-        } else {
-            None
-        };
+    // Cluster-mode launcher: skip the real dataset load. The launcher
+    // fans out to rank children and never reads training data; only
+    // `total_samples` is needed (for coord-side partition sizing).
+    // `dataset_size_hint` reports that number without constructing the
+    // real dataset. Test dataset is set to None on the launcher (the
+    // launcher doesn't run per-epoch eval or the final-eval block).
+    let is_launcher = is_cluster_launcher();
+    let dataset: Arc<dyn flodl::data::BatchDataSet> = if is_launcher {
+        let n = (model_def.dataset_size_hint)(&dataset_cfg)?;
+        Arc::new(StubDataset::new(n))
+    } else {
+        (model_def.dataset)(&dataset_cfg)?
+    };
+    let test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>> = if is_launcher {
+        None
+    } else if let Some(test_fn) = model_def.test_dataset {
+        Some(test_fn(&dataset_cfg)?)
+    } else {
+        None
+    };
     let load_ms = load_start.elapsed().as_millis();
 
     // Real-data mode: batches_per_epoch == 0 means "use full dataset".
@@ -777,7 +835,13 @@ fn run_unified(
 
     // Final evaluation: load averaged params into a fresh model, run eval_fn
     // on the test set. This gives the same definitive metric as solo mode.
-    if let Some(eval_fn) = model_def.eval_fn {
+    // Skipped on the cluster-mode launcher: the launcher has a `StubDataset`
+    // (would error on `get_batch`), no test data, and (currently) the
+    // returned `TrainedState` has empty params anyway (final-snapshot
+    // capture from via_coord is pending).
+    if is_cluster_launcher() {
+        // Fall through to the rest of the function (cleanup, return).
+    } else if let Some(eval_fn) = model_def.eval_fn {
         let device = Device::CUDA(0);
         let model = (model_def.build)(device)?;
         let model_params = model.parameters();

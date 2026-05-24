@@ -21,6 +21,7 @@ pub fn def() -> ModelDef {
         description: "LeNet-5 on MNIST (~99% acc, LeCun 1998)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(60_000),
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
         test_dataset: Some(make_test_dataset),

@@ -21,6 +21,7 @@ pub fn def() -> ModelDef {
         description: "2-layer MLP on MNIST (~97% acc)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(60_000),
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
         test_dataset: Some(make_test_dataset),
