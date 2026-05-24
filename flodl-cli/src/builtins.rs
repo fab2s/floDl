@@ -513,8 +513,8 @@ mod tests {
         // here. Keeping the list local (rather than introspecting main.rs)
         // documents the coupling explicitly.
         let dispatched = [
-            "setup", "libtorch", "diagnose", "probe", "api-ref", "init", "add",
-            "install", "skill", "schema", "completions", "autocomplete",
+            "setup", "libtorch", "nccl", "diagnose", "probe", "api-ref", "init",
+            "add", "install", "skill", "schema", "completions", "autocomplete",
             "config", "version",
         ];
         for name in &dispatched {
@@ -533,8 +533,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "setup", "libtorch", "init", "add", "diagnose", "probe",
-                "install", "skill", "api-ref", "config", "schema",
+                "setup", "libtorch", "nccl", "init", "add", "diagnose",
+                "probe", "install", "skill", "api-ref", "config", "schema",
                 "completions", "autocomplete",
             ]
         );
