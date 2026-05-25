@@ -1142,9 +1142,32 @@ fn outbound_loop(
     // a /proc/stat parse + the NVML poller thread, neither worth
     // paying for headless runs.
     let pending = crate::distributed::cluster_dashboard_emit::drain();
+    // Per-rank assigned CUDA device. On hosts where
+    // `CUDA_VISIBLE_DEVICES` is scoped per rank (`cuda_device_count()
+    // == 1`) the sampler returns a single GPU and the filter is a
+    // no-op. On hosts where multiple physical GPUs are visible to
+    // every rank (Pascal-via-VFIO observed: r1 uses cuda 0, r2 uses
+    // cuda 1, both processes see both devices) the sampler returns
+    // two snapshots — only ONE belongs to this rank's worker. Without
+    // filtering, the dashboard sink would take `.first()` and report
+    // the WRONG device's allocator stats (zero, since this process
+    // never allocated there). Pull the assigned device index here so
+    // `write_metrics` can strip foreign-device entries before shipping,
+    // and so `emit_dashboard_setup` can trim the rank's hardware
+    // string to its own GPU (the launcher's sink then groups per
+    // host and lists per-rank GPU labels without dupes).
+    let assigned_device_idx: Option<u8> =
+        crate::distributed::LocalCluster::from_env()
+            .ok()
+            .flatten()
+            .and_then(|c| c.my_rank().ok())
+            .and_then(|(_, dev)| match dev {
+                crate::tensor::Device::CUDA(idx) => Some(idx),
+                _ => None,
+            });
     let resource_sampler: Option<std::sync::Mutex<crate::monitor::ResourceSampler>> =
         if pending.port.is_some() {
-            emit_dashboard_setup(stream, salt, rank, &pending);
+            emit_dashboard_setup(stream, salt, rank, &pending, assigned_device_idx);
             Some(std::sync::Mutex::new(
                 crate::monitor::ResourceSampler::new(),
             ))
@@ -1163,7 +1186,7 @@ fn outbound_loop(
                 let _ = write_timing(stream, salt, msg);
             }
             while let Ok(msg) = metrics_rx.try_recv() {
-                let _ = write_metrics(stream, salt, msg, resource_sampler.as_ref());
+                let _ = write_metrics(stream, salt, msg, resource_sampler.as_ref(), assigned_device_idx);
             }
             return;
         }
@@ -1172,7 +1195,7 @@ fn outbound_loop(
         // (try_recv returns immediately).
         match metrics_rx.try_recv() {
             Ok(msg) => {
-                if let Err(e) = write_metrics(stream, salt, msg, resource_sampler.as_ref()) {
+                if let Err(e) = write_metrics(stream, salt, msg, resource_sampler.as_ref(), assigned_device_idx) {
                     crate::verbose!(
                         "cluster_worker: outbound r{rank} metrics write error: {e}"
                     );
@@ -1222,13 +1245,23 @@ fn write_metrics(
     salt: &SessionSalt,
     msg: crate::distributed::ddp_run::MetricsMsg,
     resource_sampler: Option<&std::sync::Mutex<crate::monitor::ResourceSampler>>,
+    assigned_device_idx: Option<u8>,
 ) -> Result<()> {
     let mut wire = metrics_msg_to_wire(msg);
     if let Some(sampler) = resource_sampler {
         // Mutex held briefly — sampler::sample reads /proc/stat +
         // copies the GPU poller's accumulator. No collective; cheap.
         let mut s = sampler.lock().unwrap();
-        wire.resources = Some(s.sample().into());
+        let mut sample = s.sample();
+        // When CUDA_VISIBLE_DEVICES isn't scoped per rank, the sampler
+        // returns one snapshot per physical device — but only the
+        // rank's assigned device carries this process's allocator
+        // stats. Strip foreign-device entries so the dashboard sink's
+        // `gpus.first()` lands on the correct GPU.
+        if let Some(target) = assigned_device_idx {
+            sample.gpus.retain(|g| g.device_index == target);
+        }
+        wire.resources = Some(sample.into());
     }
     let frame = ControlFrame::encode(salt, MsgKind::Metrics, &wire)?;
     frame.write_to(stream)
@@ -1247,6 +1280,7 @@ fn emit_dashboard_setup(
     salt: &SessionSalt,
     rank: usize,
     pending: &crate::distributed::cluster_dashboard_emit::PendingDashboardConfig,
+    assigned_device_idx: Option<u8>,
 ) {
     use crate::distributed::wire::TimingMsgWire;
     let rank_u64 = rank as u64;
@@ -1275,10 +1309,44 @@ fn emit_dashboard_setup(
         });
     }
     if let Some(ref hw) = pending.hardware {
+        // `tensor::hardware_summary` returns `CPU | gpu0 | gpu1 | …`
+        // — every visible GPU. In cluster mode each rank only USES one
+        // GPU (its assigned device); listing the others puffs the
+        // launcher's header and visually repeats hardware across ranks
+        // on the same host. Trim to `CPU | <my_gpu>` so the sink's
+        // per-host grouping can render: `host: cpu | gr=N lr=M: gpu |
+        // gr=K lr=L: gpu | other_host: …`.
+        let trimmed = trim_hardware_to_assigned(hw, assigned_device_idx);
         emit(TimingMsgWire::DashboardSetHardware {
             rank: rank_u64,
-            summary: hw.clone(),
+            summary: trimmed,
         });
+    }
+}
+
+/// Split `full` on `" | "` and keep `[0]` (CPU) + the GPU at
+/// `assigned_device_idx` if present. Returns the original string
+/// untouched when no assigned device is known (single-process / CPU
+/// builds) or when the segment count doesn't match the expected
+/// `cpu | gpu0 | gpu1 | …` shape (e.g. NVML returned no GPU names).
+fn trim_hardware_to_assigned(
+    full: &str,
+    assigned_device_idx: Option<u8>,
+) -> String {
+    let Some(target) = assigned_device_idx else {
+        return full.to_string();
+    };
+    let parts: Vec<&str> = full.split(" | ").collect();
+    if parts.len() < 2 {
+        return full.to_string();
+    }
+    let cpu = parts[0];
+    // GPUs are positionally indexed: parts[1] = device 0, parts[2] =
+    // device 1, etc. Use `target + 1` to index into the GPU portion.
+    let gpu_idx = target as usize + 1;
+    match parts.get(gpu_idx) {
+        Some(gpu) => format!("{cpu} | {gpu}"),
+        None => cpu.to_string(),
     }
 }
 

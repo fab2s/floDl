@@ -264,17 +264,37 @@ impl Monitor {
         }
     }
 
-    /// `true` when this process is a cluster rank child (vs single-
-    /// process / `Ddp::wrap`-thread / launcher trampoline). Cluster
+    /// `true` when this process is a cluster rank child. Cluster
     /// ranks defer the dashboard's HTTP bind to the controller and
     /// instead stash their intent into
     /// [`crate::distributed::cluster_dashboard_emit`] for the
     /// cluster_worker to forward over the wire.
+    ///
+    /// Distinct from [`Self::in_launcher_process`]: the launcher
+    /// process has `FLODL_FULL_CLUSTER_JSON` (full topology) set but
+    /// NOT `FLODL_CLUSTER_JSON` (per-rank envelope); ranks have the
+    /// per-rank envelope. Single-process / `Ddp::wrap`-thread has
+    /// neither.
     fn in_cluster_mode() -> bool {
         matches!(
             crate::distributed::LocalCluster::from_env(),
             Ok(Some(_))
         )
+    }
+
+    /// `true` when this process is the launcher trampoline. The
+    /// launcher hosts the dashboard via
+    /// [`crate::distributed::ClusterDashboardSink`] — the user's
+    /// Monitor on this process should NOT bind locally (or the sink
+    /// would fight it for the port). Read together with
+    /// [`Self::in_cluster_mode`]: launcher and rank are mutually
+    /// exclusive (per the `(FLODL_FULL_CLUSTER_JSON, FLODL_CLUSTER_JSON)`
+    /// table in `launcher.rs`).
+    fn in_launcher_process() -> bool {
+        std::env::var_os(
+            crate::distributed::launcher::ENV_FULL_CLUSTER_JSON,
+        )
+        .is_some()
     }
 
     /// Suppress the terminal `"training complete in …"` line emitted
@@ -320,6 +340,17 @@ impl Monitor {
     /// The dashboard is accessible at `http://localhost:{port}` and updates
     /// in real time as training progresses.
     pub fn serve(&mut self, port: u16) -> std::io::Result<()> {
+        if Self::in_launcher_process() {
+            // Launcher trampoline: the user's Monitor.serve here runs
+            // before `Trainer::run` dispatches into
+            // `run_launcher_with_config`. The launcher's
+            // `ClusterDashboardSink` (constructed inside that call)
+            // owns the dashboard server; the user's Monitor must NOT
+            // also bind or the two will race for the port. Skip
+            // silently — the sink prints `cluster dashboard: …` once
+            // a rank's DashboardRegister arrives.
+            return Ok(());
+        }
         if Self::in_cluster_mode() {
             // Cluster-rank mode: the launcher hosts the dashboard at
             // `controllerHost:port`. Stash the port; the cluster_worker
@@ -336,14 +367,56 @@ impl Monitor {
             // as a guard against future Monitor wiring that flips it.
             return Ok(());
         }
-        let srv = server::DashboardServer::start(port)?;
+        self.bind_dashboard_locally(port)?;
         crate::msg!("  dashboard: http://localhost:{}", port);
+        Ok(())
+    }
+
+    /// Force a local HTTP bind on `port`, bypassing the cluster /
+    /// launcher gating in [`Self::serve`]. Used by the launcher-side
+    /// [`crate::distributed::ClusterDashboardSink`] whose Monitor
+    /// lives inside the launcher trampoline process (where
+    /// `Self::serve` would otherwise no-op). Does not print the
+    /// `dashboard: …` line — the sink prints `cluster dashboard: …`
+    /// with the controller-host URL.
+    pub(crate) fn serve_local_unconditional(
+        &mut self,
+        port: u16,
+    ) -> std::io::Result<()> {
+        self.bind_dashboard_locally(port)
+    }
+
+    /// Shut the dashboard's HTTP server down + emit the SSE `complete`
+    /// event so connected browsers stop the elapsed counter and flip
+    /// to the "done" status. Symmetric to what
+    /// [`Self::finish`] does at end-of-training in the rank-side path;
+    /// used by [`crate::distributed::DashboardSink::shutdown`]
+    /// when the launcher tears down after every rank child has exited.
+    /// Idempotent — calling on a never-bound Monitor is a no-op.
+    pub(crate) fn shutdown_dashboard_server(&mut self) {
+        if let Some(ref mut srv) = self.server {
+            srv.shutdown();
+        }
+    }
+
+    /// Shared bind path for [`Self::serve`] and
+    /// [`Self::serve_local_unconditional`]. Performs the TCP bind +
+    /// initial header / gpu_init injection; the calling surface
+    /// decides whether to print a URL line.
+    fn bind_dashboard_locally(&mut self, port: u16) -> std::io::Result<()> {
+        let srv = server::DashboardServer::start(port)?;
         srv.set_hardware(self.hardware.clone());
 
-        // Sample GPU hardware for immediate tab init (before epoch 1)
-        let init_sample = self.sampler.sample();
-        if init_sample.gpus.len() >= 2 {
-            srv.set_gpu_init(Self::gpu_init_json(&init_sample.gpus));
+        // Sample GPU hardware for immediate tab init (before epoch 1).
+        // Skip in the launcher process: the launcher host doesn't
+        // necessarily own a GPU, and even if it does the per-rank
+        // tabs come from rank-emitted Dashboard frames anyway. The
+        // sink's first push_resource_sample populates the tabs.
+        if !Self::in_launcher_process() {
+            let init_sample = self.sampler.sample();
+            if init_sample.gpus.len() >= 2 {
+                srv.set_gpu_init(Self::gpu_init_json(&init_sample.gpus));
+            }
         }
 
         self.server = Some(srv);

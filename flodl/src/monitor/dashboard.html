@@ -563,6 +563,12 @@ function drawChart(canvasId,series,colors,labels,isPercent,yFmt,refLine){
   if(isPercent){minV=Math.min(0,minV);maxV=Math.max(100,maxV)}
   if(refLine!=null){minV=Math.min(minV,refLine.value);maxV=Math.max(maxV,refLine.value)}
   const pad=(maxV-minV)*0.05;minV-=pad;maxV+=pad;
+  // Byte-scale charts (yFmt=fmtBytes) can never be negative — clamp
+  // minV so a small allocation under a large reference line (e.g. a
+  // 100 MB VRAM trend under a 6 GB physical-VRAM ref) doesn't get a
+  // 5% padding pushed below zero, which renders as nonsense
+  // "-200 MB" gridlines. Don't clamp for percent / signed metrics.
+  if(yFmt===fmtBytes){minV=Math.max(0,minV)}
   const xScale=i=>M.left+(i/Math.max(1,maxEp-1))*pw;
   const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
 

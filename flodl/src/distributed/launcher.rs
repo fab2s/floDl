@@ -320,6 +320,13 @@ pub fn run_launcher_with_config(
     // `world_size` ranks connect; if the via-coord routing isn't
     // exercised the thread sits idle until the launcher process exits
     // (process-exit kills the thread; no graceful shutdown plumbed yet).
+    // Hoisted so `cluster_dashboard_sink.shutdown()` can fire after
+    // children exit (emits the SSE `complete` event so connected
+    // browsers stop the elapsed counter). `None` when coord_config is
+    // None — legacy NCCL routing path with no dashboard wiring.
+    let mut dashboard_sink_outer:
+        Option<Arc<dyn crate::distributed::DashboardSink>> = None;
+
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
@@ -360,6 +367,7 @@ pub fn run_launcher_with_config(
                 me.clone(),
                 config.num_epochs,
             ));
+        dashboard_sink_outer = Some(Arc::clone(&dashboard_sink));
         config = config.dashboard_sink(Arc::clone(&dashboard_sink));
         // Heartbeat timeout: now flows from `DdpRunConfig.heartbeat_timeout_secs`
         // through `build_coord_config_from_builder` — no env var override.
@@ -630,6 +638,14 @@ pub fn run_launcher_with_config(
     // This explicit pass fires immediately, so the user sees no leftover
     // process on the remote when the launcher returns.
     cleanup_remote_hosts_parallel(remote_cleanup_targets);
+
+    // All children exited; flush the dashboard's SSE `complete` event
+    // before the launcher process tears down so connected browsers
+    // stop the elapsed counter and switch to "done". Safe even when
+    // the sink was never registered (server stays None ⇒ no-op).
+    if let Some(ref sink) = dashboard_sink_outer {
+        sink.shutdown();
+    }
 
     // All children exited; signal ClusterController shutdown and join.
     if let Err(e) = cpu_averager.shutdown() {

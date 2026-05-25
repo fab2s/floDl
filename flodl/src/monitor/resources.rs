@@ -3,11 +3,27 @@
 //! CPU and RAM are read from `/proc/stat` and `/proc/meminfo` (Linux only).
 //! GPU metrics use the FFI layer (CUDA + NVML).
 
+use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// Background NVML poll interval. Higher rate means denser samples per
+/// epoch, so a single barrier-period sample (which can read 0%) gets
+/// diluted by surrounding compute samples in the rolling-window mean
+/// returned from [`ResourceSampler::sample`]. 250 ms keeps NVML
+/// overhead negligible while giving ~13 samples per 3 s epoch.
+const GPU_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Rolling-window size for per-device GPU utilization samples. At
+/// [`GPU_POLL_INTERVAL`] = 250 ms, 32 entries covers ~8 s of history
+/// — long enough to smooth out brief sync-barrier dips, short enough
+/// that the displayed average still tracks real workload shifts
+/// (mode changes, batch-size sweeps, schedule transitions) within a
+/// few seconds rather than blurring the entire run.
+const GPU_UTIL_WINDOW: usize = 32;
 
 /// Per-device GPU snapshot.
 #[derive(Debug, Clone, Default)]
@@ -115,10 +131,16 @@ pub(super) struct CpuTimes {
     pub(super) idle: u64,
 }
 
-/// Per-device GPU utilization accumulator for background polling.
+/// Per-device GPU utilization rolling-window accumulator. Background
+/// poller pushes a sample per device every [`GPU_POLL_INTERVAL`];
+/// [`ResourceSampler::sample`] reads the per-device mean over the last
+/// [`GPU_UTIL_WINDOW`] entries without draining the buffer. This
+/// dilutes single-sample dips when one poll lands during a sync
+/// barrier; with ~32 samples in the window, the per-device mean tracks
+/// the between-syncs compute load rather than any individual barrier-
+/// period zero.
 struct GpuUtilAccum {
-    sum: Vec<f64>,
-    count: Vec<u32>,
+    samples: Vec<VecDeque<f32>>,
 }
 
 /// Handle for the background GPU utilization poller thread.
@@ -165,7 +187,8 @@ impl ResourceSampler {
         Self { prev_cpu, gpu_poller }
     }
 
-    /// Start a background thread that polls NVML utilization every ~1 second.
+    /// Start a background thread that polls NVML utilization at
+    /// [`GPU_POLL_INTERVAL`] and feeds a per-device rolling window.
     /// Returns `None` if no CUDA devices are available.
     fn start_gpu_poller() -> Option<GpuPollerHandle> {
         let n = crate::tensor::cuda_device_count();
@@ -174,8 +197,7 @@ impl ResourceSampler {
         }
         let n = n as usize;
         let accum = Arc::new(Mutex::new(GpuUtilAccum {
-            sum: vec![0.0; n],
-            count: vec![0; n],
+            samples: (0..n).map(|_| VecDeque::with_capacity(GPU_UTIL_WINDOW)).collect(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let accum2 = accum.clone();
@@ -184,15 +206,18 @@ impl ResourceSampler {
             .name("gpu-util-poller".into())
             .spawn(move || {
                 while !stop2.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(GPU_POLL_INTERVAL);
                     if stop2.load(Ordering::Relaxed) {
                         break;
                     }
                     if let Ok(mut acc) = accum2.lock() {
                         for i in 0..n {
                             if let Some(util) = crate::tensor::cuda_utilization_idx(i as i32) {
-                                acc.sum[i] += util as f64;
-                                acc.count[i] += 1;
+                                let buf = &mut acc.samples[i];
+                                if buf.len() == GPU_UTIL_WINDOW {
+                                    buf.pop_front();
+                                }
+                                buf.push_back(util as f32);
                             }
                         }
                     }
@@ -235,17 +260,25 @@ impl ResourceSampler {
             s.ram_total_bytes = Some(total);
         }
 
-        // Drain background GPU utilization averages
+        // Read the per-device rolling-window mean WITHOUT draining
+        // the buffer: samples persist across `sample()` calls so a
+        // short epoch with one sync-period dip averages out against
+        // the rest of the window's compute samples. See [`GPU_UTIL_WINDOW`]
+        // / [`GPU_POLL_INTERVAL`] for window-sizing rationale.
         let n = crate::tensor::cuda_device_count();
         let util_averages: Vec<Option<f32>> = if let Some(ref poller) = self.gpu_poller {
-            if let Ok(mut acc) = poller.accum.lock() {
-                let avgs: Vec<Option<f32>> = acc.sum.iter().zip(acc.count.iter())
-                    .map(|(&s, &c)| if c > 0 { Some((s / c as f64) as f32) } else { None })
-                    .collect();
-                // Reset for next interval
-                for s in acc.sum.iter_mut() { *s = 0.0; }
-                for c in acc.count.iter_mut() { *c = 0; }
-                avgs
+            if let Ok(acc) = poller.accum.lock() {
+                acc.samples
+                    .iter()
+                    .map(|buf| {
+                        if buf.is_empty() {
+                            None
+                        } else {
+                            let sum: f32 = buf.iter().sum();
+                            Some(sum / buf.len() as f32)
+                        }
+                    })
+                    .collect()
             } else {
                 vec![None; n as usize]
             }

@@ -71,6 +71,14 @@ pub trait DashboardSink: Send + Sync {
         &self,
         metrics: &crate::distributed::ddp_run::EpochMetrics,
     );
+
+    /// Signal end-of-training to the dashboard so the SSE `complete`
+    /// event fires (browser stops the elapsed counter, switches the
+    /// status dot to "done"). Called by the launcher after every rank
+    /// child exits — symmetric to single-process [`Monitor::finish`]
+    /// in the rank-side path. Default = no-op (test stubs need not
+    /// implement). Idempotent.
+    fn shutdown(&self) {}
 }
 
 /// Concrete [`DashboardSink`] that owns a launcher-hosted [`Monitor`]
@@ -151,21 +159,45 @@ impl ClusterDashboardSink {
         None
     }
 
-    /// Render the aggregated hardware string from per-rank entries:
-    /// `host:lr=<lr> gr=<gr>: <summary> | …`.
+    /// Render the aggregated hardware string grouped by host:
+    /// `host: <cpu> | gr=N lr=M: <gpu> | gr=K lr=L: <gpu> | other_host: <cpu> | …`.
+    ///
+    /// Each rank's `summary` is `"<cpu> | <my_gpu>"` (trimmed by
+    /// `cluster_worker::trim_hardware_to_assigned` before emit). For
+    /// each host we dedup the CPU from the first arriving rank and
+    /// list every rank's GPU with a `gr=N lr=M` label. Host order
+    /// follows `FullCluster.workers`.
     fn render_aggregated_hardware(&self) -> String {
         let map = self.per_rank_hardware.lock().unwrap();
-        let mut parts: Vec<String> = Vec::with_capacity(map.len());
-        for (rank, entry) in map.iter().enumerate() {
-            if let Some(summary) = entry {
-                let label = match self.resolve_rank(rank) {
-                    Some((host, lr)) => format!("{host}:lr={lr} gr={rank}"),
-                    None => format!("gr={rank}"),
+        let mut host_blocks: Vec<String> = Vec::with_capacity(self.cluster.workers.len());
+        for worker in &self.cluster.workers {
+            let mut cpu_emitted = false;
+            let mut block = format!("{}:", worker.host);
+            for (local_rank, &global_rank) in worker.ranks.iter().enumerate() {
+                let Some(summary) = map.get(global_rank).and_then(|s| s.as_ref()) else {
+                    continue;
                 };
-                parts.push(format!("{label}: {summary}"));
+                let mut parts = summary.split(" | ");
+                let cpu = parts.next().unwrap_or("");
+                let gpu = parts.next();
+                if !cpu_emitted && !cpu.is_empty() {
+                    block.push(' ');
+                    block.push_str(cpu);
+                    cpu_emitted = true;
+                }
+                if let Some(gpu) = gpu {
+                    block.push_str(&format!(" | gr={global_rank} lr={local_rank}: {gpu}"));
+                }
+            }
+            // Skip hosts with no rank reports yet (block only has
+            // `host:` — no CPU appended, no GPUs); avoid emitting an
+            // orphan "exa:" segment before any rank on that host has
+            // pushed its hardware.
+            if cpu_emitted {
+                host_blocks.push(block);
             }
         }
-        parts.join(" | ")
+        host_blocks.join(" | ")
     }
 }
 
@@ -183,9 +215,14 @@ impl DashboardSink for ClusterDashboardSink {
             );
             return;
         }
-        // First registration — bind the server.
+        // First registration — bind the server. The internal-only
+        // `serve_local_unconditional` bypasses `Monitor::serve`'s
+        // cluster / launcher gating (which would correctly skip the
+        // bind on the launcher process — but the sink wants the
+        // bind, that's the whole point of the controller-active
+        // refactor).
         let mut mon = self.monitor.lock().unwrap();
-        match mon.serve(port) {
+        match mon.serve_local_unconditional(port) {
             Ok(()) => {
                 *bound = port;
                 eprintln!(
@@ -252,6 +289,11 @@ impl DashboardSink for ClusterDashboardSink {
         }
     }
 
+    fn shutdown(&self) {
+        let mut mon = self.monitor.lock().unwrap();
+        mon.shutdown_dashboard_server();
+    }
+
     fn push_epoch_metrics(
         &self,
         metrics: &crate::distributed::ddp_run::EpochMetrics,
@@ -290,53 +332,98 @@ impl DashboardSink for ClusterDashboardSink {
         }
 
         // Synthesize a cluster-wide ResourceSample for the dashboard
-        // header / per-rank tabs from the per-rank pushes. `gpus` is
-        // built one entry per rank using the rank's primary GPU
-        // snapshot (each rank's CUDA_VISIBLE_DEVICES is scoped to one
-        // device by the launcher, so each rank's first GPU is its
-        // active one). Top-level fields (cpu/ram) come from the most
-        // recent rank report — the launcher host's own resources are
-        // not sampled here.
+        // Home tab + per-rank tabs from the per-rank pushes.
+        //
+        // Aggregation rules:
+        // - CPU% and RAM are per-HOST (ranks on the same host share
+        //   the same /proc/stat + /proc/meminfo), so dedup by host
+        //   first to avoid double-counting. Then:
+        //     * cpu_percent  = mean across hosts (cluster compute load)
+        //     * ram_used     = sum across hosts (cluster total in use)
+        //     * ram_total    = sum across hosts (cluster physical RAM)
+        // - GPU util is per-RANK (each rank reports its assigned GPU):
+        //     * gpu_util_percent = mean across all ranks (cluster GPU load)
+        //     * vram_allocated   = sum across ranks (cluster VRAM in use)
+        //     * vram_total       = sum across ranks (cluster physical VRAM)
+        // - `gpus` is built one entry per rank with `device_index`
+        //   rewritten to the global rank (rank-local sampler returns
+        //   `device_index=0` uniformly when CUDA_VISIBLE_DEVICES is
+        //   scoped, or duplicates when not — both collapse under the
+        //   dashboard's `gpuSeries[g.dev]` key otherwise). Name is
+        //   prefixed `host:lr=<lr> gr=<gr> ` so the JS tab labels
+        //   stay cluster-aware.
         let resources = {
             let map = self.per_rank_resources.lock().unwrap();
             let mut combined = ResourceSample::default();
+
+            // Per-host dedup for CPU/RAM. Walk topology order (stable);
+            // first rank on each host that has a sample contributes.
+            let mut cpu_sum = 0.0_f64;
+            let mut cpu_count = 0u32;
+            let mut ram_used_sum = 0u64;
+            let mut ram_total_sum = 0u64;
+            for worker in &self.cluster.workers {
+                for &global_rank in &worker.ranks {
+                    let Some(Some(sample)) = map.get(global_rank) else { continue };
+                    // Take first non-empty rank per host, then break.
+                    if let Some(cpu) = sample.cpu_percent {
+                        cpu_sum += cpu as f64;
+                        cpu_count += 1;
+                    }
+                    if let Some(used) = sample.ram_used_bytes {
+                        ram_used_sum = ram_used_sum.saturating_add(used);
+                    }
+                    if let Some(total) = sample.ram_total_bytes {
+                        ram_total_sum = ram_total_sum.saturating_add(total);
+                    }
+                    break;
+                }
+            }
+            if cpu_count > 0 {
+                combined.cpu_percent = Some((cpu_sum / cpu_count as f64) as f32);
+            }
+            if ram_used_sum > 0 {
+                combined.ram_used_bytes = Some(ram_used_sum);
+            }
+            if ram_total_sum > 0 {
+                combined.ram_total_bytes = Some(ram_total_sum);
+            }
+
+            // Per-rank GPU aggregation + per-rank tab entries.
+            let mut gpu_util_sum = 0.0_f64;
+            let mut gpu_util_count = 0u32;
+            let mut vram_alloc_sum = 0u64;
+            let mut vram_total_sum = 0u64;
             for (rank, sample_opt) in map.iter().enumerate() {
                 let Some(sample) = sample_opt else { continue };
-                // Last-write wins for the scalar fields (best effort).
-                if sample.cpu_percent.is_some() {
-                    combined.cpu_percent = sample.cpu_percent;
+                if let Some(u) = sample.gpu_util_percent {
+                    gpu_util_sum += u as f64;
+                    gpu_util_count += 1;
                 }
-                if sample.ram_used_bytes.is_some() {
-                    combined.ram_used_bytes = sample.ram_used_bytes;
+                if let Some(a) = sample.vram_allocated_bytes {
+                    vram_alloc_sum = vram_alloc_sum.saturating_add(a);
                 }
-                if sample.ram_total_bytes.is_some() {
-                    combined.ram_total_bytes = sample.ram_total_bytes;
+                if let Some(t) = sample.vram_total_bytes {
+                    vram_total_sum = vram_total_sum.saturating_add(t);
                 }
-                if sample.gpu_util_percent.is_some() {
-                    combined.gpu_util_percent = sample.gpu_util_percent;
-                }
-                if sample.vram_total_bytes.is_some() {
-                    combined.vram_total_bytes = sample.vram_total_bytes;
-                }
-                if sample.vram_allocated_bytes.is_some() {
-                    combined.vram_allocated_bytes = sample.vram_allocated_bytes;
-                }
-                if sample.aggregate_rank.is_some() {
-                    combined.aggregate_rank = sample.aggregate_rank;
-                }
-                // Take this rank's primary GPU snapshot as a tab entry,
-                // prefixing the device name with `host:lr=<lr> gr=<gr>`
-                // so the dashboard JS renders cluster-aware tab labels.
                 if let Some(mut gpu) = sample.gpus.first().cloned() {
                     let label_prefix = match self.resolve_rank(rank) {
-                        Some((host, lr)) => {
-                            format!("{host}:lr={lr} gr={rank} ")
-                        }
+                        Some((host, lr)) => format!("{host}:lr={lr} gr={rank} "),
                         None => format!("gr={rank} "),
                     };
+                    gpu.device_index = rank as u8;
                     gpu.name = format!("{label_prefix}{}", gpu.name);
                     combined.gpus.push(gpu);
                 }
+            }
+            if gpu_util_count > 0 {
+                combined.gpu_util_percent = Some((gpu_util_sum / gpu_util_count as f64) as f32);
+            }
+            if vram_alloc_sum > 0 {
+                combined.vram_allocated_bytes = Some(vram_alloc_sum);
+            }
+            if vram_total_sum > 0 {
+                combined.vram_total_bytes = Some(vram_total_sum);
             }
             combined
         };

@@ -554,11 +554,17 @@ impl ClusterCoordinator {
             } else {
                 None
             };
-            // bc_share: equal share across alive ranks. Future
-            // refinement could use `el_che.recent_batch_share()`
-            // when calibrated; equal is fine for the aggregate
-            // surfacing and never produces NaN.
-            let bc_share = vec![1.0_f64 / alive.len().max(1) as f64; self.world_size];
+            // bc_share: ElChe's smoothed per-rank batch allocation
+            // (the cadence's actual partition). For Sync mode ElChe is
+            // not driving partitions so this collapses to equal share,
+            // which is the right answer for that policy. For
+            // Cadence / Async, this surfaces the real per-rank share —
+            // matching what the dashboard / `EpochMetrics.per_rank_batch_share`
+            // consumer expects to see when partition balancing is on.
+            // `recent_batch_share` falls back to equal split when no
+            // timing snapshots have landed yet (cold-start epoch 0),
+            // so it never produces NaN.
+            let bc_share = self.el_che.recent_batch_share();
             let mut metrics = crate::distributed::ddp_run::aggregate_epoch_metrics(
                 epoch_key as usize,
                 &msgs,
