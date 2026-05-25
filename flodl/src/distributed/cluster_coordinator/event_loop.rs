@@ -616,8 +616,33 @@ impl ClusterCoordinator {
                     e,
                 );
             }
-        } else if !self.progressive
-            && !matches!(self.policy, ApplyPolicy::Async)
+        } else if self.progressive {
+            // Streaming-epoch re-dispatch: any alive rank that hit the
+            // overshoot gate (or otherwise finished its last chunk and
+            // is sitting in `wait_for_epoch_plan`) has no MetricsMsg
+            // arriving to drive dispatch_next_chunk via
+            // drain_metrics_and_aggregate. The overshoot reset happens
+            // at averaging — but reset alone doesn't kick a stalled
+            // rank back into motion. After every epoch aggregate, walk
+            // alive ranks and dispatch_next_chunk to any with no
+            // in-flight chunks across any pool. Mirrors threaded
+            // `Coordinator::on_epoch_aggregated` (ddp_run/coordinator/
+            // mod.rs:978-988). Without this, multi-epoch progressive
+            // runs (cpu-cadence, cpu-async, nccl-cadence, nccl-async)
+            // wedge after epoch 0 once the calibrated `batch_counts`
+            // pulls the fast rank past its planned + max_overshoot
+            // budget.
+            for rank in 0..self.world_size {
+                if self.is_rank_dead(rank) {
+                    continue;
+                }
+                let has_inflight = self.chunk_pools.values()
+                    .any(|p| p.in_flight(rank) > 0);
+                if !has_inflight {
+                    self.dispatch_next_chunk(rank);
+                }
+            }
+        } else if !matches!(self.policy, ApplyPolicy::Async)
             && self.last_dispatched_epoch.is_none_or(|d| d < next)
         {
             self.last_dispatched_epoch = Some(next);

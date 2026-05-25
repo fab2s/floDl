@@ -480,17 +480,21 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // the write half just to be explicit (writes use TCP send buffer
         // back-pressure, not timeouts).
         write_stream.set_read_timeout(None).ok();
-        // Second write handle for the metrics outbound bridge — runs
-        // concurrently with the timing outbound bridge over the same
-        // TCP connection. TCP handles per-handle thread safety; we
-        // serialize at the frame level by giving each bridge its own
-        // mpsc receiver, not by sharing a write handle.
-        let mut metrics_write_stream = read_stream.try_clone().map_err(|e| {
-            TensorError::new(&format!(
-                "cluster_worker: stream try_clone for metrics outbound bridge: {e}"
-            ))
-        })?;
-        metrics_write_stream.set_read_timeout(None).ok();
+        // Single write handle, single outbound thread: both `timing_rx`
+        // and `metrics_rx` drain through one drainer that owns the
+        // socket. Earlier revisions split this into two bridges
+        // (timing + metrics) sharing the socket via a second try_clone,
+        // on the assumption that per-handle TCP write atomicity would
+        // serialize the frames. That assumption is wrong — multi-byte
+        // write() syscalls from different threads against the same
+        // kernel socket can interleave bytes mid-frame, and a frame
+        // whose header + payload come from two different sources fails
+        // HMAC verification on the reader, exits the coord's reader
+        // thread, and silently kills the rank (heartbeat then goes
+        // stale at 30s and the rank is declared dead). Surfaced first
+        // on cpu-async (progressive dispatch → frequent MetricsMsg
+        // collides with per-batch timing frames). Single-writer
+        // discipline is the structural fix.
 
         // mpsc quintet — the worker-side senders flow into GpuWorker,
         // the coord-side ends stay with the bridges. Clone the senders
@@ -597,7 +601,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 })?,
         );
 
-        // Outbound bridge: timing_rx → TimingMsgWire → TCP ControlFrame.
+        // Outbound bridge: drains both `timing_rx` (per-batch Timing
+        // frames + heartbeats + SyncAcks) and `metrics_rx` (per-chunk
+        // / per-epoch Metrics frames) and writes each as a
+        // ControlFrame to the coordinator. Single thread, single
+        // socket handle → frame writes are serialized by construction;
+        // no concurrent-write race on the kernel socket.
         let salt_out = salt;
         let shutdown_out = Arc::clone(&shutdown_flag);
         let rank_out = config.rank;
@@ -611,37 +620,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         &salt_out,
                         &shutdown_out,
                         timing_rx,
-                    );
-                })
-                .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_worker: spawn outbound bridge for rank {rank_out}: {e}"
-                    ))
-                })?,
-        );
-
-        // Outbound metrics bridge: drains the inner GpuWorker's
-        // `report_epoch` MetricsMsg emissions, ships each as a
-        // `MsgKind::Metrics` ControlFrame to the coordinator. The coord
-        // aggregates per-rank into [`super::EpochMetrics`] and fires
-        // `metrics_fn` once an epoch's per-rank reports are complete.
-        let salt_metrics = salt;
-        let shutdown_metrics = Arc::clone(&shutdown_flag);
-        bridges.push(
-            thread::Builder::new()
-                .name(format!("flodl-worker-metrics-outbound:r{rank_out}"))
-                .spawn(move || {
-                    metrics_outbound_loop(
-                        rank_out,
-                        &mut metrics_write_stream,
-                        &salt_metrics,
-                        &shutdown_metrics,
                         metrics_rx,
                     );
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
-                        "cluster_worker: spawn metrics outbound bridge: {e}"
+                        "cluster_worker: spawn outbound bridge for rank {rank_out}: {e}"
                     ))
                 })?,
         );
@@ -1146,20 +1130,47 @@ fn outbound_loop(
     salt: &SessionSalt,
     shutdown: &Arc<AtomicBool>,
     timing_rx: mpsc::Receiver<TimingMsg>,
+    metrics_rx: mpsc::Receiver<crate::distributed::ddp_run::MetricsMsg>,
 ) {
-    // recv_timeout so we can periodically check the shutdown flag.
+    // recv_timeout so we can periodically check the shutdown flag and
+    // service the lower-frequency metrics channel between timing
+    // frames. Single thread = serial writes on `stream`; no socket-
+    // share race.
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            // Drain any final messages so a SyncAck or Exiting
-            // doesn't get lost on exit.
+            // Drain any final messages so a SyncAck, Exiting, or
+            // final-epoch MetricsMsg doesn't get lost on exit.
             while let Ok(msg) = timing_rx.try_recv() {
-                let _ = write_one(stream, salt, msg);
+                let _ = write_timing(stream, salt, msg);
+            }
+            while let Ok(msg) = metrics_rx.try_recv() {
+                let _ = write_metrics(stream, salt, msg);
             }
             return;
         }
+        // Metrics first: lower frequency (per-chunk / per-epoch) and
+        // latency-sensitive for dashboard surfacing. Cheap when empty
+        // (try_recv returns immediately).
+        match metrics_rx.try_recv() {
+            Ok(msg) => {
+                if let Err(e) = write_metrics(stream, salt, msg) {
+                    crate::verbose!(
+                        "cluster_worker: outbound r{rank} metrics write error: {e}"
+                    );
+                    return;
+                }
+                continue;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Metrics sender dropped; timing channel may still be
+                // alive (e.g. heartbeats during teardown). Fall through
+                // to timing drain — timing's Disconnected arm exits.
+            }
+        }
         match timing_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(msg) => {
-                if let Err(e) = write_one(stream, salt, msg) {
+                if let Err(e) = write_timing(stream, salt, msg) {
                     // Exit-time BrokenPipe is the common case: coord
                     // dropped its end during shutdown. Downgrade so it
                     // doesn't drown steady-state logs.
@@ -1177,13 +1188,23 @@ fn outbound_loop(
     }
 }
 
-fn write_one(
+fn write_timing(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     msg: TimingMsg,
 ) -> Result<()> {
     let wire = timing_msg_to_wire(msg);
     let frame = ControlFrame::encode(salt, MsgKind::Timing, &wire)?;
+    frame.write_to(stream)
+}
+
+fn write_metrics(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    msg: crate::distributed::ddp_run::MetricsMsg,
+) -> Result<()> {
+    let wire = metrics_msg_to_wire(msg);
+    let frame = ControlFrame::encode(salt, MsgKind::Metrics, &wire)?;
     frame.write_to(stream)
 }
 
@@ -1207,65 +1228,6 @@ fn metrics_msg_to_wire(msg: crate::distributed::ddp_run::MetricsMsg)
             .into_iter()
             .map(|(k, (sum, count))| (k, (sum, count as u64)))
             .collect(),
-    }
-}
-
-/// Outbound metrics bridge: drains `metrics_rx` (per-epoch
-/// [`crate::distributed::ddp_run::MetricsMsg`] from the inner
-/// [`GpuWorker`]), wraps each into
-/// [`crate::distributed::wire::MetricsMsgWire`], and ships over its
-/// own write half of the rank→coord control stream. Mirrors
-/// [`outbound_loop`] but on the metrics channel + `MsgKind::Metrics`
-/// framing.
-///
-/// Holds its own `TcpStream` (a `try_clone` of the read/write split
-/// from `connect_and_build`) so it can write concurrently with the
-/// timing outbound bridge without locking.
-fn metrics_outbound_loop(
-    rank: usize,
-    stream: &mut TcpStream,
-    salt: &SessionSalt,
-    shutdown: &Arc<AtomicBool>,
-    metrics_rx: mpsc::Receiver<crate::distributed::ddp_run::MetricsMsg>,
-) {
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            // Drain remaining metrics so the final epoch's report
-            // doesn't get lost on exit.
-            while let Ok(msg) = metrics_rx.try_recv() {
-                let wire = metrics_msg_to_wire(msg);
-                if let Ok(frame) = ControlFrame::encode(salt, MsgKind::Metrics, &wire) {
-                    let _ = frame.write_to(stream);
-                }
-            }
-            return;
-        }
-        match metrics_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(msg) => {
-                let wire = metrics_msg_to_wire(msg);
-                match ControlFrame::encode(salt, MsgKind::Metrics, &wire) {
-                    Ok(frame) => {
-                        if let Err(e) = frame.write_to(stream) {
-                            // BrokenPipe at exit is expected.
-                            crate::verbose!(
-                                "cluster_worker: metrics-outbound r{rank} write error: {e}"
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        // Encode errors are protocol bugs, not exit
-                        // noise — keep loud.
-                        eprintln!(
-                            "cluster_worker: metrics-outbound r{rank} encode error: {e}"
-                        );
-                        return;
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
     }
 }
 
