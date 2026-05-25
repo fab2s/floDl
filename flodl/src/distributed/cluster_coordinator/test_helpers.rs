@@ -210,6 +210,8 @@ impl ClusterCoordinator {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             bound_port: 0,
             salt,
+            timeline: config.timeline.clone(),
+            sync_start: None,
         }
     }
 

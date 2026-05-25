@@ -283,6 +283,8 @@ impl ClusterCoordinator {
             shutdown_flag,
             bound_port,
             salt,
+            timeline: config.timeline.clone(),
+            sync_start: None,
         })
     }
 

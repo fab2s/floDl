@@ -147,6 +147,14 @@ pub(crate) fn build_coord_config_from_builder(
     // SetEpochCallbackRole to workers.
     coord_config = coord_config.epoch_callback_policy(config.epoch_callback_policy);
 
+    // Share the harness-side `Timeline` (if any) so the coord can emit
+    // `SyncStart` / `SyncEnd` events around its averaging cycles —
+    // without this, `summary.sync_count` reads 0 even when NCCL / CPU
+    // allreduces are firing on every cadence.
+    if let Some(ref tl) = config.timeline {
+        coord_config = coord_config.timeline(std::sync::Arc::clone(tl));
+    }
+
     // Resume trajectory: applies after every other field so the loaded
     // meta cleanly overrides the fresh defaults
     // (start_epoch/start_global_step/start_avg_count/start_elche_state).

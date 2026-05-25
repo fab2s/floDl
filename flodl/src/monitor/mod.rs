@@ -215,6 +215,13 @@ pub struct Monitor {
     /// aggregated slot — see
     /// [`crate::distributed::wire::ControlMsgWire::EpochAggregated`]).
     is_primary: bool,
+    /// Suppress the `"training complete in …"` terminal summary
+    /// emitted by [`Self::finish`]. Wrappers (e.g. ddp-bench's harness
+    /// owns a richer `done: loss=…, syncs=…, idle=…` summary) opt
+    /// into this so the terminal doesn't show two near-identical
+    /// end-of-run lines. HTML archive + dashboard side effects are
+    /// unaffected. Default `false`.
+    silent_summary: bool,
 }
 
 impl Monitor {
@@ -243,7 +250,17 @@ impl Monitor {
             graph_hash: None,
             hardware: crate::tensor::hardware_summary(),
             is_primary,
+            silent_summary: false,
         }
+    }
+
+    /// Suppress the terminal `"training complete in …"` line emitted
+    /// from [`Self::finish`]. Useful for wrappers that own a richer
+    /// end-of-run line (e.g. ddp-bench's harness `done:` line). HTML
+    /// archive saves + dashboard pushes are unaffected.
+    pub fn silent_summary(&mut self) -> &mut Self {
+        self.silent_summary = true;
+        self
     }
 
     /// Detect whether this process serves the dashboard.
@@ -582,16 +599,18 @@ impl Monitor {
             // user-level `monitor.finish()` is a clean no-op there.
             return;
         }
-        let total_time = self.start_time.elapsed().as_secs_f64();
-        let mut line = format!("  training complete in {}", format_eta(total_time));
+        if !self.silent_summary {
+            let total_time = self.start_time.elapsed().as_secs_f64();
+            let mut line = format!("  training complete in {}", format_eta(total_time));
 
-        if let Some(last) = self.epochs.last() {
-            for (name, val) in &last.metrics {
-                let _ = write!(line, "  | {}: {}", name, format_metric(*val));
+            if let Some(last) = self.epochs.last() {
+                for (name, val) in &last.metrics {
+                    let _ = write!(line, "  | {}: {}", name, format_metric(*val));
+                }
             }
-        }
 
-        crate::msg!("{}", line);
+            crate::msg!("{}", line);
+        }
 
         // Save HTML archive
         if let Some(ref path) = self.save_html {

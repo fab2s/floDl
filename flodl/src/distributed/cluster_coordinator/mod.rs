@@ -657,6 +657,16 @@ pub struct ClusterCoordinator {
     bound_port: u16,
     /// Session salt — write side uses it for outbound ControlFrames.
     salt: SessionSalt,
+    /// Optional shared [`crate::monitor::Timeline`]. When set,
+    /// `trigger_averaging` / `finish_averaging_*` emit `SyncStart` /
+    /// `SyncEnd` events so the user-side harness reads a non-zero
+    /// `summary.sync_count`. None on tests / standalone smoke runs.
+    timeline: Option<Arc<crate::monitor::Timeline>>,
+    /// Wall-clock start of the current averaging cycle, used to
+    /// compute the `SyncEnd { duration_ms }` payload when the cycle
+    /// finalizes. `Some` between `trigger_averaging` and the matching
+    /// `finish_averaging_*`; `None` outside a cycle.
+    sync_start: Option<std::time::Instant>,
 }
 
 impl ClusterCoordinator {

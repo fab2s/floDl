@@ -35,6 +35,15 @@ impl ClusterCoordinator {
     ///   channel ([`crate::distributed::cpu_reduce::CpuReduceClient`])
     ///   between RequestParams and the next round.
     pub fn trigger_averaging(&mut self) -> Result<()> {
+        // Open a SyncStart window on the shared timeline so the user-
+        // side `summary.sync_count` reflects this averaging cycle.
+        // `sync_start` records wall-clock for the matching SyncEnd's
+        // `duration_ms` in `finish_averaging_*`. Mirrors the threaded
+        // coord (ddp_run/coordinator/cpu_avg.rs:124).
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::SyncStart);
+        }
+        self.sync_start = Some(Instant::now());
         match self.backend {
             AverageBackend::Nccl => {
                 self.nccl_sync_start = Some(Instant::now());
@@ -429,7 +438,22 @@ impl ClusterCoordinator {
             *p = None;
         }
         self.nccl_sync_post_norm = None;
+        self.emit_sync_end();
         Ok(())
+    }
+
+    /// Close the SyncStart window opened in `trigger_averaging`. Emits
+    /// `SyncEnd { duration_ms }` on the shared timeline if one is
+    /// attached and a `sync_start` was recorded. No-op otherwise.
+    /// Called from the end of both `finish_averaging_nccl` and
+    /// `finish_averaging_cpu`.
+    fn emit_sync_end(&mut self) {
+        if let Some(start) = self.sync_start.take() {
+            if let Some(ref tl) = self.timeline {
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
+            }
+        }
     }
 
     /// CPU-backend counterpart to [`Self::finish_averaging_nccl`].
@@ -540,6 +564,7 @@ impl ClusterCoordinator {
             *p = None;
         }
         self.nccl_sync_post_norm = None;
+        self.emit_sync_end();
         Ok(())
     }
 }

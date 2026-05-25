@@ -211,6 +211,18 @@ pub struct ClusterCoordinatorConfig {
     /// trust-window seed) on top of the user's config. `None` =
     /// fresh-start (no ElChe state to restore).
     pub start_elche_state: Option<crate::distributed::ElCheState>,
+
+    /// Optional [`crate::monitor::Timeline`] shared with the user-side
+    /// harness. When set, `trigger_averaging` and `finish_averaging_*`
+    /// emit `SyncStart` / `SyncEnd` events so the launcher's
+    /// `summary.sync_count` reflects real averaging activity. Mirrors
+    /// the threaded coord's `timeline` field
+    /// ([`crate::distributed::ddp_run::ddp_coordinator::Coordinator`]).
+    /// Without it the cluster path leaves `sync_count` at 0 even when
+    /// NCCL / CPU allreduces are firing — cosmetic in `done:`, but
+    /// also breaks any analyzer that derives "did this run sync?" from
+    /// the timeline summary.
+    pub timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -255,7 +267,20 @@ impl ClusterCoordinatorConfig {
             start_global_step: 0,
             start_avg_count: 0,
             start_elche_state: None,
+            timeline: None,
         }
+    }
+
+    /// Attach a [`crate::monitor::Timeline`] for `SyncStart` /
+    /// `SyncEnd` event emission. The launcher / user harness
+    /// constructs the timeline; threading it here makes the cluster
+    /// coord's averaging activity visible in `summary.sync_count`.
+    pub fn timeline(
+        mut self,
+        tl: std::sync::Arc<crate::monitor::Timeline>,
+    ) -> Self {
+        self.timeline = Some(tl);
+        self
     }
 
     /// Resume builder: stamp the loaded

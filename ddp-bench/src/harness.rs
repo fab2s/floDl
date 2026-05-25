@@ -168,8 +168,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let timeline = Timeline::new(100);
     timeline.start();
 
-    // Create monitor
+    // Create monitor. Suppress its "training complete in …" terminal
+    // line: the harness owns a richer `done: loss=…, syncs=…,
+    // idle=…` summary below, so emitting both is just duplication.
+    // HTML archive + dashboard pushes are unaffected.
     let mut monitor = Monitor::new(config.epochs);
+    monitor.silent_summary();
     if let Some(port) = config.monitor_port {
         monitor
             .serve(port)
