@@ -237,6 +237,16 @@ impl Monitor {
     /// rank only.
     pub fn new(total_epochs: usize) -> Self {
         let is_primary = Self::detect_is_primary();
+        let hardware = crate::tensor::hardware_summary();
+        // Stash the rank's hardware string for the cluster_worker to
+        // emit at startup. No-op cost when not in cluster mode (the
+        // launcher's dashboard sink never receives the frame, so the
+        // string is just held in a static Mutex until process exit).
+        if Self::in_cluster_mode() {
+            crate::distributed::cluster_dashboard_emit::stash_hardware(
+                hardware.clone(),
+            );
+        }
         Self {
             total_epochs,
             epochs: Vec::with_capacity(total_epochs),
@@ -248,10 +258,23 @@ impl Monitor {
             metadata: None,
             graph_label: None,
             graph_hash: None,
-            hardware: crate::tensor::hardware_summary(),
+            hardware,
             is_primary,
             silent_summary: false,
         }
+    }
+
+    /// `true` when this process is a cluster rank child (vs single-
+    /// process / `Ddp::wrap`-thread / launcher trampoline). Cluster
+    /// ranks defer the dashboard's HTTP bind to the controller and
+    /// instead stash their intent into
+    /// [`crate::distributed::cluster_dashboard_emit`] for the
+    /// cluster_worker to forward over the wire.
+    fn in_cluster_mode() -> bool {
+        matches!(
+            crate::distributed::LocalCluster::from_env(),
+            Ok(Some(_))
+        )
     }
 
     /// Suppress the terminal `"training complete in …"` line emitted
@@ -263,37 +286,23 @@ impl Monitor {
         self
     }
 
-    /// Detect whether this process serves the dashboard.
+    /// Decide whether this process's Monitor records history /
+    /// prints the per-epoch terminal line.
     ///
-    /// Per the controller-active / workers-passive principle, the
-    /// controller designates which rank serves the dashboard via its
-    /// [`EpochCallbackPolicy`] resolution. The launcher can export
-    /// the resolved initial callback rank via the
-    /// `FLODL_INITIAL_CALLBACK_RANK` env var; this method reads it as
-    /// the source of truth.
-    ///
-    /// Fallback: when the env var is unset (single-GPU runs, legacy
-    /// launchers, tests), defaults to rank 0 — matching the
-    /// historical convention and keeping single-process runs serving
-    /// the dashboard unconditionally.
-    ///
-    /// Note: this is the *initial* dashboard role at Monitor
-    /// construction. A full migration to controller-aggregated
-    /// metrics + dashboard-on-controller is a separate effort; today
-    /// the per-rank Monitor remains and only the role-selection
-    /// framing is fixed.
-    ///
-    /// [`EpochCallbackPolicy`]: crate::distributed::ddp_run::EpochCallbackPolicy
+    /// - Single-process / `Ddp::wrap`-thread / launcher: `true`. The
+    ///   Monitor is fully active.
+    /// - Cluster rank child: `true` for rank 0, `false` for others.
+    ///   The launcher hosts the dashboard (per controller-active
+    ///   refactor), so the rank's Monitor server-side is always
+    ///   inert in cluster mode; the `is_primary` gate now exists only
+    ///   to deduplicate per-rank terminal output. Rank 0 prints the
+    ///   one-line summary; other ranks no-op so the `[host:rN]`-
+    ///   prefixed forwarder shows one line per epoch from the cohort,
+    ///   not N.
     fn detect_is_primary() -> bool {
         match crate::distributed::LocalCluster::from_env() {
             Ok(Some(cluster)) => match cluster.my_rank() {
-                Ok((rank, _)) => {
-                    let designated = std::env::var("FLODL_INITIAL_CALLBACK_RANK")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    rank == designated
-                }
+                Ok((rank, _)) => rank == 0,
                 Err(_) => true,
             },
             _ => true,
@@ -311,11 +320,20 @@ impl Monitor {
     /// The dashboard is accessible at `http://localhost:{port}` and updates
     /// in real time as training progresses.
     pub fn serve(&mut self, port: u16) -> std::io::Result<()> {
+        if Self::in_cluster_mode() {
+            // Cluster-rank mode: the launcher hosts the dashboard at
+            // `controllerHost:port`. Stash the port; the cluster_worker
+            // emits a `DashboardRegister` frame at startup so the
+            // launcher's sink binds the server. Don't bind locally —
+            // the rank's process can crash without taking down the
+            // dashboard with it.
+            crate::distributed::cluster_dashboard_emit::stash_port(port);
+            return Ok(());
+        }
         if !self.is_primary {
-            // Non-primary cluster ranks skip the bind: only one
-            // dashboard per cluster (rank 0). Returning Ok keeps the
-            // user's `monitor.serve(3000)?` line working identically
-            // across single-GPU and cluster runs.
+            // Belt-and-braces: in non-cluster single-process layouts
+            // is_primary is always true, so this is unreachable; kept
+            // as a guard against future Monitor wiring that flips it.
             return Ok(());
         }
         let srv = server::DashboardServer::start(port)?;
@@ -350,6 +368,11 @@ impl Monitor {
     /// Attach arbitrary JSON metadata (hyperparameters, config, etc.)
     /// that will be included in the live dashboard and HTML archive.
     pub fn set_metadata(&mut self, meta: serde_json::Value) {
+        if Self::in_cluster_mode() {
+            crate::distributed::cluster_dashboard_emit::stash_metadata(
+                meta.to_string(),
+            );
+        }
         if let Some(ref srv) = self.server {
             srv.set_metadata(meta.to_string());
         }
@@ -385,8 +408,51 @@ impl Monitor {
     /// Set a raw SVG string for display in the dashboard and HTML archive.
     pub fn set_svg(&mut self, svg: &str) {
         self.svg_snapshot = Some(svg.to_string());
+        if Self::in_cluster_mode() {
+            crate::distributed::cluster_dashboard_emit::stash_svg(
+                svg.to_string(),
+                self.graph_label.clone(),
+                self.graph_hash.clone(),
+            );
+        }
         if let Some(ref srv) = self.server {
             srv.set_svg(svg.to_string());
+        }
+    }
+
+    /// Replace the hardware-summary string displayed in the dashboard
+    /// header. The default value is captured at [`Monitor::new`] from
+    /// the running process via [`crate::tensor::hardware_summary`]; the
+    /// cluster path uses this setter to install a multi-rank summary
+    /// composed from per-rank hardware strings the launcher receives
+    /// over the wire.
+    pub fn set_hardware(&mut self, hardware: impl Into<String>) {
+        self.hardware = hardware.into();
+        if let Some(ref srv) = self.server {
+            srv.set_hardware(self.hardware.clone());
+        }
+    }
+
+    /// Push a pre-built [`EpochRecord`] through the same pipeline as
+    /// [`Self::log`] — minus the local resource sample and the
+    /// terminal one-liner. Used by the launcher's cluster dashboard
+    /// sink, which builds records from controller-aggregated
+    /// [`crate::distributed::ddp_run::EpochMetrics`] plus per-rank
+    /// resource samples received over the wire.
+    ///
+    /// Drives the same JSON encoding as `log()` (`epoch_to_json`), so
+    /// the dashboard HTML / JS sees identical frame shapes whether
+    /// driven by the single-process Monitor or the launcher sink.
+    /// Honors `is_primary` for symmetry with `log()`; non-primary calls
+    /// no-op.
+    pub fn log_epoch_record(&mut self, record: EpochRecord) {
+        if !self.is_primary {
+            return;
+        }
+        let epoch = record.epoch;
+        self.epochs.push(record);
+        if let Some(ref srv) = self.server {
+            srv.push_epoch(self.epoch_to_json(epoch));
         }
     }
 

@@ -735,9 +735,138 @@ pub enum TimingMsgWire {
         epoch: u64,
         elapsed_ms: f64,
     },
+    /// Rank → controller dashboard registration. Sent at worker startup
+    /// when the user's harness has called [`crate::monitor::Monitor::serve`]
+    /// before launching training. The launcher's coord forwards this to
+    /// the dashboard sink, which binds the HTTP server (idempotent across
+    /// ranks — all ranks register the same port, first wins, subsequent
+    /// registrations validate match).
+    DashboardRegister {
+        rank: u64,
+        /// HTTP port the controller should bind for the dashboard.
+        port: u16,
+    },
+    /// Rank → controller dashboard graph SVG. Sent at worker startup
+    /// when the user's harness has called
+    /// [`crate::monitor::Monitor::watch`] before launching training.
+    /// Every rank ships the same SVG (graph is identical across ranks);
+    /// the launcher's dashboard caches the first arrival and ignores
+    /// subsequent.
+    DashboardSetSvg {
+        rank: u64,
+        svg: String,
+        label: Option<String>,
+        hash: Option<String>,
+    },
+    /// Rank → controller dashboard metadata blob (hyperparameters,
+    /// config, etc.) Sent at worker startup. Carries the JSON value
+    /// pre-serialized by the rank (avoids dragging `serde_json::Value`
+    /// into the bincode-serialized wire surface).
+    DashboardSetMetadata {
+        rank: u64,
+        json: String,
+    },
+    /// Rank → controller per-rank hardware summary string. Sent at
+    /// worker startup. The launcher renders these as per-rank tabs
+    /// labelled `host:lr=<local_rank> gr=<global_rank>`; the
+    /// `host`/`local_rank` are resolved from the launcher's
+    /// [`FullCluster`] world map keyed by `rank` (global).
+    ///
+    /// [`FullCluster`]: crate::distributed::launcher::FullCluster
+    DashboardSetHardware {
+        rank: u64,
+        summary: String,
+    },
+}
+
+/// Per-GPU snapshot wire mirror of [`crate::monitor::resources::GpuSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GpuSnapshotWire {
+    pub device_index: u8,
+    pub name: String,
+    pub util_percent: Option<f32>,
+    pub vram_allocated_bytes: Option<u64>,
+    pub vram_total_bytes: Option<u64>,
+}
+
+/// Per-rank resource sample wire mirror of
+/// [`crate::monitor::resources::ResourceSample`]. Carried as an optional
+/// field on every [`MetricsMsgWire`] so the launcher's dashboard can
+/// render per-rank hardware tabs without paying for a separate
+/// `MsgKind` round-trip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ResourceSampleWire {
+    pub cpu_percent: Option<f32>,
+    pub ram_used_bytes: Option<u64>,
+    pub ram_total_bytes: Option<u64>,
+    pub gpu_util_percent: Option<f32>,
+    pub vram_total_bytes: Option<u64>,
+    pub vram_allocated_bytes: Option<u64>,
+    pub aggregate_rank: Option<u8>,
+    pub gpus: Vec<GpuSnapshotWire>,
+}
+
+impl From<crate::monitor::GpuSnapshot> for GpuSnapshotWire {
+    fn from(g: crate::monitor::GpuSnapshot) -> Self {
+        GpuSnapshotWire {
+            device_index: g.device_index,
+            name: g.name,
+            util_percent: g.util_percent,
+            vram_allocated_bytes: g.vram_allocated_bytes,
+            vram_total_bytes: g.vram_total_bytes,
+        }
+    }
+}
+
+impl From<GpuSnapshotWire> for crate::monitor::GpuSnapshot {
+    fn from(w: GpuSnapshotWire) -> Self {
+        crate::monitor::GpuSnapshot {
+            device_index: w.device_index,
+            name: w.name,
+            util_percent: w.util_percent,
+            vram_allocated_bytes: w.vram_allocated_bytes,
+            vram_total_bytes: w.vram_total_bytes,
+        }
+    }
+}
+
+impl From<crate::monitor::ResourceSample> for ResourceSampleWire {
+    fn from(s: crate::monitor::ResourceSample) -> Self {
+        ResourceSampleWire {
+            cpu_percent: s.cpu_percent,
+            ram_used_bytes: s.ram_used_bytes,
+            ram_total_bytes: s.ram_total_bytes,
+            gpu_util_percent: s.gpu_util_percent,
+            vram_total_bytes: s.vram_total_bytes,
+            vram_allocated_bytes: s.vram_allocated_bytes,
+            aggregate_rank: s.aggregate_rank,
+            gpus: s.gpus.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<ResourceSampleWire> for crate::monitor::ResourceSample {
+    fn from(w: ResourceSampleWire) -> Self {
+        crate::monitor::ResourceSample {
+            cpu_percent: w.cpu_percent,
+            ram_used_bytes: w.ram_used_bytes,
+            ram_total_bytes: w.ram_total_bytes,
+            gpu_util_percent: w.gpu_util_percent,
+            vram_total_bytes: w.vram_total_bytes,
+            vram_allocated_bytes: w.vram_allocated_bytes,
+            aggregate_rank: w.aggregate_rank,
+            gpus: w.gpus.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Wire-side mirror of [`ddp_run::MetricsMsg`]. All fields plain data.
+///
+/// `resources` is `Option<>` because not every per-epoch report needs a
+/// resource sample (the worker only populates it when the dashboard has
+/// been requested, and progressive-chunk reports leave it empty). When
+/// `Some(_)`, the launcher's dashboard renders per-rank hardware tabs
+/// for the originating rank.
 ///
 /// [`ddp_run::MetricsMsg`]: crate::distributed::ddp_run::MetricsMsg
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -752,6 +881,8 @@ pub struct MetricsMsgWire {
     pub compute_only_ms: f64,
     pub data_starve_ms: f64,
     pub scalars: HashMap<String, (f64, u64)>,
+    #[serde(default)]
+    pub resources: Option<ResourceSampleWire>,
 }
 
 /// Wire-side mirror of [`ddp_run::EpochMetrics`]. Carries the
@@ -1165,6 +1296,7 @@ mod tests {
             compute_only_ms: 900.0,
             data_starve_ms: 50.0,
             scalars,
+            resources: None,
         };
         let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Metrics, &m).unwrap();
         let mut buf = Vec::new();
@@ -1175,6 +1307,98 @@ mod tests {
             .unwrap();
         let back: MetricsMsgWire = got.decode().unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn metrics_msg_round_trip_with_resources() {
+        let gpus = vec![
+            GpuSnapshotWire {
+                device_index: 0,
+                name: "Pascal GP106".to_string(),
+                util_percent: Some(67.0),
+                vram_allocated_bytes: Some(2_500_000_000),
+                vram_total_bytes: Some(6_000_000_000),
+            },
+            GpuSnapshotWire {
+                device_index: 1,
+                name: "Blackwell 5060Ti".to_string(),
+                util_percent: Some(91.0),
+                vram_allocated_bytes: Some(8_200_000_000),
+                vram_total_bytes: Some(16_000_000_000),
+            },
+        ];
+        let res = ResourceSampleWire {
+            cpu_percent: Some(38.5),
+            ram_used_bytes: Some(12_000_000_000),
+            ram_total_bytes: Some(32_000_000_000),
+            gpu_util_percent: Some(91.0),
+            vram_total_bytes: Some(16_000_000_000),
+            vram_allocated_bytes: Some(8_200_000_000),
+            aggregate_rank: Some(1),
+            gpus,
+        };
+        let m = MetricsMsgWire {
+            rank: 4,
+            epoch: 12,
+            avg_loss: 0.1234,
+            batches_processed: 200,
+            epoch_ms: 4321.0,
+            samples_processed: 25600,
+            share_complete_ms: 4100.0,
+            compute_only_ms: 3600.0,
+            data_starve_ms: 220.0,
+            scalars: HashMap::new(),
+            resources: Some(res),
+        };
+        let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Metrics, &m).unwrap();
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf).unwrap();
+        let mut cur = Cursor::new(buf);
+        let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+            .unwrap()
+            .unwrap();
+        let back: MetricsMsgWire = got.decode().unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn timing_msg_round_trip_dashboard_variants() {
+        let cases = [
+            TimingMsgWire::DashboardRegister { rank: 0, port: 3000 },
+            TimingMsgWire::DashboardRegister { rank: 7, port: 4242 },
+            TimingMsgWire::DashboardSetSvg {
+                rank: 0,
+                svg: "<svg>...</svg>".to_string(),
+                label: Some("ResNet50".to_string()),
+                hash: Some("deadbeef".to_string()),
+            },
+            TimingMsgWire::DashboardSetSvg {
+                rank: 1,
+                svg: String::new(),
+                label: None,
+                hash: None,
+            },
+            TimingMsgWire::DashboardSetMetadata {
+                rank: 0,
+                json: r#"{"epochs": 10, "lr": 0.001}"#.to_string(),
+            },
+            TimingMsgWire::DashboardSetHardware {
+                rank: 2,
+                summary: "CPU=8 cores | RAM=32GB | GPU=2x RTX 5060 Ti".to_string(),
+            },
+        ];
+        for c in cases {
+            let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Timing, &c).unwrap();
+            let mut buf = Vec::new();
+            frame.write_to(&mut buf).unwrap();
+            let mut cur = Cursor::new(buf);
+            let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.kind, MsgKind::Timing);
+            let back: TimingMsgWire = got.decode().unwrap();
+            assert_eq!(back, c);
+        }
     }
 
     #[test]

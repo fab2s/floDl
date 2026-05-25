@@ -32,7 +32,11 @@ impl ClusterCoordinator {
             | TimingMsgWire::NewNcclIdGenerated { rank, .. }
             | TimingMsgWire::EvalResult { rank, .. }
             | TimingMsgWire::CheckpointResult { rank, .. }
-            | TimingMsgWire::EpochFnElapsed { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::EpochFnElapsed { rank, .. }
+            | TimingMsgWire::DashboardRegister { rank, .. }
+            | TimingMsgWire::DashboardSetSvg { rank, .. }
+            | TimingMsgWire::DashboardSetMetadata { rank, .. }
+            | TimingMsgWire::DashboardSetHardware { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -234,6 +238,31 @@ impl ClusterCoordinator {
             } => {
                 self.handle_epoch_fn_elapsed(rank as usize, elapsed_ms);
             }
+            // Dashboard-channel frames: forwarded to the controller-side
+            // DashboardSink when configured (the launcher hosts the
+            // dashboard server post controller-active refactor). Sink
+            // absent ⇒ silently dropped: the coord has no use for these
+            // outside the launcher dashboard.
+            TimingMsgWire::DashboardRegister { rank, port } => {
+                if let Some(ref sink) = self.dashboard_sink {
+                    sink.register_port(rank as usize, port);
+                }
+            }
+            TimingMsgWire::DashboardSetSvg { rank, svg, label, hash } => {
+                if let Some(ref sink) = self.dashboard_sink {
+                    sink.set_svg(rank as usize, svg, label, hash);
+                }
+            }
+            TimingMsgWire::DashboardSetMetadata { rank, json } => {
+                if let Some(ref sink) = self.dashboard_sink {
+                    sink.set_metadata(rank as usize, json);
+                }
+            }
+            TimingMsgWire::DashboardSetHardware { rank, summary } => {
+                if let Some(ref sink) = self.dashboard_sink {
+                    sink.set_hardware(rank as usize, summary);
+                }
+            }
         }
     }
 
@@ -434,6 +463,13 @@ impl ClusterCoordinator {
             if rank >= self.world_size {
                 continue;
             }
+            // Forward the rank's resource sample (if present) to the
+            // dashboard sink before consuming `wire`. The sample piggy-
+            // backs on MetricsMsgWire so we get it for free here; the
+            // sink renders per-rank hardware tabs.
+            if let (Some(sink), Some(sample)) = (&self.dashboard_sink, wire.resources.clone()) {
+                sink.push_resource_sample(rank, sample);
+            }
             let msg = crate::distributed::ddp_run::MetricsMsg {
                 rank,
                 epoch: wire.epoch as usize,
@@ -558,6 +594,13 @@ impl ClusterCoordinator {
                     "  ddp: EpochAggregated broadcast (epoch {epoch_key}) failed: {}",
                     e,
                 );
+            }
+            // Forward to the controller-side dashboard sink (when the
+            // launcher hosts a dashboard). Same aggregated value the
+            // user's `metrics_fn` / `metrics_sink_tx` receive — the
+            // dashboard surfaces it as the main-tab time series.
+            if let Some(ref sink) = self.dashboard_sink {
+                sink.push_epoch_metrics(&metrics);
             }
             if let Some(ref tx) = self.metrics_sink_tx {
                 // Sink receiver dropped is benign — handle was

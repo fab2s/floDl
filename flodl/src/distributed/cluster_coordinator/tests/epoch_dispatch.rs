@@ -499,6 +499,7 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
                 compute_only_ms: 90.0,
                 data_starve_ms: 5.0,
                 scalars,
+                resources: None,
             })?;
             // Block on the broadcast — coord will send
             // `EpochAggregated` once every alive rank has reported.

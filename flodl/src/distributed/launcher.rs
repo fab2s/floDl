@@ -345,6 +345,22 @@ pub fn run_launcher_with_config(
         config = config
             .local_ranks(local_ranks.clone())
             .dead_ranks(dead_ranks);
+
+        // Controller-hosted live dashboard. The sink owns a Monitor
+        // that binds the HTTP port lazily on the first rank-emitted
+        // `DashboardRegister` frame (the rank's `monitor.serve(port)`
+        // call from user code triggers that emit; absent that the sink
+        // stays idle and the dashboard is simply never served). The
+        // sink itself is cheap (an unbound Monitor + per-rank state
+        // maps) so we construct unconditionally and let the wire path
+        // decide whether to bind.
+        let dashboard_sink: Arc<dyn crate::distributed::DashboardSink> =
+            Arc::new(crate::distributed::ClusterDashboardSink::new(
+                Arc::new(full.clone()),
+                me.clone(),
+                config.num_epochs,
+            ));
+        config = config.dashboard_sink(Arc::clone(&dashboard_sink));
         // Heartbeat timeout: now flows from `DdpRunConfig.heartbeat_timeout_secs`
         // through `build_coord_config_from_builder` — no env var override.
 

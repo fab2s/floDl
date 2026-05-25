@@ -216,13 +216,21 @@ pub struct ClusterCoordinatorConfig {
     /// harness. When set, `trigger_averaging` and `finish_averaging_*`
     /// emit `SyncStart` / `SyncEnd` events so the launcher's
     /// `summary.sync_count` reflects real averaging activity. Mirrors
-    /// the threaded coord's `timeline` field
-    /// ([`crate::distributed::ddp_run::ddp_coordinator::Coordinator`]).
+    /// the threaded coord's `timeline` field.
     /// Without it the cluster path leaves `sync_count` at 0 even when
     /// NCCL / CPU allreduces are firing — cosmetic in `done:`, but
     /// also breaks any analyzer that derives "did this run sync?" from
     /// the timeline summary.
     pub timeline: Option<std::sync::Arc<crate::monitor::Timeline>>,
+
+    /// Optional controller-side dashboard sink. Populated by the
+    /// launcher when it hosts a live dashboard. The coord forwards every
+    /// rank-emitted [`crate::distributed::wire::TimingMsgWire::DashboardRegister`]
+    /// / `DashboardSetSvg` / `DashboardSetMetadata` / `DashboardSetHardware`
+    /// frame and the per-epoch resource sample piggy-backed on
+    /// [`crate::distributed::wire::MetricsMsgWire::resources`] to this
+    /// sink. `None` ⇒ no dashboard (headless cluster runs).
+    pub dashboard_sink: Option<std::sync::Arc<dyn crate::distributed::DashboardSink>>,
 }
 
 impl ClusterCoordinatorConfig {
@@ -268,7 +276,20 @@ impl ClusterCoordinatorConfig {
             start_avg_count: 0,
             start_elche_state: None,
             timeline: None,
+            dashboard_sink: None,
         }
+    }
+
+    /// Attach a [`crate::distributed::DashboardSink`] for forwarding
+    /// rank-emitted dashboard frames to the controller-side dashboard
+    /// server. Set by the launcher when it hosts a live dashboard;
+    /// leave `None` for headless runs.
+    pub fn dashboard_sink(
+        mut self,
+        sink: std::sync::Arc<dyn crate::distributed::DashboardSink>,
+    ) -> Self {
+        self.dashboard_sink = Some(sink);
+        self
     }
 
     /// Attach a [`crate::monitor::Timeline`] for `SyncStart` /

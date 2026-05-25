@@ -285,6 +285,7 @@ impl ClusterCoordinator {
             salt,
             timeline: config.timeline.clone(),
             sync_start: None,
+            dashboard_sink: config.dashboard_sink.clone(),
         })
     }
 

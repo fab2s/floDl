@@ -829,6 +829,7 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
                             compute_only_ms: 50.0,
                             data_starve_ms: 0.0,
                             scalars: std::collections::HashMap::new(),
+                            resources: None,
                         })?;
                         completed += 1;
                     }

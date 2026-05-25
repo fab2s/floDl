@@ -667,6 +667,14 @@ pub struct ClusterCoordinator {
     /// finalizes. `Some` between `trigger_averaging` and the matching
     /// `finish_averaging_*`; `None` outside a cycle.
     sync_start: Option<std::time::Instant>,
+    /// Optional controller-side dashboard sink. When the launcher
+    /// hosts a live dashboard, it constructs a concrete
+    /// [`crate::distributed::DashboardSink`] and threads it through
+    /// [`ClusterCoordinatorConfig::dashboard_sink`]; the
+    /// coord then forwards every rank-emitted
+    /// `TimingMsgWire::Dashboard*` frame and per-epoch resource sample
+    /// to it. `None` ⇒ no dashboard (legacy / headless cluster runs).
+    pub(super) dashboard_sink: Option<Arc<dyn crate::distributed::DashboardSink>>,
 }
 
 impl ClusterCoordinator {

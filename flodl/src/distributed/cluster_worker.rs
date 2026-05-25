@@ -1132,6 +1132,25 @@ fn outbound_loop(
     timing_rx: mpsc::Receiver<TimingMsg>,
     metrics_rx: mpsc::Receiver<crate::distributed::ddp_run::MetricsMsg>,
 ) {
+    // Drain the rank-side dashboard intent stashed by the user's
+    // Monitor calls (`monitor.serve`, `.watch`, `.set_metadata`,
+    // captured hardware string). When a dashboard port has been
+    // requested, emit the matching `TimingMsgWire::Dashboard*` frames
+    // so the launcher's `ClusterDashboardSink` binds the HTTP server
+    // and seeds its header / per-rank tabs. Construct a local
+    // `ResourceSampler` only when the user opted in — sampling costs
+    // a /proc/stat parse + the NVML poller thread, neither worth
+    // paying for headless runs.
+    let pending = crate::distributed::cluster_dashboard_emit::drain();
+    let resource_sampler: Option<std::sync::Mutex<crate::monitor::ResourceSampler>> =
+        if pending.port.is_some() {
+            emit_dashboard_setup(stream, salt, rank, &pending);
+            Some(std::sync::Mutex::new(
+                crate::monitor::ResourceSampler::new(),
+            ))
+        } else {
+            None
+        };
     // recv_timeout so we can periodically check the shutdown flag and
     // service the lower-frequency metrics channel between timing
     // frames. Single thread = serial writes on `stream`; no socket-
@@ -1144,7 +1163,7 @@ fn outbound_loop(
                 let _ = write_timing(stream, salt, msg);
             }
             while let Ok(msg) = metrics_rx.try_recv() {
-                let _ = write_metrics(stream, salt, msg);
+                let _ = write_metrics(stream, salt, msg, resource_sampler.as_ref());
             }
             return;
         }
@@ -1153,7 +1172,7 @@ fn outbound_loop(
         // (try_recv returns immediately).
         match metrics_rx.try_recv() {
             Ok(msg) => {
-                if let Err(e) = write_metrics(stream, salt, msg) {
+                if let Err(e) = write_metrics(stream, salt, msg, resource_sampler.as_ref()) {
                     crate::verbose!(
                         "cluster_worker: outbound r{rank} metrics write error: {e}"
                     );
@@ -1202,9 +1221,78 @@ fn write_metrics(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     msg: crate::distributed::ddp_run::MetricsMsg,
+    resource_sampler: Option<&std::sync::Mutex<crate::monitor::ResourceSampler>>,
 ) -> Result<()> {
-    let wire = metrics_msg_to_wire(msg);
+    let mut wire = metrics_msg_to_wire(msg);
+    if let Some(sampler) = resource_sampler {
+        // Mutex held briefly — sampler::sample reads /proc/stat +
+        // copies the GPU poller's accumulator. No collective; cheap.
+        let mut s = sampler.lock().unwrap();
+        wire.resources = Some(s.sample().into());
+    }
     let frame = ControlFrame::encode(salt, MsgKind::Metrics, &wire)?;
+    frame.write_to(stream)
+}
+
+/// Emit the rank-side dashboard setup sequence — `DashboardRegister`
+/// gated on `port`, plus `DashboardSetSvg` / `DashboardSetMetadata` /
+/// `DashboardSetHardware` whenever the stash holds a value. Called
+/// once at outbound-loop startup after the user's harness has had a
+/// chance to populate the stash through `monitor.serve` /
+/// `monitor.watch` / `monitor.set_metadata` and `Monitor::new`'s
+/// hardware capture. Errors are logged verbosely but never abort the
+/// rank — the dashboard is optional UX, not a training invariant.
+fn emit_dashboard_setup(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    rank: usize,
+    pending: &crate::distributed::cluster_dashboard_emit::PendingDashboardConfig,
+) {
+    use crate::distributed::wire::TimingMsgWire;
+    let rank_u64 = rank as u64;
+    let mut emit = |msg: TimingMsgWire| {
+        if let Err(e) = write_timing_wire(stream, salt, &msg) {
+            crate::verbose!(
+                "cluster_worker: outbound r{rank} dashboard emit failed: {e}",
+            );
+        }
+    };
+    if let Some(port) = pending.port {
+        emit(TimingMsgWire::DashboardRegister { rank: rank_u64, port });
+    }
+    if let Some(ref svg) = pending.svg {
+        emit(TimingMsgWire::DashboardSetSvg {
+            rank: rank_u64,
+            svg: svg.clone(),
+            label: pending.label.clone(),
+            hash: pending.hash.clone(),
+        });
+    }
+    if let Some(ref json) = pending.metadata_json {
+        emit(TimingMsgWire::DashboardSetMetadata {
+            rank: rank_u64,
+            json: json.clone(),
+        });
+    }
+    if let Some(ref hw) = pending.hardware {
+        emit(TimingMsgWire::DashboardSetHardware {
+            rank: rank_u64,
+            summary: hw.clone(),
+        });
+    }
+}
+
+/// Write an already-built [`TimingMsgWire`] directly. The non-wire
+/// `write_timing` takes an in-process `TimingMsg`; the dashboard emit
+/// path skips that intermediate and serializes the wire form directly
+/// (no in-process `TimingMsg` variant exists for these — they're a
+/// pure wire concern).
+fn write_timing_wire(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    msg: &crate::distributed::wire::TimingMsgWire,
+) -> Result<()> {
+    let frame = ControlFrame::encode(salt, MsgKind::Timing, msg)?;
     frame.write_to(stream)
 }
 
@@ -1228,6 +1316,11 @@ fn metrics_msg_to_wire(msg: crate::distributed::ddp_run::MetricsMsg)
             .into_iter()
             .map(|(k, (sum, count))| (k, (sum, count as u64)))
             .collect(),
+        // Populated by the dashboard-aware emit path when the launcher
+        // hosts a dashboard; the plain wire conversion leaves it None
+        // and lets the worker layer (which holds the ResourceSampler)
+        // attach a sample before writing.
+        resources: None,
     }
 }
 

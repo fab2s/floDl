@@ -23,6 +23,8 @@ pub mod controller;
 pub mod cpu_reduce;
 pub mod cuda_event;
 pub mod cuda_stream;
+pub mod dashboard_sink;
+pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;
 pub mod max_failure;
 pub mod nccl;
@@ -45,6 +47,7 @@ pub use cpu_reduce::{
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;
 pub use cuda_event::{CudaEvent, CudaEventFlags};
+pub use dashboard_sink::{ClusterDashboardSink, DashboardSink};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use rendezvous::TcpRendezvous;
