@@ -26,9 +26,12 @@ impl ClusterCoordinator {
     /// - no rank has reported its LR yet (cold-start, ≤ 1 cycle).
     ///
     /// On [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`]
-    /// the resulting anchor change is captured by the cycle's net
-    /// `AnchorChanged` event in the caller (we don't emit a duplicate
-    /// event here — only a `verbose!` log line, mirroring OLD).
+    /// the cycle's NET anchor change is captured by the post-cycle
+    /// `AnchorChanged` event emitted from `finish_averaging_*` (covers
+    /// meta nudge composed with any guard-driven adjustment).
+    /// `MetaNudge` here isolates the meta's contribution with the raw
+    /// `factor` so MSF / dashboard tooling can attribute the cycle's
+    /// anchor delta between the two sources.
     pub(super) fn observe_meta(
         &mut self,
         verdict: crate::distributed::ddp_run::convergence::ConvergenceAction,
@@ -46,6 +49,13 @@ impl ClusterCoordinator {
             let old = self.el_che.anchor();
             self.el_che.nudge_anchor_down(factor);
             let new = self.el_che.anchor();
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::MetaNudge {
+                    factor,
+                    from: old,
+                    to: new,
+                });
+            }
             crate::verbose!(
                 "  ddp: meta-controller nudge factor={:.3} anchor {} -> {}",
                 factor, old, new,

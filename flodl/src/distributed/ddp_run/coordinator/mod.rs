@@ -555,10 +555,13 @@ impl Coordinator {
             // Don't emit AnchorChanged here: the post-match block in
             // finish_averaging_{nccl,cpu} captures the cycle's net anchor
             // change and emits a single event covering both the meta nudge
-            // and any guard-driven adjustment that follows.
+            // and any guard-driven adjustment that follows. MetaNudge
+            // isolates the meta's contribution with the raw factor.
             if let Some(ref tl) = self.timeline {
-                tl.event(crate::monitor::EventKind::Custom {
-                    label: format!("meta-nudge factor={factor:.3} anchor={old}->{new}"),
+                tl.event(crate::monitor::EventKind::MetaNudge {
+                    factor,
+                    from: old,
+                    to: new,
                 });
             }
             crate::verbose!(

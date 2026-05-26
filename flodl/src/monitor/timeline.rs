@@ -96,8 +96,15 @@ pub enum EventKind {
     Throttle { rank: usize },
     /// Auto-detected GPU idle gap (post-processing).
     Idle { device: u8, duration_ms: f64 },
-    /// User-defined event.
-    Custom { label: String },
+    /// LR-aware meta-controller nudged the El Che anchor down.
+    ///
+    /// Emitted from the coordinator's `observe_meta` whenever the
+    /// meta returns `MetaAction::NudgeDown` and `ElChe::nudge_anchor_down(factor)`
+    /// fires. The cycle's net anchor delta (meta nudge composed with
+    /// any guard-driven adjustment) is reported separately via
+    /// `AnchorChanged`; this event isolates the meta's contribution
+    /// with the raw `factor` used.
+    MetaNudge { factor: f64, from: usize, to: usize },
     /// MSF passive observation: per-AllReduce divergence + lambda sample.
     ///
     /// Emitted at every `ConvergenceGuard::observe_lambda` call. `d_raw` is
@@ -739,10 +746,11 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                     "\"k\":\"idle\",\"dev\":{device},\"ms\":{duration_ms:.1}"
                 );
             }
-            EventKind::Custom { label } => {
-                // Escape quotes in label
-                let escaped = label.replace('\\', "\\\\").replace('"', "\\\"");
-                let _ = write!(out, "\"k\":\"custom\",\"label\":\"{escaped}\"");
+            EventKind::MetaNudge { factor, from, to } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"meta_nudge\",\"factor\":{factor:.6},\"from\":{from},\"to\":{to}"
+                );
             }
             EventKind::Divergence {
                 d_raw,
@@ -941,6 +949,32 @@ mod tests {
         let mut buf2 = String::new();
         write_events_json(&mut buf2, &events);
         assert!(buf2.contains("\"sync_start\""));
+    }
+
+    /// `MetaNudge` (LR-aware meta-controller anchor nudge) replaces the
+    /// stringly-typed `Custom` variant that previously squeezed
+    /// `factor` / `from` / `to` into a label. Verify the JSON shape so
+    /// ddp-bench's analyze pipeline (which parses `k=meta_nudge`) can
+    /// rely on it.
+    #[test]
+    fn test_meta_nudge_json_shape() {
+        let tl = Timeline::new(100);
+        tl.event(EventKind::MetaNudge {
+            factor: 0.85,
+            from: 40,
+            to: 34,
+        });
+
+        let mut buf = String::new();
+        let events = tl.events.lock().unwrap();
+        write_events_json(&mut buf, &events);
+        assert!(
+            buf.contains("\"k\":\"meta_nudge\""),
+            "meta_nudge kind tag missing: {buf}",
+        );
+        assert!(buf.contains("\"factor\":0.850000"), "factor missing: {buf}");
+        assert!(buf.contains("\"from\":40"), "from missing: {buf}");
+        assert!(buf.contains("\"to\":34"), "to missing: {buf}");
     }
 
     #[test]

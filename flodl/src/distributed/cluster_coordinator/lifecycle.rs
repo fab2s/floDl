@@ -213,6 +213,14 @@ impl ClusterCoordinator {
             throttled: vec![false; world_size],
             last_nccl_sync_ms: 0.0,
             nccl_sync_start: None,
+            // Per-epoch d-aggregator identity values; see field docs on
+            // `ClusterCoordinator` + threaded `coordinator/cpu_avg.rs`.
+            epoch_d_min: f64::INFINITY,
+            epoch_d_max: f64::NEG_INFINITY,
+            epoch_d_sum: 0.0,
+            epoch_d_count: 0,
+            epoch_last_d: 0.0,
+            epoch_last_k_max: 0,
             lr_event_meta: if config.meta_controller {
                 Some(crate::distributed::lr_event_meta::LrEventMeta::with_default_config())
             } else {
@@ -285,6 +293,7 @@ impl ClusterCoordinator {
             salt,
             timeline: config.timeline.clone(),
             sync_start: None,
+            cpu_avg_start: None,
             dashboard_sink: config.dashboard_sink.clone(),
         })
     }

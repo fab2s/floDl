@@ -10,9 +10,46 @@ use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
-use super::{ClusterCoordinator, CpuAvgState, NcclRendezvousPending};
+use super::{ClusterCoordinator, CpuAvgState, EpochDSummary, NcclRendezvousPending};
 
 impl ClusterCoordinator {
+    /// Per-AllReduce d-aggregator update. Called once per
+    /// `finish_averaging_{nccl,cpu}` after the convergence guard's
+    /// `d_raw` + `k_max` are known. Mirrors threaded
+    /// `coordinator/cpu_avg.rs::update_epoch_d_aggregator`.
+    pub(super) fn update_epoch_d_aggregator(&mut self, d_raw: f64, k_max: usize) {
+        self.epoch_d_count += 1;
+        self.epoch_d_sum += d_raw;
+        if d_raw < self.epoch_d_min {
+            self.epoch_d_min = d_raw;
+        }
+        if d_raw > self.epoch_d_max {
+            self.epoch_d_max = d_raw;
+        }
+        self.epoch_last_d = d_raw;
+        self.epoch_last_k_max = k_max;
+    }
+
+    /// Drain the epoch d-aggregator + reset to identity. Called from
+    /// the post-aggregate hook to build the `DivergenceEpoch` event
+    /// payload. Mirrors threaded
+    /// `coordinator/cpu_avg.rs::take_epoch_d_summary`.
+    pub(super) fn take_epoch_d_summary(&mut self) -> EpochDSummary {
+        let snap = EpochDSummary {
+            count: self.epoch_d_count,
+            d_min: self.epoch_d_min,
+            d_max: self.epoch_d_max,
+            d_sum: self.epoch_d_sum,
+            d_at_epoch_end: self.epoch_last_d,
+            k_at_epoch_end: self.epoch_last_k_max,
+        };
+        self.epoch_d_min = f64::INFINITY;
+        self.epoch_d_max = f64::NEG_INFINITY;
+        self.epoch_d_sum = 0.0;
+        self.epoch_d_count = 0;
+        snap
+    }
+
     pub(super) fn capture_nccl_sync_elapsed_if_complete(&mut self) {
         if self.nccl_ack.iter().all(|&a| a) {
             if let Some(start) = self.nccl_sync_start.take() {
@@ -68,6 +105,15 @@ impl ClusterCoordinator {
                 // throughout.
                 for slot in &mut self.last_observed_upload_ms {
                     *slot = None;
+                }
+                // CpuAvgStart: open the Pending window. Mirrors threaded
+                // `coordinator/cpu_avg.rs:634`. Closed in
+                // `finish_averaging_cpu` via the `cpu_avg_start` field
+                // so MSF / dashboard see the same `CpuAvgEnd
+                // { duration_ms }` payload shape on cluster runs.
+                self.cpu_avg_start = Some(Instant::now());
+                if let Some(ref tl) = self.timeline {
+                    tl.event(crate::monitor::EventKind::CpuAvgStart);
                 }
                 // Defer `finish_averaging_cpu` until every rank's
                 // bridge SyncAck has populated `nccl_sync_divergence`
@@ -347,6 +393,10 @@ impl ClusterCoordinator {
     pub(super) fn finish_averaging_nccl(&mut self) -> Result<()> {
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
+        // Snapshot anchor BEFORE the guard verdict + meta-nudge so the
+        // post-cycle `AnchorChanged` event captures the cycle's net
+        // change. Mirrors threaded `coordinator/cpu_avg.rs:230`.
+        let old_anchor = self.el_che.anchor();
         // Stage per-rank callback slack BEFORE report_timing so the
         // recompute inside ElChe applies it to the next cycle's
         // batch_counts (when the next cycle is the LAST cycle of the
@@ -418,6 +468,49 @@ impl ClusterCoordinator {
 
         self.global_step += cycle_batches;
 
+        // Per-AllReduce divergence event + epoch aggregator update.
+        // `d_raw` is the max relative delta across ranks for this
+        // cycle; the epoch-level aggregator drains in
+        // `try_advance_or_shutdown_after_aggregate`. Lambda fields are
+        // intentionally None — analyze.rs recomputes guard-specific
+        // λ̂ from observables now that the guard pipeline is plural.
+        // Mirrors threaded `coordinator/cpu_avg.rs:299-334`.
+        let d_raw = report.max_relative_delta();
+        self.update_epoch_d_aggregator(d_raw, k_max);
+        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::Divergence {
+                d_raw,
+                lambda_raw: None,
+                lambda_ema: None,
+                k_used: cycle_batches,
+                k_max,
+                step: self.global_step,
+                deltas: report.deltas.clone(),
+                post_norm: report.post_norm,
+                pre_norms: report.pre_norms.clone(),
+                epoch: Some(in_flight_epoch),
+            });
+            let telemetry = self.convergence_guard.telemetry();
+            if !telemetry.is_empty() {
+                tl.event(crate::monitor::EventKind::GuardTelemetry {
+                    epoch: in_flight_epoch,
+                    step: self.global_step,
+                    values: telemetry
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                });
+            }
+            let new_anchor = self.el_che.anchor();
+            if new_anchor != old_anchor {
+                tl.event(crate::monitor::EventKind::AnchorChanged {
+                    from: old_anchor,
+                    to: new_anchor,
+                });
+            }
+        }
+
         self.broadcast_control(&ControlMsgWire::SetGlobalStep {
             global_step: self.global_step as u64,
         })?;
@@ -469,6 +562,7 @@ impl ClusterCoordinator {
     pub(super) fn finish_averaging_cpu(&mut self) -> Result<()> {
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
+        let old_anchor = self.el_che.anchor();
         // Mirror of `finish_averaging_nccl`: stage slack before
         // `report_timing` so the next-cycle batch_counts shrink on the
         // callback-firing rank.
@@ -536,6 +630,44 @@ impl ClusterCoordinator {
 
         self.global_step += cycle_batches;
 
+        // Per-AllReduce divergence event + per-epoch aggregator update;
+        // see `finish_averaging_nccl` for the rationale.
+        let d_raw = report.max_relative_delta();
+        self.update_epoch_d_aggregator(d_raw, k_max);
+        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::Divergence {
+                d_raw,
+                lambda_raw: None,
+                lambda_ema: None,
+                k_used: cycle_batches,
+                k_max,
+                step: self.global_step,
+                deltas: report.deltas.clone(),
+                post_norm: report.post_norm,
+                pre_norms: report.pre_norms.clone(),
+                epoch: Some(in_flight_epoch),
+            });
+            let telemetry = self.convergence_guard.telemetry();
+            if !telemetry.is_empty() {
+                tl.event(crate::monitor::EventKind::GuardTelemetry {
+                    epoch: in_flight_epoch,
+                    step: self.global_step,
+                    values: telemetry
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                });
+            }
+            let new_anchor = self.el_che.anchor();
+            if new_anchor != old_anchor {
+                tl.event(crate::monitor::EventKind::AnchorChanged {
+                    from: old_anchor,
+                    to: new_anchor,
+                });
+            }
+        }
+
         // CPU lifecycle barrier: workers received averaged tensors on
         // the data channel; this Update notification tells them to
         // bump `current_version` and reset `steps_since_avg`.
@@ -564,6 +696,16 @@ impl ClusterCoordinator {
             *p = None;
         }
         self.nccl_sync_post_norm = None;
+        // CpuAvgEnd: close the Pending window opened in trigger_averaging.
+        // duration_ms is the bridge round-trip time (RequestParams
+        // broadcast → all alive SyncAcks landed). Distinct from the
+        // outer SyncEnd which also covers the post-finalize work.
+        if let Some(start) = self.cpu_avg_start.take() {
+            if let Some(ref tl) = self.timeline {
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
+            }
+        }
         self.emit_sync_end();
         Ok(())
     }

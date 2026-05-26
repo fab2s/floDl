@@ -70,6 +70,11 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
             "throttle" => EventKind::Throttle {
                 rank: item["rank"].as_u64().unwrap_or(0) as usize,
             },
+            "meta_nudge" => EventKind::MetaNudge {
+                factor: item["factor"].as_f64().unwrap_or(0.0),
+                from: item["from"].as_u64().unwrap_or(0) as usize,
+                to: item["to"].as_u64().unwrap_or(0) as usize,
+            },
             "div" => {
                 let deltas = item["deltas"]
                     .as_array()

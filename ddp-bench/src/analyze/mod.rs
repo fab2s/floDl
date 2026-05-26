@@ -44,6 +44,12 @@ pub enum EventKind {
     CpuAvgEnd { ms: f64 },
     Anchor { #[allow(dead_code)] from: usize, #[allow(dead_code)] to: usize },
     Throttle { #[allow(dead_code)] rank: usize },
+    /// LR-aware meta-controller nudged the anchor down (raw factor,
+    /// pre/post anchor). The cycle's NET anchor delta still surfaces
+    /// via `Anchor` from `finish_averaging_*`; `MetaNudge` isolates the
+    /// meta's contribution.
+    #[allow(dead_code)]
+    MetaNudge { factor: f64, from: usize, to: usize },
     /// MSF per-AllReduce sample (passive observation, no behavior effect).
     /// Currently we only count these for the summary; per-event detail is
     /// kept on the JSON for downstream analysis tools.

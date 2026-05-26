@@ -370,6 +370,9 @@ impl ClusterCoordinator {
         for rank in to_throttle {
             self.send_control(rank, &ControlMsgWire::Throttle)?;
             self.throttled[rank] = true;
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::Throttle { rank });
+            }
         }
         Ok(())
     }
@@ -575,6 +578,29 @@ impl ClusterCoordinator {
                 metrics.epoch_ms = ms;
             }
             self.last_aggregated_epoch = Some(epoch_key as usize);
+            // Drain the per-epoch d-aggregator and emit `DivergenceEpoch`
+            // when at least one AllReduce contributed a sample. Lambda
+            // fields are intentionally None — `ddp-bench/src/analyze/msf.rs`
+            // recomputes guard-specific λ̂ from the per-event Divergence
+            // observables. Mirrors threaded `coordinator/mod.rs:934-951`.
+            let snap = self.take_epoch_d_summary();
+            if snap.count > 0
+                && let Some(ref tl) = self.timeline
+            {
+                tl.event(crate::monitor::EventKind::DivergenceEpoch {
+                    epoch: epoch_key as usize,
+                    sync_count: snap.count,
+                    d_min: snap.d_min,
+                    d_max: snap.d_max,
+                    d_mean: snap.d_mean(),
+                    lambda_min: None,
+                    lambda_max: None,
+                    lambda_mean: None,
+                    lambda_ema_at_epoch_end: None,
+                    d_at_epoch_end: snap.d_at_epoch_end,
+                    k_at_epoch_end: snap.k_at_epoch_end,
+                });
+            }
             if let Some(ref f) = self.metrics_fn {
                 if let Err(e) = f(&metrics) {
                     eprintln!(

@@ -268,6 +268,32 @@ fn initial_callback_role(
 /// `Coordinator::finish_averaging_nccl` parity).
 ///
 /// [`ControlMsgWire::ExtendPartition`]: crate::distributed::wire::ControlMsgWire::ExtendPartition
+/// Drained payload of the per-epoch d-aggregator. Mirrors the threaded
+/// coord's `EpochDSummary` (ddp_run/coordinator/cpu_avg.rs) line-for-line
+/// so MSF analysis sees the same `DivergenceEpoch` shape on both paths.
+/// `count == 0` means no AllReduce happened in the epoch (e.g. final
+/// pure-Sync epoch with one batch per rank) and the caller should skip
+/// emission rather than ship a snapshot of identity values.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EpochDSummary {
+    pub(super) count: usize,
+    pub(super) d_min: f64,
+    pub(super) d_max: f64,
+    pub(super) d_sum: f64,
+    pub(super) d_at_epoch_end: f64,
+    pub(super) k_at_epoch_end: usize,
+}
+
+impl EpochDSummary {
+    pub(super) fn d_mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.d_sum / self.count as f64
+        }
+    }
+}
+
 #[derive(Debug)]
 enum CpuAvgState {
     /// No averaging cycle in flight.
@@ -377,6 +403,29 @@ pub struct ClusterCoordinator {
     last_nccl_sync_ms: f64,
     /// Instant the most recent SyncNow was emitted.
     nccl_sync_start: Option<Instant>,
+
+    /// Per-epoch d-aggregator. Each call to [`Self::finish_averaging_nccl`]
+    /// / [`Self::finish_averaging_cpu`] feeds the cycle's `d_raw` +
+    /// `k_max` into [`Self::update_epoch_d_aggregator`]; the
+    /// post-aggregate hook drains via [`Self::take_epoch_d_summary`] to
+    /// build the `DivergenceEpoch` timeline event payload. Initialized
+    /// to identity values (min=+∞, max=-∞, sum/count/last=0) so
+    /// `take_epoch_d_summary` distinguishes "no AllReduce this epoch"
+    /// (count=0 ⇒ skip emit) from "at least one sample observed".
+    /// Mirrors threaded `coordinator/cpu_avg.rs`'s `epoch_d_*` fields
+    /// + `update_epoch_d_aggregator` / `take_epoch_d_summary` helpers.
+    epoch_d_min: f64,
+    epoch_d_max: f64,
+    epoch_d_sum: f64,
+    epoch_d_count: usize,
+    /// Most-recent `d_raw` sample in the current epoch. Threaded path
+    /// uses this as the `d_at_epoch_end` payload field on
+    /// `EventKind::DivergenceEpoch` so MSF analysis can read the last
+    /// observation of the epoch without scanning all per-event samples.
+    epoch_last_d: f64,
+    /// `k_max` from the most-recent AllReduce in the current epoch.
+    /// Companion to `epoch_last_d`; surfaced as `k_at_epoch_end`.
+    epoch_last_k_max: usize,
 
     /// LR-aware meta-controller above ElChe. `None` when
     /// [`ClusterCoordinatorConfig::meta_controller`] is `false` (default).
@@ -667,6 +716,13 @@ pub struct ClusterCoordinator {
     /// finalizes. `Some` between `trigger_averaging` and the matching
     /// `finish_averaging_*`; `None` outside a cycle.
     sync_start: Option<std::time::Instant>,
+    /// Wall-clock start of the current CPU-averaging Pending window
+    /// (CPU backend only). Set at the same site `cpu_avg_state` flips
+    /// to `Pending`; consumed by `poll_cpu_averaging` to compute the
+    /// `CpuAvgEnd { duration_ms }` payload. Always `None` on the NCCL
+    /// backend — `CpuAvgStart` / `CpuAvgEnd` only fire for CPU
+    /// averaging, matching the threaded coordinator's event semantics.
+    cpu_avg_start: Option<std::time::Instant>,
     /// Optional controller-side dashboard sink. When the launcher
     /// hosts a live dashboard, it constructs a concrete
     /// [`crate::distributed::DashboardSink`] and threads it through
