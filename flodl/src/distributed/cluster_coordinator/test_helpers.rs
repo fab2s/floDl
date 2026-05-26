@@ -355,4 +355,13 @@ impl ClusterCoordinator {
     pub(crate) fn el_che_for_test(&self) -> &crate::distributed::ddp::ElChe {
         &self.el_che
     }
+
+    /// Test-only mutator for `steps_since_avg[rank]`. Mirrors
+    /// [`Self::set_wall_ms_accum_for_test`] for gate-firing assertions
+    /// that need a known per-rank step count without driving the full
+    /// timing-message path.
+    #[cfg(test)]
+    pub(crate) fn set_steps_since_avg_for_test(&mut self, rank: usize, n: usize) {
+        self.steps_since_avg[rank] = n;
+    }
 }

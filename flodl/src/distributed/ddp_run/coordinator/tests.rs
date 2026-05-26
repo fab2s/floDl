@@ -174,39 +174,59 @@
     }
 
     #[test]
-    fn should_average_cadence_wall_time_trigger() {
+    fn should_average_cadence_batch_count_trigger() {
+        // Cadence (post-calibration) gates on `steps_since_avg >= batch_counts[r]`.
+        // Wall time only feeds `batch_counts` via `ElChe::recompute_batch_counts`;
+        // it does not gate firing. See the comment in `should_average`'s Cadence
+        // arm for the rationale.
         let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
-        // Calibrate ElChe so anchor_wall_ms() returns > 0.
+        // Calibrate ElChe with a 2:1 throughput ratio → batch_counts becomes
+        // proportional. Exact values depend on dead-zone rounding; the test
+        // reads them back rather than hardcoding.
         coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
         assert!(coord.el_che.is_calibrated());
-        let target = coord.el_che.anchor_wall_ms();
-        assert!(target > 0.0, "anchor_wall_ms should be positive after calibration");
+        let counts = coord.el_che.batch_counts().to_vec();
 
-        // Satisfy preconditions: steps > 0 and nccl_ack = true.
-        coord.steps_since_avg = vec![1, 1];
+        // Satisfy preconditions: nccl_ack = true (steps set below).
         coord.nccl_ack = vec![true, true];
 
-        // Not enough wall time accumulated.
-        coord.wall_ms_accum[0] = target * 0.5;
-        coord.wall_ms_accum[1] = target * 0.5;
+        // Neither rank has met its count yet.
+        coord.steps_since_avg = vec![counts[0] - 1, counts[1] - 1];
         assert!(!coord.should_average());
 
-        // Both ranks reach the target.
-        coord.wall_ms_accum[0] = target;
-        coord.wall_ms_accum[1] = target;
+        // Both ranks meet their count → fire.
+        coord.steps_since_avg = counts.clone();
         assert!(coord.should_average());
     }
 
     #[test]
-    fn should_average_cadence_min_wall_governs() {
+    fn should_average_cadence_unreachable_wall_does_not_block() {
+        // Structural invariant: even when `smoothed_slow_ms` is pathologically
+        // high (simulating cold-start warmup, thermal throttle, or any other
+        // measurement spike), the gate must still fire once ranks complete
+        // their `batch_counts`. This is the deadlock the wall-time gate
+        // introduced: gate target derived from samples that only land when
+        // the gate fires → high target locks itself in. Count-based gate
+        // breaks the loop.
         let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);
-        coord.el_che.report_timing(&[100.0, 200.0], &[10, 10], 5.0);
-        let target = coord.el_che.anchor_wall_ms();
+        // Seed the trust window with a deliberately huge sample
+        // (e.g. 10_000 ms/batch — would correspond to a 10s-per-batch
+        // wall, which `wall_ms_accum` could not realistically reach in
+        // a test window).
+        coord.el_che.report_timing(&[10_000.0, 10_000.0], &[1, 1], 0.0);
+        assert!(coord.el_che.is_calibrated());
+        let counts = coord.el_che.batch_counts().to_vec();
 
-        // Rank 0 has enough, rank 1 does not: min < target.
-        coord.wall_ms_accum[0] = target * 2.0;
-        coord.wall_ms_accum[1] = target * 0.3;
-        assert!(!coord.should_average());
+        coord.nccl_ack = vec![true, true];
+        coord.steps_since_avg = counts.clone();
+        // wall_ms_accum stays trivially small — wall-based gate would NEVER
+        // fire here (target = anchor * 10_000ms). Count-based gate must fire.
+        coord.wall_ms_accum = vec![1.0, 1.0];
+        assert!(
+            coord.should_average(),
+            "count-based gate must fire on completed batch_counts regardless of \
+             smoothed_slow_ms in the trust window",
+        );
     }
 
     #[test]

@@ -62,56 +62,64 @@ fn test_coordinator_should_average_async() {
 }
 
 #[test]
-fn test_coordinator_should_average_wall_time() {
-    // After calibration, Cadence uses wall-time trigger (not batch counts).
-    // Async keeps batch-count trigger (overshooting is the feature).
-    // Setup: 2 ranks, anchor=10, rank 0 = 5ms/batch (fast), rank 1 = 10ms/batch (slow).
-    // anchor_wall_ms = 10 * 10 = 100ms.
+fn test_coordinator_should_average_count_post_calibration() {
+    // Post-calibration, Cadence (like Async) gates on
+    // `steps_since_avg >= batch_counts[r]`. Timing feeds `batch_counts`
+    // through `ElChe::recompute_batch_counts` so the next cycle's
+    // schedule lands closer to the estimated wall time, but it does
+    // NOT gate firing. The wall-based gate was structurally fragile
+    // (target derived from samples that only land when the gate fires
+    // → upward spikes lock the gate); count-based gating sidesteps
+    // that loop. Setup: 2 ranks, anchor=10, 2:1 throughput ratio.
     let mut h = make_coord_harness(2, ApplyPolicy::Cadence, AverageBackend::Nccl);
 
-    // Phase 1: calibrate ElChe (uncalibrated uses batch-count fallback).
-    // Send 10 batches per rank to trigger initial averaging.
-    // step_count must increment to satisfy NCCL ack tracking.
+    // Phase 1: calibrate ElChe (uncalibrated already uses count-based
+    // gate with equal counts). Send 10 batches per rank to trigger
+    // initial averaging. step_count must increment to satisfy NCCL ack.
     for i in 0..10 {
         h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: i + 1, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
         h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: i + 1, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
     }
     h.coord.drain_timing();
-    assert!(h.coord.should_average()); // batch-count fallback: 10 >= 10
+    assert!(h.coord.should_average()); // count gate: 10 >= 10
     h.coord.trigger_averaging().unwrap();
     for rx in &h.control_rxs { while rx.try_recv().is_ok() {} }
 
     assert!(h.coord.is_calibrated());
-    let target = h.coord.el_che.anchor_wall_ms();
-    assert!(target > 0.0, "anchor_wall_ms should be positive after calibration");
 
-    // Phase 2: wall-time trigger. The slow rank needs target ms of compute.
-    // Feed batches until slow rank reaches target, but NOT until batch_counts
-    // are met. This proves wall time triggers, not batch counts.
-    //
-    // After calibration with 2:1 ratio, batch_counts ≈ [20, 10].
-    // If we feed 10 batches to each: wall_ms_accum = [50, 100].
-    // min(50, 100) = 50 < 100 → no trigger (fast rank hasn't accumulated enough).
-    for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 11 + i, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 11 + i, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+    // Phase 2: post-calibration, count gate still governs. After a 2:1
+    // ratio calibration, batch_counts is proportional. Read it back
+    // rather than hardcoding (dead-zone rounding can shift the exact
+    // values). Feed less than counts → no fire. Feed exactly counts → fire.
+    let counts = h.coord.el_che.batch_counts().to_vec();
+    let mut next_step = 11usize;
+    for _ in 0..(counts[0] - 1) {
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: next_step, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+        next_step += 1;
+    }
+    for _ in 0..(counts[1] - 1) {
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: next_step, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+        next_step += 1;
     }
     h.coord.drain_timing();
-    assert!(!h.coord.should_average(), "fast rank wall time < target");
+    assert!(!h.coord.should_average(), "below batch_counts → no fire");
 
-    // Feed 10 more to rank 0 only (simulating fast GPU running ahead).
-    // wall_ms_accum = [100, 100]. min = 100 >= target → trigger!
-    for i in 0..10 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 21 + i, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
-    }
+    // One more batch per rank → both reach counts → fire.
+    h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: next_step, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+    next_step += 1;
+    h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: next_step, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
     h.coord.drain_timing();
-    assert!(h.coord.should_average(), "both ranks at target wall time");
+    assert!(h.coord.should_average(), "both ranks at batch_counts → fire");
 }
 
 #[test]
-fn test_async_uses_batch_count_not_wall_time() {
-    // Async keeps batch-count trigger even after calibration.
-    // The divergence between replicas IS the feature (exploration diversity).
+fn test_async_triggers_on_batch_counts() {
+    // Async (like Cadence post-calibration) gates on
+    // `steps_since_avg >= batch_counts[r]`. The async-specific behavior
+    // — divergence between replicas as implicit regularization (Local
+    // SGD) — happens via `max_overshoot` and the convergence guard,
+    // not via the firing gate. This test pins the firing semantics:
+    // both ranks at their proportional `batch_counts` → fire.
     let mut h = make_coord_harness(2, ApplyPolicy::Async, AverageBackend::Nccl);
 
     // Calibrate: 10 batches each at 2:1 speed ratio.
@@ -126,10 +134,8 @@ fn test_async_uses_batch_count_not_wall_time() {
     for rx in &h.control_rxs { while rx.try_recv().is_ok() {} }
     assert!(h.coord.is_calibrated());
 
-    // After calibration, batch_counts ~ [20, 10].
-    // Feed exactly those counts. With wall-time trigger this would NOT
-    // fire (fast rank wall = 100ms, slow = 100ms, but batch counts would
-    // differ). With batch-count trigger it fires immediately.
+    // After calibration, batch_counts ~ [20, 10] (2:1 ratio). Feed
+    // exactly those counts → fire.
     let counts = h.coord.el_che.batch_counts();
     for step0 in 11..(11 + counts[0]) {
         h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: step0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
@@ -138,7 +144,7 @@ fn test_async_uses_batch_count_not_wall_time() {
         h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: step1, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
     }
     h.coord.drain_timing();
-    assert!(h.coord.should_average(), "async triggers on batch counts, not wall time");
+    assert!(h.coord.should_average(), "async fires on batch_counts");
 }
 
 #[test]

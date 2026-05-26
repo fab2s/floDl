@@ -321,21 +321,20 @@ impl ClusterCoordinator {
             ApplyPolicy::Sync => (0..self.world_size)
                 .filter(|r| !self.is_dead(*r))
                 .all(|r| self.steps_since_avg[r] >= 1),
-            ApplyPolicy::Cadence => {
-                let target = self.el_che.anchor_wall_ms();
-                if target > 0.0 {
-                    let min_wall = (0..self.world_size)
-                        .filter(|r| !self.is_dead(*r))
-                        .map(|r| self.wall_ms_accum[r])
-                        .fold(f64::MAX, f64::min);
-                    return min_wall >= target;
-                }
-                let counts = self.el_che.batch_counts();
-                (0..self.world_size)
-                    .filter(|r| !self.is_dead(*r))
-                    .all(|r| self.steps_since_avg[r] >= counts[r])
-            }
-            ApplyPolicy::Async => {
+            ApplyPolicy::Cadence | ApplyPolicy::Async => {
+                // Count-based gate: fire when each rank has completed its
+                // scheduled `batch_counts[r]`. The phenomenological
+                // invariant is "training progresses by scheduled steps" —
+                // timing is a measurement that feeds `batch_counts` via
+                // `ElChe::recompute_batch_counts`, NOT a firing condition.
+                // A wall-time gate (`min_wall >= anchor * smoothed_slow_ms`)
+                // is structurally fragile: the target is derived from
+                // samples that only land when the gate fires, so any
+                // upward spike in `smoothed_slow_ms` (cold-start warmup,
+                // thermal throttle, GPU contention, mid-run lazy init)
+                // can lock the target above achievable wall time and
+                // deadlock the cohort. Count-based gating sidesteps that
+                // loop entirely.
                 let counts = self.el_che.batch_counts();
                 (0..self.world_size)
                     .filter(|r| !self.is_dead(*r))

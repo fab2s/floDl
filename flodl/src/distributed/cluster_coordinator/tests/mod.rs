@@ -19,6 +19,7 @@ pub(crate) use std::time::Duration;
 mod callbacks;
 mod epoch_dispatch;
 mod fastest;
+mod gate;
 mod heartbeat;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).
