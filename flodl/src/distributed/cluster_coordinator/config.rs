@@ -57,8 +57,9 @@ pub struct ClusterCoordinatorConfig {
     /// precedence over ElChe-derived throughput sizing. Length must
     /// equal `world_size` if set.
     pub partition_ratios: Option<Vec<f64>>,
-    /// Enable the LR-aware meta-controller above ElChe. Default: false
-    /// (off; opt-in). When enabled, a
+    /// Enable the LR-aware meta-controller above ElChe. Default:
+    /// `true` (always on — LR drops are always worth catching; opt out
+    /// for unconditioned-trajectory runs). When enabled, a
     /// [`crate::distributed::lr_event_meta::LrEventMeta`] is constructed
     /// and held by the coordinator; per-rank LR updates from
     /// [`crate::distributed::wire::TimingMsgWire::LrUpdate`] populate `last_lr_per_rank`, and the
@@ -163,16 +164,16 @@ pub struct ClusterCoordinatorConfig {
 
     /// Which rank should fire user-supplied per-epoch callbacks
     /// (`epoch_fn` / `checkpoint_fn` / `eval_fn`). Default
-    /// [`EpochCallbackPolicy::Rank(0)`]; setting
-    /// [`EpochCallbackPolicy::Fastest`] makes the coord runtime-
-    /// resolve the role from ElChe's per-rank smoothed throughput,
-    /// with sticky retention across cadences and re-resolution only
-    /// on rank death.
+    /// [`EpochCallbackPolicy::Fastest`] — coord runtime-resolves the
+    /// role from ElChe's per-rank smoothed throughput, with sticky
+    /// retention across cadences and re-resolution only on rank death.
+    /// Pin to a specific rank with [`EpochCallbackPolicy::Rank`] when
+    /// the research convention demands it.
     ///
-    /// [`EpochCallbackPolicy::Rank(0)`]:
-    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank
     /// [`EpochCallbackPolicy::Fastest`]:
     ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
+    /// [`EpochCallbackPolicy::Rank`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank
     pub epoch_callback_policy: crate::distributed::ddp_run::EpochCallbackPolicy,
 
     /// Progressive dispatch toggle. `None` = auto (true for
@@ -256,7 +257,7 @@ impl ClusterCoordinatorConfig {
             batch_size: 1,
             num_epochs: 0,
             partition_ratios: None,
-            meta_controller: false,
+            meta_controller: true,
             dead_ranks: None,
             heartbeat_timeout_secs: 30,
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
@@ -341,12 +342,12 @@ impl ClusterCoordinatorConfig {
 
     /// Set the [`EpochCallbackPolicy`] that decides which rank fires
     /// per-epoch user callbacks (`epoch_fn`, `checkpoint_fn`,
-    /// `eval_fn`). Default [`EpochCallbackPolicy::Rank(0)`].
+    /// `eval_fn`). Default [`EpochCallbackPolicy::Fastest`].
     ///
     /// [`EpochCallbackPolicy`]:
     ///     crate::distributed::ddp_run::EpochCallbackPolicy
-    /// [`EpochCallbackPolicy::Rank(0)`]:
-    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Rank
+    /// [`EpochCallbackPolicy::Fastest`]:
+    ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
     pub fn epoch_callback_policy(
         mut self,
         policy: crate::distributed::ddp_run::EpochCallbackPolicy,

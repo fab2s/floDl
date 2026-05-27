@@ -35,17 +35,19 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 ---
 
-> **What's new in 0.5.0** -- the `fdl` CLI maturity pass. New proc-macro
-> crate [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros)
-> adds `#[derive(FdlArgs)]` -- any Rust binary gets typed argv parsing,
-> JSON schema, shell completions, and env-var fallback for free.
-> `fdl.yml` consolidates to a single `commands:` map with three clean
-> kinds (`run:` / `path:` / preset). New
-> [`--env` overlays](docs/cli.md#environment-overlays) and
-> [`fdl config show`](docs/cli.md#fdl-config) surface per-environment
-> config with per-field origin annotations, so you can see the
-> resolved YAML before running a two-hour job. Migration from 0.4.0:
-> see [UPGRADE.md](UPGRADE.md).
+> **What's new** — full re-architecture of the distributed layer to
+> process-per-rank with elastic membership, plus the same single
+> entry (`Trainer::builder(...).run()`) now scales from CPU to
+> single-host multi-GPU (auto-promoted on 2+ visible GPUs) to
+> multi-host clusters via `fdl.cluster.yml` or `ClusterBuilder`.
+> ElChe collapsed to `ElCheMode` (six modes,
+> default `NcclAsync`); convergence guard is now authoritative over
+> `overhead_target`; per-epoch callbacks default to the fastest rank
+> (free compute on heterogeneous rigs). New CLI: `fdl probe` (cluster
+> readiness audit), `fdl nccl build` (libnccl source builder for
+> heterogeneous-NCCL clusters), `fdl --gpus` (global GPU scope
+> override), `fdl cluster <cmd>` (multi-host fan-out). See the
+> CHANGELOG and [DDP Reference](docs/ddp.md) for the full surface.
 
 ---
 
@@ -430,51 +432,64 @@ the **[Observation example](https://github.com/flodl-labs/flodl/tree/main/flodl/
 
 ## Multi-GPU Training
 
-`Trainer::setup()` gives you transparent heterogeneous multi-GPU training with
-zero changes to your training loop. floDl detects your GPUs, picks the best
-strategy, and balances work automatically: the slowest GPU anchors the pace
-while faster ones run ahead intelligently.
-
-**Graph DDP** -- one line to go from single-GPU to multi-GPU:
+The **same `Trainer::builder` call** scales from CPU to N GPUs on one
+host to N GPUs across many hosts. On a host with 2+ visible CUDA
+devices, floDl auto-promotes to process-per-rank fan-out
+automatically — zero training-loop changes.
 
 ```rust
-// Detect GPUs, replicate model, set optimizer, enable training
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
-
-// Training loop is IDENTICAL for 1 or N GPUs
-for batch in model.epoch(0) {
-    let loss = model.forward_batch(&batch?)?;
-    model.step()?;  // AllReduce + sync + optimizer + zero_grad
-}
-```
-
-**DDP Builder** -- thread-per-GPU, works with any `Module`:
-
-```rust
-let state = Trainer::builder(model_factory, optim_factory, train_fn)
+// Universal entry: works on CPU, 1 GPU, N GPUs single-host, N GPUs multi-host.
+let handle = Trainer::builder(model_factory, optim_factory, train_step)
     .dataset(dataset)
-    .batch_size(32)
-    .num_epochs(10)
-    .policy(ApplyPolicy::Cadence)       // ElChe for mixed GPUs
-    .backend(AverageBackend::Nccl)      // or Cpu for A/B testing
-    .run()?
-    .join()?;
+    .batch_size(64)
+    .num_epochs(50)
+    .run()?;
+
+let state: TrainedState = handle.join()?;
 ```
 
-| | Graph DDP | DDP Builder |
-|---|---|---|
-| **Works with** | `Graph` builder | Any `Module` |
-| **GPU model** | Scatter per batch | Thread per GPU (Local SGD) |
-| **Mixed GPUs** | El Che auto-enabled | `ApplyPolicy` x `AverageBackend` |
-| **Setup** | One line (`Trainer::setup`) | Builder pattern |
-| **Dashboard** | Integrated | Stderr logging |
+**ElChe — heterogeneous-rig cadence.** Mixed GPU generations? ElChe
+auto-balances: the slowest GPU anchors the pace; faster ones process
+proportionally more batches per averaging window, AllReduce overhead
+stays bounded, the convergence guard vetoes anchor growth when
+weight-space divergence rises. No configuration needed for the common
+case.
 
-**A/B testing**: swap `AverageBackend::Nccl` for `AverageBackend::Cpu`
-with one line. If loss curves match, you have validated the cheaper
-backend for your workload.
+**Six DDP modes, one line each.** `ElCheConfig::default()` is
+`nccl_async()` (recommended NCCL default). Swap to any of the six
+modes for A/B testing:
+
+```rust
+.elche(ElCheConfig::cpu_async().easgd_alpha(0.6))   // best-in-class on reference rig
+.elche(ElCheConfig::nccl_async())                   // default; cross-epoch lookahead on heterogeneous rigs
+.elche(ElCheConfig::nccl_cadence())                 // strict cross-epoch lockstep
+.elche(ElCheConfig::nccl_sync())                    // per-batch AllReduce baseline
+```
+
+**Multi-host clusters.** Add an `fdl.cluster.yml` next to your
+`fdl.yml`, or build the topology programmatically with
+`ClusterBuilder`. Then:
+
+```bash
+fdl probe              # readiness gate: GPU + libtorch + NCCL + shared-data audit
+fdl cluster train      # SSHes each worker, pre-builds, fans out
+```
+
+Heterogeneous-rig support extends to per-host libtorch variants
+(`precompiled/cu128` on one host, `builds/sm61-sm120` on another),
+NCCL version-skew handling via `fdl nccl build` (builds a matching
+libnccl for `LD_PRELOAD`), and elastic membership (ranks can die and
+rejoin without aborting the run).
+
+> **Invariant — no CUDA before `Trainer::run`.** User binaries must
+> not touch libtorch's CUDA context in `main()` (no
+> `cuda_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
+> tensors). The launcher exits without training; touching CUDA there
+> poisons spawned children's contexts on heterogeneous rigs. Use
+> `flodl::sys::detect_gpus()` (CUDA-free) for pre-run GPU queries.
 
 See the **[Multi-GPU Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)**,
-**[DDP Builder Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
+**[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
 **[Data Loading Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)**, and
 **[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)**.
 
@@ -726,14 +741,19 @@ codegen-units = 1
 
 | Component | What it does |
 |-----------|-------------|
-| `Trainer::setup` | One-liner: detect GPUs, distribute, set optimizer, train |
-| `Trainer::builder` | Thread-per-GPU with Local SGD, any Module |
-| `ApplyPolicy` | Sync / Cadence / Async (when to average) |
-| `AverageBackend` | Nccl / Cpu (how to average, A/B testable) |
-| `ElChe` | Heterogeneous GPU cadence strategy |
-| `NcclComms` / `NcclRankComm` | NCCL AllReduce, Broadcast, abort handles |
-| `CudaEvent` / `CudaStream` | Async GPU-CPU pipeline, timing |
-| `DataLoader` | Resident/streaming/distributed, VRAM-aware prefetch, auto OOM fallback |
+| `Trainer::builder(...).run()` | Universal entry. Same call scales from CPU to multi-host cluster. |
+| `Trainer::run(..., TrainerConfig)` | Config-bag form — same launcher, data-driven setup. |
+| `Trainer::setup(&graph, ...)` | Graph one-liner; you keep the training loop. |
+| `ElCheMode` | `NcclSync/Cadence/Async`, `CpuSync/Cadence/Async`. Default `NcclAsync`. |
+| `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
+| `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
+| `ClusterBuilder` | Programmatic cluster construction (mirrors `fdl.cluster.yml`). |
+| `flodl::sys::detect_gpus` | CUDA-free GPU detection; canonical pre-`Trainer::run` query. |
+| `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards — TrendGuard is default. Guard is authoritative over `overhead_target`. |
+| `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default — cost-aware, free-compute on heterogeneous rigs). |
+| `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
+| `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
+| `Ddp::wrap` | Manual thread-per-GPU. `cfg(test)`-gated for flodl's own tests; opt-in for external crates needing explicit replica control. |
 
 </details>
 

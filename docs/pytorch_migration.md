@@ -1018,7 +1018,8 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
 | Device check | `torch.cuda.is_available()` | `cuda_available()` |
-| Device count | `torch.cuda.device_count()` | `cuda_device_count()` |
+| Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` — CUDA-free, no libtorch init |
+| Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `cuda_device_count()` — safe inside training; touches libtorch |
 | Model move | `model.to(device)` | `module.move_to_device(device)` |
 | Tensor move | `x.to(device)` | `x.to_device(device)?` |
 | cuDNN benchmark | `torch.backends.cudnn.benchmark = True` | `set_cudnn_benchmark(true)` |
@@ -1527,8 +1528,11 @@ to query them manually during training.
 
 ## Multi-GPU Training (DDP)
 
-PyTorch's DDP requires multi-process coordination, environment variables,
-and a launcher. floDl keeps everything in a single process.
+PyTorch's DDP requires multi-process coordination, environment
+variables, and a launcher (`torchrun`). flodl auto-promotes to
+process-per-rank fan-out automatically when 2+ GPUs are visible — the
+**same `Trainer::builder` call** runs on CPU, single GPU, N GPUs
+single-host, or N GPUs across many hosts.
 
 ### Setup comparison
 
@@ -1548,10 +1552,7 @@ loader = DataLoader(dataset, sampler=sampler, batch_size=32)
 ```
 
 ```rust
-// floDl (Graph DDP): one line, no process groups, no launcher
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
-
-// Or (DDP Builder): works with any Module
+// flodl: same call on CPU, 1 GPU, N GPUs, or multi-host cluster.
 let state = Trainer::builder(model_factory, optim_factory, train_fn)
     .dataset(dataset)
     .batch_size(32)
@@ -1560,25 +1561,47 @@ let state = Trainer::builder(model_factory, optim_factory, train_fn)
     .join()?;
 ```
 
+On 2+ visible CUDA devices, flodl auto-promotes the calling binary
+process to a launcher, fork-execs one child per rank, sets up NCCL
+rendezvous, and supervises children. No torchrun, no env-var dance.
+
+For multi-host, add an `fdl.cluster.yml` (or build the topology
+programmatically with `ClusterBuilder`); `fdl cluster train` SSHes
+every worker, pre-builds, and fans out.
+
 ### Concept mapping
 
-| PyTorch | floDl | Notes |
+| PyTorch | flodl | Notes |
 |---------|-------|-------|
-| `dist.init_process_group("nccl")` | Automatic | NCCL init handled internally |
-| `DistributedDataParallel(model)` | `Trainer::setup()` or `Trainer::builder()` | Single process, multi-thread |
-| `DistributedSampler` | Automatic | DataLoader handles partitioning |
-| `torchrun --nproc_per_node=N` | Not needed | Single-process model |
+| `dist.init_process_group("nccl")` | Automatic | Launcher handles rendezvous; NCCL init on main + `split()` everywhere |
+| `DistributedDataParallel(model)` | `Trainer::builder()` / `Trainer::run()` | Auto-promote on 2+ visible GPUs |
+| `DistributedSampler` | Automatic | Each rank instantiates its own `DataLoader`; coordinator pushes per-epoch shard plan |
+| `torchrun --nproc_per_node=N` | Auto-promote (single-host) / `fdl cluster <cmd>` (multi-host) | One binary; the launcher trampoline forks rank children |
+| `MASTER_ADDR` / `MASTER_PORT` env | `fdl.cluster.yml controller.host:port` / `ClusterBuilder.controller(host).port(p)` | First-class topology |
 | `model.to(rank)` | `model_factory(device)` | Per-device model in closure |
-| Equal batch per GPU only | `ElChe` cadence | Heterogeneous GPU support |
-| `NCCL` or `Gloo` | `AverageBackend::Nccl` or `Cpu` | A/B testable backends |
-| No built-in A/B testing | `ApplyPolicy` x `AverageBackend` | 6 combinations, swap with one line |
+| Equal batch per GPU only | `ElChe` cadence | Heterogeneous GPU support; weighted gradient averaging |
+| `NCCL` / `Gloo` backend choice | `ElCheMode::{NcclSync, NcclCadence, NcclAsync, CpuSync, CpuCadence, CpuAsync}` | Six modes via one enum; default `NcclAsync` |
+| No built-in A/B testing | Swap `.elche(ElCheConfig::*)` | One line per mode |
+| No elastic membership | Ranks survive death + rejoin; `max_failure` + `ShutdownWithSave` | Controller-driven checkpoint retry / role failover |
 
 ### Key differences
 
-- **Single process**: no `torchrun`, no `MASTER_ADDR`/`MASTER_PORT`, no rank calculation. floDl detects GPUs and spawns threads internally.
-- **Heterogeneous GPUs**: PyTorch DDP requires equal batch sizes across ranks. floDl's El Che assigns proportional work based on measured throughput.
-- **A/B testing**: swap `AverageBackend::Nccl` for `AverageBackend::Cpu` with one line. PyTorch has no equivalent mechanism.
-- **Single-GPU fallback**: both `Trainer::setup()` and `Trainer::builder()` work identically on single GPU/CPU. No conditional code needed.
+- **Same code, every tier**: no conditional code for CPU / 1 GPU /
+  N GPUs / multi-host. `Trainer::builder(...).run()` is the universal
+  entry.
+- **Process-per-rank** (matches PyTorch's model) with controller-bound
+  rendezvous, auto-promoted on 2+ GPUs visible. The launcher
+  trampoline owns fan-out, supervision, and cleanup.
+- **Heterogeneous GPUs**: PyTorch DDP requires equal batch sizes
+  across ranks. flodl's ElChe assigns proportional work based on
+  measured throughput; the convergence guard vetoes anchor growth
+  when weight-space divergence rises.
+- **A/B testing**: swap `ElCheConfig::nccl_async()` for any of the
+  six modes with one line. PyTorch has no equivalent mechanism.
+- **No CUDA before `Trainer::run`** invariant: user binaries must not
+  instantiate CUDA tensors in `main()`. Use
+  `flodl::sys::detect_gpus()` (CUDA-free, via `nvidia-smi`) for any
+  pre-run GPU query.
 
 See the [DDP Reference](ddp.md) for complete API documentation.
 

@@ -373,16 +373,23 @@ need `impl Module for YourType { ... }`.
 
 ## Multi-GPU / DDP
 
-For DDP-specific troubleshooting (NCCL init failure, parameter mismatch,
-CUDA context corruption, NCCL deadlock, OOM on smaller GPU, CPU averaging
-timeout), see the dedicated [DDP Reference -- Troubleshooting](ddp.md#troubleshooting)
+**Start with `fdl probe`** (single-host) or `fdl cluster probe`
+(multi-host). It surfaces GPU/libtorch arch mismatches, NCCL version
+skew across hosts, missing `nccl_socket_ifname:`, legacy schema keys
+in `fdl.cluster.yml`, shared-data mount divergence, and dashboard
+port collisions — most "it should work" cases land in its output.
+
+For deeper troubleshooting (NCCL init failure, parameter mismatch,
+CUDA context corruption, OOM on smaller GPU, cluster progressive
+hangs), see the [DDP Reference - Troubleshooting](ddp.md#troubleshooting)
 section.
 
 Common quick fixes:
-- **NCCL init fails**: Check `nvidia-smi topo -m`. Try `AverageBackend::Cpu`.
-- **CUBLAS_STATUS_EXECUTION_FAILED after NCCL**: Use `NcclComms::new()` + `split()` on main thread, not `init_rank()` from worker threads.
-- **Training hangs**: A worker died mid-collective. `DdpHandle` auto-aborts via `NcclAbortHandle`.
-- **OOM on one GPU**: Use `Cadence` policy (El Che assigns fewer batches to smaller GPU).
+- **NCCL init fails**: `fdl probe` first. Then check `nvidia-smi topo -m` for peer connectivity. Switch to a `Cpu*` ElCheMode (`ElCheConfig::cpu_async()`) to bypass NCCL entirely.
+- **NCCL version skew across hosts**: one host's libtorch ships NCCL 2.27, another's ships 2.26. Build a matching libnccl with `fdl nccl build` and wire it via the worker's `env: LD_PRELOAD:` block in `fdl.cluster.yml`.
+- **CUBLAS_STATUS_EXECUTION_FAILED after NCCL**: also covered by the "no CUDA before `Trainer::run`" invariant — don't instantiate CUDA tensors in `main()`. Use `flodl::sys::detect_gpus()` for pre-run GPU queries.
+- **Training hangs (cluster)**: usually stale child processes from a previous aborted run holding rendezvous ports or GPU memory. `fdl cluster <cmd>` cleans these up pre-spawn, but kill-9 on the launcher bypasses cleanup — clear stragglers with `pkill -f flodl-rank` on each worker.
+- **OOM on smaller GPU**: any anchor-based mode (`NcclAsync`, `NcclCadence`, `CpuAsync`, `CpuCadence`) routes through ElChe, which proportionally shrinks the smaller GPU's batch count. Also: per-rank DataLoader backend selection — the larger GPU can go resident while the smaller streams.
 
 ---
 

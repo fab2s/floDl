@@ -444,6 +444,7 @@ impl ClusterCoordinator {
 
         match action {
             ConvergenceAction::Stable => {
+                self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {
                         self.max_overshoot =
@@ -454,8 +455,11 @@ impl ClusterCoordinator {
                     }
                 }
             }
-            ConvergenceAction::SuppressGrowth => {}
+            ConvergenceAction::SuppressGrowth => {
+                self.el_che.veto_proposed_growth();
+            }
             ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.discard_proposed_anchor();
                 self.el_che.nudge_anchor_down(factor);
                 if self.overshoot_auto && self.policy == ApplyPolicy::Async {
                     self.max_overshoot = self.overshoot_initial;
@@ -606,6 +610,7 @@ impl ClusterCoordinator {
 
         match action {
             ConvergenceAction::Stable => {
+                self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {
                         self.max_overshoot =
@@ -616,8 +621,11 @@ impl ClusterCoordinator {
                     }
                 }
             }
-            ConvergenceAction::SuppressGrowth => {}
+            ConvergenceAction::SuppressGrowth => {
+                self.el_che.veto_proposed_growth();
+            }
             ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.discard_proposed_anchor();
                 self.el_che.nudge_anchor_down(factor);
                 if self.overshoot_auto && self.policy == ApplyPolicy::Async {
                     self.max_overshoot = self.overshoot_initial;

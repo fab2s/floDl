@@ -81,16 +81,22 @@ Decoder: ConvTranspose2d(32,16,3,s=2,p=1,op=1) -> ReLU -> ConvTranspose2d(16,1,3
 
 ## DDP Modes
 
-| Mode | Backend | Policy | Description |
-|------|---------|--------|-------------|
-| `solo-0` | -- | -- | Single GPU (fast), no DDP. Baseline. |
-| `solo-1` | -- | -- | Single GPU (slow), no DDP. |
-| `nccl-sync` | NCCL | Sync | AllReduce every batch. Traditional DDP. |
-| `nccl-cadence` | NCCL | Cadence | ElChe: proportional batches per GPU, periodic AllReduce. |
-| `nccl-async` | NCCL | Async | ElChe batches, async averaging. |
-| `cpu-sync` | CPU | Sync | CPU-mediated parameter averaging, every batch. |
-| `cpu-cadence` | CPU | Cadence | CPU averaging with ElChe cadence. |
-| `cpu-async` | CPU | Async | CPU averaging, async. |
+Each mode maps 1:1 to an `ElCheMode` variant in `flodl`. The framework
+default is `nccl-async` (`ElCheConfig::default()`). See
+[DDP Reference: ElCheMode](../docs/ddp.md#elchemode--cadence--backend-in-one-name)
+for full semantics.
+
+| Mode | `ElCheMode` | Description |
+|------|---|---|
+| `solo-0` | -- | Single GPU (device 0), no DDP. Baseline. |
+| `solo-1` | -- | Single GPU (device 1), no DDP. |
+| `solo-2` | -- | Single GPU (device 2), no DDP. |
+| `nccl-sync` | `NcclSync` | NCCL AllReduce every batch. Traditional DDP / strict-sync baseline. |
+| `nccl-cadence` | `NcclCadence` | ElChe-driven anchor; cross-epoch lockstep. |
+| `nccl-async` | `NcclAsync` | **Default.** Same in-epoch loop as `nccl-cadence` + cross-epoch lookahead — fast rank gets head start on next epoch. |
+| `cpu-sync` | `CpuSync` | CPU-mediated parameter averaging, every batch. |
+| `cpu-cadence` | `CpuCadence` | CPU averaging with ElChe-driven anchor. |
+| `cpu-async` | `CpuAsync` | **Best-in-class** on the reference rig — fastest wall-time, best convergence. Opt into EASGD with `ElCheConfig::cpu_async().easgd_alpha(α)` in code; the bench harness exercises it without EASGD by default. |
 
 ## Usage
 

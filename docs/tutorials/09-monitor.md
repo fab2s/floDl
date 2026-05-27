@@ -119,6 +119,17 @@ The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozil
 If you open the dashboard mid-training, it catches up instantly. The SSE
 handler replays all past epoch events before switching to live streaming.
 
+### Multi-GPU and cluster runs
+
+`monitor.serve(port)` works the same way on single-host multi-GPU and
+multi-host clusters: **one URL covers the whole run**. When the
+launcher fans out to multiple rank processes (auto-promoted on 2+
+GPUs, or via `fdl cluster <cmd>`), the dashboard automatically grows
+per-rank tabs labeled by host and local-rank (`host: lr=N gr=M`), with
+throughput curves, batch-share distribution, VRAM, and ElChe anchor
+evolution. No extra wiring — just open `http://<launcher-host>:3000`
+and follow the whole cluster.
+
 ### Embedding the graph
 
 To show the graph architecture in the dashboard:

@@ -235,37 +235,9 @@ where every sample matters.
 
 ## DDP integration
 
-When used with `Graph::set_data_loader()`, the loader automatically
-upgrades to distributed mode:
-
-```rust
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
-
-let loader = DataLoader::from_batch_dataset(dataset)
-    .batch_size(32)
-    .names(&["image", "label"])
-    .build()?;
-
-model.set_data_loader(loader, "image");
-
-for batch in model.epoch(0) {
-    let batch = batch?;
-    let loss = model.forward_batch(&batch)?;
-    model.step()?;
-}
-```
-
-In distributed mode:
-
-- Each GPU gets its own data backend (resident or streaming, selected
-  per-device based on available VRAM)
-- No lowest-common-denominator: a 16 GB GPU can go resident while a
-  6 GB GPU streams
-- Presharded forward: each replica processes its local shard with zero
-  cross-device input transfer
-- Shard sizes adapt to the auto-balancer's chunk ratios
-
-For the DDP Builder, pass the dataset directly:
+Pass the dataset directly to `Trainer::builder` or `TrainerConfig` —
+the framework constructs a per-rank `DataLoader` against each rank's
+dataset shard automatically:
 
 ```rust
 let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
@@ -275,12 +247,54 @@ let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
     .run()?;
 ```
 
+Under DDP, each rank's loader operates independently:
+
+- **Per-rank backend selection**: a 16 GB rank can go resident while a
+  6 GB rank on the same training run streams. No
+  lowest-common-denominator constraint.
+- **Proportional sharding**: the coordinator computes shard sizes from
+  `partition_ratios` (or auto-balances by throughput via ElChe) and
+  pushes the epoch plan to each worker. Fast ranks get larger shards.
+- **No cross-rank transfer in the data path**: each rank loads its own
+  shard from its own `DataSet` impl. The DataLoader is otherwise
+  unaware that a cluster exists.
+
+### Streaming from external sources
+
+`DataSet` / `BatchDataSet` are pull-based traits — the body of `get()`
+/ `get_batch()` decides where the samples come from. The framework's
+"resident" vs "streaming" modes are about CPU → VRAM transfer; the
+underlying source can be RAM, mmap, disk, network, S3, a database, or
+anything else accessible from Rust.
+
+For source-streaming patterns:
+
+```rust
+struct S3Dataset { /* ... bucket handle, prefetch pool, etc. ... */ }
+
+impl BatchDataSet for S3Dataset {
+    fn len(&self) -> usize { /* total samples in dataset */ self.total }
+
+    fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+        // Fetch on-demand. Cache locally as you go, parallelize
+        // requests if useful — all up to your impl.
+        let bytes = self.fetch_indices(indices)?;
+        self.decode_to_tensors(&bytes, indices.len())
+    }
+}
+```
+
+The DataLoader's prefetch worker keeps `K` future batches in flight on
+a dedicated CUDA stream, so the network round-trip for batch N+1 can
+overlap with batch N's compute. No special hooks needed; just
+implement the trait and pass it.
+
 ## Builder reference
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `.batch_size(usize)` | Required | Batch size per GPU |
-| `.device(Device)` | CPU | Target device (leave as CPU for DDP) |
+| `.batch_size(usize)` | Required | Batch size per rank |
+| `.device(Device)` | CPU | Target device (the per-rank loader auto-targets its own CUDA device under DDP) |
 | `.seed(u64)` | 42 | RNG seed for shuffling |
 | `.shuffle(bool)` | true | Enable shuffling |
 | `.sampler(Box<dyn Sampler>)` | -- | Custom sampler (overrides shuffle) |
@@ -300,7 +314,6 @@ let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
 | `.batch_size()` | Batch size |
 | `.device()` | Target or gather device |
 | `.is_resident()` | Whether in resident mode |
-| `.is_distributed()` | Whether in distributed mode |
 | `.prefetch_depth()` | Current prefetch depth |
 | `.set_prefetch_depth(n)` | Override prefetch depth |
 | `.auto_resize()` | Re-probe VRAM and adapt prefetch |

@@ -25,13 +25,18 @@ use super::launcher::{FullCluster, FullWorker};
 // FullCluster builder
 // ---------------------------------------------------------------------------
 
-/// Fluent builder for [`FullCluster`]. Compose hosts via
-/// [`Self::host`] (which returns a [`HostBuilder`]) and finalize with
-/// [`Self::build`].
+/// Fluent builder for [`FullCluster`]. Compose the controller via
+/// [`Self::controller`] (returns a [`ControllerBuilder`]) and each
+/// worker via [`Self::host`] (returns a [`HostBuilder`]), finalize
+/// with [`Self::build`]. Mirrors the YAML schema's sibling
+/// `controller:` / `workers[]:` blocks.
 ///
 /// ```ignore
-/// let cluster = ClusterBuilder::new("192.168.122.1")
-///     .controller_port(29500)
+/// let cluster = ClusterBuilder::new()
+///     .controller("192.168.122.1")
+///         .port(29500)
+///         .path("/opt/flodl")
+///     .done()
 ///     .host("exa")
 ///         .ranks([0])
 ///         .devices([0])
@@ -53,25 +58,22 @@ pub struct ClusterBuilder {
     workers: Vec<FullWorker>,
 }
 
+impl Default for ClusterBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClusterBuilder {
-    /// Begin construction with the controller's rendezvous bind host.
-    /// Accepts hostname or IP — DNS resolution happens at TCP-connect
-    /// time. Use `"localhost"` (or `"127.0.0.1"`) when every worker is
-    /// local. `controller.port` defaults to 1337 (matches
-    /// `flodl-cli`'s `DEFAULT_CONTROLLER_PORT`); override with
-    /// [`Self::controller_port`]. `controller.path` defaults to the
-    /// current working directory; override with
-    /// [`Self::controller_path`].
-    pub fn new(controller_host: impl Into<String>) -> Self {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
+    /// Begin construction. [`Self::controller`] must be called before
+    /// [`Self::build`] — `build` errors loudly if the controller host
+    /// is empty.
+    pub fn new() -> Self {
         Self {
             controller: super::launcher::FullController {
-                host: controller_host.into(),
+                host: String::new(),
                 port: 1337,
-                path: cwd,
+                path: String::new(),
                 docker: None,
                 arch: None,
                 data_path: None,
@@ -80,25 +82,19 @@ impl ClusterBuilder {
         }
     }
 
-    /// Override the controller's rendezvous port. Default 1337.
-    pub fn controller_port(mut self, port: u16) -> Self {
-        self.controller.port = port;
-        self
-    }
-
-    /// Set the controller's project-root path (defaults to current
-    /// working directory at builder construction time). Override when
-    /// the controller's view of the shared project root differs from
-    /// each worker's view (heterogeneous-mount rigs).
-    pub fn controller_path(mut self, path: impl Into<String>) -> Self {
-        self.controller.path = path.into();
-        self
+    /// Start configuring the controller. `host` is the rendezvous bind
+    /// hostname or IP — DNS resolution happens at TCP-connect time. Use
+    /// `"localhost"` (or `"127.0.0.1"`) when every worker is local.
+    /// Returns a [`ControllerBuilder`]; call
+    /// [`ControllerBuilder::done`] to finalize and return to the
+    /// cluster builder.
+    pub fn controller(self, host: impl Into<String>) -> ControllerBuilder {
+        ControllerBuilder::new(self, host.into())
     }
 
     /// Start configuring a new worker. Returns a [`HostBuilder`]; call
     /// [`HostBuilder::done`] to finalize and return to the cluster
-    /// builder. (Method name `host` is kept for source-compat; the
-    /// argument names the worker.)
+    /// builder. The `name` argument identifies the worker.
     pub fn host(self, name: impl Into<String>) -> HostBuilder {
         HostBuilder::new(self, name.into())
     }
@@ -110,7 +106,8 @@ impl ClusterBuilder {
     pub fn build(self) -> Result<FullCluster> {
         if self.controller.host.trim().is_empty() {
             return Err(TensorError::new(
-                "ClusterBuilder: controller.host must be non-empty",
+                "ClusterBuilder: controller(...).done() must be called \
+                 with a non-empty host before build()",
             ));
         }
         if self.controller.path.trim().is_empty() {
@@ -160,7 +157,7 @@ impl ClusterBuilder {
     /// ```ignore
     /// let cfg = TrainerConfig::new(load_data()?)
     ///     .cluster(ClusterBuilder::all_local_gpus()?)
-    ///     .elche(ElCheConfig::nccl_cadence());
+    ///     .elche(ElCheConfig::nccl_async());
     /// Trainer::run(model_factory, opt_factory, train_fn, cfg)?;
     /// ```
     pub fn all_local_gpus() -> Result<FullCluster> {
@@ -207,6 +204,93 @@ impl ClusterBuilder {
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
             env: std::collections::BTreeMap::new(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Controller builder
+// ---------------------------------------------------------------------------
+
+/// Fluent builder for the cluster's controller block. Borrows the
+/// parent [`ClusterBuilder`] so [`Self::done`] returns to it for
+/// chaining `host(...)` calls. Mirrors the YAML `controller:` block.
+pub struct ControllerBuilder {
+    parent: ClusterBuilder,
+    host: String,
+    port: u16,
+    path: Option<String>,
+    docker: Option<String>,
+    arch: Option<String>,
+    data_path: Option<String>,
+}
+
+impl ControllerBuilder {
+    fn new(parent: ClusterBuilder, host: String) -> Self {
+        Self {
+            parent,
+            host,
+            port: 1337,
+            path: None,
+            docker: None,
+            arch: None,
+            data_path: None,
+        }
+    }
+
+    /// Controller rendezvous port. Default 1337 (matches
+    /// `flodl-cli`'s `DEFAULT_CONTROLLER_PORT`).
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Controller's view of the shared project root. Defaults to the
+    /// current working directory at [`Self::done`] time. Override when
+    /// the controller's mount path differs from each worker's
+    /// (heterogeneous-mount rigs).
+    pub fn path(mut self, p: impl Into<String>) -> Self {
+        self.path = Some(p.into());
+        self
+    }
+
+    /// Optional pre-flight build context — the docker-compose service
+    /// name fdl-cli should use when building the rank binary for this
+    /// cluster (mirrors the YAML `controller.docker` field).
+    pub fn docker(mut self, d: impl Into<String>) -> Self {
+        self.docker = Some(d.into());
+        self
+    }
+
+    /// Optional libtorch variant subpath for the controller's
+    /// pre-flight build (e.g. `"precompiled/cu128"`).
+    pub fn arch(mut self, a: impl Into<String>) -> Self {
+        self.arch = Some(a.into());
+        self
+    }
+
+    /// Optional shared-data path the controller side of the launcher
+    /// should resolve. Mirrors the YAML `controller.data_path` field.
+    pub fn data_path(mut self, p: impl Into<String>) -> Self {
+        self.data_path = Some(p.into());
+        self
+    }
+
+    /// Finalize the controller and return to the cluster builder.
+    pub fn done(self) -> ClusterBuilder {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+        let mut parent = self.parent;
+        parent.controller = super::launcher::FullController {
+            host: self.host,
+            port: self.port,
+            path: self.path.unwrap_or(cwd),
+            docker: self.docker,
+            arch: self.arch,
+            data_path: self.data_path,
+        };
+        parent
     }
 }
 
@@ -371,8 +455,10 @@ mod tests {
 
     #[test]
     fn build_two_host_cluster() {
-        let cluster = ClusterBuilder::new("192.168.122.1")
-            .controller_port(29500)
+        let cluster = ClusterBuilder::new()
+            .controller("192.168.122.1")
+                .port(29500)
+            .done()
             .host("exa")
                 .ranks([0])
                 .devices([0])
@@ -410,7 +496,8 @@ mod tests {
 
     #[test]
     fn build_rejects_rank_gap() {
-        let err = ClusterBuilder::new("localhost")
+        let err = ClusterBuilder::new()
+            .controller("localhost").done()
             .host("h0")
                 .ranks([0, 2]) // skips 1 → gap
                 .devices([0, 1])
@@ -423,8 +510,8 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_empty_controller_host() {
-        let err = ClusterBuilder::new("")
+    fn build_rejects_missing_controller() {
+        let err = ClusterBuilder::new()
             .host("h0")
                 .ranks([0])
                 .devices([0])
@@ -432,15 +519,72 @@ mod tests {
                 .path("/tmp")
             .done()
             .build()
-            .expect_err("empty controller.host must error");
-        assert!(err.to_string().contains("controller.host"), "err: {err}");
+            .expect_err("missing controller(...) call must error");
+        assert!(err.to_string().contains("controller"), "err: {err}");
+    }
+
+    #[test]
+    fn build_rejects_empty_controller_host() {
+        let err = ClusterBuilder::new()
+            .controller("").done()
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect_err("empty controller host must error");
+        assert!(err.to_string().contains("controller"), "err: {err}");
     }
 
     #[test]
     fn build_rejects_no_workers() {
-        let err = ClusterBuilder::new("localhost")
+        let err = ClusterBuilder::new()
+            .controller("localhost").done()
             .build()
             .expect_err("no workers must error");
         assert!(err.to_string().contains("worker"), "err: {err}");
+    }
+
+    #[test]
+    fn controller_path_defaults_to_cwd_when_unset() {
+        let cluster = ClusterBuilder::new()
+            .controller("localhost").done()
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect("build succeeds");
+        assert!(
+            !cluster.controller.path.is_empty(),
+            "controller.path falls back to cwd when path() is not called"
+        );
+    }
+
+    #[test]
+    fn controller_path_override() {
+        let cluster = ClusterBuilder::new()
+            .controller("localhost")
+                .port(2222)
+                .path("/opt/flodl")
+                .docker("cuda")
+                .arch("precompiled/cu128")
+            .done()
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect("build succeeds");
+        assert_eq!(cluster.controller.port, 2222);
+        assert_eq!(cluster.controller.path, "/opt/flodl");
+        assert_eq!(cluster.controller.docker.as_deref(), Some("cuda"));
+        assert_eq!(cluster.controller.arch.as_deref(), Some("precompiled/cu128"));
     }
 }

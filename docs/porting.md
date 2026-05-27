@@ -279,26 +279,29 @@ fewer than 2 GPUs are present. The same code runs on CPU, single GPU,
 and multi-GPU with no process-group setup, no `torchrun`, no `mp.spawn`,
 and no `DistributedSampler`.
 
-For DDP-specific knobs (sync policy, averaging backend),
-`Trainer::builder` exposes them on the builder chain:
+For DDP-specific knobs (cadence × backend, ElChe tuning), pass an
+`ElCheConfig` to `.elche(...)`:
 
 ```rust
 let ddp = Trainer::builder(model_factory, optim_factory, train_step)
     .dataset(dataset)
     .batch_size(32)
     .num_epochs(10)
-    .policy(ApplyPolicy::Cadence)      // Sync | Cadence | Async
-    .backend(AverageBackend::Nccl)     // Nccl | Cpu
+    .elche(ElCheConfig::nccl_async())   // default; six modes total
     .run()?;
 
-let state = ddp.join()?;               // averaged params + buffers on CPU
+let state = ddp.join()?;                // averaged params + buffers on CPU
 ```
 
-ElChe cadence auto-detects heterogeneous GPU speeds and lets the faster
-card run ahead while the slow one anchors synchronization. See the
-[DDP Reference](ddp.md) for policies, backends, convergence guard,
-metrics, and live-monitor wiring, and [DDP Benchmark](ddp-benchmark.md)
-for results on mixed consumer hardware.
+ElChe cadence auto-detects heterogeneous GPU speeds and lets the
+faster card run ahead while the slow one anchors synchronization.
+The default mode is `NcclAsync` — cross-epoch lookahead on top of the
+shared in-epoch loop with `NcclCadence`. Other modes: `NcclSync`,
+`NcclCadence`, `CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on
+the reference rig). See the [DDP Reference](ddp.md) for the full mode
+surface, convergence guard, metrics, and live-monitor wiring, and
+[DDP Benchmark](ddp-benchmark.md) for results on mixed consumer
+hardware.
 
 ## Key differences from PyTorch
 

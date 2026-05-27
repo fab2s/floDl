@@ -1,52 +1,146 @@
 # Tutorial 11: Multi-GPU Training
 
-Scale your Graph-based model to multiple GPUs with one line of code.
-The training loop stays identical: `Trainer::setup()` handles replication,
-gradient sync, and optimizer management transparently.
+Scale your model from one GPU to many with **zero training-loop
+changes**. flodl auto-promotes single-host multi-GPU runs to
+process-per-rank fan-out when 2+ CUDA devices are visible, and the
+same entry point (`Trainer::builder(...).run()` or `Trainer::run`)
+scales out to multi-host clusters via `fdl.cluster.yml` or
+`ClusterBuilder`.
 
-> **Prerequisites**: [Training](04-training.md) and
-> [Graph Builder](05-graph-builder.md). Requires 2+ CUDA GPUs at runtime
-> (works on single GPU/CPU with no code changes).
+> **Prerequisites**: [Training](04-training.md) covers single-device
+> training. This tutorial assumes the universal `Trainer::builder`
+> shape — extending it to N GPUs is configuration, not code.
 
 > **Time**: ~20 minutes.
 
-## The one-liner: Trainer::setup()
+> **Canonical reference**: [DDP Reference](../ddp.md) for the full
+> knob surface.
+
+## The one-liner
 
 ```rust
 use flodl::*;
+use std::sync::Arc;
 
-// Build your model as usual
-let model = FlowBuilder::from(Linear::new(784, 256)?)
-    .through(ReLU::new())
-    .through(Linear::new(256, 10)?)
-    .label("classifier")
-    .build()?;
+fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+    let input  = Variable::new(batch[0].clone(), false);
+    let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
+    cross_entropy_loss(&model.forward(&input)?, &target)
+}
 
-// One call: detect GPUs, replicate, set optimizer, enable training
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
+let handle = Trainer::builder(
+        |dev| build_model_on(dev),         // model factory (per-replica)
+        |params| Adam::new(params, 1e-3),  // optimizer factory (per-replica)
+        train_step,                        // one-step closure
+    )
+    .dataset(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .run()?;
 
-// Training loop -- identical for 1 or N GPUs
-for epoch in 0..100 {
-    for batch in &dataset {
-        let input = Variable::new(batch[0].clone(), false);
-        let target = Variable::new(batch[1].clone(), false);
-        let loss = model.forward(&input)?.mse(&target)?.mean()?;
-        model.step()?;  // AllReduce + sync + optimizer + zero_grad
-    }
+let state: TrainedState = handle.join()?;
+```
+
+On a single GPU or CPU, this runs in the calling process. On a host
+with 2+ visible CUDA devices, it **auto-promotes** to one process per
+rank, with NCCL-Async cadence (the default `ElCheConfig::default() =
+nccl_async()`) and the meta-controller on by default. Zero code
+change.
+
+```
+  ddp: 2 GPUs (heterogeneous) | RTX 5060 Ti (16.0 GB) | GTX 1060 (6.0 GB)
+  ddp: role=launcher → spawning 2 rank children
+  rank 0: device=CUDA(0) | RTX 5060 Ti | epoch 0/50 started
+  rank 1: device=CUDA(1) | GTX 1060    | epoch 0/50 started
+```
+
+## What just happened — auto-promote
+
+When `Trainer::builder(...).run()` (or `Trainer::run`) fires on a host
+where `flodl::sys::detect_gpus() >= 2` and **no cluster overlay is
+active**, the framework:
+
+1. Probes visible CUDA devices via `nvidia-smi` (no libtorch context
+   touched).
+2. Synthesizes a single-host cluster topology covering every visible
+   device.
+3. Turns the calling binary process into the **launcher** — it forks
+   one child per rank, each running the same binary with
+   `FLODL_RANK=<n>` set.
+4. Each rank child connects to the controller (also hosted on the
+   launcher) over TCP, joins the NCCL rendezvous, and runs the same
+   `train_step` closure on its assigned dataset shard.
+5. The launcher supervises children, forwards their stdout, and tears
+   them down on exit (including SIGINT / SIGTERM).
+
+Auto-promote is **`cfg(not(test))`-gated** for flodl's own test suite
+(so `Ddp::wrap` keeps driving the thread-based multi-GPU tests
+in-process). External crates that want a single-rank run on a
+multi-GPU host scope down via `CUDA_VISIBLE_DEVICES=0`.
+
+## The critical invariant — no CUDA before `Trainer::run`
+
+> **User binaries must not touch libtorch's CUDA context before
+> reaching `Trainer::run` / `Trainer::builder().run()`.**
+
+That means **no** `flodl::tensor::cuda_device_count()`, **no**
+`Module::on_device(CUDA(_))`, **no** CUDA-Tensor construction in
+`main()`. The launcher process exits without running training; any
+CUDA tensors it instantiated would corrupt the spawned children's
+contexts on heterogeneous-GPU rigs.
+
+For any pre-`Trainer::run` GPU query, use `flodl::sys::detect_gpus()`,
+which shells out to `nvidia-smi` and does **not** load libtorch:
+
+```rust
+use flodl::sys::detect_gpus;
+
+let gpus = detect_gpus();
+for g in &gpus {
+    eprintln!("GPU {}: {} (sm_{}, {} MB)",
+        g.index, g.name, g.sm_version, g.vram_bytes / 1_000_000);
+}
+
+if gpus.is_empty() {
+    eprintln!("no CUDA GPUs visible — single-device fallback");
 }
 ```
 
-`Trainer::setup()` prints hardware diagnostics to stderr:
+`detect_gpus()` honors `CUDA_VISIBLE_DEVICES`, so the result matches
+the view that the auto-promote path and child processes will see.
+
+## Graph one-liner — `Trainer::setup`
+
+When your model is a flodl `Graph` and you want to keep the training
+loop visible, `Trainer::setup` distributes + sets the optimizer +
+enables training mode in one call:
+
+```rust
+let model: Graph = build_model()?;        // any FlowBuilder graph
+
+Trainer::setup(
+    &model,
+    |dev| build_model_on(dev),
+    |p|   Adam::new(p, 1e-3),
+)?;
+
+// Same loop on 1 or N GPUs.
+for (input_t, target_t) in &batches {
+    let input  = Variable::new(input_t.clone(),  false);
+    let target = Variable::new(target_t.clone(), false);
+    let loss   = cross_entropy_loss(&model.forward(&input)?, &target)?;
+    loss.backward()?;
+    model.step()?;        // AllReduce + buffer sync + optimizer + zero_grad
+}
 ```
-  ddp: 2 GPUs (heterogeneous) | RTX 5060 Ti (16.0 GB) | GTX 1060 (6.0 GB)
-```
 
-On a single GPU or CPU, it still sets the optimizer and training mode.
-Your training loop needs zero conditional logic.
+`Trainer::setup_head` is the analogue for `flodl-hf` task-head
+wrappers (any type implementing `HasGraph`). Same loop, byte-identical
+between `setup` and `setup_head`.
 
-### PyTorch comparison
+## PyTorch comparison
 
-In PyTorch, multi-GPU requires process groups, environment variables,
+PyTorch multi-GPU requires process groups, environment variables,
 `torchrun`, and a `DistributedSampler`:
 
 ```python
@@ -57,243 +151,346 @@ sampler = DistributedSampler(dataset)
 loader = DataLoader(dataset, sampler=sampler)
 ```
 
-In floDl:
+flodl auto-detects and process-fans-out from one call:
+
 ```rust
-// floDl: one line, no process groups, no torchrun
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
+// One closure-based call, no torchrun, no environment dance.
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .run()?;
 ```
 
-## What happens under the hood
+## ElChe — heterogeneous GPUs train at their own pace
 
-When `Trainer::setup()` detects 2+ CUDA devices:
+Named after the marching principle: *"the column marches at the
+slowest one's pace."* ElChe is the heterogeneous-rig balancer that
+runs under every cadence mode except strict Sync.
 
-1. **Replicate**: creates a model replica on each GPU via the builder
-   closure you provided when constructing the Graph
-2. **Broadcast**: copies parameters from GPU 0 to all replicas
-3. **Set optimizer**: creates a per-replica optimizer via your factory
-4. **Training mode**: enables dropout, BatchNorm training stats
+### The problem with strict sync on mixed hardware
 
-Each call to `model.step()`:
+Traditional DDP forces all GPUs to AllReduce after every batch. If
+your RTX 5060 Ti processes a batch in 10 ms and your GTX 1060 takes
+25 ms, the fast GPU idles 60% of the time at every barrier.
 
-1. **AllReduce** gradients across all replicas (NCCL, in-place)
-2. **Sync buffers** (BatchNorm running mean/var)
-3. **Optimizer step** on each replica independently
-4. **Zero gradients**
+### The solution
 
-The forward pass scatters the input batch across GPUs (each gets a shard),
-forwards in parallel, and gathers outputs. Gradients flow back through
-cross-device transfers via libtorch autograd.
+The slow GPU anchors the cadence. The fast GPU processes more batches
+per averaging window — the same AllReduce sync time amortizes over
+more local compute. ElChe auto-tunes the anchor count based on
+observed throughput so the AllReduce overhead stays at a small
+fraction of compute time (`overhead_target`, default 10%).
+
+`Trainer::builder().run()` activates ElChe by default (the default
+mode is `NcclAsync`). No configuration needed for the common
+heterogeneous-rig case.
+
+### How it adapts
+
+After each averaging cycle, ElChe reports:
+
+- **Per-rank `compute_ms`**: wall time the rank spent doing forward +
+  backward + optimizer step for its assigned batch count.
+- **`sync_ms`**: wall time the AllReduce + divergence measurement
+  took.
+- **`overhead = sync_ms / max(compute_ms across ranks)`**: how big a
+  tax did sync charge as a fraction of the slowest rank's compute?
+
+ElChe then proposes an anchor adjustment:
+
+- `overhead > overhead_target`: grow the anchor (sync less often,
+  amortize the sync cost over more local work).
+- `overhead < overhead_target / 2`: shrink the anchor (sync is cheap,
+  can afford fresher gradients).
+
+The convergence guard has the final say: rising weight-space
+divergence vetoes growth even when `overhead_target` would propose
+it. See [DDP Reference: Guard authority over
+`overhead_target`](../ddp.md#guard-authority-over-overhead_target).
+
+## Tuning ElChe
+
+Most rigs don't need any tuning — the defaults adapt to whatever
+hardware is visible. When you do want to tune, every knob lives on
+`ElCheConfig`:
+
+```rust
+use flodl::*;
+
+let elche = ElCheConfig::nccl_async()    // also the default
+    .overhead_target(0.05)               // tighter: aim for sync < 5% of compute
+    .max_anchor(50)                      // ceiling on anchor growth
+    .max_batch_diff(20)                  // cap how far fast rank may lead slow rank
+    .relax_up(true);                     // grow the anchor on stable convergence
+
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .elche(elche)
+    .run()?;
+```
+
+Common knobs (full surface in [DDP
+Reference](../ddp.md#elcheconfig-knobs)):
+
+| Knob | Default | When to touch |
+|---|---|---|
+| `.overhead_target(f)` | `0.10` | Lower (e.g. `0.05`) on fast inter-GPU links where you can afford more sync; higher when AllReduce is expensive. |
+| `.max_anchor(n)` | `None` (auto) | Set when you want a hard ceiling on staleness. |
+| `.max_batch_diff(n)` | `None` | `Some(0)` = strict lockstep regardless of mode; useful for reproducibility. |
+| `.partition_ratios([...])` | auto | Static split when ElChe's auto-balancing isn't what you want (Sync mode only). |
+| `.meta_controller(false)` | `true` | Opt out for unconditioned-trajectory instrumentation runs. |
+
+## Mode selection — `ElCheMode`
+
+The six DDP modes:
+
+| Mode | Best for |
+|---|---|
+| `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU |
+| `NcclAsync` (default) | Strong NCCL default; cross-epoch lookahead fills wall-time on heterogeneous rigs |
+| `NcclCadence` | Same in-epoch loop as NcclAsync but lockstep on epoch boundaries |
+| `NcclSync` | Strict per-batch AllReduce — homogeneous rigs, correctness-first baseline |
+| `CpuSync`, `CpuCadence` | A/B against NCCL when peer-access is unavailable |
+
+See [A/B testing modes](../ddp.md#ab-testing-modes) for the suggested
+order and rationale.
 
 ## DataLoader integration
 
-For the full training experience, use `DataLoader` with the Graph:
+Each rank constructs its own `DataLoader` against its own dataset
+shard. The coordinator computes proportional sharding from
+`partition_ratios` (or auto-balances by throughput) and pushes the
+epoch plan to each worker. The DataLoader is otherwise unaware that a
+cluster exists.
+
+Per-device backend selection is independent on every rank — a 16 GB
+GPU can go resident (dataset loaded into VRAM once) while a 6 GB GPU
+on the same training run uses streaming (prefetch worker with async
+H2D). No lowest-common-denominator constraint.
 
 ```rust
 let loader = DataLoader::from_batch_dataset(dataset)
-    .batch_size(32)
+    .batch_size(64)
     .names(&["image", "label"])
     .build()?;
-
-// Wire the loader: "image" maps to the graph's input port
-model.set_data_loader(loader, "image");
-
-// Epoch iteration handles per-GPU data distribution
-for batch in model.epoch(0) {
-    let batch = batch?;
-    let loss = model.forward_batch(&batch)?;
-    model.step()?;
-}
 ```
 
-When distributed, `set_data_loader()` creates per-device data backends:
+See [Tutorial 13: Data Loading](13-data-loading.md) for the full
+DataLoader surface.
 
-- Each GPU independently selects **resident** (dataset fits in VRAM,
-  loaded once, reshuffled via GPU-side `index_select`) or **streaming**
-  (prefetch worker with async H2D on a dedicated CUDA stream)
-- A 16 GB GPU can go resident while a 6 GB GPU streams. No
-  lowest-common-denominator constraint.
-- **Presharded forward**: each replica forwards its local shard with zero
-  cross-device input transfer. Outputs are gathered to the gather device.
+## Host-side callbacks — `metrics_fn` / `eval_fn`
 
-## Heterogeneous GPUs: El Che
-
-### The problem
-
-Traditional DDP forces all GPUs to synchronize after every batch. If your
-RTX 5060 Ti processes a batch in 10ms and your GTX 1060 takes 25ms, the
-fast GPU idles 60% of the time.
-
-### The solution: El Che
-
-Named after Che Guevara's marching principle: "the column marches at the
-slowest one's pace." The slow device anchors the sync cadence, and the
-fast device processes more batches between sync points.
-
-`Trainer::setup()` detects heterogeneous hardware automatically and enables
-El Che. No configuration needed for the common case.
-
-### How it works
-
-- The slow GPU processes `anchor` batches (default 10)
-- The fast GPU processes `round(anchor * speed_ratio)` batches
-- Speed ratios are discovered from CudaEvent timing after the first sync
-- The anchor auto-tunes to keep AllReduce overhead below 10% of compute
-
-### Explicit configuration
-
-For manual control, use `Trainer::setup_with()` with `DdpConfig`:
+The shape `Trainer::builder().run()?.join()?` is the canonical "just
+train" form. For per-epoch logging, monitor wiring, or held-out
+evaluation, register host-side callbacks:
 
 ```rust
-let config = DdpConfig::new()
-    .speed_hint(1, 0.4)         // GPU 1 is ~40% speed of GPU 0
-    .overhead_target(0.10)      // AllReduce < 10% of compute
-    .max_anchor(Some(200));     // gradient staleness cap
+use std::sync::Arc;
 
-Trainer::setup_with(&model, &builder, |p| Adam::new(p, 0.001), config)?;
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .batch_size(64)
+    .num_epochs(100)
+    .metrics_fn(Arc::new(|m: &EpochMetrics| {
+        eprintln!(
+            "epoch={} loss={:.4} acc={:.3} {:.0}ms",
+            m.epoch, m.avg_loss,
+            m.scalars.get("accuracy").copied().unwrap_or(0.0),
+            m.epoch_ms,
+        );
+        Ok(())
+    }))
+    .eval_dataset(test_set)
+    .eval_fn(Arc::new(|model, input, target| {
+        let pred = model.forward(&Variable::new(input.clone(), false))?;
+        let acc  = pred.argmax(-1, false)?.eq_tensor(target)?.sum()?.item::<f64>()?
+                 / target.shape()[0] as f64;
+        Ok(acc)
+    }))
+    .eval_result_fn(Arc::new(|epoch, value| {
+        eprintln!("[eval] epoch={epoch} acc={value:.4}");
+    }))
+    .run()?;
 ```
 
-`speed_hint` is optional and self-corrects after the first timing report.
-Use it to avoid a slow first few batches when the speed difference is known.
+`metrics_fn` fires once per epoch on the host thread after all ranks
+aggregate. `eval_fn` runs on the rank elected by
+`EpochCallbackPolicy::Fastest` (the default — the rank with the lowest
+`smoothed_ms_per_batch`, so eval is free compute on heterogeneous
+rigs). `eval_result_fn` receives the scalar result on the host.
 
-### Weighted gradient averaging
+Pin a specific rank with `EpochCallbackPolicy::Rank(n)` — `n` is the
+**global rank index** (0..world_size), assigned sequentially by
+worker order in the cluster topology. See [DDP Reference:
+`EpochCallbackPolicy`](../ddp.md#epochcallbackpolicy).
 
-When batch counts are unequal, each replica's gradient is scaled by its
-contribution before AllReduce Sum. The result is the mathematically
-correct mean gradient regardless of per-device batch counts:
+## Live dashboard
 
-```
-weight[rank] = count[rank] / sum(counts)
-gradient_avg = sum(weight[rank] * gradient[rank])
-```
+`monitor.serve(port)` works transparently across single-host
+multi-GPU and multi-host clusters — the launcher hosts a single
+dashboard URL that aggregates every rank's metrics. Open it once;
+follow the whole cluster.
 
-### The El Che forward path
-
-When El Che is active, `model.step()` does more than a simple AllReduce:
-
-1. Each device processes `batch_counts[rank]` complete batches
-   independently. The fast GPU may process 2-3x more batches than the
-   slow one.
-2. Gradients accumulate naturally across all forward passes via libtorch
-   autograd.
-3. Accumulated gradients are normalized by `1/count[rank]` (mean per
-   device).
-4. Weighted AllReduce: each replica's gradient is scaled by
-   `count[rank]/total`, producing the mathematically correct mean.
-5. `report_timing()` feeds CudaEvent measurements back to ElChe for
-   adaptive speed ratio updates.
-6. Updated batch counts are pushed to the DataLoader for the next window.
-
-Tagged outputs (`model.tagged("name")`) and loop traces
-(`model.traces("name")`) are gathered across all batches and all devices,
-so loss functions and metrics work transparently on the combined output.
-
-## Auto-balancing
-
-The auto-balancer measures per-GPU throughput and adjusts batch
-distribution:
-
-- **CudaEvent-based timing**: zero overhead (async GPU recording, no CPU sync)
-- **EMA throughput**: exponentially smoothed samples/ms per device (alpha=0.3)
-- **Chunk ratios**: after 10 calibration steps with equal splits, ratios
-  are recomputed proportional to measured throughput. Re-evaluated every
-  50 steps.
-- **Starvation guard**: `MIN_CHUNK_RATIO` (5%) prevents any GPU from
-  receiving zero work
-
-Query the current state:
 ```rust
-let ratios = model.chunk_ratios();     // e.g., [0.7, 0.3]
-let throughput = model.throughput();    // per-device samples/ms
+use flodl::monitor::Monitor;
+
+let mut monitor = Monitor::new(num_epochs);
+monitor.serve(3000)?;             // http://launcher-host:3000
+
+// Wire the monitor through metrics_fn:
+let mon_handle = Arc::new(monitor);
+let mon_for_cb = Arc::clone(&mon_handle);
+
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .num_epochs(num_epochs)
+    .metrics_fn(Arc::new(move |m| {
+        let elapsed = std::time::Duration::from_millis(m.epoch_ms as u64);
+        mon_for_cb.log(m.epoch, elapsed, m);
+        Ok(())
+    }))
+    .run()?
+    .join()?;
 ```
 
-## Dashboard integration
+The dashboard shows per-rank tabs (one per rank, per host), throughput
+curves, batch-share distribution, VRAM, and ElChe anchor evolution. See
+[Tutorial 9: Training Monitor](09-monitor.md) for the full surface.
 
-When using the training monitor, multi-GPU metrics are visible
-automatically:
+## Scaling out — multi-host clusters
 
-- **Per-GPU tabs**: VRAM usage, utilization, throughput, batch share
-- **GPU Overview card**: compact row per GPU with VRAM bar and throughput
-- **Fastest/slowest highlighting**: fastest GPU green, slowest yellow
+Add an `fdl.cluster.yml` next to your `fdl.yml`:
 
-No extra configuration. The monitor collects `GpuSnapshot` (hardware)
-and `GpuMetrics` (DDP throughput, chunk ratio) each sample.
+```yaml
+cluster:
+  controller:
+    host: 192.168.122.1
+    port: 1337
+    path: /opt/flodl
 
-## Manual DDP: Ddp::wrap()
+  workers:
+    - host: node-a
+      local_devices: [0, 1]
+      nccl_socket_ifname: enp1s0
+      path: /opt/flodl
+      arch: precompiled/cu128
 
-For training patterns that need explicit control over when gradients
-sync (GAN discriminator vs generator, RL actor vs critic, progressive
-growing):
+    - host: node-b
+      local_devices: all
+      nccl_socket_ifname: enp1s0
+      path: /srv/flodl
+      arch: builds/sm61-sm120     # different libtorch variant — fine
+```
+
+Launch with the env overlay:
+
+```bash
+fdl probe                   # readiness gate — verify before launching
+fdl cluster train           # SSHes each worker, pre-builds, fans out
+```
+
+`Trainer::run` is the **same call** on the worker — the multi-host
+launcher trampoline takes care of fan-out, NCCL rendezvous, and
+controller binding. See [DDP Reference: Multi-host
+clusters](../ddp.md#multi-host-clusters) and [CLI Reference: cluster
+commands](../cli.md) for the full surface.
+
+For programmatic clusters (tests, embedded launchers without a yml on
+disk), use `ClusterBuilder`:
+
+```rust
+use flodl::ClusterBuilder;
+
+let cluster = ClusterBuilder::new()
+    .controller("controller.example.com").port(1337).path("/opt/flodl")
+    .done()
+    .host("worker-a").ranks([0, 1]).devices([0, 1]).nccl_socket_ifname("enp1s0").path("/opt/flodl")
+    .done()
+    .host("worker-b").ranks([2]).devices([0]).nccl_socket_ifname("enp1s0").path("/srv/flodl")
+    .done()
+    .build()?;
+
+let cfg = TrainerConfig::new(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .cluster(cluster);
+
+Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
+```
+
+For the single-host "every visible GPU" shortcut, `ClusterBuilder::all_local_gpus()` synthesizes the topology auto-promote uses internally.
+
+## Resume + checkpoints
+
+Training survives rank death (elastic membership) and saves
+periodically. Resume from any checkpoint bundle:
+
+```rust
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .batch_size(64)
+    .num_epochs(100)
+    .save_path("ckpts/run43")
+    .resume_from("ckpts/run42")     // loads ckpts/run42.{fdl,meta.json}
+    .checkpoint_every(5)
+    .run()?
+    .join()?;
+```
+
+`<stem>.meta.json` carries ElCheState (phase, calibration trajectory,
+ring buffer) so a resumed run inherits ElChe's calibration. See
+[DDP Reference: Resume + checkpoints](../ddp.md#resume--checkpoints).
+
+## Manual control — `Ddp::wrap` (test-only)
+
+For training patterns that need explicit replica control — GAN
+discriminator vs generator, RL actor vs critic, progressive growing —
+`Ddp::wrap` exposes the thread-per-GPU machinery. It is
+`cfg(test)`-gated for flodl's own tests; external crates that want it
+opt in explicitly.
 
 ```rust
 let ddp = Ddp::wrap(&[&model], &devices)?;
 
-// Explicit sync
 ddp.sync_params()?;
-
 for batch in &dataset {
     let loss = model.forward(&batch)?;
     loss.backward()?;
-
-    // Sync gradients when YOU decide
-    ddp.all_reduce_gradients()?;
+    ddp.weighted_all_reduce_gradients(&batch_counts)?;
     ddp.sync_buffers()?;
-
     optimizer.step()?;
     optimizer.zero_grad();
 }
 ```
 
-With El Che (weighted averaging):
-```rust
-ddp.weighted_all_reduce_gradients(&batch_counts)?;
-```
+For all standard use cases, `Trainer::run` / `Trainer::builder` is the
+production path — per-rank logs, rank death survival, cluster fan-out,
+elastic membership, controller-driven checkpoint retry.
 
 ## Quick reference
 
-### Ddp methods
+| Entry | When |
+|---|---|
+| `Trainer::builder(model_fn, opt_fn, step).run()` | Universal — any Module, any tier (CPU / 1 GPU / N GPUs / cluster). |
+| `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag — useful for config-driven launchers. |
+| `Trainer::setup(&graph, factory, opt_fn)` | Graph-shaped one-liner; you keep the training loop. |
+| `Trainer::setup_head(&head, factory, opt_fn)` | `flodl-hf` task-head wrapper analog. |
+| `Ddp::wrap(&[&model], &devices)` | Thread-per-GPU manual control; test-only on flodl's own suite. |
 
-| Method | Description |
-|--------|-------------|
-| `Trainer::setup(&model, &builder, optim_fn)` | One-liner: detect, distribute, set optimizer |
-| `Trainer::setup_with(..., config)` | Same with explicit DdpConfig |
-| `Ddp::wrap(&[&model], &devices)` | Manual coordinator |
-| `Ddp::is_heterogeneous()` | True if GPU models differ |
-| `.sync_params()` | Broadcast params from rank 0 |
-| `.all_reduce_gradients()` | AllReduce(Avg) all gradients |
-| `.weighted_all_reduce_gradients(&counts)` | Weighted AllReduce for El Che |
-| `.sync_buffers()` | Broadcast buffers from rank 0 |
-| `.world_size()` | Number of GPUs |
-| `.devices()` | Device list |
-
-### Graph methods (DDP-aware)
-
-| Method | Description |
-|--------|-------------|
-| `model.distribute(builder)` | Create replicas on all GPUs |
-| `model.auto_distribute(builder)` | Auto-detect GPUs and distribute (no-op if < 2) |
-| `model.set_optimizer(factory)` | Per-replica optimizers |
-| `model.step()` | AllReduce + sync + optimizer + zero_grad |
-| `model.set_lr(lr)` | Set learning rate on all optimizers |
-| `model.world_size()` | Number of GPUs (1 if not distributed) |
-| `model.is_distributed()` | True if multi-GPU |
-| `model.chunk_ratios()` | Per-GPU batch share |
-| `model.throughput()` | Per-GPU EMA throughput |
-| `model.shard_sizes()` | Per-GPU shard sizes from last forward |
-| `model.devices()` | Device list (empty if not distributed) |
-| `model.has_el_che()` | True if El Che is active |
-| `model.set_data_loader(loader, input)` | Attach DataLoader |
-| `model.epoch(n)` | Distributed epoch iterator |
-| `model.forward_batch(&batch)` | Batch-aware forward |
-
-### DdpConfig
-
-| Method | Default | Description |
-|--------|---------|-------------|
-| `.speed_hint(rank, ratio)` | None | Initial speed estimate |
-| `.overhead_target(f64)` | 0.10 | AllReduce overhead ceiling |
-| `.max_anchor(Option<usize>)` | None | None=auto, Some(0)=disable El Che |
+| Knob | Lives on | Common values |
+|---|---|---|
+| `.elche(ElCheConfig)` | TrainerConfig / DdpBuilder | `nccl_async()` (default), `cpu_async()`, etc. |
+| `.epoch_callback_policy(p)` | TrainerConfig / DdpBuilder | `Fastest` (default), `Rank(global_rank)` |
+| `.checkpoint_every(n)` | TrainerConfig / DdpBuilder | usize |
+| `.save_path(p)`, `.resume_from(p)` | TrainerConfig / DdpBuilder | `&str` |
+| `.metrics_fn(f)`, `.eval_fn(f)`, `.eval_result_fn(f)` | TrainerConfig / DdpBuilder | `Arc<dyn Fn(...)>` |
+| `.cluster(FullCluster)` | TrainerConfig | from `ClusterBuilder` or yml |
+| `.timeline(Arc<Timeline>)` | TrainerConfig / DdpBuilder | profiler events |
 
 ---
 
 Previous: [Graph Tree](10-graph-tree.md) |
-Next: [DDP Builder](12-async-ddp.md)
+Next: [Heterogeneous & Multi-Host DDP](12-async-ddp.md)

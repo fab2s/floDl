@@ -203,15 +203,48 @@ let state = handle.join()?;  // averaged params + buffers, ready for inference
 ```
 
 This is the highest-level entry: framework owns the loop, the data
-dispatch, the gradient sync (NCCL), and the optimizer. The
+dispatch, the gradient sync (NCCL or CPU averaging), and the
+optimizer. The
 [ddp-bench](https://github.com/flodl-labs/flodl/tree/main/ddp-bench) suite
 is the canonical reference for this pattern across MLP, LeNet, ResNet,
 GPT-nano, char-RNN, and conv-AE models, each wired through the same
 `train_step` closure.
 
-For policy choice (Sync / Cadence / Async), backend choice
-(NCCL / CPU averaging), and El Che heterogeneous-GPU cadence, see
-[Multi-GPU Training](11-multi-gpu.md) and the [DDP Reference](../ddp.md).
+The same call scales transparently from CPU → single GPU → multi-GPU
+single-host → multi-host cluster. On a host with 2+ visible CUDA
+devices it auto-promotes to process-per-rank. For mode selection
+(`NcclAsync` (default), `CpuAsync`, etc.), heterogeneous-rig
+cadence (ElChe), and cluster topology (`fdl.cluster.yml` /
+`ClusterBuilder`), see [Multi-GPU Training](11-multi-gpu.md), the
+[Heterogeneous & Multi-Host DDP tutorial](12-async-ddp.md), and the
+[DDP Reference](../ddp.md).
+
+### `TrainerConfig` — the config-bag form
+
+When the call site wants every knob in one data struct (e.g.
+config-driven launchers), `Trainer::run(model_fn, opt_fn, step_fn,
+cfg)` takes a `TrainerConfig`:
+
+```rust
+let cfg = TrainerConfig::new(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .elche(ElCheConfig::nccl_async())           // default; just shown explicitly
+    .max_grad_norm(5.0)
+    .checkpoint_every(5)
+    .save_path("ckpts/run43")
+    .resume_from("ckpts/run42")
+    .metrics_fn(Arc::new(|m| {
+        eprintln!("epoch={} loss={:.4} {:.0}ms", m.epoch, m.avg_loss, m.epoch_ms);
+        Ok(())
+    }));
+
+Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
+```
+
+Same launcher trampoline as `Trainer::builder(...).run()`. Pick
+whichever shape matches your call site. Full setter surface in [DDP
+Reference: `TrainerConfig<M>`](../ddp.md#trainerconfigm--the-umbrella).
 
 ## Decomposing Trainer: keep your loop, share the setup
 

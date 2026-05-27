@@ -144,7 +144,10 @@ pub struct ElCheConfig {
     /// Enable the LR-aware meta-controller above ElChe. When `true`,
     /// the meta layer observes LR trajectory + anchor trend +
     /// convergence-guard verdicts and reactively nudges the anchor
-    /// down on sharp LR drops or sustained divergence.
+    /// down on sharp LR drops or sustained divergence. Default
+    /// `true` — LR drops are always worth catching; opt out with
+    /// `.meta_controller(false)` when collecting an unconditioned
+    /// trajectory.
     pub meta_controller: bool,
     /// Divergence guardrail. `None` = `TrendGuard::new(0.05)` default;
     /// set to a custom guard to override threshold or replace
@@ -214,7 +217,7 @@ impl ElCheConfig {
             max_batch_diff: None,
             relax_up: false,
             partition_ratios: None,
-            meta_controller: false,
+            meta_controller: true,
             convergence_guard: None,
             easgd_alpha: None,
         }
@@ -253,10 +256,20 @@ impl ElCheConfig {
 }
 
 impl Default for ElCheConfig {
-    /// Default = `nccl_cadence()` (the recommended starting point for
-    /// mixed GPU rigs).
+    /// Default = [`Self::nccl_async`].
+    ///
+    /// On NCCL, `Async` and `Cadence` share the same in-epoch loop —
+    /// the difference is cross-epoch lookahead: `Async` dispatches the
+    /// next epoch's plan to a rank as soon as that rank finishes the
+    /// current one (per-rank, up to a 1-epoch lookahead bound),
+    /// without waiting for full-cluster aggregation. On heterogeneous
+    /// rigs that fills the wall-time gap between fast-rank epoch
+    /// completion and slow-rank epoch completion. Same numerics, same
+    /// rendezvous-at-every-barrier guarantees, strictly better
+    /// utilization. `Cadence` remains the right pick when you want
+    /// every rank to start each epoch in lockstep.
     fn default() -> Self {
-        Self::nccl_cadence()
+        Self::nccl_async()
     }
 }
 
@@ -498,9 +511,26 @@ mod tests {
     }
 
     #[test]
-    fn elche_default_is_nccl_cadence() {
+    fn elche_default_is_nccl_async() {
         let cfg = ElCheConfig::default();
-        assert_eq!(cfg.mode, ElCheMode::NcclCadence);
+        assert_eq!(cfg.mode, ElCheMode::NcclAsync);
         assert_eq!(cfg.anchor, 10);
+    }
+
+    #[test]
+    fn meta_controller_default_is_on() {
+        let cfg = ElCheConfig::default();
+        assert!(cfg.meta_controller, "meta_controller defaults to true");
+        // Spot-check all six presets agree on the default.
+        for preset in [
+            ElCheConfig::nccl_sync(),
+            ElCheConfig::nccl_cadence(),
+            ElCheConfig::nccl_async(),
+            ElCheConfig::cpu_sync(),
+            ElCheConfig::cpu_cadence(),
+            ElCheConfig::cpu_async(),
+        ] {
+            assert!(preset.meta_controller, "preset for {:?}", preset.mode);
+        }
     }
 }

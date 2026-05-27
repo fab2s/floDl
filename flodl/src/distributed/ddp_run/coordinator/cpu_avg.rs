@@ -242,6 +242,9 @@ impl Coordinator {
         // Apply convergence action. Overshoot is an Async-only concept.
         match action {
             convergence::ConvergenceAction::Stable => {
+                // Commit any overhead-tune proposal regardless of policy
+                // (Cadence runs the auto-tune too).
+                self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {
                         let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
@@ -260,9 +263,11 @@ impl Coordinator {
                 }
             }
             convergence::ConvergenceAction::SuppressGrowth => {
-                // Hold current anchor and overshoot, don't grow.
+                // Veto growth; allow shrink (safe direction).
+                self.el_che.veto_proposed_growth();
             }
             convergence::ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.discard_proposed_anchor();
                 self.el_che.nudge_anchor_down(factor);
                 if self.overshoot_auto && self.policy == ApplyPolicy::Async {
                     self.max_overshoot = self.overshoot_initial;
@@ -426,6 +431,7 @@ impl Coordinator {
 
         match action {
             convergence::ConvergenceAction::Stable => {
+                self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {
                         let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
@@ -436,8 +442,11 @@ impl Coordinator {
                     }
                 }
             }
-            convergence::ConvergenceAction::SuppressGrowth => {}
+            convergence::ConvergenceAction::SuppressGrowth => {
+                self.el_che.veto_proposed_growth();
+            }
             convergence::ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.discard_proposed_anchor();
                 self.el_che.nudge_anchor_down(factor);
                 crate::verbose!(
                     "  ddp: weight-space divergence nudge, anchor {} -> {}",

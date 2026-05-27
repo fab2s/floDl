@@ -365,18 +365,20 @@ fn dispatch_epoch_errors_when_total_samples_zero() {
 // -----------------------------------------------------------------
 
 #[test]
-fn meta_controller_default_is_off() {
-    // Opt-in semantics: a config built without `.meta_controller(true)`
-    // must produce a coordinator with the meta DISABLED. Mirrors OLD
-    // `CoordinatorBuilder` parity (default `meta_controller = false`).
+fn meta_controller_default_is_on() {
+    // Opt-out semantics: a config built without an explicit
+    // `.meta_controller(...)` call must produce a coordinator with the
+    // meta ENABLED. LR drops are always worth catching; callers
+    // collecting an unconditioned trajectory opt out via
+    // `.meta_controller(false)`.
     let world_size = 2;
     let (port, coord_handle) = spawn_coord(
         world_size,
         move || cfg_sync_nccl(world_size),
         |coord| {
             assert!(
-                !coord.meta_controller_enabled_for_test(),
-                "meta_controller must default to OFF"
+                coord.meta_controller_enabled_for_test(),
+                "meta_controller must default to ON"
             );
             let lrs = coord.last_lr_per_rank_for_test();
             assert_eq!(lrs.len(), 2);

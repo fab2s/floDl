@@ -286,10 +286,18 @@ impl Graph {
         // with identical inputs (post-AllReduce wall_ms_vec, same counts,
         // same sync_ms scaled to local clock); deterministic state stays
         // coherent across processes without a broadcast.
+        //
+        // Graph DDP doesn't wire a convergence guard at this site, so
+        // any overhead-tune proposal is committed unconditionally here
+        // (preserves pre-refactor behavior — the propose-then-commit
+        // split exists for the convergence-guarded worker paths). Both
+        // `commit` and `report` are deterministic across processes, so
+        // the cross-rank invariant holds.
         {
             let mut state_ref = self.cluster_el_che.borrow_mut();
             let state = state_ref.as_mut().unwrap();
             state.el_che.report_timing(&wall_ms_vec, &counts, sync_ms);
+            state.el_che.commit_proposed_anchor();
             state.local_batch_idx = 0;
             state.cycle_start = None;
         }

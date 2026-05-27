@@ -186,6 +186,40 @@ pub struct ElChe {
     /// the same call so the effect lands exactly once per
     /// `apply_callback_slack` invocation.
     pending_callback_slack_ms: Vec<f64>,
+    /// Pending anchor change from the last `report_timing`'s
+    /// `overhead_target` auto-tune, awaiting a [`ConvergenceGuard`]
+    /// verdict to commit or veto. `None` outside of `Phase::Stable+`,
+    /// inside the 5% dead-zone, or when no `report_timing` has fired
+    /// yet. The convergence-guard verdict drives one of:
+    ///
+    /// - [`Self::commit_proposed_anchor`] (Stable): apply the proposal
+    ///   regardless of direction.
+    /// - [`Self::veto_proposed_growth`] (SuppressGrowth): apply the
+    ///   proposal if it's a shrink, drop it if it's a grow — divergence
+    ///   is rising, growth makes it worse, but shrink is safe.
+    /// - [`Self::discard_proposed_anchor`] (NudgeDown): drop the
+    ///   proposal; the nudge supersedes it directly on the current
+    ///   anchor.
+    ///
+    /// Transient between `report_timing` and the verdict apply — never
+    /// serialized into [`crate::distributed::ElCheState`].
+    ///
+    /// [`ConvergenceGuard`]: super::ddp_run::ConvergenceGuard
+    proposed_anchor: Option<ProposedAnchor>,
+}
+
+/// Direction-aware overhead-tune proposal awaiting a convergence-guard
+/// verdict. See [`ElChe::proposed_anchor`].
+#[derive(Debug, Clone, Copy)]
+enum ProposedAnchor {
+    /// `overhead > overhead_target` — anchor should grow to amortize
+    /// AllReduce cost over more local batches. Vetoed by
+    /// `SuppressGrowth`; committed by `Stable`.
+    Grow(usize),
+    /// `overhead < overhead_target * 0.5` — anchor should shrink by 1
+    /// for fresher gradients. Applied on both `Stable` AND
+    /// `SuppressGrowth` (shrink is the safe direction).
+    Shrink(usize),
 }
 
 impl ElChe {
@@ -220,6 +254,7 @@ impl ElChe {
             anchor_rank: None,
             calibration_count: 0,
             pending_callback_slack_ms: vec![0.0; world_size],
+            proposed_anchor: None,
         }
     }
 
@@ -684,6 +719,50 @@ impl ElChe {
         }
     }
 
+    /// Commit any pending overhead-tune proposal from the last
+    /// `report_timing`. Called on `ConvergenceAction::Stable` — the
+    /// guard saw no divergence concern, so the proposal (grow or
+    /// shrink) applies.
+    ///
+    /// Pairs with [`Self::veto_proposed_growth`] and
+    /// [`Self::discard_proposed_anchor`] to make the convergence guard
+    /// authoritative over `overhead_target`. No-op when no proposal is
+    /// pending (Probe/Warmup phase, dead-zone hit, or no
+    /// `report_timing` call between guard verdicts).
+    pub fn commit_proposed_anchor(&mut self) {
+        if let Some(p) = self.proposed_anchor.take() {
+            self.anchor = match p {
+                ProposedAnchor::Grow(n) | ProposedAnchor::Shrink(n) => n,
+            };
+            let slow_ms = self.slow_ms();
+            if slow_ms > 0.0 {
+                self.recompute_batch_counts(slow_ms);
+            }
+        }
+    }
+
+    /// Apply a pending proposal only if it shrinks the anchor; drop
+    /// the proposal if it would grow. Called on
+    /// `ConvergenceAction::SuppressGrowth` — the guard saw rising
+    /// divergence, so growth makes it worse, but a shrink is the safe
+    /// direction.
+    pub fn veto_proposed_growth(&mut self) {
+        if let Some(ProposedAnchor::Shrink(n)) = self.proposed_anchor.take() {
+            self.anchor = n;
+            let slow_ms = self.slow_ms();
+            if slow_ms > 0.0 {
+                self.recompute_batch_counts(slow_ms);
+            }
+        }
+    }
+
+    /// Drop any pending proposal. Called on
+    /// `ConvergenceAction::NudgeDown` — the nudge supersedes the
+    /// proposal entirely, acting directly on the current anchor.
+    pub fn discard_proposed_anchor(&mut self) {
+        self.proposed_anchor = None;
+    }
+
     /// Whether at least one timing measurement has been reported.
     pub fn is_calibrated(&self) -> bool {
         self.calibrated
@@ -783,13 +862,22 @@ impl ElChe {
             return;
         }
 
-        // Overhead auto-tune: scales the anchor up when AllReduce overhead
-        // exceeds the target, decays it slowly when overhead drops well
-        // below half the target. Gated to `Phase::Stable+` because the
-        // multiplicative `scale = overhead / target` compounds noise
-        // dramatically on sparse early readings (the historical 10→22
-        // anchor jump on the first measurement). Held off until each rank
-        // has a full trust window of evidence.
+        // Overhead auto-tune: propose anchor growth/shrink based on
+        // measured AllReduce overhead. The proposal is NOT applied here
+        // — the caller's convergence-guard verdict drives one of
+        // [`Self::commit_proposed_anchor`] (Stable),
+        // [`Self::veto_proposed_growth`] (SuppressGrowth — keeps
+        // shrink, drops grow), or [`Self::discard_proposed_anchor`]
+        // (NudgeDown — nudge supersedes the proposal). Makes the
+        // convergence guard authoritative over `overhead_target`:
+        // rising divergence vetoes growth before it lands.
+        //
+        // Gated to `Phase::Stable+` because the multiplicative
+        // `scale = overhead / target` compounds noise dramatically on
+        // sparse early readings (the historical 10→22 anchor jump on
+        // the first measurement). Held off until each rank has a full
+        // trust window of evidence.
+        self.proposed_anchor = None;
         if self.phase >= Phase::Stable {
             let compute_ms = wall_ms.iter().copied().fold(0.0_f64, f64::max);
             if compute_ms > 0.0 && sync_ms > 0.0 {
@@ -798,16 +886,22 @@ impl ElChe {
                     let scale = overhead / self.overhead_target;
                     let new_anchor =
                         (self.anchor as f64 * scale).ceil() as usize;
-                    self.anchor =
+                    let clamped =
                         new_anchor.clamp(self.min_anchor, self.max_anchor);
+                    if clamped > self.anchor {
+                        self.proposed_anchor =
+                            Some(ProposedAnchor::Grow(clamped));
+                    }
                 } else if overhead < self.overhead_target * 0.5
                           && self.anchor > self.min_anchor {
-                    self.anchor -= 1;
+                    self.proposed_anchor =
+                        Some(ProposedAnchor::Shrink(self.anchor - 1));
                 }
             }
         }
 
-        // Recompute batch counts from (possibly updated) anchor.
+        // Recompute batch counts from current (pre-proposal) anchor. The
+        // commit/veto path recomputes again if the proposal lands.
         self.recompute_batch_counts(slow_ms);
         // Snapshot the post-recompute batch_counts so `recent_batch_share`
         // can report the cadence's actual per-rank allocation as a smoothed

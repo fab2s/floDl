@@ -1,532 +1,403 @@
-# Tutorial 12: DDP Builder
+# Tutorial 12: Heterogeneous & Multi-Host DDP
 
-Thread-per-GPU training with Local SGD. Each GPU runs its own optimizer
-independently; a lightweight coordinator triggers periodic parameter
-averaging. Works with any `Module`, not just `Graph`.
+When the rigs get interesting — mixed GPU generations, mixed hosts,
+mixed libtorch variants — the same `Trainer::builder` shape from
+[Tutorial 11](11-multi-gpu.md) keeps working. This tutorial covers the
+knobs that earn their keep on real heterogeneous deployments.
 
-> **Prerequisites**: [Training](04-training.md). Familiarity with
-> [Multi-GPU Training](11-multi-gpu.md) recommended but not required.
+> **Prerequisites**: [Multi-GPU Training](11-multi-gpu.md). The
+> universal `Trainer::builder` shape is assumed.
 
 > **Time**: ~25 minutes.
 
-## Quick start
+> **Canonical reference**: [DDP Reference](../ddp.md).
 
-```rust
-use flodl::*;
-use std::sync::Arc;
+## ElChe — the cadence balancer
 
-let dataset: Arc<dyn BatchDataSet> = Arc::new(MyDataset::new());
+Every cadence mode (`*Cadence`, `*Async`) routes through ElChe.
+`NcclSync` and `CpuSync` are the degenerate case (anchor=1, AllReduce
+every batch). ElChe's job is to keep AllReduce overhead bounded while
+respecting weight-space divergence.
 
-let ddp = Trainer::builder(
-    |dev| MyModel::on_device(dev),              // model factory
-    |params| Adam::new(params, 0.001),          // optimizer factory
-    |model, batch| {                            // train function
-        let input = Variable::new(batch[0].clone(), false);
-        let target = Variable::new(batch[1].clone(), false);
-        let pred = model.forward(&input)?;
-        pred.mse(&target)?.mean()
-    },
-)
-.dataset(dataset)
-.batch_size(32)
-.num_epochs(10)
-.run()?;                    // non-blocking: spawns threads, returns immediately
+### Phase machine
 
-let state = ddp.join()?;   // blocks until training completes
-// state.params[i] corresponds to model.parameters()[i]
-// state.buffers[i] corresponds to model.buffers()[i]
-```
+ElChe progresses through four phases as calibrations accumulate:
 
-That is the entire setup. The builder detects GPUs, spawns one thread per
-GPU, creates a coordinator thread, and returns immediately. `join()` blocks
-until all epochs complete and returns the averaged final parameters.
-
-### The three closures
-
-- **`model_factory(Device) -> Result<M>`**: Creates a model on the given
-  device. Called once per GPU thread. Why a closure? `Variable` and `Buffer`
-  are `Rc`-based (not Send), so each thread needs its own instance.
-- **`optim_factory(&[Parameter]) -> O`**: Creates an optimizer for a
-  model's parameters. Each GPU gets its own optimizer.
-- **`train_fn(&M, &[Tensor]) -> Result<Variable>`**: Receives the model
-  and a batch of tensors, returns the scalar loss. The worker handles
-  `backward()`, `optimizer.step()`, and `zero_grad()`.
-
-### Single-GPU fallback
-
-With fewer than 2 CUDA devices, training runs on the main thread. No
-worker threads, no coordinator, no averaging. The API is identical:
-`join()` returns `TrainedState`. Develop on a laptop, deploy to a
-multi-GPU server with zero code changes.
-
-## The builder API
-
-All configuration is done through the builder before calling `.run()`:
-
-```rust
-let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
-    .dataset(dataset)                      // required
-    .batch_size(32)                        // required
-    .num_epochs(10)                        // required
-    .policy(ApplyPolicy::Cadence)          // default: Cadence
-    .backend(AverageBackend::Nccl)         // default: Nccl
-    .overhead_target(0.10)                 // AllReduce < 10% of compute
-    .max_anchor(200)                       // gradient staleness cap
-    .anchor(10)                            // initial anchor count
-    .max_batch_diff(50)                    // max lead of fastest over slowest
-    .divergence_threshold(0.05)            // Async mode: tighten at 5% divergence
-    .progressive_dispatch(true)            // stream work in small chunks
-    .checkpoint_every(5)                   // save every 5 averaging events
-    .checkpoint_fn(|ver, model| {
-        // save model checkpoint
-        Ok(())
-    })
-    .epoch_fn(|epoch, worker| {
-        // learning rate schedule, noise curriculum, etc.
-        let lr = 0.001 * (0.95_f64).powi(epoch as i32);
-        worker.set_lr(lr);
-    })
-    .run()?;
-```
-
-## How it works
-
-```
-GPU Thread 0:  model+Adam -> [fwd -> bwd -> step -> report timing -> repeat]
-GPU Thread 1:  model+Adam -> [fwd -> bwd -> step -> report timing -> repeat]
-Coordinator:   [collect timing -> trigger averaging -> monitor divergence]
-```
-
-Each GPU runs a complete training loop independently. The coordinator
-collects per-batch timing from all workers (for ElChe throughput ratios)
-and periodically triggers parameter averaging. Between averaging events,
-each GPU trains with its own local optimizer. This is Local SGD.
-
-Two orthogonal knobs control the behavior:
-- **`ApplyPolicy`**: WHEN to average (the interval K)
-- **`AverageBackend`**: HOW to average (the transport)
-
-## Choosing a policy: when to average
-
-### Sync (K=1)
-
-Average after every batch. Every GPU processes one batch, then parameters
-are synchronized. Equivalent to standard DDP. Best convergence guarantees,
-but the fast GPU waits at every averaging point.
-
-```rust
-.policy(ApplyPolicy::Sync)
-```
-
-**Use when**: homogeneous GPUs, small models, correctness-first.
-
-### Cadence (K=N from ElChe)
-
-The slow GPU anchors the cadence; the fast GPU processes more batches per
-window. K is determined by ElChe's adaptive algorithm.
-
-```rust
-.policy(ApplyPolicy::Cadence)  // default
-```
-
-**Use when**: heterogeneous GPUs (e.g., mixing GPU generations).
-This is the recommended default for most setups.
-
-### Async (K=adaptive)
-
-ElChe starts conservative (K=1), then backs off as parameter divergence
-stays low. If replicas drift apart, K tightens again. Maximizes GPU
-utilization at the cost of some gradient staleness.
-
-```rust
-.policy(ApplyPolicy::Async)
-.divergence_threshold(0.05)  // tighten at 5% relative norm difference
-```
-
-**Use when**: large models where each batch is expensive and
-synchronization overhead matters. Monitor loss curves.
-
-### Why Cadence and Async use different triggers
-
-**Cadence** uses a **wall-time trigger**: averaging fires when the slowest
-rank's accumulated wall time reaches the anchor's wall-time. This gives
-predictable, stable rendezvous points for the AllReduce barrier.
-
-**Async** uses a **batch-count trigger**: averaging fires when all ranks
-complete their assigned batch counts. This is intentional: the slight
-overshoot between averaging events means each replica explores a slightly
-different parameter neighborhood. This diversity benefits convergence
-(like implicit meta-learning).
-
-Benchmark evidence confirms this: async with wall-time trigger gave worse
-convergence than batch-count trigger, because cutting off the overshoot
-eliminates the exploration diversity that makes async work.
-
-### Decision summary
-
-| Scenario | Recommended policy |
-|----------|-------------------|
-| Same GPU model on all devices | `Sync` |
-| Mixed GPU generations | `Cadence` |
-| Large model, expensive batches | `Async` |
-| Unsure | `Cadence` (safe default) |
-
-## Choosing a backend: how to average
-
-### Nccl
-
-In-place AllReduce on GPU via DMA (NVLink or PCIe peer-to-peer). Zero
-extra memory. All GPUs sync at the collective barrier.
-
-```rust
-.backend(AverageBackend::Nccl)  // default
-```
-
-### Cpu
-
-Workers send parameter snapshots to the coordinator, which computes a
-weighted average on CPU, then distributes the result back. No GPU ever
-blocks on another GPU. Uses O(world_size * model_size) CPU RAM.
-
-```rust
-.backend(AverageBackend::Cpu)
-```
-
-The CPU backend operates as a non-blocking 3-phase state machine
-(Idle/Collecting/Computing) that keeps the coordinator responsive even
-during averaging.
-
-### Tradeoff table
-
-| | Nccl | Cpu |
+| Phase | When | Behavior |
 |---|---|---|
-| **Memory** | Zero extra (in-place) | O(W * M) CPU RAM |
-| **Latency** | GPU-to-GPU DMA | GPU -> CPU -> average -> CPU -> GPU |
-| **Blocking** | All GPUs sync at barrier | No GPU ever blocks |
-| **Fault tolerance** | Abort handles unblock stuck ops | Timeout (5s) detects dead workers |
+| `Probe` | No calibrations yet | Equal split across ranks; gather first timings. |
+| `Warmup` | First few calibrations | Sticky anchor — cold-start noise on the larger/newer GPU can't flip the slow-anchor election. |
+| `Stable` | Steady state | Normal overhead auto-tune with hysteresis. `relax_up` and the meta-controller anchor swaps activate here. |
+| `Mature` | Long-running steady state | Same as Stable; signal for telemetry. |
 
-## A/B testing: find the best config for your model
+The phase gate prevents the multiplicative overhead-tune scale from
+compounding sparse early-reading noise (the historical "anchor jumps
+from 10 to 22 on the first measurement" bug).
 
-Every model responds differently to averaging frequency and transport
-timing. You have 6 valid configurations (3 policies x 2 backends), and
-the best one depends on your model, your data, and your hardware.
+### Weighted gradient averaging
 
-The recommended approach: **run 3-5 epochs with different configs, compare
-loss curves, then commit to the winner for your full training run.** This
-takes minutes, not hours.
+When ranks process different batch counts in a window, each replica's
+gradient contributes proportionally to its batch count:
 
-### Step 1: start with El Che (Async + NCCL)
+```
+weight[rank]  = count[rank] / sum(counts)
+grad_avg      = sum(weight[rank] * grad[rank])
+```
 
-Async + NCCL is the best overall config in practice. Fast GPUs overshoot
-between averaging events, creating parameter diversity that benefits
-convergence. The divergence monitor auto-tunes the averaging interval.
+This produces the mathematically correct mean gradient regardless of
+per-device batch counts. No accuracy degradation from uneven splits.
+
+### Anchor auto-tune
+
+After each averaging cycle (gated to `Phase::Stable+`):
+
+```
+overhead = sync_ms / max(compute_ms across ranks)
+```
+
+| Observation | ElChe's proposal |
+|---|---|
+| `overhead > overhead_target` | Grow anchor by `ceil(anchor * overhead / target)` — sync less often, amortize the cost over more local batches. |
+| `overhead < overhead_target * 0.5` | Shrink anchor by 1 — sync is cheap, can afford fresher gradients. |
+| in the band, or change < 5% of current | Hold (5% dead-zone). |
+
+The proposal is **proposed**, not committed — the convergence guard's
+verdict decides whether it lands (see below). The anchor is then
+clamped to `[min_anchor, max_anchor]`.
+
+## Convergence guards — the safety belt
+
+`overhead_target` alone would happily grow the anchor on any stable
+model, eventually starving the gradients. The convergence guard
+monitors weight-space divergence between replicas and pulls back.
+
+| Guard | Behavior | When to pick |
+|---|---|---|
+| `TrendGuard::new(thresh)` | **Production default.** Three-rises-above-threshold rule on the `\|\|pre - post\|\| / \|\|post\|\|` ring buffer. Returns `SuppressGrowth` on persistent rising drift. | Almost everyone. |
+| `MsfGuard::default().with_suppress(s, n).with_nudge(t, n, f)` | Rate-based detector built on the across-event MSF proxy `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds escalate from `SuppressGrowth` to `NudgeDown`. | When you have time to tune thresholds for your specific architecture; can react faster than TrendGuard on sharp divergence spikes. |
+| `NoGuard` | Always `Stable`. | Instrumentation runs that want an unconditioned trajectory (every overhead-tune proposal commits unconditionally). |
+
+### Guard authority over `overhead_target`
+
+ElChe's `report_timing` **proposes** an overhead-tune anchor change
+but doesn't apply it. The guard's verdict commits:
+
+| Verdict | Effect on the proposal |
+|---|---|
+| `Stable` | Commit (grow or shrink). |
+| `SuppressGrowth` | Drop a proposed grow; **apply** a proposed shrink (shrink is the safe direction when divergence is rising). |
+| `NudgeDown { factor }` | Drop the proposal entirely; nudge supersedes by shrinking the current anchor by `factor`. |
+
+So `SuppressGrowth` doesn't just *not relax up* — it actively vetoes
+the overhead-tune growth before it lands. The convergence guard is
+authoritative over `overhead_target` by construction. See [DDP
+Reference: Guard authority over
+`overhead_target`](../ddp.md#guard-authority-over-overhead_target).
+
+### LR-aware meta-controller
+
+Above ElChe sits the LR-aware meta-controller (on by default —
+`.meta_controller(true)`). It watches LR trajectory + anchor trend +
+guard verdicts in a rolling window and reactively nudges the anchor
+down on sharp LR drops or sustained divergence patterns. Reports
+`is_settled()` once the metric stops moving — useful as an
+early-stop signal.
+
+Opt out for instrumentation:
 
 ```rust
-let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
+let elche = ElCheConfig::nccl_async()
+    .meta_controller(false);     // unconditioned trajectory
+```
+
+## EASGD elastic averaging (CpuAsync)
+
+On the `CpuAsync` path, EASGD-style elastic blending smooths
+divergence in long async runs:
+
+```
+local_t1   = (1 - α) * local_t0  +  α * center_t0
+center_t1  = (1 - α) * center_t0 +  α * mean(local_t0)
+```
+
+Each rank's local params blend toward the center; the center blends
+toward the mean of locals. `α` controls the blend rate (`0 < α ≤ 1.0`,
+typical `0.4`–`0.8`). Honored on `CpuAsync` only; ignored elsewhere.
+
+```rust
+.elche(ElCheConfig::cpu_async().easgd_alpha(0.6))
+```
+
+## A/B testing modes — the recipe
+
+Six modes via `ElCheMode`. Each switch is one line:
+
+```rust
+let base = || Trainer::builder(model_factory.clone(), optim_factory.clone(), train_step)
     .dataset(dataset.clone())
-    .batch_size(32)
-    .num_epochs(5)                          // just enough to see the trend
-    .max_grad_norm(5.0)
-    .policy(ApplyPolicy::Async)
-    .backend(AverageBackend::Nccl)
-    .run()?;
-let async_state = ddp.join()?;
+    .batch_size(64)
+    .num_epochs(5)              // just enough to see the trend
+    .max_grad_norm(5.0);
+
+let a = base().elche(ElCheConfig::cpu_async()).run()?.join()?;     // best-in-class candidate
+let b = base().elche(ElCheConfig::nccl_async()).run()?.join()?;    // default; strong NCCL pick
+let c = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;  // strict cross-epoch lockstep
+let d = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;     // per-batch baseline
 ```
 
-### Step 2: test Cadence (strong second)
+Suggested order (refined from the `ddp-bench` published numbers):
 
-Same code, one line changed:
+| Position | Mode | Rationale |
+|---|---|---|
+| 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (true mid-epoch overshoot) and benefits most from EASGD. Cost: a decent CPU. |
+| 2 | **`NcclAsync`** (default) | Recommended NCCL default. Same in-epoch loop as `NcclCadence` with cross-epoch lookahead on top. |
+| 3 | `NcclCadence` | Strict cross-epoch lockstep — pick when epoch-aligned reproducibility matters. |
+| 4 | `NcclSync` | Strict per-batch sync. Tells you whether tighter synchronization helps your specific model. |
 
-```rust
-    .policy(ApplyPolicy::Cadence)           // <-- the only change
+Compare on: `loss at epoch N`, `wall time per epoch`, and **`loss per
+wall-second`** — the last is usually the decider. A slightly higher
+loss in half the time often wins.
+
+`CpuSync` and `CpuCadence` exist for A/B against the NCCL variants
+when peer-access is unavailable; they're rarely faster or more
+accurate than NCCL for typical workloads. `CpuAsync` is where the
+CPU backend shines.
+
+The `ddp-bench` suite drives every mode through the same harness with
+the same `train_step` closure. See
+[`ddp-bench`](https://github.com/flodl-labs/flodl/tree/main/ddp-bench)
+for the canonical worked example and the published convergence
+numbers.
+
+### Why `NcclAsync` is the NCCL default, not `NcclCadence`
+
+On the NCCL backend, `NcclCadence` and `NcclAsync` share the
+**same in-epoch loop** — same ElChe anchor mechanics, same weighted
+AllReduce. The difference is at the coordinator (cross-epoch) level:
+
+- `NcclCadence`: when every rank finishes epoch N, dispatch epoch N+1
+  to all ranks together.
+- `NcclAsync`: when an individual rank finishes epoch N, the
+  coordinator immediately dispatches epoch N+1 to *that rank*
+  (per-rank, up to a 1-epoch lookahead bound), without waiting for
+  full-cluster aggregation. The fast rank gets a head start on N+1's
+  batches while the slow rank finishes N — filling the wall-time gap.
+
+In-epoch barriers are still hard rendezvous points — no rank
+overshoots mid-epoch on NCCL. The "Async" in `NcclAsync` means
+*cross-epoch lookahead*, not *mid-epoch overshoot*.
+
+> Today the cross-epoch lookahead is bounded by the natural rhythm
+> of AllReduce barriers (the fast rank has to rendezvous at every
+> in-epoch sync). Generalizing `max_overshoot` to NCCL — so the gap
+> is a batch-count bound across both backends — is on the
+> next-release roadmap. The design principle is "no worker should
+> drift at epoch scale, only at batch scale."
+
+## Heterogeneous-rig real-world example
+
+A two-host cluster with mixed-generation GPUs:
+
+- **node-a** (Blackwell): 2× RTX 5060 Ti (sm_120, 16 GB each), libtorch `precompiled/cu128`
+- **node-b** (Pascal VM via virtiofs): 2× GTX 1060 (sm_61, 6 GB each), libtorch `builds/sm61-sm120` (source-built, multi-arch)
+
+NCCL handshake across mixed major.minor versions sometimes fails
+(node-a may ship NCCL 2.27, node-b may have 2.26 from libtorch). The
+fix: build a matching libnccl on the easier side and `LD_PRELOAD` it
+into libtorch:
+
+```bash
+fdl nccl build              # auto-detects target version + local archs
 ```
 
-Cadence provides more predictable sync points. If your model needs tighter
-synchronization, Cadence will show it in the first few epochs.
+Then wire it into the worker's `env:` block in `fdl.cluster.yml`:
 
-### Step 3 (optional): strict Sync baseline
-
-```rust
-    .policy(ApplyPolicy::Sync)              // <-- strict sync
+```yaml
+workers:
+  - host: node-b
+    local_devices: all
+    nccl_socket_ifname: enp1s0
+    path: /srv/flodl
+    arch: builds/sm61-sm120
+    env:
+      LD_PRELOAD: /srv/flodl/libtorch/nccl/builds/v2.27.5-sm61/lib/libnccl.so.2
 ```
 
-This tells you whether strict synchronization helps your specific model.
-For most workloads, Async and Cadence match or beat Sync.
+`fdl probe` flags the version skew before launch:
 
-### CPU and NCCL backends
-
-Both averaging backends (NCCL and CPU) are production-ready. The CPU
-convergence bug from v0.3.0 has been fixed. See the
-[DDP reference](/guide/ddp-reference) for details and the
-[DDP benchmark](/ddp-benchmark) for convergence results across all modes.
-
-### What to compare
-
-- **Loss at epoch N**: lower is better
-- **Wall time per epoch**: Cadence should be faster than Sync on mixed hardware
-- **Loss per wall-second**: the real metric. Slightly higher loss in half the time often wins.
-
-### The full matrix
-
-| Policy | Backend | Use case | Throughput | Convergence |
-|--------|---------|----------|------------|-------------|
-| Async | Nccl | **Best overall (recommended)** | Best | Best with clipping |
-| Cadence | Nccl | Strong second, predictable sync | Good | Good |
-| Sync | Nccl | Strict sync baseline | Baseline | Good |
-| Async | Cpu | Non-blocking GPUs, fault-tolerant | Good | Good |
-| Cadence | Cpu | Non-blocking for heterogeneous clusters | Good | Good |
-| Sync | Cpu | Strict sync without GPU barrier | Baseline | Good |
-
-Start with **Async + Nccl** (El Che). It's the best overall config in
-practice: fast GPUs overshoot between averaging, creating parameter
-diversity that benefits convergence. A/B test against **Cadence + Nccl**
-(strong second, more predictable sync) or **Sync + Nccl** (strict
-baseline). Swap in **`AverageBackend::Cpu`** when you want non-blocking
-GPUs (snapshot / CPU-average / distribute round-trip) or when NCCL is
-unavailable. See the [DDP reference](/guide/ddp-reference) for the
-backend trade-off in detail.
-
-## Safety guards
-
-### max_batch_diff
-
-Hard limit on how far any GPU can run ahead of the slowest. Workers that
-exceed the limit are throttled (blocked on the control channel) until the
-next averaging event.
-
-```rust
-.max_batch_diff(50)   // fast GPU can be at most 50 batches ahead
-// .max_batch_diff(0) // strict lockstep (like Sync but with any policy)
+```bash
+fdl cluster probe           # SSHes each worker; aggregates GPU + libtorch + NCCL inventory
 ```
 
-### divergence_threshold (Async mode)
+## Cluster topology — `fdl.cluster.yml`
 
-Controls how aggressively the averaging interval adapts:
-- If parameter divergence > threshold: halve the interval (more frequent)
-- If divergence < threshold/2: double the interval (less frequent)
+The structured schema with `controller:` and `workers[]:` blocks. See
+[DDP Reference: Multi-host
+clusters](../ddp.md#multi-host-clusters) for the full field listing.
 
-```rust
-.divergence_threshold(0.05)  // default: 5% relative norm difference
+Key conventions:
+
+- One process per rank; each worker owns one rank per visible CUDA
+  device.
+- Global ranks are assigned sequentially by worker order: worker 0
+  owns ranks `[0..N0)`, worker 1 owns `[N0..N0+N1)`, etc.
+- `local_devices: all` probes the host at dispatch time via SSH +
+  `nvidia-smi`. Explicit lists carry their own count.
+- `nccl_socket_ifname:` is required on every worker when the cluster
+  spans multiple hosts.
+- `arch:` selects the libtorch variant *per host* — heterogeneous
+  rigs run different variants without changing the convention path
+  (`<path>/libtorch/<arch>/`).
+- `docker:` (optional) names the compose service for training on this
+  host. Mixed deployments (controller in Docker, worker bare-metal)
+  are common.
+
+Launch via the env overlay:
+
+```bash
+fdl cluster train           # = fdl --env cluster train ; SSHes each worker
+fdl cluster probe           # readiness gate before launch
 ```
 
-### NCCL abort handles
+## Programmatic clusters — `ClusterBuilder`
 
-If a worker dies mid-collective (e.g., OOM), `DdpHandle` calls
-`ncclCommAbort` on all communicators, unblocking surviving workers instead
-of letting them hang forever. Also triggered in `Drop`.
-
-### CPU averaging timeout
-
-If not all worker snapshots arrive within `snapshot_timeout_secs` (default
-5s), the round is soft-aborted: missing ranks are logged, stale snapshots
-are drained, and the coordinator retries on the next cycle.
+For tests, embedded launchers, or any binary that wants to launch
+without a yml on disk:
 
 ```rust
-DdpRunConfig::new().with_snapshot_timeout(10)  // 10 seconds
+use flodl::ClusterBuilder;
+
+let cluster = ClusterBuilder::new()
+    .controller("192.168.122.1")
+        .port(1337)
+        .path("/opt/flodl")
+    .done()
+    .host("node-a")
+        .ranks([0, 1])
+        .devices([0, 1])
+        .nccl_socket_ifname("enp1s0")
+        .path("/opt/flodl")
+        .arch("precompiled/cu128")
+    .done()
+    .host("node-b")
+        .ranks([2, 3])
+        .all_devices()
+        .nccl_socket_ifname("enp1s0")
+        .path("/srv/flodl")
+        .arch("builds/sm61-sm120")
+        .ssh_port(2222)
+        .ssh_identity_file("/keys/cluster")
+    .done()
+    .build()?;
+
+let cfg = TrainerConfig::new(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .elche(ElCheConfig::cpu_async().easgd_alpha(0.6))
+    .cluster(cluster);
+
+Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 ```
 
-## Checkpointing
+`ClusterBuilder::all_local_gpus()` is the single-host shortcut —
+synthesizes the same topology auto-promote uses on a multi-GPU host.
 
-Save checkpoints at regular intervals during training:
+## Elastic membership
+
+Ranks can die and rejoin without aborting the run:
+
+- **Heartbeat miss** → coordinator transitions the rank to `Dead` and
+  renormalizes `partition_ratios` across survivors.
+- **Lone NCCL survivor** short-circuits and exits (no dead-quorum
+  AllReduce wait).
+- **`max_failure` threshold** triggers a clean
+  `ShutdownWithSave` — coordinator drives a final checkpoint
+  through whichever survivor has the freshest state.
+- **NCCL rendezvous-timeout retry** rebuilds the comm on the largest
+  contiguous survivor subset.
+
+Tune via:
 
 ```rust
-let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
-    .dataset(dataset)
-    .batch_size(32)
+TrainerConfig::new(dataset)
+    .batch_size(64)
     .num_epochs(100)
-    .checkpoint_every(5)          // every 5 averaging events
-    .checkpoint_fn(|version, model| {
-        model.save_checkpoint(&format!("ckpt_v{version}.fdl"))
-    })
-    .run()?;
+    .save_path("ckpts/run")
+    .checkpoint_every(5);
+// max_failure comes from cluster-coordinator config (cluster.yml or
+// programmatic ClusterCoordinatorConfig).
 ```
 
-The checkpoint function receives `(version, &model)` where `version` is
-the averaging event count (multi-GPU) or epoch number (single-GPU).
-Errors are logged but do not stop training.
-
-In single-GPU mode, `checkpoint_every` counts epochs instead of averaging
-events.
-
-## The train function
-
-The train function is called once per batch by the worker. It receives:
-- `&M`: a reference to the concrete model (your specific type, not `dyn Module`)
-- `&[Tensor]`: the batch tensors (on the worker's GPU device)
-
-It must return a scalar `Variable` representing the loss:
+The save bundle is `<stem>.fdl` + `<stem>.meta.json` (carries
+ElCheState — phase, calibration trajectory, ring buffer, guard
+history). Resume:
 
 ```rust
-// Simple MSE
-|model, batch| {
-    let input = Variable::new(batch[0].clone(), false);
-    let target = Variable::new(batch[1].clone(), false);
-    model.forward(&input)?.mse(&target)?.mean()
-}
-```
-
-The worker handles everything after the loss is returned: `backward()`,
-`optimizer.step()`, `zero_grad()`, and timing reports.
-
-## Custom metrics
-
-Record named scalars inside the train function using `record_scalar()`.
-These are aggregated per rank per epoch and available via
-`DdpHandle::poll_metrics()`:
-
-```rust
-use flodl::nn::record_scalar;
-
-let ddp = Trainer::builder(
-    model_factory,
-    optim_factory,
-    |model, batch| {
-        let input = Variable::new(batch[0].clone(), false);
-        let target = Variable::new(batch[1].clone(), false);
-        let pred = model.forward(&input)?;
-        let loss = pred.mse(&target)?.mean()?;
-
-        // Record custom metrics (thread-local, aggregated per epoch)
-        let correct = pred.argmax(-1, false)?.eq_tensor(&target.tensor())?.sum()?;
-        let accuracy = correct.item::<f64>()? / batch[0].size()[0] as f64;
-        record_scalar("accuracy", accuracy);
-
-        Ok(loss)
-    },
-)
-.dataset(dataset)
-.batch_size(32)
-.num_epochs(50)
-.run()?;
-
-// Consume metrics from outside
-while let Some(m) = ddp.next_metrics() {
-    println!(
-        "epoch {} | loss={:.4} | acc={:.3} | {:.0}ms",
-        m.epoch, m.avg_loss,
-        m.scalars.get("accuracy").unwrap_or(&0.0),
-        m.epoch_ms,
-    );
-}
-let state = ddp.join()?;
-```
-
-`EpochMetrics` includes per-rank breakdowns (`per_rank_loss`,
-`per_rank_time_ms`, `per_rank_scalars`) alongside aggregated values.
-
-## Monitor integration
-
-Wire the DDP handle into a training `Monitor` for the live dashboard
-and HTML archive:
-
-```rust
-let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
-    .dataset(dataset)
-    .batch_size(32)
+TrainerConfig::new(dataset)
+    .batch_size(64)
     .num_epochs(100)
-    .run()?;
-
-let mut monitor = Monitor::new(100);
-ddp.setup_monitor(&mut monitor);  // graph identity + architecture SVG
-monitor.serve(3000)?;              // live dashboard at http://localhost:3000
-
-while let Some(metrics) = ddp.next_metrics() {
-    let elapsed = std::time::Duration::from_millis(metrics.epoch_ms as u64);
-    monitor.log(metrics.epoch, elapsed, &metrics);
-}
-
-let state = ddp.join()?;
-monitor.finish();
-monitor.save_html("training.html");
+    .save_path("ckpts/run43")
+    .resume_from("ckpts/run42")     // loads ckpts/run42.{fdl,meta.json}
+    .checkpoint_every(5);
 ```
 
-The dashboard shows per-GPU tabs with VRAM, throughput, and batch share
-charts automatically when 2+ GPUs are detected.
+A resumed run inherits ElChe's calibration trajectory — no warmup
+re-run.
 
-## Epoch callbacks
+## `EpochCallbackPolicy::Fastest` — free-compute callbacks
 
-Use `epoch_fn` for per-epoch logic that runs inside each worker thread:
+By default, per-epoch callbacks (`checkpoint_fn`, `epoch_fn`,
+`eval_fn`) fire on the **fastest rank** (lowest
+`smoothed_ms_per_batch`). The reasoning: on heterogeneous rigs the
+fastest rank has the most idle time at the sync barrier, so eval /
+save runs as free compute. Sticky within a run; re-resolves only on
+rank death.
+
+Pin to a specific global rank with `EpochCallbackPolicy::Rank(n)`
+when the research convention demands it. `n` is the **global rank**
+(0..world_size cluster-wide), assigned sequentially by worker order
+in the cluster topology.
 
 ```rust
-.epoch_fn(|epoch, worker| {
-    // Cosine annealing
-    let lr = 0.001 * 0.5 * (1.0 + (std::f64::consts::PI * epoch as f64 / 100.0).cos());
-    worker.set_lr(lr);
-})
+TrainerConfig::new(dataset)
+    .epoch_callback_policy(EpochCallbackPolicy::Rank(0));
 ```
-
-The callback receives `(epoch: usize, worker: &mut GpuWorker<M>)` and
-runs before the epoch's training begins. Available methods on `worker`:
-
-| Method | Description |
-|--------|-------------|
-| `worker.set_lr(f64)` | Set learning rate on this worker's optimizer |
-| `worker.current_epoch()` | Current epoch number (0-based) |
-| `worker.rank()` | This worker's rank |
-| `worker.device()` | This worker's CUDA device |
-| `worker.model()` | Reference to the concrete model |
-
-## Progressive dispatch
-
-By default, Cadence and Async modes use progressive dispatch: the
-coordinator sends work in small chunks rather than full epoch partitions.
-This lets the system adapt to throughput changes mid-epoch.
-
-```rust
-// Explicit control (auto for Cadence/Async)
-.progressive_dispatch(true)
-
-// Sync mode: disabled by default (full partitions upfront)
-.progressive_dispatch(false)
-```
-
-Progressive dispatch adds slight coordination overhead but gives better
-throughput on heterogeneous hardware where speed ratios may shift during
-training (thermal throttling, competing workloads).
 
 ## Quick reference
 
-### Types
+### `ElCheConfig` presets
 
-| Type | Description |
-|------|-------------|
-| `DdpHandle` | Orchestrator: spawns workers + coordinator |
-| `DdpBuilder` | Fluent builder for configuration |
-| `DdpRunConfig` | Configuration struct with builder methods |
-| `ApplyPolicy` | Sync / Cadence / Async |
-| `AverageBackend` | Nccl / Cpu |
-| `TrainedState` | Final params + buffers (CPU tensors) |
-| `EpochMetrics` | Aggregated metrics for one completed epoch |
-| `GpuWorker<M>` | Per-GPU worker (available in epoch_fn callback) |
-| `CheckpointFn<M>` | `Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>` |
-| `EpochFn<M>` | `Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>` |
+| Constructor | Mode |
+|---|---|
+| `ElCheConfig::nccl_sync()` | `NcclSync` |
+| `ElCheConfig::nccl_cadence()` | `NcclCadence` |
+| `ElCheConfig::nccl_async()` | `NcclAsync` (**default**) |
+| `ElCheConfig::cpu_sync()` | `CpuSync` |
+| `ElCheConfig::cpu_cadence()` | `CpuCadence` |
+| `ElCheConfig::cpu_async()` | `CpuAsync` (best-in-class on reference) |
 
-### DdpHandle methods
+### Knob cheat-sheet
 
-| Method | Description |
-|--------|-------------|
-| `Trainer::builder(model_fn, optim_fn, train_fn)` | Create builder |
-| `.join()` | Block until done, return TrainedState |
-| `.world_size()` | Number of GPUs |
-| `.devices()` | Device list |
-| `.poll_metrics()` | Non-blocking: return all pending EpochMetrics |
-| `.next_metrics()` | Blocking: return next EpochMetrics |
-| `.setup_monitor(&mut Monitor)` | Wire graph identity + config into monitor |
-| `.architecture_svg()` | Graph architecture SVG (if model is a Graph) |
+| Setter | Default | Effect |
+|---|---|---|
+| `.overhead_target(f)` | `0.10` | Target ratio `sync_ms / max(compute_ms)`. Lower → grow anchor sooner; higher → tolerate more sync overhead. Cadence/Async only. |
+| `.max_anchor(n)` | auto | Anchor growth ceiling. |
+| `.max_batch_diff(n)` | `None` | Cap on fastest-vs-slowest lead. `Some(0)` = strict lockstep. |
+| `.relax_up(true)` | `false` | Grow anchor by 1 on Stable verdict (in addition to overhead-tune proposals). |
+| `.partition_ratios([...])` | auto | Static split — Sync mode only. |
+| `.meta_controller(false)` | `true` | Opt out of LR-aware meta-controller. |
+| `.convergence_guard(g)` | `TrendGuard::new(0.05)` | `NoGuard`, `TrendGuard`, or `MsfGuard`. |
+| `.easgd_alpha(α)` | `None` | EASGD elastic blend — `CpuAsync` only. |
 
-### DdpRunConfig methods
+### Cluster launch
 
-| Method | Default | Description |
-|--------|---------|-------------|
-| `.with_overhead_target(f64)` | 0.10 | AllReduce overhead ceiling |
-| `.with_max_anchor(usize)` | 200 | Gradient staleness cap |
-| `.with_anchor(usize)` | 10 | Initial anchor count |
-| `.with_divergence_threshold(f64)` | 0.05 | Async mode threshold |
-| `.with_max_batch_diff(usize)` | None | Max batch lead |
-| `.with_checkpoint_every(usize)` | None | Checkpoint interval |
-| `.with_snapshot_timeout(u64)` | 5 | CPU averaging timeout (seconds) |
-| `.with_partition_ratios(Vec<f64>)` | None | Fixed per-rank data splits |
-| `.with_progressive_dispatch(bool)` | Auto | Stream work in small chunks |
+```bash
+fdl probe                  # single-host readiness
+fdl cluster probe          # multi-host readiness (SSHes each worker)
+fdl cluster <cmd>          # fan out
+FDL_ENV=cluster fdl <cmd>  # equivalent
+fdl nccl build             # build libnccl for LD_PRELOAD bridge (heterogeneous NCCL versions)
+```
 
 ---
 

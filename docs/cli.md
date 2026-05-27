@@ -82,6 +82,9 @@ name (or in some positions, after):
 | `-h`, `--help`   | Show help for the current command scope.                       |
 | `-V`, `--version`| Print the CLI version.                                         |
 | `--env <name>`   | Apply `fdl.<name>.yml` overlay on top of `fdl.yml`.            |
+| `--gpus <spec>`  | Scope GPU visibility for the dispatched command. `all` (every visible device) or comma-separated indices (`0,1`). On cluster-aware commands, synthesizes a single-host cluster envelope; on non-cluster commands, sets `CUDA_VISIBLE_DEVICES` for the child. See [`fdl --gpus`](#fdl---gpus). |
+| `--no-prebuild`  | Skip the cluster fan-out pre-flight build (`fdl @cluster <cmd>` and any `cluster: true` command). Use when binaries are known fresh, or when iterating on a build-only issue. |
+| `--no-append`    | Drop a `run:` command's `append:` suffix.                      |
 | `-v`             | Verbose output.                                                |
 | `-vv`            | Debug output.                                                  |
 | `-vvv`           | Trace output (maximum detail).                                 |
@@ -561,6 +564,161 @@ The JSON output is useful for CI pipelines and automated tooling:
 fdl diagnose --json | jq '.cuda.devices[] | .sm'
 ```
 
+### `fdl probe`
+
+Cluster readiness audit. Single-host (default) probes the local box;
+in cluster context (`fdl cluster probe` or `FDL_ENV=cluster fdl probe`)
+SSHes every host in `fdl.cluster.yml` and aggregates the report. Use
+it as a CI gate before launching multi-hour training runs.
+
+```bash
+fdl probe                       # local host: GPU + libtorch + NCCL + shared-data
+fdl cluster probe               # multi-host: SSHes each worker, aggregates
+fdl probe --json                # machine-readable for CI gating
+fdl cluster probe --json        # cluster JSON aggregate
+fdl probe --skip-mount          # skip shared-data-mount check on single-host setups
+fdl probe --data-path /flodl/data        # override the shared-data path
+fdl probe --libtorch-path /opt/libtorch  # override the libtorch directory
+fdl probe --docker cuda         # NCCL is provided by a Docker image (compose service)
+```
+
+Exit code: **0** when every checked component is green, **1** when
+any issue was surfaced. The green path is silent enough to use as a
+post-deploy smoke test.
+
+**What it checks:**
+
+- **GPU inventory**: count, name, sm version, VRAM per device (via
+  `nvidia-smi`, no libtorch context touched).
+- **libtorch variant**: active variant, version, CUDA version, arch
+  coverage, source (precompiled vs source-built).
+- **GPU/libtorch arch compatibility**: every visible GPU's sm version
+  is covered by the active libtorch's `archs:` metadata.
+- **NCCL availability**: host-level `libnccl.so` linkage, version. On
+  workers with `docker: <svc>` declared in `fdl.cluster.yml`, the
+  probe reports "via Docker image `<svc>`" instead of erroring on a
+  missing host-level libnccl.
+- **NCCL version skew (cluster mode)**: surfaces major.minor skew
+  across hosts — the common failure mode on heterogeneous rigs.
+  Resolution: [`fdl nccl build`](#fdl-nccl) to bridge.
+- **Shared-data path**: convention default `/flodl/data` (override via
+  `--data-path` or per-host `data_path:` in cluster.yml). Verifies
+  every host can see the same mount.
+- **`fdl.cluster.yml` schema**: warns on legacy keys (`master_addr`,
+  `master_port`, top-level `ssh_*` on workers).
+- **Dashboard port availability** (default 3000).
+
+Output splits results into warnings (informational; do not block) and
+errors (block dispatch). `fdl cluster <cmd>` runs `fdl probe`
+implicitly before fan-out unless `--no-probe` is set.
+
+### `fdl nccl`
+
+Build NVIDIA's `libnccl` from source. Required for heterogeneous-rig
+clusters when the bundled NCCL versions across hosts don't match (NCCL
+refuses handshake across major.minor skew). The build runs in a
+dedicated Docker context (`Dockerfile.nccl.source`) so no host-level
+NCCL/CUDA toolchain is required.
+
+```bash
+fdl nccl build                              # auto-detect target tag + local GPU archs
+fdl nccl build --tag v2.27.5                # explicit NCCL git tag
+fdl nccl build --archs "6.1;12.0"           # explicit archs (heterogeneous rig)
+fdl nccl build --jobs 8                     # parallel compilation jobs (default 6)
+fdl nccl build --dry-run                    # print build plan, do nothing
+```
+
+Auto-detection:
+
+- **Target NCCL tag**: read from the active libtorch variant's
+  `third_party/nccl` submodule version. Override with `--tag` for
+  pre-release or version-pinned builds.
+- **Archs**: from local GPUs (multi-arch builds supported, e.g.
+  `sm_61 + sm_120` for a Pascal + Blackwell rig).
+
+**Output path**: `libtorch/nccl/builds/v<version>-<archs>/lib/libnccl.so.2`.
+
+Wire it into a worker via the `env: LD_PRELOAD:` block in
+`fdl.cluster.yml`:
+
+```yaml
+workers:
+  - host: node-b
+    arch: builds/sm61-sm120
+    env:
+      LD_PRELOAD: /srv/flodl/libtorch/nccl/builds/v2.27.5-sm61/lib/libnccl.so.2
+```
+
+Build time: 5-15 minutes depending on CPU cores and arch count.
+
+### `fdl --gpus`
+
+Scope GPU visibility for a single command. Two forms:
+
+```bash
+fdl --gpus all <cmd>            # use every visible CUDA device
+fdl --gpus 0,1 <cmd>            # explicit physical indices
+```
+
+Behavior depends on the command kind:
+
+- **Cluster-aware commands** (`cluster: true` in `fdl.yml`, like
+  `ddp-bench`): N ≥ 2 GPUs trigger synthesis of a single-host
+  cluster envelope (loopback controller, one host with N ranks) and
+  process-per-rank fan-out via the standard launcher. N = 1
+  degenerates to a single-process run on that device.
+- **Non-cluster commands** (`test`, `clippy`, …): `--gpus` sets
+  `CUDA_VISIBLE_DEVICES` for the dispatched subprocess. No envelope
+  synthesis, no spawning.
+
+**Cluster context interaction**: on `fdl cluster <cmd>`, `--gpus`
+overrides per-worker `local_devices:` for the local controller host;
+remote workers continue to use their cluster.yml-declared devices.
+Loud-errors on duplicate, missing value, or invalid spec.
+
+```bash
+fdl --gpus 0 test                # CPU-style: scope tests to GPU 0
+fdl --gpus 0,1 ddp-bench --mode nccl-async    # synthesize 2-rank single-host cluster
+fdl --gpus all cluster ddp-bench --mode nccl-async   # override local host devices in cluster mode
+```
+
+### `fdl cluster <cmd>` — multi-host fan-out
+
+`fdl cluster <cmd>` is the first-arg form of the `cluster` env
+overlay. When `fdl.cluster.yml` exists alongside `fdl.yml`, it
+deep-merges as an overlay and triggers SSH fan-out for any command
+marked `cluster: true`.
+
+Three equivalent forms:
+
+```bash
+fdl cluster <cmd>            # first-arg form (when fdl.cluster.yml exists)
+FDL_ENV=cluster fdl <cmd>    # env-var form
+fdl --env cluster <cmd>      # explicit flag
+```
+
+**Pre-flight per-host build**: before fan-out, `fdl cluster <cmd>`
+auto-builds the target binary locally for every remote host. Per-host
+`CARGO_TARGET_DIR=target/cluster/<host>/`, libtorch resolved from
+each host's `arch:` declaration, CUDA feature derived from the host's
+GPU arch metadata. Builds run in parallel per host; first failure
+aborts fan-out. Remote dispatch invokes the prebuilt binary directly —
+no cargo, no rustc on remote.
+
+Pass `--no-prebuild` to skip the pre-flight phase (when binaries are
+known fresh, or when iterating on a build-only issue).
+
+**Heterogeneous-rig flow** (a Blackwell host + a Pascal VM, say):
+
+1. `fdl cluster probe` — confirm GPU + libtorch + NCCL match per host.
+2. `fdl nccl build` on the host with the older NCCL — produces a
+   matching `libnccl.so.2` to wire via `env: LD_PRELOAD:`.
+3. `fdl cluster <cmd>` — fan out.
+
+See [DDP Reference: Multi-host
+clusters](ddp.md#multi-host-clusters) for the `fdl.cluster.yml`
+schema and conventions.
+
 ### `fdl api-ref`
 
 Generate a structured API reference from the flodl source. Extracts all
@@ -1027,11 +1185,9 @@ training:
   epochs: 5
   seed: 42
 
-ddp:
-  policy: cadence
-  backend: nccl
-  divergence_threshold: 0.05
-  lr_scale_ratio: 1.0
+# Each `mode:` value below maps 1:1 to flodl's ElCheMode variants:
+# nccl-sync, nccl-cadence, nccl-async (default), cpu-sync, cpu-cadence, cpu-async.
+# Plus solo-N for single-GPU baselines (N = physical device index).
 
 commands:
   quick:
@@ -1058,15 +1214,13 @@ helper. `fdl <cmd> --help` splits them into an **Arguments** section
 placeholder via `arg-name:`) and a **Commands** section (real
 sub-commands with their own behaviour).
 
-The `ddp:` section maps 1:1 to flodl's `DdpConfig` / `DdpRunConfig`
-(`mode`, `policy`, `backend`, `anchor`, `max_anchor`, `overhead_target`,
-`divergence_threshold`, `max_batch_diff`, `speed_hint`,
-`partition_ratios`, `progressive`, `max_grad_norm`, `lr_scale_ratio`,
-`snapshot_timeout`, `checkpoint_every`, `timeline`). See
-[docs/design/run-config.md][run-config] for the full schema and merge
-semantics.
-
-[run-config]: design/run-config.md
+Preset `options:` entries map 1:1 to the binary's `#[derive(FdlArgs)]`
+shape — `mode`, `model`, `epochs`, `batch-size`, etc. The set of
+accepted `mode` values mirrors `ElCheMode` (six modes:
+`nccl-sync` / `nccl-cadence` / `nccl-async` / `cpu-sync` / `cpu-cadence` /
+`cpu-async`) plus the `solo-N` single-GPU baselines. See
+[DDP Reference: ElCheMode](ddp.md#elchemode--cadence--backend-in-one-name)
+for the mode semantics.
 
 ### `fdl config`
 

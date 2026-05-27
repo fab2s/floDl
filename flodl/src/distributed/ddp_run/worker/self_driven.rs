@@ -371,12 +371,21 @@ impl<M: Module> GpuWorker<M> {
                         convergence_guard.report(&report, cycle_batches, k_max);
                     match action {
                         ConvergenceAction::Stable => {
+                            // Commit any overhead-tune proposal, then
+                            // optionally relax_up on top.
+                            el_che.commit_proposed_anchor();
                             if elche_relax_up {
                                 el_che.relax_anchor_up();
                             }
                         }
-                        ConvergenceAction::SuppressGrowth => {}
+                        ConvergenceAction::SuppressGrowth => {
+                            // Veto growth; allow shrink (the safe
+                            // direction when divergence is rising).
+                            el_che.veto_proposed_growth();
+                        }
                         ConvergenceAction::NudgeDown { factor } => {
+                            // Drop the proposal; nudge supersedes.
+                            el_che.discard_proposed_anchor();
                             el_che.nudge_anchor_down(factor);
                         }
                     }
@@ -532,12 +541,16 @@ impl<M: Module> GpuWorker<M> {
                         convergence_guard.report(&report, cycle_batches, k_max);
                     match action {
                         ConvergenceAction::Stable => {
+                            el_che.commit_proposed_anchor();
                             if elche_relax_up {
                                 el_che.relax_anchor_up();
                             }
                         }
-                        ConvergenceAction::SuppressGrowth => {}
+                        ConvergenceAction::SuppressGrowth => {
+                            el_che.veto_proposed_growth();
+                        }
                         ConvergenceAction::NudgeDown { factor } => {
+                            el_che.discard_proposed_anchor();
                             el_che.nudge_anchor_down(factor);
                         }
                     }
@@ -720,12 +733,16 @@ impl<M: Module> GpuWorker<M> {
             let action = guard.report(&report, k_used, k_max);
             match action {
                 ConvergenceAction::Stable => {
+                    el_che.commit_proposed_anchor();
                     if elche_relax_up {
                         el_che.relax_anchor_up();
                     }
                 }
-                ConvergenceAction::SuppressGrowth => {}
+                ConvergenceAction::SuppressGrowth => {
+                    el_che.veto_proposed_growth();
+                }
                 ConvergenceAction::NudgeDown { factor } => {
+                    el_che.discard_proposed_anchor();
                     el_che.nudge_anchor_down(factor);
                 }
             }

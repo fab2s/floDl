@@ -359,6 +359,16 @@ if flodl::cuda_available() {
 }
 ```
 
+> **Note**: `cuda_device_count()` and `cuda_available()` initialize
+> libtorch's CUDA context as a side effect. That's safe in
+> single-process code or after `Trainer::run` has fanned out. If you
+> need a GPU count *before* `Trainer::run` (e.g. to log the topology
+> from `main()`), use `flodl::sys::detect_gpus()` instead — it shells
+> out to `nvidia-smi` without touching libtorch, so it won't poison
+> spawned children's CUDA contexts on multi-GPU rigs. See
+> [Multi-GPU Training](11-multi-gpu.md) for the "no CUDA before
+> `Trainer::run`" invariant.
+
 ### Non-blocking Device Transfer
 
 The default `to_device()` blocks until the transfer completes. For CPU-to-GPU

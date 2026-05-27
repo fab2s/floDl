@@ -227,26 +227,31 @@ pub type SchedulerFn = Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send
 /// every rank would multiply side effects (N file writes, N eval
 /// passes, etc.) for no benefit.
 ///
-/// Default is `Rank(0)`, matching the common research convention of
-/// running eval / save / log on rank 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Default is [`Self::Fastest`] — on heterogeneous rigs the fastest
+/// rank has the most idle time at sync barriers, so eval / save / log
+/// runs as free compute. On a single-GPU run the only rank is
+/// trivially the fastest, so `Fastest` collapses to running on that
+/// rank — no special-case needed. Pin to a specific rank with
+/// [`Self::Rank`] when the research convention demands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EpochCallbackPolicy {
-    /// Fire on the explicitly-named rank. Loud-errors at builder
-    /// validation if `n >= world_size`.
+    /// Fire on the explicitly-named **global rank** — the
+    /// cluster-wide rank index in `[0, world_size)`, where ranks are
+    /// assigned sequentially by worker order in the cluster topology
+    /// (worker 0 owns ranks `[0..N0)`, worker 1 owns `[N0..N0+N1)`,
+    /// etc.). On a 4-rank cluster across two 2-GPU hosts, `Rank(0)`
+    /// fires on the first rank of the first worker host, `Rank(3)`
+    /// fires on the last rank of the last host. Loud-errors at
+    /// builder validation if `n >= world_size`.
     Rank(usize),
     /// Fire on the rank with the lowest `smoothed_ms_per_batch`
     /// (controller-resolved via ElChe). Sticky within a run: the
     /// chosen rank is re-selected only on rank death. Honors
     /// heterogeneous-DDP intuition — fastest rank has the most idle
-    /// time at sync barriers, so callbacks are "free compute". Only
-    /// supported on the via_coord cluster path; loud-errors otherwise.
+    /// time at sync barriers, so callbacks are "free compute". On
+    /// single-GPU runs the only rank trivially satisfies "fastest".
+    #[default]
     Fastest,
-}
-
-impl Default for EpochCallbackPolicy {
-    fn default() -> Self {
-        Self::Rank(0)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +683,7 @@ impl DdpRunConfig {
             lr_scale_ratio: 1.0,
             elche_relax_up: false,
             easgd_alpha: None,
-            meta_controller: false,
+            meta_controller: true,
             save_path: None,
             max_failure: None,
             heartbeat_timeout_secs: None,

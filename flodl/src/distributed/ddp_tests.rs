@@ -499,6 +499,9 @@
         let bc = c.batch_counts().to_vec();
         c.report_timing(&[1000.0, 1000.0], &bc, 500.0);
 
+        // overhead-tune now proposes; commit to apply (Stable verdict).
+        c.commit_proposed_anchor();
+
         // overhead = 500/1000 = 0.50, target = 0.10
         // scale = 0.50/0.10 = 5.0 => new anchor = ceil(10 * 5) = 50
         assert_eq!(c.anchor(), 50);
@@ -520,6 +523,7 @@
             c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
         }
         c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
 
         // overhead = 400/1000 = 0.40, target = 0.10, scale = 4.0
         // new anchor = ceil(10 * 4) = 40
@@ -543,6 +547,7 @@
         // Extreme overhead: sync dominates.
         let bc = c.batch_counts().to_vec();
         c.report_timing(&[100.0, 100.0], &bc, 500.0);
+        c.commit_proposed_anchor();
 
         // Would want anchor=500 but capped at 30.
         assert_eq!(c.anchor(), 30);
@@ -558,6 +563,70 @@
         let bc = c.batch_counts().to_vec(); c.report_timing(&[1000.0, 1000.0], &bc, 5.0);
 
         assert_eq!(c.anchor(), 10); // no change
+    }
+
+    #[test]
+    fn test_overhead_proposal_committed_on_stable_verdict() {
+        // High-overhead trigger should propose a grow; commit applies it.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
+        }
+        // overhead = 500/1000 = 0.50, target = 0.10, scale = 5
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        // Before commit, anchor unchanged.
+        assert_eq!(c.anchor(), 10, "report_timing must not mutate anchor");
+        c.commit_proposed_anchor();
+        assert_eq!(c.anchor(), 50, "commit applies the proposal");
+    }
+
+    #[test]
+    fn test_overhead_grow_vetoed_on_suppress_growth() {
+        // Grow proposal + SuppressGrowth verdict → anchor stays put.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
+        }
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        c.veto_proposed_growth();
+        assert_eq!(c.anchor(), 10, "SuppressGrowth vetoes the grow proposal");
+    }
+
+    #[test]
+    fn test_overhead_shrink_applied_on_suppress_growth() {
+        // Shrink proposal + SuppressGrowth verdict → shrink still applies
+        // (shrink is the safe direction when divergence is rising).
+        let mut c = ElChe::new(2, 20)
+            .with_overhead_target(0.50)
+            .with_min_anchor(1);
+        // Prime to Stable with the starting anchor.
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+        }
+        // overhead = 5/1000 = 0.005, well below target * 0.5 = 0.25 → shrink by 1.
+        c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+        c.veto_proposed_growth();
+        assert_eq!(
+            c.anchor(),
+            19,
+            "SuppressGrowth still applies shrink (safe direction)"
+        );
+    }
+
+    #[test]
+    fn test_overhead_proposal_discarded_on_nudge_down() {
+        // Grow proposal + NudgeDown verdict → proposal dropped, nudge
+        // operates on the current (pre-proposal) anchor.
+        let mut c = ElChe::new(2, 20).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+        }
+        c.report_timing(&[1000.0, 1000.0], &[20, 20], 500.0);
+        // Proposal: grow to ceil(20 * 5.0) = 100. NudgeDown discards
+        // that and applies factor 0.5 to the current anchor (20).
+        c.discard_proposed_anchor();
+        c.nudge_anchor_down(0.5);
+        assert_eq!(c.anchor(), 10, "nudge halves the pre-proposal anchor");
     }
 
     #[test]
