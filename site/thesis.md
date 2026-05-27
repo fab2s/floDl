@@ -3,6 +3,7 @@ layout: page
 title: "The Trajectory Thesis"
 description: "Neural networks as trajectory generators through high-dimensional space. The geometric intuition behind flodl's architecture."
 permalink: /thesis
+last_modified_at: 2026-04-14T22:35:51+02:00
 ---
 
 # The Trajectory Thesis

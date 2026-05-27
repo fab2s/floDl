@@ -2,6 +2,7 @@
 layout: default
 title: DDP Benchmark
 description: "8 models, 8 DDP modes, 70 runs. Every mode converges. Heterogeneous GPUs (2.5x speed gap) train faster than the fast GPU alone."
+last_modified_at: 2026-04-28T21:22:12+02:00
 ---
 
 <section class="section">
@@ -259,7 +260,7 @@ description: "8 models, 8 DDP modes, 70 runs. Every mode converges. Heterogeneou
     </p>
 
     <div style="margin-top: 2rem;">
-<pre style="background: var(--bg-card, #1a1a2e); padding: 1rem; border-radius: 6px; font-size: 14px; overflow-x: auto;">
+<pre style="background: var(--bg-alt); padding: 1rem; border-radius: 6px; font-size: 14px; overflow-x: auto;">
 fdl ddp-bench full-sweep          # all models, all modes
 fdl ddp-bench --model resnet-graph --mode nccl-async --epochs 200
 fdl ddp-bench report              # generate markdown report

@@ -76,7 +76,7 @@
 :root[data-theme="light"] .theme-toggle .sun { display: none; }
 :root[data-theme="light"] .theme-toggle .moon { display: inline-block; }
 
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; overflow-x: hidden; }
 
 body {
   font-family: var(--font);
@@ -86,6 +86,8 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow-x: hidden;
+  max-width: 100vw;
 }
 
 a { color: var(--accent); text-decoration: none; transition: color 0.15s; }
@@ -136,7 +138,7 @@ a:hover { color: var(--cyan); }
 .nav-dropdown:hover > span, .nav-dropdown.active > span { color: var(--text); }
 .nav-dropdown-menu {
   display: none; position: absolute; top: 100%; left: -8px;
-  background: var(--bg-card, #1a1a2e); border: 1px solid var(--border, #333);
+  background: var(--card); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 0; min-width: 180px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 100;
 }
@@ -829,9 +831,11 @@ a:hover { color: var(--cyan); }
 
 .footer-links {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
-  gap: 24px;
+  gap: 12px 20px;
   margin-bottom: 12px;
+  padding: 0 16px;
 }
 
 /* ── Syntax highlighting (Rouge) ────────────────── */
@@ -1121,3 +1125,51 @@ a:hover { color: var(--cyan); }
 }
 
 .post-nav a:hover { color: var(--accent); }
+
+/* ── Mobile safety: code blocks + tables ───────────── */
+
+/* Long lines in any <pre> scroll horizontally instead of pushing the
+   page wider. Width:100% + box-sizing:border-box forces the pre to its
+   parent's content width (some browsers leave width:auto sized to content
+   for <pre> with white-space: pre, which is why max-width:100% alone
+   wasn't enough). */
+pre {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Grid + block children default to min-width: auto and refuse to shrink
+   below content width — without min-width:0, one long line forces the
+   parent (and therefore the page) wider than the viewport. */
+.wyg-card, .showcase, .feature, .terminal, .bench-table, .section { min-width: 0; }
+
+/* `align-items: stretch` on body's flex column doesn't reliably shrink
+   sections whose intrinsic content is wider than the container, even
+   with min-width:0. Force explicit width:100% to anchor sections to
+   body width regardless of inner content. max-width:1120 still caps
+   on desktop via the existing .section rule. */
+body > section, body > hr, body > header, body > footer {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.bench-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+@media (max-width: 700px) {
+  /* Inline <code> tokens with internal spaces (e.g. "FDL_ENV=ci fdl test")
+     wrap as unbreakable units in most browsers and push paragraphs past
+     viewport. Force break opportunities anywhere inside code. */
+  code { overflow-wrap: anywhere; word-break: break-word; }
+
+  .bench-table table { min-width: 480px; }
+  .content table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}

@@ -3,6 +3,7 @@ layout: page
 title: "Out of the Cave"
 description: "What it feels like to leave the dark of opaque training behind, and keep walking out every day."
 permalink: /out-of-the-cave
+last_modified_at: 2026-04-28T21:22:12+02:00
 ---
 
 # Out of the Cave

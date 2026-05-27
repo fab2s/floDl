@@ -15,6 +15,7 @@ Run before Jekyll: python3 site/build_guide.py
 
 import os
 import re
+import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -131,6 +132,31 @@ def strip_source_from_frontmatter(frontmatter):
     return "".join(l for l in lines if not l.strip().startswith("source:"))
 
 
+def git_last_modified(path):
+    """ISO-8601 timestamp of the last commit touching `path`, or None if not in git."""
+    try:
+        out = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cI", "--", path],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return out or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def inject_last_modified(frontmatter, iso_ts):
+    """Insert (or replace) `last_modified_at:` in a `---\\n…\\n---\\n` block."""
+    lines = frontmatter.splitlines(keepends=True)
+    lines = [l for l in lines if not l.strip().startswith("last_modified_at:")]
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == "---":
+            lines.insert(i, f"last_modified_at: {iso_ts}\n")
+            break
+    return "".join(lines)
+
+
 def main():
     if not os.path.isdir(STUBS_DIR):
         print(f"error: {STUBS_DIR} not found", file=sys.stderr)
@@ -161,6 +187,10 @@ def main():
         content = rewrite_links(content)
         content = strip_trailing_nav(content)
         clean_frontmatter = strip_source_from_frontmatter(frontmatter)
+
+        lastmod = git_last_modified(source_path)
+        if lastmod:
+            clean_frontmatter = inject_last_modified(clean_frontmatter, lastmod)
 
         output_path = os.path.join(GUIDE_DIR, filename)
         with open(output_path, "w") as f:
