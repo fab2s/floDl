@@ -456,23 +456,63 @@ fn emit_bash(data: &CompletionData) -> String {
     let mut s = String::new();
     s.push_str("# fdl bash completion (generated)\n");
     s.push_str("# eval \"$(fdl completions bash)\"\n");
+    // Helper: walk up from $PWD looking for fdl.yml, then enumerate
+    // sibling fdl.<env>.yml overlays. Runtime detection (not embedded
+    // at generation time) so the same eval'd script works across
+    // projects and across project edits without re-installing.
+    s.push_str("__fdl_find_envs() {\n");
+    s.push_str("    local _dir=\"$PWD\" _f _n\n");
+    s.push_str("    while :; do\n");
+    s.push_str("        if [[ -f \"$_dir/fdl.yml\" ]]; then\n");
+    s.push_str("            for _f in \"$_dir\"/fdl.*.yml; do\n");
+    s.push_str("                [[ -f \"$_f\" ]] || continue\n");
+    s.push_str("                _n=\"${_f##*/fdl.}\"\n");
+    s.push_str("                _n=\"${_n%.yml}\"\n");
+    // Skip empty (bare fdl.yml) and multi-dot names (e.g. fdl.foo.bar.yml).
+    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && printf '%s\\n' \"$_n\"\n");
+    s.push_str("            done\n");
+    s.push_str("            return\n");
+    s.push_str("        fi\n");
+    s.push_str("        [[ \"$_dir\" == \"/\" ]] && return\n");
+    s.push_str("        _dir=\"$(dirname \"$_dir\")\"\n");
+    s.push_str("    done\n");
+    s.push_str("}\n");
     s.push_str("_fdl_completions() {\n");
-    s.push_str("    local cur prev cmd\n");
+    s.push_str("    local cur prev cmd cword env_offset _fdl_envs\n");
     s.push_str("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
     s.push_str("    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n");
-    s.push_str("    cmd=\"${COMP_WORDS[1]}\"\n");
+    s.push('\n');
+    // Env-overlay first-arg shift: `fdl <env> <cmd> ...` treats <env>
+    // as an overlay selector (matches a sibling fdl.<env>.yml file).
+    // When detected, position checks shift by one and `cmd` advances
+    // to the next slot.
+    s.push_str("    _fdl_envs=\" $(__fdl_find_envs | tr '\\n' ' ') \"\n");
+    s.push_str("    env_offset=0\n");
+    s.push_str("    if [[ ${#COMP_WORDS[@]} -gt 1 && \"$_fdl_envs\" == *\" ${COMP_WORDS[1]} \"* ]]; then\n");
+    s.push_str("        env_offset=1\n");
+    s.push_str("    fi\n");
+    s.push_str("    cmd=\"${COMP_WORDS[$((1 + env_offset))]}\"\n");
+    s.push_str("    cword=$((COMP_CWORD - env_offset))\n");
     s.push('\n');
 
-    // Position 1: top-level.
+    // Position 1 (command slot, after the optional env): top-level
+    // commands + flags. Envs are added too when env_offset == 0; once
+    // an env is consumed, only commands are valid in this slot.
     let top = join_for_shell(&data.top_level);
     let top_with_flags = format!(
         "{top} {}",
         TOP_FLAGS.join(" ")
     );
-    s.push_str("    if [[ $COMP_CWORD -eq 1 ]]; then\n");
+    s.push_str("    if [[ $cword -eq 1 ]]; then\n");
+    s.push_str("        if [[ $env_offset -eq 0 ]]; then\n");
     s.push_str(&format!(
-        "        COMPREPLY=($(compgen -W \"{top_with_flags}\" -- \"$cur\"))\n"
+        "            COMPREPLY=($(compgen -W \"{top_with_flags}${{_fdl_envs}}\" -- \"$cur\"))\n"
     ));
+    s.push_str("        else\n");
+    s.push_str(&format!(
+        "            COMPREPLY=($(compgen -W \"{top_with_flags}\" -- \"$cur\"))\n"
+    ));
+    s.push_str("        fi\n");
     s.push_str("        return\n");
     s.push_str("    fi\n");
 
@@ -524,7 +564,7 @@ fn emit_bash(data: &CompletionData) -> String {
         let positional_tokens = cmd.first_positional_tokens();
         let positionals_str = positional_tokens.join(" ");
 
-        s.push_str("        if [[ $COMP_CWORD -eq 2 ]]; then\n");
+        s.push_str("        if [[ $cword -eq 2 ]]; then\n");
         if positional_tokens.is_empty() {
             s.push_str(&format!(
                 "            COMPREPLY=($(compgen -W \"{cmd_flags_str}\" -- \"$cur\"))\n"
@@ -545,13 +585,14 @@ fn emit_bash(data: &CompletionData) -> String {
     }
 
     // Nested built-ins first. Each block keys on `$cmd == <parent>` and
-    // `COMP_WORDS[2] == <child>`, so value-aware rules (e.g. `--cuda`
-    // → `12.6 12.8`) fire before the single-level catch-all below.
+    // the post-env child-slot == <child>, so value-aware rules (e.g.
+    // `--cuda` → `12.6 12.8`) fire before the single-level catch-all
+    // below.
     for b in data.builtins.iter().filter(|b| b.path.len() == 2) {
         let parent = &b.path[0];
         let child = &b.path[1];
         s.push_str(&format!(
-            "\n    if [[ \"$cmd\" == \"{parent}\" && \"${{COMP_WORDS[2]}}\" == \"{child}\" && $COMP_CWORD -ge 3 ]]; then\n"
+            "\n    if [[ \"$cmd\" == \"{parent}\" && \"${{COMP_WORDS[$((2 + env_offset))]}}\" == \"{child}\" && $cword -ge 3 ]]; then\n"
         ));
         s.push_str("        case \"$prev\" in\n");
         for opt in &b.options {
@@ -601,7 +642,7 @@ fn emit_bash(data: &CompletionData) -> String {
         // beyond the command name).
         if b.options.iter().any(|o| o.takes_value) {
             s.push_str(&format!(
-                "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -ge 2 ]]; then\n"
+                "\n    if [[ \"$cmd\" == \"{name}\" && $cword -ge 2 ]]; then\n"
             ));
             s.push_str("        case \"$prev\" in\n");
             for opt in &b.options {
@@ -631,7 +672,7 @@ fn emit_bash(data: &CompletionData) -> String {
         }
 
         s.push_str(&format!(
-            "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -eq 2 ]]; then\n"
+            "\n    if [[ \"$cmd\" == \"{name}\" && $cword -eq 2 ]]; then\n"
         ));
         let mut position2_words: Vec<String> = b.sub_commands.clone();
         if has_opts {
@@ -650,7 +691,7 @@ fn emit_bash(data: &CompletionData) -> String {
 
         if has_opts {
             s.push_str(&format!(
-                "\n    if [[ \"$cmd\" == \"{name}\" && $COMP_CWORD -ge 3 ]]; then\n"
+                "\n    if [[ \"$cmd\" == \"{name}\" && $cword -ge 3 ]]; then\n"
             ));
             s.push_str(&format!(
                 "        COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))\n",
@@ -677,8 +718,26 @@ fn emit_zsh(data: &CompletionData) -> String {
     s.push_str("#compdef fdl\n");
     s.push_str("# fdl zsh completion (generated)\n");
     s.push_str("# eval \"$(fdl completions zsh)\"\n");
+    // Helper: walk up from $PWD looking for fdl.yml, then enumerate
+    // sibling fdl.<env>.yml overlays. Runtime detection so a single
+    // installed completion script works across projects and edits.
+    s.push_str("__fdl_find_envs() {\n");
+    s.push_str("    local _dir=\"$PWD\" _f _n\n");
+    s.push_str("    while :; do\n");
+    s.push_str("        if [[ -f \"$_dir/fdl.yml\" ]]; then\n");
+    s.push_str("            for _f in \"$_dir\"/fdl.*.yml(N); do\n");
+    s.push_str("                _n=\"${_f##*/fdl.}\"\n");
+    s.push_str("                _n=\"${_n%.yml}\"\n");
+    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && print -- \"$_n\"\n");
+    s.push_str("            done\n");
+    s.push_str("            return\n");
+    s.push_str("        fi\n");
+    s.push_str("        [[ \"$_dir\" == \"/\" ]] && return\n");
+    s.push_str("        _dir=\"${_dir:h}\"\n");
+    s.push_str("    done\n");
+    s.push_str("}\n");
     s.push_str("_fdl() {\n");
-    s.push_str("    local -a commands\n");
+    s.push_str("    local -a commands envs\n");
     let top_level_with_flags = {
         let mut v: Vec<String> = data.top_level.clone();
         for f in TOP_FLAGS {
@@ -690,14 +749,27 @@ fn emit_zsh(data: &CompletionData) -> String {
         "    commands=({})\n",
         top_level_with_flags.join(" ")
     ));
+    s.push_str("    envs=(${(f)\"$(__fdl_find_envs)\"})\n");
+    s.push('\n');
+    // Env-overlay first-arg shift: `fdl <env> <cmd> ...`. When
+    // $words[2] matches a discovered env, shift positions by one so
+    // every subsequent check sees the same indices as the no-env case.
+    s.push_str("    local env_offset=0\n");
+    s.push_str("    if (( ${#words} >= 2 )) && (( ${envs[(I)$words[2]]} )); then\n");
+    s.push_str("        env_offset=1\n");
+    s.push_str("    fi\n");
+    s.push_str("    local cword=$((CURRENT - env_offset))\n");
     s.push('\n');
 
-    s.push_str("    if (( CURRENT == 2 )); then\n");
+    s.push_str("    if (( cword == 2 )); then\n");
+    s.push_str("        if (( env_offset == 0 )) && (( ${#envs} > 0 )); then\n");
+    s.push_str("            _describe 'env overlay' envs\n");
+    s.push_str("        fi\n");
     s.push_str("        _describe 'command' commands\n");
     s.push_str("        return\n");
     s.push_str("    fi\n");
 
-    s.push_str("\n    case $words[2] in\n");
+    s.push_str("\n    case $words[$((2 + env_offset))] in\n");
     for cmd in &data.commands {
         s.push_str(&format!("        {name})\n", name = cmd.name));
 
@@ -741,11 +813,11 @@ fn emit_zsh(data: &CompletionData) -> String {
         all_flags.push("-h".into());
         let flags_joined = all_flags.join(" ");
 
-        // Position 3: first-positional candidates. Presets carry
-        // descriptions (zsh can render them via `name:desc` pairs),
-        // real sub-commands do not.
+        // Position 3 (env-shifted): first-positional candidates.
+        // Presets carry descriptions (zsh can render them via
+        // `name:desc` pairs), real sub-commands do not.
         if !cmd.presets.is_empty() || !cmd.sub_commands.is_empty() {
-            s.push_str("            if (( CURRENT == 3 )); then\n");
+            s.push_str("            if (( cword == 3 )); then\n");
             if !cmd.presets.is_empty() {
                 s.push_str("                local -a presets\n");
                 let pairs: Vec<String> = cmd
@@ -824,7 +896,7 @@ fn emit_zsh(data: &CompletionData) -> String {
         }
 
         if has_subs {
-            s.push_str("            if (( CURRENT == 3 )); then\n");
+            s.push_str("            if (( cword == 3 )); then\n");
             s.push_str("                local -a subcmds\n");
             s.push_str(&format!(
                 "                subcmds=({})\n",
@@ -833,14 +905,14 @@ fn emit_zsh(data: &CompletionData) -> String {
             s.push_str("                _describe 'subcommand' subcmds\n");
             s.push_str("            fi\n");
 
-            // Nested flag/value rules: dispatch on $words[3].
+            // Nested flag/value rules: dispatch on the env-shifted child slot.
             let nested: Vec<&BuiltinCommandData> = data
                 .builtins
                 .iter()
                 .filter(|n| n.path.len() == 2 && n.path[0] == *name)
                 .collect();
             if !nested.is_empty() {
-                s.push_str("            case $words[3] in\n");
+                s.push_str("            case $words[$((3 + env_offset))] in\n");
                 for nb in nested {
                     let child = &nb.path[1];
                     s.push_str(&format!("                {child})\n"));
@@ -914,11 +986,85 @@ fn emit_fish(data: &CompletionData) -> String {
     s.push_str("# fdl completions fish | source\n");
     s.push_str("complete -c fdl -f\n\n");
 
-    // Top-level commands available when no sub-command chosen yet.
-    s.push_str("# Top-level commands\n");
+    // Helper: walk up from $PWD looking for fdl.yml, then list sibling
+    // fdl.<env>.yml overlays. Runtime detection so the script works
+    // across projects and project edits without re-installing.
+    s.push_str("function __fdl_find_envs\n");
+    s.push_str("    set -l _dir $PWD\n");
+    s.push_str("    while true\n");
+    s.push_str("        if test -f \"$_dir/fdl.yml\"\n");
+    s.push_str("            for _f in \"$_dir\"/fdl.*.yml\n");
+    s.push_str("                test -f \"$_f\"; or continue\n");
+    s.push_str("                set -l _n (string replace -r '^.*/fdl\\.' '' -- $_f)\n");
+    s.push_str("                set _n (string replace -r '\\.yml$' '' -- $_n)\n");
+    s.push_str("                if test -n \"$_n\"; and not string match -q '*.*' -- \"$_n\"\n");
+    s.push_str("                    echo $_n\n");
+    s.push_str("                end\n");
+    s.push_str("            end\n");
+    s.push_str("            return\n");
+    s.push_str("        end\n");
+    s.push_str("        test \"$_dir\" = '/'; and return\n");
+    s.push_str("        set _dir (dirname \"$_dir\")\n");
+    s.push_str("    end\n");
+    s.push_str("end\n\n");
+
+    // Helper: walk the pre-cursor tokens, skip "fdl" and an optional
+    // env at position 2 (matching the `fdl <env> <cmd>` first-arg
+    // convention), return the command token. Empty when the user
+    // hasn't typed past the env / fdl yet.
+    s.push_str("function __fdl_active_command\n");
+    s.push_str("    set -l toks (commandline -opc)\n");
+    s.push_str("    set -l idx 2\n");
+    s.push_str("    if test (count $toks) -ge 2\n");
+    s.push_str("        set -l envs (__fdl_find_envs)\n");
+    s.push_str("        if contains -- $toks[2] $envs\n");
+    s.push_str("            set idx 3\n");
+    s.push_str("        end\n");
+    s.push_str("    end\n");
+    s.push_str("    if test (count $toks) -ge $idx\n");
+    s.push_str("        echo $toks[$idx]\n");
+    s.push_str("    end\n");
+    s.push_str("end\n\n");
+
+    // Helper: return the sub-command token (one past the active
+    // command). Used for nested-builtin rules like `libtorch download`.
+    s.push_str("function __fdl_active_subcommand\n");
+    s.push_str("    set -l toks (commandline -opc)\n");
+    s.push_str("    set -l idx 3\n");
+    s.push_str("    if test (count $toks) -ge 2\n");
+    s.push_str("        set -l envs (__fdl_find_envs)\n");
+    s.push_str("        if contains -- $toks[2] $envs\n");
+    s.push_str("            set idx 4\n");
+    s.push_str("        end\n");
+    s.push_str("    end\n");
+    s.push_str("    if test (count $toks) -ge $idx\n");
+    s.push_str("        echo $toks[$idx]\n");
+    s.push_str("    end\n");
+    s.push_str("end\n\n");
+
+    // Predicate: true when we're at the command slot (either fresh
+    // start with no command typed, or right after an env name has been
+    // consumed). The env-aware mirror of fish's built-in
+    // `__fish_use_subcommand`.
+    s.push_str("function __fdl_at_command_position\n");
+    s.push_str("    test -z (__fdl_active_command)\n");
+    s.push_str("end\n\n");
+
+    // Top-level surface.
+    // - Env names: position 1 only (no env-chaining), so keep on
+    //   `__fish_use_subcommand`.
+    // - Commands: fire at both fresh-start AND post-env via
+    //   `__fdl_at_command_position`.
+    // - Top-level flags (--help, --version, --env, ...): only valid
+    //   before any command, so `__fish_use_subcommand`.
+    s.push_str("# Top-level\n");
+    s.push_str(
+        "complete -c fdl -n '__fish_use_subcommand' -a '(__fdl_find_envs)' \
+         -d 'env overlay'\n",
+    );
     for word in &data.top_level {
         s.push_str(&format!(
-            "complete -c fdl -n '__fish_use_subcommand' -a '{word}'\n"
+            "complete -c fdl -n '__fdl_at_command_position' -a '{word}'\n"
         ));
     }
     for flag in TOP_FLAGS {
@@ -934,10 +1080,19 @@ fn emit_fish(data: &CompletionData) -> String {
     }
     s.push('\n');
 
-    // Sub-command-specific completions.
+    // Sub-command-specific completions. Every per-command rule
+    // predicates on `__fdl_active_command` so it fires correctly under
+    // both `fdl <cmd>` and `fdl <env> <cmd>` (and won't false-positive
+    // on weird command lines where the name appears later as an
+    // option value, the way `__fish_seen_subcommand_from` would).
+    //
+    // Uses `contains` instead of `test ... = ...` so an empty
+    // `__fdl_active_command` (no command typed yet) cleanly evaluates
+    // to false instead of erroring with "missing argument" at the
+    // `test` site.
     for cmd in &data.commands {
         s.push_str(&format!("# {name}\n", name = cmd.name));
-        let cond = format!("__fish_seen_subcommand_from {}", cmd.name);
+        let cond = format!("contains -- {} (__fdl_active_command)", cmd.name);
 
         for (name, desc) in &cmd.presets {
             let safe = desc
@@ -994,10 +1149,9 @@ fn emit_fish(data: &CompletionData) -> String {
     }
 
     // Built-in sub-command listings (parent entries) and their nested
-    // flag rules. Fish's `__fish_seen_subcommand_from` matches any of
-    // the listed words anywhere on the line, which is loose but
-    // adequate here: the combined predicate "parent seen AND child
-    // seen" pins down each nested path.
+    // flag rules. `__fdl_active_command` / `__fdl_active_subcommand`
+    // pin the rule to the exact command + sub-command being typed,
+    // regardless of whether an env prefix was used.
     for b in data.builtins.iter().filter(|b| b.path.len() == 1) {
         let name = &b.path[0];
         let has_subs = !b.sub_commands.is_empty();
@@ -1006,18 +1160,19 @@ fn emit_fish(data: &CompletionData) -> String {
             continue;
         }
         s.push_str(&format!("# {}\n", b.joined_path()));
+        let parent_cond = format!("contains -- {name} (__fdl_active_command)");
 
         if has_subs {
             for sub in &b.sub_commands {
                 s.push_str(&format!(
-                    "complete -c fdl -n '__fish_seen_subcommand_from {name}' -a '{sub}'\n"
+                    "complete -c fdl -n '{parent_cond}' -a '{sub}'\n"
                 ));
             }
         }
 
         if has_opts {
             for opt in &b.options {
-                emit_fish_option_line(&mut s, &format!("__fish_seen_subcommand_from {name}"), opt);
+                emit_fish_option_line(&mut s, &parent_cond, opt);
             }
         }
     }
@@ -1030,7 +1185,8 @@ fn emit_fish(data: &CompletionData) -> String {
         let child = &b.path[1];
         s.push_str(&format!("# {} {}\n", parent, child));
         let cond = format!(
-            "__fish_seen_subcommand_from {parent}; and __fish_seen_subcommand_from {child}"
+            "contains -- {parent} (__fdl_active_command); \
+             and contains -- {child} (__fdl_active_subcommand)"
         );
         for opt in &b.options {
             emit_fish_option_line(&mut s, &cond, opt);
@@ -1321,9 +1477,9 @@ mod tests {
         let bash = emit_bash(&data);
         assert!(
             bash.contains(
-                r#"if [[ "$cmd" == "libtorch" && "${COMP_WORDS[2]}" == "download""#
+                r#"if [[ "$cmd" == "libtorch" && "${COMP_WORDS[$((2 + env_offset))]}" == "download""#
             ),
-            "bash must guard nested libtorch download block; got:\n{bash}"
+            "bash must guard nested libtorch download block (env-offset-aware); got:\n{bash}"
         );
         assert!(
             bash.contains("--cpu --cuda --path --no-activate --dry-run --help -h")
@@ -1336,9 +1492,10 @@ mod tests {
         let fish = emit_fish(&data);
         assert!(
             fish.contains(
-                "__fish_seen_subcommand_from libtorch; and __fish_seen_subcommand_from download"
+                "contains -- libtorch (__fdl_active_command); \
+                 and contains -- download (__fdl_active_subcommand)"
             ),
-            "fish must combine parent+child predicates for nested rules; got:\n{fish}"
+            "fish must combine parent+child active-command predicates for nested rules; got:\n{fish}"
         );
     }
 
@@ -1380,6 +1537,140 @@ mod tests {
         assert!(
             bash.contains("--check") && bash.contains("--dev") && bash.contains("-h"),
             "install flag set must survive the refactor"
+        );
+    }
+
+    /// Env-overlay first-arg shift: `fdl <env> <cmd>` must autocomplete.
+    /// The generated bash script must (a) ship a runtime env discoverer,
+    /// (b) compute env_offset from $COMP_WORDS[1], (c) shift cmd + cword,
+    /// and (d) include detected envs in the position-1 word list.
+    #[test]
+    fn bash_emits_env_offset_shift_machinery() {
+        let data = CompletionData::from_project(None);
+        let bash = emit_bash(&data);
+        // Runtime env discovery helper.
+        assert!(
+            bash.contains("__fdl_find_envs()"),
+            "bash must define __fdl_find_envs runtime helper; got:\n{bash}"
+        );
+        // Glob pattern that catches fdl.<env>.yml without matching fdl.yml itself.
+        assert!(
+            bash.contains("\"$_dir\"/fdl.*.yml"),
+            "bash env helper must glob fdl.*.yml siblings"
+        );
+        // env_offset computation.
+        assert!(
+            bash.contains("env_offset=0")
+                && bash.contains("env_offset=1")
+                && bash.contains(r#""$_fdl_envs" == *" ${COMP_WORDS[1]} "*"#),
+            "bash must compute env_offset from COMP_WORDS[1]; got:\n{bash}"
+        );
+        // cmd + cword shift.
+        assert!(
+            bash.contains(r#"cmd="${COMP_WORDS[$((1 + env_offset))]}""#),
+            "bash must shift cmd by env_offset"
+        );
+        assert!(
+            bash.contains("cword=$((COMP_CWORD - env_offset))"),
+            "bash must shift cword by env_offset"
+        );
+        // Position-1 word list pulls in envs when env_offset == 0.
+        assert!(
+            bash.contains("${_fdl_envs}"),
+            "bash must include detected envs in the top-level word list"
+        );
+    }
+
+    /// Same expectation on zsh: env_offset machinery + position-3
+    /// dispatch on the env-shifted slot.
+    #[test]
+    fn zsh_emits_env_offset_shift_machinery() {
+        let data = CompletionData::from_project(None);
+        let zsh = emit_zsh(&data);
+        assert!(
+            zsh.contains("__fdl_find_envs()"),
+            "zsh must define __fdl_find_envs"
+        );
+        assert!(
+            zsh.contains("envs=(${(f)\"$(__fdl_find_envs)\"})"),
+            "zsh must populate envs array from helper"
+        );
+        assert!(
+            zsh.contains("local env_offset=0"),
+            "zsh must declare env_offset"
+        );
+        assert!(
+            zsh.contains("${envs[(I)$words[2]]}"),
+            "zsh must test $words[2] against envs"
+        );
+        assert!(
+            zsh.contains("local cword=$((CURRENT - env_offset))"),
+            "zsh must compute cword from env_offset"
+        );
+        assert!(
+            zsh.contains("case $words[$((2 + env_offset))] in"),
+            "zsh top-level dispatch must use env-shifted slot"
+        );
+    }
+
+    /// Fish goes all-in with approach (b): runtime helpers that walk
+    /// the in-progress tokens, skip "fdl" and an optional env at
+    /// position 2, and return the active command + sub-command tokens.
+    /// Every per-command predicate switches from the loose
+    /// `__fish_seen_subcommand_from` to the precise
+    /// `test (__fdl_active_command) = '<name>'`, so rules fire
+    /// identically with or without an env prefix and don't
+    /// false-positive on weird command lines.
+    #[test]
+    fn fish_emits_env_aware_active_command_machinery() {
+        let data = CompletionData::from_project(None);
+        let fish = emit_fish(&data);
+
+        // The three runtime helpers.
+        assert!(
+            fish.contains("function __fdl_find_envs"),
+            "fish must define __fdl_find_envs function"
+        );
+        assert!(
+            fish.contains("function __fdl_active_command"),
+            "fish must define __fdl_active_command function"
+        );
+        assert!(
+            fish.contains("function __fdl_active_subcommand"),
+            "fish must define __fdl_active_subcommand function"
+        );
+        assert!(
+            fish.contains("function __fdl_at_command_position"),
+            "fish must define __fdl_at_command_position predicate"
+        );
+
+        // Env names surface at top level (fresh-start only).
+        assert!(
+            fish.contains(
+                "complete -c fdl -n '__fish_use_subcommand' -a '(__fdl_find_envs)' -d 'env overlay'"
+            ),
+            "fish must surface env names at the top level via __fish_use_subcommand"
+        );
+
+        // Top-level commands use __fdl_at_command_position (fires both
+        // at fresh start AND after an env was consumed).
+        assert!(
+            fish.contains("complete -c fdl -n '__fdl_at_command_position' -a 'install'")
+                || fish.contains("complete -c fdl -n '__fdl_at_command_position' -a 'libtorch'"),
+            "fish top-level commands must predicate on __fdl_at_command_position; got:\n{fish}"
+        );
+
+        // Per-command rules use `contains -- <name> (__fdl_active_command)`
+        // (empty-safe vs `test ... = ...` when no command is typed yet).
+        assert!(
+            fish.contains("contains -- libtorch (__fdl_active_command)"),
+            "fish per-command rules must use `contains` against __fdl_active_command"
+        );
+
+        // Old loose predicate must NOT appear anywhere.
+        assert!(
+            !fish.contains("__fish_seen_subcommand_from"),
+            "fish must no longer use __fish_seen_subcommand_from (replaced by env-aware active-command helpers)"
         );
     }
 }

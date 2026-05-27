@@ -27,6 +27,37 @@ fn is_cluster_launcher() -> bool {
         && std::env::var_os("FLODL_CLUSTER_JSON").is_none()
 }
 
+/// Whether this process is a cluster rank child (slim envelope + rank
+/// slot set). Means the production via_coord path is engaged:
+/// `flodl::Trainer::builder().run()` resolves `Role::Rank`, training
+/// flows through `cluster_worker` → controller → `cluster_coordinator`
+/// (where Fastest dispatcher + checkpoint retry + role failover live).
+///
+/// Returns false on the launcher process (full envelope only) and on
+/// standalone single-host runs (neither envelope).
+fn is_cluster_rank() -> bool {
+    std::env::var_os("FLODL_CLUSTER_JSON").is_some()
+        && std::env::var_os("FLODL_LOCAL_RANK").is_some()
+}
+
+/// One-line role banner for operator visibility. Printed once per run
+/// at the top of [`run_combo`]; tells the operator at a glance which
+/// dispatch path is exercising the run, so a "this should have gone
+/// through cluster_coordinator" question has an immediate answer in
+/// the captured stderr.
+fn role_banner() -> String {
+    if is_cluster_launcher() {
+        "role=launcher (fan-out, no training body)".to_string()
+    } else if is_cluster_rank() {
+        let slot = std::env::var("FLODL_LOCAL_RANK").unwrap_or_else(|_| "?".to_string());
+        format!(
+            "role=rank slot={slot} (via_coord → cluster_coordinator)",
+        )
+    } else {
+        "role=single-device (no cluster envelope)".to_string()
+    }
+}
+
 /// Reports a fixed `len()` and refuses `get_batch`. Substituted for the
 /// real dataset on the cluster-mode launcher process, where the
 /// framework needs `total_samples` to build the coord config but never
@@ -84,6 +115,13 @@ pub struct RunResult {
 /// Run a single (model, mode) combination.
 pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Result<RunResult> {
     let mode_str = mode.to_string();
+
+    // Operator-visible dispatch banner: confirms which path is engaged
+    // (launcher / rank / single-device) so anyone glancing at captured
+    // stderr can verify the production cluster_coordinator path is
+    // actually being exercised on multi-GPU runs.
+    eprintln!("ddp-bench: {}", role_banner());
+
     let run_dir = format!("{}/{}/{}", config.output_dir, model_def.name, mode_str);
     // Shared-storage directory setup is the controller's job. The
     // launcher / single-host process creates `run_dir` once; worker
