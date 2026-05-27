@@ -280,7 +280,7 @@ fn parse_epoch_callback_policy(
     )))
 }
 
-/// Parse `--partition-ratios "0.55,0.225,0.225"` into a Vec<f64>.
+/// Parse `--partition-ratios "0.55,0.225,0.225"` into a `Vec<f64>`.
 ///
 /// Sum-to-1 and length-vs-world-size validation lives in the framework
 /// (the orchestrator checks before dispatch); we only enforce that the
@@ -313,8 +313,9 @@ fn parse_partition_ratios(spec: &str) -> flodl::tensor::Result<Vec<f64>> {
     Ok(out)
 }
 
-/// Validate the `--guard*` flag bundle and return a [`GuardChoice`] that
-/// the harness can materialize into a concrete `ConvergenceGuard`.
+/// Validate the `--guard*` flag bundle and return a
+/// [`GuardChoice`](crate::config::GuardChoice) that the harness can
+/// materialize into a concrete `ConvergenceGuard`.
 ///
 /// Loud-error policy: every guard-specific flag that doesn't apply to the
 /// selected `--guard` exits with a clear message rather than being silently

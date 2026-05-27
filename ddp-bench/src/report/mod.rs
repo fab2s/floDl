@@ -161,7 +161,7 @@ fn parse_baselines(json: &str) -> Result<Vec<Baseline>, String> {
 // ---------------------------------------------------------------------------
 
 /// Generate a markdown report from analyzed runs.
-/// `groups` is by model: Vec<(model, Vec<RunAnalysis>)>.
+/// `groups` is by model: `Vec<(model, Vec<RunAnalysis>)>`.
 /// `references` maps model name to published reference data.
 /// `gpu_info` is the hardware description from training logs.
 /// `all_modes` is every known DDP mode name (for missing-run detection).

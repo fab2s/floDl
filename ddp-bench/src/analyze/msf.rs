@@ -248,7 +248,7 @@ pub struct MsfPredictive {
     /// whether D collapses or stretches over the window the rate covers.
     /// Reporting raw correlation; interpretation goes in the report prose.
     pub lambda_to_next_logd_r: Option<f64>,
-    /// Number of (λ_mean_per_epoch, eval[ep]) pairs with both finite.
+    /// Number of `(λ_mean_per_epoch, eval[ep])` pairs with both finite.
     pub n_lambda_to_eval: usize,
     /// Pearson(epoch-mean λ̂, eval at end of same epoch).
     pub lambda_mean_to_eval_r: Option<f64>,

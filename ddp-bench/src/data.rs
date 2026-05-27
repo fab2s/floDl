@@ -23,7 +23,7 @@ pub const POOL_MUL: usize = 8;
 /// `pool_size` samples live in memory.  `virtual_len` (returned by `len()`)
 /// can be larger; indices wrap via modulo in `get_batch`.
 pub struct SyntheticDataSet {
-    /// tensors[group_idx] = [pool_size, per-sample dims...]
+    /// `tensors[group_idx]` = `[pool_size, per-sample dims...]`
     tensors: Vec<Tensor>,
     pool_size: usize,
     virtual_len: usize,
@@ -100,7 +100,7 @@ impl SyntheticDataSet {
 
     // ── ConvNet: prototype classification ──────────────────────────────
 
-    /// 10 fixed prototype images; each sample = prototype[class] + noise.
+    /// 10 fixed prototype images; each sample = `prototype[class]` + noise.
     ///
     /// The convnet learns to match noisy inputs to prototypes.
     /// Known minimum: CE near 0 (bounded by noise overlap).
@@ -223,7 +223,7 @@ impl SyntheticDataSet {
 
     // ── Transformer: shift cipher ─────────────────────────────────────
 
-    /// target[i] = (input[i] + shift) % vocab_size.
+    /// `target[i] = (input[i] + shift) % vocab_size`.
     ///
     /// Deterministic per-token mapping; known minimum CE = 0.
     pub fn shift_cipher(
