@@ -173,8 +173,7 @@ pub type MetricsFn = Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>;
 ///
 /// Controls how often the framework dispatches an eval pass to the
 /// rank chosen by [`EpochCallbackPolicy`]. Triggered from the
-/// controller's `dispatch_epoch` (Epochs variant); finer cadences
-/// (per-batch) may land in a follow-up.
+/// controller's `dispatch_epoch` on the configured epoch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalCadence {
     /// Fire eval every `n` epochs. `n == 0` is treated as "never".

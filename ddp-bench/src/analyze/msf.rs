@@ -57,7 +57,7 @@ pub struct MsfPerRank {
 
 /// Comparison of the existing convergence guard's "3 consecutive D rises
 /// above threshold" rule vs an MSF-style guard firing on sustained positive
-/// `λ_ema` (R5 in the design doc).
+/// `λ_ema`.
 ///
 /// Both guards are simulated post-hoc against the per-epoch `div_epoch`
 /// series. The comparison answers: "would an MSF-based guard fire at the
@@ -98,14 +98,14 @@ pub struct MsfLongitudinal {
     pub velocity_sd: f64,
 }
 
-/// R1 informal-test result: log(D) vs cumulative step linear fit within
-/// a single LR window (auto-detected from EpochEnd LR transitions).
+/// log(D) vs cumulative step linear fit within a single LR window
+/// (auto-detected from EpochEnd LR transitions).
 ///
 /// Slope is in units of ln(D)/step. R² is the coefficient of determination.
-/// R1 predicts log(D_t) approximately linear in step within stable phases;
-/// high R² supports R1, low R² either falsifies or indicates noise-dominated
-/// equilibria where the marginal-stability prediction (slope ≈ 0) is correct
-/// but the variance can't be fit against.
+/// The marginal-stability prediction is that log(D_t) is approximately
+/// linear in step within stable phases; high R² supports the prediction,
+/// low R² either falsifies it or indicates a noise-dominated equilibrium
+/// where slope ≈ 0 holds but the variance can't be fit against.
 ///
 /// Two bases are reported: `D_max` (per-event maximum across ranks; the legacy
 /// metric — sensitive to per-rank step asymmetry, especially under NCCL) and
@@ -181,23 +181,24 @@ pub struct MsfAnalysis {
     /// supports the meta-oscillator framing (ranks are coupled, not
     /// independent oscillators).
     pub rank_correlations: Vec<((usize, usize), f64)>,
-    /// R1 informal linear fits per auto-detected LR window. Empty when no
-    /// EpochEnd events carry LR (runs predating per-event LR logging).
+    /// Per-LR-window linear fits of log(D) vs cumulative step. Empty when
+    /// no EpochEnd events carry LR (runs predating per-event LR logging).
     pub lr_window_fits: Vec<MsfLrWindowFit>,
     /// Longitudinal meta-velocity (consensus magnitude motion). `None` when
     /// no `Divergence` event carries `post_norm` (runs predating post_norm
     /// wiring, or backends that don't compute it).
     pub longitudinal: Option<MsfLongitudinal>,
     /// Guard simulator comparison: current guard fires vs MSF-style guard
-    /// fires on per-event recomputed lambda. Replaces the old per-epoch
-    /// d_max simulator; both sides now match production temporal grain.
+    /// fires on per-event recomputed lambda. Both sides operate at the
+    /// per-event temporal grain matching production.
     pub guard_comparison: MsfGuardComparison,
-    /// Threshold sweep for the MSF guard (R5). Each row: `(threshold,
-    /// sustain, fires, epochs_covered)`. Lets the reader judge sensitivity
-    /// without committing to a single magic-number threshold.
+    /// Threshold sweep for the MSF guard. Each row: `(threshold, sustain,
+    /// fires, epochs_covered)`. Lets the reader judge sensitivity without
+    /// committing to a single magic-number threshold.
     pub msf_threshold_sweep: Vec<MsfThresholdSweepRow>,
-    /// Predictive-value stats for the design-doc Phase-1 kill criterion.
-    /// `None` when too few events for stable Pearson estimates.
+    /// Predictive-value stats for the MSF kill criterion (does `λ̂` carry
+    /// forward-looking signal on divergence and eval). `None` when too few
+    /// events for stable Pearson estimates.
     pub predictive: Option<MsfPredictive>,
     /// Per-event recomputed λ̂ trajectory. Populated by `build_msf_analysis`;
     /// consumed by `apply_training_log` to fill `predictive` once per-epoch
@@ -230,7 +231,7 @@ pub struct MsfThresholdSweepRow {
     pub epochs_covered: usize,
 }
 
-/// Phase-1 kill-criterion predictive correlations.
+/// MSF kill-criterion predictive correlations.
 ///
 /// All correlations are Pearson and scale-invariant under the `k_used` ↔
 /// `k_max` rescale, so values reported here transfer cleanly between the

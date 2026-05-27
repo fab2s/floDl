@@ -16,10 +16,9 @@ impl ClusterCoordinator {
     /// Feed an averaging-cycle observation to the LR-aware meta-controller
     /// (when enabled) and dispatch any returned action to ElChe.
     ///
-    /// Ported from OLD `Coordinator::observe_meta` (`coordinator/mod.rs`);
-    /// matches behavior including `MetaAction::NudgeDown` dispatch via
-    /// [`crate::distributed::ddp::ElChe::nudge_anchor_down`] (OLD's Stage
-    /// 3 — already landed per `project_06_controller_arc.md`).
+    /// On [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`] the
+    /// computed factor is applied via
+    /// [`crate::distributed::ddp::ElChe::nudge_anchor_down`].
     ///
     /// No-op when:
     /// - the meta-controller is disabled (`lr_event_meta` is `None`),
@@ -63,12 +62,6 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Handle a `TimingMsgWire::CheckpointResult` from a worker
-    /// (S4 fleshes this out: time exclusion + role failover + retry
-    /// across live untried ranks + EWMA update).
-    ///
-    /// S2 lands the stub so the wire propagation compiles; the
-    /// post-S4 behavior is documented at the call site.
     /// Resolve the current "fastest" rank — the live rank with the
     /// lowest smoothed ms-per-batch reading from ElChe. Returns
     /// `usize::MAX` only when every rank is dead (caller should treat

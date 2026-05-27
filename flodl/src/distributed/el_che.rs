@@ -643,9 +643,8 @@ impl ElChe {
     /// Symmetric upward path to [`Self::nudge_anchor_down`]: lets async-mode anchor
     /// drift toward `max_anchor` over time as long as the convergence guard
     /// reports `Stable`, amortizing AllReduce barrier cost over more local
-    /// SGD steps. Closes a half-implemented loop where the convergence guard
-    /// previously had a downward path (`NudgeDown`) but no upward path —
-    /// `max_overshoot` grew on stable but anchor stayed stuck at `min_anchor`.
+    /// SGD steps. Pairs with the downward `NudgeDown` path so the control
+    /// loop has both directions.
     ///
     /// Honors the user-defined `max_batch_diff` cap when set: refuses to
     /// relax if the projected per-rank batch_counts spread at `anchor + 1`

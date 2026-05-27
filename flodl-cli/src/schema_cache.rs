@@ -12,9 +12,6 @@
 //! Cache invalidation is mtime-based: the cache file's mtime is compared
 //! against `fdl.yml` in the command dir. A cache older than its fdl.yml is
 //! considered stale. Users can also force-refresh.
-//!
-//! See `docs/design/run-config.md` — "2. Option schemas and the `--fdl-schema`
-//! contract" — for the JSON shape.
 
 use std::fs;
 use std::path::{Path, PathBuf};

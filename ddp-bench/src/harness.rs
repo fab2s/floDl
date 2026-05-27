@@ -393,9 +393,7 @@ fn slice_batch(gpu_data: &[Tensor], start: usize, end: usize, device: Device) ->
 /// in the log so the report can subtract eval cost from solo's wall time
 /// when computing DDP speedup.
 ///
-/// All Solo runs currently route here. A follow-up commit will move
-/// non-baseline Solo to the unified `Trainer::builder` path with
-/// final-only eval, matching the multi-GPU shape.
+/// All Solo runs route here.
 #[allow(clippy::too_many_arguments)]
 fn run_baseline_solo(
     model_def: &ModelDef,
@@ -963,7 +961,7 @@ fn format_scalars(scalars: &std::collections::BTreeMap<String, f64>) -> String {
 }
 
 /// Rotate an existing artifact file by appending a timestamp before the extension.
-/// e.g. `training.log` -> `training_2026-04-13_00-39-34.log`
+/// e.g. `training.log` -> `training_YYYY-MM-DD_HH-MM-SS.log`
 fn rotate_artifact(dir: &str, filename: &str) {
     let path = format!("{dir}/{filename}");
     if !std::path::Path::new(&path).exists() {

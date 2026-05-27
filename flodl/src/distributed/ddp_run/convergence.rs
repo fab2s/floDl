@@ -17,9 +17,6 @@
 //! All three implement [`ConvergenceGuard`]. The Trainer accepts any
 //! `impl ConvergenceGuard + 'static` via `DdpBuilder::convergence_guard`;
 //! the coordinator boxes it internally.
-//!
-//! See `docs/design/msf-cadence-control.md` for the theoretical framing
-//! and the soft/hard threshold derivation.
 
 use std::collections::VecDeque;
 
@@ -171,8 +168,7 @@ pub trait ConvergenceGuard: Send + Sync {
 ///
 /// `lambda_raw_t = (1/k_max) * log(D_t / D_{t-1})` where `k_max` is the
 /// per-rank step count of the slowest rank between consecutive AllReduces
-/// (i.e. the wallclock cadence interval). See
-/// `docs/design/msf-cadence-control.md`.
+/// (i.e. the wallclock cadence interval).
 #[derive(Debug, Clone)]
 pub struct LambdaSample {
     /// Max normalized delta this event (= `report.max_relative_delta()`).

@@ -819,8 +819,8 @@ mod tests {
     /// different local-rank indices. With the controller-binds wire,
     /// the controller is a separate thread that binds 127.0.0.1:port;
     /// both rank threads dial in. Designated generator is workers[0]
-    /// .ranks[0] = global rank 0. Regression test for the deadlock
-    /// previously caused by the host-level master check.
+    /// .ranks[0] = global rank 0. Guards against a host-level
+    /// master-check deadlock when two ranks share a hostname.
     #[test]
     fn single_host_process_per_rank_round_trip() {
         let port = next_port();

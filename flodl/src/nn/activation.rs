@@ -151,11 +151,11 @@ pub enum GeluApprox {
 /// let g3 = GELU::with_approximate(GeluApprox::Tanh); // runtime-chosen form
 /// ```
 ///
-/// This is the canonical pattern in flodl for parametrising what was
-/// previously a unit-struct module: a `const` of the type re-exports
-/// the default-constructed value under the bare type name, so existing
-/// usage like `.through(GELU)` keeps working while opt-in constructors
-/// (`::tanh()`, …) cover the variants.
+/// This is the canonical pattern in flodl for parametrising a module
+/// while keeping the bare-name ergonomics of a unit struct: a `const`
+/// of the type re-exports the default-constructed value under the bare
+/// type name, so `.through(GELU)` resolves to the default variant while
+/// opt-in constructors (`::tanh()`, …) cover the others.
 pub struct GELU {
     approximate: GeluApprox,
 }

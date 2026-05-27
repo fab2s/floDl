@@ -586,7 +586,6 @@ mod tests {
 
     /// Round-trip: when `architectures` carries a task-head name, both
     /// the emitted JSON and the re-parsed config preserve it verbatim.
-    /// This is the actual --checkpoint round-trip the HF arc needs.
     #[test]
     fn architectures_some_round_trips_verbatim() {
         let mut cfg = BertConfig::bert_base_uncased();

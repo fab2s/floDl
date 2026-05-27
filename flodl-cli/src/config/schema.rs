@@ -306,7 +306,7 @@ pub struct OptionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
     /// Shell snippet producing completion values.
-    /// Consumed by `fdl completions <shell>` (follow-up rollout task).
+    /// Consumed by `fdl completions <shell>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)]
     pub completer: Option<String>,
@@ -329,7 +329,7 @@ pub struct ArgSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<serde_json::Value>>,
     /// Shell snippet producing completion values.
-    /// Consumed by `fdl completions <shell>` (follow-up rollout task).
+    /// Consumed by `fdl completions <shell>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)]
     pub completer: Option<String>,

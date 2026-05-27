@@ -8,12 +8,6 @@ use crate::tensor::{Result, TensorError};
 use super::ClusterCoordinator;
 
 impl ClusterCoordinator {
-    // -----------------------------------------------------------------
-    // Epoch dispatch (ports OLD coordinator/mod.rs compute_partition_sizes
-    // + plans_for_epoch + send_all_plans, with ControlMsgWire frames
-    // replacing the OLD mpsc::Sender<ControlMsg>.)
-    // -----------------------------------------------------------------
-
     /// Compute per-rank partition sizes for one epoch.
     ///
     /// Priority order:
@@ -23,8 +17,6 @@ impl ClusterCoordinator {
     ///    `with_speed_hint` is set in the config).
     /// 3. Equal sizes (fallback at startup before ElChe has
     ///    observations).
-    ///
-    /// Verbatim port of OLD `Coordinator::compute_partition_sizes`.
     pub(super) fn compute_partition_sizes(&self) -> Vec<usize> {
         if let Some(ratios) = &self.partition_ratios {
             return crate::distributed::ddp_run::ratio_to_sizes(

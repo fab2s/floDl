@@ -22,22 +22,16 @@
 //!
 //! # Phases as hints, not gates
 //!
-//! The existing controller [`crate::distributed::Phase`] machine
+//! The controller [`crate::distributed::Phase`] machine
 //! (Probe / Warmup / Stable / Mature) is consulted to modulate per-phase
 //! `base_factor` and the convergence watcher's sustain count `K`, but does
 //! not gate firing. Probe is the only excluded phase (no calibration data,
 //! all signals are noise).
 //!
-//! # Stages
+//! # Enabling
 //!
-//! - **Stage 1 (this commit)**: plumbing only. [`LrEventMeta::observe`]
-//!   records to windows; emits no actions. Verifies the wiring is in place
-//!   without behavior change.
-//! - **Stage 2**: detector logic (LR cliff, convergence pattern, anchor_trend
-//!   dampening), unit-tested in isolation.
-//! - **Stage 3**: activation — actions dispatched to coordinator's
-//!   `nudge_anchor_down` path. Default off, opt-in via
-//!   [`crate::distributed::ddp_run::DdpRunConfig::with_meta_controller`].
+//! Default off; opt in via
+//! [`crate::distributed::ddp_run::DdpRunConfig::with_meta_controller`].
 
 use std::collections::VecDeque;
 
@@ -46,16 +40,15 @@ use crate::distributed::ddp_run::convergence::ConvergenceAction;
 
 /// Static configuration for the meta-controller.
 ///
-/// Sensible defaults from the 2026-05-09 design lock; override via builder
-/// methods at the [`crate::distributed::ddp_run::DdpRunConfig`] level once
-/// CLI plumbing lands in Stage 3.
+/// Sensible defaults; override via builder methods on
+/// [`crate::distributed::ddp_run::DdpRunConfig`].
 #[derive(Debug, Clone, Copy)]
 pub struct LrEventMetaConfig {
-    /// Capacity of the LR trajectory window. Stage 1: not consulted; Stage 2
-    /// uses the most recent two samples to compute the single-cycle delta.
+    /// Capacity of the LR trajectory window. The two most recent samples
+    /// feed the single-cycle delta used by the LR-cliff detector.
     pub lr_window_cap: usize,
-    /// Capacity of the anchor trajectory window. Stage 2 uses this for the
-    /// `anchor_trend` (`(current − mean) / mean`) computation.
+    /// Capacity of the anchor trajectory window. Feeds the `anchor_trend`
+    /// (`(current − mean) / mean`) computation.
     pub anchor_window_cap: usize,
     /// Capacity of the convergence guard verdict window. Must be at least
     /// `max(sustain_k_for_phase)` so the longest-sustain phase has room.
@@ -163,7 +156,7 @@ impl LrEventMeta {
 
         // Convergence watcher: corrective, fires on trailing-K sustained
         // NudgeDown / SuppressGrowth verdicts. Phase-modulated K and base
-        // factor (echoes the original 2026-05-01 emergency-factor pattern).
+        // factor (aggressive in low-trust phases, gentle in high-trust).
         let conv_factor = if self.convergence_pattern_fires(phase) {
             Some(self.effective_factor(base_factor_for(phase), trend))
         } else {
@@ -291,10 +284,9 @@ const SETTLED_EPSILON: f64 = 0.10;
 
 /// Per-phase base nudge factor for the convergence watcher.
 ///
-/// Echoes the 2026-05-01 emergency-factor pattern (Warmup 2.0×, Stable
-/// 1.7×, Mature 1.5×): aggressive when low-trust, gentle when high-trust.
-/// Probe is excluded at the call site; the value here is a defensive
-/// fallback that should never be reached in normal operation.
+/// Aggressive in low-trust phases (Warmup), gentle in high-trust phases
+/// (Mature). Probe is excluded at the call site; the value here is a
+/// defensive fallback that should never be reached in normal operation.
 fn base_factor_for(phase: Phase) -> f64 {
     match phase {
         Phase::Probe | Phase::Warmup => 0.3,

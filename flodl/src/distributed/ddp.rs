@@ -256,7 +256,7 @@ impl Ddp {
     ///   on rising drift.
     /// - `post_norm = ||W_post||` — global L2 norm of averaged params.
     ///   Identical across ranks post-AllReduce (modulo float-rounding
-    ///   noise); the OLD coordinator kept a single scalar from rank 0.
+    ///   noise), so a single scalar from any rank suffices.
     /// - `pre_norm = ||W_pre||` — global L2 norm of this rank's pre-sync
     ///   params. Diverges across ranks pre-sync; gather like `divergence`.
     ///

@@ -487,8 +487,7 @@ where
         self
     }
 
-    /// Eval cadence. Currently only [`EvalCadence::Epochs`] is
-    /// honored; per-batch cadences may land in a follow-up.
+    /// Eval cadence. Only [`EvalCadence::Epochs`] is supported.
     pub fn eval_every(mut self, cadence: EvalCadence) -> Self {
         let EvalCadence::Epochs(n) = cadence;
         self.config = self.config.with_eval_every_epochs(n);
@@ -506,8 +505,7 @@ where
     /// [`Self::eval_result_fn`] fires.
     ///
     /// Errors propagate to the controller as a string and surface in
-    /// the per-epoch log (no early stop today; configurable failure
-    /// policy lands in a follow-up).
+    /// the per-epoch log; the run continues.
     pub fn eval_fn<E>(mut self, f: E) -> Self
     where
         E: Fn(&M, &dyn BatchDataSet) -> Result<f64> + Send + Sync + 'static,

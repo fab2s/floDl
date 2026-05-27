@@ -649,9 +649,8 @@
 
     /// SyncAck must NOT increment steps_since_avg, otherwise every NCCL sync
     /// inflates global_step by one batch per rank and the LR scheduler fires
-    /// early. Real bug found 2026-04-13: with ~27 syncs/epoch * 2 ranks the
-    /// inflation was 6.9% and a MultiStepLR milestone at total/2 fired at
-    /// epoch 94 instead of 100.
+    /// early. Concrete failure mode: ~27 syncs/epoch × 2 ranks yields 6.9%
+    /// inflation, firing a MultiStepLR milestone at total/2 six epochs early.
     #[test]
     fn sync_ack_does_not_inflate_steps_since_avg() {
         let mut coord = make_test_coordinator(2, ApplyPolicy::Cadence, 1000);

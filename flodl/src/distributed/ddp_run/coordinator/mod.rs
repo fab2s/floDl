@@ -185,12 +185,10 @@ pub struct Coordinator {
     /// Wall-time duration (ms) of the most-recent completed NCCL sync.
     /// Captured in `process_timing_msg` when the last rank acks. Fed to
     /// `ElChe::report_timing` as `sync_ms` so the anchor auto-tune block
-    /// (el_che.rs:292-308) actually fires on NCCL backend. Was previously
-    /// always 0 because `last_avg_ms` is only populated by the CPU avg path.
+    /// fires on the NCCL backend (the CPU-avg path uses `last_avg_ms`).
     last_nccl_sync_ms: f64,
 
-    // LR-aware meta-controller (Stage 2: observed but emission not yet
-    // dispatched to nudge_anchor_down — that lands in Stage 3.)
+    // LR-aware meta-controller
     /// Optional meta-controller above ElChe. `None` when
     /// [`super::DdpRunConfig::with_meta_controller`] is `false` (default).
     pub(super) lr_event_meta: Option<crate::distributed::lr_event_meta::LrEventMeta>,
@@ -383,9 +381,9 @@ impl CoordinatorBuilder {
     /// Enable the LR-aware meta-controller above ElChe. Default: false.
     ///
     /// When enabled, a [`crate::distributed::lr_event_meta::LrEventMeta`]
-    /// is constructed and held by the coordinator. Stage 1 of the rollout
-    /// keeps the meta dormant (field present, no observations); later
-    /// stages wire LR + verdict forwarding and action dispatch.
+    /// is constructed and held by the coordinator. The coordinator forwards
+    /// per-cycle LR + guard verdicts and dispatches any returned action
+    /// to ElChe's `nudge_anchor_down` path.
     pub fn meta_controller(mut self, enabled: bool) -> Self {
         self.meta_controller = enabled;
         self

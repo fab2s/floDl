@@ -45,11 +45,8 @@ impl<M: Module> GpuWorker<M> {
     /// 3. Track `total_loss` across batches; caller can read it via
     ///    [`GpuWorker::current_epoch`] etc.
     ///
-    /// **Behavior preserved:** same `train_step` (including CUDA stream
-    /// management, AccumulateGrad node pinning, grad clipping, scheduler),
-    /// same `sync_now_nccl` (AllReduce + divergence measurement). The
-    /// orchestration change: no coordinator driving SyncNow control
-    /// messages — this rank decides Sync = every batch internally.
+    /// Sync policy: this rank decides `K = 1` (AllReduce every batch)
+    /// internally, with no coordinator driving SyncNow control messages.
     ///
     /// **Not supported by this self-driven entry:**
     /// - VRAM-aware prefetch (sync data loading only)
@@ -131,10 +128,9 @@ impl<M: Module> GpuWorker<M> {
     /// - Load averaged tensors back into the live params via `copy_`
     ///   (handles the CPU-to-GPU move when params live on a CUDA device)
     ///
-    /// **Behavior preserved (vs old threaded coordinator):** same
-    /// `train_step` (grad clipping, scheduler, optimizer step), Local SGD
-    /// semantics every batch, same `param_vars` set being averaged. The
-    /// orchestration switch (TCP rather than NCCL) is the only change.
+    /// Local-SGD semantics (`train_step` then AllReduce-Avg every batch)
+    /// over the same `param_vars` set; the only switch from the NCCL
+    /// variant is TCP rather than NCCL for the reduction.
     ///
     /// **Not supported by this self-driven entry:**
     /// VRAM-aware prefetch, per-epoch [`super::super::MetricsMsg`] aggregation,
@@ -215,12 +211,9 @@ impl<M: Module> GpuWorker<M> {
     /// Local-SGD with ElChe-driven K and the full convergence-guard
     /// pipeline.
     ///
-    /// Under NCCL backend, Cadence and Async share the same algorithm: the
-    /// only difference in the old coordinator was Async-mode overshoot
-    /// machinery, which is an async/CPU concept (see
-    /// `feedback_overshoot_async_only` and `feedback_nccl_no_overshoot_throttle`).
-    /// Both policies therefore route through this single loop in cluster-rank
-    /// mode.
+    /// Under the NCCL backend, Cadence and Async share the same algorithm
+    /// (overshoot machinery is an async/CPU concept and has no meaning on
+    /// NCCL), so both policies route through this single loop.
     ///
     /// Per-cycle protocol (mirrors `Coordinator::finish_averaging_nccl`):
     ///
@@ -236,21 +229,12 @@ impl<M: Module> GpuWorker<M> {
     /// 5. Feed timing into [`crate::distributed::ElChe::report_timing`].
     /// 6. Run the guard: `convergence_guard.report(&report, k_used, k_max)`
     ///    → [`ConvergenceAction`]:
-    ///    - [`ConvergenceAction::NudgeDown`] `{ factor }` → unconditional
-    ///      [`ElChe::nudge_anchor_down`] (matches old coordinator —
-    ///      applied for all non-Sync policies).
+    ///    - [`ConvergenceAction::NudgeDown`] `{ factor }` →
+    ///      [`ElChe::nudge_anchor_down`] (applied for all non-Sync policies).
     ///    - [`ConvergenceAction::Stable`] + `elche_relax_up` →
-    ///      [`ElChe::relax_anchor_up`]. **The old coordinator gated this
-    ///      on `policy == Async` (likely an MSF-arc leftover); the
-    ///      cluster-rank loop lifts the gate so the user-set flag works
-    ///      for Cadence too. `max_anchor` bounds anchor growth.**
+    ///      [`ElChe::relax_anchor_up`], bounded by `max_anchor`. Honored
+    ///      on Cadence as well as Async.
     ///    - [`ConvergenceAction::SuppressGrowth`] → no-op (hold cadence).
-    ///
-    /// **Behavior preserved (vs old threaded coordinator):** same
-    /// `train_step` (CUDA stream pinning, per-rank grad clipping,
-    /// scheduler, optimizer step), same Local-SGD param-Avg semantics,
-    /// same divergence math (snapshot → AllReduce-Avg → `||pre - post|| /
-    /// ||post||`), same guard verdict → ElChe action wiring.
     ///
     /// **Not supported by this self-driven entry:** VRAM-aware
     /// prefetch, per-epoch [`super::super::MetricsMsg`] aggregation, `epoch_fn` /
@@ -575,39 +559,34 @@ impl<M: Module> GpuWorker<M> {
     /// polls for completion every batch, and on receipt of the
     /// averaged response performs an EASGD elastic blend with the
     /// (now-drifted) live params. The convergence-guard pipeline runs
-    /// against `(snapshot_at_submit, averaged_response)` — matching
-    /// OLD coordinator behavior (averaging is on the parameters that
-    /// were submitted, not on the live drifted ones).
+    /// against `(snapshot_at_submit, averaged_response)`: averaging is
+    /// on the parameters that were submitted, not on the live drifted ones.
     ///
-    /// **Overshoot bound:** `max_overshoot = 1` for this first pass —
-    /// if a round is still in flight when the K-boundary triggers the
-    /// next, we [`crate::distributed::AsyncCpuReduceClient::block_poll`] until the
+    /// **Overshoot bound:** `max_overshoot = 1`. If a round is still in
+    /// flight when the K-boundary triggers the next, we
+    /// [`crate::distributed::AsyncCpuReduceClient::block_poll`] until the
     /// previous round completes before submitting the new one. The
     /// previous round's EASGD-blend + guard verdict still applies
     /// before the new snapshot is taken.
     ///
     /// **EASGD blend formula:** `W := (1-α)·W_local + α·W_avg` when
     /// `easgd_alpha = Some(α)`; full overwrite (`copy_`) when `None`.
-    /// Matches OLD `worker.load_averaged`'s two cases.
     ///
     /// **Local-only guard verdict:** the cross-rank divergence gather
-    /// (NCCL/CPU AllReduce on per-rank divergence vec) is **deferred**
-    /// here. The guard runs with `deltas[rank] = local_div`, others
-    /// zero. Per user direction, this is acceptable: EASGD plus the
-    /// convergence guard (already LR-drop aware) absorb the per-rank
+    /// is not performed on this path; the guard runs with
+    /// `deltas[rank] = local_div`, others zero. EASGD plus the
+    /// convergence guard (LR-drop aware) absorb the per-rank
     /// drift as long as overshoot stays bounded.
     ///
-    /// **ElChe timing report is deferred** for the same reason —
-    /// without a cross-rank wall_ms gather, ElChe's auto-tune would
-    /// drift across ranks. Static cadence (anchor stays at config
-    /// init) for this first pass.
+    /// **No ElChe timing report:** without a cross-rank wall_ms gather
+    /// ElChe's auto-tune would drift across ranks, so cadence is static
+    /// (anchor stays at config init).
     ///
     /// **Epoch-event semantics:** LR scheduler updates fire per-rank
     /// locally on epoch crossing (the fast rank applies LR drop for
-    /// epoch E+1 ahead of slow rank still finishing E). Metrics
-    /// reporting fires once all ranks have crossed — deferred to a
-    /// follow-up slice (per-rank epoch-completion tally via async TCP
-    /// channel).
+    /// epoch E+1 ahead of slow rank still finishing E). Per-rank
+    /// epoch-completion aggregation for metrics reporting is not
+    /// supported on this path.
     #[allow(clippy::too_many_arguments)]
     pub fn run_self_driven_async_cpu(
         &mut self,

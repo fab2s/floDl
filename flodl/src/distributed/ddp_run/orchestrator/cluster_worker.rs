@@ -384,27 +384,17 @@ impl DdpHandle {
     /// save-on-unrecoverable-failure flow needs a destination. Loud
     /// error at startup if unset.
     ///
-    /// # Controller-scope config flow (in flight)
+    /// # Controller-scope config
     ///
     /// `policy`, `convergence_guard`, and the ElChe knobs on
-    /// [`DdpRunConfig`] are CONTROLLER-scope configuration. The
-    /// controller is a singleton scheduler (lives in the launcher
-    /// process, decoupled from any rank), so it cannot read trait
-    /// objects (`Box<dyn ConvergenceGuard>`) constructed in the
-    /// user's rank-side `main()` without a wire-protocol or
-    /// process-trampoline. The launcher-trampoline slice closes
-    /// this gap by running the user's `main()` up to the
-    /// `Trainer::builder(...).run()` boundary in launcher mode,
-    /// extracting controller-scope fields from the builder, then
-    /// forking rank children. Until that lands, the controller uses
-    /// hardwired defaults (Sync policy, anchor=1, default
-    /// `TrendGuard`).
-    ///
-    /// The user's `convergence_guard` is **threaded through** to this
-    /// entry for API symmetry and to keep the call site honest. It is
-    /// not yet wired into the controller — the controller-side install
-    /// happens in the trampoline slice when the same `DdpRunConfig`
-    /// is visible to both controller and rank dispatch.
+    /// [`DdpRunConfig`] are controller-scope configuration. The
+    /// controller is a singleton scheduler that lives in the launcher
+    /// process, decoupled from any rank, so trait objects
+    /// (`Box<dyn ConvergenceGuard>`) constructed in the rank-side
+    /// `main()` are threaded through this entry only for API symmetry
+    /// with the single-host path. The authoritative controller-side
+    /// install happens at the launcher boundary, where the same
+    /// `DdpRunConfig` is visible to both controller and rank dispatch.
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterCoordinator::trigger_averaging`]:

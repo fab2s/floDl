@@ -276,7 +276,7 @@ impl ClusterCoordinator {
     /// Block up to `timeout` for the first timing message, then drain
     /// the rest non-blocking. Returns `false` when every reader thread
     /// has exited (all senders dropped) so the caller can break its
-    /// loop. Mirrors OLD `Coordinator::drain_timing_blocking`.
+    /// loop.
     pub fn drain_timing_blocking(&mut self, timeout: Duration) -> bool {
         match self.timing_rx.recv_timeout(timeout) {
             Ok(msg) => self.process_timing_msg(msg),
@@ -289,14 +289,12 @@ impl ClusterCoordinator {
         true
     }
 
-    /// Check whether an averaging cycle should be triggered now. Ported
-    /// literally from OLD `Coordinator::should_average`.
+    /// Check whether an averaging cycle should be triggered now.
     ///
     /// `nccl_ack` is named for the NCCL path's SyncAck mechanism but
-    /// serves both backends in the new TCP model: workers send a
-    /// `TimingMsg::SyncAck` after every averaging round (regardless of
-    /// backend) so the coordinator can gate re-triggering until the
-    /// previous round has settled.
+    /// serves both backends: workers send a `TimingMsg::SyncAck` after
+    /// every averaging round (regardless of backend) so the coordinator
+    /// can gate re-triggering until the previous round has settled.
     pub fn should_average(&self) -> bool {
         // Every gate skips dead ranks: they won't ack, won't step, and
         // won't accumulate wall_ms. Treating them as "satisfied" lets

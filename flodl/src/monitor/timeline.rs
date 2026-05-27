@@ -111,7 +111,7 @@ pub enum EventKind {
     /// the max normalized delta across ranks; `lambda_raw`/`lambda_ema` are
     /// the across-event Lyapunov proxy `(1/k) * log(D_t / D_{t-1})` and its
     /// EMA. `None` on the first event in a fresh estimator or when below the
-    /// noise floor. See `docs/design/msf-cadence-control.md`.
+    /// noise floor.
     Divergence {
         d_raw: f64,
         lambda_raw: Option<f64>,
@@ -951,11 +951,9 @@ mod tests {
         assert!(buf2.contains("\"sync_start\""));
     }
 
-    /// `MetaNudge` (LR-aware meta-controller anchor nudge) replaces the
-    /// stringly-typed `Custom` variant that previously squeezed
-    /// `factor` / `from` / `to` into a label. Verify the JSON shape so
-    /// ddp-bench's analyze pipeline (which parses `k=meta_nudge`) can
-    /// rely on it.
+    /// `MetaNudge` (LR-aware meta-controller anchor nudge) carries
+    /// `factor` / `from` / `to` as a strongly-typed JSON shape that
+    /// ddp-bench's analyze pipeline parses as `k=meta_nudge`.
     #[test]
     fn test_meta_nudge_json_shape() {
         let tl = Timeline::new(100);

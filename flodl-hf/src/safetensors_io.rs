@@ -19,7 +19,7 @@
 //! variant, [`load_safetensors_file_into_graph`]) copy tensor data from
 //! the checkpoint into the graph's `Parameter` and `Buffer` storage
 //! in-place. Checkpoint dtypes other than f32 (f16, bf16, f64) are cast
-//! to f32 on the host; integer dtypes are currently rejected (BERT-style
+//! to f32 on the host; integer dtypes are not supported (BERT-style
 //! models only store floats).
 //!
 //! # Example (validator only)
@@ -230,7 +230,7 @@ pub fn expected_from_graph(graph: &Graph) -> Vec<ExpectedParam> {
 /// bf16 / f64) into the live graph storage in-place. Parameters keep
 /// their autograd identity; only the underlying buffer bytes change.
 ///
-/// Integer-dtype checkpoint tensors are currently rejected — HF's
+/// Integer-dtype checkpoint tensors are not supported — HF's
 /// transformer zoo doesn't ship integer-weight tensors, so the common
 /// path only needs floats.
 pub fn load_safetensors_into_graph(graph: &Graph, bytes: &[u8]) -> Result<()> {

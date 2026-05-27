@@ -101,8 +101,8 @@ pub struct ModelDefaults {
 
 /// Convergence guard selection. Materialised by the harness into a concrete
 /// `flodl::distributed::ddp_run::ConvergenceGuard` and passed through
-/// `DdpBuilder::convergence_guard`. Default is `Trend` with the production
-/// threshold (matches pre-pluggable behavior).
+/// `DdpBuilder::convergence_guard`. Default is `Trend` at the production
+/// threshold.
 #[derive(Debug, Clone)]
 pub enum GuardChoice {
     /// Pass-through: no convergence-driven anchor adjustments. ElChe's

@@ -437,11 +437,9 @@ impl ClusterCoordinatorConfig {
     /// Enable the LR-aware meta-controller above ElChe. Default: false.
     ///
     /// When enabled, a [`crate::distributed::lr_event_meta::LrEventMeta`]
-    /// is constructed by [`super::ClusterCoordinator::start_from_listener`] and
-    /// observed after every averaging-cycle guard verdict. Ports the
-    /// OLD `CoordinatorBuilder::meta_controller` opt-in (see
-    /// [`crate::distributed::lr_event_meta`] for the design and rollout
-    /// stages).
+    /// is constructed by [`super::ClusterCoordinator::start_from_listener`]
+    /// and observed after every averaging-cycle guard verdict. See
+    /// [`crate::distributed::lr_event_meta`] for the design.
     pub fn meta_controller(mut self, enabled: bool) -> Self {
         self.meta_controller = enabled;
         self

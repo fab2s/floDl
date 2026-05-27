@@ -2,7 +2,7 @@
 //! `model.safetensors` bit-exact vs HF + `config.json` present and
 //! emits a `model_type` dispatch key.
 //!
-//! Sibling of `bert_roundtrip.rs` (Stage 2 save API) and `bert_parity.rs`
+//! Sibling of `bert_roundtrip.rs` (save API) and `bert_parity.rs`
 //! (forward parity). Exercises the full user-facing export path end-to-end
 //! against real HF weights, catching wiring regressions that the
 //! in-process unit tests don't cover (fetch from Hub, legacy key

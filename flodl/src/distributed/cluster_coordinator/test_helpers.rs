@@ -69,9 +69,8 @@ impl ClusterCoordinator {
         });
     }
 
-    /// Test-only peek at the most-recent per-rank LR snapshot. Mirrors
-    /// the OLD coordinator's `last_lr_per_rank`. `None` for ranks that
-    /// have not yet sent a [`TimingMsgWire::LrUpdate`].
+    /// Test-only peek at the most-recent per-rank LR snapshot. `None`
+    /// for ranks that have not yet sent a [`TimingMsgWire::LrUpdate`].
     #[cfg(test)]
     pub(crate) fn last_lr_per_rank_for_test(&self) -> &[Option<f64>] {
         &self.last_lr_per_rank

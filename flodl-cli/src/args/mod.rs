@@ -48,8 +48,7 @@ pub trait FdlArgsTrait: Sized {
 ///   required positional, unknown flag, invalid value, ...) the error
 ///   message AND the rendered help are printed to stderr; the binary
 ///   exits with code 2. Showing help on error keeps `<bin>` (no args)
-///   and `<bin> --help` consistent for binaries that previously dumped
-///   usage on missing-args.
+///   and `<bin> --help` consistent.
 pub fn parse_or_schema<T: FdlArgsTrait>() -> T {
     let argv: Vec<String> = std::env::args().collect();
     parse_or_schema_from::<T>(&argv)

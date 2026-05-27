@@ -9,11 +9,11 @@
 //!
 //! ## Why two channels
 //!
-//! Faithful port of the OLD coordinator/worker threaded model: mpsc had
-//! separate channels for `timing_rx`, `metrics_rx`, `param_rx`, and
-//! `control_txs`. Collapsing them into one TCP stream would couple
-//! scheduling latency to bulk-data throughput; per-channel back-pressure
-//! is the cleanest port.
+//! Scheduling latency must stay decoupled from bulk-data throughput;
+//! collapsing them into one TCP stream would couple the two. The control
+//! channel carries timing, scheduling, and sync messages; the data
+//! channel carries averaged-tensor frames. Per-channel back-pressure
+//! falls out naturally.
 //!
 //! ## Frame layout
 //!
@@ -532,16 +532,13 @@ pub enum ControlMsgWire {
     ///   ranks receiving the frame silently ignore it.
     /// - `u64::MAX` → reserved for "controller executes" (CPU-async
     ///   mode where the controller already holds the canonical
-    ///   averaged tensors post `finish_averaging_cpu`). v1 emits a
-    ///   loud error if this sentinel is dispatched; v2 will add a
-    ///   `coord_checkpoint_fn` builder method.
+    ///   averaged tensors post `finish_averaging_cpu`); dispatching it
+    ///   today emits a loud error.
     ///
     /// Execution result flows back via
     /// [`TimingMsgWire::CheckpointResult`] (success or failure) so the
     /// controller can retry on a different live rank when the
-    /// assigned rank reports an error. Wire format change from v0.5.3
-    /// (was `{ version }` only); no external wire users at the time
-    /// of the cut.
+    /// assigned rank reports an error.
     Checkpoint { version: u64, target_rank: u64 },
     /// Coord-emitted directive to run the user's [`EvalFn`] against
     /// `eval_dataset` on `target_rank`. Targeted (parallels
@@ -550,11 +547,9 @@ pub enum ControlMsgWire {
     /// coord owns the role assignment (`eval_role`, resolved per
     /// [`EpochCallbackPolicy`]); the worker never decides.
     ///
-    /// Wire format change from v0.5.3 (was `{ schedule_id, epoch }`);
-    /// no external wire users at the time of the cut. `target_rank ==
-    /// u64::MAX` reserved for "controller executes" (future) — v1
-    /// rejects it via the same loud error as
-    /// [`Self::Checkpoint`].
+    /// `target_rank == u64::MAX` is reserved for "controller executes"
+    /// (a future CPU-async variant); the current implementation rejects
+    /// it via the same loud error as [`Self::Checkpoint`].
     ///
     /// Result flows back via [`TimingMsgWire::EvalResult`] with the
     /// same `schedule_id`.
