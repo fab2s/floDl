@@ -1580,7 +1580,7 @@ every worker, pre-builds, and fans out.
 | `MASTER_ADDR` / `MASTER_PORT` env | `fdl.cluster.yml controller.host:port` / `ClusterBuilder.controller(host).port(p)` | First-class topology |
 | `model.to(rank)` | `model_factory(device)` | Per-device model in closure |
 | Equal batch per GPU only | `ElChe` cadence | Heterogeneous GPU support; weighted gradient averaging |
-| `NCCL` / `Gloo` backend choice | `ElCheMode::{NcclSync, NcclCadence, NcclAsync, CpuSync, CpuCadence, CpuAsync}` | Six modes via one enum; default `NcclAsync` |
+| `NCCL` / `Gloo` backend choice | `ElCheMode::{NcclSync, NcclCadence, CpuSync, CpuCadence, CpuAsync}` | Five modes via one enum; default `NcclCadence` |
 | No built-in A/B testing | Swap `.elche(ElCheConfig::*)` | One line per mode |
 | No elastic membership | Ranks survive death + rejoin; `max_failure` + `ShutdownWithSave` | Controller-driven checkpoint retry / role failover |
 
@@ -1596,8 +1596,8 @@ every worker, pre-builds, and fans out.
   across ranks. flodl's ElChe assigns proportional work based on
   measured throughput; the convergence guard vetoes anchor growth
   when weight-space divergence rises.
-- **A/B testing**: swap `ElCheConfig::nccl_async()` for any of the
-  six modes with one line. PyTorch has no equivalent mechanism.
+- **A/B testing**: swap `ElCheConfig::nccl_cadence()` for any of the
+  five modes with one line. PyTorch has no equivalent mechanism.
 - **No CUDA before `Trainer::run`** invariant: user binaries must not
   instantiate CUDA tensors in `main()`. Use
   `flodl::sys::detect_gpus()` (CUDA-free, via `nvidia-smi`) for any

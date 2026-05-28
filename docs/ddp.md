@@ -95,7 +95,7 @@ every knob into one struct:
 let cfg = TrainerConfig::new(dataset)
     .batch_size(64)
     .num_epochs(50)
-    .elche(ElCheConfig::nccl_async())     // recommended NCCL default; see "ElCheMode" below
+    .elche(ElCheConfig::nccl_cadence())   // recommended NCCL default; see "ElCheMode" below
     .resume_from("ckpts/run42.fdl")       // optional
     .checkpoint_every(5)
     .save_path("ckpts/run43");
@@ -125,53 +125,33 @@ trampoline; pick whichever shape your call site prefers.
 
 ## ElCheMode — cadence × backend in one name
 
-The six ways to do parameter averaging are named directly. Each name is
-a `(when to average) × (how to average)` pair. `ElCheConfig::default()`
-returns `NcclAsync` (the recommended NCCL mode).
+The five ways to do parameter averaging are named directly. Each name
+is a `(when to average) × (how to average)` pair. `ElCheConfig::default()`
+returns `NcclCadence` (the recommended NCCL mode).
 
 | Mode | When | How | Best for |
 |---|---|---|---|
 | `NcclSync` | Every batch | NCCL AllReduce | Homogeneous GPUs, correctness-first baseline |
-| `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | Heterogeneous rigs that want every rank to start each epoch in lockstep |
-| `NcclAsync` | Anchor (ElChe) + `max_overshoot`-bounded cross-epoch dispatch | NCCL AllReduce | **Recommended NCCL default** — same in-epoch loop as Cadence with per-rank next-epoch dispatch on top, batch-bounded by `max_overshoot` |
+| `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | **Recommended NCCL default** — heterogeneous rigs; ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window |
 | `CpuSync` | Every batch | CPU averaging | Sync without NCCL (peer-access unavailable, A/B against NCCL) |
 | `CpuCadence` | Anchor-based | CPU averaging | Heterogeneous rigs without fast peer links |
-| `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** — fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
+| `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** — genuine async (decoupled averaging via separate channel), fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
 
 `NcclSync` is the degenerate ElChe case (anchor=1). Every mode routes
 through the same machinery, so switching between them is one line.
 
-### What `NcclAsync` actually does on NCCL
-
-NCCL barriers are hard rendezvous points — no rank can run a
-collective alone. `NcclCadence` and `NcclAsync` share the **same
-in-epoch loop**: same ElChe anchor mechanics, same weighted
-AllReduce. The difference is at the coordinator (cross-epoch) level:
-
-- **`NcclCadence`**: when every rank finishes epoch N, dispatch epoch
-  N+1 to all ranks together.
-- **`NcclAsync`**: when an individual rank finishes epoch N, the
-  coordinator immediately dispatches epoch N+1 to *that rank* without
-  waiting for full-cluster aggregation. The fast rank gets a head
-  start on N+1's batches while the slow rank finishes N — filling the
-  wall-time gap.
-
-The cross-epoch dispatch is **batch-bounded by `max_overshoot`**: a
-fast rank can stream up to `planned + max_overshoot` batches past its
-ElChe-planned count before the coordinator gates the next dispatch.
-The gated rank sits in `wait_for_epoch_plan` (still processing any
-incoming `SyncNow` via the existing control path), and is woken
-automatically when the next AllReduce completes and the gate opens
-again. The principle is "no worker drifts at epoch scale, only at
-batch scale" — `max_overshoot` is the single knob enforcing it, on
-both NCCL and CPU. The gate only fires in `Async` policy; `Sync`
-reduces every batch (drift can't build) and `Cadence` uses AllReduce
-as its sole coordination layer.
+> **Note**: `NcclAsync` used to exist as a sixth mode (NCCL + per-rank
+> cross-epoch dispatch). It was dropped — measured benefit over
+> `NcclCadence` was within noise on every tested rig, and the
+> in-place AllReduce writeback raced with autograd on heterogeneous
+> Pascal+Blackwell setups. CPU Async (`CpuAsync`) is the real
+> asynchronous mode: averaging is decoupled from the GPU pipeline
+> through a separate channel.
 
 ### `ElCheConfig` — presets + overrides
 
 ```rust
-let elche = ElCheConfig::nccl_async()    // also the value of ElCheConfig::default()
+let elche = ElCheConfig::nccl_cadence()  // also the value of ElCheConfig::default()
     .max_anchor(20)
     .overhead_target(0.05);
 ```
@@ -179,8 +159,7 @@ let elche = ElCheConfig::nccl_async()    // also the value of ElCheConfig::defau
 | Preset constructor | Mode |
 |---|---|
 | `ElCheConfig::nccl_sync()` | `NcclSync` |
-| `ElCheConfig::nccl_cadence()` | `NcclCadence` |
-| `ElCheConfig::nccl_async()` | `NcclAsync` (**default**) |
+| `ElCheConfig::nccl_cadence()` | `NcclCadence` (**default**) |
 | `ElCheConfig::cpu_sync()` | `CpuSync` |
 | `ElCheConfig::cpu_cadence()` | `CpuCadence` |
 | `ElCheConfig::cpu_async()` | `CpuAsync` (best convergence in practice; see [A/B testing modes](#ab-testing-modes)) |
@@ -189,7 +168,7 @@ Or build the value directly with a struct literal:
 
 ```rust
 let elche = ElCheConfig {
-    mode: ElCheMode::NcclAsync,
+    mode: ElCheMode::NcclCadence,
     max_anchor: Some(20),
     overhead_target: Some(0.05),
     ..Default::default()
@@ -200,7 +179,7 @@ let elche = ElCheConfig {
 
 | Field / setter | Default | Description |
 |---|---|---|
-| `.mode(ElCheMode)` | `NcclAsync` | The (when × how) pair. `ElCheConfig::default()` returns `nccl_async()`. |
+| `.mode(ElCheMode)` | `NcclCadence` | The (when × how) pair. `ElCheConfig::default()` returns `nccl_cadence()`. |
 | `.anchor(n)` | 10 (Cadence/Async); 1 (Sync) | Initial anchor count. |
 | `.min_anchor(n)` / `.max_anchor(n)` | `None` (auto) | Anchor bounds. |
 | `.overhead_target(f)` | `0.10` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** — Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
@@ -262,7 +241,7 @@ matches your call site.
 let cfg = TrainerConfig::new(dataset)
     .batch_size(64)
     .num_epochs(50)
-    .elche(ElCheConfig::nccl_async().relax_up(true))
+    .elche(ElCheConfig::nccl_cadence().relax_up(true))
     .max_grad_norm(5.0)
     .checkpoint_every(5)
     .save_path("ckpts/run43")
@@ -480,7 +459,7 @@ let cluster = ClusterBuilder::new()
 let cfg = TrainerConfig::new(dataset)
     .batch_size(64)
     .num_epochs(50)
-    .elche(ElCheConfig::nccl_async())
+    .elche(ElCheConfig::nccl_cadence())
     .cluster(cluster);
 
 Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
@@ -762,7 +741,7 @@ ignored elsewhere.
 
 ## A/B testing modes
 
-Six modes via `ElCheMode`. One line per mode:
+Five modes via `ElCheMode`. One line per mode:
 
 ```rust
 // Build the base
@@ -773,19 +752,17 @@ let base = || Trainer::builder(model_factory.clone(), optim_factory.clone(), tra
     .max_grad_norm(5.0);
 
 let a = base().elche(ElCheConfig::cpu_async()).run()?.join()?;
-let b = base().elche(ElCheConfig::nccl_async()).run()?.join()?;    // also ElCheConfig::default()
-let c = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;
-let d = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;
+let b = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;   // also ElCheConfig::default()
+let c = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;
 ```
 
 Same model, same data, same seed; change one line.
 
 | Suggested order | Rationale |
 |---|---|
-| 1. **`CpuAsync`** | **Best in class** on the reference rig — fastest wall-time *and* best convergence in the published `ddp-bench` runs. The CPU averaging path decouples from the GPU forward pass (true mid-epoch overshoot) and benefits most from EASGD elastic blending. Cost: a decent CPU. A future dedicated averaging tier (extra GPU or peer) will lift the cost; the convergence quality is intrinsic to the algorithm. |
-| 2. **`NcclAsync`** (default) | Recommended NCCL default. Same in-epoch loop as `NcclCadence` (per `self_driven.rs:215`) with cross-epoch lookahead on top — fast rank can stream into the next epoch's batches while slow rank finishes. On a homogeneous-NCCL cluster this is usually the right pick. |
-| 3. `NcclCadence` | Same in-epoch loop as `NcclAsync` but lockstep on epoch boundaries — every rank waits for the slowest before the next epoch dispatches. Pick this when reproducibility of cross-rank epoch alignment matters more than wall-time. |
-| 4. `NcclSync` | Strict-sync baseline. Tells you whether per-batch synchronization helps for your specific model. Identical to vanilla DDP. |
+| 1. **`CpuAsync`** | **Best in class** on the reference rig — fastest wall-time *and* best convergence in the published `ddp-bench` runs. The CPU averaging path decouples from the GPU forward pass (genuine async — averaging on a separate channel) and benefits most from EASGD elastic blending. Cost: a decent CPU. A future dedicated averaging tier (extra GPU or peer) will lift the cost; the convergence quality is intrinsic to the algorithm. |
+| 2. **`NcclCadence`** (default) | Recommended NCCL default. ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window. Anchor-based cadence with AllReduce at every boundary. |
+| 3. `NcclSync` | Strict-sync baseline. Tells you whether per-batch synchronization helps for your specific model. Identical to vanilla DDP. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and `loss per
 wall-second` — that last metric is usually the decider. The `ddp-bench`
@@ -1011,14 +988,13 @@ spawned children's contexts.
 
 ### OOM on smaller GPU
 
-Any anchor-based mode (`NcclAsync`, `NcclCadence`, `CpuAsync`,
-`CpuCadence`) routes through ElChe, which assigns proportionally fewer
-batches to the slower/smaller GPU. The DataLoader's per-device backend
-selection also helps: the large GPU goes resident while the small GPU
-streams.
+Any anchor-based mode (`NcclCadence`, `CpuAsync`, `CpuCadence`)
+routes through ElChe, which assigns proportionally fewer batches to
+the slower/smaller GPU. The DataLoader's per-device backend selection
+also helps: the large GPU goes resident while the small GPU streams.
 
 ```rust
-.elche(ElCheConfig::nccl_async().max_anchor(50))   // or any anchor-based preset
+.elche(ElCheConfig::nccl_cadence().max_anchor(50))   // or any anchor-based preset
 ```
 
 ### CPU averaging timeout

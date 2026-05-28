@@ -700,7 +700,7 @@ impl ClusterCoordinator {
             // in-flight chunks across any pool. Mirrors threaded
             // `Coordinator::on_epoch_aggregated` (ddp_run/coordinator/
             // mod.rs:978-988). Without this, multi-epoch progressive
-            // runs (cpu-cadence, cpu-async, nccl-cadence, nccl-async)
+            // runs (cpu-cadence, cpu-async, nccl-cadence)
             // wedge after epoch 0 once the calibrated `batch_counts`
             // pulls the fast rank past its planned + max_overshoot
             // budget.

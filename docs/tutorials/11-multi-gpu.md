@@ -43,8 +43,8 @@ let state: TrainedState = handle.join()?;
 
 On a single GPU or CPU, this runs in the calling process. On a host
 with 2+ visible CUDA devices, it **auto-promotes** to one process per
-rank, with NCCL-Async cadence (the default `ElCheConfig::default() =
-nccl_async()`) and the meta-controller on by default. Zero code
+rank, with NCCL cadence (the default `ElCheConfig::default() =
+nccl_cadence()`) and the meta-controller on by default. Zero code
 change.
 
 ```
@@ -183,7 +183,7 @@ observed throughput so the AllReduce overhead stays at a small
 fraction of compute time (`overhead_target`, default 10%).
 
 `Trainer::builder().run()` activates ElChe by default (the default
-mode is `NcclAsync`). No configuration needed for the common
+mode is `NcclCadence`). No configuration needed for the common
 heterogeneous-rig case.
 
 ### How it adapts
@@ -218,7 +218,7 @@ hardware is visible. When you do want to tune, every knob lives on
 ```rust
 use flodl::*;
 
-let elche = ElCheConfig::nccl_async()    // also the default
+let elche = ElCheConfig::nccl_cadence()  // also the default
     .overhead_target(0.05)               // tighter: aim for sync < 5% of compute
     .max_anchor(50)                      // ceiling on anchor growth
     .max_batch_diff(20)                  // cap how far fast rank may lead slow rank
@@ -245,13 +245,12 @@ Reference](../ddp.md#elcheconfig-knobs)):
 
 ## Mode selection — `ElCheMode`
 
-The six DDP modes:
+The five DDP modes:
 
 | Mode | Best for |
 |---|---|
-| `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU |
-| `NcclAsync` (default) | Strong NCCL default; cross-epoch lookahead fills wall-time on heterogeneous rigs |
-| `NcclCadence` | Same in-epoch loop as NcclAsync but lockstep on epoch boundaries |
+| `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU. Genuine async — averaging decoupled from the GPU pipeline. |
+| `NcclCadence` (default) | Strong NCCL default. Anchor-based scheduling; fast devices process proportionally more batches per averaging window. |
 | `NcclSync` | Strict per-batch AllReduce — homogeneous rigs, correctness-first baseline |
 | `CpuSync`, `CpuCadence` | A/B against NCCL when peer-access is unavailable |
 
@@ -482,7 +481,7 @@ elastic membership, controller-driven checkpoint retry.
 
 | Knob | Lives on | Common values |
 |---|---|---|
-| `.elche(ElCheConfig)` | TrainerConfig / DdpBuilder | `nccl_async()` (default), `cpu_async()`, etc. |
+| `.elche(ElCheConfig)` | TrainerConfig / DdpBuilder | `nccl_cadence()` (default), `cpu_async()`, etc. |
 | `.epoch_callback_policy(p)` | TrainerConfig / DdpBuilder | `Fastest` (default), `Rank(global_rank)` |
 | `.checkpoint_every(n)` | TrainerConfig / DdpBuilder | usize |
 | `.save_path(p)`, `.resume_from(p)` | TrainerConfig / DdpBuilder | `&str` |

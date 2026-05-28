@@ -55,13 +55,9 @@ pub enum ElCheMode {
     NcclSync,
     /// NCCL averaging, anchor-based. ElChe tunes the anchor so the
     /// slow device sets the pace; fast devices process proportionally
-    /// more batches per averaging window. Recommended for mixed GPU
-    /// setups.
+    /// more batches per averaging window. Recommended NCCL default for
+    /// mixed GPU setups.
     NcclCadence,
-    /// NCCL averaging, anchor + overshoot. Same proportional scheduling
-    /// as Cadence plus divergence-driven anchor correction; fast ranks
-    /// may stream into the next epoch's data.
-    NcclAsync,
     /// CPU-mediated averaging via the coordinator, all-reduce every
     /// batch. Useful when NVLink / PCIe peer access is unavailable,
     /// for heterogeneous-mounted rigs, or for A/B against the NCCL
@@ -85,7 +81,6 @@ impl ElCheMode {
         match self {
             Self::NcclSync => (ApplyPolicy::Sync, AverageBackend::Nccl),
             Self::NcclCadence => (ApplyPolicy::Cadence, AverageBackend::Nccl),
-            Self::NcclAsync => (ApplyPolicy::Async, AverageBackend::Nccl),
             Self::CpuSync => (ApplyPolicy::Sync, AverageBackend::Cpu),
             Self::CpuCadence => (ApplyPolicy::Cadence, AverageBackend::Cpu),
             Self::CpuAsync => (ApplyPolicy::Async, AverageBackend::Cpu),
@@ -171,18 +166,10 @@ impl ElCheConfig {
         }
     }
 
-    /// NCCL averaging, anchor-based. Default anchor 10.
+    /// NCCL averaging, anchor-based. Default anchor 10. Recommended
+    /// NCCL default for mixed-GPU rigs.
     pub fn nccl_cadence() -> Self {
         Self::default_for(ElCheMode::NcclCadence)
-    }
-
-    /// NCCL averaging, anchor + overshoot. Default anchor 10,
-    /// overhead_target 0.10.
-    pub fn nccl_async() -> Self {
-        Self {
-            overhead_target: Some(0.10),
-            ..Self::default_for(ElCheMode::NcclAsync)
-        }
     }
 
     /// CPU-mediated averaging, all-reduce every batch.
@@ -256,20 +243,16 @@ impl ElCheConfig {
 }
 
 impl Default for ElCheConfig {
-    /// Default = [`Self::nccl_async`].
+    /// Default = [`Self::nccl_cadence`].
     ///
-    /// On NCCL, `Async` and `Cadence` share the same in-epoch loop —
-    /// the difference is cross-epoch lookahead: `Async` dispatches the
-    /// next epoch's plan to a rank as soon as that rank finishes the
-    /// current one (per-rank, up to a 1-epoch lookahead bound),
-    /// without waiting for full-cluster aggregation. On heterogeneous
-    /// rigs that fills the wall-time gap between fast-rank epoch
-    /// completion and slow-rank epoch completion. Same numerics, same
-    /// rendezvous-at-every-barrier guarantees, strictly better
-    /// utilization. `Cadence` remains the right pick when you want
-    /// every rank to start each epoch in lockstep.
+    /// Recommended NCCL mode for heterogeneous rigs: anchor-based
+    /// cadence with ElChe tuning the slow-device-anchored pace. Fast
+    /// GPUs process proportionally more batches per averaging window;
+    /// AllReduce coordinates at every cadence boundary. For decoupled
+    /// asynchronous averaging on heterogeneous setups, see
+    /// [`Self::cpu_async`].
     fn default() -> Self {
-        Self::nccl_async()
+        Self::nccl_cadence()
     }
 }
 
@@ -465,20 +448,19 @@ mod tests {
     #[test]
     fn elche_mode_split_round_trip() {
         for m in [
-            ElCheMode::NcclSync, ElCheMode::NcclCadence, ElCheMode::NcclAsync,
+            ElCheMode::NcclSync, ElCheMode::NcclCadence,
             ElCheMode::CpuSync, ElCheMode::CpuCadence, ElCheMode::CpuAsync,
         ] {
             let (p, b) = m.split();
-            // Sync → Sync, Cadence → Cadence, Async → Async + correct backend.
             let expected_backend = match m {
-                ElCheMode::NcclSync | ElCheMode::NcclCadence | ElCheMode::NcclAsync => AverageBackend::Nccl,
+                ElCheMode::NcclSync | ElCheMode::NcclCadence => AverageBackend::Nccl,
                 ElCheMode::CpuSync | ElCheMode::CpuCadence | ElCheMode::CpuAsync => AverageBackend::Cpu,
             };
             assert_eq!(b, expected_backend, "{:?} backend split", m);
             let expected_policy = match m {
                 ElCheMode::NcclSync | ElCheMode::CpuSync => ApplyPolicy::Sync,
                 ElCheMode::NcclCadence | ElCheMode::CpuCadence => ApplyPolicy::Cadence,
-                ElCheMode::NcclAsync | ElCheMode::CpuAsync => ApplyPolicy::Async,
+                ElCheMode::CpuAsync => ApplyPolicy::Async,
             };
             assert_eq!(p, expected_policy, "{:?} policy split", m);
         }
@@ -491,7 +473,6 @@ mod tests {
         assert_eq!(ElCheConfig::cpu_sync().anchor, 1);
         assert_eq!(ElCheConfig::nccl_cadence().anchor, 10);
         assert_eq!(ElCheConfig::nccl_cadence().mode, ElCheMode::NcclCadence);
-        assert_eq!(ElCheConfig::nccl_async().overhead_target, Some(0.10));
         assert_eq!(ElCheConfig::cpu_async().mode, ElCheMode::CpuAsync);
     }
 
@@ -511,9 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn elche_default_is_nccl_async() {
+    fn elche_default_is_nccl_cadence() {
         let cfg = ElCheConfig::default();
-        assert_eq!(cfg.mode, ElCheMode::NcclAsync);
+        assert_eq!(cfg.mode, ElCheMode::NcclCadence);
         assert_eq!(cfg.anchor, 10);
     }
 
@@ -521,11 +502,10 @@ mod tests {
     fn meta_controller_default_is_on() {
         let cfg = ElCheConfig::default();
         assert!(cfg.meta_controller, "meta_controller defaults to true");
-        // Spot-check all six presets agree on the default.
+        // Spot-check all presets agree on the default.
         for preset in [
             ElCheConfig::nccl_sync(),
             ElCheConfig::nccl_cadence(),
-            ElCheConfig::nccl_async(),
             ElCheConfig::cpu_sync(),
             ElCheConfig::cpu_cadence(),
             ElCheConfig::cpu_async(),

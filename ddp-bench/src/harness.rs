@@ -592,7 +592,7 @@ fn run_baseline_solo(
 /// Run any DDP mode through `Trainer::builder` with thread-per-GPU.
 ///
 /// Handles every `DdpMode::Builder { policy, backend }` combination
-/// (nccl-sync, nccl-cadence, nccl-async, cpu-sync, cpu-cadence, cpu-async).
+/// (nccl-sync, nccl-cadence, cpu-sync, cpu-cadence, cpu-async).
 /// Solo runs of paper-baseline models go through [`run_baseline_solo`] instead.
 #[allow(clippy::borrowed_box, clippy::type_complexity, clippy::too_many_arguments)]
 fn run_unified(

@@ -389,7 +389,7 @@ Common quick fixes:
 - **NCCL version skew across hosts**: one host's libtorch ships NCCL 2.27, another's ships 2.26. Build a matching libnccl with `fdl nccl build` and wire it via the worker's `env: LD_PRELOAD:` block in `fdl.cluster.yml`.
 - **CUBLAS_STATUS_EXECUTION_FAILED after NCCL**: also covered by the "no CUDA before `Trainer::run`" invariant — don't instantiate CUDA tensors in `main()`. Use `flodl::sys::detect_gpus()` for pre-run GPU queries.
 - **Training hangs (cluster)**: usually stale child processes from a previous aborted run holding rendezvous ports or GPU memory. `fdl cluster <cmd>` cleans these up pre-spawn, but kill-9 on the launcher bypasses cleanup — clear stragglers with `pkill -f flodl-rank` on each worker.
-- **OOM on smaller GPU**: any anchor-based mode (`NcclAsync`, `NcclCadence`, `CpuAsync`, `CpuCadence`) routes through ElChe, which proportionally shrinks the smaller GPU's batch count. Also: per-rank DataLoader backend selection — the larger GPU can go resident while the smaller streams.
+- **OOM on smaller GPU**: any anchor-based mode (`NcclCadence`, `CpuAsync`, `CpuCadence`) routes through ElChe, which proportionally shrinks the smaller GPU's batch count. Also: per-rank DataLoader backend selection — the larger GPU can go resident while the smaller streams.
 
 ---
 

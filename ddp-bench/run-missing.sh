@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 echo "=== Starting missing runs at $(date) ==="
 
 # resnet (200 epochs) - 5 missing modes
-for mode in nccl-sync nccl-async cpu-sync cpu-cadence cpu-async; do
+for mode in nccl-sync cpu-sync cpu-cadence cpu-async; do
   echo ""
   echo "=== resnet / $mode (200 epochs) at $(date) ==="
   fdl ddp-bench --model resnet --mode $mode --epochs 200

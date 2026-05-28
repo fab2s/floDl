@@ -213,7 +213,7 @@ GPT-nano, char-RNN, and conv-AE models, each wired through the same
 The same call scales transparently from CPU → single GPU → multi-GPU
 single-host → multi-host cluster. On a host with 2+ visible CUDA
 devices it auto-promotes to process-per-rank. For mode selection
-(`NcclAsync` (default), `CpuAsync`, etc.), heterogeneous-rig
+(`NcclCadence` (default), `CpuAsync`, etc.), heterogeneous-rig
 cadence (ElChe), and cluster topology (`fdl.cluster.yml` /
 `ClusterBuilder`), see [Multi-GPU Training](11-multi-gpu.md), the
 [Heterogeneous & Multi-Host DDP tutorial](12-async-ddp.md), and the
@@ -229,7 +229,7 @@ cfg)` takes a `TrainerConfig`:
 let cfg = TrainerConfig::new(dataset)
     .batch_size(64)
     .num_epochs(50)
-    .elche(ElCheConfig::nccl_async())           // default; just shown explicitly
+    .elche(ElCheConfig::nccl_cadence())         // default; just shown explicitly
     .max_grad_norm(5.0)
     .checkpoint_every(5)
     .save_path("ckpts/run43")

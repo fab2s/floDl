@@ -358,29 +358,30 @@ impl DdpHandle {
         })
     }
 
-    /// Cluster-rank entry point for `ApplyPolicy::Cadence` /
-    /// `ApplyPolicy::Async` + `AverageBackend::Nccl` driven by a
-    /// [`ClusterCoordinator`] (elastic-membership + persistence aware).
+    /// Cluster-rank entry point for `ApplyPolicy::Cadence` +
+    /// `AverageBackend::Nccl` driven by a [`ClusterCoordinator`]
+    /// (elastic-membership + persistence aware).
     ///
     /// Mirrors [`run_cluster_rank_sync_nccl_via_coord`](Self::run_cluster_rank_sync_nccl_via_coord)
     /// — the worker side is identical between Sync and Cadence under the
     /// via-coord routing because the
     /// [`ClusterCoordinator`](crate::distributed::cluster_coordinator::ClusterCoordinator)
-    /// owns ElChe + ConvergenceGuard for all three policies (see
+    /// owns ElChe + ConvergenceGuard (see
     /// [`ClusterCoordinator::trigger_averaging`] for the cadence broadcast
     /// and [`ClusterCoordinator::finish_averaging_nccl`] for the guard /
     /// `report_timing` / `nudge_anchor_down` / `relax_anchor_up`
     /// pipeline). The worker just trains batches and responds to coord-
     /// issued `SyncNow` via `handle_control` → `sync_now_nccl`.
     ///
-    /// Cadence and Async NCCL collapse to the same entry. The
-    /// coordinator-side overshoot gate (Async-only, both backends)
-    /// keeps Async ranks within `max_overshoot` batches of their
-    /// planned cadence; Cadence relies on AllReduce as its sole
-    /// coordination layer (per `feedback_nccl_no_overshoot_throttle`)
-    /// and is unbounded between syncs. [`WorkerConfig::policy`] carries
-    /// the user's chosen policy for log lines + future-policy metadata
-    /// but does not branch the algorithm on the rank side.
+    /// The `(Async, Nccl)` policy/backend pair is still constructible
+    /// internally (the dispatch matrix accepts it) but no public
+    /// `ElCheMode` resolves to it — the user-facing `NcclAsync` mode
+    /// was dropped because cross-epoch lookahead on NCCL gave near-zero
+    /// real-world speedup over `NcclCadence` while exposing an
+    /// AllReduce-vs-autograd race on heterogeneous rigs.
+    /// [`WorkerConfig::policy`] carries the configured policy for log
+    /// lines + future-policy metadata but does not branch the algorithm
+    /// on the rank side.
     ///
     /// `save_path` on [`DdpRunConfig`] is REQUIRED — the cluster
     /// save-on-unrecoverable-failure flow needs a destination. Loud

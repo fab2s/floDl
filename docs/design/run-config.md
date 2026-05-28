@@ -85,7 +85,7 @@ docker: cuda
 entry: cargo run --release --features cuda --
 
 ddp:
-  mode: nccl-async
+  mode: nccl-cadence
   timeline: true
 
 training:
@@ -306,7 +306,6 @@ Usage:
 Arguments:
     [<preset>]  Named preset, one of:
       full-sweep     All models, all DDP modes
-      nccl-async     NCCL async for all models
       nccl-cadence   NCCL cadence for all models
       quick          Fast smoke test (linear, 1 epoch)
       solo-0         Solo baseline on fast GPU (all models)
@@ -592,7 +591,7 @@ which prints its options as JSON to stdout and exits:
       "description": "Run specific DDP mode",
       "default": "solo-0",
       "choices": ["solo-0", "solo-1", "nccl-sync", "nccl-cadence",
-                  "nccl-async", "cpu-sync", "cpu-cadence", "cpu-async", "all"]
+                  "cpu-sync", "cpu-cadence", "cpu-async", "all"]
     },
     "tags": {
       "type": "list[string]",
@@ -787,7 +786,7 @@ OPTIONS:
                              resnet-graph, char-rnn, gpt-nano, conv-ae, all]
     --mode <MODE>           Run specific DDP mode  [default: solo-0]
                             [possible: solo-0, solo-1, nccl-sync,
-                             nccl-cadence, nccl-async, cpu-sync,
+                             nccl-cadence, cpu-sync,
                              cpu-cadence, cpu-async, all]
     --epochs <N>            Override epoch count
     --lr-scale <F>          Multiply default LR
@@ -807,7 +806,7 @@ $ fdl ddp-bench --model <TAB>
 logistic  mlp  lenet  resnet  resnet-graph  char-rnn  gpt-nano  conv-ae  all
 
 $ fdl ddp-bench --mode <TAB>
-solo-0  solo-1  nccl-sync  nccl-cadence  nccl-async  cpu-sync  cpu-cadence  cpu-async  all
+solo-0  solo-1  nccl-sync  nccl-cadence  cpu-sync  cpu-cadence  cpu-async  all
 
 $ fdl ddp-bench --baseline <TAB>
 # (file path completion because type: path)

@@ -678,8 +678,8 @@ Loud-errors on duplicate, missing value, or invalid spec.
 
 ```bash
 fdl --gpus 0 test                # CPU-style: scope tests to GPU 0
-fdl --gpus 0,1 ddp-bench --mode nccl-async    # synthesize 2-rank single-host cluster
-fdl --gpus all cluster ddp-bench --mode nccl-async   # override local host devices in cluster mode
+fdl --gpus 0,1 ddp-bench --mode nccl-cadence   # synthesize 2-rank single-host cluster
+fdl --gpus all cluster ddp-bench --mode nccl-cadence   # override local host devices in cluster mode
 ```
 
 ### `fdl cluster <cmd>` — multi-host fan-out
@@ -1054,7 +1054,7 @@ pub struct BenchArgs {
     pub model: String,
 
     /// DDP mode to exercise.
-    #[option(choices = &["solo-0", "nccl-cadence", "nccl-async",
+    #[option(choices = &["solo-0", "nccl-cadence",
                          "cpu-cadence", "cpu-async"],
              default = "nccl-cadence")]
     pub mode: String,
@@ -1186,7 +1186,7 @@ training:
   seed: 42
 
 # Each `mode:` value below maps 1:1 to flodl's ElCheMode variants:
-# nccl-sync, nccl-cadence, nccl-async (default), cpu-sync, cpu-cadence, cpu-async.
+# nccl-sync, nccl-cadence (default), cpu-sync, cpu-cadence, cpu-async.
 # Plus solo-N for single-GPU baselines (N = physical device index).
 
 commands:
@@ -1216,8 +1216,8 @@ sub-commands with their own behaviour).
 
 Preset `options:` entries map 1:1 to the binary's `#[derive(FdlArgs)]`
 shape — `mode`, `model`, `epochs`, `batch-size`, etc. The set of
-accepted `mode` values mirrors `ElCheMode` (six modes:
-`nccl-sync` / `nccl-cadence` / `nccl-async` / `cpu-sync` / `cpu-cadence` /
+accepted `mode` values mirrors `ElCheMode` (five modes:
+`nccl-sync` / `nccl-cadence` / `cpu-sync` / `cpu-cadence` /
 `cpu-async`) plus the `solo-N` single-GPU baselines. See
 [DDP Reference: ElCheMode](ddp.md#elchemode--cadence--backend-in-one-name)
 for the mode semantics.

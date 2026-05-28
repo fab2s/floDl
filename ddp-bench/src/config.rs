@@ -18,6 +18,9 @@ pub enum DdpMode {
 
 impl DdpMode {
     /// Parse a mode string like "solo-0", "nccl-sync", "nccl-cadence", "cpu-async".
+    /// `nccl-async` was dropped (cross-epoch lookahead on NCCL gave near-zero
+    /// real-world speedup vs `nccl-cadence` while complicating the dispatch
+    /// path; CPU Async is the genuine async mode).
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "nccl-sync" => Some(DdpMode::Builder {
@@ -26,10 +29,6 @@ impl DdpMode {
             }),
             "nccl-cadence" => Some(DdpMode::Builder {
                 policy: ApplyPolicy::Cadence,
-                backend: AverageBackend::Nccl,
-            }),
-            "nccl-async" => Some(DdpMode::Builder {
-                policy: ApplyPolicy::Async,
                 backend: AverageBackend::Nccl,
             }),
             "cpu-sync" => Some(DdpMode::Builder {
@@ -57,7 +56,6 @@ impl DdpMode {
             "solo-2",
             "nccl-sync",
             "nccl-cadence",
-            "nccl-async",
             "cpu-sync",
             "cpu-cadence",
             "cpu-async",

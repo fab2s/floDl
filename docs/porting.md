@@ -287,7 +287,7 @@ let ddp = Trainer::builder(model_factory, optim_factory, train_step)
     .dataset(dataset)
     .batch_size(32)
     .num_epochs(10)
-    .elche(ElCheConfig::nccl_async())   // default; six modes total
+    .elche(ElCheConfig::nccl_cadence())  // default; five modes total
     .run()?;
 
 let state = ddp.join()?;                // averaged params + buffers on CPU
@@ -295,13 +295,13 @@ let state = ddp.join()?;                // averaged params + buffers on CPU
 
 ElChe cadence auto-detects heterogeneous GPU speeds and lets the
 faster card run ahead while the slow one anchors synchronization.
-The default mode is `NcclAsync` — cross-epoch lookahead on top of the
-shared in-epoch loop with `NcclCadence`. Other modes: `NcclSync`,
-`NcclCadence`, `CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on
-the reference rig). See the [DDP Reference](ddp.md) for the full mode
-surface, convergence guard, metrics, and live-monitor wiring, and
-[DDP Benchmark](ddp-benchmark.md) for results on mixed consumer
-hardware.
+The default mode is `NcclCadence` — anchor-based scheduling with
+NCCL AllReduce at every cadence boundary. Other modes: `NcclSync`,
+`CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on the reference
+rig — genuine async via decoupled CPU averaging). See the
+[DDP Reference](ddp.md) for the full mode surface, convergence guard,
+metrics, and live-monitor wiring, and [DDP Benchmark](ddp-benchmark.md)
+for results on mixed consumer hardware.
 
 ## Key differences from PyTorch
 

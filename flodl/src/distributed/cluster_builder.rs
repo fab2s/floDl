@@ -157,7 +157,7 @@ impl ClusterBuilder {
     /// ```ignore
     /// let cfg = TrainerConfig::new(load_data()?)
     ///     .cluster(ClusterBuilder::all_local_gpus()?)
-    ///     .elche(ElCheConfig::nccl_async());
+    ///     .elche(ElCheConfig::nccl_cadence());
     /// Trainer::run(model_factory, opt_factory, train_fn, cfg)?;
     /// ```
     pub fn all_local_gpus() -> Result<FullCluster> {

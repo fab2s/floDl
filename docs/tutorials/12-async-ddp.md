@@ -106,7 +106,7 @@ early-stop signal.
 Opt out for instrumentation:
 
 ```rust
-let elche = ElCheConfig::nccl_async()
+let elche = ElCheConfig::nccl_cadence()
     .meta_controller(false);     // unconditioned trajectory
 ```
 
@@ -130,7 +130,7 @@ typical `0.4`–`0.8`). Honored on `CpuAsync` only; ignored elsewhere.
 
 ## A/B testing modes — the recipe
 
-Six modes via `ElCheMode`. Each switch is one line:
+Five modes via `ElCheMode`. Each switch is one line:
 
 ```rust
 let base = || Trainer::builder(model_factory.clone(), optim_factory.clone(), train_step)
@@ -140,19 +140,17 @@ let base = || Trainer::builder(model_factory.clone(), optim_factory.clone(), tra
     .max_grad_norm(5.0);
 
 let a = base().elche(ElCheConfig::cpu_async()).run()?.join()?;     // best-in-class candidate
-let b = base().elche(ElCheConfig::nccl_async()).run()?.join()?;    // default; strong NCCL pick
-let c = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;  // strict cross-epoch lockstep
-let d = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;     // per-batch baseline
+let b = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;  // default; recommended NCCL pick
+let c = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;     // per-batch baseline
 ```
 
 Suggested order (refined from the `ddp-bench` published numbers):
 
 | Position | Mode | Rationale |
 |---|---|---|
-| 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (true mid-epoch overshoot) and benefits most from EASGD. Cost: a decent CPU. |
-| 2 | **`NcclAsync`** (default) | Recommended NCCL default. Same in-epoch loop as `NcclCadence` with cross-epoch lookahead on top. |
-| 3 | `NcclCadence` | Strict cross-epoch lockstep — pick when epoch-aligned reproducibility matters. |
-| 4 | `NcclSync` | Strict per-batch sync. Tells you whether tighter synchronization helps your specific model. |
+| 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (genuine async — averaging on a separate channel) and benefits most from EASGD. Cost: a decent CPU. |
+| 2 | **`NcclCadence`** (default) | Recommended NCCL default. ElChe-driven anchor; fast devices process proportionally more batches per averaging window. |
+| 3 | `NcclSync` | Strict per-batch sync. Tells you whether tighter synchronization helps your specific model. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and **`loss per
 wall-second`** — the last is usually the decider. A slightly higher
@@ -169,30 +167,13 @@ the same `train_step` closure. See
 for the canonical worked example and the published convergence
 numbers.
 
-### Why `NcclAsync` is the NCCL default, not `NcclCadence`
-
-On the NCCL backend, `NcclCadence` and `NcclAsync` share the
-**same in-epoch loop** — same ElChe anchor mechanics, same weighted
-AllReduce. The difference is at the coordinator (cross-epoch) level:
-
-- `NcclCadence`: when every rank finishes epoch N, dispatch epoch N+1
-  to all ranks together.
-- `NcclAsync`: when an individual rank finishes epoch N, the
-  coordinator immediately dispatches epoch N+1 to *that rank*
-  (per-rank, up to a 1-epoch lookahead bound), without waiting for
-  full-cluster aggregation. The fast rank gets a head start on N+1's
-  batches while the slow rank finishes N — filling the wall-time gap.
-
-In-epoch barriers are still hard rendezvous points — no rank
-overshoots mid-epoch on NCCL. The "Async" in `NcclAsync` means
-*cross-epoch lookahead*, not *mid-epoch overshoot*.
-
-> Today the cross-epoch lookahead is bounded by the natural rhythm
-> of AllReduce barriers (the fast rank has to rendezvous at every
-> in-epoch sync). Generalizing `max_overshoot` to NCCL — so the gap
-> is a batch-count bound across both backends — is on the
-> next-release roadmap. The design principle is "no worker should
-> drift at epoch scale, only at batch scale."
+> `NcclAsync` used to exist as a sixth mode (NCCL + per-rank
+> cross-epoch dispatch). It was dropped — measured benefit over
+> `NcclCadence` was within noise on every tested rig, and the
+> in-place AllReduce writeback raced with autograd on heterogeneous
+> Pascal+Blackwell setups. `CpuAsync` is the real async mode:
+> averaging is decoupled from the GPU pipeline through a separate
+> channel.
 
 ## Heterogeneous-rig real-world example
 
@@ -370,8 +351,7 @@ TrainerConfig::new(dataset)
 | Constructor | Mode |
 |---|---|
 | `ElCheConfig::nccl_sync()` | `NcclSync` |
-| `ElCheConfig::nccl_cadence()` | `NcclCadence` |
-| `ElCheConfig::nccl_async()` | `NcclAsync` (**default**) |
+| `ElCheConfig::nccl_cadence()` | `NcclCadence` (**default**) |
 | `ElCheConfig::cpu_sync()` | `CpuSync` |
 | `ElCheConfig::cpu_cadence()` | `CpuCadence` |
 | `ElCheConfig::cpu_async()` | `CpuAsync` (best-in-class on reference) |
