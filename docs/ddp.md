@@ -133,7 +133,7 @@ returns `NcclAsync` (the recommended NCCL mode).
 |---|---|---|---|
 | `NcclSync` | Every batch | NCCL AllReduce | Homogeneous GPUs, correctness-first baseline |
 | `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | Heterogeneous rigs that want every rank to start each epoch in lockstep |
-| `NcclAsync` | Anchor (ElChe) + cross-epoch lookahead | NCCL AllReduce | **Recommended NCCL default** — same in-epoch loop as Cadence with per-rank next-epoch dispatch on top |
+| `NcclAsync` | Anchor (ElChe) + `max_overshoot`-bounded cross-epoch dispatch | NCCL AllReduce | **Recommended NCCL default** — same in-epoch loop as Cadence with per-rank next-epoch dispatch on top, batch-bounded by `max_overshoot` |
 | `CpuSync` | Every batch | CPU averaging | Sync without NCCL (peer-access unavailable, A/B against NCCL) |
 | `CpuCadence` | Anchor-based | CPU averaging | Heterogeneous rigs without fast peer links |
 | `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** — fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
@@ -143,34 +143,30 @@ through the same machinery, so switching between them is one line.
 
 ### What `NcclAsync` actually does on NCCL
 
-NCCL barriers are hard rendezvous points — no rank can overshoot
-mid-epoch. `NcclCadence` and `NcclAsync` share the **same in-epoch
-loop**: same ElChe anchor mechanics, same weighted AllReduce. The
-difference is at the coordinator (cross-epoch) level:
+NCCL barriers are hard rendezvous points — no rank can run a
+collective alone. `NcclCadence` and `NcclAsync` share the **same
+in-epoch loop**: same ElChe anchor mechanics, same weighted
+AllReduce. The difference is at the coordinator (cross-epoch) level:
 
 - **`NcclCadence`**: when every rank finishes epoch N, dispatch epoch
   N+1 to all ranks together.
 - **`NcclAsync`**: when an individual rank finishes epoch N, the
-  coordinator immediately dispatches epoch N+1 to *that rank*
-  (per-rank, up to a 1-epoch lookahead bound), without waiting for
-  full-cluster aggregation. The fast rank gets a head start on N+1's
-  batches while the slow rank finishes N — filling the wall-time gap.
+  coordinator immediately dispatches epoch N+1 to *that rank* without
+  waiting for full-cluster aggregation. The fast rank gets a head
+  start on N+1's batches while the slow rank finishes N — filling the
+  wall-time gap.
 
-So "Async" on NCCL means *cross-epoch lookahead*, not *mid-epoch
-overshoot*. Mid-epoch overshoot is an async-CPU concept only (the CPU
-averaging path is decoupled from the GPU forward pass, so ranks can
-keep training while averaging runs).
-
-> **Note on `max_overshoot`**: today the `max_overshoot` knob (in
-> batches) gates only the CPU-Async path's mid-epoch drift. On NCCL
-> Async, the cross-epoch lookahead is bounded by the natural rhythm
-> of AllReduce barriers — the fast rank can stream into the next
-> epoch's batches but still has to rendezvous at every in-epoch
-> barrier, capping how far it can run away. Generalizing
-> `max_overshoot` to NCCL is on the next-release roadmap; the design
-> principle is "no worker should drift at epoch scale, only at batch
-> scale". When that lands, `max_overshoot` will bound NCCL cross-epoch
-> dispatch the same way it bounds CPU mid-epoch overshoot.
+The cross-epoch dispatch is **batch-bounded by `max_overshoot`**: a
+fast rank can stream up to `planned + max_overshoot` batches past its
+ElChe-planned count before the coordinator gates the next dispatch.
+The gated rank sits in `wait_for_epoch_plan` (still processing any
+incoming `SyncNow` via the existing control path), and is woken
+automatically when the next AllReduce completes and the gate opens
+again. The principle is "no worker drifts at epoch scale, only at
+batch scale" — `max_overshoot` is the single knob enforcing it, on
+both NCCL and CPU. The gate only fires in `Async` policy; `Sync`
+reduces every batch (drift can't build) and `Cadence` uses AllReduce
+as its sole coordination layer.
 
 ### `ElCheConfig` — presets + overrides
 

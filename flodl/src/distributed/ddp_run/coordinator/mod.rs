@@ -755,18 +755,20 @@ impl Coordinator {
             return;
         }
 
-        // Overshoot gate: don't dispatch if rank has exceeded its planned
-        // batch count by more than max_overshoot since the last sync.
-        // Only applies when streaming AHEAD of a not-yet-aggregated epoch.
-        // If the rank's current epoch is already aggregated, this is a normal
-        // transition (all ranks completed), not overshoot.
+        // Overshoot gate (Async only, both backends): don't dispatch if
+        // rank has exceeded its planned batch count by more than
+        // max_overshoot since the last sync. Only applies when streaming
+        // AHEAD of a not-yet-aggregated epoch. If the rank's current
+        // epoch is already aggregated, this is a normal transition.
         //
-        // Skip for NCCL backend: overshoot is an async/CPU concept. NCCL
-        // cadence uses AllReduce as its sole coordination mechanism; blocking
-        // the fast GPU here forces it into wait_for_epoch_plan where it can't
-        // send timing messages, leaving nccl_ack permanently false and
-        // deadlocking should_average + check_throttle.
-        if !matches!(self.backend, AverageBackend::Nccl) {
+        // Sync runs averaging every batch so steps_since_avg never drifts;
+        // Cadence uses AllReduce as its sole coordination layer (per
+        // `feedback_nccl_no_overshoot_throttle`). Only Async accumulates
+        // cross-cycle drift that needs a batch-scale bound. A gated NCCL
+        // rank in `wait_for_epoch_plan` still processes the next SyncNow
+        // via `dispatch_control`, and `finish_averaging_nccl` re-dispatches
+        // idle ranks once `steps_since_avg` is reset.
+        if matches!(self.policy, ApplyPolicy::Async) {
             let current_aggregated = self.last_aggregated_epoch
                 .is_some_and(|agg| epoch <= agg);
             if !current_aggregated {

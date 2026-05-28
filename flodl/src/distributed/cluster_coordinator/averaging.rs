@@ -535,6 +535,11 @@ impl ClusterCoordinator {
             *p = None;
         }
         self.nccl_sync_post_norm = None;
+        // Overshoot gate is open again — kick any rank still sitting in
+        // `wait_for_epoch_plan` (gated, or just finished its last chunk
+        // before the cycle) so progressive dispatch doesn't stall until
+        // the next epoch-aggregate hook.
+        self.wake_idle_ranks_in_progressive();
         self.emit_sync_end();
         Ok(())
     }
@@ -704,6 +709,11 @@ impl ClusterCoordinator {
             *p = None;
         }
         self.nccl_sync_post_norm = None;
+        // Overshoot gate is open again — kick any rank still sitting in
+        // `wait_for_epoch_plan` (gated, or just finished its last chunk
+        // before the cycle) so progressive dispatch doesn't stall until
+        // the next epoch-aggregate hook.
+        self.wake_idle_ranks_in_progressive();
         // CpuAvgEnd: close the Pending window opened in trigger_averaging.
         // duration_ms is the bridge round-trip time (RequestParams
         // broadcast → all alive SyncAcks landed). Distinct from the

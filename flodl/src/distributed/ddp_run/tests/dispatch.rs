@@ -448,10 +448,11 @@ fn test_overshoot_gate_blocks_runaway() {
 }
 
 #[test]
-fn test_overshoot_gate_skipped_for_nccl() {
-    // NCCL cadence must not apply the overshoot gate. Blocking the fast
-    // GPU forces it into wait_for_epoch_plan where it can't send timing
-    // messages, leaving nccl_ack permanently false and deadlocking.
+fn test_overshoot_gate_skipped_for_cadence() {
+    // Cadence uses AllReduce as its sole coordination layer (per
+    // `feedback_nccl_no_overshoot_throttle`): no overshoot gate fires
+    // regardless of backend. Sync is the same. Only Async accumulates
+    // cross-cycle drift that needs a batch-scale bound.
     let (_timing_tx, timing_rx) = mpsc::channel();
     let (metrics_tx, metrics_rx) = mpsc::channel();
     let (_param_tx, param_rx) = mpsc::channel();
@@ -477,7 +478,7 @@ fn test_overshoot_gate_skipped_for_nccl() {
     .progressive(true)
     .batch_size(10)
     .num_epochs(3)
-    .max_overshoot(Some(0)) // Would block everything with CPU backend.
+    .max_overshoot(Some(0)) // Would block everything in Async.
     .build();
 
     // Create epoch 0 pool, take all samples for both ranks.
@@ -498,8 +499,8 @@ fn test_overshoot_gate_skipped_for_nccl() {
     }).unwrap();
     coord.drain_metrics();
 
-    // With NCCL, the overshoot gate is skipped: rank 0 should get
-    // a cross-epoch StartEpoch even with max_overshoot=0.
+    // Cadence skips the overshoot gate: rank 0 should get a cross-epoch
+    // StartEpoch even with max_overshoot=0.
     let mut got_start_epoch = false;
     while let Ok(msg) = control_rxs[0].try_recv() {
         if let ControlMsg::StartEpoch(_) = msg {
@@ -507,7 +508,74 @@ fn test_overshoot_gate_skipped_for_nccl() {
         }
     }
     assert!(got_start_epoch,
-        "NCCL backend must skip overshoot gate (AllReduce handles coordination)");
+        "Cadence policy must skip overshoot gate (AllReduce handles coordination)");
+}
+
+#[test]
+fn test_overshoot_gate_blocks_runaway_nccl_async() {
+    // Symmetric to `test_overshoot_gate_blocks_runaway` (CPU) but for
+    // NCCL Async. After the NCCL exclusion was lifted, the gate fires
+    // for Async on either backend; coordinator-side
+    // `finish_averaging_nccl` already runs the wake-loop that
+    // re-dispatches gated ranks once `steps_since_avg` is reset.
+    let (_timing_tx, timing_rx) = mpsc::channel();
+    let (metrics_tx, metrics_rx) = mpsc::channel();
+    let (_param_tx, param_rx) = mpsc::channel();
+    let mut control_txs = Vec::new();
+    let mut control_rxs = Vec::new();
+    let mut final_param_rxs = Vec::new();
+    for _ in 0..2 {
+        let (tx, rx) = mpsc::channel();
+        control_txs.push(tx);
+        control_rxs.push(rx);
+        let (_ftx, frx) = mpsc::channel();
+        final_param_rxs.push(frx);
+    }
+
+    let el_che = ElChe::new(2, 10);
+    let mut coord = Coordinator::builder(
+        timing_rx, metrics_rx, param_rx,
+        final_param_rxs,
+        control_txs,
+        ApplyPolicy::Async, AverageBackend::Nccl,
+        2, 100, el_che,
+    )
+    .progressive(true)
+    .batch_size(10)
+    .num_epochs(3)
+    .max_overshoot(Some(0))
+    .build();
+
+    // Create epoch 0 pool, take all samples for both ranks.
+    let pool = super::super::coordinator::ChunkPool::new(0, 100, 2);
+    coord.chunk_pools.insert(0, pool);
+    coord.chunk_pools.get_mut(&0).unwrap().take_chunk(50, 0);
+    coord.chunk_pools.get_mut(&0).unwrap().take_chunk(50, 1);
+
+    // Rank 0 has trained at its planned batch count; pool exhausted →
+    // dispatch_next_chunk wants to stream to epoch 1.
+    coord.steps_since_avg[0] = 10;
+    coord.steps_since_avg[1] = 3;
+
+    // Drain any control messages pre-dispatched at construction so the
+    // assertion below isolates the post-overshoot behavior.
+    while control_rxs[0].try_recv().is_ok() {}
+
+    metrics_tx.send(MetricsMsg {
+        rank: 0, epoch: 0, avg_loss: 0.1, batches_processed: 5,
+        epoch_ms: 50.0, share_complete_ms: 50.0, compute_only_ms: 50.0, data_starve_ms: 0.0, samples_processed: 50,
+        scalars: Default::default(),
+    }).unwrap();
+    coord.drain_metrics();
+
+    let mut got_epoch_1 = false;
+    while let Ok(msg) = control_rxs[0].try_recv() {
+        if let ControlMsg::StartEpoch(p) = msg {
+            if p.epoch == 1 { got_epoch_1 = true; }
+        }
+    }
+    assert!(!got_epoch_1,
+        "overshoot gate must block cross-epoch dispatch on NCCL Async too");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Epoch dispatch and progressive chunk-pool scheduling for
 //! [`super::ClusterCoordinator`].
 
-use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
@@ -230,9 +230,12 @@ impl ClusterCoordinator {
     ///
     /// Tries the rank's current epoch's pool first. If exhausted,
     /// streams ahead into the next epoch's pool (subject to the
-    /// overshoot gate on CPU backends — NCCL backends skip the gate
-    /// because overshoot is an async/CPU concept; NCCL coordinates via
-    /// the AllReduce barrier itself).
+    /// overshoot gate, which fires in `ApplyPolicy::Async` only —
+    /// `Sync` reduces every batch so drift can't build, and `Cadence`
+    /// uses the next AllReduce as its sole coordination layer per
+    /// `feedback_nccl_no_overshoot_throttle`). Gated ranks are kicked
+    /// back into motion by [`Self::wake_idle_ranks_in_progressive`]
+    /// after the next averaging cycle.
     pub(super) fn dispatch_next_chunk(&mut self, rank: usize) {
         let epoch = self.rank_epoch[rank];
         if self.chunk_pools.get(&epoch).is_some_and(|p| p.remaining() > 0) {
@@ -258,14 +261,16 @@ impl ClusterCoordinator {
             return;
         }
 
-        // Overshoot gate (CPU backend only): don't dispatch into a
-        // future epoch when the rank has streamed too far past its
-        // planned batch count since the last averaging. NCCL backend
-        // skips: blocking the fast GPU here would force it into
-        // `wait_for_epoch_plan` where it can't send timing messages,
-        // leaving nccl_ack permanently false and deadlocking
-        // `should_average` + `check_throttle`.
-        if !matches!(self.backend, AverageBackend::Nccl) {
+        // Overshoot gate (Async only, both backends): don't dispatch
+        // into a future epoch when the rank has streamed too far past
+        // its planned batch count since the last averaging. The next
+        // AllReduce / Update resets `steps_since_avg` inside
+        // `finish_averaging_*` and `wake_idle_ranks_in_progressive`
+        // re-dispatches the gated rank; a fast NCCL rank sitting in
+        // `wait_for_epoch_plan` still processes `SyncNow` via
+        // `dispatch_control` (the SyncAck flips `nccl_ack` back to
+        // true), so the gate is deadlock-free on NCCL too.
+        if matches!(self.policy, ApplyPolicy::Async) {
             let current_aggregated = self.last_aggregated_epoch
                 .is_some_and(|agg| epoch <= agg);
             if !current_aggregated {
@@ -369,5 +374,36 @@ impl ClusterCoordinator {
             / total_counts as f64;
         let target = (remaining_batches as f64 * ratio).ceil() as usize;
         target.max(self.min_chunk_batches).min(remaining_batches)
+    }
+
+    /// Wake any progressive rank stalled in `wait_for_epoch_plan` after
+    /// being held by the overshoot gate (or otherwise finished its last
+    /// chunk with no in-flight work). Called from the tail of
+    /// [`Self::finish_averaging_nccl`] / [`Self::finish_averaging_cpu`]
+    /// once `steps_since_avg` has been reset — without this kick,
+    /// nothing drives `dispatch_next_chunk` for the stalled rank (no
+    /// MetricsMsg arrives from a rank sitting in `wait_for_epoch_plan`).
+    ///
+    /// Mirrors threaded `coordinator/cpu_avg.rs:376-387` / `:544-553`,
+    /// and the post-epoch hook at the tail of
+    /// `try_advance_or_shutdown_after_aggregate`. The
+    /// dispatched `StartEpoch` queues after the just-broadcast
+    /// `SyncNow` / `Update` in each rank's control stream, so a fast
+    /// NCCL rank in `wait_for_epoch_plan` processes the collective
+    /// first and then takes the new chunk via `pending_plan`.
+    pub(super) fn wake_idle_ranks_in_progressive(&mut self) {
+        if !self.progressive {
+            return;
+        }
+        for rank in 0..self.world_size {
+            if self.is_dead(rank) {
+                continue;
+            }
+            let has_inflight = self.chunk_pools.values()
+                .any(|p| p.in_flight(rank) > 0);
+            if !has_inflight {
+                self.dispatch_next_chunk(rank);
+            }
+        }
     }
 }

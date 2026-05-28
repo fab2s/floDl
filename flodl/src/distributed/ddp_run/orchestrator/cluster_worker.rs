@@ -373,12 +373,14 @@ impl DdpHandle {
     /// pipeline). The worker just trains batches and responds to coord-
     /// issued `SyncNow` via `handle_control` → `sync_now_nccl`.
     ///
-    /// Cadence and Async NCCL collapse to the same entry: overshoot
-    /// machinery (the only old-coordinator Cadence/Async distinction)
-    /// is an async/CPU concept (see `feedback_overshoot_async_only` and
-    /// `feedback_nccl_no_overshoot_throttle`). [`WorkerConfig::policy`]
-    /// carries the user's chosen policy for log lines + future-policy
-    /// metadata but does not branch the algorithm.
+    /// Cadence and Async NCCL collapse to the same entry. The
+    /// coordinator-side overshoot gate (Async-only, both backends)
+    /// keeps Async ranks within `max_overshoot` batches of their
+    /// planned cadence; Cadence relies on AllReduce as its sole
+    /// coordination layer (per `feedback_nccl_no_overshoot_throttle`)
+    /// and is unbounded between syncs. [`WorkerConfig::policy`] carries
+    /// the user's chosen policy for log lines + future-policy metadata
+    /// but does not branch the algorithm on the rank side.
     ///
     /// `save_path` on [`DdpRunConfig`] is REQUIRED — the cluster
     /// save-on-unrecoverable-failure flow needs a destination. Loud
