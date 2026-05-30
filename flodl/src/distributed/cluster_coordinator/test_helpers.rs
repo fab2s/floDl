@@ -363,4 +363,18 @@ impl ClusterCoordinator {
     pub(crate) fn set_steps_since_avg_for_test(&mut self, rank: usize, n: usize) {
         self.steps_since_avg[rank] = n;
     }
+
+    /// Force every rank's `nccl_ack` to `acked`. Used to prove the CPU
+    /// re-arm path is independent of `nccl_ack` (the NCCL-only token).
+    pub(crate) fn set_all_nccl_ack_for_test(&mut self, acked: bool) {
+        for a in &mut self.nccl_ack {
+            *a = acked;
+        }
+    }
+
+    /// Put the CPU averaging state machine into `Pending` (a cycle in
+    /// flight). Used to assert the `cpu_avg_state` re-arm gate.
+    pub(crate) fn set_cpu_avg_pending_for_test(&mut self) {
+        self.cpu_avg_state = CpuAvgState::Pending;
+    }
 }

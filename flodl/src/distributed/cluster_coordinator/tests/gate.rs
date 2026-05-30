@@ -105,3 +105,74 @@ fn cadence_gate_does_not_fire_below_batch_counts() {
          regardless of accumulated wall time",
     );
 }
+
+#[test]
+fn cpu_rearm_is_independent_of_nccl_ack() {
+    // Regression guard for the CPU averaging stall: the CPU backend
+    // re-arms via `cpu_avg_state == Idle`, NOT `nccl_ack`. The cluster
+    // rewrite had forced CPU re-arm onto `nccl_ack` and the bridge faked
+    // a `usize::MAX / 2` step_count to satisfy it, which poisoned
+    // `last_step_count` and wedged the gate after a few cycles. Here we
+    // pin `nccl_ack` all-false (the wedged state) and assert the CPU
+    // gate STILL fires once each rank completed its `batch_counts`.
+    let world_size = 2;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 2),
+        )
+        .no_divergence_guard(),
+    );
+
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[10.0, 20.0], &[2, 2], 0.0);
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    for (r, &c) in counts.iter().enumerate() {
+        coord.set_steps_since_avg_for_test(r, c);
+    }
+    // The poisoned NCCL re-arm state: no rank's `nccl_ack` is set.
+    coord.set_all_nccl_ack_for_test(false);
+
+    assert!(
+        coord.should_average(),
+        "CPU re-arm must NOT depend on `nccl_ack` — the cycle is Idle and \
+         every rank completed its batch_counts, so the gate must fire \
+         even with `nccl_ack` all-false",
+    );
+}
+
+#[test]
+fn cpu_gate_blocks_while_cycle_in_flight() {
+    // The `cpu_avg_state` re-arm gate: while a CPU averaging cycle is
+    // Pending (snapshots / TCP all-reduce in flight), `should_average`
+    // must not re-trigger, even though every rank has met its quota and
+    // `nccl_ack` is all-true. `poll_cpu_averaging` returns the state to
+    // `Idle` on finalize, which is what re-opens the gate.
+    let world_size = 2;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 2),
+        )
+        .no_divergence_guard(),
+    );
+
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[10.0, 20.0], &[2, 2], 0.0);
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    for (r, &c) in counts.iter().enumerate() {
+        coord.set_steps_since_avg_for_test(r, c);
+    }
+    coord.set_cpu_avg_pending_for_test();
+
+    assert!(
+        !coord.should_average(),
+        "CPU gate must not re-fire while a cycle is Pending in flight",
+    );
+}

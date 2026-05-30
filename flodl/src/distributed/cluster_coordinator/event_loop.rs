@@ -88,8 +88,17 @@ impl ClusterCoordinator {
                 if rank >= self.world_size {
                     return;
                 }
-                self.last_step_count[rank] =
-                    self.last_step_count[rank].max(step_count);
+                // Only the NCCL path uses `step_count` (for re-arm and
+                // global-step tracking). The CPU bridge's `SyncAck` has
+                // no meaningful step_count — the inner worker doesn't
+                // bump `local_step` on `RequestParams` — so folding it
+                // here would poison `last_step_count` and, through the
+                // next `nccl_sync_step` snapshot, permanently wedge the
+                // NCCL re-arm gate. CPU re-arm runs off `cpu_avg_state`.
+                if matches!(self.backend, AverageBackend::Nccl) {
+                    self.last_step_count[rank] =
+                        self.last_step_count[rank].max(step_count);
+                }
                 if let Some(div) = divergence {
                     self.nccl_sync_divergence[rank] = Some(div);
                 }
@@ -291,11 +300,26 @@ impl ClusterCoordinator {
 
     /// Check whether an averaging cycle should be triggered now.
     ///
-    /// `nccl_ack` is named for the NCCL path's SyncAck mechanism but
-    /// serves both backends: workers send a `TimingMsg::SyncAck` after
-    /// every averaging round (regardless of backend) so the coordinator
-    /// can gate re-triggering until the previous round has settled.
+    /// Re-arm (the "previous cycle has settled" gate) is backend-split,
+    /// mirroring the threaded coordinator (`ddp_run/coordinator/mod.rs`):
+    ///
+    /// - **NCCL**: `nccl_ack[r]` — set true once rank `r` reports a
+    ///   `Batch`/`SyncAck` whose `step_count` exceeds the trigger-time
+    ///   snapshot, proving it processed the previous `SyncNow`.
+    /// - **CPU**: `cpu_avg_state == Idle` — the deferred
+    ///   `poll_cpu_averaging` only returns to `Idle` after it has
+    ///   finalized the previous cycle. The CPU path does NOT consult
+    ///   `nccl_ack`: the bridge's `SyncAck` carries no meaningful
+    ///   `step_count`, so gating CPU on `nccl_ack` (and faking a large
+    ///   `step_count` to satisfy it) poisoned `last_step_count` and
+    ///   permanently wedged the re-arm gate after the warmup window.
     pub fn should_average(&self) -> bool {
+        // CPU re-arm: don't re-trigger while a cycle is still in flight.
+        if matches!(self.backend, AverageBackend::Cpu)
+            && !matches!(self.cpu_avg_state, CpuAvgState::Idle)
+        {
+            return false;
+        }
         // Every gate skips dead ranks: they won't ack, won't step, and
         // won't accumulate wall_ms. Treating them as "satisfied" lets
         // the surviving cohort keep training.
@@ -303,7 +327,8 @@ impl ClusterCoordinator {
             if self.is_dead(r) {
                 continue;
             }
-            if !self.nccl_ack[r] {
+            // NCCL re-arm only; CPU re-arms via `cpu_avg_state` above.
+            if matches!(self.backend, AverageBackend::Nccl) && !self.nccl_ack[r] {
                 return false;
             }
             if self.steps_since_avg[r] == 0 {

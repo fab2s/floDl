@@ -94,6 +94,24 @@ impl ClusterCoordinator {
             AverageBackend::Cpu => {
                 self.nccl_sync_start = Some(Instant::now());
                 self.broadcast_control(&ControlMsgWire::RequestParams)?;
+                // Hard barrier for Sync + Cadence: after snapshotting,
+                // the fast rank blocks until the averaged `Update` lands,
+                // recreating NCCL's AllReduce-blocking semantics on the
+                // CPU backend. Without it the fast rank keeps training
+                // through the (TCP-latency) averaging window and laps the
+                // slow ranks, so the average degrades and convergence
+                // drops off NCCL parity. Released by the bridge's
+                // `ControlMsg::Update(avg)` (the worker's `Throttle`
+                // handler still services `RequestParams` while blocked,
+                // so the round that releases it can still complete).
+                // Async deliberately skips the barrier and bounds
+                // lookahead via the overshoot gate in `dispatch_next_chunk`.
+                if matches!(self.policy, ApplyPolicy::Sync | ApplyPolicy::Cadence) {
+                    self.broadcast_control(&ControlMsgWire::Throttle)?;
+                    for t in &mut self.throttled {
+                        *t = true;
+                    }
+                }
                 for rank in 0..self.world_size {
                     self.nccl_sync_step[rank] = self.last_step_count[rank];
                     self.nccl_ack[rank] = false;
@@ -444,6 +462,15 @@ impl ClusterCoordinator {
 
         match action {
             ConvergenceAction::Stable => {
+                // Guard verdict is Stable: ElChe may grow the window to
+                // amortize sync cost (do its best to meet the rendezvous
+                // efficiently). Convergence is maintained separately by
+                // the guard's SuppressGrowth / NudgeDown verdicts, which
+                // pull the anchor back when weight-space divergence rises
+                // — so growth and convergence balance rather than being
+                // hard-disabled. (Correction A's poison fix is what lets
+                // reduces fire at all, which is what feeds the guard the
+                // divergence signal it needs to do this.)
                 self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {
@@ -615,6 +642,15 @@ impl ClusterCoordinator {
 
         match action {
             ConvergenceAction::Stable => {
+                // Guard verdict is Stable: ElChe may grow the window to
+                // amortize sync cost (do its best to meet the rendezvous
+                // efficiently). Convergence is maintained separately by
+                // the guard's SuppressGrowth / NudgeDown verdicts, which
+                // pull the anchor back when weight-space divergence rises
+                // — so growth and convergence balance rather than being
+                // hard-disabled. (Correction A's poison fix is what lets
+                // reduces fire at all, which is what feeds the guard the
+                // divergence signal it needs to do this.)
                 self.el_che.commit_proposed_anchor();
                 if self.policy == ApplyPolicy::Async {
                     if self.overshoot_auto {

@@ -180,6 +180,17 @@ impl ClusterCoordinator {
         if let Some(ref state) = config.start_elche_state {
             el_che.restore_from_state(state)?;
         }
+        // Cap the reduce window to one epoch's batches (coverage-global).
+        // The overhead auto-tune may grow the schedule to amortize an
+        // expensive sync, but a window must never span more than one
+        // dataset pass — otherwise syncs collapse to <1/epoch (observed:
+        // CPU cadence grew the window to 1092 batches against a 781-batch
+        // epoch, dropping to ~1 sync/epoch and serializing the cohort).
+        // No-op for NCCL (cheap sync → window stays well under) and for
+        // any run where the epoch size isn't known yet.
+        if config.batch_size > 0 && config.total_samples >= config.batch_size {
+            el_che.set_max_total_batches(config.total_samples / config.batch_size);
+        }
         // `calibrated` mirrors the post-restore ElChe state: true when
         // any rank has a positive smoothed reading. Matches the
         // invariant the snapshot was taken under.

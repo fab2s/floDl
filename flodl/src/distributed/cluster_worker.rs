@@ -1536,12 +1536,18 @@ fn param_bridge_loop(
             // Inner GpuWorker dropped its receiver; tear down.
             return;
         }
-        // Ack the coordinator. Use a synthetic large step_count so the
-        // coord's `step_count > nccl_sync_step` gate (NCCL-specific
-        // deadlock guard) trivially passes on the CPU path.
+        // Ack the coordinator. CPU re-arm runs off the coord's
+        // `cpu_avg_state` machine (finalized by `poll_cpu_averaging` once
+        // every rank's divergence has landed), NOT off `step_count`, so
+        // this ack carries no synthetic step. A real step_count isn't
+        // available here anyway — the inner GpuWorker doesn't bump
+        // `local_step` on `RequestParams`. Sending 0 keeps the coord's
+        // `last_step_count` clean (it ignores CPU-path step_counts). The
+        // previous `usize::MAX / 2` sentinel poisoned `last_step_count`,
+        // wedging the NCCL-style re-arm gate after a few cycles.
         let _ = timing_tx.send(TimingMsg::SyncAck {
             rank: rank as usize,
-            step_count: usize::MAX / 2,
+            step_count: 0,
             divergence: Some(divergence),
             post_norm,
             pre_norm,

@@ -557,6 +557,201 @@
         }
     }
 
+    /// End-to-end Cadence + CPU averaging smoke — the regression guard
+    /// for the CPU averaging stall.
+    ///
+    /// CPU-device, in-process: a real [`ClusterController`] (the
+    /// CpuReduce server) + a real CPU-backend [`ClusterCoordinator`] +
+    /// two ranks whose param bridge all-reduces through the controller.
+    /// No GPU/NCCL — the fixed machinery (CPU re-arm via `cpu_avg_state`,
+    /// the Sync/Cadence `Throttle` hard barrier, the bridge `SyncAck`
+    /// with no `usize::MAX / 2` sentinel) is device-independent
+    /// coordinator/bridge logic, so this runs in the ordinary CPU suite.
+    ///
+    /// The bug it guards: the cluster CPU path re-armed `should_average`
+    /// off `nccl_ack`, which the bridge satisfied with a synthetic
+    /// `usize::MAX / 2` step_count. That poisoned `last_step_count`, and
+    /// after 3-6 cycles the re-arm gate wedged permanently — averaging
+    /// flatlined for the rest of the run (replicas trained as
+    /// near-independent solos). Acceptance: `avg_count` climbs well past
+    /// that old stall ceiling, proving the cycle re-arms indefinitely.
+    ///
+    /// `#[ignore]`: this is a heavy in-process integration smoke (a live
+    /// controller + coordinator + two worker threads + TCP, on a 30s
+    /// budget). It is deterministic in isolation but timing-flaky under
+    /// the parallel test harness (thread/CPU contention slows the
+    /// averaging round-trips). The re-arm invariant it checks is also
+    /// covered deterministically by the `gate.rs` unit tests; this smoke
+    /// is the explicit end-to-end repro. Run via
+    /// `fdl test -- --ignored end_to_end_cadence_cpu_via_coord_smoke`
+    /// (single-threaded is most reliable).
+    #[test]
+    #[ignore = "heavy in-process integration smoke; timing-flaky under parallel load — run explicitly"]
+    fn end_to_end_cadence_cpu_via_coord_smoke() {
+        let world_size = 2;
+        let total_samples = 32usize;
+        let batch_size = 4usize;
+        let elche_anchor = 1usize;
+        let num_epochs = 16usize;
+        // Old poison wedged the gate at 3-6 cycles; require comfortably
+        // more so a regressed re-arm path cannot pass by luck.
+        let target_cycles = 12u64;
+
+        // CpuReduce server (the piece the loopback cluster-test rig
+        // lacks). Shares no dead-rank ledger — fixed membership.
+        let controller = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            world_size,
+            TEST_SALT,
+        )
+        .expect("controller starts");
+        let reduce_addr =
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), controller.port());
+
+        let (coord_listener, coord_port) = CCoord::bind(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        )
+        .expect("coord bind succeeds");
+        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+
+        let config_for_coord = move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Cadence,
+                AverageBackend::Cpu,
+                world_size,
+                // Cap `max_anchor` so this (pathologically cheap-compute)
+                // in-process harness can't exercise the overhead-driven
+                // window GROWTH — that throughput/convergence balance is
+                // ElChe's job and is validated on the real rig, not here.
+                // With the window bounded, this test isolates the thing it
+                // is meant to guard: that CPU averaging RE-ARMS every
+                // window (the `nccl_ack`/`MAX/2` poison regression), so
+                // `avg_count` keeps climbing instead of wedging at ~3-6.
+                ElChe::new(world_size, elche_anchor).with_max_anchor(2),
+            )
+            .total_samples(total_samples)
+            .batch_size(batch_size)
+            .num_epochs(num_epochs)
+        };
+        let coord_thread = thread::spawn(move || -> Result<CCoord> {
+            CCoord::start_from_listener(coord_listener, TEST_SALT, config_for_coord())
+        });
+
+        // Identical initial params from a shared ref model (no
+        // broadcast_from_root needed — every rank starts equal).
+        let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+        let initial_params: Vec<Tensor> = ref_model
+            .parameters()
+            .iter()
+            .map(|p| p.variable.data())
+            .collect();
+        let initial_buffers: Vec<Tensor> = ref_model
+            .buffers()
+            .iter()
+            .map(|b| b.get())
+            .collect();
+        drop(ref_model);
+
+        let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+        for rank_id in 0..world_size {
+            let initial_params = initial_params.clone();
+            let initial_buffers = initial_buffers.clone();
+            worker_handles.push(thread::spawn(move || -> Result<()> {
+                let cpu_client = crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                    reduce_addr,
+                    rank_id as u32,
+                    world_size as u32,
+                    TEST_SALT,
+                )?;
+                let config = WorkerConfig {
+                    rank: rank_id,
+                    world_size,
+                    device: Device::CPU,
+                    initial_params,
+                    initial_buffers,
+                    total_samples,
+                    batch_size,
+                    seed: 42,
+                    max_grad_norm: None,
+                    easgd_alpha: None,
+                    timeline: None,
+                    policy: ApplyPolicy::Cadence,
+                    save_path: None,
+                };
+                let dataset: Arc<dyn crate::data::BatchDataSet> =
+                    Arc::new(TestDataset { n: total_samples });
+                let worker = ClusterWorker::connect_and_build(
+                    coord_addr,
+                    Some(cpu_client),
+                    rank_id as u32,
+                    TEST_SALT,
+                    config,
+                    move |d| Linear::on_device(4, 2, d),
+                    |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                    dataset,
+                    None, // no NCCL comm — CPU averaging via the bridge
+                    None,
+                    None,
+                    None, // no eval_fn
+                    None, // no eval_dataset
+                )?;
+                worker.run_until_shutdown(mse_train).map(|_| ())
+            }));
+        }
+
+        let mut coord = coord_thread
+            .join()
+            .expect("coord thread join")
+            .expect("start_from_listener succeeds");
+
+        coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+
+        // Drive ticks until the cycle count clears the old stall
+        // ceiling. Two regressions would re-trip this: (1) the re-arm
+        // poison (CPU re-arm forced onto `nccl_ack` + the `usize::MAX/2`
+        // sentinel) wedged averaging at ~3-6 cycles; (2) the overhead
+        // auto-tune ballooning the cadence window (anchor grown to
+        // amortize the expensive CPU sync) pushed the reduce window past
+        // the dataset, so averaging died after warmup. Either way the
+        // count would stop climbing and this times out.
+        let start = Instant::now();
+        while coord.avg_count() < target_cycles {
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!(
+                    "end_to_end_cadence_cpu_via_coord_smoke: avg_count={} \
+                     never reached {target_cycles} within 30s — CPU averaging \
+                     stalled (re-arm wedge or window-blowup regression?)",
+                    coord.avg_count(),
+                );
+            }
+            coord.tick().expect("tick");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            coord.avg_count() >= target_cycles,
+            "CPU Cadence re-arms every window: avg_count={} (>= {target_cycles})",
+            coord.avg_count(),
+        );
+
+        // Sanity: the window honored the `max_anchor(2)` cap we set, so
+        // the steady stream of reduces above reflects re-arm working, not
+        // an unbounded window masking a wedge. (Growth itself is allowed
+        // and is ElChe's call; we cap it here only to keep this harness
+        // focused on the re-arm regression.)
+        let final_anchor = coord.el_che().anchor();
+        assert!(
+            final_anchor <= 2,
+            "window honored max_anchor cap: anchor={final_anchor}",
+        );
+
+        coord.shutdown_workers().expect("shutdown_workers");
+        coord.shutdown().expect("coord shutdown");
+        controller.shutdown().expect("controller shutdown");
+        for h in worker_handles {
+            h.join().expect("worker thread join").expect("worker exits clean");
+        }
+    }
+
     // -----------------------------------------------------------------
     // End-to-end Sync+Cpu smoke test scaffolding
     // -----------------------------------------------------------------

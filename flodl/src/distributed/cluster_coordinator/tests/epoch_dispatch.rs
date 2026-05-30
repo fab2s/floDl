@@ -188,9 +188,9 @@ fn dispatch_epoch_caches_plans_for_same_epoch() {
 fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     // 2 ranks, Sync+Cpu. After each rank sends one Batch + SyncAck
     // (mocking the post-data-channel ack), coord should fire
-    // RequestParams + Update{version} + SetGlobalStep exactly
-    // once. Mirrors sync_policy_fires_after_each_rank_step_once
-    // for the CPU backend.
+    // RequestParams + Throttle (the CPU hard barrier) + Update{version}
+    // + SetGlobalStep exactly once. Mirrors
+    // sync_policy_fires_after_each_rank_step_once for the CPU backend.
     let world_size = 2;
     let (port, coord_handle) = spawn_coord(
         world_size,
@@ -222,6 +222,11 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         })?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::RequestParams);
+        // Sync (and Cadence) CPU now broadcast a hard barrier: the
+        // fast rank is Throttled after snapshotting, released by the
+        // averaged Update. Mirrors NCCL's AllReduce-block.
+        let throttle = recv_control(s, salt)?;
+        assert_eq!(throttle, ControlMsgWire::Throttle);
         // Mock the post-data-channel ack the worker-side bridge
         // emits after the CPU averaging round-trip completes.
         send_timing(s, salt, TimingMsgWire::SyncAck {
@@ -248,6 +253,8 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         })?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::RequestParams);
+        let throttle = recv_control(s, salt)?;
+        assert_eq!(throttle, ControlMsgWire::Throttle);
         send_timing(s, salt, TimingMsgWire::SyncAck {
             rank: 1,
             step_count: 2,
@@ -392,6 +399,7 @@ fn snapshot_ready_resets_between_cycles() {
                 sync_divergence: None,
             })?;
             let _ = recv_control(s, salt)?; // RequestParams
+            let _ = recv_control(s, salt)?; // Throttle (Sync/Cadence barrier)
             thread::sleep(Duration::from_millis(2));
             send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 0 })?;
             send_timing(s, salt, TimingMsgWire::SyncAck {
@@ -418,6 +426,7 @@ fn snapshot_ready_resets_between_cycles() {
                 sync_divergence: None,
             })?;
             let _ = recv_control(s, salt)?; // RequestParams
+            let _ = recv_control(s, salt)?; // Throttle (Sync/Cadence barrier)
             thread::sleep(Duration::from_millis(2));
             if cycle == 0 {
                 send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 1 })?;

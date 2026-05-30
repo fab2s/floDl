@@ -1,7 +1,7 @@
 //! Epoch dispatch and progressive chunk-pool scheduling for
 //! [`super::ClusterCoordinator`].
 
-use crate::distributed::ddp_run::ApplyPolicy;
+use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
@@ -238,6 +238,30 @@ impl ClusterCoordinator {
     /// after the next averaging cycle.
     pub(super) fn dispatch_next_chunk(&mut self, rank: usize) {
         let epoch = self.rank_epoch[rank];
+
+        // REDUCE BARRIER. The controller is the single scheduler for the
+        // "one logical GPU partitioned into heterogeneous per-rank step
+        // counts" model: it never hands out a step that crosses a
+        // barrier. A rank that has produced its full step budget since
+        // the last reduce gets nothing more until the reduce resets
+        // `steps_since_avg` (then `finish_averaging_cpu` /
+        // `wake_idle_ranks_in_progressive` / the post-aggregate hook
+        // re-dispatch it). Budget = `counts[rank]` for Sync/Cadence
+        // (hard); `counts[rank] + max_overshoot` for cpu-async — the one
+        // mode allowed to overrun, bounded for now by the single
+        // `max_overshoot` knob (a future `max_overshoot_epoch` may split
+        // the reduce and epoch allowances). NCCL gets 0 here: its
+        // collective blocks the rank intrinsically, so no software
+        // barrier is applied and its streaming behavior is unchanged.
+        let reduce_budget = self.reduce_step_budget(rank);
+        if reduce_budget > 0 && self.steps_since_avg[rank] >= reduce_budget {
+            crate::debug!(
+                "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
+                self.steps_since_avg[rank], reduce_budget,
+            );
+            return;
+        }
+
         if self.chunk_pools.get(&epoch).is_some_and(|p| p.remaining() > 0) {
             let batches = self.compute_chunk_batches(rank, epoch);
             if let Err(e) = self.dispatch_next_chunk_with_batches(
@@ -261,30 +285,25 @@ impl ClusterCoordinator {
             return;
         }
 
-        // Overshoot gate (Async only, both backends): don't dispatch
-        // into a future epoch when the rank has streamed too far past
-        // its planned batch count since the last averaging. The next
-        // AllReduce / Update resets `steps_since_avg` inside
-        // `finish_averaging_*` and `wake_idle_ranks_in_progressive`
-        // re-dispatches the gated rank; a fast NCCL rank sitting in
-        // `wait_for_epoch_plan` still processes `SyncNow` via
-        // `dispatch_control` (the SyncAck flips `nccl_ack` back to
-        // true), so the gate is deadlock-free on NCCL too.
-        if matches!(self.policy, ApplyPolicy::Async) {
-            let current_aggregated = self.last_aggregated_epoch
-                .is_some_and(|agg| epoch <= agg);
-            if !current_aggregated {
-                let planned = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
-                if planned > 0
-                    && self.steps_since_avg[rank] >= planned + self.max_overshoot
-                {
-                    crate::debug!(
-                        "  ddp: overshoot gate BLOCKED rank {rank} | steps={} planned={} overshoot={}",
-                        self.steps_since_avg[rank], planned, self.max_overshoot,
-                    );
-                    return;
-                }
-            }
+        // EPOCH BARRIER (CPU backend). `epoch >= first_live` means this
+        // rank sits at the active epoch's edge and the next chunk would
+        // cross into a not-yet-aggregated epoch. Sync/Cadence forbid the
+        // crossing outright — the next epoch is dispatched by
+        // `try_advance_or_shutdown_after_aggregate` once the current
+        // epoch's reduces complete. cpu-async is allowed to cross,
+        // bounded by the same `max_overshoot` budget already enforced by
+        // the reduce-barrier check above (so reaching here means async is
+        // within budget). A rank merely catching up to the active epoch
+        // (`epoch < first_live`) is not crossing a barrier and proceeds.
+        // NCCL streams freely (collective is its barrier) — unchanged.
+        if matches!(self.backend, AverageBackend::Cpu)
+            && epoch >= first_live
+            && !matches!(self.policy, ApplyPolicy::Async)
+        {
+            crate::debug!(
+                "  ddp: epoch barrier HOLD rank {rank} | epoch={epoch} first_live={first_live}"
+            );
+            return;
         }
 
         if !self.chunk_pools.contains_key(&next_epoch) {
@@ -356,6 +375,27 @@ impl ClusterCoordinator {
         if remaining_batches == 0 {
             return 0;
         }
+
+        // SCHEDULE-EXACT dispatch (CPU Sync/Cadence): one chunk == one
+        // reduce window == the rank's scheduled `counts[rank]` (capped to
+        // the pool residual). This is what holds the single step clock:
+        // the pool drains at exactly the reduce rate, so coverage (epoch)
+        // and synchronization (reduce) can never decouple into two racing
+        // clocks. Pre-calibration `counts` is the equal-split anchor
+        // (`ElChe::new` seeds `[anchor; world_size]`), so the warmup
+        // window is just an equal schedule — no probe special-case. NCCL
+        // (collective is its barrier) and cpu-async (bounded lookahead /
+        // streaming) fall through to the throughput-proportional sizing
+        // below.
+        if matches!(self.backend, AverageBackend::Cpu)
+            && !matches!(self.policy, ApplyPolicy::Async)
+        {
+            let window = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+            if window > 0 {
+                return window.min(remaining_batches);
+            }
+        }
+
         if !self.el_che.is_calibrated() && !self.el_che.has_speed_hint() {
             // Probe: small equal chunks for fast calibration (~10%
             // per rank, min 4 batches).
@@ -373,7 +413,52 @@ impl ClusterCoordinator {
         let ratio = counts.get(rank).copied().unwrap_or(0) as f64
             / total_counts as f64;
         let target = (remaining_batches as f64 * ratio).ceil() as usize;
-        target.max(self.min_chunk_batches).min(remaining_batches)
+        let sized = target.max(self.min_chunk_batches).min(remaining_batches);
+        // REDUCE BARRIER cap: never dispatch past the rank's remaining
+        // step budget before the next reduce, so the chunk lands exactly
+        // on the reduce boundary instead of overshooting it (this is what
+        // keeps the `min_chunk_batches` floor from punching through a
+        // small cadence window). `reduce_step_budget` is 0 for NCCL /
+        // pre-calibration, leaving sizing untouched there. The caller
+        // (`dispatch_next_chunk`) already withholds when the budget is
+        // fully spent, so `budget_remaining >= 1` whenever we get here.
+        let budget = self.reduce_step_budget(rank);
+        if budget > 0 {
+            let budget_remaining =
+                budget.saturating_sub(self.steps_since_avg[rank]).max(1);
+            sized.min(budget_remaining)
+        } else {
+            sized
+        }
+    }
+
+    /// Per-rank step budget between reduces — the reduce hard barrier in
+    /// the "one logical GPU, heterogeneous per-rank step counts" model.
+    ///
+    /// `counts[rank]` for Sync/Cadence (hard); `+ max_overshoot` for
+    /// cpu-async (the one mode allowed to overrun, bounded for now by the
+    /// single `max_overshoot` knob). Returns 0 — meaning "no software
+    /// barrier, size/dispatch normally" — for the NCCL backend (its
+    /// collective blocks ranks intrinsically) and during the
+    /// pre-calibration probe phase (where `batch_counts` isn't yet a
+    /// meaningful cadence and probe chunks must flow to calibrate fast).
+    fn reduce_step_budget(&self, rank: usize) -> usize {
+        if !matches!(self.backend, AverageBackend::Cpu) {
+            return 0;
+        }
+        // No `is_calibrated` guard: pre-calibration `batch_counts` is the
+        // equal-split anchor schedule (`[anchor; world_size]`), a valid
+        // window, so the reduce barrier holds from the very first window
+        // ("the probe is no different from the rest of training").
+        let base = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+        if base == 0 {
+            return 0;
+        }
+        if matches!(self.policy, ApplyPolicy::Async) {
+            base + self.max_overshoot
+        } else {
+            base
+        }
     }
 
     /// Wake any progressive rank stalled in `wait_for_epoch_plan` after

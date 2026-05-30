@@ -534,6 +534,36 @@
     }
 
     #[test]
+    fn test_cadence_window_capped_to_max_total() {
+        // Window cap (set by the cluster coordinator to the epoch's batch
+        // count): the overhead auto-tune may grow the schedule to amortize
+        // an expensive sync, but `recompute_batch_counts` must scale the
+        // per-rank counts down proportionally so their sum never exceeds
+        // the cap — a reduce window must fit within one epoch. Mirrors
+        // `test_cadence_anchor_auto_tune_with_speed_ratio` (which grows to
+        // [80, 40], sum 120) but with the total capped at 60.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        c.set_max_total_batches(60);
+
+        for _ in 0..5 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
+        }
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
+
+        // Uncapped this is [80, 40] (sum 120). Capped to 60 and scaled
+        // proportionally: ~[40, 20] (sum <= 60, ~2x ratio preserved).
+        let total = c.batches(0) + c.batches(1);
+        assert!(total <= 60, "window capped to max_total: total={total} (<= 60)");
+        assert!(
+            c.batches(0) > c.batches(1),
+            "speed ratio preserved after cap: fast={} slow={}",
+            c.batches(0),
+            c.batches(1),
+        );
+    }
+
+    #[test]
     fn test_cadence_anchor_capped_at_max() {
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.01)

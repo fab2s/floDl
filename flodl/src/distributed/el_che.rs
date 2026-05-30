@@ -158,6 +158,15 @@ pub struct ElChe {
     min_anchor: usize,
     /// Maximum anchor (gradient staleness limit).
     max_anchor: usize,
+    /// Upper bound on the total reduce window (`sum(batch_counts)`), set
+    /// by the coordinator to the epoch's batch count. The overhead
+    /// auto-tune may grow the per-rank schedule to amortize sync cost,
+    /// but a reduce window must fit within one epoch — otherwise a single
+    /// window spans multiple dataset passes, collapsing the sync rate and
+    /// breaking the "controller knows exactly how many steps per reduce
+    /// and per epoch" invariant. `None` = unbounded (threaded default;
+    /// only the cluster coordinator sets it).
+    max_total_batches: Option<usize>,
     /// Maximum allowed batch difference between fastest and slowest worker.
     /// When set, workers that exceed this lead are throttled until the
     /// slowest catches up. `Some(0)` = strict lockstep (sync DDP behavior).
@@ -249,6 +258,7 @@ impl ElChe {
             overhead_target: 0.10,
             min_anchor: anchor,
             max_anchor: 1000,
+            max_total_batches: None,
             max_batch_diff: None,
             phase: Phase::Probe,
             anchor_rank: None,
@@ -455,6 +465,21 @@ impl ElChe {
             self.anchor = self.anchor.clamp(self.min_anchor, self.max_anchor);
         }
         self
+    }
+
+    /// Cap the total reduce window (`sum(batch_counts)`) at `max_total`
+    /// batches — set by the coordinator to the epoch's batch count so a
+    /// reduce window can never grow past one dataset pass. The overhead
+    /// auto-tune still grows the schedule to amortize sync cost, but
+    /// `recompute_batch_counts` scales the per-rank counts down
+    /// proportionally if their sum would exceed this bound. `None`
+    /// (default) leaves the window unbounded.
+    pub fn set_max_total_batches(&mut self, max_total: usize) {
+        self.max_total_batches = if max_total == 0 {
+            None
+        } else {
+            Some(max_total)
+        };
     }
 
     /// Set the minimum anchor count (overhead auto-tune floor).
@@ -1073,6 +1098,35 @@ impl ElChe {
                     _ => target,
                 };
                 self.batch_counts[rank] = clamped;
+            }
+        }
+        // Window cap: a reduce window must fit within one epoch. The
+        // overhead auto-tune can grow the per-rank counts to amortize an
+        // expensive sync, but if their sum exceeds the epoch's batch
+        // count the window would span multiple dataset passes — syncs
+        // collapse to <1/epoch and the schedule no longer "knows how many
+        // steps per epoch". Scale the counts down proportionally (keeping
+        // the speed-derived ratio) so `sum(batch_counts) <= max_total`.
+        // No-op when unset (threaded path) or already within bound.
+        if let Some(max_total) = self.max_total_batches {
+            let total: usize = self.batch_counts.iter().sum();
+            if total > max_total && max_total > 0 {
+                let scale = max_total as f64 / total as f64;
+                for c in &mut self.batch_counts {
+                    *c = ((*c as f64) * scale).floor().max(1.0) as usize;
+                }
+                // Hand any rounding remainder to the fastest rank (largest
+                // count) so the cohort still uses the full window budget.
+                let used: usize = self.batch_counts.iter().sum();
+                if let Some(rem) = max_total.checked_sub(used) {
+                    if rem > 0 {
+                        if let Some(fastest) = (0..self.world_size)
+                            .max_by_key(|&r| self.batch_counts[r])
+                        {
+                            self.batch_counts[fastest] += rem;
+                        }
+                    }
+                }
             }
         }
         // Slack is consumed exactly once per recompute. Zeroing here
