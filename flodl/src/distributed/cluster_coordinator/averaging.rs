@@ -94,19 +94,32 @@ impl ClusterCoordinator {
             AverageBackend::Cpu => {
                 self.nccl_sync_start = Some(Instant::now());
                 self.broadcast_control(&ControlMsgWire::RequestParams)?;
-                // Hard barrier for Sync + Cadence: after snapshotting,
-                // the fast rank blocks until the averaged `Update` lands,
-                // recreating NCCL's AllReduce-blocking semantics on the
-                // CPU backend. Without it the fast rank keeps training
-                // through the (TCP-latency) averaging window and laps the
-                // slow ranks, so the average degrades and convergence
-                // drops off NCCL parity. Released by the bridge's
+                // Hard barrier for the non-progressive (Sync) path:
+                // after snapshotting, the fast rank blocks until the
+                // averaged `Update` lands, recreating NCCL's
+                // AllReduce-blocking semantics on the CPU backend.
+                // Without it the fast rank keeps training through the
+                // (TCP-latency) averaging window and laps the slow
+                // ranks, so the average degrades and convergence drops
+                // off NCCL parity. Released by the bridge's
                 // `ControlMsg::Update(avg)` (the worker's `Throttle`
                 // handler still services `RequestParams` while blocked,
                 // so the round that releases it can still complete).
-                // Async deliberately skips the barrier and bounds
-                // lookahead via the overshoot gate in `dispatch_next_chunk`.
-                if matches!(self.policy, ApplyPolicy::Sync | ApplyPolicy::Cadence) {
+                //
+                // The gate is `!progressive`, not the policy enum: the
+                // Throttle is needed exactly when dispatch cannot starve
+                // the rank of work during the averaging window.
+                // Progressive Cadence dispatches `chunk == counts ==
+                // window`, so the reduce barrier in `dispatch_next_chunk`
+                // already withholds further work and the fast rank idles
+                // in `wait_for_epoch_plan` (still servicing
+                // `RequestParams`) — the Throttle would be redundant
+                // there. Non-progressive Sync has no inter-window
+                // dispatch to starve (whole epoch trained in one inner
+                // loop), so the Throttle IS its barrier. Async is always
+                // progressive and bounds lookahead via the overshoot
+                // budget instead.
+                if !self.progressive {
                     self.broadcast_control(&ControlMsgWire::Throttle)?;
                     for t in &mut self.throttled {
                         *t = true;
@@ -588,10 +601,12 @@ impl ClusterCoordinator {
     /// CPU-backend counterpart to [`Self::finish_averaging_nccl`].
     ///
     /// Differs from the NCCL path in one place: the lifecycle barrier
-    /// emitted to workers is `ControlMsgWire::Update { version }` (the
-    /// workers received their averaged tensors via the data channel
+    /// emitted to workers is `ControlMsgWire::Update { version, next_plan }`
+    /// (the workers received their averaged tensors via the data channel
     /// already; this notification bumps their `current_version` and
-    /// resets `steps_since_avg`).
+    /// resets `steps_since_avg`). On Cadence the `next_plan` carries the
+    /// rank's next reduce-window chunk (atomic-dispatch) so it starts
+    /// the next window without a separate `StartEpoch` round-trip.
     ///
     /// Everything else (ElChe report, convergence guard verdict,
     /// overshoot / anchor tuning, counter reset) mirrors NCCL.
@@ -718,11 +733,37 @@ impl ClusterCoordinator {
         }
 
         // CPU lifecycle barrier: workers received averaged tensors on
-        // the data channel; this Update notification tells them to
-        // bump `current_version` and reset `steps_since_avg`.
-        self.broadcast_control(&ControlMsgWire::Update {
-            version: self.version,
-        })?;
+        // the data channel; this Update notification tells them to bump
+        // `current_version` and reset `steps_since_avg`.
+        //
+        // atomic-dispatch: fold each rank's next reduce-window chunk
+        // into its Update so it applies the averaged params AND starts
+        // the next window from one frame, instead of idling for a
+        // separate post-reduce StartEpoch — clawing back the control RTT
+        // per cycle. Only Cadence benefits: it idles at the reduce
+        // barrier between windows (`chunk == counts == window`). Sync is
+        // non-progressive (whole-epoch dispatch, no inter-window
+        // StartEpoch) and Async streams ahead under its overshoot budget
+        // (folding would over-dispatch past the bound) — both get
+        // `next_plan: None` and the existing dispatch path
+        // (`wake_idle_ranks_in_progressive` below). `fold_next_chunk_for_rank`
+        // is intra-epoch only; at an epoch boundary it returns `None` and
+        // the epoch-advance path dispatches the next epoch.
+        let fold = matches!(self.policy, ApplyPolicy::Cadence);
+        for rank in 0..self.world_size {
+            let next_plan = if fold {
+                self.fold_next_chunk_for_rank(rank)
+            } else {
+                None
+            };
+            self.send_control(
+                rank,
+                &ControlMsgWire::Update {
+                    version: self.version,
+                    next_plan,
+                },
+            )?;
+        }
         // SetGlobalStep is still broadcast so workers can update the
         // per-batch LR scheduler base. Same as the NCCL path.
         self.broadcast_control(&ControlMsgWire::SetGlobalStep {

@@ -338,26 +338,75 @@ impl ClusterCoordinator {
         epoch: usize,
         batches: usize,
     ) -> Result<Option<crate::distributed::wire::EpochPlanWire>> {
-        let samples = batches * self.batch_size;
-        if samples == 0 {
+        let Some(plan) = self.take_next_chunk_plan(rank, epoch, batches) else {
             return Ok(None);
-        }
-        let (offset, actual_size) = match self.chunk_pools.get_mut(&epoch) {
-            Some(pool) => match pool.take_chunk(samples, rank) {
-                Some(v) => v,
-                None => return Ok(None),
-            },
-            None => return Ok(None),
-        };
-        self.rank_epoch[rank] = epoch;
-        let plan = crate::distributed::wire::EpochPlanWire {
-            epoch: epoch as u64,
-            partition_offset: offset as u64,
-            partition_size: actual_size as u64,
         };
         let msg = ControlMsgWire::StartEpoch(plan.clone());
         self.send_control(rank, &msg)?;
         Ok(Some(plan))
+    }
+
+    /// Take `batches * batch_size` samples from `epoch`'s pool for
+    /// `rank`, advance `rank_epoch`, and build the `EpochPlanWire` —
+    /// **without sending anything**. Returns `None` if `batches == 0`
+    /// or the pool is exhausted.
+    ///
+    /// Two callers ship the resulting plan differently:
+    /// [`Self::dispatch_next_chunk_with_batches`] wraps it in a
+    /// `StartEpoch` control frame; the atomic-dispatch path in
+    /// `finish_averaging_cpu` folds it into the post-reduce `Update`
+    /// frame so the rank starts its next window without a separate
+    /// control round-trip.
+    pub(super) fn take_next_chunk_plan(
+        &mut self,
+        rank: usize,
+        epoch: usize,
+        batches: usize,
+    ) -> Option<crate::distributed::wire::EpochPlanWire> {
+        let samples = batches * self.batch_size;
+        if samples == 0 {
+            return None;
+        }
+        let (offset, actual_size) = match self.chunk_pools.get_mut(&epoch) {
+            Some(pool) => pool.take_chunk(samples, rank)?,
+            None => return None,
+        };
+        self.rank_epoch[rank] = epoch;
+        Some(crate::distributed::wire::EpochPlanWire {
+            epoch: epoch as u64,
+            partition_offset: offset as u64,
+            partition_size: actual_size as u64,
+        })
+    }
+
+    /// atomic-dispatch: compute + take `rank`'s next reduce-window chunk
+    /// to fold into the post-reduce `Update` frame, or `None` to defer
+    /// to the existing dispatch path.
+    ///
+    /// **Intra-epoch only**: returns a chunk only when the rank's
+    /// *current* epoch pool still has work. At an epoch boundary
+    /// (`remaining() == 0`) it returns `None` so the epoch-advance path
+    /// (`try_advance_or_shutdown_after_aggregate`) dispatches the next
+    /// epoch's first chunk, keeping atomic-dispatch out of the
+    /// epoch-aggregation flow. No reduce-barrier check is applied: the
+    /// reduce that just completed makes a fresh window available for
+    /// every rank by construction (`steps_since_avg` is reset to 0 in
+    /// the same `finish_averaging_cpu`). Chunk size is the next cycle's
+    /// schedule (`compute_chunk_batches` reads the post-`report_timing`
+    /// `batch_counts`).
+    pub(super) fn fold_next_chunk_for_rank(
+        &mut self,
+        rank: usize,
+    ) -> Option<crate::distributed::wire::EpochPlanWire> {
+        if self.is_dead(rank) {
+            return None;
+        }
+        let epoch = self.rank_epoch[rank];
+        if self.chunk_pools.get(&epoch).is_none_or(|p| p.remaining() == 0) {
+            return None;
+        }
+        let batches = self.compute_chunk_batches(rank, epoch);
+        self.take_next_chunk_plan(rank, epoch, batches)
     }
 
     /// Compute how many batches the next chunk for `rank` in `epoch`

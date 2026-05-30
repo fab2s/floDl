@@ -222,18 +222,26 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
 /// Returns `Ok(None)` for wire variants that don't need in-process
 /// dispatch:
 ///
-/// - `ControlMsgWire::Update { version }`: the wire-side notification
-///   that the averaging cycle is complete. The real in-process
-///   `ControlMsg::Update(AveragedParams)` flows through the param
-///   bridge (where the param bridge synthesizes one with the actual
-///   averaged tensors from the data channel). The wire-Update is
-///   informational only.
+/// - `ControlMsgWire::Update { version, next_plan }`: the wire-side
+///   notification that the averaging cycle is complete. The real
+///   in-process `ControlMsg::Update(AveragedParams)` flows through the
+///   param bridge (where the param bridge synthesizes one with the
+///   actual averaged tensors from the data channel), so the wire-Update
+///   is informational here. Its atomic-dispatch `next_plan` (when
+///   `Some`) is consumed at the inbound-bridge call site, which
+///   synthesises a `StartEpoch` for the inner; it is not handled by
+///   this function.
 ///
 /// All other wire variants map 1:1.
 fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
     match wire {
         ControlMsgWire::RequestParams => Ok(Some(ControlMsg::RequestParams)),
-        ControlMsgWire::Update { version: _ } => Ok(None),
+        // Informational on its own; the param bridge drives the real
+        // `ControlMsg::Update(AveragedParams)`. The atomic-dispatch
+        // `next_plan` is handled at the inbound-bridge call site (it
+        // synthesises a `StartEpoch` there), so it never reaches here in
+        // production; ignored for the rare direct callers (tests).
+        ControlMsgWire::Update { .. } => Ok(None),
         ControlMsgWire::SyncNow => Ok(Some(ControlMsg::SyncNow)),
         ControlMsgWire::StartEpoch(plan) => Ok(Some(ControlMsg::StartEpoch(EpochPlan {
             epoch: plan.epoch as usize,
@@ -988,6 +996,32 @@ fn inbound_loop(
                                         "cluster_worker: inbound r{rank} \
                                          NcclUniqueId::new failed: {e}"
                                     );
+                                }
+                            }
+                        }
+                        // atomic-dispatch: the post-reduce Update may
+                        // carry the rank's next reduce-window chunk. The
+                        // wire-Update itself is informational (the param
+                        // bridge synthesises the real
+                        // `ControlMsg::Update(AveragedParams)`); when a
+                        // `next_plan` rides along, synthesise a
+                        // `StartEpoch` so the inner starts the next window
+                        // without a separate coord round-trip. Ordering is
+                        // safe: the param bridge's `Update(avg)` was sent
+                        // (same control channel) before its SyncAck, and
+                        // the coord only emits this frame after that ack,
+                        // so the inner dequeues `Update(avg)` before this
+                        // `StartEpoch` (mpsc FIFO).
+                        ControlMsgWire::Update { next_plan, .. } => {
+                            if let Some(plan) = next_plan {
+                                let msg = ControlMsg::StartEpoch(EpochPlan {
+                                    epoch: plan.epoch as usize,
+                                    partition_offset: plan.partition_offset as usize,
+                                    partition_size: plan.partition_size as usize,
+                                });
+                                if control_tx.send(msg).is_err() {
+                                    // Inner GpuWorker dropped its receiver.
+                                    return;
                                 }
                             }
                         }

@@ -222,9 +222,11 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         })?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::RequestParams);
-        // Sync (and Cadence) CPU now broadcast a hard barrier: the
+        // Sync (non-progressive) CPU broadcasts a hard barrier: the
         // fast rank is Throttled after snapshotting, released by the
-        // averaged Update. Mirrors NCCL's AllReduce-block.
+        // averaged Update. Mirrors NCCL's AllReduce-block. (Cadence is
+        // progressive and self-barriers via dispatch starvation, so it
+        // no longer gets a Throttle.)
         let throttle = recv_control(s, salt)?;
         assert_eq!(throttle, ControlMsgWire::Throttle);
         // Mock the post-data-channel ack the worker-side bridge
@@ -272,6 +274,83 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     r0.join().unwrap().expect("rank 0 sees RequestParams + Update + SetGlobalStep");
     r1.join().unwrap().expect("rank 1 sees RequestParams + Update + SetGlobalStep");
     coord_handle.join().unwrap().expect("coord finishes");
+}
+
+// atomic-dispatch: on Cadence, `finish_averaging_cpu` folds each rank's
+// next reduce-window chunk into its `Update` frame. These unit-test the
+// fold helper directly (no network): mid-epoch it hands back the rank's
+// scheduled window; at an epoch boundary (drained / missing pool) it
+// returns `None` so the epoch-advance path takes over.
+#[test]
+fn fold_next_chunk_returns_schedule_window_mid_epoch() {
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 10),
+    )
+    .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    // Calibrate: rank 0 fast, rank 1 slow → asymmetric batch_counts.
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    assert!(counts[0] > 0 && counts[1] > 0, "calibrated counts: {counts:?}");
+
+    // batch_size defaults to 1 → partition_size (samples) == batches.
+    // Pool far larger than one window so the fold stays intra-epoch.
+    coord.install_chunk_pool_for_test(0, 1000);
+    coord.set_rank_epoch_for_test(0, 0);
+    coord.set_rank_epoch_for_test(1, 0);
+
+    let p0 = coord
+        .fold_next_chunk_for_rank(0)
+        .expect("rank 0 mid-epoch chunk");
+    assert_eq!(p0.epoch, 0);
+    assert_eq!(
+        p0.partition_size, counts[0] as u64,
+        "rank 0 folded window must equal its schedule count",
+    );
+    let p1 = coord
+        .fold_next_chunk_for_rank(1)
+        .expect("rank 1 mid-epoch chunk");
+    assert_eq!(
+        p1.partition_size, counts[1] as u64,
+        "rank 1 folded window must equal its schedule count",
+    );
+    // Disjoint slices of the pool.
+    assert_ne!(p0.partition_offset, p1.partition_offset);
+}
+
+#[test]
+fn fold_next_chunk_none_at_epoch_boundary() {
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 10),
+    )
+    .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+    // Drained pool (remaining == 0) == epoch boundary.
+    coord.install_chunk_pool_for_test(0, 0);
+    coord.set_rank_epoch_for_test(0, 0);
+    assert!(
+        coord.fold_next_chunk_for_rank(0).is_none(),
+        "epoch boundary (drained pool) must fold no chunk",
+    );
+    // No pool for the rank's epoch at all → also None.
+    coord.set_rank_epoch_for_test(1, 5);
+    assert!(
+        coord.fold_next_chunk_for_rank(1).is_none(),
+        "missing pool must fold no chunk",
+    );
 }
 
 // Upload-completion marker: SnapshotReady frames arriving between
@@ -399,7 +478,7 @@ fn snapshot_ready_resets_between_cycles() {
                 sync_divergence: None,
             })?;
             let _ = recv_control(s, salt)?; // RequestParams
-            let _ = recv_control(s, salt)?; // Throttle (Sync/Cadence barrier)
+            let _ = recv_control(s, salt)?; // Throttle (Sync non-progressive barrier)
             thread::sleep(Duration::from_millis(2));
             send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 0 })?;
             send_timing(s, salt, TimingMsgWire::SyncAck {
@@ -426,7 +505,7 @@ fn snapshot_ready_resets_between_cycles() {
                 sync_divergence: None,
             })?;
             let _ = recv_control(s, salt)?; // RequestParams
-            let _ = recv_control(s, salt)?; // Throttle (Sync/Cadence barrier)
+            let _ = recv_control(s, salt)?; // Throttle (Sync non-progressive barrier)
             thread::sleep(Duration::from_millis(2));
             if cycle == 0 {
                 send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 1 })?;

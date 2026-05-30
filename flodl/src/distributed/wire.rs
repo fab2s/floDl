@@ -449,7 +449,23 @@ pub enum ControlMsgWire {
     RequestParams,
     /// CPU path: averaged params with `version` are ready on the data
     /// channel; worker reads the next RoundFrame and applies it.
-    Update { version: u64 },
+    ///
+    /// `next_plan` is the atomic-dispatch payload: when `Some`, it is
+    /// the rank's next reduce-window chunk, folded into this same frame
+    /// so the worker applies the averaged params **and** starts the next
+    /// window without a separate `StartEpoch` round-trip from the coord
+    /// (clawing back the post-reduce control RTT on the CPU path). The
+    /// inbound bridge synthesises a `ControlMsg::StartEpoch(next_plan)`
+    /// into the worker's control channel, ordered *after* the param
+    /// bridge's `ControlMsg::Update(avg)` (same mpsc, FIFO), so averaged
+    /// params are always applied before the next window begins. `None`
+    /// at an epoch boundary (or when the reduce barrier holds the rank):
+    /// the existing epoch-advance / `wake_idle_ranks_in_progressive`
+    /// path dispatches the next chunk as before.
+    Update {
+        version: u64,
+        next_plan: Option<EpochPlanWire>,
+    },
     /// NCCL path: trigger in-place AllReduce on the worker's params.
     SyncNow,
     /// Begin processing a new epoch with the given partition.

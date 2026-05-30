@@ -217,6 +217,38 @@
     }
 
     #[test]
+    fn control_frame_round_trip_update_atomic_dispatch() {
+        // atomic-dispatch: the post-reduce Update carries an optional
+        // folded next-window chunk. Both shapes must round-trip.
+        let cases = [
+            ControlMsgWire::Update {
+                version: 1,
+                next_plan: None,
+            },
+            ControlMsgWire::Update {
+                version: 42,
+                next_plan: Some(EpochPlanWire {
+                    epoch: 3,
+                    partition_offset: 128,
+                    partition_size: 64,
+                }),
+            },
+        ];
+        for msg in cases {
+            let frame =
+                ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+            let mut buf = Vec::new();
+            frame.write_to(&mut buf).unwrap();
+            let mut cur = Cursor::new(buf);
+            let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+                .unwrap()
+                .unwrap();
+            let back: ControlMsgWire = got.decode().unwrap();
+            assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
     fn control_frame_round_trip_eval_targeted() {
         let cases = [
             ControlMsgWire::ExecuteEvalCallback {
