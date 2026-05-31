@@ -86,6 +86,29 @@ impl ElCheMode {
             Self::CpuAsync => (ApplyPolicy::Async, AverageBackend::Cpu),
         }
     }
+
+    /// Recompose from the `(ApplyPolicy, AverageBackend)` pair — the
+    /// inverse of [`Self::split`]. Used to reconcile the builder's
+    /// transient `policy`/`backend` into the canonical `ElCheConfig::mode`
+    /// at build time. `(Async, Nccl)` has no mode (NcclAsync was dropped),
+    /// so it falls back to `NcclCadence` (debug-asserts in dev) — the
+    /// orchestrator never produces that pair.
+    pub(crate) fn from_parts(policy: ApplyPolicy, backend: AverageBackend) -> Self {
+        match (policy, backend) {
+            (ApplyPolicy::Sync, AverageBackend::Nccl) => Self::NcclSync,
+            (ApplyPolicy::Cadence, AverageBackend::Nccl) => Self::NcclCadence,
+            (ApplyPolicy::Sync, AverageBackend::Cpu) => Self::CpuSync,
+            (ApplyPolicy::Cadence, AverageBackend::Cpu) => Self::CpuCadence,
+            (ApplyPolicy::Async, AverageBackend::Cpu) => Self::CpuAsync,
+            (ApplyPolicy::Async, AverageBackend::Nccl) => {
+                debug_assert!(
+                    false,
+                    "NcclAsync was dropped; (Async, Nccl) has no ElCheMode"
+                );
+                Self::NcclCadence
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +136,7 @@ impl ElCheMode {
 ///     ..Default::default()
 /// };
 /// ```
+#[derive(Clone)]
 pub struct ElCheConfig {
     /// DDP mode (NcclSync, NcclCadence, ...).
     pub mode: ElCheMode,
@@ -152,6 +176,21 @@ pub struct ElCheConfig {
     /// EASGD elastic-averaging weight (0.0 < α ≤ 1.0). Honored on the
     /// CpuAsync path only; ignored elsewhere.
     pub easgd_alpha: Option<f64>,
+    /// Divergence threshold for the default convergence guard
+    /// ([`crate::distributed::ddp_run::TrendGuard`]). `None` = framework
+    /// default (0.05). Ignored when [`Self::convergence_guard`] supplies a
+    /// custom guard (the override takes precedence) or when
+    /// [`Self::no_divergence_guard`] is set.
+    pub divergence_threshold: Option<f64>,
+    /// Disable the convergence guard entirely
+    /// ([`crate::distributed::ddp_run::NoGuard`]). Default `false`. When
+    /// `true`, ElChe's overhead auto-tune drives cadence alone. Ignored
+    /// when [`Self::convergence_guard`] supplies a custom guard.
+    pub no_divergence_guard: bool,
+    /// Max batches a rank may run past the planned sync point (CpuAsync
+    /// streaming bound). `None` = auto-tuned from convergence feedback.
+    /// The async-strategy lookahead knob; ignored outside CpuAsync.
+    pub max_overshoot: Option<usize>,
 }
 
 impl ElCheConfig {
@@ -194,7 +233,7 @@ impl ElCheConfig {
         }
     }
 
-    fn default_for(mode: ElCheMode) -> Self {
+    pub(crate) fn default_for(mode: ElCheMode) -> Self {
         Self {
             mode,
             anchor: 10,
@@ -218,6 +257,9 @@ impl ElCheConfig {
                 ElCheMode::CpuAsync => Some(0.5),
                 _ => None,
             },
+            divergence_threshold: None,
+            no_divergence_guard: false,
+            max_overshoot: None,
         }
     }
 
@@ -251,6 +293,12 @@ impl ElCheConfig {
     }
     /// Set the EASGD elastic-averaging weight (CpuAsync only).
     pub fn easgd_alpha(mut self, a: f64) -> Self { self.easgd_alpha = Some(a); self }
+    /// Set the default convergence-guard divergence threshold.
+    pub fn divergence_threshold(mut self, t: f64) -> Self { self.divergence_threshold = Some(t); self }
+    /// Disable the convergence guard (overhead auto-tune drives cadence alone).
+    pub fn no_divergence_guard(mut self) -> Self { self.no_divergence_guard = true; self }
+    /// Set the CpuAsync streaming lookahead bound (max batches past the planned sync).
+    pub fn max_overshoot(mut self, n: usize) -> Self { self.max_overshoot = Some(n); self }
 }
 
 impl Default for ElCheConfig {
@@ -281,6 +329,9 @@ impl std::fmt::Debug for ElCheConfig {
             .field("meta_controller", &self.meta_controller)
             .field("convergence_guard", &self.convergence_guard.as_ref().map(|_| "<dyn ConvergenceGuard>"))
             .field("easgd_alpha", &self.easgd_alpha)
+            .field("divergence_threshold", &self.divergence_threshold)
+            .field("no_divergence_guard", &self.no_divergence_guard)
+            .field("max_overshoot", &self.max_overshoot)
             .finish()
     }
 }

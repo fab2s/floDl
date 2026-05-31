@@ -818,6 +818,14 @@
     }
 
     impl crate::distributed::ddp_run::convergence::ConvergenceGuard for RecordingGuard {
+        fn clone_box(
+            &self,
+        ) -> Box<dyn crate::distributed::ddp_run::convergence::ConvergenceGuard> {
+            Box::new(RecordingGuard {
+                captured: self.captured.clone(),
+            })
+        }
+
         fn report(
             &mut self,
             report: &crate::distributed::ddp_run::convergence::DivergenceReport,

@@ -127,6 +127,26 @@ where
         self
     }
 
+    /// Apply a complete [`crate::distributed::ElCheConfig`] strategy in one
+    /// call: derives `policy`/`backend` from `elche.mode`, moves the
+    /// convergence-guard override onto the builder, and stores the rest as
+    /// the config-of-record's strategy (`config.elche`). The single bridge
+    /// from the `Trainer::run` config-bag path — equivalent to calling each
+    /// individual strategy setter, with `elche.mode` as the source of truth
+    /// for `policy`/`backend`.
+    pub fn elche(mut self, mut elche: crate::distributed::ElCheConfig) -> Self {
+        let (policy, backend) = elche.mode.split();
+        self.policy = policy;
+        self.backend = backend;
+        // The guard override threads via the builder's separate field
+        // (consumed at coordinator construction); take it out so there's a
+        // single live copy and `config.elche.convergence_guard` stays `None`
+        // at runtime.
+        self.convergence_guard = elche.convergence_guard.take();
+        self.config.elche = elche;
+        self
+    }
+
     /// Set the AllReduce overhead target (fraction of compute time).
     pub fn overhead_target(mut self, target: f64) -> Self {
         self.config = self.config.with_overhead_target(target);
@@ -575,14 +595,6 @@ where
         self.eval_result_fn = Some(f);
         self
     }
-    /// Pass-through for a pre-boxed convergence guard.
-    pub(crate) fn convergence_guard_boxed(
-        mut self,
-        guard: Box<dyn ConvergenceGuard>,
-    ) -> Self {
-        self.convergence_guard = Some(guard);
-        self
-    }
 
     /// Launch training. Non-blocking: spawns threads and returns immediately.
     ///
@@ -597,18 +609,25 @@ where
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
         let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
 
-        // Framework default: cpu-async uses an EASGD elastic blend with
-        // α=0.5 unless the caller set one. The `None`/full-overwrite path
-        // (α=1.0) discards the ahead-of-sync local progress cpu-async
-        // accumulates between reduces — the degenerate mode. Gated to
-        // (Async, Cpu): `easgd_alpha` drives `load_averaged`'s blend
-        // regardless of policy, and Sync/Cadence MUST full-overwrite to
-        // the consensus each window, so the default stays async-only.
-        if matches!(self.policy, ApplyPolicy::Async)
-            && matches!(self.backend, AverageBackend::Cpu)
-            && self.config.easgd_alpha.is_none()
-        {
-            self.config = self.config.with_easgd_alpha(0.5);
+        // Reconcile the canonical strategy mode with the builder's
+        // transient policy/backend (which `.policy()`/`.backend()` may have
+        // set independently). `elche.mode` is the config-of-record's single
+        // representation; dispatch still threads policy/backend separately.
+        self.config.elche.mode =
+            crate::distributed::ElCheMode::from_parts(self.policy, self.backend);
+
+        // Single default site: the builder path (direct `.policy()`/
+        // `.backend()`, no `ElCheConfig` preset) never ran through
+        // `ElCheConfig::default_for`, so fill any unset mode-derived default
+        // from it here. Today the only such default is cpu-async's EASGD
+        // elastic blend (α=0.5) — `default_for(CpuAsync).easgd_alpha`. The
+        // `None`/full-overwrite path (α=1.0) is the degenerate cpu-async
+        // mode; every other mode's default is `None` so this is a no-op
+        // there. Keeps the default in ONE place (`default_for`).
+        if self.config.elche.easgd_alpha.is_none() {
+            self.config.elche.easgd_alpha =
+                crate::distributed::ElCheConfig::default_for(self.config.elche.mode)
+                    .easgd_alpha;
         }
 
         DdpHandle::launch(

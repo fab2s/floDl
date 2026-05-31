@@ -566,18 +566,18 @@ impl DdpHandle {
             };
 
         // Step 3: Create ElChe with config knobs
-        let anchor = config.anchor.unwrap_or(10);
+        let anchor = config.elche.anchor;
         let mut el_che = crate::distributed::ddp::ElChe::new(world_size, anchor);
-        if let Some(target) = config.overhead_target {
+        if let Some(target) = config.elche.overhead_target {
             el_che = el_che.with_overhead_target(target);
         }
-        if let Some(max) = config.max_anchor {
+        if let Some(max) = config.elche.max_anchor {
             el_che = el_che.with_max_anchor(max);
         }
-        if let Some(min) = config.min_anchor {
+        if let Some(min) = config.elche.min_anchor {
             el_che = el_che.with_min_anchor(min);
         }
-        if let Some(diff) = config.max_batch_diff {
+        if let Some(diff) = config.elche.max_batch_diff {
             el_che = el_che.with_max_batch_diff(diff);
         }
 
@@ -587,7 +587,7 @@ impl DdpHandle {
         // ask the GPUs themselves (compute capability + VRAM) which one is
         // most likely the slowest. Either way, the pick is "soft" — once
         // timing data accumulates, election may move the anchor.
-        if let Some(ratios) = config.partition_ratios.as_ref() {
+        if let Some(ratios) = config.elche.partition_ratios.as_ref() {
             if ratios.len() == world_size {
                 if let Some((slow_rank, _)) = ratios
                     .iter()
@@ -623,11 +623,11 @@ impl DdpHandle {
         // Step 4: Spawn coordinator thread
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_coord = shutdown.clone();
-        let div_threshold = config.divergence_threshold;
-        let no_div_guard = config.no_divergence_guard;
+        let div_threshold = config.elche.divergence_threshold;
+        let no_div_guard = config.elche.no_divergence_guard;
         let ckpt_every = config.checkpoint_every;
         let snap_timeout = config.snapshot_timeout_secs;
-        let partition_ratios = config.partition_ratios.clone();
+        let partition_ratios = config.elche.partition_ratios.clone();
         let max_grad_norm = config.max_grad_norm;
         let timeline = config.timeline.clone();
         let coord_timeline = timeline.clone();
@@ -652,9 +652,9 @@ impl DdpHandle {
                 .progressive(progressive)
                 .batch_size(coord_batch_size)
                 .timeline(coord_timeline.clone())
-                .max_overshoot(config.max_overshoot)
-                .elche_relax_up(config.elche_relax_up)
-                .meta_controller(config.meta_controller);
+                .max_overshoot(config.elche.max_overshoot)
+                .elche_relax_up(config.elche.relax_up)
+                .meta_controller(config.elche.meta_controller);
                 if let Some(mf) = metrics_fn {
                     builder = builder.metrics_fn(mf);
                 }
@@ -799,7 +799,7 @@ impl DdpHandle {
                 batch_size,
                 seed,
                 max_grad_norm,
-                easgd_alpha: config.easgd_alpha,
+                easgd_alpha: config.elche.easgd_alpha,
                 timeline: worker_tl,
                 policy,
                 save_path: None,
@@ -1220,25 +1220,23 @@ impl DdpHandle {
             "progressive_dispatch": progressive,
         });
 
-        if let Some(anchor) = config.anchor {
-            meta["anchor"] = serde_json::json!(anchor);
-        }
-        if let Some(target) = config.overhead_target {
+        meta["anchor"] = serde_json::json!(config.elche.anchor);
+        if let Some(target) = config.elche.overhead_target {
             meta["overhead_target"] = serde_json::json!(target);
         }
-        if let Some(max) = config.max_anchor {
+        if let Some(max) = config.elche.max_anchor {
             meta["max_anchor"] = serde_json::json!(max);
         }
-        if let Some(min) = config.min_anchor {
+        if let Some(min) = config.elche.min_anchor {
             meta["min_anchor"] = serde_json::json!(min);
         }
-        if let Some(diff) = config.max_batch_diff {
+        if let Some(diff) = config.elche.max_batch_diff {
             meta["max_batch_diff"] = serde_json::json!(diff);
         }
-        if let Some(overshoot) = config.max_overshoot {
+        if let Some(overshoot) = config.elche.max_overshoot {
             meta["max_overshoot"] = serde_json::json!(overshoot);
         }
-        if let Some(dt) = config.divergence_threshold {
+        if let Some(dt) = config.elche.divergence_threshold {
             meta["divergence_threshold"] = serde_json::json!(dt);
         }
 

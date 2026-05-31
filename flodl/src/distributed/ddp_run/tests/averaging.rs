@@ -373,10 +373,10 @@ fn test_wall_ms_accumulation() {
 #[test]
 fn test_config_defaults() {
     let cfg = DdpRunConfig::new();
-    assert!(cfg.overhead_target.is_none());
-    assert!(cfg.max_anchor.is_none());
-    assert!(cfg.anchor.is_none());
-    assert!(cfg.divergence_threshold.is_none());
+    assert!(cfg.elche.overhead_target.is_none());
+    assert!(cfg.elche.max_anchor.is_none());
+    assert_eq!(cfg.elche.anchor, 10);
+    assert!(cfg.elche.divergence_threshold.is_none());
 }
 
 #[test]
@@ -386,10 +386,10 @@ fn test_config_builder() {
         .with_max_anchor(100)
         .with_anchor(20)
         .with_divergence_threshold(0.01);
-    assert_eq!(cfg.overhead_target, Some(0.05));
-    assert_eq!(cfg.max_anchor, Some(100));
-    assert_eq!(cfg.anchor, Some(20));
-    assert_eq!(cfg.divergence_threshold, Some(0.01));
+    assert_eq!(cfg.elche.overhead_target, Some(0.05));
+    assert_eq!(cfg.elche.max_anchor, Some(100));
+    assert_eq!(cfg.elche.anchor, 20);
+    assert_eq!(cfg.elche.divergence_threshold, Some(0.01));
 }
 
 

@@ -738,39 +738,15 @@ impl Trainer {
             }
         }
 
-        let (policy, backend) = cfg.elche.mode.split();
-
+        // Single bridge: the whole ElChe strategy (mode + cadence tuning +
+        // guard + partition_ratios + easgd_alpha + max_overshoot) lands via
+        // one call. `.elche()` derives policy/backend from `mode` and moves
+        // the guard override onto the builder.
         let mut b = DdpHandle::new_builder(model_factory, optim_factory, train_fn)
             .dataset(cfg.dataset)
             .batch_size(cfg.batch_size)
             .num_epochs(cfg.num_epochs)
-            .policy(policy)
-            .backend(backend)
-            .anchor(cfg.elche.anchor)
-            .elche_relax_up(cfg.elche.relax_up)
-            .meta_controller(cfg.elche.meta_controller);
-
-        if let Some(n) = cfg.elche.max_anchor {
-            b = b.max_anchor(n);
-        }
-        if let Some(n) = cfg.elche.min_anchor {
-            b = b.min_anchor(n);
-        }
-        if let Some(t) = cfg.elche.overhead_target {
-            b = b.overhead_target(t);
-        }
-        if let Some(n) = cfg.elche.max_batch_diff {
-            b = b.max_batch_diff(n);
-        }
-        if let Some(ratios) = cfg.elche.partition_ratios {
-            b = b.partition_ratios(&ratios);
-        }
-        if let Some(alpha) = cfg.elche.easgd_alpha {
-            b = b.easgd_alpha(alpha);
-        }
-        if let Some(guard) = cfg.elche.convergence_guard {
-            b = b.convergence_guard_boxed(guard);
-        }
+            .elche(cfg.elche);
 
         if let Some(n) = cfg.max_grad_norm {
             b = b.max_grad_norm(n);

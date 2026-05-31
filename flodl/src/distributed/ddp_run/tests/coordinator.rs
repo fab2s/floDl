@@ -770,10 +770,10 @@ fn test_throttle_worker_unblocks_on_shutdown() {
 #[test]
 fn test_async_ddp_config_max_batch_diff() {
     let config = DdpRunConfig::new().with_max_batch_diff(5);
-    assert_eq!(config.max_batch_diff, Some(5));
+    assert_eq!(config.elche.max_batch_diff, Some(5));
 
     let config2 = DdpRunConfig::new();
-    assert_eq!(config2.max_batch_diff, None);
+    assert_eq!(config2.elche.max_batch_diff, None);
 }
 
 // -----------------------------------------------------------------------

@@ -489,7 +489,7 @@ impl DdpHandle {
 
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
-        let easgd_alpha = config.easgd_alpha;
+        let easgd_alpha = config.elche.easgd_alpha;
         let save_path_for_thread = save_path.clone();
 
         // Pin device + init NCCL on the rank process's main thread.
@@ -988,7 +988,7 @@ impl DdpHandle {
 
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
-        let easgd_alpha = config.easgd_alpha;
+        let easgd_alpha = config.elche.easgd_alpha;
         let save_path_for_thread = save_path.clone();
 
         // Run synchronously on rank's main thread. See

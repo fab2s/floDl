@@ -680,10 +680,10 @@ fn test_shutdown_with_streaming_pools() {
 #[test]
 fn test_ddp_run_config_max_overshoot() {
     let config = DdpRunConfig::new().with_max_overshoot(5);
-    assert_eq!(config.max_overshoot, Some(5));
+    assert_eq!(config.elche.max_overshoot, Some(5));
 
     let config2 = DdpRunConfig::new();
-    assert_eq!(config2.max_overshoot, None);
+    assert_eq!(config2.elche.max_overshoot, None);
 }
 
 #[test]

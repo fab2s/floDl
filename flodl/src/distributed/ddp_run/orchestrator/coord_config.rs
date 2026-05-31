@@ -61,18 +61,18 @@ pub(crate) fn build_coord_config_from_builder(
 
     // ElChe construction: anchor (default 10 matches DdpRunConfig docs)
     // plus optional max/min/overhead_target/max_batch_diff knobs.
-    let anchor = config.anchor.unwrap_or(10);
+    let anchor = config.elche.anchor;
     let mut el_che = ElChe::new(world_size, anchor);
-    if let Some(target) = config.overhead_target {
+    if let Some(target) = config.elche.overhead_target {
         el_che = el_che.with_overhead_target(target);
     }
-    if let Some(max) = config.max_anchor {
+    if let Some(max) = config.elche.max_anchor {
         el_che = el_che.with_max_anchor(max);
     }
-    if let Some(min) = config.min_anchor {
+    if let Some(min) = config.elche.min_anchor {
         el_che = el_che.with_min_anchor(min);
     }
-    if let Some(diff) = config.max_batch_diff {
+    if let Some(diff) = config.elche.max_batch_diff {
         el_che = el_che.with_max_batch_diff(diff);
     }
 
@@ -85,9 +85,9 @@ pub(crate) fn build_coord_config_from_builder(
     .total_samples(total_samples)
     .batch_size(batch_size)
     .num_epochs(num_epochs)
-    .elche_relax_up(config.elche_relax_up)
-    .meta_controller(config.meta_controller)
-    .partition_ratios(config.partition_ratios.clone());
+    .elche_relax_up(config.elche.relax_up)
+    .meta_controller(config.elche.meta_controller)
+    .partition_ratios(config.elche.partition_ratios.clone());
 
     // Guard precedence: user override > NoGuard (if flagged) >
     // TrendGuard with user threshold or 0.05 default. On resume, the
@@ -103,11 +103,11 @@ pub(crate) fn build_coord_config_from_builder(
     let guard: Box<dyn convergence::ConvergenceGuard> = match convergence_guard {
         Some(g) => g,
         None => {
-            if config.no_divergence_guard {
+            if config.elche.no_divergence_guard {
                 Box::new(convergence::NoGuard)
             } else {
                 let mut tg = convergence::TrendGuard::new(
-                    config.divergence_threshold.unwrap_or(0.05),
+                    config.elche.divergence_threshold.unwrap_or(0.05),
                 );
                 if let Some(history) = resume_trend_history {
                     tg = tg.with_history(history);

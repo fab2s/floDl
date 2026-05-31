@@ -472,42 +472,22 @@ pub enum AverageBackend {
 /// All fields have sensible defaults. Use the builder methods to customize.
 #[derive(Clone, Debug)]
 pub struct DdpRunConfig {
-    /// ElChe overhead target (fraction of compute time). Default: 0.10.
-    pub overhead_target: Option<f64>,
-    /// Maximum anchor count (gradient staleness limit). Default: 1000.
-    pub max_anchor: Option<usize>,
-    /// Minimum anchor count (auto-tune floor). Default: equals the
-    /// initial anchor (so the auto-tune cannot shrink below the start
-    /// value). Set explicitly to force the auto-tune above its natural
-    /// overhead-equilibrium setpoint, or together with `max_anchor` to
-    /// pin the anchor at a fixed cadence (`min == max`).
-    ///
-    /// Note: the convergence guard's `NudgeDown` action is the only
-    /// path that bypasses this floor (treated as a stronger signal than
-    /// overhead). Use `with_convergence_guard(NoGuard)` for hard pinning.
-    pub min_anchor: Option<usize>,
-    /// Initial ElChe anchor (batches before first sync). Default: 10.
-    pub anchor: Option<usize>,
-    /// Divergence threshold for the trend guardrail. Default: 0.05.
-    pub divergence_threshold: Option<f64>,
-    /// Disable the divergence guardrail entirely. Default: false (enabled).
-    /// When true, ElChe's overhead auto-tune handles cadence alone.
-    pub no_divergence_guard: bool,
-    /// Maximum batch lead of fastest over slowest worker.
-    /// `Some(0)` = strict lockstep. `None` = unlimited. Default: `None`.
-    pub max_batch_diff: Option<usize>,
+    /// The DDP coordination/convergence STRATEGY — the single source of
+    /// truth for mode (canonical), cadence tuning (anchor / max_anchor /
+    /// min_anchor / overhead_target / max_batch_diff), the convergence
+    /// guard (`convergence_guard` override + `divergence_threshold` /
+    /// `no_divergence_guard` primitives), `partition_ratios`,
+    /// `easgd_alpha`, `meta_controller`, and `max_overshoot`. The
+    /// builder's `policy`/`backend` are reconciled into `elche.mode` at
+    /// build via `ElCheMode::from_parts` (the inverse of `mode.split()`).
+    /// Everything else on `DdpRunConfig` is run-scope / topology.
+    pub elche: crate::distributed::ElCheConfig,
     /// Save a checkpoint every N global epochs.
     /// `None` = no checkpointing. Default: `None`.
     pub checkpoint_every: Option<usize>,
     /// Timeout for CPU averaging snapshot collection (seconds). Default: 5.
     /// Only applies to [`AverageBackend::Cpu`].
     pub snapshot_timeout_secs: u64,
-    /// Explicit per-rank partition ratios (e.g. `[0.7, 0.3]`).
-    ///
-    /// When set, disables automatic throughput-based rebalancing.
-    /// Ratios must sum to approximately 1.0. Length must match `world_size`.
-    /// Use this when you know your hardware and want fixed data splits.
-    pub partition_ratios: Option<Vec<f64>>,
     /// Enable progressive chunk dispatch for cold-start calibration.
     ///
     /// Instead of sending the full epoch partition upfront, the coordinator
@@ -528,18 +508,6 @@ pub struct DdpRunConfig {
     /// When set, the coordinator and workers inject training events (sync,
     /// epoch boundaries, anchor changes, throttle) into the timeline.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
-    /// Maximum batches past the planned sync point any GPU may execute.
-    ///
-    /// Controls how aggressively fast GPUs stream into the next epoch's
-    /// data when the current epoch's pool is exhausted. This is NOT the
-    /// same as `max_batch_diff` (which limits divergence between GPUs).
-    ///
-    /// `None` = auto-tuned from convergence feedback: starts conservative
-    /// (`max(2, total_batches / 100)` capped at 5), grows by +1 after
-    /// each successful sync with good convergence, resets on divergence.
-    ///
-    /// Default: `None` (auto).
-    pub max_overshoot: Option<usize>,
     /// LR scaling ratio for multi-GPU training. Default: `1.0`.
     ///
     /// Controls how much the learning rate is scaled with `world_size`.
@@ -553,54 +521,6 @@ pub struct DdpRunConfig {
     ///
     /// Tune this if convergence degrades at higher GPU counts.
     pub lr_scale_ratio: f64,
-    /// Allow ElChe to relax the anchor upward on stable convergence. Default: `false`.
-    ///
-    /// When `false` (default), the anchor only changes via the overhead-based
-    /// auto-tune in `el_che.report_timing`. This matches pre-relax-up
-    /// behavior and is the reproducibility-friendly default.
-    ///
-    /// When `true`, each `Stable` convergence-guard verdict triggers
-    /// `el_che.relax_anchor_up()`, growing the anchor toward `max_anchor` to
-    /// reduce sync frequency on workloads where convergence is healthy.
-    /// Opt in when measuring the relax-up policy specifically; aware that
-    /// the periodic loosen → drift → tighten → recover cycle adds an
-    /// implicit regularizer to the optimizer's gradient-averaging schedule.
-    pub elche_relax_up: bool,
-    /// EASGD elastic averaging weight (0.0 < α ≤ 1.0). Default: `None`
-    /// (current behavior: full overwrite of local params with averaged
-    /// consensus, equivalent to α=1.0).
-    ///
-    /// When set to a value in `(0, 1)`, the cpu-async load_averaged path
-    /// applies an elastic blend instead of full overwrite:
-    ///
-    /// ```text
-    /// W_local := (1 − α) · W_local + α · W_avg
-    /// ```
-    ///
-    /// Preserves the local progress made between snapshot-time and
-    /// averaging-completion (the "ahead-of-sync drift" that current
-    /// cpu-async discards). Reference: Zhang, Choromanska, LeCun 2015,
-    /// "Deep learning with Elastic Averaging SGD," NeurIPS 2015
-    /// (<https://arxiv.org/abs/1412.6651>).
-    ///
-    /// Honored on the cpu-async path only (`AverageBackend::Cpu` +
-    /// `ApplyPolicy::Async`). NCCL paths use in-place AllReduce(Avg) and
-    /// have no equivalent overwrite step. Values outside `(0, 1]` are
-    /// rejected at config time.
-    pub easgd_alpha: Option<f64>,
-    /// Enable the LR-aware meta-controller above ElChe. Default: `false`
-    /// (opt-in until validation sweep).
-    ///
-    /// When enabled, the meta-controller observes the LR trajectory, anchor
-    /// trend, and convergence guard verdicts each averaging cycle, and
-    /// reactively dispatches `nudge_anchor_down` on sharp LR drops or
-    /// sustained divergence patterns. ElChe's natural overhead auto-tune
-    /// handles recovery; the meta layer only adds reactive corrections that
-    /// the natural feedback can't absorb fast enough.
-    ///
-    /// See [`crate::distributed::lr_event_meta`] for the design.
-    pub meta_controller: bool,
-
     /// Checkpoint bundle stem for the cluster-mode
     /// save-on-unrecoverable-failure path. When set on a cluster
     /// run, workers persist a `<save_path>.fdl` / `.optim` /
@@ -666,24 +586,13 @@ impl DdpRunConfig {
     /// Create a default config (all defaults).
     pub fn new() -> Self {
         DdpRunConfig {
-            overhead_target: None,
-            max_anchor: None,
-            min_anchor: None,
-            anchor: None,
-            divergence_threshold: None,
-            no_divergence_guard: false,
-            max_batch_diff: None,
+            elche: crate::distributed::ElCheConfig::default(),
             checkpoint_every: None,
             snapshot_timeout_secs: 5,
-            partition_ratios: None,
             progressive_dispatch: None,
             max_grad_norm: None,
             timeline: None,
-            max_overshoot: None,
             lr_scale_ratio: 1.0,
-            elche_relax_up: false,
-            easgd_alpha: None,
-            meta_controller: true,
             save_path: None,
             max_failure: None,
             heartbeat_timeout_secs: None,
@@ -738,13 +647,13 @@ impl DdpRunConfig {
 
     /// Set the AllReduce overhead target (fraction of compute time).
     pub fn with_overhead_target(mut self, target: f64) -> Self {
-        self.overhead_target = Some(target);
+        self.elche.overhead_target = Some(target);
         self
     }
 
     /// Set the maximum anchor count.
     pub fn with_max_anchor(mut self, max: usize) -> Self {
-        self.max_anchor = Some(max);
+        self.elche.max_anchor = Some(max);
         self
     }
 
@@ -757,26 +666,26 @@ impl DdpRunConfig {
     /// `with_convergence_guard(NoGuard)` + `with_no_divergence_guard()` for
     /// truly hard pinning.
     pub fn with_min_anchor(mut self, min: usize) -> Self {
-        self.min_anchor = Some(min);
+        self.elche.min_anchor = Some(min);
         self
     }
 
     /// Set the initial anchor count.
     pub fn with_anchor(mut self, anchor: usize) -> Self {
-        self.anchor = Some(anchor);
+        self.elche.anchor = anchor;
         self
     }
 
     /// Set the divergence threshold for the trend guardrail.
     pub fn with_divergence_threshold(mut self, threshold: f64) -> Self {
-        self.divergence_threshold = Some(threshold);
+        self.elche.divergence_threshold = Some(threshold);
         self
     }
 
     /// Disable the divergence guardrail. ElChe's overhead auto-tune
     /// handles cadence alone. Use when you know your workload is stable.
     pub fn with_no_divergence_guard(mut self) -> Self {
-        self.no_divergence_guard = true;
+        self.elche.no_divergence_guard = true;
         self
     }
 
@@ -785,7 +694,7 @@ impl DdpRunConfig {
     /// `0` = strict lockstep (sync DDP behavior). Workers that exceed
     /// this lead are paused until the slowest catches up.
     pub fn with_max_batch_diff(mut self, max: usize) -> Self {
-        self.max_batch_diff = Some(max);
+        self.elche.max_batch_diff = Some(max);
         self
     }
 
@@ -797,7 +706,7 @@ impl DdpRunConfig {
     ///
     /// `0` disables cross-epoch streaming. Default: auto-tuned.
     pub fn with_max_overshoot(mut self, max: usize) -> Self {
-        self.max_overshoot = Some(max);
+        self.elche.max_overshoot = Some(max);
         self
     }
 
@@ -834,7 +743,7 @@ impl DdpRunConfig {
     /// Disables automatic throughput-based rebalancing. Ratios are normalized
     /// so they sum to 1.0. Length must match `world_size` at launch time.
     pub fn with_partition_ratios(mut self, ratios: &[f64]) -> Self {
-        self.partition_ratios = Some(ratios.to_vec());
+        self.elche.partition_ratios = Some(ratios.to_vec());
         self
     }
 
@@ -886,7 +795,7 @@ impl DdpRunConfig {
     /// regime; the default keeps the anchor under overhead-based control
     /// alone, matching pre-relax-up behavior.
     pub fn with_elche_relax_up(mut self, enabled: bool) -> Self {
-        self.elche_relax_up = enabled;
+        self.elche.relax_up = enabled;
         self
     }
 
@@ -901,7 +810,7 @@ impl DdpRunConfig {
             alpha > 0.0 && alpha <= 1.0,
             "easgd_alpha must be in (0, 1], got {alpha}"
         );
-        self.easgd_alpha = Some(alpha);
+        self.elche.easgd_alpha = Some(alpha);
         self
     }
 
@@ -910,7 +819,7 @@ impl DdpRunConfig {
     /// Off by default (opt-in). See the `meta_controller` field for behavior
     /// and `crate::distributed::lr_event_meta` for the design.
     pub fn with_meta_controller(mut self, enabled: bool) -> Self {
-        self.meta_controller = enabled;
+        self.elche.meta_controller = enabled;
         self
     }
 }
@@ -1301,7 +1210,7 @@ pub struct WorkerConfig {
     /// local params with averaged consensus on the cpu-async path (current
     /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]
     /// blends `W_local := (1-α)·W_local + α·W_avg` instead. See
-    /// [`DdpRunConfig::easgd_alpha`] for details.
+    /// [`crate::distributed::ElCheConfig::easgd_alpha`] for details.
     pub easgd_alpha: Option<f64>,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,

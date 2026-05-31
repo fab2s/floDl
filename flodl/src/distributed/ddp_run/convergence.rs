@@ -158,6 +158,18 @@ pub trait ConvergenceGuard: Send + Sync {
     fn trend_history(&self) -> Option<Vec<f64>> {
         None
     }
+
+    /// Clone this guard into a fresh box. Enables `Clone` for
+    /// `Box<dyn ConvergenceGuard>` (and thus for [`crate::distributed::ElCheConfig`],
+    /// which holds the guard as its convergence-strategy override). Impls
+    /// are one line: `Box::new(self.clone())`.
+    fn clone_box(&self) -> Box<dyn ConvergenceGuard>;
+}
+
+impl Clone for Box<dyn ConvergenceGuard> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +203,7 @@ pub struct LambdaSample {
 /// Holds the previous `D_t`, the raw EMA state, and an event counter for
 /// Adam-style bias correction. Reset across mode/run boundaries (epoch
 /// boundaries do NOT reset: lambda continuity matters across epochs).
+#[derive(Clone)]
 pub struct LambdaEstimator {
     prev_d: Option<f64>,
     /// Raw EMA — uncorrected, starts at 0.0.
@@ -283,6 +296,10 @@ impl LambdaEstimator {
 pub struct NoGuard;
 
 impl ConvergenceGuard for NoGuard {
+    fn clone_box(&self) -> Box<dyn ConvergenceGuard> {
+        Box::new(*self)
+    }
+
     fn report(&mut self, _: &DivergenceReport, _: usize, _: usize) -> ConvergenceAction {
         ConvergenceAction::Stable
     }
@@ -297,6 +314,7 @@ impl ConvergenceGuard for NoGuard {
 /// rising drift. Does not currently issue [`ConvergenceAction::NudgeDown`]
 /// — adding that is a separate decision (the trend signal is too noisy on
 /// its own to drive aggressive anchor reduction).
+#[derive(Clone)]
 pub struct TrendGuard {
     threshold: f64,
     /// Ring buffer of `max_relative_delta` from recent sync intervals (up to 5).
@@ -372,6 +390,10 @@ impl TrendGuard {
 }
 
 impl ConvergenceGuard for TrendGuard {
+    fn clone_box(&self) -> Box<dyn ConvergenceGuard> {
+        Box::new(self.clone())
+    }
+
     fn report(&mut self, report: &DivergenceReport, _: usize, _: usize) -> ConvergenceAction {
         let divergence = report.max_relative_delta();
         if self.history.len() >= 5 {
@@ -424,6 +446,7 @@ impl ConvergenceGuard for TrendGuard {
 ///
 /// Disable nudge by setting `nudge_threshold = f64::INFINITY` (or via
 /// [`MsfGuard::without_nudge`]).
+#[derive(Clone)]
 pub struct MsfGuard {
     estimator: LambdaEstimator,
     suppress_threshold: f64,
@@ -490,6 +513,10 @@ impl MsfGuard {
 }
 
 impl ConvergenceGuard for MsfGuard {
+    fn clone_box(&self) -> Box<dyn ConvergenceGuard> {
+        Box::new(self.clone())
+    }
+
     fn report(
         &mut self,
         report: &DivergenceReport,
