@@ -206,7 +206,18 @@ impl ElCheConfig {
             partition_ratios: None,
             meta_controller: true,
             convergence_guard: None,
-            easgd_alpha: None,
+            // cpu-async defaults to the EASGD elastic blend (α=0.5, the
+            // value the MSF study used). The `None`/full-overwrite path
+            // is α=1.0, which discards the ahead-of-sync local progress
+            // cpu-async accumulates between reduces — the degenerate
+            // mode. Mode-gated: `easgd_alpha` drives `load_averaged`'s
+            // blend regardless of policy, and Sync/Cadence MUST
+            // full-overwrite to the consensus each window. Override via
+            // [`Self::easgd_alpha`].
+            easgd_alpha: match mode {
+                ElCheMode::CpuAsync => Some(0.5),
+                _ => None,
+            },
         }
     }
 

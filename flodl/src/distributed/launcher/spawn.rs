@@ -392,6 +392,18 @@ pub(super) fn build_remote_bash_command(
     // Defense-in-depth for NCCL stuck-collective detection; see the
     // matching env on the local spawn path.
     s.push_str("NCCL_ASYNC_ERROR_HANDLING=1");
+    // Forward the launcher's verbosity so `-vvv` (FLODL_VERBOSITY)
+    // reaches the remote worker/coordinator processes — the local
+    // spawn path inherits it via the process env, but SSH starts a
+    // fresh environment, so without this the prof instrumentation can
+    // never be enabled on remote ranks. Emitted only when set, so
+    // normal-verbosity runs leave the remote default untouched.
+    if let Ok(v) = std::env::var(crate::log::ENV_VAR) {
+        s.push(' ');
+        s.push_str(crate::log::ENV_VAR);
+        s.push('=');
+        s.push_str(&shell_quote(&v));
+    }
     if let Some(phys) = local_phys_device {
         s.push(' ');
         s.push_str("CUDA_VISIBLE_DEVICES=");

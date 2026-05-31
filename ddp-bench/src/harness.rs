@@ -666,6 +666,9 @@ fn run_unified(
         builder = builder.min_anchor(min);
     }
 
+    // cpu-async EASGD blend defaults to α=0.5 inside `DdpBuilder::run()`
+    // (the (Async, Cpu) framework default); only override here when the
+    // user passed `--easgd-alpha` explicitly.
     if let Some(alpha) = config.easgd_alpha {
         builder = builder.easgd_alpha(alpha);
     }

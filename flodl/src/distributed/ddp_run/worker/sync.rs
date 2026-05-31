@@ -116,6 +116,11 @@ impl<M: Module> GpuWorker<M> {
         self.pending_param_h2d = true;
 
         self.current_version = update.version;
+        // Instrumentation: mark when averaged params landed so the run
+        // loop can split the between-chunk wait at this boundary.
+        if self.prof_enabled {
+            self.last_update_at = Some(std::time::Instant::now());
+        }
         Ok(())
     }
 
@@ -395,6 +400,9 @@ impl<M: Module> GpuWorker<M> {
             let t = Instant::now();
             stream.synchronize()?;
             self.last_h2d_wait_ms = t.elapsed().as_secs_f64() * 1000.0;
+            if self.prof_enabled {
+                self.h2d_wait_ms_total += self.last_h2d_wait_ms;
+            }
             self.pending_param_h2d = false;
         }
         Ok(())

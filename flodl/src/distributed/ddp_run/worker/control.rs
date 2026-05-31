@@ -49,9 +49,25 @@ impl<M: Module> GpuWorker<M> {
 
     /// Handle a single control message. Returns `true` on Shutdown.
     pub(super) fn dispatch_control(&mut self, msg: ControlMsg) -> Result<bool> {
+        // Instrumentation: count processed control messages to test
+        // whether cpu mode carries more per-cycle control traffic.
+        if self.prof_enabled {
+            self.ctrl_msgs_handled += 1;
+        }
         match msg {
             ControlMsg::RequestParams => {
-                let _ = self.param_tx.send(self.snapshot_params());
+                // Instrumentation (gated): time the GPU→CPU readout — the
+                // per-window snapshot the CPU averaging path pays to
+                // publish weights for the reduce.
+                if self.prof_enabled {
+                    let t = std::time::Instant::now();
+                    let snap = self.snapshot_params();
+                    self.snapshot_ns_total += t.elapsed().as_nanos();
+                    self.snapshot_count += 1;
+                    let _ = self.param_tx.send(snap);
+                } else {
+                    let _ = self.param_tx.send(self.snapshot_params());
+                }
             }
             ControlMsg::Update(avg) => {
                 self.load_averaged(&avg)?;

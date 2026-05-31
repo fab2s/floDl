@@ -817,9 +817,44 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // triggers a fire-check — mirrors the threaded path's behavior.
         let mut last_epoch_fired: usize = usize::MAX;
 
+        // Instrumentation (gated on `-vvv` via `inner.prof_enabled()`):
+        // split each rank's wall into time in `run_epoch_plan` (compute +
+        // data + in-chunk control) vs blocked in `wait_for_epoch_plan`
+        // (reduce-barrier / next-dispatch wait). Teardown stderr summary
+        // separates "compute" from "waiting at the barrier" to locate the
+        // cpu-cadence idle. All collection below is `if prof`-guarded.
+        let prof = inner.prof_enabled();
+        let mut wait_ns: u128 = 0;
+        let mut run_ns: u128 = 0;
+        // Split the between-chunk wait at the moment averaged params land
+        // (`load_averaged`): pre-Update = blocked waiting for the reduce
+        // to complete (which can't trigger until the slow ranks finish
+        // their compute window); post-Update = the dispatch wait from
+        // weights-applied to the next StartEpoch (atomic-dispatch should
+        // drive this to ~0). Tests whether the cpu idle is slow-rank /
+        // reduce wait vs a dispatch round-trip.
+        let mut wait_pre_update_ns: u128 = 0;
+        let mut wait_post_update_ns: u128 = 0;
+
         let exit_clean = (|| -> Result<bool> {
             loop {
-                match inner.wait_for_epoch_plan()? {
+                let prev_update = if prof { inner.last_update_at() } else { None };
+                let w0 = std::time::Instant::now();
+                let plan = inner.wait_for_epoch_plan()?;
+                if prof {
+                    let w_elapsed = w0.elapsed().as_nanos();
+                    wait_ns += w_elapsed;
+                    // If an Update landed during this wait, split at it.
+                    match inner.last_update_at() {
+                        Some(u) if Some(u) != prev_update && u >= w0 => {
+                            let pre = u.duration_since(w0).as_nanos();
+                            wait_pre_update_ns += pre;
+                            wait_post_update_ns += w_elapsed.saturating_sub(pre);
+                        }
+                        _ => wait_pre_update_ns += w_elapsed,
+                    }
+                }
+                match plan {
                     Some(plan) => {
                         // Fire `epoch_fn` once per epoch transition (not
                         // per-chunk in progressive dispatch). Sync-aligned
@@ -843,7 +878,11 @@ impl<M: Module + 'static> ClusterWorker<M> {
                                 }
                             }
                         }
+                        let r0 = std::time::Instant::now();
                         let shutdown = inner.run_epoch_plan(&plan, &train_fn)?;
+                        if prof {
+                            run_ns += r0.elapsed().as_nanos();
+                        }
                         if shutdown {
                             return Ok(true);
                         }
@@ -852,6 +891,54 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 }
             }
         })();
+
+        // Per-rank compute-vs-barrier-wait summary (stderr, `-vvv` only),
+        // with the wait split into pre-Update (reduce + slow-rank wait)
+        // vs post-Update (dispatch wait) + the GPU←CPU writeback cost.
+        if prof {
+            let run_s = run_ns as f64 / 1e9;
+            let wait_s = wait_ns as f64 / 1e9;
+            let pre_s = wait_pre_update_ns as f64 / 1e9;
+            let post_s = wait_post_update_ns as f64 / 1e9;
+            let h2d_s = inner.h2d_wait_ms_total() / 1e3;
+            // GPU→CPU snapshot readout (the per-window weight publish);
+            // counted inside run_epoch, so its share of run_s names how
+            // much of "compute" is actually the synchronous D2H readout.
+            let snap_s = inner.snapshot_readout_ms_total() / 1e3;
+            let snap_n = inner.snapshot_readout_count();
+            let snap_per = if snap_n > 0 { snap_s / snap_n as f64 } else { 0.0 };
+            // run_epoch split: compute + data are what ElChe's
+            // share_complete_ms sees; `other` (= run_epoch - compute -
+            // data) is the ctrl/sync/transport overhead it does NOT —
+            // the suspected cpu-vs-nccl allocation-blind gap.
+            let compute_s = inner.compute_ms_run_total() / 1e3;
+            let data_s = inner.data_ms_run_total() / 1e3;
+            let other_s = (run_s - compute_s - data_s).max(0.0);
+            let ctrl_msgs = inner.ctrl_msgs_handled();
+            let tot = (run_s + wait_s).max(1e-9);
+            eprintln!(
+                "[worker-prof] rank={} run_epoch={:.1}s ({:.0}%) wait={:.1}s ({:.0}%) \
+                 | run-split: compute={:.1}s data={:.1}s other(ctrl/sync)={:.1}s \
+                 | wait-split: pre_update(reduce+slowrank)={:.1}s post_update(dispatch)={:.2}s \
+                 | h2d_writeback={:.2}s | snapshot_readout={:.1}s ({} calls, {:.0}ms/call) \
+                 | ctrl_msgs={}",
+                inner.rank(),
+                run_s,
+                100.0 * run_s / tot,
+                wait_s,
+                100.0 * wait_s / tot,
+                compute_s,
+                data_s,
+                other_s,
+                pre_s,
+                post_s,
+                h2d_s,
+                snap_s,
+                snap_n,
+                snap_per * 1e3,
+                ctrl_msgs,
+            );
+        }
 
         // On error exit (e.g. lone NCCL survivor bailing out of
         // `wait_for_nccl_session`), the coord may have queued
@@ -1587,6 +1674,10 @@ fn param_bridge_loop(
             pre_norm,
         });
     }
+    // Channel closed (clean training end): emit the accumulated reduce
+    // profile so the cpu-cadence reduce floor can be attributed to
+    // serialize / wire / deserialize. One line per rank, on stderr.
+    client.log_profile_summary();
 }
 
 /// Compute the weight-space divergence triple

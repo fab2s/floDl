@@ -346,6 +346,10 @@ fn run_reduce_thread(
         }
         match listener.accept() {
             Ok((mut stream, _peer)) => {
+                // Disable Nagle on the server side too — the reduce
+                // round-trip stalls on whichever side does the small
+                // write expecting an ACK, so both ends must opt out.
+                let _ = stream.set_nodelay(true);
                 stream
                     .set_read_timeout(Some(Duration::from_millis(500)))
                     .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout: {e}")))?;

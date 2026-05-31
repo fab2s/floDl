@@ -300,20 +300,19 @@ fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Str
 /// Times out after 5s on connect to keep cluster startup snappy when a
 /// host is unreachable. Uses `BatchMode=yes` so a passphrase prompt
 /// doesn't hang the dispatch.
-fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> {
-    let target = worker
-        .ssh
-        .as_ref()
-        .and_then(|s| s.target.as_deref())
-        .unwrap_or(&worker.host);
-    let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-    ]);
+/// Apply a worker's `ssh:` sub-block (port / user / identity_file /
+/// options) as flags on an `ssh` `Command`, in the canonical order.
+/// The caller pushes the connect-behavior flags (`-T`, BatchMode,
+/// timeouts), then this, then the target host + remote command.
+///
+/// Shared by cluster GPU-count dispatch ([`ssh_query_gpu_count`]) and
+/// `fdl probe`'s remote fan-out (`probe::probe_remote_via_ssh`) so both
+/// reach a host the same way — notably a Docker-container rank exposed
+/// on `127.0.0.1:<port>` with an `identity_file` (without these flags
+/// ssh defaults to port 22 / the login user and the connect is
+/// refused). The `target` itself is set by the caller (it falls back to
+/// `worker.host` when no `ssh.target` is declared).
+pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterWorker) {
     if let Some(ssh) = worker.ssh.as_ref() {
         if let Some(port) = ssh.port {
             cmd.arg("-p").arg(port.to_string());
@@ -328,6 +327,23 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
             cmd.arg("-o").arg(opt);
         }
     }
+}
+
+fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> {
+    let target = worker
+        .ssh
+        .as_ref()
+        .and_then(|s| s.target.as_deref())
+        .unwrap_or(&worker.host);
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+    ]);
+    apply_worker_ssh_opts(&mut cmd, worker);
     cmd.arg(target);
     // Pipe to wc -l for a one-line numeric output; nvidia-smi's
     // error stream is silenced so a missing driver produces "0" cleanly

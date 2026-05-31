@@ -78,6 +78,42 @@ pub struct GpuWorker<M: Module> {
     /// verifying the pollution removal under different rig topologies
     /// (e.g. PCIe x8 vs chipset x2 lines on heterogeneous boards).
     last_h2d_wait_ms: f64,
+    /// Instrumentation: instant of the most recent `load_averaged`
+    /// (averaged params applied). The cluster run loop reads it to split
+    /// the between-chunk wait into "blocked until Update arrived"
+    /// (reduce + slow-rank compute wait) vs "Update → next StartEpoch"
+    /// (post-reduce dispatch wait — should be ~0 if atomic-dispatch is
+    /// landing).
+    last_update_at: Option<std::time::Instant>,
+    /// Instrumentation: cumulative GPU←CPU writeback wait (the post-Update
+    /// H2D sync in `sync_before_forward`, i.e. "update their weights"
+    /// cost the CPU path pays and NCCL's in-place collective doesn't).
+    h2d_wait_ms_total: f64,
+    /// Instrumentation gate: cached `crate::log::enabled(Verbosity::Debug)`
+    /// (i.e. `-vvv`), read once at construction. Guards ALL profiling
+    /// collection + reporting below so the prof path costs nothing (and
+    /// emits nothing) at normal verbosity.
+    prof_enabled: bool,
+    /// Instrumentation: cumulative time + count of `snapshot_params`
+    /// calls driven by `RequestParams` (the GPU→CPU *readout* the CPU
+    /// averaging path pays each reduce window). This is the suspected
+    /// cpu-cadence floor: a synchronous, per-param `to_device(CPU)` on
+    /// the compute thread, worst on slow-PCIe ranks. Timed at the
+    /// `dispatch_control` call site (`&mut self`); the final-snapshot
+    /// readout (`reporting::send_final_snapshot`) is excluded since it's
+    /// teardown, not per-window.
+    snapshot_ns_total: u128,
+    snapshot_count: u64,
+    /// Instrumentation: run-level sums of the per-chunk `compute_ms` and
+    /// `data_starve_ms` the balancer feeds into `share_complete_ms`
+    /// (= compute + data). The cluster run loop's `run_epoch` total minus
+    /// these two is the "other (ctrl/sync/transport)" overhead ElChe does
+    /// NOT see — the suspected cpu-vs-nccl gap (per-batch report_timing
+    /// TCP writes + handle_control). Plus a count of control messages
+    /// processed, to test "more messages in cpu mode".
+    compute_ms_run_total: f64,
+    data_ms_run_total: f64,
+    ctrl_msgs_handled: u64,
 
     // -- NCCL per-rank communicator (None for CPU averaging or CPU device) --
     nccl_comm: Option<NcclRankComm>,
@@ -256,6 +292,58 @@ impl<M: Module> GpuWorker<M> {
     /// This worker's rank.
     pub fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// Instrumentation: instant of the most recent `load_averaged`
+    /// (averaged params applied). `None` until the first sync.
+    pub fn last_update_at(&self) -> Option<std::time::Instant> {
+        self.last_update_at
+    }
+
+    /// Instrumentation: cumulative GPU←CPU writeback (post-Update H2D
+    /// sync) wait in ms — the "update their weights" cost of the CPU
+    /// averaging path.
+    pub fn h2d_wait_ms_total(&self) -> f64 {
+        self.h2d_wait_ms_total
+    }
+
+    /// Instrumentation: cumulative GPU→CPU snapshot readout
+    /// (`snapshot_params` via `RequestParams`) time in ms and call
+    /// count. The per-window cost the CPU averaging path pays to publish
+    /// weights for the reduce; the suspected cpu-cadence idle floor.
+    pub fn snapshot_readout_ms_total(&self) -> f64 {
+        self.snapshot_ns_total as f64 / 1e6
+    }
+
+    /// Instrumentation: number of per-window `snapshot_params` readouts.
+    pub fn snapshot_readout_count(&self) -> u64 {
+        self.snapshot_count
+    }
+
+    /// Instrumentation gate (`-vvv`): whether profiling collection +
+    /// reporting is active. Read by the cluster run loop to gate its
+    /// own timing and the `[worker-prof]` teardown line.
+    pub fn prof_enabled(&self) -> bool {
+        self.prof_enabled
+    }
+
+    /// Instrumentation: run-level compute / data sums (ms) the balancer
+    /// uses as `share_complete_ms`, plus the control-message count.
+    /// `run_epoch - (compute + data)` is the ctrl/sync/transport overhead
+    /// ElChe doesn't see.
+    pub fn compute_ms_run_total(&self) -> f64 {
+        self.compute_ms_run_total
+    }
+
+    /// Instrumentation: run-level data-starve (prefetch/load wait) ms.
+    pub fn data_ms_run_total(&self) -> f64 {
+        self.data_ms_run_total
+    }
+
+    /// Instrumentation: count of control messages processed by
+    /// `dispatch_control` (tests "more messages in cpu mode").
+    pub fn ctrl_msgs_handled(&self) -> u64 {
+        self.ctrl_msgs_handled
     }
 
     /// The rank designated by the controller to fire `epoch_fn` at

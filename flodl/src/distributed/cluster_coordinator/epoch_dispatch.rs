@@ -239,6 +239,31 @@ impl ClusterCoordinator {
     pub(super) fn dispatch_next_chunk(&mut self, rank: usize) {
         let epoch = self.rank_epoch[rank];
 
+        // ONE-CHUNK-IN-FLIGHT INVARIANT (CPU Sync/Cadence). The worker's
+        // `pending_plan` is a single slot (a second `StartEpoch` silently
+        // overwrites the first), so a rank must never have two chunks
+        // outstanding at once. Without this guard, atomic-dispatch races
+        // the completion path: `finish_averaging_cpu` folds the next
+        // chunk (in_flight > 0) AND resets `steps_since_avg` to 0, then
+        // the just-finished pre-reduce chunk's `MetricsMsg` arrives and
+        // `dispatch_next_chunk` sees `steps == 0 < budget` (reduce barrier
+        // below passes) and dispatches a SECOND chunk — the worker drops
+        // one, its samples stay `dispatched`-but-never-`completed`, so
+        // `in_flight` sticks, `is_epoch_done` never fires, and the epoch
+        // wedges. Mirrors the in-flight guard `wake_idle_ranks_in_progressive`
+        // already applies. cpu-async is exempt: it intentionally overruns
+        // via `max_overshoot` (bounded lookahead), and NCCL's collective
+        // is its own barrier.
+        if matches!(self.backend, AverageBackend::Cpu)
+            && !matches!(self.policy, ApplyPolicy::Async)
+            && self.chunk_pools.values().any(|p| p.in_flight(rank) > 0)
+        {
+            crate::debug!(
+                "  ddp: in-flight HOLD rank {rank} | already has an outstanding chunk"
+            );
+            return;
+        }
+
         // REDUCE BARRIER. The controller is the single scheduler for the
         // "one logical GPU partitioned into heterogeneous per-rank step
         // counts" model: it never hands out a step that crosses a

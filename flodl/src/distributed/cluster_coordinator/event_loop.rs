@@ -298,6 +298,89 @@ impl ClusterCoordinator {
         true
     }
 
+    /// Stall watchdog (debug instrumentation). `global_step` advances
+    /// only at `finish_averaging_*`; if it doesn't move for
+    /// [`super::STALL_DUMP_SECS`] while ranks are alive, dump the
+    /// `should_average` gate inputs once so the tight-window cadence
+    /// wedge is captured rather than guessed. Re-arms (dumps again) on
+    /// the next stall after progress resumes.
+    pub(super) fn maybe_dump_stall(&mut self) {
+        if !self.prof_enabled {
+            return;
+        }
+        if self.global_step != self.stall_last_global_step {
+            self.stall_last_global_step = self.global_step;
+            self.stall_since = Some(Instant::now());
+            self.stall_last_dump = None;
+            return;
+        }
+        if self.active_count == 0 {
+            return;
+        }
+        let since = *self.stall_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(super::STALL_DUMP_SECS) {
+            return;
+        }
+        // Re-dump every STALL_DUMP_SECS while stalled so one repro shows
+        // whether ranks are still progressing (last_step_count moving) or
+        // frozen.
+        let due = self
+            .stall_last_dump
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(super::STALL_DUMP_SECS));
+        if due {
+            self.dump_stall_state(since.elapsed().as_secs_f64());
+            self.stall_last_dump = Some(Instant::now());
+        }
+    }
+
+    /// Dump the `should_average` gate state for a stalled cohort:
+    /// per-rank `steps_since_avg` vs the scheduled `batch_counts`
+    /// window, current epoch, and each chunk pool's residual + in-flight
+    /// count. The predicted tight-window wedge looks like: epoch pool
+    /// `remaining=0`, one rank `0 < steps < window` (took the epoch's
+    /// short final chunk), the rest `steps=0` (drained, held at the
+    /// epoch barrier) — so `should_average` can never fire.
+    fn dump_stall_state(&self, stalled_secs: f64) {
+        let counts = self.el_che.batch_counts();
+        eprintln!(
+            "[stall-watch] STALL {:.0}s no reduce | cpu_avg_state={:?} \
+             active={}/{} last_agg_epoch={:?} avg_count={} global_step={}",
+            stalled_secs,
+            self.cpu_avg_state,
+            self.active_count,
+            self.world_size,
+            self.last_aggregated_epoch,
+            self.avg_count,
+            self.global_step,
+        );
+        for r in 0..self.world_size {
+            let steps = self.steps_since_avg[r];
+            let window = counts.get(r).copied().unwrap_or(0);
+            let gate = if self.is_dead(r) {
+                "dead"
+            } else if steps == 0 {
+                "ZERO (blocks gate)"
+            } else if steps < window {
+                "BELOW-WINDOW (blocks gate)"
+            } else {
+                "ready"
+            };
+            eprintln!(
+                "  rank {r}: epoch={} steps_since_avg={} window(counts)={} \
+                 last_step_count={} -> {gate}",
+                self.rank_epoch[r], steps, window, self.last_step_count[r],
+            );
+        }
+        for (epoch, pool) in &self.chunk_pools {
+            let inflight: Vec<usize> =
+                (0..self.world_size).map(|r| pool.in_flight(r)).collect();
+            eprintln!(
+                "  pool epoch={epoch}: remaining={} in_flight={inflight:?}",
+                pool.remaining(),
+            );
+        }
+    }
+
     /// Check whether an averaging cycle should be triggered now.
     ///
     /// Re-arm (the "previous cycle has settled" gate) is backend-split,
@@ -429,6 +512,10 @@ impl ClusterCoordinator {
         if self.should_average() {
             self.trigger_averaging()?;
         }
+        // Stall watchdog (debug): capture the should_average gate state
+        // if no reduce has fired for a while (the tight-window cadence
+        // wedge). No-op until the threshold trips.
+        self.maybe_dump_stall();
         // The mpsc returns Disconnected when every cloned sender has
         // dropped (every reader thread has exited). drain_timing alone
         // can't see that — try_recv just returns Empty if there's no

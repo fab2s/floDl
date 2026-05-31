@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::distributed::controller::{
     self, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION,
@@ -53,6 +53,22 @@ pub struct CpuReduceClient {
     /// Mismatched salts surface as "HMAC verification failed" on the
     /// first round-trip.
     salt: SessionSalt,
+    /// Instrumentation accumulators: per-phase reduce time (serialize /
+    /// wire / deserialize, in ns) + total wire byte volume, summed
+    /// across every `all_reduce_tensors` call and emitted once at
+    /// teardown via [`Self::log_profile_summary`]. Overhead is three
+    /// `Instant` deltas per reduce — negligible. Drives the
+    /// "wire-bytes-bound vs CPU-bound" decision for the hierarchical /
+    /// bf16 / pinned-copy levers.
+    prof_serialize_ns: u128,
+    prof_wire_ns: u128,
+    prof_deserialize_ns: u128,
+    prof_bytes: u64,
+    prof_count: u64,
+    /// Instrumentation gate: cached `-vvv` (`Verbosity::Debug`) at
+    /// construction. When false the per-phase timing and the teardown
+    /// summary are skipped entirely.
+    prof_enabled: bool,
 }
 
 impl CpuReduceClient {
@@ -94,6 +110,13 @@ impl CpuReduceClient {
                 "cpu_reduce: connect to {controller_addr} failed: {e}"
             ))
         })?;
+        // Disable Nagle: the reduce is a small-frame write→blocking-read
+        // ping-pong, which deadlocks Nagle against delayed-ACK for ~40ms
+        // per round-trip. With the cross-host reduce being 97-99% of the
+        // cpu-cadence wall (measured), this is the dominant lever.
+        // Best-effort — a platform without TCP_NODELAY shouldn't abort
+        // training, it just keeps the latency.
+        let _ = stream.set_nodelay(true);
         // Read timeout protects the handshake from a wedged controller;
         // gets cleared after the ack so the long-running reduce loop
         // doesn't trip on a slow round.
@@ -106,6 +129,12 @@ impl CpuReduceClient {
             rank_id,
             world_size,
             salt,
+            prof_serialize_ns: 0,
+            prof_wire_ns: 0,
+            prof_deserialize_ns: 0,
+            prof_bytes: 0,
+            prof_count: 0,
+            prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -195,9 +224,72 @@ impl CpuReduceClient {
     /// v1 supports f32 only; loud error on other dtypes. Caller is
     /// responsible for moving averaged tensors back to GPU if needed.
     pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+        // Instrumentation (gated on `-vvv`): time the three phases
+        // independently so we can attribute the cpu-cadence reduce floor
+        // to serialize (incl. GPU→CPU via `to_blob`) / wire (cross-host
+        // TCP round-trip) / deserialize. Summed across reduces, emitted
+        // at teardown by `log_profile_summary`.
+        if !self.prof_enabled {
+            let frame = tensors_to_round_frame(tensors)?;
+            let averaged = self.all_reduce(&frame)?;
+            return round_frame_to_tensors(&averaged);
+        }
+        let t0 = Instant::now();
         let frame = tensors_to_round_frame(tensors)?;
+        let t1 = Instant::now();
         let averaged = self.all_reduce(&frame)?;
-        round_frame_to_tensors(&averaged)
+        let t2 = Instant::now();
+        let out = round_frame_to_tensors(&averaged)?;
+        let t3 = Instant::now();
+        self.prof_serialize_ns += (t1 - t0).as_nanos();
+        self.prof_wire_ns += (t2 - t1).as_nanos();
+        self.prof_deserialize_ns += (t3 - t2).as_nanos();
+        self.prof_bytes += frame
+            .tensors
+            .iter()
+            .map(|p| p.bytes.len() as u64)
+            .sum::<u64>();
+        self.prof_count += 1;
+        Ok(out)
+    }
+
+    /// Emit a one-line per-rank summary of the accumulated reduce
+    /// profile (serialize / wire / deserialize split, per-reduce
+    /// averages, and effective wire bandwidth). Called once at bridge
+    /// teardown. Uses `eprintln!` (not `println!`) so it isn't lost to
+    /// Docker's block-buffered stdout. No-op if no reduces ran.
+    pub fn log_profile_summary(&self) {
+        if self.prof_count == 0 {
+            return;
+        }
+        let n = self.prof_count as f64;
+        let ser = self.prof_serialize_ns as f64 / 1e6;
+        let wire = self.prof_wire_ns as f64 / 1e6;
+        let de = self.prof_deserialize_ns as f64 / 1e6;
+        let total = (ser + wire + de).max(1e-9);
+        let mb = self.prof_bytes as f64 / 1e6;
+        // Wire carries the frame up and a same-sized averaged frame
+        // down, so ~2× bytes traverse the link per reduce.
+        let wire_s = self.prof_wire_ns as f64 / 1e9;
+        let mbps = if wire_s > 0.0 { (mb * 2.0) / wire_s } else { 0.0 };
+        eprintln!(
+            "[cpu-reduce-prof] rank={} reduces={} | serialize={:.0}ms ({:.0}%) \
+             wire={:.0}ms ({:.0}%) deserialize={:.0}ms ({:.0}%) | per-reduce \
+             ser={:.2}ms wire={:.2}ms de={:.2}ms bytes={:.2}MB | wire~{:.1}MB/s(up+down)",
+            self.rank_id,
+            self.prof_count,
+            ser,
+            100.0 * ser / total,
+            wire,
+            100.0 * wire / total,
+            de,
+            100.0 * de / total,
+            ser / n,
+            wire / n,
+            de / n,
+            mb / n,
+            mbps,
+        );
     }
 
     /// Broadcast a root rank's tensors to every rank via the avg-trick.
@@ -399,7 +491,9 @@ impl CpuReduceClient {
     ///
     /// Loud error if [`TcpStream::try_clone`] fails.
     pub fn into_async(self) -> Result<AsyncCpuReduceClient> {
-        let CpuReduceClient { stream, rank_id, world_size, salt } = self;
+        // `..` drops the profiling accumulators — the async client has
+        // its own reduce path and isn't covered by this instrumentation.
+        let CpuReduceClient { stream, rank_id, world_size, salt, .. } = self;
 
         // Clone the stream so the background reader and the main-thread
         // writer have independent handles. TCP reads and writes can

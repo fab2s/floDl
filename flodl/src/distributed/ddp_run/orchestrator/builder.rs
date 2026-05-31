@@ -592,10 +592,24 @@ where
     /// # Panics
     ///
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
-    pub fn run(self) -> Result<DdpHandle> {
+    pub fn run(mut self) -> Result<DdpHandle> {
         let dataset = self.dataset.expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
         let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
+
+        // Framework default: cpu-async uses an EASGD elastic blend with
+        // α=0.5 unless the caller set one. The `None`/full-overwrite path
+        // (α=1.0) discards the ahead-of-sync local progress cpu-async
+        // accumulates between reduces — the degenerate mode. Gated to
+        // (Async, Cpu): `easgd_alpha` drives `load_averaged`'s blend
+        // regardless of policy, and Sync/Cadence MUST full-overwrite to
+        // the consensus each window, so the default stays async-only.
+        if matches!(self.policy, ApplyPolicy::Async)
+            && matches!(self.backend, AverageBackend::Cpu)
+            && self.config.easgd_alpha.is_none()
+        {
+            self.config = self.config.with_easgd_alpha(0.5);
+        }
 
         DdpHandle::launch(
             self.model_factory,

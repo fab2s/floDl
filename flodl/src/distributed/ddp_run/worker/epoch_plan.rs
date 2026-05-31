@@ -204,6 +204,13 @@ impl<M: Module> GpuWorker<M> {
                     return Ok(true);
                 }
                 let wait_start = Instant::now();
+                // Stuck-detector (debug): if we spin here waiting for a
+                // prefetched batch that never arrives, dump the worker's
+                // state once so the tight-window fold freeze can be
+                // pinned (is the worker starved mid-chunk after an Update/
+                // StartEpoch landed?). ~3s of consecutive 10ms timeouts.
+                let mut stuck_polls: u32 = 0;
+                let mut stuck_dumped = false;
                 let prefetched = loop {
                     match batch_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                         Ok(batch) => break batch
@@ -211,6 +218,23 @@ impl<M: Module> GpuWorker<M> {
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if self.handle_control()? {
                                 return Ok(true);
+                            }
+                            stuck_polls += 1;
+                            if self.prof_enabled && stuck_polls >= 300 && !stuck_dumped {
+                                stuck_dumped = true;
+                                eprintln!(
+                                    "[worker-stuck] rank={} STUCK in prefetch recv >{:.0}s | \
+                                     batch_done={} target={} epoch={} partition_len={} \
+                                     steps_since_avg={} pending_plan={:?}",
+                                    self.rank,
+                                    wait_start.elapsed().as_secs_f64(),
+                                    batch_done,
+                                    self.partition.len() / self.batch_size,
+                                    plan.epoch,
+                                    self.partition.len(),
+                                    self.steps_since_avg,
+                                    self.pending_plan.as_ref().map(|p| (p.epoch, p.partition_offset, p.partition_size)),
+                                );
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -329,6 +353,14 @@ impl<M: Module> GpuWorker<M> {
         // (compute_ms_total + data_starve_ms_total), so it tracks the
         // rank's actual capacity, not how long it idles for peers.
         let share_complete_ms = compute_ms_total + data_starve_ms_total;
+        // Instrumentation (gated): accumulate run-level compute/data so
+        // the teardown worker-prof can split run_epoch into compute /
+        // data / other(ctrl/sync/transport) — the last being what
+        // ElChe's share_complete_ms denominator omits.
+        if self.prof_enabled {
+            self.compute_ms_run_total += compute_ms_total;
+            self.data_ms_run_total += data_starve_ms_total;
+        }
         // Recompute batch count from current partition length so an
         // `ExtendPartition`-driven reshard (cluster-mode dead-rank
         // recovery) is reflected in `avg_loss` and the report.

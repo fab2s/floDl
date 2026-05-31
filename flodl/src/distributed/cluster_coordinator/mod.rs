@@ -319,6 +319,14 @@ enum CpuAvgState {
 /// different path.
 const NCCL_RENDEZVOUS_TIMEOUT_SECS: u64 = 5;
 
+/// Stall-watchdog threshold (debug instrumentation): if `global_step`
+/// (advanced only at `finish_averaging_*`) doesn't move for this long
+/// while ranks are alive, [`ClusterCoordinator::maybe_dump_stall`] dumps
+/// the `should_average` gate state. Well above any realistic
+/// inter-reduce gap (tight-window epochs run ~4-5s end-to-end) so it
+/// only fires on a genuine cadence wedge.
+const STALL_DUMP_SECS: u64 = 15;
+
 /// In-flight NCCL re-rendezvous bookkeeping. Created when the coord
 /// declares one or more dead ranks on the NCCL path; cleared when the
 /// chosen generator rank ships back a fresh `NcclUniqueId` and the
@@ -441,6 +449,24 @@ pub struct ClusterCoordinator {
 
     /// CPU-backend averaging state machine. See [`CpuAvgState`].
     cpu_avg_state: CpuAvgState,
+    /// Stall watchdog (debug instrumentation): `global_step` advances
+    /// only at `finish_averaging_*`, so it freezes when a reduce stops
+    /// firing — the signature of the tight-window cadence wedge. Tracks
+    /// the last observed `global_step` + when it last advanced; if no
+    /// reduce fires for [`STALL_DUMP_SECS`] while ranks are alive,
+    /// [`Self::maybe_dump_stall`] dumps the `should_average` gate inputs
+    /// (per-rank steps vs `batch_counts`, epoch, pool residual) once per
+    /// stall episode so the wedge state is captured, not guessed.
+    /// Instrumentation gate: cached `-vvv` (`Verbosity::Debug`) at
+    /// construction. Guards the stall watchdog.
+    prof_enabled: bool,
+    stall_last_global_step: usize,
+    stall_since: Option<Instant>,
+    /// Last time [`Self::dump_stall_state`] fired; re-dumps every
+    /// [`STALL_DUMP_SECS`] while the stall persists so a single repro
+    /// shows whether ranks are still progressing (monotonic
+    /// `last_step_count` moving) or frozen.
+    stall_last_dump: Option<Instant>,
     /// Shared dead-rank ledger with the controller. `None` when
     /// elastic membership is disabled (legacy / NCCL-only setups).
     /// Mutating side: [`Self::check_dead_ranks`] calls `declare_dead`

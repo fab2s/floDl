@@ -213,19 +213,24 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
         worker.path.replace('\'', "'\\''"),
     );
 
-    let output = Command::new("ssh")
-        .args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=3",
-            &ssh_target,
-            &remote_cmd,
-        ])
-        .output();
+    // Honor the worker's `ssh:` sub-block (port / user / identity_file /
+    // options) just like the cluster dispatch path — otherwise a
+    // Docker-container rank on `127.0.0.1:2222` with an identity_file is
+    // dialed on the default port 22 and the connect is refused (the
+    // probe then reports the host red even though dispatch works fine).
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]);
+    crate::cluster::apply_worker_ssh_opts(&mut cmd, worker);
+    cmd.arg(&ssh_target).arg(&remote_cmd);
+    let output = cmd.output();
 
     let mut report = ProbeReport {
         host: worker.host.clone(),
