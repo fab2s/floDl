@@ -388,7 +388,43 @@ pub struct ClusterCoordinator {
     /// Per-rank steps since the last averaging cycle.
     steps_since_avg: Vec<usize>,
     /// Per-rank wall-clock ms accumulated since the last averaging cycle.
+    /// Sum of per-batch `Batch.batch_ms` (= `train_step` time) — COMPUTE
+    /// ONLY. Still the feed for Sync / Async policies and the per-batch
+    /// UID-generator tiebreak; superseded by `delivered_ms_accum` for the
+    /// Cadence feed (see `timing_feed`).
     wall_ms_accum: Vec<f64>,
+    /// Per-rank `Instant` the rank's currently-outstanding chunk was
+    /// dispatched — set in `take_next_chunk_plan` (covers both the
+    /// `StartEpoch` dispatch path and the atomic-dispatch `Update` fold),
+    /// consumed + cleared when that chunk's completion `MetricsMsg` lands
+    /// in `drain_metrics_and_aggregate`. The dispatch→completion delta is
+    /// the rank's FULL delivered per-window cost (compute + data +
+    /// control/transport round-trip). `None` between a completion and the
+    /// next dispatch — i.e. across the reduce-barrier wait, which is
+    /// deliberately excluded so the signal stays a per-rank capacity
+    /// proxy rather than a barrier-idle measurement. Progressive modes
+    /// only (non-progressive Sync never calls `take_next_chunk_plan`).
+    chunk_dispatch_ts: Vec<Option<Instant>>,
+    /// Per-rank delivered ms accumulated since the last reduce: the sum
+    /// of (completion − dispatch) over the window's chunks. Fed to
+    /// `ElChe::report_timing` in place of `wall_ms_accum` for the Cadence
+    /// policy, making the balancer data- and transport-aware (the
+    /// cpu-cadence idle fix: a data-starved rank's delivered cost rises,
+    /// so ElChe stops over-allocating the fast rank). Reset alongside
+    /// `wall_ms_accum` at `finish_averaging_*`. See `timing_feed`.
+    delivered_ms_accum: Vec<f64>,
+    /// Per-rank count of batches whose delivery is included in
+    /// `delivered_ms_accum` this window — the MATCHED DIVISOR for the
+    /// delivered feed (`delivered_ms_accum[r] / delivered_batches_accum[r]`
+    /// = per-batch delivered ms). Distinct from `steps_since_avg`, which
+    /// counts every batch reported via `Batch` frames including a
+    /// just-finished chunk whose completion `MetricsMsg` has not drained
+    /// yet. Using the matched count keeps the per-batch estimate correct
+    /// when a window's last chunk has not landed at finalize time (NCCL's
+    /// inline finish), and makes a late chunk leaking into the next
+    /// window benign — ms and batch-count leak together so the ratio
+    /// holds. Reset alongside `delivered_ms_accum`.
+    delivered_batches_accum: Vec<usize>,
     /// Per-rank most-recent batch duration (ms).
     last_batch_ms: Vec<f64>,
     /// Per-rank most-recent worker step counter.

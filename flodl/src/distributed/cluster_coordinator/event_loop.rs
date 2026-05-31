@@ -601,6 +601,23 @@ impl ClusterCoordinator {
                 if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
                     pool.mark_completed(rank, msg.samples_processed);
                 }
+                // Close the rank's delivered-cost window: the chunk
+                // dispatched at `chunk_dispatch_ts[rank]` is now complete,
+                // so (now − dispatch) is its FULL delivered cost (compute +
+                // data + control/transport). Accumulated across the
+                // window's chunks; fed to ElChe at `finish_averaging_*` for
+                // the Cadence feed. `take()` so the reduce-barrier wait
+                // until the next dispatch is NOT counted. See `timing_feed`.
+                if let Some(start) = self.chunk_dispatch_ts[rank].take() {
+                    self.delivered_ms_accum[rank] +=
+                        start.elapsed().as_secs_f64() * 1000.0;
+                    // Matched divisor: count exactly the batches whose
+                    // delivery we just added, so `delivered_ms / batches`
+                    // is a correct per-batch cost even when the window's
+                    // final chunk has not drained at finalize time (NCCL
+                    // inline finish). See `delivered_batches_accum`.
+                    self.delivered_batches_accum[rank] += msg.batches_processed;
+                }
                 progressive_completions.push((rank, msg.epoch));
             }
             self.metrics_buffer

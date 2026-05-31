@@ -1,6 +1,8 @@
 //! Epoch dispatch and progressive chunk-pool scheduling for
 //! [`super::ClusterCoordinator`].
 
+use std::time::Instant;
+
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
@@ -397,6 +399,13 @@ impl ClusterCoordinator {
             None => return None,
         };
         self.rank_epoch[rank] = epoch;
+        // Open the delivered-cost window for this chunk. Both ship paths
+        // (`StartEpoch` via `dispatch_next_chunk_with_batches`, and the
+        // atomic-dispatch `Update` fold) flow through here, so this is the
+        // single point where a rank acquires a fresh outstanding chunk.
+        // Closed when the chunk's completion `MetricsMsg` lands in
+        // `drain_metrics_and_aggregate`. See `chunk_dispatch_ts`.
+        self.chunk_dispatch_ts[rank] = Some(Instant::now());
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,
             partition_offset: offset as u64,

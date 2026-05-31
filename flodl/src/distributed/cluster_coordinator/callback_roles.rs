@@ -168,6 +168,14 @@ impl ClusterCoordinator {
             self.wall_ms_accum[rank] =
                 (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
         }
+        // Symmetric exclusion from the Cadence delivered feed: the
+        // dispatch→completion window that contained this callback would
+        // otherwise charge its wall to the rank's per-batch cost. Keeps
+        // callbacks out of both balancer denominators (see `timing_feed`).
+        if rank < self.delivered_ms_accum.len() {
+            self.delivered_ms_accum[rank] =
+                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
         match error {
             None => {
                 // Success path: update the EWMA (alpha=0.3 — same
@@ -258,6 +266,14 @@ impl ClusterCoordinator {
             self.wall_ms_accum[rank] =
                 (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
         }
+        // Symmetric exclusion from the Cadence delivered feed: the
+        // dispatch→completion window that contained this callback would
+        // otherwise charge its wall to the rank's per-batch cost. Keeps
+        // callbacks out of both balancer denominators (see `timing_feed`).
+        if rank < self.delivered_ms_accum.len() {
+            self.delivered_ms_accum[rank] =
+                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
         // EWMA blend (alpha=0.3, same as checkpoint). Fires on every
         // report regardless of error: the closure wall-time is honest
         // even when the metric is not.
@@ -293,6 +309,14 @@ impl ClusterCoordinator {
         if rank < self.wall_ms_accum.len() {
             self.wall_ms_accum[rank] =
                 (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
+        }
+        // Symmetric exclusion from the Cadence delivered feed: the
+        // dispatch→completion window that contained this callback would
+        // otherwise charge its wall to the rank's per-batch cost. Keeps
+        // callbacks out of both balancer denominators (see `timing_feed`).
+        if rank < self.delivered_ms_accum.len() {
+            self.delivered_ms_accum[rank] =
+                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
         }
         let alpha = 0.3_f64;
         self.last_epoch_fn_elapsed_ms_ewma =

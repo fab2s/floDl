@@ -59,6 +59,100 @@ impl ClusterCoordinator {
         }
     }
 
+    /// The per-rank `(ms, batches)` pair fed to
+    /// [`crate::distributed::ElChe::report_timing`] at each averaging cycle.
+    /// ElChe derives `ms_per_batch[r] = ms[r] / batches[r]`.
+    ///
+    /// **Cadence** (progressive) feeds the coordinator-measured DELIVERED
+    /// cost — `delivered_ms_accum` (the dispatch→completion wall summed over
+    /// the window's chunks = compute + data + control/transport) over its
+    /// MATCHED batch count `delivered_batches_accum`. ElChe then schedules
+    /// per-rank windows on realized wall instead of the compute-only
+    /// `wall_ms_accum` (Σ per-batch `train_step` ms). This closes the
+    /// cpu-cadence idle (a data-starved rank's delivered cost rises, so the
+    /// balancer stops over-allocating the fast rank) AND makes the nccl
+    /// path data-/transport-aware — required when identical GPUs sit at
+    /// different network distances or behind asymmetric storage.
+    ///
+    /// The matched divisor is what makes this safe on BOTH backends. The
+    /// CPU backend defers finalize a tick (Pending → `poll_cpu_averaging`)
+    /// so every completion has drained and `delivered_batches_accum ==
+    /// steps_since_avg`. NCCL's `finish_averaging_nccl` runs INLINE in
+    /// `trigger_averaging`, before `drain_metrics_and_aggregate` drains the
+    /// window's last completion — so `delivered_batches_accum <
+    /// steps_since_avg`, but dividing the delivered sum by ITS OWN batch
+    /// count still yields a correct per-batch estimate (and a late chunk
+    /// leaking into the next window is benign — ms and count leak
+    /// together). Using `steps_since_avg` as the divisor instead would
+    /// divide a partial sum by the full count → garbage (the noise seen in
+    /// early nccl `[coord-prof]` dumps).
+    ///
+    /// Per-rank fallback to `(wall_ms_accum, steps_since_avg)` when a rank
+    /// has no drained completion this window (`delivered_batches_accum == 0`
+    /// — cold-start, or a rank whose chunk has not landed) so no spurious
+    /// zero-report poisons ElChe's trust window.
+    ///
+    /// **Sync** (non-progressive, no `take_next_chunk_plan`) and **Async**
+    /// (bounded-lookahead streaming — multiple chunks in flight, so a single
+    /// dispatch timestamp can't bracket a window) keep the compute-only
+    /// `(wall_ms_accum, steps_since_avg)` feed unchanged.
+    fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
+        if !matches!(self.policy, ApplyPolicy::Cadence) {
+            return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
+        }
+        let mut ms = Vec::with_capacity(self.world_size);
+        let mut batches = Vec::with_capacity(self.world_size);
+        for r in 0..self.world_size {
+            if self.delivered_batches_accum[r] > 0 {
+                ms.push(self.delivered_ms_accum[r]);
+                batches.push(self.delivered_batches_accum[r]);
+            } else {
+                ms.push(self.wall_ms_accum[r]);
+                batches.push(self.steps_since_avg[r]);
+            }
+        }
+        (ms, batches)
+    }
+
+    /// `-vvv` delivered-vs-compute per-cycle dump (Cadence only). Surfaces
+    /// the gap the fix closes: `delivered_ms/batch` (what ElChe now
+    /// schedules on, over the matched divisor) vs `compute_ms/batch` (what
+    /// it used to, over `steps_since_avg`), per rank, against the resulting
+    /// `batch_counts`. Call BEFORE the per-cycle counter resets. No-op
+    /// unless `-vvv`.
+    fn dump_delivered_timing(&self, reduce_ms: f64) {
+        if !self.prof_enabled || !matches!(self.policy, ApplyPolicy::Cadence) {
+            return;
+        }
+        let r1 = |v: &[f64]| -> Vec<f64> {
+            v.iter().map(|m| (m * 10.0).round() / 10.0).collect()
+        };
+        let delivered_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.delivered_batches_accum[r].max(1);
+                self.delivered_ms_accum[r] / n as f64
+            })
+            .collect();
+        let compute_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.steps_since_avg[r].max(1);
+                self.wall_ms_accum[r] / n as f64
+            })
+            .collect();
+        eprintln!(
+            "[coord-prof] {:?} cadence | delivered_ms/batch={:?} \
+             compute_ms/batch={:?} steps={:?} deliv_batches={:?} \
+             batch_counts={:?} reduce_ms={:.1}",
+            self.backend,
+            r1(&delivered_per_batch),
+            r1(&compute_per_batch),
+            self.steps_since_avg,
+            self.delivered_batches_accum,
+            self.el_che.batch_counts(),
+            reduce_ms,
+        );
+    }
+
     /// Trigger an averaging cycle. Dispatches to the backend-specific
     /// trigger message + finish hook. Mirrors OLD
     /// `Coordinator::trigger_averaging`.
@@ -433,16 +527,18 @@ impl ClusterCoordinator {
         // batch_counts (when the next cycle is the LAST cycle of the
         // current epoch).
         self.maybe_apply_callback_slack_for_next_cycle();
-        if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
+        let (feed_ms, feed_batches) = self.timing_feed();
+        if feed_ms.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(
-                &self.wall_ms_accum,
-                &self.steps_since_avg,
+                &feed_ms,
+                &feed_batches,
                 prev_sync_ms,
             );
             if !self.calibrated && self.el_che.is_calibrated() {
                 self.calibrated = true;
             }
         }
+        self.dump_delivered_timing(prev_sync_ms);
 
         let nccl_pre_norms: Option<Vec<f64>> =
             if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
@@ -565,6 +661,12 @@ impl ClusterCoordinator {
         for a in &mut self.wall_ms_accum {
             *a = 0.0;
         }
+        for a in &mut self.delivered_ms_accum {
+            *a = 0.0;
+        }
+        for n in &mut self.delivered_batches_accum {
+            *n = 0;
+        }
         for t in &mut self.throttled {
             *t = false;
         }
@@ -618,16 +720,18 @@ impl ClusterCoordinator {
         // `report_timing` so the next-cycle batch_counts shrink on the
         // callback-firing rank.
         self.maybe_apply_callback_slack_for_next_cycle();
-        if self.wall_ms_accum.iter().any(|&ms| ms > 0.0) {
+        let (feed_ms, feed_batches) = self.timing_feed();
+        if feed_ms.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(
-                &self.wall_ms_accum,
-                &self.steps_since_avg,
+                &feed_ms,
+                &feed_batches,
                 prev_sync_ms,
             );
             if !self.calibrated && self.el_che.is_calibrated() {
                 self.calibrated = true;
             }
         }
+        self.dump_delivered_timing(prev_sync_ms);
 
         let pre_norms: Option<Vec<f64>> =
             if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
@@ -775,6 +879,12 @@ impl ClusterCoordinator {
         }
         for a in &mut self.wall_ms_accum {
             *a = 0.0;
+        }
+        for a in &mut self.delivered_ms_accum {
+            *a = 0.0;
+        }
+        for n in &mut self.delivered_batches_accum {
+            *n = 0;
         }
         for t in &mut self.throttled {
             *t = false;
