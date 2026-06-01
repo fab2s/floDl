@@ -6,12 +6,22 @@ use crate::autograd::{NoGradGuard, Variable};
 use crate::distributed::cuda_stream::StreamGuard;
 use crate::distributed::nccl::ReduceOp;
 use crate::nn::Module;
-use crate::tensor::{Device, Result, Tensor, TensorError};
+use crate::tensor::{Device, Result, Tensor, TensorError, TensorOptions};
 
 use super::super::{
     AveragedParams, ParamSnapshot,
 };
 use super::GpuWorker;
+
+/// Allocate a pinned (page-locked) CPU staging tensor matching `t`'s shape
+/// and dtype. Pinned memory is required for true async D2H copies
+/// (`cudaMemcpyAsync` from pageable host memory silently falls back to a
+/// synchronous staged bounce copy). Allocated once per param/buffer and
+/// reused every reduce window — see `GpuWorker::snapshot_pinned_params`.
+fn pinned_like(t: &Tensor) -> Result<Tensor> {
+    let opts = TensorOptions { dtype: t.dtype(), device: Device::CPU };
+    Tensor::empty(&t.shape(), opts)?.pin_memory()
+}
 
 impl<M: Module> GpuWorker<M> {
     /// Extract current parameter values as a [`ParamSnapshot`].
@@ -20,13 +30,90 @@ impl<M: Module> GpuWorker<M> {
     /// never needs CUDA access (avoiding slow CUDA context init on the
     /// compute thread, which can deadlock with `drain_avg_state`).
     ///
+    /// On the CUDA path the readout is a batched async D2H into REUSED
+    /// pinned host buffers followed by a SINGLE `synchronize()` (see
+    /// `read_params_pinned` and the `snapshot_pinned_params` field for the
+    /// reuse / single-consumer invariant). The previous
+    /// implementation issued one synchronous `to_device(CPU)` per param,
+    /// i.e. N serialized device syncs per window — the cpu-cadence idle
+    /// floor on slow-PCIe ranks. A failure (or the CPU device, which needs
+    /// no transfer) falls back to the per-tensor passthrough.
+    ///
     /// Synchronizes comm_stream before reading, so Update + RequestParams
     /// processed in the same `handle_control()` call cannot read mid-copy data.
-    pub fn snapshot_params(&self) -> ParamSnapshot {
-        // Wait for any pending load_averaged() non-blocking copy to finish.
+    pub fn snapshot_params(&mut self) -> ParamSnapshot {
+        // Wait for any pending load_averaged() non-blocking copy to finish,
+        // so we read post-update weights, never mid-writeback bytes.
         if let Some(stream) = &self.comm_stream {
             let _ = stream.synchronize();
         }
+
+        let (params, buffers) = if self.comm_stream.is_some() {
+            // CUDA path: one synchronize for the whole readout.
+            self.read_params_pinned()
+                .unwrap_or_else(|_| self.read_params_passthrough())
+        } else {
+            // CPU device: params already live on host, no transfer needed.
+            self.read_params_passthrough()
+        };
+
+        ParamSnapshot {
+            rank: self.rank,
+            params,
+            buffers,
+            batch_count: self.steps_since_avg.max(1),
+        }
+    }
+
+    /// Batched async GPU->CPU readout of params + buffers into the reused
+    /// pinned staging buffers, collapsing the per-param synchronous D2H
+    /// into a single `comm_stream.synchronize()`. Lazily allocates the
+    /// pinned buffers on first call. Returns clones of the staging buffers
+    /// (shared storage — caller must obey the single-consumer-per-window
+    /// invariant documented on `snapshot_pinned_params`).
+    fn read_params_pinned(&mut self) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        if self.snapshot_pinned_params.is_empty() && !self.param_vars.is_empty() {
+            let mut bufs = Vec::with_capacity(self.param_vars.len());
+            for v in &self.param_vars {
+                bufs.push(pinned_like(&v.data())?);
+            }
+            self.snapshot_pinned_params = bufs;
+        }
+        if self.snapshot_pinned_buffers.is_empty() && !self.buffer_list.is_empty() {
+            let mut bufs = Vec::with_capacity(self.buffer_list.len());
+            for b in &self.buffer_list {
+                bufs.push(pinned_like(&b.get())?);
+            }
+            self.snapshot_pinned_buffers = bufs;
+        }
+
+        let stream = self.comm_stream.as_ref().ok_or_else(|| {
+            TensorError::new("read_params_pinned: comm_stream absent")
+        })?;
+        {
+            // copy_ respects the current stream; pinned dst + non_blocking
+            // makes each D2H a true async cudaMemcpyAsync on comm_stream.
+            let _guard = StreamGuard::new(stream);
+            for (dst, v) in self.snapshot_pinned_params.iter().zip(&self.param_vars) {
+                dst.copy_(&v.data(), true)?;
+            }
+            for (dst, b) in self.snapshot_pinned_buffers.iter().zip(&self.buffer_list) {
+                dst.copy_(&b.get(), true)?;
+            }
+        }
+        // One host-sync for the entire window's readout (was N).
+        stream.synchronize()?;
+
+        Ok((
+            self.snapshot_pinned_params.clone(),
+            self.snapshot_pinned_buffers.clone(),
+        ))
+    }
+
+    /// Per-tensor synchronous readout fallback: copy each param / buffer to
+    /// CPU individually (no-op for tensors already on CPU). Used on the CPU
+    /// device and as the safety net if the pinned async path errors.
+    fn read_params_passthrough(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let params = self.param_vars.iter()
             .map(|v| {
                 let t = v.data();
@@ -39,12 +126,7 @@ impl<M: Module> GpuWorker<M> {
                 if t.device() == Device::CPU { t } else { t.to_device(Device::CPU).unwrap_or(t) }
             })
             .collect();
-        ParamSnapshot {
-            rank: self.rank,
-            params,
-            buffers,
-            batch_count: self.steps_since_avg.max(1),
-        }
+        (params, buffers)
     }
 
     /// Load averaged parameters from the coordinator (CPU averaging path).

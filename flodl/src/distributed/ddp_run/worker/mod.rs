@@ -250,6 +250,31 @@ pub struct GpuWorker<M: Module> {
     /// is near-zero by construction, no point measuring) or no NCCL comm.
     pre_sync_scratch: Option<Vec<Tensor>>,
 
+    /// Persistent pinned (page-locked) host staging buffers for the
+    /// GPU->CPU parameter / buffer readout in [`Self::snapshot_params`]
+    /// (CPU averaging path). Lazily allocated on the first snapshot (one
+    /// per param / buffer, matching shape+dtype) and REUSED every reduce
+    /// window. Pinned allocation is expensive and non-swappable, hence the
+    /// reuse; the batched async D2H into these buffers collapses the old
+    /// per-param synchronous `to_device(CPU)` (N serialized device syncs,
+    /// the cpu-cadence idle floor on slow-PCIe ranks) down to a single
+    /// `synchronize()`.
+    ///
+    /// SINGLE-CONSUMER INVARIANT: the returned [`ParamSnapshot`] shares
+    /// storage with these buffers, so each reduce window must FULLY consume
+    /// its snapshot before the next `snapshot_params` overwrites them. The
+    /// coordinator's CPU-averaging state machine guarantees this
+    /// (Idle -> Collecting -> Computing -> Idle, one `RequestParams` per
+    /// cycle, the worker re-snapshots only after the resulting `Update`
+    /// round-trips back), so reuse never aliases an in-flight snapshot.
+    /// Empty on CPU device / non-CPU-averaging setups (the readout falls
+    /// back to a per-tensor passthrough).
+    snapshot_pinned_params: Vec<Tensor>,
+    /// Companion pinned staging buffers for non-learnable buffers
+    /// (BatchNorm running stats etc.). Same lazy-alloc + reuse +
+    /// single-consumer contract as `snapshot_pinned_params`.
+    snapshot_pinned_buffers: Vec<Tensor>,
+
     /// Strong references to each parameter's AccumulateGrad node, created
     /// under `StreamGuard(compute_stream)` during worker init. Keeping
     /// these alive pins the nodes' streams to `compute_stream` across

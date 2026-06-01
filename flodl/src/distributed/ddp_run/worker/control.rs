@@ -66,7 +66,8 @@ impl<M: Module> GpuWorker<M> {
                     self.snapshot_count += 1;
                     let _ = self.param_tx.send(snap);
                 } else {
-                    let _ = self.param_tx.send(self.snapshot_params());
+                    let snap = self.snapshot_params();
+                    let _ = self.param_tx.send(snap);
                 }
             }
             ControlMsg::Update(avg) => {

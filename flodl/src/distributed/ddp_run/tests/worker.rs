@@ -13,7 +13,7 @@ fn test_worker_new_and_accessors() {
 
 #[test]
 fn test_worker_snapshot_params() {
-    let (worker, _ch) = make_test_worker();
+    let (mut worker, _ch) = make_test_worker();
     let snap = worker.snapshot_params();
     assert_eq!(snap.rank, 0);
     assert_eq!(snap.params.len(), 2); // weight + bias
@@ -27,7 +27,7 @@ fn test_worker_snapshot_params() {
 
 #[test]
 fn test_worker_snapshot_is_send() {
-    let (worker, _ch) = make_test_worker();
+    let (mut worker, _ch) = make_test_worker();
     let snap = worker.snapshot_params();
 
     // Verify snapshot can be sent through a channel

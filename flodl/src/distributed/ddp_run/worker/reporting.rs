@@ -126,8 +126,9 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// This uses `final_param_tx` (not `param_tx`) to avoid racing with
     /// CPU averaging snapshot collection on the same channel.
-    pub fn send_final_snapshot(&self) {
-        let _ = self.final_param_tx.send(self.snapshot_params());
+    pub fn send_final_snapshot(&mut self) {
+        let snap = self.snapshot_params();
+        let _ = self.final_param_tx.send(snap);
     }
 
     /// Abort the NCCL communicator, unblocking any stuck collective.

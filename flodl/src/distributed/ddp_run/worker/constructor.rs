@@ -234,6 +234,8 @@ impl<M: Module> GpuWorker<M> {
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             snapshot_ns_total: 0,
             snapshot_count: 0,
+            snapshot_pinned_params: Vec::new(),
+            snapshot_pinned_buffers: Vec::new(),
             compute_ms_run_total: 0.0,
             data_ms_run_total: 0.0,
             ctrl_msgs_handled: 0,

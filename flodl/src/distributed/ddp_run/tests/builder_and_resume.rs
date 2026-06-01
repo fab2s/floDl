@@ -403,7 +403,7 @@ fn test_epoch_fn_set_lr() {
 
 #[test]
 fn test_worker_send_final_snapshot() {
-    let (worker, ch) = make_test_worker();
+    let (mut worker, ch) = make_test_worker();
     worker.send_final_snapshot();
     let snap = ch.final_param_rx.recv().unwrap();
     assert_eq!(snap.params.len(), 2); // Linear(4,2): weight + bias
