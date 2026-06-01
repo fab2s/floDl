@@ -330,6 +330,12 @@ impl ClusterCoordinator {
         );
     }
 
+    /// Test-only: chunk size the dispatcher would hand `rank` in `epoch`.
+    #[cfg(test)]
+    pub(crate) fn compute_chunk_batches_for_test(&self, rank: usize, epoch: usize) -> usize {
+        self.compute_chunk_batches(rank, epoch)
+    }
+
     /// Test-only: drive `rank_epoch[rank]` directly. Production sets
     /// it inside `dispatch_next_chunk_with_batches`.
     #[cfg(test)]

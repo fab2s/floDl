@@ -463,6 +463,28 @@ impl ClusterCoordinator {
             return 0;
         }
 
+        // EDGE SCHEDULE (epoch / run tail). When less than a full window of
+        // work remains (`remaining < Σ batch_counts`), EVERY progressive
+        // mode dispatches its share-capped integer slice from the shared
+        // pool: `batch_counts[rank].min(remaining)`. Pure integer min — no
+        // `min_chunk` floor, no fractional split — so it stays EXACT (the
+        // pool drains to exactly 0, 100% of steps dispatched; the divide in
+        // the averaging weight is separate weight-space math). Ranks drain
+        // the pool in dispatch order; whoever finds it empty gets 0 and is
+        // excluded from the weighted average (sum-and-count). Capping each
+        // rank at its full-window share means no rank runs more than one
+        // normal window of un-synced steps before the final reduce, so the
+        // final average never over-weights a single over-driven rank.
+        // Cadence's schedule-exact path below already does exactly this;
+        // this extends it to the cpu-async / NCCL proportional path, which
+        // would otherwise floor slow ranks up to `min_chunk` and split
+        // proportionally rather than capping at the share.
+        let total_counts: usize = self.el_che.batch_counts().iter().sum();
+        if total_counts > 0 && remaining_batches < total_counts {
+            let share = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+            return self.cap_to_reduce_budget(rank, share.min(remaining_batches));
+        }
+
         // SCHEDULE-EXACT dispatch (CPU Sync/Cadence): one chunk == one
         // reduce window == the rank's scheduled `counts[rank]` (capped to
         // the pool residual). This is what holds the single step clock:
@@ -509,6 +531,15 @@ impl ClusterCoordinator {
         // pre-calibration, leaving sizing untouched there. The caller
         // (`dispatch_next_chunk`) already withholds when the budget is
         // fully spent, so `budget_remaining >= 1` whenever we get here.
+        self.cap_to_reduce_budget(rank, sized)
+    }
+
+    /// Cap a proposed chunk size at the rank's remaining reduce-step budget
+    /// so a chunk never crosses a reduce barrier (it lands exactly on the
+    /// boundary). The `.max(1)` keeps `budget_remaining` positive, but the
+    /// outer `min` never inflates a smaller `sized` — a 0-share rank stays
+    /// 0. No-op when `reduce_step_budget` is 0 (NCCL / pre-calibration).
+    fn cap_to_reduce_budget(&self, rank: usize, sized: usize) -> usize {
         let budget = self.reduce_step_budget(rank);
         if budget > 0 {
             let budget_remaining =

@@ -324,6 +324,52 @@ fn fold_next_chunk_returns_schedule_window_mid_epoch() {
     assert_ne!(p0.partition_offset, p1.partition_offset);
 }
 
+// Edge schedule: at the tail (less than a full window of work left),
+// even the Async proportional path caps each rank at its OWN share
+// (batch_counts[rank].min(remaining)) -- NOT a proportional split of the
+// remainder, NOT floored up to min_chunk. This is the share-cap that
+// keeps any rank from over-driving before the final reduce; a rank that
+// finds the drained pool gets 0 and is excluded by the weighted average.
+#[test]
+fn tail_dispatch_is_share_capped_not_proportional() {
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 10),
+    )
+    .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    // Calibrate strongly asymmetric (rank 0 fast, rank 1 slow) so a
+    // proportional split would differ from the per-rank share cap.
+    for _ in 0..5 {
+        coord
+            .el_che_mut_for_test()
+            .report_timing(&[200.0, 1000.0], &[10, 10], 10.0);
+    }
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    let total: usize = counts.iter().sum();
+    assert!(counts[0] > 0 && counts[1] > 0 && total > 2, "counts: {counts:?}");
+
+    // batch_size defaults to 1 (samples == batches). Tail: one batch short
+    // of a full window.
+    let remaining = total - 1;
+    coord.install_chunk_pool_for_test(0, remaining);
+    coord.set_rank_epoch_for_test(0, 0);
+    coord.set_rank_epoch_for_test(1, 0);
+
+    for rank in 0..world_size {
+        let got = coord.compute_chunk_batches_for_test(rank, 0);
+        let want = counts[rank].min(remaining);
+        assert_eq!(
+            got, want,
+            "tail rank {rank}: expected share-cap {want}, got {got} \
+             (counts={counts:?}, remaining={remaining})",
+        );
+    }
+}
+
 #[test]
 fn fold_next_chunk_none_at_epoch_boundary() {
     let world_size = 2;
