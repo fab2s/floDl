@@ -336,6 +336,12 @@ impl ClusterCoordinator {
         self.compute_chunk_batches(rank, epoch)
     }
 
+    /// Test-only: the end-of-training final-consensus-reduce decision.
+    #[cfg(test)]
+    pub(crate) fn needs_final_consensus_reduce_for_test(&self) -> bool {
+        self.needs_final_consensus_reduce()
+    }
+
     /// Test-only: drive `rank_epoch[rank]` directly. Production sets
     /// it inside `dispatch_next_chunk_with_batches`.
     #[cfg(test)]

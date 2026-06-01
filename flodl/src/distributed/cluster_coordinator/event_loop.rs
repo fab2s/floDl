@@ -802,6 +802,18 @@ impl ClusterCoordinator {
     /// `drain_metrics_and_aggregate` because the cluster path is
     /// async: workers can post-send `MetricsMsg` while the previous
     /// batch's bridge SyncAck is still in transit.
+    /// Whether end-of-training must force one final consensus reduce
+    /// before shutdown: at least two alive ranks (a lone survivor's weights
+    /// are already canonical, and NCCL needs `world_size >= 2`) AND some
+    /// alive rank still carries un-reduced trailing steps from the edge
+    /// schedule (`steps_since_avg > 0`). When false, the cohort is already
+    /// coherent (the last regular reduce landed on the boundary).
+    pub(super) fn needs_final_consensus_reduce(&self) -> bool {
+        self.active_count >= 2
+            && (0..self.world_size)
+                .any(|r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
+    }
+
     pub(super) fn try_advance_or_shutdown_after_aggregate(&mut self) {
         if self.shutdown_initiated {
             return;
@@ -819,6 +831,41 @@ impl ClusterCoordinator {
         }
         let next = latest + 1;
         if next >= self.num_epochs {
+            // COHERENT FINAL MODEL. The edge schedule can leave trailing
+            // steps that never filled a full reduce window, so
+            // `should_average` never fired for them — un-reduced drift that
+            // would make the saved/evaled model depend on which rank's copy
+            // we happen to read. Before shutting down, force ONE final
+            // reduce so every rank converges to a single consensus that
+            // accounts for ALL steps (the weighted sum-and-count excludes
+            // ranks that did 0 tail steps). Same coherence the final
+            // checkpoint + the single eval need.
+            //
+            // Safe against the teardown deadlock: an idle rank sits in
+            // `wait_for_epoch_plan` SERVICING control messages (SyncNow /
+            // RequestParams) until `Shutdown`, so the collective completes
+            // with full participation; mpsc is FIFO so the reduce frame is
+            // dequeued before `Shutdown`, and `sync_now_nccl` synchronizes
+            // before returning. The `cpu_avg_state == Idle` gate above plus
+            // the per-tick `try_advance` let the async CPU reduce finalize
+            // (which resets `steps_since_avg`) before this re-enters and
+            // shuts down; NCCL's finish is inline so its reset lands at once.
+            // Skip for a lone survivor (< 2 alive): a single rank's weights
+            // ARE the consensus, and NCCL needs world_size >= 2.
+            if self.needs_final_consensus_reduce() {
+                match self.trigger_averaging() {
+                    Ok(()) => return,
+                    Err(e) => {
+                        // Don't hang the run on a final-reduce failure:
+                        // log and fall through to shutdown with whatever
+                        // each rank currently holds.
+                        crate::verbose!(
+                            "  ddp: final consensus reduce failed, \
+                             shutting down without it: {e}",
+                        );
+                    }
+                }
+            }
             self.shutdown_initiated = true;
             if let Err(e) = self.shutdown_workers() {
                 crate::verbose!(

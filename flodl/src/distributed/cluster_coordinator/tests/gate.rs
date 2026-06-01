@@ -176,3 +176,36 @@ fn cpu_gate_blocks_while_cycle_in_flight() {
         "CPU gate must not re-fire while a cycle is Pending in flight",
     );
 }
+
+#[test]
+fn final_consensus_reduce_needed_only_with_trailing_steps() {
+    // End-of-training coherence decision: a final reduce is forced before
+    // shutdown iff some alive rank carries un-reduced trailing steps from
+    // the edge schedule (and >= 2 ranks are alive). When every rank is at
+    // 0 since the last reduce, the cohort is already coherent -> no reduce.
+    let world_size = 2;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 2),
+        )
+        .no_divergence_guard(),
+    );
+
+    // All ranks reduced clean (no trailing) -> already coherent.
+    coord.set_steps_since_avg_for_test(0, 0);
+    coord.set_steps_since_avg_for_test(1, 0);
+    assert!(
+        !coord.needs_final_consensus_reduce_for_test(),
+        "no trailing steps -> no final reduce",
+    );
+
+    // One rank carries a trailing tail chunk that never filled a window.
+    coord.set_steps_since_avg_for_test(1, 3);
+    assert!(
+        coord.needs_final_consensus_reduce_for_test(),
+        "a rank with trailing steps -> final reduce before shutdown",
+    );
+}
