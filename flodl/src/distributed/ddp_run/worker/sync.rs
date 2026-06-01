@@ -23,6 +23,65 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
     Tensor::empty(&t.shape(), opts)?.pin_memory()
 }
 
+/// Work-weighted in-place AllReduce of `param_tensors` across the NCCL
+/// cohort, in sum-and-count form: each rank scales its params by its own
+/// step count `n_i`, the cohort `ReduceOp::Sum`s them, and a SINGLE final
+/// divide by `Σn` yields `Σ nᵢ·Wᵢ / Σn` — the work-weighted consensus
+/// (matching the CPU path's sum-and-count). Deferring the divide to one
+/// final step keeps the op associative, so it composes with a future
+/// hierarchical reduce without averaging-of-averages.
+///
+/// A rank that did 0 steps since the last sync still holds the previous
+/// consensus; it scales to zero and contributes nothing — but it STILL
+/// joins both collectives, so the cohort never stalls. If the WHOLE cohort
+/// is idle (`Σn == 0`), the params already equal the consensus and the
+/// param reduce is skipped (every rank sees the same gathered `Σn`, so the
+/// skip is collective-consistent).
+///
+/// A cheap scalar `ReduceOp::Sum` of the per-rank counts supplies `Σn` (a
+/// few bytes vs the multi-MB params). Running it on the SAME comm as the
+/// param reduce keeps `Σn` consistent with the live cohort across an
+/// abort-driven rebuild (it reflects the survivors). Mutates
+/// `param_tensors` in place; on an abort the caller restores them from the
+/// pre-sync scratch before retrying, so the scaling is recoverable.
+fn weighted_allreduce_nccl(
+    comm: &crate::distributed::nccl::NcclRankComm,
+    stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    param_refs: &[&Tensor],
+    param_tensors: &[Tensor],
+    n_i: f64,
+    device: Device,
+) -> Result<()> {
+    // Σn over the live cohort.
+    let count = Tensor::full(&[1], n_i, TensorOptions { device, ..Default::default() })?;
+    let total_n = match stream {
+        Some(s) => {
+            comm.all_reduce_on_stream(&[&count], ReduceOp::Sum, s)?;
+            s.synchronize()?;
+            count.item()?
+        }
+        None => {
+            comm.all_reduce(&[&count], ReduceOp::Sum)?;
+            count.item()?
+        }
+    };
+    if total_n <= 0.0 {
+        // Whole cohort idle since the last sync: consensus already holds.
+        return Ok(());
+    }
+    // Scale by raw nᵢ → Sum-reduce → divide once by Σn.
+    Tensor::foreach_mul_scalar_(param_tensors, n_i)?;
+    match stream {
+        Some(s) => {
+            comm.all_reduce_on_stream(param_refs, ReduceOp::Sum, s)?;
+            s.synchronize()?;
+        }
+        None => comm.all_reduce(param_refs, ReduceOp::Sum)?,
+    }
+    Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
+    Ok(())
+}
+
 impl<M: Module> GpuWorker<M> {
     /// Extract current parameter values as a [`ParamSnapshot`].
     ///
@@ -278,17 +337,23 @@ impl<M: Module> GpuWorker<M> {
             }
 
             let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
+            let n_i = self.steps_since_avg as f64;
+            let device = self.device;
             let comm = self.nccl_comm.as_ref().expect("nccl_comm present");
 
             let nccl_start = Instant::now();
-            let attempt_result: Result<()> = if let Some(stream) = &self.comm_stream {
-                match comm.all_reduce_on_stream(&param_refs, ReduceOp::Avg, stream) {
-                    Ok(()) => stream.synchronize(),
-                    Err(e) => Err(e),
-                }
-            } else {
-                comm.all_reduce(&param_refs, ReduceOp::Avg)
-            };
+            // Work-weighted reduce (sum-and-count): scale by this rank's
+            // step count, Sum, divide once by Σn. Was an unweighted
+            // ReduceOp::Avg, which over-represented idle / under-worked
+            // ranks under proportional sharding.
+            let attempt_result: Result<()> = weighted_allreduce_nccl(
+                comm,
+                self.comm_stream.as_ref(),
+                &param_refs,
+                &param_tensors,
+                n_i,
+                device,
+            );
             nccl_ms_total += nccl_start.elapsed().as_secs_f64() * 1000.0;
 
             match attempt_result {
