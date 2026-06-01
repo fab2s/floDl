@@ -232,6 +232,99 @@ pub(super) fn build_local_spawn_command(
     cmd
 }
 
+/// Build the `Command` that fork+execs a local per-host relay child.
+/// Sets `FLODL_RELAY_JSON` (so the child detects `Role::Relay`) and strips
+/// the launcher/rank role env vars. No CUDA scoping — the relay touches no
+/// GPU.
+pub(super) fn build_local_relay_command(
+    exe: &std::path::Path,
+    user_args: &[String],
+    relay_spec_hex: &str,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(user_args)
+        .env(super::ENV_RELAY_JSON, relay_spec_hex)
+        .env_remove(ENV_FULL_CLUSTER_JSON)
+        .env_remove(crate::distributed::cluster::ENV_CLUSTER_JSON)
+        .env_remove(crate::distributed::cluster::ENV_LOCAL_RANK);
+    cmd
+}
+
+/// Build the bash command shipped via ssh to run a remote per-host relay
+/// child. Mirrors [`build_remote_bash_command`] but exports
+/// `FLODL_RELAY_JSON` instead of the rank envelope/slot and never scopes
+/// CUDA.
+pub(super) fn build_remote_relay_bash_command(
+    path: &str,
+    relay_spec_hex: &str,
+    fdl_cmd: &str,
+    user_args: &[String],
+    cluster_env: &std::collections::BTreeMap<String, String>,
+    host_env: &std::collections::BTreeMap<String, String>,
+    prebuild: Option<&PerHostPrebuild>,
+) -> String {
+    let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
+    let mut s = String::with_capacity(256 + relay_spec_hex.len());
+    s.push_str("cd ");
+    let remote_cwd: String = match prebuild {
+        Some(pb) if !pb.cwd_subpath.is_empty() => {
+            format!("{}/{}", path.trim_end_matches('/'), pb.cwd_subpath)
+        }
+        _ => path.to_string(),
+    };
+    s.push_str(&shell_quote(&remote_cwd));
+    s.push_str(" && ");
+    s.push_str(super::ENV_RELAY_JSON);
+    s.push('=');
+    s.push_str(&shell_quote(relay_spec_hex));
+    // Forward verbosity so the relay's `-vvv` prof lines reach the user.
+    if let Ok(v) = std::env::var(crate::log::ENV_VAR) {
+        s.push(' ');
+        s.push_str(crate::log::ENV_VAR);
+        s.push('=');
+        s.push_str(&shell_quote(&v));
+    }
+    if let Some(pb) = prebuild {
+        if !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
+            s.push(' ');
+            s.push_str("LD_LIBRARY_PATH=");
+            s.push_str(&shell_quote(&pb.ld_library_path));
+        }
+    }
+    for (k, v) in cluster_env {
+        s.push(' ');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&shell_quote(v));
+    }
+    for (k, v) in host_env {
+        s.push(' ');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&shell_quote(v));
+    }
+    if let Some(pb) = prebuild {
+        s.push(' ');
+        let abs_bin = format!("{}/{}", path.trim_end_matches('/'), pb.bin);
+        s.push_str(&shell_quote(&abs_bin));
+    } else {
+        s.push_str(" fdl ");
+        s.push_str(&shell_quote(fdl_cmd));
+    }
+    for a in user_args {
+        s.push(' ');
+        s.push_str(&shell_quote(a));
+    }
+    // Same trap wrapper as ranks: forward signals to the backgrounded
+    // relay so launcher death / SIGTERM reaches it cleanly.
+    s.push_str(" &\n");
+    s.push_str("__flodl_pid=$!\n");
+    s.push_str("trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT\n");
+    s.push_str("wait \"$__flodl_pid\"\n");
+    s.push_str("exit $?\n");
+    s
+}
+
 /// Build the `Command` that ssh's into a remote host and runs the given
 /// bash command string.
 ///

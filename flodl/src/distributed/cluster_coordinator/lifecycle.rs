@@ -8,12 +8,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::distributed::ddp_run::ApplyPolicy;
+use crate::distributed::relay::mux::{MuxRecord, RelayControlMsg};
 use crate::distributed::wire::{ControlFrame, ControlMsgWire, MsgKind, SessionSalt, TimingMsgWire};
 use crate::tensor::{Result, TensorError};
 
 use super::{
     ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState, initial_callback_role,
-    read_handshake_rank, reader_loop, write_handshake_ack,
+    relay_reader_loop,
 };
 
 impl ClusterCoordinator {
@@ -79,70 +80,69 @@ impl ClusterCoordinator {
             })?
             .port();
 
-        // Accept world_size connections, validate handshake, place each
-        // at its claimed rank slot. Order-independent.
-        let mut streams: Vec<Option<TcpStream>> =
-            (0..world_size).map(|_| None).collect();
-        let mut connected = 0usize;
-        while connected < world_size {
+        // Accept per-host relay connections, each announcing the ranks it
+        // carries via a `RelayHello`. Accept until every global rank is
+        // covered exactly once. `control_streams` holds the write half per
+        // connection (the coord is the sole writer); `rank_to_conn` maps a
+        // rank to its owning connection for `send_control`. Each
+        // connection's read half goes to a per-host reader thread that
+        // demuxes by rank tag.
+        let mut control_streams: Vec<TcpStream> = Vec::new();
+        let mut rank_to_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
+        let mut conn_reads: Vec<TcpStream> = Vec::new();
+        let mut covered = 0usize;
+        while covered < world_size {
             let (mut stream, _peer) = listener.accept().map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_coordinator: accept failed: {e}"
-                ))
+                TensorError::new(&format!("cluster_coordinator: accept failed: {e}"))
             })?;
-            // 10s handshake timeout protects against wedged ranks.
+            let _ = stream.set_nodelay(true);
+            // 10s handshake timeout protects against a wedged relay.
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_coordinator: set_read_timeout: {e}"
-                    ))
+                    TensorError::new(&format!("cluster_coordinator: set_read_timeout: {e}"))
                 })?;
-            let rank_id = read_handshake_rank(&mut stream, world_size as u32, &salt)?;
-            let rank_idx = rank_id as usize;
-            if rank_idx >= world_size {
-                return Err(TensorError::new(&format!(
-                    "cluster_coordinator: handshake rank_id {rank_idx} >= world_size {world_size}"
-                )));
+            let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
+                Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
+                    crate::verbose!(
+                        "  cluster_coordinator: relay '{host}' carries ranks {ranks:?}"
+                    );
+                    ranks
+                }
+                Some(other) => {
+                    return Err(TensorError::new(&format!(
+                        "cluster_coordinator: expected relay Hello, got {other:?}"
+                    )));
+                }
+                None => {
+                    return Err(TensorError::new(
+                        "cluster_coordinator: relay closed connection before Hello",
+                    ));
+                }
+            };
+            let conn_idx = control_streams.len();
+            for r in &ranks {
+                let r = *r as usize;
+                if r >= world_size {
+                    return Err(TensorError::new(&format!(
+                        "cluster_coordinator: relay announced rank {r} >= world_size {world_size}"
+                    )));
+                }
+                if rank_to_conn[r].is_some() {
+                    return Err(TensorError::new(&format!(
+                        "cluster_coordinator: rank {r} announced by two relays"
+                    )));
+                }
+                rank_to_conn[r] = Some(conn_idx);
+                covered += 1;
             }
-            if streams[rank_idx].is_some() {
-                return Err(TensorError::new(&format!(
-                    "cluster_coordinator: duplicate rank_id {rank_idx} connected"
-                )));
-            }
-            write_handshake_ack(&mut stream, &salt)?;
-            // Clear the handshake timeout; ControlFrame reads can take
-            // arbitrarily long under load.
-            stream
-                .set_read_timeout(None)
-                .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_coordinator: clear read_timeout: {e}"
-                    ))
-                })?;
-            streams[rank_idx] = Some(stream);
-            connected += 1;
-        }
-        let mut streams: Vec<TcpStream> = streams.into_iter()
-            .map(|s| s.expect("all slots filled by accept loop"))
-            .collect();
-
-        // Spawn one reader thread per rank. Each thread holds the read
-        // half of a try_clone'd stream; the coordinator owns the write
-        // half. ControlFrame::read_from handles HMAC validation per frame.
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let (timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
-        let (metrics_tx, metrics_rx) =
-            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
-
-        let mut reader_handles: Vec<Option<JoinHandle<()>>> = Vec::with_capacity(world_size);
-        for (rank, stream) in streams.iter_mut().enumerate() {
-            let mut read_half = stream.try_clone().map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_coordinator: stream try_clone for rank {rank}: {e}"
-                ))
+            MuxRecord::control(RelayControlMsg::HelloAck).write_to(&mut stream, &salt)?;
+            // Reader holds a try-cloned read half (short timeout so it can
+            // observe shutdown between records); the coord keeps the write
+            // half for `send_control`.
+            let read_half = stream.try_clone().map_err(|e| {
+                TensorError::new(&format!("cluster_coordinator: relay try_clone: {e}"))
             })?;
-            // Reader uses a short timeout to observe shutdown between frames.
             read_half
                 .set_read_timeout(Some(Duration::from_millis(250)))
                 .map_err(|e| {
@@ -150,18 +150,39 @@ impl ClusterCoordinator {
                         "cluster_coordinator: reader set_read_timeout: {e}"
                     ))
                 })?;
+            control_streams.push(stream);
+            conn_reads.push(read_half);
+        }
+
+        // Spawn one reader thread per relay connection; all feed the same
+        // timing / metrics channels (the rank rides in each frame's mux
+        // tag + payload).
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let (timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
+        let (metrics_tx, metrics_rx) =
+            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
+
+        let mut reader_handles: Vec<Option<JoinHandle<()>>> =
+            Vec::with_capacity(conn_reads.len());
+        for (conn_idx, mut read_half) in conn_reads.into_iter().enumerate() {
             let tx = timing_tx.clone();
             let mtx = metrics_tx.clone();
             let salt_for_reader = salt;
             let shutdown_for_reader = Arc::clone(&shutdown_flag);
             let handle = thread::Builder::new()
-                .name(format!("flodl-coord-reader:r{rank}"))
+                .name(format!("flodl-coord-relay{conn_idx}"))
                 .spawn(move || {
-                    reader_loop(rank, &mut read_half, &salt_for_reader, &shutdown_for_reader, &tx, &mtx);
+                    relay_reader_loop(
+                        &mut read_half,
+                        &salt_for_reader,
+                        &shutdown_for_reader,
+                        &tx,
+                        &mtx,
+                    );
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
-                        "cluster_coordinator: spawn reader for rank {rank}: {e}"
+                        "cluster_coordinator: spawn relay reader {conn_idx}: {e}"
                     ))
                 })?;
             reader_handles.push(Some(handle));
@@ -171,6 +192,7 @@ impl ClusterCoordinator {
         // automatically when reader threads exit.
         drop(timing_tx);
         drop(metrics_tx);
+        let streams = control_streams;
 
         // Resume: layer saved trajectory state on top of the user-built
         // ElChe (which carries the user's knobs from this run's
@@ -305,6 +327,7 @@ impl ClusterCoordinator {
             eval_every_epochs: config.eval_every_epochs,
             metrics_device_indices: (0..world_size as u8).collect(),
             control_streams: streams,
+            rank_to_conn,
             reader_handles,
             shutdown_flag,
             bound_port,
@@ -327,24 +350,30 @@ impl ClusterCoordinator {
                 self.world_size
             )));
         }
-        if rank >= self.control_streams.len() {
-            // Headless coord (test fixtures via `for_test`) has no
-            // streams populated. Return Err so callers that
-            // tolerate transient send failures (e.g.
-            // `handle_checkpoint_result`'s retry-dispatch path) can
-            // log + continue rather than panic the test process.
+        // Resolve the relay connection carrying this rank. Unmapped means a
+        // headless coord (test fixtures via `for_test`, no streams) or a
+        // rank no relay announced. Return Err so callers that tolerate
+        // transient send failures (e.g. `handle_checkpoint_result`'s
+        // retry-dispatch path) log + continue rather than panic.
+        let Some(conn_idx) = self.rank_to_conn.get(rank).copied().flatten() else {
             return Err(TensorError::new(&format!(
-                "cluster_coordinator: send_control(rank={rank}): no stream \
-                 (headless coord; index {rank} out of streams len {})",
-                self.control_streams.len()
+                "cluster_coordinator: send_control(rank={rank}): no relay connection \
+                 (headless coord, or rank not announced by any relay)"
             )));
-        }
+        };
+        // Encode the control frame, then wrap it as a rank-tagged mux
+        // record on the per-host connection (the relay demuxes it to the
+        // local rank).
         let frame = ControlFrame::encode(&self.salt, MsgKind::Control, msg)?;
-        frame.write_to(&mut self.control_streams[rank]).map_err(|e| {
-            TensorError::new(&format!(
-                "cluster_coordinator: send_control(rank={rank}): {e}"
-            ))
-        })?;
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf)?;
+        MuxRecord::data(rank as u32, buf)
+            .write_to(&mut self.control_streams[conn_idx], &self.salt)
+            .map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster_coordinator: send_control(rank={rank}): {e}"
+                ))
+            })?;
         Ok(())
     }
 

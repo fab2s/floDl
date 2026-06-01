@@ -1,10 +1,58 @@
     use super::*;
     use super::spawn::{
-        PerHostPrebuild, build_remote_bash_command, build_slim_envelope_for, shell_quote,
-        supervise_children,
+        build_remote_bash_command, build_remote_relay_bash_command, build_slim_envelope_for,
+        shell_quote, supervise_children, PerHostPrebuild,
     };
     use serde_json::json;
     use std::process::Command;
+
+    fn sample_relay_spec() -> RelaySpec {
+        RelaySpec {
+            host: "pascal".into(),
+            controller_host: "192.168.122.1".into(),
+            controller_port: 1337,
+            ranks: vec![1, 2],
+            salt_hex: "0123456789abcdef0123456789abcdef".into(),
+            world_size: 3,
+            data_channel: true,
+        }
+    }
+
+    #[test]
+    fn relay_spec_hex_json_round_trips() {
+        let spec = sample_relay_spec();
+        let hex = crate::distributed::cluster::hex_encode(
+            serde_json::to_string(&spec).unwrap().as_bytes(),
+        );
+        let bytes = crate::distributed::cluster::hex_decode(&hex).unwrap();
+        let back: RelaySpec = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn remote_relay_bash_command_exports_relay_env_only() {
+        let spec_hex = "deadbeef";
+        let cmd = build_remote_relay_bash_command(
+            "/opt/flodl",
+            spec_hex,
+            "ddp-bench",
+            &["--model".into(), "resnet-graph".into()],
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            None,
+        );
+        // Exports the relay spec and runs the binary...
+        assert!(cmd.contains("FLODL_RELAY_JSON="), "missing relay env: {cmd}");
+        assert!(cmd.contains("cd '/opt/flodl'"), "missing cd: {cmd}");
+        assert!(cmd.contains("fdl 'ddp-bench'"), "missing fdl cmd: {cmd}");
+        assert!(cmd.contains("--model") && cmd.contains("resnet-graph"));
+        // ...but never the rank-role env vars or CUDA scoping.
+        assert!(!cmd.contains("FLODL_CLUSTER_JSON="), "leaked rank envelope: {cmd}");
+        assert!(!cmd.contains("FLODL_LOCAL_RANK="), "leaked rank slot: {cmd}");
+        assert!(!cmd.contains("CUDA_VISIBLE_DEVICES="), "relay must not scope CUDA: {cmd}");
+        // Trap wrapper for clean signal forwarding.
+        assert!(cmd.contains("trap ") && cmd.contains("__flodl_pid"), "missing trap: {cmd}");
+    }
 
     fn canonical_full_json() -> serde_json::Value {
         json!({

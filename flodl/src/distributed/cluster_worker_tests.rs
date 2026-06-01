@@ -68,7 +68,12 @@
             let _ = coord.tick();
             Ok(())
         });
-        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+        // Workers handshake with their host control relay (which terminates
+        // the handshake and forwards to the coord). `_crelay_rx` drops at
+        // scope end, shutting the relay down.
+        let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+        let (addr, _crelay_rx) =
+            spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
 
         // Direct-handshake closures (no inner GpuWorker required —
         // we exercise only the handshake bytes + ack here).
@@ -92,33 +97,29 @@
     }
 
     /// Salt mismatch on the worker side surfaces loudly at handshake.
+    /// Under the relay transport the worker handshakes with its host
+    /// control relay, so the relay (which terminates the handshake with
+    /// the correct salt) rejects the bad-salt worker during its accept
+    /// phase — before it ever connects upstream to the coord.
     #[test]
     fn handshake_rejects_wrong_salt_on_worker_side() {
         let world_size = 2;
         let bad_salt: SessionSalt = [0u8; SESSION_SALT_BYTES];
 
-        let (listener, port) = ClusterCoordinator::bind(
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-        )
-        .unwrap();
-        let coord_handle = thread::spawn(move || -> Result<ClusterCoordinator> {
-            ClusterCoordinator::start_from_listener(
-                listener,
-                TEST_SALT,
-                coord_config_sync_nccl(world_size),
-            )
-        });
+        // Control relay with the correct salt. The upstream coord address
+        // is never reached: the relay errors in its accept phase on the
+        // bad-salt handshake, before the upstream-connect step.
+        let dummy_upstream = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1);
+        let (relay_addr, relay_rx) =
+            spawn_relay(ChannelKind::Control, dummy_upstream, world_size, TEST_SALT);
 
-        // Worker connects with the wrong salt; coordinator's
-        // start_from_listener errors → coord_handle joins with Err.
-        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
         let rank = thread::spawn(move || {
-            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+            let mut s = TcpStream::connect_timeout(&relay_addr, Duration::from_secs(5)).unwrap();
             let _ = write_handshake_rank(&mut s, 0, world_size as u32, &bad_salt);
             let _ = read_handshake_ack(&mut s, &bad_salt);
         });
-        let err = match coord_handle.join().unwrap() {
-            Ok(_) => panic!("expected coord to reject wrong-salt handshake"),
+        let err = match relay_rx.recv().unwrap() {
+            Ok(_) => panic!("expected relay to reject wrong-salt handshake"),
             Err(e) => e,
         };
         assert!(
@@ -231,7 +232,13 @@
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
         )
         .expect("coord bind succeeds");
-        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        // Workers reach the coord through their host control relay. The
+        // relay handle sits buffered in `_ctrl_relay_rx` and drops at end
+        // of scope (shutting the relay down). The coord listens on
+        // `coord_port`; the relay forwards to it.
+        let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let (coord_addr, _ctrl_relay_rx) =
+            spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
         let dead_for_coord = Arc::clone(&dead_ranks);
         let total_samples = 16usize;
         let batch_size = 4usize;
@@ -413,7 +420,13 @@
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
         )
         .expect("coord bind succeeds");
-        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        // Workers reach the coord through their host control relay. The
+        // relay handle sits buffered in `_ctrl_relay_rx` and drops at end
+        // of scope (shutting the relay down). The coord listens on
+        // `coord_port`; the relay forwards to it.
+        let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let (coord_addr, _ctrl_relay_rx) =
+            spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
         let dead_for_coord = Arc::clone(&dead_ranks);
 
         // Anchor=2 batches per rank between syncs (uncalibrated ElChe;
@@ -605,14 +618,26 @@
             TEST_SALT,
         )
         .expect("controller starts");
-        let reduce_addr =
+        let controller_addr =
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), controller.port());
+        // Workers reach the controller through their host relay. The
+        // started relay handle sits buffered in `_relay_rx` until it drops
+        // at end of scope, which shuts the relay down (after the controller
+        // + workers are torn down).
+        let (reduce_addr, _relay_rx) =
+            spawn_relay(ChannelKind::Data, controller_addr, world_size, TEST_SALT);
 
         let (coord_listener, coord_port) = CCoord::bind(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
         )
         .expect("coord bind succeeds");
-        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        // Workers reach the coord through their host control relay. The
+        // relay handle sits buffered in `_ctrl_relay_rx` and drops at end
+        // of scope (shutting the relay down). The coord listens on
+        // `coord_port`; the relay forwards to it.
+        let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let (coord_addr, _ctrl_relay_rx) =
+            spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
 
         let config_for_coord = move || {
             ClusterCoordinatorConfig::new(
@@ -758,7 +783,46 @@
 
     use crate::distributed::cluster_coordinator::ClusterCoordinator as CCoord;
     use crate::distributed::controller::ClusterController;
+    use crate::distributed::relay::agent::{ChannelKind, RelayChannel};
     use crate::nn::Linear;
+
+    /// Stand up a per-host [`RelayChannel`] of `kind` in front of
+    /// `upstream_addr` and return the loopback address workers should dial
+    /// — the relay forwards their frames to the real controller (Data) or
+    /// coordinator (Control). Under the uniform-relay transport every rank
+    /// reaches both through its host relay, so the in-process sims wire one
+    /// in per channel (the production worker dial-redirect is launch
+    /// wiring).
+    ///
+    /// `RelayChannel::start` blocks through the rank-handshake phase, so it
+    /// runs on a background thread; the started handle arrives on the
+    /// returned receiver once the workers have connected. Hold the handle
+    /// alive until end of scope — its `Drop` shuts the relay down.
+    fn spawn_relay(
+        kind: ChannelKind,
+        upstream_addr: SocketAddr,
+        world_size: usize,
+        salt: SessionSalt,
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<Result<RelayChannel>>) {
+        let (listener, relay_port) =
+            RelayChannel::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), relay_port);
+        let ranks: Vec<u32> = (0..world_size as u32).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = RelayChannel::start(
+                listener,
+                kind,
+                upstream_addr,
+                "test-host".into(),
+                ranks,
+                world_size,
+                salt,
+            );
+            let _ = tx.send(started);
+        });
+        (loopback, rx)
+    }
 
     /// Index-deterministic dataset on CPU. Each sample's values are
     /// derived from its index, so two ranks reading disjoint partitions
@@ -865,8 +929,14 @@
             Arc::clone(&dead_ranks),
         )
         .expect("ClusterController::start_with_dead_ranks succeeds");
-        let data_port = controller.port();
-        let data_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), data_port);
+        let controller_addr =
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), controller.port());
+        // Workers reach the controller through their host relay. The
+        // started relay handle sits buffered in `_relay_rx` until it drops
+        // at end of scope, which shuts the relay down (after the controller
+        // + workers are torn down).
+        let (data_addr, _relay_rx) =
+            spawn_relay(ChannelKind::Data, controller_addr, world_size, TEST_SALT);
 
         // 2. ClusterCoordinator listener. bind() returns the port
         //    before any accept blocks; start_from_listener (which
@@ -876,7 +946,13 @@
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
         )
         .expect("coord bind succeeds");
-        let coord_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        // Workers reach the coord through their host control relay. The
+        // relay handle sits buffered in `_ctrl_relay_rx` and drops at end
+        // of scope (shutting the relay down). The coord listens on
+        // `coord_port`; the relay forwards to it.
+        let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+        let (coord_addr, _ctrl_relay_rx) =
+            spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
 
         // RecordingGuard captures the deltas every `finish_averaging_*`
         // pass — proves both the bridge wire AND the deferred

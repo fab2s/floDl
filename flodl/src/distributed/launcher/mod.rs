@@ -65,6 +65,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::thread;
 
+use serde::{Deserialize, Serialize};
+
+use crate::distributed::relay::agent::{ChannelKind, RelayChannel};
+use crate::distributed::relay::{RELAY_CONTROL_LOOPBACK_OFFSET, RELAY_DATA_LOOPBACK_OFFSET};
 use crate::tensor::{Result, TensorError};
 
 mod spawn;
@@ -77,6 +81,7 @@ pub use types::{SshConfig, FullCluster, FullController, FullWorker};
 use spawn::{
     load_prebuild_envelope, supervise_children, build_local_spawn_command,
     build_ssh_spawn_command, cleanup_remote_hosts_parallel, build_remote_bash_command,
+    build_local_relay_command, build_remote_relay_bash_command,
     build_slim_envelope_for, forward_lines,
 };
 
@@ -86,6 +91,12 @@ use spawn::{
 /// propagated to rank children (each child gets a slim per-host envelope
 /// instead via `FLODL_CLUSTER_JSON`).
 pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
+
+/// Environment variable carrying the per-host relay spec (hex-encoded
+/// JSON [`RelaySpec`]). Set by the launcher on the relay child it spawns
+/// per host; consumed only by [`dispatch`] (→ [`Role::Relay`]) and
+/// [`run_relay`]. Mutually exclusive with the launcher/rank env vars.
+pub const ENV_RELAY_JSON: &str = "FLODL_RELAY_JSON";
 
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
@@ -138,6 +149,10 @@ pub enum Role {
     /// This process is the launcher. Caller must run the fan-out via
     /// [`run_launcher_with_config`] and exit the program when it returns.
     Launcher,
+    /// This process is a per-host transport relay. Caller must run
+    /// [`run_relay`] and exit the program when it returns. Touches no
+    /// CUDA; multiplexes its local ranks' frames to the controller.
+    Relay,
 }
 
 /// Detect this process's role from env vars. Pure function — no I/O,
@@ -150,26 +165,145 @@ pub enum Role {
 ///
 /// [`Trainer::setup`]: crate::distributed::Trainer::setup
 pub fn dispatch() -> Result<Role> {
+    let relay_set = env::var_os(ENV_RELAY_JSON).is_some();
     let full_set = env::var_os(ENV_FULL_CLUSTER_JSON).is_some();
     let slim_set = env::var_os(crate::distributed::cluster::ENV_CLUSTER_JSON).is_some();
     let slot_set = env::var_os(crate::distributed::cluster::ENV_LOCAL_RANK).is_some();
 
-    match (full_set, slim_set, slot_set) {
-        (false, false, false) => Ok(Role::SingleDevice),
-        (false, true, true) => Ok(Role::Rank),
-        (true, false, false) => Ok(Role::Launcher),
+    match (relay_set, full_set, slim_set, slot_set) {
+        (false, false, false, false) => Ok(Role::SingleDevice),
+        (false, false, true, true) => Ok(Role::Rank),
+        (false, true, false, false) => Ok(Role::Launcher),
+        (true, false, false, false) => Ok(Role::Relay),
         // Any other combination is a misconfiguration. Loud error with
         // every bit named so the operator can see what's off.
         _ => Err(TensorError::new(&format!(
-            "cluster launcher: inconsistent env (FLODL_FULL_CLUSTER_JSON={}, \
-             FLODL_CLUSTER_JSON={}, FLODL_LOCAL_RANK={}). \
+            "cluster launcher: inconsistent env (FLODL_RELAY_JSON={}, \
+             FLODL_FULL_CLUSTER_JSON={}, FLODL_CLUSTER_JSON={}, FLODL_LOCAL_RANK={}). \
              Expected: all-unset (single-device), slim+slot only (rank), \
-             or full only (launcher).",
+             full only (launcher), or relay only (relay).",
+            on_off(relay_set),
             on_off(full_set),
             on_off(slim_set),
             on_off(slot_set),
         ))),
     }
+}
+
+/// Per-host relay launch spec, hex-encoded JSON in [`ENV_RELAY_JSON`].
+/// Built by the launcher per host (one relay child each); consumed by
+/// [`run_relay`]. Carries only what the transport relay needs — no model,
+/// no CUDA, no full topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaySpec {
+    /// Relay host name (diagnostic, used in the upstream `RelayHello`).
+    pub host: String,
+    /// Controller host the relay dials upstream.
+    pub controller_host: String,
+    /// Controller base port: relay dials `+2` (data) / `+3` (control) and
+    /// binds loopback `+4` / `+5`.
+    pub controller_port: u16,
+    /// Global ranks this host carries (the relay's local rank set).
+    pub ranks: Vec<u32>,
+    /// Session salt, hex-encoded (HMAC key for the mux + forwarded frames).
+    pub salt_hex: String,
+    /// Cluster-wide rank count (validated in each rank's handshake).
+    pub world_size: usize,
+    /// Start the CPU-averaging data relay. `false` for NCCL backends —
+    /// ranks never dial the data channel there, so an always-on data
+    /// relay would block forever in `accept`.
+    pub data_channel: bool,
+}
+
+/// Run this process as a per-host transport relay: bind the loopback data
+/// (`+4`) / control (`+5`) channels its local ranks dial, forward upstream
+/// to the controller's `+2` / `+3`, and stay up until every local rank
+/// disconnects (training finished). Touches no CUDA.
+///
+/// The caller (the dispatch site on [`Role::Relay`]) runs this and exits
+/// the process when it returns.
+pub fn run_relay() -> Result<()> {
+    let raw = env::var(ENV_RELAY_JSON)
+        .map_err(|e| TensorError::new(&format!("relay: {ENV_RELAY_JSON} unreadable: {e}")))?;
+    let bytes = crate::distributed::cluster::hex_decode(&raw)
+        .map_err(|e| TensorError::new(&format!("relay: spec hex-decode: {e}")))?;
+    let spec: RelaySpec = serde_json::from_slice(&bytes)
+        .map_err(|e| TensorError::new(&format!("relay: spec JSON parse: {e}")))?;
+    let salt = crate::distributed::wire::salt_from_hex(&spec.salt_hex)?;
+    let base = spec.controller_port;
+
+    let loopback = |off: u16| -> Result<std::net::SocketAddr> {
+        format!("127.0.0.1:{}", base.saturating_add(off))
+            .parse()
+            .map_err(|e| TensorError::new(&format!("relay: loopback addr: {e}")))
+    };
+    let resolve = |host: &str, port: u16| -> Result<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs;
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|e| TensorError::new(&format!("relay: resolve {host}:{port}: {e}")))?
+            .next()
+            .ok_or_else(|| TensorError::new(&format!("relay: no address for {host}:{port}")))
+    };
+
+    eprintln!(
+        "cluster relay: host '{}' ranks {:?} -> controller {}:{} (data_channel={})",
+        spec.host, spec.ranks, spec.controller_host, base, spec.data_channel,
+    );
+
+    // Control channel (every backend uses it). Bind before accepting.
+    let (ctrl_listener, _) = RelayChannel::bind(loopback(RELAY_CONTROL_LOOPBACK_OFFSET)?)?;
+    let ctrl_upstream = resolve(&spec.controller_host, base.saturating_add(3))?;
+
+    // Data channel (CPU backends only). Ranks connect to BOTH channels
+    // (data first, then control in the CPU path), so the two accept loops
+    // must run concurrently — the data relay runs on its own thread.
+    let data_handle = if spec.data_channel {
+        let (data_listener, _) = RelayChannel::bind(loopback(RELAY_DATA_LOOPBACK_OFFSET)?)?;
+        let data_upstream = resolve(&spec.controller_host, base.saturating_add(2))?;
+        let host = spec.host.clone();
+        let ranks = spec.ranks.clone();
+        let ws = spec.world_size;
+        Some(
+            thread::Builder::new()
+                .name("flodl-relay-data".into())
+                .spawn(move || -> Result<()> {
+                    RelayChannel::start(
+                        data_listener,
+                        ChannelKind::Data,
+                        data_upstream,
+                        host,
+                        ranks,
+                        ws,
+                        salt,
+                    )?
+                    .join()
+                })
+                .map_err(|e| TensorError::new(&format!("relay: spawn data thread: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    // Control relay on this thread: blocks until ranks connect, then runs
+    // until they all disconnect (training finished).
+    RelayChannel::start(
+        ctrl_listener,
+        ChannelKind::Control,
+        ctrl_upstream,
+        spec.host.clone(),
+        spec.ranks.clone(),
+        spec.world_size,
+        salt,
+    )?
+    .join()?;
+
+    if let Some(h) = data_handle {
+        h.join()
+            .map_err(|_| TensorError::new("relay: data thread panicked"))??;
+    }
+    eprintln!("cluster relay: host '{}' shut down cleanly", spec.host);
+    Ok(())
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -269,6 +403,17 @@ pub fn run_launcher_with_config(
     // None — legacy NCCL routing path with no dashboard wiring.
     let mut dashboard_sink_outer:
         Option<Arc<dyn crate::distributed::DashboardSink>> = None;
+
+    // Decide relay spawn BEFORE `coord_config` is consumed below. A
+    // per-host relay is spawned whenever a coordinator is in play (the
+    // via-coord routing that uses the controller/coord channels). The
+    // data-channel relay is needed only for the CPU averaging backend
+    // (NCCL ranks never dial the data channel).
+    let spawn_relays = coord_config.is_some();
+    let relay_data_channel = coord_config
+        .as_ref()
+        .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Cpu))
+        .unwrap_or(false);
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
@@ -463,6 +608,78 @@ pub fn run_launcher_with_config(
     let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
         Vec::with_capacity(full.world_size());
     for host in &full.workers {
+        // Spawn one transport relay per host (before its ranks), when the
+        // via-coord routing is active. Ranks dial the relay's loopback
+        // (+4/+5) instead of the controller directly. The relay child is
+        // supervised alongside the ranks — it exits cleanly once its local
+        // ranks disconnect, and SIGTERM reaches it if a peer fails.
+        if spawn_relays {
+            let spec = RelaySpec {
+                host: host.host.clone(),
+                controller_host: full.controller.host.clone(),
+                controller_port: full.controller.port,
+                ranks: host.ranks.iter().map(|r| *r as u32).collect(),
+                salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
+                world_size: full.world_size(),
+                data_channel: relay_data_channel,
+            };
+            let spec_hex = crate::distributed::cluster::hex_encode(
+                serde_json::to_string(&spec)
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster launcher: serialize relay spec failed: {e}"
+                        ))
+                    })?
+                    .as_bytes(),
+            );
+            let mut cmd = if host.host == me {
+                build_local_relay_command(&exe, &user_args, &spec_hex)
+            } else {
+                let remote_cmd = build_remote_relay_bash_command(
+                    &host.path,
+                    &spec_hex,
+                    fdl_cmd
+                        .as_deref()
+                        .expect("ENV_FDL_CMD presence enforced above when has_remote"),
+                    &user_args,
+                    &full.env,
+                    &host.env,
+                    prebuild_envelope.get(&host.host),
+                );
+                build_ssh_spawn_command(host, &remote_cmd)
+            };
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if host.host == me {
+                for (k, v) in &full.env {
+                    cmd.env(k, v);
+                }
+                for (k, v) in &host.env {
+                    cmd.env(k, v);
+                }
+            }
+            let mut child = cmd.spawn().map_err(|e| {
+                let kind = if host.host == me { "local bash/exec" } else { "ssh" };
+                TensorError::new(&format!(
+                    "cluster launcher: spawn {kind} relay for {:?} failed: {e}",
+                    host.host
+                ))
+            })?;
+            let prefix = format!("[{}:relay] ", host.host);
+            let mut forwarders = Vec::with_capacity(2);
+            if let Some(out) = child.stdout.take() {
+                let p = prefix.clone();
+                forwarders.push(thread::spawn(move || forward_lines(out, p, false)));
+            }
+            if let Some(err) = child.stderr.take() {
+                let p = prefix.clone();
+                forwarders.push(thread::spawn(move || forward_lines(err, p, true)));
+            }
+            // `usize::MAX` local-rank sentinel marks the relay child in
+            // supervision diagnostics (it has no rank slot).
+            children.push((host.host.clone(), usize::MAX, child, forwarders));
+        }
         for local_rank in 0..host.ranks.len() {
             let envelope = build_slim_envelope_for(&full, host);
             let envelope_hex = crate::distributed::cluster::hex_encode(

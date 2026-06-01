@@ -28,12 +28,15 @@ pub(super) const TEST_SALT: SessionSalt = [
     0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
 ];
 
-/// Spawn a fake rank that connects to `port`, handshakes with
-/// `salt`, runs `body` against the connected stream, then drops it.
+/// Spawn a fake rank that connects to `port` and presents itself to the
+/// coordinator as a single-rank host relay (one `RelayHello` carrying
+/// just `rank_id`), then runs `body` against the connected stream and
+/// drops it. The coord's accept-until-covered loop accepts N such
+/// single-rank relays to cover the world.
 pub(super) fn fake_rank<F>(
     port: u16,
     rank_id: u32,
-    world_size: u32,
+    _world_size: u32,
     salt: SessionSalt,
     body: F,
 ) -> thread::JoinHandle<Result<()>>
@@ -45,33 +48,60 @@ where
         let mut stream = TcpStream::connect(addr).map_err(|e| {
             TensorError::new(&format!("fake_rank {rank_id} connect: {e}"))
         })?;
+        let _ = stream.set_nodelay(true);
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| TensorError::new(&format!("set_read_timeout: {e}")))?;
-        write_handshake_rank(&mut stream, rank_id, world_size, &salt)?;
-        let mut ack = [0u8; HS_ACK_BYTES];
-        stream.read_exact(&mut ack).map_err(|e| {
-            TensorError::new(&format!("fake_rank {rank_id} ack read: {e}"))
-        })?;
-        let magic = u32::from_le_bytes(ack[0..4].try_into().unwrap());
-        if magic != CTRL_HS_ACK {
-            return Err(TensorError::new(&format!(
-                "fake_rank {rank_id}: unexpected ack magic 0x{magic:08x}"
-            )));
-        }
-        // Verify the ack HMAC ourselves.
-        let expected = hmac_first8(&salt, &ack[0..8]);
-        let got: [u8; 8] = ack[8..16].try_into().unwrap();
-        if expected != got {
-            return Err(TensorError::new(
-                "fake_rank: ack HMAC verification failed",
-            ));
-        }
+        relay_hello(&mut stream, &salt, rank_id)?;
         stream
             .set_read_timeout(None)
             .map_err(|e| TensorError::new(&format!("clear timeout: {e}")))?;
         body(&mut stream, &salt)
     })
+}
+
+/// Single-rank relay handshake toward the coordinator: send `Hello` for
+/// `[rank_id]`, expect `HelloAck`.
+pub(super) fn relay_hello(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    rank_id: u32,
+) -> Result<()> {
+    MuxRecord::control(RelayControlMsg::Hello {
+        host: format!("test-r{rank_id}"),
+        ranks: vec![rank_id],
+    })
+    .write_to(stream, salt)?;
+    match MuxRecord::read_from(stream, salt)? {
+        Some(MuxRecord::Control(RelayControlMsg::HelloAck)) => Ok(()),
+        other => Err(TensorError::new(&format!(
+            "fake_rank {rank_id}: expected relay HelloAck, got {other:?}"
+        ))),
+    }
+}
+
+/// Rank carried by a [`TimingMsgWire`] (every variant tags its origin
+/// rank). Used to set the mux tag on the rank→coord leg; the coord
+/// routes by the payload's rank field, so the tag is informational, but
+/// a faithful single-rank relay still tags with its rank.
+fn timing_wire_rank(msg: &TimingMsgWire) -> u32 {
+    let r = match msg {
+        TimingMsgWire::Batch { rank, .. }
+        | TimingMsgWire::SyncAck { rank, .. }
+        | TimingMsgWire::Exiting { rank }
+        | TimingMsgWire::LrUpdate { rank, .. }
+        | TimingMsgWire::Heartbeat { rank, .. }
+        | TimingMsgWire::SnapshotReady { rank }
+        | TimingMsgWire::EvalResult { rank, .. }
+        | TimingMsgWire::CheckpointResult { rank, .. }
+        | TimingMsgWire::NewNcclIdGenerated { rank, .. }
+        | TimingMsgWire::EpochFnElapsed { rank, .. }
+        | TimingMsgWire::DashboardRegister { rank, .. }
+        | TimingMsgWire::DashboardSetSvg { rank, .. }
+        | TimingMsgWire::DashboardSetMetadata { rank, .. }
+        | TimingMsgWire::DashboardSetHardware { rank, .. } => *rank,
+    };
+    r as u32
 }
 
 pub(super) fn cfg_sync_nccl(world_size: usize) -> ClusterCoordinatorConfig {
@@ -98,33 +128,78 @@ pub(super) fn cfg_async_nccl(world_size: usize) -> ClusterCoordinatorConfig {
     .no_divergence_guard()
 }
 
-/// Send a Timing-kind ControlFrame on a fake-rank stream.
+/// Tag a ControlFrame as a rank-tagged mux record (single-rank-relay
+/// up-leg) and write it to the coord-facing stream.
+fn send_framed(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    rank: u32,
+    frame: ControlFrame,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    frame.write_to(&mut buf)?;
+    MuxRecord::data(rank, buf).write_to(stream, salt)
+}
+
+/// Send a Timing-kind ControlFrame on a fake-rank stream (mux-wrapped).
 pub(super) fn send_timing(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     msg: TimingMsgWire,
 ) -> Result<()> {
+    let rank = timing_wire_rank(&msg);
     let frame = ControlFrame::encode(salt, MsgKind::Timing, &msg)?;
-    frame.write_to(stream)
+    send_framed(stream, salt, rank, frame)
 }
 
-/// Send a Metrics-kind ControlFrame on a fake-rank stream.
+/// Send a Metrics-kind ControlFrame on a fake-rank stream (mux-wrapped).
 pub(super) fn send_metrics(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     msg: MetricsMsgWire,
 ) -> Result<()> {
+    let rank = msg.rank as u32;
     let frame = ControlFrame::encode(salt, MsgKind::Metrics, &msg)?;
-    frame.write_to(stream)
+    send_framed(stream, salt, rank, frame)
 }
 
-/// Read one Control-kind ControlFrame from the rank-side stream.
+/// Mux-aware drop-in for `ControlFrame::read_from` in fake-rank bodies:
+/// read one `MuxRecord::Data` off the (single-rank-relay) stream and parse
+/// its payload as a [`ControlFrame`]. `Ok(None)` on clean EOF. The mux tag
+/// is ignored (single-rank connection).
+pub(super) fn recv_frame(
+    s: &mut TcpStream,
+    salt: &SessionSalt,
+) -> Result<Option<ControlFrame>> {
+    match MuxRecord::read_from(s, salt)? {
+        Some(MuxRecord::Data { payload, .. }) => {
+            ControlFrame::read_from(&mut payload.as_slice(), salt)
+        }
+        Some(other) => Err(TensorError::new(&format!(
+            "recv_frame: expected mux Data, got {other:?}"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Read one Control-kind ControlFrame from the rank-side stream — the
+/// coord sends it as a rank-tagged mux record (the relay would demux it
+/// to the local rank). The tag is ignored here (single-rank conn).
 pub(super) fn recv_control(
     stream: &mut TcpStream,
     salt: &SessionSalt,
 ) -> Result<ControlMsgWire> {
-    let frame = ControlFrame::read_from(stream, salt)?
-        .ok_or_else(|| TensorError::new("EOF before frame"))?;
+    let payload = match MuxRecord::read_from(stream, salt)? {
+        Some(MuxRecord::Data { payload, .. }) => payload,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "recv_control: expected mux Data, got {other:?}"
+            )));
+        }
+        None => return Err(TensorError::new("EOF before frame")),
+    };
+    let frame = ControlFrame::read_from(&mut payload.as_slice(), salt)?
+        .ok_or_else(|| TensorError::new("truncated ControlFrame payload"))?;
     if frame.kind != MsgKind::Control {
         return Err(TensorError::new(&format!(
             "unexpected frame kind {:?}",
@@ -221,14 +296,19 @@ fn handshake_rejects_wrong_salt_full_path() {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         )
         .unwrap();
-        // Wrong salt → handshake HMAC fails server-side.
-        let _ = write_handshake_rank(&mut s, 0, world_size as u32, &bad_salt);
+        // Wrong-salt relay Hello → the coord's mux-record HMAC fails
+        // server-side during the accept handshake.
+        let _ = MuxRecord::control(RelayControlMsg::Hello {
+            host: "rogue".into(),
+            ranks: vec![0],
+        })
+        .write_to(&mut s, &bad_salt);
         // Read until the server drops us.
         let mut throwaway = [0u8; 16];
         let _ = s.read_exact(&mut throwaway);
     });
     let err = match coord_handle.join().unwrap() {
-        Ok(_) => panic!("expected start_from_listener to fail on bad-salt rank"),
+        Ok(_) => panic!("expected start_from_listener to fail on bad-salt relay"),
         Err(e) => e,
     };
     assert!(
@@ -384,7 +464,7 @@ fn check_throttle_nccl_backend_is_no_op() {
         })?;
         // Drain inbound frames until the coordinator drops us.
         // We must NOT receive a Throttle; if we do, assert.
-        let mut got = ControlFrame::read_from(s, salt);
+        let mut got = recv_frame(s, salt);
         while let Ok(Some(frame)) = got {
             let kind = frame.kind;
             let msg = frame.decode::<ControlMsgWire>()?;
@@ -392,7 +472,7 @@ fn check_throttle_nccl_backend_is_no_op() {
                 !matches!(msg, ControlMsgWire::Throttle),
                 "Throttle must not fire on NCCL backend (rank 0, kind={kind:?})"
             );
-            got = ControlFrame::read_from(s, salt);
+            got = recv_frame(s, salt);
         }
         Ok(())
     });
@@ -405,14 +485,14 @@ fn check_throttle_nccl_backend_is_no_op() {
             batch_loss: 0.5,
             sync_divergence: None,
         })?;
-        let mut got = ControlFrame::read_from(s, salt);
+        let mut got = recv_frame(s, salt);
         while let Ok(Some(frame)) = got {
             let msg = frame.decode::<ControlMsgWire>()?;
             assert!(
                 !matches!(msg, ControlMsgWire::Throttle),
                 "Throttle must not fire on NCCL backend (rank 1)"
             );
-            got = ControlFrame::read_from(s, salt);
+            got = recv_frame(s, salt);
         }
         Ok(())
     });

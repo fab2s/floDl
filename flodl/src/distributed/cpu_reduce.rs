@@ -71,6 +71,31 @@ pub struct CpuReduceClient {
     prof_enabled: bool,
 }
 
+/// Loopback connect with a short retry budget (~5s). The rank dials its
+/// host-local relay, which the launcher spawns alongside the ranks; the
+/// relay's loopback `bind` may land a beat after the rank starts, so a
+/// transient connection-refused is expected and retried.
+fn connect_with_retry(addr: SocketAddr) -> Result<TcpStream> {
+    const ATTEMPTS: u32 = 50;
+    const BACKOFF: Duration = Duration::from_millis(100);
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        match TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last_err = Some(e);
+                thread::sleep(BACKOFF);
+            }
+        }
+    }
+    Err(TensorError::new(&format!(
+        "cpu_reduce: connect to {addr} failed after {ATTEMPTS} attempts: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )))
+}
+
 impl CpuReduceClient {
     /// Connect to the controller and complete the handshake.
     ///
@@ -105,11 +130,10 @@ impl CpuReduceClient {
                 "cpu_reduce: rank_id {rank_id} must be < world_size {world_size}"
             )));
         }
-        let stream = TcpStream::connect(controller_addr).map_err(|e| {
-            TensorError::new(&format!(
-                "cpu_reduce: connect to {controller_addr} failed: {e}"
-            ))
-        })?;
+        // Ranks dial their host-local relay's loopback. The relay process
+        // may bind a beat after the rank starts (launcher spawns both),
+        // so retry briefly rather than fail on the first refusal.
+        let stream = connect_with_retry(controller_addr)?;
         // Disable Nagle: the reduce is a small-frame write→blocking-read
         // ping-pong, which deadlocks Nagle against delayed-ACK for ~40ms
         // per round-trip. With the cross-host reduce being 97-99% of the
@@ -206,8 +230,8 @@ impl CpuReduceClient {
     /// The returned frame has the same tensor count, dtypes, and shapes
     /// as the input frame; only the tensor bytes change.
     pub fn all_reduce(&mut self, frame: &RoundFrame) -> Result<RoundFrame> {
-        controller::write_round_frame(&mut self.stream, frame, &self.salt)?;
-        match controller::read_round_frame(&mut self.stream, &self.salt)? {
+        write_framed_round(&mut self.stream, frame, &self.salt)?;
+        match read_framed_round(&mut self.stream, &self.salt)? {
             Some(f) => Ok(f),
             None => Err(TensorError::new(
                 "cpu_reduce: controller closed connection before sending averaged \
@@ -515,7 +539,7 @@ impl CpuReduceClient {
                 // to the main thread (which surfaces them on
                 // poll_round); EOF is a clean shutdown signal.
                 loop {
-                    match controller::read_round_frame(&mut reader_stream, &reader_salt) {
+                    match read_framed_round(&mut reader_stream, &reader_salt) {
                         Ok(Some(frame)) => {
                             if tx.send(Ok(frame)).is_err() {
                                 // Main side dropped the receiver.
@@ -588,7 +612,7 @@ impl AsyncCpuReduceClient {
     /// Write is blocking (TCP send buffer typically accepts a round
     /// without back-pressure). Loud error on wire-level write failure.
     pub fn submit_round(&mut self, frame: &RoundFrame) -> Result<()> {
-        controller::write_round_frame(&mut self.writer, frame, &self.salt)
+        write_framed_round(&mut self.writer, frame, &self.salt)
     }
 
     /// Try to receive the next averaged round from the background
@@ -638,6 +662,33 @@ impl Drop for AsyncCpuReduceClient {
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Length-framed RoundFrame helpers (rank ↔ relay loopback leg)
+// ---------------------------------------------------------------------------
+
+/// Serialize `frame` (with its HMAC footer) and write it length-delimited
+/// to `stream`. The rank talks to its host-local relay, which forwards the
+/// opaque blob upstream untouched; the length prefix lets the relay frame
+/// it without parsing. See [`crate::distributed::relay::mux`].
+fn write_framed_round<W: Write>(
+    stream: &mut W,
+    frame: &RoundFrame,
+    salt: &SessionSalt,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    controller::write_round_frame(&mut buf, frame, salt)?;
+    crate::distributed::relay::mux::write_len_framed(stream, &buf)
+}
+
+/// Read a length-delimited [`RoundFrame`] blob and parse it. `Ok(None)` on
+/// clean EOF (relay/controller closed the connection).
+fn read_framed_round<R: Read>(stream: &mut R, salt: &SessionSalt) -> Result<Option<RoundFrame>> {
+    match crate::distributed::relay::mux::read_len_framed(stream)? {
+        Some(buf) => controller::read_round_frame(&mut buf.as_slice(), salt),
+        None => Ok(None),
     }
 }
 

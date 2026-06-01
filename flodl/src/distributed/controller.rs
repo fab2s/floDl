@@ -68,14 +68,15 @@
 //! [`AverageBackend::Cpu`]: crate::distributed::AverageBackend::Cpu
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use hmac_sha256::HMAC;
 
+use crate::distributed::relay::mux::{MuxRead, MuxRecord, RelayControlMsg};
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{Result, TensorError};
 
@@ -96,22 +97,20 @@ pub const DTYPE_F32: u8 = 0;
 
 /// Shared dead-rank ledger. Set by the cluster coordinator when it
 /// declares a rank dead (stale heartbeat). Read by the controller's
-/// reduce thread to skip the rank's stream in the current and future
+/// reduce loop to skip the rank's contribution in the current and future
 /// rounds, and by the coord-side `should_average` /
 /// `poll_cpu_averaging` gates to exclude dead ranks from quorum
 /// counting.
 ///
-/// The struct also holds per-rank shutdown handles registered by the
-/// controller after accept. `declare_dead` shuts down the dead rank's
-/// stream, which wakes the controller's reduce thread out of any
-/// pending read (so the cycle can release with survivors-only data).
+/// Under the per-host relay transport, the controller no longer owns a
+/// stream per rank, so there is nothing to shut down to wake it. The
+/// reduce loop polls this ledger (its round-wait uses a timeout), so a
+/// coord-declared death is observed on the next poll tick; rank death
+/// also arrives directly as a relay
+/// [`crate::distributed::relay::mux::RelayControlMsg::RankExit`].
 #[derive(Debug)]
 pub struct DeadRanks {
     flags: Vec<AtomicBool>,
-    /// Per-rank shutdown handles for the controller-side stream.
-    /// `Some` after accept registers them; `None` until accept or after
-    /// `declare_dead` consumed (takes) the handle to invoke shutdown.
-    stream_handles: Mutex<Vec<Option<TcpStream>>>,
 }
 
 impl DeadRanks {
@@ -120,28 +119,16 @@ impl DeadRanks {
     pub fn new(world_size: usize) -> Arc<Self> {
         Arc::new(Self {
             flags: (0..world_size).map(|_| AtomicBool::new(false)).collect(),
-            stream_handles: Mutex::new((0..world_size).map(|_| None).collect()),
         })
     }
 
     /// Declare `rank` permanently dead for the rest of this run.
-    /// Idempotent. Sets the rank's flag, then shuts down its
-    /// controller-side stream so the reduce thread unblocks from any
-    /// pending read on that rank. No-op if `rank >= world_size`.
+    /// Idempotent flag set. No-op if `rank >= world_size`. The
+    /// controller's reduce loop picks this up on its next round-wait
+    /// poll tick.
     pub fn declare_dead(&self, rank: usize) {
-        if rank >= self.flags.len() {
-            return;
-        }
-        let was_already_dead = self.flags[rank].swap(true, Ordering::SeqCst);
-        if was_already_dead {
-            return;
-        }
-        if let Ok(mut handles) = self.stream_handles.lock() {
-            if let Some(slot) = handles.get_mut(rank) {
-                if let Some(stream) = slot.take() {
-                    let _ = stream.shutdown(Shutdown::Both);
-                }
-            }
+        if let Some(flag) = self.flags.get(rank) {
+            flag.store(true, Ordering::SeqCst);
         }
     }
 
@@ -164,19 +151,6 @@ impl DeadRanks {
     /// World size the ledger was sized for.
     pub fn world_size(&self) -> usize {
         self.flags.len()
-    }
-
-    /// Controller registers a stream handle for `rank` after the
-    /// accept-side handshake completes. The handle is a `try_clone` of
-    /// the rank's stream — shutting it down affects the underlying OS
-    /// file descriptor, waking any pending read on the original stream
-    /// owned by the reduce thread.
-    pub(crate) fn register_stream_handle(&self, rank: usize, handle: TcpStream) {
-        if let Ok(mut handles) = self.stream_handles.lock() {
-            if let Some(slot) = handles.get_mut(rank) {
-                *slot = Some(handle);
-            }
-        }
     }
 }
 
@@ -324,6 +298,13 @@ impl Drop for ClusterController {
 // Reduce-thread worker
 // ---------------------------------------------------------------------------
 
+/// Reduce-thread read poll cadence: per-host reader threads block in
+/// `try_read_from` with this timeout so they re-check the shutdown flag
+/// on idle ticks, and the reduce loop's round-wait re-evaluates dead
+/// ranks (which can be declared externally by the coordinator with no
+/// notify) on the same cadence.
+const REDUCE_POLL: Duration = Duration::from_millis(100);
+
 fn run_reduce_thread(
     listener: TcpListener,
     world_size: usize,
@@ -334,53 +315,89 @@ fn run_reduce_thread(
     listener
         .set_nonblocking(true)
         .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
-    let mut streams: Vec<Option<TcpStream>> = (0..world_size).map(|_| None).collect();
-    let mut connected = 0usize;
 
-    // Phase 1: accept exactly `world_size` connections and validate the
-    // handshake on each. Connections may arrive in any order; the
-    // handshake's rank_id places each stream at the right slot.
-    while connected < world_size {
+    let slots = Arc::new(ReduceSlots::new(world_size));
+    // Sole-writer half per relay connection (the reduce loop writes
+    // replies); the matching read half is owned by a per-connection
+    // reader thread. `rank_conn[rank]` indexes the connection carrying
+    // that rank.
+    let mut conn_writes: Vec<TcpStream> = Vec::new();
+    let mut rank_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
+    let mut reader_threads: Vec<JoinHandle<()>> = Vec::new();
+    let mut covered = 0usize;
+
+    // Phase 1: accept per-host relay connections. Each announces the ranks
+    // it carries via a `RelayHello`; accept until every global rank is
+    // covered exactly once.
+    while covered < world_size {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
         match listener.accept() {
             Ok((mut stream, _peer)) => {
-                // Disable Nagle on the server side too — the reduce
-                // round-trip stalls on whichever side does the small
-                // write expecting an ACK, so both ends must opt out.
                 let _ = stream.set_nodelay(true);
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout: {e}")))?;
-                let rank_id = read_handshake(&mut stream, world_size)?;
-                if rank_id >= world_size {
-                    return Err(TensorError::new(&format!(
-                        "cluster_controller: handshake rank_id {rank_id} >= world_size {world_size}"
-                    )));
+                // Relay handshake (blocking read — relays send Hello
+                // immediately on connect).
+                let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
+                    Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
+                        crate::verbose!(
+                            "  cluster_controller: relay '{host}' carries ranks {ranks:?}"
+                        );
+                        ranks
+                    }
+                    Some(other) => {
+                        return Err(TensorError::new(&format!(
+                            "cluster_controller: expected relay Hello, got {other:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(TensorError::new(
+                            "cluster_controller: relay closed connection before Hello",
+                        ));
+                    }
+                };
+                let conn_idx = conn_writes.len();
+                let mut conn_ranks: Vec<usize> = Vec::with_capacity(ranks.len());
+                for r in &ranks {
+                    let r = *r as usize;
+                    if r >= world_size {
+                        return Err(TensorError::new(&format!(
+                            "cluster_controller: relay announced rank {r} >= world_size {world_size}"
+                        )));
+                    }
+                    if rank_conn[r].is_some() {
+                        return Err(TensorError::new(&format!(
+                            "cluster_controller: rank {r} announced by two relays"
+                        )));
+                    }
+                    rank_conn[r] = Some(conn_idx);
+                    conn_ranks.push(r);
                 }
-                if streams[rank_id].is_some() {
-                    return Err(TensorError::new(&format!(
-                        "cluster_controller: duplicate rank_id {rank_id} connected"
-                    )));
-                }
-                write_handshake_ack(&mut stream)?;
-                // Switch to blocking reads with no timeout for the
-                // long-running reduce loop. Timeouts here would make
-                // legitimately slow rounds look like failures.
-                stream
-                    .set_read_timeout(None)
-                    .map_err(|e| TensorError::new(&format!("cluster_controller: set_read_timeout(None): {e}")))?;
-                // Register a try_clone with the dead-rank ledger so
-                // the coord can wake the reduce thread out of a
-                // pending read on this rank when declaring it dead.
-                // The cloned handle shares the OS file descriptor —
-                // shutdown on either half affects both.
-                if let Ok(handle) = stream.try_clone() {
-                    dead_ranks.register_stream_handle(rank_id, handle);
-                }
-                streams[rank_id] = Some(stream);
-                connected += 1;
+                MuxRecord::control(RelayControlMsg::HelloAck).write_to(&mut stream, &salt)?;
+
+                let read_half = stream.try_clone().map_err(|e| {
+                    TensorError::new(&format!("cluster_controller: relay try_clone: {e}"))
+                })?;
+                read_half
+                    .set_read_timeout(Some(REDUCE_POLL))
+                    .map_err(|e| {
+                        TensorError::new(&format!("cluster_controller: set_read_timeout: {e}"))
+                    })?;
+                conn_writes.push(stream);
+                covered += conn_ranks.len();
+
+                let slots_c = Arc::clone(&slots);
+                let dead_c = Arc::clone(&dead_ranks);
+                let shutdown_c = Arc::clone(&shutdown);
+                let t = thread::Builder::new()
+                    .name(format!("flodl-controller-relay{conn_idx}"))
+                    .spawn(move || {
+                        reduce_reader(read_half, conn_ranks, slots_c, dead_c, shutdown_c, salt)
+                    })
+                    .map_err(|e| {
+                        TensorError::new(&format!("cluster_controller: spawn reader: {e}"))
+                    })?;
+                reader_threads.push(t);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -392,35 +409,258 @@ fn run_reduce_thread(
             }
         }
     }
-    // All connected — drop nonblocking on the listener now that no more
-    // accepts are expected.
     let _ = listener.set_nonblocking(false);
-    let mut streams: Vec<TcpStream> = streams.into_iter().map(|s| s.unwrap()).collect();
 
-    // Phase 2: reduce loop. Each round reads a RoundFrame from every
-    // ALIVE rank, sums the per-tensor data, divides by the alive count,
-    // writes the averaged frame back to alive ranks only. Terminates
-    // when an alive rank disconnects cleanly (EOF on read while NOT
-    // declared dead) or when shutdown is signalled.
-    loop {
+    // Phase 2: reduce loop. Wait until every alive rank has deposited this
+    // round's frame, average (skipping dead ranks, dividing by the alive
+    // count), and scatter the averaged frame back tagged per rank down its
+    // owning relay connection. The reduce loop is the SOLE writer of every
+    // relay connection. Terminates when an alive rank's data connection
+    // closes (clean training-end exit), every rank is dead, or shutdown is
+    // signalled.
+    let outcome = loop {
         if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
+            break Ok(());
         }
-        match read_round_from_all(&mut streams, &salt, &dead_ranks)? {
-            Some(frames) => {
-                let averaged = reduce_average_alive(&frames)?;
-                write_round_to_all(&mut streams, &averaged, &salt, &dead_ranks)?;
+        match slots.wait_for_round(&dead_ranks, &shutdown, REDUCE_POLL) {
+            RoundOutcome::Frames(frames) => {
+                if let Err(e) =
+                    average_and_scatter(&frames, &mut conn_writes, &rank_conn, &dead_ranks, &salt)
+                {
+                    break Err(e);
+                }
             }
-            None => return Ok(()), // an ALIVE rank EOFed → clean shutdown
+            RoundOutcome::Shutdown => break Ok(()),
+            RoundOutcome::Error(e) => break Err(e),
+        }
+    };
+
+    // Tear down: signal the reader threads and join them so the
+    // connections close cleanly before this thread returns.
+    shutdown.store(true, Ordering::SeqCst);
+    for t in reader_threads {
+        let _ = t.join();
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Per-host demux: reader threads + round-collection slots
+// ---------------------------------------------------------------------------
+
+/// Shared per-round frame collection, fed by the per-connection reader
+/// threads and drained by the reduce loop. One slot per rank.
+struct ReduceSlots {
+    inner: Mutex<SlotsInner>,
+    cv: Condvar,
+}
+
+struct SlotsInner {
+    /// This round's frame per rank (`None` until the rank's reader
+    /// deposits it; taken by the reduce loop once all alive ranks present).
+    frames: Vec<Option<RoundFrame>>,
+    /// A reader observed an alive rank's data connection close (clean
+    /// training-end exit, or a relay/host drop) — the reduce loop should
+    /// terminate cleanly. Mirrors the pre-relay "alive-rank EOF → clean
+    /// shutdown" semantics.
+    shutdown: bool,
+    /// A reader hit a hard wire error on an alive rank's frame. Surfaced
+    /// from the reduce loop as the thread's `Err`.
+    error: Option<TensorError>,
+}
+
+/// Outcome of one [`ReduceSlots::wait_for_round`] call.
+enum RoundOutcome {
+    /// Every alive rank's frame for this round (dead ranks are `None`).
+    Frames(Vec<Option<RoundFrame>>),
+    /// Clean shutdown requested (alive-rank exit, all ranks dead, or the
+    /// external shutdown flag).
+    Shutdown,
+    /// A reader surfaced a hard wire error.
+    Error(TensorError),
+}
+
+impl ReduceSlots {
+    fn new(world_size: usize) -> Self {
+        ReduceSlots {
+            inner: Mutex::new(SlotsInner {
+                frames: (0..world_size).map(|_| None).collect(),
+                shutdown: false,
+                error: None,
+            }),
+            cv: Condvar::new(),
         }
     }
+
+    /// A reader deposits `rank`'s frame for the current round.
+    fn deposit(&self, rank: usize, frame: RoundFrame) {
+        let mut inner = self.inner.lock().unwrap();
+        if rank < inner.frames.len() {
+            inner.frames[rank] = Some(frame);
+        }
+        self.cv.notify_all();
+    }
+
+    /// Request a clean shutdown of the reduce loop.
+    fn request_shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.shutdown = true;
+        self.cv.notify_all();
+    }
+
+    /// Record the first hard wire error; surfaced by the reduce loop.
+    fn set_error(&self, err: TensorError) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.error.is_none() {
+            inner.error = Some(err);
+        }
+        self.cv.notify_all();
+    }
+
+    /// Block until every alive rank has deposited a frame, then take them
+    /// (leaving dead ranks `None`). Re-evaluates dead ranks every `poll`
+    /// so a coord-declared death (which carries no notify) is observed.
+    fn wait_for_round(
+        &self,
+        dead: &DeadRanks,
+        external_shutdown: &AtomicBool,
+        poll: Duration,
+    ) -> RoundOutcome {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if external_shutdown.load(Ordering::SeqCst) || inner.shutdown {
+                return RoundOutcome::Shutdown;
+            }
+            if let Some(e) = inner.error.take() {
+                return RoundOutcome::Error(e);
+            }
+            let ws = inner.frames.len();
+            let alive: Vec<usize> = (0..ws).filter(|r| !dead.is_dead(*r)).collect();
+            if alive.is_empty() {
+                // Every rank dead/done → nothing left to reduce.
+                return RoundOutcome::Shutdown;
+            }
+            if alive.iter().all(|r| inner.frames[*r].is_some()) {
+                let mut out: Vec<Option<RoundFrame>> = Vec::with_capacity(ws);
+                for r in 0..ws {
+                    if dead.is_dead(r) {
+                        inner.frames[r] = None;
+                        out.push(None);
+                    } else {
+                        out.push(inner.frames[r].take());
+                    }
+                }
+                return RoundOutcome::Frames(out);
+            }
+            let (guard, _timeout) = self.cv.wait_timeout(inner, poll).unwrap();
+            inner = guard;
+        }
+    }
+}
+
+/// Per-connection reader: demux `Data{rank}` records into the reduce
+/// slots, surface `RankExit` / EOF as clean shutdown for still-alive
+/// ranks, and parse the opaque RoundFrame payload from memory.
+fn reduce_reader(
+    mut read: TcpStream,
+    ranks: Vec<usize>,
+    slots: Arc<ReduceSlots>,
+    dead_ranks: Arc<DeadRanks>,
+    shutdown: Arc<AtomicBool>,
+    salt: SessionSalt,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        match MuxRecord::try_read_from(&mut read, &salt) {
+            Ok(MuxRead::Record(MuxRecord::Data { rank, payload })) => {
+                let r = rank as usize;
+                if dead_ranks.is_dead(r) {
+                    continue; // late frame from a dead rank — drop
+                }
+                let mut slice = &payload[..];
+                match read_round_frame(&mut slice, &salt) {
+                    Ok(Some(frame)) => slots.deposit(r, frame),
+                    Ok(None) => {
+                        slots.set_error(TensorError::new(&format!(
+                            "cluster_controller: truncated RoundFrame payload for rank {r}"
+                        )));
+                        return;
+                    }
+                    Err(e) => {
+                        slots.set_error(e);
+                        return;
+                    }
+                }
+            }
+            Ok(MuxRead::Record(MuxRecord::Control(RelayControlMsg::RankExit { rank }))) => {
+                // Alive rank's data connection closed: clean training-end
+                // exit (or an undetected failure). Mirrors the pre-relay
+                // "alive-rank EOF → clean shutdown" semantics. A RankExit
+                // for an already-dead rank is expected post-failure cleanup.
+                if !dead_ranks.is_dead(rank as usize) {
+                    slots.request_shutdown();
+                }
+            }
+            Ok(MuxRead::Record(MuxRecord::Control(_))) => {
+                // Hello/HelloAck only occur at startup; ignore mid-stream.
+            }
+            Ok(MuxRead::WouldBlock) => {}
+            Ok(MuxRead::Eof) => {
+                // Relay connection closed. If any of this host's ranks were
+                // still alive, treat as their exit (clean shutdown).
+                if ranks.iter().any(|r| !dead_ranks.is_dead(*r)) {
+                    slots.request_shutdown();
+                }
+                return;
+            }
+            Err(e) => {
+                if ranks.iter().any(|r| !dead_ranks.is_dead(*r)) {
+                    slots.set_error(e);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Average this round's alive-rank frames and scatter the result back,
+/// tagged per rank, down each rank's owning relay connection. The reduce
+/// loop is the sole writer of every connection.
+fn average_and_scatter(
+    frames: &[Option<RoundFrame>],
+    conn_writes: &mut [TcpStream],
+    rank_conn: &[Option<usize>],
+    dead_ranks: &DeadRanks,
+    salt: &SessionSalt,
+) -> Result<()> {
+    let averaged = reduce_average_alive(frames)?;
+    // The averaged frame is identical for every rank; serialize once and
+    // forward the same bytes tagged per rank.
+    let mut buf: Vec<u8> = Vec::new();
+    write_round_frame(&mut buf, &averaged, salt)?;
+    for (rank, conn) in rank_conn.iter().enumerate() {
+        if dead_ranks.is_dead(rank) {
+            continue;
+        }
+        let Some(ci) = conn else {
+            continue;
+        };
+        MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Handshake
 // ---------------------------------------------------------------------------
 
-fn read_handshake(stream: &mut TcpStream, expected_world_size: usize) -> Result<usize> {
+/// Read and validate the rank-side data-channel handshake, returning the
+/// announced `rank_id`. Exposed at crate visibility so the per-host relay
+/// ([`crate::distributed::relay`]) can terminate the handshake toward its
+/// local ranks exactly as the controller does.
+pub(crate) fn read_handshake(stream: &mut TcpStream, expected_world_size: usize) -> Result<usize> {
     let mut buf = [0u8; 16];
     stream.read_exact(&mut buf).map_err(|e| {
         TensorError::new(&format!("cluster_controller: handshake read failed: {e}"))
@@ -447,7 +687,9 @@ fn read_handshake(stream: &mut TcpStream, expected_world_size: usize) -> Result<
     Ok(rank_id)
 }
 
-fn write_handshake_ack(stream: &mut TcpStream) -> Result<()> {
+/// Write the controller-side data-channel handshake ack. Exposed at
+/// crate visibility for the per-host relay (see [`read_handshake`]).
+pub(crate) fn write_handshake_ack(stream: &mut TcpStream) -> Result<()> {
     let mut buf = [0u8; 8];
     buf[0..4].copy_from_slice(&HANDSHAKE_MAGIC_CONTROLLER_ACK.to_le_bytes());
     buf[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -498,8 +740,8 @@ impl TensorPayload {
 ///
 /// `pub(crate)` so the rank-side client in `cpu_reduce` can share the
 /// wire format without duplication.
-pub(crate) fn read_round_frame(
-    stream: &mut TcpStream,
+pub(crate) fn read_round_frame<R: Read>(
+    stream: &mut R,
     salt: &SessionSalt,
 ) -> Result<Option<RoundFrame>> {
     let mut mac = HMAC::new(salt.as_slice());
@@ -592,58 +834,11 @@ pub(crate) fn read_round_frame(
     Ok(Some(RoundFrame { tensors }))
 }
 
-/// Read a frame from every alive rank. Returns `Ok(Some(frames))` with
-/// per-rank optional frames (None for dead ranks; Some for alive).
-/// Returns `Ok(None)` only if an ALIVE rank EOFs (signals shutdown).
-///
-/// EOF on a rank whose `dead_ranks` flag is already set is treated as
-/// expected (the coord shut down its stream to release this cycle) and
-/// the rank is silently skipped. A read error on a dead rank similarly
-/// folds into the skip path.
-fn read_round_from_all(
-    streams: &mut [TcpStream],
-    salt: &SessionSalt,
-    dead_ranks: &Arc<DeadRanks>,
-) -> Result<Option<Vec<Option<RoundFrame>>>> {
-    let mut frames: Vec<Option<RoundFrame>> = Vec::with_capacity(streams.len());
-    for (rank, s) in streams.iter_mut().enumerate() {
-        if dead_ranks.is_dead(rank) {
-            frames.push(None);
-            continue;
-        }
-        match read_round_frame(s, salt) {
-            Ok(Some(f)) => frames.push(Some(f)),
-            Ok(None) => {
-                // Rank EOF'd. If it was just declared dead (race
-                // between our `is_dead` check above and the coord's
-                // shutdown), treat as expected skip.
-                if dead_ranks.is_dead(rank) {
-                    frames.push(None);
-                    continue;
-                }
-                return Ok(None);
-            }
-            Err(e) => {
-                // A read error on a freshly-declared-dead rank is the
-                // expected wakeup from `dead_ranks.declare_dead`'s
-                // stream shutdown. Treat as a skip; only propagate
-                // errors when the rank wasn't declared dead.
-                if dead_ranks.is_dead(rank) {
-                    frames.push(None);
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-    Ok(Some(frames))
-}
-
 /// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
 /// footer keyed by `salt`. `pub(crate)` companion to
 /// [`read_round_frame`]; shared by the rank-side client.
-pub(crate) fn write_round_frame(
-    stream: &mut TcpStream,
+pub(crate) fn write_round_frame<W: Write>(
+    stream: &mut W,
     frame: &RoundFrame,
     salt: &SessionSalt,
 ) -> Result<()> {
@@ -698,23 +893,6 @@ pub(crate) fn write_round_frame(
     stream
         .flush()
         .map_err(|e| TensorError::new(&format!("cluster_controller: frame flush failed: {e}")))?;
-    Ok(())
-}
-
-fn write_round_to_all(
-    streams: &mut [TcpStream],
-    frame: &RoundFrame,
-    salt: &SessionSalt,
-    dead_ranks: &Arc<DeadRanks>,
-) -> Result<()> {
-    for (rank, s) in streams.iter_mut().enumerate() {
-        if dead_ranks.is_dead(rank) {
-            // Dead rank's stream may have been shut down by the coord;
-            // even if it isn't, the rank isn't going to consume.
-            continue;
-        }
-        write_round_frame(s, frame, salt)?;
-    }
     Ok(())
 }
 

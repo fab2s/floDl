@@ -182,7 +182,7 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
             let read_deadline = Instant::now() + Duration::from_secs(4);
             while Instant::now() < read_deadline {
                 s.set_read_timeout(Some(Duration::from_millis(200))).ok();
-                match ControlFrame::read_from(s, salt) {
+                match recv_frame(s, salt) {
                     Ok(Some(frame)) => match frame.decode::<ControlMsgWire>() {
                         Ok(ControlMsgWire::StartEpoch(_)) => {
                             received_start_epoch = true;

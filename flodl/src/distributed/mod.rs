@@ -28,6 +28,7 @@ pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;
 pub mod max_failure;
 pub mod nccl;
+pub mod relay;
 pub mod ddp;
 pub mod ddp_run;
 pub mod el_che;

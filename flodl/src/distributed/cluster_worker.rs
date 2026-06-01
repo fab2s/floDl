@@ -75,8 +75,9 @@ use crate::distributed::ddp_run::{
     CheckpointFn, ControlMsg, EpochFn, EpochPlan, EvalFn, GpuWorker, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
+use crate::distributed::relay::mux::{try_read_len_framed, write_len_framed, LenFramedRead};
 use crate::distributed::wire::{
-    hmac_sha256_64, ControlFrame, ControlMsgWire, FrameRead, MsgKind, SessionSalt,
+    hmac_sha256_64, ControlFrame, ControlMsgWire, MsgKind, SessionSalt,
     TimingMsgWire,
 };
 #[cfg(test)]
@@ -446,14 +447,10 @@ impl<M: Module + 'static> ClusterWorker<M> {
             )));
         }
 
-        // Connect with a generous timeout; ranks may briefly race the
-        // coordinator's accept() after the launcher kicks them off.
-        let stream = TcpStream::connect_timeout(&coord_addr, Duration::from_secs(10))
-            .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_worker: connect to {coord_addr} failed: {e}"
-                ))
-            })?;
+        // Ranks dial their host-local relay's control loopback. The relay
+        // process may bind a beat after the rank starts (launcher spawns
+        // both), so retry briefly rather than fail on the first refusal.
+        let stream = connect_coord_with_retry(coord_addr)?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| {
@@ -1044,8 +1041,25 @@ fn inbound_loop(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        match ControlFrame::try_read_from(stream, salt) {
-            Ok(FrameRead::Frame(frame)) => match frame.kind {
+        // The worker reaches the coord through its host relay, which
+        // forwards length-framed opaque ControlFrame blobs on the loopback
+        // leg. Read the blob, parse the frame, then dispatch as before.
+        match try_read_len_framed(stream) {
+            Ok(LenFramedRead::Blob(blob)) => {
+                let frame = match ControlFrame::read_from(&mut blob.as_slice(), salt) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        eprintln!("cluster_worker: inbound r{rank} truncated ControlFrame");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cluster_worker: inbound r{rank} ControlFrame parse: {e}"
+                        );
+                        return;
+                    }
+                };
+                match frame.kind {
                 MsgKind::Control => match frame.decode::<ControlMsgWire>() {
                     Ok(wire) => match wire {
                         // Elastic-membership interception (does NOT
@@ -1151,9 +1165,10 @@ fn inbound_loop(
                          on coord→rank channel; dropping"
                     );
                 }
-            },
-            Ok(FrameRead::WouldBlock) => continue,
-            Ok(FrameRead::Eof) => return,
+                }
+            }
+            Ok(LenFramedRead::WouldBlock) => continue,
+            Ok(LenFramedRead::Eof) => return,
             Err(e) => {
                 // Exit-time broken-pipe / EOF is the common case here:
                 // the coord closed its end during shutdown. Downgrade
@@ -1351,6 +1366,40 @@ fn outbound_loop(
     }
 }
 
+/// Loopback connect with a short retry budget (~5s). The rank dials its
+/// host-local relay's control loopback; the launcher spawns the relay
+/// alongside the ranks, so the relay's `bind` may land a beat after the
+/// rank starts — a transient refusal is expected and retried.
+fn connect_coord_with_retry(addr: SocketAddr) -> Result<TcpStream> {
+    const ATTEMPTS: u32 = 50;
+    const BACKOFF: Duration = Duration::from_millis(100);
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        match TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last_err = Some(e);
+                thread::sleep(BACKOFF);
+            }
+        }
+    }
+    Err(TensorError::new(&format!(
+        "cluster_worker: connect to {addr} failed after {ATTEMPTS} attempts: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )))
+}
+
+/// Serialize a [`ControlFrame`] and write it length-delimited to the
+/// worker's host relay, which forwards the opaque blob upstream to the
+/// coordinator. Control-channel mirror of the data channel's framing.
+fn write_framed_control<W: std::io::Write>(stream: &mut W, frame: &ControlFrame) -> Result<()> {
+    let mut buf = Vec::new();
+    frame.write_to(&mut buf)?;
+    write_len_framed(stream, &buf)
+}
+
 fn write_timing(
     stream: &mut TcpStream,
     salt: &SessionSalt,
@@ -1358,7 +1407,7 @@ fn write_timing(
 ) -> Result<()> {
     let wire = timing_msg_to_wire(msg);
     let frame = ControlFrame::encode(salt, MsgKind::Timing, &wire)?;
-    frame.write_to(stream)
+    write_framed_control(stream, &frame)
 }
 
 fn write_metrics(
@@ -1385,7 +1434,7 @@ fn write_metrics(
         wire.resources = Some(sample.into());
     }
     let frame = ControlFrame::encode(salt, MsgKind::Metrics, &wire)?;
-    frame.write_to(stream)
+    write_framed_control(stream, &frame)
 }
 
 /// Emit the rank-side dashboard setup sequence — `DashboardRegister`
@@ -1482,7 +1531,7 @@ fn write_timing_wire(
     msg: &crate::distributed::wire::TimingMsgWire,
 ) -> Result<()> {
     let frame = ControlFrame::encode(salt, MsgKind::Timing, msg)?;
-    frame.write_to(stream)
+    write_framed_control(stream, &frame)
 }
 
 /// Convert in-process [`crate::distributed::ddp_run::MetricsMsg`]

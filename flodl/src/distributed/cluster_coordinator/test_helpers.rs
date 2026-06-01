@@ -218,6 +218,7 @@ impl ClusterCoordinator {
             eval_every_epochs: config.eval_every_epochs,
             metrics_device_indices: (0..world_size as u8).collect(),
             control_streams: Vec::new(),
+            rank_to_conn: Vec::new(),
             reader_handles: Vec::new(),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             bound_port: 0,

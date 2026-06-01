@@ -173,8 +173,14 @@ impl DdpHandle {
         // already used by the NCCL rendezvous; +2 is the
         // ClusterController (CPU averaging, unused in NCCL mode but
         // still bound by the launcher).
-        let coord_port = cluster.controller.port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
+        // Ranks reach the coordinator through their host-local relay's
+        // control loopback (+5), not the controller's control port (+3)
+        // directly. The relay forwards each rank's frames upstream.
+        let coord_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET);
+        let coord_addr_str = format!("127.0.0.1:{coord_port}");
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
@@ -469,8 +475,14 @@ impl DdpHandle {
 
         // Coord control channel at controller_port + 3 (same convention as
         // the Sync via_coord entry).
-        let coord_port = cluster.controller.port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
+        // Ranks reach the coordinator through their host-local relay's
+        // control loopback (+5), not the controller's control port (+3)
+        // directly. The relay forwards each rank's frames upstream.
+        let coord_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET);
+        let coord_addr_str = format!("127.0.0.1:{coord_port}");
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
         let dataset_sig = [0u8; 32];
@@ -704,11 +716,23 @@ impl DdpHandle {
              (Sync+Cpu via_coord, save_path={save_path:?})"
         );
 
-        let controller_port = cluster.controller.port.saturating_add(2);
-        let controller_addr_str = format!("{}:{controller_port}", cluster.controller.host);
+        // Ranks reach the CPU-averaging controller through their host-local
+        // relay's data loopback (+4), not the controller's data port (+2)
+        // directly. The relay forwards each rank's reduce buffer upstream.
+        let controller_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET);
+        let controller_addr_str = format!("127.0.0.1:{controller_port}");
         let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
-        let coord_port = cluster.controller.port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
+        // Ranks reach the coordinator through their host-local relay's
+        // control loopback (+5), not the controller's control port (+3)
+        // directly. The relay forwards each rank's frames upstream.
+        let coord_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET);
+        let coord_addr_str = format!("127.0.0.1:{coord_port}");
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 
@@ -965,11 +989,23 @@ impl DdpHandle {
              ({policy_label}+Cpu via_coord, save_path={save_path:?})"
         );
 
-        let controller_port = cluster.controller.port.saturating_add(2);
-        let controller_addr_str = format!("{}:{controller_port}", cluster.controller.host);
+        // Ranks reach the CPU-averaging controller through their host-local
+        // relay's data loopback (+4), not the controller's data port (+2)
+        // directly. The relay forwards each rank's reduce buffer upstream.
+        let controller_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET);
+        let controller_addr_str = format!("127.0.0.1:{controller_port}");
         let controller_addr = parse_or_resolve_socket_addr(&controller_addr_str)?;
-        let coord_port = cluster.controller.port.saturating_add(3);
-        let coord_addr_str = format!("{}:{coord_port}", cluster.controller.host);
+        // Ranks reach the coordinator through their host-local relay's
+        // control loopback (+5), not the controller's control port (+3)
+        // directly. The relay forwards each rank's frames upstream.
+        let coord_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET);
+        let coord_addr_str = format!("127.0.0.1:{coord_port}");
         let coord_addr = parse_or_resolve_socket_addr(&coord_addr_str)?;
         let session_salt = cluster.salt;
 

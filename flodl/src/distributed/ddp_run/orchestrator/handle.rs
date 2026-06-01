@@ -313,6 +313,18 @@ impl DdpHandle {
                     training_meta: None,
                 });
             }
+            crate::distributed::launcher::Role::Relay => {
+                // This process is a per-host transport relay (spawned by
+                // the launcher). Run the byte-router until its local ranks
+                // finish, then exit — it never trains.
+                match crate::distributed::launcher::run_relay() {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("cluster relay: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             crate::distributed::launcher::Role::Rank
             | crate::distributed::launcher::Role::SingleDevice => {}
         }

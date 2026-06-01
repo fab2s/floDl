@@ -1,7 +1,5 @@
     use super::*;
-    use std::io::Read;
     use std::net::Ipv4Addr;
-    use std::sync::mpsc;
 
     /// Deterministic non-zero test salt: exercises the HMAC path (zero
     /// salt is degenerate enough that an accidental "skip the HMAC"
@@ -12,45 +10,83 @@
         0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ];
 
-    /// Fake rank client: connects to the controller, does the handshake,
-    /// and runs `n_rounds` of (send_frame → recv_averaged_frame).
-    /// Returns the vector of received averaged frames.
-    fn fake_rank(
+    /// Fake per-host relay: the controller now speaks the relay/mux
+    /// protocol (one connection per host carrying many ranks), so the test
+    /// peer is a relay, not a rank. Connects, sends `RelayHello` for
+    /// `ranks`, then per round forwards each rank's frame up (tagged
+    /// `MuxRecord::Data`) and collects each rank's averaged reply (demuxed
+    /// by tag). Returns, per rank (parallel to `ranks`), the averaged
+    /// frames received.
+    fn fake_relay(
         port: u16,
-        rank_id: u32,
-        world_size: u32,
+        ranks: Vec<u32>,
         salt: SessionSalt,
-        send_frames: Vec<RoundFrame>,
-    ) -> Result<Vec<RoundFrame>> {
+        per_rank_frames: Vec<Vec<RoundFrame>>,
+    ) -> Result<Vec<Vec<RoundFrame>>> {
+        assert_eq!(ranks.len(), per_rank_frames.len());
+        let n_rounds = per_rank_frames.first().map(|v| v.len()).unwrap_or(0);
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
-        let mut stream = TcpStream::connect(addr).map_err(|e| {
-            TensorError::new(&format!("fake_rank {rank_id}: connect: {e}"))
-        })?;
+        let mut stream = TcpStream::connect(addr)
+            .map_err(|e| TensorError::new(&format!("fake_relay: connect: {e}")))?;
+        stream.set_nodelay(true).ok();
 
-        // Handshake send
-        let mut h = [0u8; 16];
-        h[0..4].copy_from_slice(&HANDSHAKE_MAGIC_RANK.to_le_bytes());
-        h[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        h[8..12].copy_from_slice(&rank_id.to_le_bytes());
-        h[12..16].copy_from_slice(&world_size.to_le_bytes());
-        stream.write_all(&h).map_err(|e| {
-            TensorError::new(&format!("fake_rank {rank_id}: handshake write: {e}"))
-        })?;
-        let mut ack = [0u8; 8];
-        stream.read_exact(&mut ack).map_err(|e| {
-            TensorError::new(&format!("fake_rank {rank_id}: ack read: {e}"))
-        })?;
-        let ack_magic = u32::from_le_bytes(ack[0..4].try_into().unwrap());
-        assert_eq!(ack_magic, HANDSHAKE_MAGIC_CONTROLLER_ACK);
-
-        let mut received = Vec::with_capacity(send_frames.len());
-        for f in send_frames {
-            write_round_frame(&mut stream, &f, &salt)?;
-            let r = read_round_frame(&mut stream, &salt)?
-                .ok_or_else(|| TensorError::new("fake_rank: EOF before averaged frame"))?;
-            received.push(r);
+        // Relay handshake.
+        MuxRecord::control(RelayControlMsg::Hello {
+            host: "test-host".into(),
+            ranks: ranks.clone(),
+        })
+        .write_to(&mut stream, &salt)?;
+        match MuxRecord::read_from(&mut stream, &salt)? {
+            Some(MuxRecord::Control(RelayControlMsg::HelloAck)) => {}
+            other => {
+                return Err(TensorError::new(&format!(
+                    "fake_relay: expected HelloAck, got {other:?}"
+                )));
+            }
         }
-        // Drop stream → clean EOF to controller, signals shutdown.
+
+        // Transpose rank-major frames into round-major so we drive the
+        // reduce loop one synchronized round at a time.
+        let rounds: Vec<Vec<(u32, &RoundFrame)>> = (0..n_rounds)
+            .map(|r| {
+                ranks
+                    .iter()
+                    .zip(&per_rank_frames)
+                    .map(|(rank, frames)| (*rank, &frames[r]))
+                    .collect()
+            })
+            .collect();
+
+        let mut received: Vec<Vec<RoundFrame>> = ranks.iter().map(|_| Vec::new()).collect();
+        for round in &rounds {
+            // Forward each rank's frame up, tagged.
+            for (rank, frame) in round {
+                let mut buf = Vec::new();
+                write_round_frame(&mut buf, frame, &salt)?;
+                MuxRecord::data(*rank, buf).write_to(&mut stream, &salt)?;
+            }
+            // Collect one averaged reply per rank (tagged, any order).
+            for _ in 0..ranks.len() {
+                match MuxRecord::read_from(&mut stream, &salt)? {
+                    Some(MuxRecord::Data { rank, payload }) => {
+                        let frame = read_round_frame(&mut payload.as_slice(), &salt)?
+                            .ok_or_else(|| {
+                                TensorError::new("fake_relay: truncated averaged frame")
+                            })?;
+                        let idx = ranks.iter().position(|r| *r == rank).ok_or_else(|| {
+                            TensorError::new(&format!("fake_relay: reply for unknown rank {rank}"))
+                        })?;
+                        received[idx].push(frame);
+                    }
+                    other => {
+                        return Err(TensorError::new(&format!(
+                            "fake_relay: expected Data reply, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        // Drop stream → relay-conn EOF → controller clean shutdown.
         Ok(received)
     }
 
@@ -91,38 +127,31 @@
         .unwrap();
         let port = avg.port();
 
-        let (tx0, rx0) = mpsc::channel();
-        let (tx1, rx1) = mpsc::channel();
-        let t0 = thread::spawn(move || {
-            let r = fake_rank(port, 0, 2, TEST_SALT, vec![one_tensor_frame(&[1.0, 2.0, 3.0])]);
-            tx0.send(r).unwrap();
-        });
-        let t1 = thread::spawn(move || {
-            let r = fake_rank(port, 1, 2, TEST_SALT, vec![one_tensor_frame(&[3.0, 4.0, 5.0])]);
-            tx1.send(r).unwrap();
-        });
-
-        let r0 = rx0.recv().unwrap().unwrap();
-        let r1 = rx1.recv().unwrap().unwrap();
-        t0.join().unwrap();
-        t1.join().unwrap();
+        // One relay carries both ranks over a single connection.
+        let recv = fake_relay(
+            port,
+            vec![0, 1],
+            TEST_SALT,
+            vec![
+                vec![one_tensor_frame(&[1.0, 2.0, 3.0])],
+                vec![one_tensor_frame(&[3.0, 4.0, 5.0])],
+            ],
+        )
+        .unwrap();
         avg.shutdown().unwrap();
 
         // Average of (1,2,3) and (3,4,5) = (2,3,4)
-        let expected = bytes_as_f32(&r0[0].tensors[0].bytes).unwrap();
+        let expected = bytes_as_f32(&recv[0][0].tensors[0].bytes).unwrap();
         assert_eq!(expected, vec![2.0, 3.0, 4.0]);
         // Both ranks receive the same averaged frame.
-        assert_eq!(r0, r1);
+        assert_eq!(recv[0][0], recv[1][0]);
     }
 
     #[test]
     fn three_rank_average_multi_round_multi_tensor() {
-        // Three ranks, two rounds each, each round carries two tensors.
-        // Exercises:
-        //   - multi-rank star summation (3 ranks)
-        //   - multi-round reduce loop (2 rounds)
-        //   - multi-tensor frames (2 tensors per frame)
-        //   - clean shutdown on rank EOF
+        // Three ranks (one relay), two rounds each, each round carries two
+        // tensors. Exercises multi-rank star summation, the multi-round
+        // reduce loop, multi-tensor frames, and clean shutdown on EOF.
         let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             3,
@@ -131,9 +160,6 @@
         .unwrap();
         let port = avg.port();
 
-        // Round-1 inputs: ranks 0/1/2 contribute (0,10), (10,20), (20,30) for tensor 0
-        //                          and (1,1), (2,2), (3,3) for tensor 1.
-        // Round-2 inputs: same shape, halved values (just to vary the data).
         let r0_frames = vec![
             two_tensor_frame(&[0.0, 10.0], &[1.0, 1.0]),
             two_tensor_frame(&[0.0, 5.0], &[0.5, 0.5]),
@@ -147,45 +173,42 @@
             two_tensor_frame(&[10.0, 15.0], &[1.5, 1.5]),
         ];
 
-        let (tx0, rx0) = mpsc::channel();
-        let (tx1, rx1) = mpsc::channel();
-        let (tx2, rx2) = mpsc::channel();
-        let t0 = thread::spawn(move || tx0.send(fake_rank(port, 0, 3, TEST_SALT, r0_frames)).unwrap());
-        let t1 = thread::spawn(move || tx1.send(fake_rank(port, 1, 3, TEST_SALT, r1_frames)).unwrap());
-        let t2 = thread::spawn(move || tx2.send(fake_rank(port, 2, 3, TEST_SALT, r2_frames)).unwrap());
-
-        let r0 = rx0.recv().unwrap().unwrap();
-        let r1 = rx1.recv().unwrap().unwrap();
-        let r2 = rx2.recv().unwrap().unwrap();
-        t0.join().unwrap();
-        t1.join().unwrap();
-        t2.join().unwrap();
+        let recv = fake_relay(
+            port,
+            vec![0, 1, 2],
+            TEST_SALT,
+            vec![r0_frames, r1_frames, r2_frames],
+        )
+        .unwrap();
         avg.shutdown().unwrap();
 
         // Each rank received exactly 2 averaged frames.
-        assert_eq!(r0.len(), 2, "rank 0 should receive 2 averaged frames");
-        assert_eq!(r1.len(), 2);
-        assert_eq!(r2.len(), 2);
+        assert_eq!(recv[0].len(), 2, "rank 0 should receive 2 averaged frames");
+        assert_eq!(recv[1].len(), 2);
+        assert_eq!(recv[2].len(), 2);
 
         // Round 1 averages: tensor 0 = (10, 20), tensor 1 = (2, 2)
-        let r1_t0 = bytes_as_f32(&r0[0].tensors[0].bytes).unwrap();
-        let r1_t1 = bytes_as_f32(&r0[0].tensors[1].bytes).unwrap();
+        let r1_t0 = bytes_as_f32(&recv[0][0].tensors[0].bytes).unwrap();
+        let r1_t1 = bytes_as_f32(&recv[0][0].tensors[1].bytes).unwrap();
         assert_eq!(r1_t0, vec![10.0, 20.0]);
         assert_eq!(r1_t1, vec![2.0, 2.0]);
 
         // Round 2 averages: tensor 0 = (5, 10), tensor 1 = (1, 1)
-        let r2_t0 = bytes_as_f32(&r0[1].tensors[0].bytes).unwrap();
-        let r2_t1 = bytes_as_f32(&r0[1].tensors[1].bytes).unwrap();
+        let r2_t0 = bytes_as_f32(&recv[0][1].tensors[0].bytes).unwrap();
+        let r2_t1 = bytes_as_f32(&recv[0][1].tensors[1].bytes).unwrap();
         assert_eq!(r2_t0, vec![5.0, 10.0]);
         assert_eq!(r2_t1, vec![1.0, 1.0]);
 
         // All three ranks see bit-identical averaged frames.
-        assert_eq!(r0, r1);
-        assert_eq!(r1, r2);
+        assert_eq!(recv[0], recv[1]);
+        assert_eq!(recv[1], recv[2]);
     }
 
     #[test]
-    fn rejects_wrong_handshake_magic() {
+    fn rejects_non_hello_first_record() {
+        // The controller's phase-1 expects a RelayHello as the first
+        // record; a Data record up front must be rejected (connection
+        // dropped, no HelloAck).
         let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             1,
@@ -194,41 +217,45 @@
         .unwrap();
         let port = avg.port();
 
-        let mut s = TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
-        let mut bad = [0u8; 16];
-        bad[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        s.write_all(&bad).unwrap();
-        // The controller should reject and drop us; read_exact on ack
-        // would return EOF or error. We accept either outcome.
-        let mut ack = [0u8; 8];
-        let _ = s.read_exact(&mut ack);
+        let mut s =
+            TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        MuxRecord::data(0, vec![1, 2, 3])
+            .write_to(&mut s, &TEST_SALT)
+            .unwrap();
+        // Controller rejects + drops us: the HelloAck never arrives.
+        let ack = MuxRecord::read_from(&mut s, &TEST_SALT);
+        assert!(
+            matches!(ack, Ok(None)) || ack.is_err(),
+            "controller should drop the connection, got {ack:?}"
+        );
         drop(s);
-        // The reduce thread terminates with an error; shutdown still
-        // joins cleanly.
-        let _ = avg.shutdown(); // err is OK here
+        let _ = avg.shutdown(); // phase-1 error propagates; ignore here
     }
 
     #[test]
-    fn rejects_world_size_mismatch() {
+    fn rejects_rank_out_of_range() {
+        // Relay announces a rank >= world_size: loud phase-1 rejection.
         let avg = ClusterController::start(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-            2,
+            1,
             TEST_SALT,
         )
         .unwrap();
         let port = avg.port();
 
-        // Rank claims world_size = 3 but controller is configured for 2.
-        let mut s = TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
-        let mut h = [0u8; 16];
-        h[0..4].copy_from_slice(&HANDSHAKE_MAGIC_RANK.to_le_bytes());
-        h[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        h[8..12].copy_from_slice(&0u32.to_le_bytes());
-        h[12..16].copy_from_slice(&3u32.to_le_bytes());
-        s.write_all(&h).unwrap();
-        // Server drops us.
-        let mut ack = [0u8; 8];
-        let _ = s.read_exact(&mut ack);
+        let mut s =
+            TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        MuxRecord::control(RelayControlMsg::Hello {
+            host: "rogue".into(),
+            ranks: vec![5], // >= world_size (1)
+        })
+        .write_to(&mut s, &TEST_SALT)
+        .unwrap();
+        let ack = MuxRecord::read_from(&mut s, &TEST_SALT);
+        assert!(
+            matches!(ack, Ok(None)) || ack.is_err(),
+            "controller should reject out-of-range rank, got {ack:?}"
+        );
         drop(s);
         let _ = avg.shutdown();
     }
@@ -329,15 +356,16 @@
         assert!(err.to_string().contains("world_size"), "got: {err}");
     }
 
-    /// Cross-session safety: a rank using a salt the controller doesn't
-    /// share must fail the first RoundFrame's HMAC check loudly. This
-    /// is the load-bearing test that proves the salt is wired through
-    /// both directions.
+    /// Cross-session safety: a relay forwarding a RoundFrame whose inner
+    /// body is keyed with a salt the controller doesn't share must fail
+    /// the inner HMAC check loudly. The mux envelope uses the correct
+    /// salt (so the controller accepts + demuxes the record), but the
+    /// wrapped RoundFrame is rogue-keyed — the controller's reduce reader
+    /// surfaces a loud HMAC error.
     #[test]
-    fn rejects_round_frame_with_wrong_salt() {
+    fn rejects_round_frame_with_wrong_inner_salt() {
         use crate::distributed::wire::SESSION_SALT_BYTES;
         let controller_salt = TEST_SALT;
-        // The "rogue" salt: same length, different bytes.
         let rogue_salt: SessionSalt = [0xAAu8; SESSION_SALT_BYTES];
         assert_ne!(controller_salt, rogue_salt);
 
@@ -349,38 +377,33 @@
         .unwrap();
         let port = avg.port();
 
-        // Single-rank handshake (so the controller proceeds to the
-        // reduce loop), then send one RoundFrame keyed with the wrong
-        // salt. The controller's read_round_frame must error on the
-        // HMAC footer.
-        let send_res = thread::spawn(move || -> Result<()> {
-            let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
-            let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream =
+            TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        // Valid relay handshake (correct salt).
+        MuxRecord::control(RelayControlMsg::Hello {
+            host: "test".into(),
+            ranks: vec![0],
+        })
+        .write_to(&mut stream, &controller_salt)
+        .unwrap();
+        match MuxRecord::read_from(&mut stream, &controller_salt).unwrap() {
+            Some(MuxRecord::Control(RelayControlMsg::HelloAck)) => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        // Forward a Data record whose mux envelope is correctly keyed but
+        // whose inner RoundFrame is rogue-keyed.
+        let mut buf = Vec::new();
+        write_round_frame(&mut buf, &one_tensor_frame(&[1.0, 2.0, 3.0]), &rogue_salt).unwrap();
+        MuxRecord::data(0, buf)
+            .write_to(&mut stream, &controller_salt)
+            .unwrap();
+        // The controller errors on the inner HMAC and tears down; our next
+        // read sees the connection close.
+        let _ = MuxRecord::read_from(&mut stream, &controller_salt);
+        drop(stream);
 
-            // Handshake (the salt does not participate in handshake bytes;
-            // any rank with matching world_size + magic + version connects).
-            let mut h = [0u8; 16];
-            h[0..4].copy_from_slice(&HANDSHAKE_MAGIC_RANK.to_le_bytes());
-            h[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-            h[8..12].copy_from_slice(&0u32.to_le_bytes());
-            h[12..16].copy_from_slice(&1u32.to_le_bytes());
-            stream.write_all(&h).unwrap();
-            let mut ack = [0u8; 8];
-            stream.read_exact(&mut ack).unwrap();
-
-            // Now send a frame keyed by the rogue salt. The controller's
-            // HMAC over the body will not match → the reduce thread
-            // errors out and shuts down.
-            let frame = one_tensor_frame(&[1.0, 2.0, 3.0]);
-            write_round_frame(&mut stream, &frame, &rogue_salt)?;
-            Ok(())
-        });
-        let _ = send_res.join().unwrap();
-
-        // Drain the controller's status to confirm the loud error path
-        // ran. `shutdown()` joins the thread and propagates its Result.
         let err = avg.shutdown().expect_err(
-            "controller's reduce thread must propagate a HMAC verification error",
+            "controller's reduce loop must propagate an inner-RoundFrame HMAC error",
         );
         assert!(
             err.to_string().contains("HMAC verification failed"),

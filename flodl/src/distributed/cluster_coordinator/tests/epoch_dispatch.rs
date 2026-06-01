@@ -39,12 +39,12 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
         // Every rank receives a leading SetEpochCallbackRole before
         // StartEpoch (coord broadcasts it once on first dispatch).
         // Consume + verify, then expect StartEpoch.
-        let pre = ControlFrame::read_from(s, salt)?.unwrap();
+        let pre = recv_frame(s, salt)?.unwrap();
         assert!(matches!(
             pre.decode::<ControlMsgWire>()?,
             ControlMsgWire::SetEpochCallbackRole { .. }
         ));
-        let frame = ControlFrame::read_from(s, salt)?
+        let frame = recv_frame(s, salt)?
             .ok_or_else(|| TensorError::new("rank 0 EOF before StartEpoch"))?;
         assert_eq!(frame.kind, MsgKind::Control);
         let msg: ControlMsgWire = frame.decode()?;
@@ -61,12 +61,12 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
         }
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
-        let pre = ControlFrame::read_from(s, salt)?.unwrap();
+        let pre = recv_frame(s, salt)?.unwrap();
         assert!(matches!(
             pre.decode::<ControlMsgWire>()?,
             ControlMsgWire::SetEpochCallbackRole { .. }
         ));
-        let frame = ControlFrame::read_from(s, salt)?
+        let frame = recv_frame(s, salt)?
             .ok_or_else(|| TensorError::new("rank 1 EOF before StartEpoch"))?;
         let msg: ControlMsgWire = frame.decode()?;
         match msg {
@@ -117,12 +117,12 @@ fn dispatch_epoch_honors_explicit_partition_ratios() {
         expected_partition: u64,
     ) -> Result<()> {
         // Consume leading SetEpochCallbackRole (one-shot per run).
-        let pre = ControlFrame::read_from(s, salt)?.unwrap();
+        let pre = recv_frame(s, salt)?.unwrap();
         assert!(matches!(
             pre.decode::<ControlMsgWire>()?,
             ControlMsgWire::SetEpochCallbackRole { .. }
         ));
-        let frame = ControlFrame::read_from(s, salt)?.unwrap();
+        let frame = recv_frame(s, salt)?.unwrap();
         let msg: ControlMsgWire = frame.decode()?;
         if let ControlMsgWire::StartEpoch(plan) = msg {
             assert_eq!(plan.partition_size, expected_partition);
@@ -166,14 +166,14 @@ fn dispatch_epoch_caches_plans_for_same_epoch() {
     // per rank.
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
         for _ in 0..3 {
-            let frame = ControlFrame::read_from(s, salt)?.unwrap();
+            let frame = recv_frame(s, salt)?.unwrap();
             let _: ControlMsgWire = frame.decode()?;
         }
         Ok(())
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
         for _ in 0..3 {
-            let frame = ControlFrame::read_from(s, salt)?.unwrap();
+            let frame = recv_frame(s, salt)?.unwrap();
             let _: ControlMsgWire = frame.decode()?;
         }
         Ok(())

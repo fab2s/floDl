@@ -248,6 +248,22 @@ struct Cli {
 }
 
 fn main() {
+    // Per-host transport relay: the cluster launcher spawns this binary
+    // with `FLODL_RELAY_JSON` set on one child per host. Short-circuit to
+    // the byte-router BEFORE any GPU enumeration / dataset parsing / the
+    // 2-GPU auto-promote path — the relay touches no CUDA and runs no
+    // bench. (User binaries using `Trainer::run` don't need this; the
+    // relay role is caught inside `run()`. ddp-bench needs it because its
+    // harness does GPU/mode/dataset work before reaching `Trainer::run`.)
+    if std::env::var_os(flodl::distributed::launcher::ENV_RELAY_JSON).is_some() {
+        match flodl::distributed::launcher::run_relay() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("ddp-bench relay: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);

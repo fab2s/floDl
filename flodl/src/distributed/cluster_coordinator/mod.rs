@@ -78,8 +78,9 @@ use hmac_sha256::HMAC;
 use crate::distributed::ddp::ElChe;
 use crate::distributed::ddp_run::convergence::ConvergenceGuard;
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+use crate::distributed::relay::mux::{MuxRead, MuxRecord, RelayControlMsg};
 use crate::distributed::wire::{
-    ControlFrame, FrameRead, MsgKind, SessionSalt, TimingMsgWire,
+    ControlFrame, MsgKind, SessionSalt, TimingMsgWire,
 };
 use crate::tensor::{Result, TensorError};
 
@@ -161,7 +162,11 @@ pub(crate) fn write_handshake_rank(
     })
 }
 
-fn read_handshake_rank(
+/// Read and validate the rank-side control-channel handshake (salt-
+/// authenticated), returning the announced `rank_id`. Exposed at crate
+/// visibility so the per-host relay ([`crate::distributed::relay`]) can
+/// terminate the handshake toward its local ranks as the coordinator does.
+pub(crate) fn read_handshake_rank(
     stream: &mut TcpStream,
     expected_world_size: u32,
     salt: &SessionSalt,
@@ -201,7 +206,10 @@ fn read_handshake_rank(
     Ok(rank_id)
 }
 
-fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
+/// Write the coordinator-side control-channel handshake ack (salt-
+/// authenticated). Exposed at crate visibility for the per-host relay
+/// (see [`read_handshake_rank`]).
+pub(crate) fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
     let mut buf = [0u8; HS_ACK_BYTES];
     buf[0..4].copy_from_slice(&CTRL_HS_ACK.to_le_bytes());
     buf[4..8].copy_from_slice(&CTRL_HS_VERSION.to_le_bytes());
@@ -757,10 +765,18 @@ pub struct ClusterCoordinator {
     /// `EpochCallbackPolicy` design assumes process-per-rank with one
     /// device per process.
     metrics_device_indices: Vec<u8>,
-    /// Outbound control streams (one per rank, write half held here).
-    /// Reader thread holds a try-cloned read half.
+    /// Outbound control connections, one per host relay (write half held
+    /// here). Under the per-host transport the coord talks to one relay
+    /// per host, not one socket per rank; [`Self::rank_to_conn`] maps a
+    /// global rank to its owning connection. Each connection's read half
+    /// is held by a per-host reader thread that demuxes by rank tag.
     control_streams: Vec<TcpStream>,
-    /// Reader-thread join handles. Drop on [`Self::shutdown`].
+    /// `rank_to_conn[rank]` = index into [`Self::control_streams`] of the
+    /// relay connection carrying that rank (`None` for a headless test
+    /// coord, or a rank not announced by any relay).
+    rank_to_conn: Vec<Option<usize>>,
+    /// Reader-thread join handles (one per host relay connection). Drop on
+    /// [`Self::shutdown`].
     reader_handles: Vec<Option<JoinHandle<()>>>,
     /// Signals reader threads to stop reading and exit.
     shutdown_flag: Arc<AtomicBool>,
@@ -942,19 +958,20 @@ impl Drop for ClusterCoordinator {
 }
 
 // ---------------------------------------------------------------------------
-// Per-rank reader thread
+// Per-host relay reader thread
 // ---------------------------------------------------------------------------
 
-/// Read [`ControlFrame`]s from one rank's control stream, decode the
-/// payload according to [`MsgKind`], and forward to the coordinator
-/// via `tx`. Exits when:
+/// Per-host control-channel reader: demux `MuxRecord::Data{rank}` records
+/// off one relay connection, parse each opaque payload as a
+/// [`ControlFrame`], and dispatch it (rank→coord timing/metrics) into the
+/// shared channels. One thread per relay connection; all feed the same
+/// `tx` / `metrics_tx`.
 ///
-/// - `shutdown` flips to true (set by [`ClusterCoordinator::shutdown`]),
-/// - the stream EOFs cleanly (rank closed),
-/// - or any wire-level error surfaces (HMAC mismatch, bincode decode,
-///   bad msg_kind).
-fn reader_loop(
-    rank: usize,
+/// Control-channel liveness is heartbeat-driven (the coord tracks
+/// `last_heartbeat` per rank and clean exit via `TimingMsgWire::Exiting`),
+/// so a relay `RankExit` is informational here and ignored — the existing
+/// dead-rank path handles a vanished rank.
+fn relay_reader_loop(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     shutdown: &Arc<AtomicBool>,
@@ -965,71 +982,86 @@ fn reader_loop(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        match ControlFrame::try_read_from(stream, salt) {
-            Ok(FrameRead::Frame(frame)) => match frame.kind {
-                MsgKind::Timing => match frame.decode::<TimingMsgWire>() {
-                    Ok(msg) => {
-                        if tx.send(msg).is_err() {
-                            // Coordinator dropped its receiver.
+        match MuxRecord::try_read_from(stream, salt) {
+            Ok(MuxRead::Record(MuxRecord::Data { rank, payload })) => {
+                let mut slice = &payload[..];
+                match ControlFrame::read_from(&mut slice, salt) {
+                    Ok(Some(frame)) => {
+                        if !dispatch_control_frame(rank as usize, frame, tx, metrics_tx) {
                             return;
                         }
                     }
-                    Err(e) => {
+                    Ok(None) => {
                         eprintln!(
-                            "cluster_coordinator: reader r{rank} decode TimingMsg: {e}"
+                            "cluster_coordinator: relay reader: truncated ControlFrame \
+                             payload for rank {rank}"
                         );
                         return;
                     }
-                },
-                MsgKind::Metrics => {
-                    match frame.decode::<crate::distributed::wire::MetricsMsgWire>() {
-                        Ok(msg) => {
-                            if metrics_tx.send(msg).is_err() {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "cluster_coordinator: reader r{rank} decode MetricsMsg: {e}"
-                            );
-                            return;
-                        }
+                    Err(e) => {
+                        eprintln!(
+                            "cluster_coordinator: relay reader: rank {rank} ControlFrame \
+                             parse: {e}"
+                        );
+                        return;
                     }
                 }
-                MsgKind::Heartbeat => {
-                    // Orphan scaffolding from an earlier protocol draft.
-                    // Heartbeats now flow through `TimingMsgWire::Heartbeat`
-                    // over `MsgKind::Timing`, so this arm is intentionally
-                    // unreached in current builds. Kept for wire-format
-                    // stability (the enum value is part of protocol
-                    // version 2's surface).
-                }
-                MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous => {
-                    eprintln!(
-                        "cluster_coordinator: reader r{rank} got unexpected \
-                         MsgKind {:?} on rank→coord path; dropping",
-                        frame.kind
-                    );
-                }
-            },
-            Ok(FrameRead::WouldBlock) => {
-                // Idle tick: re-check shutdown and keep reading.
-                continue;
             }
-            Ok(FrameRead::Eof) => {
-                // Peer closed cleanly.
-                return;
+            Ok(MuxRead::Record(MuxRecord::Control(RelayControlMsg::RankExit { .. }))) => {
+                // Informational; liveness is heartbeat-driven. Ignore.
             }
+            Ok(MuxRead::Record(MuxRecord::Control(_))) => {
+                // Hello/HelloAck occur only at startup; ignore mid-stream.
+            }
+            Ok(MuxRead::WouldBlock) => continue,
+            Ok(MuxRead::Eof) => return, // relay connection closed
             Err(e) => {
-                // Wire errors at exit (rank closed connection mid-frame,
-                // BrokenPipe on read) are the common case. Real
-                // protocol violations are rare and would also show up
-                // as decode errors above, which stay loud.
-                crate::verbose!(
-                    "cluster_coordinator: reader r{rank} wire error: {e}"
-                );
+                crate::verbose!("cluster_coordinator: relay reader wire error: {e}");
                 return;
             }
+        }
+    }
+}
+
+/// Dispatch one decoded [`ControlFrame`] from `rank` into the coord's
+/// timing / metrics channels. Returns `false` to stop the reader (a
+/// channel receiver was dropped, or a payload failed to decode).
+fn dispatch_control_frame(
+    rank: usize,
+    frame: ControlFrame,
+    tx: &mpsc::Sender<TimingMsgWire>,
+    metrics_tx: &mpsc::Sender<crate::distributed::wire::MetricsMsgWire>,
+) -> bool {
+    match frame.kind {
+        MsgKind::Timing => match frame.decode::<TimingMsgWire>() {
+            Ok(msg) => tx.send(msg).is_ok(),
+            Err(e) => {
+                eprintln!("cluster_coordinator: reader r{rank} decode TimingMsg: {e}");
+                false
+            }
+        },
+        MsgKind::Metrics => match frame.decode::<crate::distributed::wire::MetricsMsgWire>() {
+            Ok(msg) => metrics_tx.send(msg).is_ok(),
+            Err(e) => {
+                eprintln!("cluster_coordinator: reader r{rank} decode MetricsMsg: {e}");
+                false
+            }
+        },
+        MsgKind::Heartbeat => {
+            // Orphan scaffolding from an earlier protocol draft.
+            // Heartbeats now flow through `TimingMsgWire::Heartbeat`
+            // over `MsgKind::Timing`, so this arm is intentionally
+            // unreached in current builds. Kept for wire-format
+            // stability (the enum value is part of the protocol surface).
+            true
+        }
+        MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous => {
+            eprintln!(
+                "cluster_coordinator: reader r{rank} got unexpected MsgKind {:?} on \
+                 rank→coord path; dropping",
+                frame.kind
+            );
+            true
         }
     }
 }
