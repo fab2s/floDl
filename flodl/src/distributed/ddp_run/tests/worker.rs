@@ -18,7 +18,7 @@ fn test_worker_snapshot_params() {
     assert_eq!(snap.rank, 0);
     assert_eq!(snap.params.len(), 2); // weight + bias
     assert_eq!(snap.buffers.len(), 0); // Linear has no buffers
-    assert_eq!(snap.batch_count, 1); // max(steps_since_avg=0, 1)
+    assert_eq!(snap.batch_count, 0); // true steps_since_avg (no .max(1) floor)
 
     // Verify snapshot tensors have the right shapes
     assert_eq!(snap.params[0].shape(), &[2, 4]); // weight

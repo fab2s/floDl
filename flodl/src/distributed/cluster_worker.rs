@@ -1604,7 +1604,7 @@ fn param_bridge_loop(
             rank: snap_rank,
             params,
             buffers,
-            batch_count: _,
+            batch_count: n_i,
         } = snapshot;
         debug_assert_eq!(
             snap_rank as u64, rank,
@@ -1654,17 +1654,48 @@ fn param_bridge_loop(
             rank: rank as usize,
         });
 
-        // AllReduce-Avg params via the data channel; returns NEW
-        // averaged tensors (snapshot.params untouched). f32 only in
-        // v1; CpuReduceClient surfaces a loud error otherwise.
-        let param_refs: Vec<&Tensor> = params.iter().collect();
-        let avg_params = match client.all_reduce_tensors(&param_refs) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "cluster_worker: param bridge r{rank} all_reduce params: {e}"
-                );
-                return;
+        // Sum-and-count weighted AllReduce. Each rank scales its
+        // contribution by the work it did since the last sync (params:
+        // batch_count `n_i`; buffers: a 0/1 mover indicator) and the
+        // division by the summed weight happens ONCE, after the reduce —
+        // never a pre-divide. That keeps it associative, so it composes
+        // with a future per-host partial sum (the relay sum-and-count)
+        // without averaging-of-averages. A rank that did 0 steps still
+        // holds the previous consensus, so it scales to 0 and is excluded
+        // from the average — but it STILL joins every collective (zero
+        // contribution), so no rank stalls. f32 only in v1; CpuReduceClient
+        // surfaces a loud error otherwise.
+        //
+        // First gather the per-rank step counts so every rank knows the
+        // summed weight (Σ n_i) and the mover count.
+        let world = client.world_size() as usize;
+        let mut counts = vec![0.0f64; world];
+        if (rank as usize) < world {
+            counts[rank as usize] = n_i as f64;
+        }
+        if let Err(e) = client.all_reduce_per_rank_f64(&mut counts) {
+            eprintln!("cluster_worker: param bridge r{rank} count gather: {e}");
+            return;
+        }
+        let total_n: f64 = counts.iter().sum();
+        let n_movers = counts.iter().filter(|&&c| c > 0.0).count();
+
+        // All-idle (no rank moved since the last sync — every snapshot
+        // already equals the consensus): skip the reduce, leave params /
+        // buffers unchanged. Every rank sees the same gathered `total_n ==
+        // 0`, so the skip is collective-consistent (no rank left waiting in
+        // an all_reduce its peers did not call).
+        let avg_params = if total_n == 0.0 {
+            params.clone()
+        } else {
+            match sumcount_reduce(&mut client, &params, n_i as f64, total_n) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "cluster_worker: param bridge r{rank} all_reduce params: {e}"
+                    );
+                    return;
+                }
             }
         };
 
@@ -1682,11 +1713,14 @@ fn param_bridge_loop(
                 }
             };
 
-        let buffer_refs: Vec<&Tensor> = buffers.iter().collect();
-        let avg_buffers = if buffer_refs.is_empty() {
-            Vec::new()
+        // Buffers (BatchNorm running stats etc.): equal weight among the
+        // ranks that moved (idle excluded via the 0/1 indicator), divided
+        // once by the mover count. `n_movers >= 1` whenever `total_n > 0`.
+        let avg_buffers = if buffers.is_empty() || total_n == 0.0 {
+            buffers.clone()
         } else {
-            match client.all_reduce_tensors(&buffer_refs) {
+            let my_indicator = if n_i > 0 { 1.0 } else { 0.0 };
+            match sumcount_reduce(&mut client, &buffers, my_indicator, n_movers as f64) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -1727,6 +1761,39 @@ fn param_bridge_loop(
     // profile so the cpu-cadence reduce floor can be attributed to
     // serialize / wire / deserialize. One line per rank, on stderr.
     client.log_profile_summary();
+}
+
+/// Sum-and-count weighted AllReduce over the CPU data channel: returns
+/// `Σ_r (w_r · T_r) / total_weight` per tensor, computed as a plain Sum
+/// followed by a SINGLE divide.
+///
+/// `CpuReduceClient::all_reduce_tensors` implements the avg-trick (the
+/// controller sums every rank's contribution then divides by
+/// `world_size`), so this pre-multiplies each rank's scaled contribution
+/// by `world_size` to recover a plain Sum, reduces, then divides once by
+/// `total_weight`. Deferring the divide to a single final step (rather
+/// than forming `w_r/total` before the reduce) keeps the operation
+/// associative: a future per-host partial sum can fold local ranks into
+/// one `(Σ w·T, Σ w)` pair and the root still divides exactly once — no
+/// averaging-of-averages. A zero-weight rank contributes a zeroed tensor
+/// but still joins the collective, so the cohort never stalls.
+fn sumcount_reduce(
+    client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
+    tensors: &[Tensor],
+    my_weight: f64,
+    total_weight: f64,
+) -> Result<Vec<Tensor>> {
+    let ws = client.world_size() as f64;
+    let scaled: Vec<Tensor> = tensors
+        .iter()
+        .map(|t| t.mul_scalar(my_weight * ws))
+        .collect::<Result<_>>()?;
+    let refs: Vec<&Tensor> = scaled.iter().collect();
+    let summed = client.all_reduce_tensors(&refs)?;
+    summed
+        .iter()
+        .map(|s| s.mul_scalar(1.0 / total_weight))
+        .collect()
 }
 
 /// Compute the weight-space divergence triple

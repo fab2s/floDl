@@ -61,7 +61,14 @@ impl<M: Module> GpuWorker<M> {
             rank: self.rank,
             params,
             buffers,
-            batch_count: self.steps_since_avg.max(1),
+            // TRUE step count since the last sync — NOT floored to 1. A rank
+            // that did 0 steps (a reduce landing with no leftover work to
+            // dispatch, e.g. the edge schedule at an epoch/run tail) still
+            // holds the previous consensus; averaging it back in with a
+            // weight of 1 would skew the consensus toward stale weights.
+            // The averaging weights by this count and excludes zero-step
+            // ranks (sum-and-count: scale by `batch_count`, divide once).
+            batch_count: self.steps_since_avg,
         }
     }
 

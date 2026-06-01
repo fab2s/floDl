@@ -39,6 +39,41 @@ fn test_cadence_heterogeneous_timing() {
 }
 
 #[test]
+fn test_average_params_excludes_zero_step_ranks() {
+    let dev = test_device();
+    let opts = TensorOptions { dtype: DType::Float32, device: dev };
+
+    // 3 ranks: two moved, one idle (0 steps). The idle rank still holds the
+    // previous consensus (here value 0.0); including it with any non-zero
+    // weight would drag the average toward stale. Sum-and-count must exclude
+    // it: result = batch-weighted mean of the movers only.
+    //   rank0: value 1.0, 100 batches
+    //   rank1: value 5.0, 300 batches
+    //   rank2: value 0.0,   0 batches (idle, stale)
+    // expected = (100*1 + 300*5) / 400 = 4.0
+    let snaps = vec![
+        ParamSnapshot { rank: 0, params: vec![Tensor::full(&[4], 1.0, opts).unwrap()], buffers: vec![], batch_count: 100 },
+        ParamSnapshot { rank: 1, params: vec![Tensor::full(&[4], 5.0, opts).unwrap()], buffers: vec![], batch_count: 300 },
+        ParamSnapshot { rank: 2, params: vec![Tensor::full(&[4], 0.0, opts).unwrap()], buffers: vec![], batch_count: 0 },
+    ];
+    let avg = Coordinator::average_params(&snaps, 1).unwrap();
+    let sum: f64 = avg.params[0].sum().unwrap().item().unwrap();
+    assert!((sum / 4.0 - 4.0).abs() < 1e-5,
+        "zero-step rank must be excluded: got {}, want 4.0", sum / 4.0);
+
+    // All-idle: every rank holds the (equal) consensus → equal-weight
+    // fallback, no divide-by-zero, result == consensus.
+    let idle = vec![
+        ParamSnapshot { rank: 0, params: vec![Tensor::full(&[4], 2.0, opts).unwrap()], buffers: vec![], batch_count: 0 },
+        ParamSnapshot { rank: 1, params: vec![Tensor::full(&[4], 2.0, opts).unwrap()], buffers: vec![], batch_count: 0 },
+    ];
+    let avg2 = Coordinator::average_params(&idle, 2).unwrap();
+    let sum2: f64 = avg2.params[0].sum().unwrap().item().unwrap();
+    assert!((sum2 / 4.0 - 2.0).abs() < 1e-5,
+        "all-idle must equal consensus: got {}", sum2 / 4.0);
+}
+
+#[test]
 fn test_cpu_averaging_divergence_correction() {
     // Full pipeline: high divergence during CPU averaging triggers
     // anchor correction via nudge_anchor_down.

@@ -760,15 +760,39 @@ impl Coordinator {
             }
         }
 
-        let total_batches: usize = snapshots.iter().map(|s| s.batch_count.max(1)).sum();
+        // Sum-and-count weighting. A rank that did 0 batches since the last
+        // sync still holds the previous consensus; averaging it back in
+        // would skew toward stale weights. So average only the ranks that
+        // moved, weighting params by their `batch_count` (work done). If NO
+        // rank moved (all `batch_count == 0` — e.g. a tail reduce with no
+        // leftover work to dispatch), every snapshot already equals the
+        // last consensus, so fall back to equal weight over all (consensus
+        // in = consensus out, and no divide-by-zero).
+        let total_batches: usize = snapshots.iter().map(|s| s.batch_count).sum();
+        let movers: Vec<&ParamSnapshot> =
+            snapshots.iter().filter(|s| s.batch_count > 0).collect();
+        let weighted = !movers.is_empty();
+        let active: Vec<&ParamSnapshot> = if weighted {
+            movers
+        } else {
+            snapshots.iter().collect()
+        };
+        let inv_active = 1.0 / active.len() as f64;
+        let param_weight = |snap: &ParamSnapshot| -> f64 {
+            if weighted {
+                snap.batch_count as f64 / total_batches as f64
+            } else {
+                inv_active
+            }
+        };
 
         // Weighted average of parameters on CPU (snapshots may be on different devices)
         let mut avg_params = Vec::with_capacity(n_params);
         for pi in 0..n_params {
-            let first = snapshots[0].params[pi].to_device(Device::CPU)?;
+            let first = active[0].params[pi].to_device(Device::CPU)?;
             let acc = Tensor::zeros_like(&first)?;
-            for snap in snapshots {
-                let weight = snap.batch_count.max(1) as f64 / total_batches as f64;
+            for snap in &active {
+                let weight = param_weight(snap);
                 let cpu_param = snap.params[pi].to_device(Device::CPU)?;
                 let scaled = cpu_param.mul_scalar(weight)?;
                 acc.add_(&scaled)?;
@@ -776,15 +800,15 @@ impl Coordinator {
             avg_params.push(acc);
         }
 
-        // Average buffers (equal weight, e.g. BatchNorm running mean/var).
-        let inv_n = 1.0 / snapshots.len() as f64;
+        // Average buffers (equal weight among the active/moving ranks, e.g.
+        // BatchNorm running mean/var). Idle ranks are excluded here too.
         let mut avg_buffers = Vec::with_capacity(n_buffers);
         for bi in 0..n_buffers {
-            let first = snapshots[0].buffers[bi].to_device(Device::CPU)?;
+            let first = active[0].buffers[bi].to_device(Device::CPU)?;
             let acc = Tensor::zeros_like(&first)?;
-            for snap in snapshots {
+            for snap in &active {
                 let cpu_buf = snap.buffers[bi].to_device(Device::CPU)?;
-                let scaled = cpu_buf.mul_scalar(inv_n)?;
+                let scaled = cpu_buf.mul_scalar(inv_active)?;
                 acc.add_(&scaled)?;
             }
             avg_buffers.push(acc);
