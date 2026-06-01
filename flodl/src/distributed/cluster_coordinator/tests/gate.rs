@@ -209,3 +209,47 @@ fn final_consensus_reduce_needed_only_with_trailing_steps() {
         "a rank with trailing steps -> final reduce before shutdown",
     );
 }
+
+#[test]
+fn quiesced_zero_step_tail_rank_does_not_block_reduce() {
+    // Step 3's edge schedule can hand a rank 0 steps in an epoch's final
+    // window. Once that rank is quiesced (no in-flight chunk + its epoch
+    // pool drained), it must NOT block the reduce gate -- otherwise the
+    // movers held at the reduce barrier (steps_since_avg never reset) wedge.
+    let world_size = 3;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 4),
+        )
+        .no_divergence_guard(),
+    );
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[200.0, 1000.0, 1000.0], &[4, 4, 4], 10.0);
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+
+    // Tail state: epoch-0 pool drained (remaining 0), every rank at epoch 0.
+    // Movers hit their counts; rank 2 got 0 (edge schedule).
+    coord.install_chunk_pool_for_test(0, 0);
+    for r in 0..world_size {
+        coord.set_rank_epoch_for_test(r, 0);
+    }
+    coord.set_steps_since_avg_for_test(0, counts[0]);
+    coord.set_steps_since_avg_for_test(1, counts[1]);
+    coord.set_steps_since_avg_for_test(2, 0);
+    assert!(
+        coord.should_average(),
+        "quiesced 0-step tail rank must not block the reduce (counts={counts:?})",
+    );
+
+    // Contrast: pool NOT drained -> rank 2's 0 means "still to be
+    // dispatched", not quiesced -> the gate must hold.
+    coord.install_chunk_pool_for_test(0, 1000);
+    assert!(
+        !coord.should_average(),
+        "a 0-step rank that can still get work must block the gate",
+    );
+}

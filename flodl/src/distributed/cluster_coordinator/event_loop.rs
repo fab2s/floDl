@@ -403,10 +403,32 @@ impl ClusterCoordinator {
         {
             return false;
         }
-        // Every gate skips dead ranks: they won't ack, won't step, and
-        // won't accumulate wall_ms. Treating them as "satisfied" lets
-        // the surviving cohort keep training.
-        for r in 0..self.world_size {
+        // active_count must be > 0 — if every rank is dead, training
+        // is over (caller's responsibility to detect that separately).
+        if self.active_count == 0 {
+            return false;
+        }
+        // Count-based gate: fire once every alive rank has completed its
+        // scheduled `batch_counts[r]` (Sync: any step). Timing is a
+        // measurement that feeds `batch_counts` via
+        // `ElChe::recompute_batch_counts`, NOT a firing condition — a
+        // wall-time gate self-reinforces into deadlock (the target derives
+        // from samples that only land when the gate fires).
+        //
+        // EXCEPTION — quiesced tail ranks: the edge schedule can hand a rank
+        // fewer (or zero) steps in the final window of an epoch, after which
+        // it can step no more this epoch (no in-flight chunk + its pool
+        // drained). Such a rank is treated as satisfied (excluded from the
+        // firing condition) — it still joins the collective on
+        // `RequestParams`, contributing weight 0 via sum-and-count. Without
+        // this, a zero-step tail rank blocks the gate forever while the
+        // movers sit HELD at the reduce barrier (`steps_since_avg` never
+        // resets) — a wedge. `any_mover` keeps a fully-idle window (no rank
+        // stepped) from firing a degenerate empty reduce.
+        let counts = self.el_che.batch_counts();
+        let mut any_mover = false;
+        for (r, &count) in counts.iter().enumerate() {
+            // Skip dead ranks: they won't ack / step / accumulate wall_ms.
             if self.is_dead(r) {
                 continue;
             }
@@ -414,39 +436,41 @@ impl ClusterCoordinator {
             if matches!(self.backend, AverageBackend::Nccl) && !self.nccl_ack[r] {
                 return false;
             }
-            if self.steps_since_avg[r] == 0 {
+            let steps = self.steps_since_avg[r];
+            if steps > 0 {
+                any_mover = true;
+            }
+            let hit_count = match self.policy {
+                ApplyPolicy::Sync => steps >= 1,
+                ApplyPolicy::Cadence | ApplyPolicy::Async => steps >= count,
+            };
+            // ...OR a quiesced tail rank (progressive only — Sync has no
+            // chunk pool and trains a whole epoch per loop, so a sub-count
+            // rank there means "still training", never quiesced).
+            if !(hit_count || self.progressive && self.is_rank_quiesced(r)) {
                 return false;
             }
         }
-        // active_count must be > 0 — if every rank is dead, training
-        // is over (caller's responsibility to detect that separately).
-        if self.active_count == 0 {
-            return false;
-        }
-        match self.policy {
-            ApplyPolicy::Sync => (0..self.world_size)
-                .filter(|r| !self.is_dead(*r))
-                .all(|r| self.steps_since_avg[r] >= 1),
-            ApplyPolicy::Cadence | ApplyPolicy::Async => {
-                // Count-based gate: fire when each rank has completed its
-                // scheduled `batch_counts[r]`. The phenomenological
-                // invariant is "training progresses by scheduled steps" —
-                // timing is a measurement that feeds `batch_counts` via
-                // `ElChe::recompute_batch_counts`, NOT a firing condition.
-                // A wall-time gate (`min_wall >= anchor * smoothed_slow_ms`)
-                // is structurally fragile: the target is derived from
-                // samples that only land when the gate fires, so any
-                // upward spike in `smoothed_slow_ms` (cold-start warmup,
-                // thermal throttle, GPU contention, mid-run lazy init)
-                // can lock the target above achievable wall time and
-                // deadlock the cohort. Count-based gating sidesteps that
-                // loop entirely.
-                let counts = self.el_che.batch_counts();
-                (0..self.world_size)
-                    .filter(|r| !self.is_dead(*r))
-                    .all(|r| self.steps_since_avg[r] >= counts[r])
-            }
-        }
+        any_mover
+    }
+
+    /// A rank can take no more steps in its current epoch: no chunk is in
+    /// flight for it anywhere AND its epoch's pool is drained. Used by
+    /// [`Self::should_average`] to exclude edge-schedule zero/short tail
+    /// ranks from the firing gate (so they cannot block the reduce while
+    /// the movers sit at the barrier). The rank's epoch pool must EXIST and
+    /// be drained — a missing pool is NOT quiesced (we can't conclude the
+    /// rank is done; `should_average` runs before `drain_metrics_and_aggregate`
+    /// removes a finished epoch's pool, so at a real tail the drained pool is
+    /// still present).
+    fn is_rank_quiesced(&self, r: usize) -> bool {
+        let no_in_flight = !self.chunk_pools.values().any(|p| p.in_flight(r) > 0);
+        let epoch = self.rank_epoch[r];
+        let pool_drained = self
+            .chunk_pools
+            .get(&epoch)
+            .is_some_and(|p| p.remaining() == 0);
+        no_in_flight && pool_drained
     }
 
     /// Throttle fast workers. NCCL backend is a no-op (the collective
