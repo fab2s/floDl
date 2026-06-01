@@ -399,13 +399,17 @@ impl ClusterCoordinator {
             None => return None,
         };
         self.rank_epoch[rank] = epoch;
-        // Open the delivered-cost window for this chunk. Both ship paths
-        // (`StartEpoch` via `dispatch_next_chunk_with_batches`, and the
-        // atomic-dispatch `Update` fold) flow through here, so this is the
-        // single point where a rank acquires a fresh outstanding chunk.
-        // Closed when the chunk's completion `MetricsMsg` lands in
-        // `drain_metrics_and_aggregate`. See `chunk_dispatch_ts`.
-        self.chunk_dispatch_ts[rank] = Some(Instant::now());
+        // Open the rank's delivered-cost BUSY SPAN iff it was idle (no
+        // outstanding chunk). Set-if-none, NOT unconditional: under async
+        // the rank streams several chunks ahead, and overwriting the start
+        // on each dispatch would shrink the measured span to the last
+        // chunk's slice (or strand earlier chunks). Leaving an existing
+        // start intact lets the span cover the union of all overlapping
+        // chunks until in-flight returns to 0. Closed in
+        // `drain_metrics_and_aggregate`. See `delivered_span_start`.
+        if self.delivered_span_start[rank].is_none() {
+            self.delivered_span_start[rank] = Some(Instant::now());
+        }
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,
             partition_offset: offset as u64,

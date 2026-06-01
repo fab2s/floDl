@@ -325,7 +325,7 @@ fn on_off(b: bool) -> &'static str {
 /// `ssh <target> bash -lc '<remote_cmd>'`, where `<remote_cmd>` exports
 /// env vars and execs `fdl <cmd>` — same shape fdl-cli used to use
 /// before this lift. Both produce identical child semantics (piped
-/// streams, `[host:rN]` line-prefix on stdout/stderr).
+/// streams, `[host:dev:rN]` line-prefix on stdout/stderr).
 ///
 /// [`ClusterController`]: crate::distributed::controller::ClusterController
 /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
@@ -762,7 +762,13 @@ pub fn run_launcher_with_config(
             })?;
 
             let global_rank = host.ranks[local_rank];
-            let prefix = format!("[{}:r{global_rank}] ", host.host);
+            // Match the `[host:dev:rN]` identity the child would otherwise
+            // emit in-process (now suppressed to avoid a double prefix; see
+            // `GpuWorker::new`). `dev` = the physical CUDA device this rank is
+            // pinned to, falling back to the local rank slot when
+            // `local_devices` is unset.
+            let dev = local_phys.map(usize::from).unwrap_or(local_rank);
+            let prefix = format!("[{}:{dev}:r{global_rank}] ", host.host);
             let mut forwarders = Vec::with_capacity(2);
             if let Some(out) = child.stdout.take() {
                 let prefix_clone = prefix.clone();

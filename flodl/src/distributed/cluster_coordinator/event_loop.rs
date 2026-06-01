@@ -601,22 +601,31 @@ impl ClusterCoordinator {
                 if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
                     pool.mark_completed(rank, msg.samples_processed);
                 }
-                // Close the rank's delivered-cost window: the chunk
-                // dispatched at `chunk_dispatch_ts[rank]` is now complete,
-                // so (now − dispatch) is its FULL delivered cost (compute +
-                // data + control/transport). Accumulated across the
-                // window's chunks; fed to ElChe at `finish_averaging_*` for
-                // the Cadence feed. `take()` so the reduce-barrier wait
-                // until the next dispatch is NOT counted. See `timing_feed`.
-                if let Some(start) = self.chunk_dispatch_ts[rank].take() {
+                // Count the completed batches now (they are delivered
+                // regardless of whether other chunks are still in flight).
+                self.delivered_batches_accum[rank] += msg.batches_processed;
+                // Close the rank's BUSY SPAN only when its total in-flight
+                // (summed across all live chunk pools) returns to 0: the
+                // span's wall (now − span_start) is the UNION of the
+                // overlapping chunks' intervals = the rank's realized busy
+                // wall (compute + data + control/transport), with no
+                // double-counting under async overlap. While other chunks
+                // are still in flight the span stays open. `take()` so the
+                // reduce-barrier / overshoot idle until the next dispatch is
+                // NOT counted. Fed to ElChe at `finish_averaging_*`. For
+                // Cadence in-flight is only ever 0/1 so the span closes on
+                // every completion — byte-identical to the old per-chunk
+                // delta. See `timing_feed` / `delivered_span_start`.
+                let still_in_flight: usize = self
+                    .chunk_pools
+                    .values()
+                    .map(|p| p.in_flight(rank))
+                    .sum();
+                if still_in_flight == 0
+                    && let Some(start) = self.delivered_span_start[rank].take()
+                {
                     self.delivered_ms_accum[rank] +=
                         start.elapsed().as_secs_f64() * 1000.0;
-                    // Matched divisor: count exactly the batches whose
-                    // delivery we just added, so `delivered_ms / batches`
-                    // is a correct per-batch cost even when the window's
-                    // final chunk has not drained at finalize time (NCCL
-                    // inline finish). See `delivered_batches_accum`.
-                    self.delivered_batches_accum[rank] += msg.batches_processed;
                 }
                 progressive_completions.push((rank, msg.epoch));
             }

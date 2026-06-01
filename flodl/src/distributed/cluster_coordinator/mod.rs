@@ -401,18 +401,27 @@ pub struct ClusterCoordinator {
     /// UID-generator tiebreak; superseded by `delivered_ms_accum` for the
     /// Cadence feed (see `timing_feed`).
     wall_ms_accum: Vec<f64>,
-    /// Per-rank `Instant` the rank's currently-outstanding chunk was
-    /// dispatched — set in `take_next_chunk_plan` (covers both the
-    /// `StartEpoch` dispatch path and the atomic-dispatch `Update` fold),
-    /// consumed + cleared when that chunk's completion `MetricsMsg` lands
-    /// in `drain_metrics_and_aggregate`. The dispatch→completion delta is
-    /// the rank's FULL delivered per-window cost (compute + data +
-    /// control/transport round-trip). `None` between a completion and the
-    /// next dispatch — i.e. across the reduce-barrier wait, which is
-    /// deliberately excluded so the signal stays a per-rank capacity
-    /// proxy rather than a barrier-idle measurement. Progressive modes
-    /// only (non-progressive Sync never calls `take_next_chunk_plan`).
-    chunk_dispatch_ts: Vec<Option<Instant>>,
+    /// Per-rank start `Instant` of the rank's current BUSY SPAN — the
+    /// contiguous interval during which the rank has at least one chunk in
+    /// flight. Set in `take_next_chunk_plan` only when the rank was idle
+    /// (transition 0→1 in-flight), so back-to-back / overlapping dispatches
+    /// (async streams multiple chunks ahead under the overshoot budget) do
+    /// NOT reset it. Consumed + cleared in `drain_metrics_and_aggregate`
+    /// when the rank's total in-flight returns to 0 (the span closes); the
+    /// span's wall (now − span_start) is added to `delivered_ms_accum`.
+    ///
+    /// Measuring the span (the UNION of overlapping chunk intervals) rather
+    /// than per-chunk `dispatch→completion` deltas is what makes the
+    /// delivered signal correct under async overlap — summing per-chunk
+    /// deltas would double-count wall while chunks run concurrently. For
+    /// Cadence the rank holds exactly one chunk at a time, so the span IS
+    /// the chunk interval and this is byte-identical to the old per-chunk
+    /// measure. `None` between a span close and the next dispatch — i.e.
+    /// across the reduce-barrier / overshoot wait, deliberately excluded so
+    /// the signal stays a per-rank capacity proxy rather than a barrier-idle
+    /// measurement. Progressive modes only (non-progressive Sync never
+    /// calls `take_next_chunk_plan`).
+    delivered_span_start: Vec<Option<Instant>>,
     /// Per-rank delivered ms accumulated since the last reduce: the sum
     /// of (completion − dispatch) over the window's chunks. Fed to
     /// `ElChe::report_timing` in place of `wall_ms_accum` for the Cadence

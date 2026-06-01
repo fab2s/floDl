@@ -62,13 +62,22 @@ impl<M: Module> GpuWorker<M> {
         O: Optimizer + 'static,
     {
         // Set the per-thread log prefix so every flodl log line from this
-        // worker carries its identity. Single-host shows [rN]; cluster mode
-        // (when set_node_label has been called) shows [host:dev:rN].
+        // worker carries its identity. Thread-based DDP (`Ddp::wrap`: one
+        // process hosts every rank) shows `[rN]`. Process-per-rank children
+        // are spawned by the cluster launcher, which ALREADY line-prefixes
+        // their stdout/stderr with `[host:dev:rN]` (see
+        // `launcher::forward_lines`) -- and that wrap also tags raw lines
+        // (libtorch warnings, bench `final eval=` / `done:` prints) the
+        // in-process logger never sees. Setting the same prefix in-process
+        // would double it on flodl-log-macro lines, so skip it there,
+        // detected by the launcher's per-rank env marker.
         let local_dev = match config.device {
             Device::CUDA(d) => d,
             _ => 0,
         };
-        crate::log::set_thread_device(local_dev, Some(config.rank));
+        if std::env::var(crate::distributed::cluster::ENV_LOCAL_RANK).is_err() {
+            crate::log::set_thread_device(local_dev, Some(config.rank));
+        }
 
         // Create CUDA streams first (before model construction) so model
         // parameters are allocated on the same stream used by subsequent

@@ -134,7 +134,7 @@ impl ClusterCoordinator {
             max_overshoot: config.overshoot_initial,
             steps_since_avg: vec![0; world_size],
             wall_ms_accum: vec![0.0; world_size],
-            chunk_dispatch_ts: vec![None; world_size],
+            delivered_span_start: vec![None; world_size],
             delivered_ms_accum: vec![0.0; world_size],
             delivered_batches_accum: vec![0; world_size],
             last_batch_ms: vec![0.0; world_size],

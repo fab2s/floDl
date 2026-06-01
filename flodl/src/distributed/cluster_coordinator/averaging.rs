@@ -63,9 +63,9 @@ impl ClusterCoordinator {
     /// [`crate::distributed::ElChe::report_timing`] at each averaging cycle.
     /// ElChe derives `ms_per_batch[r] = ms[r] / batches[r]`.
     ///
-    /// **Cadence** (progressive) feeds the coordinator-measured DELIVERED
-    /// cost — `delivered_ms_accum` (the dispatch→completion wall summed over
-    /// the window's chunks = compute + data + control/transport) over its
+    /// **Cadence and Async** (both progressive) feed the coordinator-measured
+    /// DELIVERED cost — `delivered_ms_accum` (the busy-span wall accumulated
+    /// over the window = compute + data + control/transport) over its
     /// MATCHED batch count `delivered_batches_accum`. ElChe then schedules
     /// per-rank windows on realized wall instead of the compute-only
     /// `wall_ms_accum` (Σ per-batch `train_step` ms). This closes the
@@ -87,23 +87,27 @@ impl ClusterCoordinator {
     /// divide a partial sum by the full count → garbage (the noise seen in
     /// early nccl `[coord-prof]` dumps).
     ///
-    /// Per-rank fallback to `(wall_ms_accum, steps_since_avg)` when a rank
-    /// has no drained completion this window (`delivered_batches_accum == 0`
-    /// — cold-start, or a rank whose chunk has not landed) so no spurious
-    /// zero-report poisons ElChe's trust window.
+    /// Async's bounded-lookahead streaming (several chunks in flight at
+    /// once) is handled by the busy-SPAN measure — the span brackets the
+    /// union of overlapping chunks, where a single per-chunk dispatch
+    /// timestamp could not — so Async now rides the delivered feed too.
     ///
-    /// **Sync** (non-progressive, no `take_next_chunk_plan`) and **Async**
-    /// (bounded-lookahead streaming — multiple chunks in flight, so a single
-    /// dispatch timestamp can't bracket a window) keep the compute-only
-    /// `(wall_ms_accum, steps_since_avg)` feed unchanged.
+    /// Per-rank fallback to `(wall_ms_accum, steps_since_avg)` when a rank
+    /// has no closed span this window (`delivered_batches_accum == 0` or
+    /// `delivered_ms_accum == 0.0` — cold-start, a rank whose chunk has not
+    /// landed, or a rank that never went idle so its span stayed open) so no
+    /// spurious zero / zero-ms report poisons ElChe's trust window.
+    ///
+    /// **Sync** (non-progressive, no `take_next_chunk_plan`, no spans) keeps
+    /// the compute-only `(wall_ms_accum, steps_since_avg)` feed unchanged.
     fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
-        if !matches!(self.policy, ApplyPolicy::Cadence) {
+        if !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async) {
             return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
         }
         let mut ms = Vec::with_capacity(self.world_size);
         let mut batches = Vec::with_capacity(self.world_size);
         for r in 0..self.world_size {
-            if self.delivered_batches_accum[r] > 0 {
+            if self.delivered_batches_accum[r] > 0 && self.delivered_ms_accum[r] > 0.0 {
                 ms.push(self.delivered_ms_accum[r]);
                 batches.push(self.delivered_batches_accum[r]);
             } else {
@@ -114,14 +118,17 @@ impl ClusterCoordinator {
         (ms, batches)
     }
 
-    /// `-vvv` delivered-vs-compute per-cycle dump (Cadence only). Surfaces
-    /// the gap the fix closes: `delivered_ms/batch` (what ElChe now
-    /// schedules on, over the matched divisor) vs `compute_ms/batch` (what
-    /// it used to, over `steps_since_avg`), per rank, against the resulting
+    /// `-vvv` delivered-vs-compute per-cycle dump (Cadence + Async — the
+    /// progressive policies that ride the delivered feed). Surfaces the gap
+    /// the fix closes: `delivered_ms/batch` (what ElChe now schedules on,
+    /// over the matched divisor) vs `compute_ms/batch` (what it used to,
+    /// over `steps_since_avg`), per rank, against the resulting
     /// `batch_counts`. Call BEFORE the per-cycle counter resets. No-op
     /// unless `-vvv`.
     fn dump_delivered_timing(&self, reduce_ms: f64) {
-        if !self.prof_enabled || !matches!(self.policy, ApplyPolicy::Cadence) {
+        if !self.prof_enabled
+            || !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
+        {
             return;
         }
         let r1 = |v: &[f64]| -> Vec<f64> {
@@ -140,10 +147,11 @@ impl ClusterCoordinator {
             })
             .collect();
         eprintln!(
-            "[coord-prof] {:?} cadence | delivered_ms/batch={:?} \
+            "[coord-prof] {:?} {:?} | delivered_ms/batch={:?} \
              compute_ms/batch={:?} steps={:?} deliv_batches={:?} \
              batch_counts={:?} reduce_ms={:.1}",
             self.backend,
+            self.policy,
             r1(&delivered_per_batch),
             r1(&compute_per_batch),
             self.steps_since_avg,
@@ -667,6 +675,19 @@ impl ClusterCoordinator {
         for n in &mut self.delivered_batches_accum {
             *n = 0;
         }
+        // Re-anchor any still-open busy span to the window boundary. A span
+        // open here means a rank streamed a chunk across the reduce (async
+        // overshoot); without re-anchoring, when it finally closes it would
+        // dump its whole multi-window duration into one window. Resetting
+        // the start to now keeps the next window's measurement bounded to
+        // that window. Cadence never has an open span here (in-flight is 0
+        // at the reduce), so this is a no-op there.
+        let now = Instant::now();
+        for s in &mut self.delivered_span_start {
+            if s.is_some() {
+                *s = Some(now);
+            }
+        }
         for t in &mut self.throttled {
             *t = false;
         }
@@ -885,6 +906,19 @@ impl ClusterCoordinator {
         }
         for n in &mut self.delivered_batches_accum {
             *n = 0;
+        }
+        // Re-anchor any still-open busy span to the window boundary. A span
+        // open here means a rank streamed a chunk across the reduce (async
+        // overshoot); without re-anchoring, when it finally closes it would
+        // dump its whole multi-window duration into one window. Resetting
+        // the start to now keeps the next window's measurement bounded to
+        // that window. Cadence never has an open span here (in-flight is 0
+        // at the reduce), so this is a no-op there.
+        let now = Instant::now();
+        for s in &mut self.delivered_span_start {
+            if s.is_some() {
+                *s = Some(now);
+            }
         }
         for t in &mut self.throttled {
             *t = false;
