@@ -1,6 +1,6 @@
 //! Training harness: ties Timeline + Monitor + DDP together for each (model, mode) combo.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flodl::autograd::Variable;
@@ -762,6 +762,53 @@ fn run_unified(
     }
     drop(eval_tx); // worker keeps its own clone via the EpochFn closure
 
+    // Single canonical eval (cluster mode): the controller dispatches ONE
+    // eval to the chosen rank (Fastest by default) on the coherent consensus
+    // model after the final reduce, and the scalar flows back to
+    // `eval_result_fn` here on the launcher. This replaces the redundant
+    // per-rank final eval below for cluster runs. The eval closure bridges
+    // the model_def's per-batch `eval_fn` to the framework's dataset-based
+    // `EvalFn`, running on the worker's own device.
+    let final_eval_cell: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    if let (Some(eval_fn), Some(test_ds)) = (model_def.eval_fn, test_dataset.clone()) {
+        let bs = config.batch_size;
+        builder = builder
+            .eval_dataset(test_ds)
+            .eval_fn(move |model: &Box<dyn Module>,
+                           ds: &dyn flodl::data::BatchDataSet|
+                  -> Result<f64> {
+                // Eval on the worker's own device (derived from the model so
+                // it is correct on both CUDA_VISIBLE_DEVICES-scoped ranks and
+                // unscoped ones).
+                let device = model
+                    .parameters()
+                    .first()
+                    .map(|p| p.variable.data().device())
+                    .unwrap_or(Device::CPU);
+                let data = preload_full_dataset(ds, device)?;
+                let n = data[0].shape()[0] as usize;
+                flodl::autograd::no_grad(|| -> Result<f64> {
+                    let mut total = 0.0;
+                    let mut samples = 0usize;
+                    for start in (0..n).step_by(bs) {
+                        let end = (start + bs).min(n);
+                        if end - start < bs {
+                            break;
+                        }
+                        let batch = slice_batch(&data, start, end, device)?;
+                        total += eval_fn(model.as_ref(), &batch)? * (end - start) as f64;
+                        samples += end - start;
+                    }
+                    Ok(if samples > 0 { total / samples as f64 } else { 0.0 })
+                })
+            });
+        let cell = Arc::clone(&final_eval_cell);
+        builder = builder.eval_result_fn(move |_rank: usize, metric: f64| -> Result<()> {
+            *cell.lock().unwrap() = Some(metric);
+            Ok(())
+        });
+    }
+
     let handle = builder.run()?;
 
     let mut epoch_times = Vec::new();
@@ -883,14 +930,23 @@ fn run_unified(
 
     let state = handle.join()?;
 
-    // Final evaluation: load averaged params into a fresh model, run eval_fn
-    // on the test set. This gives the same definitive metric as solo mode.
-    // Skipped on the cluster-mode launcher: the launcher has a `StubDataset`
-    // (would error on `get_batch`), no test data, and (currently) the
-    // returned `TrainedState` has empty params anyway (final-snapshot
-    // capture from via_coord is pending).
+    // Final evaluation.
+    //
+    // Cluster mode: the SINGLE canonical eval already ran on the chosen rank
+    // (Fastest) via the framework's `eval_fn` + the controller's post-
+    // consensus-reduce dispatch; the metric came back to `eval_result_fn`
+    // and lives in `final_eval_cell` on the launcher. Print it there. Rank
+    // children do NOT eval their own copy (that produced the redundant
+    // per-rank numbers). Single-host (threaded / single-GPU) keeps the
+    // in-process eval below — one process, one eval.
     if is_cluster_launcher() {
-        // Fall through to the rest of the function (cleanup, return).
+        if let Some(metric) = *final_eval_cell.lock().unwrap() {
+            let line = format!("final eval={metric:.4}");
+            eprintln!("    {line}");
+            log_lines.push(line);
+        }
+    } else if is_cluster_rank() {
+        // No-op: the launcher owns the single canonical eval.
     } else if let Some(eval_fn) = model_def.eval_fn {
         let device = Device::CUDA(0);
         let model = (model_def.build)(device)?;

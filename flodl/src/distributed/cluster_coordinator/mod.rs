@@ -694,6 +694,10 @@ pub struct ClusterCoordinator {
     /// post-aggregate hook so the broadcast does not fire on every
     /// subsequent tick before the readers observe stream close.
     shutdown_initiated: bool,
+    /// Set once the end-of-training single canonical eval has been
+    /// dispatched to the chosen rank, so the post-consensus-reduce shutdown
+    /// path fires the eval exactly once (not on every subsequent tick).
+    final_eval_dispatched: bool,
     /// Cached epoch plans: computed once per epoch, consistent across
     /// ranks regardless of when the StartEpoch frame goes out.
     epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,

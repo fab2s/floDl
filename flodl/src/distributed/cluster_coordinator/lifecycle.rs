@@ -303,6 +303,7 @@ impl ClusterCoordinator {
             last_aggregated_epoch: None,
             last_dispatched_epoch: None,
             shutdown_initiated: false,
+            final_eval_dispatched: false,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
             batch_size: config.batch_size.max(1),

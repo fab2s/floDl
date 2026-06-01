@@ -866,6 +866,34 @@ impl ClusterCoordinator {
                     }
                 }
             }
+            // SINGLE CANONICAL EVAL. Every rank now holds the coherent
+            // consensus (the final reduce just landed, or there were no
+            // trailing steps), so dispatch ONE eval to the controller-chosen
+            // rank (`EpochCallbackPolicy::Fastest` by default) — the final
+            // metric is measured once on the canonical model, not redundantly
+            // on every rank. The scalar flows back via
+            // `TimingMsg::EvalResult` → `eval_result_fn`; mpsc is FIFO so the
+            // rank evals before it processes the `Shutdown` sent next tick,
+            // and the coordinator's teardown ticks drain the result. Only
+            // when an `eval_result_fn` is wired and the chosen rank is alive.
+            if self.eval_result_fn.is_some()
+                && !self.final_eval_dispatched
+                && self.eval_role < self.world_size
+                && !self.is_dead(self.eval_role)
+            {
+                self.final_eval_dispatched = true;
+                let msg = ControlMsgWire::ExecuteEvalCallback {
+                    schedule_id: u64::MAX, // sentinel: the final canonical eval
+                    epoch: self.num_epochs as u64,
+                    target_rank: self.eval_role as u64,
+                };
+                if let Err(e) = self.send_control(self.eval_role, &msg) {
+                    crate::verbose!("  ddp: final eval dispatch failed: {e}");
+                }
+                // Give the chosen rank a tick to eval + ship EvalResult
+                // before Shutdown goes out (next tick, flag set → shutdown).
+                return;
+            }
             self.shutdown_initiated = true;
             if let Err(e) = self.shutdown_workers() {
                 crate::verbose!(
