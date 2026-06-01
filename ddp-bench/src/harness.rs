@@ -766,14 +766,31 @@ fn run_unified(
     // eval to the chosen rank (Fastest by default) on the coherent consensus
     // model after the final reduce, and the scalar flows back to
     // `eval_result_fn` here on the launcher. This replaces the redundant
-    // per-rank final eval below for cluster runs. The eval closure bridges
-    // the model_def's per-batch `eval_fn` to the framework's dataset-based
-    // `EvalFn`, running on the worker's own device.
+    // per-rank final eval below for cluster runs.
+    //
+    // ROLE-SPLIT wiring: `eval_result_fn` runs on the LAUNCHER's coordinator
+    // (it only RECEIVES the scalar), so it is gated on `eval_fn` alone — the
+    // launcher's `test_dataset` is None (StubDataset), so gating it on
+    // test-data would (wrongly) leave the coord without a result sink and it
+    // would never dispatch. `eval_fn` + `eval_dataset` run on the WORKERS
+    // (rank children + single-host have the real data), so they are gated on
+    // NOT being the launcher, with a training-data fallback when the model
+    // ships no held-out split (matching the old per-rank eval).
     let final_eval_cell: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
-    if let (Some(eval_fn), Some(test_ds)) = (model_def.eval_fn, test_dataset.clone()) {
+    if model_def.eval_fn.is_some() {
+        let cell = Arc::clone(&final_eval_cell);
+        builder = builder.eval_result_fn(move |_rank: usize, metric: f64| -> Result<()> {
+            *cell.lock().unwrap() = Some(metric);
+            Ok(())
+        });
+    }
+    if let Some(eval_fn) = model_def.eval_fn
+        && !is_cluster_launcher()
+    {
+        let eval_ds = test_dataset.clone().unwrap_or_else(|| dataset.clone());
         let bs = config.batch_size;
         builder = builder
-            .eval_dataset(test_ds)
+            .eval_dataset(eval_ds)
             .eval_fn(move |model: &Box<dyn Module>,
                            ds: &dyn flodl::data::BatchDataSet|
                   -> Result<f64> {
@@ -802,11 +819,6 @@ fn run_unified(
                     Ok(if samples > 0 { total / samples as f64 } else { 0.0 })
                 })
             });
-        let cell = Arc::clone(&final_eval_cell);
-        builder = builder.eval_result_fn(move |_rank: usize, metric: f64| -> Result<()> {
-            *cell.lock().unwrap() = Some(metric);
-            Ok(())
-        });
     }
 
     let handle = builder.run()?;

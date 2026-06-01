@@ -69,7 +69,14 @@ fn weighted_allreduce_nccl(
         // Whole cohort idle since the last sync: consensus already holds.
         return Ok(());
     }
-    // Scale by raw nᵢ → Sum-reduce → divide once by Σn.
+    // Scale by raw nᵢ → Sum-reduce → divide once by Σn. The two scalings
+    // are torch ops mutating the requires_grad leaf params in place, so they
+    // MUST run under no_grad — otherwise libtorch raises "a leaf Variable
+    // that requires grad is being used in an in-place operation" (a
+    // c10::Error that crosses the FFI boundary as a hard crash). The raw
+    // NCCL all_reduce between them is untracked by autograd, so the guard
+    // around it is harmless. Mirrors `load_averaged`'s no_grad block.
+    let _no_grad = NoGradGuard::new();
     Tensor::foreach_mul_scalar_(param_tensors, n_i)?;
     match stream {
         Some(s) => {
