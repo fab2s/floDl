@@ -459,6 +459,12 @@ pub struct ClusterCoordinator {
     nccl_sync_post_norm: Option<f64>,
     /// Per-rank: True if a Throttle has been sent and not yet cleared.
     throttled: Vec<bool>,
+    /// Per-rank dedupe for the `-vvv` "reduce barrier HOLD" log. The barrier
+    /// re-checks every `dispatch_next_chunk` call (many per tick), so logging
+    /// each hit floods the log (~150k lines/s) and steals tick CPU. Log once
+    /// per HOLD episode: set when logged, cleared at the reduce reset
+    /// (`finish_averaging_*`) so the next window's first HOLD logs again.
+    reduce_hold_logged: Vec<bool>,
     /// Wall-time (ms) of the last completed NCCL sync; fed to ElChe as
     /// `sync_ms` on the next `report_timing` call.
     last_nccl_sync_ms: f64,

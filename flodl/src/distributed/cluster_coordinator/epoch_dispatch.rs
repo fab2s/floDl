@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
@@ -241,11 +241,11 @@ impl ClusterCoordinator {
     pub(super) fn dispatch_next_chunk(&mut self, rank: usize) {
         let epoch = self.rank_epoch[rank];
 
-        // ONE-CHUNK-IN-FLIGHT INVARIANT (CPU Sync/Cadence). The worker's
-        // `pending_plan` is a single slot (a second `StartEpoch` silently
-        // overwrites the first), so a rank must never have two chunks
-        // outstanding at once. Without this guard, atomic-dispatch races
-        // the completion path: `finish_averaging_cpu` folds the next
+        // ONE-CHUNK-IN-FLIGHT INVARIANT (barrier-paced: Sync/Cadence). The
+        // worker's `pending_plan` is a single slot (a second `StartEpoch`
+        // silently overwrites the first), so a rank must never have two
+        // chunks outstanding at once. Without this guard, atomic-dispatch
+        // races the completion path: `finish_averaging_cpu` folds the next
         // chunk (in_flight > 0) AND resets `steps_since_avg` to 0, then
         // the just-finished pre-reduce chunk's `MetricsMsg` arrives and
         // `dispatch_next_chunk` sees `steps == 0 < budget` (reduce barrier
@@ -253,11 +253,11 @@ impl ClusterCoordinator {
         // one, its samples stay `dispatched`-but-never-`completed`, so
         // `in_flight` sticks, `is_epoch_done` never fires, and the epoch
         // wedges. Mirrors the in-flight guard `wake_idle_ranks_in_progressive`
-        // already applies. cpu-async is exempt: it intentionally overruns
-        // via `max_overshoot` (bounded lookahead), and NCCL's collective
-        // is its own barrier.
-        if matches!(self.backend, AverageBackend::Cpu)
-            && !matches!(self.policy, ApplyPolicy::Async)
+        // already applies. Keyed on the PACING policy, NOT the backend: the
+        // single-slot `pending_plan` is the same for NCCL and CPU workers, so
+        // the invariant holds for NCCL `Cadence` too. cpu-async is exempt: it
+        // intentionally overruns via `max_overshoot` (bounded lookahead).
+        if self.policy.is_barrier_paced()
             && self.chunk_pools.values().any(|p| p.in_flight(rank) > 0)
         {
             crate::debug!(
@@ -282,10 +282,16 @@ impl ClusterCoordinator {
         // barrier is applied and its streaming behavior is unchanged.
         let reduce_budget = self.reduce_step_budget(rank);
         if reduce_budget > 0 && self.steps_since_avg[rank] >= reduce_budget {
-            crate::debug!(
-                "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
-                self.steps_since_avg[rank], reduce_budget,
-            );
+            // Log once per HOLD episode (deduped via `reduce_hold_logged`,
+            // cleared at the reduce reset) — this branch re-fires every
+            // dispatch attempt, so an unguarded log floods at ~150k lines/s.
+            if !self.reduce_hold_logged[rank] {
+                self.reduce_hold_logged[rank] = true;
+                crate::debug!(
+                    "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
+                    self.steps_since_avg[rank], reduce_budget,
+                );
+            }
             return;
         }
 
@@ -312,9 +318,9 @@ impl ClusterCoordinator {
             return;
         }
 
-        // EPOCH BARRIER (CPU backend). `epoch >= first_live` means this
-        // rank sits at the active epoch's edge and the next chunk would
-        // cross into a not-yet-aggregated epoch. Sync/Cadence forbid the
+        // EPOCH BARRIER (barrier-paced: Sync/Cadence). `epoch >= first_live`
+        // means this rank sits at the active epoch's edge and the next chunk
+        // would cross into a not-yet-aggregated epoch. Sync/Cadence forbid the
         // crossing outright — the next epoch is dispatched by
         // `try_advance_or_shutdown_after_aggregate` once the current
         // epoch's reduces complete. cpu-async is allowed to cross,
@@ -322,11 +328,12 @@ impl ClusterCoordinator {
         // the reduce-barrier check above (so reaching here means async is
         // within budget). A rank merely catching up to the active epoch
         // (`epoch < first_live`) is not crossing a barrier and proceeds.
-        // NCCL streams freely (collective is its barrier) — unchanged.
-        if matches!(self.backend, AverageBackend::Cpu)
-            && epoch >= first_live
-            && !matches!(self.policy, ApplyPolicy::Async)
-        {
+        // Keyed on the PACING policy, NOT the backend: in cadence every rank
+        // is EXACTLY one epoch (the reduce IS the epoch-coherence mechanism),
+        // so NCCL `Cadence` must hold this barrier too — the reduce is
+        // coordinator-triggered, so the collective does not pace the fast
+        // rank, and exempting NCCL let it stream across every epoch and wedge.
+        if self.policy.is_barrier_paced() && epoch >= first_live {
             crate::debug!(
                 "  ddp: epoch barrier HOLD rank {rank} | epoch={epoch} first_live={first_live}"
             );
@@ -485,20 +492,20 @@ impl ClusterCoordinator {
             return self.cap_to_reduce_budget(rank, share.min(remaining_batches));
         }
 
-        // SCHEDULE-EXACT dispatch (CPU Sync/Cadence): one chunk == one
-        // reduce window == the rank's scheduled `counts[rank]` (capped to
+        // SCHEDULE-EXACT dispatch (barrier-paced: Sync/Cadence): one chunk ==
+        // one reduce window == the rank's scheduled `counts[rank]` (capped to
         // the pool residual). This is what holds the single step clock:
         // the pool drains at exactly the reduce rate, so coverage (epoch)
         // and synchronization (reduce) can never decouple into two racing
         // clocks. Pre-calibration `counts` is the equal-split anchor
         // (`ElChe::new` seeds `[anchor; world_size]`), so the warmup
-        // window is just an equal schedule — no probe special-case. NCCL
-        // (collective is its barrier) and cpu-async (bounded lookahead /
-        // streaming) fall through to the throughput-proportional sizing
-        // below.
-        if matches!(self.backend, AverageBackend::Cpu)
-            && !matches!(self.policy, ApplyPolicy::Async)
-        {
+        // window is just an equal schedule — no probe special-case. Keyed on
+        // the PACING policy, NOT the backend: NCCL `Cadence` needs the
+        // window-sized chunk too, else it gets a whole-epoch chunk and the
+        // reduce can only fire once per epoch (serializing the cohort).
+        // cpu-async (bounded lookahead / streaming) falls through to the
+        // throughput-proportional sizing below.
+        if self.policy.is_barrier_paced() {
             let window = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
             if window > 0 {
                 return window.min(remaining_batches);
@@ -556,18 +563,21 @@ impl ClusterCoordinator {
     /// `counts[rank]` for Sync/Cadence (hard); `+ max_overshoot` for
     /// cpu-async (the one mode allowed to overrun, bounded for now by the
     /// single `max_overshoot` knob). Returns 0 — meaning "no software
-    /// barrier, size/dispatch normally" — for the NCCL backend (its
-    /// collective blocks ranks intrinsically) and during the
-    /// pre-calibration probe phase (where `batch_counts` isn't yet a
-    /// meaningful cadence and probe chunks must flow to calibrate fast).
+    /// barrier, size/dispatch normally" — only when `batch_counts[rank]` is 0
+    /// (a 0-share edge rank).
+    ///
+    /// Keyed on the PACING policy, NOT the backend. The reduce in cadence is
+    /// coordinator-triggered (the worker syncs on `SyncNow`, not autonomously
+    /// at its window edge), so the NCCL collective does NOT pace the fast
+    /// rank — it needs the same software barrier as CPU. Returning 0 for NCCL
+    /// (the old "its collective blocks ranks intrinsically" assumption) let
+    /// the fast rank stream past its window across every epoch and wedge the
+    /// cohort. There is no `is_calibrated` guard: pre-calibration
+    /// `batch_counts` is the equal-split anchor schedule (`[anchor;
+    /// world_size]`), a valid window, so the reduce barrier holds from the
+    /// very first window ("the probe is no different from the rest of
+    /// training").
     fn reduce_step_budget(&self, rank: usize) -> usize {
-        if !matches!(self.backend, AverageBackend::Cpu) {
-            return 0;
-        }
-        // No `is_calibrated` guard: pre-calibration `batch_counts` is the
-        // equal-split anchor schedule (`[anchor; world_size]`), a valid
-        // window, so the reduce barrier holds from the very first window
-        // ("the probe is no different from the rest of training").
         let base = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
         if base == 0 {
             return 0;

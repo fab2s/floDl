@@ -247,6 +247,7 @@ impl ClusterCoordinator {
             nccl_sync_pre_norm: vec![None; world_size],
             nccl_sync_post_norm: None,
             throttled: vec![false; world_size],
+            reduce_hold_logged: vec![false; world_size],
             last_nccl_sync_ms: 0.0,
             nccl_sync_start: None,
             // Per-epoch d-aggregator identity values; see field docs on

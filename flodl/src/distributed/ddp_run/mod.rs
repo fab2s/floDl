@@ -430,6 +430,28 @@ pub enum ApplyPolicy {
     Async,
 }
 
+impl ApplyPolicy {
+    /// Whether this policy runs on a single step-clock with a HARD reduce /
+    /// epoch barrier: the coordinator never hands a rank a step that crosses
+    /// a barrier, so the fast rank is HELD at its window until the reduce
+    /// resets `steps_since_avg`, and no rank crosses an epoch boundary ahead
+    /// of the cohort. True for `Sync` and `Cadence`.
+    ///
+    /// `Async` is the one regime allowed bounded lookahead (overrunning its
+    /// window by `max_overshoot`), so it opts out.
+    ///
+    /// This is a property of the PACING policy alone — it is independent of
+    /// [`AverageBackend`] (whether the reduce moves over NCCL or CPU sockets
+    /// is transport, orthogonal to pacing). Gating these barriers on the
+    /// backend instead conflates the two axes: it silently means "NCCL => no
+    /// pacing", which is correct only because `Async` happens to be CPU-only
+    /// and is flatly wrong for NCCL `Cadence` (the fast rank then streams
+    /// across every epoch and the cohort wedges).
+    pub fn is_barrier_paced(&self) -> bool {
+        matches!(self, ApplyPolicy::Sync | ApplyPolicy::Cadence)
+    }
+}
+
 /// Controls HOW parameter averaging is performed.
 ///
 /// Orthogonal to [`ApplyPolicy`]. All combinations are valid, enabling A/B testing:

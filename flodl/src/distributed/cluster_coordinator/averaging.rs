@@ -101,7 +101,26 @@ impl ClusterCoordinator {
     /// **Sync** (non-progressive, no `take_next_chunk_plan`, no spans) keeps
     /// the compute-only `(wall_ms_accum, steps_since_avg)` feed unchanged.
     fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
-        if !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async) {
+        // Delivered-cost feed is CPU-backend + progressive ONLY. NCCL's
+        // `finish_averaging_nccl` is INLINE in `trigger_averaging` (it runs
+        // before this tick's metrics drain), so the busy-span /
+        // `delivered_batches_accum` are stale/partial at feed time: some ranks
+        // have a closed span this window and some don't, and the per-rank
+        // fallback below then MIXES delivered-ms (compute+data+transport) for
+        // the former with compute-only wall-ms for the latter. Those scales
+        // are not comparable, so ElChe's relative-throughput allocation
+        // inverts — a slow rank that fell back to its lower compute-ms looks
+        // faster than a fast rank reporting full delivered cost, and gets
+        // over-allocated (rig: the x1-link Pascal drew ~73% of all steps,
+        // diverging to NaN once the single-clock barrier made `batch_counts`
+        // binding). NCCL (and Sync) use the compute-only
+        // `(wall_ms_accum, steps_since_avg)` feed — stable and consistent
+        // across ranks. (Transport-aware NCCL is a follow-up: it needs the
+        // metrics drained BEFORE the inline finish so every rank has a closed
+        // span this window.)
+        if !(matches!(self.backend, AverageBackend::Cpu)
+            && matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async))
+        {
             return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
         }
         let mut ms = Vec::with_capacity(self.world_size);
@@ -691,6 +710,9 @@ impl ClusterCoordinator {
         for t in &mut self.throttled {
             *t = false;
         }
+        for h in &mut self.reduce_hold_logged {
+            *h = false;
+        }
         for d in &mut self.nccl_sync_divergence {
             *d = None;
         }
@@ -922,6 +944,9 @@ impl ClusterCoordinator {
         }
         for t in &mut self.throttled {
             *t = false;
+        }
+        for h in &mut self.reduce_hold_logged {
+            *h = false;
         }
         for d in &mut self.nccl_sync_divergence {
             *d = None;
