@@ -626,8 +626,17 @@ impl ClusterCoordinator {
                     pool.mark_completed(rank, msg.samples_processed);
                 }
                 // Count the completed batches now (they are delivered
-                // regardless of whether other chunks are still in flight).
-                self.delivered_batches_accum[rank] += msg.batches_processed;
+                // regardless of whether other chunks are still in flight) —
+                // UNLESS the rank's span crossed a reduce (tainted): the
+                // chunk's batches were partly computed BEFORE the boundary
+                // while the re-anchored span only holds the post-boundary
+                // slice, so crediting them would under-price the rank and
+                // spiral the allocation. A tainted window contributes no
+                // delivered sample; `timing_feed` falls back to the compute
+                // feed for the rank. See `delivered_span_crossed`.
+                if !self.delivered_span_crossed[rank] {
+                    self.delivered_batches_accum[rank] += msg.batches_processed;
+                }
                 // Close the rank's BUSY SPAN only when its total in-flight
                 // (summed across all live chunk pools) returns to 0: the
                 // span's wall (now − span_start) is the UNION of the
@@ -648,8 +657,16 @@ impl ClusterCoordinator {
                 if still_in_flight == 0
                     && let Some(start) = self.delivered_span_start[rank].take()
                 {
-                    self.delivered_ms_accum[rank] +=
-                        start.elapsed().as_secs_f64() * 1000.0;
+                    if self.delivered_span_crossed[rank] {
+                        // Tainted span (crossed a reduce): discard its ms to
+                        // match the skipped batch credits, and clear the
+                        // taint — the rank's next chunk opens a fresh, clean
+                        // span with matched accounting.
+                        self.delivered_span_crossed[rank] = false;
+                    } else {
+                        self.delivered_ms_accum[rank] +=
+                            start.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
                 progressive_completions.push((rank, msg.epoch));
             }

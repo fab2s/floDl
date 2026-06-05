@@ -260,9 +260,12 @@ impl ClusterCoordinator {
         if self.policy.is_barrier_paced()
             && self.chunk_pools.values().any(|p| p.in_flight(rank) > 0)
         {
-            crate::debug!(
-                "  ddp: in-flight HOLD rank {rank} | already has an outstanding chunk"
-            );
+            if !self.dispatch_hold_logged[rank] {
+                self.dispatch_hold_logged[rank] = true;
+                crate::debug!(
+                    "  ddp: in-flight HOLD rank {rank} | already has an outstanding chunk"
+                );
+            }
             return;
         }
 
@@ -277,16 +280,16 @@ impl ClusterCoordinator {
         // (hard); `counts[rank] + max_overshoot` for cpu-async — the one
         // mode allowed to overrun, bounded for now by the single
         // `max_overshoot` knob (a future `max_overshoot_epoch` may split
-        // the reduce and epoch allowances). NCCL gets 0 here: its
-        // collective blocks the rank intrinsically, so no software
-        // barrier is applied and its streaming behavior is unchanged.
+        // the reduce and epoch allowances). Applies to BOTH backends:
+        // the reduce is coordinator-triggered, so NCCL needs this
+        // software barrier exactly like CPU (see `reduce_step_budget`).
         let reduce_budget = self.reduce_step_budget(rank);
         if reduce_budget > 0 && self.steps_since_avg[rank] >= reduce_budget {
-            // Log once per HOLD episode (deduped via `reduce_hold_logged`,
+            // Log once per HOLD episode (deduped via `dispatch_hold_logged`,
             // cleared at the reduce reset) — this branch re-fires every
             // dispatch attempt, so an unguarded log floods at ~150k lines/s.
-            if !self.reduce_hold_logged[rank] {
-                self.reduce_hold_logged[rank] = true;
+            if !self.dispatch_hold_logged[rank] {
+                self.dispatch_hold_logged[rank] = true;
                 crate::debug!(
                     "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
                     self.steps_since_avg[rank], reduce_budget,
@@ -334,9 +337,16 @@ impl ClusterCoordinator {
         // coordinator-triggered, so the collective does not pace the fast
         // rank, and exempting NCCL let it stream across every epoch and wedge.
         if self.policy.is_barrier_paced() && epoch >= first_live {
-            crate::debug!(
-                "  ddp: epoch barrier HOLD rank {rank} | epoch={epoch} first_live={first_live}"
-            );
+            // Deduped like the reduce-barrier HOLD above: at every epoch
+            // tail this branch re-fires per dispatch attempt for each held
+            // rank — unguarded it flooded a 200ep -vvv run with 43M lines
+            // (99.99% of the log) and stole coordinator tick CPU.
+            if !self.dispatch_hold_logged[rank] {
+                self.dispatch_hold_logged[rank] = true;
+                crate::debug!(
+                    "  ddp: epoch barrier HOLD rank {rank} | epoch={epoch} first_live={first_live}"
+                );
+            }
             return;
         }
 

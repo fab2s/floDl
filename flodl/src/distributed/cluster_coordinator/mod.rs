@@ -422,6 +422,23 @@ pub struct ClusterCoordinator {
     /// measurement. Progressive modes only (non-progressive Sync never
     /// calls `take_next_chunk_plan`).
     delivered_span_start: Vec<Option<Instant>>,
+    /// Per-rank: the rank's open busy-span was re-anchored by a reduce (it
+    /// streamed a chunk ACROSS the reduce boundary — async overshoot). The
+    /// delivered ms↔batches matching is broken for that span: the chunk's
+    /// FULL batch count would land in the post-reduce window (completions
+    /// credit batches unconditionally) while the re-anchored span contributes
+    /// only the post-reduce SLICE of its true duration. Full batches over
+    /// sliced ms reads as artificially fast → ElChe over-allocates the rank →
+    /// it streams across even more reduces → a positive-feedback allocation
+    /// spiral (rig, cpu-async 200ep: one Pascal's share climbed 0.29→0.33
+    /// while its equal-speed sibling starved to 0.13, epoch time degrading
+    /// 5.6s→8.2s). While set, the drain SKIPS both the batch credit and, at
+    /// span close, the ms credit — the rank simply has no delivered sample
+    /// that window and `timing_feed`'s per-rank fallback (compute feed)
+    /// covers it. Cleared when the tainted span closes; the next chunk opens
+    /// a fresh, clean span. Cadence never sets it (its in-flight is 0 at the
+    /// reduce, so there is no open span to re-anchor).
+    delivered_span_crossed: Vec<bool>,
     /// Per-rank delivered ms accumulated since the last reduce: the sum
     /// of (completion − dispatch) over the window's chunks. Fed to
     /// `ElChe::report_timing` in place of `wall_ms_accum` for the Cadence
@@ -464,7 +481,7 @@ pub struct ClusterCoordinator {
     /// each hit floods the log (~150k lines/s) and steals tick CPU. Log once
     /// per HOLD episode: set when logged, cleared at the reduce reset
     /// (`finish_averaging_*`) so the next window's first HOLD logs again.
-    reduce_hold_logged: Vec<bool>,
+    dispatch_hold_logged: Vec<bool>,
     /// Wall-time (ms) of the last completed NCCL sync; fed to ElChe as
     /// `sync_ms` on the next `report_timing` call.
     last_nccl_sync_ms: f64,

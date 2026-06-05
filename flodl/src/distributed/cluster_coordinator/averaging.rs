@@ -702,15 +702,22 @@ impl ClusterCoordinator {
         // that window. Cadence never has an open span here (in-flight is 0
         // at the reduce), so this is a no-op there.
         let now = Instant::now();
-        for s in &mut self.delivered_span_start {
+        for (r, s) in self.delivered_span_start.iter_mut().enumerate() {
             if s.is_some() {
                 *s = Some(now);
+                // The span crossed this reduce: its ms↔batches matching is
+                // broken (the chunk's FULL batch count lands post-reduce
+                // against only the post-re-anchor time slice — reads as
+                // artificially fast and spirals the allocation). Taint it so
+                // the drain skips both credits and the rank falls back to
+                // the compute feed this window. See `delivered_span_crossed`.
+                self.delivered_span_crossed[r] = true;
             }
         }
         for t in &mut self.throttled {
             *t = false;
         }
-        for h in &mut self.reduce_hold_logged {
+        for h in &mut self.dispatch_hold_logged {
             *h = false;
         }
         for d in &mut self.nccl_sync_divergence {
@@ -937,15 +944,22 @@ impl ClusterCoordinator {
         // that window. Cadence never has an open span here (in-flight is 0
         // at the reduce), so this is a no-op there.
         let now = Instant::now();
-        for s in &mut self.delivered_span_start {
+        for (r, s) in self.delivered_span_start.iter_mut().enumerate() {
             if s.is_some() {
                 *s = Some(now);
+                // The span crossed this reduce: its ms↔batches matching is
+                // broken (the chunk's FULL batch count lands post-reduce
+                // against only the post-re-anchor time slice — reads as
+                // artificially fast and spirals the allocation). Taint it so
+                // the drain skips both credits and the rank falls back to
+                // the compute feed this window. See `delivered_span_crossed`.
+                self.delivered_span_crossed[r] = true;
             }
         }
         for t in &mut self.throttled {
             *t = false;
         }
-        for h in &mut self.reduce_hold_logged {
+        for h in &mut self.dispatch_hold_logged {
             *h = false;
         }
         for d in &mut self.nccl_sync_divergence {

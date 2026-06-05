@@ -237,6 +237,7 @@ impl ClusterCoordinator {
             steps_since_avg: vec![0; world_size],
             wall_ms_accum: vec![0.0; world_size],
             delivered_span_start: vec![None; world_size],
+            delivered_span_crossed: vec![false; world_size],
             delivered_ms_accum: vec![0.0; world_size],
             delivered_batches_accum: vec![0; world_size],
             last_batch_ms: vec![0.0; world_size],
@@ -247,7 +248,7 @@ impl ClusterCoordinator {
             nccl_sync_pre_norm: vec![None; world_size],
             nccl_sync_post_norm: None,
             throttled: vec![false; world_size],
-            reduce_hold_logged: vec![false; world_size],
+            dispatch_hold_logged: vec![false; world_size],
             last_nccl_sync_ms: 0.0,
             nccl_sync_start: None,
             // Per-epoch d-aggregator identity values; see field docs on
