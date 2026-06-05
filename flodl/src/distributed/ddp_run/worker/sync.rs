@@ -361,6 +361,22 @@ impl<M: Module> GpuWorker<M> {
             return Ok((None, None, None));
         }
 
+        // SYNC-ENTRY FENCE: order the comm-stream sync work after ALL pending
+        // compute-stream work. At a mid-chunk sync the previous batch's
+        // optimizer step can still be in flight on compute_stream (the
+        // per-batch loss readout does not guarantee the step kernels have
+        // retired); the scratch copy and the n_i scaling below read + mutate
+        // params on the COMM stream, and without this fence they race the
+        // in-flight update. The corruption is per-sync-rare — invisible at
+        // smoke scale, near-certain across the thousands of syncs of a long
+        // run (rig, 200ep: discrete loss perturbation at epoch 120, NaN at
+        // epoch 124). The exit side needs no fence: the weighted reduce ends
+        // with a comm-stream synchronize, so training resumes only after the
+        // consensus has fully landed.
+        if let Some(ref cs) = self.compute_stream {
+            cs.synchronize()?;
+        }
+
         let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
         let mut nccl_ms_total = 0.0_f64;
 
