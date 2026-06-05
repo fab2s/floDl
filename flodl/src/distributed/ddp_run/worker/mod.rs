@@ -159,6 +159,12 @@ pub struct GpuWorker<M: Module> {
 
     // -- Training state --
     local_step: usize,
+    /// Count of NCCL sync cycles this rank has processed. Diagnostic-only
+    /// (`-vvv` collective-step logging in `weighted_allreduce_nccl`): every
+    /// rank receives the coordinator's `SyncNow` broadcasts in order, so this
+    /// counter is the SAME across ranks for the same reduce — a lagging value
+    /// on one rank pins a cohort desync.
+    nccl_sync_seq: usize,
     /// Batches since last averaging (for snapshot weighting).
     steps_since_avg: usize,
     current_version: u64,

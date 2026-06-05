@@ -262,6 +262,7 @@ impl<M: Module> GpuWorker<M> {
             batch_size: config.batch_size,
             base_seed: config.seed,
             local_step: 0,
+            nccl_sync_seq: 0,
             steps_since_avg: 0,
             current_version: 0,
             current_epoch: 0,

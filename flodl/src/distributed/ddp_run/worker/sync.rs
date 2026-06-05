@@ -44,6 +44,10 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
 /// abort-driven rebuild (it reflects the survivors). Mutates
 /// `param_tensors` in place; on an abort the caller restores them from the
 /// pre-sync scratch before retrying, so the scaling is recoverable.
+// 8 args: the `rank`/`seq` pair is collective-step diagnostic context
+// (-vvv ENTER/EXIT logging); a struct wrapper would obscure the hot path for
+// a private single-caller helper.
+#[allow(clippy::too_many_arguments)]
 fn weighted_allreduce_nccl(
     comm: &crate::distributed::nccl::NcclRankComm,
     stream: Option<&crate::distributed::cuda_stream::CudaStream>,
@@ -51,7 +55,39 @@ fn weighted_allreduce_nccl(
     param_tensors: &[Tensor],
     n_i: f64,
     device: Device,
+    rank: usize,
+    seq: usize,
 ) -> Result<()> {
+    // Collective-step instrumentation (-vvv): this fn issues TWO collectives
+    // per sync (count-reduce, then a CONDITIONAL param-reduce). A cohort
+    // desync shows up as ranks issuing a DIFFERENT number of collectives for
+    // the same `seq` — e.g. one rank takes the `total_n <= 0` skip and does 1
+    // all_reduce while peers do 2, leaving them waiting on a phantom. Logging
+    // ENTER/EXIT of each collective per rank pins which one a stuck rank
+    // parks in (NCCL busy-waits at 100% CPU with no peers).
+    crate::debug!(
+        "  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i})"
+    );
+    // STREAM-ORDER EVERYTHING ON THE COMM STREAM. The two in-place scalings
+    // below bracket the param all_reduce, and the all_reduce is explicitly
+    // enqueued on `stream` (the comm stream) — but tensor ops enqueue on the
+    // thread's CURRENT stream. A rank that processes `SyncNow` BETWEEN chunks
+    // sits on the default stream (which implicitly synchronizes with every
+    // other stream → ordered → safe), but a rank that syncs MID-CHUNK is
+    // under `run_epoch_plan`'s compute-stream guard: its scalings enqueue on
+    // compute_stream while the all_reduce runs on the comm stream with NO
+    // ordering between them. The collective can then sum UNSCALED (or
+    // half-scaled) params — the consensus comes out ΣW/Σn instead of
+    // Σn·W/Σn — and every rank loads the corrupted average: intermittent
+    // (only when a sync lands mid-chunk) cohort-wide divergence → NaN.
+    // Cross-stream comm/compute interleaving around a live collective is
+    // also the documented deadlock class (see run_epoch_plan's stream
+    // notes). Pinning the WHOLE body (count tensor, both scalings, the
+    // collectives) to the comm stream makes the sequence totally ordered
+    // regardless of where the sync interrupts training. The pre-weighted
+    // `ReduceOp::Avg` was a single collective already on the comm stream,
+    // which is why this never bit before sum-and-count.
+    let _stream_guard = stream.map(StreamGuard::new);
     // Σn over the live cohort.
     let count = Tensor::full(&[1], n_i, TensorOptions { device, ..Default::default() })?;
     let total_n = match stream {
@@ -65,8 +101,15 @@ fn weighted_allreduce_nccl(
             count.item()?
         }
     };
+    crate::debug!(
+        "  ddp-areduce: rank {rank} seq={seq} COUNT exit (total_n={total_n})"
+    );
     if total_n <= 0.0 {
         // Whole cohort idle since the last sync: consensus already holds.
+        crate::debug!(
+            "  ddp-areduce: rank {rank} seq={seq} SKIP param-reduce (total_n={total_n}) \
+             -- 1 collective this seq (peers doing 2 would deadlock)"
+        );
         return Ok(());
     }
     // Scale by raw nᵢ → Sum-reduce → divide once by Σn. The two scalings
@@ -78,6 +121,10 @@ fn weighted_allreduce_nccl(
     // around it is harmless. Mirrors `load_averaged`'s no_grad block.
     let _no_grad = NoGradGuard::new();
     Tensor::foreach_mul_scalar_(param_tensors, n_i)?;
+    crate::debug!(
+        "  ddp-areduce: rank {rank} seq={seq} PARAM enter (nparams={})",
+        param_refs.len()
+    );
     match stream {
         Some(s) => {
             comm.all_reduce_on_stream(param_refs, ReduceOp::Sum, s)?;
@@ -85,6 +132,7 @@ fn weighted_allreduce_nccl(
         }
         None => comm.all_reduce(param_refs, ReduceOp::Sum)?,
     }
+    crate::debug!("  ddp-areduce: rank {rank} seq={seq} PARAM exit");
     Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
     Ok(())
 }
@@ -316,6 +364,13 @@ impl<M: Module> GpuWorker<M> {
         let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
         let mut nccl_ms_total = 0.0_f64;
 
+        // Monotonic per-rank sync sequence for the collective-step diagnostic.
+        // Bumped once per sync (NOT per retry attempt) so a `seq` value names
+        // the same logical reduce on every rank.
+        let seq = self.nccl_sync_seq;
+        self.nccl_sync_seq += 1;
+        let rank = self.rank;
+
         for attempt in 0..MAX_REBUILD_ATTEMPTS {
             // Snapshot or restore params <-> scratch.
             // First attempt: snapshot params -> scratch (pre-sync state).
@@ -360,6 +415,8 @@ impl<M: Module> GpuWorker<M> {
                 &param_tensors,
                 n_i,
                 device,
+                rank,
+                seq,
             );
             nccl_ms_total += nccl_start.elapsed().as_secs_f64() * 1000.0;
 
