@@ -439,6 +439,25 @@ pub struct ClusterCoordinator {
     /// a fresh, clean span. Cadence never sets it (its in-flight is 0 at the
     /// reduce, so there is no open span to re-anchor).
     delivered_span_crossed: Vec<bool>,
+    /// Per-rank: timestamp of the FIRST `Batch` report after the current
+    /// span opened — the start of the chunk's steady-state (marginal)
+    /// regime. The dispatch-anchored span prices the per-chunk FIXED cost
+    /// (control transit, plan pickup, prefetch spin-up, the first batch
+    /// crawling the link un-pipelined) into the per-batch rate:
+    /// `measured = true_marginal + F / chunk_batches`. F doesn't scale with
+    /// allocation, so the quoted price depends on the share itself — an
+    /// average-cost circularity that bites exactly the small-share ranks
+    /// (rig: Pascal shares slid 0.15→0.08 as F/18 inflated their cost
+    /// 30-60%). Cadence closes credit `(close − first_batch)/(batches − 1)`
+    /// instead — numerator and denominator both exclude batch 1, F never
+    /// enters the books, no estimator needed. 1-batch chunks (edge tails)
+    /// fall back to the dispatch anchor (the marginal window is empty).
+    /// Async keeps dispatch anchoring: its union-spans overlap each chunk's
+    /// fill with the previous chunk's compute, so fills are genuinely
+    /// hidden there. ElChe needs the MARGINAL rate for proportional
+    /// allocation; the fixed cost belongs to the window-policy ledger
+    /// (amortization pressure), not the per-batch price.
+    delivered_first_batch: Vec<Option<Instant>>,
     /// Per-rank delivered ms accumulated since the last reduce: the sum
     /// of (completion − dispatch) over the window's chunks. Fed to
     /// `ElChe::report_timing` in place of `wall_ms_accum` for the Cadence

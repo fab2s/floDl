@@ -100,27 +100,72 @@ impl ClusterCoordinator {
     ///
     /// **Sync** (non-progressive, no `take_next_chunk_plan`, no spans) keeps
     /// the compute-only `(wall_ms_accum, steps_since_avg)` feed unchanged.
+    /// Every alive mover (`steps_since_avg > 0`) has a delivered sample
+    /// this window (closed span: nonzero ms AND batches). This is both the
+    /// all-or-none coherence predicate for the delivered feed in
+    /// [`Self::timing_feed`] and the settle condition for
+    /// `trigger_averaging`'s pre-finish drain (the last-finishing rank's
+    /// completion frame trails its final Batch report by microseconds, so
+    /// one bounded re-drain usually completes the window).
+    fn movers_delivered_complete(&self) -> bool {
+        (0..self.world_size)
+            .filter(|&r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
+            .all(|r| {
+                self.delivered_batches_accum[r] > 0
+                    && self.delivered_ms_accum[r] > 0.0
+            })
+    }
+
     fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
-        // Delivered-cost feed is CPU-backend + progressive ONLY. NCCL's
-        // `finish_averaging_nccl` is INLINE in `trigger_averaging` (it runs
-        // before this tick's metrics drain), so the busy-span /
-        // `delivered_batches_accum` are stale/partial at feed time: some ranks
-        // have a closed span this window and some don't, and the per-rank
-        // fallback below then MIXES delivered-ms (compute+data+transport) for
-        // the former with compute-only wall-ms for the latter. Those scales
-        // are not comparable, so ElChe's relative-throughput allocation
-        // inverts — a slow rank that fell back to its lower compute-ms looks
-        // faster than a fast rank reporting full delivered cost, and gets
+        // Delivered-cost feed: CPU Cadence/Async + NCCL Cadence. The danger
+        // this gate guards against is a STALE/PARTIAL span set at feed time:
+        // some ranks with a closed span this window and some without, where
+        // the per-rank fallback below MIXES delivered-ms
+        // (compute+data+transport) for the former with compute-only wall-ms
+        // for the latter. Those scales are not comparable, so ElChe's
+        // relative-throughput allocation inverts — a slow rank that fell
+        // back to its lower compute-ms looks faster than a fast rank
+        // reporting full delivered cost, and gets
         // over-allocated (rig: the x1-link Pascal drew ~73% of all steps,
         // diverging to NaN once the single-clock barrier made `batch_counts`
-        // binding). NCCL (and Sync) use the compute-only
+        // binding). Sync uses the compute-only
         // `(wall_ms_accum, steps_since_avg)` feed — stable and consistent
-        // across ranks. (Transport-aware NCCL is a follow-up: it needs the
-        // metrics drained BEFORE the inline finish so every rank has a closed
-        // span this window.)
-        if !(matches!(self.backend, AverageBackend::Cpu)
-            && matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async))
-        {
+        // across ranks.
+        //
+        // NCCL Cadence is transport-aware: `trigger_averaging`'s NCCL arm
+        // calls `drain_metrics()` BEFORE the inline finish, so the window's
+        // completion frames (per-connection FIFO behind the final Batch
+        // report) have closed every rank's span by feed time — the staleness
+        // that originally forced NCCL onto the compute-only feed is gone.
+        // Without the delivered feed, NCCL allocation is blind to data +
+        // transport (x1-link rig: shares [0.53, 0.235, 0.235] vs the true
+        // ~4.9× delivered ratio → fast rank ~45% idle at every barrier).
+        // A hypothetical NCCL Async stays excluded: the busy-span ×
+        // inline-finish interaction under overshoot streaming is
+        // unvalidated there.
+        let delivered_capable = match self.backend {
+            AverageBackend::Cpu => {
+                matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
+            }
+            AverageBackend::Nccl => matches!(self.policy, ApplyPolicy::Cadence),
+        };
+        if !delivered_capable {
+            return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
+        }
+        // ALL-OR-NONE COHERENCE. ElChe's allocation is RELATIVE, so the
+        // per-rank scale must be uniform within a window. A single mover
+        // without a closed span this window (late completion frame, tainted
+        // span, cold start) must NOT be compared on compute-ms against
+        // peers reporting delivered-ms — the scales differ by exactly the
+        // data/transport share, so the relative allocation inverts (rig:
+        // equal-speed Pascals drifting to 0.33 vs 0.10 shares on cpu-async;
+        // the same inversion live on nccl the first window a frame lands
+        // late). When any alive mover lacks a delivered sample, feed the
+        // compute scale for EVERY rank — a uniformly compute-fed window is
+        // coherent, and the next window returns to delivered. Non-movers
+        // (quiesced tails, steps == 0) are exempt: they have no sample on
+        // either scale and contribute (0, 0) regardless.
+        if !self.movers_delivered_complete() {
             return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
         }
         let mut ms = Vec::with_capacity(self.world_size);
@@ -130,6 +175,8 @@ impl ClusterCoordinator {
                 ms.push(self.delivered_ms_accum[r]);
                 batches.push(self.delivered_batches_accum[r]);
             } else {
+                // Non-movers only (the all-movers check above guarantees
+                // every stepping rank has a delivered sample).
                 ms.push(self.wall_ms_accum[r]);
                 batches.push(self.steps_since_avg[r]);
             }
@@ -204,6 +251,83 @@ impl ClusterCoordinator {
         self.sync_start = Some(Instant::now());
         match self.backend {
             AverageBackend::Nccl => {
+                // TRANSPORT-AWARE FEED: pull the window's chunk-completion
+                // metrics into the delivered accounting BEFORE the inline
+                // `finish_averaging_nccl` consumes `timing_feed`. The gate
+                // fired because every rank hit its window — their completion
+                // frames are already queued (per-connection FIFO: the final
+                // Batch report and the MetricsMsg ride the same relay
+                // stream), just not drained this tick (`tick` drains metrics
+                // AFTER the trigger). Without this, the delivered spans are
+                // stale/partial at feed time and NCCL had to fall back to a
+                // compute-only feed — blind to data/transport cost, leaving
+                // the fast rank ~45% idle at the barrier on x1-link rigs.
+                // Aggregation is NOT run here (pool removal would break the
+                // quiesced-tail ordering); it stays in `tick`.
+                //
+                // DETERMINISTIC WINDOW-COMPLETION WAIT (progressive Cadence
+                // only — Sync feeds compute-wall and has no window chunks to
+                // wait for). At gate-fire every mover has COMPLETED its
+                // window chunk (the gate requires `steps >= count`, or
+                // quiesced with nothing in flight), so each mover's
+                // completion frame is ALREADY SENT — queued or on the wire,
+                // trailing the final Batch report that fired the gate by
+                // microseconds on the same relay stream. Wait for the frames
+                // instead of guessing a settle time, keeping the heartbeat /
+                // dead-rank detector live so a rank that dies mid-wait is
+                // declared dead, drops out of the movers set via `is_dead`,
+                // and the predicate completes (a frame cannot be silently
+                // lost while its rank stays alive: TCP lost frame == broken
+                // connection == heartbeats stop == dead-rank fires).
+                //
+                // TERMINATION: bounded by relay latency when healthy; by
+                // `heartbeat_timeout_secs` (+2s slack) under rank failure;
+                // and when NO failure detector exists (`dead_ranks` ledger
+                // unset — headless coordinators, non-elastic runs, unit
+                // tests that never send completion frames) a missing frame
+                // cannot be attributed to death, so the wait is capped SHORT
+                // and `timing_feed`'s all-or-none falls back to a coherent
+                // compute-scale window. The cohort is barrier-parked while
+                // we wait — the only thing delayed is the reduce itself.
+                if self.progressive && matches!(self.policy, ApplyPolicy::Cadence) {
+                    let ceiling = if self.dead_ranks.is_some() {
+                        Duration::from_secs(
+                            self.heartbeat_timeout_secs.saturating_add(2),
+                        )
+                    } else {
+                        Duration::from_millis(100)
+                    };
+                    let wait_start = Instant::now();
+                    let mut slow_wait_logged = false;
+                    loop {
+                        self.drain_metrics();
+                        if self.movers_delivered_complete() {
+                            break;
+                        }
+                        if wait_start.elapsed() >= ceiling {
+                            crate::verbose!(
+                                "  ddp: window-completion wait hit its \
+                                 ceiling ({:?}) — feeding compute-scale \
+                                 this window (all-or-none fallback)",
+                                ceiling,
+                            );
+                            break;
+                        }
+                        self.drain_timing();
+                        self.check_dead_ranks();
+                        if !slow_wait_logged
+                            && wait_start.elapsed().as_secs_f64() > 1.0
+                        {
+                            slow_wait_logged = true;
+                            crate::verbose!(
+                                "  ddp: window-completion wait >1s — a \
+                                 mover's completion frame is late \
+                                 (watching heartbeats)",
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 self.nccl_sync_start = Some(Instant::now());
                 self.broadcast_control(&ControlMsgWire::SyncNow)?;
                 for rank in 0..self.world_size {
@@ -712,6 +836,10 @@ impl ClusterCoordinator {
                 // the drain skips both credits and the rank falls back to
                 // the compute feed this window. See `delivered_span_crossed`.
                 self.delivered_span_crossed[r] = true;
+                // The pre-reduce first-batch anchor is stale for the
+                // re-anchored span; the taint discards the span's credits
+                // at close anyway, but keep the anchor state consistent.
+                self.delivered_first_batch[r] = None;
             }
         }
         for t in &mut self.throttled {
@@ -954,6 +1082,10 @@ impl ClusterCoordinator {
                 // the drain skips both credits and the rank falls back to
                 // the compute feed this window. See `delivered_span_crossed`.
                 self.delivered_span_crossed[r] = true;
+                // The pre-reduce first-batch anchor is stale for the
+                // re-anchored span; the taint discards the span's credits
+                // at close anyway, but keep the anchor state consistent.
+                self.delivered_first_batch[r] = None;
             }
         }
         for t in &mut self.throttled {

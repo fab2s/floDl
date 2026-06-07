@@ -657,11 +657,23 @@ impl Monitor {
 
         let _ = write!(line, "  [{}",format_eta(duration_secs));
 
-        // ETA
+        // ETA from the recent-epoch pace: mean of the last ≤5 epoch
+        // durations, NOT the global elapsed/epochs average. The global
+        // average is anchored at monitor start, so epoch 1 absorbs the
+        // whole startup (data load, NCCL init, ElChe calibration) and the
+        // ETA begins inflated, then melts for the rest of the run; it also
+        // lags real pace changes (ElChe's schedule converging speeds epochs
+        // up mid-run) by averaging them with ancient history. A short
+        // sliding window tracks the actual current pace. `self.epochs` was
+        // pushed above, so the window is never empty.
         if epoch_display < self.total_epochs {
-            let elapsed = self.start_time.elapsed().as_secs_f64();
-            let per_epoch = elapsed / epoch_display as f64;
-            let remaining = per_epoch * (self.total_epochs - epoch_display) as f64;
+            let k = self.epochs.len().min(5);
+            let recent: f64 = self.epochs[self.epochs.len() - k..]
+                .iter()
+                .map(|r| r.duration_secs)
+                .sum::<f64>()
+                / k as f64;
+            let remaining = recent * (self.total_epochs - epoch_display) as f64;
             let _ = write!(line, "  ETA {}", format_eta(remaining));
         }
         line.push(']');

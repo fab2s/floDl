@@ -122,11 +122,31 @@ impl Graph {
                 if dur > 0.0 {
                     let _ = write!(b, "  [{}",format_duration(dur));
                     if total_epochs > 0 && i + 1 < total_epochs {
-                        let elapsed = flush_times[i];
-                        let per_epoch = elapsed / (i + 1) as f64;
-                        let remaining = per_epoch * (total_epochs - i - 1) as f64;
-                        if remaining > 0.0 {
-                            let _ = write!(b, "  ETA {}", format_duration(remaining));
+                        // Recent-pace ETA (mean of the last ≤5 epoch
+                        // durations), matching the live monitor: the old
+                        // global `elapsed / (i+1)` average baked epoch 0's
+                        // startup (data load, init, calibration) into every
+                        // line, so the ETA started inflated and melted.
+                        let lo = i.saturating_sub(4);
+                        let mut acc = 0.0;
+                        let mut n = 0usize;
+                        for j in lo..=i {
+                            let d = if j == 0 {
+                                flush_times[0]
+                            } else {
+                                flush_times[j] - flush_times[j - 1]
+                            };
+                            if d > 0.0 {
+                                acc += d;
+                                n += 1;
+                            }
+                        }
+                        if n > 0 {
+                            let remaining =
+                                (acc / n as f64) * (total_epochs - i - 1) as f64;
+                            if remaining > 0.0 {
+                                let _ = write!(b, "  ETA {}", format_duration(remaining));
+                            }
                         }
                     }
                     b.push(']');

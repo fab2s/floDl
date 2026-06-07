@@ -426,6 +426,10 @@ impl ClusterCoordinator {
         // `drain_metrics_and_aggregate`. See `delivered_span_start`.
         if self.delivered_span_start[rank].is_none() {
             self.delivered_span_start[rank] = Some(Instant::now());
+            // Fresh span: re-arm the marginal-regime anchor (set by the
+            // first `Batch` report of this chunk; see
+            // `delivered_first_batch`).
+            self.delivered_first_batch[rank] = None;
         }
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,

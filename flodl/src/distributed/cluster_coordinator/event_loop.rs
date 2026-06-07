@@ -60,6 +60,17 @@ impl ClusterCoordinator {
                 self.steps_since_avg[rank] =
                     self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
+                // First Batch report since the rank's busy-span opened:
+                // anchor the chunk's steady-state (marginal) regime here.
+                // The Cadence span close measures from THIS point over
+                // `batches − 1`, excluding the per-chunk fixed fill cost
+                // from the quoted per-batch rate. See
+                // `delivered_first_batch` field docs.
+                if self.delivered_span_start[rank].is_some()
+                    && self.delivered_first_batch[rank].is_none()
+                {
+                    self.delivered_first_batch[rank] = Some(Instant::now());
+                }
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
@@ -590,6 +601,26 @@ impl ClusterCoordinator {
     /// Per-epoch buffers are dropped on aggregation. Late frames from
     /// a dead rank are ignored.
     pub(super) fn drain_metrics_and_aggregate(&mut self) {
+        self.drain_metrics();
+        self.aggregate_ready_epochs();
+    }
+
+    /// Drain pending metrics frames WITHOUT aggregating epochs: per-message
+    /// bookkeeping only (pool `mark_completed`, delivered batch credit,
+    /// busy-span close, metrics buffering, progressive next-chunk dispatch).
+    ///
+    /// Split out so `trigger_averaging`'s NCCL arm can pull the CURRENT
+    /// window's completions into the delivered accounting BEFORE its inline
+    /// `finish_averaging_nccl` consumes `timing_feed` — the staleness that
+    /// previously forced NCCL onto the compute-only feed (allocation blind
+    /// to the x1-link data/transport cost → fast rank idle ~45% at the
+    /// barrier). Aggregation — and its pool removal — stays in
+    /// [`Self::aggregate_ready_epochs`], preserving the
+    /// `should_average`-sees-drained-pool ordering that
+    /// [`Self::is_rank_quiesced`] depends on. Safe to call repeatedly per
+    /// tick (`try_recv` drain); dispatch attempts for held ranks are no-ops
+    /// (the reduce / epoch barriers hold them).
+    pub(super) fn drain_metrics(&mut self) {
         // Track ranks that received a chunk-complete report so we can
         // dispatch the next chunk after the borrow on `chunk_pools` /
         // `metrics_buffer` is released.
@@ -625,47 +656,69 @@ impl ClusterCoordinator {
                 if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
                     pool.mark_completed(rank, msg.samples_processed);
                 }
-                // Count the completed batches now (they are delivered
-                // regardless of whether other chunks are still in flight) —
-                // UNLESS the rank's span crossed a reduce (tainted): the
-                // chunk's batches were partly computed BEFORE the boundary
-                // while the re-anchored span only holds the post-boundary
-                // slice, so crediting them would under-price the rank and
-                // spiral the allocation. A tainted window contributes no
-                // delivered sample; `timing_feed` falls back to the compute
-                // feed for the rank. See `delivered_span_crossed`.
-                if !self.delivered_span_crossed[rank] {
-                    self.delivered_batches_accum[rank] += msg.batches_processed;
-                }
-                // Close the rank's BUSY SPAN only when its total in-flight
-                // (summed across all live chunk pools) returns to 0: the
-                // span's wall (now − span_start) is the UNION of the
+                // BUSY-SPAN bookkeeping. The span closes only when the
+                // rank's total in-flight (summed across all live chunk
+                // pools) returns to 0: its wall is the UNION of the
                 // overlapping chunks' intervals = the rank's realized busy
                 // wall (compute + data + control/transport), with no
-                // double-counting under async overlap. While other chunks
-                // are still in flight the span stays open. `take()` so the
+                // double-counting under async overlap. `take()` so the
                 // reduce-barrier / overshoot idle until the next dispatch is
-                // NOT counted. Fed to ElChe at `finish_averaging_*`. For
-                // Cadence in-flight is only ever 0/1 so the span closes on
-                // every completion — byte-identical to the old per-chunk
-                // delta. See `timing_feed` / `delivered_span_start`.
+                // NOT counted. Fed to ElChe at `finish_averaging_*`.
+                //
+                // Tainted spans (crossed a reduce; see
+                // `delivered_span_crossed`) credit NOTHING — batches partly
+                // predate the boundary while the re-anchored span holds only
+                // the post-boundary slice; mismatched credits under-price
+                // the rank and spiral the allocation.
+                //
+                // CADENCE closes use the MARGINAL measure when available:
+                // ms from the first-Batch anchor over `batches − 1`, so the
+                // per-chunk fixed fill cost never enters the quoted
+                // per-batch rate (see `delivered_first_batch`). 1-batch
+                // chunks (edge tails) and missing anchors fall back to the
+                // dispatch-anchored full measure. Async keeps the dispatch
+                // anchor (overlapping fills are genuinely hidden there) with
+                // per-completion batch credits, exactly as before.
                 let still_in_flight: usize = self
                     .chunk_pools
                     .values()
                     .map(|p| p.in_flight(rank))
                     .sum();
-                if still_in_flight == 0
-                    && let Some(start) = self.delivered_span_start[rank].take()
-                {
+                let closes_span = still_in_flight == 0
+                    && self.delivered_span_start[rank].is_some();
+                if !closes_span {
+                    // Mid-span completion (async union overlap): batches are
+                    // delivered now, the union ms follows at the final close.
+                    if !self.delivered_span_crossed[rank] {
+                        self.delivered_batches_accum[rank] +=
+                            msg.batches_processed;
+                    }
+                } else {
+                    let start = self.delivered_span_start[rank]
+                        .take()
+                        .expect("span present: checked by closes_span");
+                    let first_batch = self.delivered_first_batch[rank].take();
                     if self.delivered_span_crossed[rank] {
-                        // Tainted span (crossed a reduce): discard its ms to
-                        // match the skipped batch credits, and clear the
-                        // taint — the rank's next chunk opens a fresh, clean
-                        // span with matched accounting.
+                        // Discard both sides, clear the taint — the next
+                        // chunk opens a fresh, clean span.
                         self.delivered_span_crossed[rank] = false;
                     } else {
-                        self.delivered_ms_accum[rank] +=
-                            start.elapsed().as_secs_f64() * 1000.0;
+                        let marginal = matches!(self.policy, ApplyPolicy::Cadence)
+                            && msg.batches_processed >= 2;
+                        match (marginal, first_batch) {
+                            (true, Some(fb)) => {
+                                self.delivered_ms_accum[rank] +=
+                                    fb.elapsed().as_secs_f64() * 1000.0;
+                                self.delivered_batches_accum[rank] +=
+                                    msg.batches_processed - 1;
+                            }
+                            _ => {
+                                self.delivered_ms_accum[rank] +=
+                                    start.elapsed().as_secs_f64() * 1000.0;
+                                self.delivered_batches_accum[rank] +=
+                                    msg.batches_processed;
+                            }
+                        }
                     }
                 }
                 progressive_completions.push((rank, msg.epoch));
@@ -684,7 +737,13 @@ impl ClusterCoordinator {
                 self.dispatch_next_chunk(rank);
             }
         }
+    }
 
+    /// Aggregate any epochs whose metrics are complete — the second half of
+    /// [`Self::drain_metrics_and_aggregate`]: readiness resolution,
+    /// `EpochMetrics` build + `metrics_fn`/sink fire, buffer + pool removal,
+    /// and the post-aggregate dispatch hooks.
+    pub(super) fn aggregate_ready_epochs(&mut self) {
         // Resolve readiness per dispatch mode.
         let alive: Vec<usize> = (0..self.world_size)
             .filter(|r| !self.is_rank_dead(*r))

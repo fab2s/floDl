@@ -136,6 +136,7 @@ impl ClusterCoordinator {
             wall_ms_accum: vec![0.0; world_size],
             delivered_span_start: vec![None; world_size],
             delivered_span_crossed: vec![false; world_size],
+            delivered_first_batch: vec![None; world_size],
             delivered_ms_accum: vec![0.0; world_size],
             delivered_batches_accum: vec![0; world_size],
             last_batch_ms: vec![0.0; world_size],
