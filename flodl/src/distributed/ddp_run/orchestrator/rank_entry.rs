@@ -25,7 +25,7 @@ use crate::distributed::ddp_run::{
     EpochFn, EvalFn, SchedulerFn, TrainedState, WorkerConfig,
 };
 use crate::nn::{Module, Optimizer, Parameter};
-use crate::tensor::{Device, Result, Tensor, TensorError};
+use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 
 use super::DdpHandle;
 
@@ -334,6 +334,30 @@ impl DdpHandle {
                         let broadcast = client.broadcast_from_root(&refs, 0)?;
                         crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
                             for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                                dst.copy_(src, false)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    // Buffers too — the NCCL path broadcasts both, and a
+                    // rank-sensitive buffer init (e.g. randomly seeded
+                    // running stats) would otherwise diverge silently. The
+                    // CPU reduce transport is f32-only, so only f32 buffers
+                    // ride the channel; non-f32 buffers (e.g. BatchNorm's
+                    // i64 `num_batches_tracked`) are deterministic counters
+                    // initialized identically on every rank, so leaving
+                    // them at their factory value is correct, not a dropped
+                    // sync. All ranks build the same model, so the f32
+                    // subset matches in count/order across ranks and the
+                    // collective stays balanced.
+                    let f32_buffers: Vec<&Tensor> = initial_buffers_local
+                        .iter()
+                        .filter(|b| b.dtype() == DType::Float32)
+                        .collect();
+                    if !f32_buffers.is_empty() {
+                        let broadcast = client.broadcast_from_root(&f32_buffers, 0)?;
+                        crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+                            for (dst, src) in f32_buffers.iter().zip(&broadcast) {
                                 dst.copy_(src, false)?;
                             }
                             Ok(())
