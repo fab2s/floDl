@@ -102,18 +102,51 @@ impl ChunkPool {
         if size == 0 {
             return;
         }
-        match self.outstanding[rank].back() {
+        // Fast path: the newest outstanding chunk — the only case the
+        // serial coordinator produces (a take immediately followed by its
+        // failed send's rollback).
+        let matched = match self.outstanding[rank].back() {
             Some(&(off, sz)) if off == offset && sz == size => {
                 self.outstanding[rank].pop_back();
+                true
             }
-            other => {
-                debug_assert!(
-                    false,
-                    "rollback_take(rank {rank}, {offset}, {size}) does not match \
-                     newest outstanding chunk {other:?}"
-                );
-                return;
+            _ => {
+                // Defensive: a rollback that isn't the newest take should
+                // not reach here under the current serial coordinator. The
+                // old code asserted-then-silently-returned, which in
+                // release LEAKS the taken samples (`in_flight` sticks,
+                // `is_epoch_done` never fires, the epoch wedges). Instead
+                // find the exact chunk wherever it sits and reclaim THAT;
+                // if it isn't outstanding at all there is genuinely nothing
+                // to roll back (reclaiming an unknown range would risk
+                // double-serving completed samples). Loud in every build.
+                match self.outstanding[rank]
+                    .iter()
+                    .rposition(|&(off, sz)| off == offset && sz == size)
+                {
+                    Some(pos) => {
+                        eprintln!(
+                            "flodl ddp: rollback_take(rank {rank}, {offset}, \
+                             {size}) was not the newest outstanding chunk — \
+                             reclaiming the matched entry (dispatch-ordering \
+                             anomaly)"
+                        );
+                        self.outstanding[rank].remove(pos);
+                        true
+                    }
+                    None => {
+                        eprintln!(
+                            "flodl ddp: rollback_take(rank {rank}, {offset}, \
+                             {size}) matched no outstanding chunk — ignored \
+                             (nothing to roll back)"
+                        );
+                        false
+                    }
+                }
             }
+        };
+        if !matched {
+            return;
         }
         self.dispatched[rank] = self.dispatched[rank].saturating_sub(size);
         self.chunks_sent[rank] = self.chunks_sent[rank].saturating_sub(1);
@@ -434,6 +467,35 @@ mod tests {
         // Can't rewind the cursor; range is reclaimed for re-dispatch.
         assert_eq!(pool.remaining(), 30 + 40);
         assert_eq!(pool.take_chunk(40, 1), Some((0, 40)));
+    }
+
+    #[test]
+    fn chunk_pool_rollback_take_non_newest_reclaims_matched_entry() {
+        // Defensive path: same rank holds two outstanding chunks and the
+        // OLDER (non-back) one is rolled back. It must be found, removed,
+        // and reclaimed — not silently dropped (which would leak its
+        // samples) and not mis-accounted against the newest chunk.
+        let mut pool = ChunkPool::new(0, 100, 2);
+        let (off0, size0) = pool.take_chunk(40, 0).unwrap(); // rank 0: (0,40)
+        pool.take_chunk(30, 0).unwrap(); // rank 0: (40,30) — now the back
+        pool.rollback_take(0, off0, size0);
+        // Newest chunk still in flight; only the rolled-back one is gone.
+        assert_eq!(pool.in_flight(0), 30);
+        assert_eq!(pool.chunks_sent[0], 1);
+        // The reclaimed range is served before the cursor.
+        assert_eq!(pool.take_chunk(40, 1), Some((0, 40)));
+    }
+
+    #[test]
+    fn chunk_pool_rollback_take_unknown_chunk_is_noop() {
+        // Rolling back a range that was never taken must not underflow the
+        // books nor reclaim a phantom range (which would double-serve).
+        let mut pool = ChunkPool::new(0, 100, 2);
+        pool.take_chunk(40, 0).unwrap(); // (0,40)
+        pool.rollback_take(0, 50, 10); // never outstanding
+        assert_eq!(pool.in_flight(0), 40);
+        assert_eq!(pool.chunks_sent[0], 1);
+        assert_eq!(pool.remaining(), 60); // 100 - 40 dispatched, nothing reclaimed
     }
 
     #[test]
