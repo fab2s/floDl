@@ -505,6 +505,74 @@ impl ClusterCoordinator {
         Ok(())
     }
 
+    /// NCCL twin of [`Self::poll_cpu_averaging`]'s hard ceiling. The CPU
+    /// backend parks in `CpuAvgState::Pending` between `RequestParams` and
+    /// the bridge SyncAcks, so its wedge backstop lives there. The NCCL
+    /// backend has no such state — `finish_averaging_nccl` runs inline at
+    /// trigger and the cohort re-arms only when every rank reports a
+    /// post-`SyncNow` `Batch`/`SyncAck` (setting `nccl_ack`). A rank wedged
+    /// in the in-place collective (NCCL deadlock, or a peer parked at the
+    /// barrier whose heartbeat thread still ticks so dead-rank detection
+    /// never fires) leaves `nccl_sync_start` armed and `nccl_ack`
+    /// incomplete forever — the same quiet-wedge signature, with no
+    /// equivalent backstop until now.
+    ///
+    /// Past the same generous ceiling (10x the heartbeat timeout, ≥300s,
+    /// which dwarfs any real NCCL AllReduce) with the cohort alive but not
+    /// fully acked, escalate to save-and-shutdown so an overnight run ends
+    /// as a diagnosed checkpoint rather than a silent hang. Disarms
+    /// `nccl_sync_start` so the escalation fires once. Healthy cycles take
+    /// `nccl_sync_start` via `capture_nccl_sync_elapsed_if_complete` long
+    /// before the ceiling, so this never trips on a sound rig.
+    pub(super) fn poll_nccl_reduce_stall(&mut self) -> Result<()> {
+        // 10x the heartbeat timeout (default 300s) dwarfs any real NCCL
+        // AllReduce, so a healthy rig can never hit it. Mirrors
+        // `poll_cpu_averaging`'s ceiling.
+        let ceiling = Duration::from_secs(
+            self.heartbeat_timeout_secs.saturating_mul(10).max(300),
+        );
+        self.poll_nccl_reduce_stall_with(ceiling)
+    }
+
+    /// Inner body of [`Self::poll_nccl_reduce_stall`], parameterized by
+    /// `ceiling` so tests can exercise the escalation without waiting the
+    /// production 300s+ floor.
+    pub(super) fn poll_nccl_reduce_stall_with(&mut self, ceiling: Duration) -> Result<()> {
+        if !matches!(self.backend, AverageBackend::Nccl) {
+            return Ok(());
+        }
+        // Only meaningful while a sync is in flight: `nccl_sync_start` is
+        // set at `SyncNow` broadcast and taken once every alive rank acks.
+        let Some(start) = self.nccl_sync_start else {
+            return Ok(());
+        };
+        // Re-arm pending, not stalled: the all-acked transition is the
+        // capture path's job, not an escalation.
+        let all_alive_acked =
+            (0..self.world_size).all(|r| self.is_dead(r) || self.nccl_ack[r]);
+        if all_alive_acked {
+            return Ok(());
+        }
+        if start.elapsed() > ceiling {
+            eprintln!(
+                "flodl ddp: NCCL averaging cycle stalled past its {}s ceiling \
+                 with the cohort alive but not fully acked — escalating to \
+                 ShutdownWithSave",
+                ceiling.as_secs(),
+            );
+            self.dump_stall_state(start.elapsed().as_secs_f64());
+            self.nccl_sync_start = None;
+            if let Err(e) = self
+                .dispatch_shutdown_with_save(crate::distributed::SaveReason::ReduceStall)
+            {
+                crate::verbose!(
+                    "  ddp: ShutdownWithSave after NCCL reduce stall failed: {e}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// NCCL-backend re-rendezvous initiation. Called from
     /// [`Self::check_dead_ranks`] once a rank has been declared dead
     /// on the NCCL path. No-op on CPU backend (the controller-side

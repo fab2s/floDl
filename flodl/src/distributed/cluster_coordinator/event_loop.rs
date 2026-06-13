@@ -565,6 +565,10 @@ impl ClusterCoordinator {
         // arrived (alive ranks only), finalize it here.
         // No-op on NCCL backend (state stays `Idle`).
         self.poll_cpu_averaging()?;
+        // NCCL twin: escalate an alive-but-wedged in-flight collective
+        // (SyncNow broadcast, `nccl_ack` never completing) past its
+        // ceiling. No-op on CPU backend and whenever no sync is in flight.
+        self.poll_nccl_reduce_stall()?;
         if self.should_average() {
             self.trigger_averaging()?;
         }
