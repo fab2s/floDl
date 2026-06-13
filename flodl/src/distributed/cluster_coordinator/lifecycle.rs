@@ -267,6 +267,7 @@ impl ClusterCoordinator {
             },
             last_lr_per_rank: vec![None; world_size],
             cpu_avg_state: CpuAvgState::Idle,
+            lost_broadcasts: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             stall_last_global_step: 0,
             stall_since: None,
@@ -416,12 +417,38 @@ impl ClusterCoordinator {
         if failed.is_empty() {
             Ok(())
         } else {
+            // Structured trace of a dropped best-effort broadcast: a
+            // silently lost SyncNow / DeclareDead can leave the survivor
+            // cohort waiting on a signal that never arrives. Shutdown is
+            // exempt — a failed Shutdown send is an
+            // expected teardown race (the rank already exited), not lost
+            // live coordination.
+            if !matches!(msg, ControlMsgWire::Shutdown) {
+                self.note_lost_broadcast(control_label(msg), failed.len());
+            }
             Err(TensorError::new(&format!(
                 "cluster_coordinator: broadcast_control failed for {} of {} ranks [{}]",
                 failed.len(),
                 self.world_size,
                 failed.join("; "),
             )))
+        }
+    }
+
+    /// Record a dropped best-effort broadcast: bump the run-long
+    /// [`lost_broadcasts`](Self::lost_broadcasts) counter and emit a
+    /// [`crate::monitor::EventKind::LostBroadcast`] on the shared timeline
+    /// if one is attached. The caller has already logged the per-rank
+    /// detail to stderr; this is the structured, queryable twin of that
+    /// log. `failures` is the number of live ranks that did not receive
+    /// the message.
+    pub(super) fn note_lost_broadcast(&mut self, control: &str, failures: usize) {
+        self.lost_broadcasts += 1;
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::LostBroadcast {
+                control: control.to_string(),
+                failures,
+            });
         }
     }
 
@@ -445,5 +472,30 @@ impl ClusterCoordinator {
             }
         }
         Ok(())
+    }
+}
+
+/// Short, payload-free label for a control message, used in the
+/// [`EventKind::LostBroadcast`](crate::monitor::EventKind::LostBroadcast)
+/// timeline trace. Exhaustive on purpose: a new `ControlMsgWire` variant
+/// forces a label here rather than silently rendering as `"other"`.
+fn control_label(msg: &ControlMsgWire) -> &'static str {
+    match msg {
+        ControlMsgWire::RequestParams => "RequestParams",
+        ControlMsgWire::Update { .. } => "Update",
+        ControlMsgWire::SyncNow => "SyncNow",
+        ControlMsgWire::StartEpoch(_) => "StartEpoch",
+        ControlMsgWire::ExtendPartition { .. } => "ExtendPartition",
+        ControlMsgWire::DeclareDead { .. } => "DeclareDead",
+        ControlMsgWire::RequestNewNcclId => "RequestNewNcclId",
+        ControlMsgWire::NewNcclSession { .. } => "NewNcclSession",
+        ControlMsgWire::Throttle => "Throttle",
+        ControlMsgWire::SetGlobalStep { .. } => "SetGlobalStep",
+        ControlMsgWire::Checkpoint { .. } => "Checkpoint",
+        ControlMsgWire::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
+        ControlMsgWire::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
+        ControlMsgWire::Shutdown => "Shutdown",
+        ControlMsgWire::ShutdownWithSave { .. } => "ShutdownWithSave",
+        ControlMsgWire::EpochAggregated(_) => "EpochAggregated",
     }
 }

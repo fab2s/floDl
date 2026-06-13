@@ -22,6 +22,7 @@ mod epoch_dispatch;
 mod fastest;
 mod gate;
 mod heartbeat;
+mod lost_broadcast;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).
 pub(super) const TEST_SALT: SessionSalt = [

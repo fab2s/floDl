@@ -163,6 +163,7 @@ impl ClusterCoordinator {
             },
             last_lr_per_rank: vec![None; world_size],
             cpu_avg_state: CpuAvgState::Idle,
+            lost_broadcasts: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             stall_last_global_step: 0,
             stall_since: None,

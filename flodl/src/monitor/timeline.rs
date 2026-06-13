@@ -94,6 +94,14 @@ pub enum EventKind {
     AnchorChanged { from: usize, to: usize },
     /// Worker was throttled (max_batch_diff exceeded).
     Throttle { rank: usize },
+    /// A best-effort coordinator→worker control broadcast failed to reach
+    /// one or more live ranks. `control` names the dropped message (e.g.
+    /// `SyncNow`, `RequestParams`, `DeclareDead`, `Update`); `failures` is
+    /// the count of live ranks that did not receive it. Recorded loudly:
+    /// a silently dropped `SyncNow`/`DeclareDead` can leave the survivor
+    /// cohort waiting on a signal that never arrives. The per-rank error
+    /// detail is on stderr at emission time.
+    LostBroadcast { control: String, failures: usize },
     /// Auto-detected GPU idle gap (post-processing).
     Idle { device: u8, duration_ms: f64 },
     /// LR-aware meta-controller nudged the El Che anchor down.
@@ -736,6 +744,13 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
             }
             EventKind::Throttle { rank } => {
                 let _ = write!(out, "\"k\":\"throttle\",\"rank\":{rank}");
+            }
+            EventKind::LostBroadcast { control, failures } => {
+                let escaped = control.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(
+                    out,
+                    "\"k\":\"lost_broadcast\",\"control\":\"{escaped}\",\"failures\":{failures}"
+                );
             }
             EventKind::Idle {
                 device,

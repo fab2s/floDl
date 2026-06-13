@@ -552,6 +552,15 @@ pub struct ClusterCoordinator {
 
     /// CPU-backend averaging state machine. See [`CpuAvgState`].
     cpu_avg_state: CpuAvgState,
+    /// Count of best-effort control broadcasts that failed to reach one
+    /// or more live ranks over the run (dropped `SyncNow` /
+    /// `RequestParams` / `Throttle` / `SetGlobalStep` / `DeclareDead` /
+    /// `Update`). Bumped by [`Self::note_lost_broadcast`], surfaced in
+    /// [`Self::dump_stall_state`] and as
+    /// [`crate::monitor::EventKind::LostBroadcast`] on the shared
+    /// timeline. A non-zero value on a wedged cohort is the structured
+    /// trace that a coordination signal went missing.
+    lost_broadcasts: usize,
     /// Stall watchdog (debug instrumentation): `global_step` advances
     /// only at `finish_averaging_*`, so it freezes when a reduce stops
     /// firing — the signature of the tight-window cadence wedge. Tracks

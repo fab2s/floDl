@@ -374,7 +374,8 @@ impl ClusterCoordinator {
         let counts = self.el_che.batch_counts();
         eprintln!(
             "[stall-watch] STALL {:.0}s no reduce | cpu_avg_state={:?} \
-             active={}/{} last_agg_epoch={:?} avg_count={} global_step={}",
+             active={}/{} last_agg_epoch={:?} avg_count={} global_step={} \
+             lost_broadcasts={}",
             stalled_secs,
             self.cpu_avg_state,
             self.active_count,
@@ -382,6 +383,7 @@ impl ClusterCoordinator {
             self.last_aggregated_epoch,
             self.avg_count,
             self.global_step,
+            self.lost_broadcasts,
         );
         for r in 0..self.world_size {
             let steps = self.steps_since_avg[r];

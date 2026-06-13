@@ -1018,6 +1018,7 @@ impl ClusterCoordinator {
                     "flodl ddp: Update send to rank {rank} failed during CPU \
                      averaging finalize ({e}); continuing with remaining ranks"
                 );
+                self.note_lost_broadcast("Update", 1);
             }
         }
         // SetGlobalStep is still broadcast so workers can update the
