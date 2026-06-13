@@ -77,7 +77,10 @@ fn heartbeat_stale_declares_rank_dead_and_unblocks_should_average() {
                     sync_divergence: None,
                 },
             )?;
-            let _ = recv_control(s, salt)?; // RequestParams
+            // Keepalive: this wait spans the dead-rank-detection window
+            // (RequestParams only arrives after rank 2 is reaped), so
+            // heartbeat through it or the coord reaps this survivor too.
+            let _ = recv_control_keepalive(s, salt, rank, 1)?; // RequestParams
             send_timing(
                 s,
                 salt,
@@ -89,8 +92,8 @@ fn heartbeat_stale_declares_rank_dead_and_unblocks_should_average() {
                     pre_norm: Some(1.05),
                 },
             )?;
-            let _ = recv_control(s, salt)?; // Update
-            let _ = recv_control(s, salt)?; // SetGlobalStep
+            let _ = recv_control_keepalive(s, salt, rank, 2)?; // Update
+            let _ = recv_control_keepalive(s, salt, rank, 2)?; // SetGlobalStep
             Ok(())
         }
     };
@@ -181,6 +184,12 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
             let mut received_start_epoch = false;
             let read_deadline = Instant::now() + Duration::from_secs(4);
             while Instant::now() < read_deadline {
+                // Heartbeat each poll so the coord doesn't reap this
+                // survivor while it waits for its ExtendPartition — that
+                // frame only arrives after rank 2 is detected dead (~1s),
+                // well past the 1s heartbeat timeout. (send errors mean the
+                // peer is already gone; the recv below surfaces the EOF.)
+                let _ = send_timing(s, salt, TimingMsgWire::Heartbeat { rank, step_count: 1 });
                 s.set_read_timeout(Some(Duration::from_millis(200))).ok();
                 match recv_frame(s, salt) {
                     Ok(Some(frame)) => match frame.decode::<ControlMsgWire>() {

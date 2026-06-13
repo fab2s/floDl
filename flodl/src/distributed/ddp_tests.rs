@@ -301,6 +301,23 @@
             return;
         }
 
+        // Serialize against the cluster-env-mutating tests in other
+        // modules (e.g. `cluster::tests`) on the SHARED crate mutex:
+        // `Trainer::setup` calls `LocalCluster::from_env()`, which reads
+        // the process-global `FLODL_CLUSTER_JSON`. Without the shared
+        // lock a concurrent writer's envelope (worker.host "master")
+        // leaks in and the hostname check fails. Hold the guard for the
+        // whole test and clear both cluster vars so `from_env` resolves
+        // the single-host (None) path.
+        let _env_guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        // SAFETY: ENV_MUTEX serializes every cluster-env reader/writer in
+        // the crate's test suite, so no other thread touches these vars
+        // while the guard is held.
+        unsafe {
+            std::env::remove_var(crate::distributed::cluster::ENV_CLUSTER_JSON);
+            std::env::remove_var(crate::distributed::launcher::ENV_FULL_CLUSTER_JSON);
+        }
+
         use crate::graph::FlowBuilder;
         use crate::nn::{Adam, Linear, ReLU, mse_loss};
 

@@ -210,6 +210,57 @@ pub(super) fn recv_control(
     frame.decode::<ControlMsgWire>()
 }
 
+/// Like [`recv_control`] but emits a `Heartbeat` whenever no frame is
+/// ready yet, so the coordinator's staleness check does not declare this
+/// (legitimately blocked) rank dead and tear its connection. Mirrors the
+/// production heartbeat thread that real ranks run.
+///
+/// Use this for any survivor recv that can span the
+/// `heartbeat_timeout_secs` window — e.g. a survivor waiting for the
+/// post-dead-rank averaging round-trip. A plain blocking `recv_control`
+/// there goes silent for ~`heartbeat_timeout` and is spuriously reaped,
+/// surfacing as `"EOF before frame"`.
+pub(super) fn recv_control_keepalive(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    rank: u64,
+    step_count: u64,
+) -> Result<ControlMsgWire> {
+    use crate::distributed::relay::mux::MuxRead;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .map_err(|e| TensorError::new(&format!("keepalive set_read_timeout: {e}")))?;
+    let payload = loop {
+        match MuxRecord::try_read_from(stream, salt)? {
+            MuxRead::Record(MuxRecord::Data { payload, .. }) => break payload,
+            MuxRead::Record(other) => {
+                return Err(TensorError::new(&format!(
+                    "recv_control_keepalive: expected mux Data, got {other:?}"
+                )));
+            }
+            // No frame yet: refresh liveness like the real heartbeat
+            // thread, then keep polling.
+            MuxRead::WouldBlock => {
+                send_timing(stream, salt, TimingMsgWire::Heartbeat { rank, step_count })?;
+            }
+            MuxRead::Eof => return Err(TensorError::new("EOF before frame")),
+        }
+    };
+    // Restore blocking reads for the rest of the body.
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| TensorError::new(&format!("keepalive clear timeout: {e}")))?;
+    let frame = ControlFrame::read_from(&mut payload.as_slice(), salt)?
+        .ok_or_else(|| TensorError::new("truncated ControlFrame payload"))?;
+    if frame.kind != MsgKind::Control {
+        return Err(TensorError::new(&format!(
+            "unexpected frame kind {:?}",
+            frame.kind
+        )));
+    }
+    frame.decode::<ControlMsgWire>()
+}
+
 /// Pre-bind a listener in the test (so we can publish the port
 /// before any accept blocks), spawn rank threads against that
 /// port, then drive the coordinator's accept + state machine in
