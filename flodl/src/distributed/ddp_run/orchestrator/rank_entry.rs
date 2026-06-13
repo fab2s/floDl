@@ -68,6 +68,17 @@ fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
 ///
 /// Validates the policy itself loud-errors on out-of-bounds
 /// `Rank(n)`. `Fastest` is fully supported.
+///
+/// **Memory trade-off (deliberate):** because the answer is always
+/// `true`, every rank carries the `epoch_fn` / `checkpoint_fn` /
+/// `eval_fn` closures and whatever state they capture, even though only
+/// the current role rank executes them. This is the cost of elastic role
+/// rotation — when the role rank dies (or `Fastest` re-resolves), the
+/// coord can hand the role to any survivor, which only works if every
+/// survivor already holds the closure. Dropping the unused copies would
+/// re-break rotation, so the cost is intrinsic, not an oversight. Keep
+/// captured state lean (e.g. `Arc` shared handles, not cloned datasets)
+/// if a callback closure is heavy.
 fn rank_fires_callbacks(
     policy: EpochCallbackPolicy,
     _global_rank: usize,
@@ -448,6 +459,33 @@ impl DdpHandle {
             Ok(state) => state,
             Err(e) => {
                 eprintln!("flodl cluster rank: rank failed: {e}");
+                // Last-gasp forensic record so a postmortem can tell this
+                // self-inflicted crash apart from a controller-driven
+                // ShutdownWithSave (which writes a CheckpointMeta). Best-
+                // effort and only when a save_path exists; a write failure
+                // is logged, never allowed to mask the original error.
+                if let Some(ref stem) = save_path {
+                    let record = crate::distributed::RankDeathRecord::new(
+                        global_rank,
+                        world_size,
+                        e.to_string(),
+                    );
+                    let path = crate::distributed::CheckpointBundle::rank_death_path(
+                        stem,
+                        global_rank,
+                    );
+                    match record.write_to_file(&path) {
+                        Ok(()) => eprintln!(
+                            "flodl cluster rank: wrote death record to {}",
+                            path.display()
+                        ),
+                        Err(werr) => eprintln!(
+                            "flodl cluster rank: failed to write death record \
+                             to {}: {werr}",
+                            path.display()
+                        ),
+                    }
+                }
                 std::process::exit(1);
             }
         };

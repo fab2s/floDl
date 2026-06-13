@@ -273,6 +273,68 @@ impl CheckpointMeta {
     }
 }
 
+/// Last-gasp forensic record written by a cluster rank that died on an
+/// unrecoverable error (the `process::exit(1)` path in
+/// `run_cluster_rank_via_coord`).
+///
+/// Lets a postmortem / the launcher tell "a rank crashed on its own"
+/// apart from "the controller asked the cohort to save and exit" (which
+/// writes a [`CheckpointMeta`] via `ShutdownWithSave`): a `.death.json`
+/// next to the bundle means the rank itself failed, and the `error`
+/// field says why. Best-effort — written only when `save_path` is
+/// configured, and a write failure is logged, never fatal (the process
+/// is already on its way out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankDeathRecord {
+    /// Schema version for forward-compatible reads.
+    pub schema_version: u32,
+    /// Global rank that died.
+    pub rank: usize,
+    /// Cohort size at launch (context for the rank index).
+    pub world_size: usize,
+    /// The rendered error that killed the rank.
+    pub error: String,
+    /// Seconds since the Unix epoch at the moment of death. Best-effort:
+    /// `0` if the system clock read failed.
+    pub unix_time_secs: u64,
+}
+
+/// Current [`RankDeathRecord`] schema version.
+pub const RANK_DEATH_RECORD_SCHEMA_VERSION: u32 = 1;
+
+impl RankDeathRecord {
+    /// Build a record stamped with the current wall-clock time.
+    pub fn new(rank: usize, world_size: usize, error: String) -> Self {
+        let unix_time_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        RankDeathRecord {
+            schema_version: RANK_DEATH_RECORD_SCHEMA_VERSION,
+            rank,
+            world_size,
+            error,
+            unix_time_secs,
+        }
+    }
+
+    /// Serialize to pretty JSON and write to `path`.
+    pub fn write_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self).map_err(|e| {
+            TensorError::new(&format!(
+                "RankDeathRecord: serialize JSON for {}: {e}",
+                path.display(),
+            ))
+        })?;
+        std::fs::write(path, content).map_err(|e| {
+            TensorError::new(&format!(
+                "RankDeathRecord: write {}: {e}",
+                path.display(),
+            ))
+        })
+    }
+}
+
 /// Path-derivation helpers for the cluster checkpoint bundle.
 ///
 /// Given a `save_path` stem (e.g. `"runs/job_42/ckpt_final"`), produces
@@ -324,6 +386,24 @@ impl CheckpointBundle {
         p.set_extension("config.json");
         p
     }
+
+    /// Per-rank death record path: `<stem>.rank<N>.death.json`.
+    ///
+    /// Per-rank (unlike the single shared `.meta.json`) because more than
+    /// one rank can die independently, and clobbering a sibling's record
+    /// would lose forensic detail. Written by [`RankDeathRecord`].
+    pub fn rank_death_path(stem: &str, rank: usize) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(stem);
+        // Drop a single trailing extension so the death record shares the
+        // bundle stem (matches the other helpers' set_extension behavior).
+        p.set_extension("");
+        let name = format!(
+            "{}.rank{rank}.death.json",
+            p.file_name().and_then(|s| s.to_str()).unwrap_or("checkpoint"),
+        );
+        p.set_file_name(name);
+        p
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +426,40 @@ mod tests {
             p,
             std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json")
         );
+    }
+
+    #[test]
+    fn rank_death_path_is_per_rank_and_shares_stem() {
+        // No existing extension on the stem.
+        assert_eq!(
+            CheckpointBundle::rank_death_path("/tmp/run/ckpt_final", 2),
+            std::path::PathBuf::from("/tmp/run/ckpt_final.rank2.death.json"),
+        );
+        // A stem carrying a bundle extension drops it, like the siblings.
+        assert_eq!(
+            CheckpointBundle::rank_death_path("/tmp/run/ckpt.fdl", 0),
+            std::path::PathBuf::from("/tmp/run/ckpt.rank0.death.json"),
+        );
+        // Distinct ranks never collide.
+        assert_ne!(
+            CheckpointBundle::rank_death_path("ckpt", 0),
+            CheckpointBundle::rank_death_path("ckpt", 1),
+        );
+    }
+
+    #[test]
+    fn rank_death_record_round_trips_json() {
+        let dir = temp_dir("death");
+        let path = dir.join("ckpt.rank1.death.json");
+        let rec = RankDeathRecord::new(1, 4, "boom: cuda OOM".to_string());
+        rec.write_to_file(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let back: RankDeathRecord = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.rank, 1);
+        assert_eq!(back.world_size, 4);
+        assert_eq!(back.error, "boom: cuda OOM");
+        assert_eq!(back.schema_version, RANK_DEATH_RECORD_SCHEMA_VERSION);
     }
 
     #[test]

@@ -38,7 +38,8 @@ pub mod testing;
 pub(crate) mod wire;
 
 pub use checkpoint_meta::{
-    CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, ElCheState, SaveReason,
+    CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, ElCheState,
+    RANK_DEATH_RECORD_SCHEMA_VERSION, RankDeathRecord, SaveReason,
 };
 pub use cluster::{WorkerBlock, LocalCluster};
 pub use launcher::{FullCluster, FullWorker, Role};

@@ -169,7 +169,7 @@ impl ClusterCoordinator {
             let mtx = metrics_tx.clone();
             let salt_for_reader = salt;
             let shutdown_for_reader = Arc::clone(&shutdown_flag);
-            let handle = thread::Builder::new()
+            let spawn_result = thread::Builder::new()
                 .name(format!("flodl-coord-relay{conn_idx}"))
                 .spawn(move || {
                     relay_reader_loop(
@@ -179,13 +179,29 @@ impl ClusterCoordinator {
                         &tx,
                         &mtx,
                     );
-                })
-                .map_err(|e| {
-                    TensorError::new(&format!(
+                });
+            match spawn_result {
+                Ok(handle) => reader_handles.push(Some(handle)),
+                Err(e) => {
+                    // Partial-init cleanup: a mid-loop spawn failure (OS
+                    // thread limit) must not leak the readers already
+                    // running. Signal them to stop and join before
+                    // returning — without this they'd outlive the aborted
+                    // bootstrap, blocked on their sockets (the control
+                    // write halves drop on return, but the readers hold
+                    // their own try_cloned read halves and only observe
+                    // shutdown via the flag, on their 250ms poll).
+                    shutdown_flag.store(true, Ordering::SeqCst);
+                    for h in reader_handles.iter_mut() {
+                        if let Some(j) = h.take() {
+                            let _ = j.join();
+                        }
+                    }
+                    return Err(TensorError::new(&format!(
                         "cluster_coordinator: spawn relay reader {conn_idx}: {e}"
-                    ))
-                })?;
-            reader_handles.push(Some(handle));
+                    )));
+                }
+            }
         }
         // Drop the extra senders we cloned for the closures; loop exit
         // depends on every cloned sender being dropped, but that happens

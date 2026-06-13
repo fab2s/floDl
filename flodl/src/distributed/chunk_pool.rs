@@ -499,6 +499,43 @@ mod tests {
     }
 
     #[test]
+    fn chunk_pool_death_after_take_reclaims_and_completes_exactly_once() {
+        // Death-after-take-before-send: a rank takes a chunk, dies before
+        // it completes (the send/compute never happened), the range is
+        // reclaimed and re-dispatched to a survivor. Every sample must be
+        // trained EXACTLY once and the epoch must eventually complete.
+        let total = 100;
+        let mut pool = ChunkPool::new(0, total, 2);
+
+        let (off, size) = pool.take_chunk(40, 0).unwrap();
+        assert_eq!((off, size), (0, 40));
+        assert_eq!(pool.forfeit(0), 40); // rank 0 dies, range reclaimed
+
+        // Survivor drains the whole pool (reclaimed range first, then the
+        // cursor residue), completing each chunk.
+        let mut covered = vec![0u32; total];
+        loop {
+            match pool.take_chunk(40, 1) {
+                Some((o, s)) if s > 0 => {
+                    for slot in covered.iter_mut().skip(o).take(s) {
+                        *slot += 1;
+                    }
+                    pool.mark_completed(1, s);
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            covered.iter().all(|&c| c == 1),
+            "every sample trained exactly once: {covered:?}",
+        );
+        assert_eq!(pool.in_flight(0), 0, "dead rank trained nothing");
+        assert_eq!(pool.in_flight(1), 0, "survivor's chunks all completed");
+        assert!(pool.is_epoch_done(), "epoch completes after reclaim + drain");
+    }
+
+    #[test]
     fn chunk_pool_completion_after_forfeit_clamps() {
         let mut pool = ChunkPool::new(0, 100, 2);
         pool.take_chunk(40, 0).unwrap();
