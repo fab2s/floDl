@@ -174,11 +174,16 @@ pub enum MsgKind {
     Timing = 0x02,
     /// Worker → coordinator per-epoch metrics. Payload: [`MetricsMsgWire`].
     Metrics = 0x03,
-    /// Worker → coordinator pre-snapshot metadata, paired with a
-    /// matching [`crate::distributed::controller::RoundFrame`] on the
-    /// data channel. Payload: `ParamSnapshotMetaWire`.
+    /// Orphan / reserved for wire-format stability. Was worker →
+    /// coordinator pre-snapshot metadata (`ParamSnapshotMetaWire`, now
+    /// deleted); the coordinator no-ops this tag on receipt. The enum
+    /// value is kept so the protocol byte layout stays stable.
     ParamSnapshotMeta = 0x04,
-    /// Periodic heartbeat (control-channel). Payload: `HeartbeatWire`.
+    /// Orphan / reserved for wire-format stability. Live heartbeats now
+    /// flow through [`TimingMsgWire::Heartbeat`] over [`Self::Timing`]
+    /// (the dedicated `HeartbeatWire` struct was deleted); the
+    /// coordinator no-ops this tag on receipt. The enum value is kept so
+    /// the protocol byte layout stays stable.
     Heartbeat = 0x05,
     /// Bootstrap rendezvous frame: worker → controller hello, controller →
     /// worker role assignment, and either-direction NCCL unique-id

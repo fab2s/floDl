@@ -538,7 +538,8 @@ pub struct ClusterCoordinator {
     epoch_last_k_max: usize,
 
     /// LR-aware meta-controller above ElChe. `None` when
-    /// [`ClusterCoordinatorConfig::meta_controller`] is `false` (default).
+    /// [`ClusterCoordinatorConfig::meta_controller`] is `false`
+    /// (the default is `true`).
     /// Observed after every averaging-cycle guard verdict via
     /// [`Self::observe_meta`]; dispatches
     /// [`crate::distributed::lr_event_meta::MetaAction::NudgeDown`] to

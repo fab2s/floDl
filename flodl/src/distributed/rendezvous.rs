@@ -34,7 +34,7 @@
 use std::env;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{Device, Result, TensorError};
 
@@ -47,6 +47,27 @@ use super::{LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId, WorkerBlock};
 const HOSTNAME_MAX_LEN: usize = 255;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ENV_NCCL_SOCKET_IFNAME: &str = "NCCL_SOCKET_IFNAME";
+
+/// Wall-clock budget the controller waits with NO new rank slotting
+/// before it abandons cohort formation. Generous enough to absorb
+/// cold-boot ordering jitter between hosts (the rank-side connect retry
+/// is ~30s), but bounded so a rank that never launches — or a port
+/// scanner hammering the `0.0.0.0` listener — cannot wedge the cohort
+/// indefinitely while honest ranks wait. Resets on every successful
+/// accept, so a legitimate staggered start (rank N arriving long after
+/// rank 0) keeps the window open as long as ranks keep trickling in.
+const RENDEZVOUS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Poll cadence for the non-blocking accept loop while waiting on the
+/// next rank to connect.
+const RENDEZVOUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Hard cap on pre-authentication rejected connections (bad frame,
+/// non-Hello first message, timeout-setup failure) before the controller
+/// bails loudly. A misconfigured peer or a scanner pointed at the
+/// rendezvous port can otherwise churn this loop without ever advancing
+/// `accepted`.
+const MAX_REJECTED_CONNECTIONS: usize = 1024;
 
 /// Result of the TCP rendezvous: this host's local rank/device list plus the
 /// cluster-wide NCCL unique ID.
@@ -236,9 +257,27 @@ where
 /// Blocks until every rank has its UID or any rank fails the handshake.
 /// On failure, surviving streams are dropped; the launcher detects the
 /// error via this function's `Result` and tears down spawned children.
+///
+/// Cohort formation is bounded: the accept loop gives up with a loud
+/// error if no new rank slots within [`RENDEZVOUS_IDLE_TIMEOUT`] (a rank
+/// that never launched, or a stalled host) or if pre-authentication
+/// rejected connections exceed [`MAX_REJECTED_CONNECTIONS`] (a scanner /
+/// misconfigured peer hammering the `0.0.0.0` listener). Without these
+/// ceilings a single absent rank would hang the whole cohort forever.
 pub fn run_controller_rendezvous(
     full: &FullCluster,
     local_host_name: &str,
+) -> Result<()> {
+    run_controller_rendezvous_with(full, local_host_name, RENDEZVOUS_IDLE_TIMEOUT)
+}
+
+/// Inner body of [`run_controller_rendezvous`], parameterized by the
+/// no-progress `idle_timeout` so tests can exercise the wedge-break
+/// ceiling without waiting the production [`RENDEZVOUS_IDLE_TIMEOUT`].
+fn run_controller_rendezvous_with(
+    full: &FullCluster,
+    local_host_name: &str,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let world_size = full.world_size();
     if world_size == 0 {
@@ -260,21 +299,62 @@ pub fn run_controller_rendezvous(
         listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| bind_addr.clone()),
     );
 
+    // Non-blocking accept so the loop can enforce a wall-clock ceiling
+    // instead of parking forever in a blocking accept() when a rank never
+    // dials in. Accepted streams are flipped back to blocking below so
+    // their per-stream read/write timeouts take effect.
+    listener.set_nonblocking(true).map_err(|e| {
+        TensorError::new(&format!(
+            "rendezvous: controller failed to set non-blocking accept: {e}"
+        ))
+    })?;
+
     // Indexed by global_rank — each accepted stream slotted by the rank
     // it claims in its Hello. `None` until that rank arrives.
     let mut streams: Vec<Option<TcpStream>> = (0..world_size).map(|_| None).collect();
     let mut reference_sig: Option<[u8; 32]> = None;
 
     let mut accepted = 0usize;
+    // Pre-auth rejected connections (bad frame / non-Hello / setup fail).
+    let mut rejected = 0usize;
+    // Resets on every successful slot fill; a window with no progress is
+    // the wedge signature this ceiling exists to break.
+    let mut last_progress = Instant::now();
     while accepted < world_size {
-        let (mut stream, peer) = listener.accept().map_err(|e| {
-            TensorError::new(&format!("rendezvous: controller accept failed: {e}"))
-        })?;
-        if stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-            .is_err()
+        let (mut stream, peer) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_progress.elapsed() > idle_timeout {
+                    return Err(TensorError::new(&format!(
+                        "rendezvous: timed out after {}s with no new rank \
+                         connecting ({accepted}/{world_size} ranks in). Check \
+                         that every rank process launched and can reach the \
+                         controller at {bind_addr}.",
+                        idle_timeout.as_secs(),
+                    )));
+                }
+                std::thread::sleep(RENDEZVOUS_POLL_INTERVAL);
+                continue;
+            }
+            Err(e) => {
+                return Err(TensorError::new(&format!(
+                    "rendezvous: controller accept failed: {e}"
+                )));
+            }
+        };
+        // Accepted socket may inherit the listener's non-blocking flag;
+        // flip it back so the per-stream read/write timeouts below are
+        // honored (a non-blocking socket ignores SO_RCVTIMEO).
+        if stream.set_nonblocking(false).is_err()
+            || stream
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
+                .is_err()
         {
+            rejected += 1;
+            if rejected > MAX_REJECTED_CONNECTIONS {
+                return Err(rejected_cap_error(world_size, accepted));
+            }
             continue;
         }
 
@@ -293,6 +373,10 @@ pub fn run_controller_rendezvous(
                     "cluster launcher: rendezvous rejected connection from \
                      {peer} (bad frame: {e}); continuing to accept"
                 );
+                rejected += 1;
+                if rejected > MAX_REJECTED_CONNECTIONS {
+                    return Err(rejected_cap_error(world_size, accepted));
+                }
                 continue;
             }
         };
@@ -305,6 +389,10 @@ pub fn run_controller_rendezvous(
                     "cluster launcher: rendezvous rejected connection from \
                      {peer} (expected Hello, got {other:?}); continuing to accept"
                 );
+                rejected += 1;
+                if rejected > MAX_REJECTED_CONNECTIONS {
+                    return Err(rejected_cap_error(world_size, accepted));
+                }
                 continue;
             }
         };
@@ -342,6 +430,7 @@ pub fn run_controller_rendezvous(
         }
         streams[rank_idx] = Some(stream);
         accepted += 1;
+        last_progress = Instant::now();
     }
 
     // Every rank has connected. Send Role to each, collect UID from
@@ -391,6 +480,18 @@ pub fn run_controller_rendezvous(
     }
 
     Ok(())
+}
+
+/// Loud error when the controller's accept loop has rejected more than
+/// [`MAX_REJECTED_CONNECTIONS`] pre-authentication connections without
+/// forming the cohort — the scanner / misconfigured-peer wedge.
+fn rejected_cap_error(world_size: usize, accepted: usize) -> TensorError {
+    TensorError::new(&format!(
+        "rendezvous: aborting after {MAX_REJECTED_CONNECTIONS} rejected \
+         pre-auth connections with only {accepted}/{world_size} ranks in. \
+         Something is hammering the rendezvous port (scanner, health \
+         checker, or a peer from another session/cluster)."
+    ))
 }
 
 /// Pick which rank should generate the NCCL unique ID at bootstrap.
@@ -570,6 +671,32 @@ mod tests {
         assert_eq!(pick_designated_rank(&full, "host-a"), 0);
         // Controller has no local worker: falls back to workers[0].ranks[0].
         assert_eq!(pick_designated_rank(&full, "192.168.122.1"), 0);
+    }
+
+    #[test]
+    fn controller_rendezvous_times_out_when_a_rank_never_connects() {
+        // A rank that never dials in must NOT hang the controller
+        // forever. With a 2-rank cluster and zero ranks connecting, the
+        // no-progress ceiling fires and returns loudly instead of parking
+        // in accept() indefinitely.
+        let full = full_cluster_for_test(next_port());
+        let start = Instant::now();
+        let result = run_controller_rendezvous_with(
+            &full,
+            "test-controller-host",
+            Duration::from_secs(1),
+        );
+        let err = result.expect_err("must time out, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        // Fired off the idle ceiling, not after some unrelated long stall.
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "took too long: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
