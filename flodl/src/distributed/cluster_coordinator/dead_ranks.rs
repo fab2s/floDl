@@ -35,6 +35,13 @@ impl ClusterCoordinator {
             if ledger.is_dead(r) {
                 continue;
             }
+            // A rank that announced a clean exit stops heartbeating by
+            // design — staleness is not death for it (declaring it dead
+            // would double-decrement `active_count` and broadcast a bogus
+            // DeclareDead during teardown).
+            if self.exited[r] {
+                continue;
+            }
             if now.duration_since(self.last_heartbeat[r]) > threshold {
                 crate::verbose!(
                     "  ddp: heartbeat stale on rank {} (>{}s), declaring dead",
@@ -121,6 +128,32 @@ impl ClusterCoordinator {
                         );
                     }
                 }
+                // PROGRESSIVE-MODE RECLAIM. The `ExtendPartition` path above
+                // is non-progressive only (`epoch_plan_cache` is populated by
+                // `plans_for_epoch`, which progressive never calls), so
+                // without this the dead rank's dispatched-but-never-completed
+                // chunks stay in-flight forever: `is_epoch_done` never fires,
+                // the epoch never aggregates, and after the survivors drain
+                // the pool the reduce gate has no mover left to fire it — the
+                // production-default Cadence cohort wedges permanently on any
+                // single rank death. Forfeit returns those samples to the
+                // pool for survivor re-dispatch and zeroes the rank's
+                // in-flight books.
+                if self.progressive {
+                    let reclaimed: usize = self
+                        .chunk_pools
+                        .values_mut()
+                        .map(|p| p.forfeit(r))
+                        .sum();
+                    if reclaimed > 0 {
+                        crate::verbose!(
+                            "  ddp: reclaimed {} in-flight samples from dead \
+                             rank {} for survivor re-dispatch",
+                            reclaimed,
+                            r,
+                        );
+                    }
+                }
             }
         }
         // After processing all deaths this tick, decide whether the
@@ -144,6 +177,13 @@ impl ClusterCoordinator {
                     "  ddp: NCCL rendezvous initiation failed: {}",
                     e,
                 );
+            } else if self.progressive {
+                // Put the reclaimed samples (and any survivor parked in
+                // `wait_for_epoch_plan` because the pool LOOKED empty
+                // before the forfeit) back into motion. Without this kick
+                // nothing drives dispatch until the next completion frame,
+                // which may never come if every survivor is idle.
+                self.wake_idle_ranks_in_progressive();
             }
         }
     }
@@ -251,7 +291,14 @@ impl ClusterCoordinator {
         if self.shutdown_with_save_dispatched {
             return None;
         }
-        let dead_count = self.world_size.saturating_sub(self.active_count);
+        // FAILURES, not absences: `world_size - active_count` also counts
+        // ranks that exited cleanly (Exiting frame), which must not trip a
+        // failure threshold. Count the ledger when present (it only ever
+        // holds declared-dead ranks).
+        let dead_count = match &self.dead_ranks {
+            Some(ledger) => (0..self.world_size).filter(|&r| ledger.is_dead(r)).count(),
+            None => self.world_size.saturating_sub(self.active_count),
+        };
         if let Some(threshold) = self.max_failure {
             if dead_count >= threshold.limit_for(self.world_size) {
                 return Some(crate::distributed::SaveReason::MaxFailureExceeded);
@@ -270,12 +317,5 @@ impl ClusterCoordinator {
         }
     }
 
-    /// True when `rank` is in the shared dead-rank ledger. `false` when
-    /// elastic membership isn't configured (`dead_ranks` is `None`).
-    pub(super) fn is_rank_dead(&self, rank: usize) -> bool {
-        self.dead_ranks
-            .as_ref()
-            .map(|d| d.is_dead(rank))
-            .unwrap_or(false)
-    }
+
 }

@@ -13,14 +13,14 @@
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
 pub mod checkpoint_meta;
-pub mod chunk_pool;
+pub(crate) mod chunk_pool;
 pub mod cluster;
 pub mod cluster_builder;
 pub mod cluster_coordinator;
 pub mod cluster_worker;
 pub mod config;
-pub mod controller;
-pub mod cpu_reduce;
+pub(crate) mod controller;
+pub(crate) mod cpu_reduce;
 pub mod cuda_event;
 pub mod cuda_stream;
 pub mod dashboard_sink;
@@ -28,30 +28,25 @@ pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;
 pub mod max_failure;
 pub mod nccl;
-pub mod relay;
+pub(crate) mod relay;
 pub mod ddp;
 pub mod ddp_run;
 pub mod el_che;
 pub mod lr_event_meta;
-pub mod rendezvous;
+pub(crate) mod rendezvous;
 pub mod testing;
-pub mod wire;
+pub(crate) mod wire;
 
 pub use checkpoint_meta::{
     CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, ElCheState, SaveReason,
 };
 pub use cluster::{WorkerBlock, LocalCluster};
-pub use controller::{ClusterController, RoundFrame, TensorPayload, DTYPE_F32};
-pub use cpu_reduce::{
-    AsyncCpuReduceClient, CpuReduceClient, round_frame_to_tensors, tensors_to_round_frame,
-};
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use dashboard_sink::{ClusterDashboardSink, DashboardSink};
 pub use cuda_stream::{CudaStream, StreamGuard};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
-pub use rendezvous::TcpRendezvous;
 pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};
 pub use cluster_builder::{ClusterBuilder, HostBuilder};
 pub use config::{ElCheConfig, ElCheMode, TrainerConfig};

@@ -396,8 +396,8 @@ impl NcclAbortHandle {
     /// Thread-safe and idempotent. After abort, the communicator is destroyed;
     /// the owning [`NcclRankComm`]'s Drop becomes a no-op.
     pub fn abort(&self) -> Result<()> {
-        if self.aborted.swap(true, Ordering::AcqRel) {
-            return Ok(()); // already aborted
+        if !self.claim() {
+            return Ok(()); // already aborted or destroyed
         }
         let err = unsafe { ffi::flodl_nccl_abort_rank(self.ptr) };
         check_err(err)
@@ -408,10 +408,17 @@ impl NcclAbortHandle {
         self.aborted.load(Ordering::Acquire)
     }
 
-    /// Mark as handled (comm already destroyed by normal Drop).
-    /// Future `abort()` calls become no-ops, preventing use-after-free.
-    fn mark_destroyed(&self) {
-        self.aborted.store(true, Ordering::Release);
+    /// Atomically claim the right to tear the comm down (abort OR destroy).
+    /// Returns `true` for exactly one caller; everyone else gets `false`.
+    ///
+    /// Abort (watchdog thread) and destroy (`NcclRankComm::drop`) can race —
+    /// the cluster worker's NCCL watchdog runs until a shutdown flag that is
+    /// set only AFTER the comm is dropped. A check-then-act here would let
+    /// `abort()` pass the check while Drop is mid-`flodl_nccl_destroy_rank`
+    /// and call into a freed comm. The single swap makes the two teardown
+    /// paths mutually exclusive.
+    fn claim(&self) -> bool {
+        !self.aborted.swap(true, Ordering::AcqRel)
     }
 }
 
@@ -621,14 +628,19 @@ impl NcclRankComm {
 
 impl Drop for NcclRankComm {
     fn drop(&mut self) {
-        // ncclCommAbort already frees the comm; skip destroy if aborted.
-        if !self.handle.is_null() && !self.abort_handle.is_aborted() {
+        // ncclCommAbort already frees the comm; destroy only if we win the
+        // teardown claim. The swap-based claim (not check-then-act) makes
+        // this mutually exclusive with a concurrent watchdog `abort()` —
+        // see `NcclAbortHandle::claim`. Claiming also invalidates stale
+        // Arc<NcclAbortHandle> clones (held by DdpHandle / the cluster
+        // watchdog) so they never call ncclCommAbort on a freed pointer.
+        // Claim FIRST (even with a null handle) so stale clones are always
+        // invalidated; destroy only when we won the claim AND the handle is
+        // live.
+        if self.abort_handle.claim() && !self.handle.is_null() {
             unsafe { ffi::flodl_nccl_destroy_rank(self.handle) };
             self.handle = ptr::null_mut();
         }
-        // Invalidate the abort handle so stale Arc<NcclAbortHandle> clones
-        // (held by DdpHandle) don't call ncclCommAbort on a freed pointer.
-        self.abort_handle.mark_destroyed();
     }
 }
 

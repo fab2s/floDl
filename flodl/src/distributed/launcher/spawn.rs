@@ -197,6 +197,23 @@ pub(super) fn terminate_pid(pid: u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    // Escalation: a peer that ignores TERM (deadlock-spin, stuck CUDA
+    // ioctl) would otherwise hang `supervise_children`'s final
+    // `rx.recv()` loop forever — the launcher waits on every watcher's
+    // `child.wait()`, and a hung launcher is exactly the orphan-holder
+    // the kill was meant to prevent. Detached grace-then-KILL keeps
+    // terminate_pid itself non-blocking.
+    let pid_s = pid.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(&pid_s)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
 }
 
 /// Build the `Command` that fork+execs a local rank child. Sets all the
@@ -561,8 +578,15 @@ pub(super) fn build_remote_bash_command(
     // then signals the binary cleanly.
     s.push_str(" &\n");
     s.push_str("__flodl_pid=$!\n");
+    // TERM, then escalate to KILL after a grace period — INSIDE the
+    // trap. A rank wedged in an uninterruptible CUDA ioctl (or any
+    // stuck signal state) ignores TERM forever, and the only cleanup
+    // pass that escalated to KILL ran from a LIVE launcher; on launcher
+    // death nothing on the remote ever escalated, leaving the orphan
+    // holding its ports and its GPU.
     s.push_str(
-        "trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT\n",
+        "trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null; \
+( sleep 10; kill -KILL \"$__flodl_pid\" 2>/dev/null ) &' HUP TERM INT\n",
     );
     s.push_str("wait \"$__flodl_pid\"\n");
     s.push_str("exit $?\n");

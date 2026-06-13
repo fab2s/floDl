@@ -4,12 +4,12 @@
 //! Post controller-active refactor, the live training dashboard runs on
 //! the launcher process (not on rank 0). Ranks emit
 //! `TimingMsgWire::Dashboard*` frames at startup
-//! ([`crate::distributed::wire::TimingMsgWire::DashboardRegister`],
-//! [`crate::distributed::wire::TimingMsgWire::DashboardSetSvg`],
-//! [`crate::distributed::wire::TimingMsgWire::DashboardSetMetadata`],
-//! [`crate::distributed::wire::TimingMsgWire::DashboardSetHardware`])
+//! (`DashboardRegister`,
+//! `DashboardSetSvg`,
+//! `DashboardSetMetadata`,
+//! `DashboardSetHardware`)
 //! plus per-epoch resource samples piggy-backed on
-//! [`crate::distributed::wire::MetricsMsgWire::resources`]. The
+//! `resources`. The
 //! [`crate::distributed::cluster_coordinator::ClusterCoordinator`]
 //! forwards every such frame to an optional [`DashboardSink`], whose
 //! concrete implementation in
@@ -61,7 +61,7 @@ pub trait DashboardSink: Send + Sync {
     fn set_hardware(&self, rank: usize, summary: String);
 
     /// Per-epoch resource sample for `rank`. Carried as the
-    /// `resources` field on [`crate::distributed::wire::MetricsMsgWire`]
+    /// `resources` field on `MetricsMsgWire`
     /// alongside the existing metric report.
     fn push_resource_sample(&self, rank: usize, sample: ResourceSampleWire);
 

@@ -244,8 +244,12 @@
         assert!(s.contains("FLODL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
         assert!(s.contains("fdl 'train' '--epochs' '10' &\n"));
-        assert!(s.contains("trap 'kill -TERM \"$__flodl_pid\"' HUP TERM INT") ||
-                s.contains("trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT"));
+        // The trap forwards TERM, then escalates to KILL after a grace
+        // period (a rank stuck in an uninterruptible CUDA ioctl ignores
+        // TERM forever; nothing else on the remote escalates once the
+        // launcher is gone).
+        assert!(s.contains("trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null;"));
+        assert!(s.contains("kill -KILL \"$__flodl_pid\""));
         assert!(s.contains("wait \"$__flodl_pid\""));
         assert!(s.ends_with("exit $?\n"));
     }

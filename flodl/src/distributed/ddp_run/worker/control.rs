@@ -99,6 +99,29 @@ impl<M: Module> GpuWorker<M> {
                 });
             }
             ControlMsg::StartEpoch(plan) => {
+                // One-chunk-in-flight, worker side: two dispatch sources
+                // converge here (coord `StartEpoch` frames and the inbound
+                // bridge's `StartEpoch` synthesized from `Update.next_plan`).
+                // A duplicate dispatch overwriting an unconsumed plan drops a
+                // chunk on the floor — the coordinator's `in_flight` for it
+                // never completes and the reduce gate wedges. Make the
+                // violation loud instead of a silent overnight hang; keep the
+                // NEWER plan (the coordinator's in_flight tracks the newest
+                // dispatch, so the older one is the stranded chunk either way).
+                if let Some(old) = &self.pending_plan {
+                    eprintln!(
+                        "flodl ddp: rank {} StartEpoch overwrites unconsumed plan \
+                         (old epoch {} offset {} size {}; new epoch {} offset {} size {}) \
+                         — one-chunk-in-flight violated, a chunk was dropped",
+                        self.rank,
+                        old.epoch, old.partition_offset, old.partition_size,
+                        plan.epoch, plan.partition_offset, plan.partition_size,
+                    );
+                    debug_assert!(
+                        false,
+                        "StartEpoch overwrote an unconsumed pending_plan"
+                    );
+                }
                 self.pending_plan = Some(plan);
             }
             ControlMsg::DeclareDead { .. }

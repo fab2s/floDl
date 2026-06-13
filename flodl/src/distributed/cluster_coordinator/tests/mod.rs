@@ -17,6 +17,7 @@ pub(crate) use std::thread;
 pub(crate) use std::time::Duration;
 
 mod callbacks;
+mod delivered_feed;
 mod epoch_dispatch;
 mod fastest;
 mod gate;

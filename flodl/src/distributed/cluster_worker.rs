@@ -14,7 +14,7 @@
 //! 2. **Bridge the OLD mpsc channels to TCP** via two background
 //!    threads (one inbound, one outbound). The inner GpuWorker still
 //!    sees mpsc senders/receivers; the bridges translate to and from
-//!    [`ControlFrame`]s on the wire.
+//!    `ControlFrame`s on the wire.
 //!
 //! # Architecture
 //!
@@ -347,7 +347,7 @@ fn _epoch_plan_to_wire(plan: EpochPlan) -> EpochPlanWire {
 
 /// TCP-driven training worker. Wraps an inner [`GpuWorker`] with
 /// bridge threads that translate between the OLD mpsc channels and
-/// the new control-channel [`ControlFrame`] wire protocol.
+/// the new control-channel `ControlFrame` wire protocol.
 ///
 /// Mailbox slot for the most-recent coord-broadcast NCCL session.
 /// Updated by the inbound bridge on each `NewNcclSession` arrival;
@@ -450,7 +450,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // Ranks dial their host-local relay's control loopback. The relay
         // process may bind a beat after the rank starts (launcher spawns
         // both), so retry briefly rather than fail on the first refusal.
-        let stream = connect_coord_with_retry(coord_addr)?;
+        let stream = crate::distributed::wire::connect_with_retry(coord_addr, "cluster_worker coord")?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| {
@@ -481,10 +481,13 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 "cluster_worker: stream try_clone for bridge split: {e}"
             ))
         })?;
-        // Writes shouldn't inherit the short read_timeout; clear it on
-        // the write half just to be explicit (writes use TCP send buffer
-        // back-pressure, not timeouts).
-        write_stream.set_read_timeout(None).ok();
+        // NOTE: do NOT touch read_timeout on the write half. try_clone
+        // dups the fd and SO_RCVTIMEO lives on the SHARED socket, so a
+        // `set_read_timeout(None)` here silently clears the 250ms timeout
+        // set on the read half above — the inbound loop's shutdown-flag
+        // poll then never fires while idle and bridge teardown hangs on
+        // the coordinator closing the socket. Writes never read; they use
+        // TCP send-buffer back-pressure, not timeouts.
         // Single write handle, single outbound thread: both `timing_rx`
         // and `metrics_rx` drain through one drainer that owns the
         // socket. Earlier revisions split this into two bridges
@@ -947,6 +950,14 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // Clean-exit paths see no queued shutdown and this is a no-op.
         let _ = inner.drain_pending_shutdown();
 
+        // Abort NCCL before the snapshot: a pending AllReduce from a
+        // SyncNow whose peer died would block snapshot_params' stream
+        // synchronize forever (the error-exit path can get here with a
+        // collective still in flight and no DeclareDead ever arriving —
+        // e.g. the coord died with the peer). Mirrors the threaded
+        // path's exit sequence; idempotent with the watchdog's abort.
+        inner.abort_nccl();
+
         // Even on error, try to gracefully report exit + drop senders
         // so the coordinator side cleans up. send_final_snapshot uses
         // the dedicated final_param channel; the receiver now lives on
@@ -1006,7 +1017,7 @@ impl<M: Module> Drop for ClusterWorker<M> {
 // Bridge thread bodies
 // ---------------------------------------------------------------------------
 
-/// TCP → control_tx bridge: read [`ControlFrame`]s, decode the
+/// TCP → control_tx bridge: read `ControlFrame`s, decode the
 /// payload, push into the in-process control channel.
 ///
 /// Elastic-membership frames intercepted here (NOT forwarded to the
@@ -1037,6 +1048,21 @@ fn inbound_loop(
     nccl_session_mailbox: &Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
     timing_tx: &mpsc::Sender<TimingMsg>,
 ) {
+    // ESCAPE HATCH: any abnormal exit of this bridge (coordinator or relay
+    // death, frame corruption, EOF without a prior Shutdown frame) must wake
+    // the inner GpuWorker. Without this, the inner can be parked forever in
+    // a blocking `control_rx.recv()` (`wait_for_epoch_plan` / a barrier wait)
+    // while the param bridge holds its own `control_tx` clone blocked in
+    // `param_rx.recv()` — a circular wait that turns the rank into a zombie
+    // process nobody can reach (its heartbeats only ever told the dead
+    // coordinator). Injecting Shutdown breaks the cycle: the inner exits its
+    // run loop, `run_until_shutdown` drops it, the param channel disconnects
+    // and every bridge unwinds. On a CLEAN coordinator shutdown the real
+    // Shutdown frame arrives first and this injection is a harmless no-op
+    // (duplicate Shutdown on a draining/disconnected channel).
+    let inject_shutdown = || {
+        let _ = control_tx.send(ControlMsg::Shutdown);
+    };
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -1050,12 +1076,14 @@ fn inbound_loop(
                     Ok(Some(f)) => f,
                     Ok(None) => {
                         eprintln!("cluster_worker: inbound r{rank} truncated ControlFrame");
+                        inject_shutdown();
                         return;
                     }
                     Err(e) => {
                         eprintln!(
                             "cluster_worker: inbound r{rank} ControlFrame parse: {e}"
                         );
+                        inject_shutdown();
                         return;
                     }
                 };
@@ -1145,6 +1173,7 @@ fn inbound_loop(
                                 eprintln!(
                                     "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
                                 );
+                                inject_shutdown();
                                 return;
                             }
                         },
@@ -1153,6 +1182,7 @@ fn inbound_loop(
                         eprintln!(
                             "cluster_worker: inbound r{rank} decode ControlMsgWire: {e}"
                         );
+                        inject_shutdown();
                         return;
                     }
                 },
@@ -1168,12 +1198,16 @@ fn inbound_loop(
                 }
             }
             Ok(LenFramedRead::WouldBlock) => continue,
-            Ok(LenFramedRead::Eof) => return,
+            Ok(LenFramedRead::Eof) => {
+                inject_shutdown();
+                return;
+            }
             Err(e) => {
                 // Exit-time broken-pipe / EOF is the common case here:
                 // the coord closed its end during shutdown. Downgrade
                 // to verbose so steady-state logs stay clean.
                 crate::verbose!("cluster_worker: inbound r{rank} wire error: {e}");
+                inject_shutdown();
                 return;
             }
         }
@@ -1181,7 +1215,7 @@ fn inbound_loop(
 }
 
 /// timing_rx → TCP bridge: drain in-process timing reports, encode
-/// each as a [`ControlFrame`] and write to the coordinator.
+/// each as a `ControlFrame` and write to the coordinator.
 /// Heartbeat cadence (ms). Fast enough that the coord's default 30s
 /// staleness threshold catches a wedged rank within ~30 heartbeats,
 /// slow enough that the per-cycle frame overhead is negligible.
@@ -1366,32 +1400,8 @@ fn outbound_loop(
     }
 }
 
-/// Loopback connect with a short retry budget (~5s). The rank dials its
-/// host-local relay's control loopback; the launcher spawns the relay
-/// alongside the ranks, so the relay's `bind` may land a beat after the
-/// rank starts — a transient refusal is expected and retried.
-fn connect_coord_with_retry(addr: SocketAddr) -> Result<TcpStream> {
-    const ATTEMPTS: u32 = 50;
-    const BACKOFF: Duration = Duration::from_millis(100);
-    let mut last_err = None;
-    for _ in 0..ATTEMPTS {
-        match TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(BACKOFF);
-            }
-        }
-    }
-    Err(TensorError::new(&format!(
-        "cluster_worker: connect to {addr} failed after {ATTEMPTS} attempts: {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    )))
-}
 
-/// Serialize a [`ControlFrame`] and write it length-delimited to the
+/// Serialize a `ControlFrame` and write it length-delimited to the
 /// worker's host relay, which forwards the opaque blob upstream to the
 /// coordinator. Control-channel mirror of the data channel's framing.
 fn write_framed_control<W: std::io::Write>(stream: &mut W, frame: &ControlFrame) -> Result<()> {
@@ -1591,6 +1601,15 @@ fn param_bridge_loop(
         while param_rx.recv().is_ok() {}
         return;
     };
+    // ESCAPE HATCH (same contract as the inbound bridge): a mid-round error
+    // here means this rank can no longer participate in CPU averaging — the
+    // inner GpuWorker would otherwise wait at the reduce barrier for an
+    // `Update` that will never come. Wake it with Shutdown so the rank exits
+    // (checkpoint drain + final snapshot + Exiting) instead of parking
+    // forever; the coordinator's heartbeat staleness then reaps it.
+    let inject_shutdown = || {
+        let _ = control_tx.send(ControlMsg::Shutdown);
+    };
     // Monotonic local version counter; bumped per round so the
     // synthesized AveragedParams.version increases consistently.
     let mut version: u64 = 0;
@@ -1621,6 +1640,7 @@ fn param_bridge_loop(
                     eprintln!(
                         "cluster_worker: param bridge r{rank} scratch alloc: {e}"
                     );
+                    inject_shutdown();
                     return;
                 }
             }
@@ -1641,6 +1661,7 @@ fn param_bridge_loop(
             }
         }
         if copy_failed {
+            inject_shutdown();
             return;
         }
 
@@ -1675,6 +1696,7 @@ fn param_bridge_loop(
         }
         if let Err(e) = client.all_reduce_per_rank_f64(&mut counts) {
             eprintln!("cluster_worker: param bridge r{rank} count gather: {e}");
+            inject_shutdown();
             return;
         }
         let total_n: f64 = counts.iter().sum();
@@ -1694,6 +1716,7 @@ fn param_bridge_loop(
                     eprintln!(
                         "cluster_worker: param bridge r{rank} all_reduce params: {e}"
                     );
+                    inject_shutdown();
                     return;
                 }
             }
@@ -1709,6 +1732,7 @@ fn param_bridge_loop(
                     eprintln!(
                         "cluster_worker: param bridge r{rank} divergence: {e}"
                     );
+                    inject_shutdown();
                     return;
                 }
             };
@@ -1726,6 +1750,7 @@ fn param_bridge_loop(
                     eprintln!(
                         "cluster_worker: param bridge r{rank} all_reduce buffers: {e}"
                     );
+                    inject_shutdown();
                     return;
                 }
             }

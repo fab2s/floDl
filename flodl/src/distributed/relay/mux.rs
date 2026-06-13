@@ -265,11 +265,12 @@ impl MuxRecord {
         let payload_len = u32::from_le_bytes(hdr[13..17].try_into().unwrap()) as usize;
         let auth_tag = u64::from_le_bytes(hdr[17..25].try_into().unwrap());
 
-        let mut payload = vec![0u8; payload_len];
         // Committed fill: the header is already in hand, so the payload
         // must complete even if a read timeout fires mid-frame (a partial
-        // read abandoned here would desync the stream).
-        fill_committed(r, &mut payload)?;
+        // read abandoned here would desync the stream). Incremental
+        // allocation: the length is unauthenticated until the MAC check
+        // below, so never trust it for one big up-front allocation.
+        let payload = fill_committed_incremental(r, payload_len)?;
 
         let actual = hmac_sha256_64_2(salt, &hdr[0..17], &payload);
         if actual != auth_tag {
@@ -356,8 +357,7 @@ pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
         }
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)
+    let body = crate::distributed::wire::read_exact_incremental(r, len)
         .map_err(|e| TensorError::new(&format!("relay_mux: len-framed body read failed: {e}")))?;
     Ok(Some(body))
 }
@@ -376,8 +376,7 @@ pub fn try_read_len_framed<R: Read>(r: &mut R) -> Result<LenFramedRead> {
     // Committed: finish the prefix + body ignoring read timeouts.
     fill_committed(r, &mut len_buf[1..])?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    let mut body = vec![0u8; len];
-    fill_committed(r, &mut body)?;
+    let body = fill_committed_incremental(r, len)?;
     Ok(LenFramedRead::Blob(body))
 }
 
@@ -447,8 +446,19 @@ fn read_idle_gate<R: Read>(r: &mut R) -> Result<IdleGate> {
 /// stream; the single hardest bug in this transport). The socket's read
 /// timeout merely paces the retry loop. A clean close mid-frame
 /// (`read` → 0) is a hard error: a peer that vanished mid-frame.
+/// Wall-clock budget for a committed (mid-frame) read to make ANY
+/// progress. A peer that vanishes without FIN/RST (host power loss,
+/// network partition — no TCP keepalive is configured) leaves the
+/// socket in eternal WouldBlock; without this deadline the reader
+/// thread wedges forever and `RelayChannel::shutdown`/`Drop` then hang
+/// in `join()`. Mid-frame + no bytes for this long = the peer is gone;
+/// erroring out is the correct semantic. Generous: any live peer
+/// trickles at least one byte well within it.
+const COMMITTED_READ_STARVATION_SECS: u64 = 60;
+
 fn fill_committed<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;
+    let mut last_progress = std::time::Instant::now();
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
@@ -456,7 +466,10 @@ fn fill_committed<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
                     "relay_mux: peer closed mid-frame (committed read hit EOF)",
                 ));
             }
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                last_progress = std::time::Instant::now();
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -464,7 +477,16 @@ fn fill_committed<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
                 ) =>
             {
                 // Frame still arriving; the socket's read timeout paces
-                // this loop (no busy-spin).
+                // this loop (no busy-spin). The starvation deadline only
+                // fires when NO bytes arrive at all for the whole budget.
+                if last_progress.elapsed().as_secs() >= COMMITTED_READ_STARVATION_SECS {
+                    return Err(TensorError::new(&format!(
+                        "relay_mux: committed read starved mid-frame for \
+                         {COMMITTED_READ_STARVATION_SECS}s ({filled}/{} bytes); \
+                         peer presumed gone",
+                        buf.len(),
+                    )));
+                }
                 continue;
             }
             Err(e) => {
@@ -475,6 +497,22 @@ fn fill_committed<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Committed read of `len` bytes with INCREMENTAL allocation: the buffer
+/// grows in chunks as bytes actually arrive, so an unauthenticated
+/// (garbage/hostile) length field can only make us allocate what the
+/// peer really sends — never a multi-GiB up-front `vec![0; len]`.
+fn fill_committed_incremental<R: Read>(r: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < len {
+        let chunk = (len - buf.len())
+            .min(crate::distributed::wire::READ_CHUNK);
+        let old_len = buf.len();
+        buf.resize(old_len + chunk, 0);
+        fill_committed(r, &mut buf[old_len..])?;
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------

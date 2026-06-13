@@ -182,11 +182,14 @@ impl ClusterController {
     /// HMAC-SHA256 footer keyed by this value; a rank-side mismatch
     /// surfaces loudly on the first round-trip. Use
     /// `[0u8; SESSION_SALT_BYTES]` for in-process tests that pair this
-    /// directly with a matching [`crate::distributed::CpuReduceClient`].
+    /// directly with a matching `CpuReduceClient`.
     ///
     /// Use `127.0.0.1:0` for tests (kernel-assigned port; read back via
     /// [`Self::port`]). Use the cluster's `controller_addr:controller_port+2`
     /// in production.
+    // Production callers share a DeadRanks ledger (start_with_dead_ranks);
+    // this standalone form is exercised by the controller tests.
+    #[allow(dead_code)]
     pub fn start(
         bind_addr: SocketAddr,
         world_size: usize,
@@ -797,12 +800,14 @@ pub(crate) fn read_round_frame<R: Read>(
         })?;
         mac.update(nb);
         let nbytes = u64::from_le_bytes(nb) as usize;
-        let mut bytes = vec![0u8; nbytes];
-        stream.read_exact(&mut bytes).map_err(|e| {
-            TensorError::new(&format!(
-                "cluster_controller: tensor[{ti}] data read failed: {e}"
-            ))
-        })?;
+        // Incremental allocation: nbytes is unauthenticated until the
+        // trailing MAC verifies; never pre-allocate a hostile length.
+        let bytes = crate::distributed::wire::read_exact_incremental(stream, nbytes)
+            .map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster_controller: tensor[{ti}] data read failed: {e}"
+                ))
+            })?;
         mac.update(&bytes);
         tensors.push(TensorPayload {
             dtype,

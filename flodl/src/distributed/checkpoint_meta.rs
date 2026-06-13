@@ -73,7 +73,7 @@ pub struct ElCheState {
     pub smoothed_ms_per_batch: Vec<f64>,
     /// Lifecycle phase. Election + anchor-swap behavior depends on
     /// phase: Probe disables election entirely, Warmup gates swaps on
-    /// `MIN_REPORTS_BEFORE_SWAP`, Stable runs hysteresis, Mature is the
+    /// the Stable threshold, Stable runs hysteresis, Mature is the
     /// long-run steady state. Resume in the wrong phase causes
     /// mis-behavior in the first few cycles.
     pub phase: crate::distributed::el_che::Phase,
@@ -115,6 +115,11 @@ pub enum SaveReason {
     SingleSurvivor,
     /// CPU cohort lost its last survivor.
     AllRanksLost,
+    /// A reduce cycle stalled past its hard ceiling with the cohort
+    /// still alive — a scheduler wedge, not a rank failure. The
+    /// coordinator saves state and shuts down instead of hanging
+    /// silently.
+    ReduceStall,
 }
 
 impl SaveReason {
@@ -128,6 +133,7 @@ impl SaveReason {
             SaveReason::MaxFailureExceeded => 1,
             SaveReason::SingleSurvivor => 2,
             SaveReason::AllRanksLost => 3,
+            SaveReason::ReduceStall => 4,
         }
     }
 
@@ -140,6 +146,7 @@ impl SaveReason {
             1 => Some(SaveReason::MaxFailureExceeded),
             2 => Some(SaveReason::SingleSurvivor),
             3 => Some(SaveReason::AllRanksLost),
+            4 => Some(SaveReason::ReduceStall),
             _ => None,
         }
     }
@@ -431,6 +438,7 @@ mod tests {
             SaveReason::MaxFailureExceeded,
             SaveReason::SingleSurvivor,
             SaveReason::AllRanksLost,
+            SaveReason::ReduceStall,
         ] {
             let byte = r.to_u8();
             assert_eq!(SaveReason::from_u8(byte), Some(r));

@@ -124,7 +124,8 @@ pub fn drain_scalars() -> HashMap<String, (f64, usize)> {
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
 ///
-/// Called on rank 0 after averaging events (multi-GPU) or at epoch boundaries
+/// Called on the rank selected by [`EpochCallbackPolicy`] (default
+/// `Fastest`) at checkpoint events (multi-GPU) or at epoch boundaries
 /// (single-GPU). Errors are logged but do not stop training.
 pub type CheckpointFn<M> = Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>;
 
@@ -175,6 +176,7 @@ pub type MetricsFn = Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>;
 /// rank chosen by [`EpochCallbackPolicy`]. Triggered from the
 /// controller's `dispatch_epoch` on the configured epoch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvalCadence {
     /// Fire eval every `n` epochs. `n == 0` is treated as "never".
     Epochs(usize),
@@ -197,7 +199,7 @@ pub type EvalFn<M> = std::sync::Arc<
 
 /// Receiver for the [`EvalFn`] scalar result on the controller side.
 /// Mirrors [`MetricsFn`]'s shape — fires after the chosen rank's eval
-/// metric flows back over [`crate::distributed::wire::TimingMsgWire::EvalResult`].
+/// metric flows back over `EvalResult`.
 pub type EvalResultFn = std::sync::Arc<
     dyn Fn(usize, f64) -> Result<()> + Send + Sync,
 >;
@@ -234,6 +236,7 @@ pub type SchedulerFn = Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send
 /// rank — no special-case needed. Pin to a specific rank with
 /// [`Self::Rank`] when the research convention demands it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EpochCallbackPolicy {
     /// Fire on the explicitly-named **global rank** — the
     /// cluster-wide rank index in `[0, world_size)`, where ranks are
@@ -415,6 +418,7 @@ impl From<crate::distributed::wire::EpochMetricsWire> for EpochMetrics {
 ///   is nudged down (tighter sync). Differs from Cadence only in epoch
 ///   dispatch (per-rank vs broadcast) in non-progressive mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ApplyPolicy {
     /// Average after every batch (K=1). Equivalent to standard synchronous DDP.
     /// Lowest risk of model divergence. Fast GPUs wait at the collective barrier.
@@ -468,6 +472,7 @@ impl ApplyPolicy {
 /// | **Fault tolerance** | Abort handles unblock stuck collectives | Coordinator timeout (5s) detects dead workers |
 /// | **Buffer averaging** | Natural (AllReduce averages everything) | Explicit (buffers averaged with equal weight) |
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AverageBackend {
     /// NCCL AllReduce in-place on GPU params. Default and recommended.
     ///
@@ -547,7 +552,7 @@ pub struct DdpRunConfig {
     /// save-on-unrecoverable-failure path. When set on a cluster
     /// run, workers persist a `<save_path>.fdl` / `.optim` /
     /// `.meta.json` bundle on
-    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`]
+    /// `ShutdownWithSave`
     /// receipt; see [`crate::distributed::CheckpointBundle`].
     /// Required for the via-coord cluster orchestrator entry;
     /// optional for non-cluster builds.
@@ -571,7 +576,7 @@ pub struct DdpRunConfig {
 
     /// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
     /// `checkpoint_fn`, `eval_fn`). See [`EpochCallbackPolicy`] for the
-    /// variants. Default `Rank(0)`.
+    /// variants. Default [`EpochCallbackPolicy::Fastest`].
     pub epoch_callback_policy: EpochCallbackPolicy,
 
     /// Cadence (in epochs) for the user-supplied `eval_fn`. `Some(n)`
@@ -637,7 +642,7 @@ impl DdpRunConfig {
     }
 
     /// Override which rank fires user-supplied per-epoch callbacks.
-    /// See [`EpochCallbackPolicy`]. Default is `Rank(0)`.
+    /// See [`EpochCallbackPolicy`]. Default is `Fastest`.
     pub fn with_epoch_callback_policy(mut self, policy: EpochCallbackPolicy) -> Self {
         self.epoch_callback_policy = policy;
         self
@@ -838,7 +843,7 @@ impl DdpRunConfig {
 
     /// Enable the LR-aware meta-controller above ElChe.
     ///
-    /// Off by default (opt-in). See the `meta_controller` field for behavior
+    /// On by default. See the `meta_controller` field for behavior
     /// and `crate::distributed::lr_event_meta` for the design.
     pub fn with_meta_controller(mut self, enabled: bool) -> Self {
         self.elche.meta_controller = enabled;
@@ -922,7 +927,7 @@ pub enum TimingMsg {
     },
     /// Periodic liveness signal from a cluster worker's heartbeat
     /// thread. Cluster-only; OLD threaded path never emits these.
-    /// See [`crate::distributed::wire::TimingMsgWire::Heartbeat`] for
+    /// See `Heartbeat` for
     /// the failure-detection rationale.
     Heartbeat {
         /// Which rank sent this.
@@ -932,7 +937,7 @@ pub enum TimingMsg {
     },
     /// Cluster-mode "snapshot ready, entering AllReduce barrier"
     /// marker emitted by the worker's CPU-averaging param bridge.
-    /// See [`crate::distributed::wire::TimingMsgWire::SnapshotReady`].
+    /// See `SnapshotReady`.
     SnapshotReady {
         /// Which rank sent this.
         rank: usize,
@@ -947,7 +952,7 @@ pub enum TimingMsg {
         uid_bytes: Vec<u8>,
     },
     /// Eval result from the chosen rank back to the coord. See
-    /// [`crate::distributed::wire::TimingMsgWire::EvalResult`].
+    /// `EvalResult`.
     EvalResult {
         rank: usize,
         schedule_id: u64,
@@ -957,7 +962,7 @@ pub enum TimingMsg {
         error: Option<String>,
     },
     /// Checkpoint result from the role rank back to the coord. See
-    /// [`crate::distributed::wire::TimingMsgWire::CheckpointResult`].
+    /// `CheckpointResult`.
     /// Reported on success and failure; the coord decides the next
     /// action (retry on different live rank, give up + exhaust, time
     /// exclusion from `wall_ms_accum`).
@@ -968,7 +973,7 @@ pub enum TimingMsg {
         error: Option<String>,
     },
     /// Post-fire notice from the rank that ran `epoch_fn`. See
-    /// [`crate::distributed::wire::TimingMsgWire::EpochFnElapsed`].
+    /// `EpochFnElapsed`.
     /// Reported once per `epoch_fn` invocation; the coord time-excludes
     /// it from `wall_ms_accum[rank]` and updates
     /// `last_epoch_fn_elapsed_ms_ewma` for callback-aware scheduling.
@@ -1105,14 +1110,14 @@ pub enum ControlMsg {
     /// it is NOT dispatched to the inner GpuWorker because the inner
     /// is typically blocked in an in-flight NCCL collective and
     /// cannot service control messages until the watchdog aborts the
-    /// comm. See [`crate::distributed::wire::ControlMsgWire::DeclareDead`].
+    /// comm. See `DeclareDead`.
     DeclareDead {
         /// Global rank that just died.
         rank: usize,
     },
     /// Coord-emitted directive to rebuild the local NCCL comm with
     /// the shrunken cohort. Sent after one or more `DeclareDead`s.
-    /// See [`crate::distributed::wire::ControlMsgWire::NewNcclSession`].
+    /// See `NewNcclSession`.
     NewNcclSession {
         /// 128-byte NCCL unique-id, identical across survivors.
         uid_bytes: Vec<u8>,
@@ -1126,7 +1131,7 @@ pub enum ControlMsg {
     /// ship its bytes back via the timing channel
     /// ([`TimingMsg::NewNcclIdGenerated`]). Only one rank receives
     /// this per re-rendezvous cycle (the lowest-numbered survivor).
-    /// See [`crate::distributed::wire::ControlMsgWire::RequestNewNcclId`].
+    /// See `RequestNewNcclId`.
     RequestNewNcclId,
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
@@ -1145,7 +1150,7 @@ pub enum ControlMsg {
     /// `CheckpointResult.error`); the worker never decides whether
     /// it is the checkpointer.
     ///
-    /// Mirrors [`crate::distributed::wire::ControlMsgWire::Checkpoint`].
+    /// Mirrors `Checkpoint`.
     /// In threaded DDP, the coord still broadcasts to every worker's
     /// mpsc channel (same as before) — the `target_rank` field tells
     /// each worker to no-op unless it matches its own rank, preserving
@@ -1161,7 +1166,7 @@ pub enum ControlMsg {
     /// Run the user's [`EvalFn`] on the rank's current model + eval
     /// dataset. Targeted: only the rank whose `rank == target_rank`
     /// runs; others silently no-op. Mirrors
-    /// [`crate::distributed::wire::ControlMsgWire::ExecuteEvalCallback`].
+    /// `ExecuteEvalCallback`.
     ExecuteEvalCallback {
         schedule_id: u64,
         epoch: u64,
@@ -1171,7 +1176,7 @@ pub enum ControlMsg {
     /// user-supplied `epoch_fn` has been resolved. Worker stores this
     /// in its local `epoch_callback_role` and consults it at every
     /// epoch transition. Mirrors
-    /// [`crate::distributed::wire::ControlMsgWire::SetEpochCallbackRole`].
+    /// `SetEpochCallbackRole`.
     SetEpochCallbackRole {
         rank: usize,
     },
@@ -1183,7 +1188,7 @@ pub enum ControlMsg {
     /// below 2 ranks). Workers write
     /// [`crate::distributed::CheckpointBundle`] members; rank 0 is the
     /// canonical writer for the model + meta files. See
-    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`].
+    /// `ShutdownWithSave`.
     ShutdownWithSave {
         /// Why the cluster is saving + exiting; recorded in the
         /// `.meta.json` for post-mortem inspection.
@@ -1195,7 +1200,7 @@ pub enum ControlMsg {
     /// cross-rank view (user-facing UX parity: `monitor.log(&model)`
     /// shows the same aggregated view regardless of single-GPU /
     /// local-multi-GPU / cluster). See
-    /// [`crate::distributed::wire::ControlMsgWire::EpochAggregated`].
+    /// `EpochAggregated`.
     EpochAggregated(EpochMetrics),
 }
 
@@ -1243,7 +1248,7 @@ pub struct WorkerConfig {
     ///
     /// When set, workers write a bundle (`.fdl` model, `.optim` optimizer
     /// state, `.meta.json` trajectory) on receipt of
-    /// [`crate::distributed::wire::ControlMsgWire::ShutdownWithSave`]; see
+    /// `ShutdownWithSave`; see
     /// [`crate::distributed::CheckpointBundle`] for path derivation.
     /// `None` in standalone single-GPU runs and CPU-only tests that
     /// don't exercise the save path.

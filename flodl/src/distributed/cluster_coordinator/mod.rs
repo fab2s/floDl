@@ -327,13 +327,20 @@ enum CpuAvgState {
 /// different path.
 const NCCL_RENDEZVOUS_TIMEOUT_SECS: u64 = 5;
 
-/// Stall-watchdog threshold (debug instrumentation): if `global_step`
-/// (advanced only at `finish_averaging_*`) doesn't move for this long
-/// while ranks are alive, [`ClusterCoordinator::maybe_dump_stall`] dumps
-/// the `should_average` gate state. Well above any realistic
-/// inter-reduce gap (tight-window epochs run ~4-5s end-to-end) so it
-/// only fires on a genuine cadence wedge.
+/// Stall-watchdog threshold under `-vvv`: if `global_step` (advanced
+/// only at `finish_averaging_*`) doesn't move for this long while ranks
+/// are alive, [`ClusterCoordinator::maybe_dump_stall`] dumps the
+/// `should_average` gate state. Well above any realistic inter-reduce
+/// gap (tight-window epochs run ~4-5s end-to-end) so it only fires on a
+/// genuine cadence wedge.
 const STALL_DUMP_SECS: u64 = 15;
+
+/// Stall-watchdog threshold WITHOUT `-vvv` (the always-on production
+/// tier). Generous so legitimately slow reduce windows — epoch-sized
+/// cadence windows on slow rigs, long eval/checkpoint callbacks — never
+/// trip it on a healthy run, while an overnight wedge still leaves a
+/// gate-state dump in the log instead of nothing.
+const STALL_DUMP_PROD_SECS: u64 = 120;
 
 /// In-flight NCCL re-rendezvous bookkeeping. Created when the coord
 /// declares one or more dead ranks on the NCCL path; cleared when the
@@ -580,6 +587,13 @@ pub struct ClusterCoordinator {
     /// [`Self::process_timing_msg`] before any other per-message work.
     /// Drives [`Self::check_dead_ranks`].
     last_heartbeat: Vec<Instant>,
+    /// Per-rank clean-exit latch, set by `TimingMsgWire::Exiting`. A rank
+    /// that exited cleanly stops heartbeating, so without this latch the
+    /// staleness scan declares it dead 30s later and `active_count` is
+    /// decremented a second time — over-counting failures into spurious
+    /// `MaxFailureExceeded` / `SingleSurvivor` escalations and a bogus
+    /// `DeclareDead` broadcast for a rank that said goodbye properly.
+    exited: Vec<bool>,
     /// Per-rank snapshot of `last_step_count[r]` at the moment
     /// [`Self::dispatch_epoch`] emitted `StartEpoch` to rank `r`.
     /// Computing `last_step_count[r] - last_step_count_at_epoch_start[r]`
@@ -679,7 +693,7 @@ pub struct ClusterCoordinator {
     last_observed_sync_lag_ms: Vec<Option<f64>>,
 
     /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
-    /// rank's [`crate::distributed::wire::TimingMsgWire::SnapshotReady`]
+    /// rank's `SnapshotReady`
     /// arrival — captured by the SnapshotReady handler in
     /// [`Self::process_timing_msg`].
     ///
@@ -915,7 +929,7 @@ impl ClusterCoordinator {
 
     /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
     /// rank's
-    /// [`crate::distributed::wire::TimingMsgWire::SnapshotReady`].
+    /// `SnapshotReady`.
     /// Honest per-rank capacity signal — measured BEFORE the AllReduce
     /// barrier so it's clean of slowest-rank contamination (unlike
     /// the internal `last_observed_sync_lag_ms` field which records

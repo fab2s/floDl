@@ -171,6 +171,7 @@ impl ClusterCoordinator {
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
+            exited: vec![false; world_size],
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),

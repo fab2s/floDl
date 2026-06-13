@@ -23,7 +23,6 @@ mod constructor;
 mod control;
 mod epoch_plan;
 mod reporting;
-mod self_driven;
 mod sync;
 
 // ---------------------------------------------------------------------------
@@ -280,6 +279,9 @@ pub struct GpuWorker<M: Module> {
     /// (BatchNorm running stats etc.). Same lazy-alloc + reuse +
     /// single-consumer contract as `snapshot_pinned_params`.
     snapshot_pinned_buffers: Vec<Tensor>,
+    /// Whether the pinned-readout failure has been reported. The fallback
+    /// is silent-correct but slow; log the regression exactly once.
+    pinned_fallback_logged: bool,
 
     /// Strong references to each parameter's AccumulateGrad node, created
     /// under `StreamGuard(compute_stream)` during worker init. Keeping

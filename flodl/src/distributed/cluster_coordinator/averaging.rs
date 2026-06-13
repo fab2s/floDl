@@ -107,7 +107,7 @@ impl ClusterCoordinator {
     /// `trigger_averaging`'s pre-finish drain (the last-finishing rank's
     /// completion frame trails its final Batch report by microseconds, so
     /// one bounded re-drain usually completes the window).
-    fn movers_delivered_complete(&self) -> bool {
+    pub(super) fn movers_delivered_complete(&self) -> bool {
         (0..self.world_size)
             .filter(|&r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
             .all(|r| {
@@ -116,7 +116,7 @@ impl ClusterCoordinator {
             })
     }
 
-    fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
+    pub(super) fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
         // Delivered-cost feed: CPU Cadence/Async + NCCL Cadence. The danger
         // this gate guards against is a STALE/PARTIAL span set at feed time:
         // some ranks with a closed span this window and some without, where
@@ -237,7 +237,7 @@ impl ClusterCoordinator {
     /// - CPU: broadcast `RequestParams`; finish_averaging_cpu mirrors
     ///   the NCCL flow but emits `Update{version}` as the lifecycle
     ///   barrier. Workers receive averaged tensors via the data
-    ///   channel ([`crate::distributed::cpu_reduce::CpuReduceClient`])
+    ///   channel (`CpuReduceClient`)
     ///   between RequestParams and the next round.
     pub fn trigger_averaging(&mut self) -> Result<()> {
         // Open a SyncStart window on the shared timeline so the user-
@@ -329,7 +329,17 @@ impl ClusterCoordinator {
                     }
                 }
                 self.nccl_sync_start = Some(Instant::now());
-                self.broadcast_control(&ControlMsgWire::SyncNow)?;
+                // Best-effort: a rank whose send failed has a broken
+                // connection — its heartbeats ride the same stream, so
+                // dead-rank detection fires shortly and the NCCL
+                // abort/rebuild path recovers the collective. Aborting the
+                // trigger here would kill the coordinator thread instead.
+                if let Err(e) = self.broadcast_control(&ControlMsgWire::SyncNow) {
+                    eprintln!(
+                        "flodl ddp: SyncNow broadcast incomplete ({e}); \
+                         relying on dead-rank recovery"
+                    );
+                }
                 for rank in 0..self.world_size {
                     self.nccl_sync_step[rank] = self.last_step_count[rank];
                     self.nccl_ack[rank] = false;
@@ -338,7 +348,17 @@ impl ClusterCoordinator {
             }
             AverageBackend::Cpu => {
                 self.nccl_sync_start = Some(Instant::now());
-                self.broadcast_control(&ControlMsgWire::RequestParams)?;
+                // Best-effort (see the SyncNow twin above): a rank whose
+                // RequestParams never arrived has a broken connection;
+                // heartbeat staleness declares it dead and
+                // `poll_cpu_averaging`'s is_dead exception completes the
+                // cycle without it.
+                if let Err(e) = self.broadcast_control(&ControlMsgWire::RequestParams) {
+                    eprintln!(
+                        "flodl ddp: RequestParams broadcast incomplete ({e}); \
+                         relying on dead-rank recovery"
+                    );
+                }
                 // Hard barrier for the non-progressive (Sync) path:
                 // after snapshotting, the fast rank blocks until the
                 // averaged `Update` lands, recreating NCCL's
@@ -365,7 +385,9 @@ impl ClusterCoordinator {
                 // progressive and bounds lookahead via the overshoot
                 // budget instead.
                 if !self.progressive {
-                    self.broadcast_control(&ControlMsgWire::Throttle)?;
+                    if let Err(e) = self.broadcast_control(&ControlMsgWire::Throttle) {
+                        crate::verbose!("  ddp: Throttle broadcast incomplete: {e}");
+                    }
                     for t in &mut self.throttled {
                         *t = true;
                     }
@@ -441,8 +463,44 @@ impl ClusterCoordinator {
             self.nccl_sync_divergence[r].is_some()
         });
         if all_alive_acked {
+            // Finalize FIRST, then flip to Idle — and flip even when the
+            // finalize errored (re-running it would double-fold chunks and
+            // double-bump the version; the error already surfaced). The
+            // old order (Idle before finalize) let a finalize error leave
+            // half the cohort updated with the state machine claiming the
+            // cycle was over.
+            let result = self.finish_averaging_cpu();
             self.cpu_avg_state = CpuAvgState::Idle;
-            return self.finish_averaging_cpu();
+            return result;
+        }
+        // HARD CEILING on Pending. The no-deadline stance is correct for
+        // SLOW cycles (dropping a reduce is a Local-SGD correctness
+        // violation, and dead ranks are the heartbeat detector's job) —
+        // but an alive-but-wedged cohort otherwise parks here forever
+        // with heartbeats flowing (the quiet-wedge signature: coord tick
+        // alive, workers parked). Past the ceiling this is a scheduler
+        // wedge, not a slow reduce: dump the gate state and escalate to
+        // save-and-shutdown so an overnight run ends as a diagnosed
+        // checkpoint instead of a silent hang. The ceiling is generous —
+        // 10x the heartbeat timeout (default 300s) dwarfs any observed
+        // CPU reduce — so a healthy rig can never hit it.
+        if let Some(start) = self.cpu_avg_start {
+            let ceiling_secs = self.heartbeat_timeout_secs.saturating_mul(10).max(300);
+            if start.elapsed() > Duration::from_secs(ceiling_secs) {
+                eprintln!(
+                    "flodl ddp: CPU averaging cycle stalled past its {ceiling_secs}s \
+                     ceiling with the cohort alive — escalating to ShutdownWithSave"
+                );
+                self.dump_stall_state(start.elapsed().as_secs_f64());
+                self.cpu_avg_state = CpuAvgState::Idle;
+                if let Err(e) = self.dispatch_shutdown_with_save(
+                    crate::distributed::SaveReason::ReduceStall,
+                ) {
+                    crate::verbose!(
+                        "  ddp: ShutdownWithSave after reduce stall failed: {e}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -666,7 +724,14 @@ impl ClusterCoordinator {
         Ok(())
     }
 
-    pub(super) fn finish_averaging_nccl(&mut self) -> Result<()> {
+    /// Shared first half of `finish_averaging_nccl` / `finish_averaging_cpu`:
+    /// feed ElChe the window timing, run the convergence-guard verdict +
+    /// LR-aware meta-controller, apply the anchor action, bump
+    /// `version` / `avg_count` / `global_step`, and emit the per-cycle
+    /// telemetry (Divergence / GuardTelemetry / AnchorChanged). Everything
+    /// here is backend-independent; the per-backend middle (NCCL
+    /// `SetGlobalStep` vs CPU fold + `Update` fan-out) follows it.
+    fn finish_averaging_head(&mut self) {
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
         // Snapshot anchor BEFORE the guard verdict + meta-nudge so the
@@ -801,14 +866,18 @@ impl ClusterCoordinator {
                 });
             }
         }
+    }
 
-        self.broadcast_control(&ControlMsgWire::SetGlobalStep {
-            global_step: self.global_step as u64,
-        })?;
-
-        for s in &mut self.steps_since_avg {
-            *s = 0;
-        }
+    /// Shared second half of `finish_averaging_nccl` / `finish_averaging_cpu`:
+    /// reset the window accumulators, re-anchor + taint any busy span
+    /// that crossed the reduce, clear the throttle / HOLD / divergence
+    /// slots, and kick idle progressive ranks back into motion. Callers
+    /// finish with their own end-of-cycle events (`CpuAvgEnd`,
+    /// `emit_sync_end`). `steps_since_avg` is NOT reset here — its
+    /// placement is backend-specific (the CPU path must reset BEFORE the
+    /// atomic-dispatch fold so `cap_to_reduce_budget` sees the fresh
+    /// window).
+    fn finish_averaging_tail(&mut self) {
         for a in &mut self.wall_ms_accum {
             *a = 0.0;
         }
@@ -860,8 +929,6 @@ impl ClusterCoordinator {
         // before the cycle) so progressive dispatch doesn't stall until
         // the next epoch-aggregate hook.
         self.wake_idle_ranks_in_progressive();
-        self.emit_sync_end();
-        Ok(())
     }
 
     /// Close the SyncStart window opened in `trigger_averaging`. Emits
@@ -878,237 +945,95 @@ impl ClusterCoordinator {
         }
     }
 
-    /// CPU-backend counterpart to [`Self::finish_averaging_nccl`].
-    ///
-    /// Differs from the NCCL path in one place: the lifecycle barrier
-    /// emitted to workers is `ControlMsgWire::Update { version, next_plan }`
-    /// (the workers received their averaged tensors via the data channel
-    /// already; this notification bumps their `current_version` and
-    /// resets `steps_since_avg`). On Cadence the `next_plan` carries the
-    /// rank's next reduce-window chunk (atomic-dispatch) so it starts
-    /// the next window without a separate `StartEpoch` round-trip.
-    ///
-    /// Everything else (ElChe report, convergence guard verdict,
-    /// overshoot / anchor tuning, counter reset) mirrors NCCL.
+    pub(super) fn finish_averaging_nccl(&mut self) -> Result<()> {
+        self.finish_averaging_head();
+
+        // Best-effort (see the CPU twin): a failed rank misses one LR base
+        // update; the broken connection is reaped by heartbeat staleness.
+        if let Err(e) = self.broadcast_control(&ControlMsgWire::SetGlobalStep {
+            global_step: self.global_step as u64,
+        }) {
+            crate::verbose!("  ddp: SetGlobalStep broadcast incomplete: {e}");
+        }
+
+        for s in &mut self.steps_since_avg {
+            *s = 0;
+        }
+
+        self.finish_averaging_tail();
+        self.emit_sync_end();
+        Ok(())
+    }
+
     pub(super) fn finish_averaging_cpu(&mut self) -> Result<()> {
-        let prev_sync_ms = self.last_nccl_sync_ms;
-        self.last_nccl_sync_ms = 0.0;
-        let old_anchor = self.el_che.anchor();
-        // Mirror of `finish_averaging_nccl`: stage slack before
-        // `report_timing` so the next-cycle batch_counts shrink on the
-        // callback-firing rank.
-        self.maybe_apply_callback_slack_for_next_cycle();
-        let (feed_ms, feed_batches) = self.timing_feed();
-        if feed_ms.iter().any(|&ms| ms > 0.0) {
-            self.el_che.report_timing(
-                &feed_ms,
-                &feed_batches,
-                prev_sync_ms,
-            );
-            if !self.calibrated && self.el_che.is_calibrated() {
-                self.calibrated = true;
-            }
-        }
-        self.dump_delivered_timing(prev_sync_ms);
+        self.finish_averaging_head();
 
-        let pre_norms: Option<Vec<f64>> =
-            if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
-                Some(self.nccl_sync_pre_norm.iter().map(|p| p.unwrap()).collect())
-            } else {
-                None
-            };
-        let report = convergence::DivergenceReport {
-            deltas: self
-                .nccl_sync_divergence
-                .iter()
-                .map(|d| d.unwrap_or(0.0))
-                .collect(),
-            pre_norms,
-            post_norm: self.nccl_sync_post_norm,
-        };
-        let cycle_batches: usize = self.steps_since_avg.iter().sum();
-        let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
-        let action = self.convergence_guard.report(&report, cycle_batches, k_max);
-
-        // LR-aware meta-controller (OLD `observe_meta` parity); see
-        // [`Self::finish_averaging_nccl`] for the rationale.
-        self.observe_meta(action);
-
-        self.version += 1;
-        self.avg_count += 1;
-
-        match action {
-            ConvergenceAction::Stable => {
-                // Guard verdict is Stable: ElChe may grow the window to
-                // amortize sync cost (do its best to meet the rendezvous
-                // efficiently). Convergence is maintained separately by
-                // the guard's SuppressGrowth / NudgeDown verdicts, which
-                // pull the anchor back when weight-space divergence rises
-                // — so growth and convergence balance rather than being
-                // hard-disabled. (Correction A's poison fix is what lets
-                // reduces fire at all, which is what feeds the guard the
-                // divergence signal it needs to do this.)
-                self.el_che.commit_proposed_anchor();
-                if self.policy == ApplyPolicy::Async {
-                    if self.overshoot_auto {
-                        self.max_overshoot =
-                            (self.max_overshoot + 1).min(self.overshoot_ceiling);
-                    }
-                    if self.elche_relax_up {
-                        self.el_che.relax_anchor_up();
-                    }
-                }
-            }
-            ConvergenceAction::SuppressGrowth => {
-                self.el_che.veto_proposed_growth();
-            }
-            ConvergenceAction::NudgeDown { factor } => {
-                self.el_che.discard_proposed_anchor();
-                self.el_che.nudge_anchor_down(factor);
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    self.max_overshoot = self.overshoot_initial;
-                }
-            }
-        }
-        if self.policy == ApplyPolicy::Async {
-            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
-        }
-
-        self.global_step += cycle_batches;
-
-        // Per-AllReduce divergence event + per-epoch aggregator update;
-        // see `finish_averaging_nccl` for the rationale.
-        let d_raw = report.max_relative_delta();
-        self.update_epoch_d_aggregator(d_raw, k_max);
-        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
-        if let Some(ref tl) = self.timeline {
-            tl.event(crate::monitor::EventKind::Divergence {
-                d_raw,
-                lambda_raw: None,
-                lambda_ema: None,
-                k_used: cycle_batches,
-                k_max,
-                step: self.global_step,
-                deltas: report.deltas.clone(),
-                post_norm: report.post_norm,
-                pre_norms: report.pre_norms.clone(),
-                epoch: Some(in_flight_epoch),
-            });
-            let telemetry = self.convergence_guard.telemetry();
-            if !telemetry.is_empty() {
-                tl.event(crate::monitor::EventKind::GuardTelemetry {
-                    epoch: in_flight_epoch,
-                    step: self.global_step,
-                    values: telemetry
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect(),
-                });
-            }
-            let new_anchor = self.el_che.anchor();
-            if new_anchor != old_anchor {
-                tl.event(crate::monitor::EventKind::AnchorChanged {
-                    from: old_anchor,
-                    to: new_anchor,
-                });
-            }
-        }
-
-        // CPU lifecycle barrier: workers received averaged tensors on
-        // the data channel; this Update notification tells them to bump
-        // `current_version` and reset `steps_since_avg`.
-        //
-        // atomic-dispatch: fold each rank's next reduce-window chunk
-        // into its Update so it applies the averaged params AND starts
-        // the next window from one frame, instead of idling for a
-        // separate post-reduce StartEpoch — clawing back the control RTT
-        // per cycle. Only Cadence benefits: it idles at the reduce
-        // barrier between windows (`chunk == counts == window`). Sync is
-        // non-progressive (whole-epoch dispatch, no inter-window
-        // StartEpoch) and Async streams ahead under its overshoot budget
-        // (folding would over-dispatch past the bound) — both get
-        // `next_plan: None` and the existing dispatch path
-        // (`wake_idle_ranks_in_progressive` below). `fold_next_chunk_for_rank`
-        // is intra-epoch only; at an epoch boundary it returns `None` and
-        // the epoch-advance path dispatches the next epoch.
         let fold = matches!(self.policy, ApplyPolicy::Cadence);
+        // Reset the per-window step counters BEFORE the fold: the fold
+        // sizes the next chunk via `compute_chunk_batches`, whose
+        // `cap_to_reduce_budget` reads `steps_since_avg`. With the reset
+        // deferred until after the fold (the old order), the cap saw the
+        // JUST-CLOSED window's full step count, `budget_remaining`
+        // bottomed out at the `.max(1)` floor, and every epoch tail folded
+        // a 1-batch chunk — off-schedule, and a fill-cost-inflated 1-batch
+        // sample in the delivered feed. The reduce that brought us here IS
+        // the window boundary; the new window's budget is fresh.
+        for s in &mut self.steps_since_avg {
+            *s = 0;
+        }
         for rank in 0..self.world_size {
+            // Dead ranks get nothing: their controller-side stream is shut,
+            // and folding a chunk for them would ghost it.
+            if self.is_dead(rank) {
+                continue;
+            }
+            let prev_epoch = self.rank_epoch[rank];
+            let span_was_open = self.delivered_span_start[rank].is_some();
             let next_plan = if fold {
                 self.fold_next_chunk_for_rank(rank)
             } else {
                 None
             };
-            self.send_control(
+            let send_result = self.send_control(
                 rank,
                 &ControlMsgWire::Update {
                     version: self.version,
-                    next_plan,
+                    next_plan: next_plan.clone(),
                 },
-            )?;
-        }
-        // SetGlobalStep is still broadcast so workers can update the
-        // per-batch LR scheduler base. Same as the NCCL path.
-        self.broadcast_control(&ControlMsgWire::SetGlobalStep {
-            global_step: self.global_step as u64,
-        })?;
-
-        for s in &mut self.steps_since_avg {
-            *s = 0;
-        }
-        for a in &mut self.wall_ms_accum {
-            *a = 0.0;
-        }
-        for a in &mut self.delivered_ms_accum {
-            *a = 0.0;
-        }
-        for n in &mut self.delivered_batches_accum {
-            *n = 0;
-        }
-        // Re-anchor any still-open busy span to the window boundary. A span
-        // open here means a rank streamed a chunk across the reduce (async
-        // overshoot); without re-anchoring, when it finally closes it would
-        // dump its whole multi-window duration into one window. Resetting
-        // the start to now keeps the next window's measurement bounded to
-        // that window. Cadence never has an open span here (in-flight is 0
-        // at the reduce), so this is a no-op there.
-        let now = Instant::now();
-        for (r, s) in self.delivered_span_start.iter_mut().enumerate() {
-            if s.is_some() {
-                *s = Some(now);
-                // The span crossed this reduce: its ms↔batches matching is
-                // broken (the chunk's FULL batch count lands post-reduce
-                // against only the post-re-anchor time slice — reads as
-                // artificially fast and spirals the allocation). Taint it so
-                // the drain skips both credits and the rank falls back to
-                // the compute feed this window. See `delivered_span_crossed`.
-                self.delivered_span_crossed[r] = true;
-                // The pre-reduce first-batch anchor is stale for the
-                // re-anchored span; the taint discards the span's credits
-                // at close anyway, but keep the anchor state consistent.
-                self.delivered_first_batch[r] = None;
+            );
+            if let Err(e) = send_result {
+                // BEST-EFFORT finalize: one broken connection must not
+                // abort the cycle mid-fan-out (it left the cohort half
+                // updated and killed the coordinator thread via `?`). Roll
+                // back this rank's folded chunk so it isn't ghosted, log
+                // loudly, and keep finalizing the others; heartbeat
+                // staleness reaps the broken rank.
+                if let Some(plan) = next_plan {
+                    let epoch = plan.epoch as usize;
+                    self.rollback_chunk_take(
+                        rank, epoch, &plan, prev_epoch, span_was_open,
+                    );
+                }
+                eprintln!(
+                    "flodl ddp: Update send to rank {rank} failed during CPU \
+                     averaging finalize ({e}); continuing with remaining ranks"
+                );
             }
         }
-        for t in &mut self.throttled {
-            *t = false;
+        // SetGlobalStep is still broadcast so workers can update the
+        // per-batch LR scheduler base. Same as the NCCL path. Best-effort:
+        // a failed rank misses one LR base update, which the next cycle's
+        // broadcast corrects (or the rank is reaped as dead).
+        if let Err(e) = self.broadcast_control(&ControlMsgWire::SetGlobalStep {
+            global_step: self.global_step as u64,
+        }) {
+            crate::verbose!("  ddp: SetGlobalStep broadcast incomplete: {e}");
         }
-        for h in &mut self.dispatch_hold_logged {
-            *h = false;
-        }
-        for d in &mut self.nccl_sync_divergence {
-            *d = None;
-        }
-        for p in &mut self.nccl_sync_pre_norm {
-            *p = None;
-        }
-        self.nccl_sync_post_norm = None;
-        // Overshoot gate is open again — kick any rank still sitting in
-        // `wait_for_epoch_plan` (gated, or just finished its last chunk
-        // before the cycle) so progressive dispatch doesn't stall until
-        // the next epoch-aggregate hook.
-        self.wake_idle_ranks_in_progressive();
+
+        self.finish_averaging_tail();
         // CpuAvgEnd: close the Pending window opened in trigger_averaging.
         // duration_ms is the bridge round-trip time (RequestParams
-        // broadcast → all alive SyncAcks landed). Distinct from the
+        // broadcast -> all alive SyncAcks landed). Distinct from the
         // outer SyncEnd which also covers the post-finalize work.
         if let Some(start) = self.cpu_avg_start.take() {
             if let Some(ref tl) = self.timeline {
@@ -1119,4 +1044,5 @@ impl ClusterCoordinator {
         self.emit_sync_end();
         Ok(())
     }
+
 }

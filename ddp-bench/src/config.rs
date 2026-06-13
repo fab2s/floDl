@@ -76,11 +76,13 @@ impl fmt::Display for DdpMode {
                 let b = match backend {
                     AverageBackend::Nccl => "nccl",
                     AverageBackend::Cpu => "cpu",
+                    _ => "unknown-backend",
                 };
                 let p = match policy {
                     ApplyPolicy::Sync => "sync",
                     ApplyPolicy::Cadence => "cadence",
                     ApplyPolicy::Async => "async",
+                    _ => "unknown-policy",
                 };
                 write!(f, "{b}-{p}")
             }

@@ -156,6 +156,20 @@ impl<M: Module> GpuWorker<M> {
     /// Synchronizes comm_stream before reading, so Update + RequestParams
     /// processed in the same `handle_control()` call cannot read mid-copy data.
     pub fn snapshot_params(&mut self) -> ParamSnapshot {
+        // SNAPSHOT-ENTRY FENCE: order the comm-stream readout after ALL
+        // pending compute-stream work. A `RequestParams` processed mid-chunk
+        // arrives with the previous batch's backward + optimizer-step kernels
+        // possibly still in flight on compute_stream (the per-batch loss
+        // readout happens BEFORE backward, so it guarantees nothing about the
+        // step); `read_params_pinned` enqueues its D2H copies on the COMM
+        // stream, and without this fence they race the in-flight update —
+        // a torn snapshot fed into the cluster average. Same fence class as
+        // `sync_now_nccl`'s sync-entry fence (the old per-param synchronous
+        // `to_device(CPU)` ran on the current stream and was accidentally
+        // ordered; the pinned rewrite hops streams and needs it explicit).
+        if let Some(stream) = &self.compute_stream {
+            let _ = stream.synchronize();
+        }
         // Wait for any pending load_averaged() non-blocking copy to finish,
         // so we read post-update weights, never mid-writeback bytes.
         if let Some(stream) = &self.comm_stream {
@@ -164,8 +178,24 @@ impl<M: Module> GpuWorker<M> {
 
         let (params, buffers) = if self.comm_stream.is_some() {
             // CUDA path: one synchronize for the whole readout.
-            self.read_params_pinned()
-                .unwrap_or_else(|_| self.read_params_passthrough())
+            match self.read_params_pinned() {
+                Ok(out) => out,
+                Err(e) => {
+                    // The passthrough fallback is correct but serializes one
+                    // device sync per param — the slow-PCIe idle floor the
+                    // pinned path exists to remove. Surface the regression
+                    // once instead of silently eating it every window.
+                    if !self.pinned_fallback_logged {
+                        self.pinned_fallback_logged = true;
+                        eprintln!(
+                            "flodl ddp: rank {} pinned snapshot readout failed ({e}); \
+                             falling back to per-param synchronous D2H (slower)",
+                            self.rank
+                        );
+                    }
+                    self.read_params_passthrough()
+                }
+            }
         } else {
             // CPU device: params already live on host, no transfer needed.
             self.read_params_passthrough()
@@ -260,6 +290,16 @@ impl<M: Module> GpuWorker<M> {
                 "load_averaged: expected {} params, got {}",
                 self.param_vars.len(), update.params.len()
             )));
+        }
+
+        // WRITEBACK-ENTRY FENCE: order the comm-stream H2D writes after ALL
+        // pending compute-stream work. Under `Async` the worker keeps
+        // training while the averaging round-trips, so an `Update` can land
+        // with the previous batch's optimizer step still in flight on
+        // compute_stream writing the same params the copies below overwrite.
+        // Mirror of the `snapshot_params` entry fence (read side).
+        if let Some(stream) = &self.compute_stream {
+            stream.synchronize()?;
         }
 
         let non_blocking = self.comm_stream.is_some();

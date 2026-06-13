@@ -772,8 +772,18 @@ impl Trainer {
         if let Some(f) = cfg.scheduler_fn {
             b = b.scheduler_fn_boxed(f);
         }
+        // Eval cadence: an eval_fn registered without an explicit
+        // cadence runs EVERY epoch — `eval_every_epochs` defaults to
+        // `None` (= disabled) downstream, which silently turned a fully
+        // wired eval pipeline into dead code on this entry point.
+        let has_eval_fn = cfg.eval_fn.is_some();
         if let Some(f) = cfg.eval_fn {
             b = b.eval_fn_arc(f);
+        }
+        match (cfg.eval_every, has_eval_fn) {
+            (Some(n), _) => b = b.eval_every(crate::distributed::ddp_run::EvalCadence::Epochs(n)),
+            (None, true) => b = b.eval_every(crate::distributed::ddp_run::EvalCadence::Epochs(1)),
+            (None, false) => {}
         }
         if let Some(ds) = cfg.eval_dataset {
             b = b.eval_dataset(ds);

@@ -228,8 +228,15 @@ impl Default for LambdaEstimator {
 }
 
 impl LambdaEstimator {
-    /// Construct with a custom alpha. `noise_floor` keeps its default 1e-8.
+    /// Construct with a custom alpha, clamped to `(0, 1]` (an EMA
+    /// coefficient outside that range corrupts the estimate silently;
+    /// NaN falls back to the default).
     pub fn with_alpha(alpha: f64) -> Self {
+        let alpha = if alpha.is_finite() {
+            alpha.clamp(f64::EPSILON, 1.0)
+        } else {
+            Self::default().alpha
+        };
         Self {
             alpha,
             ..Default::default()

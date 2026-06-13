@@ -34,7 +34,6 @@
 use std::env;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::thread;
 use std::time::Duration;
 
 use crate::{Device, Result, TensorError};
@@ -46,8 +45,6 @@ use super::wire::{
 use super::{LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId, WorkerBlock};
 
 const HOSTNAME_MAX_LEN: usize = 255;
-const CONNECT_RETRIES: usize = 60;
-const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ENV_NCCL_SOCKET_IFNAME: &str = "NCCL_SOCKET_IFNAME";
 
@@ -162,7 +159,8 @@ where
     }
 
     let addr = format!("{}:{}", cluster.controller.host, cluster.controller.port);
-    let mut stream = connect_with_retry(&addr)?;
+    let mut stream =
+        crate::distributed::wire::connect_with_retry(addr.as_str(), "rendezvous")?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -267,28 +265,47 @@ pub fn run_controller_rendezvous(
     let mut streams: Vec<Option<TcpStream>> = (0..world_size).map(|_| None).collect();
     let mut reference_sig: Option<[u8; 32]> = None;
 
-    for _ in 0..world_size {
+    let mut accepted = 0usize;
+    while accepted < world_size {
         let (mut stream, peer) = listener.accept().map_err(|e| {
             TensorError::new(&format!("rendezvous: controller accept failed: {e}"))
         })?;
-        stream
+        if stream
             .set_read_timeout(Some(IO_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-            .map_err(|e| {
-                TensorError::new(&format!(
-                    "rendezvous: controller setting timeouts failed for {peer}: {e}"
-                ))
-            })?;
+            .is_err()
+        {
+            continue;
+        }
 
-        let msg = read_rendezvous_frame(&mut stream, &full.salt)?;
+        // PER-CONNECTION REJECTION. This listener sits on 0.0.0.0: any
+        // stray TCP connection (port scanner, health checker, a rank
+        // from another cluster) that fails frame parse / HMAC here used
+        // to abort the WHOLE cohort bootstrap while honest ranks hung
+        // out their timeouts. A pre-authentication failure condemns the
+        // connection, not the cohort. HMAC-valid protocol violations
+        // (dataset-sig mismatch, duplicate/out-of-range rank) below
+        // remain cohort-fatal — those are real members misconfigured.
+        let msg = match read_rendezvous_frame(&mut stream, &full.salt) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "cluster launcher: rendezvous rejected connection from \
+                     {peer} (bad frame: {e}); continuing to accept"
+                );
+                continue;
+            }
+        };
         let (dataset_sig, global_rank, host_name) = match msg {
             RendezvousMsgWire::Hello { dataset_sig, global_rank, host_name } => {
                 (dataset_sig, global_rank, host_name)
             }
             other => {
-                return Err(TensorError::new(&format!(
-                    "rendezvous: controller expected Hello from {peer}, got {other:?}"
-                )));
+                eprintln!(
+                    "cluster launcher: rendezvous rejected connection from \
+                     {peer} (expected Hello, got {other:?}); continuing to accept"
+                );
+                continue;
             }
         };
 
@@ -324,6 +341,7 @@ pub fn run_controller_rendezvous(
             )));
         }
         streams[rank_idx] = Some(stream);
+        accepted += 1;
     }
 
     // Every rank has connected. Send Role to each, collect UID from
@@ -427,27 +445,6 @@ fn read_rendezvous_frame(
     frame.decode()
 }
 
-fn connect_with_retry(addr: &str) -> Result<TcpStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..CONNECT_RETRIES {
-        match TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(CONNECT_RETRY_INTERVAL);
-            }
-        }
-    }
-    Err(TensorError::new(&format!(
-        "rendezvous: failed to connect to controller at {addr} after {} retries (~{}s): {}",
-        CONNECT_RETRIES,
-        CONNECT_RETRIES * CONNECT_RETRY_INTERVAL.as_secs() as usize
-            + CONNECT_RETRIES * CONNECT_RETRY_INTERVAL.subsec_millis() as usize / 1000,
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "no error captured".into())
-    )))
-}
 
 fn validate_socket_ifname(cluster: &LocalCluster, this_host: &WorkerBlock) -> Result<()> {
     if !cluster.spans_multiple_workers() {
@@ -495,6 +492,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU16, Ordering};
+    use std::thread;
 
     // Env-mutating tests serialize on this Mutex.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());

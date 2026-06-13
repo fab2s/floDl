@@ -417,42 +417,7 @@
         }
     }
 
-    #[test]
-    fn param_snapshot_meta_round_trip() {
-        let meta = ParamSnapshotMetaWire {
-            rank: 2,
-            batch_count: 17,
-            num_params: 50,
-            num_buffers: 6,
-        };
-        let frame =
-            ControlFrame::encode(&SAMPLE_SALT, MsgKind::ParamSnapshotMeta, &meta).unwrap();
-        let mut buf = Vec::new();
-        frame.write_to(&mut buf).unwrap();
-        let mut cur = Cursor::new(buf);
-        let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
-            .unwrap()
-            .unwrap();
-        let back: ParamSnapshotMetaWire = got.decode().unwrap();
-        assert_eq!(back, meta);
-    }
 
-    #[test]
-    fn heartbeat_round_trip() {
-        let hb = HeartbeatWire {
-            rank: 0,
-            step_count: 12345,
-        };
-        let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Heartbeat, &hb).unwrap();
-        let mut buf = Vec::new();
-        frame.write_to(&mut buf).unwrap();
-        let mut cur = Cursor::new(buf);
-        let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
-            .unwrap()
-            .unwrap();
-        let back: HeartbeatWire = got.decode().unwrap();
-        assert_eq!(back, hb);
-    }
 
     #[cfg(feature = "rng")]
     #[test]

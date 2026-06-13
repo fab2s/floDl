@@ -92,6 +92,11 @@ pub struct Coordinator {
     snapshot_timeout_secs: u64,
     /// Number of CPU averaging rounds aborted due to timeout.
     abort_count: usize,
+    /// Consecutive soft-abort counter (reset whenever a collection round
+    /// completes). Drives the hard cap that turns an endless
+    /// abort-retry livelock — a rank that never responds while staying
+    /// "alive" — into a loud error instead of a silent forever-loop.
+    consecutive_aborts: usize,
 
     // Epoch metrics aggregation
     /// Channel to send aggregated epoch metrics to DdpHandle.
@@ -424,6 +429,7 @@ impl CoordinatorBuilder {
             avg_state: CpuAvgState::Idle,
             snapshot_timeout_secs: self.snapshot_timeout_secs,
             abort_count: 0,
+            consecutive_aborts: 0,
             epoch_metrics_tx: self.epoch_metrics_tx,
             epoch_buffer: HashMap::new(),
             device_indices: self.device_indices,

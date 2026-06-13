@@ -48,6 +48,7 @@ use super::launcher::FullCluster;
 /// vanilla synchronous DDP. The other modes engage ElChe's anchor
 /// auto-tuning and (in `Async`) overshoot scheduling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ElCheMode {
     /// NCCL averaging, all-reduce every batch. Vanilla synchronous DDP.
     /// Fast GPUs wait at each collective barrier — best when GPUs are
@@ -393,9 +394,14 @@ pub struct TrainerConfig<M: Module> {
     pub eval_dataset: Option<Arc<dyn BatchDataSet>>,
     /// Eval result handler (controller-side).
     pub eval_result_fn: Option<EvalResultFn>,
+    /// Eval cadence in epochs. `None` + an `eval_fn` registered =
+    /// every epoch (a wired eval pipeline that silently never fires is
+    /// a bug, not a default); `None` without an `eval_fn` = no evals.
+    /// Set explicitly to space evals out.
+    pub eval_every: Option<usize>,
 
     /// Which rank fires user-supplied per-epoch callbacks. Default
-    /// `Rank(0)`.
+    /// [`EpochCallbackPolicy::Fastest`].
     pub epoch_callback_policy: EpochCallbackPolicy,
 
     /// Optional high-frequency system timeline for profiling.
@@ -442,6 +448,7 @@ impl<M: Module> TrainerConfig<M> {
             eval_fn: None,
             eval_dataset: None,
             eval_result_fn: None,
+            eval_every: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,
             cluster: None,
@@ -479,6 +486,9 @@ impl<M: Module> TrainerConfig<M> {
     pub fn eval_dataset(mut self, ds: Arc<dyn BatchDataSet>) -> Self { self.eval_dataset = Some(ds); self }
     /// Register the controller-side eval-result handler.
     pub fn eval_result_fn(mut self, f: EvalResultFn) -> Self { self.eval_result_fn = Some(f); self }
+    /// Set the eval cadence in epochs (see the `eval_every` field for
+    /// the default when an `eval_fn` is registered without a cadence).
+    pub fn eval_every(mut self, n: usize) -> Self { self.eval_every = Some(n); self }
     /// Override which rank fires per-epoch callbacks.
     pub fn epoch_callback_policy(mut self, p: EpochCallbackPolicy) -> Self {
         self.epoch_callback_policy = p;

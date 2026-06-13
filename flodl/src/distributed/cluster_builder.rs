@@ -56,6 +56,11 @@ use super::launcher::{FullCluster, FullWorker};
 pub struct ClusterBuilder {
     controller: super::launcher::FullController,
     workers: Vec<FullWorker>,
+    /// Host-finalization errors deferred from [`HostBuilder::done`] so the
+    /// fluent chain stays infallible; surfaced as `Err` by
+    /// [`ClusterBuilder::build`]. Required-field mistakes are user-input
+    /// errors, not programmer invariants — they must not panic.
+    deferred_errors: Vec<String>,
 }
 
 impl Default for ClusterBuilder {
@@ -79,6 +84,7 @@ impl ClusterBuilder {
                 data_path: None,
             },
             workers: Vec::new(),
+            deferred_errors: Vec::new(),
         }
     }
 
@@ -104,6 +110,12 @@ impl ClusterBuilder {
     /// controller.host / controller.path, non-empty workers list,
     /// non-empty per-worker fields.
     pub fn build(self) -> Result<FullCluster> {
+        if !self.deferred_errors.is_empty() {
+            return Err(TensorError::new(&format!(
+                "ClusterBuilder: incomplete host definitions — {}",
+                self.deferred_errors.join("; "),
+            )));
+        }
         if self.controller.host.trim().is_empty() {
             return Err(TensorError::new(
                 "ClusterBuilder: controller(...).done() must be called \
@@ -419,27 +431,43 @@ impl HostBuilder {
 
     /// Finalize this host and return to the cluster builder.
     ///
-    /// # Panics
-    ///
-    /// Panics if required fields (`ranks`, `local_devices`,
-    /// `nccl_socket_ifname`, `path`) were not set. Validate via
-    /// [`ClusterBuilder::build`].
+    /// Missing required fields (`ranks`, `local_devices`,
+    /// `nccl_socket_ifname`, `path`) do NOT panic: they are recorded and
+    /// surfaced as a single `Err` by [`ClusterBuilder::build`], keeping
+    /// the fluent chain infallible while user-input mistakes stay loud.
     pub fn done(self) -> ClusterBuilder {
+        let mut parent = self.parent;
+        let mut missing: Vec<&str> = Vec::new();
+        if self.ranks.is_none() {
+            missing.push("ranks(...)");
+        }
+        if self.local_devices.is_none() {
+            missing.push("devices(...) or all_devices()");
+        }
+        if self.nccl_socket_ifname.is_none() {
+            missing.push("nccl_socket_ifname(...)");
+        }
+        if self.path.is_none() {
+            missing.push("path(...)");
+        }
+        if !missing.is_empty() {
+            parent.deferred_errors.push(format!(
+                "host '{}': missing {}",
+                self.name,
+                missing.join(", "),
+            ));
+            return parent;
+        }
         let host = FullWorker {
             host: self.name,
-            ranks: self.ranks.expect("HostBuilder: ranks(...) required"),
-            local_devices: self
-                .local_devices
-                .expect("HostBuilder: devices(...) or all_devices() required"),
-            nccl_socket_ifname: self
-                .nccl_socket_ifname
-                .expect("HostBuilder: nccl_socket_ifname(...) required"),
-            path: self.path.expect("HostBuilder: path(...) required"),
+            ranks: self.ranks.expect("checked above"),
+            local_devices: self.local_devices.expect("checked above"),
+            nccl_socket_ifname: self.nccl_socket_ifname.expect("checked above"),
+            path: self.path.expect("checked above"),
             arch: self.arch,
             ssh: self.ssh,
             env: std::collections::BTreeMap::new(),
         };
-        let mut parent = self.parent;
         parent.workers.push(host);
         parent
     }

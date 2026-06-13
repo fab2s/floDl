@@ -1,6 +1,6 @@
 //! DDP run-mode orchestrator: spawns GPU worker threads and a coordinator thread.
 
-mod cluster_worker;
+mod rank_entry;
 mod coord_config;
 mod single_host;
 mod handle;

@@ -71,30 +71,6 @@ pub struct CpuReduceClient {
     prof_enabled: bool,
 }
 
-/// Loopback connect with a short retry budget (~5s). The rank dials its
-/// host-local relay, which the launcher spawns alongside the ranks; the
-/// relay's loopback `bind` may land a beat after the rank starts, so a
-/// transient connection-refused is expected and retried.
-fn connect_with_retry(addr: SocketAddr) -> Result<TcpStream> {
-    const ATTEMPTS: u32 = 50;
-    const BACKOFF: Duration = Duration::from_millis(100);
-    let mut last_err = None;
-    for _ in 0..ATTEMPTS {
-        match TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(BACKOFF);
-            }
-        }
-    }
-    Err(TensorError::new(&format!(
-        "cpu_reduce: connect to {addr} failed after {ATTEMPTS} attempts: {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    )))
-}
 
 impl CpuReduceClient {
     /// Connect to the controller and complete the handshake.
@@ -133,7 +109,10 @@ impl CpuReduceClient {
         // Ranks dial their host-local relay's loopback. The relay process
         // may bind a beat after the rank starts (launcher spawns both),
         // so retry briefly rather than fail on the first refusal.
-        let stream = connect_with_retry(controller_addr)?;
+        let stream = crate::distributed::wire::connect_with_retry(
+            controller_addr,
+            "cpu_reduce",
+        )?;
         // Disable Nagle: the reduce is a small-frame write→blocking-read
         // ping-pong, which deadlocks Nagle against delayed-ACK for ~40ms
         // per round-trip. With the cross-host reduce being 97-99% of the

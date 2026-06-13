@@ -275,6 +275,7 @@ impl ClusterCoordinator {
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
+            exited: vec![false; world_size],
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
@@ -381,11 +382,47 @@ impl ClusterCoordinator {
         Ok(())
     }
 
+    /// Broadcast `msg` to every rank.
+    ///
+    /// BEST-EFFORT, NOT FAIL-FAST: every rank gets a send attempt even
+    /// when an earlier one fails. A fail-fast `?` here left every rank
+    /// AFTER the broken connection unsignaled — a Shutdown that never
+    /// reached the trailing ranks parked them forever, and a partial
+    /// RequestParams sent part of the cohort into a reduce barrier its
+    /// peers never entered.
+    ///
+    /// Declared-dead ranks are STILL attempted ("dead" often means
+    /// slow/stale-heartbeat, and frames like ShutdownWithSave exist
+    /// precisely to reach them) but their failures are expected and only
+    /// logged at verbose. Returns `Err` listing the LIVE ranks that
+    /// failed, AFTER attempting all of them; callers on non-abortable
+    /// paths log it (a live rank that fails has a broken connection, so
+    /// heartbeat staleness reaps it shortly).
     pub(super) fn broadcast_control(&mut self, msg: &ControlMsgWire) -> Result<()> {
+        let mut failed: Vec<String> = Vec::new();
         for rank in 0..self.world_size {
-            self.send_control(rank, msg)?;
+            let dead = self.is_dead(rank);
+            if let Err(e) = self.send_control(rank, msg) {
+                if dead {
+                    crate::verbose!(
+                        "  ddp: broadcast to declared-dead rank {rank} failed \
+                         (expected): {e}"
+                    );
+                } else {
+                    failed.push(format!("rank {rank}: {e}"));
+                }
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(TensorError::new(&format!(
+                "cluster_coordinator: broadcast_control failed for {} of {} ranks [{}]",
+                failed.len(),
+                self.world_size,
+                failed.join("; "),
+            )))
+        }
     }
 
     /// Send Shutdown to every rank. Called from [`Self::shutdown`];

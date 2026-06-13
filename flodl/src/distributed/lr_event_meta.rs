@@ -107,7 +107,20 @@ pub struct LrEventMeta {
 
 impl LrEventMeta {
     /// Create a new meta-controller with the supplied configuration.
-    pub fn new(config: LrEventMetaConfig) -> Self {
+    pub fn new(mut config: LrEventMetaConfig) -> Self {
+        // The convergence watcher needs at least max(sustain_k_for_phase)
+        // verdicts in its window (Warmup K=5); a smaller user cap would
+        // silently disable the watcher in exactly the phase that needs it.
+        let min_cap = sustain_k_for(Phase::Warmup);
+        if config.guard_window_cap < min_cap {
+            crate::verbose!(
+                "  ddp: LrEventMetaConfig.guard_window_cap {} < required {}; \
+                 clamping",
+                config.guard_window_cap,
+                min_cap,
+            );
+            config.guard_window_cap = min_cap;
+        }
         let lr_window = VecDeque::with_capacity(config.lr_window_cap);
         let anchor_window = VecDeque::with_capacity(config.anchor_window_cap);
         let guard_window = VecDeque::with_capacity(config.guard_window_cap);
@@ -368,7 +381,10 @@ mod tests {
         }
         assert_eq!(meta.lr_window().len(), 3);
         assert_eq!(meta.anchor_window().len(), 3);
-        assert_eq!(meta.guard_window().len(), 3);
+        // guard_window_cap clamps up to max(sustain_k_for_phase) (Warmup
+        // K=5): a 3-cap would silently disable the convergence watcher in
+        // the phase that needs it most.
+        assert_eq!(meta.guard_window().len(), 5);
         assert!((meta.lr_window()[0] - 0.2).abs() < 1e-9);
         assert_eq!(*meta.anchor_window().back().unwrap(), 104);
     }

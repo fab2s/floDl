@@ -93,10 +93,27 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
         // Explicit "no CUDA" — libtorch treats this as zero devices.
         return Vec::new();
     }
-    let allowed: std::collections::HashSet<u8> = trimmed
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
+    let mut allowed: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for entry in trimmed.split(',') {
+        let entry = entry.trim();
+        match entry.parse::<u8>() {
+            Ok(idx) => {
+                allowed.insert(idx);
+            }
+            Err(_) => {
+                // CUDA also accepts GPU-<uuid> / MIG-<...> forms that this
+                // index-based filter can't resolve. Silently dropping them
+                // reported "no GPUs" while libtorch would happily see one —
+                // exactly the runtime divergence detect_gpus exists to
+                // prevent. Loud per the explicit-selector rule.
+                eprintln!(
+                    "flodl sys: CUDA_VISIBLE_DEVICES entry '{entry}' is not a \
+                     numeric index (UUID/MIG forms are not resolved by \
+                     detect_gpus); GPU detection may under-count"
+                );
+            }
+        }
+    }
     all.into_iter()
         .filter(|g| allowed.contains(&g.index))
         .collect()
@@ -113,7 +130,20 @@ fn detect_gpus_raw() -> Vec<GpuInfo> {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        Ok(o) => {
+            // nvidia-smi present but errored — most commonly an old driver
+            // bundle that doesn't support the `compute_cap` query field.
+            // Distinguish from "no nvidia-smi" so a real multi-GPU box
+            // reporting zero GPUs leaves a trace instead of a mystery.
+            eprintln!(
+                "flodl sys: nvidia-smi exited non-zero ({}); reporting 0 GPUs. \
+                 stderr: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim(),
+            );
+            return Vec::new();
+        }
+        Err(_) => return Vec::new(), // nvidia-smi absent: genuinely no CUDA
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);

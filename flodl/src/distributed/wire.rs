@@ -35,7 +35,8 @@
 //!
 //! Launcher generates a 128-bit random salt per training session and
 //! distributes it via the cluster envelope. Every control frame's
-//! `auth_tag` is HMAC-SHA256 over the payload bytes, keyed by the salt,
+//! `auth_tag` is HMAC-SHA256 over `kind || payload_len || payload`
+//! (header fields inside the envelope), keyed by the salt,
 //! truncated to 64 bits. A frame from a wrong session (stale process,
 //! MITM without the key, network mix-up) fails authentication with
 //! probability 2^-64 and surfaces loudly.
@@ -86,7 +87,79 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 /// Wire version of the control-channel protocol. Independent of the
 /// data-channel `PROTOCOL_VERSION` in `controller.rs`. Bump on any
 /// breaking change to [`ControlFrame`] or to the wire-message types.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+
+/// Hard cap on a ControlFrame payload. Control frames carry bincode
+/// messages in the bytes-to-KB range (the largest is an NCCL UID or a
+/// scalars map); anything bigger is a corrupt or hostile length field.
+/// Rejecting BEFORE allocation closes the unauthenticated-length
+/// memory-DoS: a single garbage header on an exposed port could
+/// otherwise demand a multi-GiB allocation up front.
+pub const MAX_CONTROL_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Incremental-allocation chunk for length-prefixed reads whose
+/// legitimate payloads can be large (tensor data). The buffer grows as
+/// bytes actually arrive instead of trusting the unauthenticated length
+/// for one big up-front allocation.
+pub(crate) const READ_CHUNK: usize = 64 * 1024 * 1024;
+
+/// One shared TCP connect budget for every cluster dial (rank ->
+/// rendezvous, relay -> controller, worker -> coordinator, reduce
+/// client -> controller): ~30s of 500ms attempts. The four call sites
+/// used to carry four hand-rolled copies with DISAGREEING budgets
+/// (10s relay vs 30s rendezvous vs 5s worker) — a slow controller
+/// start then killed the relay first and the diagnostics blamed the
+/// wrong tier. One budget, ordered by definition.
+pub(crate) const CONNECT_ATTEMPTS: u32 = 60;
+/// Pause between [`CONNECT_ATTEMPTS`].
+pub(crate) const CONNECT_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// TCP connect with the shared cluster retry budget. `what` names the
+/// dial for the error message (e.g. "relay upstream", "rendezvous").
+pub(crate) fn connect_with_retry<A>(
+    addr: A,
+    what: &str,
+) -> Result<std::net::TcpStream>
+where
+    A: std::net::ToSocketAddrs + std::fmt::Display + Copy,
+{
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..CONNECT_ATTEMPTS {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(CONNECT_BACKOFF);
+            }
+        }
+    }
+    Err(TensorError::new(&format!(
+        "{what}: connect to {addr} failed after {CONNECT_ATTEMPTS} attempts \
+         (~{}s): {}",
+        CONNECT_ATTEMPTS as u64 * CONNECT_BACKOFF.as_millis() as u64 / 1000,
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no error captured".into()),
+    )))
+}
+
+/// Read exactly `len` bytes, growing the buffer in [`READ_CHUNK`] steps
+/// so a garbage/hostile length field can only make us allocate as much
+/// as the peer actually sends.
+pub(crate) fn read_exact_incremental<R: Read>(
+    r: &mut R,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < len {
+        let chunk = (len - buf.len()).min(READ_CHUNK);
+        let old_len = buf.len();
+        buf.resize(old_len + chunk, 0);
+        r.read_exact(&mut buf[old_len..])?;
+    }
+    Ok(buf)
+}
 
 /// Length of the random session salt in bytes.
 pub const SESSION_SALT_BYTES: usize = 16;
@@ -103,9 +176,9 @@ pub enum MsgKind {
     Metrics = 0x03,
     /// Worker → coordinator pre-snapshot metadata, paired with a
     /// matching [`crate::distributed::controller::RoundFrame`] on the
-    /// data channel. Payload: [`ParamSnapshotMetaWire`].
+    /// data channel. Payload: `ParamSnapshotMetaWire`.
     ParamSnapshotMeta = 0x04,
-    /// Periodic heartbeat (control-channel). Payload: [`HeartbeatWire`].
+    /// Periodic heartbeat (control-channel). Payload: `HeartbeatWire`.
     Heartbeat = 0x05,
     /// Bootstrap rendezvous frame: worker → controller hello, controller →
     /// worker role assignment, and either-direction NCCL unique-id
@@ -161,6 +234,20 @@ pub type SessionSalt = [u8; SESSION_SALT_BYTES];
 pub fn hmac_sha256_64(salt: &SessionSalt, bytes: &[u8]) -> u64 {
     let full: [u8; 32] = HMAC::mac(bytes, salt.as_slice());
     u64::from_le_bytes(full[0..8].try_into().unwrap())
+}
+
+/// Frame MAC for [`ControlFrame`]: HMAC over `kind || payload_len ||
+/// payload` (all little-endian), keyed by the session salt. Covering the
+/// header fields means a flipped `kind` (a captured `Shutdown` replayed
+/// as `SyncNow`-shaped junk) or a forged length no longer authenticates —
+/// the payload-only MAC left both outside the envelope. Mirrors
+/// `hmac_sha256_64_2`'s header-coverage discipline on the mux layer.
+fn frame_mac(salt: &SessionSalt, kind: MsgKind, payload: &[u8]) -> u64 {
+    let mut macd = Vec::with_capacity(8 + payload.len());
+    macd.extend_from_slice(&(kind as u32).to_le_bytes());
+    macd.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    macd.extend_from_slice(payload);
+    hmac_sha256_64(salt, &macd)
 }
 
 /// Generate a fresh random session salt from the OS-seeded thread RNG.
@@ -263,7 +350,7 @@ impl ControlFrame {
         msg: &T,
     ) -> Result<Self> {
         let payload = encode(msg)?;
-        let auth_tag = hmac_sha256_64(salt, &payload);
+        let auth_tag = frame_mac(salt, kind, &payload);
         Ok(ControlFrame {
             kind,
             auth_tag,
@@ -307,7 +394,7 @@ impl ControlFrame {
     ///
     /// Treats `WouldBlock` and `TimedOut` on the initial header read as
     /// errors. For short-timeout / non-blocking readers, prefer
-    /// [`Self::try_read_from`].
+    /// `try_read_from`.
     pub fn read_from<R: Read>(r: &mut R, salt: &SessionSalt) -> Result<Option<Self>> {
         let mut hdr = [0u8; 24];
         match r.read_exact(&mut hdr) {
@@ -329,36 +416,6 @@ impl ControlFrame {
         Self::finish_read_from(hdr, r, salt).map(Some)
     }
 
-    /// Like [`Self::read_from`] but distinguishes "no data available
-    /// right now" (e.g. `set_read_timeout` fired, or non-blocking
-    /// reader sees no bytes) from clean EOF and from wire errors.
-    /// Used by the cluster coordinator's per-rank reader thread so it
-    /// can re-check its shutdown flag periodically without exiting on
-    /// idle ticks.
-    ///
-    /// Once a single header byte has been consumed the method commits
-    /// to reading the full frame — partial reads beyond that point
-    /// surface as `Err`.
-    pub fn try_read_from<R: Read>(r: &mut R, salt: &SessionSalt) -> Result<FrameRead> {
-        let mut hdr = [0u8; 24];
-        match r.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) => {
-                return match e.kind() {
-                    ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset => {
-                        Ok(FrameRead::Eof)
-                    }
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        Ok(FrameRead::WouldBlock)
-                    }
-                    _ => Err(TensorError::new(&format!(
-                        "wire: ControlFrame header read failed: {e}"
-                    ))),
-                };
-            }
-        }
-        Self::finish_read_from(hdr, r, salt).map(FrameRead::Frame)
-    }
 
     fn finish_read_from<R: Read>(
         hdr: [u8; 24],
@@ -381,13 +438,20 @@ impl ControlFrame {
         let kind_u32 = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
         let kind = MsgKind::from_u32(kind_u32)?;
         let payload_len = u32::from_le_bytes(hdr[20..24].try_into().unwrap()) as usize;
+        if payload_len > MAX_CONTROL_PAYLOAD {
+            return Err(TensorError::new(&format!(
+                "wire: ControlFrame payload_len {payload_len} exceeds \
+                 MAX_CONTROL_PAYLOAD {MAX_CONTROL_PAYLOAD} (kind={kind:?}); \
+                 rejecting before allocation"
+            )));
+        }
         let mut payload = vec![0u8; payload_len];
         r.read_exact(&mut payload).map_err(|e| {
             TensorError::new(&format!(
                 "wire: ControlFrame payload read failed (kind={kind:?}, len={payload_len}): {e}"
             ))
         })?;
-        let actual = hmac_sha256_64(salt, &payload);
+        let actual = frame_mac(salt, kind, &payload);
         if actual != auth_tag {
             return Err(TensorError::new(&format!(
                 "wire: ControlFrame HMAC verification failed (computed \
@@ -404,18 +468,6 @@ impl ControlFrame {
     }
 }
 
-/// Outcome of a single [`ControlFrame::try_read_from`] call.
-#[derive(Debug)]
-pub enum FrameRead {
-    /// A frame was decoded and HMAC-verified.
-    Frame(ControlFrame),
-    /// No frame available within the reader's timeout window (or the
-    /// reader is non-blocking and has nothing buffered). Caller should
-    /// keep polling.
-    WouldBlock,
-    /// Peer closed the stream cleanly. No more frames will arrive.
-    Eof,
-}
 
 // ---------------------------------------------------------------------------
 // Wire-friendly message types
@@ -925,33 +977,7 @@ pub struct EpochMetricsWire {
     pub device_indices: Vec<u8>,
 }
 
-/// Metadata header paired with a [`RoundFrame`] on the data channel when
-/// a worker is shipping its ParamSnapshot for CPU averaging.
-///
-/// [`RoundFrame`]: crate::distributed::controller::RoundFrame
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParamSnapshotMetaWire {
-    pub rank: u64,
-    pub batch_count: u64,
-    /// Number of parameter tensors in the upcoming RoundFrame.
-    pub num_params: u32,
-    /// Number of buffer tensors in the upcoming RoundFrame, following
-    /// the params. Worker concatenates `params || buffers` into a
-    /// single RoundFrame; this field tells the receiver where the
-    /// split is.
-    pub num_buffers: u32,
-}
 
-/// Periodic worker-emitted heartbeat. Coordinator uses last-heard time
-/// per rank for fault detection (drives `check_dead_ranks` /
-/// rank-death dispatch in
-/// [`crate::distributed::cluster_coordinator::ClusterCoordinator`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeartbeatWire {
-    pub rank: u64,
-    /// Monotonic-ish step count at heartbeat time. Diagnostic.
-    pub step_count: u64,
-}
 
 /// Per-rank role assignment for the bootstrap rendezvous.
 ///

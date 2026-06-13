@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -58,11 +58,6 @@ use super::mux::{
 /// without busy-spinning.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Upstream connect retry budget: the relay may start before the
-/// controller's listener is up. ~10s total (matches the spirit of
-/// rendezvous `connect_with_retry`).
-const UPSTREAM_CONNECT_ATTEMPTS: u32 = 50;
-const UPSTREAM_CONNECT_BACKOFF: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------
 // Channel kind + handshake termination
@@ -118,10 +113,8 @@ impl ChannelKind {
 /// A running relay transport channel for one host. Owns the mux threads;
 /// [`Self::shutdown`] (or drop) signals them and joins.
 pub struct RelayChannel {
-    kind: ChannelKind,
     shutdown: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    loopback_port: u16,
 }
 
 impl RelayChannel {
@@ -157,10 +150,6 @@ impl RelayChannel {
         salt: SessionSalt,
     ) -> Result<Self> {
         ranks.sort_unstable();
-        let loopback_port = listener
-            .local_addr()
-            .map_err(|e| TensorError::new(&format!("relay: local_addr failed: {e}")))?
-            .port();
 
         // Phase 1: accept + terminate each local rank's handshake.
         let expected: HashSet<u32> = ranks.iter().copied().collect();
@@ -185,7 +174,10 @@ impl RelayChannel {
         }
 
         // Phase 2: connect upstream + relay handshake.
-        let mut upstream = connect_upstream(upstream_addr)?;
+        let mut upstream = crate::distributed::wire::connect_with_retry(
+            upstream_addr,
+            "relay upstream",
+        )?;
         let _ = upstream.set_nodelay(true);
         MuxRecord::control(RelayControlMsg::Hello {
             host,
@@ -209,25 +201,13 @@ impl RelayChannel {
         // Phase 3: spawn the mux threads.
         let shutdown = Arc::new(AtomicBool::new(false));
         let threads = spawn_mux(rank_streams, upstream, salt, Arc::clone(&shutdown))?;
-        Ok(RelayChannel {
-            kind,
-            shutdown,
-            threads,
-            loopback_port,
-        })
-    }
-
-    /// The loopback port ranks connect to for this channel.
-    pub fn loopback_port(&self) -> u16 {
-        self.loopback_port
-    }
-
-    /// Which channel this relay carries.
-    pub fn kind(&self) -> ChannelKind {
-        self.kind
+        Ok(RelayChannel { shutdown, threads })
     }
 
     /// Signal the mux threads to stop and join them. Idempotent.
+    // Production relays exit via `join` (natural completion); the forced
+    // teardown is exercised by the relay fault tests.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         for t in self.threads.drain(..) {
@@ -263,24 +243,6 @@ impl Drop for RelayChannel {
 // Upstream connect with retry
 // ---------------------------------------------------------------------------
 
-fn connect_upstream(addr: SocketAddr) -> Result<TcpStream> {
-    let mut last_err = None;
-    for _ in 0..UPSTREAM_CONNECT_ATTEMPTS {
-        match TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(UPSTREAM_CONNECT_BACKOFF);
-            }
-        }
-    }
-    Err(TensorError::new(&format!(
-        "relay: upstream connect to {addr} failed after {UPSTREAM_CONNECT_ATTEMPTS} attempts: {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    )))
-}
 
 // ---------------------------------------------------------------------------
 // Mux core
@@ -302,7 +264,14 @@ fn spawn_mux(
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Vec<JoinHandle<()>>> {
-    let (tx, rx) = mpsc::channel::<MuxRecord>();
+    // BOUNDED: per-rank reader threads pump full param-snapshot blobs
+    // into this queue while a single blocking writer drains it to the
+    // (possibly slow) upstream link. Unbounded, a slow upstream grew the
+    // queue by O(ranks x model bytes) per reduce window; the bound makes
+    // a full queue block the rank readers — re-creating the natural TCP
+    // backpressure the mux removed. Sized in records, not bytes: each
+    // rank has at most a handful of frames in flight per window.
+    let (tx, rx) = mpsc::sync_channel::<MuxRecord>(64);
     let active = Arc::new(AtomicUsize::new(rank_streams.len()));
 
     // Upstream: one read clone (upstream-reader) + the original for the
@@ -379,7 +348,7 @@ fn spawn_mux(
 fn rank_reader(
     rank: u32,
     mut stream: TcpStream,
-    tx: Sender<MuxRecord>,
+    tx: mpsc::SyncSender<MuxRecord>,
     shutdown: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
 ) {

@@ -86,6 +86,10 @@ where
     /// Controller-side callback receiving `(epoch, metric)` once the
     /// chosen rank's `eval_fn` result arrives over the wire.
     eval_result_fn: Option<EvalResultFn>,
+    /// Programmatic cluster topology; promoted to the
+    /// `FLODL_FULL_CLUSTER_JSON` launcher contract at `.run()` (same
+    /// precedence rules as `TrainerConfig::cluster`).
+    cluster: Option<crate::distributed::launcher::FullCluster>,
     _phantom: PhantomData<(M, O)>,
 }
 
@@ -267,7 +271,7 @@ where
         self
     }
 
-    /// Enable the LR-aware meta-controller above ElChe. Default: `false`.
+    /// Enable the LR-aware meta-controller above ElChe. Default: `true`.
     ///
     /// When enabled, the coordinator constructs a
     /// [`crate::distributed::lr_event_meta::LrEventMeta`] that observes the
@@ -547,7 +551,7 @@ where
     }
 
     /// Override the epoch-callback policy (which rank fires user
-    /// callbacks). Default: `Rank(0)`. Mirrors
+    /// callbacks). Default: `Fastest`. Mirrors
     /// [`DdpRunConfig::with_epoch_callback_policy`].
     pub fn epoch_callback_policy(
         mut self,
@@ -596,6 +600,15 @@ where
         self
     }
 
+    /// Attach a programmatic cluster topology (parity with
+    /// [`TrainerConfig::cluster`](crate::distributed::TrainerConfig::cluster)).
+    /// Promoted to the `FLODL_FULL_CLUSTER_JSON` env contract at
+    /// `.run()`; an already-set env var (fdl-cli) wins.
+    pub fn cluster(mut self, c: crate::distributed::launcher::FullCluster) -> Self {
+        self.cluster = Some(c);
+        self
+    }
+
     /// Launch training. Non-blocking: spawns threads and returns immediately.
     ///
     /// Call [`DdpHandle::join`] to block until training completes and retrieve
@@ -605,9 +618,67 @@ where
     ///
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
     pub fn run(mut self) -> Result<DdpHandle> {
+        // Programmatic cluster: same env-var promotion + precedence as
+        // `Trainer::run` (an fdl-cli-set FLODL_FULL_CLUSTER_JSON wins).
+        if let Some(full) = &self.cluster {
+            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
+            if std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none() {
+                let json = full.to_json().to_string();
+                let hex = crate::distributed::cluster::hex_encode(json.as_bytes());
+                // SAFETY: `.run()` is called from main() before any
+                // thread spawning — same invariant as `Trainer::run`.
+                unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, hex); }
+            }
+        }
         let dataset = self.dataset.expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
         let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
+
+        // (Async, Nccl) has no mode: NcclAsync was dropped (within-noise
+        // vs NcclCadence; the in-place writeback raced autograd on
+        // heterogeneous GPUs). A debug_assert alone let release builds
+        // silently coerce the pair to NcclCadence while dispatch kept
+        // policy=Async — config-of-record and runtime disagreed. Hard
+        // error instead.
+        if matches!(
+            (self.policy, self.backend),
+            (
+                crate::distributed::ddp_run::ApplyPolicy::Async,
+                crate::distributed::ddp_run::AverageBackend::Nccl
+            )
+        ) {
+            return Err(crate::tensor::TensorError::new(
+                "DdpBuilder: (Async, Nccl) is not a supported combination — \
+                 NcclAsync was dropped (use NcclCadence, or CpuAsync for \
+                 bounded-lookahead streaming).",
+            ));
+        }
+
+        // partition_ratios: explicit user input — error on unresolvable
+        // values instead of silently skipping (the seed path used to
+        // no-op on a length mismatch).
+        if let Some(ratios) = &self.config.elche.partition_ratios {
+            if ratios.is_empty() || ratios.iter().any(|r| !r.is_finite() || *r <= 0.0) {
+                return Err(crate::tensor::TensorError::new(
+                    "DdpBuilder: partition_ratios must be non-empty, finite \
+                     and > 0 per rank",
+                ));
+            }
+            let sum: f64 = ratios.iter().sum();
+            if (sum - 1.0).abs() > 0.05 {
+                return Err(crate::tensor::TensorError::new(&format!(
+                    "DdpBuilder: partition_ratios must sum to ~1.0 (got {sum:.4})"
+                )));
+            }
+        }
+        // easgd_alpha: blend factor semantics require (0, 1].
+        if let Some(alpha) = self.config.elche.easgd_alpha {
+            if !(alpha > 0.0 && alpha <= 1.0) {
+                return Err(crate::tensor::TensorError::new(&format!(
+                    "DdpBuilder: easgd_alpha must be in (0, 1], got {alpha}"
+                )));
+            }
+        }
 
         // Reconcile the canonical strategy mode with the builder's
         // transient policy/backend (which `.policy()`/`.backend()` may have
@@ -704,6 +775,7 @@ impl DdpHandle {
             eval_fn: None,
             eval_dataset: None,
             eval_result_fn: None,
+            cluster: None,
             _phantom: PhantomData,
         }
     }

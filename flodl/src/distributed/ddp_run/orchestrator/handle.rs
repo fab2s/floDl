@@ -357,104 +357,32 @@ impl DdpHandle {
         // identifies a cluster-rank context with a fatal parse failure.
         match crate::distributed::cluster::LocalCluster::from_env() {
             Ok(Some(cluster)) => {
-                let dispatch_result: Result<Self> = match (policy, backend) {
-                    (ApplyPolicy::Sync, AverageBackend::Nccl) => {
-                        Self::run_cluster_rank_sync_nccl_via_coord(
-                            cluster,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            scheduler_fn,
-                            epoch_fn,
-                            checkpoint_fn,
-                            eval_fn,
-                            eval_dataset,
-                        )
-                    }
-                    (ApplyPolicy::Cadence, AverageBackend::Nccl)
-                    | (ApplyPolicy::Async, AverageBackend::Nccl) => {
-                        // Cadence and Async share the same NCCL algorithm:
-                        // overshoot is an async/CPU concept (no-op for NCCL).
-                        // `policy` is carried in `WorkerConfig` for the
-                        // worker's pre_sync_scratch / metadata branching.
-                        Self::run_cluster_rank_cadence_nccl_via_coord(
-                            cluster,
-                            policy,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            convergence_guard,
-                            scheduler_fn,
-                            epoch_fn,
-                            checkpoint_fn,
-                            eval_fn,
-                            eval_dataset,
-                        )
-                    }
-                    (ApplyPolicy::Sync, AverageBackend::Cpu) => {
-                        Self::run_cluster_rank_sync_cpu_via_coord(
-                            cluster,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            scheduler_fn,
-                            epoch_fn,
-                            checkpoint_fn,
-                            eval_fn,
-                            eval_dataset,
-                        )
-                    }
-                    (ApplyPolicy::Cadence, AverageBackend::Cpu) => {
-                        Self::run_cluster_rank_cadence_cpu_via_coord(
-                            cluster,
-                            ApplyPolicy::Cadence,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            convergence_guard,
-                            scheduler_fn,
-                            epoch_fn,
-                            checkpoint_fn,
-                            eval_fn,
-                            eval_dataset,
-                        )
-                    }
-                    (ApplyPolicy::Async, AverageBackend::Cpu) => {
-                        Self::run_cluster_rank_cadence_cpu_via_coord(
-                            cluster,
-                            ApplyPolicy::Async,
-                            model_factory,
-                            optim_factory,
-                            train_fn,
-                            dataset,
-                            batch_size,
-                            num_epochs,
-                            config,
-                            convergence_guard,
-                            scheduler_fn,
-                            epoch_fn,
-                            checkpoint_fn,
-                            eval_fn,
-                            eval_dataset,
-                        )
-                    }
-                };
+                // One cluster session per process (see launcher's
+                // `claim_cluster_entry`): the rank-side bridges and the
+                // coordinator they dial are equally per-session.
+                if let Err(e) =
+                    crate::distributed::launcher::claim_cluster_entry("rank")
+                {
+                    eprintln!("flodl cluster rank: {e}");
+                    std::process::exit(1);
+                }
+                let dispatch_result: Result<Self> = Self::run_cluster_rank_via_coord(
+                    cluster,
+                    policy,
+                    backend,
+                    model_factory,
+                    optim_factory,
+                    train_fn,
+                    dataset,
+                    batch_size,
+                    num_epochs,
+                    config,
+                    scheduler_fn,
+                    epoch_fn,
+                    checkpoint_fn,
+                    eval_fn,
+                    eval_dataset,
+                );
                 return match dispatch_result {
                     Ok(h) => Ok(h),
                     Err(e) => {
@@ -600,18 +528,27 @@ impl DdpHandle {
         // most likely the slowest. Either way, the pick is "soft" — once
         // timing data accumulates, election may move the anchor.
         if let Some(ratios) = config.elche.partition_ratios.as_ref() {
-            if ratios.len() == world_size {
-                if let Some((slow_rank, _)) = ratios
-                    .iter()
-                    .enumerate()
-                    .min_by(|(ra, a), (rb, b)| {
-                        a.partial_cmp(b)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then(ra.cmp(rb))
-                    })
-                {
-                    el_che = el_che.with_initial_anchor(slow_rank);
-                }
+            // Explicit user input: a length mismatch is a config error,
+            // not a silent skip (the old behavior dropped the slow-rank
+            // seed AND let the runtime partitioner consume a wrong-length
+            // vec).
+            if ratios.len() != world_size {
+                return Err(crate::tensor::TensorError::new(&format!(
+                    "partition_ratios has {} entries but world_size is \
+                     {world_size}; provide one ratio per rank",
+                    ratios.len(),
+                )));
+            }
+            if let Some((slow_rank, _)) = ratios
+                .iter()
+                .enumerate()
+                .min_by(|(ra, a), (rb, b)| {
+                    a.partial_cmp(b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(ra.cmp(rb))
+                })
+            {
+                el_che = el_che.with_initial_anchor(slow_rank);
             }
         } else {
             let cuda_indices: Vec<i32> = devices.iter().filter_map(|d| match d {
@@ -1061,6 +998,16 @@ impl DdpHandle {
     /// On partial failure (some workers died), returns the average of
     /// surviving workers' final snapshots. Returns an error only if
     /// all workers failed.
+    ///
+    /// **Launcher-mode caveat** (cluster runs and the multi-GPU
+    /// auto-promote path): the launcher process never trains — ranks are
+    /// separate processes — so the returned `TrainedState` is **empty**
+    /// (`params` / `buffers` are zero-length). Cross-process final-state
+    /// egress is a planned follow-up; until it lands, retrieve the final
+    /// model from the checkpoint bundle (`save_path` +
+    /// `checkpoint_every`, or the `ShutdownWithSave` bundle). A warning
+    /// is logged when an empty launcher-mode state is returned so the
+    /// gap is visible at runtime, not just in docs.
     pub fn join(mut self) -> Result<TrainedState> {
         // Single-GPU: state was captured in run_single()
         if let Some(state) = self.final_state.take() {
@@ -1078,10 +1025,20 @@ impl DdpHandle {
         // launcher's `.join()` still completes cleanly.
         if let Some(driver) = self.launcher_driver.take() {
             return match driver.join() {
-                Ok(Ok(())) => Ok(TrainedState {
-                    params: Vec::new(),
-                    buffers: Vec::new(),
-                }),
+                Ok(Ok(())) => {
+                    // See the launcher-mode caveat on `join`'s docs:
+                    // surfacing this at runtime keeps the transparent-DDP
+                    // gap loud until cross-process state egress lands.
+                    eprintln!(
+                        "flodl ddp: join() on the launcher returns an EMPTY \
+                         TrainedState (ranks are separate processes); use the \
+                         checkpoint bundle for the final model"
+                    );
+                    Ok(TrainedState {
+                        params: Vec::new(),
+                        buffers: Vec::new(),
+                    })
+                }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TensorError::new(
                     "join: launcher driver thread panicked",

@@ -153,6 +153,15 @@ impl Coordinator {
                 // CPU averaging state machine runs, then the Update
                 // overwrites those steps, wasting compute and corrupting
                 // the optimizer's momentum/variance state.
+                // Discard any straggler snapshot from a soft-aborted prior
+                // cycle. A stale snapshot landing in the NEW round would
+                // flip `received[rank]` and the rank's fresh response would
+                // then be dropped as a duplicate. (Content-wise the stale
+                // snapshot aliases the worker's reused staging buffers, so
+                // the bytes are current — this drain keeps the BOOKKEEPING
+                // honest, not the bytes.)
+                while self.param_rx.try_recv().is_ok() {}
+
                 let sync_throttle = matches!(self.policy, ApplyPolicy::Sync);
                 for (rank, tx) in self.control_txs.iter().enumerate() {
                     let _ = tx.send(ControlMsg::RequestParams);
@@ -192,7 +201,7 @@ impl Coordinator {
         // Use the wall-time elapsed of the PREVIOUS NCCL sync (captured in
         // process_timing_msg when the last rank acked) as `sync_ms`. Without
         // this, NCCL's `last_avg_ms` stayed at 0 and the anchor auto-tune
-        // block in el_che.rs:292-308 silently skipped. Result: anchor pinned
+        // block in ElChe::propose_anchor silently skipped. Result: anchor pinned
         // at min, syncs too frequent, AllReduce barrier wait dominates.
         let prev_sync_ms = self.last_nccl_sync_ms;
         self.last_nccl_sync_ms = 0.0;
@@ -232,8 +241,8 @@ impl Coordinator {
             .convergence_guard
             .report(&report, cycle_batches_for_guard, k_max_for_guard);
 
-        // Stage 2: meta-controller observes the verdict alongside LR / anchor
-        // / phase. Action emission is dropped — Stage 3 wires it to dispatch.
+        // Meta-controller observes the verdict alongside LR / anchor /
+        // phase; its NudgeDown actions dispatch through observe_meta.
         self.observe_meta(action);
 
         self.version += 1;
@@ -425,8 +434,8 @@ impl Coordinator {
             convergence::ConvergenceAction::Stable
         };
 
-        // Stage 2: meta-controller observes the verdict alongside LR / anchor
-        // / phase. Action emission is dropped — Stage 3 wires it to dispatch.
+        // Meta-controller observes the verdict alongside LR / anchor /
+        // phase; its NudgeDown actions dispatch through observe_meta.
         self.observe_meta(action);
 
         match action {
@@ -639,6 +648,7 @@ impl Coordinator {
 
                 if snapshots.len() >= self.world_size {
                     // All snapshots collected. Spawn compute thread.
+                    self.consecutive_aborts = 0;
                     if let Some(ref tl) = self.timeline {
                         tl.event(crate::monitor::EventKind::CpuAvgStart);
                     }
@@ -668,6 +678,33 @@ impl Coordinator {
                         .map(|(r, _)| r)
                         .collect();
                     self.abort_count += 1;
+                    self.consecutive_aborts += 1;
+                    // HARD CAP. The soft-abort exists for transient
+                    // slowness — the retry's RequestParams reaches even
+                    // throttled workers (they service it inside the
+                    // throttle loop) and a successful round's Update
+                    // releases everyone. But a rank that NEVER responds
+                    // while staying otherwise alive turns the retry into a
+                    // forever livelock: under Sync the rest of the cohort
+                    // sits throttled the whole time. Past the cap that is
+                    // a wedge, not slowness — fail loudly; the coordinator
+                    // unwinds and the dropped control channels release the
+                    // throttle loops (their `recv` errors out as shutdown).
+                    const MAX_CONSECUTIVE_AVG_ABORTS: usize = 5;
+                    if self.consecutive_aborts >= MAX_CONSECUTIVE_AVG_ABORTS {
+                        eprintln!(
+                            "flodl ddp: CPU averaging aborted {} consecutive \
+                             times (missing ranks each round: {missing:?}); \
+                             giving up",
+                            self.consecutive_aborts,
+                        );
+                        self.abort_cpu_averaging();
+                        return Err(TensorError::new(&format!(
+                            "CPU averaging livelock: ranks {missing:?} never \
+                             delivered a snapshot across {MAX_CONSECUTIVE_AVG_ABORTS} \
+                             rounds",
+                        )));
+                    }
                     crate::verbose!(
                         "  ddp: CPU averaging timeout, missing ranks: {missing:?} \
                          (abort #{}, will retry)", self.abort_count

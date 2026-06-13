@@ -62,7 +62,7 @@ pub struct ClusterCoordinatorConfig {
     /// for unconditioned-trajectory runs). When enabled, a
     /// [`crate::distributed::lr_event_meta::LrEventMeta`] is constructed
     /// and held by the coordinator; per-rank LR updates from
-    /// [`crate::distributed::wire::TimingMsgWire::LrUpdate`] populate `last_lr_per_rank`, and the
+    /// `LrUpdate` populate `last_lr_per_rank`, and the
     /// meta is consulted after every averaging-cycle guard verdict
     /// (see the coord's private `observe_meta` hook).
     /// `MetaAction::NudgeDown` dispatches to
@@ -74,7 +74,7 @@ pub struct ClusterCoordinatorConfig {
     /// ledger flag and shuts down the rank's controller-side stream
     /// so any in-flight AllReduce releases with surviving ranks only.
     /// Pass the same Arc clone to
-    /// [`crate::distributed::controller::ClusterController::start_with_dead_ranks`].
+    /// `start_with_dead_ranks`.
     /// `None` = elastic-membership disabled.
     pub dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
 
@@ -128,7 +128,7 @@ pub struct ClusterCoordinatorConfig {
 
     /// Cadence for `epoch_fn`-equivalent user checkpoint callback. When
     /// set, the coord emits
-    /// [`crate::distributed::wire::ControlMsgWire::Checkpoint`] every
+    /// `Checkpoint` every
     /// `checkpoint_every` epochs (right before dispatching the next
     /// epoch plan). Workers handle this on the rank chosen by
     /// [`crate::distributed::ddp_run::EpochCallbackPolicy`]; others see
@@ -136,7 +136,7 @@ pub struct ClusterCoordinatorConfig {
     pub checkpoint_every: Option<usize>,
 
     /// User-supplied per-epoch metrics callback. Fires on the
-    /// coordinator after [`crate::distributed::wire::MetricsMsgWire`]
+    /// coordinator after `MetricsMsgWire`
     /// frames from every alive rank have been aggregated into
     /// [`crate::distributed::ddp_run::EpochMetrics`]. `None` = no
     /// callback wired; aggregation still happens (used internally by
@@ -226,10 +226,10 @@ pub struct ClusterCoordinatorConfig {
 
     /// Optional controller-side dashboard sink. Populated by the
     /// launcher when it hosts a live dashboard. The coord forwards every
-    /// rank-emitted [`crate::distributed::wire::TimingMsgWire::DashboardRegister`]
+    /// rank-emitted `DashboardRegister`
     /// / `DashboardSetSvg` / `DashboardSetMetadata` / `DashboardSetHardware`
     /// frame and the per-epoch resource sample piggy-backed on
-    /// [`crate::distributed::wire::MetricsMsgWire::resources`] to this
+    /// `resources` to this
     /// sink. `None` ⇒ no dashboard (headless cluster runs).
     pub dashboard_sink: Option<std::sync::Arc<dyn crate::distributed::DashboardSink>>,
 }
@@ -435,7 +435,7 @@ impl ClusterCoordinatorConfig {
         self
     }
 
-    /// Enable the LR-aware meta-controller above ElChe. Default: false.
+    /// Enable the LR-aware meta-controller above ElChe. Default: true.
     ///
     /// When enabled, a [`crate::distributed::lr_event_meta::LrEventMeta`]
     /// is constructed by [`super::ClusterCoordinator::start_from_listener`]
@@ -449,7 +449,7 @@ impl ClusterCoordinatorConfig {
     /// Share a dead-rank ledger with the cluster controller. Required
     /// for elastic-membership (rank-death-survives-the-run) semantics.
     /// Pass the same `Arc<DeadRanks>` to
-    /// [`crate::distributed::controller::ClusterController::start_with_dead_ranks`].
+    /// `start_with_dead_ranks`.
     pub fn dead_ranks(
         mut self,
         ledger: Arc<crate::distributed::controller::DeadRanks>,

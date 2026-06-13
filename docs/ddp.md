@@ -281,7 +281,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.eval_dataset(ds)` | `Arc<dyn BatchDataSet>` | Held-out data for evaluation. |
 | `.eval_fn(f)` | `EvalFn<M>` | Receives `(&M, &Tensor, &Tensor)`, returns `Result<f64>`. |
 | `.eval_result_fn(f)` | `EvalResultFn` | Controller-side `(epoch, scalar)` sink. |
-| `.epoch_callback_policy(p)` | `EpochCallbackPolicy` | `Rank(n)` (default) or `Fastest`. |
+| `.epoch_callback_policy(p)` | `EpochCallbackPolicy` | `Fastest` (default) or `Rank(n)`. |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |
 

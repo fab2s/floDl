@@ -1,37 +1,38 @@
-/// El Che: heterogeneous DDP cadence strategy.
-///
-/// The column marches at the slowest one's pace. The slow device
-/// anchors the cadence (`anchor` batches per sync step), the fast
-/// ones range ahead doing more work, and everyone rejoins at AllReduce.
-/// No one waits, no one idles.
-///
-/// After each sync step, call [`report_timing`](ElChe::report_timing)
-/// with measured wall times and AllReduce overhead. El Che refines
-/// batch ratios and auto-tunes the anchor count to keep AllReduce overhead
-/// below a configurable target (default 10%).
-///
-/// # Example
-///
-/// ```ignore
-/// let ddp = Ddp::wrap(&[&model0, &model1], &devices)?;
-/// let mut cadence = ElChe::new(2, 10);
-///
-/// loop {
-///     let start_events = record_start_events(&devices)?;
-///     for rank in 0..2 {
-///         for _ in 0..cadence.batches(rank) {
-///             forward_backward(rank)?;
-///         }
-///     }
-///     let wall_ms = measure_elapsed(&start_events)?;
-///
-///     let sync_start = Instant::now();
-///     ddp.weighted_all_reduce_gradients(cadence.batch_counts())?;
-///     let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
-///
-///     cadence.report_timing(&wall_ms, cadence.batch_counts(), sync_ms);
-/// }
-/// ```
+//! El Che: heterogeneous DDP cadence strategy.
+//!
+//! The column marches at the slowest one's pace. The slow device
+//! anchors the cadence (`anchor` batches per sync step), the fast
+//! ones range ahead doing more work, and everyone rejoins at AllReduce.
+//! No one waits, no one idles.
+//!
+//! After each sync step, call [`report_timing`](ElChe::report_timing)
+//! with measured wall times and AllReduce overhead. El Che refines
+//! batch ratios and auto-tunes the anchor count to keep AllReduce overhead
+//! below a configurable target (default 10%).
+//!
+//! # Example
+//!
+//! ```ignore
+//! let ddp = Ddp::wrap(&[&model0, &model1], &devices)?;
+//! let mut cadence = ElChe::new(2, 10);
+//!
+//! loop {
+//!     let start_events = record_start_events(&devices)?;
+//!     for rank in 0..2 {
+//!         for _ in 0..cadence.batches(rank) {
+//!             forward_backward(rank)?;
+//!         }
+//!     }
+//!     let wall_ms = measure_elapsed(&start_events)?;
+//!
+//!     let sync_start = Instant::now();
+//!     ddp.weighted_all_reduce_gradients(cadence.batch_counts())?;
+//!     let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
+//!
+//!     cadence.report_timing(&wall_ms, cadence.batch_counts(), sync_ms);
+//! }
+//! ```
+
 /// Cohort band: a rank is in the slow-cohort (election-eligible) when its
 /// smoothed ms is within `(1 - COHORT_BAND)` of the slowest. Excludes
 /// clearly-fast GPUs from anchor candidacy by *evidence*, not by oracle —
@@ -50,6 +51,13 @@ const DOMINANCE_MARGIN: f64 = 0.10;
 /// the window is the smoothed signal for both election (cohort threshold,
 /// dominance margin) and batch-count proportions.
 const TRUST_WINDOW_CAP: usize = 5;
+
+/// Upper clamp on the per-rank speed ratio `slow_ms / ms`. No real rig
+/// exceeds ~10x; a legitimate-but-degenerate tiny sample (sub-ms wall in
+/// a 1-sample trust window) would otherwise turn into a 1e4x ratio and a
+/// garbage 1e5-batch schedule on paths without `max_batch_diff` /
+/// `max_total_batches`.
+const MAX_SPEED_RATIO: f64 = 64.0;
 
 /// Sliding-window capacity for `batch_counts` snapshots. Source for
 /// `recent_batch_share`, the smoothed view of cadence per-rank allocation
@@ -107,7 +115,7 @@ impl RingBuffer {
 
 /// Lifecycle phase of the cadence balancer. Probe = no calibrations yet,
 /// Warmup = first few calibrations (election allowed but anchor stays sticky
-/// until `MIN_REPORTS_BEFORE_SWAP`), Stable = normal operation including
+/// until the Stable threshold), Stable = normal operation including
 /// overhead auto-tune, Mature = long-running steady state. Phase ordering
 /// is monotonic and supports `>=` comparisons for gating logic.
 #[derive(
@@ -167,6 +175,14 @@ pub struct ElChe {
     /// and per epoch" invariant. `None` = unbounded (threaded default;
     /// only the cluster coordinator sets it).
     max_total_batches: Option<usize>,
+    /// True when the last `recompute_batch_counts` had to scale the
+    /// schedule down to fit `max_total_batches` (the window≤epoch cap).
+    /// While binding, anchor GROWTH proposals are suppressed: the
+    /// delivered window cannot actually grow, so a Grow would only
+    /// ratchet the anchor toward `max_anchor` while every
+    /// anchor-derived quantity (telemetry, shrink hysteresis, nudge
+    /// arithmetic) quietly detaches from the schedule being run.
+    window_cap_binding: bool,
     /// Maximum allowed batch difference between fastest and slowest worker.
     /// When set, workers that exceed this lead are throttled until the
     /// slowest catches up. `Some(0)` = strict lockstep (sync DDP behavior).
@@ -259,6 +275,7 @@ impl ElChe {
             min_anchor: anchor,
             max_anchor: 1000,
             max_total_batches: None,
+            window_cap_binding: false,
             max_batch_diff: None,
             phase: Phase::Probe,
             anchor_rank: None,
@@ -572,7 +589,7 @@ impl ElChe {
     /// Used by the coordinator when the user supplies `partition_ratios`
     /// (smallest ratio = slow rank), or by `with_device_indices` after a
     /// spec-prior pick. The pin is "soft" — it only sets the cold-start
-    /// anchor; once `MIN_REPORTS_BEFORE_SWAP` calibrations accumulate,
+    /// anchor; once enough calibrations accumulate (Phase::Stable),
     /// `elect_anchor` may move the anchor based on measured timing.
     pub fn with_initial_anchor(mut self, slow_rank: usize) -> Self {
         assert!(
@@ -690,6 +707,11 @@ impl ElChe {
     /// signal than the overhead floor. The overhead auto-tune will recover
     /// the anchor upward once divergence subsides.
     pub fn nudge_anchor_down(&mut self, factor: f64) {
+        // clamp() propagates NaN; a NaN factor (user-configured guard
+        // math gone wrong) would collapse the anchor to 1 silently.
+        if !factor.is_finite() {
+            return;
+        }
         let new = (self.anchor as f64 * factor.clamp(0.1, 1.0)).ceil() as usize;
         self.anchor = new.max(1).min(self.anchor);
         let slow_ms = self.slow_ms();
@@ -843,6 +865,11 @@ impl ElChe {
             self.world_size,
             "wall_ms length must match world_size",
         );
+        assert_eq!(
+            actual_batches.len(),
+            self.world_size,
+            "actual_batches length must match world_size",
+        );
 
         // Push each rank's reading into its trust window. A zero/invalid
         // wall_ms increments the death-exception counter; if a rank misses
@@ -882,9 +909,25 @@ impl ElChe {
             Some(r) => r,
             None => return,
         };
-        let slow_ms = self.smoothed_ms(anchor_rank);
+        let mut slow_ms = self.smoothed_ms(anchor_rank);
         if slow_ms <= 0.0 {
-            return;
+            // PINNED-ANCHOR DEAD-WINDOW ESCAPE. A pinned anchor (spec
+            // prior / partition_ratios / with_initial_anchor) that never
+            // produces a valid reading would otherwise freeze the
+            // controller in Warmup forever: this bail runs BEFORE
+            // `calibration_count += 1`, and re-election requires
+            // `Phase::Stable`, which requires calibration. Once the rank
+            // has missed a full trust window of reports, stop trusting
+            // the pin and elect from the ranks that DO have data.
+            if self.consecutive_zero_reports[anchor_rank] >= TRUST_WINDOW_CAP {
+                if let Some(elected) = self.elect_anchor() {
+                    self.anchor_rank = Some(elected);
+                    slow_ms = self.smoothed_ms(elected);
+                }
+            }
+            if slow_ms <= 0.0 {
+                return;
+            }
         }
 
         // Overhead auto-tune: propose anchor growth/shrink based on
@@ -905,24 +948,7 @@ impl ElChe {
         self.proposed_anchor = None;
         if self.phase >= Phase::Stable {
             let compute_ms = wall_ms.iter().copied().fold(0.0_f64, f64::max);
-            if compute_ms > 0.0 && sync_ms > 0.0 {
-                let overhead = sync_ms / compute_ms;
-                if overhead > self.overhead_target {
-                    let scale = overhead / self.overhead_target;
-                    let new_anchor =
-                        (self.anchor as f64 * scale).ceil() as usize;
-                    let clamped =
-                        new_anchor.clamp(self.min_anchor, self.max_anchor);
-                    if clamped > self.anchor {
-                        self.proposed_anchor =
-                            Some(ProposedAnchor::Grow(clamped));
-                    }
-                } else if overhead < self.overhead_target * 0.5
-                          && self.anchor > self.min_anchor {
-                    self.proposed_anchor =
-                        Some(ProposedAnchor::Shrink(self.anchor - 1));
-                }
-            }
+            self.proposed_anchor = self.propose_anchor(compute_ms, sync_ms);
         }
 
         // Recompute batch counts from current (pre-proposal) anchor. The
@@ -988,8 +1014,8 @@ impl ElChe {
 
     /// Phase transition rules. Probe→Warmup at first calibration; Warmup→Stable
     /// at 5 calibrations; Stable→Mature at 20. Per-phase parameter tightening
-    /// (locked anchor in Warmup, stricter Mature thresholds) lands in PR 2-3 —
-    /// PR 1 only tracks transitions and logs them.
+    /// (locked anchor in Warmup, stricter Mature thresholds) is a possible
+    /// future refinement; today phases gate election and the auto-tune.
     fn advance_phase(&mut self) {
         let next = match self.phase {
             Phase::Probe => Phase::Warmup,
@@ -1035,6 +1061,49 @@ impl ElChe {
         clamped
     }
 
+    /// Overhead-driven anchor proposal (pure decision logic, extracted so
+    /// the math is unit-testable in isolation and future growth forces —
+    /// e.g. a per-rank window-pressure term — have a typed seam to
+    /// compose into, as `max` of proposed anchors, all routed through the
+    /// same guard-vetoed `ProposedAnchor` pipeline; nothing here can
+    /// trigger a reduce).
+    ///
+    /// Grow when measured reduce overhead exceeds the target — UNLESS the
+    /// window≤epoch cap is binding: with the schedule pinned at the cap, a
+    /// larger anchor delivers nothing and only detaches the anchor from
+    /// the schedule (the wind-up then corrupts telemetry, the shrink
+    /// hysteresis band, and any later `nudge_anchor_down` arithmetic).
+    /// Shrink (anchor − 1) when overhead is comfortably below target.
+    /// The dead band between `target*0.5` and `target` is the hysteresis
+    /// that prevents grow/shrink limit-cycling.
+    fn propose_anchor(&self, compute_ms: f64, sync_ms: f64) -> Option<ProposedAnchor> {
+        if compute_ms <= 0.0 || sync_ms <= 0.0 {
+            return None;
+        }
+        let overhead = sync_ms / compute_ms;
+        if overhead > self.overhead_target {
+            if self.window_cap_binding {
+                crate::verbose!(
+                    "  ddp: anchor growth suppressed — window cap binding \
+                     (overhead {:.3} > target {:.3} is unreachable at this \
+                     epoch size)",
+                    overhead,
+                    self.overhead_target,
+                );
+                return None;
+            }
+            let scale = overhead / self.overhead_target;
+            let new_anchor = (self.anchor as f64 * scale).ceil() as usize;
+            let clamped = new_anchor.clamp(self.min_anchor, self.max_anchor);
+            if clamped > self.anchor {
+                return Some(ProposedAnchor::Grow(clamped));
+            }
+        } else if overhead < self.overhead_target * 0.5 && self.anchor > self.min_anchor {
+            return Some(ProposedAnchor::Shrink(self.anchor - 1));
+        }
+        None
+    }
+
     /// Recompute batch counts: slow device gets `anchor`, faster devices
     /// get proportionally more based on their ms_per_batch.
     ///
@@ -1050,7 +1119,7 @@ impl ElChe {
             let target_no_slack = if ms <= 0.0 || (ms - slow_ms).abs() < 1e-6 {
                 self.anchor
             } else {
-                let ratio = slow_ms / ms;
+                let ratio = (slow_ms / ms).min(MAX_SPEED_RATIO);
                 (self.anchor as f64 * ratio).round().max(1.0) as usize
             };
 
@@ -1108,9 +1177,11 @@ impl ElChe {
         // steps per epoch". Scale the counts down proportionally (keeping
         // the speed-derived ratio) so `sum(batch_counts) <= max_total`.
         // No-op when unset (threaded path) or already within bound.
+        self.window_cap_binding = false;
         if let Some(max_total) = self.max_total_batches {
             let total: usize = self.batch_counts.iter().sum();
             if total > max_total && max_total > 0 {
+                self.window_cap_binding = true;
                 let scale = max_total as f64 / total as f64;
                 for c in &mut self.batch_counts {
                     *c = ((*c as f64) * scale).floor().max(1.0) as usize;

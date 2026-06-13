@@ -146,8 +146,18 @@ impl ClusterCoordinator {
                     self.capture_nccl_sync_elapsed_if_complete();
                 }
             }
-            TimingMsgWire::Exiting { rank: _ } => {
-                self.active_count = self.active_count.saturating_sub(1);
+            TimingMsgWire::Exiting { rank } => {
+                // Clean-exit latch: decrement exactly once, and remember the
+                // exit so the heartbeat staleness scan doesn't declare this
+                // rank dead 30s later (it stops heartbeating after Exiting)
+                // and decrement again — the double count inflated
+                // `dead_count` into spurious MaxFailureExceeded /
+                // SingleSurvivor escalations during teardown.
+                let rank = rank as usize;
+                if rank < self.world_size && !self.exited[rank] {
+                    self.exited[rank] = true;
+                    self.active_count = self.active_count.saturating_sub(1);
+                }
             }
             TimingMsgWire::LrUpdate { rank, lr } => {
                 let rank = rank as usize;
@@ -316,9 +326,18 @@ impl ClusterCoordinator {
     /// wedge is captured rather than guessed. Re-arms (dumps again) on
     /// the next stall after progress resumes.
     pub(super) fn maybe_dump_stall(&mut self) {
-        if !self.prof_enabled {
-            return;
-        }
+        // ALWAYS ON (not gated on -vvv): the dump is the only diagnostic a
+        // production wedge leaves behind, it costs nothing while training
+        // progresses, and it emits at most once per interval. The interval
+        // is tiered: tight (STALL_DUMP_SECS) under -vvv for active
+        // debugging; generous (STALL_DUMP_PROD_SECS) otherwise so
+        // legitimately slow reduce windows (epoch-sized cadence windows on
+        // slow rigs, long eval callbacks) don't spam a healthy run.
+        let interval = if self.prof_enabled {
+            super::STALL_DUMP_SECS
+        } else {
+            super::STALL_DUMP_PROD_SECS
+        };
         if self.global_step != self.stall_last_global_step {
             self.stall_last_global_step = self.global_step;
             self.stall_since = Some(Instant::now());
@@ -329,15 +348,15 @@ impl ClusterCoordinator {
             return;
         }
         let since = *self.stall_since.get_or_insert_with(Instant::now);
-        if since.elapsed() < Duration::from_secs(super::STALL_DUMP_SECS) {
+        if since.elapsed() < Duration::from_secs(interval) {
             return;
         }
-        // Re-dump every STALL_DUMP_SECS while stalled so one repro shows
+        // Re-dump every interval while stalled so one repro shows
         // whether ranks are still progressing (last_step_count moving) or
         // frozen.
         let due = self
             .stall_last_dump
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(super::STALL_DUMP_SECS));
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval));
         if due {
             self.dump_stall_state(since.elapsed().as_secs_f64());
             self.stall_last_dump = Some(Instant::now());
@@ -351,7 +370,7 @@ impl ClusterCoordinator {
     /// `remaining=0`, one rank `0 < steps < window` (took the epoch's
     /// short final chunk), the rest `steps=0` (drained, held at the
     /// epoch barrier) — so `should_average` can never fire.
-    fn dump_stall_state(&self, stalled_secs: f64) {
+    pub(super) fn dump_stall_state(&self, stalled_secs: f64) {
         let counts = self.el_che.batch_counts();
         eprintln!(
             "[stall-watch] STALL {:.0}s no reduce | cpu_avg_state={:?} \
@@ -746,7 +765,7 @@ impl ClusterCoordinator {
     pub(super) fn aggregate_ready_epochs(&mut self) {
         // Resolve readiness per dispatch mode.
         let alive: Vec<usize> = (0..self.world_size)
-            .filter(|r| !self.is_rank_dead(*r))
+            .filter(|r| !self.is_dead(*r))
             .collect();
         let ready_epochs: Vec<u64> = if self.progressive {
             // BTreeMap order: walk chunk_pools in ascending epoch
@@ -1018,7 +1037,7 @@ impl ClusterCoordinator {
             // pulls the fast rank past its planned + max_overshoot
             // budget.
             for rank in 0..self.world_size {
-                if self.is_rank_dead(rank) {
+                if self.is_dead(rank) {
                     continue;
                 }
                 let has_inflight = self.chunk_pools.values()
@@ -1030,13 +1049,22 @@ impl ClusterCoordinator {
         } else if !matches!(self.policy, ApplyPolicy::Async)
             && self.last_dispatched_epoch.is_none_or(|d| d < next)
         {
-            self.last_dispatched_epoch = Some(next);
-            if let Err(e) = self.dispatch_epoch(next) {
-                crate::verbose!(
-                    "  ddp: dispatch_epoch({}) after aggregate failed: {}",
-                    next,
-                    e,
-                );
+            // Latch ON SUCCESS only. Latching before the dispatch turned
+            // any dispatch error into a permanent wedge: the idempotence
+            // guard suppressed every retry while the cohort parked in
+            // `wait_for_epoch_plan` with live heartbeats. Per-rank send
+            // failures inside `dispatch_epoch` are best-effort (logged,
+            // dead-rank machinery reaps them), so an `Err` here is a hard
+            // config/state problem — still worth retrying on the next
+            // aggregate tick rather than silently never dispatching again.
+            match self.dispatch_epoch(next) {
+                Ok(_) => self.last_dispatched_epoch = Some(next),
+                Err(e) => {
+                    eprintln!(
+                        "flodl ddp: dispatch_epoch({next}) after aggregate \
+                         failed: {e}; will retry"
+                    );
+                }
             }
         }
     }

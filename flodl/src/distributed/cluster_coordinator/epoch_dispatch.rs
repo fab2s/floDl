@@ -84,7 +84,7 @@ impl ClusterCoordinator {
     /// carrying that rank's full per-epoch partition; returns the
     /// plans dispatched. In **progressive** mode (set on the coord
     /// config) creates a
-    /// [`crate::distributed::chunk_pool::ChunkPool`] for the epoch
+    /// `ChunkPool` for the epoch
     /// and dispatches the first chunk to every rank; subsequent
     /// chunks are dispatched from `drain_metrics_and_aggregate` as
     /// ranks report chunk completion. The returned `Vec` reflects only
@@ -104,8 +104,13 @@ impl ClusterCoordinator {
         // StartEpoch arrives, so the worker's autonomous epoch_fn
         // fire-check sees a definite role on the first transition.
         // No-op on subsequent calls until `epoch_role_dirty` flips
-        // (Fastest re-resolve on rank death).
-        self.broadcast_epoch_callback_role_if_dirty()?;
+        // (Fastest re-resolve on rank death). Best-effort: a rank that
+        // missed the role frame has a broken connection and is reaped by
+        // heartbeat staleness; blocking the whole epoch on it would park
+        // the healthy cohort.
+        if let Err(e) = self.broadcast_epoch_callback_role_if_dirty() {
+            crate::verbose!("  ddp: epoch-callback role broadcast incomplete: {e}");
+        }
         // User checkpoint cadence: when entering epoch N (N > 0) and
         // `N % checkpoint_every == 0`, broadcast a `Checkpoint(N)` frame
         // before `StartEpoch`. Workers fire `checkpoint_fn(N, &model)`
@@ -129,7 +134,15 @@ impl ClusterCoordinator {
                         version: epoch as u64,
                         target_rank: target as u64,
                     };
-                    self.send_control(target, &msg)?;
+                    // Best-effort: a missed checkpoint is a gap in the
+                    // checkpoint series, not a reason to halt training
+                    // (the role failover machinery re-targets on death).
+                    if let Err(e) = self.send_control(target, &msg) {
+                        eprintln!(
+                            "flodl ddp: checkpoint dispatch to rank {target} \
+                             failed at epoch {epoch}: {e}"
+                        );
+                    }
                 }
             }
             // Eval cadence: dispatch `ExecuteEvalCallback` to the
@@ -150,7 +163,14 @@ impl ClusterCoordinator {
                         epoch: epoch as u64,
                         target_rank: target as u64,
                     };
-                    self.send_control(target, &msg)?;
+                    // Best-effort, same rationale as the checkpoint
+                    // dispatch above.
+                    if let Err(e) = self.send_control(target, &msg) {
+                        eprintln!(
+                            "flodl ddp: eval dispatch to rank {target} \
+                             failed at epoch {epoch}: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -159,8 +179,23 @@ impl ClusterCoordinator {
         }
         let plans = self.plans_for_epoch(epoch);
         for (rank, plan) in plans.iter().enumerate() {
+            if self.is_dead(rank) {
+                continue;
+            }
             let msg = ControlMsgWire::StartEpoch(plan.clone());
-            self.send_control(rank, &msg)?;
+            // Best-effort per rank: a fail-fast `?` here left every rank
+            // after the broken connection without a StartEpoch — parked in
+            // `wait_for_epoch_plan` for an epoch the coordinator believed
+            // dispatched. The failed rank's connection is broken; heartbeat
+            // staleness reaps it and `ExtendPartition` redistributes its
+            // share.
+            if let Err(e) = self.send_control(rank, &msg) {
+                eprintln!(
+                    "flodl ddp: StartEpoch({epoch}) send to rank {rank} \
+                     failed: {e}; continuing with remaining ranks"
+                );
+                continue;
+            }
             self.rank_epoch[rank] = epoch;
             // Snapshot per-rank monotonic batch counter so a future
             // dead-rank declaration can compute how many of this
@@ -173,7 +208,7 @@ impl ClusterCoordinator {
     }
 
     /// Start a new epoch in progressive mode: create a
-    /// [`crate::distributed::chunk_pool::ChunkPool`] and dispatch the
+    /// `ChunkPool` and dispatch the
     /// first chunk to every rank. Returns the per-rank
     /// [`crate::distributed::wire::EpochPlanWire`] of those first chunks
     /// so callers can pair the call with rank-side acknowledgments in
@@ -382,12 +417,51 @@ impl ClusterCoordinator {
         epoch: usize,
         batches: usize,
     ) -> Result<Option<crate::distributed::wire::EpochPlanWire>> {
+        let prev_epoch = self.rank_epoch[rank];
+        let span_was_open = self.delivered_span_start[rank].is_some();
         let Some(plan) = self.take_next_chunk_plan(rank, epoch, batches) else {
             return Ok(None);
         };
         let msg = ControlMsgWire::StartEpoch(plan.clone());
-        self.send_control(rank, &msg)?;
+        if let Err(e) = self.send_control(rank, &msg) {
+            // TRANSACTIONAL ROLLBACK: the take mutated the pool (and the
+            // rank's epoch / busy-span bookkeeping) before the send. Left
+            // in place after a failed send, the taken samples would stay
+            // dispatched-but-never-completed — a ghost in-flight chunk
+            // that permanently wedges `is_epoch_done` and the reduce gate
+            // off ONE transient write error. Undo everything the take did,
+            // then surface the error (the rank's connection is broken; if
+            // it stays broken, heartbeat staleness declares it dead and
+            // `forfeit` keeps the epoch moving).
+            self.rollback_chunk_take(rank, epoch, &plan, prev_epoch, span_was_open);
+            return Err(e);
+        }
         Ok(Some(plan))
+    }
+
+    /// Undo a [`Self::take_next_chunk_plan`] whose dispatch could not be
+    /// delivered: pool take, `rank_epoch`, and the busy-span open (only
+    /// when THIS take opened it) are restored to their pre-take state.
+    pub(super) fn rollback_chunk_take(
+        &mut self,
+        rank: usize,
+        epoch: usize,
+        plan: &crate::distributed::wire::EpochPlanWire,
+        prev_epoch: usize,
+        span_was_open: bool,
+    ) {
+        if let Some(pool) = self.chunk_pools.get_mut(&epoch) {
+            pool.rollback_take(
+                rank,
+                plan.partition_offset as usize,
+                plan.partition_size as usize,
+            );
+        }
+        self.rank_epoch[rank] = prev_epoch;
+        if !span_was_open {
+            self.delivered_span_start[rank] = None;
+            self.delivered_first_batch[rank] = None;
+        }
     }
 
     /// Take `batches * batch_size` samples from `epoch`'s pool for

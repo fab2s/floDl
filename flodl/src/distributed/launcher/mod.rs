@@ -327,12 +327,38 @@ fn on_off(b: bool) -> &'static str {
 /// before this lift. Both produce identical child semantics (piped
 /// streams, `[host:dev:rN]` line-prefix on stdout/stderr).
 ///
-/// [`ClusterController`]: crate::distributed::controller::ClusterController
 /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
+/// One-cluster-run-per-process latch. The launcher-side infrastructure
+/// (rendezvous listener, relay processes, coordinator, controller) is
+/// built for exactly ONE training session: the rendezvous closes after
+/// the first bootstrap, relays self-shut when their ranks disconnect,
+/// and the coordinator is constructed from the first run's config. A
+/// second cluster `Trainer::run` in the same process (e.g. a bench
+/// binary looping over models) would dial infrastructure that no longer
+/// exists and hang or get connection-refused — fail it loudly instead,
+/// with the supported pattern in the message.
+static CLUSTER_ENTRY_CONSUMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim this process's single cluster entry. `Err` on the second call.
+pub(crate) fn claim_cluster_entry(role: &str) -> Result<()> {
+    if CLUSTER_ENTRY_CONSUMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(TensorError::new(&format!(
+            "cluster {role}: a cluster training session was already run in \
+             this process — the launcher infrastructure (rendezvous, relays, \
+             coordinator) is per-session and has shut down. Run one cluster \
+             `Trainer::run` per process: loop at the process level (e.g. \
+             invoke the binary once per model) instead of looping inside it.",
+        )));
+    }
+    Ok(())
+}
+
 pub fn run_launcher_with_config(
     full: FullCluster,
     coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
 ) -> Result<()> {
+    claim_cluster_entry("launcher")?;
     // Fresh 128-bit session salt per launcher invocation. Becomes the
     // HMAC key for every cross-process control + data frame; shipped
     // to ranks via their slim envelope.
@@ -492,8 +518,19 @@ pub fn run_launcher_with_config(
                             return;
                         }
                         // Drive ticks until shutdown_workers fires (all
-                        // ranks exited) or the process is killed.
+                        // ranks exited) or the process is killed. Paced
+                        // on a short blocking timing-drain instead of a
+                        // 100% busy-spin: the spin pegged one controller
+                        // core (competing with rank 0's data pipeline —
+                        // the documented starve lever on slow-PCIe rigs)
+                        // and amplified every per-tick allocation
+                        // millions of times per second for zero work.
+                        // 2ms keeps reduce latency negligible while the
+                        // blocking recv yields the core between frames.
                         loop {
+                            coord.drain_timing_blocking(
+                                std::time::Duration::from_millis(2),
+                            );
                             match coord.tick() {
                                 Ok(true) => continue,
                                 Ok(false) => break,

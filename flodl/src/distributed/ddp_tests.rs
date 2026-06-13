@@ -534,6 +534,89 @@
     }
 
     #[test]
+    fn test_cap_binding_suppresses_anchor_growth() {
+        // Anchor wind-up guard: when the window cap is binding (counts
+        // scaled down to fit the epoch), measured overhead stays above
+        // target forever — growth proposals must be suppressed, or the
+        // anchor ratchets toward max_anchor while delivered counts stay
+        // pinned and every anchor-derived quantity lies.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        c.set_max_total_batches(30); // binding almost immediately
+
+        for _ in 0..5 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
+        }
+        // Force the cap to bind once.
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
+        let anchor_after_first = c.anchor();
+
+        // Keep reporting pathological overhead: with the cap binding, no
+        // further growth proposals may land.
+        for _ in 0..10 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+            c.commit_proposed_anchor();
+        }
+        assert!(
+            c.anchor() <= anchor_after_first,
+            "anchor ratcheted under a binding window cap: {} -> {}",
+            anchor_after_first,
+            c.anchor(),
+        );
+        let total = c.batches(0) + c.batches(1);
+        assert!(total <= 30, "cap still enforced: total={total}");
+    }
+
+    #[test]
+    fn test_speed_ratio_clamped_against_degenerate_sample() {
+        // One legitimate-but-tiny reading (sub-ms wall over many batches)
+        // must not blow the schedule up by a 1e4x ratio on paths without
+        // max_batch_diff / max_total_batches.
+        let mut c = ElChe::new(2, 10);
+        for _ in 0..6 {
+            // rank 0: absurdly fast reading; rank 1: 100 ms/batch.
+            c.report_timing(&[0.1, 1000.0], &[10, 10], 1.0);
+        }
+        // ratio would be 10_000x unclamped; with the 64x clamp the fast
+        // rank gets at most anchor * 64 batches.
+        assert!(
+            c.batches(0) <= 10 * 64,
+            "ratio clamp failed: fast rank got {} batches",
+            c.batches(0),
+        );
+    }
+
+    #[test]
+    fn test_warmup_unsticks_when_pinned_anchor_never_reports() {
+        // A pinned anchor rank that never produces a valid reading must
+        // not freeze the controller in Warmup forever: after a full trust
+        // window of misses, election falls back to ranks with data.
+        let mut c = ElChe::new(2, 10).with_initial_anchor(1);
+        for _ in 0..10 {
+            // rank 1 (the pinned anchor) reports nothing valid; rank 0
+            // reports steadily.
+            c.report_timing(&[100.0, 0.0], &[10, 0], 1.0);
+        }
+        assert!(
+            c.is_calibrated(),
+            "controller stayed un-calibrated: pinned dead anchor froze Warmup",
+        );
+    }
+
+    #[test]
+    fn test_nudge_anchor_down_ignores_nan_factor() {
+        let mut c = ElChe::new(2, 10);
+        for _ in 0..6 {
+            c.report_timing(&[100.0, 100.0], &[10, 10], 1.0);
+        }
+        let before = c.anchor();
+        c.nudge_anchor_down(f64::NAN);
+        assert_eq!(c.anchor(), before, "NaN factor must be a no-op");
+        c.nudge_anchor_down(0.5);
+        assert!(c.anchor() < before, "finite factor still nudges");
+    }
+
+    #[test]
     fn test_cadence_window_capped_to_max_total() {
         // Window cap (set by the cluster coordinator to the epoch's batch
         // count): the overhead auto-tune may grow the schedule to amortize

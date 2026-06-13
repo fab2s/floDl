@@ -245,6 +245,7 @@ impl<M: Module> GpuWorker<M> {
             snapshot_count: 0,
             snapshot_pinned_params: Vec::new(),
             snapshot_pinned_buffers: Vec::new(),
+            pinned_fallback_logged: false,
             compute_ms_run_total: 0.0,
             data_ms_run_total: 0.0,
             ctrl_msgs_handled: 0,
