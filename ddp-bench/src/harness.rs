@@ -185,7 +185,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     };
 
     let preload_tag = if mode.requires_multi_gpu() { "cpu" } else { "gpu-preload" };
-    let baseline_tag = if model_def.needs_baseline_eval { " [paper-baseline]" } else { "" };
+    let baseline_tag = if model_def.needs_baseline_eval { " [baseline-eval]" } else { "" };
     if real_data {
         eprintln!(
             "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}){} ===",
@@ -385,7 +385,7 @@ fn slice_batch(gpu_data: &[Tensor], start: usize, end: usize, device: Device) ->
 // Solo GPU
 // ---------------------------------------------------------------------------
 
-/// Solo GPU run for paper-baseline reproduction.
+/// Solo GPU run for the baseline-eval speedup denominator.
 ///
 /// Used for models whose published baseline reports per-epoch loss + accuracy
 /// curves (set `ModelDef::needs_baseline_eval = true`). Runs eval on the test
@@ -593,7 +593,7 @@ fn run_baseline_solo(
 ///
 /// Handles every `DdpMode::Builder { policy, backend }` combination
 /// (nccl-sync, nccl-cadence, cpu-sync, cpu-cadence, cpu-async).
-/// Solo runs of paper-baseline models go through [`run_baseline_solo`] instead.
+/// Solo runs of baseline-eval models go through [`run_baseline_solo`] instead.
 #[allow(clippy::borrowed_box, clippy::type_complexity, clippy::too_many_arguments)]
 fn run_unified(
     model_def: &ModelDef,
@@ -654,9 +654,12 @@ fn run_unified(
         builder = builder.elche_relax_up(true);
     }
 
-    if config.meta_controller {
-        builder = builder.meta_controller(true);
-    }
+    // Pass the bench's meta_controller setting UNCONDITIONALLY so the flag is
+    // authoritative: absent (default false) -> explicitly OFF, matching the
+    // documented opt-in. Without this the framework default (on) leaks
+    // through when the flag is absent -- running the controller unasked AND
+    // making the config echo's `meta_controller=false` a lie.
+    builder = builder.meta_controller(config.meta_controller);
 
     if let Some(max) = config.max_anchor {
         builder = builder.max_anchor(max);
@@ -672,6 +675,35 @@ fn run_unified(
     if let Some(alpha) = config.easgd_alpha {
         builder = builder.easgd_alpha(alpha);
     }
+
+    // CpuAsync lookahead bound. `None` keeps the framework auto-tune (small
+    // initial growing to a ceiling); `Some(n)` pins the ceiling, so a high
+    // `n` lets the convergence guard, not a hard cap, govern how far the
+    // fast rank ranges ahead.
+    if let Some(n) = config.max_overshoot {
+        builder = builder.max_overshoot(n);
+    }
+
+    // Effective ElChe config echo, so "is EASGD on / what overshoot" is
+    // answerable from any run log without `-vvv`. Defaults mirror flodl:
+    // cpu-async gets EASGD α=0.5 and auto-tuned overshoot unless overridden.
+    let is_cpu_async = matches!(policy, ApplyPolicy::Async)
+        && matches!(backend, AverageBackend::Cpu);
+    let easgd_eff = config
+        .easgd_alpha
+        .or(if is_cpu_async { Some(0.5) } else { None });
+    let overshoot_eff = config
+        .max_overshoot
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "auto".to_string());
+    eprintln!(
+        "  elche: easgd_alpha={easgd_eff:?} max_overshoot={overshoot_eff} \
+         meta_controller={} max_anchor={:?} min_anchor={:?} relax_up={}",
+        config.meta_controller,
+        config.max_anchor,
+        config.min_anchor,
+        config.elche_relax_up,
+    );
 
     // Materialize the configured convergence guard. NoGuard / TrendGuard /
     // MsfGuard each implement the trait; we pass through the generic

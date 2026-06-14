@@ -440,6 +440,17 @@ pub fn run_launcher_with_config(
         .as_ref()
         .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Cpu))
         .unwrap_or(false);
+    // The NCCL-UID bootstrap rendezvous (port +0) is dialed only by NCCL
+    // ranks. CPU-averaging ranks never connect, so spawning it on a CPU
+    // backend just idles the accept loop to its timeout and logs a
+    // spurious "rendezvous: timed out ... (0/N ranks in)" error while
+    // training proceeds fine over the control/data channels. Gate the
+    // spawn on the backend. Unknown backend (no `coord_config`) defaults
+    // to spawning, preserving prior behavior for non-coordinator paths.
+    let backend_is_nccl = coord_config
+        .as_ref()
+        .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Nccl))
+        .unwrap_or(true);
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
@@ -568,22 +579,25 @@ pub fn run_launcher_with_config(
     // Spawned as a short-lived thread that exits once every rank has
     // its UID. If it errors, ranks fail to rendezvous and surface their
     // own loud errors; we eprintln any failure here for diagnostics.
-    let rdv_full = full.clone();
-    let rdv_me = me.clone();
-    let _ = thread::Builder::new()
-        .name("flodl-cluster-rendezvous".to_string())
-        .spawn(move || {
-            if let Err(e) =
-                crate::distributed::rendezvous::run_controller_rendezvous(&rdv_full, &rdv_me)
-            {
-                eprintln!("cluster launcher: rendezvous server error: {e}");
-            }
-        })
-        .map_err(|e| {
-            TensorError::new(&format!(
-                "cluster launcher: spawn rendezvous thread failed: {e}"
-            ))
-        })?;
+    // Skipped entirely on CPU backends, which never dial it in.
+    if backend_is_nccl {
+        let rdv_full = full.clone();
+        let rdv_me = me.clone();
+        let _ = thread::Builder::new()
+            .name("flodl-cluster-rendezvous".to_string())
+            .spawn(move || {
+                if let Err(e) =
+                    crate::distributed::rendezvous::run_controller_rendezvous(&rdv_full, &rdv_me)
+                {
+                    eprintln!("cluster launcher: rendezvous server error: {e}");
+                }
+            })
+            .map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster launcher: spawn rendezvous thread failed: {e}"
+                ))
+            })?;
+    }
 
     // For remote hosts, fdl-cli must have passed the original fdl command
     // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent.

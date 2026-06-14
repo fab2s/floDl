@@ -11,7 +11,7 @@ use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use super::super::{
-    CheckpointFn, ControlMsg, EvalFn,
+    ApplyPolicy, CheckpointFn, ControlMsg, EvalFn,
     MetricsMsg, ParamSnapshot, TimingMsg, WorkerConfig,
 };
 use super::{GpuWorker, WorkerChannels, WorkerEndpoints};
@@ -280,7 +280,19 @@ impl<M: Module> GpuWorker<M> {
             per_sample_bytes,
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,
-            easgd_alpha: config.easgd_alpha,
+            // EASGD elastic blending is an Async-only concept: Sync and
+            // Cadence MUST full-overwrite to the consensus each window. Gate
+            // structurally on the worker's policy here -- the single point
+            // every worker (threaded, single-host, cluster) is built through
+            // -- so a stray `easgd_alpha` from ANY upstream config path can
+            // never blend a non-async worker. The config value alone is too
+            // weak a guard for this invariant, and the only honored value is
+            // already mode-defaulted to `Some` for CpuAsync.
+            easgd_alpha: if matches!(config.policy, ApplyPolicy::Async) {
+                config.easgd_alpha
+            } else {
+                None
+            },
             timeline: config.timeline.clone(),
             pre_sync_scratch,
             _grad_accumulators: grad_accumulators,

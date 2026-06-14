@@ -169,6 +169,11 @@ pub struct RunConfig {
     /// Honored on cpu-async only. Reference: Zhang, Choromanska, LeCun
     /// NeurIPS 2015.
     pub easgd_alpha: Option<f64>,
+    /// Max batches a rank may run past its planned sync point (CpuAsync
+    /// lookahead bound). `None` lets the framework auto-tune; `Some(n)`
+    /// pins the ceiling (high `n` => convergence-guard-governed overshoot
+    /// instead of a hard cap). Honored on cpu-async only.
+    pub max_overshoot: Option<usize>,
     /// Run `eval_fn` at the end of every epoch (rank 0 only) and emit
     /// `epoch N: ... eval=X.XXXX` into `training.log` so the analysis
     /// pipeline can correlate λ̂ aggregates with held-out metric per epoch.

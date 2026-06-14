@@ -245,13 +245,11 @@ impl DdpHandle {
 
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
-        // EASGD blending is a cadence/async concept (CpuAsync in
-        // practice); Sync always full-overwrites.
-        let easgd_alpha = if matches!(policy, ApplyPolicy::Sync) {
-            None
-        } else {
-            config.elche.easgd_alpha
-        };
+        // EASGD blending is gated to Async at the single authoritative
+        // point, `GpuWorker::new` (every worker path funnels through it),
+        // which forces `None` for any non-async worker. Pass the configured
+        // value through unchanged.
+        let easgd_alpha = config.elche.easgd_alpha;
         let save_path_for_thread = save_path.clone();
 
         // Run the rank body synchronously on the rank process's main

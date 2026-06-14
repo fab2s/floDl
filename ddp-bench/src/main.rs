@@ -157,6 +157,16 @@ struct Cli {
     #[option]
     easgd_alpha: Option<f64>,
 
+    /// Max batches a rank may run past its planned sync point before being
+    /// held (the CpuAsync lookahead bound). `None` (default) lets the
+    /// framework auto-tune from a small initial up to its ceiling. Set high
+    /// (e.g. `200`) to let the convergence guard, rather than a hard
+    /// ceiling, govern how far the fast rank ranges ahead during averaging.
+    ///
+    /// Honored on cpu-async only; ignored by Sync/Cadence and solo modes.
+    #[option]
+    max_overshoot: Option<usize>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -693,6 +703,7 @@ fn run() -> flodl::tensor::Result<()> {
                 max_anchor: cli.max_anchor,
                 min_anchor: cli.min_anchor,
                 easgd_alpha: cli.easgd_alpha,
+                max_overshoot: cli.max_overshoot,
                 per_epoch_eval: cli.per_epoch_eval,
                 guard: guard_choice.clone(),
                 epoch_callback_policy,

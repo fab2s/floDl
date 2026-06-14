@@ -79,6 +79,24 @@ fn main() -> ExitCode {
         }
     }
 
+    // Export HOSTNAME so docker-compose's `hostname: ${HOSTNAME}` resolves to
+    // the host's name (the cluster launcher matches
+    // `cluster.hosts[i].name == hostname()`). Bash keeps HOSTNAME as a shell
+    // variable but does NOT export it, so a non-interactive `fdl` invocation
+    // otherwise leaves it unset -- compose warns ("The \"HOSTNAME\" variable
+    // is not set. Defaulting to a blank string.") and the container hostname
+    // comes up blank. Only fill when unset, so an explicit exported HOSTNAME
+    // still wins.
+    if env::var_os("HOSTNAME").is_none() {
+        let host = crate::cluster::resolve_local_hostname();
+        if !host.is_empty() {
+            // SAFETY: called before any threads are spawned.
+            unsafe {
+                env::set_var("HOSTNAME", host);
+            }
+        }
+    }
+
     // Extract `--no-append`, the escape hatch that suppresses any
     // `append:` suffix declared by a run-kind command. Scoped to this
     // invocation only — nested `fdl` calls re-evaluate their own flags.

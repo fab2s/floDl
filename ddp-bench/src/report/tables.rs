@@ -452,7 +452,7 @@ pub(super) fn write_speedup_table(md: &mut String, groups: &[(String, Vec<RunAna
 
     if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.mode == "solo-0" && r.train_only_ms.is_some())) {
         md.push_str("\nSpeedup denominator uses solo-0's `# train_only:` time when reported \
-(paper-baseline models), so the ratio compares DDP wall time against solo's \
+(baseline-eval models), so the ratio compares DDP wall time against solo's \
 training-only wall time. Solo's per-epoch eval is excluded from this comparison \
 because DDP runs only eval once at the end.\n\n");
     }

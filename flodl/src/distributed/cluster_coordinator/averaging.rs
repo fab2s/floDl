@@ -212,8 +212,31 @@ impl ClusterCoordinator {
                 self.wall_ms_accum[r] / n as f64
             })
             .collect();
+        // Which feed did ElChe actually schedule on this cycle? `delivered`
+        // means every stepping rank had a closed delivered span;
+        // `COMPUTE-FALLBACK` means the all-or-none coherence gate
+        // ([`Self::movers_delivered_complete`]) dropped the WHOLE cohort to
+        // compute-only because at least one mover lacked one. `missing`
+        // names those movers — the culprits that trip the fallback (e.g. a
+        // span tainted by overshooting across the reduce boundary on
+        // cpu-async). A run that alternates delivered / COMPUTE-FALLBACK is
+        // mixing scales across windows — the suspected cpu-async share gap.
+        let feed = if self.movers_delivered_complete() {
+            "delivered"
+        } else {
+            "COMPUTE-FALLBACK"
+        };
+        let missing: Vec<usize> = (0..self.world_size)
+            .filter(|&r| {
+                !self.is_dead(r)
+                    && self.steps_since_avg[r] > 0
+                    && !(self.delivered[r].batches_accum > 0
+                        && self.delivered[r].ms_accum > 0.0)
+            })
+            .collect();
         eprintln!(
-            "[coord-prof] {:?} {:?} | delivered_ms/batch={:?} \
+            "[coord-prof] {:?} {:?} | feed={feed} missing={missing:?} \
+             delivered_ms/batch={:?} \
              compute_ms/batch={:?} steps={:?} deliv_batches={:?} \
              batch_counts={:?} reduce_ms={:.1}",
             self.backend,
