@@ -97,97 +97,6 @@ mod test_helpers;
 pub use config::ClusterCoordinatorConfig;
 
 // ---------------------------------------------------------------------------
-// Delivered-cost span state
-// ---------------------------------------------------------------------------
-
-/// Per-rank delivered-cost span state — the ElChe Cadence timing feed.
-///
-/// One entry per rank (indexed by rank). The five fields form one busy-span
-/// state machine that opens on dispatch, accrues a matched (ms, batches)
-/// credit pair, and closes when the rank's in-flight returns to zero; they
-/// were five parallel `Vec`s and are kept together here so they cannot
-/// drift apart. Reset together at `finish_averaging_*`.
-#[derive(Clone, Debug, Default)]
-pub(super) struct DeliveredSpan {
-    /// Start `Instant` of the rank's current BUSY SPAN — the contiguous
-    /// interval during which the rank has at least one chunk in flight. Set
-    /// in `take_next_chunk_plan` only when the rank was idle (transition
-    /// 0→1 in-flight), so back-to-back / overlapping dispatches (async
-    /// streams multiple chunks ahead under the overshoot budget) do NOT
-    /// reset it. Consumed + cleared in `drain_metrics_and_aggregate` when
-    /// the rank's total in-flight returns to 0 (the span closes); the
-    /// span's wall (now − span_start) is added to `ms_accum`.
-    ///
-    /// Measuring the span (the UNION of overlapping chunk intervals) rather
-    /// than per-chunk `dispatch→completion` deltas is what makes the
-    /// delivered signal correct under async overlap — summing per-chunk
-    /// deltas would double-count wall while chunks run concurrently. For
-    /// Cadence the rank holds exactly one chunk at a time, so the span IS
-    /// the chunk interval and this is byte-identical to the old per-chunk
-    /// measure. `None` between a span close and the next dispatch — i.e.
-    /// across the reduce-barrier / overshoot wait, deliberately excluded so
-    /// the signal stays a per-rank capacity proxy rather than a barrier-idle
-    /// measurement. Progressive modes only (non-progressive Sync never
-    /// calls `take_next_chunk_plan`).
-    span_start: Option<Instant>,
-    /// The rank's open busy-span was re-anchored by a reduce (it streamed a
-    /// chunk ACROSS the reduce boundary — async overshoot). The delivered
-    /// ms↔batches matching is broken for that span: the chunk's FULL batch
-    /// count would land in the post-reduce window (completions credit
-    /// batches unconditionally) while the re-anchored span contributes only
-    /// the post-reduce SLICE of its true duration. Full batches over sliced
-    /// ms reads as artificially fast → ElChe over-allocates the rank → it
-    /// streams across even more reduces → a positive-feedback allocation
-    /// spiral (rig, cpu-async 200ep: one Pascal's share climbed 0.29→0.33
-    /// while its equal-speed sibling starved to 0.13, epoch time degrading
-    /// 5.6s→8.2s). While set, the drain SKIPS both the batch credit and, at
-    /// span close, the ms credit — the rank simply has no delivered sample
-    /// that window and `timing_feed`'s per-rank fallback (compute feed)
-    /// covers it. Cleared when the tainted span closes; the next chunk opens
-    /// a fresh, clean span. Cadence never sets it (its in-flight is 0 at the
-    /// reduce, so there is no open span to re-anchor).
-    span_crossed: bool,
-    /// Timestamp of the FIRST `Batch` report after the current span opened —
-    /// the start of the chunk's steady-state (marginal) regime. The
-    /// dispatch-anchored span prices the per-chunk FIXED cost (control
-    /// transit, plan pickup, prefetch spin-up, the first batch crawling the
-    /// link un-pipelined) into the per-batch rate:
-    /// `measured = true_marginal + F / chunk_batches`. F doesn't scale with
-    /// allocation, so the quoted price depends on the share itself — an
-    /// average-cost circularity that bites exactly the small-share ranks
-    /// (rig: Pascal shares slid 0.15→0.08 as F/18 inflated their cost
-    /// 30-60%). Cadence closes credit `(close − first_batch)/(batches − 1)`
-    /// instead — numerator and denominator both exclude batch 1, F never
-    /// enters the books, no estimator needed. 1-batch chunks (edge tails)
-    /// fall back to the dispatch anchor (the marginal window is empty).
-    /// Async keeps dispatch anchoring: its union-spans overlap each chunk's
-    /// fill with the previous chunk's compute, so fills are genuinely hidden
-    /// there. ElChe needs the MARGINAL rate for proportional allocation; the
-    /// fixed cost belongs to the window-policy ledger (amortization
-    /// pressure), not the per-batch price.
-    first_batch: Option<Instant>,
-    /// Delivered ms accumulated since the last reduce: the sum of
-    /// (completion − dispatch) over the window's chunks. Fed to
-    /// `ElChe::report_timing` in place of `wall_ms_accum` for the Cadence
-    /// policy, making the balancer data- and transport-aware (the
-    /// cpu-cadence idle fix: a data-starved rank's delivered cost rises, so
-    /// ElChe stops over-allocating the fast rank). Reset alongside
-    /// `wall_ms_accum` at `finish_averaging_*`. See `timing_feed`.
-    ms_accum: f64,
-    /// Count of batches whose delivery is included in `ms_accum` this
-    /// window — the MATCHED DIVISOR for the delivered feed
-    /// (`ms_accum / batches_accum` = per-batch delivered ms). Distinct from
-    /// `steps_since_avg`, which counts every batch reported via `Batch`
-    /// frames including a just-finished chunk whose completion `MetricsMsg`
-    /// has not drained yet. Using the matched count keeps the per-batch
-    /// estimate correct when a window's last chunk has not landed at
-    /// finalize time (NCCL's inline finish), and makes a late chunk leaking
-    /// into the next window benign — ms and batch-count leak together so the
-    /// ratio holds. Reset alongside `ms_accum`.
-    batches_accum: usize,
-}
-
-// ---------------------------------------------------------------------------
 // Run phase
 // ---------------------------------------------------------------------------
 
@@ -526,24 +435,18 @@ pub struct ClusterCoordinator {
     steps_since_avg: Vec<usize>,
     /// Per-rank wall-clock ms accumulated since the last averaging cycle.
     /// Sum of per-batch `Batch.batch_ms` (= `train_step` time) — COMPUTE
-    /// ONLY. Still the feed for Sync / Async policies and the per-batch
-    /// UID-generator tiebreak; superseded by `ms_accum` for the
-    /// Cadence feed (see `timing_feed`).
+    /// ONLY. Still the feed for the Sync policy and the per-batch
+    /// UID-generator tiebreak; superseded by `pb_delivered_ms_accum` for the
+    /// progressive (Cadence / Async) feed (see `timing_feed`).
     wall_ms_accum: Vec<f64>,
-    /// STAGE 1 (report-at-sync, dual-track): per-rank rank-reported
-    /// DELIVERED wall accumulated CONTINUOUSLY from each `Batch`
-    /// (`batch_ms + data_ms`), with its matched batch count. Mirrors how
-    /// `wall_ms_accum` accumulates, so it is present at sync by
-    /// construction (no completion-frame race). Held ALONGSIDE the
-    /// busy-span feed for now; the `[coord-prof]` dump compares the two so
-    /// we can confirm they agree before the feed switches to it. Reset per
-    /// window in `finish_averaging_tail`.
+    /// Per-rank rank-reported DELIVERED wall accumulated CONTINUOUSLY from
+    /// each `Batch` (`batch_ms + data_ms`), with its matched batch count —
+    /// the ElChe Cadence timing feed. Mirrors how `wall_ms_accum`
+    /// accumulates, so it is present at sync by construction (no
+    /// completion-frame race). Reset per window in `finish_averaging_tail`.
+    /// See `timing_feed`.
     pb_delivered_ms_accum: Vec<f64>,
     pb_delivered_batches: Vec<usize>,
-    /// Per-rank delivered-cost span state (the ElChe Cadence timing feed).
-    /// One entry per rank; [`DeliveredSpan`] documents the busy-span
-    /// lifecycle and the matched (ms, batches) credit pair its fields hold.
-    delivered: Vec<DeliveredSpan>,
     /// Per-rank most-recent batch duration (ms).
     last_batch_ms: Vec<f64>,
     /// Per-rank most-recent worker step counter.

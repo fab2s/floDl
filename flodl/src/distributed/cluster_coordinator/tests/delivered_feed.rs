@@ -1,8 +1,8 @@
 //! Unit tests for the delivered-cost timing feed: the all-or-none
 //! coherence predicate and the feed-scale selection. These guard the
 //! failure modes observed on the rig (mixed compute/delivered scales
-//! inverting the allocation; partial spans poisoning ElChe) without
-//! needing a live cluster.
+//! inverting the allocation; partial delivered sets poisoning ElChe)
+//! without needing a live cluster.
 
 use crate::distributed::ddp::ElChe;
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
@@ -23,9 +23,8 @@ fn cadence_cpu_coord(world_size: usize) -> ClusterCoordinator {
 }
 
 /// Seed the per-rank delivered (ms, batches) credit pair the feed reads.
-/// Under report-at-sync the feed + all-or-none predicate consume the
-/// per-batch accumulator (`pb_delivered_*`), not the completion-frame
-/// busy-span, so seed that.
+/// The feed + all-or-none predicate consume the per-batch accumulator
+/// (`pb_delivered_*`), so seed that.
 fn set_delivered(coord: &mut ClusterCoordinator, ms: &[f64], batches: &[usize]) {
     for (i, (&m, &b)) in ms.iter().zip(batches).enumerate() {
         coord.pb_delivered_ms_accum[i] = m;
@@ -38,7 +37,7 @@ fn movers_delivered_complete_requires_every_mover() {
     let mut coord = cadence_cpu_coord(2);
     // Both ranks moved this window.
     coord.steps_since_avg = vec![4, 4];
-    // Only rank 0 has a closed span.
+    // Only rank 0 has a delivered sample.
     set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
     assert!(
         !coord.movers_delivered_complete(),
@@ -74,7 +73,7 @@ fn timing_feed_all_or_none_falls_back_to_compute_scale() {
     let mut coord = cadence_cpu_coord(2);
     coord.steps_since_avg = vec![4, 4];
     coord.wall_ms_accum = vec![40.0, 100.0];
-    // Rank 0 closed a delivered span (its delivered cost is 2x its
+    // Rank 0 has a delivered sample (its delivered cost is 2x its
     // compute); rank 1 has none.
     set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
 
@@ -92,8 +91,8 @@ fn timing_feed_uses_delivered_when_window_complete() {
     let mut coord = cadence_cpu_coord(2);
     coord.steps_since_avg = vec![4, 4];
     coord.wall_ms_accum = vec![40.0, 100.0];
-    // Both movers closed spans: the delivered scale is coherent and
-    // must win (it carries the data/transport cost the balancer needs).
+    // Both movers have delivered samples: the delivered scale is coherent
+    // and must win (it carries the data/transport cost the balancer needs).
     set_delivered(&mut coord, &[80.0, 220.0], &[4, 4]);
 
     let (ms, batches) = coord.timing_feed();
@@ -103,8 +102,8 @@ fn timing_feed_uses_delivered_when_window_complete() {
 
 #[test]
 fn timing_feed_sync_keeps_compute_scale() {
-    // Sync is non-progressive: no spans exist; the compute feed is the
-    // contract even when stray delivered values are present.
+    // Sync is non-progressive: no delivered samples exist; the compute
+    // feed is the contract even when stray delivered values are present.
     let mut coord = ClusterCoordinator::for_test(
         ClusterCoordinatorConfig::new(
             ApplyPolicy::Sync,

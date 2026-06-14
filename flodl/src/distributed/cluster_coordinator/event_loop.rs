@@ -64,29 +64,16 @@ impl ClusterCoordinator {
                 // REPORT-AT-SYNC delivered feed: accumulate the rank-reported
                 // DELIVERED wall (compute + data) per batch, continuously —
                 // like `wall_ms_accum`, so it is present at the reduce by
-                // construction (no completion-frame race the busy-span has).
-                // MARGINAL: skip the window's FIRST batch (the per-chunk fill
-                // — control transit, plan pickup, prefetch spin-up,
-                // first-batch unpipelined H2D), crediting batches 2..n so the
-                // fixed fill never enters the per-batch rate. Mirrors the
-                // busy-span's first-batch anchor. `steps_since_avg` was just
-                // incremented above, so `> 1` means "not the window's first
-                // batch". (`timing_feed` consumes this; the busy-span is kept
-                // in parallel for the `[coord-prof]` comparison until retired.)
+                // construction (no completion-frame race). MARGINAL: skip the
+                // window's FIRST batch (the per-chunk fill — control transit,
+                // plan pickup, prefetch spin-up, first-batch unpipelined H2D),
+                // crediting batches 2..n so the fixed fill never enters the
+                // per-batch rate. `steps_since_avg` was just incremented above,
+                // so `> 1` means "not the window's first batch".
+                // (`timing_feed` consumes this.)
                 if self.steps_since_avg[rank] > 1 {
                     self.pb_delivered_ms_accum[rank] += batch_ms + data_ms;
                     self.pb_delivered_batches[rank] += 1;
-                }
-                // First Batch report since the rank's busy-span opened:
-                // anchor the chunk's steady-state (marginal) regime here.
-                // The Cadence span close measures from THIS point over
-                // `batches − 1`, excluding the per-chunk fixed fill cost
-                // from the quoted per-batch rate. See
-                // [`DeliveredSpan`] field docs.
-                if self.delivered[rank].span_start.is_some()
-                    && self.delivered[rank].first_batch.is_none()
-                {
-                    self.delivered[rank].first_batch = Some(Instant::now());
                 }
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);
@@ -648,8 +635,8 @@ impl ClusterCoordinator {
     }
 
     /// Drain pending metrics frames WITHOUT aggregating epochs: per-message
-    /// bookkeeping only (pool `mark_completed`, delivered batch credit,
-    /// busy-span close, metrics buffering, progressive next-chunk dispatch).
+    /// bookkeeping only (pool `mark_completed`, metrics buffering,
+    /// progressive next-chunk dispatch).
     ///
     /// Split out so `trigger_averaging`'s NCCL arm can pull the CURRENT
     /// window's completions into the delivered accounting BEFORE its inline
@@ -697,71 +684,6 @@ impl ClusterCoordinator {
             if self.progressive {
                 if let Some(pool) = self.chunk_pools.get_mut(&msg.epoch) {
                     pool.mark_completed(rank, msg.samples_processed);
-                }
-                // BUSY-SPAN bookkeeping. The span closes only when the
-                // rank's total in-flight (summed across all live chunk
-                // pools) returns to 0: its wall is the UNION of the
-                // overlapping chunks' intervals = the rank's realized busy
-                // wall (compute + data + control/transport), with no
-                // double-counting under async overlap. `take()` so the
-                // reduce-barrier / overshoot idle until the next dispatch is
-                // NOT counted. Fed to ElChe at `finish_averaging_*`.
-                //
-                // Tainted spans (crossed a reduce; see
-                // [`DeliveredSpan`]) credit NOTHING — batches partly
-                // predate the boundary while the re-anchored span holds only
-                // the post-boundary slice; mismatched credits under-price
-                // the rank and spiral the allocation.
-                //
-                // CADENCE closes use the MARGINAL measure when available:
-                // ms from the first-Batch anchor over `batches − 1`, so the
-                // per-chunk fixed fill cost never enters the quoted
-                // per-batch rate (see [`DeliveredSpan`]). 1-batch
-                // chunks (edge tails) and missing anchors fall back to the
-                // dispatch-anchored full measure. Async keeps the dispatch
-                // anchor (overlapping fills are genuinely hidden there) with
-                // per-completion batch credits, exactly as before.
-                let still_in_flight: usize = self
-                    .chunk_pools
-                    .values()
-                    .map(|p| p.in_flight(rank))
-                    .sum();
-                let closes_span = still_in_flight == 0
-                    && self.delivered[rank].span_start.is_some();
-                if !closes_span {
-                    // Mid-span completion (async union overlap): batches are
-                    // delivered now, the union ms follows at the final close.
-                    if !self.delivered[rank].span_crossed {
-                        self.delivered[rank].batches_accum +=
-                            msg.batches_processed;
-                    }
-                } else {
-                    let start = self.delivered[rank].span_start
-                        .take()
-                        .expect("span present: checked by closes_span");
-                    let first_batch = self.delivered[rank].first_batch.take();
-                    if self.delivered[rank].span_crossed {
-                        // Discard both sides, clear the taint — the next
-                        // chunk opens a fresh, clean span.
-                        self.delivered[rank].span_crossed = false;
-                    } else {
-                        let marginal = matches!(self.policy, ApplyPolicy::Cadence)
-                            && msg.batches_processed >= 2;
-                        match (marginal, first_batch) {
-                            (true, Some(fb)) => {
-                                self.delivered[rank].ms_accum +=
-                                    fb.elapsed().as_secs_f64() * 1000.0;
-                                self.delivered[rank].batches_accum +=
-                                    msg.batches_processed - 1;
-                            }
-                            _ => {
-                                self.delivered[rank].ms_accum +=
-                                    start.elapsed().as_secs_f64() * 1000.0;
-                                self.delivered[rank].batches_accum +=
-                                    msg.batches_processed;
-                            }
-                        }
-                    }
                 }
                 progressive_completions.push((rank, msg.epoch));
             }

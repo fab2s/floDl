@@ -63,10 +63,12 @@ impl ClusterCoordinator {
     /// [`crate::distributed::ElChe::report_timing`] at each averaging cycle.
     /// ElChe derives `ms_per_batch[r] = ms[r] / batches[r]`.
     ///
-    /// **Cadence and Async** (both progressive) feed the coordinator-measured
-    /// DELIVERED cost — `ms_accum` (the busy-span wall accumulated
-    /// over the window = compute + data + control/transport) over its
-    /// MATCHED batch count `batches_accum`. ElChe then schedules
+    /// **Cadence and Async** (both progressive) feed the rank-reported
+    /// DELIVERED cost — `pb_delivered_ms_accum` (Σ per-batch
+    /// `batch_ms + data_ms` = compute + data) over its MATCHED batch count
+    /// `pb_delivered_batches`. Accumulated CONTINUOUSLY from each `Batch`
+    /// report (see `event_loop`), so it is present at the reduce by
+    /// construction — no completion-frame race. ElChe then schedules
     /// per-rank windows on realized wall instead of the compute-only
     /// `wall_ms_accum` (Σ per-batch `train_step` ms). This closes the
     /// cpu-cadence idle (a data-starved rank's delivered cost rises, so the
@@ -74,39 +76,28 @@ impl ClusterCoordinator {
     /// path data-/transport-aware — required when identical GPUs sit at
     /// different network distances or behind asymmetric storage.
     ///
-    /// The matched divisor is what makes this safe on BOTH backends. The
-    /// CPU backend defers finalize a tick (Pending → `poll_cpu_averaging`)
-    /// so every completion has drained and `batches_accum ==
-    /// steps_since_avg`. NCCL's `finish_averaging_nccl` runs INLINE in
-    /// `trigger_averaging`, before `drain_metrics_and_aggregate` drains the
-    /// window's last completion — so `batches_accum <
-    /// steps_since_avg`, but dividing the delivered sum by ITS OWN batch
-    /// count still yields a correct per-batch estimate (and a late chunk
-    /// leaking into the next window is benign — ms and count leak
-    /// together). Using `steps_since_avg` as the divisor instead would
-    /// divide a partial sum by the full count → garbage (the noise seen in
-    /// early nccl `[coord-prof]` dumps).
-    ///
-    /// Async's bounded-lookahead streaming (several chunks in flight at
-    /// once) is handled by the busy-SPAN measure — the span brackets the
-    /// union of overlapping chunks, where a single per-chunk dispatch
-    /// timestamp could not — so Async now rides the delivered feed too.
+    /// The matched divisor is what makes this safe on BOTH backends. ms and
+    /// batch count accumulate TOGETHER per `Batch`, so even when NCCL's
+    /// `finish_averaging_nccl` runs INLINE in `trigger_averaging` (before
+    /// the window's last completion drains), dividing the delivered sum by
+    /// ITS OWN batch count yields a correct per-batch estimate — and a late
+    /// batch leaking into the next window is benign (ms and count leak
+    /// together). The accumulator is MARGINAL: the window's FIRST batch is
+    /// skipped (`steps_since_avg > 1` gate in `event_loop`) so the per-chunk
+    /// fixed fill cost never enters the quoted per-batch rate.
     ///
     /// Per-rank fallback to `(wall_ms_accum, steps_since_avg)` when a rank
-    /// has no closed span this window (`batches_accum == 0` or
-    /// `ms_accum == 0.0` — cold-start, a rank whose chunk has not
-    /// landed, or a rank that never went idle so its span stayed open) so no
-    /// spurious zero / zero-ms report poisons ElChe's trust window.
+    /// has no delivered sample this window (`pb_delivered_batches == 0` or
+    /// `pb_delivered_ms_accum == 0.0` — cold-start, or a single-batch window
+    /// whose only batch the marginal skip dropped) so no spurious zero /
+    /// zero-ms report poisons ElChe's trust window.
     ///
-    /// **Sync** (non-progressive, no `take_next_chunk_plan`, no spans) keeps
-    /// the compute-only `(wall_ms_accum, steps_since_avg)` feed unchanged.
-    /// Every alive mover (`steps_since_avg > 0`) has a delivered sample
-    /// this window (closed span: nonzero ms AND batches). This is both the
-    /// all-or-none coherence predicate for the delivered feed in
-    /// [`Self::timing_feed`] and the settle condition for
-    /// `trigger_averaging`'s pre-finish drain (the last-finishing rank's
-    /// completion frame trails its final Batch report by microseconds, so
-    /// one bounded re-drain usually completes the window).
+    /// **Sync** (non-progressive) keeps the compute-only
+    /// `(wall_ms_accum, steps_since_avg)` feed unchanged. Every alive mover
+    /// (`steps_since_avg > 0`) has a delivered sample this window (nonzero
+    /// ms AND batches). This is both the all-or-none coherence predicate for
+    /// the delivered feed in [`Self::timing_feed`] and the settle condition
+    /// for `trigger_averaging`'s pre-finish drain.
     pub(super) fn movers_delivered_complete(&self) -> bool {
         (0..self.world_size)
             .filter(|&r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
@@ -125,11 +116,11 @@ impl ClusterCoordinator {
 
     pub(super) fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
         // Delivered-cost feed: CPU Cadence/Async + NCCL Cadence. The danger
-        // this gate guards against is a STALE/PARTIAL span set at feed time:
-        // some ranks with a closed span this window and some without, where
-        // the per-rank fallback below MIXES delivered-ms
-        // (compute+data+transport) for the former with compute-only wall-ms
-        // for the latter. Those scales are not comparable, so ElChe's
+        // this gate guards against is a PARTIAL delivered set at feed time:
+        // some ranks with a delivered sample this window and some without,
+        // where the per-rank fallback below MIXES delivered-ms
+        // (compute+data) for the former with compute-only wall-ms for the
+        // latter. Those scales are not comparable, so ElChe's
         // relative-throughput allocation inverts — a slow rank that fell
         // back to its lower compute-ms looks faster than a fast rank
         // reporting full delivered cost, and gets
@@ -139,17 +130,14 @@ impl ClusterCoordinator {
         // `(wall_ms_accum, steps_since_avg)` feed — stable and consistent
         // across ranks.
         //
-        // NCCL Cadence is transport-aware: `trigger_averaging`'s NCCL arm
-        // calls `drain_metrics()` BEFORE the inline finish, so the window's
-        // completion frames (per-connection FIFO behind the final Batch
-        // report) have closed every rank's span by feed time — the staleness
-        // that originally forced NCCL onto the compute-only feed is gone.
-        // Without the delivered feed, NCCL allocation is blind to data +
-        // transport (x1-link rig: shares [0.53, 0.235, 0.235] vs the true
-        // ~4.9× delivered ratio → fast rank ~45% idle at every barrier).
-        // A hypothetical NCCL Async stays excluded: the busy-span ×
-        // inline-finish interaction under overshoot streaming is
-        // unvalidated there.
+        // NCCL Cadence is transport-aware too: `pb_delivered_*` accumulates
+        // continuously per `Batch`, so it is present at the inline finish by
+        // construction — the completion-frame race that originally forced
+        // NCCL onto the compute-only feed is gone. Without the delivered
+        // feed, NCCL allocation is blind to data + transport (x1-link rig:
+        // shares [0.53, 0.235, 0.235] vs the true ~4.9× delivered ratio →
+        // fast rank ~45% idle at every barrier). NCCL Async stays excluded:
+        // overshoot streaming under the inline finish is unvalidated there.
         let delivered_capable = match self.backend {
             AverageBackend::Cpu => {
                 matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
@@ -161,8 +149,9 @@ impl ClusterCoordinator {
         }
         // ALL-OR-NONE COHERENCE. ElChe's allocation is RELATIVE, so the
         // per-rank scale must be uniform within a window. A single mover
-        // without a closed span this window (late completion frame, tainted
-        // span, cold start) must NOT be compared on compute-ms against
+        // without a delivered sample this window (cold start, or a
+        // single-batch window the marginal skip dropped) must NOT be
+        // compared on compute-ms against
         // peers reporting delivered-ms — the scales differ by exactly the
         // data/transport share, so the relative allocation inverts (rig:
         // equal-speed Pascals drifting to 0.33 vs 0.10 shares on cpu-async;
@@ -180,9 +169,7 @@ impl ClusterCoordinator {
         for r in 0..self.world_size {
             // REPORT-AT-SYNC: feed the per-batch-accumulated DELIVERED wall
             // (`pb_delivered_*`, marginal), present at the reduce by
-            // construction. The completion-frame busy-span (`delivered[r]`)
-            // is still maintained for the `[coord-prof]` comparison but no
-            // longer feeds ElChe.
+            // construction (no completion-frame race).
             if self.pb_delivered_batches[r] > 0 && self.pb_delivered_ms_accum[r] > 0.0 {
                 ms.push(self.pb_delivered_ms_accum[r]);
                 batches.push(self.pb_delivered_batches[r]);
@@ -198,7 +185,7 @@ impl ClusterCoordinator {
 
     /// `-vvv` delivered-vs-compute per-cycle dump (Cadence + Async — the
     /// progressive policies that ride the delivered feed). Surfaces the gap
-    /// the fix closes: `delivered_ms/batch` (what ElChe now schedules on,
+    /// the fix closes: `pb_delivered_ms/batch` (what ElChe schedules on,
     /// over the matched divisor) vs `compute_ms/batch` (what it used to,
     /// over `steps_since_avg`), per rank, against the resulting
     /// `batch_counts`. Call BEFORE the per-cycle counter resets. No-op
@@ -212,22 +199,15 @@ impl ClusterCoordinator {
         let r1 = |v: &[f64]| -> Vec<f64> {
             v.iter().map(|m| (m * 10.0).round() / 10.0).collect()
         };
-        let delivered_per_batch: Vec<f64> = (0..self.world_size)
-            .map(|r| {
-                let n = self.delivered[r].batches_accum.max(1);
-                self.delivered[r].ms_accum / n as f64
-            })
-            .collect();
         let compute_per_batch: Vec<f64> = (0..self.world_size)
             .map(|r| {
                 let n = self.steps_since_avg[r].max(1);
                 self.wall_ms_accum[r] / n as f64
             })
             .collect();
-        // Stage-1 dual-track: rank-reported DELIVERED (compute+data),
-        // accumulated continuously per `Batch` — present at sync by
-        // construction. Compare against `delivered_ms/batch` (the
-        // completion-frame busy-span): if they track, the feed can switch.
+        // The feed: rank-reported DELIVERED (compute+data), accumulated
+        // continuously per `Batch` (marginal), present at sync by
+        // construction.
         let pb_delivered_per_batch: Vec<f64> = (0..self.world_size)
             .map(|r| {
                 let n = self.pb_delivered_batches[r].max(1);
@@ -235,14 +215,13 @@ impl ClusterCoordinator {
             })
             .collect();
         // Which feed did ElChe actually schedule on this cycle? `delivered`
-        // means every stepping rank had a closed delivered span;
+        // means every stepping rank had a delivered sample;
         // `COMPUTE-FALLBACK` means the all-or-none coherence gate
         // ([`Self::movers_delivered_complete`]) dropped the WHOLE cohort to
         // compute-only because at least one mover lacked one. `missing`
-        // names those movers — the culprits that trip the fallback (e.g. a
-        // span tainted by overshooting across the reduce boundary on
-        // cpu-async). A run that alternates delivered / COMPUTE-FALLBACK is
-        // mixing scales across windows — the suspected cpu-async share gap.
+        // names those movers — the culprits that trip the fallback. A run
+        // that alternates delivered / COMPUTE-FALLBACK is mixing scales
+        // across windows.
         let feed = if self.movers_delivered_complete() {
             "delivered"
         } else {
@@ -252,22 +231,19 @@ impl ClusterCoordinator {
             .filter(|&r| {
                 !self.is_dead(r)
                     && self.steps_since_avg[r] > 0
-                    && !(self.delivered[r].batches_accum > 0
-                        && self.delivered[r].ms_accum > 0.0)
+                    && !(self.pb_delivered_batches[r] > 0
+                        && self.pb_delivered_ms_accum[r] > 0.0)
             })
             .collect();
         eprintln!(
             "[coord-prof] {:?} {:?} | feed={feed} missing={missing:?} \
-             delivered_ms/batch={:?} pb_delivered_ms/batch={:?} \
-             compute_ms/batch={:?} steps={:?} deliv_batches={:?} \
+             pb_delivered_ms/batch={:?} compute_ms/batch={:?} steps={:?} \
              pb_batches={:?} batch_counts={:?} reduce_ms={:.1}",
             self.backend,
             self.policy,
-            r1(&delivered_per_batch),
             r1(&pb_delivered_per_batch),
             r1(&compute_per_batch),
             self.steps_since_avg,
-            self.delivered.iter().map(|d| d.batches_accum).collect::<Vec<_>>(),
             self.pb_delivered_batches,
             self.el_che.batch_counts(),
             reduce_ms,
@@ -984,8 +960,7 @@ impl ClusterCoordinator {
     }
 
     /// Shared second half of `finish_averaging_nccl` / `finish_averaging_cpu`:
-    /// reset the window accumulators, re-anchor + taint any busy span
-    /// that crossed the reduce, clear the throttle / HOLD / divergence
+    /// reset the window accumulators, clear the throttle / HOLD / divergence
     /// slots, and kick idle progressive ranks back into motion. Callers
     /// finish with their own end-of-cycle events (`CpuAvgEnd`,
     /// `emit_sync_end`). `steps_since_avg` is NOT reset here — its
@@ -996,40 +971,12 @@ impl ClusterCoordinator {
         for a in &mut self.wall_ms_accum {
             *a = 0.0;
         }
-        // Stage-1 dual-track delivered accumulator resets with the window.
+        // Delivered accumulator resets with the window.
         for a in &mut self.pb_delivered_ms_accum {
             *a = 0.0;
         }
         for n in &mut self.pb_delivered_batches {
             *n = 0;
-        }
-        for d in &mut self.delivered {
-            d.ms_accum = 0.0;
-            d.batches_accum = 0;
-        }
-        // Re-anchor any still-open busy span to the window boundary. A span
-        // open here means a rank streamed a chunk across the reduce (async
-        // overshoot); without re-anchoring, when it finally closes it would
-        // dump its whole multi-window duration into one window. Resetting
-        // the start to now keeps the next window's measurement bounded to
-        // that window. Cadence never has an open span here (in-flight is 0
-        // at the reduce), so this is a no-op there.
-        let now = Instant::now();
-        for span in &mut self.delivered {
-            if span.span_start.is_some() {
-                span.span_start = Some(now);
-                // The span crossed this reduce: its ms↔batches matching is
-                // broken (the chunk's FULL batch count lands post-reduce
-                // against only the post-re-anchor time slice — reads as
-                // artificially fast and spirals the allocation). Taint it so
-                // the drain skips both credits and the rank falls back to
-                // the compute feed this window. See [`DeliveredSpan`].
-                span.span_crossed = true;
-                // The pre-reduce first-batch anchor is stale for the
-                // re-anchored span; the taint discards the span's credits
-                // at close anyway, but keep the anchor state consistent.
-                span.first_batch = None;
-            }
         }
         for t in &mut self.throttled {
             *t = false;
@@ -1106,7 +1053,6 @@ impl ClusterCoordinator {
                 continue;
             }
             let prev_epoch = self.rank_epoch[rank];
-            let span_was_open = self.delivered[rank].span_start.is_some();
             let next_plan = if fold {
                 self.fold_next_chunk_for_rank(rank)
             } else {
@@ -1128,9 +1074,7 @@ impl ClusterCoordinator {
                 // staleness reaps the broken rank.
                 if let Some(plan) = next_plan {
                     let epoch = plan.epoch as usize;
-                    self.rollback_chunk_take(
-                        rank, epoch, &plan, prev_epoch, span_was_open,
-                    );
+                    self.rollback_chunk_take(rank, epoch, &plan, prev_epoch);
                 }
                 eprintln!(
                     "flodl ddp: Update send to rank {rank} failed during CPU \

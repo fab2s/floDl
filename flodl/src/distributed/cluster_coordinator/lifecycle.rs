@@ -13,7 +13,7 @@ use crate::distributed::wire::{ControlFrame, ControlMsgWire, MsgKind, SessionSal
 use crate::tensor::{Result, TensorError};
 
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState, DeliveredSpan,
+    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState,
     RunPhase, initial_callback_role, relay_reader_loop,
 };
 
@@ -254,7 +254,6 @@ impl ClusterCoordinator {
             wall_ms_accum: vec![0.0; world_size],
             pb_delivered_ms_accum: vec![0.0; world_size],
             pb_delivered_batches: vec![0; world_size],
-            delivered: vec![DeliveredSpan::default(); world_size],
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
             nccl_sync_step: vec![0; world_size],

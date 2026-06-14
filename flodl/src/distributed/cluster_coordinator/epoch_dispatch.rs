@@ -1,8 +1,6 @@
 //! Epoch dispatch and progressive chunk-pool scheduling for
 //! [`super::ClusterCoordinator`].
 
-use std::time::Instant;
-
 use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
@@ -418,14 +416,13 @@ impl ClusterCoordinator {
         batches: usize,
     ) -> Result<Option<crate::distributed::wire::EpochPlanWire>> {
         let prev_epoch = self.rank_epoch[rank];
-        let span_was_open = self.delivered[rank].span_start.is_some();
         let Some(plan) = self.take_next_chunk_plan(rank, epoch, batches) else {
             return Ok(None);
         };
         let msg = ControlMsgWire::StartEpoch(plan.clone());
         if let Err(e) = self.send_control(rank, &msg) {
             // TRANSACTIONAL ROLLBACK: the take mutated the pool (and the
-            // rank's epoch / busy-span bookkeeping) before the send. Left
+            // rank's epoch bookkeeping) before the send. Left
             // in place after a failed send, the taken samples would stay
             // dispatched-but-never-completed — a ghost in-flight chunk
             // that permanently wedges `is_epoch_done` and the reduce gate
@@ -433,22 +430,21 @@ impl ClusterCoordinator {
             // then surface the error (the rank's connection is broken; if
             // it stays broken, heartbeat staleness declares it dead and
             // `forfeit` keeps the epoch moving).
-            self.rollback_chunk_take(rank, epoch, &plan, prev_epoch, span_was_open);
+            self.rollback_chunk_take(rank, epoch, &plan, prev_epoch);
             return Err(e);
         }
         Ok(Some(plan))
     }
 
     /// Undo a [`Self::take_next_chunk_plan`] whose dispatch could not be
-    /// delivered: pool take, `rank_epoch`, and the busy-span open (only
-    /// when THIS take opened it) are restored to their pre-take state.
+    /// delivered: the pool take and `rank_epoch` are restored to their
+    /// pre-take state.
     pub(super) fn rollback_chunk_take(
         &mut self,
         rank: usize,
         epoch: usize,
         plan: &crate::distributed::wire::EpochPlanWire,
         prev_epoch: usize,
-        span_was_open: bool,
     ) {
         if let Some(pool) = self.chunk_pools.get_mut(&epoch) {
             pool.rollback_take(
@@ -458,10 +454,6 @@ impl ClusterCoordinator {
             );
         }
         self.rank_epoch[rank] = prev_epoch;
-        if !span_was_open {
-            self.delivered[rank].span_start = None;
-            self.delivered[rank].first_batch = None;
-        }
     }
 
     /// Take `batches * batch_size` samples from `epoch`'s pool for
@@ -490,21 +482,6 @@ impl ClusterCoordinator {
             None => return None,
         };
         self.rank_epoch[rank] = epoch;
-        // Open the rank's delivered-cost BUSY SPAN iff it was idle (no
-        // outstanding chunk). Set-if-none, NOT unconditional: under async
-        // the rank streams several chunks ahead, and overwriting the start
-        // on each dispatch would shrink the measured span to the last
-        // chunk's slice (or strand earlier chunks). Leaving an existing
-        // start intact lets the span cover the union of all overlapping
-        // chunks until in-flight returns to 0. Closed in
-        // `drain_metrics_and_aggregate`. See [`DeliveredSpan`].
-        if self.delivered[rank].span_start.is_none() {
-            self.delivered[rank].span_start = Some(Instant::now());
-            // Fresh span: re-arm the marginal-regime anchor (set by the
-            // first `Batch` report of this chunk; see
-            // [`DeliveredSpan`]).
-            self.delivered[rank].first_batch = None;
-        }
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,
             partition_offset: offset as u64,

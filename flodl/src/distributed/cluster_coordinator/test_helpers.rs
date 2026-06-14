@@ -10,7 +10,7 @@ use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::{SessionSalt, TimingMsgWire};
 
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState, DeliveredSpan,
+    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState,
     NcclRendezvousPending, RunPhase, initial_callback_role,
 };
 
@@ -136,7 +136,6 @@ impl ClusterCoordinator {
             wall_ms_accum: vec![0.0; world_size],
             pb_delivered_ms_accum: vec![0.0; world_size],
             pb_delivered_batches: vec![0; world_size],
-            delivered: vec![DeliveredSpan::default(); world_size],
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
             nccl_sync_step: vec![0; world_size],
