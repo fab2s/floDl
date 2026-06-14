@@ -214,6 +214,7 @@ impl ClusterCoordinator {
                 !matches!(config.policy, ApplyPolicy::Sync),
             ),
             min_chunk_batches: 4,
+            final_window_plan: None,
             metrics_fn: config.metrics_fn.clone(),
             metrics_sink_tx: config.metrics_sink_tx.clone(),
             eval_result_fn: config.eval_result_fn.clone(),
@@ -336,6 +337,13 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn compute_chunk_batches_for_test(&self, rank: usize, epoch: usize) -> usize {
         self.compute_chunk_batches(rank, epoch)
+    }
+
+    /// Test-only: refresh the final-window plan as a dispatch entry point
+    /// would, so a following `compute_chunk_batches_for_test` sees it.
+    #[cfg(test)]
+    pub(crate) fn refresh_final_window_plan_for_test(&mut self, epoch: usize) {
+        self.refresh_final_window_plan(epoch);
     }
 
     /// Test-only: the end-of-training final-consensus-reduce decision.

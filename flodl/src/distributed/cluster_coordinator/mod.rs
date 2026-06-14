@@ -780,6 +780,17 @@ pub struct ClusterCoordinator {
     /// rank doesn't get a one-batch chunk that pays per-chunk overhead
     /// without amortising it.
     min_chunk_batches: usize,
+    /// Barrier-paced (Cadence) only: the pre-computed allocation for an
+    /// epoch's FINAL reduce window, as `(epoch, per-rank batches)`. When the
+    /// pool drops to within one window of empty, the whole remainder is
+    /// dispatched as a single coherent window sized so no rank ends at
+    /// exactly 1 step (the delivered-feed fallback trigger). Computed ONCE
+    /// at window start (so the per-rank, pool-draining dispatch loop cannot
+    /// shear a proportional split into degenerate scraps) by
+    /// [`ClusterCoordinator::refresh_final_window_plan`] and read by
+    /// [`ClusterCoordinator::compute_chunk_batches`]. `None` outside the
+    /// final window. See `docs/design/epoch-tail-allocation.md`.
+    final_window_plan: Option<(usize, Vec<usize>)>,
     /// User-supplied per-epoch metrics callback (controller-side). Fires
     /// after each successful aggregation. `None` = no callback wired.
     metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,

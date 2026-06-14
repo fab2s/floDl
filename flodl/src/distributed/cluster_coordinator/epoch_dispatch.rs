@@ -231,6 +231,9 @@ impl ClusterCoordinator {
                 self.world_size,
             ),
         );
+        // A tiny epoch (whole dataset < one window + crumb) is its own final
+        // window: plan it before sizing so the per-rank sizes are coherent.
+        self.refresh_final_window_plan(epoch);
         let sizes: Vec<usize> = (0..self.world_size)
             .map(|r| self.compute_chunk_batches(r, epoch))
             .collect();
@@ -273,6 +276,10 @@ impl ClusterCoordinator {
     /// after the next averaging cycle.
     pub(super) fn dispatch_next_chunk(&mut self, rank: usize) {
         let epoch = self.rank_epoch[rank];
+        // Plan the epoch's final reduce window before sizing (no-op until the
+        // pool is within one window of empty). The first rank dispatched this
+        // window sees the window-start remainder and pins the split.
+        self.refresh_final_window_plan(epoch);
 
         // ONE-CHUNK-IN-FLIGHT INVARIANT (barrier-paced: Sync/Cadence). The
         // worker's `pending_plan` is a single slot (a second `StartEpoch`
@@ -515,8 +522,56 @@ impl ClusterCoordinator {
         if self.chunk_pools.get(&epoch).is_none_or(|p| p.remaining() == 0) {
             return None;
         }
+        self.refresh_final_window_plan(epoch);
         let batches = self.compute_chunk_batches(rank, epoch);
         self.take_next_chunk_plan(rank, epoch, batches)
+    }
+
+    /// Refresh [`Self::final_window_plan`] for `epoch` (barrier-paced only).
+    ///
+    /// A no-op unless the pool has dropped to within one window of empty
+    /// (`remaining < Σ batch_counts + world_size`), in which case the WHOLE
+    /// remainder is the epoch's final reduce window. The plan is computed
+    /// ONCE — the first dispatch call of that window, when the pool still
+    /// holds the window-start remainder — and cached keyed by epoch, so the
+    /// per-rank, pool-draining dispatch loop (CPU fold loop / NCCL wake loop,
+    /// both size one rank then take from the shared pool) reads a consistent
+    /// split instead of shearing it into degenerate scraps. Cleared (set
+    /// `None`) outside the final-window regime, so normal windows fall through
+    /// to per-rank [`Self::compute_chunk_batches`] sizing. Idempotent within a
+    /// window; recomputed when `epoch` advances.
+    pub(super) fn refresh_final_window_plan(&mut self, epoch: usize) {
+        if !self.policy.is_barrier_paced() {
+            self.final_window_plan = None;
+            return;
+        }
+        let Some(pool) = self.chunk_pools.get(&epoch) else {
+            self.final_window_plan = None;
+            return;
+        };
+        let rem = pool.remaining() / self.batch_size;
+        let counts = self.el_che.batch_counts();
+        let total: usize = (0..self.world_size)
+            .filter(|&r| !self.is_dead(r))
+            .map(|r| counts.get(r).copied().unwrap_or(0))
+            .sum();
+        // Final window iff the remainder fits in one schedule plus a
+        // sub-cohort crumb (`< Σcounts + world_size`). Outside that, a normal
+        // window dispatches `Σcounts` and leaves `>= world_size` behind, so
+        // the per-rank path handles it.
+        if rem == 0 || total == 0 || rem >= total + self.world_size {
+            self.final_window_plan = None;
+            return;
+        }
+        // Already planned for this epoch: keep the window-start split (the
+        // live `rem` has since drained as ranks took their slots).
+        if matches!(&self.final_window_plan, Some((e, _)) if *e == epoch) {
+            return;
+        }
+        let alive: Vec<bool> =
+            (0..self.world_size).map(|r| !self.is_dead(r)).collect();
+        let alloc = final_window_alloc(rem, counts, &alive);
+        self.final_window_plan = Some((epoch, alloc));
     }
 
     /// Compute how many batches the next chunk for `rank` in `epoch`
@@ -533,6 +588,20 @@ impl ClusterCoordinator {
         let remaining_batches = pool.remaining() / self.batch_size;
         if remaining_batches == 0 {
             return 0;
+        }
+
+        // FINAL-WINDOW PLAN (barrier-paced). Once the pool drops to within one
+        // window of empty, `refresh_final_window_plan` has dispatched the whole
+        // remainder as a single coherent window sized to avoid any lone-1 step
+        // (the delivered-feed fallback trigger). Serve each rank its
+        // pre-computed slot and bypass the per-rank sizing below entirely
+        // (including `cap_to_reduce_budget` — the plan IS the final word, and
+        // its fold crumb deliberately runs one batch past the reduce budget on
+        // a slow rank). See `docs/design/epoch-tail-allocation.md`.
+        if let Some((plan_epoch, plan)) = self.final_window_plan.as_ref() {
+            if *plan_epoch == epoch {
+                return plan.get(rank).copied().unwrap_or(0);
+            }
         }
 
         // EDGE SCHEDULE (epoch / run tail). When less than a full window of
@@ -683,5 +752,198 @@ impl ClusterCoordinator {
                 self.dispatch_next_chunk(rank);
             }
         }
+    }
+}
+
+/// Index of the alive rank with the largest scheduled `counts` (ties → lowest
+/// index). The fast rank: never padded by the fold crumb, because its
+/// between-sync step count is the convergence-sensitive quantity. `None` when
+/// no rank is alive.
+fn fastest_alive_rank(counts: &[usize], alive: &[bool]) -> Option<usize> {
+    (0..counts.len())
+        .filter(|&r| alive[r])
+        .max_by_key(|&r| (counts.get(r).copied().unwrap_or(0), usize::MAX - r))
+}
+
+/// Repair lone-1 allocations in place: any alive rank holding exactly one
+/// batch has it moved onto the smallest alive peer that already holds `>= 1`
+/// (which becomes `>= 2`); the orphan drops to 0. Never moves onto a 0 — that
+/// would just relocate the lone 1. If no `>= 1` peer exists (the remainder is
+/// too small for any pair), the lone 1 is left as is and that window's feed
+/// falls back to the compute scale — irreducible and benign.
+fn consolidate_lone_ones(alloc: &mut [usize], alive: &[bool]) {
+    while let Some(orphan) =
+        (0..alloc.len()).find(|&r| alive[r] && alloc[r] == 1)
+    {
+        let peer = (0..alloc.len())
+            .filter(|&p| p != orphan && alive[p] && alloc[p] >= 1)
+            .min_by_key(|&p| alloc[p]);
+        match peer {
+            Some(p) => {
+                alloc[p] += 1;
+                alloc[orphan] = 0;
+            }
+            None => break,
+        }
+    }
+}
+
+/// Allocate an epoch's FINAL reduce window: the entire remaining `rem` batches
+/// in one window, sized so no participating rank ends at exactly 1 step (the
+/// delivered-feed marginal-skip fallback trigger). `counts` is the live ElChe
+/// schedule, `alive[r]` is false for a dead rank (allocated 0). The returned
+/// vector sums to `rem` exactly (coverage is exact — this only reshapes how
+/// the remainder is split). See `docs/design/epoch-tail-allocation.md`.
+///
+/// Two regimes by `rem` vs `Σcounts` (over alive ranks):
+/// - `rem >= Σcounts` (FOLD BAND, `rem = Σcounts + R`, `R < world_size`):
+///   each alive rank takes its full scheduled share, then the `R`-batch crumb
+///   goes one-per-rank to the slowest alive non-fast ranks. The fast rank is
+///   never padded.
+/// - `rem < Σcounts` (PROPORTIONAL SUB-WINDOW): largest-remainder split of
+///   `rem` across alive shares, then [`consolidate_lone_ones`].
+fn final_window_alloc(rem: usize, counts: &[usize], alive: &[bool]) -> Vec<usize> {
+    let world = counts.len();
+    let mut alloc = vec![0usize; world];
+    if rem == 0 {
+        return alloc;
+    }
+    let total: usize = (0..world)
+        .filter(|&r| alive[r])
+        .map(|r| counts[r])
+        .sum();
+    if total == 0 {
+        return alloc;
+    }
+
+    if rem >= total {
+        // FOLD BAND: full schedule + a sub-cohort crumb, dispatched together.
+        for r in 0..world {
+            if alive[r] {
+                alloc[r] = counts[r];
+            }
+        }
+        let mut crumb = rem - total;
+        if crumb > 0 {
+            let fast = fastest_alive_rank(counts, alive);
+            let mut order: Vec<usize> = (0..world)
+                .filter(|&r| alive[r] && Some(r) != fast)
+                .collect();
+            // Slowest first so the crumb lands on the ranks with the most
+            // headroom; round-robin if it exceeds the slot count (only when
+            // dead ranks shrink the cohort below the crumb size).
+            order.sort_by_key(|&r| counts[r]);
+            if order.is_empty() {
+                // Single alive rank: it takes the whole remainder.
+                if let Some(f) = fast {
+                    alloc[f] += crumb;
+                }
+            } else {
+                let mut i = 0;
+                while crumb > 0 {
+                    alloc[order[i % order.len()]] += 1;
+                    crumb -= 1;
+                    i += 1;
+                }
+            }
+        }
+        return alloc;
+    }
+
+    // PROPORTIONAL SUB-WINDOW: largest-remainder apportionment of `rem`.
+    let mut frac: Vec<(usize, f64)> = Vec::with_capacity(world);
+    let mut placed = 0usize;
+    for r in 0..world {
+        if !alive[r] {
+            continue;
+        }
+        let exact = rem as f64 * counts[r] as f64 / total as f64;
+        let floor = exact.floor() as usize;
+        alloc[r] = floor;
+        placed += floor;
+        frac.push((r, exact - floor as f64));
+    }
+    frac.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut leftover = rem - placed;
+    let mut i = 0;
+    while leftover > 0 && !frac.is_empty() {
+        alloc[frac[i % frac.len()].0] += 1;
+        leftover -= 1;
+        i += 1;
+    }
+    consolidate_lone_ones(&mut alloc, alive);
+    alloc
+}
+
+#[cfg(test)]
+mod final_window_alloc_tests {
+    use super::{consolidate_lone_ones, fastest_alive_rank, final_window_alloc};
+
+    fn no_lone_one(alloc: &[usize]) -> bool {
+        alloc.iter().all(|&n| n != 1)
+    }
+
+    #[test]
+    fn proportional_split_sums_and_has_no_lone_one() {
+        // The observed rig tail: remaining 72, schedule [71, 18, 15].
+        let alloc = final_window_alloc(72, &[71, 18, 15], &[true, true, true]);
+        assert_eq!(alloc.iter().sum::<usize>(), 72, "coverage exact");
+        assert!(no_lone_one(&alloc), "no rank at exactly 1: {alloc:?}");
+        // Fast rank still dominant, slow ranks get a real (>=2) slice.
+        assert!(alloc[0] > alloc[1] && alloc[0] > alloc[2], "{alloc:?}");
+    }
+
+    #[test]
+    fn tiny_proportional_windows_consolidate() {
+        // Remainders that would orphan a slow rank under a raw split.
+        for rem in 3..=20usize {
+            let alloc = final_window_alloc(rem, &[71, 18, 15], &[true, true, true]);
+            assert_eq!(alloc.iter().sum::<usize>(), rem, "rem={rem} {alloc:?}");
+            assert!(no_lone_one(&alloc), "rem={rem} lone-1: {alloc:?}");
+        }
+    }
+
+    #[test]
+    fn fold_band_pads_slow_ranks_not_the_fastest() {
+        // rem = Σcounts + 2: two crumb batches, both to slow ranks.
+        let counts = [71, 18, 15];
+        let alloc = final_window_alloc(106, &counts, &[true, true, true]);
+        assert_eq!(alloc.iter().sum::<usize>(), 106);
+        assert_eq!(alloc[0], 71, "fast rank never padded");
+        assert_eq!(alloc[1] + alloc[2], 35, "crumb landed on the slow ranks");
+    }
+
+    #[test]
+    fn dead_rank_gets_nothing() {
+        let alloc = final_window_alloc(40, &[71, 18, 15], &[true, false, true]);
+        assert_eq!(alloc[1], 0, "dead rank allocated nothing: {alloc:?}");
+        assert_eq!(alloc.iter().sum::<usize>(), 40);
+        assert!(no_lone_one(&alloc), "{alloc:?}");
+    }
+
+    #[test]
+    fn irreducible_lone_one_is_left_for_the_fallback() {
+        // rem = 1, nowhere to consolidate: accept the single lone 1.
+        let alloc = final_window_alloc(1, &[71, 18, 15], &[true, true, true]);
+        assert_eq!(alloc.iter().sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn consolidate_examples() {
+        let alive = [true, true, true];
+        let mut a = [1, 1, 0];
+        consolidate_lone_ones(&mut a, &alive);
+        assert!(a.iter().all(|&n| n != 1) && a.iter().sum::<usize>() == 2, "{a:?}");
+        let mut b = [2, 1, 1];
+        consolidate_lone_ones(&mut b, &alive);
+        assert!(b.iter().all(|&n| n != 1) && b.iter().sum::<usize>() == 4, "{b:?}");
+    }
+
+    #[test]
+    fn fastest_rank_skips_dead() {
+        assert_eq!(fastest_alive_rank(&[71, 18, 15], &[false, true, true]), Some(1));
+        assert_eq!(fastest_alive_rank(&[71, 18, 15], &[true, true, true]), Some(0));
     }
 }

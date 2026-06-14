@@ -339,6 +339,7 @@ impl ClusterCoordinator {
             // Floor for proportional chunk sizing after calibration —
             // matches the threaded coordinator's default.
             min_chunk_batches: 4,
+            final_window_plan: None,
             metrics_fn: config.metrics_fn.clone(),
             metrics_sink_tx: config.metrics_sink_tx.clone(),
             eval_result_fn: config.eval_result_fn.clone(),

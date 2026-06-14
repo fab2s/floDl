@@ -370,6 +370,63 @@ fn tail_dispatch_is_share_capped_not_proportional() {
     }
 }
 
+// Cadence tail: the final reduce window is planned as one coherent split of
+// the whole remainder, sized so no rank ends at exactly 1 step (which would
+// zero its marginal delivered sample and trip the all-or-none feed fallback).
+// Coverage stays exact and the fast rank is never over-driven.
+#[test]
+fn cadence_tail_plans_a_no_lone_one_window() {
+    let world_size = 3;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 10),
+    )
+    .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    // Asymmetric calibration: rank 0 fast, ranks 1/2 slow.
+    for _ in 0..5 {
+        coord
+            .el_che_mut_for_test()
+            .report_timing(&[200.0, 900.0, 1000.0], &[10, 10, 10], 10.0);
+    }
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    let total: usize = counts.iter().sum();
+    let fast = counts.iter().enumerate().max_by_key(|&(_, &c)| c).unwrap().0;
+    assert!(total > world_size + 2, "counts: {counts:?}");
+
+    // One batch short of a full window: the whole remainder is the final
+    // window (proportional sub-window regime).
+    let remaining = total - 1;
+    coord.install_chunk_pool_for_test(0, remaining);
+    for r in 0..world_size {
+        coord.set_rank_epoch_for_test(r, 0);
+    }
+    coord.refresh_final_window_plan_for_test(0);
+
+    let sizes: Vec<usize> = (0..world_size)
+        .map(|r| coord.compute_chunk_batches_for_test(r, 0))
+        .collect();
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        remaining,
+        "coverage exact: {sizes:?} (counts={counts:?}, remaining={remaining})",
+    );
+    assert!(
+        sizes.iter().all(|&n| n != 1),
+        "no rank at exactly 1 step: {sizes:?}",
+    );
+    assert!(
+        sizes[fast] >= sizes.iter().enumerate()
+            .filter(|&(r, _)| r != fast)
+            .map(|(_, &n)| n)
+            .max()
+            .unwrap_or(0),
+        "fast rank stays dominant: {sizes:?}",
+    );
+}
+
 #[test]
 fn fold_next_chunk_none_at_epoch_boundary() {
     let world_size = 2;
