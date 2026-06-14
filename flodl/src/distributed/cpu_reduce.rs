@@ -38,6 +38,19 @@ use crate::distributed::controller::{
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 
+/// Per-read deadline for the long-running reduce loop (replaces the
+/// previously-cleared timeout). A vanished controller or relay must not
+/// park the rank forever: the coordinator-side ReduceStall ceiling cannot
+/// fire if the coordinator is the process that died, so the rank needs an
+/// independent backstop. `SO_RCVTIMEO` counts silence per `read()` (waiting
+/// for the next byte), NOT total round time, so a slow-but-live round
+/// (bytes still trickling, a slow straggler holding the barrier, a long
+/// eval/checkpoint callback) never trips it; only true peer-death silence
+/// does. Sized to the coordinator's production stall ceiling (120s) so rank
+/// and coordinator agree on what "stalled" means. This is the in-band
+/// analogue of the relay's `fill_committed` starvation deadline.
+const REDUCE_READ_DEADLINE_SECS: u64 = 120;
+
 /// Rank-side client for the CPU-averaging controller.
 ///
 /// One instance per rank process. Lives for the duration of training.
@@ -141,10 +154,16 @@ impl CpuReduceClient {
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
+        // Swap the tight handshake timeout for a generous per-read deadline
+        // (see `REDUCE_READ_DEADLINE_SECS`): keeps the reduce loop from
+        // wedging forever on a vanished controller/relay without tripping on
+        // a slow-but-live round.
         client
             .stream
-            .set_read_timeout(None)
-            .map_err(|e| TensorError::new(&format!("cpu_reduce: clear read_timeout: {e}")))?;
+            .set_read_timeout(Some(Duration::from_secs(REDUCE_READ_DEADLINE_SECS)))
+            .map_err(|e| {
+                TensorError::new(&format!("cpu_reduce: set reduce read deadline: {e}"))
+            })?;
         Ok(client)
     }
 

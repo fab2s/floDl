@@ -22,21 +22,30 @@ fn cadence_cpu_coord(world_size: usize) -> ClusterCoordinator {
     )
 }
 
+/// Seed the per-rank delivered (ms, batches) credit pair from parallel
+/// lists — the readable shape these tests were written in before the five
+/// parallel `Vec`s collapsed into `Vec<DeliveredSpan>`.
+fn set_delivered(coord: &mut ClusterCoordinator, ms: &[f64], batches: &[usize]) {
+    for (i, (&m, &b)) in ms.iter().zip(batches).enumerate() {
+        coord.delivered[i].ms_accum = m;
+        coord.delivered[i].batches_accum = b;
+    }
+}
+
 #[test]
 fn movers_delivered_complete_requires_every_mover() {
     let mut coord = cadence_cpu_coord(2);
     // Both ranks moved this window.
     coord.steps_since_avg = vec![4, 4];
     // Only rank 0 has a closed span.
-    coord.delivered_ms_accum = vec![80.0, 0.0];
-    coord.delivered_batches_accum = vec![4, 0];
+    set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
     assert!(
         !coord.movers_delivered_complete(),
         "a mover without a delivered sample must block the predicate",
     );
     // Rank 1's span closes: predicate completes.
-    coord.delivered_ms_accum[1] = 200.0;
-    coord.delivered_batches_accum[1] = 4;
+    coord.delivered[1].ms_accum = 200.0;
+    coord.delivered[1].batches_accum = 4;
     assert!(coord.movers_delivered_complete());
 }
 
@@ -46,8 +55,7 @@ fn movers_delivered_complete_ignores_idle_and_dead_ranks() {
     // Rank 1 did nothing this window (quiesced tail): not a mover, must
     // not block the predicate.
     coord.steps_since_avg = vec![4, 0];
-    coord.delivered_ms_accum = vec![80.0, 0.0];
-    coord.delivered_batches_accum = vec![4, 0];
+    set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
     assert!(
         coord.movers_delivered_complete(),
         "an idle rank must not block the predicate",
@@ -67,8 +75,7 @@ fn timing_feed_all_or_none_falls_back_to_compute_scale() {
     coord.wall_ms_accum = vec![40.0, 100.0];
     // Rank 0 closed a delivered span (its delivered cost is 2x its
     // compute); rank 1 has none.
-    coord.delivered_ms_accum = vec![80.0, 0.0];
-    coord.delivered_batches_accum = vec![4, 0];
+    set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
 
     let (ms, batches) = coord.timing_feed();
     assert_eq!(
@@ -86,8 +93,7 @@ fn timing_feed_uses_delivered_when_window_complete() {
     coord.wall_ms_accum = vec![40.0, 100.0];
     // Both movers closed spans: the delivered scale is coherent and
     // must win (it carries the data/transport cost the balancer needs).
-    coord.delivered_ms_accum = vec![80.0, 220.0];
-    coord.delivered_batches_accum = vec![4, 4];
+    set_delivered(&mut coord, &[80.0, 220.0], &[4, 4]);
 
     let (ms, batches) = coord.timing_feed();
     assert_eq!(ms, vec![80.0, 220.0], "complete window feeds delivered cost");
@@ -109,8 +115,7 @@ fn timing_feed_sync_keeps_compute_scale() {
     );
     coord.steps_since_avg = vec![1, 1];
     coord.wall_ms_accum = vec![10.0, 20.0];
-    coord.delivered_ms_accum = vec![99.0, 99.0];
-    coord.delivered_batches_accum = vec![1, 1];
+    set_delivered(&mut coord, &[99.0, 99.0], &[1, 1]);
 
     let (ms, _) = coord.timing_feed();
     assert_eq!(ms, vec![10.0, 20.0], "Sync stays on the compute feed");

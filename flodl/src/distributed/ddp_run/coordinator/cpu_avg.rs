@@ -193,6 +193,61 @@ impl Coordinator {
     /// NCCL workers block in AllReduce so no new batches arrive during the
     /// collective; zeroing is correct.
     ///
+    /// Apply a [`convergence::ConvergenceAction`] to ElChe's anchor and the
+    /// Async overshoot controls. Shared by the NCCL and CPU finish paths so
+    /// the verdict-to-action mapping stays single-source (`old_anchor` is the
+    /// pre-action anchor, used only for the verbose nudge log). Overshoot is
+    /// an Async-only concept; the trailing ceiling is the absolute safety
+    /// valve applied after all auto-tune logic.
+    fn apply_convergence_action(
+        &mut self,
+        action: convergence::ConvergenceAction,
+        old_anchor: usize,
+    ) {
+        match action {
+            convergence::ConvergenceAction::Stable => {
+                // Commit any overhead-tune proposal regardless of policy
+                // (Cadence runs the auto-tune too).
+                self.el_che.commit_proposed_anchor();
+                if self.policy == ApplyPolicy::Async {
+                    if self.overshoot_auto {
+                        let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
+                        self.max_overshoot = (self.max_overshoot + 1).min(cap);
+                    }
+                    // Symmetric upward path for anchor: relax cadence on stable
+                    // convergence (capped by max_batch_diff and max_anchor).
+                    // Without this, anchor stays pinned at min_anchor forever
+                    // because the overhead-based auto-tune lives in a dead
+                    // zone for low-overhead workloads. Suppressed when the
+                    // user disables relax-up (e.g. to isolate share-allocation
+                    // dynamics from the periodic anchor cycle).
+                    if self.elche_relax_up {
+                        self.el_che.relax_anchor_up();
+                    }
+                }
+            }
+            convergence::ConvergenceAction::SuppressGrowth => {
+                // Veto growth; allow shrink (safe direction).
+                self.el_che.veto_proposed_growth();
+            }
+            convergence::ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.discard_proposed_anchor();
+                self.el_che.nudge_anchor_down(factor);
+                crate::verbose!(
+                    "  ddp: weight-space divergence nudge, anchor {} -> {}",
+                    old_anchor, self.el_che.anchor()
+                );
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    self.max_overshoot = self.overshoot_initial;
+                }
+            }
+        }
+        // Absolute ceiling (safety valve, applied after all auto-tune logic).
+        if self.policy == ApplyPolicy::Async {
+            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
+        }
+    }
+
     /// Weight-space divergence guard feeds into cadence control via
     /// [`convergence::ConvergenceGuard`]. The guard is mode-aware: Sync skips entirely,
     /// Cadence/Async use trend detection on `||pre-post|| / ||post||`.
@@ -248,45 +303,8 @@ impl Coordinator {
         self.version += 1;
         self.avg_count += 1;
 
-        // Apply convergence action. Overshoot is an Async-only concept.
-        match action {
-            convergence::ConvergenceAction::Stable => {
-                // Commit any overhead-tune proposal regardless of policy
-                // (Cadence runs the auto-tune too).
-                self.el_che.commit_proposed_anchor();
-                if self.policy == ApplyPolicy::Async {
-                    if self.overshoot_auto {
-                        let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-                        self.max_overshoot = (self.max_overshoot + 1).min(cap);
-                    }
-                    // Symmetric upward path for anchor: relax cadence on stable
-                    // convergence (capped by max_batch_diff and max_anchor).
-                    // Without this, anchor stays pinned at min_anchor forever
-                    // because the overhead-based auto-tune lives in a dead
-                    // zone for low-overhead workloads. Suppressed when the
-                    // user disables relax-up (e.g. to isolate share-allocation
-                    // dynamics from the periodic anchor cycle).
-                    if self.elche_relax_up {
-                        self.el_che.relax_anchor_up();
-                    }
-                }
-            }
-            convergence::ConvergenceAction::SuppressGrowth => {
-                // Veto growth; allow shrink (safe direction).
-                self.el_che.veto_proposed_growth();
-            }
-            convergence::ConvergenceAction::NudgeDown { factor } => {
-                self.el_che.discard_proposed_anchor();
-                self.el_che.nudge_anchor_down(factor);
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    self.max_overshoot = self.overshoot_initial;
-                }
-            }
-        }
-        // Absolute ceiling (safety valve, applied after all auto-tune logic).
-        if self.policy == ApplyPolicy::Async {
-            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
-        }
+        // Apply convergence action (shared NCCL/CPU verdict-to-action map).
+        self.apply_convergence_action(action, old_anchor);
 
         // Timeline: sync duration and anchor changes. Uses the previous
         // sync's measured duration (captured when last rank acked). The
@@ -374,13 +392,11 @@ impl Coordinator {
         for c in &mut self.loss_count {
             *c = 0;
         }
-        for d in &mut self.nccl_sync_divergence {
-            *d = None;
-        }
-        for p in &mut self.nccl_sync_pre_norm {
-            *p = None;
-        }
-        self.nccl_sync_post_norm = None;
+        convergence::reset_divergence_signals(
+            &mut self.nccl_sync_divergence,
+            &mut self.nccl_sync_pre_norm,
+            &mut self.nccl_sync_post_norm,
+        );
 
         // Re-dispatch to ranks that are idle (no in-flight chunks in any pool)
         // and may have been waiting at the overshoot gate. Now that
@@ -438,37 +454,7 @@ impl Coordinator {
         // phase; its NudgeDown actions dispatch through observe_meta.
         self.observe_meta(action);
 
-        match action {
-            convergence::ConvergenceAction::Stable => {
-                self.el_che.commit_proposed_anchor();
-                if self.policy == ApplyPolicy::Async {
-                    if self.overshoot_auto {
-                        let cap = (self.total_samples / self.batch_size.max(1) / 50).clamp(3, 10);
-                        self.max_overshoot = (self.max_overshoot + 1).min(cap);
-                    }
-                    if self.elche_relax_up {
-                        self.el_che.relax_anchor_up();
-                    }
-                }
-            }
-            convergence::ConvergenceAction::SuppressGrowth => {
-                self.el_che.veto_proposed_growth();
-            }
-            convergence::ConvergenceAction::NudgeDown { factor } => {
-                self.el_che.discard_proposed_anchor();
-                self.el_che.nudge_anchor_down(factor);
-                crate::verbose!(
-                    "  ddp: weight-space divergence nudge, anchor {} -> {}",
-                    old_anchor, self.el_che.anchor()
-                );
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    self.max_overshoot = self.overshoot_initial;
-                }
-            }
-        }
-        if self.policy == ApplyPolicy::Async {
-            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
-        }
+        self.apply_convergence_action(action, old_anchor);
 
         self.version += 1;
         self.avg_count += 1;

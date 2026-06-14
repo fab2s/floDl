@@ -108,6 +108,28 @@ pub enum ConvergenceAction {
     NudgeDown { factor: f64 },
 }
 
+/// Clear the per-window NCCL-sync divergence accumulators after a reduce.
+///
+/// Both the cluster coordinator and the threaded coordinator stash the
+/// most recent sync's per-rank divergence, per-rank pre-norm, and the
+/// scalar post-norm so the [`ConvergenceGuard`] can read them once, then
+/// must reset them to `None` before the next window opens (stale values
+/// would pin the anchor — see the divergence-reset invariant). Shared so
+/// the two coordinators cannot drift on what "reset" means.
+pub(crate) fn reset_divergence_signals(
+    divergence: &mut [Option<f64>],
+    pre_norm: &mut [Option<f64>],
+    post_norm: &mut Option<f64>,
+) {
+    for d in divergence {
+        *d = None;
+    }
+    for p in pre_norm {
+        *p = None;
+    }
+    *post_norm = None;
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------

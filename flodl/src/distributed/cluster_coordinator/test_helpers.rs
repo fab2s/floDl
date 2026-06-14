@@ -10,8 +10,8 @@ use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::{SessionSalt, TimingMsgWire};
 
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState, NcclRendezvousPending,
-    initial_callback_role,
+    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState, DeliveredSpan,
+    NcclRendezvousPending, RunPhase, initial_callback_role,
 };
 
 impl ClusterCoordinator {
@@ -134,11 +134,7 @@ impl ClusterCoordinator {
             max_overshoot: config.overshoot_initial,
             steps_since_avg: vec![0; world_size],
             wall_ms_accum: vec![0.0; world_size],
-            delivered_span_start: vec![None; world_size],
-            delivered_span_crossed: vec![false; world_size],
-            delivered_first_batch: vec![None; world_size],
-            delivered_ms_accum: vec![0.0; world_size],
-            delivered_batches_accum: vec![0; world_size],
+            delivered: vec![DeliveredSpan::default(); world_size],
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
             nccl_sync_step: vec![0; world_size],
@@ -203,8 +199,7 @@ impl ClusterCoordinator {
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             last_dispatched_epoch: None,
-            shutdown_initiated: false,
-            final_eval_dispatched: false,
+            run_phase: RunPhase::Training,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
             batch_size: config.batch_size.max(1),

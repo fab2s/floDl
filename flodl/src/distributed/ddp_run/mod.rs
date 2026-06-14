@@ -14,8 +14,7 @@
 //!     .dataset(dataset)
 //!     .batch_size(32)
 //!     .num_epochs(10)
-//!     .policy(ApplyPolicy::Cadence)
-//!     .backend(AverageBackend::Nccl)
+//!     .elche(ElCheConfig::nccl_cadence())
 //!     .checkpoint_every(5)
 //!     .checkpoint_fn(|ver, g| g.save_checkpoint(&format!("ckpt_v{ver}.fdl")))
 //!     .run()?;
@@ -861,7 +860,7 @@ impl DdpRunConfig {
 /// Exiting is sent exactly once, before the worker thread terminates, so the
 /// coordinator never sends NCCL collectives to a dead worker.
 #[derive(Clone, Debug)]
-pub enum TimingMsg {
+pub(crate) enum TimingMsg {
     /// Per-batch timing report.
     Batch {
         /// Which GPU sent this.
@@ -884,7 +883,7 @@ pub enum TimingMsg {
     ///
     /// Satisfies the coordinator's `nccl_ack` check (`step_count >
     /// nccl_sync_step`) without inflating `steps_since_avg`. Using
-    /// [`TimingMsg::Batch`] here would add a phantom batch per sync per
+    /// `TimingMsg::Batch` here would add a phantom batch per sync per
     /// rank, inflating `global_step` and firing the LR scheduler early.
     SyncAck {
         /// Which GPU sent this.
@@ -943,7 +942,7 @@ pub enum TimingMsg {
         rank: usize,
     },
     /// Response from the chosen surviving rank to coord's
-    /// [`ControlMsg::RequestNewNcclId`]: 128 raw bytes of a freshly
+    /// `ControlMsg::RequestNewNcclId`: 128 raw bytes of a freshly
     /// generated `NcclUniqueId`.
     NewNcclIdGenerated {
         /// Sender rank (so coord validates against its request).
@@ -1075,7 +1074,7 @@ pub struct AveragedParams {
 
 /// Control signals from the coordinator to a GPU worker.
 #[derive(Debug)]
-pub enum ControlMsg {
+pub(crate) enum ControlMsg {
     /// \[CPU path\] Request parameter snapshot for averaging.
     RequestParams,
     /// \[CPU path\] Deliver averaged parameters.
@@ -1110,26 +1109,21 @@ pub enum ControlMsg {
     /// it is NOT dispatched to the inner GpuWorker because the inner
     /// is typically blocked in an in-flight NCCL collective and
     /// cannot service control messages until the watchdog aborts the
-    /// comm. See `DeclareDead`.
-    DeclareDead {
-        /// Global rank that just died.
-        rank: usize,
-    },
+    /// comm. See `DeclareDead`. Fieldless: the inbound bridge reads the
+    /// `ControlMsgWire::DeclareDead { rank }` payload directly into the
+    /// local ledger; this worker-facing token carries no payload because
+    /// the inner GpuWorker never consumes it.
+    DeclareDead,
     /// Coord-emitted directive to rebuild the local NCCL comm with
     /// the shrunken cohort. Sent after one or more `DeclareDead`s.
-    /// See `NewNcclSession`.
-    NewNcclSession {
-        /// 128-byte NCCL unique-id, identical across survivors.
-        uid_bytes: Vec<u8>,
-        /// Recipient's new rank-in-comm (its position among
-        /// survivors ordered by ascending global rank).
-        new_rank: usize,
-        /// Total ranks in the new comm.
-        new_world_size: usize,
-    },
+    /// See `NewNcclSession`. Fieldless for the same reason as
+    /// [`DeclareDead`](Self::DeclareDead): the bridge stages the
+    /// `ControlMsgWire::NewNcclSession` payload into the session mailbox;
+    /// the inner GpuWorker never reads it off this token.
+    NewNcclSession,
     /// Coord-emitted request to generate a fresh NCCL unique-id and
     /// ship its bytes back via the timing channel
-    /// ([`TimingMsg::NewNcclIdGenerated`]). Only one rank receives
+    /// (`TimingMsg::NewNcclIdGenerated`). Only one rank receives
     /// this per re-rendezvous cycle (the lowest-numbered survivor).
     /// See `RequestNewNcclId`.
     RequestNewNcclId,

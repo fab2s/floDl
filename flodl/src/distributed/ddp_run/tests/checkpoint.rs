@@ -44,7 +44,7 @@ fn test_checkpoint_error_logged_not_propagated() {
 }
 
 /// `ControlMsg::ExecuteEvalCallback` fires the worker's `eval_fn`
-/// against `eval_dataset` and emits a [`TimingMsg::EvalResult`] back
+/// against `eval_dataset` and emits a `TimingMsg::EvalResult` back
 /// to the coordinator. Mirrors the checkpoint test pattern.
 #[test]
 fn test_eval_fn_called_on_dispatch_and_emits_result() {

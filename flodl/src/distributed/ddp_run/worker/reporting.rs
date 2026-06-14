@@ -75,7 +75,7 @@ impl<M: Module> GpuWorker<M> {
 
     /// Send a timing report to the coordinator.
     ///
-    /// Also emits a [`TimingMsg::LrUpdate`] piggyback message so the
+    /// Also emits a `TimingMsg::LrUpdate` piggyback message so the
     /// coordinator's LR-aware meta-controller (when enabled) can track the
     /// LR trajectory between averaging cycles. Cheap fire-and-forget; the
     /// coordinator caches only the most recent value per rank.

@@ -99,6 +99,25 @@ pub(super) const SSH_OPTS: &[&str] = &[
 /// `libc` in, which keeps `flodl`'s direct deps unchanged. The child
 /// `Child` value is owned by its watcher thread for the duration of
 /// `wait()`, so we capture the PID up front and signal by PID.
+///
+/// # No parent-driven process-group sweep
+///
+/// This handles the peer-failure direction (a child dies → terminate the
+/// rest). It deliberately does NOT put local children in their own process
+/// group and sweep them on launcher exit. The launcher hosts the
+/// coordinator, so launcher death IS coordinator death — and ranks already
+/// self-terminate on that: each rank's inbound bridge sees the control
+/// stream EOF and injects `ControlMsg::Shutdown`, and the reduce loop's
+/// per-read deadline (`cpu_reduce::REDUCE_READ_DEADLINE_SECS`) bails a rank
+/// blocked reading from the vanished coordinator. Comms-loss self-exit is
+/// strictly more robust than a `Drop`-based sweep, which would not run at
+/// all on a launcher hard-kill (`SIGKILL`) — exactly the case that strands
+/// children. Full coverage of hard-kill would need `PR_SET_PDEATHSIG`
+/// (libc/prctl), outside the no-libc constraint. The one irreducible
+/// residual is a rank wedged inside a hung NCCL collective / CUDA kernel
+/// the driver never returns from: it holds the GPU and no pure-Rust
+/// mechanism reaps it, so it stays a manual `docker restart` / `ssh pkill`
+/// (the rig-hygiene backstop).
 pub(super) fn supervise_children(
     children: Vec<(
         String,

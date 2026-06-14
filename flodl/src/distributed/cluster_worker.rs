@@ -127,7 +127,7 @@ fn read_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> 
 // Bridge helpers (mpsc ↔ TCP)
 // ---------------------------------------------------------------------------
 
-/// Convert an in-process [`TimingMsg`] into the bincode-serializable
+/// Convert an in-process `TimingMsg` into the bincode-serializable
 /// [`TimingMsgWire`] for transit over the TCP control channel.
 fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
     match msg {
@@ -218,7 +218,7 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
 }
 
 /// Convert an inbound [`ControlMsgWire`] from the coordinator into an
-/// optional in-process [`ControlMsg`] for [`GpuWorker::dispatch_control`].
+/// optional in-process `ControlMsg` for [`GpuWorker::dispatch_control`].
 ///
 /// Returns `Ok(None)` for wire variants that don't need in-process
 /// dispatch:
@@ -256,18 +256,8 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
             partition_offset: partition_offset as usize,
             partition_size: partition_size as usize,
         })),
-        ControlMsgWire::DeclareDead { rank } => Ok(Some(ControlMsg::DeclareDead {
-            rank: rank as usize,
-        })),
-        ControlMsgWire::NewNcclSession {
-            uid_bytes,
-            new_rank,
-            new_world_size,
-        } => Ok(Some(ControlMsg::NewNcclSession {
-            uid_bytes,
-            new_rank: new_rank as usize,
-            new_world_size: new_world_size as usize,
-        })),
+        ControlMsgWire::DeclareDead { .. } => Ok(Some(ControlMsg::DeclareDead)),
+        ControlMsgWire::NewNcclSession { .. } => Ok(Some(ControlMsg::NewNcclSession)),
         ControlMsgWire::RequestNewNcclId => Ok(Some(ControlMsg::RequestNewNcclId)),
         ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
@@ -1221,7 +1211,7 @@ fn inbound_loop(
 /// slow enough that the per-cycle frame overhead is negligible.
 const HEARTBEAT_CADENCE_MS: u64 = 1_000;
 
-/// Worker-side heartbeat emitter. Fires a [`TimingMsg::Heartbeat`]
+/// Worker-side heartbeat emitter. Fires a `TimingMsg::Heartbeat`
 /// every [`HEARTBEAT_CADENCE_MS`] until `shutdown` is signalled or the
 /// `timing_tx` channel closes (inner GpuWorker dropped). The heartbeat
 /// flows through the outbound bridge alongside Batch / SyncAck / etc.,

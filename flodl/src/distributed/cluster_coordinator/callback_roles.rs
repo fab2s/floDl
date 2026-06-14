@@ -172,9 +172,9 @@ impl ClusterCoordinator {
         // dispatch→completion window that contained this callback would
         // otherwise charge its wall to the rank's per-batch cost. Keeps
         // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.delivered_ms_accum.len() {
-            self.delivered_ms_accum[rank] =
-                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
+        if rank < self.delivered.len() {
+            self.delivered[rank].ms_accum =
+                (self.delivered[rank].ms_accum - elapsed_ms).max(0.0);
         }
         match error {
             None => {
@@ -270,9 +270,9 @@ impl ClusterCoordinator {
         // dispatch→completion window that contained this callback would
         // otherwise charge its wall to the rank's per-batch cost. Keeps
         // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.delivered_ms_accum.len() {
-            self.delivered_ms_accum[rank] =
-                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
+        if rank < self.delivered.len() {
+            self.delivered[rank].ms_accum =
+                (self.delivered[rank].ms_accum - elapsed_ms).max(0.0);
         }
         // EWMA blend (alpha=0.3, same as checkpoint). Fires on every
         // report regardless of error: the closure wall-time is honest
@@ -314,9 +314,9 @@ impl ClusterCoordinator {
         // dispatch→completion window that contained this callback would
         // otherwise charge its wall to the rank's per-batch cost. Keeps
         // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.delivered_ms_accum.len() {
-            self.delivered_ms_accum[rank] =
-                (self.delivered_ms_accum[rank] - elapsed_ms).max(0.0);
+        if rank < self.delivered.len() {
+            self.delivered[rank].ms_accum =
+                (self.delivered[rank].ms_accum - elapsed_ms).max(0.0);
         }
         let alpha = 0.3_f64;
         self.last_epoch_fn_elapsed_ms_ewma =

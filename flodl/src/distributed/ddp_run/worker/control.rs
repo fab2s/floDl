@@ -124,8 +124,8 @@ impl<M: Module> GpuWorker<M> {
                 }
                 self.pending_plan = Some(plan);
             }
-            ControlMsg::DeclareDead { .. }
-            | ControlMsg::NewNcclSession { .. }
+            ControlMsg::DeclareDead
+            | ControlMsg::NewNcclSession
             | ControlMsg::RequestNewNcclId => {
                 // Cluster-mode elastic-membership signals. The
                 // cluster_worker layer intercepts these in its

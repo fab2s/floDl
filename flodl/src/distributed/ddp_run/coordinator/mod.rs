@@ -62,7 +62,7 @@ pub struct Coordinator {
     calibrated: bool,
 
     /// Number of workers still actively training. Decremented when the
-    /// coordinator drains a [`TimingMsg::Exiting`] message. Single-writer
+    /// coordinator drains a `TimingMsg::Exiting` message. Single-writer
     /// (coordinator thread only), no race with NCCL collectives.
     pub(super) active_count: usize,
 
@@ -485,7 +485,7 @@ impl CoordinatorBuilder {
 impl Coordinator {
     /// Create a coordinator builder.
     #[allow(clippy::too_many_arguments)]
-    pub fn builder(
+    pub(crate) fn builder(
         timing_rx: mpsc::Receiver<TimingMsg>,
         metrics_rx: mpsc::Receiver<MetricsMsg>,
         param_rx: mpsc::Receiver<ParamSnapshot>,
@@ -1131,7 +1131,7 @@ impl Coordinator {
     /// Process all pending timing messages (non-blocking drain).
     ///
     /// Updates per-rank step counts and accumulates wall-clock time for ElChe.
-    /// When a worker sends [`TimingMsg::Exiting`], decrements `active_count`
+    /// When a worker sends `TimingMsg::Exiting`, decrements `active_count`
     /// so [`should_average`](Self::should_average) stops triggering collectives.
     pub fn drain_timing(&mut self) {
         while let Ok(msg) = self.timing_rx.try_recv() {
@@ -1323,7 +1323,7 @@ impl Coordinator {
 
     /// Throttle workers that have run too far ahead of the slowest rank.
     ///
-    /// Sends [`ControlMsg::Throttle`] to any worker whose `steps_since_avg`
+    /// Sends `ControlMsg::Throttle` to any worker whose `steps_since_avg`
     /// exceeds the slowest rank's by more than `max_batch_diff`. The worker
     /// blocks until the next real command (averaging or shutdown).
     ///

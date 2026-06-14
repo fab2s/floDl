@@ -22,7 +22,7 @@ impl<M: Module> GpuWorker<M> {
     /// Returns (worker-side senders/receiver, coordinator-side receivers/sender).
     /// Call this on the main thread, then pass the worker-side halves into
     /// [`GpuWorker::new`] inside the spawned thread.
-    pub fn channels() -> (WorkerEndpoints, WorkerChannels) {
+    pub(crate) fn channels() -> (WorkerEndpoints, WorkerChannels) {
         let (timing_tx, timing_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
         let (param_tx, param_rx) = mpsc::channel();
@@ -41,7 +41,7 @@ impl<M: Module> GpuWorker<M> {
     /// `initial_params`/`initial_buffers` from `WorkerConfig` are copied into the
     /// model's Variables to synchronize all workers to the same starting state.
     #[allow(clippy::too_many_arguments)]
-    pub fn new<F, G, O>(
+    pub(crate) fn new<F, G, O>(
         config: &WorkerConfig,
         model_factory: F,
         optim_factory: G,

@@ -652,8 +652,7 @@ impl Trainer {
     /// .dataset(dataset)
     /// .batch_size(32)
     /// .num_epochs(10)
-    /// .policy(ApplyPolicy::Cadence)
-    /// .backend(AverageBackend::Nccl)
+    /// .elche(ElCheConfig::nccl_cadence())
     /// .run()?;
     ///
     /// let state = handle.join()?;

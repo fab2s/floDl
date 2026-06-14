@@ -197,7 +197,7 @@ pub struct GpuWorker<M: Module> {
     pub(super) checkpoint_fn: Option<CheckpointFn<M>>,
     /// Sticky rank designated by the controller to fire `epoch_fn` at
     /// epoch transitions. `None` until the coord broadcasts the first
-    /// [`ControlMsg::SetEpochCallbackRole`]; while `None`, the
+    /// `ControlMsg::SetEpochCallbackRole`; while `None`, the
     /// autonomous epoch-transition fire in the cluster worker's main
     /// loop is gated off (no rank fires until the controller has
     /// chosen). Coord resolves the value at startup
@@ -210,12 +210,12 @@ pub struct GpuWorker<M: Module> {
     ///     crate::distributed::ddp_run::EpochCallbackPolicy::Fastest
     pub(super) epoch_callback_role: Option<usize>,
     /// User-supplied eval callback. Fires from [`Self::handle_control`]
-    /// on [`ControlMsg::ExecuteEvalCallback`] receipt, only on the rank
+    /// on `ControlMsg::ExecuteEvalCallback` receipt, only on the rank
     /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`]
     /// (other ranks see `None`). The framework flips
     /// [`Module::eval`]/[`Module::train`] around the closure and ships
     /// the scalar result back to the controller via
-    /// [`TimingMsg::EvalResult`].
+    /// `TimingMsg::EvalResult`.
     pub(super) eval_fn: Option<EvalFn<M>>,
     /// Held-out eval dataset paired with `eval_fn`. Required when
     /// `eval_fn` is set (the framework loud-errors if absent at eval
@@ -226,7 +226,7 @@ pub struct GpuWorker<M: Module> {
     /// failure flow. Populated from [`super::WorkerConfig::save_path`]. When
     /// set, the worker writes a `<save_path>.fdl` / `<save_path>.optim`
     /// / `<save_path>.meta.json` bundle on
-    /// [`ControlMsg::ShutdownWithSave`] receipt; when unset, the
+    /// `ControlMsg::ShutdownWithSave` receipt; when unset, the
     /// shutdown still happens but no save attempt is made.
     save_path: Option<String>,
 
@@ -298,7 +298,16 @@ pub struct GpuWorker<M: Module> {
 }
 
 /// Channels bundle returned by [`GpuWorker::channels`] for wiring into the coordinator.
-pub struct WorkerChannels {
+///
+/// In the single-host fallback the receivers and `control_tx` are *held*
+/// (not drained) so the worker's senders and `control_rx` stay connected
+/// for the whole run; only `metrics_rx` is consumed, because there is no
+/// coordinator to drain the rest. The multi-GPU path wires its channels
+/// inline and reads the receivers through `Coordinator::builder`. Several
+/// fields are therefore liveness-held rather than read in the non-test
+/// build (and exercised directly by the worker tests).
+#[allow(dead_code)]
+pub(crate) struct WorkerChannels {
     /// Receives timing reports from this worker.
     pub timing_rx: mpsc::Receiver<TimingMsg>,
     /// Receives epoch-end metrics from this worker.
@@ -313,7 +322,7 @@ pub struct WorkerChannels {
 
 /// Worker-side channel endpoints for passing into [`GpuWorker::new`].
 #[allow(clippy::type_complexity)]
-pub type WorkerEndpoints = (
+pub(crate) type WorkerEndpoints = (
     mpsc::Sender<TimingMsg>,
     mpsc::Sender<MetricsMsg>,
     mpsc::Sender<ParamSnapshot>,
@@ -382,7 +391,7 @@ impl<M: Module> GpuWorker<M> {
     /// The rank designated by the controller to fire `epoch_fn` at
     /// each epoch transition. `None` until the coord has resolved
     /// [`crate::distributed::ddp_run::EpochCallbackPolicy`] and
-    /// broadcast [`ControlMsg::SetEpochCallbackRole`]; while `None`
+    /// broadcast `ControlMsg::SetEpochCallbackRole`; while `None`
     /// the autonomous fire is gated off. The cluster worker's main
     /// loop consults this via the public accessor.
     pub fn epoch_callback_role(&self) -> Option<usize> {

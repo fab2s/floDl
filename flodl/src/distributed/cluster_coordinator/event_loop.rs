@@ -10,7 +10,7 @@ use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::{ControlMsgWire, TimingMsgWire};
 use crate::tensor::Result;
 
-use super::{ClusterCoordinator, CpuAvgState};
+use super::{ClusterCoordinator, CpuAvgState, RunPhase};
 
 impl ClusterCoordinator {
     /// Process a single timing message. Ported literally from OLD
@@ -65,11 +65,11 @@ impl ClusterCoordinator {
                 // The Cadence span close measures from THIS point over
                 // `batches − 1`, excluding the per-chunk fixed fill cost
                 // from the quoted per-batch rate. See
-                // `delivered_first_batch` field docs.
-                if self.delivered_span_start[rank].is_some()
-                    && self.delivered_first_batch[rank].is_none()
+                // [`DeliveredSpan`] field docs.
+                if self.delivered[rank].span_start.is_some()
+                    && self.delivered[rank].first_batch.is_none()
                 {
-                    self.delivered_first_batch[rank] = Some(Instant::now());
+                    self.delivered[rank].first_batch = Some(Instant::now());
                 }
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);
@@ -691,7 +691,7 @@ impl ClusterCoordinator {
                 // NOT counted. Fed to ElChe at `finish_averaging_*`.
                 //
                 // Tainted spans (crossed a reduce; see
-                // `delivered_span_crossed`) credit NOTHING — batches partly
+                // [`DeliveredSpan`]) credit NOTHING — batches partly
                 // predate the boundary while the re-anchored span holds only
                 // the post-boundary slice; mismatched credits under-price
                 // the rank and spiral the allocation.
@@ -699,7 +699,7 @@ impl ClusterCoordinator {
                 // CADENCE closes use the MARGINAL measure when available:
                 // ms from the first-Batch anchor over `batches − 1`, so the
                 // per-chunk fixed fill cost never enters the quoted
-                // per-batch rate (see `delivered_first_batch`). 1-batch
+                // per-batch rate (see [`DeliveredSpan`]). 1-batch
                 // chunks (edge tails) and missing anchors fall back to the
                 // dispatch-anchored full measure. Async keeps the dispatch
                 // anchor (overlapping fills are genuinely hidden there) with
@@ -710,37 +710,37 @@ impl ClusterCoordinator {
                     .map(|p| p.in_flight(rank))
                     .sum();
                 let closes_span = still_in_flight == 0
-                    && self.delivered_span_start[rank].is_some();
+                    && self.delivered[rank].span_start.is_some();
                 if !closes_span {
                     // Mid-span completion (async union overlap): batches are
                     // delivered now, the union ms follows at the final close.
-                    if !self.delivered_span_crossed[rank] {
-                        self.delivered_batches_accum[rank] +=
+                    if !self.delivered[rank].span_crossed {
+                        self.delivered[rank].batches_accum +=
                             msg.batches_processed;
                     }
                 } else {
-                    let start = self.delivered_span_start[rank]
+                    let start = self.delivered[rank].span_start
                         .take()
                         .expect("span present: checked by closes_span");
-                    let first_batch = self.delivered_first_batch[rank].take();
-                    if self.delivered_span_crossed[rank] {
+                    let first_batch = self.delivered[rank].first_batch.take();
+                    if self.delivered[rank].span_crossed {
                         // Discard both sides, clear the taint — the next
                         // chunk opens a fresh, clean span.
-                        self.delivered_span_crossed[rank] = false;
+                        self.delivered[rank].span_crossed = false;
                     } else {
                         let marginal = matches!(self.policy, ApplyPolicy::Cadence)
                             && msg.batches_processed >= 2;
                         match (marginal, first_batch) {
                             (true, Some(fb)) => {
-                                self.delivered_ms_accum[rank] +=
+                                self.delivered[rank].ms_accum +=
                                     fb.elapsed().as_secs_f64() * 1000.0;
-                                self.delivered_batches_accum[rank] +=
+                                self.delivered[rank].batches_accum +=
                                     msg.batches_processed - 1;
                             }
                             _ => {
-                                self.delivered_ms_accum[rank] +=
+                                self.delivered[rank].ms_accum +=
                                     start.elapsed().as_secs_f64() * 1000.0;
-                                self.delivered_batches_accum[rank] +=
+                                self.delivered[rank].batches_accum +=
                                     msg.batches_processed;
                             }
                         }
@@ -940,7 +940,7 @@ impl ClusterCoordinator {
     }
 
     pub(super) fn try_advance_or_shutdown_after_aggregate(&mut self) {
-        if self.shutdown_initiated {
+        if self.run_phase == RunPhase::ShutdownInitiated {
             return;
         }
         let Some(latest) = self.last_aggregated_epoch else {
@@ -1002,11 +1002,11 @@ impl ClusterCoordinator {
             // and the coordinator's teardown ticks drain the result. Only
             // when an `eval_result_fn` is wired and the chosen rank is alive.
             if self.eval_result_fn.is_some()
-                && !self.final_eval_dispatched
+                && self.run_phase == RunPhase::Training
                 && self.eval_role < self.world_size
                 && !self.is_dead(self.eval_role)
             {
-                self.final_eval_dispatched = true;
+                self.run_phase = RunPhase::FinalEvalDispatched;
                 let msg = ControlMsgWire::ExecuteEvalCallback {
                     schedule_id: u64::MAX, // sentinel: the final canonical eval
                     epoch: self.num_epochs as u64,
@@ -1019,7 +1019,7 @@ impl ClusterCoordinator {
                 // before Shutdown goes out (next tick, flag set → shutdown).
                 return;
             }
-            self.shutdown_initiated = true;
+            self.run_phase = RunPhase::ShutdownInitiated;
             if let Err(e) = self.shutdown_workers() {
                 crate::verbose!(
                     "  ddp: shutdown_workers after final aggregate failed: {}",

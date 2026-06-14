@@ -418,7 +418,7 @@ impl ClusterCoordinator {
         batches: usize,
     ) -> Result<Option<crate::distributed::wire::EpochPlanWire>> {
         let prev_epoch = self.rank_epoch[rank];
-        let span_was_open = self.delivered_span_start[rank].is_some();
+        let span_was_open = self.delivered[rank].span_start.is_some();
         let Some(plan) = self.take_next_chunk_plan(rank, epoch, batches) else {
             return Ok(None);
         };
@@ -459,8 +459,8 @@ impl ClusterCoordinator {
         }
         self.rank_epoch[rank] = prev_epoch;
         if !span_was_open {
-            self.delivered_span_start[rank] = None;
-            self.delivered_first_batch[rank] = None;
+            self.delivered[rank].span_start = None;
+            self.delivered[rank].first_batch = None;
         }
     }
 
@@ -497,13 +497,13 @@ impl ClusterCoordinator {
         // chunk's slice (or strand earlier chunks). Leaving an existing
         // start intact lets the span cover the union of all overlapping
         // chunks until in-flight returns to 0. Closed in
-        // `drain_metrics_and_aggregate`. See `delivered_span_start`.
-        if self.delivered_span_start[rank].is_none() {
-            self.delivered_span_start[rank] = Some(Instant::now());
+        // `drain_metrics_and_aggregate`. See [`DeliveredSpan`].
+        if self.delivered[rank].span_start.is_none() {
+            self.delivered[rank].span_start = Some(Instant::now());
             // Fresh span: re-arm the marginal-regime anchor (set by the
             // first `Batch` report of this chunk; see
-            // `delivered_first_batch`).
-            self.delivered_first_batch[rank] = None;
+            // [`DeliveredSpan`]).
+            self.delivered[rank].first_batch = None;
         }
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,
