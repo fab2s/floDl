@@ -22,13 +22,14 @@ fn cadence_cpu_coord(world_size: usize) -> ClusterCoordinator {
     )
 }
 
-/// Seed the per-rank delivered (ms, batches) credit pair from parallel
-/// lists — the readable shape these tests were written in before the five
-/// parallel `Vec`s collapsed into `Vec<DeliveredSpan>`.
+/// Seed the per-rank delivered (ms, batches) credit pair the feed reads.
+/// Under report-at-sync the feed + all-or-none predicate consume the
+/// per-batch accumulator (`pb_delivered_*`), not the completion-frame
+/// busy-span, so seed that.
 fn set_delivered(coord: &mut ClusterCoordinator, ms: &[f64], batches: &[usize]) {
     for (i, (&m, &b)) in ms.iter().zip(batches).enumerate() {
-        coord.delivered[i].ms_accum = m;
-        coord.delivered[i].batches_accum = b;
+        coord.pb_delivered_ms_accum[i] = m;
+        coord.pb_delivered_batches[i] = b;
     }
 }
 
@@ -43,9 +44,9 @@ fn movers_delivered_complete_requires_every_mover() {
         !coord.movers_delivered_complete(),
         "a mover without a delivered sample must block the predicate",
     );
-    // Rank 1's span closes: predicate completes.
-    coord.delivered[1].ms_accum = 200.0;
-    coord.delivered[1].batches_accum = 4;
+    // Rank 1's delivered sample lands: predicate completes.
+    coord.pb_delivered_ms_accum[1] = 200.0;
+    coord.pb_delivered_batches[1] = 4;
     assert!(coord.movers_delivered_complete());
 }
 

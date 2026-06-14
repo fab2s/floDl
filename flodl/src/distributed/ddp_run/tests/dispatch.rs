@@ -163,8 +163,8 @@ fn test_proportional_sharding() {
 
     // Calibrate ElChe with 2:1 timing
     for _ in 0..3 {
-        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
-        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 5.0, data_ms: 0.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+        h.timing_tx.send(TimingMsg::Batch { rank: 1, batch_ms: 10.0, data_ms: 0.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
         h.coord.drain_timing();
         if h.coord.should_average() {
             h.coord.trigger_averaging().unwrap();

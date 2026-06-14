@@ -242,7 +242,10 @@ impl<M: Module> GpuWorker<M> {
                         }
                     }
                 };
-                prefetch_wait_diag += wait_start.elapsed();
+                let batch_data = wait_start.elapsed();
+                prefetch_wait_diag += batch_data;
+                // Per-batch DATA wall for the delivered feed (prefetch stall).
+                let data_ms_batch = batch_data.as_secs_f64() * 1000.0;
 
                 // Ensure compute stream waits for async H2D copy to finish
                 #[cfg(feature = "cuda")]
@@ -261,7 +264,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm, loss, None);
+                let _ = self.report_timing(ms, data_ms_batch, norm, loss, None);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }
@@ -304,7 +307,9 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     batch
                 };
-                data_starve_ms_total += data_start.elapsed().as_secs_f64() * 1000.0;
+                // Per-batch DATA wall for the delivered feed (fetch+to-device).
+                let data_ms_batch = data_start.elapsed().as_secs_f64() * 1000.0;
+                data_starve_ms_total += data_ms_batch;
 
                 let (loss, ms) = self.train_step(&batch, train_fn)?;
                 compute_ms_total += ms;
@@ -336,7 +341,7 @@ impl<M: Module> GpuWorker<M> {
                 } else {
                     None
                 };
-                let _ = self.report_timing(ms, norm, loss, None);
+                let _ = self.report_timing(ms, data_ms_batch, norm, loss, None);
                 if self.handle_control()? {
                     return Ok(true); // Shutdown
                 }

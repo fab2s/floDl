@@ -150,7 +150,7 @@
         let cases = [
             TimingMsgWire::Batch {
                 rank: 1,
-                batch_ms: 12.5,
+                batch_ms: 12.5, data_ms: 0.0,
                 step_count: 42,
                 param_norm: Some(3.5),
                 batch_loss: 0.1,

@@ -530,6 +530,16 @@ pub struct ClusterCoordinator {
     /// UID-generator tiebreak; superseded by `ms_accum` for the
     /// Cadence feed (see `timing_feed`).
     wall_ms_accum: Vec<f64>,
+    /// STAGE 1 (report-at-sync, dual-track): per-rank rank-reported
+    /// DELIVERED wall accumulated CONTINUOUSLY from each `Batch`
+    /// (`batch_ms + data_ms`), with its matched batch count. Mirrors how
+    /// `wall_ms_accum` accumulates, so it is present at sync by
+    /// construction (no completion-frame race). Held ALONGSIDE the
+    /// busy-span feed for now; the `[coord-prof]` dump compares the two so
+    /// we can confirm they agree before the feed switches to it. Reset per
+    /// window in `finish_averaging_tail`.
+    pb_delivered_ms_accum: Vec<f64>,
+    pb_delivered_batches: Vec<usize>,
     /// Per-rank delivered-cost span state (the ElChe Cadence timing feed).
     /// One entry per rank; [`DeliveredSpan`] documents the busy-span
     /// lifecycle and the matched (ms, batches) credit pair its fields hold.

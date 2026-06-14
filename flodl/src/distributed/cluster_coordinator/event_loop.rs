@@ -47,6 +47,7 @@ impl ClusterCoordinator {
             TimingMsgWire::Batch {
                 rank,
                 batch_ms,
+                data_ms,
                 step_count,
                 param_norm,
                 batch_loss,
@@ -60,6 +61,22 @@ impl ClusterCoordinator {
                 self.steps_since_avg[rank] =
                     self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
+                // REPORT-AT-SYNC delivered feed: accumulate the rank-reported
+                // DELIVERED wall (compute + data) per batch, continuously —
+                // like `wall_ms_accum`, so it is present at the reduce by
+                // construction (no completion-frame race the busy-span has).
+                // MARGINAL: skip the window's FIRST batch (the per-chunk fill
+                // — control transit, plan pickup, prefetch spin-up,
+                // first-batch unpipelined H2D), crediting batches 2..n so the
+                // fixed fill never enters the per-batch rate. Mirrors the
+                // busy-span's first-batch anchor. `steps_since_avg` was just
+                // incremented above, so `> 1` means "not the window's first
+                // batch". (`timing_feed` consumes this; the busy-span is kept
+                // in parallel for the `[coord-prof]` comparison until retired.)
+                if self.steps_since_avg[rank] > 1 {
+                    self.pb_delivered_ms_accum[rank] += batch_ms + data_ms;
+                    self.pb_delivered_batches[rank] += 1;
+                }
                 // First Batch report since the rank's busy-span opened:
                 // anchor the chunk's steady-state (marginal) regime here.
                 // The Cadence span close measures from THIS point over

@@ -114,7 +114,7 @@ fn test_worker_train_step() {
 fn test_worker_report_timing() {
     let (worker, ch) = make_test_worker();
 
-    worker.report_timing(12.5, None, 0.5, None).unwrap();
+    worker.report_timing(12.5, 2.0, None, 0.5, None).unwrap();
 
     let msg = ch.timing_rx.recv().unwrap();
     match msg {
@@ -265,7 +265,7 @@ fn test_worker_channels_create() {
         GpuWorker::<Linear>::channels();
 
     // Verify channel pairs work
-    timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+    timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, data_ms: 0.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
     let msg = ch.timing_rx.recv().unwrap();
     assert!(matches!(msg, TimingMsg::Batch { rank: 0, .. }));
 

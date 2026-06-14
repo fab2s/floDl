@@ -1021,7 +1021,7 @@ impl Coordinator {
     /// [`Self::drain_timing_blocking`].
     fn process_timing_msg(&mut self, msg: TimingMsg) {
         match msg {
-            TimingMsg::Batch { rank, batch_ms, step_count, param_norm, batch_loss, sync_divergence } => {
+            TimingMsg::Batch { rank, batch_ms, data_ms: _, step_count, param_norm, batch_loss, sync_divergence } => {
                 self.steps_since_avg[rank] = self.steps_since_avg[rank].saturating_add(1);
                 self.wall_ms_accum[rank] += batch_ms;
                 self.last_step_count[rank] = self.last_step_count[rank].max(step_count);

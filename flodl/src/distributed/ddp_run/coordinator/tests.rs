@@ -300,13 +300,13 @@
         assert_eq!(coord.steps_since_avg[0], 0);
         assert_eq!(coord.wall_ms_accum[0], 0.0);
 
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, step_count: 1, param_norm: None, batch_loss: 0.1, sync_divergence: None });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 10.0, data_ms: 0.0, step_count: 1, param_norm: None, batch_loss: 0.1, sync_divergence: None });
         assert_eq!(coord.steps_since_avg[0], 1);
         assert!((coord.wall_ms_accum[0] - 10.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 10.0).abs() < 1e-9);
 
         // Second message accumulates.
-        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, step_count: 2, param_norm: None, batch_loss: 0.1, sync_divergence: None });
+        coord.process_timing_msg(TimingMsg::Batch { rank: 0, batch_ms: 15.0, data_ms: 0.0, step_count: 2, param_norm: None, batch_loss: 0.1, sync_divergence: None });
         assert_eq!(coord.steps_since_avg[0], 2);
         assert!((coord.wall_ms_accum[0] - 25.0).abs() < 1e-9);
         assert!((coord.last_batch_ms[0] - 15.0).abs() < 1e-9);
@@ -623,20 +623,20 @@
         assert_eq!(coord.loss_count[0], 0);
 
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 10.0, step_count: 1, param_norm: Some(5.5), batch_loss: 0.3, sync_divergence: None,
+            rank: 0, batch_ms: 10.0, data_ms: 0.0, step_count: 1, param_norm: Some(5.5), batch_loss: 0.3, sync_divergence: None,
         });
         assert!((coord.loss_accum[0] - 0.3).abs() < 1e-9);
         assert_eq!(coord.loss_count[0], 1);
 
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 10.0, step_count: 2, param_norm: None, batch_loss: 0.2, sync_divergence: None,
+            rank: 0, batch_ms: 10.0, data_ms: 0.0, step_count: 2, param_norm: None, batch_loss: 0.2, sync_divergence: None,
         });
         assert!((coord.loss_accum[0] - 0.5).abs() < 1e-9);
         assert_eq!(coord.loss_count[0], 2);
 
         // SyncNow ack (batch_loss=0.0) is skipped.
         coord.process_timing_msg(TimingMsg::Batch {
-            rank: 0, batch_ms: 0.0, step_count: 3, param_norm: None, batch_loss: 0.0, sync_divergence: None,
+            rank: 0, batch_ms: 0.0, data_ms: 0.0, step_count: 3, param_norm: None, batch_loss: 0.0, sync_divergence: None,
         });
         assert_eq!(coord.loss_count[0], 2); // unchanged
 
@@ -659,7 +659,7 @@
         for step in 1..=10 {
             for rank in 0..2 {
                 coord.process_timing_msg(TimingMsg::Batch {
-                    rank, batch_ms: 5.0, step_count: step,
+                    rank, batch_ms: 5.0, data_ms: 0.0, step_count: step,
                     param_norm: None, batch_loss: 0.1, sync_divergence: None,
                 });
             }

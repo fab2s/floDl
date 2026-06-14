@@ -434,7 +434,7 @@ fn sync_policy_fires_after_each_rank_step_once() {
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 0,
-            batch_ms: 10.0,
+            batch_ms: 10.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.5,
@@ -449,7 +449,7 @@ fn sync_policy_fires_after_each_rank_step_once() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 1,
-            batch_ms: 12.0,
+            batch_ms: 12.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.4,
@@ -510,7 +510,7 @@ fn check_throttle_nccl_backend_is_no_op() {
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 0,
-            batch_ms: 5.0,
+            batch_ms: 5.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.5,
@@ -533,7 +533,7 @@ fn check_throttle_nccl_backend_is_no_op() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 1,
-            batch_ms: 5.0,
+            batch_ms: 5.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.5,

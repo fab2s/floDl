@@ -111,8 +111,15 @@ impl ClusterCoordinator {
         (0..self.world_size)
             .filter(|&r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
             .all(|r| {
-                self.delivered[r].batches_accum > 0
-                    && self.delivered[r].ms_accum > 0.0
+                // REPORT-AT-SYNC: the delivered sample is the per-batch
+                // accumulator (`pb_delivered_*`), present at the reduce by
+                // construction from the continuous `Batch` reports — so this
+                // is true for every stepping rank with >= 2 batches this
+                // window. A single-batch window (marginal skipped its only
+                // batch) leaves `pb_delivered_batches == 0` -> coherent
+                // compute-scale fallback for that (rare) window.
+                self.pb_delivered_batches[r] > 0
+                    && self.pb_delivered_ms_accum[r] > 0.0
             })
     }
 
@@ -171,9 +178,14 @@ impl ClusterCoordinator {
         let mut ms = Vec::with_capacity(self.world_size);
         let mut batches = Vec::with_capacity(self.world_size);
         for r in 0..self.world_size {
-            if self.delivered[r].batches_accum > 0 && self.delivered[r].ms_accum > 0.0 {
-                ms.push(self.delivered[r].ms_accum);
-                batches.push(self.delivered[r].batches_accum);
+            // REPORT-AT-SYNC: feed the per-batch-accumulated DELIVERED wall
+            // (`pb_delivered_*`, marginal), present at the reduce by
+            // construction. The completion-frame busy-span (`delivered[r]`)
+            // is still maintained for the `[coord-prof]` comparison but no
+            // longer feeds ElChe.
+            if self.pb_delivered_batches[r] > 0 && self.pb_delivered_ms_accum[r] > 0.0 {
+                ms.push(self.pb_delivered_ms_accum[r]);
+                batches.push(self.pb_delivered_batches[r]);
             } else {
                 // Non-movers only (the all-movers check above guarantees
                 // every stepping rank has a delivered sample).
@@ -212,6 +224,16 @@ impl ClusterCoordinator {
                 self.wall_ms_accum[r] / n as f64
             })
             .collect();
+        // Stage-1 dual-track: rank-reported DELIVERED (compute+data),
+        // accumulated continuously per `Batch` — present at sync by
+        // construction. Compare against `delivered_ms/batch` (the
+        // completion-frame busy-span): if they track, the feed can switch.
+        let pb_delivered_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.pb_delivered_batches[r].max(1);
+                self.pb_delivered_ms_accum[r] / n as f64
+            })
+            .collect();
         // Which feed did ElChe actually schedule on this cycle? `delivered`
         // means every stepping rank had a closed delivered span;
         // `COMPUTE-FALLBACK` means the all-or-none coherence gate
@@ -236,15 +258,17 @@ impl ClusterCoordinator {
             .collect();
         eprintln!(
             "[coord-prof] {:?} {:?} | feed={feed} missing={missing:?} \
-             delivered_ms/batch={:?} \
+             delivered_ms/batch={:?} pb_delivered_ms/batch={:?} \
              compute_ms/batch={:?} steps={:?} deliv_batches={:?} \
-             batch_counts={:?} reduce_ms={:.1}",
+             pb_batches={:?} batch_counts={:?} reduce_ms={:.1}",
             self.backend,
             self.policy,
             r1(&delivered_per_batch),
+            r1(&pb_delivered_per_batch),
             r1(&compute_per_batch),
             self.steps_since_avg,
             self.delivered.iter().map(|d| d.batches_accum).collect::<Vec<_>>(),
+            self.pb_delivered_batches,
             self.el_che.batch_counts(),
             reduce_ms,
         );
@@ -971,6 +995,13 @@ impl ClusterCoordinator {
     fn finish_averaging_tail(&mut self) {
         for a in &mut self.wall_ms_accum {
             *a = 0.0;
+        }
+        // Stage-1 dual-track delivered accumulator resets with the window.
+        for a in &mut self.pb_delivered_ms_accum {
+            *a = 0.0;
+        }
+        for n in &mut self.pb_delivered_batches {
+            *n = 0;
         }
         for d in &mut self.delivered {
             d.ms_accum = 0.0;

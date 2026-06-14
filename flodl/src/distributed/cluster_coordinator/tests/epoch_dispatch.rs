@@ -214,7 +214,7 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 0,
-            batch_ms: 10.0,
+            batch_ms: 10.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.5,
@@ -247,7 +247,7 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 1,
-            batch_ms: 12.0,
+            batch_ms: 12.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.4,
@@ -444,7 +444,7 @@ fn snapshot_ready_populates_upload_marker_cpu_only() {
         move |s, salt| {
             send_timing(s, salt, TimingMsgWire::Batch {
                 rank,
-                batch_ms: 10.0,
+                batch_ms: 10.0, data_ms: 0.0,
                 step_count: 1,
                 param_norm: None,
                 batch_loss: 0.5,
@@ -517,7 +517,7 @@ fn snapshot_ready_resets_between_cycles() {
         for cycle in 0..2 {
             send_timing(s, salt, TimingMsgWire::Batch {
                 rank: 0,
-                batch_ms: 10.0,
+                batch_ms: 10.0, data_ms: 0.0,
                 step_count: (cycle + 1) as u64,
                 param_norm: None,
                 batch_loss: 0.5,
@@ -544,7 +544,7 @@ fn snapshot_ready_resets_between_cycles() {
         for cycle in 0..2 {
             send_timing(s, salt, TimingMsgWire::Batch {
                 rank: 1,
-                batch_ms: 12.0,
+                batch_ms: 12.0, data_ms: 0.0,
                 step_count: (cycle + 1) as u64,
                 param_norm: None,
                 batch_loss: 0.4,
@@ -755,7 +755,7 @@ fn cpu_finalize_defers_until_all_sync_acks_arrived() {
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, move |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 0,
-            batch_ms: 10.0,
+            batch_ms: 10.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.5,
@@ -783,7 +783,7 @@ fn cpu_finalize_defers_until_all_sync_acks_arrived() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, move |s, salt| {
         send_timing(s, salt, TimingMsgWire::Batch {
             rank: 1,
-            batch_ms: 12.0,
+            batch_ms: 12.0, data_ms: 0.0,
             step_count: 1,
             param_norm: None,
             batch_loss: 0.4,
@@ -853,7 +853,7 @@ fn cpu_finalize_records_per_rank_lag_for_diagnostics() {
         move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
             send_timing(s, salt, TimingMsgWire::Batch {
                 rank,
-                batch_ms: 10.0,
+                batch_ms: 10.0, data_ms: 0.0,
                 step_count: 1,
                 param_norm: None,
                 batch_loss: 0.5,

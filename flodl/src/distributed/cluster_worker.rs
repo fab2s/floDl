@@ -134,6 +134,7 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
         TimingMsg::Batch {
             rank,
             batch_ms,
+            data_ms,
             step_count,
             param_norm,
             batch_loss,
@@ -141,6 +142,7 @@ fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
         } => TimingMsgWire::Batch {
             rank: rank as u64,
             batch_ms,
+            data_ms,
             step_count: step_count as u64,
             param_norm,
             batch_loss,

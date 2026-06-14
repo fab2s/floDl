@@ -865,8 +865,13 @@ pub(crate) enum TimingMsg {
     Batch {
         /// Which GPU sent this.
         rank: usize,
-        /// Wall-clock time for this batch (ms).
+        /// Compute-only wall-clock time for this batch (ms): the `train_step`.
         batch_ms: f64,
+        /// Per-batch DATA wall (ms): prefetch/H2D stall (prefetch path) or
+        /// dataset fetch+to-device (sync path). `batch_ms + data_ms` is the
+        /// rank's realized DELIVERED per-batch wall; the coordinator
+        /// accumulates it continuously (race-free, like `batch_ms`).
+        data_ms: f64,
         /// Worker's local step counter (monotonically increasing).
         step_count: usize,
         /// L2 norm of all parameters (computed periodically, not every batch).

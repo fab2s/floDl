@@ -70,7 +70,7 @@ fn heartbeat_stale_declares_rank_dead_and_unblocks_should_average() {
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0,
+                    batch_ms: 10.0, data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 0.5,
@@ -200,7 +200,7 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
                                 salt,
                                 TimingMsgWire::Batch {
                                     rank,
-                                    batch_ms: 5.0,
+                                    batch_ms: 5.0, data_ms: 0.0,
                                     step_count: 1,
                                     param_norm: None,
                                     batch_loss: 0.1,
@@ -342,7 +342,7 @@ fn observe_meta_runs_during_averaging_cycle_no_anchor_change_in_probe() {
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0,
+                    batch_ms: 10.0, data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 1.0,

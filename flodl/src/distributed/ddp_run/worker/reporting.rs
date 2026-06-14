@@ -82,6 +82,7 @@ impl<M: Module> GpuWorker<M> {
     pub fn report_timing(
         &self,
         batch_ms: f64,
+        data_ms: f64,
         param_norm: Option<f64>,
         batch_loss: f64,
         sync_divergence: Option<f64>,
@@ -89,6 +90,7 @@ impl<M: Module> GpuWorker<M> {
         let res = self.timing_tx.send(TimingMsg::Batch {
             rank: self.rank,
             batch_ms,
+            data_ms,
             step_count: self.local_step,
             param_norm,
             batch_loss,

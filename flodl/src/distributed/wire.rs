@@ -696,6 +696,13 @@ pub enum TimingMsgWire {
     Batch {
         rank: u64,
         batch_ms: f64,
+        /// Per-batch DATA wall (ms): prefetch/H2D stall for this batch
+        /// (prefetch path) or dataset fetch+to-device (sync path). Paired
+        /// with `batch_ms` (compute-only) so the coordinator can accumulate
+        /// a DELIVERED feed (`batch_ms + data_ms`) continuously — present at
+        /// sync by construction, unlike the completion-frame-closed span.
+        #[serde(default)]
+        data_ms: f64,
         step_count: u64,
         param_norm: Option<f64>,
         batch_loss: f64,
