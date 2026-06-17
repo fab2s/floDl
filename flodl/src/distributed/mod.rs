@@ -13,6 +13,7 @@
 //! heterogeneous cadence strategy, and the async DDP runtime.
 
 pub mod checkpoint_meta;
+pub(crate) mod checkpoint_forge;
 pub(crate) mod chunk_pool;
 pub mod cluster;
 pub mod cluster_builder;
@@ -38,9 +39,11 @@ pub mod testing;
 pub(crate) mod wire;
 
 pub use checkpoint_meta::{
-    CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, ElCheState,
-    RANK_DEATH_RECORD_SCHEMA_VERSION, RankDeathRecord, SaveReason,
+    CHECKPOINT_META_SCHEMA_VERSION, CheckpointBundle, CheckpointMeta, CoverageBlock,
+    ElCheState, EpochCoverage, ModelSchema, RANK_DEATH_RECORD_SCHEMA_VERSION,
+    RankDeathRecord, SaveReason,
 };
+pub(crate) use checkpoint_forge::CheckpointForge;
 pub use cluster::{WorkerBlock, LocalCluster};
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;

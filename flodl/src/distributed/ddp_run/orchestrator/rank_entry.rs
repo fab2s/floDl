@@ -399,7 +399,7 @@ impl DdpHandle {
                 initial_buffers,
                 total_samples,
                 batch_size,
-                seed: 42,
+                seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
                 max_grad_norm,
                 easgd_alpha,
                 timeline: timeline_for_thread,

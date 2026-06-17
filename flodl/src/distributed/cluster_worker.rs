@@ -319,6 +319,17 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
         ControlMsgWire::EpochAggregated(metrics_wire) => {
             Ok(Some(ControlMsg::EpochAggregated(metrics_wire.into())))
         }
+        ControlMsgWire::SaveConsensusModel { target_rank } => {
+            if target_rank == u64::MAX {
+                return Err(crate::tensor::TensorError::new(
+                    "cluster_worker: SaveConsensusModel target_rank=u64::MAX is \
+                     reserved; the coordinator must dispatch to a worker rank ID",
+                ));
+            }
+            Ok(Some(ControlMsg::SaveConsensusModel {
+                target_rank: target_rank as usize,
+            }))
+        }
     }
 }
 

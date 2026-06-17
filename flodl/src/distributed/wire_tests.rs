@@ -217,6 +217,21 @@
     }
 
     #[test]
+    fn control_frame_round_trip_save_consensus_model() {
+        let msg = ControlMsgWire::SaveConsensusModel { target_rank: 2 };
+        let frame =
+            ControlFrame::encode(&SAMPLE_SALT, MsgKind::Control, &msg).unwrap();
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf).unwrap();
+        let mut cur = Cursor::new(buf);
+        let got = ControlFrame::read_from(&mut cur, &SAMPLE_SALT)
+            .unwrap()
+            .unwrap();
+        let back: ControlMsgWire = got.decode().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
     fn control_frame_round_trip_update_atomic_dispatch() {
         // atomic-dispatch: the post-reduce Update carries an optional
         // folded next-window chunk. Both shapes must round-trip.

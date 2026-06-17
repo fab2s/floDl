@@ -356,7 +356,7 @@ pub(crate) fn claim_cluster_entry(role: &str) -> Result<()> {
 
 pub fn run_launcher_with_config(
     full: FullCluster,
-    coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
+    mut coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
 ) -> Result<()> {
     claim_cluster_entry("launcher")?;
     // Fresh 128-bit session salt per launcher invocation. Becomes the
@@ -396,12 +396,26 @@ pub fn run_launcher_with_config(
     // keeps both backends pluggable.
     let dead_ranks_shared =
         crate::distributed::controller::DeadRanks::new(full.world_size());
+    // Consensus-checkpoint forge: holds the launch-captured model schema so the
+    // controller reduce thread can write a named `.fdl` from the averaged
+    // (name-less) frame. Shared with the coordinator (which arms it before a
+    // checkpoint reduce) — same Arc-sharing pattern as `dead_ranks`. Take the
+    // schema out of the coord config (the coord never writes the model itself).
+    let model_schema = coord_config
+        .as_mut()
+        .and_then(|c| c.model_schema.take());
+    let checkpoint_forge =
+        crate::distributed::CheckpointForge::new(model_schema);
+    if let Some(cfg) = coord_config.as_mut() {
+        cfg.checkpoint_forge = Some(Arc::clone(&checkpoint_forge));
+    }
     let cpu_averager =
         crate::distributed::controller::ClusterController::start_with_dead_ranks(
             cpu_avg_addr,
             full.world_size(),
             full.salt,
             Arc::clone(&dead_ranks_shared),
+            Some(Arc::clone(&checkpoint_forge)),
         )?;
     // Bound port stays the configured value (no kernel auto-assign here);
     // log it once for diagnostics.
@@ -522,11 +536,28 @@ pub fn run_launcher_with_config(
                         // `orchestrator.rs`; resume runs pass
                         // `start_epoch = meta.epoch` to continue from
                         // the saved trajectory point.
-                        if let Err(e) = coord.dispatch_epoch(start_epoch) {
-                            eprintln!(
-                                "cluster launcher: dispatch_epoch({start_epoch}) failed: {e}"
-                            );
-                            return;
+                        //
+                        // Coverage-granular resume first: if the loaded meta
+                        // carried a coverage block, reconstruct the in-progress
+                        // pools and dispatch only the uncovered remainder. When
+                        // it handles the kickoff, skip the fresh full-epoch
+                        // dispatch; otherwise fall back to it.
+                        let kicked = match coord.resume_progressive_from_coverage() {
+                            Ok(handled) => handled,
+                            Err(e) => {
+                                eprintln!(
+                                    "cluster launcher: resume_progressive_from_coverage failed: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        if !kicked {
+                            if let Err(e) = coord.dispatch_epoch(start_epoch) {
+                                eprintln!(
+                                    "cluster launcher: dispatch_epoch({start_epoch}) failed: {e}"
+                                );
+                                return;
+                            }
                         }
                         // Drive ticks until shutdown_workers fires (all
                         // ranks exited) or the process is killed. Paced

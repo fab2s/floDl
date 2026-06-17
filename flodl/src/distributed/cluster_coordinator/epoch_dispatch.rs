@@ -527,6 +527,108 @@ impl ClusterCoordinator {
         self.take_next_chunk_plan(rank, epoch, batches)
     }
 
+    /// Resume kickoff for a coverage-granular checkpoint: reconstruct the
+    /// recorded in-progress epoch pools and dispatch only the uncovered
+    /// remainder, instead of a fresh full epoch. Returns `Ok(true)` when it
+    /// handled the kickoff (caller skips `dispatch_epoch`); `Ok(false)` when
+    /// there is no coverage to resume from (fresh run, or a non-progressive /
+    /// Sync run that has no chunk pools) so the caller falls back to
+    /// `dispatch_epoch(start_epoch)`.
+    ///
+    /// Errors loudly if the recorded `seed` differs from the run's `seed`: a
+    /// different shuffle re-randomizes the index space, so the recorded
+    /// uncovered offsets would map to different samples and resume would both
+    /// repeat covered data and skip uncovered data. The whole contract rests
+    /// on reconstructing the SAME permutation (see
+    /// [`crate::distributed::ddp_run::SHUFFLE_BASE_SEED`]).
+    pub fn resume_progressive_from_coverage(&mut self) -> Result<bool> {
+        let Some(coverage) = self.start_coverage.take() else {
+            return Ok(false);
+        };
+        if !self.progressive {
+            // Coverage-granular resume is a progressive-mode (Cadence/Async)
+            // feature; a Sync run has no chunk pools to reconstruct.
+            return Ok(false);
+        }
+        if coverage.seed != self.seed {
+            return Err(TensorError::new(&format!(
+                "cluster_coordinator: resume coverage seed {} != run seed {} — the \
+                 epoch permutation would differ, so recorded uncovered offsets map \
+                 to different samples (resume would repeat covered data and skip \
+                 uncovered data). Resume with the same seed.",
+                coverage.seed, self.seed,
+            )));
+        }
+        if coverage.per_epoch.is_empty() {
+            // Nothing was in progress at the snapshot (saved exactly on a clean
+            // epoch boundary): fall back to fresh dispatch of `start_epoch`.
+            return Ok(false);
+        }
+        // Reconstruct each in-progress epoch's pool to its recorded holes.
+        for ec in &coverage.per_epoch {
+            let pool = crate::distributed::chunk_pool::ChunkPool::from_coverage(
+                ec.epoch,
+                ec.total_samples,
+                self.world_size,
+                &ec.uncovered_ranges,
+            );
+            self.chunk_pools.insert(ec.epoch, pool);
+        }
+        // The lowest recorded epoch is the active one; everything before it is
+        // fully covered (aggregated). Anchor `last_aggregated_epoch` there so
+        // the streaming `first_live` math (`last_aggregated + 1`) lets ranks
+        // advance past the resumed epochs but not re-enter completed ones.
+        let lowest = coverage
+            .per_epoch
+            .iter()
+            .map(|ec| ec.epoch)
+            .min()
+            .expect("non-empty per_epoch checked above");
+        self.last_aggregated_epoch = lowest.checked_sub(1);
+        crate::verbose!(
+            "  ddp: resume from coverage | epochs {:?} reconstructed, active epoch {lowest}",
+            coverage.per_epoch.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+        );
+        // Dispatch the first chunk of the active epoch to every live rank; the
+        // streaming path (drain_metrics / wake_idle_ranks_in_progressive) takes
+        // over from there, including advancing into the next recorded epoch.
+        for rank in 0..self.world_size {
+            if self.is_dead(rank) {
+                continue;
+            }
+            self.rank_epoch[rank] = lowest;
+            self.last_step_count_at_epoch_start[rank] = self.last_step_count[rank];
+            self.dispatch_next_chunk(rank);
+        }
+        Ok(true)
+    }
+
+    /// Snapshot data coverage across every in-progress epoch pool into a
+    /// [`crate::distributed::CoverageBlock`] for a checkpoint. Called at the
+    /// reduce that takes the checkpoint, so the recorded coverage is exactly
+    /// "what the just-forged consensus has trained against" — in-flight chunks
+    /// are reported uncovered (see
+    /// [`crate::distributed::chunk_pool::ChunkPool::uncovered_ranges`]) and
+    /// re-dispatched as first-coverage on resume. Records the run's `seed` so
+    /// resume can verify the same permutation space.
+    pub(super) fn snapshot_coverage(&self) -> crate::distributed::CoverageBlock {
+        use crate::distributed::{CoverageBlock, EpochCoverage};
+        let per_epoch = self
+            .chunk_pools
+            .iter()
+            .map(|(&epoch, pool)| EpochCoverage {
+                epoch,
+                total_samples: pool.total_samples,
+                uncovered_ranges: pool.uncovered_ranges(),
+            })
+            .collect();
+        CoverageBlock {
+            seed: self.seed,
+            batch_size: self.batch_size,
+            per_epoch,
+        }
+    }
+
     /// Refresh [`Self::final_window_plan`] for `epoch` (barrier-paced only).
     ///
     /// A no-op unless the pool has dropped to within one window of empty

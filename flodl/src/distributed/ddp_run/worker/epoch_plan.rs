@@ -58,6 +58,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
                             ControlMsg::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
                             ControlMsg::EpochAggregated(_) => "EpochAggregated",
+                            ControlMsg::SaveConsensusModel { .. } => "SaveConsensusModel",
                         }
                     );
                     if self.dispatch_control(msg)? {
@@ -406,6 +407,46 @@ impl<M: Module> GpuWorker<M> {
     /// All save errors are logged + ignored — we'd rather surface a
     /// disk-full or permission error in the logs than deadlock the
     /// cluster on shutdown.
+    /// Write this rank's CURRENT model (params + buffers) to `<stem>.fdl` via
+    /// [`crate::nn::save_checkpoint_file`]. Shared by the failure-save bundle
+    /// (primary rank) and the NCCL `SaveConsensusModel` consensus checkpoint
+    /// (elected rank, post-collective). Errors are logged + ignored — a
+    /// disk/permission failure should surface in logs, never deadlock the
+    /// cluster.
+    pub(super) fn write_model_to_fdl(&self, stem: &str) {
+        use crate::distributed::CheckpointBundle;
+        let model_path = CheckpointBundle::model_path(stem);
+        let params: Vec<(String, _)> = self
+            .model
+            .parameters()
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+        let buffers: Vec<(String, _)> = self
+            .model
+            .buffers()
+            .into_iter()
+            .map(|b| (b.name.clone(), b))
+            .collect();
+        match model_path.to_str() {
+            Some(path_str) => {
+                if let Err(e) =
+                    crate::nn::save_checkpoint_file(path_str, &params, &buffers, None)
+                {
+                    eprintln!(
+                        "ddp-worker: rank {} model save to {path_str} failed: {e}",
+                        self.rank,
+                    );
+                }
+            }
+            None => eprintln!(
+                "ddp-worker: rank {} model path is not utf-8: {}",
+                self.rank,
+                model_path.display(),
+            ),
+        }
+    }
+
     pub(super) fn write_checkpoint_bundle(
         &self,
         stem: &str,
@@ -417,35 +458,7 @@ impl<M: Module> GpuWorker<M> {
 
         // Primary rank: model file (params + buffers).
         if self.rank == primary_rank {
-            let model_path = CheckpointBundle::model_path(stem);
-            let params: Vec<(String, _)> = self
-                .model
-                .parameters()
-                .into_iter()
-                .map(|p| (p.name.clone(), p))
-                .collect();
-            let buffers: Vec<(String, _)> = self
-                .model
-                .buffers()
-                .into_iter()
-                .map(|b| (b.name.clone(), b))
-                .collect();
-            match model_path.to_str() {
-                Some(path_str) => {
-                    if let Err(e) = crate::nn::save_checkpoint_file(
-                        path_str, &params, &buffers, None,
-                    ) {
-                        eprintln!(
-                            "ddp-worker: primary rank {primary_rank} model save \
-                             to {path_str} failed: {e}",
-                        );
-                    }
-                }
-                None => eprintln!(
-                    "ddp-worker: primary rank {primary_rank} model path is not utf-8: {}",
-                    model_path.display(),
-                ),
-            }
+            self.write_model_to_fdl(stem);
         }
 
         // All ranks: optimizer state. Primary rank uses the canonical

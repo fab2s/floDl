@@ -314,6 +314,11 @@ impl ClusterCoordinator {
             last_epoch_fn_elapsed_ms_ewma: None,
             save_path: config.save_path.clone(),
             checkpoint_every: config.checkpoint_every,
+            seed: config.seed,
+            checkpoint_at_epoch: config.checkpoint_at_epoch,
+            start_coverage: config.start_coverage.clone(),
+            checkpoint_forge: config.checkpoint_forge.clone(),
+            pending_checkpoint_coverage: None,
             shutdown_with_save_dispatched: false,
             last_observed_sync_lag_ms: vec![None; world_size],
             last_observed_upload_ms: vec![None; world_size],
@@ -510,5 +515,6 @@ fn control_label(msg: &ControlMsgWire) -> &'static str {
         ControlMsgWire::Shutdown => "Shutdown",
         ControlMsgWire::ShutdownWithSave { .. } => "ShutdownWithSave",
         ControlMsgWire::EpochAggregated(_) => "EpochAggregated",
+        ControlMsgWire::SaveConsensusModel { .. } => "SaveConsensusModel",
     }
 }

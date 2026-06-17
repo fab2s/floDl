@@ -1,7 +1,10 @@
 # Epoch-Tail Allocation: Eliminating the Boundary Fallback
 
-**Status:** implemented for the barrier-paced (Cadence) progressive path;
-cpu-async is a deliberate follow-up (see [Scope](#scope-cadence-first)).
+**Status:** the barrier-paced (Cadence) epoch-tail fix is implemented. The
+async **checkpoint/resume** mechanism (the [Async](#async) section: consensus
+model plus exact data-coverage, both CPU and NCCL backends) is implemented and
+unit-validated; rig kill-and-resume validation is pending. Eval-on-consensus
+and the callback report-and-wait gate remain design.
 Motivated by a single delivered-feed `COMPUTE-FALLBACK` window observed at
 every epoch boundary on the heterogeneous rig (3-GPU, RTX 5060 Ti + 2× Pascal
 GP106 behind asymmetric PCIe links). The Cadence implementation lives in
@@ -154,22 +157,15 @@ equals one reduce window and "the penultimate window" is a well-defined
 cohort-level object. That is also where the observed `[71, 1, 0]`
 originated.
 
-cpu-async is deferred. It is still delivered-capable, so it can in principle
-hit the same lone-1 fallback, but the dynamics are softer and the right
-mechanism is different:
+cpu-async does **not** share this problem, and the reason is worth stating: its
+reduces ride the overshoot cadence, not epoch-aligned windows, and
+`pb_delivered` accumulates continuously across the overshoot (spanning chunks
+and epochs). So a small epoch-tail chunk never produces a 1-step *reduce
+window* — the `[N,1,0]` fallback is a Cadence artifact of barrier-aligned final
+windows. Async needs no `final_window_alloc` analog.
 
-- **Overshoot diffuses the drain.** Async ranks stream several chunks ahead
-  under the overshoot budget, so the pool does not empty in the clean
-  dispatch-order cascade the barrier path shows; a sharp `[N,1,0]` is far
-  less likely to form at all.
-- **EASGD softens the cost.** The elastic pull means a single compute-scale
-  tail window barely perturbs the trajectory.
-
-The natural async intervention is overshoot-aware — let the boundary residual
-ride the overshoot rather than forcing a barrier-aligned crumb window — which
-is a genuinely separate mechanism. It can reuse the `R < world_size`
-predicate but needs async-aware timing, and is taken up in a follow-up once
-the Cadence path is landed and validated.
+Async's boundary question is a different one — coherent callbacks and
+resumable checkpoints — and is specified in [Async](#async) below.
 
 ## Validation
 
@@ -191,5 +187,191 @@ The originally-observed `[71,1,0]` boundary is gone; a representative small
 final window now reads `steps=[3,3,0]` (`feed=delivered`) — rank 2 sits out at
 0 (excluded as a non-mover) and the other two land at ≥2.
 
-**Follow-up:** the async treatment (overshoot-aware, reusing the
-`R < world_size` predicate), per [Scope](#scope-cadence-first).
+---
+
+## Async
+
+**Status:** the **checkpoint/resume** mechanism described here is implemented
+and unit-validated (see [What landed](#what-landed)); rig kill-and-resume
+validation is pending. Eval-on-consensus and the callback report-and-wait gate
+remain design. Async (CpuAsync — there is no
+NcclAsync) has no lone-1 tail problem (see [Scope](#scope-cadence-first)), so
+this section is not about chunk sizing. It is about the *other* thing the
+epoch boundary touches in async: firing callbacks coherently and writing
+checkpoints that resume without repeating data — while never introducing an
+artificial barrier.
+
+### The boundary is a bookkeeping point, not a pacing event
+
+Async has no epoch barrier. A rank streams straight across the epoch boundary
+into the next epoch's pool; the only cohort gate is the reduce barrier, which
+holds a rank at `counts[rank] + max_overshoot` steps since the last reduce.
+The single-step-clock invariant ("coverage and synchronization must not split
+into two racing clocks") keeps the cohort within one window of the shared
+reduce clock. Epochs are a data-coverage label, not a synchronization event —
+and the design below keeps them that way.
+
+LR scheduling, convergence, and ElChe are all step-denominated and don't care
+where epochs land. Eval cares only about trend and the single final number
+(which already gets its own consensus reduce before the canonical eval). So
+the epoch boundary is load-bearing for exactly one consumer: **checkpoint**,
+and only because an epoch has meaning for data coverage on resume.
+
+### Callbacks, split by what they touch
+
+- **`metrics_fn` — controller-side, model-free.** Already fires from the
+  aggregate hook when every rank has crossed the epoch (`is_epoch_done`), with
+  the aggregated metrics in hand. This *is* the epoch-report hook; no separate
+  rank-side reporting callback is needed. No barrier.
+- **`eval_fn` / `checkpoint_fn` — elected rank, on the consensus.** These read
+  the model, so they must operate on the **consensus average**, not the
+  elected rank's own (overshot, or EASGD-blended) weights.
+- **`epoch_fn` — elected rank, generic per-epoch model hook.** Unchanged; the
+  rank-side callback that may touch the model for arbitrary user purposes.
+
+### Eval/checkpoint observe the consensus non-destructively
+
+There is no persistent center variable: the consensus each cycle is the
+averaged param set the worker receives (`update.params`), which the EASGD
+elastic blend reads but never mutates. So the elected rank **overshoots
+normally** — no barrier, no hold, no unlock — and at the boundary reduce it
+eval/checkpoints `update.params` (the consensus), captured *beside* the blend
+into its own training weights:
+
+- **checkpoint** serializes the received average directly;
+- **eval** forwards on the staged average (`no_grad`), not the rank's blended
+  weights.
+
+The training trajectory is byte-identical to a no-eval run — the callback is a
+pure observation. Two effects must be kept separate, because they have very
+different review-risk:
+
+- **(A) which average gets saved is non-deterministic in step count** (reflects
+  N epochs ± up-to-`max_overshoot` batches). This is inherent to
+  async-without-a-barrier and standard for the Local-SGD family; state it
+  plainly ("step count varies by ≤ max_overshoot, sub-epoch noise").
+- **(B) the elected rank's post-callback trajectory.** Do **not** take the
+  "α=1 full-adopt" shortcut (elected rank jumps to the consensus to avoid a
+  param-buffer): it perturbs that rank's EASGD trajectory for no necessary
+  gain. Observe non-destructively instead. And never defend (B) with "noise is
+  helpful" — that conflates an avoidable artifact with the intentional
+  exploration noise, which is exactly what a careful reviewer flags.
+
+### Checkpoint: when, and the resume contract
+
+A checkpoint fires at the **first reduce after the epoch boundary is
+crossed**, and captures, snapshotted atomically at that reduce:
+
+1. **the consensus model** (`update.params`) — written by the elected rank
+   (the reserved `target_rank == u64::MAX` sentinel already anticipates a
+   controller-as-checkpointer variant for CpuAsync, where the coord holds the
+   averaged tensors);
+2. **resume counters** — `global_step`, epoch, ElChe + sync state (controller
+   meta);
+3. **exact data-coverage** — for each in-progress epoch pool: the *completed*
+   ranges, the cursor, and the epoch's **shuffle seed**.
+
+**Resume** reconstructs the pools to the recorded completed-coverage and
+dispatches only the uncovered remainder. Two details are load-bearing for
+"resume without repeating data":
+
+- **Completed, not dispatched.** A chunk in-flight at the checkpoint reduce
+  has *not* had its gradient applied into the consensus, so it is recorded as
+  not-covered and **re-dispatched** on resume. That is first-coverage, not a
+  repeat — and it is why the consensus↔coverage snapshot must be atomic at the
+  reduce (the coverage recorded is exactly "what's in this average").
+- **The in-progress shuffle seed.** "Cover only the remaining chunks" is only
+  well-defined if the resumed epoch reuses the same permutation. Resume
+  reconstructs the pool over the recorded seed and dispatches the uncovered
+  ranges. Without it, a fresh reshuffle re-randomizes the index space and
+  re-coverage becomes unavoidable.
+
+With exact coverage recorded, **resumability is independent of how the cohort
+was spread across epochs at snapshot time.** Even a consensus smeared across
+several epochs is exactly resumable — you record the precise completed-set
+that produced it. The redo is only the in-flight-at-R chunks (small, bounded),
+never whole epochs. So the smear width is **not** a checkpoint-correctness
+concern; it is purely a training-dynamics concern (averaging too-divergent
+models), already owned by `max_overshoot` and the convergence guard.
+
+### No optimizer momentum in the checkpoint
+
+The cluster path param-averages (Local-SGD / EASGD): each rank's optimizer
+momentum accumulates on its own local gradients and is **never synced**, so it
+diverges per-rank. Unlike gradient-averaging DDP — where the optimizer state
+stays bit-identical across ranks and any one rank's is canonical — there is no
+canonical single-rank momentum to save. The checkpoint therefore stores the
+**consensus model only**, and resume **re-warms the inner optimizer from
+fresh**. This is defensible: at a sync the per-rank momentum is already stale
+relative to the just-averaged weights, and the warm-up is short and sub-noise
+over a real run. It also keeps the checkpoint topology-independent (no per-rank
+`.optim`).
+
+The principled way to gain a *canonical* optimizer state is an **outer
+optimizer** at the same tier as the convergence guard — SlowMo's slow momentum
+or DiLoCo's outer Nesterov over inner local steps. That is a separate
+optimization-method track (it changes training, not just checkpointing); if it
+lands, the checkpoint gains a canonical global optimizer state as a byproduct.
+Parked for now.
+
+### VRAM: the elected rank is asymmetric
+
+Observing the consensus is **not** a second full model — no duplicate
+optimizer, no second module. Eval adds a param-sized average buffer (largely
+reusable from the EASGD staging copy already allocated in the apply path) plus
+forward-pass activations (`no_grad`, freeable layer-by-layer) plus eval-data
+batches; checkpoint adds only the param-sized average. But that working set
+competes with the adaptive prefetcher's ~90% ceiling, so the elected rank can
+OOM at the boundary on a full-budget prefetch.
+
+The elected rank is asymmetric in **time** (already handled — `apply_callback_slack`
+pre-reserves its callback wall-time in ElChe's allocation) and now in **space**.
+The space fix, deferred as a named follow-up, is to **predictively ramp the
+prefetch margin down as the elected rank approaches the boundary** (more async
+load around the boundary, sized from a rough eval-working-set estimate, then
+ramp back) — composing with the prefetcher's auto-resize, rather than a
+permanently lower ceiling or a full drain-and-cold-refill.
+
+### What landed
+
+Resume was epoch-granular (`start_epoch`, fresh pool). The async work added
+**coverage-granular reconstruction**:
+
+- **Coverage.** `ChunkPool::uncovered_ranges()` derives the holes (the
+  unassigned tail plus the in-flight `outstanding` chunks plus `reclaimed`);
+  `ChunkPool::from_coverage()` rebuilds a pool serving only those, reusing the
+  existing reclaimed / `take_chunk` machinery (built for dead-rank
+  redistribution) to re-dispatch the in-flight-at-reduce chunks as
+  first-coverage. `CheckpointMeta` gained an optional `CoverageBlock` (the
+  shuffle seed plus, per in-progress epoch, the uncovered offset ranges); older
+  meta files still parse. Resume verifies the seed and rebuilds via
+  `ClusterCoordinator::resume_progressive_from_coverage()`; the launcher
+  kickoff falls back to fresh dispatch when no coverage is recorded. No
+  barrier, no rendezvous, no `final_window_alloc` analog.
+
+- **Atomicity.** The checkpoint is armed at `trigger_averaging`, before the
+  `RequestParams` / `SyncNow` broadcast (before workers freeze their params for
+  the reduce), so the captured coverage is a subset of the consensus. A
+  finish-time capture would over-count under async overshoot and lose data; an
+  early capture can only redo in-flight chunks (bounded), never lose covered
+  ones. The `.meta.json` is written at `finish_averaging_*` with the final
+  post-round counters. This confirms the fact flagged before building:
+  `should_average` plus the `max_overshoot` reduce barrier keep the cohort
+  within one window of the reduce clock, so the in-flight-at-reduce redo stays
+  small.
+
+- **Consensus model, at the forge** (the meta is always coord-side). CPU: the
+  consensus is forged in the controller reduce thread, so a `CheckpointForge`
+  holds the static model schema (param/buffer names captured once at launch
+  from a CPU-built model) and writes a named `.fdl` from the averaged
+  `RoundFrame` on a detached thread, keeping the controller a model-agnostic
+  byte reducer. NCCL: the consensus is on-device after the collective, so a
+  `SaveConsensusModel` control frame tells the elected rank to write
+  `self.model` (no EASGD blend on the NCCL path).
+
+- **No optimizer momentum** in the checkpoint (param-averaging has no canonical
+  momentum); resume re-warms the inner optimizer fresh.
+
+A one-shot trigger (`checkpoint_at_epoch`) drives validation; the recurring
+cadence (and eval-on-consensus, the callback report-and-wait gate) is a
+follow-on.

@@ -1201,11 +1201,31 @@ pub(crate) enum ControlMsg {
     /// local-multi-GPU / cluster). See
     /// `EpochAggregated`.
     EpochAggregated(EpochMetrics),
+    /// NCCL consensus checkpoint: write the elected rank's CURRENT model
+    /// (post-collective consensus) to `<save_path>.fdl`. See
+    /// [`crate::distributed::wire::ControlMsgWire::SaveConsensusModel`]. No
+    /// `.optim`, no shutdown; the worker no-ops unless `target_rank` matches.
+    SaveConsensusModel {
+        /// Elected rank that should write the consensus model.
+        target_rank: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Initial setup
 // ---------------------------------------------------------------------------
+
+/// Default base seed for deterministic per-epoch shuffling across the DDP
+/// paths (single-host fallback, cluster rank entry, threaded coordinator).
+///
+/// The epoch `e` permutation is `Rng::seed(SHUFFLE_BASE_SEED + e)` (see
+/// [`make_partition`] and [`crate::data::RandomSampler`]). Coverage-granular
+/// resume records this value in
+/// [`crate::distributed::CoverageBlock::seed`] so a resumed run can verify it
+/// re-shuffles over the SAME index space; changing it between save and resume
+/// invalidates recorded coverage. Single source of truth — every
+/// `WorkerConfig.seed` default and the coverage snapshot read it from here.
+pub const SHUFFLE_BASE_SEED: u64 = 42;
 
 /// Configuration passed to a GPU worker at spawn time.
 ///
@@ -1228,7 +1248,9 @@ pub struct WorkerConfig {
     pub total_samples: usize,
     /// Batch size.
     pub batch_size: usize,
-    /// RNG seed for deterministic shuffling.
+    /// RNG base seed for deterministic shuffling; the epoch `e` permutation is
+    /// `Rng::seed(seed + e)`. Defaults to [`SHUFFLE_BASE_SEED`] at every
+    /// construction site.
     pub seed: u64,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,

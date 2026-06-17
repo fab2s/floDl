@@ -8,6 +8,163 @@ use super::*;
 
 
 #[test]
+fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
+    // End-to-end coverage half of the async resume contract (no network):
+    // build partial coverage on an epoch pool, fire the one-shot checkpoint
+    // (coord writes .meta.json + coverage), then resume a fresh coord from
+    // that meta and confirm it reconstructs the pool to exactly the holes.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::{AverageBackend, SHUFFLE_BASE_SEED};
+    use crate::distributed::{CheckpointBundle, CheckpointMeta, SaveReason};
+
+    let world_size = 2;
+    let total = 100usize;
+
+    let dir = std::env::temp_dir()
+        .join(format!("flodl_ckpt_resume_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("ckpt").to_string_lossy().into_owned();
+
+    // Coord A: progressive cpu-cadence, save_path set, one-shot armed @ epoch 2.
+    let cfg_a = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(5)
+    .save_path(stem.clone())
+    .checkpoint_at_epoch(2);
+    let mut coord_a = ClusterCoordinator::for_test(cfg_a);
+
+    // Partial coverage on epoch 2: rank 0 completes (0,40); rank 1 has (40,30)
+    // still in flight. Covered = [0,40); uncovered = (40,30) in-flight + tail
+    // [70,100) → coalesced (40,60).
+    coord_a.install_chunk_pool_for_test(2, total);
+    {
+        let pool = coord_a.chunk_pools.get_mut(&2).unwrap();
+        assert_eq!(pool.take_chunk(40, 0).unwrap(), (0, 40));
+        assert_eq!(pool.take_chunk(30, 1).unwrap(), (40, 30));
+        pool.mark_completed(0, 40);
+    }
+    coord_a.rank_epoch[0] = 2;
+    coord_a.rank_epoch[1] = 2;
+
+    // Drive the split trigger directly (no real reduce): arm at cycle start
+    // (captures coverage + disarms), then write the stashed meta at finish.
+    coord_a.maybe_arm_checkpoint();
+    assert!(
+        coord_a.checkpoint_at_epoch.is_none(),
+        "one-shot disarms after firing"
+    );
+    assert!(
+        coord_a.pending_checkpoint_coverage.is_some(),
+        "coverage captured at arm time"
+    );
+    coord_a.finish_pending_checkpoint_meta();
+    assert!(
+        coord_a.pending_checkpoint_coverage.is_none(),
+        "pending coverage consumed at finish"
+    );
+
+    // Read the meta back.
+    let meta_path = CheckpointBundle::meta_path(&stem);
+    let meta = CheckpointMeta::read_from_file(&meta_path).unwrap();
+    assert_eq!(meta.save_reason, SaveReason::Checkpoint);
+    let cov = meta.coverage.clone().expect("coverage block recorded");
+    assert_eq!(cov.seed, SHUFFLE_BASE_SEED);
+    assert_eq!(cov.per_epoch.len(), 1);
+    assert_eq!(cov.per_epoch[0].epoch, 2);
+    assert_eq!(cov.per_epoch[0].total_samples, total);
+    assert_eq!(cov.per_epoch[0].uncovered_ranges, vec![(40, 60)]);
+
+    // Coord B: resume from the recorded coverage.
+    let cfg_b = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(5)
+    .resume_from_meta(&meta);
+    let mut coord_b = ClusterCoordinator::for_test(cfg_b);
+
+    let handled = coord_b.resume_progressive_from_coverage().unwrap();
+    assert!(handled, "coverage present → resume handled the kickoff");
+    // Reconstructed pool holds only the holes. (Headless send_control fails and
+    // rolls back the dispatch take, so `remaining` reflects the staged holes.)
+    let pool_b = coord_b.chunk_pools.get(&2).expect("epoch 2 pool reconstructed");
+    assert_eq!(pool_b.remaining(), 60);
+    assert!(!pool_b.is_epoch_done());
+    // Epochs 0,1 anchored as already aggregated; cohort placed at epoch 2.
+    assert_eq!(coord_b.last_aggregated_epoch, Some(1));
+    assert_eq!(coord_b.rank_epoch, vec![2, 2]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resume_from_coverage_rejects_seed_mismatch() {
+    // The contract rests on the same permutation: a seed change must error
+    // loudly rather than silently re-train the wrong samples.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+    use crate::distributed::{CoverageBlock, EpochCoverage};
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(5)
+    .seed(7); // run seed
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.start_coverage = Some(CoverageBlock {
+        seed: 999, // recorded with a DIFFERENT seed
+        batch_size: 1,
+        per_epoch: vec![EpochCoverage {
+            epoch: 0,
+            total_samples: 100,
+            uncovered_ranges: vec![(0, 100)],
+        }],
+    });
+    let err = coord.resume_progressive_from_coverage().unwrap_err();
+    assert!(err.to_string().contains("seed"), "got: {err}");
+}
+
+#[test]
+fn resume_from_coverage_absent_falls_back() {
+    // No coverage → Ok(false): caller dispatches a fresh epoch.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(5);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    assert!(!coord.resume_progressive_from_coverage().unwrap());
+}
+
+#[test]
 fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
     // 2 ranks, Sync, 10 samples → expect ranks to split (5, 5) by
     // equal_sizes (Sync ignores ElChe ratios).

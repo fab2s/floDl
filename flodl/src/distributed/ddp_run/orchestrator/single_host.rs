@@ -94,7 +94,7 @@ impl DdpHandle {
             initial_buffers,
             total_samples,
             batch_size,
-            seed: 42,
+            seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
             // Single-GPU fallback never goes through the cpu-async load_averaged
             // path, so EASGD alpha is irrelevant here. None keeps the

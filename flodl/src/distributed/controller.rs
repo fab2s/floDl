@@ -199,7 +199,7 @@ impl ClusterController {
         // elastic-membership path. Equivalent to passing a private
         // ledger that nobody else can declare into.
         let dead_ranks = DeadRanks::new(world_size);
-        Self::start_with_dead_ranks(bind_addr, world_size, salt, dead_ranks)
+        Self::start_with_dead_ranks(bind_addr, world_size, salt, dead_ranks, None)
     }
 
     /// Like [`Self::start`] but shares the dead-rank ledger with the
@@ -215,6 +215,7 @@ impl ClusterController {
         world_size: usize,
         salt: SessionSalt,
         dead_ranks: Arc<DeadRanks>,
+        forge: Option<Arc<crate::distributed::CheckpointForge>>,
     ) -> Result<Self> {
         if world_size == 0 {
             return Err(TensorError::new(
@@ -253,7 +254,9 @@ impl ClusterController {
         let handle = thread::Builder::new()
             .name(format!("flodl-cluster-controller:{bound_port}"))
             .spawn(move || {
-                run_reduce_thread(listener, world_size, salt, shutdown_cloned, dead_ranks)
+                run_reduce_thread(
+                    listener, world_size, salt, shutdown_cloned, dead_ranks, forge,
+                )
             })
             .map_err(|e| {
                 TensorError::new(&format!("cluster_controller: spawn worker failed: {e}"))
@@ -314,6 +317,7 @@ fn run_reduce_thread(
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
     dead_ranks: Arc<DeadRanks>,
+    forge: Option<Arc<crate::distributed::CheckpointForge>>,
 ) -> Result<()> {
     listener
         .set_nonblocking(true)
@@ -427,9 +431,14 @@ fn run_reduce_thread(
         }
         match slots.wait_for_round(&dead_ranks, &shutdown, REDUCE_POLL) {
             RoundOutcome::Frames(frames) => {
-                if let Err(e) =
-                    average_and_scatter(&frames, &mut conn_writes, &rank_conn, &dead_ranks, &salt)
-                {
+                if let Err(e) = average_and_scatter(
+                    &frames,
+                    &mut conn_writes,
+                    &rank_conn,
+                    &dead_ranks,
+                    &salt,
+                    forge.as_deref(),
+                ) {
                     break Err(e);
                 }
             }
@@ -637,6 +646,7 @@ fn average_and_scatter(
     rank_conn: &[Option<usize>],
     dead_ranks: &DeadRanks,
     salt: &SessionSalt,
+    forge: Option<&crate::distributed::CheckpointForge>,
 ) -> Result<()> {
     let averaged = reduce_average_alive(frames)?;
     // The averaged frame is identical for every rank; serialize once and
@@ -651,6 +661,13 @@ fn average_and_scatter(
             continue;
         };
         MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)?;
+    }
+    // FORGE TAP: scatter ranks first (they resume training ASAP), then — if the
+    // coordinator armed a checkpoint for this reduce — hand the freshly-forged
+    // consensus to the writer, which clones it once and serializes the `.fdl`
+    // on a detached thread. No-op when unarmed; the reduce loop never blocks.
+    if let Some(f) = forge {
+        f.maybe_write(&averaged);
     }
     Ok(())
 }

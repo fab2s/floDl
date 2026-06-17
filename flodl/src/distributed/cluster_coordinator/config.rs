@@ -213,6 +213,43 @@ pub struct ClusterCoordinatorConfig {
     /// fresh-start (no ElChe state to restore).
     pub start_elche_state: Option<crate::distributed::ElCheState>,
 
+    /// Shuffle base seed recorded in the coverage block at checkpoint time
+    /// (the epoch `e` permutation is `Rng::seed(seed + e)`). Defaults to
+    /// [`crate::distributed::ddp_run::SHUFFLE_BASE_SEED`]; resume uses it to
+    /// verify the resumed run re-shuffles over the same index space.
+    pub seed: u64,
+
+    /// One-shot checkpoint trigger: when `Some(e)`, the coordinator takes a
+    /// coverage-granular checkpoint at the first reduce after the cohort
+    /// crosses epoch `e` (the consensus is coherent there). `None` disables.
+    /// This is the explicit-checkpoint path the resume contract is validated
+    /// against; the recurring cadence (`checkpoint_every`) is layered on top
+    /// of the same mechanism later.
+    pub checkpoint_at_epoch: Option<usize>,
+
+    /// Resume kickoff: optional [`crate::distributed::CoverageBlock`] from a
+    /// prior run's `.meta.json`. When `Some`, the coordinator reconstructs the
+    /// recorded in-progress epoch pools (via
+    /// [`crate::distributed::chunk_pool::ChunkPool::from_coverage`]) and
+    /// dispatches only the uncovered remainder instead of a fresh epoch.
+    /// `None` = fresh-start (epoch-granular dispatch from `start_epoch`).
+    pub start_coverage: Option<crate::distributed::CoverageBlock>,
+
+    /// Static model schema (param/buffer names) captured at launch. Carried
+    /// here as the conduit from the typed `DdpHandle::launch` (which has the
+    /// model factory) to `run_launcher_with_config` (which builds the
+    /// controller-side consensus-checkpoint writer). Lets the CPU forge write
+    /// a named, loadable `.fdl` from the name-less averaged frame without
+    /// routing the model through a rank. `None` for the coordinator itself
+    /// (it never writes the model) and for entry paths without a factory.
+    pub model_schema: Option<crate::distributed::ModelSchema>,
+
+    /// Shared CPU-forge handle, set by the launcher so the coordinator can arm
+    /// a consensus model save the controller reduce thread fulfills. Not serde
+    /// (an `Arc`); `None` on NCCL / non-launcher paths.
+    pub checkpoint_forge:
+        Option<std::sync::Arc<crate::distributed::CheckpointForge>>,
+
     /// Optional [`crate::monitor::Timeline`] shared with the user-side
     /// harness. When set, `trigger_averaging` and `finish_averaging_*`
     /// emit `SyncStart` / `SyncEnd` events so the launcher's
@@ -276,6 +313,11 @@ impl ClusterCoordinatorConfig {
             start_global_step: 0,
             start_avg_count: 0,
             start_elche_state: None,
+            seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
+            checkpoint_at_epoch: None,
+            start_coverage: None,
+            model_schema: None,
+            checkpoint_forge: None,
             timeline: None,
             dashboard_sink: None,
         }
@@ -322,6 +364,29 @@ impl ClusterCoordinatorConfig {
         self.start_global_step = meta.global_step;
         self.start_avg_count = meta.sync_round;
         self.start_elche_state = meta.elche_state.clone();
+        self.start_coverage = meta.coverage.clone();
+        self
+    }
+
+    /// Set the shuffle base seed recorded in checkpoint coverage blocks.
+    /// Defaults to [`crate::distributed::ddp_run::SHUFFLE_BASE_SEED`].
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// One-shot checkpoint trigger at the first reduce after epoch `e`.
+    /// `None`-equivalent disable is just not calling this.
+    pub fn checkpoint_at_epoch(mut self, epoch: usize) -> Self {
+        self.checkpoint_at_epoch = Some(epoch);
+        self
+    }
+
+    /// Attach the static model schema captured at launch (param/buffer names),
+    /// used by the controller-side consensus-checkpoint writer to name the
+    /// averaged frame's tensors.
+    pub fn model_schema(mut self, schema: crate::distributed::ModelSchema) -> Self {
+        self.model_schema = Some(schema);
         self
     }
 

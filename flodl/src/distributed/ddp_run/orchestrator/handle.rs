@@ -279,6 +279,26 @@ impl DdpHandle {
                     num_epochs,
                 )?;
                 coord_config = coord_config.metrics_sink_tx(sink_tx);
+                // Capture the static model schema (param/buffer names) for the
+                // controller-side consensus-checkpoint writer. Built on CPU in
+                // the launcher process — reads names only, touches no CUDA
+                // context (honors the "no CUDA before training" launcher
+                // invariant). Best-effort: a factory that fails here just
+                // leaves the schema unset (consensus checkpoints degrade to
+                // meta-only); it does not abort the launch.
+                match model_factory(Device::CPU) {
+                    Ok(probe) => {
+                        coord_config = coord_config.model_schema(
+                            crate::distributed::ModelSchema::from_module(&probe),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cluster launcher: model schema capture failed \
+                             (consensus checkpoints will be meta-only): {e}"
+                        );
+                    }
+                }
                 // Spawn the launcher driver on a dedicated thread.
                 // Previously this called `run_launcher_with_config`
                 // inline then `process::exit(0)` — user's main() never
@@ -581,7 +601,7 @@ impl DdpHandle {
         let timeline = config.timeline.clone();
         let coord_timeline = timeline.clone();
         let coord_batch_size = batch_size;
-        let seed: u64 = 42;
+        let seed: u64 = crate::distributed::ddp_run::SHUFFLE_BASE_SEED;
 
         let coordinator_handle = std::thread::Builder::new()
             .name("ddp-coordinator".into())

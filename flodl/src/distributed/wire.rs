@@ -685,6 +685,19 @@ pub enum ControlMsgWire {
     /// `monitor.log(epoch, dur, &model)` sees the aggregated view
     /// regardless of single-GPU / local-multi-GPU / cluster.
     EpochAggregated(EpochMetricsWire),
+    /// NCCL consensus checkpoint: tell the elected rank to write its CURRENT
+    /// model (params + buffers) to `<save_path>.fdl` as the resumable consensus
+    /// — distinct from [`Self::Checkpoint`] (which fires the user `checkpoint_fn`)
+    /// and from [`Self::ShutdownWithSave`] (which also writes `.optim` and
+    /// exits). Dispatched by the coordinator at `finish_averaging_nccl`, AFTER
+    /// the in-place AllReduce-Avg, so the rank's `self.model` holds the pure
+    /// consensus (no EASGD blend on the NCCL path). The CPU path does NOT use
+    /// this — its consensus is forged controller-side
+    /// ([`crate::distributed::CheckpointForge`]). Targeted send; the worker
+    /// no-ops unless `target_rank == self.rank`. No result frame (best-effort,
+    /// mirrors the CPU forge's detached write); the `.meta.json` written
+    /// coord-side is the resume index.
+    SaveConsensusModel { target_rank: u64 },
 }
 
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain

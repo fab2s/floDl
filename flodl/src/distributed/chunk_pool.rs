@@ -221,6 +221,71 @@ impl ChunkPool {
         self.dispatched[rank].saturating_sub(self.completed[rank])
     }
 
+    /// The offset ranges NOT yet covered (dispatched-AND-completed by some
+    /// rank) at this instant: the unassigned tail `[cursor, total)`, every
+    /// in-flight `outstanding` chunk across all ranks, and every `reclaimed`
+    /// range awaiting re-dispatch. Coalesced and sorted by offset; covered =
+    /// everything else in `[0, total)`.
+    ///
+    /// In-flight chunks are reported UNCOVERED by design: a chunk dispatched
+    /// but not yet completed has not had its gradient folded into the
+    /// consensus, so resume must re-dispatch it as first-coverage (not a
+    /// repeat). This is the snapshot half of the coverage-granular resume
+    /// contract — see [`Self::from_coverage`] and
+    /// `docs/design/epoch-tail-allocation.md` (## Async).
+    pub fn uncovered_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        if self.cursor < self.total_samples {
+            ranges.push((self.cursor, self.total_samples - self.cursor));
+        }
+        for q in &self.outstanding {
+            ranges.extend(q.iter().copied().filter(|&(_, sz)| sz > 0));
+        }
+        ranges.extend(self.reclaimed.iter().copied().filter(|&(_, sz)| sz > 0));
+        ranges.sort_by_key(|&(off, _)| off);
+        // Coalesce contiguous ranges (the tail abutting a reclaimed range, etc.)
+        // so the recorded block is minimal; offsets are disjoint by the pool's
+        // non-overlap invariant, so a simple adjacent-merge is exact.
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (off, sz) in ranges {
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == off => last.1 += sz,
+                _ => out.push((off, sz)),
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a pool whose only remaining work is `uncovered` — the
+    /// ranges recorded by [`Self::uncovered_ranges`] at a checkpoint reduce.
+    /// Covered samples are treated as already done; the uncovered ranges are
+    /// staged in the `reclaimed` queue, so [`Self::take_chunk`] hands out
+    /// exactly the holes (in offset order, splitting as needed) — each once —
+    /// and [`Self::is_epoch_done`] fires when they are all completed.
+    ///
+    /// The resume half of the coverage-granular contract. The cursor is parked
+    /// at `total_samples` so no fresh samples are served; only the staged holes
+    /// remain. Re-dispatching an in-flight-at-checkpoint range here is
+    /// first-coverage, not a repeat (the snapshot recorded it uncovered).
+    pub fn from_coverage(
+        epoch: usize,
+        total_samples: usize,
+        world_size: usize,
+        uncovered: &[(usize, usize)],
+    ) -> Self {
+        let mut pool = ChunkPool::new(epoch, total_samples, world_size);
+        // The covered region is settled and gone; only the holes remain to
+        // dispatch. Park the cursor past the end (no fresh samples) and stage
+        // the holes for the reclaimed-first `take_chunk` path.
+        pool.cursor = total_samples;
+        pool.reclaimed = uncovered
+            .iter()
+            .copied()
+            .filter(|&(_, sz)| sz > 0)
+            .collect();
+        pool
+    }
+
     /// True when all samples have been dispatched AND all ranks have
     /// reported completion for everything dispatched to them. Forfeited
     /// ranges awaiting re-dispatch count as un-dispatched work.
@@ -551,6 +616,86 @@ mod tests {
         assert_eq!((off, size), (40, 60));
         pool.mark_completed(1, 60);
         assert!(pool.is_epoch_done());
+    }
+
+    #[test]
+    fn uncovered_ranges_tail_only_on_fresh_pool() {
+        let pool = ChunkPool::new(0, 100, 2);
+        // Nothing dispatched: the whole pool is the uncovered tail.
+        assert_eq!(pool.uncovered_ranges(), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn uncovered_ranges_excludes_completed_includes_inflight_and_tail() {
+        let mut pool = ChunkPool::new(0, 100, 2);
+        pool.take_chunk(30, 0).unwrap(); // (0,30) -> rank 0
+        pool.take_chunk(20, 1).unwrap(); // (30,20) -> rank 1, in-flight
+        pool.mark_completed(0, 30); // rank 0's chunk now COVERED
+        // Covered: [0,30). Uncovered: rank 1's in-flight (30,20) + tail [50,100).
+        // (30,20) abuts (50,50) -> coalesced to (30,70).
+        assert_eq!(pool.uncovered_ranges(), vec![(30, 70)]);
+    }
+
+    #[test]
+    fn uncovered_ranges_includes_reclaimed() {
+        let mut pool = ChunkPool::new(0, 100, 2);
+        pool.take_chunk(40, 0).unwrap(); // (0,40)
+        pool.take_chunk(20, 1).unwrap(); // (40,20)
+        pool.mark_completed(1, 20); // (40,60) covered
+        pool.forfeit(0); // (0,40) back to reclaimed (uncovered)
+        // Uncovered: reclaimed (0,40) + tail [60,100). Not contiguous (gap is
+        // the covered [40,60)).
+        assert_eq!(pool.uncovered_ranges(), vec![(0, 40), (60, 40)]);
+    }
+
+    #[test]
+    fn from_coverage_dispatches_only_holes_each_once() {
+        // Snapshot a partially-covered pool, reconstruct, and verify the
+        // reconstructed pool serves EXACTLY the uncovered ranges, once.
+        let mut orig = ChunkPool::new(0, 100, 3);
+        orig.take_chunk(30, 0).unwrap(); // (0,30)
+        orig.take_chunk(20, 1).unwrap(); // (30,20)
+        orig.take_chunk(10, 2).unwrap(); // (50,10)
+        orig.mark_completed(0, 30); // (0,30) covered
+        orig.mark_completed(2, 10); // (50,10) covered
+        // Uncovered: rank 1 in-flight (30,20) + tail [60,100) = (60,40).
+        let uncovered = orig.uncovered_ranges();
+        assert_eq!(uncovered, vec![(30, 20), (60, 40)]);
+
+        let mut resumed = ChunkPool::from_coverage(0, 100, 3, &uncovered);
+        assert_eq!(resumed.remaining(), 60, "only the holes remain");
+        assert!(!resumed.is_epoch_done());
+
+        // Drain it and confirm coverage = exactly the uncovered set, once.
+        let mut covered = vec![0u32; 100];
+        while resumed.remaining() > 0 {
+            for rank in 0..3 {
+                if let Some((o, s)) = resumed.take_chunk(15, rank) {
+                    if s > 0 {
+                        for slot in covered.iter_mut().skip(o).take(s) {
+                            *slot += 1;
+                        }
+                        resumed.mark_completed(rank, s);
+                    }
+                }
+            }
+        }
+        assert!(resumed.is_epoch_done(), "resumed epoch completes");
+        // Exactly the holes covered once; the covered-at-snapshot samples never
+        // re-served.
+        for (i, &c) in covered.iter().enumerate() {
+            let in_hole = (30..50).contains(&i) || (60..100).contains(&i);
+            assert_eq!(c, u32::from(in_hole), "sample {i}");
+        }
+    }
+
+    #[test]
+    fn from_coverage_empty_holes_is_done() {
+        // A pool snapshotted fully-covered (no holes) reconstructs as already
+        // done — resume dispatches nothing for that epoch.
+        let resumed = ChunkPool::from_coverage(0, 100, 2, &[]);
+        assert_eq!(resumed.remaining(), 0);
+        assert!(resumed.is_epoch_done());
     }
 
     #[test]

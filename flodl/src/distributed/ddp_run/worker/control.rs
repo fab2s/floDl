@@ -321,6 +321,26 @@ impl<M: Module> GpuWorker<M> {
                     *slot = Some(metrics);
                 }
             }
+            ControlMsg::SaveConsensusModel { target_rank } => {
+                // NCCL consensus checkpoint: the elected rank writes its
+                // CURRENT model — which holds the just-completed in-place
+                // AllReduce-Avg consensus (no EASGD blend on the NCCL path) —
+                // to `<save_path>.fdl`. Targeted: only the named rank runs.
+                // No `.optim`, no shutdown; best-effort (mirrors the CPU
+                // forge's detached write), so no result frame. The coord's
+                // `.meta.json` is the resume index.
+                if target_rank != self.rank {
+                    return Ok(false);
+                }
+                match self.save_path.clone() {
+                    Some(stem) => self.write_model_to_fdl(&stem),
+                    None => eprintln!(
+                        "ddp-worker: rank {} SaveConsensusModel received but \
+                         save_path is unset; consensus .fdl not written",
+                        self.rank,
+                    ),
+                }
+            }
         }
         Ok(false)
     }

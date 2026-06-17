@@ -704,6 +704,39 @@ pub struct ClusterCoordinator {
     /// has `checkpoint_fn = Some(...)`, others no-op.
     checkpoint_every: Option<usize>,
 
+    /// Shuffle base seed, recorded in the coverage block at checkpoint time so
+    /// resume can verify the same permutation space. See
+    /// [`crate::distributed::ddp_run::SHUFFLE_BASE_SEED`].
+    seed: u64,
+
+    /// One-shot coverage-granular checkpoint trigger. When `Some(e)`, the
+    /// first reduce after the cohort crosses epoch `e` takes an atomic
+    /// consensus+coverage checkpoint. Cleared to `None` once fired so it
+    /// happens exactly once. The explicit-checkpoint path the resume contract
+    /// is validated against (the recurring cadence layers on the same
+    /// mechanism later).
+    checkpoint_at_epoch: Option<usize>,
+
+    /// Resume coverage: in-progress epoch pools to reconstruct on kickoff
+    /// (via [`crate::distributed::chunk_pool::ChunkPool::from_coverage`])
+    /// instead of fresh dispatch. Consumed once at resume; `None` for fresh
+    /// runs.
+    start_coverage: Option<crate::distributed::CoverageBlock>,
+
+    /// Shared CPU-forge signal: the coordinator ARMS a consensus model save
+    /// (before a checkpoint reduce); the controller reduce thread writes the
+    /// `.fdl` from the forged frame + launch-captured schema. `None` on the
+    /// NCCL path (consensus is on-device → elected-rank write) and for entry
+    /// paths without a launcher-built forge.
+    checkpoint_forge: Option<std::sync::Arc<crate::distributed::CheckpointForge>>,
+
+    /// Coverage captured at the checkpoint reduce's TRIGGER (before the param
+    /// freeze, so `covered ⊆ consensus` — late capture would over-count and
+    /// lose data under async overshoot). Stashed here at trigger and consumed
+    /// at the matching `finish_averaging_*`, where the post-round counters are
+    /// final, to write the `.meta.json`. `None` outside a checkpoint cycle.
+    pending_checkpoint_coverage: Option<crate::distributed::CoverageBlock>,
+
     // --- Epoch dispatch ---
     /// Per-rank current epoch (last StartEpoch dispatched).
     rank_epoch: Vec<usize>,

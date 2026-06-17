@@ -272,6 +272,13 @@ impl ClusterCoordinator {
             tl.event(crate::monitor::EventKind::SyncStart);
         }
         self.sync_start = Some(Instant::now());
+        // CHECKPOINT ARM (before any RequestParams/SyncNow broadcast = before the
+        // param freeze): if a checkpoint is due this reduce, capture coverage now
+        // (so `covered ⊆ consensus`; a post-reduce capture would over-count under
+        // async overshoot → lost data) and arm the consensus model write. The
+        // `.meta.json` is written at the matching `finish_averaging_*` from the
+        // stashed coverage + final counters.
+        self.maybe_arm_checkpoint();
         match self.backend {
             AverageBackend::Nccl => {
                 // TRANSPORT-AWARE FEED: pull the window's chunk-completion
@@ -1026,6 +1033,7 @@ impl ClusterCoordinator {
         }
 
         self.finish_averaging_tail();
+        self.finish_pending_checkpoint_meta();
         self.emit_sync_end();
         Ok(())
     }
@@ -1104,8 +1112,137 @@ impl ClusterCoordinator {
                 tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
             }
         }
+        self.finish_pending_checkpoint_meta();
         self.emit_sync_end();
         Ok(())
     }
 
+    /// ARM a one-shot coverage-granular checkpoint at the START of a reduce
+    /// cycle (called from `trigger_averaging`, before any
+    /// `RequestParams`/`SyncNow` broadcast — i.e. before the workers freeze
+    /// their params for this reduce).
+    ///
+    /// When `checkpoint_at_epoch` is armed and the cohort has reached that
+    /// epoch, this:
+    /// 1. captures coverage NOW (`snapshot_coverage`) and stashes it in
+    ///    `pending_checkpoint_coverage` for the matching `finish_*` to write —
+    ///    capturing before the param freeze guarantees `covered ⊆ consensus`
+    ///    (a chunk completed-and-drained before the freeze is provably in each
+    ///    rank's frozen params; anything later is recorded uncovered → bounded
+    ///    redo on resume, never lost data);
+    /// 2. arms the consensus MODEL write at the forge — CPU: the controller
+    ///    reduce thread taps this round's averaged frame
+    ///    ([`crate::distributed::CheckpointForge::arm`]); NCCL: elected-rank
+    ///    write (wired in a follow-on step);
+    /// 3. disarms `checkpoint_at_epoch` so it fires exactly once.
+    pub(super) fn maybe_arm_checkpoint(&mut self) {
+        let Some(target_epoch) = self.checkpoint_at_epoch else {
+            return;
+        };
+        // Fire at the first reduce where any live rank has reached the target
+        // epoch (typically mid-epoch, so the coverage block is non-trivial).
+        let reached = (0..self.world_size)
+            .any(|r| !self.is_dead(r) && self.rank_epoch[r] >= target_epoch);
+        if !reached {
+            return;
+        }
+        self.checkpoint_at_epoch = None; // exactly once
+        // Capture coverage at the freeze boundary; consumed at finish.
+        self.pending_checkpoint_coverage = Some(self.snapshot_coverage());
+        // Arm the model write at the forge.
+        match self.backend {
+            AverageBackend::Cpu => {
+                if let (Some(stem), Some(forge)) =
+                    (self.save_path.as_ref(), self.checkpoint_forge.as_ref())
+                {
+                    let model_path =
+                        crate::distributed::CheckpointBundle::model_path(stem);
+                    if forge.can_write_model() {
+                        forge.arm(model_path);
+                    } else {
+                        crate::verbose!(
+                            "  ddp: checkpoint armed but no model schema captured; \
+                             writing meta-only (epoch {target_epoch})"
+                        );
+                    }
+                }
+            }
+            AverageBackend::Nccl => {
+                // NCCL consensus is on-device across ranks (nothing to arm
+                // controller-side). The elected-rank model write is dispatched
+                // from `finish_pending_checkpoint_meta` at the tail of
+                // `finish_averaging_nccl`, AFTER the collective, so the rank
+                // holds the post-collective consensus. Nothing to do here
+                // beyond the coverage capture already done above.
+                let _ = target_epoch;
+            }
+        }
+    }
+
+    /// Write the stashed checkpoint `.meta.json` at the end of a reduce cycle
+    /// (called from both `finish_averaging_*`). No-op unless
+    /// `maybe_arm_checkpoint` captured coverage for this cycle. The meta pairs
+    /// the trigger-time coverage with the now-final post-round counters
+    /// (epoch / global_step / sync_round) + ElChe/guard state, stamped
+    /// [`crate::distributed::SaveReason::Checkpoint`]. Mirrors the
+    /// controller-side meta write in `dispatch_shutdown_with_save`.
+    pub(super) fn finish_pending_checkpoint_meta(&mut self) {
+        let Some(coverage) = self.pending_checkpoint_coverage.take() else {
+            return;
+        };
+        let Some(stem) = self.save_path.as_ref() else {
+            eprintln!(
+                "flodl ddp: checkpoint coverage captured but save_path is unset; \
+                 meta not written"
+            );
+            return;
+        };
+        let meta_path = crate::distributed::CheckpointBundle::meta_path(stem);
+        // Cluster-wide epoch = max across live ranks (the highest any reached).
+        let epoch = self.rank_epoch.iter().copied().max().unwrap_or(0);
+        let mut elche_state = self.el_che.to_state();
+        elche_state.trend_history = self.convergence_guard.trend_history();
+        let meta = crate::distributed::CheckpointMeta::new(
+            epoch,
+            self.global_step,
+            self.avg_count,
+            self.world_size,
+            crate::distributed::SaveReason::Checkpoint,
+        )
+        .with_elche_state(elche_state)
+        .with_coverage(coverage);
+        if let Err(e) = meta.write_to_file(&meta_path) {
+            eprintln!(
+                "flodl ddp: checkpoint meta write to {} failed: {e}",
+                meta_path.display(),
+            );
+            return;
+        }
+        crate::verbose!(
+            "  ddp: checkpoint meta written {} (epoch {epoch}, version {})",
+            meta_path.display(),
+            self.version,
+        );
+        // NCCL consensus MODEL write: the consensus is on-device across ranks
+        // (no controller-side frame to tap), so dispatch the elected rank to
+        // write its post-collective `self.model`. We are at the tail of
+        // `finish_averaging_nccl`, AFTER the in-place AllReduce-Avg, so the
+        // rank holds the pure consensus; mpsc/wire FIFO orders this frame after
+        // the `SyncNow` it already processed. CPU is a no-op here — its model
+        // was already written by the controller forge tap.
+        if matches!(self.backend, AverageBackend::Nccl) {
+            let target = self.checkpoint_role;
+            if target < self.world_size && !self.is_dead(target) {
+                let msg = ControlMsgWire::SaveConsensusModel {
+                    target_rank: target as u64,
+                };
+                if let Err(e) = self.send_control(target, &msg) {
+                    eprintln!(
+                        "flodl ddp: SaveConsensusModel dispatch to rank {target} \
+                         failed: {e}"
+                    );
+                }
+            }
+        }
+    }
 }

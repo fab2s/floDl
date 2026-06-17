@@ -38,7 +38,57 @@ use crate::tensor::{Result, TensorError};
 ///   [`crate::distributed::ddp_run::convergence::ConvergenceGuard`] state (currently just the
 ///   `TrendGuard` divergence ring buffer; other guards return `None`).
 ///   v2 files still parse — the field defaults to `None`.
-pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 3;
+/// - 4: adds optional `coverage` ([`CoverageBlock`]) for coverage-granular
+///   async resume (per in-progress epoch: the uncovered offset ranges + the
+///   shuffle seed). v3 files still parse — the field defaults to `None`.
+pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 4;
+
+/// Uncovered data coverage for one in-progress epoch pool, captured at a
+/// checkpoint reduce.
+///
+/// Records the offset ranges into the epoch's shuffled permutation that have
+/// NOT been covered (dispatched-AND-completed into the consensus) at the
+/// snapshot. Resume reconstructs the epoch's `ChunkPool` to exactly this state
+/// (via [`crate::distributed::chunk_pool::ChunkPool::from_coverage`]) and
+/// re-dispatches only these ranges, so no covered sample is trained twice and
+/// no in-flight-at-checkpoint sample is dropped.
+///
+/// The permutation itself is NOT serialized: it is reproducible from
+/// `(seed, epoch)` via `Rng::seed(seed + epoch)` (see [`CoverageBlock::seed`]),
+/// so only the uncovered offset ranges are recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpochCoverage {
+    /// Epoch index this coverage belongs to.
+    pub epoch: usize,
+    /// Total samples in the epoch's batch-aligned pool (the
+    /// `ChunkPool::total_samples`, not the raw dataset length).
+    pub total_samples: usize,
+    /// Uncovered `(offset, size)` ranges into the epoch's permutation,
+    /// coalesced and sorted by offset (the output of
+    /// [`crate::distributed::chunk_pool::ChunkPool::uncovered_ranges`]).
+    pub uncovered_ranges: Vec<(usize, usize)>,
+}
+
+/// Data-coverage snapshot across all in-progress epoch pools at a checkpoint
+/// reduce — the resume contract's coverage half (the consensus model is the
+/// other half, written at the forge).
+///
+/// Async streams across epoch boundaries, so more than one epoch pool can be
+/// in progress at the snapshot; `per_epoch` carries one [`EpochCoverage`] per
+/// live pool. `seed` is the run's shuffle base seed
+/// ([`crate::distributed::ddp_run::DdpRunConfig::seed`]); together with each
+/// `epoch` it reconstructs the permutation, so resume re-dispatches the
+/// recorded uncovered ranges over the SAME index space.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoverageBlock {
+    /// Shuffle base seed; the epoch `e` permutation is `Rng::seed(seed + e)`.
+    pub seed: u64,
+    /// Batch size at save time (sanity-check on resume; the pool total is
+    /// already batch-aligned in [`EpochCoverage::total_samples`]).
+    pub batch_size: usize,
+    /// One entry per in-progress epoch pool at the snapshot.
+    pub per_epoch: Vec<EpochCoverage>,
+}
 
 /// ElChe trajectory snapshot for Cadence/Async resume.
 ///
@@ -97,6 +147,57 @@ pub struct ElCheState {
     pub trend_history: Option<Vec<f64>>,
 }
 
+/// Static structural schema of the model: the ordered parameter and buffer
+/// NAMES. Fixed at init — names, shapes, and order don't change across a run;
+/// only the weights move (and those we already ship every round as the
+/// averaging traffic). Captured once at launch from the model the factory
+/// builds.
+///
+/// This is the "static label" that lets a checkpoint writer holding only the
+/// moving consensus tensors (the averaging tier's ordered, name-less
+/// [`crate::distributed::controller::RoundFrame`]) reconstruct a NAMED,
+/// loadable `.fdl` via [`crate::nn::save_checkpoint_file`] — without routing
+/// the model through a training rank or shipping its structure every round.
+///
+/// **Order contract:** `param_names` is in [`crate::nn::Module::parameters`]
+/// order and `buffer_names` in [`crate::nn::Module::buffers`] order, which is
+/// exactly the order workers lay tensors into the averaging frame (params
+/// first, then buffers) in `GpuWorker::snapshot_params`. The writer pairs
+/// `param_names[i]`/`buffer_names[i]` with the consensus tensors positionally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSchema {
+    /// Parameter names, in `Module::parameters()` order.
+    pub param_names: Vec<String>,
+    /// Buffer names, in `Module::buffers()` order.
+    pub buffer_names: Vec<String>,
+}
+
+impl ModelSchema {
+    /// Capture the schema from a freshly-built model. Reads only names — no
+    /// weights, no device work — so it is safe to call on a CPU-built model
+    /// in the launcher process (no CUDA context touched).
+    pub fn from_module<M: crate::nn::Module + ?Sized>(model: &M) -> Self {
+        ModelSchema {
+            param_names: model
+                .parameters()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect(),
+            buffer_names: model
+                .buffers()
+                .iter()
+                .map(|b| b.name.clone())
+                .collect(),
+        }
+    }
+
+    /// Total tensor count (params + buffers); the length the consensus frame
+    /// must match for a positional pairing.
+    pub fn tensor_count(&self) -> usize {
+        self.param_names.len() + self.buffer_names.len()
+    }
+}
+
 /// Why the cluster wrote this checkpoint.
 ///
 /// Marked `#[non_exhaustive]` so adding variants is a non-breaking
@@ -120,6 +221,10 @@ pub enum SaveReason {
     /// coordinator saves state and shuts down instead of hanging
     /// silently.
     ReduceStall,
+    /// A mid-run checkpoint taken atomically at a reduce (training
+    /// continues). Distinguishes a resumable periodic/one-shot checkpoint
+    /// from the shutdown-driven save reasons above.
+    Checkpoint,
 }
 
 impl SaveReason {
@@ -134,6 +239,7 @@ impl SaveReason {
             SaveReason::SingleSurvivor => 2,
             SaveReason::AllRanksLost => 3,
             SaveReason::ReduceStall => 4,
+            SaveReason::Checkpoint => 5,
         }
     }
 
@@ -147,6 +253,7 @@ impl SaveReason {
             2 => Some(SaveReason::SingleSurvivor),
             3 => Some(SaveReason::AllRanksLost),
             4 => Some(SaveReason::ReduceStall),
+            5 => Some(SaveReason::Checkpoint),
             _ => None,
         }
     }
@@ -184,6 +291,13 @@ pub struct CheckpointMeta {
     /// deserialize via serde).
     #[serde(default)]
     pub elche_state: Option<ElCheState>,
+    /// Data-coverage snapshot for coverage-granular async resume. `None`
+    /// for saves taken outside a coherent reduce (the legacy forensic
+    /// `ShutdownWithSave` dump) and for v3 files (defaulted on deserialize).
+    /// `Some` when the checkpoint was taken atomically at a reduce so the
+    /// recorded coverage matches the saved consensus.
+    #[serde(default)]
+    pub coverage: Option<CoverageBlock>,
 }
 
 impl CheckpointMeta {
@@ -207,6 +321,7 @@ impl CheckpointMeta {
             world_size_at_save,
             save_reason,
             elche_state: None,
+            coverage: None,
         }
     }
 
@@ -214,6 +329,14 @@ impl CheckpointMeta {
     /// construction sites that have the ElChe trajectory available.
     pub fn with_elche_state(mut self, state: ElCheState) -> Self {
         self.elche_state = Some(state);
+        self
+    }
+
+    /// Attach a [`CoverageBlock`] snapshot. Builder-style; set only when the
+    /// checkpoint is taken atomically at a reduce (so coverage matches the
+    /// saved consensus).
+    pub fn with_coverage(mut self, coverage: CoverageBlock) -> Self {
+        self.coverage = Some(coverage);
         self
     }
 
@@ -553,6 +676,7 @@ mod tests {
             SaveReason::SingleSurvivor,
             SaveReason::AllRanksLost,
             SaveReason::ReduceStall,
+            SaveReason::Checkpoint,
         ] {
             let byte = r.to_u8();
             assert_eq!(SaveReason::from_u8(byte), Some(r));
@@ -751,6 +875,89 @@ mod tests {
         assert_eq!(config.start_global_step, 42_000);
         assert_eq!(config.start_avg_count, 201);
         assert_eq!(config.start_elche_state, Some(elche_state));
+    }
+
+    #[test]
+    fn v3_file_loads_with_coverage_defaulted_to_none() {
+        // v3 layout: elche_state present (with trend_history) but no
+        // `coverage`. Schema bump to v4 added it as #[serde(default)] so v3
+        // files still parse. Mirror of the v1→v2 and v2→v3 forward-compat
+        // cases above.
+        let dir = temp_dir("v3_forward_compat");
+        let path = dir.join("ckpt.meta.json");
+
+        let raw_json = r#"{
+            "schema_version": 3,
+            "epoch": 5,
+            "global_step": 10000,
+            "sync_round": 25,
+            "world_size_at_save": 2,
+            "save_reason": "graceful_shutdown",
+            "elche_state": {
+                "anchor": 8,
+                "anchor_rank": 0,
+                "smoothed_ms_per_batch": [3.0, 5.0],
+                "phase": "stable",
+                "calibration_count": 17,
+                "trend_history": [0.01, 0.02, 0.03]
+            }
+        }"#;
+        std::fs::write(&path, raw_json).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.schema_version, 3);
+        assert!(loaded.elche_state.is_some());
+        assert_eq!(loaded.coverage, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roundtrip_preserves_coverage() {
+        let dir = temp_dir("coverage_roundtrip");
+        let path = dir.join("ckpt.meta.json");
+
+        let coverage = CoverageBlock {
+            seed: 42,
+            batch_size: 32,
+            per_epoch: vec![
+                EpochCoverage {
+                    epoch: 7,
+                    total_samples: 1024,
+                    uncovered_ranges: vec![(320, 64), (640, 384)],
+                },
+                EpochCoverage {
+                    epoch: 8,
+                    total_samples: 1024,
+                    uncovered_ranges: vec![(0, 1024)],
+                },
+            ],
+        };
+        let meta = CheckpointMeta::new(7, 7500, 12, 3, SaveReason::GracefulShutdown)
+            .with_coverage(coverage.clone());
+        meta.write_to_file(&path).unwrap();
+
+        let loaded = CheckpointMeta::read_from_file(&path).unwrap();
+        assert_eq!(loaded.coverage, Some(coverage));
+        assert_eq!(loaded.schema_version, CHECKPOINT_META_SCHEMA_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_schema_from_module_captures_ordered_names() {
+        use crate::nn::Linear;
+        use crate::tensor::Device;
+        // CPU build (names only, no CUDA) — mirrors the launcher capture.
+        let lin = Linear::on_device(4, 2, Device::CPU).unwrap();
+        let schema = ModelSchema::from_module(&lin);
+        assert_eq!(
+            schema.param_names,
+            vec!["weight".to_string(), "bias".to_string()],
+            "Linear params in declaration order"
+        );
+        assert!(schema.buffer_names.is_empty(), "Linear has no buffers");
+        assert_eq!(schema.tensor_count(), 2);
     }
 
     #[test]
