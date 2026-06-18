@@ -192,6 +192,18 @@ pub struct ElCheConfig {
     /// streaming bound). `None` = auto-tuned from convergence feedback.
     /// The async-strategy lookahead knob; ignored outside CpuAsync.
     pub max_overshoot: Option<usize>,
+    /// Consensus allocation-weighting exponent: rank `k` is weighted
+    /// `nₖ^γ` in the work-weighted average (`nₖ` = batches processed this
+    /// window). `γ = 1.0` (default) is plain work-weighting (more data =
+    /// proportionally more weight); `γ = 0.0` is an unweighted average
+    /// (each rank equal regardless of steps); `γ = −1.0` equalizes
+    /// per-step trust. A single knob sweeping data-volume ↔ per-step
+    /// fairness, primarily a diagnostic for the source of the
+    /// heterogeneous-cadence regularization effect. Honored on the CPU
+    /// averaging backend; the builder loud-errors if set away from `1.0`
+    /// on an NCCL backend (not yet wired there). Idle ranks (`nₖ = 0`)
+    /// contribute zero weight for any `γ`.
+    pub gamma: f64,
 }
 
 impl ElCheConfig {
@@ -261,6 +273,9 @@ impl ElCheConfig {
             divergence_threshold: None,
             no_divergence_guard: false,
             max_overshoot: None,
+            // Plain work-weighting (nₖ¹): the production default, byte-identical
+            // to pre-gamma behavior.
+            gamma: 1.0,
         }
     }
 
@@ -300,6 +315,10 @@ impl ElCheConfig {
     pub fn no_divergence_guard(mut self) -> Self { self.no_divergence_guard = true; self }
     /// Set the CpuAsync streaming lookahead bound (max batches past the planned sync).
     pub fn max_overshoot(mut self, n: usize) -> Self { self.max_overshoot = Some(n); self }
+    /// Set the consensus allocation-weighting exponent `γ` (see [`Self::gamma`]).
+    /// `1.0` = plain work-weighting (default), `0.0` = unweighted average,
+    /// `−1.0` = per-step-equal. CPU backend only.
+    pub fn gamma(mut self, g: f64) -> Self { self.gamma = g; self }
 }
 
 impl Default for ElCheConfig {
@@ -333,6 +352,7 @@ impl std::fmt::Debug for ElCheConfig {
             .field("divergence_threshold", &self.divergence_threshold)
             .field("no_divergence_guard", &self.no_divergence_guard)
             .field("max_overshoot", &self.max_overshoot)
+            .field("gamma", &self.gamma)
             .finish()
     }
 }

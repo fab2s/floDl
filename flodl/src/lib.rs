@@ -96,7 +96,7 @@ pub use distributed::{
     ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker,
     ElCheConfig, ElCheMode, TrainerConfig,
     ClusterBuilder, HostBuilder,
-    OuterAvg, OuterOptimizer,
+    OuterAvg, OuterOptimizer, SlowMomentum,
 };
 pub use graph::{
     FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,

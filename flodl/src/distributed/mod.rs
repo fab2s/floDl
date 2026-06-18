@@ -51,7 +51,7 @@ pub use checkpoint_forge::load_consensus_checkpoint;
 pub use cluster::{WorkerBlock, LocalCluster};
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;
-pub use outer_optimizer::{OuterAvg, OuterOptimizer};
+pub use outer_optimizer::{OuterAvg, OuterOptimizer, SlowMomentum};
 pub use cuda_event::{CudaEvent, CudaEventFlags};
 pub use dashboard_sink::{ClusterDashboardSink, DashboardSink};
 pub use cuda_stream::{CudaStream, StreamGuard};

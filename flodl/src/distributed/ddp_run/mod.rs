@@ -1303,6 +1303,11 @@ pub struct WorkerConfig {
     /// blends `W_local := (1-α)·W_local + α·W_avg` instead. See
     /// [`crate::distributed::ElCheConfig::easgd_alpha`] for details.
     pub easgd_alpha: Option<f64>,
+    /// Consensus allocation-weighting exponent `γ`: rank weighted `nₖ^γ` in
+    /// the CPU work-weighted average. `1.0` (default) = plain work-weighting,
+    /// byte-identical to pre-gamma behavior. See
+    /// [`crate::distributed::ElCheConfig::gamma`].
+    pub gamma: f64,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
     /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:

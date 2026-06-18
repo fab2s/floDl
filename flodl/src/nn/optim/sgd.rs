@@ -166,6 +166,15 @@ impl Optimizer for SGD {
         })
     }
 
+    fn reset_state(&mut self) {
+        // Momentum velocity buffers back to fresh (lazily re-allocated on the
+        // next step, as at construction). Length preserved so the per-param
+        // indexing stays valid.
+        for slot in &mut self.velocity {
+            *slot = None;
+        }
+    }
+
     fn zero_grad(&self) {
         for param in &self.params {
             param.zero_grad_set_to_none();

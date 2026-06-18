@@ -650,6 +650,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // (NCCL-only worker layout — the inner never emits ParamSnapshot
         // in that mode either, so the receiver simply idles).
         let rank_for_bridge = rank_id as u64;
+        let gamma_for_bridge = config.gamma;
         bridges.push(
             thread::Builder::new()
                 .name(format!("flodl-worker-param-bridge:r{rank_out}"))
@@ -660,6 +661,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         cpu_client,
                         control_tx_for_param_bridge,
                         timing_tx_for_param_bridge,
+                        gamma_for_bridge,
                     );
                 })
                 .map_err(|e| {
@@ -1597,6 +1599,7 @@ fn param_bridge_loop(
     cpu_client: Option<crate::distributed::cpu_reduce::CpuReduceClient>,
     control_tx: mpsc::Sender<ControlMsg>,
     timing_tx: mpsc::Sender<TimingMsg>,
+    gamma: f64,
 ) {
     use crate::distributed::ddp_run::{AveragedParams, ParamSnapshot};
     let Some(mut client) = cpu_client else {
@@ -1710,10 +1713,19 @@ fn param_bridge_loop(
         // buffers unchanged. Every rank sees the same gathered `total_n ==
         // 0`, so the skip is collective-consistent (no rank left waiting in
         // an all_reduce its peers did not call).
+        // Gamma allocation-weighting: rank k is weighted nₖ^γ (γ=1.0 = plain
+        // work-weighting, byte-identical to pre-gamma; γ<1 compresses the
+        // fast/over-allocated rank's dominance, γ=0 = unweighted average,
+        // γ<0 = per-step-equal). Idle ranks (nₖ=0) contribute zero weight for
+        // any γ. The normalizer Σ nₖ^γ is computed locally from the
+        // all-gathered `counts` vector (every rank holds it after the
+        // count-reduce), so no extra communication. Only the params consensus
+        // is gamma-weighted; buffers stay equal-weighted among movers.
+        let (my_w, w_sum) = gamma_weights(n_i as f64, &counts, gamma);
         let avg_params = if total_n == 0.0 {
             params.clone()
         } else {
-            match sumcount_reduce(&mut client, &params, n_i as f64, total_n) {
+            match sumcount_reduce(&mut client, &params, my_w, w_sum) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -1805,6 +1817,64 @@ fn param_bridge_loop(
 /// one `(Σ w·T, Σ w)` pair and the root still divides exactly once — no
 /// averaging-of-averages. A zero-weight rank contributes a zeroed tensor
 /// but still joins the collective, so the cohort never stalls.
+/// Gamma allocation-weighting: this rank's consensus weight `nᵢ^γ` and the
+/// cohort normalizer `Σ nₖ^γ` over movers.
+///
+/// `n_i` is this rank's batch count this window; `counts` is the all-gathered
+/// per-rank count vector (so the normalizer needs no extra communication).
+/// Idle ranks (`nₖ = 0`) contribute zero weight for any `γ` (and `0^γ` is
+/// never evaluated). At `γ = 1.0` this is `(nᵢ, Σnₖ)` — plain work-weighting,
+/// byte-identical to pre-gamma behavior.
+fn gamma_weights(n_i: f64, counts: &[f64], gamma: f64) -> (f64, f64) {
+    let my_w = if n_i > 0.0 { n_i.powf(gamma) } else { 0.0 };
+    let w_sum: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0.0)
+        .map(|&c| c.powf(gamma))
+        .sum();
+    (my_w, w_sum)
+}
+
+#[cfg(test)]
+mod gamma_tests {
+    use super::gamma_weights;
+
+    #[test]
+    fn gamma_one_is_plain_work_weighting() {
+        // γ=1: weight = nᵢ, normalizer = Σnₖ (idle excluded). Byte-identical
+        // to the pre-gamma path.
+        let counts = [2.0, 4.0, 0.0]; // rank 2 idle
+        let (w, s) = gamma_weights(4.0, &counts, 1.0);
+        assert_eq!(w, 4.0);
+        assert_eq!(s, 6.0); // 2 + 4, idle 0 excluded
+    }
+
+    #[test]
+    fn gamma_zero_is_unweighted_average() {
+        // γ=0: every mover weight 1, normalizer = mover count.
+        let counts = [2.0, 4.0];
+        let (w, s) = gamma_weights(4.0, &counts, 0.0);
+        assert_eq!(w, 1.0);
+        assert_eq!(s, 2.0);
+    }
+
+    #[test]
+    fn gamma_negative_one_is_per_step_equal() {
+        // γ=-1: weight = 1/nᵢ, normalizer = Σ 1/nₖ.
+        let counts = [2.0, 4.0];
+        let (w, s) = gamma_weights(4.0, &counts, -1.0);
+        assert!((w - 0.25).abs() < 1e-12);
+        assert!((s - 0.75).abs() < 1e-12); // 0.5 + 0.25
+    }
+
+    #[test]
+    fn idle_rank_gets_zero_weight() {
+        let counts = [2.0, 4.0, 0.0];
+        let (w, _) = gamma_weights(0.0, &counts, 0.5);
+        assert_eq!(w, 0.0);
+    }
+}
+
 fn sumcount_reduce(
     client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
     tensors: &[Tensor],

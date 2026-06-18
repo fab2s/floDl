@@ -128,6 +128,22 @@ impl Default for GuardChoice {
     }
 }
 
+/// Outer-optimizer selection. Materialised by the harness into a
+/// `flodl::distributed::OuterOptimizer` factory passed to
+/// `DdpBuilder::outer_optimizer`. Default `None` reproduces today's plain
+/// weighted averaging (`OuterAvg`). Honored on the CPU backend (the
+/// consensus is forged controller-side there); the NCCL per-rank site is a
+/// follow-on.
+#[derive(Debug, Clone, Default)]
+pub enum OuterOptChoice {
+    /// No outer optimizer: plain weighted averaging (`OuterAvg`).
+    #[default]
+    None,
+    /// SlowMo heavy-ball slow momentum on the pseudo-gradient
+    /// `g = prev_global - consensus`.
+    SlowMomentum { lr: f64, mu: f64 },
+}
+
 /// Runtime configuration for a single benchmark run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -214,4 +230,10 @@ pub struct RunConfig {
     /// the cohort reaches this epoch. Pairs with `save_path`. Progressive
     /// (cadence/async) cluster modes only.
     pub checkpoint_at_epoch: Option<usize>,
+    /// Outer optimizer applied to the consensus between reduce and broadcast
+    /// (SlowMo / DiLoCo A/B arm). Default `None` = plain weighted averaging.
+    pub outer_optimizer: OuterOptChoice,
+    /// Consensus allocation-weighting exponent `γ` (rank weighted `nₖ^γ`).
+    /// `1.0` = plain work-weighting (default). CPU backend only.
+    pub gamma: f64,
 }

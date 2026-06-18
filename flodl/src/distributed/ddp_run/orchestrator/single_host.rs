@@ -100,6 +100,9 @@ impl DdpHandle {
             // path, so EASGD alpha is irrelevant here. None keeps the
             // current-behavior copy_ path in case the code path changes.
             easgd_alpha: None,
+            // Single-GPU fallback does no averaging; gamma is irrelevant. 1.0
+            // (plain work-weighting) is the neutral default.
+            gamma: 1.0,
             timeline: None,
             policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
             save_path: None,

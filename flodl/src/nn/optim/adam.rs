@@ -125,6 +125,18 @@ impl Optimizer for Adam {
         self.adam_update(0.0)
     }
 
+    fn reset_state(&mut self) {
+        // First + second moment estimates back to fresh, step counter to 0
+        // (bias correction restarts). Lengths preserved for per-param indexing.
+        for slot in &mut self.m {
+            *slot = None;
+        }
+        for slot in &mut self.v {
+            *slot = None;
+        }
+        self.t = 0;
+    }
+
     fn zero_grad(&self) {
         for param in &self.params {
             param.zero_grad_set_to_none();
@@ -343,6 +355,10 @@ impl Optimizer for AdamW {
         self.adam.adam_update(self.weight_decay)
     }
 
+    fn reset_state(&mut self) {
+        self.adam.reset_state()
+    }
+
     fn zero_grad(&self) {
         self.adam.zero_grad()
     }
@@ -396,6 +412,64 @@ mod tests {
         opt.step().unwrap();
         let after = p.variable.data().to_f32_vec().unwrap();
         assert_ne!(before, after, "params should change after step");
+    }
+
+    #[test]
+    fn test_reset_state_matches_fresh_optimizer() {
+        // After warming an optimizer (advancing `t`, filling `m`/`v`),
+        // `reset_state` must make its next step identical to a freshly
+        // constructed optimizer over the same parameter values — i.e. the
+        // moment estimates and step counter are genuinely wiped (the DiLoCo
+        // disposable-inner property).
+        let dev = crate::tensor::test_device();
+        let init = [0.5f32, -0.3, 0.8, 0.2, -0.1, 0.4];
+        let shape = [3i64, 2];
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], dev).unwrap();
+        // Grad of sum(x · p) wrt p is independent of p's values, so two params
+        // at the same values get identical grads from this expression.
+        let loss_of = |p: &crate::nn::Parameter| {
+            Variable::new(x.clone(), false)
+                .matmul(&p.variable)
+                .unwrap()
+                .sum()
+                .unwrap()
+        };
+
+        let p_warm = crate::nn::Parameter::new(
+            Tensor::from_f32(&init, &shape, dev).unwrap(),
+            "w",
+        );
+        let mut opt_warm = Adam::new(std::slice::from_ref(&p_warm), 0.01);
+        for _ in 0..5 {
+            loss_of(&p_warm).backward().unwrap();
+            opt_warm.step().unwrap();
+            opt_warm.zero_grad();
+        }
+
+        // A truly fresh optimizer over a param at the SAME (warmed) values.
+        let warmed = p_warm.variable.data().to_f32_vec().unwrap();
+        let p_fresh = crate::nn::Parameter::new(
+            Tensor::from_f32(&warmed, &shape, dev).unwrap(),
+            "w",
+        );
+        let mut opt_fresh = Adam::new(std::slice::from_ref(&p_fresh), 0.01);
+
+        opt_warm.reset_state();
+
+        loss_of(&p_warm).backward().unwrap();
+        opt_warm.step().unwrap();
+        loss_of(&p_fresh).backward().unwrap();
+        opt_fresh.step().unwrap();
+
+        let after_reset = p_warm.variable.data().to_f32_vec().unwrap();
+        let after_fresh = p_fresh.variable.data().to_f32_vec().unwrap();
+        for (i, (a, b)) in after_reset.iter().zip(&after_fresh).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "param[{i}]: reset-then-step {a} != fresh {b} \
+                 (reset_state must wipe m/v and the step counter)"
+            );
+        }
     }
 
     #[test]

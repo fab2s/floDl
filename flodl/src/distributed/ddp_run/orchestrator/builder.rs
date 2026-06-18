@@ -290,6 +290,16 @@ where
         self
     }
 
+    /// Set the consensus allocation-weighting exponent `γ`: rank `k` is
+    /// weighted `nₖ^γ` in the work-weighted average. `1.0` (default) is plain
+    /// work-weighting, `0.0` an unweighted average, `−1.0` per-step-equal.
+    /// CPU averaging backend only (the builder errors at `.run()` if set away
+    /// from `1.0` on NCCL). See [`crate::distributed::ElCheConfig::gamma`].
+    pub fn gamma(mut self, g: f64) -> Self {
+        self.config.elche.gamma = g;
+        self
+    }
+
     /// Enable the LR-aware meta-controller above ElChe. Default: `true`.
     ///
     /// When enabled, the coordinator constructs a
@@ -711,6 +721,24 @@ where
                     "DdpBuilder: easgd_alpha must be in (0, 1], got {alpha}"
                 )));
             }
+        }
+        // gamma: the consensus allocation-weighting exponent must be finite,
+        // and is currently wired only on the CPU averaging backend (the
+        // controller-forged consensus path). Loud-error rather than silently
+        // ignore a non-default gamma on NCCL, where the weighting site
+        // (in-place AllReduce) is not yet gamma-aware.
+        let gamma = self.config.elche.gamma;
+        if !gamma.is_finite() {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "DdpBuilder: gamma must be finite, got {gamma}"
+            )));
+        }
+        if gamma != 1.0 && self.backend == AverageBackend::Nccl {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "DdpBuilder: gamma ({gamma}) is currently supported only on the \
+                 CPU averaging backend; the NCCL path is not yet gamma-aware. \
+                 Use a cpu-* mode, or leave gamma at 1.0 (plain work-weighting)."
+            )));
         }
 
         // Reconcile the canonical strategy mode with the builder's

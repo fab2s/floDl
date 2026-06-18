@@ -95,6 +95,18 @@ impl Optimizer for RAdam {
         })
     }
 
+    fn reset_state(&mut self) {
+        // Moment estimates back to fresh, step counter to 0 (rectification
+        // schedule restarts). Lengths preserved for per-param indexing.
+        for slot in &mut self.m {
+            *slot = None;
+        }
+        for slot in &mut self.v {
+            *slot = None;
+        }
+        self.step_count = 0;
+    }
+
     fn zero_grad(&self) {
         for p in &self.params { p.zero_grad_set_to_none(); }
     }

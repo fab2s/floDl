@@ -188,6 +188,17 @@ impl Optimizer for RMSprop {
         })
     }
 
+    fn reset_state(&mut self) {
+        // Squared-grad running average + momentum buffer back to fresh.
+        // Lengths preserved for per-param indexing.
+        for slot in &mut self.v {
+            *slot = None;
+        }
+        for slot in &mut self.buf {
+            *slot = None;
+        }
+    }
+
     fn zero_grad(&self) {
         for param in &self.params {
             param.zero_grad_set_to_none();

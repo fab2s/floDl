@@ -107,6 +107,75 @@ impl OuterOptimizer for OuterAvg {
     }
 }
 
+/// SlowMo outer optimizer: heavy-ball slow momentum on the pseudo-gradient.
+///
+/// Each window the outer (pseudo) gradient is `g = prev_global - consensus`
+/// (the drift the inner steps produced, in the averaged-consensus form);
+/// the slow momentum accumulates it and the global takes a momentum-SGD
+/// step:
+///
+/// ```text
+/// g = prev_global - consensus
+/// v = mu * v + g            (slow momentum, persisted across windows)
+/// new_global = prev_global - lr * v
+/// ```
+///
+/// The inner optimizer runs **continuously** (no reset between windows), so
+/// SlowMo needs no worker-side change — it is purely a transform on the
+/// consensus at the outer tier. (DiLoCo's Nesterov variant instead applies
+/// `new = prev - lr * (mu*v + g)` and resets the inner optimizer each round;
+/// see [`OuterOptimizer`].)
+///
+/// On the first window the driver passes `prev_global == consensus`, so
+/// `g = 0`, the momentum seeds at zero, and the step is a no-op — matching
+/// [`OuterAvg`] for that window.
+pub struct SlowMomentum {
+    /// Outer (slow) learning rate.
+    lr: f64,
+    /// Outer (slow) momentum coefficient.
+    mu: f64,
+    /// Per-parameter slow-momentum buffer, persisted across windows. Empty
+    /// until the first step (then sized to the parameter count).
+    velocity: Vec<Tensor>,
+}
+
+impl SlowMomentum {
+    /// New SlowMo outer optimizer with slow learning rate `lr` and slow
+    /// momentum `mu`. Typical SlowMo settings are `lr ≈ 1.0`, `mu ≈ 0.9`.
+    pub fn new(lr: f64, mu: f64) -> Self {
+        SlowMomentum { lr, mu, velocity: Vec::new() }
+    }
+}
+
+impl OuterOptimizer for SlowMomentum {
+    fn outer_step(
+        &mut self,
+        prev_global: &[Tensor],
+        consensus: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let n = consensus.len();
+        // A parameter-count change (only on a fresh / mismatched buffer)
+        // restarts the momentum from zero. `mu * 0 + g == g`, so the first
+        // step just uses `g` directly.
+        let fresh = self.velocity.len() != n;
+        let mut new_global = Vec::with_capacity(n);
+        let mut new_velocity = Vec::with_capacity(n);
+        for i in 0..n {
+            let g = prev_global[i].sub(&consensus[i])?;
+            let v = if fresh {
+                g
+            } else {
+                self.velocity[i].mul_scalar(self.mu)?.add(&g)?
+            };
+            let step = v.mul_scalar(self.lr)?;
+            new_global.push(prev_global[i].sub(&step)?);
+            new_velocity.push(v);
+        }
+        self.velocity = new_velocity;
+        Ok(new_global)
+    }
+}
+
 /// Controller-side driver that applies an [`OuterOptimizer`] to the CPU
 /// reduce stream, keeping `controller.rs` a model-agnostic byte reducer
 /// (the same separation the consensus forge keeps).
@@ -244,6 +313,68 @@ mod tests {
         stepper.process_frame(control_frame).unwrap();
         let p_out2 = stepper.process_frame(params_frame.clone()).unwrap();
         assert_eq!(p_out2, params_frame, "params still byte-identical second window");
+    }
+
+    #[test]
+    fn slow_momentum_heavy_ball_math() {
+        // lr=0.5, mu=0.9. Drive prev/consensus by hand, mimicking the driver
+        // (prev = last new_global).
+        let mut opt = SlowMomentum::new(0.5, 0.9);
+
+        // First window: prev == consensus -> g=0 -> no-op, momentum seeded 0.
+        let w1 = opt
+            .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])])
+            .unwrap();
+        assert_eq!(w1[0].to_f32_vec().unwrap(), vec![1.0, 2.0]);
+
+        // Window 2: g=[0.5,1.0], v=[0.5,1.0], step=lr*v=[0.25,0.5],
+        // new = prev - step = [0.75, 1.5].
+        let w2 = opt
+            .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
+            .unwrap();
+        let w2v = w2[0].to_f32_vec().unwrap();
+        assert!((w2v[0] - 0.75).abs() < 1e-6 && (w2v[1] - 1.5).abs() < 1e-6, "got {w2v:?}");
+
+        // Window 3: g=[0.05,0.1], v=0.9*[0.5,1.0]+g=[0.5,1.0],
+        // step=[0.25,0.5], new=[0.75,1.5]-step=[0.5,1.0]. Confirms momentum
+        // carried across windows (the 0.9*v term).
+        let w3 = opt
+            .outer_step(&[t(&[0.75, 1.5], &[2])], &[t(&[0.7, 1.4], &[2])])
+            .unwrap();
+        let w3v = w3[0].to_f32_vec().unwrap();
+        assert!((w3v[0] - 0.5).abs() < 1e-6 && (w3v[1] - 1.0).abs() < 1e-6, "got {w3v:?}");
+    }
+
+    #[test]
+    fn stepper_slow_momentum_steps_params_only() {
+        // Through the driver: parameters are stepped, buffers pass through.
+        let mut control = tensors_to_round_frame(&[&t(&[0.0], &[1])]).unwrap();
+        control.kind = RoundKind::Control;
+        let buffers = tensors_to_round_frame(&[&t(&[9.0, 8.0], &[2])]).unwrap();
+
+        let mut stepper = OuterStepper::new(Box::new(SlowMomentum::new(0.5, 0.9)));
+
+        // Window 1: params1=[2,4] (prev==consensus first window -> unchanged),
+        // buffers untouched.
+        stepper.process_frame(control.clone()).unwrap();
+        let p1 = tensors_to_round_frame(&[&t(&[2.0, 4.0], &[2])]).unwrap();
+        let p1_out = stepper.process_frame(p1.clone()).unwrap();
+        assert_eq!(p1_out, p1, "first-window params unchanged (g=0)");
+        let b1_out = stepper.process_frame(buffers.clone()).unwrap();
+        assert_eq!(b1_out, buffers, "buffers pass through");
+
+        // Window 2: consensus=[1,2], prev=[2,4]. g=[1,2], v=[1,2],
+        // step=0.5*[1,2]=[0.5,1], new=[1.5,3]. Buffers still pass through.
+        stepper.process_frame(control).unwrap();
+        let p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])]).unwrap();
+        let p2_out = stepper.process_frame(p2).unwrap();
+        let stepped = round_frame_to_tensors(&p2_out).unwrap()[0].to_f32_vec().unwrap();
+        assert!(
+            (stepped[0] - 1.5).abs() < 1e-6 && (stepped[1] - 3.0).abs() < 1e-6,
+            "second-window params stepped: got {stepped:?}"
+        );
+        let b2_out = stepper.process_frame(buffers.clone()).unwrap();
+        assert_eq!(b2_out, buffers, "buffers still pass through after a real step");
     }
 
     #[test]

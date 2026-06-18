@@ -105,6 +105,15 @@ impl Optimizer for Adagrad {
         })
     }
 
+    fn reset_state(&mut self) {
+        // Accumulated squared-grad sums back to fresh, step counter to 0
+        // (lr_decay schedule restarts). Length preserved for per-param indexing.
+        for slot in &mut self.state_sum {
+            *slot = None;
+        }
+        self.step_count = 0;
+    }
+
     fn zero_grad(&self) {
         for p in &self.params { p.zero_grad_set_to_none(); }
     }

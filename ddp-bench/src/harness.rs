@@ -683,6 +683,23 @@ fn run_unified(
         builder = builder.resume_from(stem.clone());
     }
 
+    // Outer optimizer at the consensus tier (SlowMo / DiLoCo A/B arm).
+    // `None` leaves today's plain weighted averaging (OuterAvg); a variant
+    // is instantiated once per site by the framework (controller on CPU).
+    // Honored on the CPU backend (the consensus is forged controller-side).
+    match config.outer_optimizer {
+        crate::config::OuterOptChoice::None => {}
+        crate::config::OuterOptChoice::SlowMomentum { lr, mu } => {
+            builder = builder
+                .outer_optimizer(move || Box::new(flodl::distributed::SlowMomentum::new(lr, mu)));
+        }
+    }
+
+    // Consensus allocation-weighting exponent. Default 1.0 (plain
+    // work-weighting) is a no-op; the builder loud-errors at `.run()` if a
+    // non-default gamma is paired with an NCCL backend.
+    builder = builder.gamma(config.gamma);
+
     // Heterogeneous topology: explicit per-rank shares disable the uniform
     // default. Without this, the fast GPU idles waiting for the slow ones at
     // every sync barrier (the publication-arc anti-pattern).

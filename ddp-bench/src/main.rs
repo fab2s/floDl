@@ -167,6 +167,30 @@ struct Cli {
     #[option]
     max_overshoot: Option<usize>,
 
+    /// Outer optimizer applied to the consensus between reduce and
+    /// broadcast: `none` (default, plain weighted averaging) or `slowmo`
+    /// (heavy-ball slow momentum on the pseudo-gradient). The A/B lever for
+    /// the SlowMo / DiLoCo arc. Honored on the CPU backend (the consensus is
+    /// forged controller-side); pair with `--outer-lr` / `--outer-mu`.
+    #[option]
+    outer_optimizer: Option<String>,
+
+    /// Outer (slow) learning rate for `--outer-optimizer slowmo`. Default 1.0.
+    #[option]
+    outer_lr: Option<f64>,
+
+    /// Outer (slow) momentum for `--outer-optimizer slowmo`. Default 0.9.
+    #[option]
+    outer_mu: Option<f64>,
+
+    /// Consensus allocation-weighting exponent `γ`: rank weighted `nₖ^γ` in
+    /// the work-weighted average. `1.0` (default) = plain work-weighting,
+    /// `0.0` = unweighted average, `−1.0` = per-step-equal. The diagnostic
+    /// for the source of the heterogeneous-cadence regularization effect.
+    /// CPU averaging backend only (errors on nccl-* modes when ≠ 1.0).
+    #[option]
+    gamma: Option<f64>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -411,6 +435,46 @@ fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::G
     }
 }
 
+/// Validate the `--outer-optimizer*` flag bundle and return an
+/// [`OuterOptChoice`](crate::config::OuterOptChoice) the harness materializes
+/// into a `flodl` `OuterOptimizer` factory.
+///
+/// Loud-error policy (matching `--guard`): outer-optimizer-specific flags
+/// that don't apply to the selected variant exit with a clear message.
+/// Default is `none` (plain weighted averaging).
+fn validate_outer_optimizer_selection(
+    cli: &Cli,
+) -> flodl::tensor::Result<crate::config::OuterOptChoice> {
+    use crate::config::OuterOptChoice;
+    let kind = cli
+        .outer_optimizer
+        .as_deref()
+        .unwrap_or("none")
+        .trim()
+        .to_lowercase();
+    let only_slowmo = |name: &str, present: bool| -> flodl::tensor::Result<()> {
+        if present && kind != "slowmo" {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "--{name} is only valid with --outer-optimizer slowmo \
+                 (current: --outer-optimizer {kind})",
+            )));
+        }
+        Ok(())
+    };
+    only_slowmo("outer-lr", cli.outer_lr.is_some())?;
+    only_slowmo("outer-mu", cli.outer_mu.is_some())?;
+    match kind.as_str() {
+        "none" => Ok(OuterOptChoice::None),
+        "slowmo" => Ok(OuterOptChoice::SlowMomentum {
+            lr: cli.outer_lr.unwrap_or(1.0),
+            mu: cli.outer_mu.unwrap_or(0.9),
+        }),
+        other => Err(flodl::tensor::TensorError::new(&format!(
+            "unknown --outer-optimizer '{other}' (expected: none, slowmo)",
+        ))),
+    }
+}
+
 /// Resolve `--gpus` to a `CUDA_VISIBLE_DEVICES` value and set it before
 /// libtorch sees any device. `"all"` is a no-op (lets the host env or
 /// physical hardware decide).
@@ -475,6 +539,7 @@ fn run() -> flodl::tensor::Result<()> {
     // Loud errors when guard-specific flags don't match the chosen guard
     // (the `--guard <name>` selector is the source of truth).
     let guard_choice = validate_guard_selection(&cli)?;
+    let outer_opt_choice = validate_outer_optimizer_selection(&cli)?;
 
     // Map parsed fields to the variable names the rest of this function
     // already uses. Thin bridge keeps the business logic bit-for-bit
@@ -730,6 +795,8 @@ fn run() -> flodl::tensor::Result<()> {
                 save_path: cli.save_path.clone(),
                 resume_from: cli.resume_from.clone(),
                 checkpoint_at_epoch: cli.checkpoint_at_epoch,
+                outer_optimizer: outer_opt_choice.clone(),
+                gamma: cli.gamma.unwrap_or(1.0),
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

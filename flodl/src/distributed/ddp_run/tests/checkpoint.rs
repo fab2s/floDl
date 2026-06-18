@@ -231,6 +231,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         seed: 42,
         max_grad_norm: None,
         easgd_alpha: None,
+        gamma: 1.0,
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: Some(stem_str.clone()),

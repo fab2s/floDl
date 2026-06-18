@@ -780,6 +780,7 @@ impl DdpHandle {
                 seed,
                 max_grad_norm,
                 easgd_alpha: config.elche.easgd_alpha,
+                gamma: config.elche.gamma,
                 timeline: worker_tl,
                 policy,
                 save_path: None,

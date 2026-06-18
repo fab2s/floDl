@@ -409,6 +409,7 @@ impl DdpHandle {
                 )?,
                 max_grad_norm,
                 easgd_alpha,
+                gamma: config.elche.gamma,
                 timeline: timeline_for_thread,
                 policy,
                 save_path: save_path_for_thread,

@@ -42,6 +42,20 @@ pub trait Optimizer {
     fn scale_lr(&mut self, factor: f64) {
         self.set_lr(self.lr() * factor);
     }
+    /// Reset all internal optimizer state — momentum / velocity buffers and
+    /// step counters — to the fresh, pre-training values, as if the
+    /// optimizer were just constructed over the same parameters. Learning
+    /// rate and hyperparameters (betas, weight decay, etc.) are unchanged,
+    /// and the parameter set is untouched.
+    ///
+    /// Used by the DiLoCo outer-optimizer regime: each round the worker
+    /// adopts the new global by full overwrite and discards its inner
+    /// optimizer state (the inner optimizer is disposable, so resume is
+    /// faithful from the canonical *outer* momentum). The default is a
+    /// no-op — stateless optimizers need no override; every stateful
+    /// flodl optimizer overrides it to clear its buffers and counters.
+    fn reset_state(&mut self) {}
+
     /// Persist optimizer state (LR + momentum buffers + step counters)
     /// to `path`. Object-safe wrapper around [`Stateful::save_state_file`]
     /// — necessary because `Stateful::save_state` is generic in `W: Write`
