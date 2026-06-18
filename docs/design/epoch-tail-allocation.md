@@ -294,25 +294,162 @@ never whole epochs. So the smear width is **not** a checkpoint-correctness
 concern; it is purely a training-dynamics concern (averaging too-divergent
 models), already owned by `max_overshoot` and the convergence guard.
 
-### No optimizer momentum in the checkpoint
+### No optimizer momentum in the checkpoint (today), and the outer-optimizer arc
 
 The cluster path param-averages (Local-SGD / EASGD): each rank's optimizer
 momentum accumulates on its own local gradients and is **never synced**, so it
-diverges per-rank. Unlike gradient-averaging DDP — where the optimizer state
-stays bit-identical across ranks and any one rank's is canonical — there is no
+diverges per-rank. Unlike gradient-averaging DDP (where the optimizer state
+stays bit-identical across ranks and any one rank's is canonical), there is no
 canonical single-rank momentum to save. The checkpoint therefore stores the
 **consensus model only**, and resume **re-warms the inner optimizer from
-fresh**. This is defensible: at a sync the per-rank momentum is already stale
-relative to the just-averaged weights, and the warm-up is short and sub-noise
-over a real run. It also keeps the checkpoint topology-independent (no per-rank
-`.optim`).
+fresh**. This keeps the checkpoint topology-independent (no per-rank `.optim`).
 
-The principled way to gain a *canonical* optimizer state is an **outer
-optimizer** at the same tier as the convergence guard — SlowMo's slow momentum
-or DiLoCo's outer Nesterov over inner local steps. That is a separate
-optimization-method track (it changes training, not just checkpointing); if it
-lands, the checkpoint gains a canonical global optimizer state as a byproduct.
-Parked for now.
+**Rig finding (2026-06-18) revises the cost.** The earlier claim, that the
+fresh-inner warm-up is "short and sub-noise," does **not** hold in the resume
+regime. Resuming a partly-converged run (lenet, checkpoint at epoch 3/8, train
+loss already ~0.05), fresh Adam near the optimum mis-scales: with tiny
+gradients `m/sqrt(v)` approaches `sign(g)`, so each step moves about `lr`
+regardless of gradient magnitude, and cpu-async takes *hundreds* of local steps
+per window (one rank ran 611) before consensus pulls it back. The result was a
+sustained ~1e10 local training loss, masked from eval (0.9857) only because the
+work-weighted consensus stayed near the loaded optimum. So fresh-inner resume
+is not benign for a checkpoint of a model already in training, which is the
+normal case. **Caveat:** the tiny-model, near-convergence regime almost
+certainly *amplifies* this (gradients are smallest exactly there). Severity on a
+real workload is unknown, so the first step of this arc is to **re-measure** it.
+
+This reclassifies the **outer optimizer** from "parked nice-to-have" to the
+principled fix: a *canonical global* optimizer state that survives a resume by
+construction, and a known convergence lever (it was already on the convergence
+bucket list). It is an **optimization-method track**: it changes training, not
+only checkpointing, so it ships **opt-in** behind one selector, defaulting to
+today's exact behavior, so all three regimes A/B on the same harness.
+
+#### Step 0: re-measure the resume cost on a real model
+
+Before building, quantify what we are fixing. Run resnet (`--depth-n`) at a real
+epoch count, checkpoint mid-run, resume, and measure post-resume train-loss
+continuity (not just eval). If the spike is tiny-model-only and a real run's
+warm-up is genuinely sub-noise, the soft fix (SlowMo) suffices for resume and
+DiLoCo is wanted for convergence alone; if the spike persists, DiLoCo's strict
+fix earns its keep on the resume axis too. The design below supports both; this
+measurement sets how hard we lean on each.
+
+#### Pluggable `OuterOptimizer` at the guard tier
+
+The outer step lives at the **same tier as the convergence guard**: the
+controller's reduce, between the work-weighted average and the scatter back to
+ranks (exactly where the [consensus forge](#async) already taps). It transforms
+the averaged consensus into the new global before broadcast.
+
+- **Trait (averaged-consensus form):**
+  `outer_step(prev_global, work_weighted_consensus) -> new_global`, momentum
+  held internally. It consumes the consensus the reduce *already* produces (the
+  sum-and-count weighted average), **not** per-worker deltas: the outer gradient
+  `g = prev_global - consensus` equals `mean_k(prev_global - theta_k)` under
+  that weighting, so no per-rank state is needed at the controller and the step
+  composes with the relay's per-host fold.
+- **Variants:** `OuterAvg` (default; identity passthrough = today, zero
+  regression), `SlowMomentum` (SlowMo), `NesterovMomentum` (DiLoCo).
+- **Selector:** one builder setter (`.outer_optimizer(..)`); absent = `OuterAvg`.
+
+#### The selector spans two tiers (not just a coordinator knob)
+
+DiLoCo's faithful-resume property comes from **disposable inner state**, which
+is a *worker-side* behavior the coordinator knob cannot supply alone:
+
+| regime | coordinator (outer step) | worker (inner policy) | new optimizer API |
+|---|---|---|---|
+| `OuterAvg` (today) | identity | continuous inner, EASGD blend | none |
+| `SlowMomentum` | slow momentum on consensus | continuous inner, EASGD blend | none |
+| `NesterovMomentum` (DiLoCo) | Nesterov on pseudo-grad | **full overwrite (alpha=1) + reset inner each round** | `Optimizer::reset_state()` |
+
+So DiLoCo needs: (1) a new `Optimizer::reset_state()` on the trait + impls
+(clear Adam's `m`/`v` to `None`, `step_count = 0`; trivial given the lazy
+`None`-init, but it is real API surface across optimizers); (2) the worker sync
+handler, in DiLoCo mode, applying the new global with no blend and calling
+`reset_state()`; (3) the selected variant signaling that inner policy to the
+workers. `SlowMomentum`/`OuterAvg` keep the inner loop exactly as today.
+
+#### Backends: CPU forge (centralized) vs NCCL (replicated per rank)
+
+The outer step's *site* differs by backend, because the consensus lives in
+different places. The trait is the same; only where it runs, and where its
+momentum lives, changes.
+
+**CPU.** The consensus is forged host-side in the controller reduce thread, so
+the outer step runs **once, at the controller**, on the averaged frame before
+scatter. The momentum is a single host buffer, and the controller already holds
+the last scattered global, so `prev_global` is free. The scattered frame becomes
+the outer-stepped `new_global`.
+
+**NCCL.** The in-place AllReduce leaves the consensus on **every rank's GPU**;
+the controller never sees model bytes (the same reason NCCL checkpointing is
+elected-rank). So the outer step runs **replicated, once per rank**: each rank
+holds the outer momentum (replicated) plus a `prev_global` anchor (the global it
+adopted at the end of the previous round) and computes
+`outer_step(prev_global, consensus)` on its own GPU copies. Identical inputs and
+a deterministic op give every rank the same `new_global` and the same momentum
+update, so the cohort stays in lock-step **with no extra collective** (the outer
+optimizer is replicated state, exactly like the model already is on the NCCL
+path). Electing one rank to compute and broadcast would add a broadcast and a
+single point of failure; replicated needs neither.
+
+This makes the factory **per-site**: `.outer_optimizer(|| ..)` is instantiated
+once at the controller for CPU, but once per rank for NCCL (each rank owns its
+replicated instance).
+
+| | CPU | NCCL |
+|---|---|---|
+| consensus produced | controller reduce (host) | in-place AllReduce (every GPU) |
+| outer step runs | once at controller | replicated, per rank on GPU |
+| momentum lives | one host buffer | replicated GPU buffer per rank |
+| `prev_global` | controller holds last global | per-rank GPU anchor (new buffer) |
+| momentum checkpoint | forge, host payload-direct | elected rank, D2H |
+
+The model checkpoint already splits this way (forge host-side for CPU,
+`SaveConsensusModel` elected-rank for NCCL); the outer momentum rides the same
+split. "All ranks AllReduce, all apply the identical outer step, the elected
+rank checkpoints its copy" holds by construction, since the replicated momentum
+is canonical.
+
+**VRAM:** NCCL DiLoCo adds **two param-sized GPU buffers per rank** (replicated
+momentum + `prev_global` anchor) on top of model + optimizer. Standard DiLoCo
+footprint, but asymmetric vs CPU (where the momentum sits once on the host) and
+worth budgeting on small cards (the Pascal 6 GB rig).
+
+#### Uneven allocation stays meaningful
+
+ElChe sizes per-rank work unevenly, so a fast rank takes more inner steps and
+drifts further. This composes correctly because the consensus the outer step
+consumes is **work-weighted** (`sum_k w_k theta_k / sum_k w_k`, `w_k` = batch
+count): a fast rank is weighted in proportion to the data it actually processed,
+so the outer gradient leans toward more-data, not toward fast-hardware bias
+(with IID sharding). The second-order concern is the **outer learning rate**:
+its calibration assumes a per-round drift *scale*, which shifts as ElChe
+re-allocates. ElChe already tracks per-rank step counts, so the pseudo-gradient
+can be step-normalized, which is precisely the **MSF-as-DiLoCo-H-controller**
+composition (MSF gives DiLoCo the principled `H`/scale schedule it leaves as a
+tuned constant).
+
+#### Checkpoint byproduct
+
+The outer momentum is model-sized (one buffer per parameter), so it is a second
+consensus artifact, `<stem>.outer.fdl`, written by the **same writer as the
+consensus model** (forge host-side on CPU, elected rank D2H on NCCL; see the
+backend table above), with the same atomic-rename. Inner state stays disposable
+and uncheckpointed. Resume loads consensus + outer momentum (replicated back to
+every rank on NCCL, as the model is); under DiLoCo the fresh inner is correct by
+design, so the resume is faithful. `OuterAvg` resume is unchanged (no outer
+artifact).
+
+#### A/B plan
+
+Three arms on one harness and seed: **no-outer (`OuterAvg`, current EASGD) /
+SlowMo / DiLoCo**, measured on **two axes**: convergence (held-out eval) and
+resume (post-resume train-loss continuity). The selector makes no-outer the
+default codepath, so the baseline is the real production path, not a synthetic
+one.
 
 ### VRAM: the elected rank is asymmetric
 

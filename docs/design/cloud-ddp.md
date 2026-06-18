@@ -59,15 +59,29 @@ top.
 
 ### Design targets
 
-- **`OuterOptimizer` trait**: `step(&mut self, global: &[Tensor], worker_deltas: &[Vec<Tensor>]) -> Vec<Tensor>`.
-  Returns the new global parameters.
-- **Built-ins**: `NesterovMomentum` (DiLoCo default), `OuterSgd`
-  (momentum=0 baseline for ablation), `OuterAdam` (sanity-check).
+> The concrete, current design for this increment (refined trait, the
+> two-tier worker coupling, and the checkpoint integration now that the
+> consensus checkpoint path exists) lives in
+> [`epoch-tail-allocation.md`](epoch-tail-allocation.md). The sketch below is
+> the originating vision; the trait was since collapsed to the
+> averaged-consensus form so it composes with the relay sum-and-count.
+
+- **`OuterOptimizer` trait**: `outer_step(&mut self, prev_global, work_weighted_consensus) -> new_global`.
+  Consumes the consensus the reduce already produces (not per-worker deltas);
+  the outer gradient `prev_global - consensus` equals `mean_k(prev_global - theta_k)`
+  under work-weighting, so no per-rank state is needed at the controller.
+- **Built-ins**: `NesterovMomentum` (DiLoCo default), `SlowMomentum`
+  (SlowMo), `OuterSgd` (momentum=0 ablation), `OuterAdam` (sanity-check).
 - **Stateless variant**: `OuterAvg` exactly replicates today's
   weighted-AllReduce behavior so existing code is unchanged when no
-  outer optimizer is set.
-- **Checkpoints**: the outer-optimizer state (momentum buffer) persists
-  across training runs through the existing checkpoint path.
+  outer optimizer is set (the default).
+- **Two tiers**: the outer step is coordinator-side, but DiLoCo also needs a
+  worker-side inner policy (full overwrite + `Optimizer::reset_state()` each
+  round) for its disposable-inner / faithful-resume property. SlowMo and
+  OuterAvg keep the inner loop as today. See the linked doc.
+- **Checkpoints**: the outer-optimizer momentum is model-sized and persists as
+  a `<stem>.outer.fdl` consensus artifact through the forge path; inner state
+  stays disposable.
 
 ## Meta-step rendezvous
 
