@@ -928,6 +928,7 @@
             TEST_SALT,
             Arc::clone(&dead_ranks),
             None,
+            None,
         )
         .expect("ClusterController::start_with_dead_ranks succeeds");
         let controller_addr =

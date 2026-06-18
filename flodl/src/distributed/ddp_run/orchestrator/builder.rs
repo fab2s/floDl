@@ -89,6 +89,10 @@ where
     /// `FLODL_FULL_CLUSTER_JSON` launcher contract at `.run()` (same
     /// precedence rules as `TrainerConfig::cluster`).
     cluster: Option<crate::distributed::launcher::FullCluster>,
+    /// Outer optimizer applied to the consensus between reduce and
+    /// broadcast (SlowMo / DiLoCo). `None` = today's averaging behavior
+    /// ([`crate::distributed::OuterAvg`]). See [`Self::outer_optimizer`].
+    outer_optimizer_factory: Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
     _phantom: PhantomData<(M, O)>,
 }
 
@@ -127,6 +131,22 @@ where
     /// Set the averaging backend. Default: [`AverageBackend::Nccl`].
     pub fn backend(mut self, backend: AverageBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Set the outer optimizer applied to the consensus between reduce and
+    /// broadcast (SlowMo / DiLoCo). The factory is invoked once per site
+    /// (once at the controller on the CPU backend, once per rank on NCCL),
+    /// so each site owns its instance.
+    ///
+    /// Absent (the default) reproduces today's averaging behavior exactly;
+    /// [`crate::distributed::OuterAvg`] is the explicit identity equivalent.
+    /// See [`crate::distributed::OuterOptimizer`].
+    pub fn outer_optimizer<P>(mut self, factory: P) -> Self
+    where
+        P: Fn() -> Box<dyn crate::distributed::OuterOptimizer> + Send + Sync + 'static,
+    {
+        self.outer_optimizer_factory = Some(Arc::new(factory));
         self
     }
 
@@ -732,6 +752,7 @@ where
             self.eval_fn,
             self.eval_dataset,
             self.eval_result_fn,
+            self.outer_optimizer_factory,
         )
     }
 }
@@ -789,6 +810,7 @@ impl DdpHandle {
             eval_dataset: None,
             eval_result_fn: None,
             cluster: None,
+            outer_optimizer_factory: None,
             _phantom: PhantomData,
         }
     }

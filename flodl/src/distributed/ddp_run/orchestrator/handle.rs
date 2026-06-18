@@ -152,7 +152,7 @@ impl DdpHandle {
             model_factory, optim_factory, train_fn,
             dataset, batch_size, num_epochs,
             policy, backend, config, None, None, None, None, None,
-            None, None, None,
+            None, None, None, None,
         )
     }
 
@@ -176,6 +176,9 @@ impl DdpHandle {
         eval_fn: Option<EvalFn<M>>,
         eval_dataset: Option<Arc<dyn BatchDataSet>>,
         eval_result_fn: Option<EvalResultFn>,
+        outer_optimizer_factory: Option<
+            crate::distributed::outer_optimizer::OuterOptimizerFactory,
+        >,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -305,12 +308,20 @@ impl DdpHandle {
                 // returned past `.run()`. Returning a `DdpHandle` here
                 // lets user code poll metrics + call `.join()` to
                 // await completion.
+                // Build the controller's outer optimizer from the factory
+                // (CPU backend: the step runs once at the controller in this
+                // launcher process). `None` leaves the reduce stream
+                // untouched. Constructed here, off any CUDA context, so it
+                // honors the "no CUDA before training" launcher invariant.
+                let outer_optimizer =
+                    outer_optimizer_factory.as_ref().map(|f| f());
                 let driver = std::thread::Builder::new()
                     .name("flodl-launcher-driver".to_string())
                     .spawn(move || {
                         crate::distributed::launcher::run_launcher_with_config(
                             full,
                             Some(coord_config),
+                            outer_optimizer,
                         )
                     })
                     .map_err(|e| {

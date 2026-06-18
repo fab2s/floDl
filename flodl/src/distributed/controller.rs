@@ -199,7 +199,7 @@ impl ClusterController {
         // elastic-membership path. Equivalent to passing a private
         // ledger that nobody else can declare into.
         let dead_ranks = DeadRanks::new(world_size);
-        Self::start_with_dead_ranks(bind_addr, world_size, salt, dead_ranks, None)
+        Self::start_with_dead_ranks(bind_addr, world_size, salt, dead_ranks, None, None)
     }
 
     /// Like [`Self::start`] but shares the dead-rank ledger with the
@@ -216,6 +216,7 @@ impl ClusterController {
         salt: SessionSalt,
         dead_ranks: Arc<DeadRanks>,
         forge: Option<Arc<crate::distributed::CheckpointForge>>,
+        outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     ) -> Result<Self> {
         if world_size == 0 {
             return Err(TensorError::new(
@@ -256,6 +257,7 @@ impl ClusterController {
             .spawn(move || {
                 run_reduce_thread(
                     listener, world_size, salt, shutdown_cloned, dead_ranks, forge,
+                    outer_optimizer,
                 )
             })
             .map_err(|e| {
@@ -318,7 +320,13 @@ fn run_reduce_thread(
     shutdown: Arc<AtomicBool>,
     dead_ranks: Arc<DeadRanks>,
     forge: Option<Arc<crate::distributed::CheckpointForge>>,
+    outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
 ) -> Result<()> {
+    // Outer optimizer applied to the consensus before scatter (and before
+    // the forge tap, so the checkpoint captures the stepped global). `None`
+    // leaves the reduce stream byte-for-byte as the plain weighted average.
+    let mut outer_stepper = outer_optimizer
+        .map(crate::distributed::outer_optimizer::OuterStepper::new);
     listener
         .set_nonblocking(true)
         .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
@@ -438,6 +446,7 @@ fn run_reduce_thread(
                     &dead_ranks,
                     &salt,
                     forge.as_deref(),
+                    outer_stepper.as_mut(),
                 ) {
                     break Err(e);
                 }
@@ -647,8 +656,19 @@ fn average_and_scatter(
     dead_ranks: &DeadRanks,
     salt: &SessionSalt,
     forge: Option<&crate::distributed::CheckpointForge>,
+    outer_stepper: Option<&mut crate::distributed::outer_optimizer::OuterStepper>,
 ) -> Result<()> {
     let averaged = reduce_average_alive(frames)?;
+    // OUTER STEP: transform the averaged consensus into the new global
+    // BEFORE scatter (ranks adopt the stepped global) and BEFORE the forge
+    // tap below (the checkpoint captures the stepped global). Applies to the
+    // parameters frame only; Control / buffers frames pass through. `None`
+    // (no outer optimizer configured) leaves `averaged` exactly as the
+    // weighted average — the byte-for-byte pre-outer-optimizer path.
+    let averaged = match outer_stepper {
+        Some(stepper) => stepper.process_frame(averaged)?,
+        None => averaged,
+    };
     // The averaged frame is identical for every rank; serialize once and
     // forward the same bytes tagged per rank.
     let mut buf: Vec<u8> = Vec::new();

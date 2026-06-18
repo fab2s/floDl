@@ -357,6 +357,7 @@ pub(crate) fn claim_cluster_entry(role: &str) -> Result<()> {
 pub fn run_launcher_with_config(
     full: FullCluster,
     mut coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
+    outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
 ) -> Result<()> {
     claim_cluster_entry("launcher")?;
     // Fresh 128-bit session salt per launcher invocation. Becomes the
@@ -416,6 +417,7 @@ pub fn run_launcher_with_config(
             full.salt,
             Arc::clone(&dead_ranks_shared),
             Some(Arc::clone(&checkpoint_forge)),
+            outer_optimizer,
         )?;
     // Bound port stays the configured value (no kernel auto-assign here);
     // log it once for diagnostics.
