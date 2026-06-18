@@ -200,4 +200,18 @@ pub struct RunConfig {
     /// loud-errors if `Fastest` is configured on a non-via_coord run).
     /// Solo modes ignore this field.
     pub epoch_callback_policy: Option<flodl::distributed::ddp_run::EpochCallbackPolicy>,
+    /// Cluster-mode checkpoint bundle stem (save side). When set, passed to
+    /// `DdpBuilder::save_path` so the consensus forge writes `<stem>.fdl` +
+    /// `<stem>.meta.json` on a mid-run checkpoint or unrecoverable failure.
+    pub save_path: Option<String>,
+    /// Resume a cluster run from a previously-saved bundle stem. The model
+    /// factory loads `<stem>.fdl` consensus weights into each freshly-built
+    /// replica, and the coordinator reconstructs the saved data-coverage so
+    /// only the uncovered remainder is dispatched (no data repeated).
+    /// Progressive (cadence/async) cluster modes only.
+    pub resume_from: Option<String>,
+    /// Arm a one-shot coverage-granular checkpoint at the first reduce where
+    /// the cohort reaches this epoch. Pairs with `save_path`. Progressive
+    /// (cadence/async) cluster modes only.
+    pub checkpoint_at_epoch: Option<usize>,
 }

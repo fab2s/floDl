@@ -399,7 +399,14 @@ impl DdpHandle {
                 initial_buffers,
                 total_samples,
                 batch_size,
-                seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
+                // On resume, read the shuffle seed from the checkpoint meta so
+                // this rank reproduces the recorded epoch permutation exactly;
+                // a fresh run falls back to SHUFFLE_BASE_SEED. The coordinator
+                // reads the same meta, so the cohort stays consistent without a
+                // broadcast.
+                seed: crate::distributed::ddp_run::resolve_shuffle_seed(
+                    config.resume_from.as_deref(),
+                )?,
                 max_grad_norm,
                 easgd_alpha,
                 timeline: timeline_for_thread,

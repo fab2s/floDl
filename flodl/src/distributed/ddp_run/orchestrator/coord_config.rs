@@ -130,6 +130,9 @@ pub(crate) fn build_coord_config_from_builder(
     if let Some(every) = config.checkpoint_every {
         coord_config = coord_config.checkpoint_every(every);
     }
+    if let Some(epoch) = config.checkpoint_at_epoch {
+        coord_config = coord_config.checkpoint_at_epoch(epoch);
+    }
     if let Some(f) = metrics_fn {
         coord_config = coord_config.metrics_fn(f);
     }
@@ -153,6 +156,19 @@ pub(crate) fn build_coord_config_from_builder(
     // allreduces are firing on every cadence.
     if let Some(ref tl) = config.timeline {
         coord_config = coord_config.timeline(std::sync::Arc::clone(tl));
+    }
+
+    // Resume: source the shuffle seed from the saved coverage block so the
+    // coverage guard + the workers (which read the same meta via
+    // `resolve_shuffle_seed`) reproduce the recorded epoch permutation by
+    // reading the value, not by assuming the build's `SHUFFLE_BASE_SEED` still
+    // matches it. No coverage block (clean-boundary save) leaves the default.
+    if let Some(seed) = resume_meta
+        .as_ref()
+        .and_then(|m| m.coverage.as_ref())
+        .map(|c| c.seed)
+    {
+        coord_config = coord_config.seed(seed);
     }
 
     // Resume trajectory: applies after every other field so the loaded

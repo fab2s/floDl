@@ -97,6 +97,7 @@
                 shape: vec![data.len() as u32],
                 bytes: f32_to_bytes(data),
             }],
+            ..Default::default()
         }
     }
 
@@ -114,6 +115,7 @@
                     bytes: f32_to_bytes(b),
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -270,6 +272,7 @@
                     shape: vec![2],
                     bytes: vec![0; 8],
                 }],
+                ..Default::default()
             }),
             Some(RoundFrame {
                 tensors: vec![TensorPayload {
@@ -277,6 +280,7 @@
                     shape: vec![2],
                     bytes: vec![0; 8],
                 }],
+                ..Default::default()
             }),
         ];
         let err = reduce_average_alive(&frames).unwrap_err();
@@ -295,6 +299,7 @@
                     shape: vec![2],
                     bytes: f32_to_bytes(&[1.0, 2.0]),
                 }],
+                ..Default::default()
             }),
             Some(RoundFrame {
                 tensors: vec![TensorPayload {
@@ -302,6 +307,7 @@
                     shape: vec![3],
                     bytes: f32_to_bytes(&[1.0, 2.0, 3.0]),
                 }],
+                ..Default::default()
             }),
         ];
         let err = reduce_average_alive(&frames).unwrap_err();
@@ -318,6 +324,7 @@
                     shape: vec![2],
                     bytes: f32_to_bytes(&[2.0, 4.0]),
                 }],
+                ..Default::default()
             }),
             None, // rank 1 dead
             Some(RoundFrame {
@@ -326,6 +333,7 @@
                     shape: vec![2],
                     bytes: f32_to_bytes(&[6.0, 8.0]),
                 }],
+                ..Default::default()
             }),
         ];
         let out = reduce_average_alive(&frames).unwrap();

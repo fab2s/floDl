@@ -49,7 +49,7 @@ pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 4;
 /// Records the offset ranges into the epoch's shuffled permutation that have
 /// NOT been covered (dispatched-AND-completed into the consensus) at the
 /// snapshot. Resume reconstructs the epoch's `ChunkPool` to exactly this state
-/// (via [`crate::distributed::chunk_pool::ChunkPool::from_coverage`]) and
+/// (via `ChunkPool::from_coverage`) and
 /// re-dispatches only these ranges, so no covered sample is trained twice and
 /// no in-flight-at-checkpoint sample is dropped.
 ///
@@ -65,7 +65,7 @@ pub struct EpochCoverage {
     pub total_samples: usize,
     /// Uncovered `(offset, size)` ranges into the epoch's permutation,
     /// coalesced and sorted by offset (the output of
-    /// [`crate::distributed::chunk_pool::ChunkPool::uncovered_ranges`]).
+    /// `ChunkPool::uncovered_ranges`).
     pub uncovered_ranges: Vec<(usize, usize)>,
 }
 
@@ -76,7 +76,7 @@ pub struct EpochCoverage {
 /// Async streams across epoch boundaries, so more than one epoch pool can be
 /// in progress at the snapshot; `per_epoch` carries one [`EpochCoverage`] per
 /// live pool. `seed` is the run's shuffle base seed
-/// ([`crate::distributed::ddp_run::DdpRunConfig::seed`]); together with each
+/// ([`crate::distributed::ddp_run::SHUFFLE_BASE_SEED`]); together with each
 /// `epoch` it reconstructs the permutation, so resume re-dispatches the
 /// recorded uncovered ranges over the SAME index space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ pub struct ElCheState {
 ///
 /// This is the "static label" that lets a checkpoint writer holding only the
 /// moving consensus tensors (the averaging tier's ordered, name-less
-/// [`crate::distributed::controller::RoundFrame`]) reconstruct a NAMED,
+/// `RoundFrame`) reconstruct a NAMED,
 /// loadable `.fdl` via [`crate::nn::save_checkpoint_file`] — without routing
 /// the model through a training rank or shipping its structure every round.
 ///
@@ -360,9 +360,20 @@ impl CheckpointMeta {
                 path.display(),
             ))
         })?;
-        std::fs::write(path, content).map_err(|e| {
+        // Atomic commit: write a temp sibling then rename, so a crash
+        // mid-write never leaves a torn meta that resume parses as valid.
+        // The meta is the bundle's commit marker — it must appear whole.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, content).map_err(|e| {
             TensorError::new(&format!(
                 "CheckpointMeta: write {}: {e}",
+                tmp.display(),
+            ))
+        })?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            TensorError::new(&format!(
+                "CheckpointMeta: atomic rename {} -> {}: {e}",
+                tmp.display(),
                 path.display(),
             ))
         })

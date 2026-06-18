@@ -377,6 +377,13 @@ pub struct TrainerConfig<M: Module> {
     pub save_path: Option<String>,
     /// Resume from a previously-saved checkpoint bundle stem.
     pub resume_from: Option<String>,
+    /// Arm a one-shot coverage-granular checkpoint at the first reduce
+    /// where the cohort reaches this epoch (cluster progressive modes:
+    /// Cadence / Async). The forged consensus model is written to
+    /// `<save_path>.fdl` and the trajectory + data-coverage to
+    /// `<save_path>.meta.json`; pair with [`Self::save_path`]. `None` =
+    /// no mid-run checkpoint. See [`crate::distributed::CheckpointBundle`].
+    pub checkpoint_at_epoch: Option<usize>,
 
     /// Per-checkpoint callback (`version, &model`). Fires on the rank
     /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`].
@@ -441,6 +448,7 @@ impl<M: Module> TrainerConfig<M> {
             checkpoint_every: None,
             save_path: None,
             resume_from: None,
+            checkpoint_at_epoch: None,
             checkpoint_fn: None,
             epoch_fn: None,
             metrics_fn: None,
@@ -471,6 +479,9 @@ impl<M: Module> TrainerConfig<M> {
     pub fn save_path(mut self, p: impl Into<String>) -> Self { self.save_path = Some(p.into()); self }
     /// Resume training from a previously-saved bundle stem.
     pub fn resume_from(mut self, p: impl Into<String>) -> Self { self.resume_from = Some(p.into()); self }
+    /// Arm a one-shot mid-run checkpoint at the given epoch. Pairs with
+    /// [`Self::save_path`]. See [`Self::checkpoint_at_epoch`].
+    pub fn checkpoint_at_epoch(mut self, n: usize) -> Self { self.checkpoint_at_epoch = Some(n); self }
 
     /// Register a checkpoint callback. Fires on the selected rank.
     pub fn checkpoint_fn(mut self, f: CheckpointFn<M>) -> Self { self.checkpoint_fn = Some(f); self }

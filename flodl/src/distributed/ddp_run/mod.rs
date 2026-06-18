@@ -600,6 +600,15 @@ pub struct DdpRunConfig {
     ///
     /// `None` = fresh run. Builder sugar: [`DdpBuilder::resume_from`].
     pub resume_from: Option<String>,
+
+    /// Arm a one-shot coverage-granular checkpoint at the first reduce
+    /// where the cohort reaches this epoch. Progressive modes only
+    /// (Cadence / Async — a Sync run has no chunk pools to snapshot).
+    /// Pairs with [`Self::save_path`] for the bundle stem: the forged
+    /// consensus model lands in `<stem>.fdl` and the trajectory +
+    /// data-coverage in `<stem>.meta.json`. `None` = no mid-run
+    /// checkpoint. Builder sugar: [`DdpBuilder::checkpoint_at_epoch`].
+    pub checkpoint_at_epoch: Option<usize>,
 }
 
 impl Default for DdpRunConfig {
@@ -625,6 +634,7 @@ impl DdpRunConfig {
             epoch_callback_policy: EpochCallbackPolicy::default(),
             eval_every_epochs: None,
             resume_from: None,
+            checkpoint_at_epoch: None,
         }
     }
 
@@ -637,6 +647,13 @@ impl DdpRunConfig {
     /// [`Self::resume_from`] for details on what is and isn't restored.
     pub fn with_resume_from(mut self, stem: impl Into<String>) -> Self {
         self.resume_from = Some(stem.into());
+        self
+    }
+
+    /// Arm a one-shot coverage-granular checkpoint at the given epoch.
+    /// Pairs with [`Self::with_save_path`]. See [`Self::checkpoint_at_epoch`].
+    pub fn with_checkpoint_at_epoch(mut self, epoch: usize) -> Self {
+        self.checkpoint_at_epoch = Some(epoch);
         self
     }
 
@@ -1219,13 +1236,39 @@ pub(crate) enum ControlMsg {
 /// paths (single-host fallback, cluster rank entry, threaded coordinator).
 ///
 /// The epoch `e` permutation is `Rng::seed(SHUFFLE_BASE_SEED + e)` (see
-/// [`make_partition`] and [`crate::data::RandomSampler`]). Coverage-granular
+/// `make_partition` and [`crate::data::RandomSampler`]). Coverage-granular
 /// resume records this value in
 /// [`crate::distributed::CoverageBlock::seed`] so a resumed run can verify it
 /// re-shuffles over the SAME index space; changing it between save and resume
 /// invalidates recorded coverage. Single source of truth — every
 /// `WorkerConfig.seed` default and the coverage snapshot read it from here.
 pub const SHUFFLE_BASE_SEED: u64 = 42;
+
+/// Resolve the data-shuffle base seed for a run.
+///
+/// On **resume** the seed is read from the checkpoint meta's
+/// [`CoverageBlock::seed`](crate::distributed::CoverageBlock) so the resumed
+/// permutation reproduces the saved one by *reading* the recorded value, not
+/// by assuming the build's [`SHUFFLE_BASE_SEED`] still matches it. Every role
+/// (coordinator + each rank) resolves it from the same meta file, so the value
+/// is consistent across the cohort without a broadcast. A fresh run, or a meta
+/// with no coverage block (e.g. a clean-boundary save), falls back to
+/// [`SHUFFLE_BASE_SEED`]. Errors loudly if `resume_from` is set but the meta
+/// can't be read — a silent fallback could desync a worker's permutation from
+/// the recorded coverage.
+pub(crate) fn resolve_shuffle_seed(resume_from: Option<&str>) -> crate::tensor::Result<u64> {
+    let Some(stem) = resume_from else {
+        return Ok(SHUFFLE_BASE_SEED);
+    };
+    let meta = crate::distributed::CheckpointMeta::read_from_file(
+        &crate::distributed::CheckpointBundle::meta_path(stem),
+    )?;
+    Ok(meta
+        .coverage
+        .as_ref()
+        .map(|c| c.seed)
+        .unwrap_or(SHUFFLE_BASE_SEED))
+}
 
 /// Configuration passed to a GPU worker at spawn time.
 ///

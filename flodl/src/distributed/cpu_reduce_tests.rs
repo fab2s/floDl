@@ -43,6 +43,7 @@
                 shape: vec![data.len() as u32],
                 bytes: f32_to_bytes(data),
             }],
+            ..Default::default()
         }
     }
 
@@ -251,6 +252,7 @@
                 shape: vec![4],
                 bytes: vec![0u8; 8],
             }],
+            ..Default::default()
         };
         let err = round_frame_to_tensors(&bogus).unwrap_err();
         let msg = err.to_string();

@@ -39,34 +39,111 @@ pub fn save_checkpoint<W: Write>(
     buffers: &[(String, Buffer)],
     structural_hash: Option<&str>,
 ) -> Result<()> {
+    let total = (params.len() + buffers.len()) as u32;
+    write_checkpoint_header(w, total, structural_hash)?;
+
+    for (name, p) in params {
+        write_entry_name(w, name)?;
+        write_tensor_data(w, &p.variable.data())?;
+    }
+
+    for (name, b) in buffers {
+        write_entry_name(w, name)?;
+        write_tensor_data(w, &b.get())?;
+    }
+
+    Ok(())
+}
+
+/// Write the checkpoint header: `MAGIC(4) | VERSION(u32) | hash(32) | count(u32)`.
+///
+/// Shared by [`save_checkpoint`] (the `Tensor` path) and
+/// [`save_checkpoint_from_raw`] (the raw-payload path) so the on-disk
+/// layout has a single definition.
+pub(crate) fn write_checkpoint_header<W: Write>(
+    w: &mut W,
+    total: u32,
+    structural_hash: Option<&str>,
+) -> Result<()> {
     w.write_all(&MAGIC).map_err(io_err)?;
     w.write_all(&VERSION.to_le_bytes()).map_err(io_err)?;
-
-    // Write 32-byte hash (or zeros)
     let hash_bytes = match structural_hash {
         Some(hex) => hex_to_bytes(hex)?,
         None => [0u8; HASH_LEN],
     };
     w.write_all(&hash_bytes).map_err(io_err)?;
-
-    let total = (params.len() + buffers.len()) as u32;
     w.write_all(&total.to_le_bytes()).map_err(io_err)?;
-
-    for (name, p) in params {
-        let name_bytes = name.as_bytes();
-        w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
-        w.write_all(name_bytes).map_err(io_err)?;
-        write_tensor_data(w, &p.variable.data())?;
-    }
-
-    for (name, b) in buffers {
-        let name_bytes = name.as_bytes();
-        w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
-        w.write_all(name_bytes).map_err(io_err)?;
-        write_tensor_data(w, &b.get())?;
-    }
-
     Ok(())
+}
+
+/// Write an entry's `name_len(u32) | name` prefix (the bytes that precede
+/// the tensor body in every checkpoint entry).
+fn write_entry_name<W: Write>(w: &mut W, name: &str) -> Result<()> {
+    let name_bytes = name.as_bytes();
+    w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(name_bytes).map_err(io_err)?;
+    Ok(())
+}
+
+/// One entry for [`save_checkpoint_from_raw`]: a name plus an already-
+/// serialized tensor body (shape, dtype, native bytes). Lets a caller that
+/// already holds raw native-byte tensor data (e.g. the cluster consensus
+/// reduce) write a loadable `.fdl` without reconstructing `Tensor`s — no
+/// bytes→Tensor→bytes round-trip, no duplicate model in RAM.
+pub(crate) struct RawCheckpointEntry<'a> {
+    /// Qualified parameter / buffer name (matches load-side keys).
+    pub name: &'a str,
+    /// Tensor shape (i64 dims, as the on-disk format stores them).
+    pub shape: &'a [i64],
+    /// Checkpoint dtype tag (see `dtype_tag` — `3` = Float32).
+    pub dtype_tag: u8,
+    /// Raw native-byte-order tensor data.
+    pub raw: &'a [u8],
+}
+
+/// Save a checkpoint directly from raw, already-serialized tensor bodies,
+/// bypassing `Tensor` construction. The on-disk format is byte-identical to
+/// [`save_checkpoint`] (so [`load_checkpoint`] reads it unchanged); only the
+/// source differs. Entry order is the load-side name-match order; pass
+/// params first then buffers to mirror [`save_checkpoint`].
+pub(crate) fn save_checkpoint_from_raw<W: Write>(
+    w: &mut W,
+    entries: &[RawCheckpointEntry<'_>],
+    structural_hash: Option<&str>,
+) -> Result<()> {
+    write_checkpoint_header(w, entries.len() as u32, structural_hash)?;
+    for e in entries {
+        write_entry_name(w, e.name)?;
+        // Tensor body: ndim(u32) + shape(i64*ndim) + dtype_tag(1) +
+        // byte_count(u64) + raw. Mirrors `write_tensor_data` exactly.
+        w.write_all(&(e.shape.len() as u32).to_le_bytes()).map_err(io_err)?;
+        for &s in e.shape {
+            w.write_all(&s.to_le_bytes()).map_err(io_err)?;
+        }
+        w.write_all(&[e.dtype_tag]).map_err(io_err)?;
+        w.write_all(&(e.raw.len() as u64).to_le_bytes()).map_err(io_err)?;
+        w.write_all(e.raw).map_err(io_err)?;
+    }
+    Ok(())
+}
+
+/// File wrapper for [`save_checkpoint_from_raw`]: gzips when `path` ends in
+/// `.gz`, matching [`save_checkpoint_file`].
+pub(crate) fn save_checkpoint_from_raw_file(
+    path: &str,
+    entries: &[RawCheckpointEntry<'_>],
+    structural_hash: Option<&str>,
+) -> Result<()> {
+    let f = std::fs::File::create(path).map_err(io_err)?;
+    if path.ends_with(".gz") {
+        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        save_checkpoint_from_raw(&mut w, entries, structural_hash)?;
+        w.finish().map_err(io_err)?;
+        Ok(())
+    } else {
+        let mut w = std::io::BufWriter::new(f);
+        save_checkpoint_from_raw(&mut w, entries, structural_hash)
+    }
 }
 
 /// Load a checkpoint, matching entries by qualified name against both
@@ -351,8 +428,10 @@ pub(crate) fn read_tensor_state<R: Read>(r: &mut R, device: Device) -> Result<Op
 
 // --- Internal: dtype-aware tensor serialization ---
 
-/// DType tag byte for checkpoint format.
-fn dtype_tag(dtype: DType) -> u8 {
+/// DType tag byte for checkpoint format. `pub(crate)` so the cluster
+/// consensus writer can tag raw f32 payloads for
+/// [`save_checkpoint_from_raw`] without duplicating the mapping.
+pub(crate) fn dtype_tag(dtype: DType) -> u8 {
     match dtype {
         DType::Float16  => 1,
         DType::BFloat16 => 2,

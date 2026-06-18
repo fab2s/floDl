@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::distributed::controller::{
     self, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION,
-    RoundFrame, TensorPayload,
+    RoundFrame, RoundKind, TensorPayload,
 };
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -400,8 +400,16 @@ impl CpuReduceClient {
             &[world_size as i64],
             Device::CPU,
         )?;
-        let avg = self.all_reduce_tensors(&[&tensor])?;
-        let out = avg[0].to_f32_vec()?;
+        // Bookkeeping reduce: tag it `Control` so the consensus-checkpoint
+        // forge never mistakes this count vector for a slice of the model.
+        let mut frame = tensors_to_round_frame(&[&tensor])?;
+        frame.kind = RoundKind::Control;
+        let averaged = self.all_reduce(&frame)?;
+        let out = round_frame_to_tensors(&averaged)?;
+        let avg = out
+            .first()
+            .ok_or_else(|| TensorError::new("cpu_reduce: count-gather returned empty frame"))?;
+        let out = avg.to_f32_vec()?;
         for (dst, src) in local.iter_mut().zip(out) {
             *dst = src as f64;
         }
@@ -735,7 +743,12 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
             bytes,
         });
     }
-    Ok(RoundFrame { tensors: payloads })
+    // Default to a model-weight frame; bookkeeping reduces (the count-gather)
+    // override the kind on the built frame before sending.
+    Ok(RoundFrame {
+        tensors: payloads,
+        kind: RoundKind::Model,
+    })
 }
 
 /// Build a list of new CPU `Tensor`s from a [`RoundFrame`].

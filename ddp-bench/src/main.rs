@@ -252,6 +252,26 @@ struct Cli {
     #[option]
     depth_n: Option<usize>,
 
+    /// Cluster checkpoint bundle stem (save side). The consensus forge
+    /// writes `<stem>.fdl` (averaged weights) + `<stem>.meta.json`
+    /// (trajectory + data-coverage). Pair with `--checkpoint-at-epoch` for
+    /// a mid-run snapshot. Progressive (cadence/async) cluster modes only.
+    #[option]
+    save_path: Option<String>,
+
+    /// Resume a cluster run from a bundle stem. Loads `<stem>.fdl` consensus
+    /// weights into each replica AND reconstructs the saved data-coverage so
+    /// the coordinator dispatches only the uncovered remainder — no data is
+    /// repeated. Progressive (cadence/async) cluster modes only.
+    #[option]
+    resume_from: Option<String>,
+
+    /// Arm a one-shot mid-run checkpoint at this epoch (the first reduce
+    /// where any rank reaches it). Pair with `--save-path`. Progressive
+    /// (cadence/async) cluster modes only.
+    #[option]
+    checkpoint_at_epoch: Option<usize>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -707,6 +727,9 @@ fn run() -> flodl::tensor::Result<()> {
                 per_epoch_eval: cli.per_epoch_eval,
                 guard: guard_choice.clone(),
                 epoch_callback_policy,
+                save_path: cli.save_path.clone(),
+                resume_from: cli.resume_from.clone(),
+                checkpoint_at_epoch: cli.checkpoint_at_epoch,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

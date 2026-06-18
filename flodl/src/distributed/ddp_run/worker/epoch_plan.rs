@@ -415,18 +415,25 @@ impl<M: Module> GpuWorker<M> {
     /// cluster.
     pub(super) fn write_model_to_fdl(&self, stem: &str) {
         use crate::distributed::CheckpointBundle;
+        use crate::distributed::checkpoint_forge::{consensus_buffer_key, consensus_param_key};
         let model_path = CheckpointBundle::model_path(stem);
+        // Positional keys (p{i}/b{j}) — NOT the model's own names, which repeat
+        // across stacked layers and would collide in the on-disk map. Matches
+        // the CPU forge + `load_consensus_checkpoint` convention so any
+        // consensus / failure-save bundle reloads positionally.
         let params: Vec<(String, _)> = self
             .model
             .parameters()
             .into_iter()
-            .map(|p| (p.name.clone(), p))
+            .enumerate()
+            .map(|(i, p)| (consensus_param_key(i), p))
             .collect();
         let buffers: Vec<(String, _)> = self
             .model
             .buffers()
             .into_iter()
-            .map(|b| (b.name.clone(), b))
+            .enumerate()
+            .map(|(j, b)| (consensus_buffer_key(j), b))
             .collect();
         match model_path.to_str() {
             Some(path_str) => {

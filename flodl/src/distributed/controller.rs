@@ -663,11 +663,17 @@ fn average_and_scatter(
         MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)?;
     }
     // FORGE TAP: scatter ranks first (they resume training ASAP), then — if the
-    // coordinator armed a checkpoint for this reduce — hand the freshly-forged
-    // consensus to the writer, which clones it once and serializes the `.fdl`
-    // on a detached thread. No-op when unarmed; the reduce loop never blocks.
+    // coordinator armed a checkpoint — hand this reduce's averaged consensus to
+    // the forge. `averaged` is unused after the scatter above, so it is *moved*
+    // (no clone) into the accumulator; once a cycle's model reduces (params then
+    // buffers) have all arrived, the forge spawns a detached `.fdl` writer. Only
+    // `Model` reduces feed the forge — the per-rank count-gather (`Control`)
+    // scatters normally but is never part of the model. No-op when unarmed; the
+    // reduce loop never blocks on the disk write.
     if let Some(f) = forge {
-        f.maybe_write(&averaged);
+        if averaged.kind == RoundKind::Model {
+            f.accumulate(averaged);
+        }
     }
     Ok(())
 }
@@ -723,13 +729,56 @@ pub(crate) fn write_handshake_ack(stream: &mut TcpStream) -> Result<()> {
 // RoundFrame
 // ---------------------------------------------------------------------------
 
+/// What a reduce round carries, so the controller can tell model-weight
+/// traffic from bookkeeping traffic without parsing tensors.
+///
+/// A single sync cycle issues several reduces over the same channel: a
+/// per-rank `Control` count-gather, then one or two `Model` reduces
+/// (params, then buffers). The consensus-checkpoint forge accumulates only
+/// `Model` frames; `Control` frames scatter normally but are never fed to
+/// it. This is also the framing the relay sum-and-count layer needs to fold
+/// per-host partials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoundKind {
+    /// Model weights (params / buffers) — the consensus payload.
+    #[default]
+    Model,
+    /// Bookkeeping (e.g. the per-rank batch-count gather) — not the model.
+    Control,
+}
+
+impl RoundKind {
+    /// Wire byte (MAC-covered) distinguishing the kinds.
+    fn to_wire(self) -> u8 {
+        match self {
+            RoundKind::Model => 0,
+            RoundKind::Control => 1,
+        }
+    }
+
+    /// Inverse of [`Self::to_wire`]; unknown bytes are a protocol error.
+    fn from_wire(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(RoundKind::Model),
+            1 => Ok(RoundKind::Control),
+            other => Err(TensorError::new(&format!(
+                "cluster_controller: unknown RoundKind wire byte {other}"
+            ))),
+        }
+    }
+}
+
 /// A round's payload: a list of tensors with shape + dtype + data.
 ///
 /// Identical shape sent rank→controller and controller→rank. v1 only
 /// supports `DTYPE_F32`; controller errors loudly on other dtypes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RoundFrame {
     pub tensors: Vec<TensorPayload>,
+    /// Whether this is model-weight or bookkeeping traffic. Defaults to
+    /// [`RoundKind::Model`] so existing constructors keep building model
+    /// frames; the count-gather sets [`RoundKind::Control`] explicitly.
+    pub kind: RoundKind,
 }
 
 /// One tensor inside a [`RoundFrame`].
@@ -786,6 +835,15 @@ pub(crate) fn read_round_frame<R: Read>(
         )));
     }
     let num_tensors = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+
+    // Round-kind byte (model vs bookkeeping), MAC-covered, immediately
+    // after the header and before the tensor list.
+    let mut kind_byte = [0u8; 1];
+    stream.read_exact(&mut kind_byte).map_err(|e| {
+        TensorError::new(&format!("cluster_controller: frame kind read failed: {e}"))
+    })?;
+    mac.update(kind_byte);
+    let kind = RoundKind::from_wire(kind_byte[0])?;
 
     let mut tensors = Vec::with_capacity(num_tensors);
     for ti in 0..num_tensors {
@@ -853,7 +911,7 @@ pub(crate) fn read_round_frame<R: Read>(
              disagreement, tampered frame, or payload corruption"
         )));
     }
-    Ok(Some(RoundFrame { tensors }))
+    Ok(Some(RoundFrame { tensors, kind }))
 }
 
 /// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
@@ -873,6 +931,12 @@ pub(crate) fn write_round_frame<W: Write>(
         TensorError::new(&format!("cluster_controller: frame header write failed: {e}"))
     })?;
     mac.update(hdr);
+    // Round-kind byte (MAC-covered), mirroring `read_round_frame`.
+    let kind_byte = [frame.kind.to_wire()];
+    stream.write_all(&kind_byte).map_err(|e| {
+        TensorError::new(&format!("cluster_controller: frame kind write failed: {e}"))
+    })?;
+    mac.update(kind_byte);
     for (ti, t) in frame.tensors.iter().enumerate() {
         let meta = [t.dtype, t.shape.len() as u8];
         stream.write_all(&meta).map_err(|e| {
@@ -1019,6 +1083,10 @@ fn reduce_average_alive(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
     }
     Ok(RoundFrame {
         tensors: out_tensors,
+        // The averaged frame carries the same kind as its inputs (all alive
+        // ranks send the same kind in a round); preserve it so the forge tap
+        // and any downstream relay see model vs bookkeeping correctly.
+        kind: ref_frame.kind,
     })
 }
 

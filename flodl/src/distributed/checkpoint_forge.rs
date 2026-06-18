@@ -3,43 +3,108 @@
 //!
 //! In CPU averaging the consensus is forged in the controller's reduce thread
 //! ([`crate::distributed::controller`]'s `run_reduce_thread` →
-//! `average_and_scatter`) as a name-less, ordered
-//! [`RoundFrame`](crate::distributed::controller::RoundFrame). [`CheckpointForge`]
-//! lets the coordinator **arm** a model save (before the reduce it wants
-//! captured); the reduce thread then hands the freshly-averaged frame to the
-//! forge, which — holding the static [`ModelSchema`] captured at launch —
-//! pairs names to the frame's tensors and writes a loadable `.fdl` on a
-//! **detached** thread so the reduce loop never blocks.
+//! `average_and_scatter`) as name-less, ordered
+//! `RoundFrame`s. One sync cycle
+//! issues several reduces over the same channel — a `Control` per-rank
+//! count-gather, then one or two `Model` reduces (params, then buffers) — so no
+//! single frame ever carries the whole model. [`CheckpointForge`] lets the
+//! coordinator **arm** a save (before the cycle it wants captured); the reduce
+//! thread then hands each `Model` frame to the forge, which **accumulates**
+//! them (params' tensors then buffers') until it holds the full model, pairs
+//! the held static [`ModelSchema`] names to the accumulated tensors, and writes
+//! a loadable `.fdl` on a **detached** thread so the reduce loop never blocks.
+//!
+//! Two properties matter:
+//! - **Async**: frames are scattered to ranks *before* the forge tap, and the
+//!   `.fdl` is serialized off the reduce thread — training never waits on the
+//!   checkpoint.
+//! - **Zero extra copy**: the averaged frame is *moved* into the accumulator
+//!   (not cloned), and the writer emits the frame's raw native bytes straight
+//!   to disk via [`save_checkpoint_from_raw_file`] — no bytes→`Tensor`→bytes
+//!   round-trip, no duplicate model in RAM.
 //!
 //! This keeps `controller.rs` a model-agnostic byte reducer: all nn/model
-//! knowledge (names, `save_checkpoint_file`) lives here. The moving weights
-//! already flow as averaging traffic; only the static schema is captured once,
-//! so the forge writes a named checkpoint without routing the model through a
-//! training rank.
+//! knowledge (names, the `.fdl` format) lives here.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::distributed::ModelSchema;
-use crate::distributed::controller::RoundFrame;
-use crate::distributed::cpu_reduce::round_frame_to_tensors;
-use crate::nn::{Buffer, Parameter};
-use crate::tensor::{Result, TensorError};
+use crate::distributed::controller::{DTYPE_F32, RoundFrame, TensorPayload};
+use crate::nn::checkpoint::{LoadReport, RawCheckpointEntry, dtype_tag, save_checkpoint_from_raw_file};
+use crate::nn::{Buffer, Module, Parameter};
+use crate::tensor::{DType, Result, TensorError};
+
+/// Positional `.fdl` key for the `i`-th model **parameter** in a cluster
+/// consensus checkpoint (`Module::parameters()` order).
+///
+/// Consensus bundles are positional by nature — the forge pairs the reduce's
+/// averaged tensors to the model by index, never by the model's own parameter
+/// names, which routinely repeat across a layer stack (bare `"weight"` /
+/// `"bias"` per `Linear`/`Conv`). Keying by those names would collide in the
+/// on-disk map and load the wrong tensor. Synthetic `p{i}` / `b{j}` keys are
+/// unique by construction. Writers and [`load_consensus_checkpoint`] share
+/// these helpers so the convention has a single definition.
+pub(crate) fn consensus_param_key(i: usize) -> String {
+    format!("p{i}")
+}
+
+/// Positional `.fdl` key for the `j`-th model **buffer** (`Module::buffers()`
+/// order). See [`consensus_param_key`].
+pub(crate) fn consensus_buffer_key(j: usize) -> String {
+    format!("b{j}")
+}
+
+/// Load a cluster consensus checkpoint (written by `CheckpointForge` or the
+/// elected-rank / failure-save model writer) into `model`, matching tensors
+/// **positionally** via `consensus_param_key` / `consensus_buffer_key`.
+///
+/// Use this on resume instead of keying by the model's own parameter names:
+/// stacked layers reuse bare names (`"weight"`, `"bias"`), which a name-keyed
+/// load would collapse and mismatch. Positional keys load each tensor into the
+/// same slot it was saved from, given the same `model_factory` (deterministic
+/// `parameters()` / `buffers()` order).
+pub fn load_consensus_checkpoint<M: Module + ?Sized>(model: &M, path: &str) -> Result<LoadReport> {
+    let params: Vec<(String, Parameter)> = model
+        .parameters()
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (consensus_param_key(i), p))
+        .collect();
+    let buffers: Vec<(String, Buffer)> = model
+        .buffers()
+        .into_iter()
+        .enumerate()
+        .map(|(j, b)| (consensus_buffer_key(j), b))
+        .collect();
+    crate::nn::load_checkpoint_file(path, &params, &buffers, None)
+}
 
 /// Coordinator→reduce-thread checkpoint signal, holding the static model
-/// schema needed to name the averaged frame.
+/// schema needed to name the accumulated frames.
 ///
 /// Shared as an `Arc` between the [`crate::distributed::cluster_coordinator::ClusterCoordinator`]
-/// (which **arms** it before a checkpoint reduce) and the controller reduce
-/// thread (which **consumes** the arm on the next forged frame) — the same
-/// sharing pattern as the [`crate::distributed::controller::DeadRanks`] ledger.
+/// (which **arms** it before a checkpoint cycle) and the controller reduce
+/// thread (which **accumulates** the cycle's `Model` frames) — the same sharing
+/// pattern as the [`crate::distributed::controller::DeadRanks`] ledger.
 pub struct CheckpointForge {
     /// Static param/buffer names captured at launch. `None` when no schema was
     /// captured (factory failure) → model writes are skipped (meta-only).
     schema: Option<ModelSchema>,
-    /// Armed model path for the NEXT forged consensus frame. The coordinator
-    /// sets it before the reduce it wants captured; the reduce thread takes it.
-    pending: Mutex<Option<PathBuf>>,
+    /// Mutable accumulation state (armed path + tensors gathered so far).
+    inner: Mutex<ForgeState>,
+}
+
+/// What the forge has gathered toward the next consensus checkpoint.
+#[derive(Default)]
+struct ForgeState {
+    /// Armed model path for the current checkpoint cycle (`<stem>.fdl`). Set by
+    /// the coordinator before the cycle it wants captured; taken when the write
+    /// is spawned. `None` = not armed (frames are ignored).
+    pending_path: Option<PathBuf>,
+    /// `Model`-reduce tensors gathered this cycle, in arrival order (params'
+    /// frame, then buffers' frame). Moved in, never copied. Drained on write.
+    accumulated: Vec<TensorPayload>,
 }
 
 impl CheckpointForge {
@@ -47,7 +112,7 @@ impl CheckpointForge {
     pub fn new(schema: Option<ModelSchema>) -> Arc<Self> {
         Arc::new(CheckpointForge {
             schema,
-            pending: Mutex::new(None),
+            inner: Mutex::new(ForgeState::default()),
         })
     }
 
@@ -59,41 +124,62 @@ impl CheckpointForge {
     }
 
     /// Coordinator: arm a consensus model save to `model_path` (`<stem>.fdl`)
-    /// for the NEXT forged frame. The latest arm wins (a prior un-consumed arm
-    /// is overwritten — a new checkpoint supersedes a missed one).
+    /// for the NEXT checkpoint cycle. Clears any partial accumulation (a new
+    /// checkpoint supersedes a missed one), so the forge starts the cycle
+    /// fresh.
     pub fn arm(&self, model_path: PathBuf) {
-        *self.pending.lock().expect("checkpoint forge mutex poisoned") =
-            Some(model_path);
+        let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
+        st.pending_path = Some(model_path);
+        st.accumulated.clear();
     }
 
-    /// Reduce thread: if armed, take the path and spawn a **detached** writer
-    /// for `averaged` (one host-tensor-bytes clone), returning immediately so
-    /// the reduce loop keeps scattering. No-op when not armed.
-    pub fn maybe_write(&self, averaged: &RoundFrame) {
-        let path = match self
-            .pending
-            .lock()
-            .expect("checkpoint forge mutex poisoned")
-            .take()
-        {
-            Some(p) => p,
-            None => return,
+    /// Reduce thread: fold one `Model` reduce's averaged frame into the
+    /// accumulation. The frame is **moved** in (no clone). When the gathered
+    /// tensor count reaches the schema's total (params + buffers), take the
+    /// armed path + accumulated tensors and spawn a **detached** writer,
+    /// returning immediately so the reduce loop keeps scattering. No-op when
+    /// not armed or no schema was captured.
+    ///
+    /// Caller must only pass [`crate::distributed::controller::RoundKind::Model`]
+    /// frames; the per-rank count-gather (`Control`) is never the model.
+    pub fn accumulate(&self, frame: RoundFrame) {
+        let Some(schema) = self.schema.as_ref() else {
+            return; // no schema captured; .fdl skipped (meta-only)
         };
-        let Some(schema) = self.schema.clone() else {
+        let want = schema.tensor_count();
+        let (path, payloads) = {
+            let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
+            if st.pending_path.is_none() {
+                return; // not armed — drop this cycle's frame
+            }
+            // MOVE the frame's tensors into the accumulator (no copy).
+            st.accumulated.extend(frame.tensors);
+            if st.accumulated.len() < want {
+                return; // more model reduces to come this cycle (buffers)
+            }
+            let path = st.pending_path.take().expect("armed checked above");
+            let payloads = std::mem::take(&mut st.accumulated);
+            (path, payloads)
+        };
+        if payloads.len() != want {
+            // Overshoot: more tensors arrived than the schema expects — a wiring
+            // bug. Skip rather than write a misaligned checkpoint.
             eprintln!(
-                "flodl ddp: consensus checkpoint armed but no model schema was \
-                 captured at launch; .fdl skipped (meta-only) for {}",
+                "flodl ddp: consensus checkpoint accumulated {} tensors but schema \
+                 expects {} ({} params + {} buffers); .fdl skipped for {}",
+                payloads.len(),
+                want,
+                schema.param_names.len(),
+                schema.buffer_names.len(),
                 path.display(),
             );
             return;
-        };
-        // One clone of the host-resident averaged frame; the detached writer
-        // owns it so the reduce loop is free to continue immediately.
-        let frame = averaged.clone();
+        }
+        let schema = schema.clone();
         let spawn = std::thread::Builder::new()
             .name("flodl-ckpt-writer".to_string())
             .spawn(move || {
-                if let Err(e) = write_consensus_fdl(&schema, &frame, &path) {
+                if let Err(e) = write_consensus_fdl(&schema, &payloads, &path) {
                     eprintln!(
                         "flodl ddp: consensus checkpoint write to {} failed: {e}",
                         path.display(),
@@ -106,51 +192,72 @@ impl CheckpointForge {
     }
 }
 
-/// Build a named, loadable `.fdl` from the ordered averaged frame + the static
-/// schema. Positional pairing: the first `param_names.len()` tensors are
-/// params, the rest buffers — the `GpuWorker::snapshot_params` layout. Loud on
-/// a tensor-count mismatch (schema and frame disagree → a wiring bug; never
-/// silently write a corrupt checkpoint).
-fn write_consensus_fdl(
-    schema: &ModelSchema,
-    frame: &RoundFrame,
-    path: &Path,
-) -> Result<()> {
-    let tensors = round_frame_to_tensors(frame)?;
-    if tensors.len() != schema.tensor_count() {
+/// Write a named, loadable `.fdl` straight from the accumulated averaged
+/// payloads + the static schema. Positional pairing: the first
+/// `param_names.len()` tensors are params, the rest buffers — the
+/// `GpuWorker::snapshot_params` / reduce order. Emits the payloads' raw native
+/// bytes directly (no `Tensor` reconstruction) and commits with a temp-file +
+/// atomic rename, so a crash mid-write never leaves a torn `.fdl` that resume
+/// could mistake for valid.
+fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &Path) -> Result<()> {
+    if payloads.len() != schema.tensor_count() {
         return Err(TensorError::new(&format!(
-            "checkpoint_forge: averaged frame has {} tensors but schema expects \
-             {} ({} params + {} buffers) — schema/frame mismatch",
-            tensors.len(),
+            "checkpoint_forge: accumulated {} tensors but schema expects \
+             {} ({} params + {} buffers) — schema/accumulation mismatch",
+            payloads.len(),
             schema.tensor_count(),
             schema.param_names.len(),
             schema.buffer_names.len(),
         )));
     }
-    let mut iter = tensors.into_iter();
-    let params: Vec<(String, Parameter)> = schema
-        .param_names
+    // Pre-convert u32 wire shapes to the i64 dims the .fdl format stores;
+    // entries borrow these.
+    let shapes: Vec<Vec<i64>> = payloads
         .iter()
-        .map(|name| {
-            let t = iter.next().expect("tensor count checked above");
-            (name.clone(), Parameter::new(t, name))
+        .map(|p| p.shape.iter().map(|&d| d as i64).collect())
+        .collect();
+    // Positional keys: the first `param_names.len()` payloads are params
+    // (`p{i}`), the rest buffers (`b{j}`). Synthetic + unique — never the
+    // model's own (possibly repeated) names. Matches `load_consensus_checkpoint`.
+    let param_count = schema.param_names.len();
+    let keys: Vec<String> = (0..payloads.len())
+        .map(|i| {
+            if i < param_count {
+                consensus_param_key(i)
+            } else {
+                consensus_buffer_key(i - param_count)
+            }
         })
         .collect();
-    let buffers: Vec<(String, Buffer)> = schema
-        .buffer_names
-        .iter()
-        .map(|name| {
-            let t = iter.next().expect("tensor count checked above");
-            (name.clone(), Buffer::new(t, name))
-        })
-        .collect();
+    let mut entries = Vec::with_capacity(payloads.len());
+    for (i, p) in payloads.iter().enumerate() {
+        if p.dtype != DTYPE_F32 {
+            return Err(TensorError::new(&format!(
+                "checkpoint_forge: payload[{i}] dtype {} not supported (v1 f32 only)",
+                p.dtype,
+            )));
+        }
+        entries.push(RawCheckpointEntry {
+            name: keys[i].as_str(),
+            shape: &shapes[i],
+            dtype_tag: dtype_tag(DType::Float32),
+            raw: &p.bytes,
+        });
+    }
     let path_str = path.to_str().ok_or_else(|| {
         TensorError::new(&format!(
             "checkpoint_forge: non-utf8 checkpoint path {}",
             path.display(),
         ))
     })?;
-    crate::nn::save_checkpoint_file(path_str, &params, &buffers, None)
+    let tmp = format!("{path_str}.tmp");
+    save_checkpoint_from_raw_file(&tmp, &entries, None)?;
+    std::fs::rename(&tmp, path_str).map_err(|e| {
+        TensorError::new(&format!(
+            "checkpoint_forge: atomic rename {tmp} -> {path_str} failed: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -164,31 +271,53 @@ mod tests {
     }
 
     #[test]
-    fn write_consensus_fdl_round_trips_through_load() {
+    fn accumulate_params_then_buffers_round_trips_through_load() {
         // Schema: 2 params (w, b) + 1 buffer (running_mean), in snapshot order.
         let schema = ModelSchema {
             param_names: vec!["w".to_string(), "b".to_string()],
             buffer_names: vec!["running_mean".to_string()],
         };
+        let forge = CheckpointForge::new(Some(schema));
+        assert!(forge.can_write_model());
+
         let w = cpu_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = cpu_tensor(&[5.0, 6.0], &[2]);
         let rm = cpu_tensor(&[7.0, 8.0], &[2]);
-        let frame = tensors_to_round_frame(&[&w, &b, &rm]).unwrap();
+        // Two model reduces: params frame (w, b) then buffers frame (rm).
+        let params_frame = tensors_to_round_frame(&[&w, &b]).unwrap();
+        let buffers_frame = tensors_to_round_frame(&[&rm]).unwrap();
 
-        let dir = std::env::temp_dir()
-            .join(format!("flodl_forge_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flodl_forge_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus.fdl");
-        write_consensus_fdl(&schema, &frame, &path).unwrap();
+
+        forge.arm(path.clone());
+        forge.accumulate(params_frame); // partial: 2 of 3, no write yet
+        assert!(!path.exists(), "no write before all model frames arrive");
+        forge.accumulate(buffers_frame); // completes 3/3 → detached write
+
+        // Join is implicit (detached); poll briefly for the file.
+        let mut found = false;
+        for _ in 0..200 {
+            if path.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(found, "completed accumulation produced the .fdl");
 
         // Load back into zero-initialised targets keyed by the same names.
+        use crate::nn::{Buffer, Parameter};
         let tw = Parameter::new(cpu_tensor(&[0.0; 4], &[2, 2]), "w");
         let tb = Parameter::new(cpu_tensor(&[0.0; 2], &[2]), "b");
         let trm = Buffer::new(cpu_tensor(&[0.0; 2], &[2]), "running_mean");
+        // Load by the positional keys the writer emits (p0, p1, b0) — not the
+        // model's own names (which can repeat across layers).
         crate::nn::load_checkpoint_file(
             path.to_str().unwrap(),
-            &[("w".to_string(), tw.clone()), ("b".to_string(), tb.clone())],
-            &[("running_mean".to_string(), trm.clone())],
+            &[("p0".to_string(), tw.clone()), ("p1".to_string(), tb.clone())],
+            &[("b0".to_string(), trm.clone())],
             None,
         )
         .unwrap();
@@ -201,42 +330,41 @@ mod tests {
     }
 
     #[test]
-    fn write_consensus_fdl_rejects_tensor_count_mismatch() {
-        let schema = ModelSchema {
-            param_names: vec!["w".to_string()],
-            buffer_names: vec![],
-        };
-        // Frame carries 2 tensors but schema expects 1.
-        let a = cpu_tensor(&[1.0], &[1]);
-        let b = cpu_tensor(&[2.0], &[1]);
-        let frame = tensors_to_round_frame(&[&a, &b]).unwrap();
-        let path = std::env::temp_dir().join("flodl_forge_mismatch.fdl");
-        let err = write_consensus_fdl(&schema, &frame, &path).unwrap_err();
-        assert!(err.to_string().contains("mismatch"), "got: {err}");
-    }
-
-    #[test]
-    fn arm_then_maybe_write_consumes_once() {
+    fn unarmed_accumulate_is_noop() {
         let schema = ModelSchema {
             param_names: vec!["w".to_string()],
             buffer_names: vec![],
         };
         let forge = CheckpointForge::new(Some(schema));
-        assert!(forge.can_write_model());
         let w = cpu_tensor(&[1.0, 2.0], &[2]);
-        let frame = tensors_to_round_frame(&[&w]).unwrap();
+        // No arm() — accumulate must not crash or write.
+        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap());
+    }
 
-        let dir = std::env::temp_dir()
-            .join(format!("flodl_forge_arm_{}", std::process::id()));
+    #[test]
+    fn arm_clears_partial_accumulation() {
+        // A new arm supersedes a missed one: a stale partial frame must not
+        // bleed into the next cycle's model.
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string(), "b".to_string()],
+            buffer_names: vec![],
+        };
+        let forge = CheckpointForge::new(Some(schema));
+        let stale = cpu_tensor(&[9.0], &[1]);
+        let w = cpu_tensor(&[1.0, 2.0], &[2]);
+        let b = cpu_tensor(&[3.0], &[1]);
+
+        let dir = std::env::temp_dir().join(format!("flodl_forge_arm_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.fdl");
 
         forge.arm(path.clone());
-        forge.maybe_write(&frame); // spawns detached writer
-        // A second call with no re-arm is a no-op (arm consumed).
-        forge.maybe_write(&frame);
+        forge.accumulate(tensors_to_round_frame(&[&stale]).unwrap()); // partial 1/2
+        // Re-arm: the stale partial is dropped, cycle restarts.
+        forge.arm(path.clone());
+        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap()); // 1/2
+        forge.accumulate(tensors_to_round_frame(&[&b]).unwrap()); // 2/2 → write
 
-        // Join is implicit (detached); poll briefly for the file.
         let mut found = false;
         for _ in 0..200 {
             if path.exists() {
@@ -245,7 +373,35 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(found, "armed write produced the .fdl");
+        assert!(found, "re-armed accumulation produced the .fdl");
+
+        use crate::nn::Parameter;
+        let tw = Parameter::new(cpu_tensor(&[0.0; 2], &[2]), "w");
+        let tb = Parameter::new(cpu_tensor(&[0.0; 1], &[1]), "b");
+        crate::nn::load_checkpoint_file(
+            path.to_str().unwrap(),
+            &[("p0".to_string(), tw.clone()), ("p1".to_string(), tb.clone())],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(tw.variable.data().to_f32_vec().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(tb.variable.data().to_f32_vec().unwrap(), vec![3.0]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_consensus_fdl_rejects_tensor_count_mismatch() {
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+        };
+        // Two payloads but schema expects 1.
+        let a = cpu_tensor(&[1.0], &[1]);
+        let b = cpu_tensor(&[2.0], &[1]);
+        let frame = tensors_to_round_frame(&[&a, &b]).unwrap();
+        let path = std::env::temp_dir().join("flodl_forge_mismatch.fdl");
+        let err = write_consensus_fdl(&schema, &frame.tensors, &path).unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "got: {err}");
     }
 }

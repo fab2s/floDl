@@ -1211,18 +1211,27 @@ impl ClusterCoordinator {
         )
         .with_elche_state(elche_state)
         .with_coverage(coverage);
-        if let Err(e) = meta.write_to_file(&meta_path) {
-            eprintln!(
-                "flodl ddp: checkpoint meta write to {} failed: {e}",
-                meta_path.display(),
-            );
-            return;
+        // Detach the meta file write so the checkpoint never touches the
+        // training clock (matches the forge's detached `.fdl` write). The
+        // meta is built synchronously from coordinator state above (cheap);
+        // only the serialize + atomic disk write runs off-thread. Ownership
+        // of `meta` + `meta_path` moves into the writer.
+        let version = self.version;
+        let spawn = std::thread::Builder::new()
+            .name("flodl-ckpt-meta".to_string())
+            .spawn(move || match meta.write_to_file(&meta_path) {
+                Ok(()) => crate::verbose!(
+                    "  ddp: checkpoint meta written {} (epoch {epoch}, version {version})",
+                    meta_path.display(),
+                ),
+                Err(e) => eprintln!(
+                    "flodl ddp: checkpoint meta write to {} failed: {e}",
+                    meta_path.display(),
+                ),
+            });
+        if let Err(e) = spawn {
+            eprintln!("flodl ddp: failed to spawn checkpoint meta writer thread: {e}");
         }
-        crate::verbose!(
-            "  ddp: checkpoint meta written {} (epoch {epoch}, version {})",
-            meta_path.display(),
-            self.version,
-        );
         // NCCL consensus MODEL write: the consensus is on-device across ranks
         // (no controller-side frame to tap), so dispatch the elected rank to
         // write its post-collective `self.model`. We are at the tail of

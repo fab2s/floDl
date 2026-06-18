@@ -70,8 +70,16 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
         "pending coverage consumed at finish"
     );
 
-    // Read the meta back.
+    // Read the meta back. The meta write is detached off the coordinator
+    // finish path (production keeps checkpointing off the training clock) and
+    // committed via temp+atomic-rename, so the path appearing means it is
+    // whole — poll briefly for it rather than racing the writer thread.
     let meta_path = CheckpointBundle::meta_path(&stem);
+    let mut waited = 0;
+    while !meta_path.exists() && waited < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        waited += 1;
+    }
     let meta = CheckpointMeta::read_from_file(&meta_path).unwrap();
     assert_eq!(meta.save_reason, SaveReason::Checkpoint);
     let cov = meta.coverage.clone().expect("coverage block recorded");

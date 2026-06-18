@@ -617,8 +617,39 @@ fn run_unified(
     let sched_factory = model_def.scheduler;
     let sched_epochs = config.epochs;
 
+    // Resume: when a checkpoint stem is configured, each freshly-built replica
+    // loads the forged consensus weights from `<stem>.fdl` so the resumed run
+    // continues from the saved model. The framework restores the trajectory +
+    // data-coverage separately (via `.resume_from` below). Names match by
+    // construction: the forge keyed the `.fdl` by this same model's
+    // `parameters()`/`buffers()` order (captured as the launch `ModelSchema`).
+    // This closure runs on every replica device AND on the launcher's CPU
+    // schema probe, so the load lands on each rank's own device.
+    let resume_stem = config.resume_from.clone();
+    let model_factory = move |device: Device| -> Result<Box<dyn Module>> {
+        let model = build_fn(device)?;
+        if let Some(stem) = resume_stem.as_ref() {
+            let path = flodl::distributed::CheckpointBundle::model_path(stem);
+            let path = path
+                .to_str()
+                .ok_or_else(|| TensorError::new("resume: non-utf8 checkpoint path"))?;
+            // Positional load: consensus bundles key tensors by index, not by
+            // the model's own (often repeated) param names. flodl owns the
+            // convention so writer + loader can't drift.
+            let report = flodl::distributed::load_consensus_checkpoint(model.as_ref(), path)?;
+            eprintln!(
+                "  resume: loaded consensus weights from {path} \
+                 ({} loaded, {} missing, {} skipped) on {device:?}",
+                report.loaded.len(),
+                report.missing.len(),
+                report.skipped.len(),
+            );
+        }
+        Ok(model)
+    };
+
     let mut builder = Trainer::builder(
-        build_fn,
+        model_factory,
         move |params: &[Parameter]| DynOptimizer(opt_fn(params, lr)),
         move |model: &Box<dyn Module>, batch: &[Tensor]| -> Result<Variable> {
             let batch = if let Some(aug) = augment_fn {
@@ -635,6 +666,22 @@ fn run_unified(
     .policy(policy)
     .backend(backend)
     .timeline(Arc::clone(timeline));
+
+    // Cluster checkpoint / resume wiring. `save_path` sets the bundle stem the
+    // consensus forge writes to; `checkpoint_at_epoch` arms a one-shot mid-run
+    // snapshot at that epoch; `resume_from` seeds the controller's trajectory +
+    // data-coverage so only the uncovered remainder is dispatched (the model
+    // weights are reloaded in `model_factory` above). Progressive (cadence/
+    // async) modes only -- a Sync run has no chunk pools to snapshot.
+    if let Some(stem) = &config.save_path {
+        builder = builder.save_path(stem.clone());
+    }
+    if let Some(epoch) = config.checkpoint_at_epoch {
+        builder = builder.checkpoint_at_epoch(epoch);
+    }
+    if let Some(stem) = &config.resume_from {
+        builder = builder.resume_from(stem.clone());
+    }
 
     // Heterogeneous topology: explicit per-rank shares disable the uniform
     // default. Without this, the fast GPU idles waiting for the slow ones at

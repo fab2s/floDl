@@ -230,7 +230,7 @@ pub struct ClusterCoordinatorConfig {
     /// Resume kickoff: optional [`crate::distributed::CoverageBlock`] from a
     /// prior run's `.meta.json`. When `Some`, the coordinator reconstructs the
     /// recorded in-progress epoch pools (via
-    /// [`crate::distributed::chunk_pool::ChunkPool::from_coverage`]) and
+    /// `ChunkPool::from_coverage`) and
     /// dispatches only the uncovered remainder instead of a fresh epoch.
     /// `None` = fresh-start (epoch-granular dispatch from `start_epoch`).
     pub start_coverage: Option<crate::distributed::CoverageBlock>,

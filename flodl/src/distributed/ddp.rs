@@ -759,6 +759,9 @@ impl Trainer {
         if let Some(p) = cfg.resume_from {
             b = b.resume_from(p);
         }
+        if let Some(e) = cfg.checkpoint_at_epoch {
+            b = b.checkpoint_at_epoch(e);
+        }
         if let Some(f) = cfg.checkpoint_fn {
             b = b.checkpoint_fn_arc(f);
         }

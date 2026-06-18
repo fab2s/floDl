@@ -346,6 +346,20 @@ where
         self
     }
 
+    /// Arm a one-shot coverage-granular checkpoint at the given epoch.
+    /// Pairs with [`Self::save_path`] (the bundle stem). On the first
+    /// reduce where the cohort reaches `epoch`, the forged consensus
+    /// model is written to `<stem>.fdl` and the trajectory +
+    /// data-coverage to `<stem>.meta.json`. A later run with
+    /// [`Self::resume_from`] (same dataset seed) reconstructs the
+    /// in-progress epoch pools and dispatches only the uncovered
+    /// remainder — no data is repeated. Progressive modes only
+    /// (Cadence / Async). See [`DdpRunConfig::checkpoint_at_epoch`].
+    pub fn checkpoint_at_epoch(mut self, epoch: usize) -> Self {
+        self.config = self.config.with_checkpoint_at_epoch(epoch);
+        self
+    }
+
     /// Cluster-mode threshold for declaring a run unrecoverable. When
     /// the dead-rank count reaches this limit, the controller
     /// broadcasts `ShutdownWithSave` to survivors and writes the
