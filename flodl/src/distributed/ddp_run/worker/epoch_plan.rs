@@ -454,6 +454,74 @@ impl<M: Module> GpuWorker<M> {
         }
     }
 
+    /// Write this rank's replicated outer-optimizer momentum to
+    /// `<stem>.outer.fdl` (one tensor per parameter, positional `p{i}`), the
+    /// NCCL elected-rank counterpart to the CPU forge's `.outer.fdl`. No-op
+    /// when there is no outer optimizer or it is stateless
+    /// ([`crate::distributed::OuterAvg`] returns `None`, so no artifact).
+    /// Errors are logged + ignored (a disk
+    /// failure must never deadlock the cohort), mirroring [`Self::write_model_to_fdl`].
+    pub(super) fn write_outer_momentum_to_fdl(&self, stem: &str) {
+        use crate::distributed::CheckpointBundle;
+        use crate::distributed::checkpoint_forge::consensus_param_key;
+        use crate::nn::Parameter;
+        let Some(outer) = self.outer_optimizer.as_ref() else {
+            return;
+        };
+        let Some(momentum) = outer.checkpoint_state() else {
+            return; // stateless outer optimizer — no artifact
+        };
+        let outer_path = CheckpointBundle::model_path(stem).with_extension("outer.fdl");
+        let params: Vec<(String, Parameter)> = momentum
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| (consensus_param_key(i), Parameter::new(t, "outer_momentum")))
+            .collect();
+        match outer_path.to_str() {
+            Some(path_str) => {
+                if let Err(e) = crate::nn::save_checkpoint_file(path_str, &params, &[], None) {
+                    eprintln!(
+                        "ddp-worker: rank {} outer-momentum save to {path_str} failed: {e}",
+                        self.rank,
+                    );
+                }
+            }
+            None => eprintln!(
+                "ddp-worker: rank {} outer-momentum path is not utf-8: {}",
+                self.rank,
+                outer_path.display(),
+            ),
+        }
+    }
+
+    /// Resume this rank's replicated outer-optimizer momentum from
+    /// `<stem>.outer.fdl` (positional `p{i}`, shaped by the model's
+    /// parameters). No-op when there is no outer optimizer, the variant is
+    /// stateless (load ignored), or the sidecar is absent (fresh / OuterAvg
+    /// run). Called once per rank at setup so the NCCL outer step resumes from
+    /// the saved momentum instead of re-seeding from zero. Replicates: every
+    /// rank loads the same file, matching the model's replicated resume.
+    pub(crate) fn resume_outer_momentum(&mut self, stem: &str) -> Result<()> {
+        use crate::distributed::CheckpointBundle;
+        let Some(outer) = self.outer_optimizer.as_mut() else {
+            return Ok(());
+        };
+        let outer_path = CheckpointBundle::model_path(stem).with_extension("outer.fdl");
+        if !outer_path.exists() {
+            return Ok(()); // fresh run / OuterAvg — no sidecar to load
+        }
+        let path = outer_path.to_str().ok_or_else(|| {
+            crate::tensor::TensorError::new("resume: non-utf8 outer-momentum path")
+        })?;
+        let momentum = crate::distributed::load_outer_momentum(&self.model, path)?;
+        outer.load_checkpoint_state(momentum)?;
+        eprintln!(
+            "  resume: rank {} loaded outer-optimizer momentum from {path}",
+            self.rank,
+        );
+        Ok(())
+    }
+
     pub(super) fn write_checkpoint_bundle(
         &self,
         stem: &str,

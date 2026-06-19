@@ -446,6 +446,21 @@ impl DdpHandle {
                 cluster_worker.inner_mut().set_scheduler(f(world_size));
             }
 
+            // Resume: re-seed this rank's replicated outer-optimizer momentum
+            // from `<stem>.outer.fdl` (NCCL path; the momentum lives per-rank
+            // on GPU, so every rank loads it, mirroring the model's replicated
+            // resume). No-op when not resuming / no outer optimizer / sidecar
+            // absent. Errors are logged + ignored (resume from zero momentum is
+            // a safe fallback, not a hard failure).
+            if let Some(stem) = config.resume_from.as_ref() {
+                if let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem) {
+                    eprintln!(
+                        "cluster_worker: rank {global_rank} outer-momentum resume \
+                         failed ({e}); starting from zero momentum"
+                    );
+                }
+            }
+
             let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
 
             // Final snapshot captured from the inner GpuWorker before

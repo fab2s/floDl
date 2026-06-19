@@ -333,7 +333,14 @@ impl<M: Module> GpuWorker<M> {
                     return Ok(false);
                 }
                 match self.save_path.clone() {
-                    Some(stem) => self.write_model_to_fdl(&stem),
+                    Some(stem) => {
+                        self.write_model_to_fdl(&stem);
+                        // Outer-optimizer momentum rides the same elected-rank
+                        // write: this rank's replicated momentum -> `<stem>.outer.fdl`.
+                        // No-op for a stateless outer optimizer / no outer
+                        // optimizer (OuterAvg writes no artifact).
+                        self.write_outer_momentum_to_fdl(&stem);
+                    }
                     None => eprintln!(
                         "ddp-worker: rank {} SaveConsensusModel received but \
                          save_path is unset; consensus .fdl not written",
