@@ -86,6 +86,23 @@ pub trait OuterOptimizer: Send {
         prev_global: &[Tensor],
         consensus: &[Tensor],
     ) -> Result<Vec<Tensor>>;
+
+    /// Snapshot the checkpointable outer state (the slow momentum), one
+    /// tensor per model parameter in `Module::parameters()` order, for
+    /// `<stem>.outer.fdl`. `None` for stateless variants ([`OuterAvg`]),
+    /// which write no artifact. Returns clones (shallow); the caller
+    /// serializes them synchronously, so the live state may be overwritten by
+    /// the next window without racing the detached write.
+    fn checkpoint_state(&self) -> Option<Vec<Tensor>> {
+        None
+    }
+
+    /// Restore outer state from `<stem>.outer.fdl` on resume. `state` is
+    /// positional, one tensor per parameter (`Module::parameters()` order).
+    /// Stateless variants ignore it.
+    fn load_checkpoint_state(&mut self, _state: Vec<Tensor>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Identity outer optimizer: `new_global = consensus`. Stateless, no
@@ -174,6 +191,22 @@ impl OuterOptimizer for SlowMomentum {
         self.velocity = new_velocity;
         Ok(new_global)
     }
+
+    fn checkpoint_state(&self) -> Option<Vec<Tensor>> {
+        // No step taken yet (velocity unseeded) => nothing to checkpoint.
+        if self.velocity.is_empty() {
+            None
+        } else {
+            Some(self.velocity.clone())
+        }
+    }
+
+    fn load_checkpoint_state(&mut self, state: Vec<Tensor>) -> Result<()> {
+        // Restore the slow-momentum buffer; the next outer_step resumes
+        // accumulation from it (a faithful resume, vs re-seeding from zero).
+        self.velocity = state;
+        Ok(())
+    }
 }
 
 /// Controller-side driver that applies an [`OuterOptimizer`] to the CPU
@@ -242,6 +275,21 @@ impl OuterStepper {
             }
             RoundKind::Model => Ok(frame),
         }
+    }
+
+    /// Snapshot the outer optimizer's checkpointable state (delegates to the
+    /// variant). `None` for stateless variants ([`OuterAvg`]), so no
+    /// `<stem>.outer.fdl` is written.
+    pub fn checkpoint_state(&self) -> Option<Vec<Tensor>> {
+        self.opt.checkpoint_state()
+    }
+
+    /// Restore the outer optimizer's state on resume (delegates). Also seeds
+    /// `prev_global` to `None` is left untouched — the first post-resume
+    /// window re-anchors on the restored consensus, while the restored
+    /// momentum carries the accumulated drift.
+    pub fn load_checkpoint_state(&mut self, state: Vec<Tensor>) -> Result<()> {
+        self.opt.load_checkpoint_state(state)
     }
 }
 
@@ -375,6 +423,46 @@ mod tests {
         );
         let b2_out = stepper.process_frame(buffers.clone()).unwrap();
         assert_eq!(b2_out, buffers, "buffers still pass through after a real step");
+    }
+
+    #[test]
+    fn outer_avg_checkpoint_state_is_none() {
+        // Stateless: no momentum, so no <stem>.outer.fdl artifact.
+        let opt = OuterAvg;
+        assert!(opt.checkpoint_state().is_none());
+    }
+
+    #[test]
+    fn slow_momentum_checkpoint_round_trip_is_faithful() {
+        // Warm a SlowMomentum, snapshot its momentum, restore into a fresh
+        // instance, and confirm the next outer_step matches the warmed one's
+        // (the resume is faithful, vs re-seeding velocity from zero).
+        let mut warm = SlowMomentum::new(0.5, 0.9);
+        // Two windows to build non-trivial momentum.
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])]).unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])]).unwrap();
+
+        let saved = warm.checkpoint_state().expect("has momentum after stepping");
+        let mut resumed = SlowMomentum::new(0.5, 0.9);
+        resumed.load_checkpoint_state(saved).unwrap();
+
+        // Identical next step from identical inputs => momentum was carried.
+        let prev = [t(&[0.75, 1.5], &[2])];
+        let cons = [t(&[0.7, 1.4], &[2])];
+        let a = warm.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        let b = resumed.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() < 1e-6, "param[{i}]: resumed {y} != warmed {x}");
+        }
+
+        // Sanity: a from-zero instance would differ on this step (proves the
+        // round-trip carried real state, not nothing).
+        let mut fresh = SlowMomentum::new(0.5, 0.9);
+        let c = fresh.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        assert!(
+            (a[0] - c[0]).abs() > 1e-6 || (a[1] - c[1]).abs() > 1e-6,
+            "warmed and from-zero should differ, else the test is vacuous"
+        );
     }
 
     #[test]

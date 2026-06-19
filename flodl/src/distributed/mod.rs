@@ -48,6 +48,9 @@ pub(crate) use checkpoint_forge::CheckpointForge;
 /// Positional loader for cluster consensus / failure-save `.fdl` bundles —
 /// the resume-side counterpart to the consensus writers (`load_consensus_checkpoint`).
 pub use checkpoint_forge::load_consensus_checkpoint;
+/// Loader for the outer-optimizer momentum sidecar (`<stem>.outer.fdl`),
+/// used by the launcher on resume to re-seed the outer optimizer.
+pub use checkpoint_forge::load_outer_momentum;
 pub use cluster::{WorkerBlock, LocalCluster};
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;

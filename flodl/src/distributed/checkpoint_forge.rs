@@ -105,6 +105,11 @@ struct ForgeState {
     /// `Model`-reduce tensors gathered this cycle, in arrival order (params'
     /// frame, then buffers' frame). Moved in, never copied. Drained on write.
     accumulated: Vec<TensorPayload>,
+    /// Outer-optimizer momentum payloads for this cycle (one tensor per model
+    /// parameter), stashed by the controller when an outer optimizer carries
+    /// state. `None` for stateless outer optimizers (OuterAvg) — no
+    /// `<stem>.outer.fdl` is written. Taken alongside the model on write.
+    pending_outer: Option<Vec<TensorPayload>>,
 }
 
 impl CheckpointForge {
@@ -131,6 +136,29 @@ impl CheckpointForge {
         let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
         st.pending_path = Some(model_path);
         st.accumulated.clear();
+        st.pending_outer = None;
+    }
+
+    /// Whether a checkpoint is currently armed (a `<stem>.fdl` path is
+    /// pending). The controller checks this to decide whether to snapshot the
+    /// outer-optimizer momentum this window — a rare event, so the (cheap)
+    /// momentum serialize only happens when a checkpoint is actually pending.
+    pub fn is_armed(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("checkpoint forge mutex poisoned")
+            .pending_path
+            .is_some()
+    }
+
+    /// Stash this cycle's outer-optimizer momentum payloads (one tensor per
+    /// model parameter). Written to `<stem>.outer.fdl` alongside the consensus
+    /// model when this cycle's accumulation completes. No-op contract: pass
+    /// only when the outer optimizer carries state (stateless OuterAvg never
+    /// stashes, so no artifact is written).
+    pub fn stash_outer_momentum(&self, payloads: Vec<TensorPayload>) {
+        let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
+        st.pending_outer = Some(payloads);
     }
 
     /// Reduce thread: fold one `Model` reduce's averaged frame into the
@@ -147,7 +175,7 @@ impl CheckpointForge {
             return; // no schema captured; .fdl skipped (meta-only)
         };
         let want = schema.tensor_count();
-        let (path, payloads) = {
+        let (path, payloads, outer) = {
             let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
             if st.pending_path.is_none() {
                 return; // not armed — drop this cycle's frame
@@ -159,7 +187,10 @@ impl CheckpointForge {
             }
             let path = st.pending_path.take().expect("armed checked above");
             let payloads = std::mem::take(&mut st.accumulated);
-            (path, payloads)
+            // Outer-optimizer momentum for this cycle, if any (None for
+            // stateless OuterAvg => no `.outer.fdl`).
+            let outer = st.pending_outer.take();
+            (path, payloads, outer)
         };
         if payloads.len() != want {
             // Overshoot: more tensors arrived than the schema expects — a wiring
@@ -175,6 +206,25 @@ impl CheckpointForge {
             );
             return;
         }
+        // Validate the outer momentum count here (on the reduce thread, where
+        // the error is actionable) before handing it to the detached writer:
+        // it is model-sized (one tensor per parameter), so it must match the
+        // schema's param count. A mismatch drops just the `.outer.fdl` (the
+        // consensus model still writes); a stateless outer optimizer passes
+        // `None` and writes no artifact.
+        let outer = outer.filter(|o| {
+            let ok = o.len() == schema.param_names.len();
+            if !ok {
+                eprintln!(
+                    "flodl ddp: outer-momentum has {} tensors but schema expects \
+                     {} params; .outer.fdl skipped for {}",
+                    o.len(),
+                    schema.param_names.len(),
+                    path.display(),
+                );
+            }
+            ok
+        });
         let schema = schema.clone();
         let spawn = std::thread::Builder::new()
             .name("flodl-ckpt-writer".to_string())
@@ -184,6 +234,19 @@ impl CheckpointForge {
                         "flodl ddp: consensus checkpoint write to {} failed: {e}",
                         path.display(),
                     );
+                }
+                // Outer-optimizer momentum rides the same writer: `<stem>.fdl`
+                // -> `<stem>.outer.fdl`, same atomic-rename commit. Written
+                // after the model so a present `.outer.fdl` implies a present
+                // `.fdl`.
+                if let Some(outer_payloads) = outer {
+                    let outer_path = path.with_extension("outer.fdl");
+                    if let Err(e) = write_outer_momentum_fdl(&outer_payloads, &outer_path) {
+                        eprintln!(
+                            "flodl ddp: outer-momentum checkpoint write to {} failed: {e}",
+                            outer_path.display(),
+                        );
+                    }
                 }
             });
         if let Err(e) = spawn {
@@ -260,6 +323,72 @@ fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &
     Ok(())
 }
 
+/// Write the outer-optimizer momentum to `<stem>.outer.fdl`: one tensor per
+/// model **parameter**, keyed positionally (`p{i}`) exactly like the
+/// consensus params (no buffers), committed with a temp-file + atomic rename.
+/// Loaded back on resume by [`load_outer_momentum`].
+fn write_outer_momentum_fdl(payloads: &[TensorPayload], path: &Path) -> Result<()> {
+    let shapes: Vec<Vec<i64>> = payloads
+        .iter()
+        .map(|p| p.shape.iter().map(|&d| d as i64).collect())
+        .collect();
+    let keys: Vec<String> = (0..payloads.len()).map(consensus_param_key).collect();
+    let mut entries = Vec::with_capacity(payloads.len());
+    for (i, p) in payloads.iter().enumerate() {
+        if p.dtype != DTYPE_F32 {
+            return Err(TensorError::new(&format!(
+                "checkpoint_forge: outer payload[{i}] dtype {} not supported (v1 f32 only)",
+                p.dtype,
+            )));
+        }
+        entries.push(RawCheckpointEntry {
+            name: keys[i].as_str(),
+            shape: &shapes[i],
+            dtype_tag: dtype_tag(DType::Float32),
+            raw: &p.bytes,
+        });
+    }
+    let path_str = path.to_str().ok_or_else(|| {
+        TensorError::new(&format!(
+            "checkpoint_forge: non-utf8 outer-momentum path {}",
+            path.display(),
+        ))
+    })?;
+    let tmp = format!("{path_str}.tmp");
+    save_checkpoint_from_raw_file(&tmp, &entries, None)?;
+    std::fs::rename(&tmp, path_str).map_err(|e| {
+        TensorError::new(&format!(
+            "checkpoint_forge: atomic rename {tmp} -> {path_str} failed: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Load `<stem>.outer.fdl` (outer-optimizer momentum) into a fresh tensor per
+/// model parameter, matched positionally (`p{i}`) like
+/// [`load_consensus_checkpoint`]. Returns the momentum tensors in
+/// `Module::parameters()` order, ready for
+/// [`crate::distributed::OuterOptimizer::load_checkpoint_state`].
+///
+/// Used by the launcher on resume: the outer momentum lives controller-side
+/// (CPU backend), so the launcher reconstructs it here from a throwaway probe
+/// model's parameter shapes before handing the seeded optimizer to the
+/// controller.
+pub fn load_outer_momentum<M: Module + ?Sized>(
+    model: &M,
+    path: &str,
+) -> Result<Vec<crate::tensor::Tensor>> {
+    let params = model.parameters();
+    // Fresh zero targets shaped like each parameter; the load overwrites them.
+    let mut targets: Vec<(String, Parameter)> = Vec::with_capacity(params.len());
+    for (i, p) in params.iter().enumerate() {
+        let zeros = crate::tensor::Tensor::zeros_like(&p.variable.data())?;
+        targets.push((consensus_param_key(i), Parameter::new(zeros, "outer_momentum")));
+    }
+    crate::nn::load_checkpoint_file(path, &targets, &[], None)?;
+    Ok(targets.iter().map(|(_, p)| p.variable.data()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +454,95 @@ mod tests {
         assert_eq!(tw.variable.data().to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(tb.variable.data().to_f32_vec().unwrap(), vec![5.0, 6.0]);
         assert_eq!(trm.get().to_f32_vec().unwrap(), vec![7.0, 8.0]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn outer_momentum_writes_sidecar_and_round_trips() {
+        // When outer momentum is stashed, the completing cycle writes both
+        // <stem>.fdl and <stem>.outer.fdl, and the sidecar loads back.
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string(), "b".to_string()],
+            buffer_names: vec!["running_mean".to_string()],
+        };
+        let forge = CheckpointForge::new(Some(schema));
+
+        let w = cpu_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = cpu_tensor(&[5.0, 6.0], &[2]);
+        let rm = cpu_tensor(&[7.0, 8.0], &[2]);
+        // Momentum is one tensor per PARAM (not buffers): 2 here.
+        let mw = cpu_tensor(&[0.1, 0.2, 0.3, 0.4], &[2, 2]);
+        let mb = cpu_tensor(&[0.5, 0.6], &[2]);
+
+        let dir = std::env::temp_dir().join(format!("flodl_forge_outer_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus.fdl");
+
+        forge.arm(path.clone());
+        assert!(forge.is_armed());
+        // Stash momentum, then complete the model accumulation (params, buffers).
+        forge.stash_outer_momentum(tensors_to_round_frame(&[&mw, &mb]).unwrap().tensors);
+        forge.accumulate(tensors_to_round_frame(&[&w, &b]).unwrap());
+        forge.accumulate(tensors_to_round_frame(&[&rm]).unwrap()); // completes
+
+        let outer_path = path.with_extension("outer.fdl");
+        let mut found = false;
+        for _ in 0..200 {
+            if path.exists() && outer_path.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(found, "both .fdl and .outer.fdl written");
+
+        // Load the momentum sidecar by positional keys (p0, p1).
+        use crate::nn::Parameter;
+        let t0 = Parameter::new(cpu_tensor(&[0.0; 4], &[2, 2]), "m0");
+        let t1 = Parameter::new(cpu_tensor(&[0.0; 2], &[2]), "m1");
+        crate::nn::load_checkpoint_file(
+            outer_path.to_str().unwrap(),
+            &[("p0".to_string(), t0.clone()), ("p1".to_string(), t1.clone())],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t0.variable.data().to_f32_vec().unwrap(), vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(t1.variable.data().to_f32_vec().unwrap(), vec![0.5, 0.6]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_outer_momentum_writes_no_sidecar() {
+        // Stateless outer optimizer stashes nothing => no .outer.fdl.
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+        };
+        let forge = CheckpointForge::new(Some(schema));
+        let w = cpu_tensor(&[1.0, 2.0], &[2]);
+        let dir = std::env::temp_dir().join(format!("flodl_forge_noouter_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.fdl");
+
+        forge.arm(path.clone());
+        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap()); // completes, no stash
+
+        let outer_path = path.with_extension("outer.fdl");
+        let mut model_found = false;
+        for _ in 0..200 {
+            if path.exists() {
+                model_found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(model_found, ".fdl written");
+        // Give any (erroneous) sidecar writer a chance, then assert absence.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!outer_path.exists(), "no .outer.fdl when no momentum stashed");
 
         std::fs::remove_dir_all(&dir).ok();
     }

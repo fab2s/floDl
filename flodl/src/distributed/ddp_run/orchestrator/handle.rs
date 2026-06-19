@@ -313,8 +313,53 @@ impl DdpHandle {
                 // launcher process). `None` leaves the reduce stream
                 // untouched. Constructed here, off any CUDA context, so it
                 // honors the "no CUDA before training" launcher invariant.
-                let outer_optimizer =
+                let mut outer_optimizer =
                     outer_optimizer_factory.as_ref().map(|f| f());
+                // Resume: re-seed the outer optimizer's momentum from
+                // `<stem>.outer.fdl` (the outer momentum lives controller-side,
+                // so the launcher restores it, not the ranks). Skipped when not
+                // resuming, when the sidecar is absent (a fresh / OuterAvg
+                // run), or for a stateless variant (load is a no-op). A throwaway
+                // CPU probe model supplies the parameter shapes — same "no CUDA
+                // before training" CPU-only probe as the schema capture above.
+                if let (Some(opt), Some(stem)) =
+                    (outer_optimizer.as_mut(), config.resume_from.as_ref())
+                {
+                    let outer_path = crate::distributed::CheckpointBundle::model_path(stem)
+                        .with_extension("outer.fdl");
+                    if outer_path.exists() {
+                        match model_factory(Device::CPU) {
+                            Ok(probe) => {
+                                let loaded = outer_path
+                                    .to_str()
+                                    .ok_or_else(|| {
+                                        crate::tensor::TensorError::new(
+                                            "resume: non-utf8 outer-momentum path",
+                                        )
+                                    })
+                                    .and_then(|p| {
+                                        crate::distributed::load_outer_momentum(&probe, p)
+                                    })
+                                    .and_then(|m| opt.load_checkpoint_state(m));
+                                match loaded {
+                                    Ok(()) => eprintln!(
+                                        "  resume: loaded outer-optimizer momentum from {}",
+                                        outer_path.display()
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "  resume: outer-momentum load from {} failed \
+                                         ({e}); outer optimizer starts from zero momentum",
+                                        outer_path.display()
+                                    ),
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "  resume: probe model for outer-momentum shapes failed \
+                                 ({e}); outer optimizer starts from zero momentum"
+                            ),
+                        }
+                    }
+                }
                 let driver = std::thread::Builder::new()
                     .name("flodl-launcher-driver".to_string())
                     .spawn(move || {

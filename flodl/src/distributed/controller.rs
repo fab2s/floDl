@@ -665,8 +665,25 @@ fn average_and_scatter(
     // parameters frame only; Control / buffers frames pass through. `None`
     // (no outer optimizer configured) leaves `averaged` exactly as the
     // weighted average — the byte-for-byte pre-outer-optimizer path.
+    // Outer-momentum capture rides alongside the step: only when a checkpoint
+    // is armed (rare) and the variant carries state. Serialized synchronously
+    // here (owned bytes) so the forge's detached writer never races the next
+    // window's momentum update. `None` for OuterAvg / unarmed.
+    let mut outer_momentum: Option<Vec<TensorPayload>> = None;
     let averaged = match outer_stepper {
-        Some(stepper) => stepper.process_frame(averaged)?,
+        Some(stepper) => {
+            let stepped = stepper.process_frame(averaged)?;
+            if stepped.kind == RoundKind::Model
+                && forge.is_some_and(|f| f.is_armed())
+                && let Some(m) = stepper.checkpoint_state()
+            {
+                let refs: Vec<&crate::tensor::Tensor> = m.iter().collect();
+                outer_momentum = Some(
+                    crate::distributed::cpu_reduce::tensors_to_round_frame(&refs)?.tensors,
+                );
+            }
+            stepped
+        }
         None => averaged,
     };
     // The averaged frame is identical for every rank; serialize once and
@@ -692,6 +709,12 @@ fn average_and_scatter(
     // reduce loop never blocks on the disk write.
     if let Some(f) = forge {
         if averaged.kind == RoundKind::Model {
+            // Stash this cycle's outer momentum (if captured above) so the
+            // forge writes `<stem>.outer.fdl` alongside `<stem>.fdl` when the
+            // accumulation completes.
+            if let Some(m) = outer_momentum {
+                f.stash_outer_momentum(m);
+            }
             f.accumulate(averaged);
         }
     }
