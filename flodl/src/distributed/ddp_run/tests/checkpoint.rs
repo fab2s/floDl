@@ -254,6 +254,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         param_tx,
         final_param_tx,
         control_rx,
+        None, // no outer optimizer
     )
     .unwrap();
 

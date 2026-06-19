@@ -213,6 +213,7 @@ pub(super) fn make_test_worker_with(
         param_tx,
         final_param_tx,
         control_rx,
+        None, // no outer optimizer in unit tests
     ).unwrap();
 
     (worker, channels)

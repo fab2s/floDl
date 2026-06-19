@@ -458,6 +458,7 @@ impl DdpHandle {
                     checkpoint_fn,
                     eval_fn,
                     eval_dataset,
+                    outer_optimizer_factory,
                 );
                 return match dispatch_result {
                     Ok(h) => Ok(h),
@@ -797,6 +798,7 @@ impl DdpHandle {
             let device = devices[rank];
             let mf = model_factory.clone();
             let of = optim_factory.clone();
+            let oof = outer_optimizer_factory.clone();
             let tf = train_fn.clone();
             let ds = dataset.clone();
             let params = initial_params.clone();
@@ -845,6 +847,9 @@ impl DdpHandle {
                         // Rc-based, thread-local). NCCL comm was pre-initialized
                         // on the main thread via NcclComms::split() to avoid
                         // per-thread ncclCommInitRank CUDA context corruption.
+                        // This rank's replicated outer optimizer (None = plain
+                        // averaging). Built per-thread from the cloned factory.
+                        let outer_optimizer = oof.as_ref().map(|f| f());
                         let mut worker = GpuWorker::new(
                             &config,
                             |dev| (*mf)(dev),
@@ -859,6 +864,7 @@ impl DdpHandle {
                             p_tx,
                             fp_tx,
                             control_rx,
+                            outer_optimizer,
                         )?;
 
                         // Apply linear LR scaling for DDP.

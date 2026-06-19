@@ -437,6 +437,9 @@ impl<M: Module + 'static> ClusterWorker<M> {
         epoch_fn: Option<EpochFn<M>>,
         eval_fn: Option<EvalFn<M>>,
         eval_dataset: Option<Arc<dyn BatchDataSet>>,
+        outer_optimizer_factory: Option<
+            crate::distributed::outer_optimizer::OuterOptimizerFactory,
+        >,
     ) -> Result<Self>
     where
         F: FnOnce(Device) -> Result<M>,
@@ -541,6 +544,9 @@ impl<M: Module + 'static> ClusterWorker<M> {
         let nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        // Build this rank's replicated outer optimizer from the per-site
+        // factory (once per rank). `None` = plain averaging.
+        let outer_optimizer = outer_optimizer_factory.as_ref().map(|f| f());
         let mut inner = GpuWorker::<M>::new(
             &config,
             model_factory,
@@ -555,6 +561,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             param_tx,
             final_param_tx,
             control_rx,
+            outer_optimizer,
         )?;
 
         // Attach the cluster-mode NCCL session mailbox so the inner's

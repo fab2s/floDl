@@ -255,6 +255,23 @@ pub struct GpuWorker<M: Module> {
     /// is near-zero by construction, no point measuring) or no NCCL comm.
     pre_sync_scratch: Option<Vec<Tensor>>,
 
+    /// Outer optimizer applied to the consensus on the NCCL path, replicated
+    /// per rank. After the in-place AllReduce leaves the work-weighted
+    /// consensus on every rank's params, each rank runs
+    /// `outer_step(prev_global, consensus)` on its own GPU copies. Identical
+    /// inputs + a deterministic op give every rank the same new global and
+    /// momentum update, so the cohort stays in lock-step with NO extra
+    /// collective. `None` = no outer optimizer (today's plain averaging).
+    /// Built once per rank from the user's `.outer_optimizer(..)` factory.
+    outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
+    /// Per-rank `prev_global` anchor for the NCCL outer step: the global this
+    /// rank adopted at the end of the previous reduce window. `None` on the
+    /// first window (the consensus is used as the anchor, so the outer
+    /// gradient is zero). A param-sized GPU buffer, allocated lazily; with the
+    /// outer optimizer's replicated momentum this is the +2 param-sized GPU
+    /// buffers/rank of the DiLoCo/SlowMo footprint.
+    outer_prev_global: Option<Vec<Tensor>>,
+
     /// Persistent pinned (page-locked) host staging buffers for the
     /// GPU->CPU parameter / buffer readout in [`Self::snapshot_params`]
     /// (CPU averaging path). Lazily allocated on the first snapshot (one

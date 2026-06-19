@@ -330,6 +330,7 @@
                     None,
                     None, // no eval_fn
                     None, // no eval_dataset
+                    None, // no outer optimizer
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -522,6 +523,7 @@
                     None,
                     None, // no eval_fn
                     None, // no eval_dataset
+                    None, // no outer optimizer
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -722,6 +724,7 @@
                     None,
                     None, // no eval_fn
                     None, // no eval_dataset
+                    None, // no outer optimizer
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -1050,6 +1053,7 @@
                     None, // no epoch_fn
                     None, // no eval_fn
                     None, // no eval_dataset
+                    None, // no outer optimizer
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));

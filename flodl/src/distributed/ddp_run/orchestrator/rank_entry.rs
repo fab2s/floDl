@@ -163,6 +163,9 @@ impl DdpHandle {
         checkpoint_fn: Option<CheckpointFn<M>>,
         eval_fn: Option<EvalFn<M>>,
         eval_dataset: Option<Arc<dyn BatchDataSet>>,
+        outer_optimizer_factory: Option<
+            crate::distributed::outer_optimizer::OuterOptimizerFactory,
+        >,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -436,6 +439,7 @@ impl DdpHandle {
                     epoch_fn_for_thread,
                     eval_fn_for_thread,
                     eval_dataset_for_thread,
+                    outer_optimizer_factory,
                 )?;
 
             if let Some(f) = scheduler_fn {

@@ -55,6 +55,7 @@ impl<M: Module> GpuWorker<M> {
         param_tx: mpsc::Sender<ParamSnapshot>,
         final_param_tx: mpsc::Sender<ParamSnapshot>,
         control_rx: mpsc::Receiver<ControlMsg>,
+        outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     ) -> Result<Self>
     where
         F: FnOnce(Device) -> Result<M>,
@@ -295,6 +296,8 @@ impl<M: Module> GpuWorker<M> {
             },
             timeline: config.timeline.clone(),
             pre_sync_scratch,
+            outer_optimizer,
+            outer_prev_global: None,
             _grad_accumulators: grad_accumulators,
         })
     }

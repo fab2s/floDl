@@ -526,6 +526,42 @@ impl<M: Module> GpuWorker<M> {
                         (None, None, None)
                     };
 
+                    // OUTER STEP (NCCL, replicated per rank): transform the
+                    // work-weighted consensus now in `param_tensors` into the
+                    // new global on this rank's GPU. Identical consensus +
+                    // replicated prev_global / momentum + a deterministic op
+                    // give every rank the same new global and momentum update,
+                    // so the cohort stays in lock-step with NO extra collective
+                    // (the outer optimizer is replicated state, like the model).
+                    // Runs AFTER divergence (which host-syncs its reads via
+                    // `.item()`, so overwriting params here cannot race those
+                    // reads) and BEFORE the copy_done event record below (so
+                    // compute_stream waits for the stepped params). The whole
+                    // step runs on comm_stream so it is ordered after the
+                    // AllReduce and before that event. `None` => plain
+                    // averaging (today's behavior, no extra work). Taken out of
+                    // `self` so the comm-stream guard can coexist with the
+                    // prev_global field updates without overlapping borrows.
+                    if let Some(mut outer) = self.outer_optimizer.take() {
+                        let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+                        // First window: no prior anchor — use the consensus, so
+                        // the outer gradient is zero (a no-op for any
+                        // well-behaved variant) and the momentum seeds at zero.
+                        let new_global = {
+                            let prev: &[Tensor] =
+                                self.outer_prev_global.as_deref().unwrap_or(&param_tensors);
+                            outer.outer_step(prev, &param_tensors)?
+                        };
+                        {
+                            let _no_grad = NoGradGuard::new();
+                            for (p, ng) in param_tensors.iter().zip(&new_global) {
+                                p.copy_(ng, true)?;
+                            }
+                        }
+                        self.outer_prev_global = Some(new_global);
+                        self.outer_optimizer = Some(outer);
+                    }
+
                     if let (Some(ev), Some(stream)) =
                         (&self.copy_done, &self.comm_stream)
                     {

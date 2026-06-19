@@ -129,6 +129,7 @@ impl DdpHandle {
             param_tx,
             final_param_tx,
             control_rx,
+            None, // single-GPU: no averaging, so no outer optimizer
         )?;
 
         // Attach per-batch LR scheduler.
