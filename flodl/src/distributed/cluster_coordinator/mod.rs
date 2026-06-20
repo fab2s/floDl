@@ -447,6 +447,14 @@ pub struct ClusterCoordinator {
     /// See `timing_feed`.
     pb_delivered_ms_accum: Vec<f64>,
     pb_delivered_batches: Vec<usize>,
+    /// Per-rank delivered cost (`batch_ms + data_ms`) of the window's FIRST
+    /// batch — the one `pb_delivered_*` deliberately skips. Its excess over
+    /// the steady-state (marginal) rate is the per-window FILL (control
+    /// transit, plan pickup, prefetch spin-up, first-batch unpipelined H2D):
+    /// a fixed per-window cost that amortizes as the window grows. Fed to
+    /// `ElChe::set_window_fill_ms` before `report_timing` as the window-
+    /// pressure growth signal. Reset per window in `finish_averaging_tail`.
+    first_batch_delivered_ms: Vec<f64>,
     /// Per-rank most-recent batch duration (ms).
     last_batch_ms: Vec<f64>,
     /// Per-rank most-recent worker step counter.

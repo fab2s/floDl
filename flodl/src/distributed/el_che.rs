@@ -66,6 +66,20 @@ const MAX_SPEED_RATIO: f64 = 64.0;
 /// stability (one noisy sync doesn't move the metric).
 const BATCH_COUNTS_WINDOW_CAP: usize = 10;
 
+/// Consecutive `Stable` convergence verdicts required to re-arm window-
+/// pressure growth after the guard returned anything else. The asymmetry
+/// (disable on the first non-`Stable`, re-arm only after a clean streak) is
+/// the margin to the convergence cliff: the controller settles below the
+/// boundary instead of limit-cycling against it. See [`ElChe::growth_enabled`].
+const GROWTH_REARM_STABLE: usize = 5;
+
+/// Cap on a single window-pressure grow step (multiplicative). The proposal
+/// scale is `overhead_fraction / overhead_target`, which can be large on the
+/// first big-overhead reading (the historical 10→22 single-shot jump);
+/// capping at ×2/cycle rides the steep part of the amortization curve in a
+/// few cycles without overshooting the knee on one noisy sample.
+const GROWTH_STEP_CAP: f64 = 2.0;
+
 // Anchor swaps are gated by `Phase::Stable` (≥5 calibrations). Stable starts
 // at the 6th `report_timing` call, by which point each rank has a full
 // 5-sample trust window AND the noisiest first sample (kernel JIT, cuBLAS
@@ -160,7 +174,9 @@ pub struct ElChe {
     batch_counts_window: std::collections::VecDeque<Vec<usize>>,
     /// Whether at least one real measurement has been taken.
     calibrated: bool,
-    /// Target: max AllReduce overhead as fraction of compute time.
+    /// Window-pressure target: max per-window FIXED overhead (reduce + fill)
+    /// as a fraction of the bottleneck rank's window wall. The anchor grows
+    /// to keep it below this; see `propose_anchor`.
     overhead_target: f64,
     /// Minimum anchor (never below initial value).
     min_anchor: usize,
@@ -231,20 +247,52 @@ pub struct ElChe {
     ///
     /// [`ConvergenceGuard`]: super::ddp_run::ConvergenceGuard
     proposed_anchor: Option<ProposedAnchor>,
+    /// Per-rank amortizable per-window FILL (ms), set by the coordinator
+    /// before `report_timing` and consumed once by the next
+    /// `propose_anchor`. The fill is the window's first-batch excess over
+    /// the steady-state (marginal) rate — control transit, plan pickup,
+    /// prefetch spin-up, first-batch unpipelined H2D — the cost the
+    /// marginal-anchor allocation feed deliberately excludes (batch 1
+    /// skipped). It is the window-pressure signal: a fixed per-window cost
+    /// that amortizes as the window grows. `0.0` (threaded path, or before
+    /// any coordinator report) makes window-pressure fall back to the
+    /// reduce-overhead term alone. Indexed by the elected anchor rank in
+    /// `propose_anchor`. Zeroed in `report_timing` after the proposal so a
+    /// stale fill cannot drive a later cycle.
+    pending_window_fill_ms: Vec<f64>,
+    /// Growth-enable latch for the window-pressure controller. Set `false`
+    /// the instant the convergence guard returns anything other than
+    /// `Stable` (`SuppressGrowth` early-warning OR `NudgeDown`), and
+    /// re-armed to `true` only after `GROWTH_REARM_STABLE` consecutive
+    /// `Stable` verdicts. This is the margin to the convergence cliff: the
+    /// controller backs off the instant divergence trends up and refuses to
+    /// poke the boundary again until convergence is robustly clean, rather
+    /// than re-attempting growth every cycle. Starts `true` (nothing seen
+    /// yet). Driven by `commit_proposed_anchor` / `veto_proposed_growth` /
+    /// `discard_proposed_anchor`.
+    growth_enabled: bool,
+    /// Count of consecutive `Stable` guard verdicts since the last non-Stable
+    /// one; re-arms `growth_enabled` at `GROWTH_REARM_STABLE`.
+    consecutive_stable: usize,
 }
 
-/// Direction-aware overhead-tune proposal awaiting a convergence-guard
+/// A staged window-pressure grow proposal awaiting a convergence-guard
 /// verdict. See [`ElChe::proposed_anchor`].
+///
+/// Grow-only by design: the window-pressure controller never shrinks the
+/// anchor for "fresher gradients". Empirically, in the regime this targets
+/// (`H_max` far above one epoch) fewer syncs is harmless to convergence, so
+/// shrinking only re-creates the small-window overhead it exists to remove.
+/// The single downward force is the convergence guard's `NudgeDown`
+/// ([`ElChe::nudge_anchor_down`]), and the epoch cap
+/// ([`ElChe::set_max_total_batches`]) is the hard ceiling.
 #[derive(Debug, Clone, Copy)]
 enum ProposedAnchor {
-    /// `overhead > overhead_target` — anchor should grow to amortize
-    /// AllReduce cost over more local batches. Vetoed by
-    /// `SuppressGrowth`; committed by `Stable`.
+    /// Per-window fixed overhead (reduce + fill) exceeds `overhead_target`
+    /// as a fraction of window wall: grow the anchor to amortize it over
+    /// more local batches. Committed by `Stable`; dropped by
+    /// `SuppressGrowth` / `NudgeDown`.
     Grow(usize),
-    /// `overhead < overhead_target * 0.5` — anchor should shrink by 1
-    /// for fresher gradients. Applied on both `Stable` AND
-    /// `SuppressGrowth` (shrink is the safe direction).
-    Shrink(usize),
 }
 
 impl ElChe {
@@ -271,7 +319,7 @@ impl ElChe {
                 BATCH_COUNTS_WINDOW_CAP,
             ),
             calibrated: false,
-            overhead_target: 0.10,
+            overhead_target: 0.05,
             min_anchor: anchor,
             max_anchor: 1000,
             max_total_batches: None,
@@ -282,6 +330,9 @@ impl ElChe {
             calibration_count: 0,
             pending_callback_slack_ms: vec![0.0; world_size],
             proposed_anchor: None,
+            pending_window_fill_ms: vec![0.0; world_size],
+            growth_enabled: true,
+            consecutive_stable: 0,
         }
     }
 
@@ -457,11 +508,14 @@ impl ElChe {
             .unwrap_or(0.0)
     }
 
-    /// Set the target AllReduce overhead as a fraction of compute time.
+    /// Set the target per-window FIXED overhead (reduce + fill) as a
+    /// fraction of the bottleneck rank's window wall.
     ///
-    /// Default: 0.10 (10%). The anchor auto-tunes upward to keep overhead
-    /// below this target. Lower values = fewer syncs = more gradient
-    /// staleness.
+    /// Default: 0.05 (5%). The anchor auto-tunes upward to keep this
+    /// per-window overhead below the target — fewer, larger windows amortize
+    /// the fixed cost. Lower values = fewer syncs = larger window = more
+    /// gradient staleness (bounded by the convergence guard and the epoch
+    /// cap). Clamped to `[0.01, 0.50]`.
     pub fn with_overhead_target(mut self, target: f64) -> Self {
         self.overhead_target = target.clamp(0.01, 0.50);
         self
@@ -674,6 +728,39 @@ impl ElChe {
         &self.pending_callback_slack_ms
     }
 
+    /// Stage the per-rank per-window FILL (ms) for the window-pressure
+    /// controller, consumed once by the next `propose_anchor`. The fill is
+    /// the window's first-batch excess over the steady-state (marginal)
+    /// rate — the amortizable per-window fixed cost the marginal-anchor
+    /// allocation feed excludes. The coordinator computes it from the
+    /// per-window timing and sets it before [`Self::report_timing`]; left
+    /// unset (all-zero), window-pressure falls back to the reduce-overhead
+    /// term alone (threaded path).
+    ///
+    /// Silently no-ops on a length mismatch (matches the rest of the
+    /// builder/setter shape: a caller off-by-one must not crash a running
+    /// cluster; growing on the reduce term alone is a safe fallback).
+    pub fn set_window_fill_ms(&mut self, fill_ms: &[f64]) {
+        if fill_ms.len() != self.world_size {
+            return;
+        }
+        self.pending_window_fill_ms.clone_from_slice(fill_ms);
+    }
+
+    /// Read the currently-staged per-window fill (ms per rank). Returns
+    /// all-zero by default. Test/diagnostic accessor.
+    pub fn pending_window_fill_ms(&self) -> &[f64] {
+        &self.pending_window_fill_ms
+    }
+
+    /// Whether window-pressure growth is currently armed (the latch). Test/
+    /// diagnostic accessor; the latch is driven by the guard verdict through
+    /// [`Self::commit_proposed_anchor`] / [`Self::veto_proposed_growth`] /
+    /// [`Self::discard_proposed_anchor`].
+    pub fn growth_enabled(&self) -> bool {
+        self.growth_enabled
+    }
+
     /// Total batches across all devices for this cadence step.
     pub fn total_batches(&self) -> usize {
         self.batch_counts.iter().sum()
@@ -766,35 +853,26 @@ impl ElChe {
         }
     }
 
-    /// Commit any pending overhead-tune proposal from the last
-    /// `report_timing`. Called on `ConvergenceAction::Stable` — the
-    /// guard saw no divergence concern, so the proposal (grow or
-    /// shrink) applies.
+    /// Commit any pending window-pressure grow proposal from the last
+    /// `report_timing`. Called on `ConvergenceAction::Stable` — the guard
+    /// saw no divergence concern, so the grow applies.
+    ///
+    /// Also advances the growth-enable latch: each `Stable` verdict counts
+    /// toward re-arming growth (`GROWTH_REARM_STABLE` consecutive clean
+    /// verdicts), so growth that was latched off by a prior `SuppressGrowth`
+    /// / `NudgeDown` only resumes once convergence is robustly clean again.
     ///
     /// Pairs with [`Self::veto_proposed_growth`] and
     /// [`Self::discard_proposed_anchor`] to make the convergence guard
-    /// authoritative over `overhead_target`. No-op when no proposal is
-    /// pending (Probe/Warmup phase, dead-zone hit, or no
+    /// authoritative over `overhead_target`. No-op on the anchor when no
+    /// proposal is pending (Probe/Warmup phase, overhead below target, or no
     /// `report_timing` call between guard verdicts).
     pub fn commit_proposed_anchor(&mut self) {
-        if let Some(p) = self.proposed_anchor.take() {
-            self.anchor = match p {
-                ProposedAnchor::Grow(n) | ProposedAnchor::Shrink(n) => n,
-            };
-            let slow_ms = self.slow_ms();
-            if slow_ms > 0.0 {
-                self.recompute_batch_counts(slow_ms);
-            }
+        self.consecutive_stable = self.consecutive_stable.saturating_add(1);
+        if self.consecutive_stable >= GROWTH_REARM_STABLE {
+            self.growth_enabled = true;
         }
-    }
-
-    /// Apply a pending proposal only if it shrinks the anchor; drop
-    /// the proposal if it would grow. Called on
-    /// `ConvergenceAction::SuppressGrowth` — the guard saw rising
-    /// divergence, so growth makes it worse, but a shrink is the safe
-    /// direction.
-    pub fn veto_proposed_growth(&mut self) {
-        if let Some(ProposedAnchor::Shrink(n)) = self.proposed_anchor.take() {
+        if let Some(ProposedAnchor::Grow(n)) = self.proposed_anchor.take() {
             self.anchor = n;
             let slow_ms = self.slow_ms();
             if slow_ms > 0.0 {
@@ -803,11 +881,26 @@ impl ElChe {
         }
     }
 
-    /// Drop any pending proposal. Called on
-    /// `ConvergenceAction::NudgeDown` — the nudge supersedes the
-    /// proposal entirely, acting directly on the current anchor.
+    /// Drop the pending grow proposal and latch growth OFF. Called on
+    /// `ConvergenceAction::SuppressGrowth` — the guard saw divergence
+    /// trending up, so growth would make it worse. Growth stays disabled
+    /// until `GROWTH_REARM_STABLE` consecutive `Stable` verdicts re-arm it
+    /// (the margin to the cliff: don't poke the boundary again until
+    /// convergence is robustly clean).
+    pub fn veto_proposed_growth(&mut self) {
+        self.proposed_anchor = None;
+        self.consecutive_stable = 0;
+        self.growth_enabled = false;
+    }
+
+    /// Drop any pending grow proposal and latch growth OFF. Called on
+    /// `ConvergenceAction::NudgeDown` — the nudge ([`Self::nudge_anchor_down`])
+    /// shrinks the anchor directly; growth is disabled and re-arms only
+    /// after `GROWTH_REARM_STABLE` consecutive `Stable` verdicts.
     pub fn discard_proposed_anchor(&mut self) {
         self.proposed_anchor = None;
+        self.consecutive_stable = 0;
+        self.growth_enabled = false;
     }
 
     /// Whether at least one timing measurement has been reported.
@@ -930,15 +1023,16 @@ impl ElChe {
             }
         }
 
-        // Overhead auto-tune: propose anchor growth/shrink based on
-        // measured AllReduce overhead. The proposal is NOT applied here
-        // — the caller's convergence-guard verdict drives one of
-        // [`Self::commit_proposed_anchor`] (Stable),
-        // [`Self::veto_proposed_growth`] (SuppressGrowth — keeps
-        // shrink, drops grow), or [`Self::discard_proposed_anchor`]
-        // (NudgeDown — nudge supersedes the proposal). Makes the
-        // convergence guard authoritative over `overhead_target`:
-        // rising divergence vetoes growth before it lands.
+        // Window-pressure auto-tune: propose anchor growth from the
+        // bottleneck rank's per-window fixed overhead (reduce + fill). The
+        // proposal is NOT applied here — the caller's convergence-guard
+        // verdict drives one of [`Self::commit_proposed_anchor`] (Stable),
+        // [`Self::veto_proposed_growth`] (SuppressGrowth — drops the grow),
+        // or [`Self::discard_proposed_anchor`] (NudgeDown — drops the grow;
+        // the nudge then shrinks directly). Makes the convergence guard
+        // authoritative over `overhead_target`: rising divergence vetoes
+        // growth before it lands, and latches growth off until convergence
+        // is robustly clean again.
         //
         // Gated to `Phase::Stable+` because the multiplicative
         // `scale = overhead / target` compounds noise dramatically on
@@ -947,8 +1041,12 @@ impl ElChe {
         // trust window of evidence.
         self.proposed_anchor = None;
         if self.phase >= Phase::Stable {
-            let compute_ms = wall_ms.iter().copied().fold(0.0_f64, f64::max);
-            self.proposed_anchor = self.propose_anchor(compute_ms, sync_ms);
+            self.proposed_anchor = self.propose_anchor(sync_ms);
+        }
+        // The fill is a one-window signal: consume it so a stale value can't
+        // drive a later cycle (mirrors the callback-slack one-shot).
+        for f in &mut self.pending_window_fill_ms {
+            *f = 0.0;
         }
 
         // Recompute batch counts from current (pre-proposal) anchor. The
@@ -1061,45 +1159,71 @@ impl ElChe {
         clamped
     }
 
-    /// Overhead-driven anchor proposal (pure decision logic, extracted so
-    /// the math is unit-testable in isolation and future growth forces —
-    /// e.g. a per-rank window-pressure term — have a typed seam to
-    /// compose into, as `max` of proposed anchors, all routed through the
-    /// same guard-vetoed `ProposedAnchor` pipeline; nothing here can
-    /// trigger a reduce).
+    /// Window-pressure grow proposal (pure decision logic, extracted so the
+    /// math is unit-testable in isolation; nothing here can trigger a
+    /// reduce). Grow-only — see [`ProposedAnchor`].
     ///
-    /// Grow when measured reduce overhead exceeds the target — UNLESS the
-    /// window≤epoch cap is binding: with the schedule pinned at the cap, a
-    /// larger anchor delivers nothing and only detaches the anchor from
-    /// the schedule (the wind-up then corrupts telemetry, the shrink
-    /// hysteresis band, and any later `nudge_anchor_down` arithmetic).
-    /// Shrink (anchor − 1) when overhead is comfortably below target.
-    /// The dead band between `target*0.5` and `target` is the hysteresis
-    /// that prevents grow/shrink limit-cycling.
-    fn propose_anchor(&self, compute_ms: f64, sync_ms: f64) -> Option<ProposedAnchor> {
-        if compute_ms <= 0.0 || sync_ms <= 0.0 {
+    /// The signal is the bottleneck (anchor) rank's per-window FIXED
+    /// overhead as a fraction of its window wall:
+    ///
+    /// ```text
+    /// overhead = (reduce_ms + fill_b) / (anchor·marginal_b + reduce_ms + fill_b)
+    /// ```
+    ///
+    /// where `marginal_b` is the anchor rank's steady-state ms/batch and
+    /// `fill_b` its first-batch fill (`pending_window_fill_ms`). Both
+    /// `reduce_ms` and `fill_b` are fixed per-window costs, so the fraction
+    /// falls as the window (`anchor·marginal_b`) grows — a diminishing-
+    /// returns signal that settles at the knee where amortization is spent,
+    /// NOT at an absolute utilization target (the achievable utilization
+    /// ceiling is rig-dependent — heterogeneity / granularity — and an
+    /// absolute target would chase an unreachable floor). The anchor rank is
+    /// used because it never waits on allocation imbalance, so its residual
+    /// overhead is purely the amortizable per-window cost, cleanly separated
+    /// from ElChe's share-allocation job.
+    ///
+    /// This replaces the prior `reduce_ms / compute` rule, which saw only
+    /// the reduce: cheap on NCCL it never tripped (anchor stalled tiny);
+    /// expensive on CPU it over-grew. Folding the (backend-independent) fill
+    /// into the numerator gives a consistent operating point on both.
+    ///
+    /// Suppressed when growth is latched off (the guard saw rising
+    /// divergence — see [`Self::growth_enabled`]) or the window≤epoch cap is
+    /// binding (a larger anchor delivers nothing at the cap and only
+    /// detaches the anchor from the schedule).
+    fn propose_anchor(&self, sync_ms: f64) -> Option<ProposedAnchor> {
+        if !self.growth_enabled {
             return None;
         }
-        let overhead = sync_ms / compute_ms;
-        if overhead > self.overhead_target {
-            if self.window_cap_binding {
-                crate::verbose!(
-                    "  ddp: anchor growth suppressed — window cap binding \
-                     (overhead {:.3} > target {:.3} is unreachable at this \
-                     epoch size)",
-                    overhead,
-                    self.overhead_target,
-                );
-                return None;
-            }
-            let scale = overhead / self.overhead_target;
-            let new_anchor = (self.anchor as f64 * scale).ceil() as usize;
-            let clamped = new_anchor.clamp(self.min_anchor, self.max_anchor);
-            if clamped > self.anchor {
-                return Some(ProposedAnchor::Grow(clamped));
-            }
-        } else if overhead < self.overhead_target * 0.5 && self.anchor > self.min_anchor {
-            return Some(ProposedAnchor::Shrink(self.anchor - 1));
+        if self.window_cap_binding {
+            crate::verbose!(
+                "  ddp: window-pressure growth suppressed — window cap binding \
+                 (epoch is the ceiling at this size)"
+            );
+            return None;
+        }
+        let b = self.anchor_rank?;
+        let marginal_b = self.smoothed_ms(b);
+        if marginal_b <= 0.0 {
+            return None;
+        }
+        let fill_b = self.pending_window_fill_ms.get(b).copied().unwrap_or(0.0).max(0.0);
+        let reduce_ms = sync_ms.max(0.0);
+        let window_compute = self.anchor as f64 * marginal_b;
+        let fixed = reduce_ms + fill_b;
+        let denom = window_compute + fixed;
+        if denom <= 0.0 || fixed <= 0.0 {
+            return None;
+        }
+        let overhead = fixed / denom;
+        if overhead <= self.overhead_target {
+            return None;
+        }
+        let scale = (overhead / self.overhead_target).min(GROWTH_STEP_CAP);
+        let new_anchor = (self.anchor as f64 * scale).ceil() as usize;
+        let clamped = new_anchor.clamp(self.min_anchor, self.max_anchor);
+        if clamped > self.anchor {
+            return Some(ProposedAnchor::Grow(clamped));
         }
         None
     }

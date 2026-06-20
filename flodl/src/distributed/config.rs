@@ -148,8 +148,9 @@ pub struct ElCheConfig {
     pub max_anchor: Option<usize>,
     /// Minimum anchor count. `None` = equals the initial anchor.
     pub min_anchor: Option<usize>,
-    /// ElChe overhead target (fraction of compute time). `None` =
-    /// framework default (0.10).
+    /// ElChe per-window fixed-overhead target (reduce + fill, as a fraction
+    /// of the bottleneck rank's window wall). `None` = framework default
+    /// (0.05).
     pub overhead_target: Option<f64>,
     /// Maximum batch lead of fastest over slowest worker.
     /// `Some(0)` = strict lockstep. `None` = unlimited.
@@ -241,7 +242,7 @@ impl ElCheConfig {
     /// CPU-mediated averaging, anchor + overshoot.
     pub fn cpu_async() -> Self {
         Self {
-            overhead_target: Some(0.10),
+            overhead_target: Some(0.05),
             ..Self::default_for(ElCheMode::CpuAsync)
         }
     }

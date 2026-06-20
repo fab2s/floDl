@@ -254,6 +254,7 @@ impl ClusterCoordinator {
             wall_ms_accum: vec![0.0; world_size],
             pb_delivered_ms_accum: vec![0.0; world_size],
             pb_delivered_batches: vec![0; world_size],
+            first_batch_delivered_ms: vec![0.0; world_size],
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
             nccl_sync_step: vec![0; world_size],

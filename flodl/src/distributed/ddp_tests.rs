@@ -501,8 +501,10 @@
 
     #[test]
     fn test_cadence_anchor_auto_tune() {
-        // High AllReduce overhead should trigger anchor increase.
-        // 10% target: compute 1000ms, sync 500ms => overhead 50% >> 10%.
+        // High per-window fixed overhead should trigger anchor growth.
+        // No fill is staged (no coordinator), so the signal is reduce-only:
+        // overhead = sync / (anchor·marginal + sync). With marginal 100ms,
+        // anchor 10 => window_compute 1000, sync 500 => 500/1500 = 0.33 > 0.10.
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.10);
 
@@ -516,14 +518,14 @@
         let bc = c.batch_counts().to_vec();
         c.report_timing(&[1000.0, 1000.0], &bc, 500.0);
 
-        // overhead-tune now proposes; commit to apply (Stable verdict).
+        // window-pressure proposes; commit to apply (Stable verdict).
         c.commit_proposed_anchor();
 
-        // overhead = 500/1000 = 0.50, target = 0.10
-        // scale = 0.50/0.10 = 5.0 => new anchor = ceil(10 * 5) = 50
-        assert_eq!(c.anchor(), 50);
-        assert_eq!(c.batches(0), 50);
-        assert_eq!(c.batches(1), 50);
+        // scale = min(0.33/0.10, GROWTH_STEP_CAP=2.0) = 2.0
+        // new anchor = ceil(10 * 2) = 20 (capped per cycle; multi-cycle climb)
+        assert_eq!(c.anchor(), 20);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 20);
     }
 
     #[test]
@@ -542,12 +544,13 @@
         c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
         c.commit_proposed_anchor();
 
-        // overhead = 400/1000 = 0.40, target = 0.10, scale = 4.0
-        // new anchor = ceil(10 * 4) = 40
-        assert_eq!(c.anchor(), 40);
-        assert_eq!(c.batches(1), 40); // slow device
-        // fast device: 100ms/batch vs 50ms/batch => 2x ratio => 80
-        assert_eq!(c.batches(0), 80);
+        // anchor rank = slow rank 1 (100ms/batch). window_compute = 10·100 = 1000,
+        // sync 400 => overhead 400/1400 = 0.286. scale = min(2.86, 2.0) = 2.0.
+        // new anchor = ceil(10 * 2) = 20.
+        assert_eq!(c.anchor(), 20);
+        assert_eq!(c.batches(1), 20); // slow device
+        // fast device: 100ms/batch vs 50ms/batch => 2x ratio => 40
+        assert_eq!(c.batches(0), 40);
     }
 
     #[test]
@@ -643,7 +646,7 @@
         // `test_cadence_anchor_auto_tune_with_speed_ratio` (which grows to
         // [80, 40], sum 120) but with the total capped at 60.
         let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
-        c.set_max_total_batches(60);
+        c.set_max_total_batches(40);
 
         for _ in 0..5 {
             c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
@@ -651,10 +654,10 @@
         c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
         c.commit_proposed_anchor();
 
-        // Uncapped this is [80, 40] (sum 120). Capped to 60 and scaled
-        // proportionally: ~[40, 20] (sum <= 60, ~2x ratio preserved).
+        // Uncapped (×2 grow) this is [40, 20] (sum 60). Capped to 40 and
+        // scaled proportionally: ~[26, 13] (sum <= 40, ~2x ratio preserved).
         let total = c.batches(0) + c.batches(1);
-        assert!(total <= 60, "window capped to max_total: total={total} (<= 60)");
+        assert!(total <= 40, "window capped to max_total: total={total} (<= 40)");
         assert!(
             c.batches(0) > c.batches(1),
             "speed ratio preserved after cap: fast={} slow={}",
@@ -667,7 +670,7 @@
     fn test_cadence_anchor_capped_at_max() {
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.01)
-            .with_max_anchor(30);
+            .with_max_anchor(15);
 
         // Prime to Stable phase before triggering auto-tune.
         for _ in 0..5 {
@@ -679,9 +682,9 @@
         c.report_timing(&[100.0, 100.0], &bc, 500.0);
         c.commit_proposed_anchor();
 
-        // Would want anchor=500 but capped at 30.
-        assert_eq!(c.anchor(), 30);
-        assert_eq!(c.batches(0), 30);
+        // ×2 grow wants ceil(10*2)=20, but max_anchor clamps it to 15.
+        assert_eq!(c.anchor(), 15);
+        assert_eq!(c.batches(0), 15);
     }
 
     #[test]
@@ -702,12 +705,12 @@
         for _ in 0..5 {
             c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
         }
-        // overhead = 500/1000 = 0.50, target = 0.10, scale = 5
+        // overhead = 500/1500 = 0.33 > 0.10; scale = min(3.3, 2.0) = 2.0
         c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
         // Before commit, anchor unchanged.
         assert_eq!(c.anchor(), 10, "report_timing must not mutate anchor");
         c.commit_proposed_anchor();
-        assert_eq!(c.anchor(), 50, "commit applies the proposal");
+        assert_eq!(c.anchor(), 20, "commit applies the ×2-capped grow");
     }
 
     #[test]
@@ -723,24 +726,34 @@
     }
 
     #[test]
-    fn test_overhead_shrink_applied_on_suppress_growth() {
-        // Shrink proposal + SuppressGrowth verdict → shrink still applies
-        // (shrink is the safe direction when divergence is rising).
-        let mut c = ElChe::new(2, 20)
-            .with_overhead_target(0.50)
-            .with_min_anchor(1);
-        // Prime to Stable with the starting anchor.
+    fn test_growth_latched_off_after_suppress_growth() {
+        // SuppressGrowth latches growth OFF; it re-arms only after
+        // GROWTH_REARM_STABLE (5) consecutive Stable verdicts — the margin
+        // to the convergence cliff. The controller must not re-attempt
+        // growth every cycle while latched.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
         for _ in 0..5 {
-            c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
         }
-        // overhead = 5/1000 = 0.005, well below target * 0.5 = 0.25 → shrink by 1.
-        c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+        // Grow proposed, then SuppressGrowth: drop it AND latch growth off.
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
         c.veto_proposed_growth();
-        assert_eq!(
-            c.anchor(),
-            19,
-            "SuppressGrowth still applies shrink (safe direction)"
-        );
+        assert_eq!(c.anchor(), 10, "SuppressGrowth vetoes the grow");
+        assert!(!c.growth_enabled(), "growth latched off");
+
+        // While latched, a high-overhead report proposes nothing → no grow
+        // even on a Stable commit. Five Stable commits re-arm the latch.
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+            c.commit_proposed_anchor();
+            assert_eq!(c.anchor(), 10, "no growth while latched off / re-arming");
+        }
+        assert!(c.growth_enabled(), "5 consecutive Stable verdicts re-arm growth");
+
+        // A fresh high-overhead report now grows again.
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        c.commit_proposed_anchor();
+        assert!(c.anchor() > 10, "growth resumes after re-arm");
     }
 
     #[test]
@@ -752,7 +765,7 @@
             c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
         }
         c.report_timing(&[1000.0, 1000.0], &[20, 20], 500.0);
-        // Proposal: grow to ceil(20 * 5.0) = 100. NudgeDown discards
+        // Proposal: ×2-capped grow to ceil(20 * 2.0) = 40. NudgeDown discards
         // that and applies factor 0.5 to the current anchor (20).
         c.discard_proposed_anchor();
         c.nudge_anchor_down(0.5);

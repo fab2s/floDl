@@ -197,6 +197,9 @@ DDP stack is additive:
   loose-cadence DiLoCo. One heterogeneous cluster, two
   participation-closure levels. The wall-time predictor operates at
   the outer level; the inner level reuses today's single-host ElChe.
+  The recursive generalization (arbitrary depth, plane separation,
+  resilience economics) is sketched as hypothesis-gated preliminary
+  thinking under [Hierarchical scaling](#hierarchical-scaling-to-massive-clusters-preliminary).
 - **Parameter-server / fully-async rounds**: drop the rendezvous
   barrier entirely and submit deltas with a staleness bound. Harder
   to reason about than meta-step async, so offered as an opt-in when
@@ -205,6 +208,161 @@ DDP stack is additive:
 - **Byzantine-tolerant aggregation** (optional): trimmed mean /
   median instead of weighted mean for untrusted workers (federated /
   open-contribution training).
+
+## Hierarchical scaling to massive clusters (preliminary)
+
+This section is **preliminary thinking, not a committed design**. It records
+the architecture the project is pointed at, so that near-term work
+(window-pressure auto-tune, the outer optimizer) can be shaped to generalize
+and so the assumptions are written down as falsifiable hypotheses rather than
+carried implicitly. No code exists for any of it, and none should be built
+until the governing hypothesis below is measured on real workloads.
+
+### The governing hypothesis (the gate)
+
+Everything here is subordinate to one precondition:
+
+> **H1.** Scaling is only meaningful while convergence holds across the *full
+> end-to-end averaging cycle*. Tree depth times per-level window sums to a
+> total staleness budget `H_total`; the entire topology exists to keep every
+> unit's work landing comfortably inside it. Outside `H_total` the workers
+> decohere (the divergence / NaN regime) and no topology recovers that.
+
+So `H_max(model, LR, data)`, the largest staleness a workload tolerates before
+convergence degrades, is the quantity every other decision is subordinate to,
+and it is currently unmeasured. The near-term window-pressure work and the
+outer optimizer are the instruments that measure and widen `H`; hierarchical
+scaling is unfounded until `H_max` is characterized.
+
+### The unifying abstraction (hypothesis)
+
+Under H1, a sub-cluster behaves like a single device with more gradient noise:
+larger effective batch, bounded staleness, and the implicit-regularization
+effect already observed at single-host scale. The noise has a sign that flips
+at `H_max`: regularizing inside the window, destructive beyond it. "A cluster
+is a bigger GPU, a datacenter is one huge GPU" is a useful frame precisely and
+only while H1 holds.
+
+### Two planes scale independently
+
+flodl already separates the **averager** (data plane: the deterministic
+sum-and-count reduce) from the **controller** (control plane: ElChe
+scheduling). Both generalize to a tree, but differently.
+
+- **Averager: recursive pre-summation.** Hosts sum their ranks; intermediate
+  nodes sum hosts; the root sums sub-clusters. Sum-and-count is associative, so
+  a reduction tree adds no averaging bias (no average-of-averages). The only
+  cost of depth is added staleness, charged against `H_total`. A pure
+  compute-versus-network tradeoff.
+- **Controller: recursive ElChe.** Each level balances its children; the parent
+  treats each sub-cluster as one virtual device with an aggregate throughput.
+  Deterministic, seed-derived shard assignment keeps coverage well-defined at
+  every level.
+
+### Recursive ElChe stability (hypothesis)
+
+Nested adaptive controllers can oscillate, but the topology enforces the
+cascade-control stability condition structurally: the expensive link sits at
+the top with large windows (slow adaptation), the fast local links at the
+bottom with small windows (fast adaptation). Inner-fast / outer-slow is exactly
+the separation that prevents the loops from fighting, and it falls out of
+placing the costly link at the root rather than being engineered. Aggregation
+also reduces variance: a sub-controller absorbs local throttling locally, so
+the parent sees a more stationary signal than a flat controller would.
+**Invariant to enforce:** per-level window must increase up the tree; inverting
+it breaks the stability condition. The convergence guard is scale-invariant in
+mechanism (tightening a rank's cadence and tightening a sub-cluster's cadence
+are the same operation); only its thresholds scale with level, looser higher up
+because the aggregate is pre-smoothed.
+
+### Resilience economics (hypothesis)
+
+- Aggregator nodes do CPU-side summation and scheduling, no GPU, so they are
+  far cheaper than the compute they front. Redundancy is cheapest exactly where
+  blast radius is largest.
+- A sub-cluster failure is graceful, not a stop: the root's alive-count
+  division (today's dead-rank ledger generalized to a dead meta-rank) drops the
+  sub-cluster and continues, losing one window of its work, the same semantics
+  as a single rank failing today.
+- Expected failure exposure stays dominated by the GPU tier (`N_gpu * p_gpu`);
+  the aggregator tier (fewer nodes, more reliable, replicable) adds a negligible
+  term, and replication drives it to `p^2`.
+- **Principle: replicate by (blast-radius * rate / cost).** Aggregators score
+  high (large blast, cheap, rare), so replicate them; GPUs score low (1/N
+  blast, expensive, common), so use elastic membership instead. Redundancy
+  lands where it is cheap and impactful.
+- The averager replicates **active-active**: a deterministic reduce means two
+  replicas on the same inputs produce bit-identical output, so failover is
+  seamless. The controller's allocation is a soft, timing-influenced decision,
+  but coverage is reconstructable from seed-derived sharding plus the
+  replicated count stream, so a standby recomputes valid coverage
+  independently; the only requirement is leader fencing (one primary drives the
+  workers at a time).
+- The **root** is the genuine single point. It concentrates the hardening (ECC
+  RAM, redundant power, RAID) and, critically, its entire state (coverage,
+  outer-optimizer momentum, ElChe trajectory) is already checkpointable through
+  the consensus-forge path, so recovery is promote-a-standby-and-resume with
+  bounded cost.
+
+### The determinism boundary
+
+The recurring seam under all of the above: deterministic components
+(sum-and-count, seed-derived sharding) replicate and resume trivially; the
+single timing-driven component (ElChe scheduling) is where soft variance lives,
+and it is tolerable because allocation is a soft decision while coverage stays
+deterministic. Resilience, replication, and the transport split below all
+cleave along this same boundary.
+
+### Transport at extreme scale (hypothesis)
+
+At millions of devices the connection mesh itself becomes the problem. A
+durable log / stream substrate (for example Kafka) for the **control plane**
+replaces point-to-point connections and gives replay-based fault tolerance; the
+**data plane** (gigabyte-scale tensor payloads) stays on a high-bandwidth path
+(RDMA, collectives, or an object store), since bulk blobs are not a log's sweet
+spot. Broker latency is tolerable only in the large-`H` regime, where
+infrequent syncs amortize it; it would not survive tight all-reduce. Replay
+requires the reduce to be idempotent, keyed by `(round, unit)`.
+
+### Where the abstraction leaks
+
+These do not fall out of "a cluster is a bigger GPU" and must be designed
+explicitly:
+
+- **Failure blast radius grows up the tree** even as allocation variance
+  smooths down it. Fault tolerance is the one place the single-GPU analogy
+  fails outright; it needs its own subtree-failure and aggregator-redundancy
+  design.
+- **Sharding must become hierarchy-aware**: sub-clusters need disjoint,
+  IID-balanced slices, or sub-aggregates correlate and the noise stops being
+  benign.
+- **The staleness-noise sign-flip** means the regularization benefit and the
+  divergence cliff are the same mechanism at different magnitudes; the margin to
+  the cliff is `H_max` and must be respected, not assumed.
+
+### Hypotheses that must hold (checklist)
+
+Before any of this is built, each must be validated, not assumed:
+
+1. **H1 (gate):** `H_max` is large enough that a full end-to-end averaging
+   cycle lands comfortably inside it. Currently unmeasured; the near-term `H`
+   work is the instrument.
+2. **Equivalence:** "sub-cluster = one noisier GPU" holds inside `H_max`, and
+   the added noise is net neutral or beneficial there.
+3. **Recursive control:** nested ElChe is stable given windows-grow-up-the-tree;
+   to be demonstrated at depth 2 first.
+4. **Sharding:** data assignment can be made hierarchy-aware without inducing
+   cross-sub-cluster correlation.
+5. **Resilience:** aggregator failure is graceful and cheaply made rare; root
+   recovery via checkpoint/resume meets the availability target.
+6. **Transport (extreme scale only):** control-plane streaming latency is
+   amortized by large `H`, and a separate high-bandwidth data-plane path exists.
+
+The depth-2 case of this structure already exists today: per-host relays
+(level-1 aggregation) under a single controller, with the inner/outer optimizer
+split as the two-level cadence. The recursive version is that same structure
+unrolled, earned one level at a time as workloads demand it, never built ahead
+of the hypothesis that gates it.
 
 ## Why this matters for flodl
 

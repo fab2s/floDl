@@ -74,6 +74,12 @@ impl ClusterCoordinator {
                 if self.steps_since_avg[rank] > 1 {
                     self.pb_delivered_ms_accum[rank] += batch_ms + data_ms;
                     self.pb_delivered_batches[rank] += 1;
+                } else {
+                    // The window's FIRST batch carries the per-chunk FILL the
+                    // marginal feed above excludes. Capture its delivered cost
+                    // so `finish_averaging_head` can derive the fill (first −
+                    // marginal) and feed the window-pressure controller.
+                    self.first_batch_delivered_ms[rank] = batch_ms + data_ms;
                 }
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);

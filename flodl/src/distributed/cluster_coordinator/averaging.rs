@@ -841,6 +841,24 @@ impl ClusterCoordinator {
         // batch_counts (when the next cycle is the LAST cycle of the
         // current epoch).
         self.maybe_apply_callback_slack_for_next_cycle();
+        // WINDOW-PRESSURE FILL signal: per-rank excess of the window's first
+        // batch (`first_batch_delivered_ms`) over the steady-state marginal
+        // rate (`pb_delivered_ms_accum / pb_delivered_batches`) — the
+        // amortizable per-window fill the marginal feed excludes. Staged for
+        // ElChe's window-pressure grow term, consumed once inside
+        // `report_timing`. Zero when the window has no marginal sample
+        // (cold-start / single-batch window) — falls back to the reduce term.
+        let fill_ms: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.pb_delivered_batches[r];
+                if n == 0 || self.pb_delivered_ms_accum[r] <= 0.0 {
+                    return 0.0;
+                }
+                let marginal = self.pb_delivered_ms_accum[r] / n as f64;
+                (self.first_batch_delivered_ms[r] - marginal).max(0.0)
+            })
+            .collect();
+        self.el_che.set_window_fill_ms(&fill_ms);
         let (feed_ms, feed_batches) = self.timing_feed();
         if feed_ms.iter().any(|&ms| ms > 0.0) {
             self.el_che.report_timing(
@@ -984,6 +1002,9 @@ impl ClusterCoordinator {
         }
         for n in &mut self.pb_delivered_batches {
             *n = 0;
+        }
+        for f in &mut self.first_batch_delivered_ms {
+            *f = 0.0;
         }
         for t in &mut self.throttled {
             *t = false;
