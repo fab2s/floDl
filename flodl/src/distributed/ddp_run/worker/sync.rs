@@ -315,6 +315,21 @@ impl<M: Module> GpuWorker<M> {
         // = `(1−α)·var + α·avg` across all params via one CUDA kernel
         // launch). Buffers (BatchNorm running stats etc.) always overwrite
         // — blending them is undefined under the EASGD framework.
+        // DiLoCo signal (disposable inner state): query this worker's own
+        // per-site outer-optimizer instance (built-but-unused for stepping on
+        // the CPU path, but it carries the policy bit). `resets_inner` governs
+        // ONLY the inner-optimizer reset below — it is ORTHOGONAL to param
+        // adoption. Param adoption stays governed by `easgd_alpha`: on cadence
+        // (α=None) the new global is full-overwritten = textbook DiLoCo; on
+        // cpu-async (α set) the ahead-of-sync overshoot is EASGD-blended into
+        // the outer-stepped global, preserving that local work. DiLoCo's
+        // resume edge comes from the momentum reset (per-rank inner momentum
+        // has no consensus to checkpoint), NOT from the param overwrite, so
+        // blending the overshoot keeps that edge.
+        let resets_inner = self
+            .outer_optimizer
+            .as_ref()
+            .is_some_and(|o| o.resets_inner());
         {
             let _no_grad = NoGradGuard::new();
             match self.easgd_alpha {
@@ -346,6 +361,14 @@ impl<M: Module> GpuWorker<M> {
         }
         for (buf, src) in self.buffer_list.iter().zip(&update.buffers) {
             buf.get().copy_(src, non_blocking)?;
+        }
+
+        // DiLoCo: reset the inner optimizer after adopting the new global, so
+        // its momentum / step count restart each outer round (disposable
+        // inner state — the resume-faithful axis). Orthogonal to how params
+        // were adopted above. No-op for SlowMo / OuterAvg / no outer optimizer.
+        if resets_inner {
+            self.optimizer.reset_state();
         }
 
         // Record event on comm_stream so compute_stream can wait
@@ -559,7 +582,17 @@ impl<M: Module> GpuWorker<M> {
                             }
                         }
                         self.outer_prev_global = Some(new_global);
+                        // DiLoCo: disposable inner state. The new global is now
+                        // in params (full overwrite — the NCCL path already
+                        // overwrites via the in-place AllReduce, so nothing
+                        // extra needed there); reset the inner optimizer so its
+                        // momentum / step count restart from the new global.
+                        // SlowMo / OuterAvg keep the inner loop continuous.
+                        let resets_inner = outer.resets_inner();
                         self.outer_optimizer = Some(outer);
+                        if resets_inner {
+                            self.optimizer.reset_state();
+                        }
                     }
 
                     if let (Some(ev), Some(stream)) =

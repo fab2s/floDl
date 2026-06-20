@@ -453,6 +453,13 @@ pub struct TrainerConfig<M: Module> {
     ///
     /// [`Trainer::run`]: crate::distributed::Trainer::run
     pub cluster: Option<FullCluster>,
+
+    /// Outer optimizer applied to the consensus between reduce and broadcast
+    /// (SlowMo / DiLoCo). `None` = today's plain averaging
+    /// ([`crate::distributed::OuterAvg`]). Built once per site (controller on
+    /// CPU, per rank on NCCL) from this factory. Set via
+    /// [`Self::outer_optimizer`].
+    pub outer_optimizer: Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
 }
 
 impl<M: Module> TrainerConfig<M> {
@@ -480,6 +487,7 @@ impl<M: Module> TrainerConfig<M> {
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,
             cluster: None,
+            outer_optimizer: None,
         }
     }
 
@@ -487,6 +495,18 @@ impl<M: Module> TrainerConfig<M> {
 
     /// Set the batch size.
     pub fn batch_size(mut self, n: usize) -> Self { self.batch_size = n; self }
+
+    /// Set the outer optimizer (SlowMo / DiLoCo) applied to the consensus.
+    /// The factory is invoked once per site (controller on CPU, per rank on
+    /// NCCL). Absent = today's plain averaging. See
+    /// [`crate::distributed::OuterOptimizer`].
+    pub fn outer_optimizer<P>(mut self, factory: P) -> Self
+    where
+        P: Fn() -> Box<dyn crate::distributed::OuterOptimizer> + Send + Sync + 'static,
+    {
+        self.outer_optimizer = Some(Arc::new(factory));
+        self
+    }
     /// Set the number of epochs.
     pub fn num_epochs(mut self, n: usize) -> Self { self.num_epochs = n; self }
     /// Replace the nested ElChe config.

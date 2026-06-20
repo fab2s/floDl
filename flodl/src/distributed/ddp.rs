@@ -762,6 +762,9 @@ impl Trainer {
         if let Some(e) = cfg.checkpoint_at_epoch {
             b = b.checkpoint_at_epoch(e);
         }
+        if let Some(f) = cfg.outer_optimizer {
+            b = b.outer_optimizer_arc(f);
+        }
         if let Some(f) = cfg.checkpoint_fn {
             b = b.checkpoint_fn_arc(f);
         }

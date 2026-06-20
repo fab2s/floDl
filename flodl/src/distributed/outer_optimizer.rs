@@ -103,6 +103,20 @@ pub trait OuterOptimizer: Send {
     fn load_checkpoint_state(&mut self, _state: Vec<Tensor>) -> Result<()> {
         Ok(())
     }
+
+    /// Whether this variant requires **disposable inner optimizer state**:
+    /// the worker, each sync, fully overwrites its params with the new global
+    /// and **resets its inner optimizer** (clears momentum, step count). This
+    /// is DiLoCo's contract — the inner optimizer is restarted every outer
+    /// round, which is what makes the *outer* momentum the canonical,
+    /// resume-faithful state. `false` (default) keeps the inner loop
+    /// continuous ([`OuterAvg`], [`SlowMomentum`]).
+    ///
+    /// The worker queries its own (per-site) instance for this, so the signal
+    /// rides the same factory that selects the variant — no extra config.
+    fn resets_inner(&self) -> bool {
+        false
+    }
 }
 
 /// Identity outer optimizer: `new_global = consensus`. Stateless, no
@@ -206,6 +220,88 @@ impl OuterOptimizer for SlowMomentum {
         // accumulation from it (a faithful resume, vs re-seeding from zero).
         self.velocity = state;
         Ok(())
+    }
+}
+
+/// DiLoCo outer optimizer: Nesterov momentum on the pseudo-gradient, paired
+/// with **disposable inner optimizer state** (the worker resets its inner
+/// optimizer each outer round; see [`OuterOptimizer::resets_inner`]).
+///
+/// ```text
+/// g = prev_global - consensus
+/// v = mu * v + g                       (momentum, persisted across windows)
+/// new_global = prev_global - lr * (mu * v + g)   (Nesterov look-ahead)
+/// ```
+///
+/// The look-ahead term `mu * v` distinguishes it from [`SlowMomentum`]'s
+/// heavy-ball `new = prev - lr * v`. DiLoCo's reference settings are a
+/// smaller outer lr (≈0.7) with `mu ≈ 0.9`, run over many inner steps `H`.
+/// Because the inner optimizer is reset every round, the *outer* momentum is
+/// the canonical optimizer state — checkpointed to `<stem>.outer.fdl` and
+/// restored faithfully on resume (unlike a continuous inner optimizer, whose
+/// per-rank state has no consensus to save).
+///
+/// First window: the driver passes `prev_global == consensus`, so `g = 0`,
+/// momentum seeds at zero, and the step is a no-op.
+pub struct NesterovMomentum {
+    lr: f64,
+    mu: f64,
+    velocity: Vec<Tensor>,
+}
+
+impl NesterovMomentum {
+    /// New DiLoCo outer optimizer with outer learning rate `lr` and outer
+    /// momentum `mu`. Reference DiLoCo settings: `lr ≈ 0.7`, `mu ≈ 0.9`.
+    pub fn new(lr: f64, mu: f64) -> Self {
+        NesterovMomentum { lr, mu, velocity: Vec::new() }
+    }
+}
+
+impl OuterOptimizer for NesterovMomentum {
+    fn outer_step(
+        &mut self,
+        prev_global: &[Tensor],
+        consensus: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let n = consensus.len();
+        let fresh = self.velocity.len() != n;
+        let mut new_global = Vec::with_capacity(n);
+        let mut new_velocity = Vec::with_capacity(n);
+        for i in 0..n {
+            let g = prev_global[i].sub(&consensus[i])?;
+            // v = mu * v_prev + g  (mu*0 + g = g on a fresh buffer). On the
+            // fresh branch `mul_scalar(1.0)` makes an independent copy of g
+            // (NOT a shared-storage clone) so the buffer and g stay distinct.
+            let v = if fresh {
+                g.mul_scalar(1.0)?
+            } else {
+                self.velocity[i].mul_scalar(self.mu)?.add(&g)?
+            };
+            // Nesterov look-ahead: step by (mu * v + g), not v.
+            let look_ahead = v.mul_scalar(self.mu)?.add(&g)?;
+            let step = look_ahead.mul_scalar(self.lr)?;
+            new_global.push(prev_global[i].sub(&step)?);
+            new_velocity.push(v);
+        }
+        self.velocity = new_velocity;
+        Ok(new_global)
+    }
+
+    fn checkpoint_state(&self) -> Option<Vec<Tensor>> {
+        if self.velocity.is_empty() {
+            None
+        } else {
+            Some(self.velocity.clone())
+        }
+    }
+
+    fn load_checkpoint_state(&mut self, state: Vec<Tensor>) -> Result<()> {
+        self.velocity = state;
+        Ok(())
+    }
+
+    fn resets_inner(&self) -> bool {
+        true
     }
 }
 
@@ -463,6 +559,63 @@ mod tests {
             (a[0] - c[0]).abs() > 1e-6 || (a[1] - c[1]).abs() > 1e-6,
             "warmed and from-zero should differ, else the test is vacuous"
         );
+    }
+
+    #[test]
+    fn nesterov_resets_inner_others_dont() {
+        assert!(NesterovMomentum::new(0.7, 0.9).resets_inner(), "DiLoCo resets inner");
+        assert!(!SlowMomentum::new(0.5, 0.7).resets_inner(), "SlowMo keeps inner continuous");
+        assert!(!OuterAvg.resets_inner(), "OuterAvg keeps inner continuous");
+    }
+
+    #[test]
+    fn nesterov_look_ahead_math() {
+        // lr=0.5, mu=0.9.
+        let mut opt = NesterovMomentum::new(0.5, 0.9);
+
+        // First window: prev==consensus -> g=0 -> no-op.
+        let w1 = opt
+            .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])])
+            .unwrap();
+        assert_eq!(w1[0].to_f32_vec().unwrap(), vec![1.0, 2.0]);
+
+        // Window 2: prev=[1,2], consensus=[0.5,1.0]. g=[0.5,1.0].
+        // fresh velocity -> v=g=[0.5,1.0]. look_ahead = mu*v+g =
+        // 0.9*[0.5,1.0]+[0.5,1.0] = [0.95,1.9]. step = lr*look_ahead =
+        // [0.475,0.95]. new = prev-step = [0.525,1.05].
+        let w2 = opt
+            .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
+            .unwrap();
+        let w2v = w2[0].to_f32_vec().unwrap();
+        assert!((w2v[0] - 0.525).abs() < 1e-6 && (w2v[1] - 1.05).abs() < 1e-6, "got {w2v:?}");
+
+        // Window 3: prev=[0.525,1.05], consensus=[0.5,1.0]. g=[0.025,0.05].
+        // v = 0.9*[0.5,1.0]+[0.025,0.05] = [0.475,0.95]. look_ahead =
+        // 0.9*[0.475,0.95]+[0.025,0.05] = [0.4525,0.905]. step =
+        // [0.22625,0.4525]. new = [0.525,1.05]-step = [0.29875,0.5975].
+        // (confirms momentum carried across windows via the 0.9*v term).
+        let w3 = opt
+            .outer_step(&[t(&[0.525, 1.05], &[2])], &[t(&[0.5, 1.0], &[2])])
+            .unwrap();
+        let w3v = w3[0].to_f32_vec().unwrap();
+        assert!((w3v[0] - 0.29875).abs() < 1e-5 && (w3v[1] - 0.5975).abs() < 1e-5, "got {w3v:?}");
+    }
+
+    #[test]
+    fn nesterov_checkpoint_round_trip() {
+        let mut warm = NesterovMomentum::new(0.5, 0.9);
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])]).unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])]).unwrap();
+        let saved = warm.checkpoint_state().expect("has momentum");
+        let mut resumed = NesterovMomentum::new(0.5, 0.9);
+        resumed.load_checkpoint_state(saved).unwrap();
+        let prev = [t(&[0.525, 1.05], &[2])];
+        let cons = [t(&[0.5, 1.0], &[2])];
+        let a = warm.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        let b = resumed.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-6, "resumed {y} != warmed {x}");
+        }
     }
 
     #[test]

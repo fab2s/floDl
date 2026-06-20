@@ -693,6 +693,10 @@ fn run_unified(
             builder = builder
                 .outer_optimizer(move || Box::new(flodl::distributed::SlowMomentum::new(lr, mu)));
         }
+        crate::config::OuterOptChoice::Nesterov { lr, mu } => {
+            builder = builder
+                .outer_optimizer(move || Box::new(flodl::distributed::NesterovMomentum::new(lr, mu)));
+        }
     }
 
     // Consensus allocation-weighting exponent. Default 1.0 (plain

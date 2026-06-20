@@ -142,6 +142,11 @@ pub enum OuterOptChoice {
     /// SlowMo heavy-ball slow momentum on the pseudo-gradient
     /// `g = prev_global - consensus`.
     SlowMomentum { lr: f64, mu: f64 },
+    /// DiLoCo Nesterov momentum on the pseudo-gradient + disposable inner
+    /// optimizer (worker resets its inner optimizer each outer round). Param
+    /// adoption follows the mode: full-overwrite on cadence, EASGD-blended on
+    /// cpu-async (the inner reset is orthogonal to param adoption).
+    Nesterov { lr: f64, mu: f64 },
 }
 
 /// Runtime configuration for a single benchmark run.

@@ -167,19 +167,21 @@ struct Cli {
     #[option]
     max_overshoot: Option<usize>,
 
-    /// Outer optimizer applied to the consensus between reduce and
-    /// broadcast: `none` (default, plain weighted averaging) or `slowmo`
-    /// (heavy-ball slow momentum on the pseudo-gradient). The A/B lever for
-    /// the SlowMo / DiLoCo arc. Honored on the CPU backend (the consensus is
-    /// forged controller-side); pair with `--outer-lr` / `--outer-mu`.
+    /// Outer optimizer applied to the consensus between reduce and broadcast:
+    /// `none` (default, plain weighted averaging), `slowmo` (heavy-ball slow
+    /// momentum on the pseudo-gradient), or `diloco` (Nesterov momentum +
+    /// disposable inner optimizer — worker resets its inner optimizer each
+    /// round; param adoption follows the mode, EASGD-blended on cpu-async).
+    /// Honored on both CPU (controller-forged consensus) and NCCL (per-rank
+    /// replicated step); pair with `--outer-lr` / `--outer-mu`.
     #[option]
     outer_optimizer: Option<String>,
 
-    /// Outer (slow) learning rate for `--outer-optimizer slowmo`. Default 1.0.
+    /// Outer learning rate for slowmo/diloco. Default 1.0 (slowmo) / 0.7 (diloco).
     #[option]
     outer_lr: Option<f64>,
 
-    /// Outer (slow) momentum for `--outer-optimizer slowmo`. Default 0.9.
+    /// Outer momentum for slowmo/diloco. Default 0.9.
     #[option]
     outer_mu: Option<f64>,
 
@@ -452,25 +454,32 @@ fn validate_outer_optimizer_selection(
         .unwrap_or("none")
         .trim()
         .to_lowercase();
-    let only_slowmo = |name: &str, present: bool| -> flodl::tensor::Result<()> {
-        if present && kind != "slowmo" {
+    // --outer-lr / --outer-mu apply to any momentum-bearing variant
+    // (slowmo + diloco), not none.
+    let only_momentum = |name: &str, present: bool| -> flodl::tensor::Result<()> {
+        if present && kind == "none" {
             return Err(flodl::tensor::TensorError::new(&format!(
-                "--{name} is only valid with --outer-optimizer slowmo \
+                "--{name} requires --outer-optimizer slowmo|diloco \
                  (current: --outer-optimizer {kind})",
             )));
         }
         Ok(())
     };
-    only_slowmo("outer-lr", cli.outer_lr.is_some())?;
-    only_slowmo("outer-mu", cli.outer_mu.is_some())?;
+    only_momentum("outer-lr", cli.outer_lr.is_some())?;
+    only_momentum("outer-mu", cli.outer_mu.is_some())?;
     match kind.as_str() {
         "none" => Ok(OuterOptChoice::None),
         "slowmo" => Ok(OuterOptChoice::SlowMomentum {
             lr: cli.outer_lr.unwrap_or(1.0),
             mu: cli.outer_mu.unwrap_or(0.9),
         }),
+        // DiLoCo reference defaults: smaller outer lr (≈0.7), mu ≈ 0.9.
+        "diloco" => Ok(OuterOptChoice::Nesterov {
+            lr: cli.outer_lr.unwrap_or(0.7),
+            mu: cli.outer_mu.unwrap_or(0.9),
+        }),
         other => Err(flodl::tensor::TensorError::new(&format!(
-            "unknown --outer-optimizer '{other}' (expected: none, slowmo)",
+            "unknown --outer-optimizer '{other}' (expected: none, slowmo, diloco)",
         ))),
     }
 }

@@ -150,6 +150,18 @@ where
         self
     }
 
+    /// Set the outer optimizer from a pre-built factory `Arc`. The config-bag
+    /// (`Trainer::run`) path uses this to forward
+    /// [`crate::distributed::TrainerConfig`]'s stored factory; prefer
+    /// [`Self::outer_optimizer`] when writing a closure directly.
+    pub fn outer_optimizer_arc(
+        mut self,
+        factory: crate::distributed::outer_optimizer::OuterOptimizerFactory,
+    ) -> Self {
+        self.outer_optimizer_factory = Some(factory);
+        self
+    }
+
     /// Apply a complete [`crate::distributed::ElCheConfig`] strategy in one
     /// call: derives `policy`/`backend` from `elche.mode`, moves the
     /// convergence-guard override onto the builder, and stores the rest as
