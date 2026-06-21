@@ -70,6 +70,19 @@ not a commitment; only moving one to In Progress is.
   hierarchical ElChe (intra-host NCCL + inter-host DiLoCo). Real
   feature PR with design doc and cloud test budget. See
   [docs/design/cloud-ddp.md](docs/design/cloud-ddp.md).
+- **Async stale-update correction (HeLoCo-style)**: direction-aware
+  pseudo-gradient correction for fully-async and wide-window regimes,
+  where worker drift exceeds ElChe's bounded-staleness envelope.
+  Per-tensor-block cosine alignment against the outer-optimizer
+  momentum (preserve aligned blocks, shrink conflicting components,
+  reorient weakly-aligned ones at fixed norm) plus a momentum
+  look-ahead initialization, layered on the DiLoCo `NesterovMomentum`
+  outer optimizer already shipped. The complement to ElChe's
+  cadence/window control: ElChe keeps drift small so utilization can
+  reclaim barrier idle; this repairs drift when a deployment chooses
+  to let it grow (geo-distributed, non-IID per-node shards). After
+  HeLoCo (Asif et al., arXiv 2606.00271). See
+  [docs/design/cloud-ddp.md](docs/design/cloud-ddp.md).
 - **ddp-bench: next published model**. Class-level pull, repeats as
   models land. Top candidates: small transformer (GPT-2 tiny / BERT-
   small) for the attention family, ViT, UNet for multi-scale skip
