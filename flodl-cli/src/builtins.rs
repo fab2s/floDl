@@ -41,7 +41,7 @@ pub struct DiagnoseArgs {
 ///
 /// Default (single-host): probes the local box for GPU + libtorch arch
 /// match + shared-data path + NCCL availability. Cluster context
-/// (`fdl cluster probe` / `FDL_ENV=cluster`): probes every host in
+/// (`fdl @cluster probe` / `FDL_ENV=cluster`): probes every host in
 /// `fdl.cluster.yml` via SSH and aggregates the report.
 ///
 /// Exit code: 0 when every checked component is green; 1 when any
@@ -427,7 +427,7 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: None,
         },
         // Hidden: `version` is covered by `-V` / `--version` but still
-        // reserved so first-arg env detection doesn't hijack it.
+        // reserved as a top-level built-in name.
         BuiltinSpec {
             path: &["version"],
             description: None,
@@ -438,7 +438,6 @@ pub fn registry() -> &'static [BuiltinSpec] {
 }
 
 /// True when `name` is a reserved top-level built-in (visible or hidden).
-/// Drives env-collision detection in first-arg resolution.
 pub fn is_builtin_name(name: &str) -> bool {
     registry()
         .iter()

@@ -1,7 +1,7 @@
 # Tutorial 3: Modules
 
 The `nn` module provides neural network layers, activations, and the `Module`
-trait that unifies them all. Modules compose naturally — a model is a Module
+trait that unifies them all. Modules compose naturally - a model is a Module
 that contains other Modules.
 
 This tutorial builds on [Tutorial 2: Automatic Differentiation](02-autograd.md).
@@ -199,7 +199,7 @@ let output = ln.forward(&input)?;  // [batch, 512] -> [batch, 512]
 
 ### RMSNorm
 
-Root Mean Square normalization. Simpler and faster than LayerNorm — no mean
+Root Mean Square normalization. Simpler and faster than LayerNorm - no mean
 subtraction, just RMS scaling. Used in LLaMA, Gemma, and other modern
 architectures:
 
@@ -226,13 +226,13 @@ let output = bn2d.forward(&input)?;  // [B, 64, H, W] -> [B, 64, H, W]
 Use `BatchNorm` after Linear layers and `BatchNorm2d` after Conv2d layers.
 Both behave differently during training (batch statistics) vs. inference
 (running statistics). They track `num_batches_tracked` and will error in eval
-mode if no training has occurred — this catches a common silent bug.
+mode if no training has occurred - this catches a common silent bug.
 
 See [Train/Eval Mode](#traineval-mode) below.
 
 ### GroupNorm
 
-Normalizes over groups of channels. Independent of batch size — works well
+Normalizes over groups of channels. Independent of batch size - works well
 with small batches where BatchNorm struggles:
 
 ```rust
@@ -255,7 +255,7 @@ Randomly zeroes elements during training. Uses inverted dropout so no
 scaling is needed at inference.
 
 ```rust
-let drop = Dropout::new(0.1);    // 10% drop probability — zeroes individual elements
+let drop = Dropout::new(0.1);    // 10% drop probability - zeroes individual elements
 let drop2d = Dropout2d::new(0.1); // drops entire channels (for conv features)
 let adrop = AlphaDropout::new(0.1); // maintains self-normalizing property (for SELU networks)
 let output = drop.forward(&input)?;
@@ -324,7 +324,7 @@ let state = lstm.forward_step(&x2, Some(&state))?;    // subsequent steps
 
 Multi-layer sequence modules matching PyTorch's `nn.GRU` / `nn.LSTM`.
 Process entire sequences and stack multiple layers. `forward_seq` uses
-fused `at::lstm` / `at::gru` kernels (cuDNN-accelerated on CUDA) —
+fused `at::lstm` / `at::gru` kernels (cuDNN-accelerated on CUDA) -
 the full sequence is processed in a single kernel call, no per-timestep
 dispatch overhead:
 
@@ -377,24 +377,24 @@ Activation functions are also modules, making them composable in the graph
 builder:
 
 ```rust
-// Zero-sized types — no parameters, no allocation
+// Zero-sized types - no parameters, no allocation
 ReLU              // max(0, x)
 Sigmoid           // 1 / (1 + exp(-x))
 Tanh              // hyperbolic tangent
 GELU              // Gaussian Error Linear Unit
 SiLU              // x * sigmoid(x), also called Swish
-SELU              // scaled ELU — self-normalizing (pair with AlphaDropout)
+SELU              // scaled ELU - self-normalizing (pair with AlphaDropout)
 Mish              // x * tanh(softplus(x))
 Hardswish         // efficient Swish approximation
 Hardsigmoid       // piecewise-linear sigmoid approximation
 Identity          // pass-through
 
-// Parameterized — take a config value at construction
+// Parameterized - take a config value at construction
 LeakyReLU::new(0.01)         // max(x, slope * x)
 ELU::new(1.0)                // alpha * (exp(x) - 1) for x < 0
 Softplus::new(1.0, 20.0)     // smooth approximation of ReLU (beta, threshold)
 Softmax::new(-1)              // softmax along dim
-LogSoftmax::new(-1)           // log(softmax(x)) — numerically stable
+LogSoftmax::new(-1)           // log(softmax(x)) - numerically stable
 Flatten::new(1, -1)           // flatten spatial dims (start_dim, end_dim)
 
 // Learnable
@@ -410,8 +410,8 @@ inference. The `set_training` method on Module controls this, and
 convenience aliases `train()` / `eval()` make it concise:
 
 ```rust
-model.eval();    // eval mode  — same as set_training(false)
-model.train();   // training mode — same as set_training(true)
+model.eval();    // eval mode  - same as set_training(false)
+model.train();   // training mode - same as set_training(true)
 ```
 
 `train()` and `eval()` are convenience methods for `set_training(true)`
@@ -466,7 +466,7 @@ impl Module for RecurrentModule {
 ## Composing Modules Manually
 
 Without the graph builder, you compose modules in plain Rust. Implement
-`sub_modules()` to declare children — the framework then handles device
+`sub_modules()` to declare children - the framework then handles device
 placement, training mode, and parameter collection:
 
 ```rust
@@ -503,7 +503,7 @@ impl Module for MLP {
 }
 ```
 
-This is the same pattern as PyTorch's `nn.Module` — declare children, let
+This is the same pattern as PyTorch's `nn.Module` - declare children, let
 the framework walk the tree. For anything involving residual connections,
 parallel branches, loops, or conditional execution, the graph builder API
 is more expressive and handles the wiring automatically.

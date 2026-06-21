@@ -41,13 +41,13 @@ per forward pass, each going through Python -> TorchScript -> C++ in
 PyTorch, versus direct FFI in flodl. The per-op overhead compounds across
 attention heads, feed-forward layers, and residual connections.
 
-Both frameworks produce identical attention weights -- same cuDNN kernels,
+Both frameworks produce identical attention weights - same cuDNN kernels,
 same numerics. The 31% gap is pure framework overhead.
 
 ### Fused RNN kernels
 
 LSTM and GRU now call cuDNN's fused sequence kernels (`at::lstm()` /
-`at::gru()`) -- a single kernel for the entire sequence across all layers,
+`at::gru()`) - a single kernel for the entire sequence across all layers,
 replacing per-timestep cell dispatch. On top of that, flodl caches the
 packed parameter tensors on the C++ side behind an opaque handle
 (`RnnParams`). After the first forward call, subsequent calls pass a
@@ -56,8 +56,8 @@ parameter collection, FFI array marshalling, and `std::vector`
 reconstruction.
 
 The result: lstm_seq matches PyTorch exactly (692.3ms vs 692.3ms), and
-gru_seq edges ahead by 4%. Both are compute-bound -- cuDNN does the real
-work -- so the tie confirms parity in the underlying kernel dispatch.
+gru_seq edges ahead by 4%. Both are compute-bound - cuDNN does the real
+work - so the tie confirms parity in the underlying kernel dispatch.
 
 ### Two new ties prove the architecture
 
@@ -102,7 +102,7 @@ interference from outside the benchmark, not real framework variance.
 
 With stddev, flodl looks noisier (because of that one gru_seq spike).
 With MAD, flodl looks tighter (because its steady-state variance is
-actually lower on most models). Neither framing is more "favorable" --
+actually lower on most models). Neither framing is more "favorable" -
 MAD is simply more accurate about what each framework does when the OS
 isn't interfering.
 
@@ -132,7 +132,7 @@ One number that doesn't appear in the timing table: Docker image size.
 | PyTorch benchmark | 38.45 GB |
 | flodl benchmark | 26.86 GB |
 
-That's 30% smaller. No Python, no pip, no PyTorch distribution -- just the
+That's 30% smaller. No Python, no pip, no PyTorch distribution - just the
 Rust binary and libtorch.
 
 On spot instances with cold starts, image pull time is real wall-clock cost.
@@ -175,7 +175,7 @@ documents the protocol, environment, and statistical model in detail.
 ## Where this goes
 
 The benchmark suite doesn't use CUDA Graphs, mixed precision, or
-channels-last -- features that would further widen the gap. Those are fair
+channels-last - features that would further widen the gap. Those are fair
 game for a future comparison.
 
 But the core result is structural. Ten models, two framework versions, and

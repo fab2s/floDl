@@ -6,7 +6,7 @@ description: "flodl vs PyTorch on 7 models with publication-grade methodology. U
 ---
 
 *Update: these v0.1.3 results have been superseded by the
-[v0.2.2 benchmarks](/blog/benchmark-update) -- 10 models, fused RNN
+[v0.2.2 benchmarks](/blog/benchmark-update) - 10 models, fused RNN
 kernels, and improved statistical methodology.*
 
 When I published the [first benchmark](/benchmark) a week ago, the headline
@@ -18,7 +18,7 @@ That wasn't a measurement artifact. It was the actual finding.
 
 ## The suite
 
-The first benchmark was a single model — a fair criticism is that any one
+The first benchmark was a single model - a fair criticism is that any one
 workload might favor one framework by accident. So I built a proper suite.
 Seven models spanning the architectures that matter:
 
@@ -32,7 +32,7 @@ Seven models spanning the architectures that matter:
 | iterative_refine | 8-step refinement loop | 3.2M |
 | feedback_fixed | 10-step feedback loop (smaller model) | 0.8M |
 
-Tier 1 (mlp, convnet, gru_seq) uses standard nn modules — Linear, Conv2d,
+Tier 1 (mlp, convnet, gru_seq) uses standard nn modules - Linear, Conv2d,
 GRUCell. Both sides write the same code. Tier 2 uses flodl's graph builder
 on the Rust side and equivalent manual `forward()` on the Python side. Same
 architecture, same parameters, same optimizer.
@@ -77,10 +77,10 @@ flodl wins 6 of 7. The speed numbers are good. But look at the σ column.
 ## The number that matters
 
 Every single model, without exception, shows tighter variance on flodl.
-Not by a little — by 3x to 20x:
+Not by a little - by 3x to 20x:
 
 - **gru_seq:** PyTorch ±222ms on a 1-second epoch. That's a 22% swing between
-  runs. flodl: ±10.8ms — a 1% swing. Same model, same GPU, same CUDA kernels.
+  runs. flodl: ±10.8ms - a 1% swing. Same model, same GPU, same CUDA kernels.
 
 - **residual_tower:** PyTorch ±25.9ms. flodl ±3.6ms. Seven times more
   predictable.
@@ -104,7 +104,7 @@ PyTorch. The variance comes from:
    counting + cyclic GC arrives at the CUDA allocator in bursts, causing
    pressure spikes that fragment the allocation pool.
 
-Rust has none of these. Tensor memory is freed by `Drop` at scope exit —
+Rust has none of these. Tensor memory is freed by `Drop` at scope exit -
 deterministically, on the same thread, at the exact point where the value is no
 longer needed. There is no GC to pause. There is no interpreter between you and
 the FFI call. The memory behavior is the same on every run because the
@@ -115,8 +115,8 @@ execution model is the same on every run.
 The convnet result at +0% is not a disappointment. It's a proof.
 
 Convolution is compute-bound. Both frameworks spend >99% of their time inside
-cuDNN kernels. The framework overhead — dispatch, memory management, Python
-interpretation — is invisible because the GPU is doing all the work.
+cuDNN kernels. The framework overhead - dispatch, memory management, Python
+interpretation - is invisible because the GPU is doing all the work.
 
 This proves that flodl and PyTorch dispatch identical CUDA kernels. The speed
 advantage on other models comes entirely from what happens *between* kernel
@@ -133,20 +133,20 @@ framework overhead, not CUDA kernel differences.
 The first benchmark (19% on FBRL letter model) ran on flodl v0.1.1. Since
 then:
 
-- **Fused Adam/AdamW** — single multi-tensor CUDA kernel instead of 4N
+- **Fused Adam/AdamW** - single multi-tensor CUDA kernel instead of 4N
   per-parameter launches
-- **Foreach operations** — 7 batched tensor ops (zero, norm, scale, lerp,
+- **Foreach operations** - 7 batched tensor ops (zero, norm, scale, lerp,
   sqrt, add, mul) that replace N individual kernel launches
-- **Fused gradient clipping** — 2 kernels total instead of 2N
-- **CUDA Graphs** — capture/replay kernel sequences for static-shape models
-- **Automatic mixed precision** — autocast + GradScaler for fp16/bf16
-- **Channels-last memory** — NHWC layout for Conv2d on Tensor Core GPUs
-- **Pre-computed graph routing** — Vec-indexed dispatch with cached buffers
+- **Fused gradient clipping** - 2 kernels total instead of 2N
+- **CUDA Graphs** - capture/replay kernel sequences for static-shape models
+- **Automatic mixed precision** - autocast + GradScaler for fp16/bf16
+- **Channels-last memory** - NHWC layout for Conv2d on Tensor Core GPUs
+- **Pre-computed graph routing** - Vec-indexed dispatch with cached buffers
 
 All automatic. Users get them without changing their training code.
 
 The benchmark suite intentionally *doesn't* enable CUDA Graphs, mixed
-precision, or channels-last — those would give flodl an unfair advantage
+precision, or channels-last - those would give flodl an unfair advantage
 over standard PyTorch usage. The numbers above are apples-to-apples: same
 dtype (fp32), same memory layout (contiguous), same training loop structure.
 
@@ -193,7 +193,7 @@ make bench-publish
 
 Per-round JSON with full per-epoch timings is saved in `benchmarks/rounds/`.
 The merged report goes to `benchmarks/report.txt`. If you have a different
-GPU, run it and see — the absolute numbers will differ but the relative
+GPU, run it and see - the absolute numbers will differ but the relative
 story should hold.
 
 The [full methodology](https://github.com/flodl-labs/flodl/blob/main/docs/benchmark.md)
@@ -204,7 +204,7 @@ accounted for.
 ## What's next
 
 This benchmark measures standard fp32 training without CUDA Graphs or mixed
-precision — the optimizations that would further widen the gap. Future
+precision - the optimizations that would further widen the gap. Future
 benchmark updates will add:
 
 - Mixed precision (autocast + GradScaler) comparison

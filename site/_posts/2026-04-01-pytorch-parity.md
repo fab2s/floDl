@@ -1,6 +1,6 @@
 ---
 title: "Everything you use in PyTorch, now in Rust"
-subtitle: "30+ modules, 15 losses, 7 optimizers, 100+ tensor ops, 769 tests — flodl reaches PyTorch parity"
+subtitle: "30+ modules, 15 losses, 7 optimizers, 100+ tensor ops, 769 tests - flodl reaches PyTorch parity"
 date: 2026-04-01
 description: "flodl's parity release covers the full PyTorch API surface that DL researchers actually use: every conv, every norm, every pooling, every loss, every optimizer. Same names, same semantics, up to 31% faster."
 ---
@@ -29,7 +29,7 @@ flodl, nod, and go back to PyTorch.
 
 ### Modules: 30+ and counting
 
-**Convolutions** — the full family:
+**Convolutions** - the full family:
 
 ```rust
 let conv = Conv1d::configure(3, 16, 5).with_stride(2).with_padding(2).done()?;
@@ -46,7 +46,7 @@ All share the same fluent builder pattern: `.with_stride()`, `.with_padding()`,
 `.with_dilation()`, `.with_groups()`, `.on_device()`. If you've used one,
 you've used them all.
 
-**Normalization** — every variant:
+**Normalization** - every variant:
 
 ```rust
 let ln = LayerNorm::new(512)?;           // transformers
@@ -59,7 +59,7 @@ let inn = InstanceNorm::new(64, true)?;   // style transfer
 `RMSNorm` was the most requested. It's simpler than `LayerNorm` (no mean
 subtraction) and faster, the go-to for modern LLM architectures.
 
-**Recurrent** — full sequence modules, not just cells:
+**Recurrent** - full sequence modules, not just cells:
 
 ```rust
 // Multi-layer GRU matching nn.GRU exactly
@@ -82,7 +82,7 @@ let y = mha.forward(&x)?;                              // self-attention
 let y = mha.forward_ext(&query, &key, &value, Some(&mask))?;  // cross-attention
 ```
 
-**Pooling** — the complete set:
+**Pooling** - the complete set:
 
 `MaxPool1d`, `MaxPool2d`, `AvgPool1d`, `AvgPool2d`, `AdaptiveMaxPool2d`,
 `PixelShuffle`, `PixelUnshuffle`, `Upsample`, `Unfold`, `Fold`. Plus
@@ -144,7 +144,7 @@ let opt = Adam::new(&params, 0.001);
 let opt = AdamW::new(&params, 0.001, 0.01);
 let opt = RMSprop::new(&params, 0.01);
 let opt = Adagrad::new(&params, 0.01);
-let opt = RAdam::new(&params, 0.001);   // rectified Adam — no warmup needed
+let opt = RAdam::new(&params, 0.001);   // rectified Adam - no warmup needed
 let opt = NAdam::new(&params, 0.001);   // Nesterov-accelerated Adam
 ```
 
@@ -204,15 +204,15 @@ Every tensor op has a differentiable autograd path (90+ backward implementations
 
 The parity push alone added 165 tests:
 
-- **55 autograd gradient checks** — finite-difference verification for every
+- **55 autograd gradient checks** - finite-difference verification for every
   new differentiable op
-- **60+ module tests** — forward shape, backward gradient, builder options,
+- **60+ module tests** - forward shape, backward gradient, builder options,
   edge cases (batch-size-one GroupNorm, BatchNorm rejecting eval without
   training, SmoothL1 rejecting negative beta)
-- **20+ loss tests** — including "focal reduces to cross-entropy at gamma=0"
+- **20+ loss tests** - including "focal reduces to cross-entropy at gamma=0"
   and "triplet loss is zero when negative is far"
-- **7 mixed precision tests** — GradScaler growth, backoff, inf detection
-- **6 gradient clipping tests** — fused foreach path verification
+- **7 mixed precision tests** - GradScaler growth, backoff, inf detection
+- **6 gradient clipping tests** - fused foreach path verification
 
 The gradient checks matter most. Every differentiable path is verified against
 finite-difference approximation. If the analytical gradient disagrees with

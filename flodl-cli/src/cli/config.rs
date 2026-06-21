@@ -308,6 +308,17 @@ pub(crate) fn dispatch_config(
         }
         WalkOutcome::UnknownCommand { name } => {
             eprintln!("unknown command: {name}");
+            // Likely the retired positional-env form (`fdl cluster probe`):
+            // if a sibling `fdl.<name>.yml` overlay exists, steer to `@`.
+            if let Some(base) = config::find_config(&cwd)
+                && overlay::find_env_file(&base, &name).is_some()
+            {
+                eprintln!();
+                eprintln!(
+                    "`{name}` is an env overlay (fdl.{name}.yml), not a command. \
+                     Select it with the `@` sigil: `fdl @{name} <command>`."
+                );
+            }
             eprintln!();
             run::print_project_help(&project, &project_root, env);
             ExitCode::FAILURE
@@ -330,7 +341,7 @@ pub(crate) fn dispatch_config(
 ///
 /// `tail` is `args[1..]`: `tail[0]` is always "config", `tail[1]` is the
 /// sub-command ("show"), `tail[2..]` carry options (an optional explicit
-/// `<env>` that overrides the first-arg env detection).
+/// `<env>` that overrides the active `@env` / `--env` selector).
 pub(crate) fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> ExitCode {
     let sub = tail.get(1).map(String::as_str).unwrap_or("--help");
     match sub {
@@ -397,8 +408,8 @@ fn print_config_usage() {
     println!();
     println!("Without an env argument, prints the base fdl.yml. With an env argument");
     println!("(e.g. `fdl config show ci`), prints the base deep-merged with");
-    println!("fdl.<env>.yml. When invoked through the first-arg form");
-    println!("(`fdl ci config show`), the env is already active and no extra");
+    println!("fdl.<env>.yml. When invoked through the `@` sigil form");
+    println!("(`fdl @ci config show`), the env is already active and no extra");
     println!("argument is needed.");
 }
 

@@ -1,4 +1,4 @@
-# Cloud DDP — Communication-Efficient Distributed Training
+# Cloud DDP - Communication-Efficient Distributed Training
 
 The next DDP iteration targets **cloud and cross-datacenter** training,
 where network latency (not GPU compute) dominates wall time, hardware

@@ -70,8 +70,8 @@ equally to the flodl source checkout and to anything you scaffolded with
   a nested sub-project with its own `fdl.yml`, or a preset that merges
   structured config over an enclosing `entry:`. Replaces the old
   `make`/`docker compose` workflow.
-- **Environment overlays.** `fdl --env ci test` loads `fdl.ci.yml` on top
-  of the base config; `FDL_ENV=ci` and first-arg conventions work too.
+- **Environment overlays.** `fdl @ci test` loads `fdl.ci.yml` on top
+  of the base config; `fdl --env ci test` and `FDL_ENV=ci` are equivalent.
   `fdl config show [env]` prints the resolved merged config with per-layer
   annotations.
 - **Shell completions.** `fdl completions bash|zsh|fish` emits a
@@ -107,7 +107,7 @@ equally to the flodl source checkout and to anything you scaffolded with
 - **`fdl --gpus <spec>`** — global GPU scope override. On
   cluster-aware commands, synthesizes a single-host cluster envelope;
   on non-cluster commands, sets `CUDA_VISIBLE_DEVICES`.
-- **`fdl cluster <cmd>`** — first-arg form of the `cluster` env
+- **`fdl @cluster <cmd>`** — `@` selector for the `cluster` env
   overlay. Auto-builds the target binary per-host (resolving per-host
   libtorch variants from `fdl.cluster.yml`'s `arch:` declarations),
   SSHes each worker, fans out, supervises rank children, tears them

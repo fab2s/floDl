@@ -68,7 +68,7 @@ Graph builder for model composition.
 | `nn.LayerNorm(n)` | `LayerNorm::new(n)?` |
 | `nn.Dropout(p)` | `Dropout::new(p)` |
 | `nn.ReLU()` | `ReLU::new()` |
-| `nn.GELU()` | `GELU` (erf form, default) — use `GELU::tanh()` for the tanh approximation |
+| `nn.GELU()` | `GELU` (erf form, default) - use `GELU::tanh()` for the tanh approximation |
 | `nn.Embedding(n, d)` | `Embedding::new(n, d)?` |
 | `nn.LSTM(in, h, layers)` | `LSTM::new(in, h, layers)?` |
 | `nn.GRU(in, h, layers)` | `GRU::new(in, h, layers)?` |
@@ -295,10 +295,10 @@ let state = ddp.join()?;                // averaged params + buffers on CPU
 
 ElChe cadence auto-detects heterogeneous GPU speeds and lets the
 faster card run ahead while the slow one anchors synchronization.
-The default mode is `NcclCadence` — anchor-based scheduling with
+The default mode is `NcclCadence` - anchor-based scheduling with
 NCCL AllReduce at every cadence boundary. Other modes: `NcclSync`,
 `CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on the reference
-rig — genuine async via decoupled CPU averaging). See the
+rig - genuine async via decoupled CPU averaging). See the
 [DDP Reference](ddp.md) for the full mode surface, convergence guard,
 metrics, and live-monitor wiring, and [DDP Benchmark](ddp-benchmark.md)
 for results on mixed consumer hardware.

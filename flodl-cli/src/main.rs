@@ -122,11 +122,10 @@ fn main() -> ExitCode {
         }
     };
 
-    // Environment selection: `--env X` > `FDL_ENV=X` > first-arg convention.
-    // Explicit selectors must resolve to an existing overlay; first-arg
-    // detection falls through when the arg matches no overlay. Ambiguous
-    // cases (a command name also matches a sibling env file) are a loud
-    // error rather than silent precedence.
+    // Environment selection: `@env` / `--env X` (command-line, equivalent)
+    // override `FDL_ENV=X`. Every form must resolve to an existing overlay
+    // or it is a loud error — there is no positional-env convention, so the
+    // first bare token is always a command.
     let cwd = env::current_dir().unwrap_or_default();
     let fdl_env_var = env::var("FDL_ENV").ok();
     let (active_env, args) = match resolve_env(&args, &cwd, fdl_env_var.as_deref()) {
@@ -266,15 +265,19 @@ fn main() -> ExitCode {
 
 /// Resolve the active environment selector.
 ///
-/// Precedence (highest wins):
-///   1. Explicit `--env X` / `--env=X` flag (scan-anywhere, like `-v`).
-///   2. `FDL_ENV=X` environment variable (`fdl_env`).
-///   3. First-arg convention: `fdl ci test` where `fdl.ci.yml` exists.
+/// Three forms, no positional convention:
+///   * `@env` sigil token (`fdl @cluster probe`), accepted anywhere before
+///     a standalone `--`, exactly like `--env`.
+///   * `--env X` / `--env=X` flag (scan-anywhere).
+///   * `FDL_ENV=X` environment variable (`fdl_env`).
 ///
-/// Explicit selectors (#1, #2) must resolve to an existing overlay — missing
-/// files error loudly rather than silently falling through. First-arg
-/// detection still falls through when the arg matches no overlay (it may
-/// just be a command).
+/// `@env` and `--env` are command-line selectors and rank equal; supplying
+/// both with *different* values is a loud conflict error, and either one
+/// overrides `FDL_ENV`. Every form must resolve to an existing
+/// `fdl.<env>.yml` overlay — a miss errors loudly rather than falling
+/// through. Because there is no positional-env convention, the first bare
+/// token is unconditionally a command (no command/env name collision is
+/// possible).
 ///
 /// `cwd` and `fdl_env` are injected for testability; `main` reads them from
 /// the process environment once at startup.
@@ -283,14 +286,29 @@ fn resolve_env(
     cwd: &std::path::Path,
     fdl_env: Option<&str>,
 ) -> Result<(Option<String>, Vec<String>), String> {
-    // 1. Explicit flag wins — strip it from args before anything else.
+    // Strip both command-line selectors up front.
     let (args, flag_env) = extract_env_flag(args)?;
-    if let Some(ref env_name) = flag_env {
-        validate_env_exists(env_name, "--env", cwd)?;
-        return Ok((flag_env, args));
+    let (args, at_env) = extract_at_env(&args)?;
+
+    // Reconcile `@env` and `--env` — equal rank, conflict if they disagree.
+    let cli_env = match (flag_env, at_env) {
+        (Some(f), Some(a)) if f != a => {
+            return Err(format!(
+                "conflicting env selectors: `--env {f}` and `@{a}` — pick one"
+            ));
+        }
+        (Some(v), _) => Some((v, "--env")),
+        (None, Some(v)) => Some((v, "@<env>")),
+        (None, None) => None,
+    };
+
+    // A command-line selector wins over the ambient `FDL_ENV`.
+    if let Some((env_name, source)) = cli_env {
+        validate_env_exists(&env_name, source, cwd)?;
+        return Ok((Some(env_name), args));
     }
 
-    // 2. Environment variable, if set and non-empty.
+    // Environment variable, if set and non-empty.
     if let Some(env_name) = fdl_env {
         if !env_name.is_empty() {
             validate_env_exists(env_name, "FDL_ENV", cwd)?;
@@ -298,16 +316,9 @@ fn resolve_env(
         }
     }
 
-    // 3. First-arg convention — returns None if no overlay matches.
-    resolve_env_first_arg(&args, cwd)
+    Ok((None, args))
 }
 
-/// Strip `--env <value>` / `--env=<value>` tokens from `args`.
-///
-/// Accepts either long-separated (`--env ci`) or equals-joined
-/// (`--env=ci`) form. Errors on missing value, empty value, or duplicate
-/// occurrence. Returns `(filtered_args, Some(value))` on success, or
-/// `(filtered_args, None)` when the flag is absent.
 /// Extract the global `--gpus` flag. Accepted at any position; both forms:
 /// `--gpus 0,1` and `--gpus=0,1`. Errors on duplicate, missing value, or
 /// value that looks like another flag.
@@ -356,12 +367,28 @@ fn extract_gpus_flag(
     Ok((out, spec))
 }
 
+/// Strip `--env <value>` / `--env=<value>` tokens from `args`.
+///
+/// Accepts either long-separated (`--env ci`) or equals-joined
+/// (`--env=ci`) form. Errors on missing value, empty value, or duplicate
+/// occurrence. Returns `(filtered_args, Some(value))` on success, or
+/// `(filtered_args, None)` when the flag is absent.
+///
+/// Scan-anywhere, but stops at the first standalone `--`: a `--env` token
+/// past the separator is bound for the inner command and forwarded
+/// untouched (consistent with [`extract_at_env`] and the other global
+/// flag extractors).
 fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     let mut out = Vec::with_capacity(args.len());
     let mut env: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if a == "--" {
+            // Everything from here on is forwarded verbatim.
+            out.extend(args[i..].iter().cloned());
+            break;
+        }
         if a == "--env" {
             let value = args.get(i + 1).ok_or_else(|| {
                 "--env requires a value (e.g. `--env ci`)".to_string()
@@ -393,6 +420,47 @@ fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), St
     Ok((out, env))
 }
 
+/// Strip a single `@<env>` selector token from `args`, returning the env
+/// name without the leading `@`.
+///
+/// Scan-anywhere (`fdl @cluster probe` ≡ `fdl probe @cluster`) but stops at
+/// the first standalone `--`, so a literal `@`-prefixed argument can still
+/// be forwarded to an inner command after the separator. Index 0 (the
+/// program name) is never inspected. Errors on a bare `@` (no name) or on
+/// more than one `@`-token.
+fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut env: Option<String> = None;
+    let mut past_dashdash = false;
+    for (i, arg) in args.iter().enumerate() {
+        if i == 0 || past_dashdash {
+            out.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            out.push(arg.clone());
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix('@') {
+            if name.is_empty() {
+                return Err(
+                    "`@` requires an env name (e.g. `@cluster`)".to_string(),
+                );
+            }
+            if env.is_some() {
+                return Err(
+                    "env selector (`@<env>`) specified more than once".to_string(),
+                );
+            }
+            env = Some(name.to_string());
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    Ok((out, env))
+}
+
 /// Confirm that `fdl.<env>.yml` exists next to the nearest base config,
 /// erroring with the source (`--env` or `FDL_ENV`) when it doesn't.
 fn validate_env_exists(
@@ -414,57 +482,6 @@ fn validate_env_exists(
         ));
     }
     Ok(())
-}
-
-/// First-arg environment resolution. Returns `(Some(env), args_without_env)`
-/// when the first positional matches a sibling `fdl.<arg>.yml` overlay and
-/// no built-in, script, or sub-command by that name exists. Returns
-/// `(None, args)` when no env applies. Errors on ambiguity.
-fn resolve_env_first_arg(
-    args: &[String],
-    cwd: &std::path::Path,
-) -> Result<(Option<String>, Vec<String>), String> {
-    let candidate = match args.get(1) {
-        Some(a) if !a.starts_with('-') => a,
-        _ => return Ok((None, args.to_vec())),
-    };
-
-    let base_config = match config::find_config(cwd) {
-        Some(p) => p,
-        None => return Ok((None, args.to_vec())),
-    };
-    let env_file = overlay::find_env_file(&base_config, candidate);
-    if env_file.is_none() {
-        return Ok((None, args.to_vec()));
-    }
-
-    // An overlay exists — check for collision with a command of the same name.
-    let is_command = is_builtin_name(candidate) || is_project_command(&base_config, candidate);
-    if is_command {
-        return Err(format!(
-            "ambiguous `{candidate}`: matches both a command and an env overlay \
-             (fdl.{candidate}.yml).\nResolve by renaming one."
-        ));
-    }
-
-    // Unambiguously an env; consume it and return the rest.
-    let mut rest = Vec::with_capacity(args.len() - 1);
-    rest.push(args[0].clone());
-    rest.extend(args.iter().skip(2).cloned());
-    Ok((Some(candidate.clone()), rest))
-}
-
-fn is_builtin_name(name: &str) -> bool {
-    builtins::is_builtin_name(name)
-}
-
-fn is_project_command(base_config: &std::path::Path, name: &str) -> bool {
-    // Must NOT merge env overlays here — that would be circular when the
-    // env name also matches a command key. Inspect the raw base only.
-    let Ok(project) = config::load_project_with_env(base_config, None) else {
-        return false;
-    };
-    project.commands.contains_key(name)
 }
 
 /// Thin wrapper over `parse_or_schema_from` that sets the program name

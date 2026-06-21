@@ -28,38 +28,38 @@ let loss = poisson_nll_loss(&pred, &target, true)?; // Poisson NLL (log_input=tr
 // target: [batch] class indices (Int64) or [batch, classes] one-hot/soft labels.
 let loss = cross_entropy_loss(&logits, &target)?;
 
-// Negative Log Likelihood — use after log_softmax
+// Negative Log Likelihood - use after log_softmax
 let loss = nll_loss(&log_probs, &target)?;
 
 // Binary Cross-Entropy (from probabilities, after sigmoid)
 let loss = bce_loss(&probs, &target)?;
 
-// Binary Cross-Entropy with logits (numerically stable — preferred)
+// Binary Cross-Entropy with logits (numerically stable - preferred)
 let loss = bce_with_logits_loss(&logits, &target)?;
 
-// Focal Loss — down-weights easy examples for class imbalance
+// Focal Loss - down-weights easy examples for class imbalance
 let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma
 
 // KL Divergence
 let loss = kl_div_loss(&log_pred, &target)?;
 
-// CTC Loss — for sequence-to-sequence without alignment (speech, OCR)
+// CTC Loss - for sequence-to-sequence without alignment (speech, OCR)
 let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0)?;
 ```
 
 ### Metric Learning Losses
 
 ```rust
-// Triplet margin loss — push negatives away from anchor-positive pairs
+// Triplet margin loss - push negatives away from anchor-positive pairs
 let loss = triplet_margin_loss(&anchor, &positive, &negative, 1.0)?;
 
-// Cosine embedding loss — similar pairs close, dissimilar far
+// Cosine embedding loss - similar pairs close, dissimilar far
 let loss = cosine_embedding_loss(&x1, &x2, &labels, 0.5)?;
 
-// Hinge embedding loss — for binary tasks with {-1, +1} labels
+// Hinge embedding loss - for binary tasks with {-1, +1} labels
 let loss = hinge_embedding_loss(&input, &labels, 1.0)?;
 
-// Margin ranking loss — x1 should be ranked higher than x2
+// Margin ranking loss - x1 should be ranked higher than x2
 let loss = margin_ranking_loss(&x1, &x2, &labels, 0.0)?;
 ```
 
@@ -99,7 +99,7 @@ let optimizer = RMSprop::new(&params, 0.01);  // default alpha=0.99, eps=1e-8
 
 ### Adagrad
 
-Accumulates all past squared gradients — works well for sparse features:
+Accumulates all past squared gradients - works well for sparse features:
 
 ```rust
 let optimizer = Adagrad::new(&params, 0.01);
@@ -116,7 +116,7 @@ let optimizer = NAdam::new(&params, 0.001);  // Nesterov momentum with Adam
 
 ### Fused CUDA Optimizers
 
-On CUDA, both `Adam` and `AdamW` automatically use `_fused_adamw_` -- a
+On CUDA, both `Adam` and `AdamW` automatically use `_fused_adamw_` - a
 single multi-tensor kernel that updates all parameters, gradients, and
 moment buffers in one launch. A naive implementation would require 4N
 separate kernels (one each for momentum update, variance update, bias
@@ -145,7 +145,7 @@ clip_grad_value(&params, 0.5)?;
 ```
 
 Under the hood, `clip_grad_norm` uses `_foreach_norm` + `_foreach_mul_`
-internally -- two kernels total regardless of the number of parameters,
+internally - two kernels total regardless of the number of parameters,
 instead of 2N kernels with a naive per-parameter approach. This is
 particularly beneficial on CUDA where kernel launch overhead dominates
 for small per-parameter operations.
@@ -219,7 +219,7 @@ cadence (ElChe), and cluster topology (`fdl.cluster.yml` /
 [Heterogeneous & Multi-Host DDP tutorial](12-async-ddp.md), and the
 [DDP Reference](../ddp.md).
 
-### `TrainerConfig` — the config-bag form
+### `TrainerConfig` - the config-bag form
 
 When the call site wants every knob in one data struct (e.g.
 config-driven launchers), `Trainer::run(model_fn, opt_fn, step_fn,
@@ -354,7 +354,7 @@ for epoch in 0..num_epochs {
 `record` pushes raw `f64` values into the same buffer. `flush` computes
 the mean, stores it in epoch history, and clears the buffer.
 
-## Stateful Graphs — end_step
+## Stateful Graphs - end_step
 
 Call `end_step()` after each training step. It severs autograd references
 held by the graph and increments the step counter (used by schedulers and
@@ -364,7 +364,7 @@ observation). It detaches:
 - **Tagged outputs** (Variables captured by `tag()` for observation)
 - **Module internal state** (e.g., recurrent hidden state in custom modules)
 
-> **Warning:** Forgetting `end_step()` causes linear memory growth — the
+> **Warning:** Forgetting `end_step()` causes linear memory growth - the
 > autograd graph accumulates across batches without bound. If you see
 > steadily rising RAM during training, a missing `end_step()` is the most
 > likely cause.
@@ -392,7 +392,7 @@ for (input_t, target_t) in &batches {
 before `tag("x")`) it is mandatory. For graphs that use `tag()` for
 observation, it prevents tagged output Variables from holding stale
 autograd graph references between batches. Even for simple graphs, it is
-good practice — it keeps the step counter accurate and costs nothing.
+good practice - it keeps the step counter accurate and costs nothing.
 
 The lower-level `detach_state()` is available if you need to break gradient
 chains without incrementing the step counter.
@@ -420,7 +420,7 @@ opt.set_lr(1e-3);
 
 ## Parameter Freezing
 
-Freeze parameters to disable gradient tracking — useful for transfer
+Freeze parameters to disable gradient tracking - useful for transfer
 learning:
 
 ```rust
@@ -438,7 +438,7 @@ if param.is_frozen() { /* ... */ }
 ```
 
 Frozen parameters are automatically skipped by optimizers (they produce
-no gradient). Freezing works through `Rc<RefCell>` — a freeze is visible
+no gradient). Freezing works through `Rc<RefCell>` - a freeze is visible
 everywhere the parameter is referenced.
 
 ## Checkpoints
@@ -446,10 +446,10 @@ everywhere the parameter is referenced.
 Save and restore model parameters using named checkpoints:
 
 ```rust
-// Save — includes all parameters, buffers, and structural hash
+// Save - includes all parameters, buffers, and structural hash
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load — validates architecture, returns a report
+// Load - validates architecture, returns a report
 let report = model.load_checkpoint("/tmp/model.fdl")?;
 ```
 
@@ -471,7 +471,7 @@ Named checkpoints match by qualified name, so you can load a subset of parameter
 // Save with qualified names
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load into a different model — matches by name
+// Load into a different model - matches by name
 // Use the lower-level API with None hash to skip architecture validation
 let new_named = new_model.named_parameters();
 let new_buffers = new_model.named_buffers();
@@ -495,7 +495,7 @@ are errors.
 
 ## LR Scheduling
 
-Schedulers compute learning rates without owning the optimizer — they are
+Schedulers compute learning rates without owning the optimizer - they are
 pure calculators:
 
 ```rust
@@ -554,7 +554,7 @@ if is_autocast_enabled() {
 Half-precision gradients can underflow to zero. `GradScaler` solves this
 by scaling the loss before backward (inflating gradient magnitudes), then
 unscaling gradients before the optimizer step. It dynamically adjusts the
-scale factor -- growing it when gradients stay finite, backing off when
+scale factor - growing it when gradients stay finite, backing off when
 inf/nan is detected.
 
 ```rust
@@ -631,7 +631,7 @@ no_grad(|| {
 
 The graph tracks step and epoch counts for schedulers and observation.
 `end_step()` should be called after every training step (it detaches state
-and increments the counter — see above). `end_epoch()` closes out the epoch:
+and increments the counter - see above). `end_epoch()` closes out the epoch:
 
 ```rust
 model.end_step();   // detach state + increment step counter (call every batch)
@@ -652,7 +652,7 @@ fn main() -> Result<()> {
     // CPU-side RNG: controls data shuffling, augmentation
     let mut rng = Rng::seed(42);
 
-    // Build model AFTER seeding — weight initialization uses the seed
+    // Build model AFTER seeding - weight initialization uses the seed
     let model = FlowBuilder::from(Linear::new(2, 16)?)
         .through(GELU)
         .through(Linear::new(16, 2)?)
@@ -692,7 +692,7 @@ fn main() -> Result<()> {
     let mut optimizer = Adam::new(&params, 0.01);
     model.train();
 
-    // Training loop (simplified — no data loader yet).
+    // Training loop (simplified - no data loader yet).
     let input_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
     let target_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
 

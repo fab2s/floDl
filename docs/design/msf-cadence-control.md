@@ -560,8 +560,8 @@ problem by comparing endpoints of consecutive cycles.
 
 The closest venue-scale predecessor on the heterogeneous-DDP empirical
 axis is **HetSeq** (Ding, Botzer, Weninger, AAAI 2021). HetSeq addresses
-the same motivation — university clusters with mixed consumer GPUs that
-stock DDP cannot use — by introducing a weighted loss-averaging shim on
+the same motivation - university clusters with mixed consumer GPUs that
+stock DDP cannot use - by introducing a weighted loss-averaging shim on
 top of unmodified step-synchronous PyTorch DDP: each GPU gets a batch
 sized to its capacity, per-GPU losses are aggregated by the master with
 weights proportional to batch size or token count, and the averaged

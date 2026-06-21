@@ -27,7 +27,7 @@ For the historical record of shipped phases and individual changes, see
 - **fdl maturity pass**: zero-dep `FdlArgs` derive (flodl-cli +
   flodl-cli-macros), `--fdl-schema` contract, ddp-bench and flodl-cli
   migrated, multi-env overlay (`fdl.local.yml`, `fdl.ci.yml`, …) with
-  first-arg routing, deep-merge, conflict detection, and
+  `@env` selector routing, deep-merge, conflict detection, and
   `fdl config show`. See
   [docs/design/run-config.md](docs/design/run-config.md).
 - **HuggingFace integration** sibling crate `flodl-hf`: six BERT-family

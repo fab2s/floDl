@@ -4,14 +4,14 @@ This tutorial covers the graph builder's advanced constructs: backward
 and forward references, loops, gated routing, and conditional branching.
 
 > **Prerequisites**: [The Graph Builder](05-graph-builder.md) covers the
-> basics — from, through, build, also, split/merge, tag, map, and
+> basics - from, through, build, also, split/merge, tag, map, and
 > Graph-as-Module. Everything here builds on those primitives.
 
-## Tag and Using — backward references
+## Tag and Using - backward references
 
 Tutorial 05 introduced `tag` for naming points in the flow. `using`
 consumes those names. When the tag appears *before* the using call in
-the builder chain, the value is wired directly — it is available in the
+the builder chain, the value is wired directly - it is available in the
 same forward pass with no extra machinery:
 
 ```rust
@@ -21,7 +21,7 @@ let g = FlowBuilder::from(Linear::new(4, 8)?).tag("hidden")
     .build()?;
 ```
 
-Here `cross_attention` must implement `NamedInputModule` — it receives
+Here `cross_attention` must implement `NamedInputModule` - it receives
 the stream and the tagged `"hidden"` tensor via `forward_named(stream, refs)`.
 
 You can wire multiple tags at once:
@@ -32,7 +32,7 @@ You can wire multiple tags at once:
 
 The module receives `(stream, {"audio": audio, "video": video})`.
 
-## Forward references — recurrent state
+## Forward references - recurrent state
 
 When `using` appears *before* the matching `tag`, the builder creates a
 **forward reference**. The value does not exist yet during the current
@@ -50,7 +50,7 @@ let g = FlowBuilder::from(Linear::new(4, 8)?)
 
 Walk through what happens:
 
-1. `using("memory")` appears before `tag("memory")` — the builder
+1. `using("memory")` appears before `tag("memory")` - the builder
    detects this automatically and creates a state buffer.
 2. On the **first** `g.forward(&input)` call, the `"memory"` state is
    nil. The graph auto-fills with zeros, so `StateAdd` computes
@@ -108,7 +108,7 @@ let g = FlowBuilder::from(encoder)
 ```
 
 The body runs exactly 5 times. Each iteration builds its own computation
-graph, so the backward pass unrolls automatically — backpropagation
+graph, so the backward pass unrolls automatically - backpropagation
 through time (BPTT) with no special handling.
 
 `for_n` detects at call time whether refs are needed and skips
@@ -136,14 +136,14 @@ max iterations):
 
 ### Built-in halt conditions
 
-**ThresholdHalt(val)** — signals halt when the max element of the state
+**ThresholdHalt(val)** - signals halt when the max element of the state
 exceeds the threshold. Parameter-free.
 
-**LearnedHalt(dim)** — a learnable linear probe that projects the state
+**LearnedHalt(dim)** - a learnable linear probe that projects the state
 to a scalar. The network learns when to stop (ACT pattern). Has trainable
 parameters.
 
-### Loops with Using — external references
+### Loops with Using - external references
 
 Loop bodies often need access to data that does not change between
 iterations:
@@ -269,7 +269,7 @@ under the implicit name set by the loop's `tag(...)`. Reach for
 `LoopBody` + `TraceEmit` whenever you need more than one stream,
 sparse emits, or DDP support.
 
-## Gate — soft routing
+## Gate - soft routing
 
 `gate` implements mixture-of-experts style routing. A router module
 produces weights, all expert modules execute, and their outputs are
@@ -296,27 +296,27 @@ Key properties:
   expert outputs are stacked into a single tensor, then combined via
   broadcast multiply + sum in approximately 3 kernel launches regardless
   of expert count (compared to 3N with naive per-expert accumulation).
-  This is transparent to the user -- just use `.gate()` as before.
+  This is transparent to the user - just use `.gate()` as before.
 
 ### Built-in routers
 
-**SoftmaxRouter(dim, n)** — linear projection to n logits, then softmax:
+**SoftmaxRouter(dim, n)** - linear projection to n logits, then softmax:
 
 ```rust
 gate(SoftmaxRouter::new(hidden, 3)?, modules![...])
 ```
 
-**SigmoidRouter(dim, n)** — sigmoid gating, each expert independent:
+**SigmoidRouter(dim, n)** - sigmoid gating, each expert independent:
 
 ```rust
 gate(SigmoidRouter::new(hidden, 2)?, modules![...])
 ```
 
-Both routers implement `NamedInputModule` — they sum Using refs into the
+Both routers implement `NamedInputModule` - they sum Using refs into the
 input before projection, so extra context does not change the input
 dimension.
 
-## Switch — hard routing
+## Switch - hard routing
 
 `switch` selects a single branch to execute based on the router's output.
 Only the selected branch runs:
@@ -339,13 +339,13 @@ Key properties:
 
 ### Built-in selectors
 
-**FixedSelector(idx)** — always picks the same branch:
+**FixedSelector(idx)** - always picks the same branch:
 
 ```rust
 switch(FixedSelector::new(0), modules![branch_a, branch_b])
 ```
 
-**ArgmaxSelector(dim, n)** — learnable projection, picks highest logit:
+**ArgmaxSelector(dim, n)** - learnable projection, picks highest logit:
 
 ```rust
 switch(ArgmaxSelector::new(hidden, 3)?, modules![...])
@@ -355,7 +355,7 @@ switch(ArgmaxSelector::new(hidden, 3)?, modules![...])
 
 The builder validates that `using()` refs are only wired to modules
 that implement `NamedInputModule`. If a router does not support named
-inputs, the builder returns a clear error at `build()` time — not a
+inputs, the builder returns a clear error at `build()` time - not a
 runtime crash.
 
 ## Performance internals
@@ -364,7 +364,7 @@ runtime crash.
 successor list and reference wiring is resolved into Vec-indexed routes
 instead of HashMap lookups, and execution buffers are cached across
 forward calls. There is zero HashMap allocation during inference. This
-means graphs have near-zero framework overhead after build -- the cost
+means graphs have near-zero framework overhead after build - the cost
 is dominated by the modules themselves.
 
 ## Putting it together
@@ -432,8 +432,8 @@ let output = model.forward(&test_input)?;
 
 ## What's next
 
-For hierarchical model composition -- freezing subgraphs, loading
-checkpoints into subtrees, cross-boundary observation -- see the
+For hierarchical model composition - freezing subgraphs, loading
+checkpoints into subtrees, cross-boundary observation - see the
 [Graph Tree](10-graph-tree.md) tutorial.
 
 For DOT/SVG output of your graphs, see

@@ -9,14 +9,14 @@ compiles in under a second, and works on any machine with Rust or Docker.
 `fdl` is useful in three contexts, and this reference is structured around
 them:
 
-1. **[Standalone](#1-standalone-no-project-required)** -- just the binary,
+1. **[Standalone](#1-standalone-no-project-required)** - just the binary,
    no project around. Hardware probing, libtorch install, scaffolding,
    skill bundles, `fdl install`.
-2. **[Inside a floDl project](#2-inside-a-flodl-project-the-fdlyml-manifest)** --
+2. **[Inside a floDl project](#2-inside-a-flodl-project-the-fdlyml-manifest)** -
    any directory (or ancestor) that contains an `fdl.yml`. Manifest-driven
    task dispatch, environment overlays, schema introspection, preset
    sub-commands, value-aware completions.
-3. **[In the flodl source checkout](#3-in-the-flodl-source-checkout)** --
+3. **[In the flodl source checkout](#3-in-the-flodl-source-checkout)** -
    the cloned repo's `fdl.yml` ships the concrete command set used to
    develop flodl itself (`fdl test`, `fdl cuda-test`, `fdl ddp-bench …`,
    `fdl self-build`, etc.).
@@ -95,7 +95,7 @@ name (or in some positions, after):
 Verbosity flags propagate into the framework's logging system
 (`flodl::log`) and into Docker child commands via `FLODL_VERBOSITY`.
 Equivalent without the CLI: `FLODL_VERBOSITY=verbose cargo run`. The
-variable accepts integers `0`–`4` or names
+variable accepts integers `0`-`4` or names
 `quiet`/`normal`/`verbose`/`debug`/`trace`. Level `normal` (1) is the
 default when no verbosity flag is passed.
 
@@ -155,7 +155,7 @@ Config-file shape (auto-managed except `enabled`):
 ```
 
 The probe uses `curl --max-time 2` and silently skips on every failure
-mode — the user's command is never delayed past the timeout, and a
+mode - the user's command is never delayed past the timeout, and a
 broken or offline network just means today's check didn't update the
 cache. Pre-release versions are ignored; nudges only fire against the
 crate's `max_stable_version`.
@@ -178,9 +178,9 @@ Cargo project, or a flodl checkout.
 
 Interactive wizard that walks you through everything:
 
-1. **Detects your system** -- CPU, RAM, Docker, Rust, GPUs.
-2. **Downloads libtorch** -- auto-picks the right variant for your GPU(s).
-3. **Configures your build** -- Docker or native, builds images if needed.
+1. **Detects your system** - CPU, RAM, Docker, Rust, GPUs.
+2. **Downloads libtorch** - auto-picks the right variant for your GPU(s).
+3. **Configures your build** - Docker or native, builds images if needed.
 
 ```bash
 fdl setup                      # interactive (asks questions)
@@ -193,7 +193,7 @@ The wizard handles tricky scenarios automatically:
 
 - **No GPU?** Downloads CPU libtorch.
 - **Volta+ GPUs (sm_70+)?** Downloads cu128.
-- **Pre-Volta GPUs (sm_50–sm_61)?** Downloads cu126.
+- **Pre-Volta GPUs (sm_50-sm_61)?** Downloads cu126.
 - **Mixed GPUs (old + new)?** Offers to build from source or pick the best
   pre-built variant.
 
@@ -224,7 +224,7 @@ versions). Auto-completion offers both.
 
 | Variant | Architectures  | GPUs                              |
 |---------|----------------|-----------------------------------|
-| CPU     | --              | Any (no GPU acceleration)          |
+| CPU     | -              | Any (no GPU acceleration)          |
 | cu126   | sm_50 to sm_90 | Maxwell through Ada Lovelace      |
 | cu128   | sm_70 to sm_120 | Volta through Blackwell          |
 
@@ -234,11 +234,11 @@ pre-built variant covers both. Use `fdl libtorch build` instead.
 #### `fdl libtorch build`
 
 Compile libtorch from PyTorch source for your exact GPU combination.
-Takes 2–6 hours depending on CPU cores. Two build methods are available:
+Takes 2-6 hours depending on CPU cores. Two build methods are available:
 
-- **Docker** (default when available) -- isolated, reproducible, resumes
+- **Docker** (default when available) - isolated, reproducible, resumes
   via layer caching. Requires Docker.
-- **Native** -- faster, builds directly on your host. Requires CUDA
+- **Native** - faster, builds directly on your host. Requires CUDA
   toolkit (nvcc), cmake, python3, git, and gcc.
 
 When both are available, the CLI asks which you prefer. Use `--docker`
@@ -300,17 +300,17 @@ The libtorch-management and diagnostics commands are independent of
 flodl and fill a gap PyTorch itself never filled: a proper installer.
 `fdl` works as a drop-in libtorch manager for:
 
-- **tch-rs projects** -- download the right libtorch, point `LIBTORCH`
+- **tch-rs projects** - download the right libtorch, point `LIBTORCH`
   at it, build. No more hand-fetching URLs from the PyTorch
   get-started page.
-- **PyTorch C++ development** -- juggle CPU, CUDA 12.6, CUDA 12.8, and
+- **PyTorch C++ development** - juggle CPU, CUDA 12.6, CUDA 12.8, and
   source-built variants on the same host without symlink choreography.
-- **Mixed-GPU systems** -- when no single pre-built variant covers
+- **Mixed-GPU systems** - when no single pre-built variant covers
   your architectures (e.g. GTX 1060 sm_61 + RTX 5060 Ti sm_120),
   `fdl libtorch build` compiles PyTorch from source with the exact
   archs you need. Docker-isolated by default, native toolchain
   supported.
-- **CI pipelines** -- `fdl diagnose --json` emits a machine-readable
+- **CI pipelines** - `fdl diagnose --json` emits a machine-readable
   hardware and compatibility report to gate jobs on GPU presence or
   libtorch version.
 
@@ -413,12 +413,12 @@ else
 fi
 ```
 
-None of the above touches flodl itself -- `fdl` is just the libtorch
+None of the above touches flodl itself - `fdl` is just the libtorch
 installer / activator / diagnostics tool in this mode.
 
 ### `fdl init`
 
-Scaffold a new floDl project. Three modes, mutually exclusive — pick via
+Scaffold a new floDl project. Three modes, mutually exclusive - pick via
 flag, or accept the interactive prompt when none is passed:
 
 ```bash
@@ -444,13 +444,13 @@ project later.
 
 In all three modes the scaffold generates:
 
-- `Cargo.toml` -- flodl dependency and optimized profiles.
-- `src/main.rs` -- complete training template.
-- `fdl.yml.example` -- committed manifest; fdl copies it to a gitignored
+- `Cargo.toml` - flodl dependency and optimized profiles.
+- `src/main.rs` - complete training template.
+- `fdl.yml.example` - committed manifest; fdl copies it to a gitignored
   `fdl.yml` on first use. Declares `build` / `test` / `run` / `check` /
   `clippy` (and `shell` / `cuda-shell` in Docker modes) plus the `cuda-*`
   siblings.
-- `./fdl` -- self-contained bootstrap script (`./fdl install` promotes it
+- `./fdl` - self-contained bootstrap script (`./fdl install` promotes it
   to `~/.local/bin/fdl`).
 - `.gitignore`.
 
@@ -460,7 +460,7 @@ Docker modes additionally generate:
   `Dockerfile.cpu` / `Dockerfile.cuda` (baked variant).
 - `docker-compose.yml`.
 
-Native mode skips all the Docker files — commands run on the host. Point
+Native mode skips all the Docker files - commands run on the host. Point
 `$LIBTORCH` / `$LD_LIBRARY_PATH` at a libtorch install (use
 `./fdl libtorch download --cpu` or `--cuda 12.8`) and `./fdl build`
 dispatches straight to `cargo build`.
@@ -468,7 +468,7 @@ dispatches straight to `cargo build`.
 > The scaffold is fdl-native: there is no Makefile. Every task lives in
 > `fdl.yml` and runs via `./fdl <cmd>`. Libtorch environment variables
 > (`LIBTORCH_HOST_PATH`, `CUDA_VERSION`, `CUDA_TAG`) are derived from
-> `libtorch/.active` by flodl-cli before each dispatch — the logic that
+> `libtorch/.active` by flodl-cli before each dispatch - the logic that
 > used to live in the scaffolded Makefile now lives in one place inside
 > the binary.
 
@@ -567,15 +567,15 @@ fdl diagnose --json | jq '.cuda.devices[] | .sm'
 ### `fdl probe`
 
 Cluster readiness audit. Single-host (default) probes the local box;
-in cluster context (`fdl cluster probe` or `FDL_ENV=cluster fdl probe`)
+in cluster context (`fdl @cluster probe` or `FDL_ENV=cluster fdl probe`)
 SSHes every host in `fdl.cluster.yml` and aggregates the report. Use
 it as a CI gate before launching multi-hour training runs.
 
 ```bash
 fdl probe                       # local host: GPU + libtorch + NCCL + shared-data
-fdl cluster probe               # multi-host: SSHes each worker, aggregates
+fdl @cluster probe               # multi-host: SSHes each worker, aggregates
 fdl probe --json                # machine-readable for CI gating
-fdl cluster probe --json        # cluster JSON aggregate
+fdl @cluster probe --json        # cluster JSON aggregate
 fdl probe --skip-mount          # skip shared-data-mount check on single-host setups
 fdl probe --data-path /flodl/data        # override the shared-data path
 fdl probe --libtorch-path /opt/libtorch  # override the libtorch directory
@@ -599,7 +599,7 @@ post-deploy smoke test.
   probe reports "via Docker image `<svc>`" instead of erroring on a
   missing host-level libnccl.
 - **NCCL version skew (cluster mode)**: surfaces major.minor skew
-  across hosts — the common failure mode on heterogeneous rigs.
+  across hosts - the common failure mode on heterogeneous rigs.
   Resolution: [`fdl nccl build`](#fdl-nccl) to bridge.
 - **Shared-data path**: convention default `/flodl/data` (override via
   `--data-path` or per-host `data_path:` in cluster.yml). Verifies
@@ -609,7 +609,7 @@ post-deploy smoke test.
 - **Dashboard port availability** (default 3000).
 
 Output splits results into warnings (informational; do not block) and
-errors (block dispatch). `fdl cluster <cmd>` runs `fdl probe`
+errors (block dispatch). `fdl @cluster <cmd>` runs `fdl probe`
 implicitly before fan-out unless `--no-probe` is set.
 
 ### `fdl nccl`
@@ -671,7 +671,7 @@ Behavior depends on the command kind:
   `CUDA_VISIBLE_DEVICES` for the dispatched subprocess. No envelope
   synthesis, no spawning.
 
-**Cluster context interaction**: on `fdl cluster <cmd>`, `--gpus`
+**Cluster context interaction**: on `fdl @cluster <cmd>`, `--gpus`
 overrides per-worker `local_devices:` for the local controller host;
 remote workers continue to use their cluster.yml-declared devices.
 Loud-errors on duplicate, missing value, or invalid spec.
@@ -682,27 +682,27 @@ fdl --gpus 0,1 ddp-bench --mode nccl-cadence   # synthesize 2-rank single-host c
 fdl --gpus all cluster ddp-bench --mode nccl-cadence   # override local host devices in cluster mode
 ```
 
-### `fdl cluster <cmd>` — multi-host fan-out
+### `fdl @cluster <cmd>` - multi-host fan-out
 
-`fdl cluster <cmd>` is the first-arg form of the `cluster` env
-overlay. When `fdl.cluster.yml` exists alongside `fdl.yml`, it
+`fdl @cluster <cmd>` selects the `cluster` env overlay via the `@`
+sigil. When `fdl.cluster.yml` exists alongside `fdl.yml`, it
 deep-merges as an overlay and triggers SSH fan-out for any command
 marked `cluster: true`.
 
 Three equivalent forms:
 
 ```bash
-fdl cluster <cmd>            # first-arg form (when fdl.cluster.yml exists)
-FDL_ENV=cluster fdl <cmd>    # env-var form
+fdl @cluster <cmd>           # sigil form
 fdl --env cluster <cmd>      # explicit flag
+FDL_ENV=cluster fdl <cmd>    # env-var form
 ```
 
-**Pre-flight per-host build**: before fan-out, `fdl cluster <cmd>`
+**Pre-flight per-host build**: before fan-out, `fdl @cluster <cmd>`
 auto-builds the target binary locally for every remote host. Per-host
 `CARGO_TARGET_DIR=target/cluster/<host>/`, libtorch resolved from
 each host's `arch:` declaration, CUDA feature derived from the host's
 GPU arch metadata. Builds run in parallel per host; first failure
-aborts fan-out. Remote dispatch invokes the prebuilt binary directly —
+aborts fan-out. Remote dispatch invokes the prebuilt binary directly -
 no cargo, no rustc on remote.
 
 Pass `--no-prebuild` to skip the pre-flight phase (when binaries are
@@ -710,10 +710,10 @@ known fresh, or when iterating on a build-only issue).
 
 **Heterogeneous-rig flow** (a Blackwell host + a Pascal VM, say):
 
-1. `fdl cluster probe` — confirm GPU + libtorch + NCCL match per host.
-2. `fdl nccl build` on the host with the older NCCL — produces a
+1. `fdl @cluster probe` - confirm GPU + libtorch + NCCL match per host.
+2. `fdl nccl build` on the host with the older NCCL - produces a
    matching `libnccl.so.2` to wire via `env: LD_PRELOAD:`.
-3. `fdl cluster <cmd>` — fan out.
+3. `fdl @cluster <cmd>` - fan out.
 
 See [DDP Reference: Multi-host
 clusters](ddp.md#multi-host-clusters) for the `fdl.cluster.yml`
@@ -850,7 +850,7 @@ to the real (gitignored) `fdl.yml` so users can customise locally.
 3. **Layer environments** with `fdl.<env>.yml` overlays (dev / ci /
    prod variations of the same command tree).
 4. **Fall back to shell environment variables** per-option with
-   `#[option(env = "…")]` -- argv wins, then env var, then default.
+   `#[option(env = "…")]` - argv wins, then env var, then default.
 
 End-to-end example. A cargo-backed sub-command with Rust-declared flags,
 an env overlay, and an env-var fallback for a secret:
@@ -926,7 +926,7 @@ fdl train --help
 Path-kind sub-commands with an `entry:` forward every extra argv token to
 the underlying binary, where the derived parser validates it. `run:`-kind
 commands (shown in the next section) forward argv only after an explicit
-`--` separator -- `fdl test-live -- -p flodl-hf` splices `-p flodl-hf`
+`--` separator - `fdl test-live -- -p flodl-hf` splices `-p flodl-hf`
 into the script, while `fdl test-live -p flodl-hf` errors loudly. Stray
 args before `--` are rejected with a hint pointing at the right form.
 
@@ -941,15 +941,15 @@ attribute surface (`short`, `default`, `choices`, `env`, `completer`,
 `fdl.yml` declares a unified `commands:` map. Each entry is exactly one
 of three kinds, chosen by which fields are set:
 
-- **Run** -- `run:` is set. Executes the inline shell script, optionally
+- **Run** - `run:` is set. Executes the inline shell script, optionally
   wrapped in `docker compose run --rm <service>` when `docker:` is set.
   An optional `append:` field declares literal trailing tokens
   (typically the libtest `-- --nocapture --ignored` portion) that should
   follow any user-supplied args.
-- **Path** -- `path:` is set (or, by convention, the entry is empty/null
+- **Path** - `path:` is set (or, by convention, the entry is empty/null
   and a sibling directory named `<command>/` with its own `fdl.yml`
   exists). Loads the nested manifest and recurses.
-- **Preset** -- neither `run:` nor `path:` is set. Inline `ddp:` /
+- **Preset** - neither `run:` nor `path:` is set. Inline `ddp:` /
   `training:` / `output:` / `options:` fields merge over the enclosing
   config and invoke its `entry:`. Only legal inside a sub-command
   (path-kind entry's own `fdl.yml`).
@@ -984,7 +984,7 @@ fdl ddp-bench --list                  # dispatches into the ddp-bench sub-comman
 
 When a `run:` command declares `docker: <service>`, `fdl` wraps it in
 `docker compose run --rm <service> bash -c "…"`. Without `docker:`, it
-runs on the host. `docker:` is only valid on `run:` commands --
+runs on the host. `docker:` is only valid on `run:` commands -
 declaring it on a `path:` or preset entry is rejected at load time.
 
 #### Forwarding extra args with `--` and `append:`
@@ -1032,10 +1032,10 @@ every option and positional; `fdl` runs the entry with that flag
 for script/pre-built-binary entries), caches the JSON under
 `<cmd-dir>/.fdl/schema-cache/<cmd>.json`, and uses it to drive:
 
-- `fdl <cmd> --help` -- typed, color-annotated help rendered from the
+- `fdl <cmd> --help` - typed, color-annotated help rendered from the
   doc-comments and attributes.
-- Shell completion -- choices, short/long forms, value types.
-- Validation -- unknown flags error with a clear message.
+- Shell completion - choices, short/long forms, value types.
+- Validation - unknown flags error with a clear message.
 
 One struct is the single source of truth. The doc-comments become help
 text. The attribute metadata becomes schema. The struct fields become
@@ -1141,31 +1141,33 @@ attribute surface and internals.
 
 ### Environment overlays
 
-The `--env <name>` flag tells `fdl` to deep-merge `fdl.<name>.yml` on
+An environment selector tells `fdl` to deep-merge `fdl.<name>.yml` on
 top of the base `fdl.yml` before resolving any command. Three equivalent
-forms are supported, in this precedence order:
+forms are supported; a command-line selector (`@` or `--env`) overrides
+`FDL_ENV`:
 
-1. `fdl --env <name> <cmd>` -- explicit flag.
-2. `FDL_ENV=<name> fdl <cmd>` -- environment variable.
-3. `fdl <name> <cmd>` -- first-arg convention. Only fires when `<name>`
-   matches a known overlay file AND does not collide with an existing
-   command name (ambiguity errors loudly).
+1. `fdl @<name> <cmd>` - `@` sigil token. Accepted anywhere before a
+   standalone `--` (`fdl @ci test` ≡ `fdl test @ci`), exactly like `--env`.
+2. `fdl --env <name> <cmd>` - explicit flag.
+3. `FDL_ENV=<name> fdl <cmd>` - environment variable.
 
 ```bash
+fdl @ci test                         # sigil form
 fdl --env ci test                    # flag form
 FDL_ENV=ci fdl test                  # env var form
-fdl ci test                          # first-arg form (if fdl.ci.yml exists)
 ```
 
-Explicit selectors (flag / env var) fail loudly if the overlay file is
-missing. The first-arg form silently falls through to normal dispatch
-when no matching file exists, so existing commands are never shadowed.
+Every form must resolve to an existing `fdl.<name>.yml` overlay or it
+fails loudly. There is no bare-positional form: `fdl ci test` treats `ci`
+as a command, so an env overlay may freely share a name with a command.
+Supplying `@` and `--env` with different values is a conflict error. A
+literal `@`-prefixed argument for an inner command goes after `--`.
 
 Typical overlay files:
 
-- `fdl.dev.yml` -- fast iteration (shorter epochs, smaller batches).
-- `fdl.ci.yml` -- CPU-only, minimal epochs, strict validation.
-- `fdl.prod.yml` -- full runs, checkpoint to cloud storage.
+- `fdl.dev.yml` - fast iteration (shorter epochs, smaller batches).
+- `fdl.ci.yml` - CPU-only, minimal epochs, strict validation.
+- `fdl.prod.yml` - full runs, checkpoint to cloud storage.
 
 Use `fdl config show <env>` to preview the resolved merged config.
 
@@ -1173,7 +1175,7 @@ Use `fdl config show <env>` to preview the resolved merged config.
 
 A sub-command directory (e.g. `ddp-bench/`) has its own `fdl.yaml` with
 an `entry:`, optional `docker:`, structured `ddp` / `training` /
-`output` sections, and a `commands:` map whose entries are **presets** --
+`output` sections, and a `commands:` map whose entries are **presets** -
 inline overrides of this config's `entry`:
 
 ```yaml
@@ -1210,12 +1212,12 @@ fdl ddp-bench validate --help         # resolved options
 A sub-command's `commands:` may mix kinds freely: a preset sits
 alongside a nested `path:` (another directory) or a standalone `run:`
 helper. `fdl <cmd> --help` splits them into an **Arguments** section
-(the single preset slot, with values indented underneath -- override the
+(the single preset slot, with values indented underneath - override the
 placeholder via `arg-name:`) and a **Commands** section (real
 sub-commands with their own behaviour).
 
 Preset `options:` entries map 1:1 to the binary's `#[derive(FdlArgs)]`
-shape — `mode`, `model`, `epochs`, `batch-size`, etc. The set of
+shape - `mode`, `model`, `epochs`, `batch-size`, etc. The set of
 accepted `mode` values mirrors `ElCheMode` (five modes:
 `nccl-sync` / `nccl-cadence` / `cpu-sync` / `cpu-cadence` /
 `cpu-async`) plus the `solo-N` single-GPU baselines. See
@@ -1231,7 +1233,7 @@ applied.
 fdl config show              # base fdl.yml
 fdl config show ci           # base deep-merged with fdl.ci.yml
 fdl --env ci config show     # same result, via the flag form
-fdl ci config show           # same result, via first-arg
+fdl @ci config show          # same result, via the @ sigil
 ```
 
 The output is the fully-merged YAML with per-layer annotations, so you
@@ -1247,9 +1249,9 @@ validation, caching the output per-command.
 
 Two ways to opt in:
 
-- **Rust binaries** -- `#[derive(FdlArgs)]` wires `--fdl-schema`
+- **Rust binaries** - `#[derive(FdlArgs)]` wires `--fdl-schema`
   automatically (see [Declaring flags in Rust](#declaring-flags-in-rust)).
-- **Scripts and pre-built tools** -- emit the JSON yourself. A few lines
+- **Scripts and pre-built tools** - emit the JSON yourself. A few lines
   of shell/Python/whatever at the top of the entry, exit 0 before any
   real work. The shape is the same JSON object that the derive macro
   emits (`{"options": {...}, "args": [...], "strict": bool}`). See
@@ -1268,10 +1270,10 @@ Cached schemas live at `<cmd-dir>/.fdl/schema-cache/<cmd>.json`.
 
 **Non-cargo entries auto-probe** on first use (or when the cache goes
 stale after an `fdl.yml` edit). Scripts and pre-built binaries get
-their schema into the cache without any manual step -- `fdl <cmd>
+their schema into the cache without any manual step - `fdl <cmd>
 --help` on a fresh clone just works.
 
-**Cargo entries must be built before `refresh`** -- `fdl` runs the
+**Cargo entries must be built before `refresh`** - `fdl` runs the
 entry's `--fdl-schema` as a subprocess, which requires the binary to
 exist. To avoid the compile latency ruining `--help`, cargo entries
 are **never** auto-probed: you refresh explicitly after rebuilding.
@@ -1495,12 +1497,12 @@ dependencies** beyond serde. GPU detection uses `nvidia-smi`, downloads
 use `curl`/`wget`, and zip extraction uses `unzip` (or PowerShell on
 Windows). This means:
 
-- **~750KB binary** -- trivially distributable.
-- **Compiles in under 1 second** -- no C++ compilation, no libtorch
+- **~750KB binary** - trivially distributable.
+- **Compiles in under 1 second** - no C++ compilation, no libtorch
   linking.
-- **Cross-platform** -- Linux x86_64/aarch64, macOS arm64, Windows
+- **Cross-platform** - Linux x86_64/aarch64, macOS arm64, Windows
   x86_64.
-- **No runtime dependencies** -- works on any machine; GPU features
+- **No runtime dependencies** - works on any machine; GPU features
   degrade gracefully when `nvidia-smi` is absent.
 
 Pre-compiled binaries are published to GitHub Releases on every tagged

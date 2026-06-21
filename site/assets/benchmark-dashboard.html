@@ -95,16 +95,16 @@ animation:pulse 2s ease-in-out infinite}
     </div>
     <div class="stat">
       <div class="stat-label">Epoch</div>
-      <div class="stat-value" id="epochNum">—</div>
+      <div class="stat-value" id="epochNum">-</div>
     </div>
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="stat">
       <div class="stat-label">ETA</div>
-      <div class="stat-value" id="etaDisplay">—</div>
+      <div class="stat-value" id="etaDisplay">-</div>
     </div>
     <div class="stat">
       <div class="stat-label">Elapsed</div>
-      <div class="stat-value" id="elapsedDisplay">—</div>
+      <div class="stat-value" id="elapsedDisplay">-</div>
     </div>
   </div>
   <div class="hw-info" id="hwInfo" style="display:none"></div>
@@ -122,13 +122,13 @@ animation:pulse 2s ease-in-out infinite}
     <canvas id="resourceChart"></canvas>
     <div class="legend" id="resourceLegend"></div>
     <div class="res-grid" id="resGrid">
-      <div class="res-item"><div class="res-label"><span>CPU</span><span id="cpuVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>CPU</span><span id="cpuVal">-</span></div>
         <div class="res-bar"><div class="res-fill cpu" id="cpuBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>RAM</span><span id="ramVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>RAM</span><span id="ramVal">-</span></div>
         <div class="res-bar"><div class="res-fill ram" id="ramBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>GPU</span><span id="gpuVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>GPU</span><span id="gpuVal">-</span></div>
         <div class="res-bar"><div class="res-fill gpu" id="gpuBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>VRAM</span><span id="vramVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>VRAM</span><span id="vramVal">-</span></div>
         <div class="res-bar"><div class="res-fill vram" id="vramBar" style="width:0"></div></div></div>
     </div>
   </div>
@@ -402,7 +402,7 @@ if(typeof ARCHIVE_DATA!=='undefined'){
   // Set elapsed from sum of epoch durations (wall-clock startTime is meaningless in archive)
   const totalElapsed=ARCHIVE_DATA.reduce((s,d)=>s+(d.duration||0),0);
   document.getElementById('elapsedDisplay').textContent=fmtDur(totalElapsed);
-  markComplete(archiveErr?'Archive error — see console':(ARCHIVE_COMPLETE||'Complete'));
+  markComplete(archiveErr?'Archive error - see console':(ARCHIVE_COMPLETE||'Complete'));
   if(typeof ARCHIVE_SVG==='string'){try{showSvg(ARCHIVE_SVG)}catch(e){console.error('showSvg:',e)}}
   // Re-render after layout to ensure correct canvas dimensions
   requestAnimationFrame(()=>{try{drawMetrics();drawResources()}catch(e){console.error('rAF redraw:',e)}});
@@ -511,7 +511,7 @@ function updateLog(d){
   const tr=document.createElement('tr');
   let html='<td>'+d.epoch+'/'+d.total+'</td><td>'+fmtDur(d.duration)+'</td>';
   metricNames.forEach(n=>{
-    const v=d.metrics&&d.metrics[n]!=null?fmtVal(d.metrics[n]):'—';
+    const v=d.metrics&&d.metrics[n]!=null?fmtVal(d.metrics[n]):'-';
     html+='<td>'+v+'</td>';
   });
   const r=d.resources||{};
@@ -576,7 +576,7 @@ function drawChart(canvasId,series,colors,labels,isPercent,yFmt){
     ctx.fillText(''+(i+1),xScale(i),H-M.bottom+14);
   }
 
-  // Lines (filtered by solo state — names already filtered above)
+  // Lines (filtered by solo state - names already filtered above)
   allNames.forEach((n,si)=>{
     if(solo&&solo!==n)return;
     const vals=series[n];

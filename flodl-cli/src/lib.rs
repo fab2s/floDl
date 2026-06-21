@@ -109,8 +109,8 @@ pub mod libtorch;
 /// pattern used by cross-host heterogeneous-arch clusters.
 pub mod nccl;
 
-/// Environment overlay loader (`--env`, `FDL_ENV`, first-arg convention)
-/// with per-field origin annotations for `fdl config show`.
+/// Environment overlay loader (`@env`, `--env`, `FDL_ENV`) with
+/// per-field origin annotations for `fdl config show`.
 pub mod overlay;
 
 /// Runtime: invoking resolved commands, streaming their output, and

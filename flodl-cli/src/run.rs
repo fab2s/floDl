@@ -585,7 +585,7 @@ pub(crate) fn compose_run_command(
 /// with `append: -- --nocapture --ignored` still receives its libtest
 /// flags after a user-supplied `-p flodl-hf`.
 /// Forward the testing-cluster envelope into a docker-compose run
-/// invocation. When `fdl cluster-test-{nccl,cpu} <cmd>` activates an
+/// invocation. When `fdl @cluster-test-{nccl,cpu} <cmd>` activates an
 /// overlay with a `cluster:` block, the dispatcher sets
 /// `FLODL_TESTING_CLUSTER_JSON` in fdl-cli's own env (see
 /// `dispatch_config` in main.rs). This helper reads that variable and
@@ -1193,8 +1193,8 @@ pub fn print_project_help(
         style::green(&format!("{:<18}", "-V, --version"))
     );
     eprintln!(
-        "    {}  Use fdl.<name>.yml overlay (also: FDL_ENV=<name>)",
-        style::green(&format!("{:<18}", "--env <name>"))
+        "    {}  Use fdl.<name>.yml overlay (also: --env <name>, FDL_ENV=<name>)",
+        style::green(&format!("{:<18}", "@<name>"))
     );
     eprintln!(
         "    {}  Verbose output",
@@ -1285,14 +1285,14 @@ pub fn print_project_help(
                 };
                 eprintln!(
                     "    {}  Overlay from fdl.{}.yml{active_marker}",
-                    style::green(&format!("{:<18}", e)),
+                    style::green(&format!("{:<18}", format!("@{e}"))),
                     e
                 );
             }
             eprintln!();
             eprintln!(
                 "Use {} to run a command with an environment overlay.",
-                style::dim("fdl <env> <command>")
+                style::dim("fdl @<env> <command>")
             );
         }
     }

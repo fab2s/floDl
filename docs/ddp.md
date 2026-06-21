@@ -5,7 +5,7 @@ For progressive introductions, see
 [Tutorial 11: Multi-GPU Training](tutorials/11-multi-gpu.md) and
 [Tutorial 12: Heterogeneous & Multi-Host DDP](tutorials/12-async-ddp.md).
 
-flodl has one training entry — `Trainer::builder(...).run()` (chained
+flodl has one training entry - `Trainer::builder(...).run()` (chained
 form) or `Trainer::run(model_factory, optim_factory, train_fn, cfg)`
 (config-bag form). The same call runs identically on:
 
@@ -23,7 +23,7 @@ a code rewrite.
 
 ## Quick start
 
-### Universal form — `Trainer::builder` + step closure
+### Universal form - `Trainer::builder` + step closure
 
 The recommended shape. Works on every tier without modification.
 
@@ -59,7 +59,7 @@ let state: TrainedState = handle.join()?;  // params + buffers (CPU)
 into a fresh CPU model for inference, or feed them into
 `Trainer::resume_from` to continue training.
 
-### Graph-shape one-liner — `Trainer::setup`
+### Graph-shape one-liner - `Trainer::setup`
 
 When the model is a flodl `Graph` and the training loop is yours:
 
@@ -86,7 +86,7 @@ for (input_t, target_t) in &batches {
 (implements `HasGraph`); the loop stays byte-identical between
 `setup` / `setup_head`.
 
-### Config-bag form — `Trainer::run`
+### Config-bag form - `Trainer::run`
 
 For config-driven launchers, the umbrella `TrainerConfig<M>` gathers
 every knob into one struct:
@@ -112,7 +112,7 @@ Trainer::run(
 `Trainer::run` and `Trainer::builder().run()` reach the same launcher
 trampoline; pick whichever shape your call site prefers.
 
-> **Invariant — "no CUDA before `Trainer::run`"**: user binaries must
+> **Invariant - "no CUDA before `Trainer::run`"**: user binaries must
 > not touch libtorch's CUDA context before reaching `Trainer::run`. That
 > means no `flodl::tensor::cuda_device_count()`, no
 > `Module::on_device(CUDA(_))`, no CUDA-Tensor construction in `main()`.
@@ -123,7 +123,7 @@ trampoline; pick whichever shape your call site prefers.
 
 ---
 
-## ElCheMode — cadence × backend in one name
+## ElCheMode - cadence × backend in one name
 
 The five ways to do parameter averaging are named directly. Each name
 is a `(when to average) × (how to average)` pair. `ElCheConfig::default()`
@@ -132,23 +132,23 @@ returns `NcclCadence` (the recommended NCCL mode).
 | Mode | When | How | Best for |
 |---|---|---|---|
 | `NcclSync` | Every batch | NCCL AllReduce | Homogeneous GPUs, correctness-first baseline |
-| `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | **Recommended NCCL default** — heterogeneous rigs; ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window |
+| `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | **Recommended NCCL default** - heterogeneous rigs; ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window |
 | `CpuSync` | Every batch | CPU averaging | Sync without NCCL (peer-access unavailable, A/B against NCCL) |
 | `CpuCadence` | Anchor-based | CPU averaging | Heterogeneous rigs without fast peer links |
-| `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** — genuine async (decoupled averaging via separate channel), fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
+| `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** - genuine async (decoupled averaging via separate channel), fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
 
 `NcclSync` is the degenerate ElChe case (anchor=1). Every mode routes
 through the same machinery, so switching between them is one line.
 
 > **Note**: `NcclAsync` used to exist as a sixth mode (NCCL + per-rank
-> cross-epoch dispatch). It was dropped — measured benefit over
+> cross-epoch dispatch). It was dropped - measured benefit over
 > `NcclCadence` was within noise on every tested rig, and the
 > in-place AllReduce writeback raced with autograd on heterogeneous
 > Pascal+Blackwell setups. CPU Async (`CpuAsync`) is the real
 > asynchronous mode: averaging is decoupled from the GPU pipeline
 > through a separate channel.
 
-### `ElCheConfig` — presets + overrides
+### `ElCheConfig` - presets + overrides
 
 ```rust
 let elche = ElCheConfig::nccl_cadence()  // also the value of ElCheConfig::default()
@@ -182,11 +182,11 @@ let elche = ElCheConfig {
 | `.mode(ElCheMode)` | `NcclCadence` | The (when × how) pair. `ElCheConfig::default()` returns `nccl_cadence()`. |
 | `.anchor(n)` | 10 (Cadence/Async); 1 (Sync) | Initial anchor count. |
 | `.min_anchor(n)` / `.max_anchor(n)` | `None` (auto) | Anchor bounds. |
-| `.overhead_target(f)` | `0.10` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** — Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
+| `.overhead_target(f)` | `0.10` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** - Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
 | `.max_batch_diff(n)` | `None` | Cap on how far the fastest rank may lead the slowest. `Some(0)` = strict lockstep regardless of mode. |
 | `.relax_up(bool)` | `false` | Allow ElChe to grow the anchor in `Phase::Stable` when convergence stays clean. |
 | `.partition_ratios(Vec<f64>)` | auto | Static per-rank data split (e.g. `[0.7, 0.3]`). **Honored on `Sync` policy only**; Cadence/Async use progressive dispatch driven by ElChe and ignore the static ratios. For dynamic heterogeneous scheduling under those policies, ElChe's throughput-based auto-rebalancing is the intended path. |
-| `.meta_controller(bool)` | `true` | LR-aware meta-controller — watches LR + anchor + divergence; nudges anchor down on sharp LR drops or sustained divergence. On by default (LR drops are always worth catching); opt out for unconditioned-trajectory instrumentation. |
+| `.meta_controller(bool)` | `true` | LR-aware meta-controller - watches LR + anchor + divergence; nudges anchor down on sharp LR drops or sustained divergence. On by default (LR drops are always worth catching); opt out for unconditioned-trajectory instrumentation. |
 | `.convergence_guard(g)` | `TrendGuard::new(0.05)` | Divergence guardrail. `NoGuard`, `TrendGuard`, or `MsfGuard` (rate-based). |
 | `.easgd_alpha(α)` | `None` | EASGD elastic blend on the `CpuAsync` path (`0 < α ≤ 1.0`). Ignored elsewhere. |
 
@@ -200,12 +200,12 @@ anchor.
 
 | Guard | Behavior |
 |---|---|
-| `NoGuard` | Passive baseline — always `Stable`. Use for instrumented runs that want an unconditioned trajectory. |
+| `NoGuard` | Passive baseline - always `Stable`. Use for instrumented runs that want an unconditioned trajectory. |
 | `TrendGuard::new(thresh)` | **Production default.** Three-rises-above-threshold rule on the per-rank `\|\|pre - post\|\| / \|\|post\|\|` ring buffer (last 5 events). Returns `SuppressGrowth` on persistent rising drift. |
 | `MsfGuard::default().with_suppress(s, n).with_nudge(t, n, factor)` | Rate-based detector built on the across-event MSF proxy `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds: sustained `λ_ema > suppress_threshold` → `SuppressGrowth`; sustained `λ_ema > nudge_threshold` → `NudgeDown` with `factor` (`0.5` halves the anchor). Opt-in. |
 
 `TrendGuard` state (the divergence ring buffer) is part of
-`ElCheState` and round-trips through `resume_from` — a resumed run
+`ElCheState` and round-trips through `resume_from` - a resumed run
 inherits the calibration trajectory. `MsfGuard`'s EMA + streak
 counters re-warm from scratch across resume (by design, since the
 across-event proxy is a derivative signal that recovers quickly).
@@ -218,20 +218,20 @@ commit:
 
 | Verdict | Effect |
 |---|---|
-| `Stable` | Commit the proposal — grow or shrink the anchor by the proposed amount. |
+| `Stable` | Commit the proposal - grow or shrink the anchor by the proposed amount. |
 | `SuppressGrowth` | Drop a proposed grow; **apply** a proposed shrink (shrink is the safe direction when divergence is rising). |
 | `NudgeDown { factor }` | Drop the proposal entirely; nudge supersedes by shrinking the current anchor by `factor`. |
 
 This makes the convergence guard authoritative: rising weight-space
 divergence vetoes anchor growth *before* it lands, rather than
 catching up after `overhead_target` has already moved the anchor. The
-two-sided trade-off — `overhead_target` proposes growth on throughput
-pressure, guard vetoes when convergence pressure rises — runs through
+two-sided trade-off - `overhead_target` proposes growth on throughput
+pressure, guard vetoes when convergence pressure rises - runs through
 one explicit commit/veto pipeline.
 
 ---
 
-## `TrainerConfig<M>` — the umbrella
+## `TrainerConfig<M>` - the umbrella
 
 Every knob `Trainer::run` needs sits on `TrainerConfig`. The chained
 `Trainer::builder()` API exposes the same setters; pick whichever
@@ -246,7 +246,7 @@ let cfg = TrainerConfig::new(dataset)
     .checkpoint_every(5)
     .save_path("ckpts/run43")
     .resume_from("ckpts/run42.fdl")
-    // .epoch_callback_policy(EpochCallbackPolicy::Fastest)  // default — pin a specific rank with EpochCallbackPolicy::Rank(n)
+    // .epoch_callback_policy(EpochCallbackPolicy::Fastest)  // default - pin a specific rank with EpochCallbackPolicy::Rank(n)
     .checkpoint_fn(Arc::new(|epoch, model| {
         model.save_checkpoint(&format!("ckpts/run43-ep{epoch}.fdl"))
     }))
@@ -321,7 +321,7 @@ handle.join()?;
 
 Fires once per epoch on the host thread, after all ranks have reported.
 Composes with the polling API (`handle.next_metrics()` /
-`handle.poll_metrics()`) — the same `EpochMetrics` reaches both. Callback
+`handle.poll_metrics()`) - the same `EpochMetrics` reaches both. Callback
 errors are logged to stderr; training continues.
 
 Transparent across tiers: fires identically on single-GPU, single-host
@@ -370,7 +370,7 @@ Controls which rank executes per-epoch callbacks (`checkpoint_fn`,
 
 ---
 
-## CUDA-free GPU detection — `flodl::sys::detect_gpus`
+## CUDA-free GPU detection - `flodl::sys::detect_gpus`
 
 `detect_gpus() -> Vec<GpuInfo>` shells out to `nvidia-smi` and returns
 per-device `(index, name, sm_version, vram_bytes)` without loading
@@ -425,7 +425,7 @@ set `CUDA_VISIBLE_DEVICES=0`.
 
 ---
 
-## Programmatic clusters — `ClusterBuilder`
+## Programmatic clusters - `ClusterBuilder`
 
 For tests and binaries that want to launch a multi-host cluster from
 inside `main()` without depending on a yml on disk:
@@ -465,7 +465,7 @@ let cfg = TrainerConfig::new(dataset)
 Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 ```
 
-`ClusterBuilder` mirrors `fdl.cluster.yml` 1:1 — same fields, same
+`ClusterBuilder` mirrors `fdl.cluster.yml` 1:1 - same fields, same
 validation, same launcher contract. `controller(...)` and `host(...)`
 are sibling sub-builders, matching the YAML's `controller:` /
 `workers[]:` shape. A `FullCluster` reaches the launcher the same way
@@ -495,7 +495,7 @@ checkpoint bundle and continues training. The bundle is three files:
 |---|---|
 | `<stem>.fdl` | Model parameters + buffers + optimizer state. |
 | `<stem>.meta.json` | `CheckpointMeta`: `ElCheState` (phase, calibration_count, anchor, partition_ratios, ring buffer) + `SaveReason`. |
-| `<stem>.config.json` | (optional) Source config sidecar — `flodl-hf` writes this on export. |
+| `<stem>.config.json` | (optional) Source config sidecar - `flodl-hf` writes this on export. |
 
 ```rust
 TrainerConfig::new(dataset)
@@ -527,16 +527,16 @@ the lifecycle; workers just report and follow.
 
 ### What happens when a rank dies
 
-1. **Heartbeat miss** — controller transitions the rank to `Dead` in
+1. **Heartbeat miss** - controller transitions the rank to `Dead` in
    per-rank state, elastically renormalizes `partition_ratios` across
    survivors.
-2. **Lone NCCL survivor** — short-circuits the wait and exits
+2. **Lone NCCL survivor** - short-circuits the wait and exits
    immediately rather than blocking on a dead-quorum AllReduce.
-3. **`max_failure` threshold** — when survivor count drops below this,
+3. **`max_failure` threshold** - when survivor count drops below this,
    the cluster aborts cleanly. Coordinator drives a final
    `ShutdownWithSave` checkpoint through whichever rank still has the
    freshest state, then signals every survivor to exit.
-4. **NCCL rendezvous-timeout retry** — if `ncclCommInitRank` doesn't
+4. **NCCL rendezvous-timeout retry** - if `ncclCommInitRank` doesn't
    quorum within the timeout, the coordinator picks the largest
    contiguous survivor subset, rebuilds the comm, and retries. Used at
    run start and after mid-run rank death.
@@ -607,7 +607,7 @@ Conventions:
 - `nccl_socket_ifname:` is required on every worker when the cluster
   spans multiple hosts.
 - `path:` is the project checkout dir on this host (heterogeneous
-  mounts are fine — `/opt/flodl` on one host, `/srv/flodl` on another).
+  mounts are fine - `/opt/flodl` on one host, `/srv/flodl` on another).
 - `arch:` is the libtorch variant subpath under `<path>/libtorch/` on
   this host. For heterogeneous rigs, each worker can select a different
   variant (e.g. one host on `precompiled/cu128`, another on
@@ -619,15 +619,15 @@ Conventions:
 
 ### Activating the overlay
 
-Three equivalent forms (precedence order):
+Three equivalent forms (a command-line selector overrides `FDL_ENV`):
 
 ```bash
+fdl @cluster <cmd>            # @ sigil (scan-anywhere before --)
 fdl --env cluster <cmd>       # explicit flag
 FDL_ENV=cluster fdl <cmd>     # environment variable
-fdl cluster <cmd>             # first-arg convention (when fdl.cluster.yml exists)
 ```
 
-`fdl cluster <cmd>` fans out to every worker via SSH, pre-builds the
+`fdl @cluster <cmd>` fans out to every worker via SSH, pre-builds the
 target binary per-host with the right libtorch variant, dispatches the
 remote rank children, and tears them down on parent exit.
 
@@ -656,14 +656,14 @@ fdl nccl build                  # auto-detects target NCCL tag + local archs
 Wire it in via the worker's `env: LD_PRELOAD:` block in cluster.yml.
 See [CLI reference](cli.md#fdl-nccl-build) for full options.
 
-### Readiness gate — `fdl probe`
+### Readiness gate - `fdl probe`
 
 Before launching, audit the cluster:
 
 ```bash
 fdl probe                       # single-host: GPU + libtorch + NCCL + shared-data path
-fdl cluster probe               # cluster: SSHes each worker, aggregates
-fdl cluster probe --json        # machine-readable for CI gating
+fdl @cluster probe               # cluster: SSHes each worker, aggregates
+fdl @cluster probe --json        # machine-readable for CI gating
 ```
 
 Errors loudly on misconfig; the green path is silent enough to use as
@@ -696,8 +696,8 @@ After each averaging round, `(overhead = sync_ms / (wall_ms - sync_ms))`
 is the fraction of compute time spent in AllReduce.
 
 - `overhead > target`: increase anchor by `ceil(anchor * overhead /
-  target)` (proportional to excess — overhead is wasted GPU time).
-- `overhead < target/2`: decrease anchor by 1 (gradual — lower anchor
+  target)` (proportional to excess - overhead is wasted GPU time).
+- `overhead < target/2`: decrease anchor by 1 (gradual - lower anchor
   means fresher gradients).
 - 5% dead-zone: anchor changes smaller than 5% of current are no-ops.
 
@@ -760,24 +760,24 @@ Same model, same data, same seed; change one line.
 
 | Suggested order | Rationale |
 |---|---|
-| 1. **`CpuAsync`** | **Best in class** on the reference rig — fastest wall-time *and* best convergence in the published `ddp-bench` runs. The CPU averaging path decouples from the GPU forward pass (genuine async — averaging on a separate channel) and benefits most from EASGD elastic blending. Cost: a decent CPU. A future dedicated averaging tier (extra GPU or peer) will lift the cost; the convergence quality is intrinsic to the algorithm. |
+| 1. **`CpuAsync`** | **Best in class** on the reference rig - fastest wall-time *and* best convergence in the published `ddp-bench` runs. The CPU averaging path decouples from the GPU forward pass (genuine async - averaging on a separate channel) and benefits most from EASGD elastic blending. Cost: a decent CPU. A future dedicated averaging tier (extra GPU or peer) will lift the cost; the convergence quality is intrinsic to the algorithm. |
 | 2. **`NcclCadence`** (default) | Recommended NCCL default. ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window. Anchor-based cadence with AllReduce at every boundary. |
 | 3. `NcclSync` | Strict-sync baseline. Tells you whether per-batch synchronization helps for your specific model. Identical to vanilla DDP. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and `loss per
-wall-second` — that last metric is usually the decider. The `ddp-bench`
+wall-second` - that last metric is usually the decider. The `ddp-bench`
 suite drives every mode through the same harness; see
 [`ddp-bench`](https://github.com/flodl-labs/flodl/tree/main/ddp-bench)
 for the canonical worked example and the published numbers.
 
-`CpuSync` and `CpuCadence` exist for completeness — A/B against the
+`CpuSync` and `CpuCadence` exist for completeness - A/B against the
 NCCL variants when peer-access is unavailable. They're not usually
 faster or more accurate than the NCCL variants for typical workloads;
 `CpuAsync` is where the CPU backend shines.
 
 ---
 
-## Manual control — `Ddp::wrap` (test-only)
+## Manual control - `Ddp::wrap` (test-only)
 
 For complex training patterns (GAN, RL, progressive growing) where you
 need explicit replica control, `Ddp::wrap` exposes the thread-per-GPU
@@ -795,7 +795,7 @@ ddp.sync_buffers()?;
 ```
 
 For all other use cases reach for `Trainer::run` or
-`Trainer::builder().run()` — the process-based path is the production
+`Trainer::builder().run()` - the process-based path is the production
 one, with per-rank logs, rank death survival, and cluster fan-out.
 
 ---
@@ -816,7 +816,7 @@ unaware that a cluster exists.
 | **Streaming** | Persistent background worker thread, async H2D on a dedicated CUDA stream. Prefetch depth auto-adapts. | Dataset too large for VRAM. |
 
 A 16 GB rank can go resident while a 6 GB rank on the same training
-run uses streaming — each rank picks its own mode independently. No
+run uses streaming - each rank picks its own mode independently. No
 lowest-common-denominator constraint.
 
 ### VRAM-aware prefetch
@@ -870,7 +870,7 @@ let rank_comms: Vec<NcclRankComm> = group.split()?;
 ```
 
 Never call `NcclRankComm::init_rank()` from worker threads on
-heterogeneous hardware — use `split()`.
+heterogeneous hardware - use `split()`.
 
 ### `NcclAbortHandle`
 
@@ -933,7 +933,7 @@ stream.wait_event(&event)?;        // stream waits for event
 
 ### Start with `fdl probe`
 
-`fdl probe` (single host) or `fdl cluster probe` (cluster) is the first
+`fdl probe` (single host) or `fdl @cluster probe` (cluster) is the first
 stop for any "it should work, why doesn't it" question. It surfaces:
 
 - Missing libtorch variant / wrong arch for the local GPUs.
@@ -982,7 +982,7 @@ heterogeneous GPUs. The framework uses the init-on-main + `split()`
 pattern everywhere, but if you're driving `NcclComms` manually, make
 sure you follow the same pattern.
 
-Also covered by the "no CUDA before `Trainer::run`" invariant — any
+Also covered by the "no CUDA before `Trainer::run`" invariant - any
 CUDA tensor created in `main()` before the launcher trampoline poisons
 spawned children's contexts.
 
@@ -1002,15 +1002,15 @@ also helps: the large GPU goes resident while the small GPU streams.
 The CPU averaging path now waits indefinitely for survivors and lets
 the elastic-membership machinery handle the dead-rank decision. If you
 need a hard time bound (e.g. CI gating), `max_failure` + `ShutdownWithSave`
-is the right knob — it triggers a clean checkpoint exit rather than
+is the right knob - it triggers a clean checkpoint exit rather than
 hanging.
 
 ### Cluster progressive hangs
 
-If `fdl cluster` runs hang several epochs in, the cause is usually:
+If `fdl @cluster` runs hang several epochs in, the cause is usually:
 
 1. **Stale child processes** from a previous aborted run holding GPU
-   memory or rendezvous ports. `fdl cluster` cleans these up
+   memory or rendezvous ports. `fdl @cluster` cleans these up
    pre-spawn, but a kill -9 on the launcher bypasses cleanup.
 2. **Shared-mount staleness** when the project mount is NFS or virtiofs
    and the controller and a worker see different file states. `fdl

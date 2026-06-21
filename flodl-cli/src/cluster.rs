@@ -48,7 +48,7 @@ pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
 pub const ENV_FDL_CMD: &str = "FLODL_FDL_CMD";
 
 /// Env var name picking the overlay env name (e.g. `cluster`). Set by
-/// fdl-cli at first-arg parsing time; propagated through to remote
+/// fdl-cli at env-selector parsing time; propagated through to remote
 /// hosts by the launcher so they see the same overlay-merged view.
 pub const ENV_FDL_ENV: &str = "FDL_ENV";
 
@@ -183,7 +183,7 @@ pub fn prepare_cluster_env(
 /// Local-only sibling of [`probe_worker_device_counts`], used by the
 /// testing-envelope export path in [`prepare_test_cluster_env`].
 ///
-/// Testing-mode cluster invocations (`fdl cluster-test <cmd>`) run the
+/// Testing-mode cluster invocations (`fdl @cluster-test <cmd>`) run the
 /// test binary in-process on one host; there's no SSH fan-out, so any
 /// worker declaring `local_devices: all` is by definition referring to
 /// the local machine's visible GPUs. Use `nvidia-smi -L` locally
@@ -220,7 +220,7 @@ fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Stri
         if count == 0 {
             return Err(format!(
                 "cluster.workers[{i}] ({:?}): 0 CUDA devices visible \
-                 (local_devices: all). Run `fdl cluster-test <cmd>` on a \
+                 (local_devices: all). Run `fdl @cluster-test <cmd>` on a \
                  host with visible GPUs, or use an explicit \
                  `local_devices: [...]` list.",
                 w.host,

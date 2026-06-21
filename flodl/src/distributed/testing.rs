@@ -21,7 +21,7 @@
 //!
 //! ```ignore
 //! #[test]
-//! #[ignore = "cluster topology needed; run via `fdl cluster-test <cmd>` or with N GPUs visible"]
+//! #[ignore = "cluster topology needed; run via `fdl @cluster-test <cmd>` or with N GPUs visible"]
 //! fn my_cluster_test() {
 //!     let cluster = match flodl::distributed::testing::discover_test_cluster() {
 //!         Some(c) => c,

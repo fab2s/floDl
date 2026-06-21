@@ -1,6 +1,6 @@
 # Distributed architecture
 
-This document maps the **entire distributed pattern** -- the data, the
+This document maps the **entire distributed pattern** - the data, the
 communication, and the logic that move parameters between heterogeneous GPUs
 and hosts during DDP training.
 
@@ -13,13 +13,13 @@ own view, in the diagram type that fits it:
 | [1. Role topology](#1-role-topology) | Who runs where? Process vs thread boundaries. | flowchart |
 | [2. Training lifecycle](#2-training-lifecycle) | What happens end to end, in order? | sequence |
 | [3. Coordinator state machine](#3-coordinator-state-machine) | How does CPU averaging stay non-blocking? | state |
-| [4. Reduce backends](#4-reduce-backends) | NCCL in-place collective vs CPU data-channel star -- the key divergence. | flowchart |
+| [4. Reduce backends](#4-reduce-backends) | NCCL in-place collective vs CPU data-channel star - the key divergence. | flowchart |
 | [5. ElChe scheduling](#5-elche-scheduling-data-flow) | How does work get allocated per rank? | flowchart |
 | [6. Message catalog](#6-message-catalog) | Which message carries what, between whom? | tables |
 | [7. Failure handling](#7-failure-handling) | What stops a wedge or a dead rank from hanging the run? | flowchart |
 
 > Every diagram cites its source file(s). When the code moves, re-sync the
-> diagram from the cited enum/struct -- the variant names below are pulled
+> diagram from the cited enum/struct - the variant names below are pulled
 > verbatim so drift is greppable.
 
 The user-facing strategy is a single **`ElCheMode`** (`nccl_sync`,
@@ -27,13 +27,13 @@ The user-facing strategy is a single **`ElCheMode`** (`nccl_sync`,
 [`ElCheConfig`]. Internally each mode decomposes into the two axes that
 parameterize everything below:
 
-- **`ApplyPolicy`** -- the *pacing* clock: `Sync` (K=1), `Cadence` (K=N via
+- **`ApplyPolicy`** - the *pacing* clock: `Sync` (K=1), `Cadence` (K=N via
   ElChe), `Async` (Cadence + bounded lookahead). `Sync`/`Cadence` are
   *barrier-paced* (a rank is held at its window until the reduce resets it);
   `Async` opts out.
-- **`AverageBackend`** -- the *transport*: `Nccl` (in-place GPU AllReduce) or
+- **`AverageBackend`** - the *transport*: `Nccl` (in-place GPU AllReduce) or
   `Cpu` (snapshot round-trip through the coordinator). **Orthogonal to
-  pacing** -- five of the six combinations are valid modes (`Async + Nccl`
+  pacing** - five of the six combinations are valid modes (`Async + Nccl`
   was dropped and hard-errors at `.run()`), which is what makes NCCL-vs-CPU
   A/B testing possible.
 
@@ -152,12 +152,12 @@ sequenceDiagram
 CPU averaging is a **data-channel star** (`ClusterController` / `CpuReduceClient`
 on data port +2): each rank ships its params as a `RoundFrame`, the controller
 sums and divides by `world_size`, and the averaged frame returns on the same
-channel -- the scheduler's `Update { version, next_plan }` carries only the next
+channel - the scheduler's `Update { version, next_plan }` carries only the next
 schedule, never the weights. The scheduler stays free throughout (see view 3).
 
 The `share_complete_ms` in `MetricsMsg` (not `epoch_ms`) is the honest
 balancer denominator; ElChe's per-batch signal is the coordinator-measured
-**delivered** cost, not `batch_ms` (compute only) -- see view 5.
+**delivered** cost, not `batch_ms` (compute only) - see view 5.
 
 > Source: `wire.rs` (`RendezvousMsgWire`), `ddp_run/mod.rs` (`ControlMsg`,
 > `TimingMsg`, `MetricsMsg`), `cluster_coordinator/epoch_dispatch.rs`,
@@ -169,13 +169,13 @@ balancer denominator; ElChe's per-batch signal is the coordinator-measured
 
 ## 3. Coordinator state machine
 
-CPU averaging must **never block the scheduler** -- the coordinator keeps
+CPU averaging must **never block the scheduler** - the coordinator keeps
 servicing `check_throttle` and timing reports while a reduce is in flight. The
 production cluster scheduler does this with a **2-state** machine: it broadcasts
 `RequestParams`, parks in `Pending`, and the actual averaging happens
 out-of-band on the data-channel star (view 2). `poll_cpu_averaging` (driven
 every `tick`) finalizes one tick later, once every alive rank's bridge `SyncAck`
-has landed -- no background-thread join, the scheduler never owns the tensors.
+has landed - no background-thread join, the scheduler never owns the tensors.
 
 ```mermaid
 stateDiagram-v2
@@ -196,7 +196,7 @@ stateDiagram-v2
   persistent pinned buffers; the `Idle -> Pending -> Idle` cycle issues exactly
   one `RequestParams` per cycle and the worker re-snapshots only after the
   `Update` round-trips back, so a snapshot is never overwritten while in flight.
-- **finalize on `nccl_sync_divergence`, not `nccl_ack`** -- the CPU bridge
+- **finalize on `nccl_sync_divergence`, not `nccl_ack`** - the CPU bridge
   `SyncAck` (which populates `nccl_sync_divergence`) is the only signal the
   AllReduce round-trip finished; its `step_count` is not meaningful for the
   cadence clock, so re-arm is driven by `cpu_avg_state`, not the ack.
@@ -247,16 +247,16 @@ Key asymmetries (each a hard-won fix):
 - **Memory**: NCCL is zero-extra (in-place); CPU is `O(world_size *
   model_size)` host RAM at the star controller.
 - **Blocking**: NCCL sync at a collective barrier (fast GPU waits); CPU never
-  blocks the scheduler -- it parks in `Pending` (view 3) while the star reduces.
+  blocks the scheduler - it parks in `Pending` (view 3) while the star reduces.
 - **Timing feed**: CPU+Cadence/Async and NCCL+Cadence ride the transport-aware
   `delivered_ms_accum` feed (view 5). NCCL+Cadence earns it because
   `trigger_averaging` now drains the window-completion frames (the deterministic
   window-completion wait) *before* the inline `finish_averaging_nccl` consumes
-  the feed -- the staleness that originally forced NCCL onto compute-only is
+  the feed - the staleness that originally forced NCCL onto compute-only is
   gone. `Sync` (either backend) and the hypothetical NCCL+Async stay on the
   compute-only `wall_ms_accum` feed.
 - **Snapshot readout** (CPU): `snapshot_params` does batched **async** D2H into
-  reused **pinned** host buffers, then a single `synchronize()` per window --
+  reused **pinned** host buffers, then a single `synchronize()` per window -
   not per-param synchronous copies.
 
 > Source: `ddp_run/mod.rs` (`AverageBackend`),
@@ -301,7 +301,7 @@ compute + data + transport, but ElChe was scheduling on compute-only timing, so
 it over-allocated the fast RTX and left it idle at the barrier. Feeding the
 coordinator-measured dispatch-to-completion delta (which excludes the
 reduce-barrier wait) made cpu-cadence track nccl-cadence. NCCL+Cadence later
-joined the delivered feed too -- its inline finish drains the window-completion
+joined the delivered feed too - its inline finish drains the window-completion
 frames first, so the spans are no longer stale by feed time. The feed is
 **all-or-none per window**: if any stepping rank lacks a closed delivered span,
 every rank falls back to the compute scale for that window (mixing the two
@@ -330,8 +330,8 @@ Every frame is tagged with a `MsgKind` and carried in an HMAC-signed
 | `Control` | coord -> worker | `ControlMsgWire` | RequestParams / Update{version,next_plan} / SyncNow / StartEpoch / DeclareDead / ShutdownWithSave{reason} / ... |
 | `Timing` | worker -> coord | `TimingMsgWire` | Batch / SyncAck / SnapshotReady / Heartbeat / LrUpdate / Exiting / EvalResult |
 | `Metrics` | worker -> coord | `MetricsMsgWire` | per-epoch avg_loss, share_complete_ms, samples |
-| `ParamSnapshotMeta` | -- | *(orphan / reserved)* | `ParamSnapshotMetaWire` deleted; tag kept for byte-layout stability, no-op on receipt |
-| `Heartbeat` | -- | *(orphan / reserved)* | `HeartbeatWire` deleted; live liveness rides `TimingMsgWire::Heartbeat` on the `Timing` row |
+| `ParamSnapshotMeta` | - | *(orphan / reserved)* | `ParamSnapshotMetaWire` deleted; tag kept for byte-layout stability, no-op on receipt |
+| `Heartbeat` | - | *(orphan / reserved)* | `HeartbeatWire` deleted; live liveness rides `TimingMsgWire::Heartbeat` on the `Timing` row |
 | `Rendezvous` | both | `RendezvousMsgWire` | Hello / Role / Uid bootstrap |
 
 > Source: `wire.rs` (`MsgKind`, `ControlMsgWire`, `TimingMsgWire`,
@@ -347,7 +347,7 @@ Every frame is tagged with a `MsgKind` and carried in an HMAC-signed
 | data | both | `RoundFrame` | tensor payloads (ParamSnapshot, AveragedParams) |
 
 These are the inner `GpuWorker`'s channels, and they are present in **both**
-paths -- the cluster path wraps the same `GpuWorker` and the `cluster_worker`
+paths - the cluster path wraps the same `GpuWorker` and the `cluster_worker`
 bridge translates wire frames to and from them. So the cluster path's wire-side
 `Update { version, next_plan }` (schedule only) and the in-process
 `Update(AveragedParams)` are two different things: the param bridge synthesizes
@@ -409,7 +409,7 @@ ended so a resume can reason about it:
 | `GracefulShutdown` | normal end / user stop |
 | `MaxFailureExceeded` | too many ranks reaped to continue |
 | `AllRanksLost` | the whole cohort died |
-| `SingleSurvivor` | only one rank left -- no peer to average with |
+| `SingleSurvivor` | only one rank left - no peer to average with |
 | `ReduceStall` | a reduce wedged past its ceiling (either backend) |
 
 The two reduce-stall ceilings are twins: the CPU backend parks in

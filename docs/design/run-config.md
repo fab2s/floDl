@@ -23,7 +23,7 @@ YAML primary. JSON accepted too (auto-detected by file extension).
 
 ## One concept: `commands:`
 
-Every `fdl.yml` — root and sub — declares a single `commands:` map. The
+Every `fdl.yml` - root and sub - declares a single `commands:` map. The
 kind of each entry is inferred from its fields:
 
 - **Path** (child directory): the entry has `path:` set, or is empty/null
@@ -69,7 +69,7 @@ commands:
     run: cargo install --path flodl-cli
 ```
 
-Top-level commands must be `Run` or `Path` — `Preset` is disallowed because
+Top-level commands must be `Run` or `Path` - `Preset` is disallowed because
 there is no enclosing `entry:` at the project root.
 
 ## Sub-command manifest
@@ -110,7 +110,7 @@ commands:
     description: ElChe with tight sync
     ddp: { anchor: 3 }
 
-  # A `run:` command inside a sub-command is also fine — it replaces
+  # A `run:` command inside a sub-command is also fine - it replaces
   # the parent entry invocation with a self-contained shell script.
   report:
     description: Regenerate the convergence report
@@ -142,10 +142,10 @@ fdl ddp-bench --model mlp --epochs 10  # no preset, pure pass-through
 ## CLI resolution
 
 ```
-fdl <name> [args...]
+fdl [@env] <name> [args...]
+  0. strip env selector (@env / --env / FDL_ENV), validate overlay exists
   1. built-in?                                     -> execute (setup, init, …)
-  2. first-arg env overlay? (fdl.<name>.yml)       -> activate overlay, shift args
-  3. commands[<name>] in root fdl.yml?             -> resolve by kind:
+  2. commands[<name>] in root fdl.yml?             -> resolve by kind:
        Run  -> execute `run:` (optionally in docker)
        Path -> load child fdl.yml, recurse with args[1..]
   4. not found                                     -> error + help listing
@@ -166,7 +166,7 @@ entry.
 
 ## Help conventions
 
-One way to ask for help: `--help` / `-h`. No `fdl help` subcommand —
+One way to ask for help: `--help` / `-h`. No `fdl help` subcommand -
 keeps the top-level namespace clean and frees `help` from being a
 reserved name.
 
@@ -259,7 +259,7 @@ model:
 4. Preset-level map extends root-level map (matching keys overwritten).
 5. CLI args override everything (appended after config-derived args).
 6. `null` means "use default", not "clear the field" (within a sub-command
-   config — the env-overlay layer above *does* use `null` to delete).
+   config - the env-overlay layer above *does* use `null` to delete).
 
 ## Execution model
 
@@ -323,7 +323,7 @@ Entry:
 
 This reflects what is actually happening: `ddp-bench` takes one
 optional positional argument (a named preset) plus options. The preset
-slot renders once with its possible values indented underneath — not
+slot renders once with its possible values indented underneath - not
 N distinct argument rows. Preset entries share the enclosing `entry:`;
 each value just pins some option defaults and invokes the same binary.
 
@@ -361,7 +361,7 @@ Arguments:
       vanilla    …
 ```
 
-This is purely help cosmetics — the user still types `fdl bake-off
+This is purely help cosmetics - the user still types `fdl bake-off
 chocolate` to invoke the preset.
 
 ## Design principles
@@ -408,46 +408,46 @@ rewriting the training script.
 
 ### Discovery and targeting
 
-Two ways to select an environment:
-
-**Convention (first-arg detection)** — zero ceremony:
-
-```bash
-fdl test                      # no env: uses fdl.yml, runs the "test" command
-fdl ci test                   # "ci" matches fdl.ci.yml -> env overlay, runs "test"
-fdl local ddp-bench validate  # env=local, cmd=ddp-bench, preset=validate
-```
-
-**Explicit flag** — disambiguation + automation:
+Three equivalent forms, all explicit; a command-line selector (`@` or
+`--env`) overrides the ambient `FDL_ENV`:
 
 ```bash
-fdl --env ci test            # scan-anywhere: also `fdl test --env ci` / `--env=ci`
+fdl @ci test                 # @ sigil - scan-anywhere before --, also `fdl test @ci`
+fdl --env ci test            # flag - scan-anywhere: also `fdl test --env ci` / `--env=ci`
 FDL_ENV=ci fdl test          # environment variable, for CI runners + shell rc
+fdl local ddp-bench validate # env=local: `fdl @local ddp-bench validate`
 ```
 
-Precedence: `--env X` > `FDL_ENV=X` > first-arg convention. Explicit
-selectors (flag or env var) must resolve to an existing overlay; a missing
-`fdl.X.yml` errors loudly rather than silently falling through — the
-first-arg path only silent-falls-through because the candidate may just
-be a command name. Duplicate `--env` also errors.
+Precedence: (`@env` ≡ `--env X`) > `FDL_ENV=X`. Every form must resolve to
+an existing `fdl.X.yml` overlay; a miss errors loudly. `@` and `--env` are
+mutually exclusive unless they name the same env (different values are a
+conflict error); duplicate `--env` or duplicate `@` also errors.
 
-### First-arg resolution rules
+### Why a sigil, not a bare positional
+
+There is **no** bare-positional convention (`fdl ci test` does *not* select
+the `ci` env). An earlier design tried `fdl <name> <cmd>` with first-arg
+detection, but that forced the env namespace and the command namespace to
+be disjoint - naming an env `ci`, `test`, or `setup` collided with a
+command and had to error. Parsing was *semantic*: deciding whether the
+first token was an env or a command required consulting the full overlay
+and command sets.
+
+The `@` sigil makes resolution *lexical* - one character of lookahead, no
+tables consulted. The two namespaces stop interfering: an env may freely
+share a name with a command. The first bare token is unconditionally a
+command.
 
 ```
-fdl <arg> [...]
+fdl [@env] <name> [...]
 
-1. Does a command named <arg> exist?          -> Y1
-2. Does fdl.<arg>.yml exist in walk-up tree?  -> Y2
-
-Y1 only:    dispatch the command
-Y2 only:    use fdl.<arg>.yml as overlay, expect next positional = command
-Y1 + Y2:    LOUD CONFLICT — error out, show both candidates
-Neither:    unknown command
+0. strip @env / --env / FDL_ENV; each must resolve to fdl.<env>.yml or error
+1. Does a command named <name> exist?          -> dispatch it
+2. Otherwise                                    -> unknown command
 ```
 
-The loud-conflict rule is the key. Silent precedence here would be a
-footgun (renaming a command could accidentally shadow an env). Failing
-on ambiguity the moment it's introduced is cheap insurance.
+A `@`-token after a standalone `--` is left verbatim (escape hatch for an
+inner command that genuinely wants a `@`-prefixed argument).
 
 ### `inherit-from:` for non-obvious topologies
 
@@ -481,7 +481,7 @@ Resolution rules:
 - **Scalars: replace.** Overlay value takes over.
 - **Lists: replace entirely.** Order is always contentious; append/prepend
   modes cause more debugging pain than they save. Users who want to
-  extend a list copy the full new list — unambiguous when reading.
+  extend a list copy the full new list - unambiguous when reading.
 - **`null` deletes.** `ddp: null` in an overlay removes the entire block,
   useful for "reset to defaults in this env." Avoids needing a separate
   `!unset` syntax.
@@ -517,20 +517,20 @@ With it, "why is it using that value" is one command.
 $ fdl help
 ...
 Available environments:
-  local     (fdl.local.yml)       [gitignored]
-  ci        (fdl.ci.yml)
-  cloud     (fdl.cloud.yml)
-  prod      (fdl.prod.yml)
+  @local    (fdl.local.yml)       [gitignored]
+  @ci       (fdl.ci.yml)
+  @cloud    (fdl.cloud.yml)
+  @prod     (fdl.prod.yml)
 
-Use:  fdl <env> <command>   or   fdl --env <env> <command>
+Use:  fdl @<env> <command>   or   fdl --env <env> <command>
 ```
 
 ### MVP increment
 
 ~300 LOC in `flodl-cli/src/config.rs`:
 
-1. First-arg env detection + conflict check (no explicit `--env` flag yet).
-2. Deep-merge maps, replace lists, `null` deletes — post-parse on
+1. `@env` / `--env` / `FDL_ENV` selector parsing + validate-overlay-exists.
+2. Deep-merge maps, replace lists, `null` deletes - post-parse on
    existing `ProjectConfig` / `CommandConfig` structs.
 3. `fdl config show [<env>]` with source annotations.
 4. `fdl help` lists available envs.
@@ -628,7 +628,7 @@ preset) expects. Each entry:
 Rules:
 - Only the *last* positional may be `variadic: true`.
 - A required positional cannot follow an optional one.
-- Presets may pin an arg value (`args: { run-id: latest }`) — the
+- Presets may pin an arg value (`args: { run-id: latest }`) - the
   positional becomes effectively fixed for that preset.
 
 ### Long and short option variants
@@ -637,7 +637,7 @@ Options are always long-form (`--name`). Adding `"short": "x"` gives a
 short alias (`-x`). Short forms are single ASCII letters. Long forms are
 derived from the JSON key and always kebab-case.
 
-Short aliases are optional and always declared explicitly — no implicit
+Short aliases are optional and always declared explicitly - no implicit
 first-letter mapping (that path leads to drift when a new option shares
 a prefix).
 
@@ -670,7 +670,7 @@ List semantics:
 - Repeated flags *append*; comma-separated values *extend*. Both forms
   are equivalent and may be mixed in one invocation.
 - Empty default is `[]`. A preset-level list replaces the root-level
-  list (same rule as env-overlay merging — lists replace, never append).
+  list (same rule as env-overlay merging - lists replace, never append).
 - `list[bool]` is not allowed (meaningless).
 
 Kept deliberately small. Richer types belong in the binary's own
@@ -684,7 +684,7 @@ interactions predictable:
 
 - **Default implies optional.** A field with `default` is never
   "required." In the derive, pair `default` with plain `T` (not
-  `Option<T>`) — the two are redundant and the derive rejects the
+  `Option<T>`) - the two are redundant and the derive rejects the
   combination at compile time.
 - **`Option<T>` without `default` means "None when absent."** Use it
   when the binary needs to distinguish "user didn't set it" from "user
@@ -707,7 +707,7 @@ argv  >  env var (via `env = "..."`)  >  preset-level YAML  >  root-level
 
 The chain is collapsed at resolve time into a single value per field
 before exec. `fdl config show` annotates each resolved value with its
-source — which is how you debug "why is it using that value."
+source - which is how you debug "why is it using that value."
 
 ### fdl-side behavior
 
@@ -754,17 +754,17 @@ complementary checks:
   the schema before the binary is invoked. Unknown flags are rejected
   with a "did you mean `--...`?" suggestion (edit-distance ≤ 2).
   Positional count and type coercion stay the binary's responsibility
-  — strict is scoped to option-level typos.
+  - strict is scoped to option-level typos.
 
 Reserved universals (`--help`, `--version`, `--fdl-schema`,
 `--refresh-schema`) are always allowed through, even when they are not
 declared in `schema.options`.
 
-This preserves "don't break working usage" — adding a schema to an
+This preserves "don't break working usage" - adding a schema to an
 existing command surfaces help without enforcing anything until
 `strict: true` is added explicitly.
 
-### Rendered help — the payoff
+### Rendered help - the payoff
 
 ```
 $ fdl ddp-bench --help
@@ -814,7 +814,7 @@ $ fdl ddp-bench --baseline <TAB>
 
 ---
 
-## 3. The `FdlArgs` derive — one struct, everything derived
+## 3. The `FdlArgs` derive - one struct, everything derived
 
 > **Consolidation note (2026-04-17):** An earlier revision of this doc
 > proposed a separate `flodl-args` crate, initially clap-backed. After
@@ -824,7 +824,7 @@ $ fdl ddp-bench --baseline <TAB>
 > "option are optional, only their value can have a default" principle
 > below. We consolidated into **flodl-cli as a lib+bin** (exposes the
 > runtime) + **flodl-cli-macros** as the proc-macro crate (one extra
-> crate is unavoidable — Rust language rule). Clap was dropped entirely;
+> crate is unavoidable - Rust language rule). Clap was dropped entirely;
 > flodl-cli owns the argv parser + schema emission. The `#[option]` /
 > `#[arg]` split proposed below is what the derive actually uses.
 
@@ -945,29 +945,29 @@ fn run(cli: Cli) -> flodl::tensor::Result<()> {
 - Field names snake_case in Rust, rendered as kebab-case in argv
   (`batch_size` -> `--batch-size`).
 
-#### `#[option(...)]` — a flag (`--name` / `-n`)
+#### `#[option(...)]` - a flag (`--name` / `-n`)
 
 Maps to the JSON schema `options:` section. Attrs:
 
-- `default = <literal>` — explicit default
-- `choices = &[...]` — allowed values (drives completion + validation)
-- `name = "..."` — override the CLI name (rare)
-- `short = 'x'` — add a short alias (`-x`). Explicit only, no implicit
+- `default = <literal>` - explicit default
+- `choices = &[...]` - allowed values (drives completion + validation)
+- `name = "..."` - override the CLI name (rare)
+- `short = 'x'` - add a short alias (`-x`). Explicit only, no implicit
   first-letter mapping.
-- `completer = "..."` — shell snippet producing completion values
+- `completer = "..."` - shell snippet producing completion values
   (escape hatch beyond `choices` and `type: path`)
-- `env = "..."` — read from environment variable when not in argv
+- `env = "..."` - read from environment variable when not in argv
 
-#### `#[arg(...)]` — a positional
+#### `#[arg(...)]` - a positional
 
 Maps to the JSON schema `args:` section. Field order in the struct
 defines positional order. Attrs:
 
-- `default = <literal>` — explicit default (requires `Option<T>` or
+- `default = <literal>` - explicit default (requires `Option<T>` or
   equivalent to also be optional)
-- `choices = &[...]` — allowed values
-- `name = "..."` — override the `<name>` rendered in usage
-- `completer = "..."` — shell snippet producing completion values
+- `choices = &[...]` - allowed values
+- `name = "..."` - override the `<name>` rendered in usage
+- `completer = "..."` - shell snippet producing completion values
 
 Guardrails (compile errors):
 - `short` is not valid on `#[arg]` (positionals have no short).
@@ -976,14 +976,14 @@ Guardrails (compile errors):
   (`Option<T>` or one with `default`).
 
 The derive emits the same collision checks as the JSON schema (reserved
-fdl flags, duplicate longs/shorts) — build fails at compile time rather
+fdl flags, duplicate longs/shorts) - build fails at compile time rather
 than at runtime.
 
 ### What ddp-bench shrinks by
 
-- 65 lines of `while i < args.len() { match ... }` — gone
-- 35 lines of `print_help` — gone
-- Two places that had to stay in sync — consolidated into one struct
+- 65 lines of `while i < args.len() { match ... }` - gone
+- 35 lines of `print_help` - gone
+- Two places that had to stay in sync - consolidated into one struct
 
 `main.rs` becomes ~20 lines (struct definition + `fn main` + `fn run`).
 
@@ -1067,7 +1067,7 @@ overrides, and the explicit `--env` flag remain future-work polish.
 
 ## Why this matters
 
-The scale-up story — laptop to datacenter in one YAML file — only works
+The scale-up story - laptop to datacenter in one YAML file - only works
 if the config layer can carry the weight. Four things have to be true:
 
 - **Options are self-documenting.** Otherwise every new scale gets a new
@@ -1081,7 +1081,7 @@ if the config layer can carry the weight. Four things have to be true:
   schema contract means any capability added to the underlying binary
   surfaces in `fdl -h` automatically.
 - **The right path is the easiest path.** Adopting `struct Cli` is
-  strictly cheaper than hand-rolling argv parsing — fewer lines, no
+  strictly cheaper than hand-rolling argv parsing - fewer lines, no
   `print_help` to maintain, no YAML mirror to keep in sync. And the
   payoff is immediate: early validation (unknown values and bad types
   caught at fdl's boundary before Docker spin-up), "did you mean"
@@ -1091,6 +1091,6 @@ if the config layer can carry the weight. Four things have to be true:
   contract that relies on "please keep these two places in sync"
   decays; this one has one place.
 
-Together these make `fdl.yaml` a *stable* project interface — one that
+Together these make `fdl.yaml` a *stable* project interface - one that
 research code, infra code, and AI agents can all target without
 coordinating on which flag moved where.

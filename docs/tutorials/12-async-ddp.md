@@ -1,7 +1,7 @@
 # Tutorial 12: Heterogeneous & Multi-Host DDP
 
-When the rigs get interesting — mixed GPU generations, mixed hosts,
-mixed libtorch variants — the same `Trainer::builder` shape from
+When the rigs get interesting - mixed GPU generations, mixed hosts,
+mixed libtorch variants - the same `Trainer::builder` shape from
 [Tutorial 11](11-multi-gpu.md) keeps working. This tutorial covers the
 knobs that earn their keep on real heterogeneous deployments.
 
@@ -12,7 +12,7 @@ knobs that earn their keep on real heterogeneous deployments.
 
 > **Canonical reference**: [DDP Reference](../ddp.md).
 
-## ElChe — the cadence balancer
+## ElChe - the cadence balancer
 
 Every cadence mode (`*Cadence`, `*Async`) routes through ElChe.
 `NcclSync` and `CpuSync` are the degenerate case (anchor=1, AllReduce
@@ -26,7 +26,7 @@ ElChe progresses through four phases as calibrations accumulate:
 | Phase | When | Behavior |
 |---|---|---|
 | `Probe` | No calibrations yet | Equal split across ranks; gather first timings. |
-| `Warmup` | First few calibrations | Sticky anchor — cold-start noise on the larger/newer GPU can't flip the slow-anchor election. |
+| `Warmup` | First few calibrations | Sticky anchor - cold-start noise on the larger/newer GPU can't flip the slow-anchor election. |
 | `Stable` | Steady state | Normal overhead auto-tune with hysteresis. `relax_up` and the meta-controller anchor swaps activate here. |
 | `Mature` | Long-running steady state | Same as Stable; signal for telemetry. |
 
@@ -57,15 +57,15 @@ overhead = sync_ms / max(compute_ms across ranks)
 
 | Observation | ElChe's proposal |
 |---|---|
-| `overhead > overhead_target` | Grow anchor by `ceil(anchor * overhead / target)` — sync less often, amortize the cost over more local batches. |
-| `overhead < overhead_target * 0.5` | Shrink anchor by 1 — sync is cheap, can afford fresher gradients. |
+| `overhead > overhead_target` | Grow anchor by `ceil(anchor * overhead / target)` - sync less often, amortize the cost over more local batches. |
+| `overhead < overhead_target * 0.5` | Shrink anchor by 1 - sync is cheap, can afford fresher gradients. |
 | in the band, or change < 5% of current | Hold (5% dead-zone). |
 
-The proposal is **proposed**, not committed — the convergence guard's
+The proposal is **proposed**, not committed - the convergence guard's
 verdict decides whether it lands (see below). The anchor is then
 clamped to `[min_anchor, max_anchor]`.
 
-## Convergence guards — the safety belt
+## Convergence guards - the safety belt
 
 `overhead_target` alone would happily grow the anchor on any stable
 model, eventually starving the gradients. The convergence guard
@@ -88,7 +88,7 @@ but doesn't apply it. The guard's verdict commits:
 | `SuppressGrowth` | Drop a proposed grow; **apply** a proposed shrink (shrink is the safe direction when divergence is rising). |
 | `NudgeDown { factor }` | Drop the proposal entirely; nudge supersedes by shrinking the current anchor by `factor`. |
 
-So `SuppressGrowth` doesn't just *not relax up* — it actively vetoes
+So `SuppressGrowth` doesn't just *not relax up* - it actively vetoes
 the overhead-tune growth before it lands. The convergence guard is
 authoritative over `overhead_target` by construction. See [DDP
 Reference: Guard authority over
@@ -96,11 +96,11 @@ Reference: Guard authority over
 
 ### LR-aware meta-controller
 
-Above ElChe sits the LR-aware meta-controller (on by default —
+Above ElChe sits the LR-aware meta-controller (on by default -
 `.meta_controller(true)`). It watches LR trajectory + anchor trend +
 guard verdicts in a rolling window and reactively nudges the anchor
 down on sharp LR drops or sustained divergence patterns. Reports
-`is_settled()` once the metric stops moving — useful as an
+`is_settled()` once the metric stops moving - useful as an
 early-stop signal.
 
 Opt out for instrumentation:
@@ -122,13 +122,13 @@ center_t1  = (1 - α) * center_t0 +  α * mean(local_t0)
 
 Each rank's local params blend toward the center; the center blends
 toward the mean of locals. `α` controls the blend rate (`0 < α ≤ 1.0`,
-typical `0.4`–`0.8`). Honored on `CpuAsync` only; ignored elsewhere.
+typical `0.4`-`0.8`). Honored on `CpuAsync` only; ignored elsewhere.
 
 ```rust
 .elche(ElCheConfig::cpu_async().easgd_alpha(0.6))
 ```
 
-## A/B testing modes — the recipe
+## A/B testing modes - the recipe
 
 Five modes via `ElCheMode`. Each switch is one line:
 
@@ -148,12 +148,12 @@ Suggested order (refined from the `ddp-bench` published numbers):
 
 | Position | Mode | Rationale |
 |---|---|---|
-| 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (genuine async — averaging on a separate channel) and benefits most from EASGD. Cost: a decent CPU. |
+| 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (genuine async - averaging on a separate channel) and benefits most from EASGD. Cost: a decent CPU. |
 | 2 | **`NcclCadence`** (default) | Recommended NCCL default. ElChe-driven anchor; fast devices process proportionally more batches per averaging window. |
 | 3 | `NcclSync` | Strict per-batch sync. Tells you whether tighter synchronization helps your specific model. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and **`loss per
-wall-second`** — the last is usually the decider. A slightly higher
+wall-second`** - the last is usually the decider. A slightly higher
 loss in half the time often wins.
 
 `CpuSync` and `CpuCadence` exist for A/B against the NCCL variants
@@ -168,7 +168,7 @@ for the canonical worked example and the published convergence
 numbers.
 
 > `NcclAsync` used to exist as a sixth mode (NCCL + per-rank
-> cross-epoch dispatch). It was dropped — measured benefit over
+> cross-epoch dispatch). It was dropped - measured benefit over
 > `NcclCadence` was within noise on every tested rig, and the
 > in-place AllReduce writeback raced with autograd on heterogeneous
 > Pascal+Blackwell setups. `CpuAsync` is the real async mode:
@@ -207,10 +207,10 @@ workers:
 `fdl probe` flags the version skew before launch:
 
 ```bash
-fdl cluster probe           # SSHes each worker; aggregates GPU + libtorch + NCCL inventory
+fdl @cluster probe           # SSHes each worker; aggregates GPU + libtorch + NCCL inventory
 ```
 
-## Cluster topology — `fdl.cluster.yml`
+## Cluster topology - `fdl.cluster.yml`
 
 The structured schema with `controller:` and `workers[]:` blocks. See
 [DDP Reference: Multi-host
@@ -226,7 +226,7 @@ Key conventions:
   `nvidia-smi`. Explicit lists carry their own count.
 - `nccl_socket_ifname:` is required on every worker when the cluster
   spans multiple hosts.
-- `arch:` selects the libtorch variant *per host* — heterogeneous
+- `arch:` selects the libtorch variant *per host* - heterogeneous
   rigs run different variants without changing the convention path
   (`<path>/libtorch/<arch>/`).
 - `docker:` (optional) names the compose service for training on this
@@ -236,11 +236,11 @@ Key conventions:
 Launch via the env overlay:
 
 ```bash
-fdl cluster train           # = fdl --env cluster train ; SSHes each worker
-fdl cluster probe           # readiness gate before launch
+fdl @cluster train           # = fdl --env cluster train ; SSHes each worker
+fdl @cluster probe           # readiness gate before launch
 ```
 
-## Programmatic clusters — `ClusterBuilder`
+## Programmatic clusters - `ClusterBuilder`
 
 For tests, embedded launchers, or any binary that wants to launch
 without a yml on disk:
@@ -280,7 +280,7 @@ let cfg = TrainerConfig::new(dataset)
 Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 ```
 
-`ClusterBuilder::all_local_gpus()` is the single-host shortcut —
+`ClusterBuilder::all_local_gpus()` is the single-host shortcut -
 synthesizes the same topology auto-promote uses on a multi-GPU host.
 
 ## Elastic membership
@@ -292,7 +292,7 @@ Ranks can die and rejoin without aborting the run:
 - **Lone NCCL survivor** short-circuits and exits (no dead-quorum
   AllReduce wait).
 - **`max_failure` threshold** triggers a clean
-  `ShutdownWithSave` — coordinator drives a final checkpoint
+  `ShutdownWithSave` - coordinator drives a final checkpoint
   through whichever survivor has the freshest state.
 - **NCCL rendezvous-timeout retry** rebuilds the comm on the largest
   contiguous survivor subset.
@@ -310,7 +310,7 @@ TrainerConfig::new(dataset)
 ```
 
 The save bundle is `<stem>.fdl` + `<stem>.meta.json` (carries
-ElCheState — phase, calibration trajectory, ring buffer, guard
+ElCheState - phase, calibration trajectory, ring buffer, guard
 history). Resume:
 
 ```rust
@@ -322,10 +322,10 @@ TrainerConfig::new(dataset)
     .checkpoint_every(5);
 ```
 
-A resumed run inherits ElChe's calibration trajectory — no warmup
+A resumed run inherits ElChe's calibration trajectory - no warmup
 re-run.
 
-## `EpochCallbackPolicy::Fastest` — free-compute callbacks
+## `EpochCallbackPolicy::Fastest` - free-compute callbacks
 
 By default, per-epoch callbacks (`checkpoint_fn`, `epoch_fn`,
 `eval_fn`) fire on the **fastest rank** (lowest
@@ -364,17 +364,17 @@ TrainerConfig::new(dataset)
 | `.max_anchor(n)` | auto | Anchor growth ceiling. |
 | `.max_batch_diff(n)` | `None` | Cap on fastest-vs-slowest lead. `Some(0)` = strict lockstep. |
 | `.relax_up(true)` | `false` | Grow anchor by 1 on Stable verdict (in addition to overhead-tune proposals). |
-| `.partition_ratios([...])` | auto | Static split — Sync mode only. |
+| `.partition_ratios([...])` | auto | Static split - Sync mode only. |
 | `.meta_controller(false)` | `true` | Opt out of LR-aware meta-controller. |
 | `.convergence_guard(g)` | `TrendGuard::new(0.05)` | `NoGuard`, `TrendGuard`, or `MsfGuard`. |
-| `.easgd_alpha(α)` | `None` | EASGD elastic blend — `CpuAsync` only. |
+| `.easgd_alpha(α)` | `None` | EASGD elastic blend - `CpuAsync` only. |
 
 ### Cluster launch
 
 ```bash
 fdl probe                  # single-host readiness
-fdl cluster probe          # multi-host readiness (SSHes each worker)
-fdl cluster <cmd>          # fan out
+fdl @cluster probe          # multi-host readiness (SSHes each worker)
+fdl @cluster <cmd>          # fan out
 FDL_ENV=cluster fdl <cmd>  # equivalent
 fdl nccl build             # build libnccl for LD_PRELOAD bridge (heterogeneous NCCL versions)
 ```

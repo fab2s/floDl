@@ -19,10 +19,10 @@ let g = FlowBuilder::from(Linear::new(4, 8)?)
     .through(Linear::new(8, 2)?)
     .build()?;
 
-// DOT string — print, pipe, or paste into an online viewer.
+// DOT string - print, pipe, or paste into an online viewer.
 println!("{}", g.dot());
 
-// SVG file — requires the `dot` binary from Graphviz.
+// SVG file - requires the `dot` binary from Graphviz.
 let svg = g.svg(Some("model.svg"))?;
 ```
 
@@ -140,14 +140,14 @@ for epoch in 0..num_epochs {
 ## Tips
 
 - **Iterate with DOT first.** Paste into an online viewer while
-  prototyping — no need to install Graphviz locally during design.
+  prototyping - no need to install Graphviz locally during design.
 - **Check levels for parallelism.** If branches you expect to be at the
   same level end up in different levels, there is an unintended dependency.
 - **Verify Using wires.** Dashed blue edges should connect the tagged
   node to the consuming node.
 - **State loops.** Dotted orange edges show forward-ref state. They
-  should form cycles — from writer back to reader.
-- **Large models.** Write SVG and open in a browser — SVG scales cleanly.
+  should form cycles - from writer back to reader.
+- **Large models.** Write SVG and open in a browser - SVG scales cleanly.
 
 ## What's next
 

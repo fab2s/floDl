@@ -11,7 +11,7 @@ A side-by-side reference for PyTorch users learning flodl.
 ## Imports
 
 In PyTorch, `import torch` gives you almost everything. Rust uses explicit
-imports — flodl re-exports its full API from the crate root for convenience:
+imports - flodl re-exports its full API from the crate root for convenience:
 
 ```rust
 use flodl::*;  // brings in Tensor, Variable, all nn modules, graph builder, etc.
@@ -353,7 +353,7 @@ grids = torch.meshgrid(x, y, indexing='ij')
 ```rust
 // flodl
 let y = x.reshape(&[2, 3])?;
-// no separate view — reshape handles it
+// no separate view - reshape handles it
 let y = x.squeeze(0)?;
 let y = x.unsqueeze(0)?;
 let y = x.flatten(1, -1)?;
@@ -508,7 +508,7 @@ println!("{:?}", x.grad());  // Some(tensor([2.0, 4.0]))
 |--------|---------|-------|
 | Gradient access | `x.grad` (attribute) | `x.grad()` returns `Option<Tensor>` |
 | Clear gradients | `x.grad.zero_()` | `x.zero_grad()` |
-| Detach | `x.detach()` | `x.detach()` — returns new leaf Variable |
+| Detach | `x.detach()` | `x.detach()` - returns new leaf Variable |
 | No-grad block | `with torch.no_grad():` | `no_grad(\|\| { ... })` or `let _g = NoGradGuard::new();` |
 | Check grad enabled | `torch.is_grad_enabled()` | `is_grad_enabled()` |
 | Leaf check | `x.is_leaf` | `x.is_leaf()` |
@@ -657,11 +657,11 @@ nn.Identity()
 ```
 
 ```rust
-// flodl — unit structs (no allocation, bare-name usage)
+// flodl - unit structs (no allocation, bare-name usage)
 ReLU
 Sigmoid
 Tanh
-GELU                       // erf form (default) — GELU::tanh() for the tanh approximation
+GELU                       // erf form (default) - GELU::tanh() for the tanh approximation
 SiLU
 Mish
 SELU
@@ -691,26 +691,26 @@ y = torchvision.transforms.functional.gaussian_blur(x, kernel_size=7, sigma=1.5)
 ```
 
 ```rust
-// flodl — as a Module (for use in FlowBuilder graphs)
+// flodl - as a Module (for use in FlowBuilder graphs)
 let blur = GaussianBlur::new(1.5);  // kernel size auto-computed from sigma
 let y = blur.forward(&x)?;
 
-// flodl — as a free function
+// flodl - as a free function
 let y = gaussian_blur_2d(&x, 1.5)?;  // input must be [B, C, H, W]
 ```
 
 `GaussianBlur` is stateless (no parameters). Kernel size is `2 * ceil(3 * sigma) + 1`,
-matching OpenCV's default. Runs under `NoGradGuard` -- no autograd graph built.
+matching OpenCV's default. Runs under `NoGradGuard` - no autograd graph built.
 
 ## Composite Modules
 
 In PyTorch, `nn.Module.__init__` auto-discovers child modules assigned to `self`.
 In flodl, composite modules implement the `Module` trait and declare children
-via `sub_modules()` — enabling recursive device placement, training mode
+via `sub_modules()` - enabling recursive device placement, training mode
 toggling, and parameter collection.
 
 ```python
-# PyTorch — children auto-discovered
+# PyTorch - children auto-discovered
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -726,7 +726,7 @@ model.train()              # propagates to children
 ```
 
 ```rust
-// flodl — declare children via parameters()
+// flodl - declare children via parameters()
 struct MLP {
     fc1: Linear,
     fc2: Linear,
@@ -746,7 +746,7 @@ impl Module for MLP {
 }
 ```
 
-Or skip manual structs entirely — use the **graph builder** (see below).
+Or skip manual structs entirely - use the **graph builder** (see below).
 
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
@@ -773,11 +773,11 @@ loss = F.triplet_margin_loss(anchor, positive, negative, margin=1.0)
 loss = F.cosine_embedding_loss(x1, x2, labels, margin=0.0)
 loss = F.hinge_embedding_loss(input, labels, margin=1.0)
 loss = F.margin_ranking_loss(x1, x2, labels, margin=0.0)
-# focal_loss — not in PyTorch, popular in object detection
+# focal_loss - not in PyTorch, popular in object detection
 ```
 
 ```rust
-// flodl — free functions, return Variable (differentiable)
+// flodl - free functions, return Variable (differentiable)
 let loss = mse_loss(&pred, &target)?;
 let loss = cross_entropy_loss(&logits, &labels)?;   // labels: [B] indices or [B,C] one-hot
 let loss = nll_loss(&log_probs, &labels)?;           // after log_softmax
@@ -788,7 +788,7 @@ let loss = smooth_l1_loss(&pred, &target, 1.0)?;
 let loss = kl_div_loss(&log_probs, &targets)?;
 let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0)?;
 let loss = poisson_nll_loss(&pred, &target, true)?;
-let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma — class imbalance
+let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma - class imbalance
 let loss = triplet_margin_loss(&anchor, &positive, &negative, 1.0)?;
 let loss = cosine_embedding_loss(&x1, &x2, &labels, 0.0)?;
 let loss = hinge_embedding_loss(&input, &labels, 1.0)?;
@@ -813,13 +813,13 @@ opt.step()
 ```
 
 ```rust
-// flodl — optimizers own a clone of the param list
+// flodl - optimizers own a clone of the param list
 let mut opt = SGD::new(&params, 0.01, 0.9);     // lr, momentum
 let mut opt = Adam::new(&params, 0.001);         // lr
 let mut opt = AdamW::new(&params, 0.001, 0.01);  // lr, weight_decay
 let mut opt = RMSprop::new(&params, 0.01);       // lr (alpha=0.99, eps=1e-8)
 let mut opt = Adagrad::new(&params, 0.01);       // lr
-let mut opt = RAdam::new(&params, 0.001);        // rectified Adam — auto warmup
+let mut opt = RAdam::new(&params, 0.001);        // rectified Adam - auto warmup
 let mut opt = NAdam::new(&params, 0.001);        // Nesterov-accelerated Adam
 
 opt.zero_grad();
@@ -838,7 +838,7 @@ opt = torch.optim.Adam([
 ```
 
 ```rust
-// flodl — builder API
+// flodl - builder API
 let mut opt = Adam::with_groups()
     .group(&encoder_params, 1e-5)
     .group(&decoder_params, 1e-3)
@@ -879,7 +879,7 @@ scheduler.step()
 ```
 
 ```rust
-// flodl — schedulers produce an lr, you apply it
+// flodl - schedulers produce an lr, you apply it
 let sched = StepDecay::new(0.001, 30, 0.1);
 let sched = CosineScheduler::new(0.001, 1e-6, 100);
 let sched = ExponentialLR::new(0.001, 0.95);
@@ -899,7 +899,7 @@ opt.set_lr(lr);
 ```
 
 **Key difference:** PyTorch schedulers wrap optimizers. flodl schedulers are pure
-functions — you call `.lr(step)` or `.observe(metric)` and set the lr yourself.
+functions - you call `.lr(step)` or `.observe(metric)` and set the lr yourself.
 
 ## Gradient Clipping
 
@@ -924,7 +924,7 @@ model.load_state_dict(torch.load("model.pt"))
 ```
 
 ```rust
-// flodl — one-call checkpoint (saves params + buffers + structural hash)
+// flodl - one-call checkpoint (saves params + buffers + structural hash)
 model.save_checkpoint("model.fdl")?;
 let report = model.load_checkpoint("model.fdl")?;
 // report.loaded, report.skipped, report.missing
@@ -984,7 +984,7 @@ model.load_checkpoint("model_v2.fdl")?;
 
 The migration matches entries by exact name first, then by shape+dtype in
 positional order. `MigrateReport::is_complete()` returns `true` when nothing
-was dropped or missing. Only works for the same model architecture -- if you
+was dropped or missing. Only works for the same model architecture - if you
 changed the architecture, retrain.
 
 ## Device Placement
@@ -1018,8 +1018,8 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
 | Device check | `torch.cuda.is_available()` | `cuda_available()` |
-| Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` — CUDA-free, no libtorch init |
-| Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `cuda_device_count()` — safe inside training; touches libtorch |
+| Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` - CUDA-free, no libtorch init |
+| Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `cuda_device_count()` - safe inside training; touches libtorch |
 | Model move | `model.to(device)` | `module.move_to_device(device)` |
 | Tensor move | `x.to(device)` | `x.to_device(device)?` |
 | cuDNN benchmark | `torch.backends.cudnn.benchmark = True` | `set_cudnn_benchmark(true)` |
@@ -1027,7 +1027,7 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 ## Weight Initialization
 
 ```python
-# PyTorch — in-place mutation
+# PyTorch - in-place mutation
 nn.init.xavier_uniform_(layer.weight)
 nn.init.xavier_normal_(layer.weight)
 nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
@@ -1039,7 +1039,7 @@ nn.init.trunc_normal_(layer.weight, std=0.02)
 ```
 
 ```rust
-// flodl — returns a new Tensor, then set_data() to apply
+// flodl - returns a new Tensor, then set_data() to apply
 let w = xavier_uniform(&[out, inp], inp, out, device)?;
 let w = xavier_normal(&[out, inp], inp, out, device)?;
 let w = kaiming_uniform(&[out, inp], inp, 0.0, device)?;   // a=0.0 for ReLU
@@ -1145,9 +1145,9 @@ fn train_step(model: &Graph, input: &Variable, target: &Variable,
 
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
-| Model memory | Python GC + reference counting | Rust `Drop` trait — deterministic deallocation |
+| Model memory | Python GC + reference counting | Rust `Drop` trait - deterministic deallocation |
 | GPU memory | GC-delayed; `torch.cuda.empty_cache()` | Freed immediately when last reference drops |
-| Gradient graph | Freed after `.backward()` | `backward()` also calls `detach_()` — grad_fn chain freed synchronously |
+| Gradient graph | Freed after `.backward()` | `backward()` also calls `detach_()` - grad_fn chain freed synchronously |
 | No-grad inference | `with torch.no_grad():` | `no_grad(\|\| { ... })` or `NoGradGuard::new()` |
 | Handle diagnostics | N/A | `live_tensor_count()`, `rss_kb()` |
 
@@ -1156,7 +1156,7 @@ No manual memory management needed. Rust's ownership system handles it.
 ## Graph Builder (flodl-specific)
 
 flodl's unique feature: a fluent API for building computation graphs declaratively.
-No PyTorch equivalent — this replaces manual `nn.Module` subclassing.
+No PyTorch equivalent - this replaces manual `nn.Module` subclassing.
 
 ### Sequential
 
@@ -1180,7 +1180,7 @@ let model = FlowBuilder::from(Linear::new(784, 128)?)
 ### Residual Connections
 
 ```python
-# PyTorch — manual
+# PyTorch - manual
 class ResBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1190,7 +1190,7 @@ class ResBlock(nn.Module):
 ```
 
 ```rust
-// flodl — one line
+// flodl - one line
 let model = FlowBuilder::from(Linear::new(128, 128)?)
     .also(ReLU)    // skip connection: output = input + ReLU(input)
     .build()?;
@@ -1204,7 +1204,7 @@ It generalizes `also` with an explicit `skip` path alongside the `main`
 path: `output = skip(x) + main(x)`.
 
 ```python
-# PyTorch — ResNet BasicBlock with downsample
+# PyTorch - ResNet BasicBlock with downsample
 class BasicBlock(nn.Module):
     def __init__(self, c_in, c_out, stride):
         super().__init__()
@@ -1221,7 +1221,7 @@ class BasicBlock(nn.Module):
 ```
 
 ```rust
-// flodl — same block, one builder chain
+// flodl - same block, one builder chain
 FlowBuilder::from(prev)
     .also_with(
         downsample_1x1_bn,         // skip branch (Identity if no projection needed)
@@ -1237,7 +1237,7 @@ with `also_with`.
 ### Parallel Branches
 
 ```python
-# PyTorch — manual fork/merge
+# PyTorch - manual fork/merge
 class ParallelModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1272,12 +1272,12 @@ let model = FlowBuilder::from(init_module)
 ### Routing (Mixture of Experts)
 
 ```rust
-// Hard routing — one expert per input
+// Hard routing - one expert per input
 let model = FlowBuilder::from(encoder)
     .switch(ArgmaxSelector::new(128, 3)?, modules![expert1, expert2, expert3])
     .build()?;
 
-// Soft routing — weighted mixture
+// Soft routing - weighted mixture
 let model = FlowBuilder::from(encoder)
     .gate(SoftmaxRouter::new(128, 3)?, modules![expert1, expert2, expert3])
     .build()?;
@@ -1331,14 +1331,14 @@ The graph implements `Module`, so it works with optimizers, checkpointing, and e
 ## Graph Tree (Hierarchical Composition)
 
 PyTorch uses `nn.Module` nesting and `named_modules()` for hierarchical access.
-flodl's graph tree provides label-path addressing for the same patterns — freeze
+flodl's graph tree provides label-path addressing for the same patterns - freeze
 by path, per-subgraph optimizer groups, subgraph checkpoint loading, and
 cross-boundary observation.
 
 ### Labeling subgraphs
 
 ```python
-# PyTorch — child modules are auto-discovered
+# PyTorch - child modules are auto-discovered
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1347,7 +1347,7 @@ class Model(nn.Module):
 ```
 
 ```rust
-// flodl — label graphs for tree features
+// flodl - label graphs for tree features
 let encoder = FlowBuilder::from(scan_module)
     .through(read_module)
     .label("encoder")
@@ -1370,7 +1370,7 @@ for param in model.encoder.scan.parameters():
 ```
 
 ```rust
-// flodl — declarative, by label path
+// flodl - declarative, by label path
 model.freeze("encoder")?;
 model.thaw("encoder.scan")?;
 assert!(model.is_frozen("encoder.read")?);  // read stays frozen
@@ -1397,24 +1397,24 @@ let mut optimizer = Adam::with_groups()
 ### Subgraph checkpoint loading
 
 ```python
-# PyTorch — load weights into a submodule
+# PyTorch - load weights into a submodule
 state = torch.load("encoder_v1.pt")
 model.encoder.load_state_dict(state)
 ```
 
 ```rust
-// flodl — loads using the child's own namespace and hash validation
+// flodl - loads using the child's own namespace and hash validation
 let report = model.load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")?;
 ```
 
 ### Cross-boundary observation
 
 ```python
-# PyTorch — manual: register hooks or store intermediates in forward()
+# PyTorch - manual: register hooks or store intermediates in forward()
 ```
 
 ```rust
-// flodl — read tags and metrics across graph boundaries
+// flodl - read tags and metrics across graph boundaries
 model.forward(&input)?;
 let hidden = model.tagged_at("encoder.hidden")?;  // Option<Variable>
 
@@ -1433,7 +1433,7 @@ model.encoder.eval()  # BatchNorm uses running stats
 ```
 
 ```rust
-// flodl — by label path
+// flodl - by label path
 model.set_training_at("encoder", false)?;
 ```
 
@@ -1442,7 +1442,7 @@ See [Graph Tree tutorial](tutorials/10-graph-tree.md) for the full API reference
 ## Training Monitor (replaces TensorBoard)
 
 PyTorch researchers typically use TensorBoard, Weights & Biases, or MLflow for
-training visibility. In floDl, the training monitor is built in — no external
+training visibility. In floDl, the training monitor is built in - no external
 process, no pip install, no separate UI.
 
 ```python
@@ -1459,7 +1459,7 @@ for epoch in range(num_epochs):
 ```
 
 ```rust
-// flodl — built-in monitor with live dashboard
+// flodl - built-in monitor with live dashboard
 use flodl::monitor::Monitor;
 
 let mut monitor = Monitor::new(num_epochs);
@@ -1484,9 +1484,9 @@ monitor.finish_with(&model);  // profiled SVG + archive saved
 | Terminal output | None (web only) | One-line per epoch with ETA |
 | Resource tracking | Manual (no GPU metrics built in) | CPU/RAM/GPU/VRAM automatic |
 | Live charts | Yes (web) | Yes (SSE, no polling) |
-| Architecture viz | `add_graph()` (limited) | `monitor.watch(&model)` — full DOT/SVG with profiling heat map |
+| Architecture viz | `add_graph()` (limited) | `monitor.watch(&model)` - full DOT/SVG with profiling heat map |
 | Offline archive | Log files (need TensorBoard to view) | Self-contained HTML |
-| Dependencies | protobuf, gRPC, webpack frontend | Zero — 16KB inline HTML/JS |
+| Dependencies | protobuf, gRPC, webpack frontend | Zero - 16KB inline HTML/JS |
 
 ## GPU Memory Queries
 
@@ -1498,9 +1498,9 @@ torch.cuda.max_memory_allocated()  # peak allocated
 ```
 
 ```rust
-// flodl — hardware-level via cudaMemGetInfo
+// flodl - hardware-level via cudaMemGetInfo
 let (used, total) = cuda_memory_info()?;   // (bytes_used, bytes_total)
-let util = cuda_utilization();              // Option<u32> — GPU % via NVML
+let util = cuda_utilization();              // Option<u32> - GPU % via NVML
 
 // Allocator-level queries
 let active = cuda_active_bytes()?;             // bytes backing live tensors
@@ -1523,14 +1523,14 @@ cuda_reset_peak_stats();
 | `torch.cuda.empty_cache()` | `cuda_empty_cache()` | Release unused cached blocks |
 | *(no built-in)* | `cuda_utilization()` | GPU compute % via NVML |
 
-The monitor samples these automatically on every `log()` call — you don't need
+The monitor samples these automatically on every `log()` call - you don't need
 to query them manually during training.
 
 ## Multi-GPU Training (DDP)
 
 PyTorch's DDP requires multi-process coordination, environment
 variables, and a launcher (`torchrun`). flodl auto-promotes to
-process-per-rank fan-out automatically when 2+ GPUs are visible — the
+process-per-rank fan-out automatically when 2+ GPUs are visible - the
 **same `Trainer::builder` call** runs on CPU, single GPU, N GPUs
 single-host, or N GPUs across many hosts.
 
@@ -1566,7 +1566,7 @@ process to a launcher, fork-execs one child per rank, sets up NCCL
 rendezvous, and supervises children. No torchrun, no env-var dance.
 
 For multi-host, add an `fdl.cluster.yml` (or build the topology
-programmatically with `ClusterBuilder`); `fdl cluster train` SSHes
+programmatically with `ClusterBuilder`); `fdl @cluster train` SSHes
 every worker, pre-builds, and fans out.
 
 ### Concept mapping
@@ -1576,7 +1576,7 @@ every worker, pre-builds, and fans out.
 | `dist.init_process_group("nccl")` | Automatic | Launcher handles rendezvous; NCCL init on main + `split()` everywhere |
 | `DistributedDataParallel(model)` | `Trainer::builder()` / `Trainer::run()` | Auto-promote on 2+ visible GPUs |
 | `DistributedSampler` | Automatic | Each rank instantiates its own `DataLoader`; coordinator pushes per-epoch shard plan |
-| `torchrun --nproc_per_node=N` | Auto-promote (single-host) / `fdl cluster <cmd>` (multi-host) | One binary; the launcher trampoline forks rank children |
+| `torchrun --nproc_per_node=N` | Auto-promote (single-host) / `fdl @cluster <cmd>` (multi-host) | One binary; the launcher trampoline forks rank children |
 | `MASTER_ADDR` / `MASTER_PORT` env | `fdl.cluster.yml controller.host:port` / `ClusterBuilder.controller(host).port(p)` | First-class topology |
 | `model.to(rank)` | `model_factory(device)` | Per-device model in closure |
 | Equal batch per GPU only | `ElChe` cadence | Heterogeneous GPU support; weighted gradient averaging |
@@ -1642,7 +1642,7 @@ See the [DDP Reference](ddp.md) for complete API documentation.
 
 ## See also
 
-- [Porting Guide](porting.md) -- AI-assisted porting with `fdl` and the `/port` skill
-- [CLI documentation](cli.md) -- project scaffolding (`fdl init`), libtorch management, `fdl api-ref`
-- [Graph builder tutorial](tutorials/05-graph-builder.md) -- FlowBuilder patterns in depth
-- [DDP Reference](ddp.md) -- multi-GPU training
+- [Porting Guide](porting.md) - AI-assisted porting with `fdl` and the `/port` skill
+- [CLI documentation](cli.md) - project scaffolding (`fdl init`), libtorch management, `fdl api-ref`
+- [Graph builder tutorial](tutorials/05-graph-builder.md) - FlowBuilder patterns in depth
+- [DDP Reference](ddp.md) - multi-GPU training

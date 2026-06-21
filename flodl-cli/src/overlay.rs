@@ -19,7 +19,8 @@
 //! # Discovery
 //!
 //! Sibling files matching `fdl.<env>.{yml,yaml,json}` alongside the base
-//! config. The `<env>` token is the first-arg env selector.
+//! config. `<env>` is selected via the `@<env>` token, `--env <env>`, or
+//! `FDL_ENV=<env>`.
 
 use std::path::{Path, PathBuf};
 

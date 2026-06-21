@@ -9,7 +9,7 @@ scales out to multi-host clusters via `fdl.cluster.yml` or
 
 > **Prerequisites**: [Training](04-training.md) covers single-device
 > training. This tutorial assumes the universal `Trainer::builder`
-> shape — extending it to N GPUs is configuration, not code.
+> shape - extending it to N GPUs is configuration, not code.
 
 > **Time**: ~20 minutes.
 
@@ -54,7 +54,7 @@ change.
   rank 1: device=CUDA(1) | GTX 1060    | epoch 0/50 started
 ```
 
-## What just happened — auto-promote
+## What just happened - auto-promote
 
 When `Trainer::builder(...).run()` (or `Trainer::run`) fires on a host
 where `flodl::sys::detect_gpus() >= 2` and **no cluster overlay is
@@ -64,7 +64,7 @@ active**, the framework:
    touched).
 2. Synthesizes a single-host cluster topology covering every visible
    device.
-3. Turns the calling binary process into the **launcher** — it forks
+3. Turns the calling binary process into the **launcher** - it forks
    one child per rank, each running the same binary with
    `FLODL_RANK=<n>` set.
 4. Each rank child connects to the controller (also hosted on the
@@ -78,7 +78,7 @@ Auto-promote is **`cfg(not(test))`-gated** for flodl's own test suite
 in-process). External crates that want a single-rank run on a
 multi-GPU host scope down via `CUDA_VISIBLE_DEVICES=0`.
 
-## The critical invariant — no CUDA before `Trainer::run`
+## The critical invariant - no CUDA before `Trainer::run`
 
 > **User binaries must not touch libtorch's CUDA context before
 > reaching `Trainer::run` / `Trainer::builder().run()`.**
@@ -102,14 +102,14 @@ for g in &gpus {
 }
 
 if gpus.is_empty() {
-    eprintln!("no CUDA GPUs visible — single-device fallback");
+    eprintln!("no CUDA GPUs visible - single-device fallback");
 }
 ```
 
 `detect_gpus()` honors `CUDA_VISIBLE_DEVICES`, so the result matches
 the view that the auto-promote path and child processes will see.
 
-## Graph one-liner — `Trainer::setup`
+## Graph one-liner - `Trainer::setup`
 
 When your model is a flodl `Graph` and you want to keep the training
 loop visible, `Trainer::setup` distributes + sets the optimizer +
@@ -162,7 +162,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
     .run()?;
 ```
 
-## ElChe — heterogeneous GPUs train at their own pace
+## ElChe - heterogeneous GPUs train at their own pace
 
 Named after the marching principle: *"the column marches at the
 slowest one's pace."* ElChe is the heterogeneous-rig balancer that
@@ -177,7 +177,7 @@ your RTX 5060 Ti processes a batch in 10 ms and your GTX 1060 takes
 ### The solution
 
 The slow GPU anchors the cadence. The fast GPU processes more batches
-per averaging window — the same AllReduce sync time amortizes over
+per averaging window - the same AllReduce sync time amortizes over
 more local compute. ElChe auto-tunes the anchor count based on
 observed throughput so the AllReduce overhead stays at a small
 fraction of compute time (`overhead_target`, default 10%).
@@ -211,7 +211,7 @@ it. See [DDP Reference: Guard authority over
 
 ## Tuning ElChe
 
-Most rigs don't need any tuning — the defaults adapt to whatever
+Most rigs don't need any tuning - the defaults adapt to whatever
 hardware is visible. When you do want to tune, every knob lives on
 `ElCheConfig`:
 
@@ -243,15 +243,15 @@ Reference](../ddp.md#elcheconfig-knobs)):
 | `.partition_ratios([...])` | auto | Static split when ElChe's auto-balancing isn't what you want (Sync mode only). |
 | `.meta_controller(false)` | `true` | Opt out for unconditioned-trajectory instrumentation runs. |
 
-## Mode selection — `ElCheMode`
+## Mode selection - `ElCheMode`
 
 The five DDP modes:
 
 | Mode | Best for |
 |---|---|
-| `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU. Genuine async — averaging decoupled from the GPU pipeline. |
+| `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU. Genuine async - averaging decoupled from the GPU pipeline. |
 | `NcclCadence` (default) | Strong NCCL default. Anchor-based scheduling; fast devices process proportionally more batches per averaging window. |
-| `NcclSync` | Strict per-batch AllReduce — homogeneous rigs, correctness-first baseline |
+| `NcclSync` | Strict per-batch AllReduce - homogeneous rigs, correctness-first baseline |
 | `CpuSync`, `CpuCadence` | A/B against NCCL when peer-access is unavailable |
 
 See [A/B testing modes](../ddp.md#ab-testing-modes) for the suggested
@@ -265,7 +265,7 @@ shard. The coordinator computes proportional sharding from
 epoch plan to each worker. The DataLoader is otherwise unaware that a
 cluster exists.
 
-Per-device backend selection is independent on every rank — a 16 GB
+Per-device backend selection is independent on every rank - a 16 GB
 GPU can go resident (dataset loaded into VRAM once) while a 6 GB GPU
 on the same training run uses streaming (prefetch worker with async
 H2D). No lowest-common-denominator constraint.
@@ -280,7 +280,7 @@ let loader = DataLoader::from_batch_dataset(dataset)
 See [Tutorial 13: Data Loading](13-data-loading.md) for the full
 DataLoader surface.
 
-## Host-side callbacks — `metrics_fn` / `eval_fn`
+## Host-side callbacks - `metrics_fn` / `eval_fn`
 
 The shape `Trainer::builder().run()?.join()?` is the canonical "just
 train" form. For per-epoch logging, monitor wiring, or held-out
@@ -317,11 +317,11 @@ Trainer::builder(model_factory, optim_factory, train_step)
 
 `metrics_fn` fires once per epoch on the host thread after all ranks
 aggregate. `eval_fn` runs on the rank elected by
-`EpochCallbackPolicy::Fastest` (the default — the rank with the lowest
+`EpochCallbackPolicy::Fastest` (the default - the rank with the lowest
 `smoothed_ms_per_batch`, so eval is free compute on heterogeneous
 rigs). `eval_result_fn` receives the scalar result on the host.
 
-Pin a specific rank with `EpochCallbackPolicy::Rank(n)` — `n` is the
+Pin a specific rank with `EpochCallbackPolicy::Rank(n)` - `n` is the
 **global rank index** (0..world_size), assigned sequentially by
 worker order in the cluster topology. See [DDP Reference:
 `EpochCallbackPolicy`](../ddp.md#epochcallbackpolicy).
@@ -329,7 +329,7 @@ worker order in the cluster topology. See [DDP Reference:
 ## Live dashboard
 
 `monitor.serve(port)` works transparently across single-host
-multi-GPU and multi-host clusters — the launcher hosts a single
+multi-GPU and multi-host clusters - the launcher hosts a single
 dashboard URL that aggregates every rank's metrics. Open it once;
 follow the whole cluster.
 
@@ -359,7 +359,7 @@ The dashboard shows per-rank tabs (one per rank, per host), throughput
 curves, batch-share distribution, VRAM, and ElChe anchor evolution. See
 [Tutorial 9: Training Monitor](09-monitor.md) for the full surface.
 
-## Scaling out — multi-host clusters
+## Scaling out - multi-host clusters
 
 Add an `fdl.cluster.yml` next to your `fdl.yml`:
 
@@ -381,17 +381,17 @@ cluster:
       local_devices: all
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
-      arch: builds/sm61-sm120     # different libtorch variant — fine
+      arch: builds/sm61-sm120     # different libtorch variant - fine
 ```
 
 Launch with the env overlay:
 
 ```bash
-fdl probe                   # readiness gate — verify before launching
-fdl cluster train           # SSHes each worker, pre-builds, fans out
+fdl probe                   # readiness gate - verify before launching
+fdl @cluster train           # SSHes each worker, pre-builds, fans out
 ```
 
-`Trainer::run` is the **same call** on the worker — the multi-host
+`Trainer::run` is the **same call** on the worker - the multi-host
 launcher trampoline takes care of fan-out, NCCL rendezvous, and
 controller binding. See [DDP Reference: Multi-host
 clusters](../ddp.md#multi-host-clusters) and [CLI Reference: cluster
@@ -443,10 +443,10 @@ Trainer::builder(model_factory, optim_factory, train_step)
 ring buffer) so a resumed run inherits ElChe's calibration. See
 [DDP Reference: Resume + checkpoints](../ddp.md#resume--checkpoints).
 
-## Manual control — `Ddp::wrap` (test-only)
+## Manual control - `Ddp::wrap` (test-only)
 
-For training patterns that need explicit replica control — GAN
-discriminator vs generator, RL actor vs critic, progressive growing —
+For training patterns that need explicit replica control - GAN
+discriminator vs generator, RL actor vs critic, progressive growing -
 `Ddp::wrap` exposes the thread-per-GPU machinery. It is
 `cfg(test)`-gated for flodl's own tests; external crates that want it
 opt in explicitly.
@@ -466,15 +466,15 @@ for batch in &dataset {
 ```
 
 For all standard use cases, `Trainer::run` / `Trainer::builder` is the
-production path — per-rank logs, rank death survival, cluster fan-out,
+production path - per-rank logs, rank death survival, cluster fan-out,
 elastic membership, controller-driven checkpoint retry.
 
 ## Quick reference
 
 | Entry | When |
 |---|---|
-| `Trainer::builder(model_fn, opt_fn, step).run()` | Universal — any Module, any tier (CPU / 1 GPU / N GPUs / cluster). |
-| `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag — useful for config-driven launchers. |
+| `Trainer::builder(model_fn, opt_fn, step).run()` | Universal - any Module, any tier (CPU / 1 GPU / N GPUs / cluster). |
+| `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag - useful for config-driven launchers. |
 | `Trainer::setup(&graph, factory, opt_fn)` | Graph-shaped one-liner; you keep the training loop. |
 | `Trainer::setup_head(&head, factory, opt_fn)` | `flodl-hf` task-head wrapper analog. |
 | `Ddp::wrap(&[&model], &devices)` | Thread-per-GPU manual control; test-only on flodl's own suite. |

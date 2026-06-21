@@ -1,7 +1,7 @@
 # Tutorial 9: Training Monitor
 
 The training monitor provides human-readable progress output, system resource
-tracking, and an optional live web dashboard — all with zero external
+tracking, and an optional live web dashboard - all with zero external
 dependencies.
 
 > **Prerequisites**: [Training](04-training.md) covers the training loop.
@@ -68,7 +68,7 @@ available. On CPU-only builds they are silently omitted.
 
 ## Multiple Metrics
 
-Record everything on the graph — `flush` averages each tag independently:
+Record everything on the graph - `flush` averages each tag independently:
 
 ```rust
 model.record_scalar("loss", loss.item()?);
@@ -105,7 +105,7 @@ Open `http://localhost:3000` in a browser. The dashboard shows:
 
 ### How it works
 
-The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-Sent_Events) (SSE) — no HTTP framework, no WebSocket library, no JavaScript dependencies.
+The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-Sent_Events) (SSE) - no HTTP framework, no WebSocket library, no JavaScript dependencies.
 
 1. `monitor.serve(port)` spawns a background listener thread
 2. Each browser connection gets its own handler thread
@@ -124,10 +124,10 @@ handler replays all past epoch events before switching to live streaming.
 `monitor.serve(port)` works the same way on single-host multi-GPU and
 multi-host clusters: **one URL covers the whole run**. When the
 launcher fans out to multiple rank processes (auto-promoted on 2+
-GPUs, or via `fdl cluster <cmd>`), the dashboard automatically grows
+GPUs, or via `fdl @cluster <cmd>`), the dashboard automatically grows
 per-rank tabs labeled by host and local-rank (`host: lr=N gr=M`), with
 throughput curves, batch-share distribution, VRAM, and ElChe anchor
-evolution. No extra wiring — just open `http://<launcher-host>:3000`
+evolution. No extra wiring - just open `http://<launcher-host>:3000`
 and follow the whole cluster.
 
 ### Embedding the graph
@@ -155,7 +155,7 @@ for epoch in 0..num_epochs {
 monitor.finish_with(&model);  // final SVG with steady-state timing heat map
 ```
 
-`finish_with` generates the profiled SVG at the end of training — when the
+`finish_with` generates the profiled SVG at the end of training - when the
 last forward pass timing is representative of steady-state performance. The
 heat map is pushed to the live dashboard and baked into the HTML archive.
 
@@ -188,7 +188,7 @@ flodl exposes two levels of CUDA memory measurement:
 | `cuda_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
 
 The monitor tracks `cuda_allocated_bytes` (reserved) because it detects
-unified-memory spill — when reserved bytes exceed physical VRAM, the
+unified-memory spill - when reserved bytes exceed physical VRAM, the
 allocator has spilled to host RAM.
 
 For debugging, compare both: if `active` is small but `reserved` is large,
@@ -208,7 +208,7 @@ for record in monitor.history() {
 
 ### Dashboard archive
 
-Save the full dashboard as a self-contained HTML file — all charts, resource
+Save the full dashboard as a self-contained HTML file - all charts, resource
 graphs, epoch log, and graph SVG baked in. Open it in any browser, no server.
 
 ```rust
@@ -289,7 +289,7 @@ for epoch in 0..num_epochs {
 ```
 
 The dashboard shows each metric as a separate curve. Dotted names group
-naturally in the legend -- you can solo-click `subscan.ce` to focus on it.
+naturally in the legend - you can solo-click `subscan.ce` to focus on it.
 
 If child subgraphs flush on a different cadence, use `flush_local()` to manage
 them independently. See [Independent flush cadences](10-graph-tree.md#independent-flush-cadences).
@@ -298,13 +298,13 @@ them independently. See [Independent flush cadences](10-graph-tree.md#independen
 
 floDl has two metric systems that serve different purposes:
 
-- **Graph observation** (`record`/`flush`/`trend`) — metrics that **feed back
+- **Graph observation** (`record`/`flush`/`trend`) - metrics that **feed back
   into training**. Use trends to trigger early stopping, LR decay, or
   convergence checks. The graph owns this data and your training loop reads it.
 
-- **Monitor** (`log`/`serve`/`save_html`) — metrics for **the human watching
+- **Monitor** (`log`/`serve`/`save_html`) - metrics for **the human watching
   training**. Terminal output, live dashboard, resource tracking. It doesn't
-  feed back into anything — it's purely observational.
+  feed back into anything - it's purely observational.
 
 | | Graph observation | Monitor |
 |---|---|---|
@@ -312,7 +312,7 @@ floDl has two metric systems that serve different purposes:
 | **Record** | `record()`/`collect()` per step, `flush()` per epoch | `log()` per epoch |
 | **Analysis** | `trend().slope()`, `stalled()`, `improving()` | Raw history only |
 | **Resources** | No | CPU, RAM, GPU, VRAM |
-| **HTML output** | `plot_html()` — static chart of epoch curves | `save_html()` — full dashboard archive with resource graphs, epoch log, and graph SVG |
+| **HTML output** | `plot_html()` - static chart of epoch curves | `save_html()` - full dashboard archive with resource graphs, epoch log, and graph SVG |
 | **Live dashboard** | No | Yes (`serve()` with SSE streaming) |
 
 They complement each other: use graph observation for metrics that drive
@@ -320,7 +320,7 @@ training decisions, and the monitor for human-facing output and system health.
 
 ### Using both together
 
-`log` accepts a graph reference directly — it reads the latest epoch
+`log` accepts a graph reference directly - it reads the latest epoch
 history and forwards it to the monitor. You still flush yourself, so
 observation and monitoring stay decoupled:
 
@@ -361,13 +361,13 @@ monitor.finish_with(&model);  // final SVG with profiling heat map
 `log` accepts several forms via the [`Metrics`] trait:
 
 ```rust
-// Plain metrics — no graph:
+// Plain metrics - no graph:
 monitor.log(epoch, t.elapsed(), &[("loss", val), ("lr", lr)]);
 
-// Graph only — all recorded metrics:
+// Graph only - all recorded metrics:
 monitor.log(epoch, t.elapsed(), &model);
 
-// Graph + extras — recorded metrics plus additional values:
+// Graph + extras - recorded metrics plus additional values:
 monitor.log(epoch, t.elapsed(), (&model, &[("lr", lr)]));
 ```
 

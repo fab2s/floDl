@@ -3,8 +3,9 @@
 # Usage:
 #   cp fdl.cluster.yml.example fdl.cluster.yml
 #   # edit `controller:` + `workers:` sections to match your rig
-#   fdl cluster <command>      # activates this overlay (first-arg env convention)
-#   FDL_ENV=cluster fdl <cmd>  # equivalent
+#   fdl @cluster <command>     # activates this overlay (`@` env selector)
+#   fdl --env cluster <cmd>    # equivalent (flag form)
+#   FDL_ENV=cluster fdl <cmd>  # equivalent (env-var form)
 #
 # Schema (Refactor 2): strict separation of `controller:` (the
 # orchestrator host fdl-cli runs on, NEVER a NCCL rank) and `workers:`
@@ -12,8 +13,8 @@
 #
 # Conventions:
 #   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism
-#     picks it up when invoked as `fdl cluster <cmd>` (first arg =
-#     overlay name) or with `FDL_ENV=cluster` set in the environment.
+#     picks it up when invoked as `fdl @cluster <cmd>` (the `@` env
+#     selector) or with `FDL_ENV=cluster` set in the environment.
 #   - One process per rank. Each worker owns one rank per visible CUDA
 #     device. Global rank IDs are NOT user input — fdl probes each host
 #     for its device count before fan-out and assigns ranks sequentially

@@ -19,7 +19,7 @@ nothing you wrote against 0.4.0 needs to change unless you were using
    `version`, `quiet`, or `env` (or short-flagged `h`, `V`, `q`, `v`,
    `e`), rename it.
 3. Optional: rename `fdl.dev.yml` / `fdl.ci.yml` style files you had
-   been selecting manually -- `fdl --env <name>` now loads them
+   been selecting manually - `fdl --env <name>` now loads them
    automatically.
 
 That's it. Everything else is additive.
@@ -30,8 +30,8 @@ That's it. Everything else is additive.
 
 In 0.4.0, `fdl.yml` had two top-level maps:
 
-- `scripts:` -- shell-string commands, no docker wrapping.
-- `commands:` -- docker-wrapped entries with structured config.
+- `scripts:` - shell-string commands, no docker wrapping.
+- `commands:` - docker-wrapped entries with structured config.
 
 In 0.5.0 these are merged into one **`commands:` map** with three
 kinds, chosen by which fields the entry sets: `run:` (shell), `path:`
@@ -131,13 +131,12 @@ If you already maintained per-environment `fdl.yml` files manually
 the base via:
 
 ```bash
+fdl @ci test              # @ sigil (scan-anywhere before --)
 fdl --env ci test         # explicit flag
 FDL_ENV=ci fdl test       # env var
-fdl ci test               # first-arg convention, if fdl.ci.yml exists
-                          # and "ci" is not also a command name
 ```
 
-Nothing breaks if you don't use this -- overlays are purely additive.
+Nothing breaks if you don't use this - overlays are purely additive.
 `fdl config show [env]` prints the resolved merged config with
 per-layer origin annotations, which is the fastest way to verify a
 new overlay before running a long job.
@@ -149,10 +148,10 @@ new overlay before running a long job.
 None of these replace existing commands; they are new conveniences
 that existed as no-ops or were simply absent in 0.4.0:
 
-- `fdl config show [env]` -- resolved YAML with origin annotations.
-- `fdl schema list | clear [<cmd>] | refresh [<cmd>]` -- manage the
+- `fdl config show [env]` - resolved YAML with origin annotations.
+- `fdl schema list | clear [<cmd>] | refresh [<cmd>]` - manage the
   per-command schema cache.
-- `fdl autocomplete` -- one-shot installer for shell completions.
+- `fdl autocomplete` - one-shot installer for shell completions.
 - `--refresh-schema` per-invocation flag to refresh one entry's cache
   without a manual `fdl schema refresh`.
 
@@ -162,7 +161,7 @@ that existed as no-ops or were simply absent in 0.4.0:
 
 0.5.0 adds one new published crate:
 
-- [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros) --
+- [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros) -
   the proc-macro derive for `FdlArgs`, re-exported by
   [`flodl-cli`](https://crates.io/crates/flodl-cli) as
   `flodl_cli::FdlArgs`. Downstream binaries depend on `flodl-cli`,
@@ -183,7 +182,7 @@ no `### Removed` or `### Changed (breaking)` entries outside of the
 CLI / manifest scope above.
 
 If you're upgrading from 0.3.0 or earlier, read through CHANGELOG.md
-from your version forward -- the 0.4.0 entry is the larger one on the
+from your version forward - the 0.4.0 entry is the larger one on the
 framework side.
 
 ---

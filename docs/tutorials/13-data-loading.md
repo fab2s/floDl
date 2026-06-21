@@ -235,7 +235,7 @@ where every sample matters.
 
 ## DDP integration
 
-Pass the dataset directly to `Trainer::builder` or `TrainerConfig` —
+Pass the dataset directly to `Trainer::builder` or `TrainerConfig` -
 the framework constructs a per-rank `DataLoader` against each rank's
 dataset shard automatically:
 
@@ -261,7 +261,7 @@ Under DDP, each rank's loader operates independently:
 
 ### Streaming from external sources
 
-`DataSet` / `BatchDataSet` are pull-based traits — the body of `get()`
+`DataSet` / `BatchDataSet` are pull-based traits - the body of `get()`
 / `get_batch()` decides where the samples come from. The framework's
 "resident" vs "streaming" modes are about CPU → VRAM transfer; the
 underlying source can be RAM, mmap, disk, network, S3, a database, or
@@ -277,7 +277,7 @@ impl BatchDataSet for S3Dataset {
 
     fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
         // Fetch on-demand. Cache locally as you go, parallelize
-        // requests if useful — all up to your impl.
+        // requests if useful - all up to your impl.
         let bytes = self.fetch_indices(indices)?;
         self.decode_to_tensors(&bytes, indices.len())
     }
@@ -297,7 +297,7 @@ implement the trait and pass it.
 | `.device(Device)` | CPU | Target device (the per-rank loader auto-targets its own CUDA device under DDP) |
 | `.seed(u64)` | 42 | RNG seed for shuffling |
 | `.shuffle(bool)` | true | Enable shuffling |
-| `.sampler(Box<dyn Sampler>)` | -- | Custom sampler (overrides shuffle) |
+| `.sampler(Box<dyn Sampler>)` | - | Custom sampler (overrides shuffle) |
 | `.prefetch(usize)` | Auto | Override auto-detected prefetch depth |
 | `.vram_max_usage(f64)` | 0.90 | Max VRAM fraction for prefetch |
 | `.streaming()` | Auto | Force streaming mode |

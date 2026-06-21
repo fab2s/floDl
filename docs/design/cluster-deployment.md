@@ -1,7 +1,7 @@
 # Cluster Deployment Architecture
 
 flodl's distributed-training stack ships in three structurally
-independent layers — **storage**, **orchestration**, and **compute** —
+independent layers - **storage**, **orchestration**, and **compute** -
 that production users can scale, replace, and pay for separately. The
 default in-tree dev path (single host, controller + averager + ranks
 in one process tree) is the special case where all three layers
@@ -19,14 +19,14 @@ design-only. It does not cover communication algorithms (see
 
 A shared filesystem accessible by every node in the cluster, hosting:
 
-- **Datasets** — read-mostly. NFS, S3-FUSE, virtiofs, NetApp, anything
+- **Datasets** - read-mostly. NFS, S3-FUSE, virtiofs, NetApp, anything
   that mounts. Production users handle this exactly the way they'd
   mount any other ML dataset.
-- **libtorch builds** — read-only after provisioning. One install per
+- **libtorch builds** - read-only after provisioning. One install per
   arch (or one multi-arch variant covering many) lives here.
-- **Training binaries** — compiled artifacts the controller ships
+- **Training binaries** - compiled artifacts the controller ships
   out per training run. Read-only at runtime.
-- **Checkpoints** — written by ranks during training; read at resume.
+- **Checkpoints** - written by ranks during training; read at resume.
   Bundle layout per
   [`CheckpointBundle`](../../flodl/src/distributed/checkpoint_meta.rs).
 
@@ -133,13 +133,13 @@ Data, libs, and binaries live on the shared layer. Each host
 mounts them; nothing is rsync'd or git-pulled at training-start time.
 This is how real datacenters work. NFS / S3-FUSE / NAS for prod;
 virtiofs for dev rigs. Either way, the storage layer **is** the
-source-of-truth — eliminates entire classes of "host X has a stale
+source-of-truth - eliminates entire classes of "host X has a stale
 checkout" failures.
 
 ## Controller / averager separation (future capability)
 
 Today the launcher process hosts both `ClusterCoordinator` (cheap
-orchestration) and `ClusterController` (heavy CPU averaging — receives
+orchestration) and `ClusterController` (heavy CPU averaging - receives
 every rank's params, computes mean, broadcasts back). They share an
 address space because they were sequenced together; nothing in their
 contracts requires it.
@@ -152,7 +152,7 @@ Production users will want them separable:
 | Averager | Per training run | High bandwidth, moderate CPU | $$ per hour, on-demand |
 | GPU ranks | Per training run | High GPU + interconnect | $$$ per hour, on-demand |
 
-Cluster.yml gains optional separate addressing — `coordinator_addr`
+Cluster.yml gains optional separate addressing - `coordinator_addr`
 + `coordinator_port` distinct from `averager_addr` + `averager_port`.
 Falling back to `master_addr:master_port+2/+3` (current behavior)
 when both unset preserves the single-host dev path.
@@ -179,7 +179,7 @@ manylinux2014 base with cudnn + cufile bundled. For those users,
 precompiled variant.
 
 Edge cases (one extreme: Pascal sm_61 + Blackwell sm_120 on the same
-cluster — actual dev rig used to validate this arc) require custom
+cluster - actual dev rig used to validate this arc) require custom
 libtorch builds. Today `fdl libtorch build` produces native-glibc
 binaries; for cloud portability of custom builds, add a `--portable`
 flag that:
@@ -222,12 +222,12 @@ visible GPUs, the controller + averager run in-process, NCCL elastic
 membership survives rank death, ShutdownWithSave persists state on
 unrecoverable failure.
 
-Multi-host production user with `fdl cluster <cmd>`: **works**, with
+Multi-host production user with `fdl @cluster <cmd>`: **works**, with
 manual libtorch provisioning per host (`fdl libtorch download`
 on each, separately). No auto-probe, no auto-deploy, no
 controller/averager separation, no shared-storage abstraction in
-the cluster topology — these are deferred.
+the cluster topology - these are deferred.
 
-Test rig with `fdl cluster-test <cmd>`: **works** with virtiofs or
+Test rig with `fdl @cluster-test <cmd>`: **works** with virtiofs or
 sshfs shared mount. The end-to-end NCCL via-coord smoke test passed
 on a 2-rank Pascal rig validating the elasticity + persistence work.

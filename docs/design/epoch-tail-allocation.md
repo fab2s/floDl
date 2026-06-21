@@ -38,7 +38,7 @@ epoch/run tail: once `remaining < Σ batch_counts`, each rank is dispatched
 shared pool drains in dispatch order, the fast rank consumes its full share
 off the top and the slow ranks receive whatever scraps remain. With 72
 batches left and a `[71, 18, 15]` schedule, rank 0 took 71, leaving 1 for
-rank 1 and 0 for rank 2 — the `[71, 1, 0]` above.
+rank 1 and 0 for rank 2 - the `[71, 1, 0]` above.
 
 Coverage is unaffected: the pool still drains to exactly 0, every sample is
 dispatched once, and a rank that finds the pool empty contributes `(0, 0)`
@@ -48,7 +48,7 @@ does not touch the averaging weights or convergence.
 
 ## The actual trigger: a lone-1 window, not a 1-batch chunk
 
-The delivered accumulator in the event loop is marginal — it skips the
+The delivered accumulator in the event loop is marginal - it skips the
 window's first batch (`steps_since_avg[rank] > 1`) so the per-chunk fixed
 fill cost never enters the per-batch rate. Consequently a rank's delivered
 sample is zeroed **only when it runs exactly one step in the whole window**:
@@ -72,13 +72,13 @@ pad).
 
 Two branches:
 
-### 1. `R ≥ world_size` — fire the final window, proportionally, then consolidate
+### 1. `R ≥ world_size` - fire the final window, proportionally, then consolidate
 
 Split the remainder proportionally: `round(R · ratio[r])`, assigning the
 integer rounding residual to a single rank so the dispatched total equals `R`
 exactly (coverage stays exact). Then a **consolidation pass**: any rank
 allocated exactly 1 has that batch moved onto the smallest peer that already
-holds ≥ 1 (never onto a 0 — that would create a fresh lone-1 and walk the
+holds ≥ 1 (never onto a 0 - that would create a fresh lone-1 and walk the
 problem around the ring); the orphan drops to 0.
 
 Because `R ≥ world_size` there is always a ≥1 peer, so the pass terminates
@@ -88,7 +88,7 @@ with every nonzero rank at ≥2. Worked cases:
 [1,1,1] → [0,3,0]      [2,1,1] → [2,0,2]      [2,2,1] → [3,2,0]
 ```
 
-### 2. `R < world_size` — fold the crumb into the penultimate window
+### 2. `R < world_size` - fold the crumb into the penultimate window
 
 When fewer than `world_size` batches remain there is not enough to give every
 rank even one, so no clean final window exists. Instead, fold all of `R` into
@@ -98,7 +98,7 @@ exactly enough room, and the fastest rank is never touched. No final window
 fires.
 
 This is the piece that closes the last gap. Within a single window the
-`[1,0,0]` case (R = 1) is irreducible — there is no peer to consolidate the
+`[1,0,0]` case (R = 1) is irreducible - there is no peer to consolidate the
 lone batch onto. But the **previous window is always a valid sink**: a +1 on
 a slow rank in the penultimate costs a single batch of negligible drift, and
 the degenerate final window simply never happens. Composed with branch 1,
@@ -137,7 +137,7 @@ edge condition (`remaining < Σ batch_counts`); the two never overlap.
   also running eval/checkpoint (whose time `callback_roles` already subtracts
   from `wall_ms_accum` / `pb_delivered`); if that rank is the fast one,
   pushing the tail onto slow ranks overlaps their compute with the fast
-  rank's eval bubble — a net win, not merely benign.
+  rank's eval bubble - a net win, not merely benign.
 - **The fallback remains as a backstop.** The all-or-none gate is untouched.
   A bug in the new branches can at worst reintroduce a one-window
   compute-scale fallback; it cannot corrupt coverage or the average.
@@ -146,7 +146,7 @@ edge condition (`remaining < Σ batch_counts`); the two never overlap.
 
 The guarantee is "every participating rank ends at **0 or ≥2**," not "every
 GPU runs ≥2." Consolidation legitimately parks some slow ranks at 0 in the
-final window — they sit out, excluded as non-movers, which is correct. The
+final window - they sit out, excluded as non-movers, which is correct. The
 property we actually enforce is the absence of any rank at exactly 1, because
 that is the fallback trigger.
 
@@ -161,11 +161,11 @@ cpu-async does **not** share this problem, and the reason is worth stating: its
 reduces ride the overshoot cadence, not epoch-aligned windows, and
 `pb_delivered` accumulates continuously across the overshoot (spanning chunks
 and epochs). So a small epoch-tail chunk never produces a 1-step *reduce
-window* — the `[N,1,0]` fallback is a Cadence artifact of barrier-aligned final
+window* - the `[N,1,0]` fallback is a Cadence artifact of barrier-aligned final
 windows. Async needs no `final_window_alloc` analog.
 
-Async's boundary question is a different one — coherent callbacks and
-resumable checkpoints — and is specified in [Async](#async) below.
+Async's boundary question is a different one - coherent callbacks and
+resumable checkpoints - and is specified in [Async](#async) below.
 
 ## Validation
 
@@ -184,7 +184,7 @@ fix against the existing `[coord-prof]` dump, which already reports `feed=`,
 | nccl-cadence | 105 / 105 | 0 | none | 0.690 | 0.850 |
 
 The originally-observed `[71,1,0]` boundary is gone; a representative small
-final window now reads `steps=[3,3,0]` (`feed=delivered`) — rank 2 sits out at
+final window now reads `steps=[3,3,0]` (`feed=delivered`) - rank 2 sits out at
 0 (excluded as a non-mover) and the other two land at ≥2.
 
 ---
@@ -194,11 +194,11 @@ final window now reads `steps=[3,3,0]` (`feed=delivered`) — rank 2 sits out at
 **Status:** the **checkpoint/resume** mechanism described here is implemented
 and unit-validated (see [What landed](#what-landed)); rig kill-and-resume
 validation is pending. Eval-on-consensus and the callback report-and-wait gate
-remain design. Async (CpuAsync — there is no
+remain design. Async (CpuAsync - there is no
 NcclAsync) has no lone-1 tail problem (see [Scope](#scope-cadence-first)), so
 this section is not about chunk sizing. It is about the *other* thing the
 epoch boundary touches in async: firing callbacks coherently and writing
-checkpoints that resume without repeating data — while never introducing an
+checkpoints that resume without repeating data - while never introducing an
 artificial barrier.
 
 ### The boundary is a bookkeeping point, not a pacing event
@@ -208,7 +208,7 @@ into the next epoch's pool; the only cohort gate is the reduce barrier, which
 holds a rank at `counts[rank] + max_overshoot` steps since the last reduce.
 The single-step-clock invariant ("coverage and synchronization must not split
 into two racing clocks") keeps the cohort within one window of the shared
-reduce clock. Epochs are a data-coverage label, not a synchronization event —
+reduce clock. Epochs are a data-coverage label, not a synchronization event -
 and the design below keeps them that way.
 
 LR scheduling, convergence, and ElChe are all step-denominated and don't care
@@ -219,14 +219,14 @@ and only because an epoch has meaning for data coverage on resume.
 
 ### Callbacks, split by what they touch
 
-- **`metrics_fn` — controller-side, model-free.** Already fires from the
+- **`metrics_fn` - controller-side, model-free.** Already fires from the
   aggregate hook when every rank has crossed the epoch (`is_epoch_done`), with
   the aggregated metrics in hand. This *is* the epoch-report hook; no separate
   rank-side reporting callback is needed. No barrier.
-- **`eval_fn` / `checkpoint_fn` — elected rank, on the consensus.** These read
+- **`eval_fn` / `checkpoint_fn` - elected rank, on the consensus.** These read
   the model, so they must operate on the **consensus average**, not the
   elected rank's own (overshot, or EASGD-blended) weights.
-- **`epoch_fn` — elected rank, generic per-epoch model hook.** Unchanged; the
+- **`epoch_fn` - elected rank, generic per-epoch model hook.** Unchanged; the
   rank-side callback that may touch the model for arbitrary user purposes.
 
 ### Eval/checkpoint observe the consensus non-destructively
@@ -234,7 +234,7 @@ and only because an epoch has meaning for data coverage on resume.
 There is no persistent center variable: the consensus each cycle is the
 averaged param set the worker receives (`update.params`), which the EASGD
 elastic blend reads but never mutates. So the elected rank **overshoots
-normally** — no barrier, no hold, no unlock — and at the boundary reduce it
+normally** - no barrier, no hold, no unlock - and at the boundary reduce it
 eval/checkpoints `update.params` (the consensus), captured *beside* the blend
 into its own training weights:
 
@@ -242,7 +242,7 @@ into its own training weights:
 - **eval** forwards on the staged average (`no_grad`), not the rank's blended
   weights.
 
-The training trajectory is byte-identical to a no-eval run — the callback is a
+The training trajectory is byte-identical to a no-eval run - the callback is a
 pure observation. Two effects must be kept separate, because they have very
 different review-risk:
 
@@ -254,7 +254,7 @@ different review-risk:
   "α=1 full-adopt" shortcut (elected rank jumps to the consensus to avoid a
   param-buffer): it perturbs that rank's EASGD trajectory for no necessary
   gain. Observe non-destructively instead. And never defend (B) with "noise is
-  helpful" — that conflates an avoidable artifact with the intentional
+  helpful" - that conflates an avoidable artifact with the intentional
   exploration noise, which is exactly what a careful reviewer flags.
 
 ### Checkpoint: when, and the resume contract
@@ -262,13 +262,13 @@ different review-risk:
 A checkpoint fires at the **first reduce after the epoch boundary is
 crossed**, and captures, snapshotted atomically at that reduce:
 
-1. **the consensus model** (`update.params`) — written by the elected rank
+1. **the consensus model** (`update.params`) - written by the elected rank
    (the reserved `target_rank == u64::MAX` sentinel already anticipates a
    controller-as-checkpointer variant for CpuAsync, where the coord holds the
    averaged tensors);
-2. **resume counters** — `global_step`, epoch, ElChe + sync state (controller
+2. **resume counters** - `global_step`, epoch, ElChe + sync state (controller
    meta);
-3. **exact data-coverage** — for each in-progress epoch pool: the *completed*
+3. **exact data-coverage** - for each in-progress epoch pool: the *completed*
    ranges, the cursor, and the epoch's **shuffle seed**.
 
 **Resume** reconstructs the pools to the recorded completed-coverage and
@@ -278,7 +278,7 @@ dispatches only the uncovered remainder. Two details are load-bearing for
 - **Completed, not dispatched.** A chunk in-flight at the checkpoint reduce
   has *not* had its gradient applied into the consensus, so it is recorded as
   not-covered and **re-dispatched** on resume. That is first-coverage, not a
-  repeat — and it is why the consensus↔coverage snapshot must be atomic at the
+  repeat - and it is why the consensus↔coverage snapshot must be atomic at the
   reduce (the coverage recorded is exactly "what's in this average").
 - **The in-progress shuffle seed.** "Cover only the remaining chunks" is only
   well-defined if the resumed epoch reuses the same permutation. Resume
@@ -288,7 +288,7 @@ dispatches only the uncovered remainder. Two details are load-bearing for
 
 With exact coverage recorded, **resumability is independent of how the cohort
 was spread across epochs at snapshot time.** Even a consensus smeared across
-several epochs is exactly resumable — you record the precise completed-set
+several epochs is exactly resumable - you record the precise completed-set
 that produced it. The redo is only the in-flight-at-R chunks (small, bounded),
 never whole epochs. So the smear width is **not** a checkpoint-correctness
 concern; it is purely a training-dynamics concern (averaging too-divergent
@@ -453,7 +453,7 @@ one.
 
 ### VRAM: the elected rank is asymmetric
 
-Observing the consensus is **not** a second full model — no duplicate
+Observing the consensus is **not** a second full model - no duplicate
 optimizer, no second module. Eval adds a param-sized average buffer (largely
 reusable from the EASGD staging copy already allocated in the apply path) plus
 forward-pass activations (`no_grad`, freeable layer-by-layer) plus eval-data
@@ -461,12 +461,12 @@ batches; checkpoint adds only the param-sized average. But that working set
 competes with the adaptive prefetcher's ~90% ceiling, so the elected rank can
 OOM at the boundary on a full-budget prefetch.
 
-The elected rank is asymmetric in **time** (already handled — `apply_callback_slack`
+The elected rank is asymmetric in **time** (already handled - `apply_callback_slack`
 pre-reserves its callback wall-time in ElChe's allocation) and now in **space**.
 The space fix, deferred as a named follow-up, is to **predictively ramp the
 prefetch margin down as the elected rank approaches the boundary** (more async
 load around the boundary, sized from a rough eval-working-set estimate, then
-ramp back) — composing with the prefetcher's auto-resize, rather than a
+ramp back) - composing with the prefetcher's auto-resize, rather than a
 permanently lower ceiling or a full drain-and-cold-refill.
 
 ### What landed

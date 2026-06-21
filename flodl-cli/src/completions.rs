@@ -469,7 +469,8 @@ fn emit_bash(data: &CompletionData) -> String {
     s.push_str("                _n=\"${_f##*/fdl.}\"\n");
     s.push_str("                _n=\"${_n%.yml}\"\n");
     // Skip empty (bare fdl.yml) and multi-dot names (e.g. fdl.foo.bar.yml).
-    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && printf '%s\\n' \"$_n\"\n");
+    // Emit each overlay as a `@<env>` selector token.
+    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && printf '@%s\\n' \"$_n\"\n");
     s.push_str("            done\n");
     s.push_str("            return\n");
     s.push_str("        fi\n");
@@ -482,11 +483,16 @@ fn emit_bash(data: &CompletionData) -> String {
     s.push_str("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
     s.push_str("    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n");
     s.push('\n');
-    // Env-overlay first-arg shift: `fdl <env> <cmd> ...` treats <env>
-    // as an overlay selector (matches a sibling fdl.<env>.yml file).
-    // When detected, position checks shift by one and `cmd` advances
-    // to the next slot.
+    // `@<env>` selector: matches a sibling fdl.<env>.yml overlay. Offered
+    // (with the `@` sigil) as a top-level candidate and completed at any
+    // position the moment the current word starts with `@`.
     s.push_str("    _fdl_envs=\" $(__fdl_find_envs | tr '\\n' ' ') \"\n");
+    s.push_str("    if [[ \"$cur\" == @* ]]; then\n");
+    s.push_str("        COMPREPLY=($(compgen -W \"${_fdl_envs}\" -- \"$cur\"))\n");
+    s.push_str("        return\n");
+    s.push_str("    fi\n");
+    // A `@<env>` token sitting in slot 1 shifts the command slot by one
+    // (`fdl @cluster <cmd> ...`), so position checks below advance past it.
     s.push_str("    env_offset=0\n");
     s.push_str("    if [[ ${#COMP_WORDS[@]} -gt 1 && \"$_fdl_envs\" == *\" ${COMP_WORDS[1]} \"* ]]; then\n");
     s.push_str("        env_offset=1\n");
@@ -728,7 +734,7 @@ fn emit_zsh(data: &CompletionData) -> String {
     s.push_str("            for _f in \"$_dir\"/fdl.*.yml(N); do\n");
     s.push_str("                _n=\"${_f##*/fdl.}\"\n");
     s.push_str("                _n=\"${_n%.yml}\"\n");
-    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && print -- \"$_n\"\n");
+    s.push_str("                [[ -n \"$_n\" && \"$_n\" != *.* ]] && print -- \"@$_n\"\n");
     s.push_str("            done\n");
     s.push_str("            return\n");
     s.push_str("        fi\n");
@@ -751,8 +757,8 @@ fn emit_zsh(data: &CompletionData) -> String {
     ));
     s.push_str("    envs=(${(f)\"$(__fdl_find_envs)\"})\n");
     s.push('\n');
-    // Env-overlay first-arg shift: `fdl <env> <cmd> ...`. When
-    // $words[2] matches a discovered env, shift positions by one so
+    // `@<env>` selector shift: `fdl @cluster <cmd> ...`. When
+    // $words[2] matches a discovered `@env`, shift positions by one so
     // every subsequent check sees the same indices as the no-env case.
     s.push_str("    local env_offset=0\n");
     s.push_str("    if (( ${#words} >= 2 )) && (( ${envs[(I)$words[2]]} )); then\n");
@@ -998,7 +1004,7 @@ fn emit_fish(data: &CompletionData) -> String {
     s.push_str("                set -l _n (string replace -r '^.*/fdl\\.' '' -- $_f)\n");
     s.push_str("                set _n (string replace -r '\\.yml$' '' -- $_n)\n");
     s.push_str("                if test -n \"$_n\"; and not string match -q '*.*' -- \"$_n\"\n");
-    s.push_str("                    echo $_n\n");
+    s.push_str("                    echo \"@$_n\"\n");
     s.push_str("                end\n");
     s.push_str("            end\n");
     s.push_str("            return\n");
@@ -1009,9 +1015,9 @@ fn emit_fish(data: &CompletionData) -> String {
     s.push_str("end\n\n");
 
     // Helper: walk the pre-cursor tokens, skip "fdl" and an optional
-    // env at position 2 (matching the `fdl <env> <cmd>` first-arg
-    // convention), return the command token. Empty when the user
-    // hasn't typed past the env / fdl yet.
+    // `@env` selector at position 2 (`fdl @cluster <cmd>`), return the
+    // command token. Empty when the user hasn't typed past the env /
+    // fdl yet.
     s.push_str("function __fdl_active_command\n");
     s.push_str("    set -l toks (commandline -opc)\n");
     s.push_str("    set -l idx 2\n");
@@ -1082,7 +1088,7 @@ fn emit_fish(data: &CompletionData) -> String {
 
     // Sub-command-specific completions. Every per-command rule
     // predicates on `__fdl_active_command` so it fires correctly under
-    // both `fdl <cmd>` and `fdl <env> <cmd>` (and won't false-positive
+    // both `fdl <cmd>` and `fdl @<env> <cmd>` (and won't false-positive
     // on weird command lines where the name appears later as an
     // option value, the way `__fish_seen_subcommand_from` would).
     //
@@ -1540,18 +1546,29 @@ mod tests {
         );
     }
 
-    /// Env-overlay first-arg shift: `fdl <env> <cmd>` must autocomplete.
-    /// The generated bash script must (a) ship a runtime env discoverer,
-    /// (b) compute env_offset from $COMP_WORDS[1], (c) shift cmd + cword,
-    /// and (d) include detected envs in the position-1 word list.
+    /// `@<env>` selector shift: `fdl @cluster <cmd>` must autocomplete.
+    /// The generated bash script must (a) ship a runtime env discoverer
+    /// that emits `@`-prefixed names, (b) complete `@<env>` at any
+    /// position once the word starts with `@`, (c) compute env_offset
+    /// from $COMP_WORDS[1], (d) shift cmd + cword, and (e) include
+    /// detected envs in the position-1 word list.
     #[test]
     fn bash_emits_env_offset_shift_machinery() {
         let data = CompletionData::from_project(None);
         let bash = emit_bash(&data);
-        // Runtime env discovery helper.
+        // Runtime env discovery helper, emitting `@`-prefixed selectors.
         assert!(
             bash.contains("__fdl_find_envs()"),
             "bash must define __fdl_find_envs runtime helper; got:\n{bash}"
+        );
+        assert!(
+            bash.contains("printf '@%s\\n'"),
+            "bash env helper must emit `@`-prefixed env names; got:\n{bash}"
+        );
+        // Any-position `@<env>` completion branch.
+        assert!(
+            bash.contains(r#"if [[ "$cur" == @* ]]; then"#),
+            "bash must complete `@<env>` when the word starts with @; got:\n{bash}"
         );
         // Glob pattern that catches fdl.<env>.yml without matching fdl.yml itself.
         assert!(

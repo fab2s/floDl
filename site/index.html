@@ -228,11 +228,11 @@ commands:
   </div>
 
   <p class="section-sub" style="margin-top: 1.5rem; font-size: 0.95rem;">
-    Three equivalent ways to apply an overlay: <code>fdl --env ci test</code>,
-    <code>FDL_ENV=ci fdl test</code>, or just <code>fdl ci test</code> when the name
-    doesn't collide with a command. Explicit selectors fail loudly on missing
-    files; the first-arg convention falls through so existing commands are never
-    shadowed.
+    Three equivalent ways to apply an overlay: <code>fdl @ci test</code>,
+    <code>fdl --env ci test</code>, or <code>FDL_ENV=ci fdl test</code>. The
+    <code>@</code> selector works anywhere before <code>--</code>, just like
+    <code>--env</code>. Every form fails loudly on a missing overlay file, and an
+    env may freely share a name with a command.
   </p>
 </section>
 
@@ -374,7 +374,7 @@ commands:
     On a host with 2+ visible CUDA devices, floDl auto-promotes to
     process-per-rank fan-out automatically. Multi-host clusters add an
     <code>fdl.cluster.yml</code> (or a programmatic
-    <code>ClusterBuilder</code>); <code>fdl cluster train</code> SSHes
+    <code>ClusterBuilder</code>); <code>fdl @cluster train</code> SSHes
     every worker, pre-builds per-host, fans out.
   </p>
 

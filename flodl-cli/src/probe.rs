@@ -41,7 +41,7 @@ use crate::util::system::{self, GpuInfo};
 /// emits one report. `--data-path` overrides config; `--skip-mount`
 /// short-circuits the shared-data check.
 ///
-/// **Cluster** (FDL_ENV=cluster / `fdl cluster probe`): loads
+/// **Cluster** (`fdl @cluster probe` / `FDL_ENV=cluster`): loads
 /// `fdl.<env>.yml`'s `cluster.workers:` list. For each host: if it's
 /// the local host, probes in-process; otherwise SSHes to it and runs
 /// `<worker.path>/target/release/fdl probe --json` remotely. Per-host

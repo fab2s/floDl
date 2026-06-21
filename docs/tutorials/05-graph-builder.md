@@ -1,15 +1,15 @@
 # The Graph Builder
 
 The fluent graph builder is how you describe model architectures in floDl.
-Instead of manually wiring layers together, you write data flow — what
+Instead of manually wiring layers together, you write data flow - what
 happens to the tensor as it moves through the model.
 
 By the end of this tutorial you'll be able to build models with linear
 chains, parallel branches, residual connections, and per-element mapping.
 
 > **Prerequisites**: familiarity with [Modules](03-modules.md) and
-> [Training](04-training.md). You don't need to have read them — the
-> code here is self-contained — but they explain the building blocks.
+> [Training](04-training.md). You don't need to have read them - the
+> code here is self-contained - but they explain the building blocks.
 
 ## Your first graph
 
@@ -21,12 +21,12 @@ let g = FlowBuilder::from(Linear::new(4, 8)?)
 ```
 
 `from` starts the flow. `through` appends a module. `build` finalizes the
-graph and returns a `Graph` that implements `Module` — it has `forward` and
+graph and returns a `Graph` that implements `Module` - it has `forward` and
 `parameters` just like any other module.
 
 > **Note for PyTorch users**: In Python you write
 > `model = nn.Sequential(...)` and errors raise exceptions implicitly.
-> In Rust, `build()` returns `Result<Graph>` — errors are explicit values
+> In Rust, `build()` returns `Result<Graph>` - errors are explicit values
 > you handle with `?`. Throughout these tutorials you will see
 > `let g = ... .build()?;` which propagates errors to the caller.
 
@@ -54,8 +54,8 @@ let g = FlowBuilder::from(Linear::new(8, 8)?)
 
 This is the standard residual pattern from ResNet.
 
-When the skip path also needs a transform — e.g. a 1×1 conv + BN to match
-channel or stride changes in ResNet downsample blocks — use `also_with`.
+When the skip path also needs a transform - e.g. a 1×1 conv + BN to match
+channel or stride changes in ResNet downsample blocks - use `also_with`.
 It takes an explicit `skip` and `main` pair: `output = skip(x) + main(x)`.
 
 ```rust
@@ -89,8 +89,8 @@ let g = FlowBuilder::from(Linear::new(4, 8)?)
 ```
 
 Each branch has independent parameters. Built-in merge operations:
-- `MergeOp::Add` — element-wise sum
-- `MergeOp::Mean` — element-wise average
+- `MergeOp::Add` - element-wise sum
+- `MergeOp::Mean` - element-wise average
 
 ## Naming points with tag
 
@@ -121,7 +121,7 @@ let g = FlowBuilder::from(Linear::new(4, 8)?)
 // Creates tags: "head_0", "head_1", "head_2"
 ```
 
-The suffixed tags work with all existing APIs — `tagged`, `collect`,
+The suffixed tags work with all existing APIs - `tagged`, `collect`,
 `trends`. `g.trends(&["head"])` expands the group and returns a
 `TrendGroup` for aggregate queries.
 
@@ -151,9 +151,9 @@ let g = FlowBuilder::from(encoder)
 ```
 
 Three iteration modes:
-- `.each()` — iterate over current stream (dim 0)
-- `.over(tag)` — iterate over a tagged tensor
-- `.slices(n)` — decompose last dim into n slices, map, recompose
+- `.each()` - iterate over current stream (dim 0)
+- `.over(tag)` - iterate over a tagged tensor
+- `.slices(n)` - decompose last dim into n slices, map, recompose
 
 For stateless bodies, add `.batched()` to skip element-by-element iteration:
 
@@ -180,7 +180,7 @@ let model = FlowBuilder::from(Linear::new(4, 8)?)
     .build()?;
 ```
 
-This is **Graph-as-Module** -- the same pattern scales from small blocks
+This is **Graph-as-Module** - the same pattern scales from small blocks
 to entire model components. Add `.label("encoder")` to enable
 [graph tree](10-graph-tree.md) features: selective freeze/thaw, subgraph
 checkpointing, and cross-boundary observation.
@@ -223,10 +223,10 @@ let output = model.forward(&input)?;
 
 This tutorial covered the core builder methods. The
 [Advanced Graphs](06-advanced-graphs.md) tutorial covers:
-- **Forward references** — recurrent state across calls
-- **Loops** — fixed, while, and until with BPTT
-- **Gates** — soft routing with learned weights
-- **Switches** — hard routing with selectors
+- **Forward references** - recurrent state across calls
+- **Loops** - fixed, while, and until with BPTT
+- **Gates** - soft routing with learned weights
+- **Switches** - hard routing with selectors
 
 ---
 

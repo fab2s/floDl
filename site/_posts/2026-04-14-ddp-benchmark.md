@@ -16,7 +16,7 @@ That bug is fixed. And we can prove it.
 
 One line. `comm_stream.synchronize()` before reading GPU parameters for
 CPU averaging snapshots. The `snapshot_params()` call was racing with
-`load_averaged()` -- a non-blocking CUDA stream copy was still writing
+`load_averaged()` - a non-blocking CUDA stream copy was still writing
 to GPU memory when the next snapshot tried to read it. Classic race
 condition, subtle because it only corrupted parameters gradually over
 hundreds of averaging rounds.
@@ -29,13 +29,13 @@ every single CPU averaging configuration converges correctly.
 
 We built `ddp-bench`, a dedicated benchmark suite that runs every model
 against every DDP mode and validates convergence against published
-results. Not toy models -- ResNet-20 on CIFAR-10, GPT-nano on
+results. Not toy models - ResNet-20 on CIFAR-10, GPT-nano on
 Shakespeare, char-RNN, LeNet, convolutional autoencoders. Real
 architectures with known convergence curves.
 
 The hardware: an RTX 5060 Ti (sm_120, 15GB) and a GTX 1060 (sm_61, 6GB).
 A 2.5x compute gap between GPUs. No pre-built libtorch covers both
-architectures -- we compile from source with `fdl libtorch build`.
+architectures - we compile from source with `fdl libtorch build`.
 This is the kind of setup traditional DDP frameworks choke on.
 
 The modes:
@@ -96,7 +96,7 @@ and all eight benchmark models. Both backends are production-ready.
 ## Why this was hard
 
 flodl doesn't use PyTorch's `c10d` distributed backend. We call NCCL
-directly through FFI -- raw `ncclAllReduce`, `ncclCommInitRank`,
+directly through FFI - raw `ncclAllReduce`, `ncclCommInitRank`,
 manual stream synchronization. This gives us control (El Che's
 per-rank cadence wouldn't be possible through `c10d`'s collective
 API), but it means we own every synchronization bug.
@@ -110,7 +110,7 @@ by reading NCCL source and correlating CUBLAS failures with init order.
 The CPU averaging path is a three-phase state machine
 (Idle/Collecting/Computing) running on a coordinator thread. GPU
 workers send parameter snapshots via channels, the coordinator averages
-on CPU, then distributes back. Non-blocking at every stage -- the
+on CPU, then distributes back. Non-blocking at every stage - the
 coordinator keeps processing control messages while averaging runs.
 Getting the stream synchronization right between snapshot reads, NCCL
 transfers, and CPU copies required instrumenting every stage with
@@ -180,7 +180,7 @@ Eight models, each chosen to stress a different aspect:
 This release validates DDP on local hardware. The next step is
 cloud: multi-node training across machines, where network latency
 replaces PCIe as the bottleneck. El Che's cadence policies were
-designed with this in mind -- the same anchor/range-ahead principle
+designed with this in mind - the same anchor/range-ahead principle
 applies whether the slow device is a weaker GPU or a node behind a
 network hop.
 
