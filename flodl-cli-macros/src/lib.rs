@@ -63,6 +63,50 @@
 //! }
 //! ```
 //!
+//! # Enum form (subcommands)
+//!
+//! Deriving on an **enum of newtype variants** turns each variant into a
+//! subcommand. The derive is a thin dispatcher: it peels the leading
+//! subcommand token and delegates parsing, schema, and help to the
+//! wrapped type, which carries its own `#[derive(FdlArgs)]`. No field
+//! parsing happens at the enum level.
+//!
+//! ```ignore
+//! use flodl_cli::{FdlArgs, parse_or_schema};
+//!
+//! /// flodl letter CLI.
+//! #[derive(FdlArgs)]
+//! enum Cli {
+//!     /// Train a letter model on a dataset
+//!     Train(TrainArgs),
+//!     /// Evaluate a trained letter model on a test split
+//!     Eval(EvalArgs),
+//!     /// Generate samples (subcommand renamed from the variant ident)
+//!     #[command(name = "gen")]
+//!     Generate(GenArgs),
+//! }
+//!
+//! fn main() {
+//!     match parse_or_schema::<Cli>() {
+//!         Cli::Train(a) => { /* ... */ let _ = a; }
+//!         Cli::Eval(a) => { let _ = a; }
+//!         Cli::Generate(a) => { let _ = a; }
+//!     }
+//! }
+//! ```
+//!
+//! - Subcommand name = the variant ident kebab-cased (`TrainSubscan` →
+//!   `train-subscan`), overridable with `#[command(name = "...")]`.
+//! - Variant doc-comments become the per-subcommand descriptions shown in
+//!   the parent `--help` command list.
+//! - `--help` is contextual: `<bin> train --help` shows train's flags,
+//!   `<bin> --help` shows the command list. `--fdl-schema` emits the full
+//!   tree.
+//! - Only single-tuple (newtype) variants are supported — each subcommand
+//!   *is* a struct. Unit, named-field, and multi-field variants are
+//!   rejected at derive time. A variant may itself wrap another
+//!   `FdlArgs` enum for nested subcommands.
+//!
 //! See the [`flodl-cli`](https://docs.rs/flodl-cli) crate for the
 //! user-facing API (`parse_or_schema`, `FdlArgsTrait`, `Schema`) and
 //! the full CLI reference.
@@ -82,11 +126,14 @@ const RESERVED_SHORTS: &[char] = &['h', 'V', 'q', 'v', 'e'];
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
-/// Derive `FdlArgs` on a struct with named fields to generate an argv
-/// parser, `--fdl-schema` JSON emitter, and ANSI-coloured `--help`
-/// renderer. See the [crate-level docs](crate) for the attribute
-/// reference and a worked example.
-#[proc_macro_derive(FdlArgs, attributes(option, arg))]
+/// Derive `FdlArgs` to generate an argv parser, `--fdl-schema` JSON
+/// emitter, and ANSI-coloured `--help` renderer.
+///
+/// On a **struct with named fields**, each field is a flag or positional.
+/// On an **enum of newtype variants**, each variant is a subcommand that
+/// delegates to the wrapped type. See the [crate-level docs](crate) for
+/// the attribute reference and worked examples of both forms.
+#[proc_macro_derive(FdlArgs, attributes(option, arg, command))]
 pub fn derive_fdl_args(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match impl_derive(input) {
@@ -109,10 +156,14 @@ fn impl_derive(input: DeriveInput) -> syn::Result<TokenStream> {
                 ));
             }
         },
+        // An enum is a variant-shaped CLI: each newtype variant is a
+        // subcommand wrapping a type that itself derives FdlArgs. The
+        // derive here is a thin dispatcher over those inner impls.
+        Data::Enum(e) => return impl_enum_derive(ident, description.as_deref(), e),
         _ => {
             return Err(syn::Error::new_spanned(
                 ident,
-                "FdlArgs requires a struct",
+                "FdlArgs requires a struct or enum",
             ));
         }
     };
@@ -151,6 +202,228 @@ fn impl_derive(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     };
     Ok(expanded.into())
+}
+
+// ── Enum (variant-shaped CLI) ───────────────────────────────────────────
+
+/// What we learn from one enum variant: a subcommand.
+struct VariantSpec {
+    /// Variant identifier (used in the generated `Self::Ident(...)` arm).
+    ident: Ident,
+    /// Subcommand name on the command line — kebab of the ident, or the
+    /// `#[command(name = "...")]` override.
+    name: String,
+    /// The wrapped type (`TrainArgs` in `Train(TrainArgs)`); must itself
+    /// implement `FdlArgsTrait` (i.e. derive `FdlArgs`).
+    inner_ty: Type,
+    /// Variant doc-comment → the subcommand's one-line help description.
+    description: Option<String>,
+}
+
+/// Generate the `FdlArgsTrait` impl for an enum of newtype variants. The
+/// impl is a dispatcher: it peels the leading subcommand token and
+/// delegates parse / schema / help to the wrapped type, which carries its
+/// own derived impl. No field parsing happens here.
+fn impl_enum_derive(
+    ident: &Ident,
+    description: Option<&str>,
+    data: &syn::DataEnum,
+) -> syn::Result<TokenStream> {
+    if data.variants.is_empty() {
+        return Err(syn::Error::new_spanned(
+            ident,
+            "FdlArgs enum needs at least one variant (each variant is a subcommand)",
+        ));
+    }
+
+    let mut variants: Vec<VariantSpec> = Vec::new();
+    let mut seen: std::collections::HashMap<String, Span> = std::collections::HashMap::new();
+    for v in &data.variants {
+        let inner_ty = match &v.fields {
+            Fields::Unnamed(f) if f.unnamed.len() == 1 => f.unnamed[0].ty.clone(),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    v,
+                    "FdlArgs enum variants must be single-tuple (newtype) variants \
+                     wrapping a type that derives FdlArgs, e.g. `Train(TrainArgs)` \
+                     (unit, named-field, and multi-field variants are not supported)",
+                ));
+            }
+        };
+        let name = variant_command_name(v)?;
+        if let Some(prev) = seen.insert(name.clone(), v.span()) {
+            let _ = prev;
+            return Err(syn::Error::new_spanned(
+                v,
+                format!("duplicate subcommand name `{name}`"),
+            ));
+        }
+        variants.push(VariantSpec {
+            ident: v.ident.clone(),
+            name,
+            inner_ty,
+            description: extract_doc(&v.attrs),
+        });
+    }
+
+    // Comma-separated name list for "expected one of" / "did you mean".
+    let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+    let names_csv = names.join(", ");
+    let names_arr = quote! { &[ #( #names ),* ] };
+
+    // try_parse_from: match the subcommand token, delegate the tail.
+    let parse_arms = variants.iter().map(|v| {
+        let name = &v.name;
+        let vident = &v.ident;
+        let inner_ty = &v.inner_ty;
+        quote! {
+            #name => ::std::result::Result::Ok(#ident::#vident(
+                <#inner_ty as ::flodl_cli::FdlArgsTrait>::try_parse_from(&args[1..])?
+            )),
+        }
+    });
+
+    // schema(): build a branch node, one child per subcommand.
+    let schema_inserts = variants.iter().map(|v| {
+        let name = &v.name;
+        let inner_ty = &v.inner_ty;
+        let desc_set = match &v.description {
+            Some(d) => quote! { __child.description = ::std::option::Option::Some(::std::string::String::from(#d)); },
+            None => quote! {},
+        };
+        quote! {
+            {
+                let mut __child = <#inner_ty as ::flodl_cli::FdlArgsTrait>::schema();
+                #desc_set
+                __commands.insert(::std::string::String::from(#name), __child);
+            }
+        }
+    });
+
+    // render_help_path(): peel the first non-flag token, delegate to that
+    // subcommand's (recursive) help; otherwise the command list.
+    let help_path_arms = variants.iter().map(|v| {
+        let name = &v.name;
+        let inner_ty = &v.inner_ty;
+        quote! {
+            #name => return <#inner_ty as ::flodl_cli::FdlArgsTrait>::render_help_path(__tail),
+        }
+    });
+
+    // render_help(): the root command listing.
+    let header = match description {
+        Some(d) => format!("{d}\n\n"),
+        None => format!("{ident}\n\n"),
+    };
+    let command_lines = variants.iter().map(|v| {
+        let label = v.name.clone();
+        let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
+        let tail = v.description.clone().unwrap_or_default();
+        quote! {
+            out.push_str("    ");
+            out.push_str(&::flodl_cli::style::green(#label));
+            out.push_str(#pad);
+            out.push_str(#tail);
+            out.push('\n');
+        }
+    });
+
+    let expanded = quote! {
+        impl ::flodl_cli::FdlArgsTrait for #ident {
+            fn try_parse_from(args: &[::std::string::String])
+                -> ::std::result::Result<Self, ::std::string::String>
+            {
+                let sub = match args.get(1) {
+                    ::std::option::Option::Some(s) => s.as_str(),
+                    ::std::option::Option::None => {
+                        return ::std::result::Result::Err(::std::format!(
+                            "missing command, expected one of: {}", #names_csv
+                        ));
+                    }
+                };
+                match sub {
+                    #( #parse_arms )*
+                    other => {
+                        match ::flodl_cli::args::parser::suggest(#names_arr, other) {
+                            ::std::option::Option::Some(s) => ::std::result::Result::Err(::std::format!(
+                                "unknown command `{other}`, did you mean `{s}`?"
+                            )),
+                            ::std::option::Option::None => ::std::result::Result::Err(::std::format!(
+                                "unknown command `{other}`, expected one of: {}", #names_csv
+                            )),
+                        }
+                    }
+                }
+            }
+
+            fn schema() -> ::flodl_cli::Schema {
+                let mut __commands: ::std::collections::BTreeMap<::std::string::String, ::flodl_cli::Schema> =
+                    ::std::collections::BTreeMap::new();
+                #( #schema_inserts )*
+                ::flodl_cli::Schema {
+                    commands: __commands,
+                    ..::core::default::Default::default()
+                }
+            }
+
+            fn render_help() -> ::std::string::String {
+                let mut out = ::std::string::String::from(#header);
+                out.push_str(&::flodl_cli::style::yellow("Commands"));
+                out.push_str(":\n");
+                #( #command_lines )*
+                out
+            }
+
+            fn render_help_path(args: &[::std::string::String]) -> ::std::string::String {
+                // Skip the program name and any leading flags; the first
+                // bare token is the subcommand. Delegate to its (possibly
+                // nested) help; fall back to the command list.
+                let mut __idx = 1usize;
+                while __idx < args.len() && args[__idx].starts_with('-') {
+                    __idx += 1;
+                }
+                if __idx < args.len() {
+                    let __tail = &args[__idx..];
+                    match args[__idx].as_str() {
+                        #( #help_path_arms )*
+                        _ => {}
+                    }
+                }
+                Self::render_help()
+            }
+        }
+    };
+    Ok(expanded.into())
+}
+
+/// Resolve a variant's subcommand name: kebab of the ident by default, or
+/// the `#[command(name = "...")]` override.
+fn variant_command_name(v: &syn::Variant) -> syn::Result<String> {
+    for attr in &v.attrs {
+        if !attr.path().is_ident("command") {
+            continue;
+        }
+        let mut name: Option<String> = None;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let s: syn::LitStr = meta.value()?.parse()?;
+                name = Some(s.value());
+                Ok(())
+            } else {
+                Err(meta.error("unknown #[command] key (valid: name)"))
+            }
+        })?;
+        if let Some(n) = name {
+            if n.trim().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[command(name = ...)] must be non-empty",
+                ));
+            }
+            return Ok(n);
+        }
+    }
+    Ok(pascal_to_kebab(&v.ident.to_string()))
 }
 
 // ── Field spec (what we learn from each field) ──────────────────────────
@@ -745,6 +1018,10 @@ fn build_schema_expr(fields: &[FieldSpec], description: Option<&str>) -> TokenSt
                 args,
                 options,
                 strict: false,
+                // A `#[derive(FdlArgs)]` struct is always a leaf — no
+                // subcommand tree. The enum derive builds branches itself.
+                description: ::std::option::Option::None,
+                commands: ::std::collections::BTreeMap::new(),
             }
         }
     }
@@ -1148,5 +1425,44 @@ fn kebab(s: &str) -> String {
     s.replace('_', "-")
 }
 
+/// PascalCase enum variant ident → kebab-case subcommand name.
+/// `Train` → `train`, `TrainSubscan` → `train-subscan`,
+/// `EvalLetterDirect` → `eval-letter-direct`. A leading capital does not
+/// get a separator; underscores are also treated as boundaries.
+fn pascal_to_kebab(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c == '_' {
+            out.push('-');
+        } else if c.is_uppercase() {
+            if i != 0 && !out.ends_with('-') {
+                out.push('-');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // syn's Span import trick: pull from proc_macro2 above.
 use syn::spanned::Spanned;
+
+#[cfg(test)]
+mod tests {
+    use super::pascal_to_kebab;
+
+    #[test]
+    fn pascal_to_kebab_maps_variant_idents() {
+        assert_eq!(pascal_to_kebab("Train"), "train");
+        assert_eq!(pascal_to_kebab("Eval"), "eval");
+        // The fbrl `word` modes — the generalization-stressing cases.
+        assert_eq!(pascal_to_kebab("TrainSubscan"), "train-subscan");
+        assert_eq!(pascal_to_kebab("EvalSubscan"), "eval-subscan");
+        assert_eq!(pascal_to_kebab("EvalLetterDirect"), "eval-letter-direct");
+        // Underscores are boundaries too; no double separators.
+        assert_eq!(pascal_to_kebab("Train_Subscan"), "train-subscan");
+        assert_eq!(pascal_to_kebab("Generate"), "generate");
+    }
+}

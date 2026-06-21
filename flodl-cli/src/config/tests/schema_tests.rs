@@ -74,6 +74,73 @@ fn validate_schema_rejects_required_after_optional() {
     assert!(err.contains("cannot follow"), "err was: {err}");
 }
 
+// ── Tree (variant-shaped) schemas: leaf-XOR-branch + recursion ───────
+
+/// A branch node with valid leaf children passes, JSON round-trips, and
+/// the leaf children keep serializing in the flat shape (wire BC).
+#[test]
+fn validate_schema_accepts_variant_tree() {
+    let mut train = Schema {
+        description: Some("Train a model".into()),
+        ..Schema::default()
+    };
+    train.options.insert("epochs".into(), opt("int"));
+    let mut eval = Schema {
+        description: Some("Evaluate a model".into()),
+        ..Schema::default()
+    };
+    eval.args.push(arg("checkpoint", "path"));
+
+    let mut root = Schema::default();
+    root.commands.insert("train".into(), train);
+    root.commands.insert("eval".into(), eval);
+
+    validate_schema(&root).expect("a valid subcommand tree must pass");
+
+    // Round-trip: the tree serializes and parses back identically.
+    let json = serde_json::to_string(&root).expect("tree serializes");
+    let back: Schema = serde_json::from_str(&json).expect("tree parses back");
+    assert_eq!(back.commands.len(), 2);
+    assert_eq!(
+        back.commands["train"].description.as_deref(),
+        Some("Train a model")
+    );
+
+    // A leaf with no tree must NOT emit a `commands` key (flat wire BC).
+    let leaf_json = serde_json::to_string(&root.commands["eval"]).unwrap();
+    assert!(
+        !leaf_json.contains("commands"),
+        "leaf schema must not serialize an empty commands map; got: {leaf_json}"
+    );
+}
+
+/// A node cannot be both a leaf (args/options) and a branch (commands).
+#[test]
+fn validate_schema_rejects_leaf_and_branch_mix() {
+    let mut root = Schema::default();
+    root.options.insert("global".into(), opt("string"));
+    root.commands.insert("train".into(), Schema::default());
+    let err = validate_schema(&root).expect_err("leaf+branch mix must fail");
+    assert!(
+        err.contains("leaf or a branch"),
+        "err was: {err}"
+    );
+}
+
+/// Validation recurses into children; a bad leaf surfaces with its path.
+#[test]
+fn validate_schema_recurses_into_subcommands() {
+    let mut bad = Schema::default();
+    bad.options.insert("help".into(), opt("bool")); // reserved
+    let mut root = Schema::default();
+    root.commands.insert("train".into(), bad);
+    let err = validate_schema(&root).expect_err("reserved flag in child must fail");
+    assert!(
+        err.contains("subcommand `train`") && err.contains("reserved"),
+        "err must name the offending subcommand; got: {err}"
+    );
+}
+
 // ── Tail validation (always-on) + strict unknown-rejection ─────
 
 

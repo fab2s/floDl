@@ -348,6 +348,18 @@ fn unknown_long_error(spec: &ArgsSpec, name: &str) -> String {
     }
 }
 
+/// "Did you mean" suggestion over a fixed candidate list: returns the
+/// first candidate within edit distance 2 of `input`, if any. The
+/// flag-level equivalent is folded into `unknown_long_error`; this
+/// public entry is for the enum-dispatch codegen, which suggests a
+/// subcommand name when the user mistypes one (`bin trian` → `train`).
+pub fn suggest(candidates: &[&str], input: &str) -> Option<String> {
+    candidates
+        .iter()
+        .find(|c| similar(c, input))
+        .map(|c| (*c).to_string())
+}
+
 /// "did you mean" similarity: edit distance ≤ 2 qualifies.
 ///
 /// Simple Levenshtein on char vectors. The input sizes here are tiny

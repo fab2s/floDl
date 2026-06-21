@@ -140,6 +140,38 @@ New `fdl probe` subcommand (`flodl-cli/src/probe.rs`) audits a host or a whole c
 - Orchestrator-only host entries are permitted (worker entry with empty `ranks:`) for clusters where the controller is itself one of the SSH targets but owns no GPUs.
 - `cluster-testing` env (in-process topology source, no fan-out) replaces the previous test-discovery convention. Exports `FLODL_TESTING_CLUSTER_JSON` to `cargo test` so `flodl::distributed::testing::discover_test_cluster()` reads the same yml the production overlay does.
 
+#### Variant-shaped `#[derive(FdlArgs)]`: enum subcommands
+
+`#[derive(FdlArgs)]` now accepts an **enum of newtype variants**, turning each variant into a subcommand. Previously the derive only accepted a struct with named fields, so multi-mode binaries hand-rolled their own `while let` argv dispatch (and a separate hand-maintained `usage()` printer that drifted from it). A multi-mode CLI is now one enum whose `main` is an exhaustive `match` — adding a mode is a compile-time exhaustiveness obligation, not a dispatch-table edit.
+
+```rust
+#[derive(FdlArgs)]
+enum Cli {
+    /// Train a model on a dataset
+    Train(TrainArgs),
+    /// Evaluate a trained model on a test split
+    Eval(EvalArgs),
+    /// Generate samples (subcommand renamed from the variant ident)
+    #[command(name = "gen")]
+    Generate(GenArgs),
+}
+
+fn main() {
+    match parse_or_schema::<Cli>() {
+        Cli::Train(a) => { /* ... */ }
+        Cli::Eval(a) => { /* ... */ }
+        Cli::Generate(a) => { /* ... */ }
+    }
+}
+```
+
+- **Thin dispatcher, full reuse**: the enum derive peels the leading subcommand token and delegates parsing / schema / help to the wrapped type, which carries its own `#[derive(FdlArgs)]`. No new field-parsing — a subcommand *is* a struct. Only single-tuple (newtype) variants are accepted; unit, named-field, and multi-field variants fail at derive time with a pointed error.
+- **Self-documenting**: subcommand name = the variant ident kebab-cased (`TrainSubscan` → `train-subscan`), overridable with `#[command(name = "...")]`. Variant doc-comments become the per-subcommand descriptions in the parent `--help` command list.
+- **Contextual help**: `<bin> --help` lists the commands; `<bin> train --help` renders only train's flags. `<bin> --fdl-schema` emits the whole tree. Backed by a new defaulted `FdlArgsTrait::render_help_path` method (single-struct CLIs are unaffected — the default forwards to `render_help`).
+- **`Schema` grew two additive fields** (`description`, `commands: BTreeMap<String, Schema>`), both `#[serde(skip_serializing_if)]`. A leaf schema serializes byte-identically to before, so existing single-struct consumers (`ddp-bench`, `flodl-hf`, `fdl`'s own commands) and inline `fdl.yml` schemas are untouched. A node is a leaf (`args`/`options`) **or** a branch (`commands`), never both — enforced by `validate_schema`. The shape mirrors the recursive `commands:` map `fdl.yml` already uses, closing the depth-1 asymmetry between the macro and yaml layers.
+- **`fdl`-side consumers are tree-aware**: `fdl <bin> --help` lists the binary's subcommands; tail validation descends to the invoked subcommand's leaf (with "did you mean" on a mistyped subcommand); bash / zsh / fish completions complete subcommand names and per-subcommand flags.
+- **Arbitrary depth for free**: a variant may wrap another `FdlArgs` enum; dispatch, schema, and help all recurse through tail-recursive delegation with no special-casing.
+
 #### Heterogeneous-rig cluster support
 
 These features came out of a forced heterogeneous topology: a rig crash and OS migration pushed two of three GPUs into a VM, producing a single-machine cluster whose VM rank ran a different libtorch variant from the bare-metal ranks. Every heterogeneous-rig pain point a multi-host deployment would hit (NCCL version skew, per-host libtorch arch, shared-mount conventions, per-host CUDA scoping) showed up inside one box, and shaped the design accordingly.

@@ -287,6 +287,24 @@ pub struct Schema {
     /// validating declared contracts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub strict: bool,
+    /// One-line human description of this node. Usually unset for the root
+    /// of a flat schema (help banners come from the binary's struct doc);
+    /// for a child under [`Self::commands`] it carries the subcommand's
+    /// summary (the enum variant's doc-comment), rendered in the parent
+    /// `--help` COMMANDS list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Sub-command tree. Empty for a leaf — the common case: a single
+    /// `#[derive(FdlArgs)]` struct. Non-empty for a variant-shaped CLI
+    /// (`#[derive(FdlArgs)]` on an enum of newtype variants), where each key
+    /// is a subcommand name and each value is that subcommand's own schema.
+    ///
+    /// A node is either a **leaf** (`args` / `options`) or a **branch**
+    /// (`commands`), never both — enforced by [`validate_schema`]. The shape
+    /// mirrors the recursive `commands:` map already used by
+    /// [`CommandConfig`]/[`super::ProjectConfig`] at the yaml layer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, Schema>,
 }
 
 /// A flag option, `--name` / `-x`.
@@ -361,6 +379,28 @@ const VALID_TYPES: &[&str] = &[
 /// Loud-at-load-time: ambiguity caught here is cheaper to fix than mysterious
 /// pass-through behavior at runtime.
 pub fn validate_schema(schema: &Schema) -> Result<(), String> {
+    // Branch node (variant-shaped CLI): a subcommand tree. A node is
+    // either a leaf (args/options) or a branch (commands), never both —
+    // the enum derive emits branches with empty args/options, and a
+    // hand-authored yaml tree must keep its flags on the leaves.
+    if !schema.commands.is_empty() {
+        if !schema.args.is_empty() || !schema.options.is_empty() {
+            return Err(
+                "schema declares both `commands` (a subcommand tree) and \
+                 top-level `args`/`options`; a node is either a leaf or a \
+                 branch, not both — move the flags onto the subcommands"
+                    .to_string(),
+            );
+        }
+        for (name, child) in &schema.commands {
+            if name.trim().is_empty() {
+                return Err("schema `commands` has an empty subcommand name".to_string());
+            }
+            validate_schema(child).map_err(|e| format!("subcommand `{name}`: {e}"))?;
+        }
+        return Ok(());
+    }
+
     // Options: check types, shorts, reserved flags.
     let mut short_seen: BTreeMap<String, String> = BTreeMap::new();
     for (long, spec) in &schema.options {

@@ -453,10 +453,14 @@ pub(crate) fn cmd_refresh_schema(
         return ExitCode::FAILURE;
     }
     eprintln!("Cached schema for `{cmd_name}` at {}", cache.display());
-    eprintln!(
-        "  {} options, {} positional args",
-        schema.options.len(),
-        schema.args.len()
-    );
+    if schema.commands.is_empty() {
+        eprintln!(
+            "  {} options, {} positional args",
+            schema.options.len(),
+            schema.args.len()
+        );
+    } else {
+        eprintln!("  {} subcommands", schema.commands.len());
+    }
     ExitCode::SUCCESS
 }

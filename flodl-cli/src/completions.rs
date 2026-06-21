@@ -70,14 +70,29 @@ struct CommandData {
     /// behind another lookup, so we keep this list lean.
     sub_commands: Vec<String>,
     options: Vec<OptionCompletion>,
+    /// Sub-commands declared by the entry binary's own schema tree (a
+    /// variant-shaped `#[derive(FdlArgs)]` CLI). Each carries its own
+    /// option set, so completion can offer the right flags after the
+    /// subcommand token — the project-command analogue of the nested
+    /// built-in (`libtorch download`) machinery.
+    tree_commands: Vec<TreeCommand>,
+}
+
+/// One subcommand of a variant-shaped entry binary, with its own flags.
+struct TreeCommand {
+    name: String,
+    description: Option<String>,
+    options: Vec<OptionCompletion>,
 }
 
 impl CommandData {
-    /// Every first-positional candidate, presets and sub-commands both.
-    /// Used by shells that can't render descriptions (bash).
+    /// Every first-positional candidate: presets, fdl.yml sub-commands,
+    /// and the entry binary's own schema-tree subcommands. Used by shells
+    /// that can't render descriptions (bash).
     fn first_positional_tokens(&self) -> Vec<String> {
         let mut out: Vec<String> = self.presets.iter().map(|(n, _)| n.clone()).collect();
         out.extend(self.sub_commands.iter().cloned());
+        out.extend(self.tree_commands.iter().map(|t| t.name.clone()));
         out
     }
 }
@@ -136,6 +151,7 @@ impl CompletionData {
                         presets: Vec::new(),
                         sub_commands: Vec::new(),
                         options: Vec::new(),
+                        tree_commands: Vec::new(),
                     });
                 }
             }
@@ -251,11 +267,30 @@ impl CommandData {
                     .collect()
             })
             .unwrap_or_default();
+        let tree_commands = cfg
+            .schema
+            .as_ref()
+            .map(|s| {
+                s.commands
+                    .iter()
+                    .map(|(sub_name, sub)| TreeCommand {
+                        name: sub_name.clone(),
+                        description: sub.description.clone(),
+                        options: sub
+                            .options
+                            .iter()
+                            .map(|(long, spec)| OptionCompletion::from_spec(long, spec))
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             name,
             presets,
             sub_commands,
             options,
+            tree_commands,
         }
     }
 }
@@ -521,6 +556,57 @@ fn emit_bash(data: &CompletionData) -> String {
     s.push_str("        fi\n");
     s.push_str("        return\n");
     s.push_str("    fi\n");
+
+    // Variant-shaped entry binaries: per-subcommand value + flag blocks,
+    // keyed on the env-shifted subcommand slot. Emitted BEFORE the generic
+    // per-command blocks so the more specific rule wins (mirrors the
+    // nested-builtin handling for `libtorch download`). Position-2 listing
+    // of the subcommand names themselves comes from the per-command block's
+    // first-positional word list (which now includes tree-command names).
+    for cmd in &data.commands {
+        for tc in &cmd.tree_commands {
+            s.push_str(&format!(
+                "\n    if [[ \"$cmd\" == \"{cmdname}\" && \"${{COMP_WORDS[$((2 + env_offset))]}}\" == \"{sub}\" && $cword -ge 3 ]]; then\n",
+                cmdname = cmd.name,
+                sub = tc.name
+            ));
+            s.push_str("        case \"$prev\" in\n");
+            for opt in &tc.options {
+                if !opt.takes_value {
+                    continue;
+                }
+                let flags = opt.flag_tokens().join("|");
+                let line = match &opt.value {
+                    ValueKind::Choices(cs) => format!(
+                        "            {flags}) COMPREPLY=($(compgen -W \"{}\" -- \"$cur\")); return ;;\n",
+                        cs.join(" ")
+                    ),
+                    ValueKind::Path => format!(
+                        "            {flags}) COMPREPLY=($(compgen -f -- \"$cur\")); return ;;\n",
+                    ),
+                    ValueKind::Completer(c) => format!(
+                        "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
+                    ),
+                    ValueKind::Any => format!(
+                        "            {flags}) return ;;\n",
+                    ),
+                    ValueKind::None => continue,
+                };
+                s.push_str(&line);
+            }
+            s.push_str("        esac\n");
+            let mut flags: Vec<String> =
+                tc.options.iter().flat_map(|o| o.flag_tokens()).collect();
+            flags.push("--help".into());
+            flags.push("-h".into());
+            s.push_str(&format!(
+                "        COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))\n",
+                flags.join(" ")
+            ));
+            s.push_str("        return\n");
+            s.push_str("    fi\n");
+        }
+    }
 
     // Sub-commands with schema / nested commands.
     for cmd in &data.commands {
@@ -822,7 +908,10 @@ fn emit_zsh(data: &CompletionData) -> String {
         // Position 3 (env-shifted): first-positional candidates.
         // Presets carry descriptions (zsh can render them via
         // `name:desc` pairs), real sub-commands do not.
-        if !cmd.presets.is_empty() || !cmd.sub_commands.is_empty() {
+        if !cmd.presets.is_empty()
+            || !cmd.sub_commands.is_empty()
+            || !cmd.tree_commands.is_empty()
+        {
             s.push_str("            if (( cword == 3 )); then\n");
             if !cmd.presets.is_empty() {
                 s.push_str("                local -a presets\n");
@@ -851,7 +940,70 @@ fn emit_zsh(data: &CompletionData) -> String {
                 ));
                 s.push_str("                _describe 'command' subcommands\n");
             }
+            // Variant-shaped entry binary: its own subcommands, with
+            // descriptions sourced from the schema tree.
+            if !cmd.tree_commands.is_empty() {
+                s.push_str("                local -a treecmds\n");
+                let pairs: Vec<String> = cmd
+                    .tree_commands
+                    .iter()
+                    .map(|t| {
+                        let desc = t.description.as_deref().unwrap_or("command");
+                        let safe = desc.replace('\'', "'\\''").replace(':', "\\:");
+                        format!("'{}:{safe}'", t.name)
+                    })
+                    .collect();
+                s.push_str(&format!(
+                    "                treecmds=({})\n",
+                    pairs.join(" ")
+                ));
+                s.push_str("                _describe 'command' treecmds\n");
+            }
             s.push_str("            fi\n");
+        }
+        // Per-subcommand value + flag dispatch (env-shifted slot), so
+        // `fdl <cmd> <sub> --<TAB>` offers that subcommand's flags.
+        if !cmd.tree_commands.is_empty() {
+            s.push_str("            case $words[$((3 + env_offset))] in\n");
+            for tc in &cmd.tree_commands {
+                s.push_str(&format!("                {})\n", tc.name));
+                if tc.options.iter().any(|o| o.takes_value) {
+                    s.push_str("                    case $words[CURRENT-1] in\n");
+                    for opt in &tc.options {
+                        if !opt.takes_value {
+                            continue;
+                        }
+                        let flags = opt.flag_tokens().join("|");
+                        let body = match &opt.value {
+                            ValueKind::Choices(cs) => format!(
+                                "                        {flags}) _values 'value' {}; return ;;\n",
+                                cs.join(" ")
+                            ),
+                            ValueKind::Path => format!(
+                                "                        {flags}) _files; return ;;\n",
+                            ),
+                            ValueKind::Completer(c) => format!(
+                                "                        {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
+                            ),
+                            ValueKind::Any => format!(
+                                "                        {flags}) return ;;\n",
+                            ),
+                            ValueKind::None => continue,
+                        };
+                        s.push_str(&body);
+                    }
+                    s.push_str("                    esac\n");
+                }
+                let mut sub_flags: Vec<String> =
+                    tc.options.iter().flat_map(|o| o.flag_tokens()).collect();
+                sub_flags.push("--help".into());
+                sub_flags.push("-h".into());
+                s.push_str(&format!(
+                    "                    _values 'option' {}\n                    ;;\n",
+                    sub_flags.join(" ")
+                ));
+            }
+            s.push_str("            esac\n");
         }
         s.push_str(&format!(
             "            _values 'option' {flags_joined}\n"
@@ -1151,6 +1303,31 @@ fn emit_fish(data: &CompletionData) -> String {
             line.push('\n');
             s.push_str(&line);
         }
+
+        // Variant-shaped entry binary: offer its subcommand names (with
+        // descriptions), then per-subcommand flag rules gated on the
+        // active subcommand (the project analogue of nested-builtin rules).
+        for tc in &cmd.tree_commands {
+            let safe = tc
+                .description
+                .as_deref()
+                .unwrap_or("command")
+                .replace('\'', "\\'");
+            s.push_str(&format!(
+                "complete -c fdl -n '{cond}' -a '{}' -d '{safe}'\n",
+                tc.name
+            ));
+        }
+        for tc in &cmd.tree_commands {
+            let sub_cond = format!(
+                "contains -- {} (__fdl_active_command); \
+                 and contains -- {} (__fdl_active_subcommand)",
+                cmd.name, tc.name
+            );
+            for opt in &tc.options {
+                emit_fish_option_line(&mut s, &sub_cond, opt);
+            }
+        }
         s.push('\n');
     }
 
@@ -1288,6 +1465,7 @@ mod tests {
             args: vec![],
             options,
             strict: false,
+            ..Schema::default()
         };
         let cfg = CommandConfig {
             schema: Some(schema),
@@ -1688,6 +1866,143 @@ mod tests {
         assert!(
             !fish.contains("__fish_seen_subcommand_from"),
             "fish must no longer use __fish_seen_subcommand_from (replaced by env-aware active-command helpers)"
+        );
+    }
+
+    // ── Variant-shaped entry binary (tree schema) completions ──────────
+
+    /// A command whose entry binary is a variant-shaped CLI: its schema is
+    /// a tree of subcommands, each with its own flags.
+    fn make_cmd_with_tree() -> CommandData {
+        let mut train = Schema {
+            description: Some("Train a model".into()),
+            ..Schema::default()
+        };
+        let model = OptionSpec {
+            ty: "string".into(),
+            description: None,
+            default: None,
+            choices: Some(vec![serde_json::json!("mlp"), serde_json::json!("resnet")]),
+            short: Some("m".into()),
+            env: None,
+            completer: None,
+        };
+        train.options.insert("model".into(), model);
+        train.options.insert(
+            "epochs".into(),
+            OptionSpec {
+                ty: "int".into(),
+                description: None,
+                default: None,
+                choices: None,
+                short: None,
+                env: None,
+                completer: None,
+            },
+        );
+
+        let mut eval = Schema {
+            description: Some("Evaluate a model".into()),
+            ..Schema::default()
+        };
+        eval.options.insert(
+            "checkpoint".into(),
+            OptionSpec {
+                ty: "path".into(),
+                description: None,
+                default: None,
+                choices: None,
+                short: None,
+                env: None,
+                completer: None,
+            },
+        );
+
+        let mut schema = Schema::default();
+        schema.commands.insert("train".into(), train);
+        schema.commands.insert("eval".into(), eval);
+        let cfg = CommandConfig {
+            schema: Some(schema),
+            ..Default::default()
+        };
+        CommandData::from_config("fbrl-letter".into(), &cfg)
+    }
+
+    fn tree_data() -> CompletionData {
+        CompletionData {
+            top_level: vec!["fbrl-letter".into()],
+            commands: vec![make_cmd_with_tree()],
+            builtins: CompletionData::collect_builtins(),
+        }
+    }
+
+    #[test]
+    fn tree_commands_become_first_positional_candidates() {
+        let cmd = make_cmd_with_tree();
+        let toks = cmd.first_positional_tokens();
+        assert!(toks.contains(&"train".to_string()) && toks.contains(&"eval".to_string()));
+    }
+
+    #[test]
+    fn bash_emits_per_subcommand_flag_block() {
+        let out = emit_bash(&tree_data());
+        // The env-offset-aware guard, mirroring nested builtins.
+        assert!(
+            out.contains(
+                r#"if [[ "$cmd" == "fbrl-letter" && "${COMP_WORDS[$((2 + env_offset))]}" == "train""#
+            ),
+            "bash must guard a per-subcommand block for train; got:\n{out}"
+        );
+        // train's flags + its --model choices flow through.
+        assert!(out.contains("--model|-m"), "train --model flag present");
+        assert!(
+            out.contains("--model|-m) COMPREPLY=($(compgen -W \"mlp resnet\""),
+            "train --model choices must expand; got:\n{out}"
+        );
+        // eval's path option → file completion.
+        assert!(
+            out.contains(
+                r#""${COMP_WORDS[$((2 + env_offset))]}" == "eval""#
+            ) && out.contains("--checkpoint) COMPREPLY=($(compgen -f"),
+            "eval --checkpoint must offer file completion; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zsh_emits_tree_subcommands_and_per_sub_values() {
+        let out = emit_zsh(&tree_data());
+        assert!(
+            out.contains("treecmds=('train:Train a model' 'eval:Evaluate a model')")
+                || out.contains("'train:Train a model'"),
+            "zsh must list tree subcommands with descriptions; got:\n{out}"
+        );
+        assert!(
+            out.contains("case $words[$((3 + env_offset))] in"),
+            "zsh must dispatch per-subcommand on the env-shifted slot"
+        );
+        assert!(
+            out.contains("--model|-m) _values 'value' mlp resnet"),
+            "zsh must expand train --model choices under its arm; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fish_emits_tree_subcommands_and_per_sub_flags() {
+        let out = emit_fish(&tree_data());
+        assert!(
+            out.contains("-a 'train' -d 'Train a model'"),
+            "fish must offer the subcommand name with its description; got:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "contains -- fbrl-letter (__fdl_active_command); \
+                 and contains -- train (__fdl_active_subcommand)"
+            ),
+            "fish per-subcommand flag rules must gate on the active subcommand; got:\n{out}"
+        );
+        assert!(
+            out.contains("-l 'model' -s 'm'") && out.contains("-a 'mlp resnet'"),
+            "fish must emit train --model choices; got:\n{out}"
         );
     }
 }

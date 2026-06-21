@@ -885,6 +885,7 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     print_usage_line(cmd_config, name, &presets, &sub_cmds, preset_slot);
     print_arguments_section(cmd_config, &presets, preset_slot);
     print_sub_commands_section(&sub_cmds);
+    print_schema_commands_section(cmd_config, name);
     print_options_section(cmd_config);
     print_entry_section(cmd_config);
     print_defaults_section(cmd_config);
@@ -975,6 +976,35 @@ fn print_sub_commands_section(sub_cmds: &CommandGroup) {
             desc
         );
     }
+}
+
+/// List the entry binary's own subcommands when its schema is a tree
+/// (a variant-shaped `#[derive(FdlArgs)]` CLI). Distinct from
+/// [`print_sub_commands_section`], which lists fdl.yml-level Run/Path
+/// commands — these come from the binary's `--fdl-schema` output, and each
+/// has its own flag set (drill in with `fdl <name> <subcommand> --help`).
+fn print_schema_commands_section(cmd_config: &CommandConfig, name: &str) {
+    let Some(schema) = &cmd_config.schema else {
+        return;
+    };
+    if schema.commands.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("{}:", style::yellow("Commands"));
+    for (sub_name, sub_schema) in &schema.commands {
+        let desc = sub_schema.description.as_deref().unwrap_or("-");
+        eprintln!(
+            "    {}  {}",
+            style::green(&format!("{:<20}", sub_name)),
+            desc
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "    Run {} for a subcommand's options.",
+        style::dim(&format!("fdl {name} <command> --help"))
+    );
 }
 
 fn print_options_section(cmd_config: &CommandConfig) {

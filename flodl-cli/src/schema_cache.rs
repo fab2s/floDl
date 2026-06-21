@@ -255,6 +255,7 @@ mod tests {
             args: Vec::new(),
             options,
             strict: false,
+            ..Schema::default()
         }
     }
 

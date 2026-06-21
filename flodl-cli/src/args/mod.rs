@@ -38,6 +38,21 @@ pub trait FdlArgsTrait: Sized {
 
     /// Render `--help` to a string.
     fn render_help() -> String;
+
+    /// Render `--help` for a specific argv path (program name first, then
+    /// the tokens typed). The default ignores the path and returns
+    /// [`Self::render_help`] — correct for a single struct, whose help is
+    /// context-free.
+    ///
+    /// The enum derive overrides this to peel the leading subcommand token
+    /// and render that subcommand's help, recursing for nested trees. An
+    /// absent or unknown subcommand falls back to the root (command-list)
+    /// help. This is why `bin train --help` shows train's flags rather than
+    /// the top-level command list.
+    fn render_help_path(argv: &[String]) -> String {
+        let _ = argv;
+        Self::render_help()
+    }
 }
 
 /// Intercept `--fdl-schema` and `--help`, otherwise parse argv.
@@ -68,7 +83,10 @@ pub fn parse_or_schema_from<T: FdlArgsTrait>(argv: &[String]) -> T {
         std::process::exit(0);
     }
     if argv.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}", T::render_help());
+        // `render_help_path` is context-aware: for a variant-shaped CLI,
+        // `bin train --help` renders train's help, not the command list.
+        // For a single struct it is identical to `render_help`.
+        println!("{}", T::render_help_path(argv));
         std::process::exit(0);
     }
     match T::try_parse_from(argv) {
@@ -76,7 +94,7 @@ pub fn parse_or_schema_from<T: FdlArgsTrait>(argv: &[String]) -> T {
         Err(msg) => {
             eprintln!("{msg}");
             eprintln!();
-            eprintln!("{}", T::render_help());
+            eprintln!("{}", T::render_help_path(argv));
             std::process::exit(2);
         }
     }
@@ -235,6 +253,215 @@ mod env_tests {
         let cli: ShortArgs =
             ShortArgs::try_parse_from(&mk_args(&["prog", "-p", "9999"])).unwrap();
         assert_eq!(cli.port, Some(9999));
+    }
+}
+
+#[cfg(test)]
+mod enum_tests {
+    //! Variant-shaped CLI: `#[derive(FdlArgs)]` on an enum of newtype
+    //! variants dispatches a subcommand to the wrapped type.
+
+    use crate::args::FdlArgsTrait;
+    use crate::FdlArgs;
+
+    fn mk_args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Train a model on a dataset.
+    #[derive(FdlArgs, Debug)]
+    struct TrainArgs {
+        /// Number of epochs.
+        #[option(short = 'n', default = "10")]
+        epochs: u32,
+    }
+
+    /// Evaluate a trained model.
+    #[derive(FdlArgs, Debug)]
+    struct EvalArgs {
+        /// Checkpoint to load.
+        #[arg]
+        checkpoint: String,
+    }
+
+    /// flodl demo CLI.
+    #[derive(FdlArgs, Debug)]
+    enum Cli {
+        /// Train a letter model on a dataset
+        Train(TrainArgs),
+        /// Evaluate a trained letter model
+        Eval(EvalArgs),
+        /// Generate samples (renamed)
+        #[command(name = "gen")]
+        Generate(TrainArgs),
+    }
+
+    #[test]
+    fn dispatches_to_variant_and_parses_its_flags() {
+        let cli = Cli::try_parse_from(&mk_args(&["prog", "train", "--epochs", "5"])).unwrap();
+        match cli {
+            Cli::Train(a) => assert_eq!(a.epochs, 5),
+            other => panic!("expected Train, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variant_default_applies_when_flag_absent() {
+        let cli = Cli::try_parse_from(&mk_args(&["prog", "train"])).unwrap();
+        match cli {
+            Cli::Train(a) => assert_eq!(a.epochs, 10),
+            other => panic!("expected Train, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatches_positional_to_variant() {
+        let cli = Cli::try_parse_from(&mk_args(&["prog", "eval", "model.fdl"])).unwrap();
+        match cli {
+            Cli::Eval(a) => assert_eq!(a.checkpoint, "model.fdl"),
+            other => panic!("expected Eval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_name_override_is_honored() {
+        let cli = Cli::try_parse_from(&mk_args(&["prog", "gen"])).unwrap();
+        match cli {
+            // Reading the wrapped value also confirms the tail parsed.
+            Cli::Generate(a) => assert_eq!(a.epochs, 10),
+            other => panic!("`gen` must map to Generate, got {other:?}"),
+        }
+        // And the original kebab name no longer dispatches.
+        let err = Cli::try_parse_from(&mk_args(&["prog", "generate"])).unwrap_err();
+        assert!(err.contains("unknown command"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_command_errors_with_list() {
+        let err = Cli::try_parse_from(&mk_args(&["prog"])).unwrap_err();
+        assert!(
+            err.contains("missing command") && err.contains("train") && err.contains("eval"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_suggests_close_match() {
+        let err = Cli::try_parse_from(&mk_args(&["prog", "trian"])).unwrap_err();
+        assert!(
+            err.contains("did you mean `train`"),
+            "near-miss must suggest; got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_far_miss_lists_options() {
+        let err = Cli::try_parse_from(&mk_args(&["prog", "zzzzz"])).unwrap_err();
+        assert!(
+            err.contains("expected one of") && err.contains("train"),
+            "far miss must list commands; got: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_is_a_branch_with_described_children() {
+        let s = Cli::schema();
+        assert!(s.args.is_empty() && s.options.is_empty(), "root is a branch, not a leaf");
+        assert_eq!(s.commands.len(), 3);
+        assert_eq!(
+            s.commands["train"].description.as_deref(),
+            Some("Train a letter model on a dataset")
+        );
+        // Child carries the wrapped struct's own leaf shape.
+        assert!(s.commands["train"].options.contains_key("epochs"));
+        // Renamed variant keys by its override.
+        assert!(s.commands.contains_key("gen"));
+        // The whole tree must clear validation.
+        crate::config::validate_schema(&s).expect("derived tree schema must validate");
+    }
+
+    #[test]
+    fn root_help_lists_commands() {
+        let help = Cli::render_help();
+        assert!(help.contains("Commands"), "root help has a Commands section");
+        assert!(help.contains("train") && help.contains("eval") && help.contains("gen"));
+        assert!(
+            help.contains("Train a letter model on a dataset"),
+            "command descriptions come from variant docs; got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn help_path_renders_the_subcommands_help() {
+        // `prog train --help` → train's help (mentions its own flag), not
+        // the command list.
+        let help = Cli::render_help_path(&mk_args(&["prog", "train", "--help"]));
+        assert!(help.contains("epochs"), "train help must show its flags; got:\n{help}");
+        assert!(!help.contains("Commands"), "must not fall back to the command list");
+    }
+
+    #[test]
+    fn help_path_falls_back_to_root_when_no_subcommand() {
+        let help = Cli::render_help_path(&mk_args(&["prog"]));
+        assert!(help.contains("Commands"), "bare --help shows the command list");
+    }
+
+    // ── Nested enums: arbitrary subcommand depth, for free ─────────────
+
+    /// A variant that wraps *another* `FdlArgs` enum nests the tree one
+    /// level deeper via plain tail-recursive delegation.
+    #[derive(FdlArgs, Debug)]
+    enum WordCli {
+        /// Train group
+        Train(TrainGroup),
+        /// Evaluate
+        Eval(EvalArgs),
+    }
+
+    #[derive(FdlArgs, Debug)]
+    enum TrainGroup {
+        /// Plain training
+        Full(TrainArgs),
+        /// Subscan sweep
+        Subscan(TrainArgs),
+    }
+
+    #[test]
+    fn nested_enum_dispatches_two_levels() {
+        let cli =
+            WordCli::try_parse_from(&mk_args(&["prog", "train", "subscan", "--epochs", "3"]))
+                .unwrap();
+        match cli {
+            WordCli::Train(TrainGroup::Subscan(a)) => assert_eq!(a.epochs, 3),
+            other => panic!("expected Train>Subscan, got {other:?}"),
+        }
+        // Exercise the other two paths (inner-group default + outer leaf).
+        match WordCli::try_parse_from(&mk_args(&["prog", "train", "full"])).unwrap() {
+            WordCli::Train(TrainGroup::Full(a)) => assert_eq!(a.epochs, 10),
+            other => panic!("expected Train>Full, got {other:?}"),
+        }
+        match WordCli::try_parse_from(&mk_args(&["prog", "eval", "ckpt.fdl"])).unwrap() {
+            WordCli::Eval(a) => assert_eq!(a.checkpoint, "ckpt.fdl"),
+            other => panic!("expected Eval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_enum_schema_is_a_two_level_tree() {
+        let s = WordCli::schema();
+        let train = &s.commands["train"];
+        assert!(train.options.is_empty(), "the train node is itself a branch");
+        assert!(train.commands.contains_key("subscan"));
+        assert!(train.commands["full"].options.contains_key("epochs"));
+        crate::config::validate_schema(&s).expect("nested tree must validate");
+    }
+
+    #[test]
+    fn nested_enum_help_drills_to_leaf() {
+        // `prog train subscan --help` reaches the innermost struct's help.
+        let help =
+            WordCli::render_help_path(&mk_args(&["prog", "train", "subscan", "--help"]));
+        assert!(help.contains("epochs"), "must reach the leaf struct help; got:\n{help}");
     }
 }
 

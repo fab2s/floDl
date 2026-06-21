@@ -127,6 +127,58 @@ fn validate_tail_passthrough_after_double_dash() {
 }
 
 
+// ── Tree (variant-shaped) tail validation ───────────────────────────
+
+/// Build a strict tree schema: `train` (with --model choices) + `eval`.
+fn strict_tree_schema() -> Schema {
+    let mut train = strict_schema_with_model_option();
+    train.strict = true;
+    let mut eval = Schema {
+        strict: true,
+        ..Schema::default()
+    };
+    eval.args.push(arg("checkpoint", "path"));
+    let mut root = Schema::default();
+    root.commands.insert("train".into(), train);
+    root.commands.insert("eval".into(), eval);
+    root
+}
+
+#[test]
+fn validate_tail_descends_into_subcommand_leaf() {
+    let schema = strict_tree_schema();
+    // A flag valid for `train` passes once routed to the train leaf.
+    validate_tail(&["train".into(), "--model".into(), "mlp".into()], &schema)
+        .expect("declared train flag must pass");
+    // Strict mode on the train leaf rejects an undeclared flag.
+    let err = validate_tail(&["train".into(), "--bogus".into()], &schema)
+        .expect_err("undeclared flag under train must fail in strict mode");
+    assert!(err.contains("bogus"), "got: {err}");
+}
+
+#[test]
+fn validate_tail_rejects_unknown_subcommand_with_suggestion() {
+    let schema = strict_tree_schema();
+    let err = validate_tail(&["trian".into()], &schema)
+        .expect_err("misspelled subcommand must fail");
+    assert!(err.contains("did you mean `train`"), "got: {err}");
+}
+
+#[test]
+fn validate_tail_tree_choice_violation_caught_at_leaf() {
+    let schema = strict_tree_schema();
+    let err = validate_tail(&["train".into(), "--model".into(), "nope".into()], &schema)
+        .expect_err("invalid choice under train must fail");
+    assert!(err.contains("allowed"), "got: {err}");
+}
+
+#[test]
+fn validate_tail_tree_no_subcommand_is_ok() {
+    // Nothing to validate at the leaf yet — the binary handles arity.
+    let schema = strict_tree_schema();
+    validate_tail(&[], &schema).expect("bare tree invocation must not error");
+}
+
 #[test]
 fn validate_presets_strict_rejects_unknown_option() {
     let schema = strict_schema_with_model_option();

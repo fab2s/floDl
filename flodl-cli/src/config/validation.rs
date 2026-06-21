@@ -109,6 +109,30 @@ fn strict_choices_to_strings(cs: &[serde_json::Value]) -> Vec<String> {
 /// The tokenizer from [`crate::args::parser`] is reused so "did you
 /// mean" suggestions, cluster, and equals handling come for free.
 pub fn validate_tail(tail: &[String], schema: &Schema) -> Result<(), String> {
+    // Variant-shaped CLI (tree schema): resolve to the invoked
+    // subcommand's leaf, then validate the rest against it. The first bare
+    // (non-flag) token is the subcommand; flags before it (if any) are
+    // globals already peeled by the fdl wrapper, so we don't second-guess
+    // them — the binary re-parses authoritatively.
+    if !schema.commands.is_empty() {
+        let Some(pos) = tail.iter().position(|t| !t.starts_with('-')) else {
+            // No subcommand token typed yet — nothing leaf-level to check.
+            return Ok(());
+        };
+        let sub = &tail[pos];
+        let Some(child) = schema.commands.get(sub) else {
+            let names: Vec<&str> = schema.commands.keys().map(String::as_str).collect();
+            return Err(match crate::args::parser::suggest(&names, sub) {
+                Some(s) => format!("unknown command `{sub}`, did you mean `{s}`?"),
+                None => format!(
+                    "unknown command `{sub}`, expected one of: {}",
+                    names.join(", ")
+                ),
+            });
+        };
+        return validate_tail(&tail[pos + 1..], child);
+    }
+
     let spec = schema_to_args_spec(schema);
     let mut argv = Vec::with_capacity(tail.len() + 1);
     argv.push("fdl".to_string());
