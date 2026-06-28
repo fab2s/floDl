@@ -18,6 +18,10 @@ ddp-bench/runs-*/
 ddp-bench/data/
 /data/
 
+# Research sweeps (elche-msf etc.) — valuable but every result needs a re-run
+# before it is publishable, so the tree is kept on disk, out of git.
+/research/
+
 # Generated guide pages (built from site/_stubs/ + docs/ by site/build_guide.py)
 site/guide/*.md
 # Jekyll build output and bundle lock
