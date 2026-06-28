@@ -8,8 +8,13 @@ use super::*;
 
 #[test]
 fn test_async_ddp_single_gpu_fallback() {
-    // With <2 GPUs, falls back to single-device training.
-    // With 2+ GPUs, uses all of them. Either way, join succeeds.
+    // The builder entry's multi-GPU path auto-promotes to process-per-rank
+    // in production and is gated off under cfg(test); the only cfg(test)
+    // reachable behavior is the single-device fallback (<2 visible devices).
+    // Skip on a multi-GPU box so this stays a deterministic fallback test.
+    if crate::tensor::usable_cuda_devices().len() >= 2 {
+        return;
+    }
     let ddp = DdpHandle::auto(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
@@ -28,30 +33,10 @@ fn test_async_ddp_single_gpu_fallback() {
     assert_eq!(state.buffers.len(), 0);
 }
 
-#[test]
-#[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-nccl"]
-fn test_async_ddp_multi_gpu_nccl() {
-    if crate::tensor::usable_cuda_devices().len() < 2 {
-        return;
-    }
-
-    let ddp = DdpHandle::auto(
-        |dev| Linear::on_device(4, 2, dev),
-        |params| crate::nn::SGD::new(params, 0.01, 0.0),
-        mse_train,
-        Arc::new(TestDataset { n: 256 }),
-        32,
-        2,  // 2 epochs
-        ApplyPolicy::Sync,
-        AverageBackend::Nccl,
-    ).unwrap();
-
-    assert!(ddp.world_size() >= 2);
-
-    // Workers train for 2 epochs then exit, join returns trained state
-    let state = ddp.join().unwrap();
-    assert_eq!(state.params.len(), 2);
-}
+// `test_async_ddp_multi_gpu_nccl` drove the in-process multi-GPU engine via
+// the builder entry; that engine was removed (production auto-promotes to
+// process-per-rank). End-to-end multi-GPU training is validated by the
+// `ddp-bench` binary under `fdl cuda-test-nccl`, not a cfg(test) unit test.
 
 #[test]
 fn test_async_ddp_send_sync() {
@@ -410,90 +395,7 @@ fn test_worker_send_final_snapshot() {
     assert_eq!(snap.rank, 0);
 }
 
-#[test]
-fn test_collect_final_state_averages() {
-    let (timing_tx, timing_rx) = mpsc::channel();
-    let (_metrics_tx, metrics_rx) = mpsc::channel();
-    let (_param_tx, param_rx) = mpsc::channel();
-
-    let mut control_txs = Vec::new();
-    let mut final_param_rxs = Vec::new();
-    let mut final_param_txs = Vec::new();
-    for _ in 0..2 {
-        let (ctx, _crx) = mpsc::channel();
-        control_txs.push(ctx);
-        let (ftx, frx) = mpsc::channel();
-        final_param_txs.push(ftx);
-        final_param_rxs.push(frx);
-    }
-
-    let el_che = ElChe::new(2, 10);
-    let coord = Coordinator::builder(
-        timing_rx, metrics_rx, param_rx,
-        final_param_rxs,
-        control_txs,
-        ApplyPolicy::Sync, AverageBackend::Cpu,
-        2, 1000, el_che,
-    ).build();
-
-    // Send final snapshots from both "workers"
-    let opts = crate::tensor::test_opts();
-    let t1 = Tensor::full(&[3], 2.0, opts).unwrap();
-    let t2 = Tensor::full(&[3], 4.0, opts).unwrap();
-    final_param_txs[0].send(ParamSnapshot {
-        rank: 0, params: vec![t1], buffers: vec![], batch_count: 1,
-    }).unwrap();
-    final_param_txs[1].send(ParamSnapshot {
-        rank: 1, params: vec![t2], buffers: vec![], batch_count: 1,
-    }).unwrap();
-
-    let state = coord.collect_final_state().unwrap();
-    assert_eq!(state.params.len(), 1);
-    // Average of 2.0 and 4.0 with equal weights = 3.0
-    let vals: Vec<f64> = state.params[0].to_f64_vec().unwrap();
-    assert!(vals.iter().all(|v| (v - 3.0).abs() < 1e-5), "expected all ~3.0, got {vals:?}");
-
-    // Also verify timing_tx keeps coordinator alive
-    drop(timing_tx);
-}
-
-#[test]
-fn test_collect_final_state_single_survivor() {
-    let (_timing_tx, timing_rx) = mpsc::channel();
-    let (_metrics_tx, metrics_rx) = mpsc::channel();
-    let (_param_tx, param_rx) = mpsc::channel();
-
-    let mut control_txs = Vec::new();
-    let mut final_param_rxs = Vec::new();
-    let mut final_param_txs = Vec::new();
-    for _ in 0..2 {
-        let (ctx, _crx) = mpsc::channel();
-        control_txs.push(ctx);
-        let (ftx, frx) = mpsc::channel();
-        final_param_txs.push(ftx);
-        final_param_rxs.push(frx);
-    }
-
-    let el_che = ElChe::new(2, 10);
-    let coord = Coordinator::builder(
-        timing_rx, metrics_rx, param_rx,
-        final_param_rxs,
-        control_txs,
-        ApplyPolicy::Sync, AverageBackend::Cpu,
-        2, 1000, el_che,
-    ).build();
-
-    // Only one worker sends a final snapshot (the other "died")
-    let opts = crate::tensor::test_opts();
-    let t = Tensor::full(&[3], 7.0, opts).unwrap();
-    final_param_txs[0].send(ParamSnapshot {
-        rank: 0, params: vec![t], buffers: vec![], batch_count: 5,
-    }).unwrap();
-    // Worker 1 never sends
-
-    let state = coord.collect_final_state().unwrap();
-    assert_eq!(state.params.len(), 1);
-    let vals: Vec<f64> = state.params[0].to_f64_vec().unwrap();
-    assert!(vals.iter().all(|v| (v - 7.0).abs() < 1e-5), "single survivor should return its own params");
-}
+// `collect_final_state` tests lived here; they exercised the in-process
+// Coordinator and were removed with it. Final-state collection on the
+// process path is covered under `cluster_coordinator/tests/`.
 

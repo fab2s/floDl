@@ -1,9 +1,17 @@
-//! DDP run mode: thread-per-GPU training with Local SGD and adaptive parameter averaging.
+//! DDP run mode: the `Trainer::builder()` / [`DdpBuilder`] entry, the
+//! [`DdpHandle`] it returns, the per-rank [`GpuWorker`], and the shared
+//! cadence config ([`ApplyPolicy`] / [`AverageBackend`] / `DdpRunConfig`).
 //!
-//! Each GPU runs its own optimizer independently (zero wait). A lightweight coordinator
-//! triggers periodic parameter averaging at ElChe-determined intervals. Two orthogonal
-//! knobs control the behavior: [`ApplyPolicy`] (when to average) and [`AverageBackend`]
-//! (how to average).
+//! `DdpHandle::launch` dispatches by topology: a single visible device runs
+//! the inline single-host fallback; 2+ devices or an active cluster overlay
+//! auto-promote to the process-per-rank cluster path (launcher / controller /
+//! `cluster_coordinator` / `cluster_worker`), where each rank process drives a
+//! [`GpuWorker`] over the wire. The in-process thread-per-GPU engine that once
+//! lived here was removed; thread-based multi-GPU is available only as the
+//! lower-level `Ddp::wrap` primitive.
+//!
+//! Two orthogonal knobs control averaging cadence: [`ApplyPolicy`] (when to
+//! average) and [`AverageBackend`] (how to average).
 //!
 //! # Quick start
 //!
@@ -24,12 +32,12 @@
 //! // state.buffers[i] corresponds to model.buffers()[i]
 //! ```
 //!
-//! # Architecture
+//! # Architecture (process-per-rank)
 //!
 //! ```text
-//! GPU Thread 0:  create model+Adam+dataset -> [fwd -> bwd -> adam step -> repeat]
-//! GPU Thread 1:  create model+Adam+dataset -> [fwd -> bwd -> adam step -> repeat]
-//! Coordinator:   collect timing/metrics -> trigger param averaging -> monitor divergence
+//! Rank process 0:  create model+optim+dataset -> [fwd -> bwd -> step -> repeat]
+//! Rank process 1:  create model+optim+dataset -> [fwd -> bwd -> step -> repeat]
+//! Controller:      collect timing/metrics -> trigger param averaging -> monitor divergence
 //! ```
 //!
 //! # Choosing a policy
@@ -61,13 +69,14 @@
 //!   unblocked via `ncclCommAbort` instead of hanging forever.
 
 mod worker;
-mod coordinator;
 mod orchestrator;
+mod shared;
 pub mod convergence;
 
 pub use worker::*;
-pub use coordinator::*;
-pub(crate) use coordinator::{equal_sizes, ratio_to_sizes, throughput_sizes};
+pub(crate) use shared::{
+    aggregate_epoch_metrics, equal_sizes, ratio_to_sizes, throughput_sizes,
+};
 pub use orchestrator::*;
 pub use convergence::{
     ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample,

@@ -516,11 +516,8 @@ impl DdpHandle {
         };
 
         Ok(DdpHandle {
-            worker_handles: Vec::new(),
-            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(false)),
-            nccl_abort_handles: Vec::new(),
             final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,

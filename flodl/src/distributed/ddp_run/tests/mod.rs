@@ -10,17 +10,12 @@
 
 pub(crate) use super::*;
 pub(crate) use crate::autograd::Variable;
-pub(crate) use crate::distributed::ddp::ElChe;
 pub(crate) use crate::nn::{Linear, Module};
 pub(crate) use crate::tensor::{DType, Tensor, TensorError, TensorOptions, test_device, test_opts};
 pub(crate) use std::sync::mpsc;
 
-mod averaging;
 mod builder_and_resume;
 mod checkpoint;
-mod coordinator;
-mod dispatch;
-mod lr;
 mod worker;
 
 #[test]
@@ -219,61 +214,6 @@ pub(super) fn make_test_worker_with(
     (worker, channels)
 }
 
-// ---------------------------------------------------------------------------
-// Shared coordinator-test fixtures (used by coordinator.rs, averaging.rs,
-// dispatch.rs, lr.rs, builder_and_resume.rs)
-// ---------------------------------------------------------------------------
-
-/// Simple coordinator test helper.
-pub(super) struct CoordTestHarness {
-    coord: Coordinator,
-    /// Send timing/metrics/params TO the coordinator.
-    timing_tx: mpsc::Sender<TimingMsg>,
-    metrics_tx: mpsc::Sender<MetricsMsg>,
-    param_tx: mpsc::Sender<ParamSnapshot>,
-    /// Receive control messages FROM the coordinator (one per worker).
-    control_rxs: Vec<mpsc::Receiver<ControlMsg>>,
-}
-
-pub(super) fn make_coord_harness(
-    n: usize,
-    policy: ApplyPolicy,
-    backend: AverageBackend,
-) -> CoordTestHarness {
-    make_coord_harness_with_timeout(n, policy, backend, 5)
-}
-
-pub(super) fn make_coord_harness_with_timeout(
-    n: usize,
-    policy: ApplyPolicy,
-    backend: AverageBackend,
-    snapshot_timeout_secs: u64,
-) -> CoordTestHarness {
-    let (timing_tx, timing_rx) = mpsc::channel();
-    let (metrics_tx, metrics_rx) = mpsc::channel();
-    let (param_tx, param_rx) = mpsc::channel();
-
-    let mut control_txs = Vec::new();
-    let mut control_rxs = Vec::new();
-    let mut final_param_rxs = Vec::new();
-    for _ in 0..n {
-        let (tx, rx) = mpsc::channel();
-        control_txs.push(tx);
-        control_rxs.push(rx);
-        let (_ftx, frx) = mpsc::channel();
-        final_param_rxs.push(frx);
-    }
-
-    let el_che = ElChe::new(n, 10);
-    let coord = Coordinator::builder(
-        timing_rx, metrics_rx, param_rx,
-        final_param_rxs,
-        control_txs,
-        policy, backend,
-        n, 10000, el_che,
-    )
-    .snapshot_timeout_secs(snapshot_timeout_secs)
-    .build();
-
-    CoordTestHarness { coord, timing_tx, metrics_tx, param_tx, control_rxs }
-}
+// In-process coordinator test fixtures lived here. They were removed with
+// the in-process orchestration engine; the process-per-rank path is covered
+// by `cluster_coordinator/tests/` and `cluster_worker_tests.rs`.

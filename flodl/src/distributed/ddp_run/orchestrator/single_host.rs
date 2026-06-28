@@ -171,7 +171,7 @@ impl DdpHandle {
                 // Single-GPU fast path: only one rank, so the cadence-share
                 // is trivially [1.0]. No balancer involved.
                 let bc_share = vec![1.0_f64];
-                let metrics = ddp_run::coordinator::aggregate_epoch_metrics(
+                let metrics = ddp_run::aggregate_epoch_metrics(
                     epoch, &msgs, &device_indices, &bc_share,
                 );
                 if let Some(f) = &metrics_fn {
@@ -239,11 +239,8 @@ impl DdpHandle {
         };
 
         Ok(DdpHandle {
-            worker_handles: Vec::new(),
-            coordinator_handle: None,
             devices: vec![device],
             shutdown: Arc::new(AtomicBool::new(true)),
-            nccl_abort_handles: Vec::new(),
             final_state: Some(final_state),
             metrics_rx: Some(epoch_metrics_rx),
             launcher_driver: None,
