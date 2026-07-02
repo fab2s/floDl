@@ -40,8 +40,8 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 > entry (`Trainer::builder(...).run()`) now scales from CPU to
 > single-host multi-GPU (auto-promoted on 2+ visible GPUs) to
 > multi-host clusters via `fdl.cluster.yml` or `ClusterBuilder`.
-> ElChe collapsed to `ElCheMode` (six modes,
-> default `NcclAsync`); convergence guard is now authoritative over
+> ElChe collapsed to `ElCheMode` (five modes,
+> default `NcclCadence`); convergence guard is now authoritative over
 > `overhead_target`; per-epoch callbacks default to the fastest rank
 > (free compute on heterogeneous rigs). New CLI: `fdl probe` (cluster
 > readiness audit), `fdl nccl build` (libnccl source builder for
@@ -455,15 +455,15 @@ stays bounded, the convergence guard vetoes anchor growth when
 weight-space divergence rises. No configuration needed for the common
 case.
 
-**Six DDP modes, one line each.** `ElCheConfig::default()` is
-`nccl_async()` (recommended NCCL default). Swap to any of the six
+**Five DDP modes, one line each.** `ElCheConfig::default()` is
+`nccl_cadence()` (recommended NCCL default). Swap to any of the five
 modes for A/B testing:
 
 ```rust
 .elche(ElCheConfig::cpu_async().easgd_alpha(0.6))   // best-in-class on reference rig
-.elche(ElCheConfig::nccl_async())                   // default; cross-epoch lookahead on heterogeneous rigs
-.elche(ElCheConfig::nccl_cadence())                 // strict cross-epoch lockstep
+.elche(ElCheConfig::nccl_cadence())                 // default; slow rank anchors, fast ranks fill the window
 .elche(ElCheConfig::nccl_sync())                    // per-batch AllReduce baseline
+.elche(ElCheConfig::cpu_cadence())                  // CPU-mediated cadence (no NVLink/P2P needed)
 ```
 
 **Multi-host clusters.** Add an `fdl.cluster.yml` next to your
@@ -650,7 +650,6 @@ GTX 1060, 2.5x speed ratio). Published reference: 91.25%
 | Mode | Eval | vs Published | Time | vs Solo-0 |
 |---|---:|---:|---:|---:|
 | solo-0 (fast GPU only) | 91.66% | +0.41% | 3127s | - |
-| nccl-async | **92.44%** | **+1.19%** | 2697s | 1.2x |
 | nccl-cadence | **92.42%** | **+1.17%** | 2650s | 1.2x |
 | cpu-async | **92.43%** | **+1.18%** | 2614s | 1.2x |
 | cpu-cadence | **92.04%** | **+0.79%** | 2670s | 1.2x |
@@ -744,7 +743,7 @@ codegen-units = 1
 | `Trainer::builder(...).run()` | Universal entry. Same call scales from CPU to multi-host cluster. |
 | `Trainer::run(..., TrainerConfig)` | Config-bag form - same launcher, data-driven setup. |
 | `Trainer::setup(&graph, ...)` | Graph one-liner; you keep the training loop. |
-| `ElCheMode` | `NcclSync/Cadence/Async`, `CpuSync/Cadence/Async`. Default `NcclAsync`. |
+| `ElCheMode` | `NcclSync/Cadence`, `CpuSync/Cadence/Async`. Default `NcclCadence`. |
 | `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
 | `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
 | `ClusterBuilder` | Programmatic cluster construction (mirrors `fdl.cluster.yml`). |
@@ -753,7 +752,7 @@ codegen-units = 1
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
 | `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
-| `Ddp::wrap` | Manual thread-per-GPU. `cfg(test)`-gated for flodl's own tests; opt-in for external crates needing explicit replica control. |
+| `Ddp::wrap` | Manual thread-based DDP primitive (per-rank gradient sync) for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
 
 </details>
 
@@ -799,7 +798,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 9. **[Training Monitor](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/09-monitor.md)** - ETA, resource tracking, live dashboard
 10. **[Graph Tree](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/10-graph-tree.md)** - hierarchical composition, freeze/thaw, subgraph checkpoints
 11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** - Trainer::setup, El Che, auto-balancing, DataLoader integration
-12. **[DDP Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** - thread-per-GPU, Local SGD, A/B testable backends
+12. **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** - ElChe cadence, process-per-rank cluster, A/B testable backends
 13. **[Data Loading](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)** - DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
 14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** - load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::setup_head`, round-trip export to the HF ecosystem, PyTorch parity
 

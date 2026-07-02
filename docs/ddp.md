@@ -182,13 +182,17 @@ let elche = ElCheConfig {
 | `.mode(ElCheMode)` | `NcclCadence` | The (when × how) pair. `ElCheConfig::default()` returns `nccl_cadence()`. |
 | `.anchor(n)` | 10 (Cadence/Async); 1 (Sync) | Initial anchor count. |
 | `.min_anchor(n)` / `.max_anchor(n)` | `None` (auto) | Anchor bounds. |
-| `.overhead_target(f)` | `0.10` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** - Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
+| `.overhead_target(f)` | `0.05` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** - Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
 | `.max_batch_diff(n)` | `None` | Cap on how far the fastest rank may lead the slowest. `Some(0)` = strict lockstep regardless of mode. |
 | `.relax_up(bool)` | `false` | Allow ElChe to grow the anchor in `Phase::Stable` when convergence stays clean. |
 | `.partition_ratios(Vec<f64>)` | auto | Static per-rank data split (e.g. `[0.7, 0.3]`). **Honored on `Sync` policy only**; Cadence/Async use progressive dispatch driven by ElChe and ignore the static ratios. For dynamic heterogeneous scheduling under those policies, ElChe's throughput-based auto-rebalancing is the intended path. |
 | `.meta_controller(bool)` | `true` | LR-aware meta-controller - watches LR + anchor + divergence; nudges anchor down on sharp LR drops or sustained divergence. On by default (LR drops are always worth catching); opt out for unconditioned-trajectory instrumentation. |
 | `.convergence_guard(g)` | `TrendGuard::new(0.05)` | Divergence guardrail. `NoGuard`, `TrendGuard`, or `MsfGuard` (rate-based). |
 | `.easgd_alpha(α)` | `None` | EASGD elastic blend on the `CpuAsync` path (`0 < α ≤ 1.0`). Ignored elsewhere. |
+| `.gamma(γ)` | `1.0` | Consensus allocation-weighting exponent applied when the outer optimizer / averaging weights ranks by work. `1.0` = pre-gamma (plain work-weighting). |
+| `.divergence_threshold(f)` | `None` | Legacy primitive feeding the default `TrendGuard` threshold when no explicit `convergence_guard` is set. Prefer `.convergence_guard(...)`. |
+| `.no_divergence_guard()` | `false` | Disable the divergence guardrail entirely (overhead auto-tune drives cadence alone). Use only when the workload is known stable. |
+| `.max_overshoot(n)` | `None` (auto) | Max batches a rank may run past its planned sync point before being held. **`CpuAsync` only**; ignored by Sync/Cadence. |
 
 ### Convergence guards
 
@@ -282,6 +286,9 @@ let cfg = TrainerConfig::new(dataset)
 | `.eval_fn(f)` | `EvalFn<M>` | Receives `(&M, &Tensor, &Tensor)`, returns `Result<f64>`. |
 | `.eval_result_fn(f)` | `EvalResultFn` | Controller-side `(epoch, scalar)` sink. |
 | `.epoch_callback_policy(p)` | `EpochCallbackPolicy` | `Fastest` (default) or `Rank(n)`. |
+| `.outer_optimizer(factory)` | `Fn() -> Box<dyn OuterOptimizer>` | Outer-loop optimizer on the consensus (SlowMo / DiLoCo). Default = plain work-weighted averaging (`OuterAvg`). See [Outer optimizer](#outer-optimizer---slowmo--diloco). |
+| `.checkpoint_at_epoch(n)` | `usize` | One-shot coverage-granular checkpoint at the epoch any rank first reaches (progressive modes). Pairs with `.save_path`. |
+| `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |
 
@@ -513,10 +520,12 @@ files. Compatible with `.meta.json` from any prior flodl run.
 
 | Variant | Trigger |
 |---|---|
-| `Periodic` | `checkpoint_every` interval. |
-| `EpochFn` | `checkpoint_fn` callback. |
-| `ShutdownWithSave` | Cluster shutdown after `max_failure` ranks died. |
-| `RoleFailover` | Callback-rank death; controller picked a new rank and re-issued the save. |
+| `Checkpoint` | A mid-run checkpoint taken atomically at a reduce (`checkpoint_every` / `checkpoint_at_epoch`); training continues. |
+| `GracefulShutdown` | Normal cluster shutdown after reaching end-of-training. |
+| `MaxFailureExceeded` | User-configured `max_failure` threshold was breached. |
+| `SingleSurvivor` | NCCL cohort dropped below 2 ranks; the lone survivor saves before exiting (NCCL needs world_size >= 2). |
+| `AllRanksLost` | CPU cohort lost its last survivor. |
+| `ReduceStall` | A reduce cycle stalled past its hard ceiling with the cohort still alive (scheduler wedge); save + shut down rather than hang. |
 
 ---
 
@@ -739,6 +748,42 @@ ignored elsewhere.
 
 ---
 
+## Outer optimizer - SlowMo / DiLoCo
+
+By default the cluster averages replicas with a plain work-weighted mean.
+An **outer optimizer** adds a second optimization loop applied to the
+work-weighted consensus *between* the reduce and the broadcast, on top of
+the inner per-rank optimizers - the hook for communication-efficient
+methods like SlowMo and DiLoCo. Configure it on the builder or
+`TrainerConfig`:
+
+```rust
+use flodl::{NesterovMomentum, SlowMomentum, OuterAvg};
+
+Trainer::builder(model_factory, optim_factory, train_fn)
+    .dataset(dataset).batch_size(32).num_epochs(20)
+    .elche(ElCheConfig::nccl_cadence())
+    .outer_optimizer(|| Box::new(NesterovMomentum::new(0.7, 0.9)))  // DiLoCo
+    .run()?;
+```
+
+| Variant | Behavior |
+|---|---|
+| `OuterAvg` (default) | Stateless identity passthrough - reproduces plain work-weighted averaging. No momentum, no artifact. |
+| `SlowMomentum::new(lr, mu)` | SlowMo heavy-ball momentum on the pseudo-gradient; continuous inner loop. |
+| `NesterovMomentum::new(lr, mu)` | DiLoCo-style Nesterov outer step; `resets_inner()` makes each worker reset its inner optimizer per outer round. |
+
+- Built once per site: controller-side on the CPU backend, per-rank
+  replicated lock-step on NCCL.
+- `ElCheConfig::gamma(γ)` sets the consensus allocation-weighting exponent
+  (default `1.0` = pre-gamma behavior).
+- **Checkpointing**: momentum-bearing variants persist their slow momentum
+  to a `<stem>.outer.fdl` sidecar alongside the model / optim / meta
+  bundle, and reload it on resume so the outer trajectory is faithful.
+  `OuterAvg` writes no sidecar.
+- `ddp-bench`: `--outer-optimizer none|slowmo|diloco` plus `--outer-lr` /
+  `--outer-mu` / `--gamma`.
+
 ## A/B testing modes
 
 Five modes via `ElCheMode`. One line per mode:
@@ -777,15 +822,20 @@ faster or more accurate than the NCCL variants for typical workloads;
 
 ---
 
-## Manual control - `Ddp::wrap` (test-only)
+## Manual control - `Ddp::wrap`
 
 For complex training patterns (GAN, RL, progressive growing) where you
-need explicit replica control, `Ddp::wrap` exposes the thread-per-GPU
-machinery. It is `cfg(test)`-gated for flodl's own test suite and
-available to external crates that explicitly opt in.
+need explicit per-step replica control, `Ddp::wrap` is the low-level
+per-rank gradient-sync primitive. It is **not** the production multi-GPU
+entry (that auto-promotes to process-per-rank); it wraps **one** replica
+per rank against a shared rendezvous, and it is also what each cluster
+rank uses internally. One rank per thread (single-process testing) or per
+process; the world size comes from the rendezvous.
 
 ```rust
-let ddp = Ddp::wrap(&[&model_a, &model_b], &devices)?;
+// Per rank: wrap this rank's replica. `global_rank` in [0, world_size),
+// `rdv` a TcpRendezvous all ranks share.
+let ddp = Ddp::wrap(&model, device, global_rank, &rdv)?;
 
 ddp.sync_params()?;
 // ... forward + backward ...

@@ -609,8 +609,10 @@ post-deploy smoke test.
 - **Dashboard port availability** (default 3000).
 
 Output splits results into warnings (informational; do not block) and
-errors (block dispatch). `fdl @cluster <cmd>` runs `fdl probe`
-implicitly before fan-out unless `--no-probe` is set.
+errors (block dispatch). `fdl probe` is a manual readiness gate — run it
+yourself before a cluster run; it is not invoked implicitly by fan-out.
+(The automatic pre-flight step `fdl @cluster <cmd>` performs is the
+per-host binary build, skippable with `--no-prebuild`.)
 
 ### `fdl nccl`
 
@@ -679,7 +681,7 @@ Loud-errors on duplicate, missing value, or invalid spec.
 ```bash
 fdl --gpus 0 test                # CPU-style: scope tests to GPU 0
 fdl --gpus 0,1 ddp-bench --mode nccl-cadence   # synthesize 2-rank single-host cluster
-fdl --gpus all cluster ddp-bench --mode nccl-cadence   # override local host devices in cluster mode
+fdl --gpus all @cluster ddp-bench --mode nccl-cadence   # override local host devices in cluster mode
 ```
 
 ### `fdl @cluster <cmd>` - multi-host fan-out

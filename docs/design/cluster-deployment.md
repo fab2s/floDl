@@ -124,7 +124,7 @@ arch matches the probed hardware:
   any mismatch to error.
 
 The arch field landed as an optional schema entry in
-[`ClusterHost`](../../flodl-cli/src/config.rs); the probe consumer
+[`ClusterWorker`](../../flodl-cli/src/config/cluster.rs); the probe consumer
 is future work.
 
 ### Shared storage > per-host source-of-truth

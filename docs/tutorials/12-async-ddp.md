@@ -360,7 +360,7 @@ TrainerConfig::new(dataset)
 
 | Setter | Default | Effect |
 |---|---|---|
-| `.overhead_target(f)` | `0.10` | Target ratio `sync_ms / max(compute_ms)`. Lower → grow anchor sooner; higher → tolerate more sync overhead. Cadence/Async only. |
+| `.overhead_target(f)` | `0.05` | Target ratio `sync_ms / max(compute_ms)`. Lower → grow anchor sooner; higher → tolerate more sync overhead. Cadence/Async only. |
 | `.max_anchor(n)` | auto | Anchor growth ceiling. |
 | `.max_batch_diff(n)` | `None` | Cap on fastest-vs-slowest lead. `Some(0)` = strict lockstep. |
 | `.relax_up(true)` | `false` | Grow anchor by 1 on Stable verdict (in addition to overhead-tune proposals). |

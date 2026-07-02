@@ -13,7 +13,7 @@ The headline of this release is a full re-architecture of the distributed layer 
 
 #### Multi-process cluster architecture: launcher / controller / coordinator / worker
 
-The distributed layer is now process-based end-to-end. A single `Trainer::run` invocation transparently auto-promotes to process-per-rank fan-out when 2+ GPUs are visible (homogeneous local rig) or when a cluster overlay is active (`fdl cluster <cmd>` / `FDL_ENV=cluster`). Threads-per-GPU is retained only as the test harness via `Ddp::wrap`.
+The distributed layer is now process-based end-to-end. A single `Trainer::run` invocation transparently auto-promotes to process-per-rank fan-out when 2+ GPUs are visible (homogeneous local rig) or when a cluster overlay is active (`fdl @cluster <cmd>` / `FDL_ENV=cluster`). Thread-based multi-GPU is retained only as the lower-level `Ddp::wrap` primitive (manual / test use); the in-process multi-GPU orchestration engine is gone (see Changed).
 
 - **`flodl::distributed::launcher`**: role detector (`Role::SingleDevice | Rank | Launcher`) plus the launcher trampoline that fans out children (fork+exec for local hosts, ssh for remote), starts the controller thread, supervises children concurrently, and tears them down on parent exit. The trampoline runs from inside the user's `main()` at the `Trainer::builder(...).run()` boundary so guard closures and other non-`Serialize` `DdpRunConfig` knobs reach the controller without crossing a process boundary as JSON.
 - **`flodl::distributed::controller`**: `ClusterController` runs on the launcher host as a TCP byte router for CPU averaging round-frames and rank-side log fan-in. The controller, not rank 0, binds rendezvous (`distributed: controller binds rendezvous; drop rank-0 master pattern`) so the orchestrator host is no longer a NCCL rank itself.
@@ -27,8 +27,8 @@ The distributed layer is now process-based end-to-end. A single `Trainer::run` i
 
 Collapses the policy × backend matrix into one user-facing enum and gathers everything `Trainer::run` needs into one struct. The chained `Trainer::builder(...)` form still exists and remains the right tool for callback-heavy setups; `TrainerConfig` is the data-bag form for config-driven launchers.
 
-- **`ElCheMode`** enum (in `flodl::distributed::config`): `NcclSync | NcclCadence | NcclAsync | CpuSync | CpuCadence | CpuAsync`. Names match the ddp-bench / commit / design-doc vocabulary; internally splits into the legacy `(ApplyPolicy, AverageBackend)` pair. `NcclSync` is the degenerate ElChe case (anchor=1) so all six modes route through the same code path.
-- **`ElCheConfig`**: controller-scope tuning (mode, anchor, max_anchor, min_anchor, overhead_target, max_batch_diff, relax_up, partition_ratios, meta_controller, convergence_guard, easgd_alpha). Six preset constructors (`nccl_sync()`, `nccl_cadence()`, `nccl_async()`, `cpu_*`) plus a builder chain.
+- **`ElCheMode`** enum (in `flodl::distributed::config`): `NcclSync | NcclCadence | CpuSync | CpuCadence | CpuAsync`. Names match the ddp-bench / commit / design-doc vocabulary; internally splits into the legacy `(ApplyPolicy, AverageBackend)` pair. `NcclSync` is the degenerate ElChe case (anchor=1) so all five modes route through the same code path.
+- **`ElCheConfig`**: controller-scope tuning (mode, anchor, max_anchor, min_anchor, overhead_target, max_batch_diff, gamma, relax_up, partition_ratios, meta_controller, convergence_guard, easgd_alpha). Five preset constructors (`nccl_sync()`, `nccl_cadence()`, `cpu_sync()`, `cpu_cadence()`, `cpu_async()`) plus a builder chain.
 - **`TrainerConfig<M>`**: umbrella struct gathering dataset / batch_size / num_epochs / elche / max_grad_norm / checkpoint_every / save_path / resume_from / callbacks (`checkpoint_fn`, `epoch_fn`, `metrics_fn`, `scheduler_fn`, `eval_fn`, `eval_result_fn`) / epoch_callback_policy / timeline / optional programmatic `cluster`. Both `Trainer::run` and `Trainer::builder().run()` accept it.
 - **`Trainer::run(model_factory, optim_factory, train_fn, cfg)`**: config-bag entry. Internally builds a `DdpBuilder`, sets the launcher env from `cfg.cluster` if present, and dispatches through the same launcher trampoline as fdl-cli-launched runs (one launcher contract; two construction paths).
 
@@ -46,7 +46,7 @@ Fluent builder mirroring `fdl.cluster.yml` 1:1 (same fields, same validation), f
 
 This is the canonical pre-`Trainer::run` GPU query. The previous habit of calling `flodl::tensor::cuda_device_count()` from `main()` initializes libtorch's CUDA context in the launcher process; that context then poisons the spawned children's contexts on heterogeneous-GPU rigs ("no CUDA before `Trainer::run`" invariant). `detect_gpus` is the safe replacement.
 
-The "no CUDA before `Trainer::run`" invariant is now hardened: `Trainer::setup` / `Trainer::builder` / `Module::on_device(CUDA(_))` all defer device touches until inside the run path. User binaries that respected the invariant pre-0.5.4 are unaffected; binaries that didn't will now error at a clearer site instead of corrupting a spawned child's CUDA state silently.
+The "no CUDA before `Trainer::run`" invariant is now hardened: `Trainer::setup` / `Trainer::builder` / `Module::on_device(CUDA(_))` all defer device touches until inside the run path. User binaries that respected the invariant pre-0.6.0 are unaffected; binaries that didn't will now error at a clearer site instead of corrupting a spawned child's CUDA state silently.
 
 #### Elastic membership + controller-driven checkpoint orchestration
 
@@ -54,10 +54,11 @@ Ranks can die and rejoin without aborting the run. The controller owns the lifec
 
 - **Heartbeat**: `HeartbeatWire` flows worker → controller; missed heartbeats past a configurable threshold transition the rank to `Dead` in the coordinator's per-rank state and elastically renormalize partition ratios across survivors.
 - **`max_failure` threshold + `ShutdownWithSave`**: cluster aborts cleanly when the surviving rank count drops below `max_failure`. On abort the coordinator drives a final checkpoint save through whichever rank still has the freshest state (callback-role-aware), then signals every survivor to exit. Lone NCCL survivors short-circuit the wait and exit immediately.
-- **`flodl::distributed::checkpoint_meta`**: `CheckpointMeta` writes a `<stem>.meta.json` sidecar carrying ElCheState (phase, calibration_count, anchor, partition_ratios, ring buffer) plus the `SaveReason` (Periodic / EpochFn / ShutdownWithSave / RoleFailover) and the `CheckpointBundle` path helpers (`model_path` / `optim_path` / `meta_path` / `config_sidecar_path`). The controller writes meta atomically alongside the model + optimizer files.
+- **`flodl::distributed::checkpoint_meta`**: `CheckpointMeta` writes a `<stem>.meta.json` sidecar carrying ElCheState (phase, calibration_count, anchor, partition_ratios, ring buffer) plus the `SaveReason` (GracefulShutdown / MaxFailureExceeded / SingleSurvivor / AllRanksLost / ReduceStall / Checkpoint) and the `CheckpointBundle` path helpers (`model_path` / `optim_path` / `meta_path` / `config_sidecar_path`). The controller writes meta atomically alongside the model + optimizer files.
 - **Controller-driven checkpoint retry + role failover**: a save failure on the elected callback rank does not poison the run. The coordinator picks a new callback rank from survivors (cost-aware: lowest smoothed_ms_per_batch first, sticky within a run), re-issues the save, and resumes. Failed callbacks are time-excluded from rank-cost accounting so retry latency doesn't bias the next dispatch decision.
 - **NCCL rendezvous-timeout retry with `survivors_ordered`**: if `ncclCommInitRank` doesn't quorum within the timeout, the coordinator picks the largest contiguous survivor subset, rebuilds the comm, and retries. Used at run start and after a mid-run rank death.
 - **`Trainer::resume_from(stem)` / `TrainerConfig::resume_from`**: launcher kickoff loads the model / optim / meta bundle, restores `ElCheState` (preserving phase + calibration trajectory), and continues training from the resume epoch. Compatible with controller-written `.meta.json` from any prior run.
+- **Coverage-granular checkpoint/resume** (`TrainerConfig::checkpoint_at_epoch` / `DdpBuilder::checkpoint_at_epoch`): a one-shot checkpoint fires on a progressive data-*coverage* boundary (the epoch where any rank reaches the target) rather than on a wall clock. `load_consensus_checkpoint` forges a coherent consensus model from the cluster's `RoundFrame`s; `ddp-bench` exposes `--save-path` / `--resume-from` / `--checkpoint-at-epoch` to exercise the round-trip.
 
 #### ElChe: phase machine, divergence guard, LR-aware meta-controller, EASGD
 
@@ -66,6 +67,7 @@ The cadence balancer that shipped in 0.5.x grew load-bearing additions for produ
 - **`Phase` lifecycle**: `Probe → Warmup → Stable → Mature`, monotonic and `>=`-comparable. Probe = no calibrations yet; Warmup = first few calibrations with sticky anchor; Stable = normal operation with overhead auto-tune + hysteresis; Mature = long-running steady state. Gates the more aggressive controllers (anchor swaps, relax-up) to `>= Stable`.
 - **`relax_up`**: in `Phase::Stable` with passing convergence guard, ElChe is allowed to grow the anchor upward, amortizing AllReduce barrier cost over more local SGD when divergence stays bounded. Off by default; opt in via `ElCheConfig::relax_up(true)`.
 - **Progressive warmup + 5% dead zone**: anchor decisions inside the dead zone (anchor differences smaller than 5% of current) are no-ops, reducing thrash on near-stable cadences.
+- **Window-pressure anchor auto-tune**: the anchor is tuned from per-window *fixed overhead* (reduce + window-fill measured against the bottleneck rank's window wall) toward `ElCheConfig::overhead_target` (default `0.05`), with a growth latch that only grows the anchor while pressure stays below target. Replaces the compute-only overhead signal on the cadence path.
 - **Convergence guard (`flodl::distributed::ddp_run::convergence`)**: `ConvergenceGuard` trait with three implementations:
   - **`NoGuard`** (passive baseline; always reports `Stable`).
   - **`TrendGuard`** (production default; three-rises-above-threshold rule on weight-space divergence, default threshold 0.05).
@@ -74,6 +76,19 @@ The cadence balancer that shipped in 0.5.x grew load-bearing additions for produ
   - Guard state is part of `ElCheState` and round-trips through checkpoint resume.
 - **LR-aware meta-controller (`flodl::distributed::lr_event_meta`)**: optional layer above ElChe (`ElCheConfig::meta_controller(true)`) that watches the LR trajectory, anchor trend, and convergence-guard verdicts in a rolling window. Reactively nudges the anchor down on sharp LR drops or sustained divergence, and reports `is_settled()` once the metric stops moving. Drives `cluster_coordinator`'s meta-controller wiring; off by default.
 - **EASGD elastic averaging**: `ElCheConfig::easgd_alpha(α)` enables EASGD-style elastic blending (0 < α ≤ 1.0) on the `CpuAsync` path. The CPU averaging backend receives a blend of local + center weights instead of a hard overwrite, smoothing divergence in long async runs. Ignored outside `CpuAsync`.
+
+#### Pluggable outer optimizer: SlowMo / DiLoCo
+
+A second optimization loop applied to the work-weighted **consensus** model between the reduce and the broadcast, on top of the inner per-rank optimizers. Opens the door to communication-efficient distributed methods (DiLoCo, SlowMo) without touching the inner training loop.
+
+- **`flodl::distributed::OuterOptimizer`** trait + `OuterOptimizerFactory`: an `outer_step` plus `checkpoint_state` / `load_checkpoint_state` / `resets_inner`. Three impls, all re-exported at the crate root:
+  - **`OuterAvg`** (default): stateless identity passthrough — reproduces plain work-weighted averaging exactly, no momentum, no artifact.
+  - **`SlowMomentum::new(lr, mu)`**: SlowMo heavy-ball momentum on the pseudo-gradient, continuous inner loop.
+  - **`NesterovMomentum::new(lr, mu)`**: DiLoCo-style Nesterov outer step with disposable inner state (`resets_inner()` makes each worker reset its inner optimizer per outer round).
+- **`TrainerConfig::outer_optimizer(factory)`** / **`DdpBuilder::outer_optimizer(factory)`** select the variant; built once per site (controller-side on the CPU backend, per-rank replicated lock-step on NCCL).
+- **`ElCheConfig::gamma(γ)`**: consensus allocation-weighting exponent (default `1.0` = pre-gamma behavior).
+- **Outer-optimizer momentum checkpointing**: momentum-bearing variants persist their slow momentum to a `<stem>.outer.fdl` sidecar (one tensor per model parameter, positional). On CPU the controller writes it; on NCCL an elected rank writes it and every rank reloads its replicated copy on resume, so the resumed outer trajectory is faithful. Stateless `OuterAvg` writes no sidecar.
+- **`ddp-bench`**: `--outer-optimizer none|slowmo|diloco` plus `--outer-lr` / `--outer-mu` / `--gamma`, with a loud-error guard on momentum flags passed to `none`.
 
 #### `EpochCallbackPolicy::Fastest`: cost-aware free-compute callbacks
 
@@ -125,7 +140,7 @@ New `fdl probe` subcommand (`flodl-cli/src/probe.rs`) audits a host or a whole c
 
 `fdl --gpus <spec> <cmd>` sets `CUDA_VISIBLE_DEVICES` for the dispatched command. Accepted at any argv position; spec is a comma-separated index list (`0,1`) or the `all` shorthand.
 
-- Cluster-aware: on `fdl cluster <cmd>`, `--gpus` overrides per-worker `local_devices` for the local controller host; remote workers continue to use their cluster.yml-declared devices.
+- Cluster-aware: on `fdl @cluster <cmd>`, `--gpus` overrides per-worker `local_devices` for the local controller host; remote workers continue to use their cluster.yml-declared devices.
 - Non-cluster: maps `--gpus` directly to `CUDA_VISIBLE_DEVICES` for the dispatched subprocess.
 - Loud errors on duplicate, missing value, or invalid spec.
 
@@ -138,7 +153,11 @@ New `fdl probe` subcommand (`flodl-cli/src/probe.rs`) audits a host or a whole c
 - `ssh:` sub-block: groups `target` / `port` / `user` / `identity_file` / `options` (list of `-o Key=Value`) into one launcher-only block. Omit entirely to use system ssh + `~/.ssh/config` defaults.
 - `env:` blocks: cluster-scope `env:` applies to every rank child on every worker; per-worker `env:` overrides matching keys. Per-host CUDA_VISIBLE_DEVICES scoping for heterogeneous rigs.
 - Orchestrator-only host entries are permitted (worker entry with empty `ranks:`) for clusters where the controller is itself one of the SSH targets but owns no GPUs.
-- `cluster-testing` env (in-process topology source, no fan-out) replaces the previous test-discovery convention. Exports `FLODL_TESTING_CLUSTER_JSON` to `cargo test` so `flodl::distributed::testing::discover_test_cluster()` reads the same yml the production overlay does.
+- `cluster-test` env (in-process topology source, no fan-out) replaces the previous test-discovery convention. Exports `FLODL_TESTING_CLUSTER_JSON` to `cargo test` so `flodl::distributed::testing::discover_test_cluster()` reads the same yml the production overlay does.
+
+#### `fdl @<env>` environment selector
+
+The `@<env>` sigil (scan-anywhere before `--`) selects an `fdl.<env>.yml` overlay: `fdl @cluster probe`, `fdl @cluster-test cuda-test-nccl`. It ranks equally with `--env <name>` and `FDL_ENV=<name>`; supplying two that disagree is a loud error, and all three forms must resolve to an existing overlay. Replaces the previous "first positional token matches an overlay" convention, so the first bare token is now always a command (an env may share a name with a command).
 
 #### Variant-shaped `#[derive(FdlArgs)]`: enum subcommands
 
@@ -191,14 +210,17 @@ These features came out of a forced heterogeneous topology: a rig crash and OS m
 - **`flodl::distributed::chunk_pool`**: extracted from coordinator; reusable chunk-pool dispatch primitive for replaying training data across cluster ranks deterministically after a rank rejoin.
 - **Network-aware logging (`flodl::log`)**: rank-scope prefixes that survive the cluster fan-in (`[rank=N]`-style markers preserved when controller forwards logs to launcher stdout).
 - **Optimizer `state_dict_keys()`**: Adam / RMSprop / SGD expose state-dict key listings for checkpoint introspection.
-- **Scaled CUDA NCCL communicator wiring**: `NcclComms` better handles N-rank topologies; `NcclRankComm::split` is the per-thread comm seam used by both the in-process and via-coord paths.
+- **Scaled CUDA NCCL communicator wiring**: `NcclComms` better handles N-rank topologies; `NcclRankComm::split` is the per-thread comm seam used by the `Ddp::wrap` / cluster-worker thread-test path (production ranks use per-process `NcclRankComm::init_rank`).
 
 ### Changed
 
-#### Distributed layer: thread-per-GPU multi-replica DDP removed from production path
+#### Distributed layer: in-process thread-per-GPU DDP engine removed
 
-The in-process multi-replica DDP machinery on `Ddp`, `Graph::distribute`, and the `DataLoader::distributed` mode is no longer the production multi-GPU path. The new launcher trampoline + cluster coordinator path is the canonical one and auto-promotes on 2+ visible GPUs. `Ddp::wrap` remains for thread-based multi-GPU testing inside `cfg(test)` (and external crates that explicitly want it); `Trainer::run` / `Trainer::builder` always go through the cluster path on `cfg(not(test))` when multiple GPUs are visible.
+The in-process multi-replica DDP machinery on `Ddp`, `Graph::distribute`, and the `DataLoader::distributed` mode is no longer the production multi-GPU path. The new launcher trampoline + cluster coordinator path is the canonical one and auto-promotes on 2+ visible GPUs. `Trainer::run` / `Trainer::builder` always go through the cluster path on `cfg(not(test))` when multiple GPUs are visible.
 
+The in-process multi-GPU **orchestration engine** that briefly survived as the `cfg(test)` multi-GPU harness — the thread-based `Coordinator` plus the multi-worker branch of `DdpHandle::launch` — is now removed outright. `DdpHandle::launch` keeps only the launcher-trampoline path (auto-promote / cluster) and the single-device fallback; reaching it with 2+ GPUs and no cluster envelope (only possible under `cfg(test)`) is a loud error. flodl's own multi-GPU validation moved to the `ddp-bench` binary (real process-per-rank, exercised by `fdl cuda-test-nccl`); thread-based multi-GPU survives only as the lower-level `Ddp::wrap` primitive (GAN / RL / manual control) and the coordinator's own thread-driven control-protocol tests.
+
+- **`Coordinator` / `CoordinatorBuilder` removed**: the in-process coordinator and its builder are gone (they were never part of the `flodl::distributed` public re-export — `Trainer` / `DdpHandle` / `DdpBuilder` / `GpuWorker` are the surface). The cross-process `ClusterCoordinator` is the only coordinator now.
 - **Single training entry**: `Trainer::run` / `Trainer::builder().run()` work identically on 1 GPU, N GPUs on one host, or N GPUs across hosts. No code change to scale up.
 - **`Graph::distribute` simplified**: the cross-replica gather pipeline, the per-replica `named_trace_buf` plumbing, the host-side `Rc<RefCell>` choreography are gone from the production path. Re-introduced only in `cfg(test)` for the `Ddp::wrap`-driven test suite.
 - **`DataLoader::distributed` mode removed**: each rank child instantiates its own loader against its own dataset shard; proportional sharding is computed from `ElCheConfig::partition_ratios` (or auto-balanced) by the coordinator and pushed to workers as part of the epoch plan.
@@ -250,7 +272,7 @@ The benchmark crate was overhauled to drive the new cluster path and to surface 
 - **`dispatch_next_chunk` pool recreation guard**: never recreate chunk pools for already-aggregated epochs (the workaround for the rare double-dispatch was creating duplicate pools).
 - **Launcher exit cleanup**: remote SSH'd ranks are now cleaned up on launcher exit (including SIGINT / SIGTERM), in parallel. Pre-spawn cleanup catches stale processes from a previous aborted run before re-fanning out. Bash signal trap on the remote side guarantees connection drop reaches the rank's signal handler.
 - **Cluster `--add-host` injection**: non-loopback IP preference when the controller host has multiple NICs; the previous behaviour could pick the loopback and break worker rendezvous.
-- **NCCL communicator init from threads**: `ncclCommInitRank` must run on the main thread; the in-process path's `Coordinator` was occasionally calling it from a worker thread on heterogeneous-GPU rigs, corrupting CUDA context. The cluster path init-on-main + `split()` pattern is now enforced everywhere.
+- **NCCL communicator init from threads**: `ncclCommInitRank` must run on the main thread; the (now-removed) in-process `Coordinator` was occasionally calling it from a worker thread on heterogeneous-GPU rigs, corrupting CUDA context. Production ranks are separate processes (per-process `init_rank`); the thread-test path uses init-on-main + `split()`.
 - **`fdl probe`** false-negatives on Docker-bundled NCCL: a worker with `docker: cuda` and no host-level libnccl was failing the NCCL check even though the runtime container had it. Now the probe reports "via Docker image `<svc>`" and passes.
 - **`hostname` warning noise** dropped from the launcher startup banner; the worker `done` line is now suppressed when the rank exited cleanly (only printed on non-zero exit). Launcher stdout is flushed before exit so the final epoch's metrics aren't lost on a fast exit.
 

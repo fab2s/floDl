@@ -4,7 +4,7 @@ The next DDP iteration targets **cloud and cross-datacenter** training,
 where network latency (not GPU compute) dominates wall time, hardware
 is heterogeneous across workers, and any single node can disappear
 mid-epoch. Current flodl DDP is a single-host story: NCCL AllReduce
-over PCIe / NVLink finishes in microseconds and `overhead_target=0.10`
+over PCIe / NVLink finishes in microseconds and `overhead_target=0.05`
 is trivial. On a cross-region link, one AllReduce can cost *seconds*,
 so sync-every-step becomes impractical and cadence-every-10-batches
 still wastes time. `max_batch_diff` and `max_overshoot` are pairwise
@@ -22,6 +22,13 @@ handling. Together they make cloud DDP viable at N>2 heterogeneous
 nodes with bounded convergence and graceful failure.
 
 ## Outer optimizer on pseudo-gradients
+
+> **Status**: this axis has **shipped**. `OuterOptimizer` (`OuterAvg` /
+> `SlowMomentum` / `NesterovMomentum`), the `.outer_optimizer()` setter, and
+> the `<stem>.outer.fdl` momentum sidecar are live — see
+> [`docs/ddp.md`](../ddp.md#outer-optimizer---slowmo--diloco). The prose
+> below is the originating design; the meta-step rendezvous axis further down
+> remains future work.
 
 flodl's current `ElChe` cadence averages parameters directly (Local SGD
 / FedAvg semantics). This produces the implicit-regularization boost
@@ -44,9 +51,8 @@ Every round saved is one AllReduce not performed on the internet.
 
 ```rust
 Trainer::builder(...)
-    .policy(ApplyPolicy::Cadence)
-    .outer_optimizer(|| NesterovMomentum::new(lr = 0.7, mu = 0.9))
-    .max_anchor(500)                    // H, widen aggressively
+    .elche(ElCheConfig::nccl_cadence().max_anchor(500))   // H, widen aggressively
+    .outer_optimizer(|| Box::new(NesterovMomentum::new(0.7, 0.9)))
     .run()?;
 ```
 
@@ -70,8 +76,8 @@ top.
   Consumes the consensus the reduce already produces (not per-worker deltas);
   the outer gradient `prev_global - consensus` equals `mean_k(prev_global - theta_k)`
   under work-weighting, so no per-rank state is needed at the controller.
-- **Built-ins**: `NesterovMomentum` (DiLoCo default), `SlowMomentum`
-  (SlowMo), `OuterSgd` (momentum=0 ablation), `OuterAdam` (sanity-check).
+- **Built-ins** (as shipped): `NesterovMomentum` (DiLoCo), `SlowMomentum`
+  (SlowMo), and the stateless `OuterAvg` default.
 - **Stateless variant**: `OuterAvg` exactly replicates today's
   weighted-AllReduce behavior so existing code is unchanged when no
   outer optimizer is set (the default).

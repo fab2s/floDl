@@ -180,7 +180,7 @@ The slow GPU anchors the cadence. The fast GPU processes more batches
 per averaging window - the same AllReduce sync time amortizes over
 more local compute. ElChe auto-tunes the anchor count based on
 observed throughput so the AllReduce overhead stays at a small
-fraction of compute time (`overhead_target`, default 10%).
+fraction of compute time (`overhead_target`, default 5%).
 
 `Trainer::builder().run()` activates ElChe by default (the default
 mode is `NcclCadence`). No configuration needed for the common
@@ -237,7 +237,7 @@ Reference](../ddp.md#elcheconfig-knobs)):
 
 | Knob | Default | When to touch |
 |---|---|---|
-| `.overhead_target(f)` | `0.10` | Lower (e.g. `0.05`) on fast inter-GPU links where you can afford more sync; higher when AllReduce is expensive. |
+| `.overhead_target(f)` | `0.05` | Lower on fast inter-GPU links where you can afford more sync; higher (e.g. `0.10`) when AllReduce is expensive. |
 | `.max_anchor(n)` | `None` (auto) | Set when you want a hard ceiling on staleness. |
 | `.max_batch_diff(n)` | `None` | `Some(0)` = strict lockstep regardless of mode; useful for reproducibility. |
 | `.partition_ratios([...])` | auto | Static split when ElChe's auto-balancing isn't what you want (Sync mode only). |
@@ -445,14 +445,16 @@ ring buffer) so a resumed run inherits ElChe's calibration. See
 
 ## Manual control - `Ddp::wrap` (test-only)
 
-For training patterns that need explicit replica control - GAN
+For training patterns that need explicit per-step replica control - GAN
 discriminator vs generator, RL actor vs critic, progressive growing -
-`Ddp::wrap` exposes the thread-per-GPU machinery. It is
-`cfg(test)`-gated for flodl's own tests; external crates that want it
-opt in explicitly.
+`Ddp::wrap` is the low-level per-rank gradient-sync primitive (it wraps
+one replica per rank against a shared rendezvous, and is what each
+cluster rank uses internally). It is not the production multi-GPU entry,
+which auto-promotes to process-per-rank.
 
 ```rust
-let ddp = Ddp::wrap(&[&model], &devices)?;
+// Per rank: global_rank in [0, world_size), rdv a shared TcpRendezvous.
+let ddp = Ddp::wrap(&model, device, global_rank, &rdv)?;
 
 ddp.sync_params()?;
 for batch in &dataset {
@@ -477,7 +479,7 @@ elastic membership, controller-driven checkpoint retry.
 | `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag - useful for config-driven launchers. |
 | `Trainer::setup(&graph, factory, opt_fn)` | Graph-shaped one-liner; you keep the training loop. |
 | `Trainer::setup_head(&head, factory, opt_fn)` | `flodl-hf` task-head wrapper analog. |
-| `Ddp::wrap(&[&model], &devices)` | Thread-per-GPU manual control; test-only on flodl's own suite. |
+| `Ddp::wrap(&model, device, global_rank, &rdv)` | Low-level per-rank gradient-sync primitive for manual control (GAN/RL); production multi-GPU auto-promotes to processes. |
 
 | Knob | Lives on | Common values |
 |---|---|---|
