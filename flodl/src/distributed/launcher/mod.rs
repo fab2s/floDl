@@ -871,12 +871,14 @@ pub fn run_launcher_with_config(
                     .stderr(Stdio::piped());
 
                 // Apply user-declared env from `full.env` (cluster-scope)
-                // first, then `host.env` (per-host override). Built-in env
-                // vars set later by build_local_spawn_command (e.g.
-                // FLODL_LOCAL_RANK, CUDA_VISIBLE_DEVICES, FLODL_CLUSTER_JSON)
-                // are not overridable here — the launcher owns those. SSH
-                // path: env propagation is bash-level inside
-                // build_remote_bash_command and not affected here.
+                // first, then `host.env` (per-host override). This is
+                // last-write-wins over the built-ins the Command already
+                // carries — safe ONLY because reserved keys (FLODL_*,
+                // CUDA_VISIBLE_DEVICES) are rejected at config parse
+                // (`parse_env_block`), so no user key can reach here
+                // that would clobber launcher-owned rank identity. SSH
+                // path: same parse-time guarantee, bash-level apply in
+                // build_remote_bash_command.
                 if host.host == me {
                     for (k, v) in &full.env {
                         cmd.env(k, v);

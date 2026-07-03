@@ -541,8 +541,11 @@ pub(super) fn build_remote_bash_command(
         }
     }
     // Apply user-declared env: cluster-scope first, host-scope second
-    // (host overrides cluster for matching keys). Built-in env vars
-    // above are not overridable here — the launcher owns those.
+    // (host overrides cluster for matching keys). In a shell assignment
+    // prefix the LAST duplicate wins, so these could override the
+    // built-ins above — safe ONLY because reserved keys (FLODL_*,
+    // CUDA_VISIBLE_DEVICES) are rejected at config parse
+    // (`parse_env_block`).
     for (k, v) in cluster_env {
         s.push(' ');
         s.push_str(k);

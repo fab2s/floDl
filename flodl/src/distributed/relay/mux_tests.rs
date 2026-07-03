@@ -303,3 +303,39 @@ fn opaque_payload_is_not_parsed() {
         other => panic!("expected Data, got {other:?}"),
     }
 }
+
+    // ---- payload ceiling ----------------------------------------------------
+
+    /// The length fields are unauthenticated until the MAC verifies; a
+    /// claimed length past MAX_MUX_PAYLOAD must be rejected before the
+    /// reader commits to buffering it.
+    #[test]
+    fn oversized_len_framed_blob_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]); // some body bytes, never enough
+        let mut cursor = std::io::Cursor::new(bytes);
+        let err = try_read_len_framed(&mut cursor).unwrap_err();
+        assert!(
+            err.to_string().contains("MAX_MUX_PAYLOAD"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_mux_record_is_rejected() {
+        // Header: magic | version | kind | rank | payload_len | auth_tag.
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&MUX_RECORD_MAGIC.to_le_bytes());
+        hdr.extend_from_slice(&MUX_PROTOCOL_VERSION.to_le_bytes());
+        hdr.push(0); // REC_DATA
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // rank
+        hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // hostile length
+        hdr.extend_from_slice(&0u64.to_le_bytes()); // bogus tag
+        let mut cursor = std::io::Cursor::new(hdr);
+        let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
+        assert!(
+            err.to_string().contains("MAX_MUX_PAYLOAD"),
+            "got: {err}"
+        );
+    }

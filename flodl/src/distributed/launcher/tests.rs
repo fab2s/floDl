@@ -612,3 +612,49 @@
         assert!(!promote_programmatic_cluster(&full));
         clear_role_env();
     }
+
+    // ---- env-block validation ----------------------------------------------
+
+    /// Reserved keys are rejected at parse: user env is applied
+    /// last-write-wins over the launcher's built-ins on both spawn
+    /// mediums, so a reserved key reaching the spawn paths would
+    /// silently clobber rank↔device identity.
+    #[test]
+    fn env_block_rejects_reserved_and_malformed_keys() {
+        let with_env = |k: &str, v: &str| {
+            let mut val = canonical_full_json();
+            val["env"] = serde_json::json!({ k: v });
+            FullCluster::from_value(&val)
+        };
+        for reserved in ["CUDA_VISIBLE_DEVICES", "FLODL_LOCAL_RANK", "FLODL_ANYTHING"] {
+            let err = with_env(reserved, "x").unwrap_err();
+            assert!(
+                err.to_string().contains("reserved"),
+                "{reserved}: expected reserved-key rejection, got: {err}"
+            );
+        }
+        for bad in ["HAS SPACE", "1LEADING_DIGIT", "DASH-ED", ""] {
+            let err = with_env(bad, "x").unwrap_err();
+            assert!(
+                err.to_string().contains("valid env var name"),
+                "{bad:?}: expected charset rejection, got: {err}"
+            );
+        }
+        // The whole point of the env block stays available.
+        for ok in ["NCCL_DEBUG", "LD_PRELOAD", "LD_LIBRARY_PATH", "_UNDER"] {
+            assert!(
+                with_env(ok, "x").is_ok(),
+                "{ok}: legitimate tuning key must be accepted"
+            );
+        }
+    }
+
+    /// Per-worker env blocks ride the same chokepoint.
+    #[test]
+    fn worker_env_block_rejects_reserved_keys() {
+        let mut val = canonical_full_json();
+        val["workers"][0]["env"] =
+            serde_json::json!({ "FLODL_CLUSTER_JSON": "deadbeef" });
+        let err = FullCluster::from_value(&val).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+    }

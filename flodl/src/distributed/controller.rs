@@ -98,6 +98,12 @@ pub(crate) const PROTOCOL_VERSION: u32 = 2;
 /// dtype tag for f32 in the wire protocol. Only dtype supported.
 pub const DTYPE_F32: u8 = 0;
 
+/// Ceiling on a [`RoundFrame`]'s claimed tensor count — unauthenticated
+/// until the MAC verifies, so bounded before the read loop trusts it.
+/// Generous: one entry per model param/buffer; the largest realistic
+/// models sit in the thousands.
+pub(crate) const MAX_ROUND_FRAME_TENSORS: usize = 65_536;
+
 /// Shared dead-rank ledger. Set by the cluster coordinator when it
 /// declares a rank dead (stale heartbeat). Read by the controller's
 /// reduce loop to skip the rank's contribution in the current and future
@@ -931,6 +937,14 @@ pub(crate) fn read_round_frame<R: Read>(
         )));
     }
     let num_tensors = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+    // Unauthenticated until the trailing MAC verifies — bound before
+    // trusting (same discipline as the mux envelope's MAX_MUX_PAYLOAD).
+    if num_tensors > MAX_ROUND_FRAME_TENSORS {
+        return Err(TensorError::new(&format!(
+            "cluster_controller: frame claims {num_tensors} tensors \
+             (> {MAX_ROUND_FRAME_TENSORS}); corrupt or hostile peer"
+        )));
+    }
 
     // Round-kind byte (model vs bookkeeping), MAC-covered, immediately
     // after the header and before the tensor list.
@@ -957,6 +971,7 @@ pub(crate) fn read_round_frame<R: Read>(
     }
 
     let mut tensors = Vec::with_capacity(num_tensors);
+    let mut total_bytes: usize = 0;
     for ti in 0..num_tensors {
         let mut meta = [0u8; 2];
         stream.read_exact(&mut meta).map_err(|e| {
@@ -986,6 +1001,15 @@ pub(crate) fn read_round_frame<R: Read>(
         })?;
         mac.update(nb);
         let nbytes = u64::from_le_bytes(nb) as usize;
+        total_bytes = total_bytes.saturating_add(nbytes);
+        if total_bytes > crate::distributed::relay::mux::MAX_MUX_PAYLOAD {
+            return Err(TensorError::new(&format!(
+                "cluster_controller: tensor[{ti}] pushes frame past the \
+                 {} byte ceiling; corrupt or hostile peer, or a model that \
+                 has outgrown the frame ceiling",
+                crate::distributed::relay::mux::MAX_MUX_PAYLOAD
+            )));
+        }
         // Incremental allocation: nbytes is unauthenticated until the
         // trailing MAC verifies; never pre-allocate a hostile length.
         let bytes = crate::distributed::wire::read_exact_incremental(stream, nbytes)

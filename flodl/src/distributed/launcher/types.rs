@@ -662,6 +662,38 @@ fn parse_env_block(
         Some(serde_json::Value::Object(map)) => {
             let mut out = BTreeMap::new();
             for (k, val) in map {
+                // Reserved keys: the launcher owns rank identity. User env
+                // is applied after the launcher's built-ins on both spawn
+                // mediums (Command::env re-insertion locally, last shell
+                // assignment remotely) and last-write-wins, so a reserved
+                // key here would silently clobber rank↔device identity —
+                // e.g. `CUDA_VISIBLE_DEVICES: "0"` pins every local rank
+                // to GPU 0 (NCCL duplicate-device failure, or silently
+                // permuted ranks). Rejected loudly at parse, never
+                // filtered at spawn.
+                if k.starts_with("FLODL_") || k == "CUDA_VISIBLE_DEVICES" {
+                    return Err(TensorError::new(&format!(
+                        "cluster launcher: {label}[{k:?}] is reserved \
+                         (launcher-owned rank identity). GPU scoping belongs \
+                         in `local_devices:`; FLODL_* vars are set by the \
+                         launcher itself."
+                    )));
+                }
+                // Keys are interpolated unquoted into the remote shell's
+                // K=V assignment prefix — restrict to the portable
+                // identifier charset so a stray space or metacharacter
+                // cannot break (or inject into) the remote command line.
+                let valid_key = !k.is_empty()
+                    && k.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid_key {
+                    return Err(TensorError::new(&format!(
+                        "cluster launcher: {label}[{k:?}] is not a valid env var \
+                         name ([A-Za-z_][A-Za-z0-9_]*)"
+                    )));
+                }
                 let s = val.as_str().ok_or_else(|| {
                     TensorError::new(&format!(
                         "cluster launcher: {label}[{k:?}] must be a string, got {val}"

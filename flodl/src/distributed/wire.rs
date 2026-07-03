@@ -229,6 +229,12 @@ impl MsgKind {
 /// rank via the cluster envelope. Used as the HMAC key for every wire
 /// frame; cross-session frames fail authentication via
 /// [`hmac_sha256_64`].
+///
+/// The salt-keyed MAC is therefore also a SESSION TOKEN, not just an
+/// integrity check: frames from an adjacent training session (same rig,
+/// reused ports, stale process) carry a different salt and fail
+/// authentication — cross-run signal isolation is a guarantee, not an
+/// accident of port allocation.
 pub type SessionSalt = [u8; SESSION_SALT_BYTES];
 
 /// HMAC-SHA256 over `bytes` keyed by `salt`, truncated to the leading
