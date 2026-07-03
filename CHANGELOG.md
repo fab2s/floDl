@@ -258,6 +258,7 @@ The benchmark crate was overhauled to drive the new cluster path and to surface 
 ### Deprecated
 
 - The flat `cluster.yml` schema (`master_addr`, `master_port`, top-level `ssh_*` on workers) is deprecated in favor of the structured `controller:` / `workers[].ssh:` layout. `fdl probe` flags legacy keys with migration hints. Removal targeted for a future release.
+- The self-driven setup tier - `Trainer::setup()`, `Trainer::setup_with()`, `Trainer::setup_head()`, `Trainer::setup_head_with()` - and its `DdpConfig` config bag. It is the only path that schedules without the controller (no convergence guard, meta-controller, outer optimizer, elastic membership, or checkpoint orchestration), so the two scheduling brains can drift apart. Use `Trainer::builder()` / `Trainer::run()`; the user-owned-loop ergonomics return as a cooperative tier on the controller engine (see `docs/design/trainer-execution-tiers.md`). Removal in a future release.
 
 ### Removed
 

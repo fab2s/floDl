@@ -5,26 +5,20 @@
 //! [`Trainer`] by default; drop to [`Ddp`] only when you need explicit
 //! multi-GPU control.
 //!
-//! **Default** ([`Trainer::setup()`], [`Trainer::builder()`]): user-owned or
-//! framework-owned training loop, transparent single/multi-GPU. Same API in
-//! both cases.
+//! **Default** ([`Trainer::builder()`], [`Trainer::run()`]): framework-owned
+//! training loop driven by the authoritative controller, transparent
+//! single/multi-GPU/cluster from one code path.
 //!
-//! **Explicit multi-GPU** ([`Ddp::wrap()`]): manual control over gradient
-//! sync and parameter broadcast for advanced patterns (GAN, RL, progressive).
+//! **Explicit multi-GPU** ([`Ddp::wrap()`]): manual per-rank control over
+//! gradient sync and parameter broadcast for advanced patterns (GAN, RL,
+//! progressive).
 //!
-//! # Setup mode (user owns the loop)
-//!
-//! ```ignore
-//! Trainer::setup(&model, |dev| build_model(dev), |p| Adam::new(p, 0.001))?;
-//!
-//! // Training loop is identical for 1 or N GPUs:
-//! for (x, y) in &train_loader {
-//!     let out = model.forward(&x)?;
-//!     let loss = cross_entropy_loss(&out, &y)?;
-//!     loss.backward()?;
-//!     model.step()?;
-//! }
-//! ```
+//! The self-driven setup tier ([`Trainer::setup()`] and friends) is
+//! deprecated: it schedules without the controller and misses the
+//! convergence guard, meta-controller, outer optimizer, elastic membership,
+//! and checkpoint orchestration. Its user-owned-loop ergonomics return as a
+//! cooperative tier on the controller engine (see
+//! `docs/design/trainer-execution-tiers.md`).
 //!
 //! # Builder mode (framework owns the loop)
 //!
@@ -38,10 +32,10 @@
 //! let state = handle.join()?;
 //! ```
 //!
-//! # Manual DDP
+//! # Manual DDP (one process per rank)
 //!
 //! ```ignore
-//! let ddp = Ddp::wrap(&[&model0, &model1], &devices)?;
+//! let ddp = Ddp::wrap(&model, device, global_rank, &rendezvous)?;
 //! ddp.sync_params()?;
 //! // ... custom forward/backward ...
 //! ddp.all_reduce_gradients()?;
@@ -103,6 +97,7 @@ impl ClusterElCheState {
     /// Auto-tunes from observed timing after the warmup window.
     pub(crate) const DEFAULT_INITIAL_ANCHOR: usize = 10;
 
+    #[allow(deprecated)]
     pub(crate) fn from_config(world_size: usize, config: &DdpConfig) -> Self {
         let anchor = ClusterElCheState::DEFAULT_INITIAL_ANCHOR;
         let mut el_che = ElChe::new(world_size, anchor);
@@ -131,7 +126,7 @@ impl ClusterElCheState {
 /// Manual DDP coordinator for cluster-mode (process-per-rank) gradient sync.
 ///
 /// Each process in the cluster holds one `Ddp` joining a cross-process NCCL
-/// group. For standard training, use [`Trainer::setup`] / [`Trainer::setup_with`].
+/// group. For standard training, use [`Trainer::builder`] / [`Trainer::run`].
 pub struct Ddp {
     comms: NcclRankComm,
     device: Device,
@@ -554,6 +549,10 @@ impl Trainer {
     ///     model.step()?;
     /// }
     /// ```
+    #[deprecated(note = "superseded by the controller-driven \
+`Trainer::builder()` / `Trainer::run()`; the self-driven setup tier will be \
+removed in a future release once the cooperative tier lands (see \
+docs/design/trainer-execution-tiers.md)")]
     pub fn setup<F, M, G, O>(
         model: &Graph,
         builder: F,
@@ -590,6 +589,11 @@ impl Trainer {
     /// Trainer::setup_with(&model, builder, optimizer,
     ///     DdpConfig::new().speed_hint(1, 2.3))?;
     /// ```
+    #[deprecated(note = "superseded by the controller-driven \
+`Trainer::builder()` / `Trainer::run()`; the self-driven setup tier will be \
+removed in a future release once the cooperative tier lands (see \
+docs/design/trainer-execution-tiers.md)")]
+    #[allow(deprecated)] // DdpConfig in our own deprecated signature
     pub fn setup_with<F, M, G, O>(
         model: &Graph,
         builder: F,
@@ -813,6 +817,10 @@ impl Trainer {
     ///     head.graph().step()?;
     /// }
     /// ```
+    #[deprecated(note = "superseded by the controller-driven \
+`Trainer::builder()` / `Trainer::run()`; the self-driven setup tier will be \
+removed in a future release once the cooperative tier lands (see \
+docs/design/trainer-execution-tiers.md)")]
     pub fn setup_head<H, F, G, O>(
         head: &H,
         head_factory: F,
@@ -842,6 +850,11 @@ impl Trainer {
 
     /// Task-head variant of [`Trainer::setup_with`]. Same behaviour as
     /// [`Trainer::setup_head`] but takes an explicit [`DdpConfig`].
+    #[deprecated(note = "superseded by the controller-driven \
+`Trainer::builder()` / `Trainer::run()`; the self-driven setup tier will be \
+removed in a future release once the cooperative tier lands (see \
+docs/design/trainer-execution-tiers.md)")]
+    #[allow(deprecated)] // DdpConfig in our own deprecated signature
     pub fn setup_head_with<H, F, G, O>(
         head: &H,
         head_factory: F,
@@ -946,6 +959,7 @@ fn dispatch_launcher_or_continue() -> Result<()> {
     }
 }
 
+#[allow(deprecated)]
 fn setup_cluster<F, M, G, O>(
     model: &Graph,
     cluster: &LocalCluster,
@@ -982,6 +996,7 @@ where
 /// envelope: a cluster that spans multiple hosts is, by construction,
 /// the heterogeneous case El Che is designed for. An explicit
 /// [`DdpConfig::max_anchor`] of `Some(0)` always opts out.
+#[allow(deprecated)]
 fn enable_cluster_el_che(
     model: &Graph,
     world_size: usize,
@@ -1017,6 +1032,7 @@ fn enable_cluster_el_che(
 /// reference because `head.compute_loss` / `head.graph().forward_multi`
 /// route through the graph's cluster-aware short-circuits to the local
 /// replica's graph (which [`HeadReplica::as_graph`] exposes).
+#[allow(deprecated)]
 fn setup_head_cluster<H, F, G, O>(
     graph: &Graph,
     cluster: &LocalCluster,
@@ -1121,6 +1137,8 @@ impl<H: HasGraph + 'static> Module for HeadReplica<H> {
 ///         .overhead_target(0.08)  // tune to 8% overhead
 /// )?;
 /// ```
+#[deprecated(note = "config for the deprecated `Trainer::setup_with()`; \
+use `ElCheConfig` with `Trainer::builder()` / `Trainer::run()`")]
 #[derive(Debug, Clone)]
 pub struct DdpConfig {
     /// Initial speed ratio hint: (slow_rank, fast_to_slow_ratio).
@@ -1156,6 +1174,7 @@ pub struct DdpConfig {
     pub dataset_signature: [u8; 32],
 }
 
+#[allow(deprecated)]
 impl DdpConfig {
     /// Default configuration: El Che auto-enabled for heterogeneous GPUs.
     pub fn new() -> Self {
@@ -1230,6 +1249,7 @@ impl DdpConfig {
     }
 }
 
+#[allow(deprecated)]
 impl Default for DdpConfig {
     fn default() -> Self {
         Self::new()
@@ -1238,4 +1258,5 @@ impl Default for DdpConfig {
 
 #[cfg(test)]
 #[path = "ddp_tests.rs"]
+#[allow(deprecated)] // tests exercise the deprecated setup tier until removal
 mod tests;

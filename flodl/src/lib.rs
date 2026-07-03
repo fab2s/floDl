@@ -92,12 +92,14 @@ pub use nn::{
 };
 pub use distributed::{
     CudaEvent, CudaEventFlags, CudaStream, StreamGuard,
-    NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, DdpConfig, HasGraph, Trainer, ElChe,
+    NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, HasGraph, Trainer, ElChe,
     ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker,
     ElCheConfig, ElCheMode, TrainerConfig,
     ClusterBuilder, HostBuilder,
     NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum,
 };
+#[allow(deprecated)] // re-exported until the setup tier is removed
+pub use distributed::DdpConfig;
 pub use graph::{
     FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,

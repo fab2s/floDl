@@ -2,15 +2,24 @@
 //!
 //! Primary API:
 //!
-//! - [`Trainer::setup()`] -- user owns the training loop (Graph-based, transparent 1 or N GPU)
-//! - [`Trainer::builder()`] -- framework manages threads, data, epochs, averaging
+//! - [`Trainer::builder()`] / [`Trainer::run()`] -- framework-managed
+//!   training on the controller engine; transparent single-device,
+//!   single-host multi-GPU (process-per-rank auto-promote), and
+//!   multi-host cluster from one code path
 //!
 //! Explicit multi-GPU control:
 //!
-//! - [`Ddp::wrap()`] -- manual gradient sync for advanced patterns (GAN, RL)
+//! - [`Ddp::wrap()`] -- manual per-rank gradient sync for advanced
+//!   patterns (GAN, RL, custom collectives)
+//!
+//! Deprecated: the self-driven setup tier ([`Trainer::setup()`] and
+//! friends) schedules without the controller; its user-owned-loop
+//! ergonomics return as a cooperative tier on the controller engine
+//! (see `docs/design/trainer-execution-tiers.md`).
 //!
 //! Supporting infrastructure: NCCL bindings, CUDA events/streams, El Che
-//! heterogeneous cadence strategy, and the async DDP runtime.
+//! heterogeneous cadence strategy, the launcher/controller/coordinator
+//! cluster runtime, and the wire protocol.
 
 pub mod checkpoint_meta;
 pub(crate) mod checkpoint_forge;
@@ -62,7 +71,9 @@ pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, N
 pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};
 pub use cluster_builder::{ClusterBuilder, HostBuilder};
 pub use config::{ElCheConfig, ElCheMode, TrainerConfig};
-pub use ddp::{Ddp, DdpConfig, HasGraph, Trainer};
+pub use ddp::{Ddp, HasGraph, Trainer};
+#[allow(deprecated)] // re-exported until the setup tier is removed
+pub use ddp::DdpConfig;
 pub use el_che::{ElChe, Phase};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
 pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker};

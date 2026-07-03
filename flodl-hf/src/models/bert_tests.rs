@@ -662,6 +662,7 @@
     /// `step()`; flodl's own DDP test suite covers that end-to-end, so
     /// here we exit early rather than duplicate that coverage.
     #[test]
+    #[allow(deprecated)] // exercises the deprecated setup tier until removal
     fn setup_head_drives_cpu_training_step() {
         use flodl::{usable_cuda_devices, Adam, Trainer};
         use crate::task_heads::sequence_classification_loss;

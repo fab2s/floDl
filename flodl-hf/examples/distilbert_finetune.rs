@@ -50,8 +50,14 @@ fn main() -> Result<()> {
     // the same call auto-distributes, so the loop below is identical for
     // 1 or N devices. The factory closure is only invoked for additional
     // replica devices.
+    //
+    // NOTE: the setup tier is deprecated pending its cooperative-tier
+    // replacement on the controller engine (the user-owned loop below is
+    // exactly the shape that tier keeps); it still works until then. See
+    // docs/design/trainer-execution-tiers.md.
     let replica_config = head.config().clone();
     let num_labels = head.labels().len() as i64;
+    #[allow(deprecated)]
     Trainer::setup_head(
         &head,
         move |dev| DistilBertForSequenceClassification::on_device(
