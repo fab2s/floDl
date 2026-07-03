@@ -673,17 +673,18 @@ where
     ///
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
     pub fn run(mut self) -> Result<DdpHandle> {
-        // Programmatic cluster: same env-var promotion + precedence as
-        // `Trainer::run` (an fdl-cli-set FLODL_FULL_CLUSTER_JSON wins).
+        // Programmatic cluster: the single promotion site. Converts
+        // `self.cluster` to the FLODL_FULL_CLUSTER_JSON env contract
+        // fdl-cli uses, so `DdpHandle::launch`'s dispatch sees
+        // Role::Launcher exactly as if fdl-cli had set it — but only
+        // when this process holds no cluster role yet. An fdl-cli-set
+        // envelope wins (overlay-resolved view matches the yml on
+        // disk), and rank / relay children re-entering the user binary
+        // keep their spawned role instead of poisoning their env
+        // (which made every child die at dispatch with
+        // "inconsistent env").
         if let Some(full) = &self.cluster {
-            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
-            if std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none() {
-                let json = full.to_json().to_string();
-                let hex = crate::distributed::cluster::hex_encode(json.as_bytes());
-                // SAFETY: `.run()` is called from main() before any
-                // thread spawning — same invariant as `Trainer::run`.
-                unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, hex); }
-            }
+            crate::distributed::launcher::promote_programmatic_cluster(full);
         }
         let dataset = self.dataset.expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
@@ -798,26 +799,6 @@ where
 }
 
 impl DdpHandle {
-    /// Create a builder for configuring framework-managed DDP training.
-    ///
-    /// Prefer [`Trainer::builder()`](crate::distributed::Trainer::builder) as the primary entry point.
-    /// This method exists for backward compatibility.
-    #[deprecated(since = "0.3.0", note = "Use Trainer::builder() instead")]
-    pub fn builder<F, M, G, O, T>(
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-    ) -> DdpBuilder<F, M, G, O, T>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        Self::new_builder(model_factory, optim_factory, train_fn)
-    }
-
     /// Internal builder constructor, called by [`Trainer::builder()`](crate::distributed::Trainer::builder).
     pub(crate) fn new_builder<F, M, G, O, T>(
         model_factory: F,

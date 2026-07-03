@@ -87,68 +87,7 @@ pub struct DdpHandle {
 }
 
 impl DdpHandle {
-    /// Detect GPUs, spawn worker threads and coordinator thread with default config.
-    ///
-    /// Prefer [`Trainer::builder()`](crate::distributed::Trainer::builder) as the primary entry point.
-    #[allow(clippy::too_many_arguments)]
-    #[deprecated(since = "0.3.0", note = "Use Trainer::builder() instead")]
-    pub fn auto<F, M, G, O, T>(
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-        dataset: Arc<dyn BatchDataSet>,
-        batch_size: usize,
-        num_epochs: usize,
-        policy: ApplyPolicy,
-        backend: AverageBackend,
-    ) -> Result<Self>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        #[allow(deprecated)]
-        Self::auto_with(
-            model_factory, optim_factory, train_fn,
-            dataset, batch_size, num_epochs,
-            policy, backend, DdpRunConfig::new(),
-        )
-    }
-
-    /// Detect GPUs, spawn worker threads and coordinator thread.
-    ///
-    /// Prefer [`Trainer::builder()`](crate::distributed::Trainer::builder) as the primary entry point.
-    #[allow(clippy::too_many_arguments)]
-    #[deprecated(since = "0.3.0", note = "Use Trainer::builder() instead")]
-    pub fn auto_with<F, M, G, O, T>(
-        model_factory: F,
-        optim_factory: G,
-        train_fn: T,
-        dataset: Arc<dyn BatchDataSet>,
-        batch_size: usize,
-        num_epochs: usize,
-        policy: ApplyPolicy,
-        backend: AverageBackend,
-        config: DdpRunConfig,
-    ) -> Result<Self>
-    where
-        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
-        M: Module + 'static,
-        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
-        O: Optimizer + 'static,
-        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
-    {
-        Self::launch(
-            model_factory, optim_factory, train_fn,
-            dataset, batch_size, num_epochs,
-            policy, backend, config, None, None, None, None, None,
-            None, None, None, None,
-        )
-    }
-
-    /// Internal launcher shared by `auto_with` and the builder.
+    /// Internal launcher shared by the builder (`DdpBuilder::run`).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn launch<F, M, G, O, T>(
         model_factory: F,
@@ -190,26 +129,29 @@ impl DdpHandle {
         // while running on the canonical process-per-rank path.
         //
         // Skips auto-promote when:
-        //   - Any cluster envelope env var is already set (user opted
-        //     in via fdl-cli overlay or `cfg.cluster`).
+        //   - Any cluster-role env var is already set (fdl-cli overlay,
+        //     programmatic `cfg.cluster`, or this process IS a spawned
+        //     rank / relay child re-entering the user binary).
         //   - `detect_gpus()` returns <2 (no DDP to do; single-device
         //     path will run).
         //   - Compiled with `cfg(test)` (flodl's own test builds; tests
-        //     that exercise multi-GPU should use `Ddp::wrap` for the
-        //     thread-based path. External crates depending on flodl
-        //     always see auto-promote in production builds, including
-        //     `cargo run` and release binaries.)
+        //     that exercise multi-GPU use `Ddp::wrap` — manual per-rank
+        //     DDP. External crates depending on flodl always see
+        //     auto-promote in production builds, including `cargo run`
+        //     and release binaries.)
         //
         // `detect_gpus()` respects `CUDA_VISIBLE_DEVICES`, so production
         // callers that want to scope down also have that lever.
         #[cfg(not(test))]
         {
             use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
-            use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_LOCAL_RANK};
-            let env_pristine = std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none()
-                && std::env::var_os(ENV_CLUSTER_JSON).is_none()
-                && std::env::var_os(ENV_LOCAL_RANK).is_none();
-            if env_pristine {
+            // Role-env gate shared with the programmatic-cluster
+            // promotion in `DdpBuilder::run`: covers ALL role vars,
+            // including the relay's. A relay child spawned on this
+            // very host sees >=2 GPUs too — re-promoting inside it
+            // poisoned its env and killed the cohort at dispatch
+            // ("inconsistent env").
+            if crate::distributed::launcher::role_env_pristine() {
                 let gpus = crate::sys::detect_gpus();
                 if gpus.len() >= 2 {
                     match crate::distributed::ClusterBuilder::all_local_gpus() {

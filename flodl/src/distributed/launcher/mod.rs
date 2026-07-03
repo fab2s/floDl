@@ -190,6 +190,47 @@ pub fn dispatch() -> Result<Role> {
     }
 }
 
+/// True only when this process carries no cluster-role env at all —
+/// i.e. [`dispatch`] resolves to [`Role::SingleDevice`]. Every
+/// promotion site (programmatic cluster config, multi-GPU
+/// auto-promote) must pass this gate before synthesizing
+/// [`ENV_FULL_CLUSTER_JSON`]: launcher, rank and relay children all
+/// carry a role var and must never re-promote — a child re-entering
+/// the user binary would otherwise poison its own role env and die at
+/// [`dispatch`]. An inconsistent env also returns `false`: promotion
+/// is skipped and the launch-path [`dispatch`] reports it loudly.
+///
+/// Derived from [`dispatch`]'s truth table rather than a second var
+/// list, so a future role var extends the gate automatically.
+pub(crate) fn role_env_pristine() -> bool {
+    matches!(dispatch(), Ok(Role::SingleDevice))
+}
+
+/// Promote a programmatic [`FullCluster`] to the
+/// [`ENV_FULL_CLUSTER_JSON`] env contract iff this process holds no
+/// cluster role yet (see [`role_env_pristine`]). Returns whether
+/// promotion happened.
+///
+/// Precedence: an fdl-cli-set full envelope wins (never overwritten),
+/// and rank / relay children re-entering the user binary keep their
+/// spawned role.
+///
+/// Caller contract: main(), before any thread spawning — the same
+/// `set_var` invariant as fdl-cli's `prepare_cluster_env`.
+pub(crate) fn promote_programmatic_cluster(full: &FullCluster) -> bool {
+    if !role_env_pristine() {
+        crate::debug!(
+            "cluster: role env already set; skipping programmatic cluster promotion"
+        );
+        return false;
+    }
+    let hex =
+        crate::distributed::cluster::hex_encode(full.to_json().to_string().as_bytes());
+    // SAFETY: caller contract above — main(), before any thread spawning.
+    unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, hex) };
+    true
+}
+
 /// Per-host relay launch spec, hex-encoded JSON in [`ENV_RELAY_JSON`].
 /// Built by the launcher per host (one relay child each); consumed by
 /// [`run_relay`]. Carries only what the transport relay needs — no model,

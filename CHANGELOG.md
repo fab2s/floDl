@@ -259,6 +259,10 @@ The benchmark crate was overhauled to drive the new cluster path and to surface 
 
 - The flat `cluster.yml` schema (`master_addr`, `master_port`, top-level `ssh_*` on workers) is deprecated in favor of the structured `controller:` / `workers[].ssh:` layout. `fdl probe` flags legacy keys with migration hints. Removal targeted for a future release.
 
+### Removed
+
+- The `0.3.0`-deprecated compatibility surface is gone: the `AsyncDdp` / `AsyncDdpBuilder` / `AsyncDdpConfig` type aliases and the `DdpHandle::auto()` / `DdpHandle::auto_with()` / `DdpHandle::builder()` constructors. All of them had pointed at `Trainer::builder()` for two minor releases; migrate any remaining call to `Trainer::builder(...)` (chained setters) or `Trainer::run(...)` (config bag).
+
 ### Fixed
 
 - **Cluster progressive hangs** from a race between the HMAC handshake and the first control frame, and from a post-aggregate dispatch gap where the coordinator didn't re-arm the next-epoch dispatch under specific Sync+Cpu timing. (`distributed: fix cluster progressive hangs (HMAC race/post-aggregate dispatch gap)`)

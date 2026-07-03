@@ -266,22 +266,6 @@ pub enum EpochCallbackPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Deprecated aliases (backward compatibility)
-// ---------------------------------------------------------------------------
-
-/// Deprecated: renamed to [`DdpHandle`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpHandle. Use Trainer::builder() to create.")]
-pub type AsyncDdp = DdpHandle;
-
-/// Deprecated: renamed to [`DdpBuilder`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpBuilder. Use Trainer::builder() to create.")]
-pub type AsyncDdpBuilder<F, M, G, O, T> = DdpBuilder<F, M, G, O, T>;
-
-/// Deprecated: renamed to [`DdpRunConfig`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpRunConfig")]
-pub type AsyncDdpConfig = DdpRunConfig;
-
-// ---------------------------------------------------------------------------
 // Return type
 // ---------------------------------------------------------------------------
 
@@ -1363,5 +1347,4 @@ fn make_partition(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests;

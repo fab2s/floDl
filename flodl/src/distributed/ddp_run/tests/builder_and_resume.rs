@@ -1,5 +1,5 @@
-//! DdpHandle / DdpBuilder builder tests, Trainer::resume_from + missing
-//! meta surfacing, epoch_fn integration tests.
+//! DdpHandle / DdpBuilder builder tests, `Trainer::builder(...).resume_from`
+//! + missing meta surfacing, epoch_fn integration tests.
 
 use super::*;
 
@@ -7,7 +7,7 @@ use super::*;
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_async_ddp_single_gpu_fallback() {
+fn test_builder_single_gpu_fallback() {
     // The builder entry's multi-GPU path auto-promotes to process-per-rank
     // in production and is gated off under cfg(test); the only cfg(test)
     // reachable behavior is the single-device fallback (<2 visible devices).
@@ -15,16 +15,18 @@ fn test_async_ddp_single_gpu_fallback() {
     if crate::tensor::usable_cuda_devices().len() >= 2 {
         return;
     }
-    let ddp = DdpHandle::auto(
+    let ddp = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
-        Arc::new(TestDataset { n: 100 }),
-        4,
-        2,  // 2 epochs
-        ApplyPolicy::Sync,
-        AverageBackend::Cpu, // CPU backend: no NCCL needed for this test
-    ).unwrap();
+    )
+    .dataset(Arc::new(TestDataset { n: 100 }))
+    .batch_size(4)
+    .num_epochs(2)
+    .policy(ApplyPolicy::Sync)
+    .backend(AverageBackend::Cpu) // CPU backend: no NCCL needed for this test
+    .run()
+    .unwrap();
 
     assert!(ddp.world_size() >= 1);
     let state = ddp.join().unwrap();
@@ -39,7 +41,7 @@ fn test_async_ddp_single_gpu_fallback() {
 // `ddp-bench` binary under `fdl cuda-test-nccl`, not a cfg(test) unit test.
 
 #[test]
-fn test_async_ddp_send_sync() {
+fn test_ddp_handle_send_sync() {
     fn assert_send<T: Send>() {}
     assert_send::<DdpHandle>();
     assert_send::<TrainedState>();
@@ -51,7 +53,7 @@ fn test_async_ddp_send_sync() {
 
 #[test]
 fn test_builder_with_defaults() {
-    let ddp = DdpHandle::builder(
+    let ddp = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -78,7 +80,7 @@ fn test_builder_with_all_options() {
     // Sync alone doesn't fully isolate the test from that pathology
     // here, so we also keep the dataset small enough that any
     // remaining lapping cannot accumulate before completion.
-    let ddp = DdpHandle::builder(
+    let ddp = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -103,7 +105,7 @@ fn test_builder_with_all_options() {
 #[test]
 #[should_panic(expected = "dataset is required")]
 fn test_builder_missing_dataset_panics() {
-    let _ = DdpHandle::builder(
+    let _ = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -116,7 +118,7 @@ fn test_builder_missing_dataset_panics() {
 #[test]
 #[should_panic(expected = "batch_size is required")]
 fn test_builder_missing_batch_size_panics() {
-    let _ = DdpHandle::builder(
+    let _ = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -129,7 +131,7 @@ fn test_builder_missing_batch_size_panics() {
 #[test]
 #[should_panic(expected = "num_epochs is required")]
 fn test_builder_missing_num_epochs_panics() {
-    let _ = DdpHandle::builder(
+    let _ = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -305,7 +307,7 @@ fn test_epoch_fn_called_per_epoch() {
     // test that asserts the weaker invariant (every epoch fires at
     // least once across the cluster, no rank fires the same epoch
     // twice).
-    let ddp = DdpHandle::builder(
+    let ddp = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,
@@ -362,7 +364,7 @@ fn test_epoch_fn_set_lr() {
     // the full rationale). In Sync every rank fires `epoch_fn` for
     // every epoch, so `lr` stays consistent across ranks during each
     // gradient average — which is what this test actually verifies.
-    let ddp = DdpHandle::builder(
+    let ddp = crate::distributed::Trainer::builder(
         |dev| Linear::on_device(4, 2, dev),
         |params| crate::nn::SGD::new(params, 0.01, 0.0),
         mse_train,

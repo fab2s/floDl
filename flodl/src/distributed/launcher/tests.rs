@@ -534,3 +534,81 @@
             "SIGTERM-on-failure must reap the sleeper well before its 60s budget; took {elapsed:?}"
         );
     }
+
+    // ---- role-env promotion gate -------------------------------------------
+
+    /// Clear all four role vars. Callers hold `cluster::ENV_MUTEX`.
+    fn clear_role_env() {
+        unsafe {
+            std::env::remove_var(ENV_FULL_CLUSTER_JSON);
+            std::env::remove_var(ENV_RELAY_JSON);
+            std::env::remove_var(crate::distributed::cluster::ENV_CLUSTER_JSON);
+            std::env::remove_var(crate::distributed::cluster::ENV_LOCAL_RANK);
+        }
+    }
+
+    #[test]
+    fn role_env_pristine_matches_dispatch_truth_table() {
+        let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        clear_role_env();
+        assert!(role_env_pristine());
+
+        // Each solo role var flips the gate off — including the relay's,
+        // which the old hand-rolled auto-promote check missed (a relay
+        // child on a multi-GPU host re-promoted and died at dispatch).
+        for k in [ENV_FULL_CLUSTER_JSON, ENV_RELAY_JSON] {
+            unsafe { std::env::set_var(k, "deadbeef") };
+            assert!(!role_env_pristine(), "{k} set must not be pristine");
+            clear_role_env();
+        }
+        // Rank-child shape: slim envelope + slot.
+        unsafe {
+            std::env::set_var(crate::distributed::cluster::ENV_CLUSTER_JSON, "deadbeef");
+            std::env::set_var(crate::distributed::cluster::ENV_LOCAL_RANK, "0");
+        }
+        assert!(!role_env_pristine());
+        // Inconsistent env (full + slim + slot) is not pristine either:
+        // promotion is skipped and the launch-path dispatch errors loudly.
+        unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, "deadbeef") };
+        assert!(!role_env_pristine());
+        clear_role_env();
+    }
+
+    #[test]
+    fn programmatic_promotion_is_role_gated() {
+        let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
+        clear_role_env();
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+
+        // Rank child: slim + slot set, FULL stripped by the launcher. The
+        // child re-enters user code whose config still carries `cluster:` —
+        // it must NOT re-promote (it did: every rank child died at dispatch
+        // with "inconsistent env", breaking programmatic clusters end to
+        // end).
+        unsafe {
+            std::env::set_var(crate::distributed::cluster::ENV_CLUSTER_JSON, "deadbeef");
+            std::env::set_var(crate::distributed::cluster::ENV_LOCAL_RANK, "0");
+        }
+        assert!(!promote_programmatic_cluster(&full));
+        assert!(std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none());
+        clear_role_env();
+
+        // Relay child: only FLODL_RELAY_JSON set.
+        unsafe { std::env::set_var(ENV_RELAY_JSON, "deadbeef") };
+        assert!(!promote_programmatic_cluster(&full));
+        assert!(std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none());
+        clear_role_env();
+
+        // Pristine process: promotes, and the envelope round-trips through
+        // the same path `DdpHandle::launch`'s dispatch consumes.
+        assert!(promote_programmatic_cluster(&full));
+        assert!(matches!(dispatch(), Ok(Role::Launcher)));
+        let back = FullCluster::from_env().unwrap();
+        assert_eq!(back.controller.host, full.controller.host);
+        assert_eq!(back.controller.port, full.controller.port);
+        assert_eq!(back.world_size(), full.world_size());
+        // Already-promoted (launcher) process: fdl-cli's envelope wins,
+        // no overwrite.
+        assert!(!promote_programmatic_cluster(&full));
+        clear_role_env();
+    }
