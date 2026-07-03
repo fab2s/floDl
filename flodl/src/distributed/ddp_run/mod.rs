@@ -69,6 +69,7 @@
 //!   unblocked via `ncclCommAbort` instead of hanging forever.
 
 mod worker;
+pub(crate) use worker::NcclAbortSlot;
 mod orchestrator;
 mod shared;
 pub mod convergence;

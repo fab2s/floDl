@@ -1182,3 +1182,89 @@
             });
         }
     }
+
+    // ---- inbound-bridge failure discipline --------------------------------
+    //
+    // Losing the coordinator link while the main thread is inside an NCCL
+    // collective is unreachable by the injected ControlMsg::Shutdown (the
+    // control channel is never read there). The escape hatch declares all
+    // peers dead in the local ledger so the NCCL watchdog aborts the comm
+    // and the rank exits instead of zombifying — but ONLY on an abnormal
+    // link loss: a clean Shutdown frame followed by EOF is the normal
+    // teardown sequence and must leave the ledger untouched (the main
+    // thread may still be draining the final coherent reduce).
+
+    fn inbound_test_rig(
+        world_size: usize,
+    ) -> (
+        std::net::TcpStream,                                   // coord side
+        std::thread::JoinHandle<()>,                            // inbound
+        std::sync::mpsc::Receiver<ControlMsg>,                  // control_rx
+        Arc<crate::distributed::controller::DeadRanks>,         // ledger
+    ) {
+        use std::net::{TcpListener, TcpStream};
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let coord_side = TcpStream::connect(addr).expect("connect");
+        let (mut worker_side, _) = listener.accept().expect("accept");
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (timing_tx, _timing_rx) = std::sync::mpsc::channel();
+        let dead = crate::distributed::controller::DeadRanks::new(world_size);
+        let mailbox = Arc::new(std::sync::Mutex::new(None));
+        let dead_for_loop = Arc::clone(&dead);
+        let handle = std::thread::spawn(move || {
+            inbound_loop(
+                0,
+                &mut worker_side,
+                &TEST_SALT,
+                &shutdown,
+                &control_tx,
+                &dead_for_loop,
+                &mailbox,
+                &timing_tx,
+            );
+        });
+        (coord_side, handle, control_rx, dead)
+    }
+
+    #[test]
+    fn inbound_eof_without_shutdown_poisons_peer_ledger() {
+        let (coord_side, handle, control_rx, dead) = inbound_test_rig(3);
+        // Abnormal loss: the coordinator link drops with no Shutdown frame.
+        drop(coord_side);
+        handle.join().expect("inbound join");
+        assert!(!dead.is_dead(0), "own rank must never be poisoned");
+        assert!(dead.is_dead(1) && dead.is_dead(2),
+            "all peers must be declared dead so the NCCL watchdog can \
+             abort an in-flight collective");
+        // The recv-parked escape path still fires too.
+        assert!(matches!(control_rx.recv(), Ok(ControlMsg::Shutdown)));
+    }
+
+    #[test]
+    fn inbound_eof_after_clean_shutdown_leaves_ledger_alone() {
+        let (mut coord_side, handle, control_rx, dead) = inbound_test_rig(3);
+        // Clean teardown: Shutdown frame first, then the link drops.
+        let frame = crate::distributed::wire::ControlFrame::encode(
+            &TEST_SALT,
+            crate::distributed::wire::MsgKind::Control,
+            &crate::distributed::wire::ControlMsgWire::Shutdown,
+        )
+        .expect("encode shutdown");
+        let mut bytes = Vec::new();
+        frame.write_to(&mut bytes).expect("serialize frame");
+        crate::distributed::relay::mux::write_len_framed(&mut coord_side, &bytes)
+            .expect("write len-framed");
+        drop(coord_side);
+        handle.join().expect("inbound join");
+        assert_eq!(
+            dead.dead_count(),
+            0,
+            "clean Shutdown-then-EOF is the normal teardown — poisoning \
+             here would abort a final coherent reduce mid-flight"
+        );
+        assert!(matches!(control_rx.recv(), Ok(ControlMsg::Shutdown)));
+    }

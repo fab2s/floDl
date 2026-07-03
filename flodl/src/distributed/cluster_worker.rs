@@ -74,7 +74,7 @@ use crate::distributed::cluster_coordinator::{write_handshake_rank, CTRL_HS_ACK,
 use crate::distributed::ddp_run::{
     CheckpointFn, ControlMsg, EpochFn, EpochPlan, EvalFn, GpuWorker, TimingMsg, WorkerConfig,
 };
-use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
+use crate::distributed::nccl::NcclRankComm;
 use crate::distributed::relay::mux::{try_read_len_framed, write_len_framed, LenFramedRead};
 use crate::distributed::wire::{
     hmac_sha256_64, ControlFrame, ControlMsgWire, MsgKind, SessionSalt,
@@ -576,10 +576,16 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // coord will never send.
         inner.attach_local_dead_ranks(Arc::clone(&local_dead_ranks));
 
-        // Grab the initial NCCL abort handle (if any) for the watchdog.
-        // Cluster mode without an NCCL comm (CPU averaging) skips the
-        // watchdog entirely.
-        let initial_abort_handle = inner.nccl_abort_handle();
+        // NCCL abort slot: a shared cell the watchdog re-reads on every
+        // poll and `GpuWorker::replace_nccl_comm` refreshes on every
+        // rebuild, so cascading deaths (a second peer dying after the
+        // cohort already rebuilt once) always abort the LIVE comm — a
+        // captured handle would go stale at the first rebuild. Cluster
+        // mode without an NCCL comm (CPU averaging) leaves it `None`
+        // and skips the watchdog entirely.
+        let nccl_abort_slot: crate::distributed::ddp_run::NcclAbortSlot =
+            Arc::new(std::sync::Mutex::new(inner.nccl_abort_handle()));
+        inner.attach_nccl_abort_slot(Arc::clone(&nccl_abort_slot));
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut bridges: Vec<JoinHandle<()>> = Vec::new();
@@ -716,17 +722,19 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // coord's shared DeadRanks ledger shuts down the controller
         // stream which already releases the blocked AllReduce read).
         //
-        // Caveat: the watchdog holds the INITIAL abort handle. After
-        // the main thread rebuilds the comm, the watchdog's clone
-        // points at the destroyed comm — `abort()` becomes a no-op
-        // (the handle's `aborted` AtomicBool is already true). For
-        // cascading death scenarios (a second peer dies during the
-        // 2-rank cohort) NCCL's own watchdog handles the second abort
-        // via NCCL_ASYNC_ERROR_HANDLING=1 (set in the launcher env);
-        // see the launcher coord-spawn slice.
-        if let Some(abort_handle) = initial_abort_handle {
+        // The watchdog reads the CURRENT handle from the shared slot on
+        // every poll, so a comm rebuild re-arms it automatically: death A
+        // aborts comm 1, the survivors rebuild comm 2 (refreshing the
+        // slot), death B aborts comm 2. Per-handle `aborted` flags keep
+        // each abort idempotent per comm lifetime.
+        let spawn_watchdog = nccl_abort_slot
+            .lock()
+            .expect("nccl abort slot poisoned")
+            .is_some();
+        if spawn_watchdog {
             let shutdown_for_wd = Arc::clone(&shutdown_flag);
             let dead_for_wd = Arc::clone(&local_dead_ranks);
+            let slot_for_wd = Arc::clone(&nccl_abort_slot);
             let rank_for_wd = rank_id as usize;
             bridges.push(
                 thread::Builder::new()
@@ -734,7 +742,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
                     .spawn(move || {
                         nccl_watchdog_loop(
                             rank_for_wd,
-                            abort_handle,
+                            slot_for_wd,
                             dead_for_wd,
                             shutdown_for_wd,
                         );
@@ -1062,19 +1070,38 @@ fn inbound_loop(
 ) {
     // ESCAPE HATCH: any abnormal exit of this bridge (coordinator or relay
     // death, frame corruption, EOF without a prior Shutdown frame) must wake
-    // the inner GpuWorker. Without this, the inner can be parked forever in
-    // a blocking `control_rx.recv()` (`wait_for_epoch_plan` / a barrier wait)
-    // while the param bridge holds its own `control_tx` clone blocked in
-    // `param_rx.recv()` — a circular wait that turns the rank into a zombie
-    // process nobody can reach (its heartbeats only ever told the dead
-    // coordinator). Injecting Shutdown breaks the cycle: the inner exits its
-    // run loop, `run_until_shutdown` drops it, the param channel disconnects
-    // and every bridge unwinds. On a CLEAN coordinator shutdown the real
-    // Shutdown frame arrives first and this injection is a harmless no-op
-    // (duplicate Shutdown on a draining/disconnected channel).
+    // the inner GpuWorker — WHEREVER it is parked:
+    //
+    // - Parked in a blocking `control_rx.recv()` (`wait_for_epoch_plan` /
+    //   a barrier wait): injecting Shutdown breaks the cycle — the inner
+    //   exits its run loop, `run_until_shutdown` drops it, the param
+    //   channel disconnects and every bridge unwinds.
+    // - Parked INSIDE an NCCL collective / stream synchronize: the control
+    //   channel is never read there, so Shutdown alone leaves the rank a
+    //   zombie at 100% CPU (its heartbeats only ever told the dead
+    //   coordinator). The controller is this rank's only window on the
+    //   world, so losing the link means every peer is unreachable:
+    //   declare them all dead in the local ledger — the NCCL watchdog
+    //   observes the ledger within its poll tick and aborts the comm,
+    //   the collective errors out, and the lone-survivor bail exits the
+    //   rank with a death record instead of zombifying.
+    //
+    // On a CLEAN coordinator shutdown the real Shutdown frame arrives
+    // BEFORE the link drops; `clean_shutdown_seen` suppresses the peer
+    // poison on the subsequent EOF (the main thread may legitimately
+    // still be draining the final coherent reduce), and the duplicate
+    // Shutdown injection stays a harmless no-op.
     let inject_shutdown = || {
         let _ = control_tx.send(ControlMsg::Shutdown);
     };
+    let poison_peers = || {
+        for r in 0..local_dead_ranks.world_size() {
+            if r != rank {
+                local_dead_ranks.declare_dead(r);
+            }
+        }
+    };
+    let mut clean_shutdown_seen = false;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -1088,6 +1115,9 @@ fn inbound_loop(
                     Ok(Some(f)) => f,
                     Ok(None) => {
                         eprintln!("cluster_worker: inbound r{rank} truncated ControlFrame");
+                        if !clean_shutdown_seen {
+                            poison_peers();
+                        }
                         inject_shutdown();
                         return;
                     }
@@ -1095,6 +1125,9 @@ fn inbound_loop(
                         eprintln!(
                             "cluster_worker: inbound r{rank} ControlFrame parse: {e}"
                         );
+                        if !clean_shutdown_seen {
+                            poison_peers();
+                        }
                         inject_shutdown();
                         return;
                     }
@@ -1170,6 +1203,12 @@ fn inbound_loop(
                         // control_wire_to_msg → inner control_tx.
                         other => match control_wire_to_msg(other) {
                             Ok(Some(msg)) => {
+                                if matches!(msg, ControlMsg::Shutdown) {
+                                    // Clean teardown announced: the EOF
+                                    // that follows is expected — do not
+                                    // poison the peer ledger for it.
+                                    clean_shutdown_seen = true;
+                                }
                                 if control_tx.send(msg).is_err() {
                                     // Inner GpuWorker dropped its receiver.
                                     return;
@@ -1185,6 +1224,9 @@ fn inbound_loop(
                                 eprintln!(
                                     "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
                                 );
+                                if !clean_shutdown_seen {
+                                    poison_peers();
+                                }
                                 inject_shutdown();
                                 return;
                             }
@@ -1194,6 +1236,9 @@ fn inbound_loop(
                         eprintln!(
                             "cluster_worker: inbound r{rank} decode ControlMsgWire: {e}"
                         );
+                        if !clean_shutdown_seen {
+                            poison_peers();
+                        }
                         inject_shutdown();
                         return;
                     }
@@ -1211,6 +1256,9 @@ fn inbound_loop(
             }
             Ok(LenFramedRead::WouldBlock) => continue,
             Ok(LenFramedRead::Eof) => {
+                if !clean_shutdown_seen {
+                    poison_peers();
+                }
                 inject_shutdown();
                 return;
             }
@@ -1219,6 +1267,9 @@ fn inbound_loop(
                 // the coord closed its end during shutdown. Downgrade
                 // to verbose so steady-state logs stay clean.
                 crate::verbose!("cluster_worker: inbound r{rank} wire error: {e}");
+                if !clean_shutdown_seen {
+                    poison_peers();
+                }
                 inject_shutdown();
                 return;
             }
@@ -1267,19 +1318,21 @@ const NCCL_WATCHDOG_POLL_MS: u64 = 100;
 /// NCCL watchdog thread body.
 ///
 /// Polls `local_dead_ranks.dead_count()` and calls
-/// [`NcclAbortHandle::abort`] each time the count increases. The abort
-/// unblocks the main thread's in-flight NCCL collective with an Err so
-/// the main thread can rebuild the comm on the surviving cohort.
+/// [`abort`](crate::distributed::nccl::NcclAbortHandle::abort) on the
+/// CURRENT handle each time the count
+/// increases. The abort unblocks the main thread's in-flight NCCL
+/// collective with an Err so the main thread can rebuild the comm on
+/// the surviving cohort.
 ///
-/// `abort()` is idempotent (the handle's internal `aborted: AtomicBool`
-/// guards against double-aborts), so multiple successive increments
-/// translate into one effective abort per comm lifetime. After the
-/// main thread rebuilds the comm, this handle is stale; cascading
-/// deaths beyond the first are handled by NCCL's own watchdog when
-/// `NCCL_ASYNC_ERROR_HANDLING=1` is set in the worker env.
+/// The handle is re-read from the shared slot on every firing:
+/// `GpuWorker::replace_nccl_comm` refreshes the slot at each rebuild,
+/// so cascading deaths always abort the live comm (a captured handle
+/// would go stale after the first rebuild — its `aborted` flag already
+/// tripped — leaving a second death with no abort path: permanent
+/// hang). `abort()` stays idempotent per handle via that flag.
 fn nccl_watchdog_loop(
     rank: usize,
-    abort_handle: Arc<NcclAbortHandle>,
+    abort_slot: crate::distributed::ddp_run::NcclAbortSlot,
     local_dead_ranks: Arc<crate::distributed::controller::DeadRanks>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1294,11 +1347,23 @@ fn nccl_watchdog_loop(
                 last_dead_count,
                 now_dead,
             );
-            if let Err(e) = abort_handle.abort() {
-                eprintln!(
-                    "cluster_worker: rank {} NCCL watchdog abort error: {}",
-                    rank, e,
-                );
+            let handle = abort_slot
+                .lock()
+                .expect("nccl abort slot poisoned")
+                .clone();
+            match handle {
+                Some(h) => {
+                    if let Err(e) = h.abort() {
+                        eprintln!(
+                            "cluster_worker: rank {} NCCL watchdog abort error: {}",
+                            rank, e,
+                        );
+                    }
+                }
+                None => {
+                    // Slot emptied (comm torn down for exit); nothing to
+                    // abort.
+                }
             }
             last_dead_count = now_dead;
         }
@@ -1766,12 +1831,36 @@ fn param_bridge_loop(
         // Buffers (BatchNorm running stats etc.): equal weight among the
         // ranks that moved (idle excluded via the 0/1 indicator); the
         // controller divides by the accepted mover count.
-        let avg_buffers = if buffers.is_empty() || total_n == 0.0 {
+        //
+        // Only the f32 subset rides the reduce — the CPU transport is
+        // f32-only, and non-f32 buffers (integer counters and the like)
+        // are deterministic values updated identically on every rank,
+        // so passing the local value through unchanged is correct, not
+        // a dropped sync (mirrors the bootstrap broadcast's filter in
+        // `rank_entry`). The merge is positional, so the consumer's
+        // zip against the live buffer list stays aligned; every rank
+        // builds the same model, so the subset matches in count/order
+        // across ranks and the collective stays balanced.
+        let f32_buffer_idx: Vec<usize> = buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.dtype() == crate::tensor::DType::Float32)
+            .map(|(i, _)| i)
+            .collect();
+        let avg_buffers = if f32_buffer_idx.is_empty() || total_n == 0.0 {
             buffers.clone()
         } else {
+            let subset: Vec<Tensor> =
+                f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
             let my_indicator = if n_i > 0 { 1.0 } else { 0.0 };
-            match sumcount_reduce(&mut client, &buffers, my_indicator) {
-                Ok(v) => v,
+            match sumcount_reduce(&mut client, &subset, my_indicator) {
+                Ok(reduced) => {
+                    let mut merged = buffers.clone();
+                    for (k, &i) in f32_buffer_idx.iter().enumerate() {
+                        merged[i] = reduced[k].clone();
+                    }
+                    merged
+                }
                 Err(e) => {
                     eprintln!(
                         "cluster_worker: param bridge r{rank} all_reduce buffers: {e}"

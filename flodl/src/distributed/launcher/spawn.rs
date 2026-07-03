@@ -255,12 +255,6 @@ pub(super) fn build_local_spawn_command(
             crate::distributed::cluster::ENV_LOCAL_RANK,
             local_rank.to_string(),
         )
-        // Defense-in-depth: enable NCCL's own watchdog so stuck
-        // collectives get aborted independently of flodl's
-        // cluster-mode NCCL watchdog (the latter only fires on
-        // peer-death events the coord broadcasts; this catches
-        // wedge cases beyond that surface).
-        .env("NCCL_ASYNC_ERROR_HANDLING", "1")
         .env_remove(ENV_FULL_CLUSTER_JSON);
     if let Some(phys) = local_phys_device {
         cmd.env("CUDA_VISIBLE_DEVICES", phys.to_string());
@@ -518,9 +512,6 @@ pub(super) fn build_remote_bash_command(
     s.push('=');
     s.push_str(&local_rank.to_string());
     s.push(' ');
-    // Defense-in-depth for NCCL stuck-collective detection; see the
-    // matching env on the local spawn path.
-    s.push_str("NCCL_ASYNC_ERROR_HANDLING=1");
     // Forward the launcher's verbosity so `-vvv` (FLODL_VERBOSITY)
     // reaches the remote worker/coordinator processes — the local
     // spawn path inherits it via the process env, but SSH starts a

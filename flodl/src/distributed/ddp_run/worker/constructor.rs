@@ -251,6 +251,7 @@ impl<M: Module> GpuWorker<M> {
             data_ms_run_total: 0.0,
             ctrl_msgs_handled: 0,
             nccl_abort_handle: nccl_comm.as_ref().map(|c| c.abort_handle()),
+            nccl_abort_slot: None,
             nccl_comm,
             nccl_session_mailbox: None,
             local_dead_ranks: None,

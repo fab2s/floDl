@@ -29,6 +29,14 @@ mod sync;
 // GpuWorker
 // ---------------------------------------------------------------------------
 
+/// Shared cell holding the CURRENT NCCL abort handle for a rank.
+///
+/// Written by [`GpuWorker::replace_nccl_comm`] on every comm rebuild;
+/// read by the cluster-mode NCCL watchdog on every firing, so the
+/// watchdog always aborts the live comm across cascading peer deaths.
+pub(crate) type NcclAbortSlot =
+    Arc<Mutex<Option<Arc<NcclAbortHandle>>>>;
+
 /// A training worker bound to a single GPU device.
 ///
 /// Generic over the model type `M` so training closures can access concrete
@@ -124,6 +132,13 @@ pub struct GpuWorker<M: Module> {
     /// uses [`NcclAbortHandle::is_aborted`] to distinguish "our abort"
     /// from other NCCL errors in [`Self::sync_now_nccl`].
     nccl_abort_handle: Option<Arc<NcclAbortHandle>>,
+    /// Cluster-mode shared abort slot. The NCCL watchdog re-reads the
+    /// CURRENT handle from here on every firing and
+    /// [`Self::replace_nccl_comm`] refreshes it on every rebuild, so
+    /// cascading peer deaths always abort the live comm (a handle
+    /// captured at spawn time goes stale at the first rebuild).
+    /// `None` outside cluster mode.
+    nccl_abort_slot: Option<NcclAbortSlot>,
     /// Cluster-mode NCCL session mailbox. Populated by the
     /// cluster_worker inbound bridge on each `NewNcclSession` arrival;
     /// drained here by `sync_now_nccl` post-abort to rebuild the comm.
@@ -471,6 +486,14 @@ impl<M: Module> GpuWorker<M> {
         self.local_dead_ranks = Some(dead_ranks);
     }
 
+    /// Attach the cluster-mode shared NCCL abort slot (see
+    /// [`NcclAbortSlot`]). [`Self::replace_nccl_comm`] refreshes it on
+    /// every rebuild so the watchdog always holds the live comm's
+    /// handle. No-op for standalone NCCL setups.
+    pub(crate) fn attach_nccl_abort_slot(&mut self, slot: NcclAbortSlot) {
+        self.nccl_abort_slot = Some(slot);
+    }
+
     /// Replace this worker's NCCL communicator with `new_comm` after a
     /// cluster-mode re-rendezvous (peer rank died, surviving cohort
     /// formed a fresh comm).
@@ -483,7 +506,14 @@ impl<M: Module> GpuWorker<M> {
     /// `world_size` (= position in the shrunken cohort / cohort size)
     /// for collective dispatch; the worker never reads those.
     pub fn replace_nccl_comm(&mut self, new_comm: NcclRankComm) {
-        self.nccl_abort_handle = Some(new_comm.abort_handle());
+        let handle = new_comm.abort_handle();
+        // Re-arm the cluster-mode watchdog: it re-reads this slot on
+        // every firing, so the NEXT peer death aborts the rebuilt comm
+        // instead of no-op'ing on the old handle's tripped flag.
+        if let Some(slot) = &self.nccl_abort_slot {
+            *slot.lock().expect("nccl abort slot poisoned") = Some(Arc::clone(&handle));
+        }
+        self.nccl_abort_handle = Some(handle);
         self.nccl_comm = Some(new_comm);
     }
 
