@@ -71,10 +71,12 @@ fn weighted_allreduce_nccl(
     // STREAM-ORDER EVERYTHING ON THE COMM STREAM. The two in-place scalings
     // below bracket the param all_reduce, and the all_reduce is explicitly
     // enqueued on `stream` (the comm stream) — but tensor ops enqueue on the
-    // thread's CURRENT stream. A rank that processes `SyncNow` BETWEEN chunks
-    // sits on the default stream (which implicitly synchronizes with every
-    // other stream → ordered → safe), but a rank that syncs MID-CHUNK is
-    // under `run_epoch_plan`'s compute-stream guard: its scalings enqueue on
+    // thread's CURRENT stream. Pool streams are created non-blocking
+    // (`cudaStreamNonBlocking`), so NOT even the legacy default stream
+    // implicitly orders against them: a rank that processes `SyncNow`
+    // BETWEEN chunks (default stream) is exposed exactly like one that
+    // syncs MID-CHUNK under `run_epoch_plan`'s compute-stream guard,
+    // where the scalings would enqueue on
     // compute_stream while the all_reduce runs on the comm stream with NO
     // ordering between them. The collective can then sum UNSCALED (or
     // half-scaled) params — the consensus comes out ΣW/Σn instead of
@@ -128,12 +130,34 @@ fn weighted_allreduce_nccl(
     match stream {
         Some(s) => {
             comm.all_reduce_on_stream(param_refs, ReduceOp::Sum, s)?;
+            // The divide is stream-ordered after the collective (both on
+            // the comm stream via the guard above); the EXIT FENCE below
+            // retires it before returning.
+            Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
+            // EXIT FENCE: this synchronize MUST come after the divide.
+            // The sync-entry fence's contract ("the weighted reduce
+            // retires everything before returning") is what lets the
+            // caller's divergence readout, the outer-optimizer
+            // writeback, and the next forward all run unfenced on THEIR
+            // streams — none of which are ordered against the comm
+            // stream (pool streams are non-blocking). A synchronize
+            // placed before the divide instead leaves the divide in
+            // flight at return: a per-sync-rare consensus-corruption
+            // race of the same class as the mid-chunk collective race
+            // documented at the entry fence. A wedged collective still
+            // parks the host here, where the NCCL watchdog's abort can
+            // free it.
             s.synchronize()?;
         }
-        None => comm.all_reduce(param_refs, ReduceOp::Sum)?,
+        None => {
+            comm.all_reduce(param_refs, ReduceOp::Sum)?;
+            // No dedicated comm stream: collective and divide share the
+            // caller's current stream, so plain enqueue order fences
+            // them against every downstream consumer on that stream.
+            Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
+        }
     }
     crate::debug!("  ddp-areduce: rank {rank} seq={seq} PARAM exit");
-    Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
     Ok(())
 }
 
@@ -433,9 +457,13 @@ impl<M: Module> GpuWorker<M> {
         // in-flight update. The corruption is per-sync-rare — invisible at
         // smoke scale, near-certain across the thousands of syncs of a long
         // run (rig, 200ep: discrete loss perturbation at epoch 120, NaN at
-        // epoch 124). The exit side needs no fence: the weighted reduce ends
-        // with a comm-stream synchronize, so training resumes only after the
-        // consensus has fully landed.
+        // epoch 124). The exit side needs no fence HERE because the weighted
+        // reduce provides its own: it retires the final divide on the comm
+        // stream and host-synchronizes before returning (the EXIT FENCE in
+        // `weighted_allreduce_nccl`), so training resumes only after the
+        // consensus has fully landed. That exit fence is load-bearing for
+        // this contract — the divergence readout and outer-optimizer
+        // writeback below rely on it.
         if let Some(ref cs) = self.compute_stream {
             cs.synchronize()?;
         }
