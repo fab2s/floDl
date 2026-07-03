@@ -239,29 +239,46 @@ impl CpuReduceClient {
         }
     }
 
-    /// Convenience: build a [`RoundFrame`] from a slice of tensors, call
-    /// [`Self::all_reduce`], and convert the averaged frame back to a
-    /// `Vec<Tensor>` on CPU.
+    /// Weighted frame-level reduce: build a [`RoundFrame`], tag it with
+    /// `kind` + the sender's realized-work `weight`, round-trip it, and
+    /// return the reduced tensors plus the round's summed accepted mass.
+    ///
+    /// [`RoundKind::Model`]: the controller returns the consensus (sum
+    /// divided ONCE by the mass of exactly the frames it accepted). A
+    /// returned mass of `0.0` means nothing was realized this round and
+    /// the tensors are meaningless zeros — callers must keep local state.
+    ///
+    /// [`RoundKind::Control`]: pure element-wise sum (gathers /
+    /// broadcasts build on it); the returned mass is informational.
     ///
     /// v1 supports f32 only; loud error on other dtypes. Caller is
-    /// responsible for moving averaged tensors back to GPU if needed.
-    pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+    /// responsible for moving reduced tensors back to GPU if needed.
+    pub fn all_reduce_weighted(
+        &mut self,
+        tensors: &[&Tensor],
+        kind: RoundKind,
+        weight: f64,
+    ) -> Result<(Vec<Tensor>, f64)> {
         // Instrumentation (gated on `-vvv`): time the three phases
         // independently so we can attribute the cpu-cadence reduce floor
         // to serialize (incl. GPU→CPU via `to_blob`) / wire (cross-host
         // TCP round-trip) / deserialize. Summed across reduces, emitted
         // at teardown by `log_profile_summary`.
         if !self.prof_enabled {
-            let frame = tensors_to_round_frame(tensors)?;
-            let averaged = self.all_reduce(&frame)?;
-            return round_frame_to_tensors(&averaged);
+            let mut frame = tensors_to_round_frame(tensors)?;
+            frame.kind = kind;
+            frame.weight = weight;
+            let reduced = self.all_reduce(&frame)?;
+            return Ok((round_frame_to_tensors(&reduced)?, reduced.weight));
         }
         let t0 = Instant::now();
-        let frame = tensors_to_round_frame(tensors)?;
+        let mut frame = tensors_to_round_frame(tensors)?;
+        frame.kind = kind;
+        frame.weight = weight;
         let t1 = Instant::now();
-        let averaged = self.all_reduce(&frame)?;
+        let reduced = self.all_reduce(&frame)?;
         let t2 = Instant::now();
-        let out = round_frame_to_tensors(&averaged)?;
+        let out = round_frame_to_tensors(&reduced)?;
         let t3 = Instant::now();
         self.prof_serialize_ns += (t1 - t0).as_nanos();
         self.prof_wire_ns += (t2 - t1).as_nanos();
@@ -272,7 +289,16 @@ impl CpuReduceClient {
             .map(|p| p.bytes.len() as u64)
             .sum::<u64>();
         self.prof_count += 1;
-        Ok(out)
+        Ok((out, reduced.weight))
+    }
+
+    /// Convenience: equal-weight mean over the accepted cohort. Each
+    /// rank contributes mass `1.0`, so the consensus is the plain mean
+    /// of exactly the frames the controller accepted into the round.
+    pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+        Ok(self
+            .all_reduce_weighted(tensors, RoundKind::Model, 1.0)?
+            .0)
     }
 
     /// Emit a one-line per-rank summary of the accumulated reduce
@@ -314,13 +340,11 @@ impl CpuReduceClient {
         );
     }
 
-    /// Broadcast a root rank's tensors to every rank via the avg-trick.
+    /// Broadcast a root rank's tensors to every rank via a pure sum.
     ///
-    /// The controller only supports AllReduce-Avg (sum then divide by
-    /// `world_size`). To express "every rank receives root's values" with
-    /// that primitive: root scales its tensors by `world_size`, every
-    /// other rank sends zeros. After avg = sum/world_size, every rank
-    /// ends up with root's original values.
+    /// Root sends its values; every other rank sends zeros. The
+    /// [`RoundKind::Control`] sum delivers root's original values to
+    /// every rank — no scaling tricks, no divisor.
     ///
     /// Used by the cluster-rank entry points to align initial parameter
     /// state across ranks (mirrors `nccl_comm.broadcast(refs, root=0)` on
@@ -341,18 +365,16 @@ impl CpuReduceClient {
                 self.world_size,
             )));
         }
-        // Build the per-rank contribution: root multiplies by world_size,
-        // non-root ranks send zeros_like. Tensors are moved to CPU via
-        // tensors_to_round_frame downstream; the scaled / zeroed copies
-        // are short-lived (single-round scratch).
-        let n = self.world_size as f64;
-        let scaled: Vec<Tensor> = if self.rank_id == root {
+        // Build the per-rank contribution: root sends a copy of its
+        // values, non-root ranks send zeros_like. Tensors are moved to
+        // CPU via tensors_to_round_frame downstream; the copies are
+        // short-lived (single-round scratch).
+        let contribution: Vec<Tensor> = if self.rank_id == root {
             tensors
                 .iter()
                 .map(|t| {
                     let copy = Tensor::zeros_like(t)?;
                     copy.copy_(t, false)?;
-                    copy.mul_scalar_(n)?;
                     Ok(copy)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -362,18 +384,21 @@ impl CpuReduceClient {
                 .map(|t| Tensor::zeros_like(t))
                 .collect::<Result<Vec<_>>>()?
         };
-        let scaled_refs: Vec<&Tensor> = scaled.iter().collect();
-        self.all_reduce_tensors(&scaled_refs)
+        let refs: Vec<&Tensor> = contribution.iter().collect();
+        Ok(self
+            .all_reduce_weighted(&refs, RoundKind::Control, 0.0)?
+            .0)
     }
 
     /// AllReduce-gather a per-rank `f64` measurement vector across the
-    /// cluster via the avg-trick.
+    /// cluster via a pure sum.
     ///
     /// `local` must be length `world_size`. Each rank writes its own
-    /// measurement into its own slot (other slots zero). The values are
-    /// scaled by `world_size` before send so the controller's
-    /// divide-by-`world_size` cancels, yielding the gathered vector on
-    /// every rank.
+    /// measurement into its own slot (other slots zero); the
+    /// [`RoundKind::Control`] sum yields the gathered vector on every
+    /// rank. Slots of ranks whose frames the controller did not accept
+    /// (dead / lost mid-round) stay zero — the gather reports realized
+    /// contributions only.
     ///
     /// Counterpart to [`Ddp::all_reduce_per_rank_f64`](crate::distributed::Ddp::all_reduce_per_rank_f64)
     /// — same semantics, CPU-routed. v1 carries f32 over the wire (the
@@ -393,10 +418,9 @@ impl CpuReduceClient {
                 world_size,
             )));
         }
-        let n = self.world_size as f32;
-        let scaled: Vec<f32> = local.iter().map(|v| (*v as f32) * n).collect();
+        let vals: Vec<f32> = local.iter().map(|v| *v as f32).collect();
         let tensor = Tensor::from_f32(
-            &scaled,
+            &vals,
             &[world_size as i64],
             Device::CPU,
         )?;
@@ -743,11 +767,13 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
             bytes,
         });
     }
-    // Default to a model-weight frame; bookkeeping reduces (the count-gather)
-    // override the kind on the built frame before sending.
+    // Default to a model-weight frame with no realized-work mass;
+    // senders set `kind` / `weight` on the built frame (see
+    // `CpuReduceClient::all_reduce_weighted`).
     Ok(RoundFrame {
         tensors: payloads,
         kind: RoundKind::Model,
+        weight: 0.0,
     })
 }
 

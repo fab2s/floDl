@@ -358,7 +358,15 @@ impl OuterStepper {
                 Ok(frame)
             }
             RoundKind::Model if !self.seen_params_this_window => {
+                // Zero accepted mass: a degenerate all-idle round whose
+                // tensors are a meaningless zero sum. Pass it through so
+                // ranks see `weight == 0` and keep local state; do NOT
+                // step the outer optimizer on it.
+                if frame.weight <= 0.0 {
+                    return Ok(frame);
+                }
                 self.seen_params_this_window = true;
+                let weight = frame.weight;
                 let consensus = round_frame_to_tensors(&frame)?;
                 // First window: no prior anchor — use the consensus, so the
                 // outer gradient is zero and the step is a no-op for any
@@ -367,7 +375,13 @@ impl OuterStepper {
                 let new_global = self.opt.outer_step(&prev, &consensus)?;
                 self.prev_global = Some(new_global.clone());
                 let refs: Vec<&Tensor> = new_global.iter().collect();
-                tensors_to_round_frame(&refs)
+                // Preserve the realized-work mass on the rebuilt frame:
+                // ranks treat `weight == 0` as "keep local state", so
+                // dropping it would turn every outer step into a
+                // cohort-wide no-op adopt.
+                let mut stepped = tensors_to_round_frame(&refs)?;
+                stepped.weight = weight;
+                Ok(stepped)
             }
             RoundKind::Model => Ok(frame),
         }
@@ -435,7 +449,8 @@ mod tests {
         let p1 = t(&[4.0, 5.0], &[2]);
         let buf = t(&[9.0, 8.0], &[2]);
 
-        let params_frame = tensors_to_round_frame(&[&p0, &p1]).unwrap();
+        let mut params_frame = tensors_to_round_frame(&[&p0, &p1]).unwrap();
+        params_frame.weight = 1.0; // realized mass: the stepper skips zero-mass frames
         let buffers_frame = tensors_to_round_frame(&[&buf]).unwrap();
         let mut control_frame = tensors_to_round_frame(&[&p0]).unwrap();
         control_frame.kind = RoundKind::Control;
@@ -501,7 +516,8 @@ mod tests {
         // Window 1: params1=[2,4] (prev==consensus first window -> unchanged),
         // buffers untouched.
         stepper.process_frame(control.clone()).unwrap();
-        let p1 = tensors_to_round_frame(&[&t(&[2.0, 4.0], &[2])]).unwrap();
+        let mut p1 = tensors_to_round_frame(&[&t(&[2.0, 4.0], &[2])]).unwrap();
+        p1.weight = 1.0; // realized mass: the stepper skips zero-mass frames
         let p1_out = stepper.process_frame(p1.clone()).unwrap();
         assert_eq!(p1_out, p1, "first-window params unchanged (g=0)");
         let b1_out = stepper.process_frame(buffers.clone()).unwrap();
@@ -510,7 +526,8 @@ mod tests {
         // Window 2: consensus=[1,2], prev=[2,4]. g=[1,2], v=[1,2],
         // step=0.5*[1,2]=[0.5,1], new=[1.5,3]. Buffers still pass through.
         stepper.process_frame(control).unwrap();
-        let p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])]).unwrap();
+        let mut p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])]).unwrap();
+        p2.weight = 1.0;
         let p2_out = stepper.process_frame(p2).unwrap();
         let stepped = round_frame_to_tensors(&p2_out).unwrap()[0].to_f32_vec().unwrap();
         assert!(

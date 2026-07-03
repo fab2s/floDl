@@ -43,6 +43,10 @@
                 shape: vec![data.len() as u32],
                 bytes: f32_to_bytes(data),
             }],
+            // Equal-mass contributions: the realized-work reduce then
+            // returns the plain mean over the accepted cohort, which is
+            // what these wire-level tests assert.
+            weight: 1.0,
             ..Default::default()
         }
     }
@@ -388,4 +392,230 @@
             msg.contains("connect") && msg.contains(":1 failed"),
             "expected connect-failed error mentioning port 1, got: {msg}"
         );
+    }
+
+    // -- realized-work invariant -------------------------------------------
+    //
+    // The consensus equals Σ(wᵣ·Tᵣ) / Σwᵣ over exactly the contributions
+    // the controller accepted into the round ("realized work"), and the
+    // frame the controller scatters — which the checkpoint forge and the
+    // controller-hosted outer optimizer consume — IS that consensus.
+    //
+    // These drive the REAL rank-side math (`gamma_weights` +
+    // `sumcount_reduce`) through the true 3-tier path
+    // (client → relay → controller), all-alive and after a death.
+
+    use crate::distributed::cluster_worker::{gamma_weights, sumcount_reduce};
+    use crate::distributed::controller::DeadRanks;
+    use crate::tensor::{Device, Tensor};
+    use std::sync::Arc;
+
+    /// Like `with_relayed_controller` but shares a caller-provided
+    /// dead-rank ledger so tests can declare deaths.
+    fn with_relayed_controller_and_ledger<F, T>(
+        world_size: u32,
+        ranks: Vec<u32>,
+        salt: SessionSalt,
+        dead: Arc<DeadRanks>,
+        client_body: F,
+    ) -> T
+    where
+        F: FnOnce(SocketAddr) -> T,
+    {
+        let controller = ClusterController::start_with_dead_ranks(
+            local(0),
+            world_size as usize,
+            salt,
+            dead,
+            None,
+            None,
+        )
+        .unwrap();
+        let controller_addr = local(controller.port());
+        let (listener, relay_port) = RelayChannel::bind(local(0)).unwrap();
+        let (htx, hrx) = mpsc::channel();
+        thread::spawn(move || {
+            let started = RelayChannel::start(
+                listener,
+                ChannelKind::Data,
+                controller_addr,
+                "test-host".into(),
+                ranks,
+                world_size as usize,
+                salt,
+            );
+            let _ = htx.send(started);
+        });
+        let result = client_body(local(relay_port));
+        match hrx.recv().unwrap() {
+            Ok(ch) => {
+                let _ = ch.shutdown();
+            }
+            Err(e) => panic!("relay start failed: {e}"),
+        }
+        controller.shutdown().unwrap();
+        result
+    }
+
+    /// One rank's full param-bridge window math against live wire state:
+    /// count gather → gamma weights → weighted reduce. Returns
+    /// (gathered counts, rank-adopted consensus value, raw scattered
+    /// value = what the forge/outer stepper see).
+    fn window_round(
+        c: &mut CpuReduceClient,
+        rank: usize,
+        world: usize,
+        n_i: usize,
+        t_val: f32,
+        gamma: f64,
+    ) -> (Vec<f64>, f32, f32) {
+        let mut counts = vec![0.0f64; world];
+        counts[rank] = n_i as f64;
+        c.all_reduce_per_rank_f64(&mut counts).unwrap();
+        let (my_w, _w_sum) = gamma_weights(n_i as f64, &counts, gamma);
+        let t = Tensor::from_f32(&[t_val], &[1], Device::CPU).unwrap();
+        let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w)
+            .unwrap()[0]
+            .to_f32_vec()
+            .unwrap()[0];
+        // Second round replicating `sumcount_reduce`'s send side, keeping
+        // the RAW reduce output: byte-identical to the frame the
+        // controller scatters and hands to the forge / outer stepper.
+        let scaled = t.mul_scalar(my_w).unwrap();
+        let (raw_t, _mass) = c
+            .all_reduce_weighted(
+                &[&scaled],
+                crate::distributed::controller::RoundKind::Model,
+                my_w,
+            )
+            .unwrap();
+        let raw = raw_t[0].to_f32_vec().unwrap()[0];
+        let _ = world;
+        (counts, adopted, raw)
+    }
+
+    /// All ranks alive, γ=1, counts [3,5,2], values [1,2,3]:
+    /// consensus = (3·1 + 5·2 + 2·3) / 10 = 1.9. Both the rank-adopted
+    /// value AND the scattered frame must equal it.
+    #[test]
+    fn realized_work_all_alive_scattered_frame_is_consensus() {
+        let dead = DeadRanks::new(3);
+        let (r0, r1, r2) = with_relayed_controller_and_ledger(
+            3,
+            vec![0, 1, 2],
+            TEST_SALT,
+            dead,
+            |addr| {
+                let spawn = |rank: usize, n: usize, v: f32| {
+                    thread::spawn(move || {
+                        let mut c =
+                            CpuReduceClient::connect(addr, rank as u32, 3, TEST_SALT)
+                                .unwrap();
+                        window_round(&mut c, rank, 3, n, v, 1.0)
+                    })
+                };
+                let t0 = spawn(0, 3, 1.0);
+                let t1 = spawn(1, 5, 2.0);
+                let t2 = spawn(2, 2, 3.0);
+                (t0.join().unwrap(), t1.join().unwrap(), t2.join().unwrap())
+            },
+        );
+        for (rank, (counts, adopted, raw)) in
+            [(0, &r0), (1, &r1), (2, &r2)]
+        {
+            assert_eq!(counts, &vec![3.0, 5.0, 2.0], "rank {rank} gathered counts");
+            assert!(
+                (adopted - 1.9).abs() < 1e-6,
+                "rank {rank} adopted {adopted}, want consensus 1.9"
+            );
+            assert!(
+                (raw - 1.9).abs() < 1e-6,
+                "rank {rank} scattered frame carries {raw}, want the \
+                 consensus 1.9 — this is the value the checkpoint forge \
+                 writes and the outer stepper transforms"
+            );
+        }
+    }
+
+    /// Rank 2 declared dead before the window; ranks 0,1 do counts [3,5],
+    /// values [1,2], buffers [1,2]. Realized work says: params
+    /// consensus = 13/8 = 1.625 (γ=1), buffers = mean of movers = 1.5,
+    /// γ=0.5 params = (√3·1 + √5·2)/(√3+√5) ≈ 1.563798, and the gathered
+    /// count vector reports the realized counts [3,5,0].
+    #[test]
+    fn realized_work_after_death() {
+        let dead = DeadRanks::new(3);
+        let dead_for_body = Arc::clone(&dead);
+        let (r0, r1) = with_relayed_controller_and_ledger(
+            3,
+            vec![0, 1, 2],
+            TEST_SALT,
+            dead,
+            move |addr| {
+                // Rank 2 connects (relay + controller cohort formation
+                // need all announced ranks) then goes permanently silent.
+                let (park_tx, park_rx) = mpsc::channel::<()>();
+                let t2 = thread::spawn(move || {
+                    let _c =
+                        CpuReduceClient::connect(addr, 2, 3, TEST_SALT).unwrap();
+                    let _ = park_rx.recv(); // hold the connection open, idle
+                });
+                dead_for_body.declare_dead(2);
+                let spawn = |rank: usize, n: usize, v: f32, b: f32| {
+                    thread::spawn(move || {
+                        let mut c =
+                            CpuReduceClient::connect(addr, rank as u32, 3, TEST_SALT)
+                                .unwrap();
+                        let g1 = window_round(&mut c, rank, 3, n, v, 1.0);
+                        // Buffer window: mover-indicator weighting.
+                        let bt =
+                            Tensor::from_f32(&[b], &[1], Device::CPU).unwrap();
+                        let buf = sumcount_reduce(
+                            &mut c,
+                            std::slice::from_ref(&bt),
+                            1.0,
+                        )
+                        .unwrap()[0]
+                            .to_f32_vec()
+                            .unwrap()[0];
+                        let g_half = window_round(&mut c, rank, 3, n, v, 0.5);
+                        (g1, buf, g_half)
+                    })
+                };
+                let t0 = spawn(0, 3, 1.0, 1.0);
+                let t1 = spawn(1, 5, 2.0, 2.0);
+                let out = (t0.join().unwrap(), t1.join().unwrap());
+                let _ = park_tx.send(());
+                t2.join().unwrap();
+                out
+            },
+        );
+        let want_gamma_half = (3f64.sqrt() + 2.0 * 5f64.sqrt())
+            / (3f64.sqrt() + 5f64.sqrt());
+        for (rank, ((counts, adopted, raw), buf, (_, adopted_h, _))) in
+            [(0, &r0), (1, &r1)]
+        {
+            assert_eq!(
+                counts,
+                &vec![3.0, 5.0, 0.0],
+                "rank {rank}: gathered counts must be the realized counts"
+            );
+            assert!(
+                (adopted - 1.625).abs() < 1e-6,
+                "rank {rank} adopted {adopted}, want realized consensus 1.625"
+            );
+            assert!(
+                (raw - 1.625).abs() < 1e-6,
+                "rank {rank} scattered frame carries {raw}, want 1.625"
+            );
+            assert!(
+                (buf - 1.5).abs() < 1e-6,
+                "rank {rank} buffer consensus {buf}, want mean-of-movers 1.5 \
+                 — inflation here compounds every window on running stats"
+            );
+            assert!(
+                (*adopted_h as f64 - want_gamma_half).abs() < 1e-5,
+                "rank {rank} γ=0.5 adopted {adopted_h}, want {want_gamma_half}"
+            );
+        }
     }

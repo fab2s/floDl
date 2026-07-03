@@ -1688,20 +1688,25 @@ fn param_bridge_loop(
             rank: rank as usize,
         });
 
-        // Sum-and-count weighted AllReduce. Each rank scales its
+        // Realized-work weighted AllReduce. Each rank scales its
         // contribution by the work it did since the last sync (params:
-        // batch_count `n_i`; buffers: a 0/1 mover indicator) and the
-        // division by the summed weight happens ONCE, after the reduce —
-        // never a pre-divide. That keeps it associative, so it composes
-        // with a future per-host partial sum (the relay sum-and-count)
-        // without averaging-of-averages. A rank that did 0 steps still
-        // holds the previous consensus, so it scales to 0 and is excluded
-        // from the average — but it STILL joins every collective (zero
-        // contribution), so no rank stalls. f32 only in v1; CpuReduceClient
-        // surfaces a loud error otherwise.
+        // batch_count `n_i` raised to gamma; buffers: a 0/1 mover
+        // indicator) and ships the mass IN THE SAME FRAME — the
+        // controller divides the summed contributions ONCE by the mass
+        // of exactly the frames it accepted, so the divisor can never
+        // disagree with the sum and the scattered frame IS the
+        // consensus (also what the forge writes and the outer optimizer
+        // steps). Sum stays associative, so it composes with a future
+        // per-host partial sum (the relay sum-and-count) without
+        // averaging-of-averages. A rank that did 0 steps still holds
+        // the previous consensus, so it contributes zero mass — but it
+        // STILL joins every collective, so no rank stalls. f32 only in
+        // v1; CpuReduceClient surfaces a loud error otherwise.
         //
-        // First gather the per-rank step counts so every rank knows the
-        // summed weight (Σ n_i) and the mover count.
+        // The count gather is the all-idle skip signal (and schedule
+        // telemetry): every rank learns Σ n_i and makes the identical
+        // enter-or-skip decision. The authoritative divisor is NOT
+        // taken from here — it rides each reduce frame.
         let world = client.world_size() as usize;
         let mut counts = vec![0.0f64; world];
         if (rank as usize) < world {
@@ -1713,7 +1718,6 @@ fn param_bridge_loop(
             return;
         }
         let total_n: f64 = counts.iter().sum();
-        let n_movers = counts.iter().filter(|&&c| c > 0.0).count();
 
         // All-idle (no rank moved since the last sync — every snapshot
         // already equals the consensus): skip the reduce, leave params /
@@ -1728,11 +1732,11 @@ fn param_bridge_loop(
         // all-gathered `counts` vector (every rank holds it after the
         // count-reduce), so no extra communication. Only the params consensus
         // is gamma-weighted; buffers stay equal-weighted among movers.
-        let (my_w, w_sum) = gamma_weights(n_i as f64, &counts, gamma);
+        let (my_w, _w_sum) = gamma_weights(n_i as f64, &counts, gamma);
         let avg_params = if total_n == 0.0 {
             params.clone()
         } else {
-            match sumcount_reduce(&mut client, &params, my_w, w_sum) {
+            match sumcount_reduce(&mut client, &params, my_w) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -1760,13 +1764,13 @@ fn param_bridge_loop(
             };
 
         // Buffers (BatchNorm running stats etc.): equal weight among the
-        // ranks that moved (idle excluded via the 0/1 indicator), divided
-        // once by the mover count. `n_movers >= 1` whenever `total_n > 0`.
+        // ranks that moved (idle excluded via the 0/1 indicator); the
+        // controller divides by the accepted mover count.
         let avg_buffers = if buffers.is_empty() || total_n == 0.0 {
             buffers.clone()
         } else {
             let my_indicator = if n_i > 0 { 1.0 } else { 0.0 };
-            match sumcount_reduce(&mut client, &buffers, my_indicator, n_movers as f64) {
+            match sumcount_reduce(&mut client, &buffers, my_indicator) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -1832,7 +1836,7 @@ fn param_bridge_loop(
 /// Idle ranks (`nₖ = 0`) contribute zero weight for any `γ` (and `0^γ` is
 /// never evaluated). At `γ = 1.0` this is `(nᵢ, Σnₖ)` — plain work-weighting,
 /// byte-identical to pre-gamma behavior.
-fn gamma_weights(n_i: f64, counts: &[f64], gamma: f64) -> (f64, f64) {
+pub(crate) fn gamma_weights(n_i: f64, counts: &[f64], gamma: f64) -> (f64, f64) {
     let my_w = if n_i > 0.0 { n_i.powf(gamma) } else { 0.0 };
     let w_sum: f64 = counts
         .iter()
@@ -1882,23 +1886,40 @@ mod gamma_tests {
     }
 }
 
-fn sumcount_reduce(
+/// Realized-work weighted reduce: ship `my_weight`-scaled tensors with
+/// the mass riding the SAME frame, so the controller's divisor is the
+/// summed mass of exactly the contributions it accepted into the round
+/// — the sum and its divisor can never disagree, whatever the cohort
+/// did between rounds. The controller divides ONCE and scatters the
+/// consensus, which is therefore also what the checkpoint forge writes
+/// and what the outer optimizer steps.
+///
+/// Returns the adopted tensors: the scattered consensus, or shallow
+/// clones of `tensors` when the round realized no work (returned mass
+/// `0.0`, e.g. every accepted contributor was idle) — the caller keeps
+/// its local state, mirroring the all-idle collective skip.
+pub(crate) fn sumcount_reduce(
     client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
     tensors: &[Tensor],
     my_weight: f64,
-    total_weight: f64,
 ) -> Result<Vec<Tensor>> {
-    let ws = client.world_size() as f64;
     let scaled: Vec<Tensor> = tensors
         .iter()
-        .map(|t| t.mul_scalar(my_weight * ws))
+        .map(|t| t.mul_scalar(my_weight))
         .collect::<Result<_>>()?;
     let refs: Vec<&Tensor> = scaled.iter().collect();
-    let summed = client.all_reduce_tensors(&refs)?;
-    summed
-        .iter()
-        .map(|s| s.mul_scalar(1.0 / total_weight))
-        .collect()
+    let (consensus, realized) = client.all_reduce_weighted(
+        &refs,
+        crate::distributed::controller::RoundKind::Model,
+        my_weight,
+    )?;
+    if realized <= 0.0 {
+        crate::debug!(
+            "cluster_worker: reduce round realized no work (mass 0); keeping local state"
+        );
+        return Ok(tensors.to_vec());
+    }
+    Ok(consensus)
 }
 
 /// Compute the weight-space divergence triple

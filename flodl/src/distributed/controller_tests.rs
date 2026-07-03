@@ -97,6 +97,9 @@
                 shape: vec![data.len() as u32],
                 bytes: f32_to_bytes(data),
             }],
+            // Equal-mass contributions: the realized-work reduce then
+            // returns the plain mean over the accepted cohort.
+            weight: 1.0,
             ..Default::default()
         }
     }
@@ -115,6 +118,8 @@
                     bytes: f32_to_bytes(b),
                 },
             ],
+            // Equal-mass contributions (see `one_tensor_frame`).
+            weight: 1.0,
             ..Default::default()
         }
     }
@@ -264,7 +269,7 @@
 
     #[test]
     fn rejects_non_f32_dtype_in_reduce() {
-        // Pure unit test of reduce_average_alive without TCP wiring.
+        // Pure unit test of reduce_realized_work without TCP wiring.
         let frames = vec![
             Some(RoundFrame {
                 tensors: vec![TensorPayload {
@@ -283,7 +288,7 @@
                 ..Default::default()
             }),
         ];
-        let err = reduce_average_alive(&frames).unwrap_err();
+        let err = reduce_realized_work(&frames).unwrap_err();
         assert!(
             err.to_string().contains("dtype 7"),
             "expected dtype-7-not-supported, got: {err}"
@@ -310,45 +315,114 @@
                 ..Default::default()
             }),
         ];
-        let err = reduce_average_alive(&frames).unwrap_err();
+        let err = reduce_realized_work(&frames).unwrap_err();
         assert!(err.to_string().contains("shape"), "got: {err}");
     }
 
     #[test]
-    fn reduce_average_alive_skips_none_entries_and_divides_by_alive_count() {
-        // 3-rank world, rank 1 dead (None). Mean over alive = (rank0 + rank2) / 2.
+    fn reduce_realized_work_normalizes_by_accepted_mass_only() {
+        // 3-rank world, rank 1 dead (None). Contributions are pre-scaled
+        // by the sender's mass (3 and 1); the divisor is the accepted
+        // mass sum (4) — the dead rank enters neither sum nor divisor.
         let frames = vec![
             Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: DTYPE_F32,
                     shape: vec![2],
-                    bytes: f32_to_bytes(&[2.0, 4.0]),
+                    bytes: f32_to_bytes(&[3.0, 6.0]), // 3 × [1, 2]
                 }],
+                weight: 3.0,
                 ..Default::default()
             }),
-            None, // rank 1 dead
+            None, // rank 1 dead — its work was never realized
             Some(RoundFrame {
                 tensors: vec![TensorPayload {
                     dtype: DTYPE_F32,
                     shape: vec![2],
-                    bytes: f32_to_bytes(&[6.0, 8.0]),
+                    bytes: f32_to_bytes(&[5.0, 10.0]), // 1 × [5, 10]
                 }],
+                weight: 1.0,
                 ..Default::default()
             }),
         ];
-        let out = reduce_average_alive(&frames).unwrap();
-        let avg = bytes_as_f32(&out.tensors[0].bytes).unwrap();
-        // (2 + 6) / 2 = 4.0; (4 + 8) / 2 = 6.0
-        assert!((avg[0] - 4.0).abs() < 1e-6, "got {avg:?}");
-        assert!((avg[1] - 6.0).abs() < 1e-6, "got {avg:?}");
+        let out = reduce_realized_work(&frames).unwrap();
+        let consensus = bytes_as_f32(&out.tensors[0].bytes).unwrap();
+        // (3·1 + 1·5) / 4 = 2.0; (3·2 + 1·10) / 4 = 4.0
+        assert!((consensus[0] - 2.0).abs() < 1e-6, "got {consensus:?}");
+        assert!((consensus[1] - 4.0).abs() < 1e-6, "got {consensus:?}");
+        assert!(
+            (out.weight - 4.0).abs() < 1e-9,
+            "accepted mass, got {}",
+            out.weight
+        );
     }
 
     #[test]
-    fn reduce_average_alive_rejects_all_dead() {
+    fn reduce_realized_work_control_is_pure_sum() {
+        // Control frames (gathers / broadcasts) sum without a divide,
+        // whatever the weights say.
+        let frames = vec![
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![2],
+                    bytes: f32_to_bytes(&[3.0, 0.0]),
+                }],
+                kind: RoundKind::Control,
+                ..Default::default()
+            }),
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![2],
+                    bytes: f32_to_bytes(&[0.0, 5.0]),
+                }],
+                kind: RoundKind::Control,
+                ..Default::default()
+            }),
+        ];
+        let out = reduce_realized_work(&frames).unwrap();
+        let sum = bytes_as_f32(&out.tensors[0].bytes).unwrap();
+        assert!((sum[0] - 3.0).abs() < 1e-6, "got {sum:?}");
+        assert!((sum[1] - 5.0).abs() < 1e-6, "got {sum:?}");
+    }
+
+    #[test]
+    fn reduce_realized_work_zero_mass_returns_untouched_sum() {
+        // A Model round whose accepted mass is zero (all contributors
+        // idle) must not divide — the output carries weight 0.0 so
+        // receivers keep local state.
+        let frames = vec![
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![1],
+                    bytes: f32_to_bytes(&[0.0]),
+                }],
+                weight: 0.0,
+                ..Default::default()
+            }),
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![1],
+                    bytes: f32_to_bytes(&[0.0]),
+                }],
+                weight: 0.0,
+                ..Default::default()
+            }),
+        ];
+        let out = reduce_realized_work(&frames).unwrap();
+        assert_eq!(out.weight, 0.0);
+        assert!(bytes_as_f32(&out.tensors[0].bytes).unwrap()[0].abs() < 1e-9);
+    }
+
+    #[test]
+    fn reduce_realized_work_rejects_all_dead() {
         let frames: Vec<Option<RoundFrame>> = vec![None, None];
-        let err = reduce_average_alive(&frames).unwrap_err();
+        let err = reduce_realized_work(&frames).unwrap_err();
         assert!(
-            err.to_string().contains("no alive ranks"),
+            err.to_string().contains("no accepted frames"),
             "got: {err}"
         );
     }

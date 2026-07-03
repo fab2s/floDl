@@ -11,8 +11,9 @@
 //! Architecture (star, not collective): every rank ships a `RoundFrame`
 //! containing this round's tensors to a single TCP listener on the
 //! launcher process. The launcher accumulates the per-tensor sum on its
-//! CPU, divides by `world_size`, and writes the averaged `RoundFrame`
-//! back to each rank. No NCCL. Genuinely async from NCCL's perspective:
+//! CPU, divides ONCE by the summed realized-work mass of exactly the
+//! frames it accepted into the round, and writes the consensus
+//! `RoundFrame` back to each rank. No NCCL. Genuinely async from NCCL's perspective:
 //! ranks' GPUs keep computing while their CPUs push/pull bytes.
 //!
 //! Future swap-in: a gloo-backed all-reduce can replace the serial
@@ -26,7 +27,7 @@
 //! Handshake (rank → controller, exactly once per connection):
 //! ```text
 //! u32 magic         = 0xF10D_17C0
-//! u32 protocol_ver  = 1
+//! u32 protocol_ver  = 2
 //! u32 rank_id       (this rank's global rank, 0..world_size)
 //! u32 world_size    (rank's view; controller validates against its own)
 //! ```
@@ -34,7 +35,7 @@
 //! Handshake ack (controller → rank):
 //! ```text
 //! u32 magic        = 0xF10D_17C1
-//! u32 protocol_ver = 1
+//! u32 protocol_ver = 2
 //! ```
 //!
 //! RoundFrame (rank → controller, then controller → rank, identical
@@ -42,6 +43,8 @@
 //! ```text
 //! u32 magic       = 0xF10D_17F1
 //! u32 num_tensors
+//! u8  round_kind  (0 = Model, 1 = Control)
+//! f64 weight      (realized-work mass; see RoundFrame::weight)
 //! for each tensor:
 //!   u8  dtype   (0 = f32; v1 only)
 //!   u8  ndim
@@ -90,7 +93,7 @@ pub(crate) const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
 /// footer keyed by the session salt; a session-salt disagreement
 /// surfaces as an `HMAC verification failed` error on the first
 /// round-trip.
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 /// dtype tag for f32 in the wire protocol. Only dtype supported.
 pub const DTYPE_F32: u8 = 0;
@@ -204,8 +207,10 @@ impl ClusterController {
 
     /// Like [`Self::start`] but shares the dead-rank ledger with the
     /// coordinator. When the coord declares a rank dead, the
-    /// controller's reduce thread skips its contribution and divides by
-    /// the surviving-rank count instead of `world_size`. Use the
+    /// controller's reduce thread stops waiting for its frames; the
+    /// realized-work reduce only ever sums (and normalizes by) the
+    /// frames it actually accepted, so a death needs no divisor
+    /// adjustment. Use the
     /// [`DeadRanks`] returned by [`DeadRanks::new`] (or pass the same
     /// Arc clone to both this constructor and the
     /// [`crate::distributed::cluster_coordinator::ClusterCoordinator`]
@@ -658,7 +663,7 @@ fn average_and_scatter(
     forge: Option<&crate::distributed::CheckpointForge>,
     outer_stepper: Option<&mut crate::distributed::outer_optimizer::OuterStepper>,
 ) -> Result<()> {
-    let averaged = reduce_average_alive(frames)?;
+    let averaged = reduce_realized_work(frames)?;
     // OUTER STEP: transform the averaged consensus into the new global
     // BEFORE scatter (ranks adopt the stepped global) and BEFORE the forge
     // tap below (the checkpoint captures the stepped global). Applies to the
@@ -822,6 +827,22 @@ pub struct RoundFrame {
     /// [`RoundKind::Model`] so existing constructors keep building model
     /// frames; the count-gather sets [`RoundKind::Control`] explicitly.
     pub kind: RoundKind,
+    /// Realized-work mass, atomic with the contribution it scales.
+    ///
+    /// Rank -> controller on [`RoundKind::Model`]: the sender's weight
+    /// (params: `n_i^gamma` for `n_i` optimizer steps since the last
+    /// sync; buffers: a 0/1 mover indicator). The tensors are pre-scaled
+    /// by this weight; the controller divides the summed tensors ONCE by
+    /// the summed weight of exactly the frames it accepted into the
+    /// round — work it never received never enters the divisor.
+    ///
+    /// Controller -> rank: the summed weight of the round. `0.0` means
+    /// "nothing realized" (degenerate all-idle round): the scattered
+    /// tensors are meaningless zeros and the receiver must keep its
+    /// local state.
+    ///
+    /// Ignored on [`RoundKind::Control`] (pure-sum bookkeeping).
+    pub weight: f64,
 }
 
 /// One tensor inside a [`RoundFrame`].
@@ -887,6 +908,21 @@ pub(crate) fn read_round_frame<R: Read>(
     })?;
     mac.update(kind_byte);
     let kind = RoundKind::from_wire(kind_byte[0])?;
+
+    // Realized-work weight (f64 LE, MAC-covered), immediately after the
+    // kind byte. See [`RoundFrame::weight`].
+    let mut weight_bytes = [0u8; 8];
+    stream.read_exact(&mut weight_bytes).map_err(|e| {
+        TensorError::new(&format!("cluster_controller: frame weight read failed: {e}"))
+    })?;
+    mac.update(weight_bytes);
+    let weight = f64::from_le_bytes(weight_bytes);
+    if !weight.is_finite() || weight < 0.0 {
+        return Err(TensorError::new(&format!(
+            "cluster_controller: frame weight {weight} is not a finite non-negative \
+             realized-work mass"
+        )));
+    }
 
     let mut tensors = Vec::with_capacity(num_tensors);
     for ti in 0..num_tensors {
@@ -954,7 +990,7 @@ pub(crate) fn read_round_frame<R: Read>(
              disagreement, tampered frame, or payload corruption"
         )));
     }
-    Ok(Some(RoundFrame { tensors, kind }))
+    Ok(Some(RoundFrame { tensors, kind, weight }))
 }
 
 /// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
@@ -980,6 +1016,12 @@ pub(crate) fn write_round_frame<W: Write>(
         TensorError::new(&format!("cluster_controller: frame kind write failed: {e}"))
     })?;
     mac.update(kind_byte);
+    // Realized-work weight (MAC-covered), mirroring `read_round_frame`.
+    let weight_bytes = frame.weight.to_le_bytes();
+    stream.write_all(&weight_bytes).map_err(|e| {
+        TensorError::new(&format!("cluster_controller: frame weight write failed: {e}"))
+    })?;
+    mac.update(weight_bytes);
     for (ti, t) in frame.tensors.iter().enumerate() {
         let meta = [t.dtype, t.shape.len() as u8];
         stream.write_all(&meta).map_err(|e| {
@@ -1026,36 +1068,50 @@ pub(crate) fn write_round_frame<W: Write>(
 }
 
 // ---------------------------------------------------------------------------
-// Reduction (CPU sum + divide by world_size)
+// Reduction (realized work: sum + divide once by the accepted mass)
 // ---------------------------------------------------------------------------
 
-/// Average per-rank frames into a single frame, skipping dead ranks.
+/// Reduce per-rank frames into the realized-work consensus, over exactly
+/// the frames the controller accepted into the round.
 ///
-/// `frames[i] = None` means rank `i` is dead and didn't contribute;
-/// `Some(frame)` means rank `i` is alive. The divisor is the
-/// alive-count (number of `Some`), not `frames.len()` — matching the
-/// avg-trick semantics over the surviving cohort.
+/// `frames[i] = None` means rank `i` contributed nothing (dead, or
+/// declared dead before its frame was accepted); its work is not
+/// realized, so it enters neither the sum nor the divisor. The sum and
+/// its divisor come from the same accepted frames — they cannot
+/// disagree, whatever the cohort did between rounds.
 ///
-/// Validates that every alive rank's frames have identical schema
-/// (same number of tensors, same dtype per tensor, same shape per
-/// tensor). Returns the element-wise mean.
+/// [`RoundKind::Model`]: contributions arrive pre-scaled by the sender's
+/// realized-work mass ([`RoundFrame::weight`]); the output is the sum
+/// divided ONCE by the summed accepted mass — the true consensus, which
+/// is simultaneously what every rank adopts, what the checkpoint forge
+/// writes, and what the outer optimizer steps. A round whose accepted
+/// mass is zero (every contributor idle, or all movers lost mid-round)
+/// returns the zero sum tagged `weight = 0.0`; receivers must keep
+/// their local state.
+///
+/// [`RoundKind::Control`]: pure element-wise sum, no divide — gathers
+/// and broadcasts build on this (each rank fills its own slot / root
+/// sends values and peers send zeros).
+///
+/// Validates that every accepted frame has identical schema (same
+/// number of tensors, same dtype per tensor, same shape per tensor).
 ///
 /// v1 supports only [`DTYPE_F32`]; loud error on other dtypes (so a
 /// future user wiring f16 here gets a clear pointer at where to add
 /// support, instead of silent garbage from byte-level summation).
-fn reduce_average_alive(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
-    let alive: Vec<&RoundFrame> = frames.iter().filter_map(|f| f.as_ref()).collect();
-    if alive.is_empty() {
+fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
+    let accepted: Vec<&RoundFrame> = frames.iter().filter_map(|f| f.as_ref()).collect();
+    if accepted.is_empty() {
         return Err(TensorError::new(
-            "cluster_controller: reduce_average_alive called with no alive ranks \
+            "cluster_controller: reduce_realized_work called with no accepted frames \
              (all participants dead — caller should not have reached this point)",
         ));
     }
-    let n = alive.len();
-    let ref_frame = alive[0];
+    let w_sum: f64 = accepted.iter().map(|f| f.weight).sum();
+    let ref_frame = accepted[0];
     // Adapter so the existing schema-validation + reduce code below
     // can keep using its original variable names.
-    let frames: &[&RoundFrame] = &alive;
+    let frames: &[&RoundFrame] = &accepted;
     // Schema validation.
     for (i, f) in frames.iter().enumerate().skip(1) {
         if f.tensors.len() != ref_frame.tensors.len() {
@@ -1114,9 +1170,16 @@ fn reduce_average_alive(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
                 *a += *x;
             }
         }
-        let inv = 1.0_f32 / (n as f32);
-        for a in &mut accum {
-            *a *= inv;
+        // Model frames normalize by the accepted realized-work mass;
+        // Control frames (gathers / broadcasts) stay a pure sum. A
+        // zero-mass Model round leaves the (zero) sum untouched — the
+        // `weight = 0.0` on the output tells receivers to keep their
+        // local state.
+        if matches!(ref_frame.kind, RoundKind::Model) && w_sum > 0.0 {
+            let inv = (1.0 / w_sum) as f32;
+            for a in &mut accum {
+                *a *= inv;
+            }
         }
         out_tensors.push(TensorPayload {
             dtype: DTYPE_F32,
@@ -1126,10 +1189,12 @@ fn reduce_average_alive(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
     }
     Ok(RoundFrame {
         tensors: out_tensors,
-        // The averaged frame carries the same kind as its inputs (all alive
-        // ranks send the same kind in a round); preserve it so the forge tap
-        // and any downstream relay see model vs bookkeeping correctly.
+        // The consensus frame carries the same kind as its inputs (all
+        // accepted ranks send the same kind in a round); preserve it so
+        // the forge tap and any downstream relay see model vs
+        // bookkeeping correctly.
         kind: ref_frame.kind,
+        weight: w_sum,
     })
 }
 
