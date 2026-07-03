@@ -139,6 +139,9 @@ impl CpuReduceClient {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| TensorError::new(&format!("cpu_reduce: set_read_timeout: {e}")))?;
+        stream
+            .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+            .map_err(|e| TensorError::new(&format!("cpu_reduce: set_write_timeout: {e}")))?;
 
         let mut client = CpuReduceClient {
             stream,

@@ -732,183 +732,214 @@ pub fn run_launcher_with_config(
     // Spawn one child per rank across every host.
     let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
         Vec::with_capacity(full.world_size());
-    for host in &full.workers {
-        // Spawn one transport relay per host (before its ranks), when the
-        // via-coord routing is active. Ranks dial the relay's loopback
-        // (+4/+5) instead of the controller directly. The relay child is
-        // supervised alongside the ranks — it exits cleanly once its local
-        // ranks disconnect, and SIGTERM reaches it if a peer fails.
-        if spawn_relays {
-            let spec = RelaySpec {
-                host: host.host.clone(),
-                controller_host: full.controller.host.clone(),
-                controller_port: full.controller.port,
-                ranks: host.ranks.iter().map(|r| *r as u32).collect(),
-                salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
-                world_size: full.world_size(),
-                data_channel: relay_data_channel,
-            };
-            let spec_hex = crate::distributed::cluster::hex_encode(
-                serde_json::to_string(&spec)
-                    .map_err(|e| {
-                        TensorError::new(&format!(
-                            "cluster launcher: serialize relay spec failed: {e}"
-                        ))
-                    })?
-                    .as_bytes(),
-            );
-            let mut cmd = if host.host == me {
-                build_local_relay_command(&exe, &user_args, &spec_hex)
-            } else {
-                let remote_cmd = build_remote_relay_bash_command(
-                    &host.path,
-                    &spec_hex,
-                    fdl_cmd
-                        .as_deref()
-                        .expect("ENV_FDL_CMD presence enforced above when has_remote"),
-                    &user_args,
-                    &full.env,
-                    &host.env,
-                    prebuild_envelope.get(&host.host),
+    // Fan-out is all-or-nothing. Any spawn / serialize failure inside the
+    // closure takes the teardown path below instead of returning early:
+    // a bare `?` used to strand the already-spawned half of the cohort
+    // (local ranks, relays, remote SSH sessions) with the controller
+    // still up — on the programmatic path the caller's main() could keep
+    // running while orphaned ranks trained on against a run it thinks
+    // failed.
+    let spawn_result: Result<()> = (|| {
+        for host in &full.workers {
+            // Spawn one transport relay per host (before its ranks), when the
+            // via-coord routing is active. Ranks dial the relay's loopback
+            // (+4/+5) instead of the controller directly. The relay child is
+            // supervised alongside the ranks — it exits cleanly once its local
+            // ranks disconnect, and SIGTERM reaches it if a peer fails.
+            if spawn_relays {
+                let spec = RelaySpec {
+                    host: host.host.clone(),
+                    controller_host: full.controller.host.clone(),
+                    controller_port: full.controller.port,
+                    ranks: host.ranks.iter().map(|r| *r as u32).collect(),
+                    salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
+                    world_size: full.world_size(),
+                    data_channel: relay_data_channel,
+                };
+                let spec_hex = crate::distributed::cluster::hex_encode(
+                    serde_json::to_string(&spec)
+                        .map_err(|e| {
+                            TensorError::new(&format!(
+                                "cluster launcher: serialize relay spec failed: {e}"
+                            ))
+                        })?
+                        .as_bytes(),
                 );
-                build_ssh_spawn_command(host, &remote_cmd)
-            };
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            if host.host == me {
-                for (k, v) in &full.env {
-                    cmd.env(k, v);
+                let mut cmd = if host.host == me {
+                    build_local_relay_command(&exe, &user_args, &spec_hex)
+                } else {
+                    let remote_cmd = build_remote_relay_bash_command(
+                        &host.path,
+                        &spec_hex,
+                        fdl_cmd
+                            .as_deref()
+                            .expect("ENV_FDL_CMD presence enforced above when has_remote"),
+                        &user_args,
+                        &full.env,
+                        &host.env,
+                        prebuild_envelope.get(&host.host),
+                    );
+                    build_ssh_spawn_command(host, &remote_cmd)
+                };
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if host.host == me {
+                    for (k, v) in &full.env {
+                        cmd.env(k, v);
+                    }
+                    for (k, v) in &host.env {
+                        cmd.env(k, v);
+                    }
                 }
-                for (k, v) in &host.env {
-                    cmd.env(k, v);
+                let mut child = cmd.spawn().map_err(|e| {
+                    let kind = if host.host == me { "local bash/exec" } else { "ssh" };
+                    TensorError::new(&format!(
+                        "cluster launcher: spawn {kind} relay for {:?} failed: {e}",
+                        host.host
+                    ))
+                })?;
+                let prefix = format!("[{}:relay] ", host.host);
+                let mut forwarders = Vec::with_capacity(2);
+                if let Some(out) = child.stdout.take() {
+                    let p = prefix.clone();
+                    forwarders.push(thread::spawn(move || forward_lines(out, p, false)));
                 }
+                if let Some(err) = child.stderr.take() {
+                    let p = prefix.clone();
+                    forwarders.push(thread::spawn(move || forward_lines(err, p, true)));
+                }
+                // `usize::MAX` local-rank sentinel marks the relay child in
+                // supervision diagnostics (it has no rank slot).
+                children.push((host.host.clone(), usize::MAX, child, forwarders));
             }
-            let mut child = cmd.spawn().map_err(|e| {
-                let kind = if host.host == me { "local bash/exec" } else { "ssh" };
-                TensorError::new(&format!(
-                    "cluster launcher: spawn {kind} relay for {:?} failed: {e}",
-                    host.host
-                ))
-            })?;
-            let prefix = format!("[{}:relay] ", host.host);
-            let mut forwarders = Vec::with_capacity(2);
-            if let Some(out) = child.stdout.take() {
-                let p = prefix.clone();
-                forwarders.push(thread::spawn(move || forward_lines(out, p, false)));
-            }
-            if let Some(err) = child.stderr.take() {
-                let p = prefix.clone();
-                forwarders.push(thread::spawn(move || forward_lines(err, p, true)));
-            }
-            // `usize::MAX` local-rank sentinel marks the relay child in
-            // supervision diagnostics (it has no rank slot).
-            children.push((host.host.clone(), usize::MAX, child, forwarders));
-        }
-        for local_rank in 0..host.ranks.len() {
-            let envelope = build_slim_envelope_for(&full, host);
-            let envelope_hex = crate::distributed::cluster::hex_encode(
-                serde_json::to_string(&envelope)
-                    .map_err(|e| {
-                        TensorError::new(&format!(
-                            "cluster launcher: serialize slim envelope failed: {e}"
-                        ))
-                    })?
-                    .as_bytes(),
-            );
-
-            // Scope each rank's child to its assigned physical GPU
-            // via `CUDA_VISIBLE_DEVICES=<phys>`. Standard torchrun-
-            // style recipe: the child sees only one GPU, addresses it
-            // as CUDA(0). Required for multi-process CUDA on older CCs
-            // (Pascal/sm_61 surfaced this: dual-process where both
-            // ranks see both GPUs hits `cudaErrorNoKernelImageForDevice`
-            // sticky on the first allocation, even though kernels are
-            // present for sm_61 — the lazy module load picks the wrong
-            // context). `cluster::my_rank` honors the scoping by
-            // returning CUDA(0) when CUDA_VISIBLE_DEVICES is single-
-            // valued.
-            let local_phys = host
-                .local_devices
-                .as_ref()
-                .and_then(|d| d.get(local_rank).copied());
-            let mut cmd = if host.host == me {
-                build_local_spawn_command(
-                    &exe,
-                    &user_args,
-                    &envelope_hex,
-                    local_rank,
-                    local_phys,
-                )
-            } else {
-                let remote_cmd = build_remote_bash_command(
-                    &host.path,
-                    &envelope_hex,
-                    &host.host,
-                    local_rank,
-                    overlay_env.as_deref(),
-                    fdl_cmd
-                        .as_deref()
-                        .expect("ENV_FDL_CMD presence enforced above when has_remote"),
-                    &user_args,
-                    &full.env,
-                    &host.env,
-                    local_phys,
-                    prebuild_envelope.get(&host.host),
+            for local_rank in 0..host.ranks.len() {
+                let envelope = build_slim_envelope_for(&full, host);
+                let envelope_hex = crate::distributed::cluster::hex_encode(
+                    serde_json::to_string(&envelope)
+                        .map_err(|e| {
+                            TensorError::new(&format!(
+                                "cluster launcher: serialize slim envelope failed: {e}"
+                            ))
+                        })?
+                        .as_bytes(),
                 );
-                build_ssh_spawn_command(host, &remote_cmd)
-            };
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
 
-            // Apply user-declared env from `full.env` (cluster-scope)
-            // first, then `host.env` (per-host override). Built-in env
-            // vars set later by build_local_spawn_command (e.g.
-            // FLODL_LOCAL_RANK, CUDA_VISIBLE_DEVICES, FLODL_CLUSTER_JSON)
-            // are not overridable here — the launcher owns those. SSH
-            // path: env propagation is bash-level inside
-            // build_remote_bash_command and not affected here.
-            if host.host == me {
-                for (k, v) in &full.env {
-                    cmd.env(k, v);
+                // Scope each rank's child to its assigned physical GPU
+                // via `CUDA_VISIBLE_DEVICES=<phys>`. Standard torchrun-
+                // style recipe: the child sees only one GPU, addresses it
+                // as CUDA(0). Required for multi-process CUDA on older CCs
+                // (Pascal/sm_61 surfaced this: dual-process where both
+                // ranks see both GPUs hits `cudaErrorNoKernelImageForDevice`
+                // sticky on the first allocation, even though kernels are
+                // present for sm_61 — the lazy module load picks the wrong
+                // context). `cluster::my_rank` honors the scoping by
+                // returning CUDA(0) when CUDA_VISIBLE_DEVICES is single-
+                // valued.
+                let local_phys = host
+                    .local_devices
+                    .as_ref()
+                    .and_then(|d| d.get(local_rank).copied());
+                let mut cmd = if host.host == me {
+                    build_local_spawn_command(
+                        &exe,
+                        &user_args,
+                        &envelope_hex,
+                        local_rank,
+                        local_phys,
+                    )
+                } else {
+                    let remote_cmd = build_remote_bash_command(
+                        &host.path,
+                        &envelope_hex,
+                        &host.host,
+                        local_rank,
+                        overlay_env.as_deref(),
+                        fdl_cmd
+                            .as_deref()
+                            .expect("ENV_FDL_CMD presence enforced above when has_remote"),
+                        &user_args,
+                        &full.env,
+                        &host.env,
+                        local_phys,
+                        prebuild_envelope.get(&host.host),
+                    );
+                    build_ssh_spawn_command(host, &remote_cmd)
+                };
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                // Apply user-declared env from `full.env` (cluster-scope)
+                // first, then `host.env` (per-host override). Built-in env
+                // vars set later by build_local_spawn_command (e.g.
+                // FLODL_LOCAL_RANK, CUDA_VISIBLE_DEVICES, FLODL_CLUSTER_JSON)
+                // are not overridable here — the launcher owns those. SSH
+                // path: env propagation is bash-level inside
+                // build_remote_bash_command and not affected here.
+                if host.host == me {
+                    for (k, v) in &full.env {
+                        cmd.env(k, v);
+                    }
+                    for (k, v) in &host.env {
+                        cmd.env(k, v);
+                    }
                 }
-                for (k, v) in &host.env {
-                    cmd.env(k, v);
+
+                let mut child = cmd.spawn().map_err(|e| {
+                    let kind = if host.host == me { "local bash/exec" } else { "ssh" };
+                    TensorError::new(&format!(
+                        "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
+                        host.host
+                    ))
+                })?;
+
+                let global_rank = host.ranks[local_rank];
+                // Match the `[host:dev:rN]` identity the child would otherwise
+                // emit in-process (now suppressed to avoid a double prefix; see
+                // `GpuWorker::new`). `dev` = the physical CUDA device this rank is
+                // pinned to, falling back to the local rank slot when
+                // `local_devices` is unset.
+                let dev = local_phys.map(usize::from).unwrap_or(local_rank);
+                let prefix = format!("[{}:{dev}:r{global_rank}] ", host.host);
+                let mut forwarders = Vec::with_capacity(2);
+                if let Some(out) = child.stdout.take() {
+                    let prefix_clone = prefix.clone();
+                    forwarders.push(thread::spawn(move || {
+                        forward_lines(out, prefix_clone, false);
+                    }));
                 }
+                if let Some(err) = child.stderr.take() {
+                    let prefix_clone = prefix.clone();
+                    forwarders.push(thread::spawn(move || {
+                        forward_lines(err, prefix_clone, true);
+                    }));
+                }
+                children.push((host.host.clone(), local_rank, child, forwarders));
             }
-
-            let mut child = cmd.spawn().map_err(|e| {
-                let kind = if host.host == me { "local bash/exec" } else { "ssh" };
-                TensorError::new(&format!(
-                    "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
-                    host.host
-                ))
-            })?;
-
-            let global_rank = host.ranks[local_rank];
-            // Match the `[host:dev:rN]` identity the child would otherwise
-            // emit in-process (now suppressed to avoid a double prefix; see
-            // `GpuWorker::new`). `dev` = the physical CUDA device this rank is
-            // pinned to, falling back to the local rank slot when
-            // `local_devices` is unset.
-            let dev = local_phys.map(usize::from).unwrap_or(local_rank);
-            let prefix = format!("[{}:{dev}:r{global_rank}] ", host.host);
-            let mut forwarders = Vec::with_capacity(2);
-            if let Some(out) = child.stdout.take() {
-                let prefix_clone = prefix.clone();
-                forwarders.push(thread::spawn(move || {
-                    forward_lines(out, prefix_clone, false);
-                }));
-            }
-            if let Some(err) = child.stderr.take() {
-                let prefix_clone = prefix.clone();
-                forwarders.push(thread::spawn(move || {
-                    forward_lines(err, prefix_clone, true);
-                }));
-            }
-            children.push((host.host.clone(), local_rank, child, forwarders));
         }
+
+        Ok(())
+    })();
+    if let Err(e) = spawn_result {
+        eprintln!(
+            "cluster launcher: fan-out failed; terminating {} already-spawned \
+             child(ren) and cleaning up remote hosts: {e}",
+            children.len()
+        );
+        // Owned `Child` handles: kill + reap directly — no PID-reuse
+        // window (unlike the pid-based peer termination in supervise).
+        // SIGKILL on a local ssh client drops its connection; the remote
+        // cleanup pass below reaps whatever the trap wrapper misses.
+        for (_, _, mut child, forwarders) in children.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+            for f in forwarders {
+                let _ = f.join();
+            }
+        }
+        cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
+        return Err(e);
     }
     let _ = my_host_idx; // currently unused but kept for parity with future logic
 

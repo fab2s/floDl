@@ -492,3 +492,77 @@
             "expected HMAC verification failure, got: {err}"
         );
     }
+
+    // ---- elastic scatter ---------------------------------------------------
+
+    /// A scatter write failure (wedged or vanished connection — the
+    /// write-stall timeout surfaces the wedged case as an Err) must
+    /// declare that CONNECTION's ranks dead and keep scattering to the
+    /// survivors, not kill the reduce thread. One wedged host degrades
+    /// membership; the realized-work reduce stays exact over the rest.
+    #[test]
+    fn elastic_scatter_declares_broken_connection_dead_and_continues() {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener =
+            TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pair = || {
+            let client = TcpStream::connect(addr).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            (server, client)
+        };
+        // conn 0 carries rank 0 and is broken (locally shut down so the
+        // very first write errors deterministically); conn 1 carries
+        // ranks 1+2 and is live.
+        let (ctrl0, _peer0) = pair();
+        let (ctrl1, mut peer1) = pair();
+        ctrl0.shutdown(Shutdown::Both).unwrap();
+        let mut conn_writes = vec![ctrl0, ctrl1];
+        let rank_conn = vec![Some(0usize), Some(1usize), Some(1usize)];
+        let dead = DeadRanks::new(3);
+
+        // Realized-work frames: values [0,1,2] at mass 1 each → consensus 1.0.
+        let frames: Vec<Option<RoundFrame>> = (0..3)
+            .map(|r| {
+                Some(RoundFrame {
+                    tensors: vec![TensorPayload {
+                        dtype: DTYPE_F32,
+                        shape: vec![1],
+                        bytes: f32_to_bytes(&[r as f32]),
+                    }],
+                    weight: 1.0,
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        average_and_scatter(
+            &frames,
+            &mut conn_writes,
+            &rank_conn,
+            &dead,
+            &TEST_SALT,
+            None,
+            None,
+        )
+        .expect("elastic scatter must not propagate a per-connection failure");
+
+        assert!(dead.is_dead(0), "broken connection's rank must be declared dead");
+        assert!(!dead.is_dead(1) && !dead.is_dead(2), "survivors stay alive");
+
+        // Both survivors received the consensus on the live connection.
+        for _ in 0..2 {
+            match MuxRecord::read_from(&mut peer1, &TEST_SALT).unwrap() {
+                Some(MuxRecord::Data { rank, payload }) => {
+                    assert!(rank == 1 || rank == 2, "unexpected rank {rank}");
+                    let frame = read_round_frame(&mut payload.as_slice(), &TEST_SALT)
+                        .unwrap()
+                        .expect("scattered frame");
+                    let vals = bytes_as_f32(&frame.tensors[0].bytes).unwrap();
+                    assert!((vals[0] - 1.0).abs() < 1e-6, "consensus, got {vals:?}");
+                    assert!((frame.weight - 3.0).abs() < 1e-9, "accepted mass rides down");
+                }
+                other => panic!("expected Data record, got {other:?}"),
+            }
+        }
+    }

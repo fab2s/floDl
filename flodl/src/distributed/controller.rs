@@ -356,6 +356,17 @@ fn run_reduce_thread(
         match listener.accept() {
             Ok((mut stream, _peer)) => {
                 let _ = stream.set_nodelay(true);
+                // Write-stall ceiling (fd-level): a wedged relay errors
+                // the reduce thread's scatter instead of parking it; the
+                // elastic scatter below then declares that connection's
+                // ranks dead and continues with the survivors.
+                stream
+                    .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster_controller: set_write_timeout: {e}"
+                        ))
+                    })?;
                 // Relay handshake (blocking read — relays send Hello
                 // immediately on connect).
                 let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
@@ -691,10 +702,19 @@ fn average_and_scatter(
         }
         None => averaged,
     };
-    // The averaged frame is identical for every rank; serialize once and
+    // The consensus frame is identical for every rank; serialize once and
     // forward the same bytes tagged per rank.
     let mut buf: Vec<u8> = Vec::new();
     write_round_frame(&mut buf, &averaged, salt)?;
+    // ELASTIC SCATTER: a write failure (including a zero-progress stall
+    // tripping the socket's write timeout) marks that CONNECTION broken
+    // and declares its ranks dead, and the scatter continues to the
+    // surviving connections — one wedged host degrades membership
+    // instead of killing the run. `wait_for_round` recomputes the alive
+    // set every poll, and the realized-work reduce is exact over
+    // whatever cohort remains; if every connection breaks, the next
+    // round-wait sees an empty alive set and shuts down.
+    let mut conn_broken: Vec<bool> = vec![false; conn_writes.len()];
     for (rank, conn) in rank_conn.iter().enumerate() {
         if dead_ranks.is_dead(rank) {
             continue;
@@ -702,7 +722,19 @@ fn average_and_scatter(
         let Some(ci) = conn else {
             continue;
         };
-        MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)?;
+        if conn_broken[*ci] {
+            dead_ranks.declare_dead(rank);
+            continue;
+        }
+        if let Err(e) =
+            MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)
+        {
+            eprintln!(
+                "cluster_controller: scatter to rank {rank} failed ({e}); declaring                  its connection's ranks dead and continuing with survivors"
+            );
+            conn_broken[*ci] = true;
+            dead_ranks.declare_dead(rank);
+        }
     }
     // FORGE TAP: scatter ranks first (they resume training ASAP), then — if the
     // coordinator armed a checkpoint — hand this reduce's averaged consensus to

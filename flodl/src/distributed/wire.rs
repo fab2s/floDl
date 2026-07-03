@@ -114,6 +114,19 @@ pub(crate) const CONNECT_ATTEMPTS: u32 = 60;
 /// Pause between [`CONNECT_ATTEMPTS`].
 pub(crate) const CONNECT_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(500);
+/// Zero-progress write-stall ceiling for every cluster socket.
+///
+/// `SO_SNDTIMEO` applies per `write()` call and `write_all` loops over
+/// partial writes, so a slow-but-draining link never trips (each
+/// successful partial write starts a fresh window); only a peer whose
+/// receive path made no progress for this long — a wedged process or a
+/// silently-dead link TCP cannot detect — turns the blocking write into
+/// an error. Matches the heartbeat-staleness default so both liveness
+/// axes agree on what "gone" means. Socket options are fd-level, so one
+/// call at socket setup covers every cloned handle.
+pub(crate) const WRITE_STALL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 
 /// TCP connect with the shared cluster retry budget. `what` names the
 /// dial for the error message (e.g. "relay upstream", "rendezvous").

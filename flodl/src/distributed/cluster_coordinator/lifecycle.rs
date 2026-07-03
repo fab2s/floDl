@@ -150,6 +150,18 @@ impl ClusterCoordinator {
                         "cluster_coordinator: reader set_read_timeout: {e}"
                     ))
                 })?;
+            // Write-stall ceiling on the socket (fd-level, covers the
+            // retained write half): a wedged relay must error the tick
+            // thread's send instead of parking it forever — the tick
+            // thread also drives the dead-rank detector that would
+            // otherwise rescue the situation.
+            stream
+                .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster_coordinator: set_write_timeout: {e}"
+                    ))
+                })?;
             control_streams.push(stream);
             conn_reads.push(read_half);
         }

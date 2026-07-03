@@ -462,6 +462,15 @@ impl<M: Module + 'static> ClusterWorker<M> {
             .map_err(|e| {
                 TensorError::new(&format!("cluster_worker: set_read_timeout: {e}"))
             })?;
+        // Write-stall ceiling (fd-level, covers every cloned handle): a
+        // wedged relay errors the outbound bridge and the heartbeat
+        // emitter instead of parking them — the bridges then unwind and
+        // the rank exits rather than hanging silently.
+        stream
+            .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+            .map_err(|e| {
+                TensorError::new(&format!("cluster_worker: set_write_timeout: {e}"))
+            })?;
 
         // Two independent stream handles so the inbound reader and the
         // outbound writer can sit on different threads without
