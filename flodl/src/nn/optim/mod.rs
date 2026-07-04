@@ -92,20 +92,37 @@ pub trait Stateful {
     fn load_state<R: Read>(&mut self, r: &mut R) -> Result<()>;
 
     /// Save state to a file. Uses gzip compression if path ends with `.gz`.
+    ///
+    /// Atomic: streams into `<path>.tmp` then renames over the final path, so
+    /// a crash mid-write never leaves a torn `<stem>.optim` that resume could
+    /// mistake for valid — it leaves a stale `.tmp` instead. This matches the
+    /// crash-safety of [`crate::nn::save_checkpoint_file`] (the `.fdl` writer)
+    /// so every artifact in an NCCL consensus checkpoint commits atomically.
+    /// gzip is chosen from the FINAL extension, not the tmp name.
     fn save_state_file(&self, path: &str) -> Result<()> {
-        let f = std::fs::File::create(path).map_err(|e| {
-            crate::tensor::TensorError::new(&format!("io: {}", e))
-        })?;
-        if path.ends_with(".gz") {
-            let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-            self.save_state(&mut w)?;
-            w.finish().map_err(|e| {
-                crate::tensor::TensorError::new(&format!("io: {}", e))
-            })?;
-            Ok(())
-        } else {
-            let mut w = std::io::BufWriter::new(f);
-            self.save_state(&mut w)
+        let io_err =
+            |e: std::io::Error| crate::tensor::TensorError::new(&format!("io: {}", e));
+        let is_gz = path.ends_with(".gz");
+        let tmp = format!("{path}.tmp");
+        let write_result = (|| -> Result<()> {
+            let f = std::fs::File::create(&tmp).map_err(io_err)?;
+            if is_gz {
+                let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+                self.save_state(&mut w)?;
+                w.finish().map_err(io_err)?;
+                Ok(())
+            } else {
+                let mut w = std::io::BufWriter::new(f);
+                self.save_state(&mut w)?;
+                w.flush().map_err(io_err)
+            }
+        })();
+        match write_result {
+            Ok(()) => std::fs::rename(&tmp, path).map_err(io_err),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
         }
     }
 

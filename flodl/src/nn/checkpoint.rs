@@ -283,15 +283,37 @@ pub fn save_checkpoint_file(
     buffers: &[(String, Buffer)],
     structural_hash: Option<&str>,
 ) -> Result<()> {
-    let f = std::fs::File::create(path).map_err(io_err)?;
-    if path.ends_with(".gz") {
-        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        save_checkpoint(&mut w, params, buffers, structural_hash)?;
-        w.finish().map_err(io_err)?;
-        Ok(())
-    } else {
-        let mut w = std::io::BufWriter::new(f);
-        save_checkpoint(&mut w, params, buffers, structural_hash)
+    // Atomic write: stream into `<path>.tmp`, then rename over the final path.
+    // A crash mid-write (SIGKILL, disk-full, power loss) then never leaves a
+    // torn `<path>` that resume could mistake for valid — it leaves a stale
+    // `.tmp` instead, which resume ignores. gzip is chosen from the FINAL
+    // extension, not the tmp name, so the `.tmp` suffix cannot defeat `.gz`
+    // detection. Rename within a single directory is atomic on POSIX.
+    let is_gz = path.ends_with(".gz");
+    let tmp = format!("{path}.tmp");
+    let write_result = (|| -> Result<()> {
+        let f = std::fs::File::create(&tmp).map_err(io_err)?;
+        if is_gz {
+            let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            save_checkpoint(&mut w, params, buffers, structural_hash)?;
+            w.finish().map_err(io_err)?;
+            Ok(())
+        } else {
+            let mut w = std::io::BufWriter::new(f);
+            save_checkpoint(&mut w, params, buffers, structural_hash)?;
+            // Explicit flush so a write error surfaces here rather than being
+            // swallowed by BufWriter's drop-flush after we've already renamed.
+            w.flush().map_err(io_err)
+        }
+    })();
+    match write_result {
+        Ok(()) => std::fs::rename(&tmp, path).map_err(io_err),
+        Err(e) => {
+            // Best-effort cleanup so a failed write doesn't litter a stale
+            // `.tmp`; the write error is what the caller needs to see.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 

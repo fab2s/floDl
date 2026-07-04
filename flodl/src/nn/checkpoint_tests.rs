@@ -1013,3 +1013,70 @@
         assert!(format!("{err}").contains("bad magic"), "got: {err}");
         std::fs::remove_file(path).ok();
     }
+
+    // A successful save commits via `<path>.tmp` + atomic rename, so the final
+    // file loads AND no stale `.tmp` sibling is left behind. This is the M1
+    // guarantee the NCCL elected-rank consensus checkpoint depends on: a crash
+    // between `File::create` and the last byte can only ever leave a `.tmp`,
+    // never a torn `<stem>.fdl` at the canonical path.
+    #[test]
+    fn test_atomic_save_commits_and_leaves_no_tmp() {
+        let params = make_named_params(&[(8, 4)]);
+        let buffers = make_named_buffers(&[4]);
+
+        let dir = std::env::temp_dir();
+        // Unique name so the parallel test harness cannot collide on the path.
+        let path = dir.join("test_atomic_save_m1.fdl");
+        let path_str = path.to_str().unwrap();
+        let tmp = format!("{path_str}.tmp");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&tmp).ok();
+
+        save_checkpoint_file(path_str, &params, &buffers, None).unwrap();
+
+        // Final file exists and round-trips.
+        assert!(path.exists(), "committed checkpoint missing at {path_str}");
+        let load_params = make_named_params(&[(8, 4)]);
+        let load_buffers = make_named_buffers(&[4]);
+        let report =
+            load_checkpoint_file(path_str, &load_params, &load_buffers, None).unwrap();
+        assert_eq!(report.loaded.len(), 2); // 1 param + 1 buffer
+
+        // The tmp scratch file was renamed away, not left as litter.
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "stale .tmp left behind at {tmp}",
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // gzip is chosen from the FINAL `.gz` extension, not the transient `.tmp`
+    // name — the atomic-write refactor must not silently drop compression.
+    #[test]
+    fn test_atomic_save_gz_still_compresses() {
+        let params = make_named_params(&[(16, 32), (32, 8)]);
+
+        let dir = std::env::temp_dir();
+        let gz_path = dir.join("test_atomic_save_m1.fdl.gz");
+        let gz = gz_path.to_str().unwrap();
+        std::fs::remove_file(&gz_path).ok();
+
+        save_checkpoint_file(gz, &params, &[], None).unwrap();
+
+        // A gzip stream begins with the 0x1f 0x8b magic; an uncompressed
+        // `.fdl` would begin with `FDLC`. This asserts the `.gz` path fired
+        // even though the bytes were first written to `<path>.tmp`.
+        let bytes = std::fs::read(gz).unwrap();
+        assert!(
+            bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
+            "expected gzip magic, got {:?}",
+            &bytes[..bytes.len().min(4)],
+        );
+        assert!(
+            !std::path::Path::new(&format!("{gz}.tmp")).exists(),
+            "stale .tmp left behind",
+        );
+
+        std::fs::remove_file(&gz_path).ok();
+    }
