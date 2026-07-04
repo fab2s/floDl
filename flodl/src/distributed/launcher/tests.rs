@@ -31,18 +31,25 @@
 
     #[test]
     fn remote_relay_bash_command_exports_relay_env_only() {
-        let spec_hex = "deadbeef";
         let cmd = build_remote_relay_bash_command(
             "/opt/flodl",
-            spec_hex,
             "ddp-bench",
             &["--model".into(), "resnet-graph".into()],
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             None,
         );
-        // Exports the relay spec and runs the binary...
-        assert!(cmd.contains("FLODL_RELAY_JSON="), "missing relay env: {cmd}");
+        // Salt hygiene: the relay spec (salt-bearing) is read from stdin,
+        // not spliced into the argv-visible command string.
+        assert!(
+            cmd.contains("IFS= read -r __FLODL_ENVELOPE"),
+            "relay envelope must be read from stdin: {cmd}"
+        );
+        // Exports the relay spec from the stdin var and runs the binary...
+        assert!(
+            cmd.contains("FLODL_RELAY_JSON=\"$__FLODL_ENVELOPE\""),
+            "relay env must expand the stdin var: {cmd}"
+        );
         assert!(cmd.contains("cd '/opt/flodl'"), "missing cd: {cmd}");
         assert!(cmd.contains("fdl 'ddp-bench'"), "missing fdl cmd: {cmd}");
         assert!(cmd.contains("--model") && cmd.contains("resnet-graph"));
@@ -227,7 +234,6 @@
         let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/flodl",
-            "abcd1234",
             "host-b",
             0,
             Some("cluster"),
@@ -238,8 +244,11 @@
             None,
             None,
         );
-        assert!(s.starts_with("cd '/srv/flodl' && "));
-        assert!(s.contains("FLODL_CLUSTER_JSON='abcd1234'"));
+        // Salt hygiene: the envelope is read from stdin, then expanded
+        // into the child's env — never spliced into the argv string.
+        assert!(s.starts_with("IFS= read -r __FLODL_ENVELOPE\n"));
+        assert!(s.contains("cd '/srv/flodl' && "));
+        assert!(s.contains("FLODL_CLUSTER_JSON=\"$__FLODL_ENVELOPE\""));
         assert!(s.contains("FLODL_HOST_NAME='host-b'"));
         assert!(s.contains("FLODL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
@@ -260,7 +269,6 @@
         let host_env = empty_env();
         let s = build_remote_bash_command(
             "/srv/flodl",
-            "abcd",
             "worker",
             0,
             None,
@@ -288,7 +296,7 @@
         let cluster_env = empty_env();
         let host_env = empty_env();
         let s = build_remote_bash_command(
-            "/srv", "ff", "w", 0, None, "train", &[],
+            "/srv", "w", 0, None, "train", &[],
             &cluster_env, &host_env, None, None,
         );
         assert!(s.contains(" fdl "), "missing `fdl` invocation: {s}");
@@ -312,7 +320,7 @@
         let cluster_env = empty_env();
         let host_env = empty_env();
         let s = build_remote_bash_command(
-            "/srv/it's", "ff", "w", 0, None, "train", &[],
+            "/srv/it's", "w", 0, None, "train", &[],
             &cluster_env, &host_env, None, None,
         );
         assert!(
@@ -337,7 +345,6 @@
         };
         let s = build_remote_bash_command(
             "/srv/flodl",
-            "abcd",
             "worker",
             0,
             None,
@@ -389,7 +396,7 @@
             cwd_subpath: String::new(),
         };
         let s = build_remote_bash_command(
-            "/srv", "ff", "w", 0, None, "ddp-bench", &[],
+            "/srv", "w", 0, None, "ddp-bench", &[],
             &cluster_env, &host_env, None, Some(&pb),
         );
         // Only the host_env value should be present; the auto-derived
@@ -416,7 +423,7 @@
         host_env.insert("HOST_FLAG".into(), "host-val".into());
         host_env.insert("SHARED_FLAG".into(), "host-wins".into());
         let s = build_remote_bash_command(
-            "/srv", "ff", "w", 0, None, "train", &[],
+            "/srv", "w", 0, None, "train", &[],
             &cluster_env, &host_env, Some(1), None,
         );
         assert!(s.contains("NCCL_P2P_DISABLE='1'"));

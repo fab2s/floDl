@@ -794,12 +794,10 @@ pub fn run_launcher_with_config(
                         })?
                         .as_bytes(),
                 );
-                let mut cmd = if host.host == me {
-                    build_local_relay_command(&exe, &user_args, &spec_hex)
-                } else {
+                let is_remote = host.host != me;
+                let mut cmd = if is_remote {
                     let remote_cmd = build_remote_relay_bash_command(
                         &host.path,
-                        &spec_hex,
                         fdl_cmd
                             .as_deref()
                             .expect("ENV_FDL_CMD presence enforced above when has_remote"),
@@ -809,11 +807,16 @@ pub fn run_launcher_with_config(
                         prebuild_envelope.get(&host.host),
                     );
                     build_ssh_spawn_command(host, &remote_cmd)
+                } else {
+                    build_local_relay_command(&exe, &user_args, &spec_hex)
                 };
-                cmd.stdin(Stdio::null())
+                // Remote children read the salt-bearing envelope from stdin
+                // (see `pipe_envelope_to_child`); local children get it via
+                // `Command::env`.
+                cmd.stdin(if is_remote { Stdio::piped() } else { Stdio::null() })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
-                if host.host == me {
+                if !is_remote {
                     for (k, v) in &full.env {
                         cmd.env(k, v);
                     }
@@ -822,12 +825,15 @@ pub fn run_launcher_with_config(
                     }
                 }
                 let mut child = cmd.spawn().map_err(|e| {
-                    let kind = if host.host == me { "local bash/exec" } else { "ssh" };
+                    let kind = if is_remote { "ssh" } else { "local bash/exec" };
                     TensorError::new(&format!(
                         "cluster launcher: spawn {kind} relay for {:?} failed: {e}",
                         host.host
                     ))
                 })?;
+                if is_remote {
+                    spawn::pipe_envelope_to_child(&mut child, &spec_hex);
+                }
                 let prefix = format!("[{}:relay] ", host.host);
                 let mut forwarders = Vec::with_capacity(2);
                 if let Some(out) = child.stdout.take() {
@@ -875,18 +881,10 @@ pub fn run_launcher_with_config(
                     .local_devices
                     .as_ref()
                     .and_then(|d| d.get(local_rank).copied());
-                let mut cmd = if host.host == me {
-                    build_local_spawn_command(
-                        &exe,
-                        &user_args,
-                        &envelope_hex,
-                        local_rank,
-                        local_phys,
-                    )
-                } else {
+                let is_remote = host.host != me;
+                let mut cmd = if is_remote {
                     let remote_cmd = build_remote_bash_command(
                         &host.path,
-                        &envelope_hex,
                         &host.host,
                         local_rank,
                         overlay_env.as_deref(),
@@ -900,8 +898,19 @@ pub fn run_launcher_with_config(
                         prebuild_envelope.get(&host.host),
                     );
                     build_ssh_spawn_command(host, &remote_cmd)
+                } else {
+                    build_local_spawn_command(
+                        &exe,
+                        &user_args,
+                        &envelope_hex,
+                        local_rank,
+                        local_phys,
+                    )
                 };
-                cmd.stdin(Stdio::null())
+                // Remote children read the salt-bearing envelope from stdin
+                // (see `pipe_envelope_to_child`); local children carry it
+                // via `Command::env` in build_local_spawn_command.
+                cmd.stdin(if is_remote { Stdio::piped() } else { Stdio::null() })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 
@@ -914,7 +923,7 @@ pub fn run_launcher_with_config(
                 // that would clobber launcher-owned rank identity. SSH
                 // path: same parse-time guarantee, bash-level apply in
                 // build_remote_bash_command.
-                if host.host == me {
+                if !is_remote {
                     for (k, v) in &full.env {
                         cmd.env(k, v);
                     }
@@ -924,12 +933,15 @@ pub fn run_launcher_with_config(
                 }
 
                 let mut child = cmd.spawn().map_err(|e| {
-                    let kind = if host.host == me { "local bash/exec" } else { "ssh" };
+                    let kind = if is_remote { "ssh" } else { "local bash/exec" };
                     TensorError::new(&format!(
                         "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
                         host.host
                     ))
                 })?;
+                if is_remote {
+                    spawn::pipe_envelope_to_child(&mut child, &envelope_hex);
+                }
 
                 let global_rank = host.ranks[local_rank];
                 // Match the `[host:dev:rN]` identity the child would otherwise

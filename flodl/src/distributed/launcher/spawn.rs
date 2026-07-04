@@ -375,7 +375,6 @@ pub(super) fn build_local_relay_command(
 /// CUDA.
 pub(super) fn build_remote_relay_bash_command(
     path: &str,
-    relay_spec_hex: &str,
     fdl_cmd: &str,
     user_args: &[String],
     cluster_env: &std::collections::BTreeMap<String, String>,
@@ -383,7 +382,11 @@ pub(super) fn build_remote_relay_bash_command(
     prebuild: Option<&PerHostPrebuild>,
 ) -> String {
     let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
-    let mut s = String::with_capacity(256 + relay_spec_hex.len());
+    let mut s = String::with_capacity(256);
+    // SALT HYGIENE: the relay spec carries the session salt too — pipe it
+    // via stdin rather than the argv-visible command string (see
+    // `build_remote_bash_command`).
+    s.push_str("IFS= read -r __FLODL_ENVELOPE\n");
     s.push_str("cd ");
     let remote_cwd: String = match prebuild {
         Some(pb) if !pb.cwd_subpath.is_empty() => {
@@ -394,8 +397,7 @@ pub(super) fn build_remote_relay_bash_command(
     s.push_str(&shell_quote(&remote_cwd));
     s.push_str(" && ");
     s.push_str(super::ENV_RELAY_JSON);
-    s.push('=');
-    s.push_str(&shell_quote(relay_spec_hex));
+    s.push_str("=\"$__FLODL_ENVELOPE\"");
     // Forward verbosity so the relay's `-vvv` prof lines reach the user.
     if let Ok(v) = std::env::var(crate::log::ENV_VAR) {
         s.push(' ');
@@ -489,6 +491,25 @@ pub(super) fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Co
     c
 }
 
+/// Pipe the hex-encoded cluster/relay envelope to a REMOTE child's stdin
+/// and close it. The remote bash command reads one line
+/// (`IFS= read -r __FLODL_ENVELOPE`) and expands it into the rank/relay
+/// binary's environment — so the session salt inside the envelope never
+/// appears in the remote shell's argv (`ps` / `/proc/<pid>/cmdline`). The
+/// payload is small (well under the 64 KiB pipe buffer) and the remote
+/// `read` runs first thing after ssh connects, so the single write never
+/// blocks; a failed write is non-fatal (the child will fail its own
+/// handshake loudly). Local children carry the envelope via `Command::env`
+/// and never reach here.
+pub(super) fn pipe_envelope_to_child(child: &mut std::process::Child, envelope_hex: &str) {
+    use std::io::Write;
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = writeln!(sin, "{envelope_hex}");
+        // drop(sin) → EOF, so a remote `read` that somehow got two lines
+        // still terminates.
+    }
+}
+
 /// Best-effort SSH pkill of any leftover `abs_bin` process on `host`.
 ///
 /// Fired twice per remote host:
@@ -549,7 +570,6 @@ pub(super) fn cleanup_remote_hosts_parallel(remotes: Vec<(FullWorker, String)>) 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_remote_bash_command(
     path: &str,
-    cluster_json_hex: &str,
     host_name: &str,
     local_rank: usize,
     overlay_env: Option<&str>,
@@ -570,8 +590,17 @@ pub(super) fn build_remote_bash_command(
     let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
 
     let mut s = String::with_capacity(
-        256 + cluster_json_hex.len() + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
+        256 + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
     );
+    // SALT HYGIENE: the rank envelope carries the session salt (the HMAC
+    // key). Splicing it into the command string would leave it in the
+    // remote shell's argv — world-readable via `ps` / `/proc/<pid>/cmdline`
+    // for the whole run. Instead the launcher pipes the hex envelope on
+    // this ssh child's STDIN; we read it into a shell var here and expand
+    // it into the child's ENVIRONMENT (env-assignment prefix), which is
+    // only owner/root-readable via `/proc/<pid>/environ`. `-r` + empty IFS:
+    // the hex is one whitespace-free line, read verbatim.
+    s.push_str("IFS= read -r __FLODL_ENVELOPE\n");
     // Pick the remote cwd. With a prebuild envelope, the controller
     // built the command from `<project_root>/<cwd_subpath>` (e.g.
     // `ddp-bench/`) so the remote should execute from the same offset
@@ -590,9 +619,7 @@ pub(super) fn build_remote_bash_command(
     s.push_str(&shell_quote(&remote_cwd));
     s.push_str(" && ");
     s.push_str(ENV_CLUSTER_JSON);
-    s.push('=');
-    s.push_str(&shell_quote(cluster_json_hex));
-    s.push(' ');
+    s.push_str("=\"$__FLODL_ENVELOPE\" ");
     s.push_str(ENV_HOST_OVERRIDE);
     s.push('=');
     s.push_str(&shell_quote(host_name));
