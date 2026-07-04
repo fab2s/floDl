@@ -485,6 +485,16 @@ impl<M: Module> GpuWorker<M> {
             // in-place AllReduce may have left params partially mutated.
             if let Some(ref scratch) = self.pre_sync_scratch {
                 let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+                // no_grad: the RETRY branch copies INTO `param_tensors`,
+                // which are `.data()` of the leaf `requires_grad` params —
+                // an in-place op on a grad-requiring leaf raises libtorch's
+                // `check_inplace` c10::Error (crosses FFI as a hard abort).
+                // Retries only happen after an NCCL abort, so this fired
+                // exclusively on the rebuild path (attempt 0's dst is
+                // scratch, which is fine ungated); guarding the whole
+                // block is harmless and mirrors `load_averaged` /
+                // `weighted_allreduce_nccl`.
+                let _no_grad = NoGradGuard::new();
                 if attempt == 0 {
                     for (dst, src) in scratch.iter().zip(&param_tensors) {
                         dst.copy_(src, true)?; // scratch <- params
