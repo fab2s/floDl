@@ -107,6 +107,8 @@ fn test_worker_config_clone() {
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        coord_liveness_timeout_secs:
+            crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
     let cfg2 = cfg.clone();
     assert_eq!(cfg2.rank, 0);
@@ -186,6 +188,8 @@ pub(super) fn make_test_worker_with(
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        coord_liveness_timeout_secs:
+            crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
 
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), channels) =

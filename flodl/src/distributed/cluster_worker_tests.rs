@@ -313,6 +313,8 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    coord_liveness_timeout_secs:
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });
@@ -506,6 +508,8 @@
                     // Production callers using auto_with auto-route here
                     // when save_path is set on DdpRunConfig.
                     save_path: None,
+                    coord_liveness_timeout_secs:
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });
@@ -707,6 +711,8 @@
                     timeline: None,
                     policy: ApplyPolicy::Cadence,
                     save_path: None,
+                    coord_liveness_timeout_secs:
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });
@@ -1030,6 +1036,8 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    coord_liveness_timeout_secs:
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
                 let dataset: Arc<dyn crate::data::BatchDataSet> =
                     Arc::new(TestDataset { n: total_samples });
@@ -1196,6 +1204,7 @@
 
     fn inbound_test_rig(
         world_size: usize,
+        coord_liveness_timeout_secs: u64,
     ) -> (
         std::net::TcpStream,                                   // coord side
         std::thread::JoinHandle<()>,                            // inbound
@@ -1208,6 +1217,12 @@
         let addr = listener.local_addr().expect("addr");
         let coord_side = TcpStream::connect(addr).expect("connect");
         let (mut worker_side, _) = listener.accept().expect("accept");
+        // Mirror production (connect_and_build): a read timeout so a silent
+        // link surfaces as periodic WouldBlock, letting the coord-liveness
+        // deadline fire rather than blocking the read forever.
+        worker_side
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .expect("set_read_timeout");
 
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -1225,6 +1240,7 @@
                 &dead_for_loop,
                 &mailbox,
                 &timing_tx,
+                coord_liveness_timeout_secs,
             );
         });
         (coord_side, handle, control_rx, dead)
@@ -1232,7 +1248,7 @@
 
     #[test]
     fn inbound_eof_without_shutdown_poisons_peer_ledger() {
-        let (coord_side, handle, control_rx, dead) = inbound_test_rig(3);
+        let (coord_side, handle, control_rx, dead) = inbound_test_rig(3, 30);
         // Abnormal loss: the coordinator link drops with no Shutdown frame.
         drop(coord_side);
         handle.join().expect("inbound join");
@@ -1246,7 +1262,7 @@
 
     #[test]
     fn inbound_eof_after_clean_shutdown_leaves_ledger_alone() {
-        let (mut coord_side, handle, control_rx, dead) = inbound_test_rig(3);
+        let (mut coord_side, handle, control_rx, dead) = inbound_test_rig(3, 30);
         // Clean teardown: Shutdown frame first, then the link drops.
         let frame = crate::distributed::wire::ControlFrame::encode(
             &TEST_SALT,
@@ -1267,4 +1283,32 @@
              here would abort a final coherent reduce mid-flight"
         );
         assert!(matches!(control_rx.recv(), Ok(ControlMsg::Shutdown)));
+    }
+
+    // Wedged-open coordinator: the link stays ALIVE (no EOF, no error) but the
+    // coord sends nothing — the SIGSTOP / deadlock case. Neither the EOF nor
+    // the parse-error escape hatch can fire, so without a liveness deadline the
+    // loop would poll WouldBlock forever. After `coord_liveness_timeout_secs`
+    // of silence it must bail exactly like a hard link drop: poison peers (so
+    // the NCCL watchdog aborts the in-flight collective) and inject Shutdown.
+    #[test]
+    fn inbound_wedged_open_coord_trips_liveness_deadline() {
+        // 1s deadline keeps the test quick; the 100ms rig read-timeout gives
+        // ~10 WouldBlock polls before the deadline trips.
+        let (coord_side, handle, control_rx, dead) = inbound_test_rig(3, 1);
+        // Hold the connection OPEN and SILENT — the wedged-open condition.
+        // Dropping coord_side here would fire EOF instead and test the wrong
+        // path, so keep it bound until after the deadline has been detected.
+        handle.join().expect("inbound join");
+        assert!(!dead.is_dead(0), "own rank must never be poisoned");
+        assert!(
+            dead.is_dead(1) && dead.is_dead(2),
+            "a coord silent past the liveness deadline must poison peers so \
+             the NCCL watchdog can abort an in-flight collective"
+        );
+        assert!(
+            matches!(control_rx.recv(), Ok(ControlMsg::Shutdown)),
+            "the recv-parked inner must be woken with Shutdown"
+        );
+        drop(coord_side);
     }

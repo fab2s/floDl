@@ -106,6 +106,9 @@ impl DdpHandle {
             timeline: None,
             policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
             save_path: None,
+            // Inert on this thread-based GpuWorker path (no TCP inbound loop).
+            coord_liveness_timeout_secs:
+                crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
         };
 
         // Keep the worker channels: `run_epoch_plan` calls `worker.report_epoch`

@@ -192,24 +192,32 @@ pub(super) fn recv_control(
     stream: &mut TcpStream,
     salt: &SessionSalt,
 ) -> Result<ControlMsgWire> {
-    let payload = match MuxRecord::read_from(stream, salt)? {
-        Some(MuxRecord::Data { payload, .. }) => payload,
-        Some(other) => {
+    loop {
+        let payload = match MuxRecord::read_from(stream, salt)? {
+            Some(MuxRecord::Data { payload, .. }) => payload,
+            Some(other) => {
+                return Err(TensorError::new(&format!(
+                    "recv_control: expected mux Data, got {other:?}"
+                )));
+            }
+            None => return Err(TensorError::new("EOF before frame")),
+        };
+        let frame = ControlFrame::read_from(&mut payload.as_slice(), salt)?
+            .ok_or_else(|| TensorError::new("truncated ControlFrame payload"))?;
+        if frame.kind != MsgKind::Control {
             return Err(TensorError::new(&format!(
-                "recv_control: expected mux Data, got {other:?}"
+                "unexpected frame kind {:?}",
+                frame.kind
             )));
         }
-        None => return Err(TensorError::new("EOF before frame")),
-    };
-    let frame = ControlFrame::read_from(&mut payload.as_slice(), salt)?
-        .ok_or_else(|| TensorError::new("truncated ControlFrame payload"))?;
-    if frame.kind != MsgKind::Control {
-        return Err(TensorError::new(&format!(
-            "unexpected frame kind {:?}",
-            frame.kind
-        )));
+        // Skip the coord→rank liveness beacon: it is not a semantic frame, and
+        // the production rank inbound bridge absorbs it the same way. Tests
+        // asserting a specific control sequence must not trip over it.
+        match frame.decode::<ControlMsgWire>()? {
+            ControlMsgWire::CoordHeartbeat => continue,
+            msg => return Ok(msg),
+        }
     }
-    frame.decode::<ControlMsgWire>()
 }
 
 /// Like [`recv_control`] but emits a `Heartbeat` whenever no frame is
@@ -232,11 +240,14 @@ pub(super) fn recv_control_keepalive(
     stream
         .set_read_timeout(Some(Duration::from_millis(150)))
         .map_err(|e| TensorError::new(&format!("keepalive set_read_timeout: {e}")))?;
-    let payload = loop {
-        match MuxRecord::try_read_from(stream, salt)? {
-            MuxRead::Record(MuxRecord::Data { payload, .. }) => break payload,
+    // Loop until a SEMANTIC control frame arrives: WouldBlock refreshes our own
+    // liveness (like the real heartbeat thread), and an inbound CoordHeartbeat
+    // beacon is skipped (liveness noise, absorbed by the production rank too).
+    let result = loop {
+        let payload = match MuxRecord::try_read_from(stream, salt)? {
+            MuxRead::Record(MuxRecord::Data { payload, .. }) => payload,
             MuxRead::Record(other) => {
-                return Err(TensorError::new(&format!(
+                break Err(TensorError::new(&format!(
                     "recv_control_keepalive: expected mux Data, got {other:?}"
                 )));
             }
@@ -244,23 +255,30 @@ pub(super) fn recv_control_keepalive(
             // thread, then keep polling.
             MuxRead::WouldBlock => {
                 send_timing(stream, salt, TimingMsgWire::Heartbeat { rank, step_count })?;
+                continue;
             }
-            MuxRead::Eof => return Err(TensorError::new("EOF before frame")),
+            MuxRead::Eof => break Err(TensorError::new("EOF before frame")),
+        };
+        let frame = match ControlFrame::read_from(&mut payload.as_slice(), salt)? {
+            Some(f) => f,
+            None => break Err(TensorError::new("truncated ControlFrame payload")),
+        };
+        if frame.kind != MsgKind::Control {
+            break Err(TensorError::new(&format!(
+                "unexpected frame kind {:?}",
+                frame.kind
+            )));
+        }
+        match frame.decode::<ControlMsgWire>() {
+            Ok(ControlMsgWire::CoordHeartbeat) => continue,
+            other => break other,
         }
     };
-    // Restore blocking reads for the rest of the body.
+    // Restore blocking reads for the rest of the body, regardless of outcome.
     stream
         .set_read_timeout(None)
         .map_err(|e| TensorError::new(&format!("keepalive clear timeout: {e}")))?;
-    let frame = ControlFrame::read_from(&mut payload.as_slice(), salt)?
-        .ok_or_else(|| TensorError::new("truncated ControlFrame payload"))?;
-    if frame.kind != MsgKind::Control {
-        return Err(TensorError::new(&format!(
-            "unexpected frame kind {:?}",
-            frame.kind
-        )));
-    }
-    frame.decode::<ControlMsgWire>()
+    result
 }
 
 /// Pre-bind a listener in the test (so we can publish the port

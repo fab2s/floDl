@@ -303,6 +303,7 @@ impl ClusterCoordinator {
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
+            last_coord_heartbeat: None,
             exited: vec![false; world_size],
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
@@ -530,5 +531,6 @@ fn control_label(msg: &ControlMsgWire) -> &'static str {
         ControlMsgWire::ShutdownWithSave { .. } => "ShutdownWithSave",
         ControlMsgWire::EpochAggregated(_) => "EpochAggregated",
         ControlMsgWire::SaveConsensusModel { .. } => "SaveConsensusModel",
+        ControlMsgWire::CoordHeartbeat => "CoordHeartbeat",
     }
 }

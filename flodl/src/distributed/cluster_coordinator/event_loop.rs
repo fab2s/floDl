@@ -12,6 +12,12 @@ use crate::tensor::Result;
 
 use super::{ClusterCoordinator, CpuAvgState, RunPhase};
 
+/// Coord→rank liveness-beacon cadence. Matches the rank→coord
+/// `HEARTBEAT_CADENCE_MS` (1s): frequent enough that a rank's default 30s
+/// coord-liveness deadline sees ~30 beacons before it could false-trip, cheap
+/// enough that the per-tick broadcast overhead is negligible.
+const COORD_HEARTBEAT_CADENCE: Duration = Duration::from_secs(1);
+
 impl ClusterCoordinator {
     /// Process a single timing message. Ported literally from OLD
     /// `Coordinator::process_timing_msg`, modulo the field-name `rank`
@@ -548,12 +554,45 @@ impl ClusterCoordinator {
         Ok(())
     }
 
+    /// Broadcast a [`ControlMsgWire::CoordHeartbeat`] to every rank, throttled
+    /// to [`COORD_HEARTBEAT_CADENCE`]. Fires independently of training traffic
+    /// so a rank can tell a legitimately-silent coordinator (mid-compute) from
+    /// a wedged-open one.
+    ///
+    /// Deliberately infallible: the result of `broadcast_control` is logged at
+    /// verbose and dropped. Propagating it would let a single transient send
+    /// error abort the whole tick loop (`Err(e) => break` at the call site),
+    /// and a genuinely unreachable rank is already handled by heartbeat
+    /// staleness. Headless test coordinators (no control streams) short-circuit
+    /// before attempting any send.
+    fn emit_coord_heartbeat(&mut self) {
+        if self.control_streams.is_empty() {
+            return; // headless coord (test fixtures) — nothing to beacon to
+        }
+        let due = self
+            .last_coord_heartbeat
+            .is_none_or(|t| t.elapsed() >= COORD_HEARTBEAT_CADENCE);
+        if !due {
+            return;
+        }
+        if let Err(e) = self.broadcast_control(&ControlMsgWire::CoordHeartbeat) {
+            crate::verbose!("  ddp: coord heartbeat broadcast (best-effort): {e}");
+        }
+        self.last_coord_heartbeat = Some(Instant::now());
+    }
+
     /// One coordinator tick: drain incoming timing, throttle fast
     /// workers, and trigger averaging when due. Mirrors OLD
     /// `Coordinator::tick`. Returns `false` when every reader thread
     /// has exited so the caller can break its loop.
     pub fn tick(&mut self) -> Result<bool> {
         self.drain_timing();
+        // Coord→rank liveness beacon (throttled to ~1s). Best-effort and
+        // error-swallowing on purpose: a transient send failure must never
+        // abort the tick loop, and a wedged rank's failure is already reaped
+        // by the staleness scan. The reverse-direction twin of the rank→coord
+        // heartbeat, letting each rank detect a wedged-open coordinator.
+        self.emit_coord_heartbeat();
         // Heartbeat-driven dead-rank detection. Must run BEFORE
         // poll_cpu_averaging / should_average so the rest of this
         // tick already sees the updated active membership; a rank

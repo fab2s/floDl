@@ -1316,7 +1316,21 @@ pub struct WorkerConfig {
     /// `None` in standalone single-GPU runs and CPU-only tests that
     /// don't exercise the save path.
     pub save_path: Option<String>,
+    /// Coordinator-liveness deadline (seconds) for the cluster worker's
+    /// inbound bridge: if no frame (coord heartbeat or real traffic) arrives
+    /// within this window, the coord is presumed wedged-open and the rank
+    /// bails. Mirrors the coordinator's own `heartbeat_timeout_secs` so both
+    /// liveness directions share one timescale. Inert on the thread-based
+    /// [`crate::distributed::GpuWorker`] path (single-host / tests) — only
+    /// [`crate::distributed::cluster_worker`]'s TCP inbound loop reads it.
+    /// Defaults to [`DEFAULT_COORD_LIVENESS_TIMEOUT_SECS`].
+    pub coord_liveness_timeout_secs: u64,
 }
+
+/// Default coordinator-liveness deadline (seconds), matching the
+/// coordinator's default `heartbeat_timeout_secs`. Used when a run does not
+/// set `heartbeat_timeout_secs` explicitly.
+pub const DEFAULT_COORD_LIVENESS_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Partition generation

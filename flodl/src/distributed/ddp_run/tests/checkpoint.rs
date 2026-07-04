@@ -235,6 +235,8 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: Some(stem_str.clone()),
+        coord_liveness_timeout_secs:
+            crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), ch) =
         GpuWorker::<Linear>::channels();

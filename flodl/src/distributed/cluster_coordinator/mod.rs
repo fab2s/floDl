@@ -579,6 +579,12 @@ pub struct ClusterCoordinator {
     /// [`Self::process_timing_msg`] before any other per-message work.
     /// Drives [`Self::check_dead_ranks`].
     last_heartbeat: Vec<Instant>,
+    /// Wall-clock of the last coord→rank liveness beacon broadcast, throttling
+    /// the ~1s emit inside [`Self::tick`]. `None` until the first beacon fires.
+    /// The reverse-direction twin of `last_heartbeat`: lets each rank's inbound
+    /// bridge distinguish a legitimately-silent coord (mid-compute) from a
+    /// wedged-open one.
+    last_coord_heartbeat: Option<Instant>,
     /// Per-rank clean-exit latch, set by `TimingMsgWire::Exiting`. A rank
     /// that exited cleanly stops heartbeating, so without this latch the
     /// staleness scan declares it dead 30s later and `active_count` is

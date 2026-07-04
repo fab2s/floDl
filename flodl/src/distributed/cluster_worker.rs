@@ -330,6 +330,11 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
                 target_rank: target_rank as usize,
             }))
         }
+        // Pure liveness beacon: the inbound bridge intercepts it before this
+        // point (resetting its coord-liveness deadline) and never forwards it
+        // to the inner worker. Reached only by direct callers (tests); no
+        // inner dispatch, like `Update { .. }`.
+        ControlMsgWire::CoordHeartbeat => Ok(None),
     }
 }
 
@@ -609,6 +614,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         let salt_in = salt;
         let shutdown_in = Arc::clone(&shutdown_flag);
         let rank_in = config.rank;
+        let coord_liveness_timeout_in = config.coord_liveness_timeout_secs;
         let mut read_stream_for_bridge = read_stream;
         let dead_for_inbound = Arc::clone(&local_dead_ranks);
         let mailbox_for_inbound = Arc::clone(&nccl_session_mailbox);
@@ -625,6 +631,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         &dead_for_inbound,
                         &mailbox_for_inbound,
                         &timing_tx_for_inbound,
+                        coord_liveness_timeout_in,
                     );
                 })
                 .map_err(|e| {
@@ -1076,6 +1083,7 @@ fn inbound_loop(
     local_dead_ranks: &Arc<crate::distributed::controller::DeadRanks>,
     nccl_session_mailbox: &Arc<std::sync::Mutex<Option<PendingNcclSession>>>,
     timing_tx: &mpsc::Sender<TimingMsg>,
+    coord_liveness_timeout_secs: u64,
 ) {
     // ESCAPE HATCH: any abnormal exit of this bridge (coordinator or relay
     // death, frame corruption, EOF without a prior Shutdown frame) must wake
@@ -1111,6 +1119,15 @@ fn inbound_loop(
         }
     };
     let mut clean_shutdown_seen = false;
+    // Coord-liveness deadline: if no inbound frame (CoordHeartbeat OR real
+    // traffic) arrives within this window, the coordinator is presumed
+    // wedged-open (alive TCP, frozen userspace — the SIGSTOP / deadlock case
+    // that never produces EOF or error) and we bail like a hard link drop.
+    // Reuses `heartbeat_timeout_secs` so both liveness directions share one
+    // wall-clock timescale. Reset below on every successful frame decode; the
+    // handshake ACK we just read seeds the clock at loop entry.
+    let coord_liveness_deadline = Duration::from_secs(coord_liveness_timeout_secs);
+    let mut last_inbound = std::time::Instant::now();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -1141,9 +1158,15 @@ fn inbound_loop(
                         return;
                     }
                 };
+                // Any coherent frame is proof the coord is alive: reset the
+                // liveness deadline (covers CoordHeartbeat AND real traffic).
+                last_inbound = std::time::Instant::now();
                 match frame.kind {
                 MsgKind::Control => match frame.decode::<ControlMsgWire>() {
                     Ok(wire) => match wire {
+                        // Pure liveness beacon: absorbed here (the deadline
+                        // was just reset above), never forwarded to the inner.
+                        ControlMsgWire::CoordHeartbeat => {}
                         // Elastic-membership interception (does NOT
                         // forward to the inner GpuWorker).
                         ControlMsgWire::DeclareDead { rank: dead_r } => {
@@ -1263,7 +1286,27 @@ fn inbound_loop(
                 }
                 }
             }
-            Ok(LenFramedRead::WouldBlock) => continue,
+            Ok(LenFramedRead::WouldBlock) => {
+                // Wedged-open coordinator: alive socket, no frames. Neither
+                // EOF nor error ever fires, so the read-timeout poll alone
+                // would loop here forever. If the coord has been silent past
+                // the liveness deadline, treat it exactly like a hard link
+                // drop — poison peers (NCCL watchdog aborts the collective)
+                // and inject Shutdown so the rank exits with a death record.
+                if last_inbound.elapsed() >= coord_liveness_deadline {
+                    eprintln!(
+                        "cluster_worker: inbound r{rank} coordinator silent for \
+                         {coord_liveness_timeout_secs}s (presumed wedged); \
+                         declaring peers dead and shutting down"
+                    );
+                    if !clean_shutdown_seen {
+                        poison_peers();
+                    }
+                    inject_shutdown();
+                    return;
+                }
+                continue;
+            }
             Ok(LenFramedRead::Eof) => {
                 if !clean_shutdown_seen {
                     poison_peers();

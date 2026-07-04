@@ -717,6 +717,21 @@ pub enum ControlMsgWire {
     /// mirrors the CPU forge's detached write); the `.meta.json` written
     /// coord-side is the resume index.
     SaveConsensusModel { target_rank: u64 },
+    /// Coord→rank liveness beacon. Broadcast to every rank on a fixed ~1s
+    /// cadence, independent of training traffic, so a rank can distinguish
+    /// "coordinator alive but legitimately silent during my compute window"
+    /// from "coordinator wedged / gone." The rank's inbound bridge resets its
+    /// coord-liveness deadline on ANY inbound frame (this beacon or real
+    /// traffic) and, if no frame arrives within `heartbeat_timeout_secs`,
+    /// declares the coord dead — poisoning its peer ledger and injecting a
+    /// local Shutdown so the rank exits with a death record instead of
+    /// spinning forever on `WouldBlock` against a wedged-open socket.
+    ///
+    /// This is the reverse-direction twin of [`TimingMsgWire::Heartbeat`]
+    /// (rank→coord): both directions now have an independent liveness signal
+    /// on the same wall-clock timescale. Purely informational — the inbound
+    /// bridge intercepts it and never forwards it to the inner worker.
+    CoordHeartbeat,
 }
 
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain

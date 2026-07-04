@@ -416,6 +416,12 @@ impl DdpHandle {
                 timeline: timeline_for_thread,
                 policy,
                 save_path: save_path_for_thread,
+                // Mirror the coord's staleness threshold (same default) so the
+                // rank's coord-liveness deadline shares one timescale with the
+                // coordinator's rank-staleness detection.
+                coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or(
+                    crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+                ),
             };
 
             // ClusterWorker bridges set up heartbeat + NCCL watchdog +
