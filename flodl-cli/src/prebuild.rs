@@ -33,6 +33,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cluster::apply_worker_ssh_opts;
 use crate::config::{ClusterConfig, ClusterWorker};
 
 /// Env var carrying the per-host pre-flight build envelope (a JSON
@@ -208,6 +209,137 @@ pub struct PerHostEnvelope {
 /// (remote view). Both point at the same physical libtorch via the
 /// shared mount; the two paths differ only when controller and remote
 /// see the project at different filesystem locations.
+/// Outcome of the ABI-compatibility check between the controller's
+/// build environment and a remote host.
+#[derive(Debug, PartialEq)]
+enum AbiCheck {
+    /// Compatible (arch matches, remote is glibc). `warning` is `Some`
+    /// for a soft glibc-version skew note the caller should surface.
+    Ok { warning: Option<String> },
+    /// Definitively incompatible — the prebuilt binary cannot exec on
+    /// the remote. Hard error before fan-out.
+    Incompatible(String),
+}
+
+/// Compare the controller build environment against a remote host's
+/// `uname -m` + `ldd --version` output. Pure — no I/O — so it is
+/// directly unit-tested; [`probe_remote_abi`] supplies the live inputs.
+///
+/// - **arch** must match exactly: an x86-64 binary is `Exec format
+///   error` on aarch64. Hard error.
+/// - **libc flavor**: the flodl build images are glibc-based, so a musl
+///   (Alpine) remote cannot run the glibc-linked binary. Hard error.
+/// - **glibc version**: a soft warning only. It often works, fails only
+///   when the remote glibc is OLDER than the build env's (`GLIBC_2.XX
+///   not found`), and that error at least names glibc — far less
+///   cryptic than the two hard cases. We do not parse/order versions
+///   here (that needs the build-container glibc too); we just flag when
+///   the remote's reported glibc line is worth the operator's eye.
+fn check_remote_abi(
+    host: &str,
+    controller_arch: &str,
+    remote_uname_m: &str,
+    remote_ldd: &str,
+) -> AbiCheck {
+    let remote_arch = remote_uname_m.trim();
+    if remote_arch.is_empty() {
+        // Couldn't read arch — treat as indeterminate, not a mismatch
+        // (see probe_remote_abi's unreachable-is-a-warning discipline).
+        return AbiCheck::Ok {
+            warning: Some(format!(
+                "host {host:?}: could not read remote `uname -m`; skipping \
+                 ABI pre-check (a real mismatch would surface at fan-out)"
+            )),
+        };
+    }
+    if remote_arch != controller_arch {
+        return AbiCheck::Incompatible(format!(
+            "host {host:?}: CPU arch mismatch — the pre-built binary is \
+             {controller_arch} (controller build env) but the remote is \
+             {remote_arch}. A cross-arch binary cannot exec (`Exec format \
+             error`). Run same-arch hosts, or build per-arch."
+        ));
+    }
+    let ldd_lc = remote_ldd.to_ascii_lowercase();
+    if ldd_lc.contains("musl") {
+        return AbiCheck::Incompatible(format!(
+            "host {host:?}: remote uses musl libc, but the pre-built binary \
+             is glibc-linked (flodl build images are glibc-based) and cannot \
+             run there. Match the libc (glibc remote), or build on the remote."
+        ));
+    }
+    // Soft glibc note: surface the remote's reported version line when we
+    // could read one, so a later `GLIBC_… not found` is unsurprising. No
+    // hard gate — build on the OLDEST-glibc host to be safe.
+    let looks_glibc = ldd_lc.contains("glibc") || ldd_lc.contains("gnu libc");
+    let warning = remote_ldd
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && looks_glibc)
+        .map(|l| {
+            format!(
+                "host {host:?}: remote glibc reports `{l}`. If the run later \
+                 fails with `GLIBC_… not found`, the remote glibc is older \
+                 than the controller build env — build on the oldest-glibc \
+                 host."
+            )
+        });
+    AbiCheck::Ok { warning }
+}
+
+/// SSH the remote, read `uname -m` + `ldd --version`, and run the
+/// [`check_remote_abi`] gate. Returns `Ok(Some(warning))` /
+/// `Ok(None)` on a compatible host, `Err(msg)` on a definitive
+/// incompatibility.
+///
+/// UNREACHABLE-IS-A-WARNING: if the probe ssh itself fails (blip, host
+/// down), we return `Ok(Some(warning))` and proceed — today there is no
+/// pre-check at all, so a transient probe failure must never make things
+/// worse than the status quo; the real fan-out ssh surfaces a genuine
+/// connectivity error anyway. The probe only ever ADDS loud errors for
+/// definitive ABI mismatches.
+fn probe_remote_abi(worker: &ClusterWorker) -> Result<Option<String>, String> {
+    let target = worker
+        .ssh
+        .as_ref()
+        .and_then(|s| s.target.as_deref())
+        .unwrap_or(&worker.host);
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    apply_worker_ssh_opts(&mut cmd, worker);
+    cmd.arg(target);
+    // uname line, then the ldd banner (its version line lands on stderr
+    // for glibc, stdout for some — capture both, sentinel-separated).
+    cmd.arg("uname -m; echo __FLODL_LDD__; ldd --version 2>&1 | head -1");
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return Ok(Some(format!(
+                "host {:?}: ABI pre-check ssh spawn failed ({e}); skipping \
+                 (a real mismatch would surface at fan-out)",
+                worker.host,
+            )));
+        }
+    };
+    if !output.status.success() {
+        return Ok(Some(format!(
+            "host {:?}: ABI pre-check ssh exited {}; skipping (a real \
+             mismatch would surface at fan-out)",
+            worker.host, output.status,
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (uname_m, ldd) = stdout
+        .split_once("__FLODL_LDD__")
+        .unwrap_or((stdout.as_ref(), ""));
+    let controller_arch = std::env::consts::ARCH;
+    match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
+        AbiCheck::Ok { warning } => Ok(warning),
+        AbiCheck::Incompatible(msg) => Err(msg),
+    }
+}
+
 fn prebuild_one_worker(
     project_root: &Path,
     cmd_cwd: &Path,
@@ -236,6 +368,14 @@ fn prebuild_one_worker(
         ));
     }
     let host_path = controller_variant_dir.display().to_string();
+    // ABI pre-check BEFORE the (multi-minute) build: the prebuilt binary
+    // is exec'd directly on the remote via the shared mount, so a
+    // controller-vs-remote arch or libc mismatch would fail at fan-out
+    // with a cryptic `Exec format error`. Fail fast + loud here instead;
+    // a definitive mismatch aborts, an unreachable probe only warns.
+    if let Some(warning) = probe_remote_abi(worker)? {
+        eprintln!("fdl: {warning}");
+    }
     // Derive features + docker service from the YAML-declared `arch:`
     // basename — single source of truth, no `.arch` metadata file
     // required. `cpu` is the only non-CUDA variant by convention; every
@@ -447,6 +587,50 @@ fn posix_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abi_arch_mismatch_is_hard_incompatible() {
+        let r = check_remote_abi("gv", "x86_64", "aarch64", "ldd (GNU libc) 2.31");
+        assert!(matches!(r, AbiCheck::Incompatible(m) if m.contains("arch mismatch")));
+    }
+
+    #[test]
+    fn abi_musl_is_hard_incompatible_on_matching_arch() {
+        let r = check_remote_abi("alp", "x86_64", "x86_64", "musl libc (x86_64)\nVersion 1.2.4");
+        assert!(matches!(r, AbiCheck::Incompatible(m) if m.contains("musl")));
+    }
+
+    #[test]
+    fn abi_matching_arch_glibc_ok_with_version_note() {
+        let r = check_remote_abi(
+            "w", "x86_64", "x86_64",
+            "ldd (Ubuntu GLIBC 2.35-0ubuntu3.4) 2.35",
+        );
+        match r {
+            AbiCheck::Ok { warning: Some(w) } => {
+                assert!(w.contains("2.35"), "warning should quote the reported line: {w}");
+            }
+            other => panic!("expected Ok+warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abi_empty_uname_is_indeterminate_not_mismatch() {
+        let r = check_remote_abi("w", "x86_64", "", "");
+        assert!(matches!(r, AbiCheck::Ok { warning: Some(_) }));
+    }
+
+    #[test]
+    fn abi_arch_checked_before_musl() {
+        let r = check_remote_abi("x", "x86_64", "aarch64", "musl libc");
+        assert!(matches!(r, AbiCheck::Incompatible(m) if m.contains("arch mismatch")));
+    }
+
+    #[test]
+    fn abi_matching_arch_no_ldd_ok_no_warning() {
+        let r = check_remote_abi("w", "x86_64", "x86_64", "");
+        assert_eq!(r, AbiCheck::Ok { warning: None });
+    }
 
     #[test]
     fn features_and_service_precompiled_cuda_picks_cuda() {
