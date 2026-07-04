@@ -380,7 +380,10 @@ fn prebuild_one_worker(
     // basename — single source of truth, no `.arch` metadata file
     // required. `cpu` is the only non-CUDA variant by convention; every
     // other basename (`cuNN`, `sm<NN>-sm<NN>`, etc.) is a GPU build.
-    let (features_arg, feature_docker_svc) = features_and_service_from_arch(arch);
+    // `arch:` basename → cargo --features (`cuda` for GPU variants, none
+    // for `cpu`). The compose SERVICE is `controller.docker` (above),
+    // not arch-derived — the controller's toolchain builds every host.
+    let (features_arg, _) = features_and_service_from_arch(arch);
     let cuda_version_for_image = cuda_version_from_arch(arch);
     let target_dir_relative = format!("target/cluster/{}", worker.host);
 
@@ -388,18 +391,21 @@ fn prebuild_one_worker(
     // set in cluster.yml) or native cargo on the host filesystem.
     //
     // Docker mode: the project root mounts at `/workspace`; cwd +
-    // CARGO_TARGET_DIR are in the `/workspace/...` namespace. The
-    // service to use is the controller's `docker:` value when
-    // present (it owns the toolchain), falling back to the libtorch-
-    // derived `cuda` / `dev` choice (matches the existing
-    // `fdl cuda-build` / `fdl build` split).
+    // CARGO_TARGET_DIR are in the `/workspace/...` namespace. Docker
+    // mode is gated on `controller.docker` being set, and that value
+    // IS the build service — the controller owns one build toolchain
+    // and compiles every host's binary in it (per-host libtorch comes
+    // from LIBTORCH_HOST_PATH, per-host features from `arch:`). The
+    // service must be a superset toolchain (`cuda` builds both CUDA and
+    // CPU binaries); a service that lacks the CUDA toolkit fails loudly
+    // at cargo build for a CUDA-arch worker, naming the chosen service.
     //
     // Native mode: cwd is the cmd's filesystem cwd, CARGO_TARGET_DIR
     // is the same project-root-relative path on the host, and
     // LIBTORCH_PATH is set directly on the cargo process (no Docker
     // bind-mount indirection).
     let (sh_cmd, cwd_for_spawn, extra_envs): (String, &Path, Vec<(&str, String)>) =
-        if let Some(_svc) = controller_docker_svc {
+        if let Some(docker_svc) = controller_docker_svc {
             // Docker-backed build.
             let target_dir_in_container = format!("/workspace/{target_dir_relative}");
             let sub_path = cmd_cwd
@@ -427,10 +433,9 @@ fn prebuild_one_worker(
                     bin = posix_quote(cmd_name),
                 )
             };
-            let svc = feature_docker_svc;
             let docker_cmd = format!(
                 "docker compose run --rm {svc} bash -c {inner}",
-                svc = svc,
+                svc = docker_svc,
                 inner = posix_quote(&build_cmd),
             );
             (docker_cmd, project_root, vec![

@@ -101,8 +101,8 @@ cluster:
       ssh:                            # optional sub-block; omit entirely to use defaults
         target: node-b                # ssh target; defaults to host: if omitted
         # port: 2222
-        # user: fab2s
-        # identity_file: /home/fab2s/.ssh/cluster_key
+        # user: ubuntu
+        # identity_file: /home/ubuntu/.ssh/cluster_key
         # options:
         #   - ProxyJump=bastion
         #   - StrictHostKeyChecking=no
@@ -133,3 +133,24 @@ cluster:
   # Per-worker `env:` blocks override matching keys.
   # env:
   #   NCCL_DEBUG: INFO
+
+# ---------------------------------------------------------------------------
+# commands: which commands fan out to the cluster.
+#
+# A command is single-host UNLESS it carries `cluster: true` — that flag
+# is what makes `fdl @cluster <name>` SSH to every worker above and run
+# the pre-flight build + fan-out. Without a `commands:` block, copying
+# this file gives you a topology but nothing that dispatches to it (the
+# launcher stays single-host and prints "N GPUs visible, cluster off").
+# ---------------------------------------------------------------------------
+commands:
+  # Connectivity smoke: one line per rank proves SSH + env reach every host.
+  smoke:
+    cluster: true
+    run: echo "rank says hello from $(hostname)"
+
+  # Real training binary. `cluster: true` is inherited by every command
+  # under the binary's own fdl.yml (e.g. ddp-bench/), so a per-command
+  # entry here is only needed for binaries launched from this overlay.
+  # ddp-bench:
+  #   cluster: true
