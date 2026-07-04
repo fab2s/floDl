@@ -299,6 +299,7 @@ impl ClusterCoordinator {
             stall_since: None,
             stall_last_dump: None,
             dead_ranks: config.dead_ranks,
+            reported_deaths: config.reported_deaths,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],

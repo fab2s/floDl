@@ -298,6 +298,12 @@ struct Cli {
     #[option]
     checkpoint_at_epoch: Option<usize>,
 
+    /// Cluster stop threshold: number of rank losses before the run is
+    /// declared unrecoverable and survivors save-and-shutdown. Omit to
+    /// tolerate any partial loss (only losing every rank stops the run).
+    #[option]
+    max_failure: Option<usize>,
+
     /// Show available models and modes, then exit.
     #[option]
     list: bool,
@@ -804,6 +810,7 @@ fn run() -> flodl::tensor::Result<()> {
                 save_path: cli.save_path.clone(),
                 resume_from: cli.resume_from.clone(),
                 checkpoint_at_epoch: cli.checkpoint_at_epoch,
+                max_failure: cli.max_failure,
                 outer_optimizer: outer_opt_choice.clone(),
                 gamma: cli.gamma.unwrap_or(1.0),
             };

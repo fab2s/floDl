@@ -869,3 +869,120 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
     r1.join().unwrap().expect("rank 1 completed all epochs");
     coord_handle.join().unwrap().expect("coord finishes cleanly");
 }
+
+/// Externally-reported death (launcher child supervision) takes the
+/// SAME side-effect chain as heartbeat staleness — but fires on the
+/// next tick instead of after the staleness window. Mirror of
+/// `heartbeat_stale_rank_declared_dead_and_cycle_completes` with the
+/// staleness window set far past the test budget (30s): the ONLY way
+/// rank 2 can be declared dead in time is the reported-deaths drain,
+/// and the cycle must still finalize with the survivors.
+#[test]
+fn reported_death_declared_via_drain_and_cycle_completes() {
+    let world_size = 3;
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_for_coord = Arc::clone(&dead_ranks);
+    let reported: crate::distributed::cluster_coordinator::ReportedDeaths =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reported_for_coord = Arc::clone(&reported);
+    let (port, coord_handle) = spawn_coord(
+        world_size,
+        move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Sync,
+                AverageBackend::Cpu,
+                world_size,
+                ElChe::new(world_size, 1),
+            )
+            .no_divergence_guard()
+            .dead_ranks(dead_for_coord)
+            .reported_deaths(reported_for_coord)
+            // Staleness must NOT fire inside the test budget — the
+            // reported-deaths drain is the only detector in play.
+            .heartbeat_timeout_secs(30)
+        },
+        |coord| {
+            let start = Instant::now();
+            while coord.avg_count() == 0 {
+                if start.elapsed() > Duration::from_secs(10) {
+                    return Err(TensorError::new(
+                        "reported_death: avg_count never advanced",
+                    ));
+                }
+                coord.tick()?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        },
+    );
+
+    // Rank 2 handshakes then goes silent (simulating the process that
+    // just died — its child-exit is what supervision reports).
+    let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, move |_s, _salt| {
+        thread::sleep(Duration::from_millis(3500));
+        Ok(())
+    });
+
+    // The "launcher": report rank 2 dead shortly after the cohort has
+    // handshaked. The coord's next tick drains it through
+    // process_rank_death.
+    let reporter = {
+        let q = Arc::clone(&reported);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(800));
+            q.lock().unwrap().push(2);
+        })
+    };
+
+    let body = |rank: u64| {
+        move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0, data_ms: 0.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                },
+            )?;
+            let _ = recv_control_keepalive(s, salt, rank, 1)?; // RequestParams
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::SyncAck {
+                    rank,
+                    step_count: 2,
+                    divergence: Some(0.05),
+                    post_norm: Some(1.0),
+                    pre_norm: Some(1.05),
+                },
+            )?;
+            let _ = recv_control_keepalive(s, salt, rank, 2)?; // Update
+            let _ = recv_control_keepalive(s, salt, rank, 2)?; // SetGlobalStep
+            Ok(())
+        }
+    };
+    let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, body(0));
+    let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
+    r0.join().unwrap().expect("rank 0 completes averaging");
+    r1.join().unwrap().expect("rank 1 completes averaging");
+    let _ = r2.join();
+    let _ = reporter.join();
+    coord_handle.join().unwrap().expect("coord drives clean");
+
+    assert!(
+        dead_ranks.is_dead(2),
+        "reported death must land in the shared ledger via the drain"
+    );
+    assert!(
+        !dead_ranks.is_dead(0) && !dead_ranks.is_dead(1),
+        "survivors must not be reaped (staleness window is 30s)"
+    );
+    assert!(
+        reported.lock().unwrap().is_empty(),
+        "queue must be drained by the tick"
+    );
+}

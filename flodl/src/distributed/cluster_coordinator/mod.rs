@@ -401,6 +401,14 @@ struct NcclRendezvousPending {
     tried_generators: Vec<usize>,
 }
 
+/// Externally-reported rank deaths, pushed by the launcher's child
+/// supervision the instant a rank process exits (vs the coordinator's
+/// ~30s heartbeat-staleness detection) and drained by the coordinator
+/// tick through the same death side-effect chain. The shared ledger
+/// dedups: stale or duplicate reports are skipped.
+pub type ReportedDeaths = std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
+
+
 /// Process-model coordinator: ports the OLD threaded
 /// `ddp_run::coordinator::Coordinator` to talk to remote rank
 /// processes over TCP.
@@ -555,6 +563,10 @@ pub struct ClusterCoordinator {
     /// on heartbeat staleness; reading side: should_average,
     /// poll_cpu_averaging, and other gates skip dead ranks.
     dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
+    /// Externally-reported death queue (launcher child supervision).
+    /// Drained at each tick before the staleness scan, through the
+    /// same side-effect chain. `None` when no external reporter exists.
+    reported_deaths: Option<ReportedDeaths>,
     /// Heartbeat staleness threshold copied from config.
     heartbeat_timeout_secs: u64,
     /// NCCL re-rendezvous wall-budget copied from config. Consumed by

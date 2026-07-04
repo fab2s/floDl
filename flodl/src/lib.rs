@@ -94,7 +94,7 @@ pub use distributed::{
     CudaEvent, CudaEventFlags, CudaStream, StreamGuard,
     NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, HasGraph, Trainer, ElChe,
     ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker,
-    ElCheConfig, ElCheMode, TrainerConfig,
+    ElCheConfig, ElCheMode, TrainerConfig, MaxFailureThreshold,
     ClusterBuilder, HostBuilder,
     NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum,
 };

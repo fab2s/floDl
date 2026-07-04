@@ -28,9 +28,14 @@ impl ClusterCoordinator {
         let Some(ledger) = self.dead_ranks.as_ref().cloned() else {
             return;
         };
+        // Externally-reported deaths first: the launcher's child
+        // supervision knows a rank died within milliseconds of the
+        // process exiting — long before the heartbeat staleness window
+        // — and reports it through the shared queue. Same side-effect
+        // chain as staleness detection, just a faster detector.
+        let mut any_newly_dead = self.drain_reported_deaths(&ledger);
         let now = Instant::now();
         let threshold = Duration::from_secs(self.heartbeat_timeout_secs);
-        let mut any_newly_dead = false;
         for r in 0..self.world_size {
             if ledger.is_dead(r) {
                 continue;
@@ -48,112 +53,8 @@ impl ClusterCoordinator {
                     r,
                     self.heartbeat_timeout_secs,
                 );
-                // Compute the dead rank's un-processed remainder
-                // BEFORE flipping `active_count` (the survivor count
-                // used by the redistribution formula reads the
-                // pre-decrement value plus the to-die rank).
-                let remainder_plan = self.compute_dead_rank_remainder(r);
-                ledger.declare_dead(r);
-                self.active_count = self.active_count.saturating_sub(1);
-                self.last_heartbeat[r] = now;
+                self.process_rank_death(r, &ledger);
                 any_newly_dead = true;
-                // Callback-role failover. For `Rank(n)` policy the
-                // role stays put — a static rank that died will surface
-                // as a loud send_control error at the next dispatch
-                // (matches the "controller decides" principle: no
-                // silent re-routing of a user-pinned rank). For
-                // `Fastest` policy, re-resolve all three roles
-                // against the new live set + ElChe smoothed values.
-                match self.epoch_callback_policy {
-                    crate::distributed::ddp_run::EpochCallbackPolicy::Rank(_) => {
-                        // Checkpoint-role failover: if Rank(n) policy
-                        // and the dead rank happens to be the
-                        // checkpoint role, fall over to lowest live as
-                        // a best-effort. Eval/epoch roles stay pinned.
-                        if r == self.checkpoint_role {
-                            if let Some(next) =
-                                (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
-                            {
-                                self.checkpoint_role = next;
-                                crate::verbose!(
-                                    "  ddp: checkpoint_role failover {} -> {} \
-                                     (prior role declared dead)",
-                                    r,
-                                    next,
-                                );
-                            }
-                        }
-                    }
-                    crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => {
-                        self.re_resolve_callback_roles_on_death(r);
-                        crate::verbose!(
-                            "  ddp: Fastest re-resolve after rank {} death \
-                             — checkpoint={}, eval={}, epoch_fn={}",
-                            r,
-                            self.checkpoint_role,
-                            self.eval_role,
-                            self.epoch_callback_role,
-                        );
-                    }
-                }
-                // NCCL backend: notify every surviving worker so they
-                // can update their LOCAL dead-rank ledgers and the
-                // NCCL watchdog can abort the in-flight collective.
-                // CPU backend doesn't need this — the controller-side
-                // stream shutdown via the shared `DeadRanks` ledger
-                // already releases its blocked AllReduce read.
-                if matches!(self.backend, AverageBackend::Nccl) {
-                    if let Err(e) = self.broadcast_control(
-                        &ControlMsgWire::DeclareDead { rank: r as u64 },
-                    ) {
-                        crate::verbose!(
-                            "  ddp: DeclareDead broadcast for rank {} failed: {}",
-                            r,
-                            e,
-                        );
-                    }
-                }
-                if let Some((remainder_offset, remainder_size)) = remainder_plan {
-                    if let Err(e) = self.redistribute_dead_rank_partition(
-                        r,
-                        remainder_offset,
-                        remainder_size,
-                    ) {
-                        crate::verbose!(
-                            "  ddp: ExtendPartition dispatch for dead rank {} \
-                             remainder failed: {} (samples will roll into \
-                             next epoch's reshuffle)",
-                            r,
-                            e,
-                        );
-                    }
-                }
-                // PROGRESSIVE-MODE RECLAIM. The `ExtendPartition` path above
-                // is non-progressive only (`epoch_plan_cache` is populated by
-                // `plans_for_epoch`, which progressive never calls), so
-                // without this the dead rank's dispatched-but-never-completed
-                // chunks stay in-flight forever: `is_epoch_done` never fires,
-                // the epoch never aggregates, and after the survivors drain
-                // the pool the reduce gate has no mover left to fire it — the
-                // production-default Cadence cohort wedges permanently on any
-                // single rank death. Forfeit returns those samples to the
-                // pool for survivor re-dispatch and zeroes the rank's
-                // in-flight books.
-                if self.progressive {
-                    let reclaimed: usize = self
-                        .chunk_pools
-                        .values_mut()
-                        .map(|p| p.forfeit(r))
-                        .sum();
-                    if reclaimed > 0 {
-                        crate::verbose!(
-                            "  ddp: reclaimed {} in-flight samples from dead \
-                             rank {} for survivor re-dispatch",
-                            reclaimed,
-                            r,
-                        );
-                    }
-                }
             }
         }
         // After processing all deaths this tick, decide whether the
@@ -186,6 +87,153 @@ impl ClusterCoordinator {
                 self.wake_idle_ranks_in_progressive();
             }
         }
+    }
+
+
+    /// Full death side-effect chain for rank `r`, shared by every
+    /// detector (heartbeat staleness, externally-reported child exits).
+    /// Callers guarantee `r` is not already dead and not cleanly
+    /// `exited`. Order matters: the remainder is computed BEFORE the
+    /// ledger flip (the redistribution formula reads the pre-decrement
+    /// survivor count plus the to-die rank).
+    pub(super) fn process_rank_death(
+        &mut self,
+        r: usize,
+        ledger: &std::sync::Arc<crate::distributed::controller::DeadRanks>,
+    ) {
+        let remainder_plan = self.compute_dead_rank_remainder(r);
+        ledger.declare_dead(r);
+        self.active_count = self.active_count.saturating_sub(1);
+        self.last_heartbeat[r] = Instant::now();
+        // Callback-role failover. For `Rank(n)` policy the
+        // role stays put — a static rank that died will surface
+        // as a loud send_control error at the next dispatch
+        // (matches the "controller decides" principle: no
+        // silent re-routing of a user-pinned rank). For
+        // `Fastest` policy, re-resolve all three roles
+        // against the new live set + ElChe smoothed values.
+        match self.epoch_callback_policy {
+            crate::distributed::ddp_run::EpochCallbackPolicy::Rank(_) => {
+                // Checkpoint-role failover: if Rank(n) policy
+                // and the dead rank happens to be the
+                // checkpoint role, fall over to lowest live as
+                // a best-effort. Eval/epoch roles stay pinned.
+                if r == self.checkpoint_role {
+                    if let Some(next) =
+                        (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
+                    {
+                        self.checkpoint_role = next;
+                        crate::verbose!(
+                            "  ddp: checkpoint_role failover {} -> {} \
+                             (prior role declared dead)",
+                            r,
+                            next,
+                        );
+                    }
+                }
+            }
+            crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => {
+                self.re_resolve_callback_roles_on_death(r);
+                crate::verbose!(
+                    "  ddp: Fastest re-resolve after rank {} death \
+                     — checkpoint={}, eval={}, epoch_fn={}",
+                    r,
+                    self.checkpoint_role,
+                    self.eval_role,
+                    self.epoch_callback_role,
+                );
+            }
+        }
+        // NCCL backend: notify every surviving worker so they
+        // can update their LOCAL dead-rank ledgers and the
+        // NCCL watchdog can abort the in-flight collective.
+        // CPU backend doesn't need this — the controller-side
+        // stream shutdown via the shared `DeadRanks` ledger
+        // already releases its blocked AllReduce read.
+        if matches!(self.backend, AverageBackend::Nccl) {
+            if let Err(e) = self.broadcast_control(
+                &ControlMsgWire::DeclareDead { rank: r as u64 },
+            ) {
+                crate::verbose!(
+                    "  ddp: DeclareDead broadcast for rank {} failed: {}",
+                    r,
+                    e,
+                );
+            }
+        }
+        if let Some((remainder_offset, remainder_size)) = remainder_plan {
+            if let Err(e) = self.redistribute_dead_rank_partition(
+                r,
+                remainder_offset,
+                remainder_size,
+            ) {
+                crate::verbose!(
+                    "  ddp: ExtendPartition dispatch for dead rank {} \
+                     remainder failed: {} (samples will roll into \
+                     next epoch's reshuffle)",
+                    r,
+                    e,
+                );
+            }
+        }
+        // PROGRESSIVE-MODE RECLAIM. The `ExtendPartition` path above
+        // is non-progressive only (`epoch_plan_cache` is populated by
+        // `plans_for_epoch`, which progressive never calls), so
+        // without this the dead rank's dispatched-but-never-completed
+        // chunks stay in-flight forever: `is_epoch_done` never fires,
+        // the epoch never aggregates, and after the survivors drain
+        // the pool the reduce gate has no mover left to fire it — the
+        // production-default Cadence cohort wedges permanently on any
+        // single rank death. Forfeit returns those samples to the
+        // pool for survivor re-dispatch and zeroes the rank's
+        // in-flight books.
+        if self.progressive {
+            let reclaimed: usize = self
+                .chunk_pools
+                .values_mut()
+                .map(|p| p.forfeit(r))
+                .sum();
+            if reclaimed > 0 {
+                crate::verbose!(
+                    "  ddp: reclaimed {} in-flight samples from dead \
+                     rank {} for survivor re-dispatch",
+                    reclaimed,
+                    r,
+                );
+            }
+        }
+    }
+
+    /// Drain the externally-reported death queue (launcher child
+    /// supervision) through [`Self::process_rank_death`]. Duplicate or
+    /// stale reports (already dead, cleanly exited, out of range) are
+    /// skipped — the ledger is the dedup. Returns whether any death was
+    /// newly processed.
+    fn drain_reported_deaths(
+        &mut self,
+        ledger: &std::sync::Arc<crate::distributed::controller::DeadRanks>,
+    ) -> bool {
+        let Some(queue) = self.reported_deaths.as_ref().cloned() else {
+            return false;
+        };
+        let drained: Vec<usize> = {
+            let mut q = queue.lock().expect("reported-deaths queue poisoned");
+            q.drain(..).collect()
+        };
+        let mut any = false;
+        for r in drained {
+            if r >= self.world_size || ledger.is_dead(r) || self.exited[r] {
+                continue;
+            }
+            crate::verbose!(
+                "  ddp: rank {} reported dead by child supervision \
+                 (process exited); declaring dead",
+                r,
+            );
+            self.process_rank_death(r, ledger);
+            any = true;
+        }
+        any
     }
 
     /// Compute the un-processed `(partition_offset, partition_size)`

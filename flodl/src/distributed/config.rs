@@ -391,6 +391,15 @@ pub struct TrainerConfig<M: Module> {
 
     /// Maximum gradient norm for per-worker clipping. `None` = no clipping.
     pub max_grad_norm: Option<f64>,
+    /// Cluster-mode stop threshold: how many ranks may be lost (spot
+    /// reclaims, hardware, network) before the run is declared
+    /// unrecoverable and survivors save-and-shutdown. `None` (default)
+    /// tolerates any partial loss — a single rank vanishing from a
+    /// large collective never kills the training; only losing every
+    /// rank (or the backend hard floor: NCCL needs 2 survivors) stops
+    /// it. Deaths and redistribution are surfaced in logs and on the
+    /// live dashboard either way.
+    pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
     /// Save a checkpoint every N global epochs. `None` = no periodic save.
     pub checkpoint_every: Option<usize>,
     /// Checkpoint bundle stem for cluster-mode unrecoverable-failure
@@ -473,6 +482,7 @@ impl<M: Module> TrainerConfig<M> {
             num_epochs: 1,
             elche: ElCheConfig::default(),
             max_grad_norm: None,
+            max_failure: None,
             checkpoint_every: None,
             save_path: None,
             resume_from: None,

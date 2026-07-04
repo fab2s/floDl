@@ -118,29 +118,38 @@ pub(super) const SSH_OPTS: &[&str] = &[
 /// the driver never returns from: it holds the GPU and no pure-Rust
 /// mechanism reaps it, so it stays a manual `docker restart` / `ssh pkill`
 /// (the rig-hygiene backstop).
+/// One supervised child: host, local rank (or the relay's `usize::MAX`
+/// sentinel), the global ranks the child carries (reported dead on a
+/// non-zero exit under elastic supervision), the process handle, and
+/// its output-forwarder threads.
+pub(super) type SupervisedChild = (
+    String,
+    usize,
+    Vec<usize>,
+    std::process::Child,
+    Vec<thread::JoinHandle<()>>,
+);
+
 pub(super) fn supervise_children(
-    children: Vec<(
-        String,
-        usize,
-        std::process::Child,
-        Vec<thread::JoinHandle<()>>,
-    )>,
+    children: Vec<SupervisedChild>,
+    elastic: Option<ElasticSupervision>,
 ) -> Option<TensorError> {
     if children.is_empty() {
         return None;
     }
     // Snapshot identity + PID for every child up front. Used both to
     // attribute incoming events and to signal still-running peers when
-    // any one of them fails.
+    // the kill-all path fires.
     let pids: Vec<(String, usize, u32)> = children
         .iter()
-        .map(|(host, lr, c, _)| (host.clone(), *lr, c.id()))
+        .map(|(host, lr, _, c, _)| (host.clone(), *lr, c.id()))
         .collect();
 
-    let (tx, rx) = mpsc::channel::<(String, usize, std::io::Result<ExitStatus>)>();
+    let (tx, rx) =
+        mpsc::channel::<(String, usize, Vec<usize>, std::io::Result<ExitStatus>)>();
     let mut watchers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(children.len());
     let mut all_forwarders: Vec<thread::JoinHandle<()>> = Vec::new();
-    for (host, lr, mut child, fwd) in children {
+    for (host, lr, granks, mut child, fwd) in children {
         all_forwarders.extend(fwd);
         let txc = tx.clone();
         watchers.push(thread::spawn(move || {
@@ -148,7 +157,7 @@ pub(super) fn supervise_children(
             // Channel send only fails if the receiver was dropped, which
             // only happens after the main loop has finished collecting
             // every expected event. Treat as best-effort.
-            let _ = txc.send((host, lr, st));
+            let _ = txc.send((host, lr, granks, st));
         }));
     }
     // Drop the producer handle held by main so `rx.recv()` terminates
@@ -159,7 +168,8 @@ pub(super) fn supervise_children(
     let mut finished: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
     let mut terminated_peers = false;
-    while let Ok((host, lr, st)) = rx.recv() {
+    let mut tolerated_deaths: usize = 0;
+    while let Ok((host, lr, granks, st)) = rx.recv() {
         finished.insert((host.clone(), lr));
         let failure_msg: Option<String> = match st {
             Ok(s) if s.success() => None,
@@ -172,7 +182,32 @@ pub(super) fn supervise_children(
             )),
         };
         if let Some(msg) = failure_msg {
-            if any_failure.is_none() {
+            // ELASTIC MEMBERSHIP: once the cohort has formed, a child
+            // exit is a membership event, not a run failure — report
+            // the child's global ranks to the coordinator (which
+            // redistributes work, fails over callback roles, and
+            // decides recoverability against max_failure) and keep
+            // supervising the survivors. A single rank vanishing from a
+            // large collective must never kill the training; the
+            // coordinator owns the stop decision. Pre-formation (or
+            // with no coordinator) the legacy first-failure kill-all
+            // stands: a half-formed NCCL cohort blocks in connect-retry
+            // with no comm to abort and no rebuild machinery running.
+            let elastic_active = elastic
+                .as_ref()
+                .map(|e| e.cohort_formed.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false);
+            if elastic_active {
+                let e = elastic.as_ref().expect("elastic_active implies Some");
+                eprintln!(
+                    "{msg} — tolerating (elastic membership): reporting rank(s) \
+                     {granks:?} dead; the coordinator redistributes their work"
+                );
+                tolerated_deaths += 1;
+                if let Ok(mut q) = e.reported_deaths.lock() {
+                    q.extend(granks.iter().copied());
+                }
+            } else if any_failure.is_none() {
                 any_failure = Some(TensorError::new(&msg));
                 if !terminated_peers {
                     terminated_peers = true;
@@ -198,7 +233,61 @@ pub(super) fn supervise_children(
     for f in all_forwarders {
         let _ = f.join();
     }
+
+    // Elastic verdict: the launcher's exit status reflects the RUN, not
+    // individual children. Deaths within tolerance on a run that drained
+    // to completion are a degraded-but-valid result.
+    if any_failure.is_none() {
+        if let Some(e) = elastic.as_ref() {
+            let dead = e.dead_ranks.dead_count();
+            let limit = e.max_failure.map(|t| t.limit_for(e.world_size));
+            if dead >= e.world_size {
+                any_failure = Some(TensorError::new(
+                    "cluster launcher: every rank was lost; consensus checkpoint \
+                     saved if a save path was armed",
+                ));
+            } else if let Some(l) = limit {
+                if dead >= l {
+                    any_failure = Some(TensorError::new(&format!(
+                        "cluster launcher: max_failure exceeded ({dead}/{} ranks \
+                         dead, threshold {l}); coordinator dispatched \
+                         save-and-shutdown — consensus checkpoint saved if a \
+                         save path was armed",
+                        e.world_size,
+                    )));
+                }
+            }
+            if any_failure.is_none() && (dead > 0 || tolerated_deaths > 0) {
+                eprintln!(
+                    "cluster launcher: run completed DEGRADED — {dead} of {} \
+                     ranks lost along the way (tolerated by elastic \
+                     membership); survivors carried the full workload",
+                    e.world_size,
+                );
+            }
+        }
+    }
     any_failure
+}
+
+/// Context handed to [`supervise_children`] when a coordinator is
+/// running: lets child supervision defer rank-death decisions to the
+/// coordinator's elastic membership instead of the legacy
+/// first-failure kill-all.
+pub(super) struct ElasticSupervision {
+    /// Fast death reports into the coordinator tick (same side-effect
+    /// chain as heartbeat-staleness detection, minus the 30s wait).
+    pub reported_deaths: crate::distributed::cluster_coordinator::ReportedDeaths,
+    /// Shared ledger — read for the end-of-run verdict (includes
+    /// staleness-declared deaths supervision never saw as child exits).
+    pub dead_ranks: std::sync::Arc<crate::distributed::controller::DeadRanks>,
+    /// User stop-threshold; `None` = tolerate any partial loss (only
+    /// all-ranks-lost fails the run).
+    pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
+    pub world_size: usize,
+    /// Cohort-formation gate: elastic behavior only after the cohort
+    /// bootstrapped (NCCL rendezvous complete / CPU immediately).
+    pub cohort_formed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Send SIGTERM to `pid` via the `kill` binary (PATH-resolved). The

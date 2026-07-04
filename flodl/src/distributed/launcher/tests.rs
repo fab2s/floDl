@@ -477,12 +477,7 @@
     fn supervise_children_clean_exit_returns_none() {
         // Both children exit cleanly. supervise_children should return
         // None without sending any kill signals.
-        let mut children: Vec<(
-            String,
-            usize,
-            std::process::Child,
-            Vec<std::thread::JoinHandle<()>>,
-        )> = Vec::new();
+        let mut children: Vec<super::spawn::SupervisedChild> = Vec::new();
         for lr in 0..2 {
             let child = Command::new("true")
                 .stdin(Stdio::null())
@@ -490,9 +485,9 @@
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn `true`");
-            children.push(("host".to_string(), lr, child, Vec::new()));
+            children.push(("host".to_string(), lr, vec![lr], child, Vec::new()));
         }
-        assert!(supervise_children(children).is_none());
+        assert!(supervise_children(children, None).is_none());
     }
 
     #[test]
@@ -517,12 +512,12 @@
             .spawn()
             .expect("spawn `sleep 60`");
         let children = vec![
-            ("host-fail".to_string(), 0, fail_child, Vec::new()),
-            ("host-sleep".to_string(), 1, sleep_child, Vec::new()),
+            ("host-fail".to_string(), 0, vec![0], fail_child, Vec::new()),
+            ("host-sleep".to_string(), 1, vec![1], sleep_child, Vec::new()),
         ];
 
         let start = std::time::Instant::now();
-        let err = supervise_children(children).expect("expected failure attribution");
+        let err = supervise_children(children, None).expect("expected failure attribution");
         let elapsed = start.elapsed();
 
         assert!(
@@ -657,4 +652,135 @@
             serde_json::json!({ "FLODL_CLUSTER_JSON": "deadbeef" });
         let err = FullCluster::from_value(&val).unwrap_err();
         assert!(err.to_string().contains("reserved"), "got: {err}");
+    }
+
+    // ---- elastic supervision ------------------------------------------------
+
+    /// Post-formation, a child failure is a membership event: its global
+    /// ranks land in the reported-deaths queue, peers are NOT terminated,
+    /// and a within-tolerance run returns success (degraded, not failed).
+    #[test]
+    fn supervise_elastic_tolerates_death_and_reports_ranks() {
+        use crate::distributed::cluster_coordinator::ReportedDeaths;
+        let fail_child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn failing child");
+        // The survivor exits cleanly after a short beat — under
+        // kill-all it would be SIGTERMed instead (exit code != 0 →
+        // this test would then trip the verdict below).
+        let survivor = Command::new("sh")
+            .args(["-c", "sleep 1; exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn survivor");
+        let children = vec![
+            ("host-a".to_string(), 0, vec![0], fail_child, Vec::new()),
+            ("host-b".to_string(), 1, vec![1], survivor, Vec::new()),
+        ];
+        let queue: ReportedDeaths =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dead = crate::distributed::controller::DeadRanks::new(2);
+        let elastic = ElasticSupervision {
+            reported_deaths: std::sync::Arc::clone(&queue),
+            dead_ranks: std::sync::Arc::clone(&dead),
+            max_failure: Some(
+                crate::distributed::max_failure::MaxFailureThreshold::Absolute(2),
+            ),
+            world_size: 2,
+            cohort_formed: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ),
+        };
+        let verdict = supervise_children(children, Some(elastic));
+        assert!(
+            verdict.is_none(),
+            "within-tolerance death must not fail the run: {verdict:?}"
+        );
+        assert_eq!(
+            queue.lock().unwrap().as_slice(),
+            &[0],
+            "failed child's global ranks must be reported to the coordinator"
+        );
+    }
+
+    /// Pre-formation the legacy kill-all stands even with an elastic
+    /// context attached — a half-formed NCCL cohort cannot absorb a
+    /// death.
+    #[test]
+    fn supervise_elastic_pre_formation_kills_all() {
+        let fail_child = Command::new("sh")
+            .args(["-c", "exit 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn failing child");
+        let sleeper = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let children = vec![
+            ("host-a".to_string(), 0, vec![0], fail_child, Vec::new()),
+            ("host-b".to_string(), 1, vec![1], sleeper, Vec::new()),
+        ];
+        let elastic = ElasticSupervision {
+            reported_deaths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            dead_ranks: crate::distributed::controller::DeadRanks::new(2),
+            max_failure: None,
+            world_size: 2,
+            cohort_formed: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+        };
+        let start = std::time::Instant::now();
+        let err = supervise_children(children, Some(elastic))
+            .expect("pre-formation failure must fail the run");
+        assert!(err.to_string().contains("host-a"), "got: {err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "sleeper must be SIGTERMed promptly pre-formation"
+        );
+    }
+
+    /// Deaths at or past max_failure fail the run even when every child
+    /// eventually exited cleanly (the coordinator's ShutdownWithSave
+    /// path produces clean exits).
+    #[test]
+    fn supervise_elastic_verdict_fails_past_threshold() {
+        let c0 = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let children = vec![("host-a".to_string(), 0, vec![0], c0, Vec::new())];
+        let dead = crate::distributed::controller::DeadRanks::new(3);
+        // Simulate the coordinator having processed reports up to the
+        // threshold (supervision reads the LEDGER for its verdict).
+        dead.declare_dead(0);
+        dead.declare_dead(1);
+        let elastic = ElasticSupervision {
+            reported_deaths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            dead_ranks: std::sync::Arc::clone(&dead),
+            max_failure: Some(
+                crate::distributed::max_failure::MaxFailureThreshold::Absolute(2),
+            ),
+            world_size: 3,
+            cohort_formed: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ),
+        };
+        let err = supervise_children(children, Some(elastic))
+            .expect("threshold breach must fail the run");
+        assert!(err.to_string().contains("max_failure exceeded"), "got: {err}");
     }

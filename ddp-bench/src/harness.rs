@@ -679,6 +679,11 @@ fn run_unified(
     if let Some(epoch) = config.checkpoint_at_epoch {
         builder = builder.checkpoint_at_epoch(epoch);
     }
+    if let Some(n) = config.max_failure {
+        builder = builder.max_failure(
+            flodl::MaxFailureThreshold::Absolute(n),
+        );
+    }
     if let Some(stem) = &config.resume_from {
         builder = builder.resume_from(stem.clone());
     }

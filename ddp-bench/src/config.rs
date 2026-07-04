@@ -225,6 +225,9 @@ pub struct RunConfig {
     /// `DdpBuilder::save_path` so the consensus forge writes `<stem>.fdl` +
     /// `<stem>.meta.json` on a mid-run checkpoint or unrecoverable failure.
     pub save_path: Option<String>,
+    /// Cluster stop threshold (absolute rank-loss count) forwarded to
+    /// `DdpBuilder::max_failure`. `None` tolerates any partial loss.
+    pub max_failure: Option<usize>,
     /// Resume a cluster run from a previously-saved bundle stem. The model
     /// factory loads `<stem>.fdl` consensus weights into each freshly-built
     /// replica, and the coordinator reconstructs the saved data-coverage so

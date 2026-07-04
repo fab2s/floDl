@@ -77,6 +77,11 @@ pub struct ClusterCoordinatorConfig {
     /// `start_with_dead_ranks`.
     /// `None` = elastic-membership disabled.
     pub dead_ranks: Option<Arc<crate::distributed::controller::DeadRanks>>,
+    /// Externally-reported death queue (launcher child supervision).
+    /// Drained each tick through the same side-effect chain as
+    /// heartbeat-staleness detection — a faster detector, not a second
+    /// policy. `None` when no external reporter exists.
+    pub reported_deaths: Option<crate::distributed::cluster_coordinator::ReportedDeaths>,
 
     /// Heartbeat staleness threshold (seconds). If a rank's last
     /// TimingMsg-frame arrival is older than this, the coord declares
@@ -296,6 +301,7 @@ impl ClusterCoordinatorConfig {
             partition_ratios: None,
             meta_controller: true,
             dead_ranks: None,
+            reported_deaths: None,
             heartbeat_timeout_secs: 30,
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
             local_ranks: Vec::new(),
@@ -520,6 +526,16 @@ impl ClusterCoordinatorConfig {
         ledger: Arc<crate::distributed::controller::DeadRanks>,
     ) -> Self {
         self.dead_ranks = Some(ledger);
+        self
+    }
+
+    /// Attach the externally-reported death queue (see
+    /// [`ClusterCoordinatorConfig::reported_deaths`]).
+    pub fn reported_deaths(
+        mut self,
+        queue: crate::distributed::cluster_coordinator::ReportedDeaths,
+    ) -> Self {
+        self.reported_deaths = Some(queue);
         self
     }
 

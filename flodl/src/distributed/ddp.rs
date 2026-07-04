@@ -731,6 +731,9 @@ docs/design/trainer-execution-tiers.md)")]
         if let Some(n) = cfg.max_grad_norm {
             b = b.max_grad_norm(n);
         }
+        if let Some(t) = cfg.max_failure {
+            b = b.max_failure(t);
+        }
         if let Some(n) = cfg.checkpoint_every {
             b = b.checkpoint_every(n);
         }

@@ -79,7 +79,7 @@ mod tests;
 pub use types::{SshConfig, FullCluster, FullController, FullWorker};
 
 use spawn::{
-    load_prebuild_envelope, supervise_children, build_local_spawn_command,
+    load_prebuild_envelope, supervise_children, ElasticSupervision, build_local_spawn_command,
     build_ssh_spawn_command, cleanup_remote_hosts_parallel, build_remote_bash_command,
     build_local_relay_command, build_remote_relay_bash_command,
     build_slim_envelope_for, forward_lines,
@@ -508,6 +508,13 @@ pub fn run_launcher_with_config(
         .as_ref()
         .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Nccl))
         .unwrap_or(true);
+    // Elastic supervision context, captured before `coord_config` is
+    // consumed. No coordinator → no elastic machinery to defer to →
+    // supervision keeps the legacy first-failure kill-all.
+    let has_coord = coord_config.is_some();
+    let elastic_max_failure = coord_config.as_ref().and_then(|c| c.max_failure);
+    let reported_deaths: crate::distributed::cluster_coordinator::ReportedDeaths =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
@@ -531,9 +538,14 @@ pub fn run_launcher_with_config(
             .map(|i| full.workers[i].ranks.clone())
             .unwrap_or_default();
         let dead_ranks = Arc::clone(&dead_ranks_shared);
+        // Fast external death reports from child supervision (below):
+        // the launcher knows a rank process exited within milliseconds;
+        // the coordinator drains this queue each tick through the same
+        // side-effect chain as heartbeat-staleness detection.
         config = config
             .local_ranks(local_ranks.clone())
-            .dead_ranks(dead_ranks);
+            .dead_ranks(dead_ranks)
+            .reported_deaths(Arc::clone(&reported_deaths));
 
         // Controller-hosted live dashboard. The sink owns a Monitor
         // that binds the HTTP port lazily on the first rank-emitted
@@ -654,16 +666,29 @@ pub fn run_launcher_with_config(
     // its UID. If it errors, ranks fail to rendezvous and surface their
     // own loud errors; we eprintln any failure here for diagnostics.
     // Skipped entirely on CPU backends, which never dial it in.
+    // Cohort-formation gate for elastic child supervision. Pre-formation
+    // a rank death must kill-all (peers are blocked in NCCL's
+    // connect-retry with no comm to abort and no rebuild machinery
+    // running); post-formation the coordinator's elastic membership owns
+    // the decision. NCCL: flipped by the rendezvous thread after a
+    // successful bootstrap. CPU: true from the start — there is no
+    // init-hang window (the controller's round-wait polls the shared
+    // ledger, so a pre-round death cannot wedge survivors).
+    let cohort_formed = Arc::new(std::sync::atomic::AtomicBool::new(!backend_is_nccl));
     if backend_is_nccl {
         let rdv_full = full.clone();
         let rdv_me = me.clone();
+        let formed_for_rdv = Arc::clone(&cohort_formed);
         let _ = thread::Builder::new()
             .name("flodl-cluster-rendezvous".to_string())
             .spawn(move || {
-                if let Err(e) =
-                    crate::distributed::rendezvous::run_controller_rendezvous(&rdv_full, &rdv_me)
-                {
-                    eprintln!("cluster launcher: rendezvous server error: {e}");
+                match crate::distributed::rendezvous::run_controller_rendezvous(
+                    &rdv_full, &rdv_me,
+                ) {
+                    Ok(()) => formed_for_rdv.store(true, std::sync::atomic::Ordering::SeqCst),
+                    Err(e) => {
+                        eprintln!("cluster launcher: rendezvous server error: {e}");
+                    }
                 }
             })
             .map_err(|e| {
@@ -730,7 +755,11 @@ pub fn run_launcher_with_config(
     cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
 
     // Spawn one child per rank across every host.
-    let mut children: Vec<(String, usize, std::process::Child, Vec<thread::JoinHandle<()>>)> =
+    // (host, local-rank-or-relay-sentinel, global ranks this child
+    // carries, child handle, output forwarders). The global-ranks vec is
+    // what elastic supervision reports dead on a non-zero exit: one rank
+    // for a rank child, the host's whole rank set for its relay.
+    let mut children: Vec<spawn::SupervisedChild> =
         Vec::with_capacity(full.world_size());
     // Fan-out is all-or-nothing. Any spawn / serialize failure inside the
     // closure takes the teardown path below instead of returning early:
@@ -811,7 +840,13 @@ pub fn run_launcher_with_config(
                 }
                 // `usize::MAX` local-rank sentinel marks the relay child in
                 // supervision diagnostics (it has no rank slot).
-                children.push((host.host.clone(), usize::MAX, child, forwarders));
+                children.push((
+                    host.host.clone(),
+                    usize::MAX,
+                    host.ranks.clone(),
+                    child,
+                    forwarders,
+                ));
             }
             for local_rank in 0..host.ranks.len() {
                 let envelope = build_slim_envelope_for(&full, host);
@@ -917,7 +952,13 @@ pub fn run_launcher_with_config(
                         forward_lines(err, prefix_clone, true);
                     }));
                 }
-                children.push((host.host.clone(), local_rank, child, forwarders));
+                children.push((
+                    host.host.clone(),
+                    local_rank,
+                    vec![global_rank],
+                    child,
+                    forwarders,
+                ));
             }
         }
 
@@ -933,7 +974,7 @@ pub fn run_launcher_with_config(
         // window (unlike the pid-based peer termination in supervise).
         // SIGKILL on a local ssh client drops its connection; the remote
         // cleanup pass below reaps whatever the trap wrapper misses.
-        for (_, _, mut child, forwarders) in children.drain(..) {
+        for (_, _, _, mut child, forwarders) in children.drain(..) {
             let _ = child.kill();
             let _ = child.wait();
             for f in forwarders {
@@ -953,7 +994,16 @@ pub fn run_launcher_with_config(
     // NCCL's connect-retry loop forever, and the launcher's old
     // sequential `wait()` never even reached the dead peer's status to
     // react.
-    let any_failure = supervise_children(children);
+    let any_failure = supervise_children(
+        children,
+        has_coord.then(|| ElasticSupervision {
+            reported_deaths: Arc::clone(&reported_deaths),
+            dead_ranks: Arc::clone(&dead_ranks_shared),
+            max_failure: elastic_max_failure,
+            world_size: full.world_size(),
+            cohort_formed: Arc::clone(&cohort_formed),
+        }),
+    );
 
     // Post-exit cleanup: belt-and-braces ssh-pkill on every remote host.
     // The remote-side trap wrapper handles SIGHUP-on-disconnect, but
