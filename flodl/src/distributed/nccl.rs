@@ -298,6 +298,7 @@ impl NcclComms {
             let abort_handle = Arc::new(NcclAbortHandle {
                 ptr: rank_handle,
                 aborted: AtomicBool::new(false),
+                guard: std::sync::Mutex::new(()),
             });
             comms.push(NcclRankComm {
                 handle: rank_handle,
@@ -383,6 +384,24 @@ impl std::fmt::Debug for NcclUniqueId {
 pub struct NcclAbortHandle {
     ptr: *mut c_void,
     aborted: AtomicBool,
+    /// ISSUE GUARD: mutual exclusion between enqueuing a collective and
+    /// aborting the communicator. `ncclCommAbort` FREES the comm, so an
+    /// abort landing in the gap BETWEEN two collectives turns the next
+    /// enqueue into a use-after-free (SIGSEGV — observed live: the
+    /// watchdog fired between the count-reduce and the param-reduce of
+    /// a weighted sync). Every enqueue takes this lock and re-checks
+    /// `aborted` under it; `abort()` takes it too, so the freed-comm
+    /// state is only ever observable as a loud pre-issue error, never
+    /// as a dangling pointer.
+    ///
+    /// No-deadlock argument: NCCL calls here are enqueue-fast — the
+    /// peer-wait happens in the CUDA stream synchronize, OUTSIDE this
+    /// lock (that is also why aborting a comm whose kernels are being
+    /// waited on works: the kernels die and the stream sync returns).
+    /// Residual: an enqueue wedging INSIDE NCCL (internal connect
+    /// stall) would hold the lock and block the watchdog — strictly
+    /// rarer than the deterministic use-after-free this lock removes.
+    guard: std::sync::Mutex<()>,
 }
 
 // SAFETY: ncclCommAbort is explicitly documented as thread-safe.
@@ -396,11 +415,32 @@ impl NcclAbortHandle {
     /// Thread-safe and idempotent. After abort, the communicator is destroyed;
     /// the owning [`NcclRankComm`]'s Drop becomes a no-op.
     pub fn abort(&self) -> Result<()> {
+        // Take the issue guard so no collective can be mid-enqueue (or
+        // start enqueuing) while the comm is being freed. A collective
+        // already blocked in its stream-wait is unaffected — that wait
+        // is outside the guard, and killing the comm's kernels is
+        // exactly how it gets released.
+        let _guard = self.guard.lock().expect("nccl issue guard poisoned");
         if !self.claim() {
             return Ok(()); // already aborted or destroyed
         }
         let err = unsafe { ffi::flodl_nccl_abort_rank(self.ptr) };
         check_err(err)
+    }
+
+    /// Take the issue guard for enqueuing one collective, failing loudly
+    /// if the communicator has been aborted. Callers hold the returned
+    /// guard across the FFI enqueue only — stream synchronization happens
+    /// after release.
+    pub(crate) fn lock_for_issue(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.guard.lock().expect("nccl issue guard poisoned");
+        if self.is_aborted() {
+            return Err(TensorError::new(
+                "NCCL communicator aborted (peer death); collective refused — \
+                 the caller must rebuild the comm on the surviving cohort",
+            ));
+        }
+        Ok(guard)
     }
 
     /// Whether this communicator has been aborted or destroyed.
@@ -486,6 +526,7 @@ impl NcclRankComm {
         let abort_handle = Arc::new(NcclAbortHandle {
             ptr: handle,
             aborted: AtomicBool::new(false),
+            guard: std::sync::Mutex::new(()),
         });
         Ok(NcclRankComm { handle, rank, world_size, abort_handle })
     }
@@ -520,6 +561,7 @@ impl NcclRankComm {
     ///   inside a single NCCL group call for efficiency).
     /// - `op`: reduction operation applied element-wise (e.g. `ReduceOp::Avg`).
     pub fn all_reduce(&self, tensors: &[&Tensor], op: ReduceOp) -> Result<()> {
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce_rank(
@@ -549,6 +591,7 @@ impl NcclRankComm {
         op: ReduceOp,
         stream: &CudaStream,
     ) -> Result<()> {
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce_rank(
@@ -582,6 +625,7 @@ impl NcclRankComm {
                 self.world_size
             )));
         }
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_broadcast_rank(
@@ -612,6 +656,7 @@ impl NcclRankComm {
                 self.world_size
             )));
         }
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_broadcast_rank(
