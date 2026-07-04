@@ -22,7 +22,7 @@ scales out to multi-host clusters via `fdl.cluster.yml` or
 use flodl::*;
 use std::sync::Arc;
 
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input  = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
     cross_entropy_loss(&model.forward(&input)?, &target)

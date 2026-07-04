@@ -76,6 +76,41 @@ Today these collapse into one process tree; tomorrow they should
 be deployable independently. See "Controller / averager separation"
 below.
 
+### Network reachability (two planes, one is a full mesh)
+
+flodl's own transport is **hub-and-spoke**: every worker dials the
+controller, nothing else. From `controller.port` (base, default 1337):
+
+| Port | Bind | Purpose |
+|---|---|---|
+| base | `0.0.0.0` | NCCL-UID bootstrap rendezvous |
+| base+1 | — | reserved (dashboard side-channel) |
+| base+2 | `0.0.0.0` | CPU-averaging `ClusterController` |
+| base+3 | `0.0.0.0` | `ClusterCoordinator` control channel |
+| base+4 / +5 | `127.0.0.1` | per-host relay loopback (rank ↔ relay) — **not** cross-host |
+
+So for flodl's transport, only the controller needs inbound from
+workers; workers need no inbound from each other, and the `+4/+5` relay
+ports never leave `localhost`. This is NAT-friendly on the control side.
+
+The **NCCL data plane is a separate, full-mesh network** and is the
+cloud gotcha. On the NCCL backend, once the UID is exchanged via
+rendezvous, NCCL forms its communicator with `ncclCommInitRank` and
+opens **direct rank-to-rank connections on ephemeral ports** over the
+interface named by each host's `nccl_socket_ifname` (required on any
+multi-host cluster — see `rendezvous.rs`). This needs **all-to-all TCP
+among the workers**, which flodl neither brokers nor sees.
+
+On a cloud with default-deny security groups or NAT between workers,
+this manifests as a silent hang inside `ncclCommInitRank` with no
+flodl-level diagnostic (flodl's own hub-and-spoke channels connect
+fine; only NCCL's mesh stalls). Deployment requirement: open all-to-all
+TCP among the worker nodes on the `nccl_socket_ifname` interface, and
+pin NCCL's port range (`NCCL_PORT_RANGE` / IB/socket env) if the
+security group must enumerate ports. The CPU-averaging backend has no
+mesh — it routes only through the controller — so it is the fallback
+for topologies where an all-to-all NCCL mesh is not achievable.
+
 ## Principles
 
 These principles together produced the testing-convention slice and

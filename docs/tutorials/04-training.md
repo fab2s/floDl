@@ -180,7 +180,7 @@ optimizer step, the gradient sync, and the device replication.
 ```rust
 // Step closure: takes the replica's model and one batch, returns the
 // loss Variable. The framework calls backward + optimizer step + sync.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
     let pred = model.forward(&input)?;

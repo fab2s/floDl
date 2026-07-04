@@ -173,7 +173,7 @@ the universal `Trainer` takes a step closure and owns the loop:
 
 ```rust
 // One step: forward + loss, returns the loss Variable.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].clone(), false);
     mse_loss(&model.forward(&input)?, &target)

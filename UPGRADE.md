@@ -1,15 +1,103 @@
-# Upgrading to floDl 0.5.0
+# Upgrading floDl
+
+Two upgrades are documented here, newest first: the unreleased
+process-model distributed rewrite, then the 0.5.0 CLI maturity pass.
+
+---
+
+## Upgrading past 0.5.x (unreleased): the process-model distributed rewrite
+
+This is the largest pre-1.0 change to the `flodl` crate's public
+surface. Single-device and single-host code is unaffected; the breaks
+are all in the multi-GPU / cluster distributed layer. Removal targets
+are not version-pinned (the release is unversioned as of writing); this
+guide describes the shape of each change.
+
+### The in-process multi-GPU engine is gone; multi-GPU is process-per-rank
+
+`Trainer::builder(...).run()` and `Trainer::run(...)` now transparently
+auto-promote to process-per-rank fan-out when 2+ GPUs are visible (or a
+cluster overlay is active). The training entry point is unchanged — the
+same code runs single-device, single-host multi-GPU, and multi-host
+cluster. You do not launch anything differently.
+
+`Ddp::wrap` remains as the explicit per-rank bypass primitive, but its
+signature changed from the old multi-model/multi-device thread form to
+one rank per call:
+
+```rust
+// before: one call wrapped every local replica
+// Ddp::wrap(&[&model0, &model1], &[dev0, dev1])?
+
+// now: one call per rank (one model, one device, this rank's global id,
+// the shared rendezvous)
+let ddp = Ddp::wrap(&model, device, global_rank, &rendezvous)?;
+```
+
+### Removed: the 0.3.0-deprecated compatibility surface
+
+These aliased `Trainer::builder()` for two minor releases and are now
+gone:
+
+| Removed | Replacement |
+|---|---|
+| `AsyncDdp` / `AsyncDdpBuilder` / `AsyncDdpConfig` | `DdpHandle` / `DdpBuilder` / `DdpRunConfig` (create via `Trainer::builder()`) |
+| `DdpHandle::auto()` / `auto_with()` / `builder()` | `Trainer::builder(model_factory, optim_factory, train_fn)` |
+
+### Deprecated: the self-driven `Trainer::setup` tier
+
+`Trainer::setup` / `setup_with` / `setup_head` / `setup_head_with` and
+their `DdpConfig` config bag are deprecated (they still compile). They
+are the only path that schedules without the controller, so they miss
+the convergence guard, LR-aware meta-controller, outer optimizer,
+elastic membership, and checkpoint orchestration. Move to
+`Trainer::builder(...)` (own the loop-body via the step closure) or
+`Trainer::run(...)` (framework owns the loop). The user-owned-loop
+ergonomics return later as a cooperative tier on the controller engine
+(see `docs/design/trainer-execution-tiers.md`).
+
+### Removed: `DataLoader::distributed`
+
+Data sharding is now owned by the cluster coordinator (it dispatches
+each rank's per-epoch partition from the shared dataset). Build a plain
+`DataLoader` / pass the dataset to `Trainer::builder(...).dataset(...)`;
+the framework shards it.
+
+### cluster.yml: structured `controller:` / `workers:` schema
+
+The flat top-level keys are replaced by nested blocks:
+
+```yaml
+# before
+master_addr: 192.168.1.10
+master_port: 29500
+workers:
+  - host: gpu-1
+    ssh_user: ubuntu
+    ssh_port: 22
+
+# now
+cluster:
+  controller:
+    host: 192.168.1.10          # was master_addr
+    port: 1337                   # was master_port
+    path: /home/me/project       # controller's view of the shared root
+  workers:
+    - host: gpu-1
+      ssh:                       # ssh_* knobs move into an ssh: sub-block
+        user: ubuntu
+        port: 22
+```
+
+`fdl probe` flags the legacy flat keys with migration hints.
+
+---
+
+## Upgrading to floDl 0.5.0 (the fdl CLI maturity pass)
 
 floDl 0.5.0 is the **fdl CLI maturity pass**. The framework API stays
 compatible with 0.4.0; the only breaking change lives in the `fdl.yml`
 manifest and the `#[derive(FdlArgs)]` attribute contract.
-
-This document is a quick upgrade guide. For the full per-change log,
-see [CHANGELOG.md](CHANGELOG.md); for the framework's public surface,
-nothing you wrote against 0.4.0 needs to change unless you were using
-`#[derive(FdlArgs)]` with one of the flags now reserved.
-
----
 
 ## TL;DR
 

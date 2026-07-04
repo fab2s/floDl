@@ -35,7 +35,7 @@ let dataset: Arc<dyn BatchDataSet> = Arc::new(MyDataset::new());
 
 // One training step: forward + loss, returns the loss Variable.
 // The framework owns backward, optimizer step, gradient sync.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input  = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
     cross_entropy_loss(&model.forward(&input)?, &target)
@@ -56,8 +56,8 @@ let state: TrainedState = handle.join()?;  // params + buffers (CPU)
 
 `state.params` / `state.buffers` are CPU tensors aligned with
 `build_model_on(Device::CPU)?.parameters()` and `.buffers()`. Drop them
-into a fresh CPU model for inference, or feed them into
-`Trainer::resume_from` to continue training.
+into a fresh CPU model for inference, or continue training via
+`Trainer::builder(...).resume_from(stem)` (or `TrainerConfig::resume_from`).
 
 ### Graph-shape one-liner - `Trainer::setup`
 
@@ -495,8 +495,8 @@ when you want to drive the same shape from a test.
 
 ## Resume + checkpoints
 
-`Trainer::resume_from(stem)` (and `TrainerConfig::resume_from`) loads a
-checkpoint bundle and continues training. The bundle is three files:
+`Trainer::builder(...).resume_from(stem)` (or `TrainerConfig::resume_from`
+on the config-bag entry) loads a checkpoint bundle and continues training. The bundle is three files:
 
 | File | Contents |
 |---|---|
