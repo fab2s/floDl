@@ -1380,3 +1380,49 @@ mod spec_prior {
     }
 }
 
+
+#[cfg(test)]
+mod meta_nudge_tests {
+    use super::*;
+
+    // H12 regression: when the meta-controller nudges the anchor down and
+    // a grow proposal was staged this cycle (from the PRE-nudge anchor),
+    // the nudge must survive a subsequent guard-`Stable`
+    // `commit_proposed_anchor`. The meta path (`observe_meta`) achieves
+    // this by calling `discard_proposed_anchor` right after the nudge —
+    // exactly what the guard's own NudgeDown branch does.
+    #[test]
+    fn nudge_then_discard_survives_a_later_commit() {
+        let mut el = ElChe::new(2, 10);
+        // Stage a grow proposal as report_timing would (private access).
+        el.proposed_anchor = Some(ProposedAnchor::Grow(20));
+        el.nudge_anchor_down(0.5); // meta LR-cliff nudge: 10 -> 5
+        assert_eq!(el.anchor(), 5);
+        el.discard_proposed_anchor(); // meta path invalidates the stale grow
+        el.commit_proposed_anchor(); // guard verdict Stable, later in the cycle
+        assert_eq!(
+            el.anchor(),
+            5,
+            "meta nudge must survive: discard drops the pre-nudge grow so \
+             commit has nothing to apply"
+        );
+    }
+
+    // The mirror image — this is the BUG the fix removes. Without the
+    // discard, commit applies the pre-nudge grow target and clobbers the
+    // nudge. Kept as executable documentation of why the discard is
+    // load-bearing (NOT the desired behavior).
+    #[test]
+    fn nudge_without_discard_is_clobbered_by_commit() {
+        let mut el = ElChe::new(2, 10);
+        el.proposed_anchor = Some(ProposedAnchor::Grow(20));
+        el.nudge_anchor_down(0.5); // 10 -> 5
+        assert_eq!(el.anchor(), 5);
+        el.commit_proposed_anchor(); // no discard: the grow wins
+        assert_eq!(
+            el.anchor(),
+            20,
+            "documents the H12 bug: an un-discarded grow overwrites the nudge"
+        );
+    }
+}

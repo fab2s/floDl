@@ -401,3 +401,51 @@ fn test_worker_send_final_snapshot() {
 // Coordinator and were removed with it. Final-state collection on the
 // process path is covered under `cluster_coordinator/tests/`.
 
+
+// H13: ElCheConfig.max_overshoot must reach the coordinator config. It
+// was written into the config but never read by
+// build_coord_config_from_builder, so the coordinator always ran the
+// auto default (initial=3, ceiling=15, auto=true) and the knob was
+// silently inert. A user-set value pins the bound and disables
+// auto-tune (the `overshoot_auto` contract).
+#[test]
+fn max_overshoot_plumbs_into_coord_config_and_pins_it() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let user_config = DdpRunConfig::new().with_max_overshoot(7);
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &user_config,
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert_eq!(coord_config.overshoot_initial, 7);
+    assert_eq!(coord_config.overshoot_ceiling, 7);
+    assert!(
+        !coord_config.overshoot_auto,
+        "a user-set max_overshoot pins the bound and disables auto-tune"
+    );
+}
+
+// Default (unset) leaves the coordinator's auto-tune defaults intact.
+#[test]
+fn unset_max_overshoot_leaves_auto_tune_defaults() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let user_config = DdpRunConfig::new();
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &user_config,
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert!(
+        coord_config.overshoot_auto,
+        "unset max_overshoot keeps auto-tune on"
+    );
+    assert_eq!(coord_config.overshoot_ceiling, 15);
+}

@@ -47,6 +47,16 @@ impl ClusterCoordinator {
         if let crate::distributed::lr_event_meta::MetaAction::NudgeDown { factor } = action {
             let old = self.el_che.anchor();
             self.el_che.nudge_anchor_down(factor);
+            // Invalidate any grow proposal report_timing staged THIS cycle
+            // (computed from the pre-nudge anchor) and latch growth off —
+            // exactly what the guard's own NudgeDown branch does. Without
+            // this, a guard verdict of `Stable` later in `finish_averaging_head`
+            // calls `commit_proposed_anchor()`, which sets `anchor = n` (the
+            // pre-nudge grow target) and OVERWRITES the nudge we just applied,
+            // silently defeating the meta-controller in its intended-actuation
+            // window (it fires proactively on an LR cliff, BEFORE divergence
+            // rises, so guard-`Stable` + meta-`NudgeDown` is the common case).
+            self.el_che.discard_proposed_anchor();
             let new = self.el_che.anchor();
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::MetaNudge {

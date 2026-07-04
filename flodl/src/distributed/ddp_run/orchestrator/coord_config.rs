@@ -118,6 +118,24 @@ pub(crate) fn build_coord_config_from_builder(
     };
     coord_config = coord_config.with_convergence_guard(guard);
 
+    // max_overshoot: the CpuAsync streaming lookahead bound. A user-set
+    // value pins the bound and disables auto-tune (matches the
+    // `overshoot_auto` contract: "true when the user did not set
+    // max_overshoot explicitly"). Was previously written into ElCheConfig
+    // but never read here, so the coordinator always ran the auto default
+    // (3→15) and the knob was silently inert. It only has effect on the
+    // Async path, so warn loudly if set on a non-Async policy rather than
+    // ignore it.
+    if let Some(n) = config.elche.max_overshoot {
+        if policy != ApplyPolicy::Async {
+            eprintln!(
+                "fdl: max_overshoot={n} is ignored outside CpuAsync \
+                 (mode resolves to policy {policy:?}); the async streaming \
+                 lookahead bound has no effect here"
+            );
+        }
+        coord_config = coord_config.overshoot(n, n, false);
+    }
     if let Some(threshold) = config.max_failure {
         coord_config = coord_config.max_failure(threshold);
     }
