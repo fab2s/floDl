@@ -375,16 +375,16 @@ fn impl_enum_derive(
             }
 
             fn render_help_path(args: &[::std::string::String]) -> ::std::string::String {
-                // Skip the program name and any leading flags; the first
-                // bare token is the subcommand. Delegate to its (possibly
-                // nested) help; fall back to the command list.
-                let mut __idx = 1usize;
-                while __idx < args.len() && args[__idx].starts_with('-') {
-                    __idx += 1;
-                }
-                if __idx < args.len() {
-                    let __tail = &args[__idx..];
-                    match args[__idx].as_str() {
+                // The subcommand is args[1] (mirrors `try_parse_from`). A
+                // leading flag or no token falls to the top-level command list.
+                // Scanning past leading flags to the first bare token would
+                // mis-pick an option value (e.g. `42` in `--seed 42 train`) as
+                // the subcommand.
+                if let ::std::option::Option::Some(__sub) =
+                    args.get(1).filter(|s| !s.starts_with('-'))
+                {
+                    let __tail = &args[1..];
+                    match __sub.as_str() {
                         #( #help_path_arms )*
                         _ => {}
                     }

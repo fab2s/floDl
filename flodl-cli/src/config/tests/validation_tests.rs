@@ -180,6 +180,20 @@ fn validate_tail_tree_no_subcommand_is_ok() {
 }
 
 #[test]
+fn validate_tail_defers_when_option_precedes_subcommand() {
+    // M25: `--seed 42 train` must NOT be rejected as "unknown command `42`".
+    // A leading flag means the subcommand can't be identified here (the value
+    // `42` is not a subcommand); defer to the binary's authoritative parse
+    // rather than mistake the option value for the command.
+    let schema = strict_tree_schema();
+    validate_tail(
+        &["--seed".into(), "42".into(), "train".into()],
+        &schema,
+    )
+    .expect("a leading option before the subcommand must defer, not error");
+}
+
+#[test]
 fn validate_presets_strict_rejects_unknown_option() {
     let schema = strict_schema_with_model_option();
     let mut commands = BTreeMap::new();

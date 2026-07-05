@@ -109,17 +109,20 @@ fn strict_choices_to_strings(cs: &[serde_json::Value]) -> Vec<String> {
 /// The tokenizer from [`crate::args::parser`] is reused so "did you
 /// mean" suggestions, cluster, and equals handling come for free.
 pub fn validate_tail(tail: &[String], schema: &Schema) -> Result<(), String> {
-    // Variant-shaped CLI (tree schema): resolve to the invoked
-    // subcommand's leaf, then validate the rest against it. The first bare
-    // (non-flag) token is the subcommand; flags before it (if any) are
-    // globals already peeled by the fdl wrapper, so we don't second-guess
-    // them — the binary re-parses authoritatively.
+    // Variant-shaped CLI (tree schema): resolve to the invoked subcommand's
+    // leaf, then validate the rest against it. The subcommand is `tail[0]`:
+    // globals are peeled by the fdl wrapper and a branch node declares no
+    // options of its own (a node is leaf XOR branch — see `Schema.commands`),
+    // so any correct invocation has the subcommand first. If the tail is empty
+    // (nothing typed yet) OR starts with a flag (a misplaced leaf option, or
+    // its value), we can't confidently identify the subcommand here: a naive
+    // scan for the first bare token would mistake `42` in `--seed 42 train`
+    // for the subcommand and emit a bogus "unknown command `42`". Defer to the
+    // binary's authoritative re-parse instead.
     if !schema.commands.is_empty() {
-        let Some(pos) = tail.iter().position(|t| !t.starts_with('-')) else {
-            // No subcommand token typed yet — nothing leaf-level to check.
+        let Some(sub) = tail.first().filter(|t| !t.starts_with('-')) else {
             return Ok(());
         };
-        let sub = &tail[pos];
         let Some(child) = schema.commands.get(sub) else {
             let names: Vec<&str> = schema.commands.keys().map(String::as_str).collect();
             return Err(match crate::args::parser::suggest(&names, sub) {
@@ -130,7 +133,7 @@ pub fn validate_tail(tail: &[String], schema: &Schema) -> Result<(), String> {
                 ),
             });
         };
-        return validate_tail(&tail[pos + 1..], child);
+        return validate_tail(&tail[1..], child);
     }
 
     let spec = schema_to_args_spec(schema);
@@ -350,4 +353,3 @@ fn merge_output(base: &Option<OutputConfig>, over: &Option<OutputConfig>) -> Out
         monitor: merge_field!(base, over, monitor),
     }
 }
-
