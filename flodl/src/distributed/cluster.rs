@@ -623,12 +623,16 @@ pub(crate) fn resolve_hostname() -> Result<String> {
         ))
     })?;
     if !out.status.success() {
-        return Err(TensorError::new(
-            "cluster: `hostname` command exited non-zero",
-        ));
+        return Err(TensorError::new(&format!(
+            "cluster: `hostname` command exited non-zero \
+             (set {ENV_HOST_OVERRIDE} to override)"
+        )));
     }
     let s = String::from_utf8(out.stdout).map_err(|e| {
-        TensorError::new(&format!("cluster: hostname output not UTF-8: {e}"))
+        TensorError::new(&format!(
+            "cluster: hostname output not UTF-8: {e} \
+             (set {ENV_HOST_OVERRIDE} to override)"
+        ))
     })?;
     Ok(s.trim().to_string())
 }

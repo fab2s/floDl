@@ -299,7 +299,7 @@ fn check_remote_abi(
 /// worse than the status quo; the real fan-out ssh surfaces a genuine
 /// connectivity error anyway. The probe only ever ADDS loud errors for
 /// definitive ABI mismatches.
-fn probe_remote_abi(worker: &ClusterWorker) -> Result<Option<String>, String> {
+fn probe_remote_abi(worker: &ClusterWorker) -> Result<Vec<String>, String> {
     let target = worker
         .ssh
         .as_ref()
@@ -310,34 +310,56 @@ fn probe_remote_abi(worker: &ClusterWorker) -> Result<Option<String>, String> {
     apply_worker_ssh_opts(&mut cmd, worker);
     cmd.arg(target);
     // uname line, then the ldd banner (its version line lands on stderr
-    // for glibc, stdout for some — capture both, sentinel-separated).
-    cmd.arg("uname -m; echo __FLODL_LDD__; ldd --version 2>&1 | head -1");
+    // for glibc, stdout for some — capture both, sentinel-separated), then a
+    // `pkill` availability probe (belt-and-braces orphan-cleanup depends on
+    // it; see the warning below). All sentinel-delimited on one round-trip.
+    cmd.arg(
+        "uname -m; echo __FLODL_LDD__; ldd --version 2>&1 | head -1; \
+         echo __FLODL_PKILL__; command -v pkill >/dev/null 2>&1 \
+         && echo present || echo absent",
+    );
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
-            return Ok(Some(format!(
-                "host {:?}: ABI pre-check ssh spawn failed ({e}); skipping \
+            return Ok(vec![format!(
+                "host {:?}: remote pre-check ssh spawn failed ({e}); skipping \
                  (a real mismatch would surface at fan-out)",
                 worker.host,
-            )));
+            )]);
         }
     };
     if !output.status.success() {
-        return Ok(Some(format!(
-            "host {:?}: ABI pre-check ssh exited {}; skipping (a real \
+        return Ok(vec![format!(
+            "host {:?}: remote pre-check ssh exited {}; skipping (a real \
              mismatch would surface at fan-out)",
             worker.host, output.status,
-        )));
+        )]);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (uname_m, ldd) = stdout
+    let (uname_m, rest) = stdout
         .split_once("__FLODL_LDD__")
         .unwrap_or((stdout.as_ref(), ""));
+    let (ldd, pkill_field) = rest
+        .split_once("__FLODL_PKILL__")
+        .unwrap_or((rest, ""));
     let controller_arch = std::env::consts::ARCH;
-    match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
-        AbiCheck::Ok { warning } => Ok(warning),
-        AbiCheck::Incompatible(msg) => Err(msg),
+    let mut warnings = match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
+        AbiCheck::Ok { warning } => warning.into_iter().collect::<Vec<_>>(),
+        AbiCheck::Incompatible(msg) => return Err(msg),
+    };
+    // Only warn on an EXPLICIT "absent" — an empty/garbled field (older
+    // remote, parse hiccup) is indeterminate and must not false-warn, mirroring
+    // the empty-arch discipline in `check_remote_abi`.
+    if pkill_field.trim() == "absent" {
+        warnings.push(format!(
+            "host {:?}: `pkill` not found on the remote — belt-and-braces \
+             orphan cleanup is disabled; teardown relies solely on the \
+             per-host trap wrapper (kills by known pid, no external tool). \
+             Install procps if you want pre-spawn stale-orphan clearing.",
+            worker.host,
+        ));
     }
+    Ok(warnings)
 }
 
 fn prebuild_one_worker(
@@ -373,7 +395,7 @@ fn prebuild_one_worker(
     // controller-vs-remote arch or libc mismatch would fail at fan-out
     // with a cryptic `Exec format error`. Fail fast + loud here instead;
     // a definitive mismatch aborts, an unreachable probe only warns.
-    if let Some(warning) = probe_remote_abi(worker)? {
+    for warning in probe_remote_abi(worker)? {
         eprintln!("fdl: {warning}");
     }
     // Derive features + docker service from the YAML-declared `arch:`
