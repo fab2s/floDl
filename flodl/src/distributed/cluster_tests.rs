@@ -458,7 +458,7 @@
     #[test]
     fn my_rank_single_rank_host() {
         // master_envelope: ranks=[0], local_devices=[0]. Single-rank host.
-        // FLODL_LOCAL_RANK=0 still must be set per the explicit-overlay
+        // FLODL_INTERNAL_LOCAL_RANK=0 still must be set per the explicit-overlay
         // contract -- launcher always injects it.
         let c = LocalCluster::from_value(&master_envelope()).unwrap();
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -473,5 +473,23 @@
         }
         assert_eq!(global_rank, 0);
         assert_eq!(device, Device::CUDA(0));
+    }
+
+    #[test]
+    fn reserved_env_key_predicate() {
+        // FLODL_INTERNAL_ prefix: the whole launcher-private bulk.
+        assert!(is_reserved_cluster_env_key("FLODL_INTERNAL_CLUSTER_JSON"));
+        assert!(is_reserved_cluster_env_key("FLODL_INTERNAL_LOCAL_RANK"));
+        assert!(is_reserved_cluster_env_key("FLODL_INTERNAL_ANYTHING_NEW"));
+        // Named exceptions: user-facing elsewhere, reserved in the env-map.
+        assert!(is_reserved_cluster_env_key("CUDA_VISIBLE_DEVICES"));
+        assert!(is_reserved_cluster_env_key(ENV_HOST_OVERRIDE)); // FLODL_HOST_NAME
+        assert!(is_reserved_cluster_env_key("FDL_ENV"));
+        // Deliberately NOT reserved: user-facing FLODL_ vars + arbitrary
+        // tuning keys stay overridable.
+        assert!(!is_reserved_cluster_env_key("FLODL_VERBOSITY"));
+        assert!(!is_reserved_cluster_env_key("FLODL_DASHBOARD_BIND"));
+        assert!(!is_reserved_cluster_env_key("NCCL_P2P_DISABLE"));
+        assert!(!is_reserved_cluster_env_key("LD_LIBRARY_PATH"));
     }
 

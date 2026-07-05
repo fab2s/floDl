@@ -126,7 +126,7 @@ pub(crate) fn dispatch_config(
 
     // Cluster dispatch sources: YAML `cluster:` block, or synthesized from
     // `--gpus` on a cluster-aware command (loopback, one host, N ranks).
-    // Recursion guard skips both paths when `FLODL_CLUSTER_JSON` is already
+    // Recursion guard skips both paths when `FLODL_INTERNAL_CLUSTER_JSON` is already
     // set in env -- we're a spawned child of a parent launcher.
     let cluster_chain: Option<&[Option<bool>]> = match &outcome {
         WalkOutcome::RunScript { cluster_chain, .. } => Some(cluster_chain.as_slice()),

@@ -47,15 +47,15 @@
         );
         // Exports the relay spec from the stdin var and runs the binary...
         assert!(
-            cmd.contains("FLODL_RELAY_JSON=\"$__FLODL_ENVELOPE\""),
+            cmd.contains("FLODL_INTERNAL_RELAY_JSON=\"$__FLODL_ENVELOPE\""),
             "relay env must expand the stdin var: {cmd}"
         );
         assert!(cmd.contains("cd '/opt/flodl'"), "missing cd: {cmd}");
         assert!(cmd.contains("fdl 'ddp-bench'"), "missing fdl cmd: {cmd}");
         assert!(cmd.contains("--model") && cmd.contains("resnet-graph"));
         // ...but never the rank-role env vars or CUDA scoping.
-        assert!(!cmd.contains("FLODL_CLUSTER_JSON="), "leaked rank envelope: {cmd}");
-        assert!(!cmd.contains("FLODL_LOCAL_RANK="), "leaked rank slot: {cmd}");
+        assert!(!cmd.contains("FLODL_INTERNAL_CLUSTER_JSON="), "leaked rank envelope: {cmd}");
+        assert!(!cmd.contains("FLODL_INTERNAL_LOCAL_RANK="), "leaked rank slot: {cmd}");
         assert!(!cmd.contains("CUDA_VISIBLE_DEVICES="), "relay must not scope CUDA: {cmd}");
         // Trap wrapper for clean signal forwarding.
         assert!(cmd.contains("trap ") && cmd.contains("__flodl_pid"), "missing trap: {cmd}");
@@ -248,9 +248,9 @@
         // into the child's env — never spliced into the argv string.
         assert!(s.starts_with("IFS= read -r __FLODL_ENVELOPE\n"));
         assert!(s.contains("cd '/srv/flodl' && "));
-        assert!(s.contains("FLODL_CLUSTER_JSON=\"$__FLODL_ENVELOPE\""));
+        assert!(s.contains("FLODL_INTERNAL_CLUSTER_JSON=\"$__FLODL_ENVELOPE\""));
         assert!(s.contains("FLODL_HOST_NAME='host-b'"));
-        assert!(s.contains("FLODL_LOCAL_RANK=0"));
+        assert!(s.contains("FLODL_INTERNAL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
         assert!(s.contains("fdl 'train' '--epochs' '10' &\n"));
         // The trap forwards TERM, then escalates to KILL after a grace
@@ -595,7 +595,7 @@
         assert!(std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none());
         clear_role_env();
 
-        // Relay child: only FLODL_RELAY_JSON set.
+        // Relay child: only FLODL_INTERNAL_RELAY_JSON set.
         unsafe { std::env::set_var(ENV_RELAY_JSON, "deadbeef") };
         assert!(!promote_programmatic_cluster(&full));
         assert!(std::env::var_os(ENV_FULL_CLUSTER_JSON).is_none());
@@ -628,7 +628,7 @@
             val["env"] = serde_json::json!({ k: v });
             FullCluster::from_value(&val)
         };
-        for reserved in ["CUDA_VISIBLE_DEVICES", "FLODL_LOCAL_RANK", "FLODL_ANYTHING"] {
+        for reserved in ["CUDA_VISIBLE_DEVICES", "FLODL_INTERNAL_LOCAL_RANK", "FLODL_ANYTHING"] {
             let err = with_env(reserved, "x").unwrap_err();
             assert!(
                 err.to_string().contains("reserved"),
@@ -656,7 +656,7 @@
     fn worker_env_block_rejects_reserved_keys() {
         let mut val = canonical_full_json();
         val["workers"][0]["env"] =
-            serde_json::json!({ "FLODL_CLUSTER_JSON": "deadbeef" });
+            serde_json::json!({ "FLODL_INTERNAL_CLUSTER_JSON": "deadbeef" });
         let err = FullCluster::from_value(&val).unwrap_err();
         assert!(err.to_string().contains("reserved"), "got: {err}");
     }

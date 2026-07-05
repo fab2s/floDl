@@ -377,7 +377,7 @@ impl DdpHandle {
         // under threshold) and never reach this site.
         //
         // `LocalCluster::from_env` returns `Ok(None)` ONLY when
-        // `FLODL_CLUSTER_JSON` is unset, so any `Err` here unambiguously
+        // `FLODL_INTERNAL_CLUSTER_JSON` is unset, so any `Err` here unambiguously
         // identifies a cluster-rank context with a fatal parse failure.
         match crate::distributed::cluster::LocalCluster::from_env() {
             Ok(Some(cluster)) => {
@@ -419,7 +419,7 @@ impl DdpHandle {
                 };
             }
             Ok(None) => {
-                // Not a cluster rank (FLODL_CLUSTER_JSON unset). Fall
+                // Not a cluster rank (FLODL_INTERNAL_CLUSTER_JSON unset). Fall
                 // through to the single-host path below.
             }
             Err(e) => {

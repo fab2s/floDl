@@ -30,18 +30,18 @@
 //!   children.
 //!
 //! - [`crate::distributed::cluster::ENV_CLUSTER_JSON`]
-//!   (`FLODL_CLUSTER_JSON`): hex-encoded slim per-host envelope, mirroring
+//!   (`FLODL_INTERNAL_CLUSTER_JSON`): hex-encoded slim per-host envelope, mirroring
 //!   the existing rank-side wire format. Set by the launcher (not fdl-cli)
 //!   when spawning each rank child. Read by [`LocalCluster::from_env`].
 //!
-//! - [`crate::distributed::cluster::ENV_LOCAL_RANK`] (`FLODL_LOCAL_RANK`):
+//! - [`crate::distributed::cluster::ENV_LOCAL_RANK`] (`FLODL_INTERNAL_LOCAL_RANK`):
 //!   integer index into the slim envelope's `host.ranks`. Set by the
 //!   launcher when spawning each rank child. Read by
 //!   [`crate::distributed::cluster::LocalCluster::my_rank`].
 //!
 //! Role detection table:
 //!
-//! | `FLODL_FULL_CLUSTER_JSON` | `FLODL_CLUSTER_JSON` | `FLODL_LOCAL_RANK` | Role |
+//! | `FLODL_FULL_CLUSTER_JSON` | `FLODL_INTERNAL_CLUSTER_JSON` | `FLODL_INTERNAL_LOCAL_RANK` | Role |
 //! |---|---|---|---|
 //! | unset | unset | unset | [`Role::SingleDevice`] |
 //! | unset | set | set | [`Role::Rank`] |
@@ -89,21 +89,21 @@ use spawn::{
 /// Environment variable carrying the *full* cluster topology to the
 /// launcher process. Set by fdl-cli; consumed only by [`dispatch`]. Not
 /// propagated to rank children (each child gets a slim per-host envelope
-/// instead via `FLODL_CLUSTER_JSON`).
+/// instead via `FLODL_INTERNAL_CLUSTER_JSON`).
 pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
 
 /// Environment variable carrying the per-host relay spec (hex-encoded
 /// JSON [`RelaySpec`]). Set by the launcher on the relay child it spawns
 /// per host; consumed only by [`dispatch`] (→ [`Role::Relay`]) and
 /// [`run_relay`]. Mutually exclusive with the launcher/rank env vars.
-pub const ENV_RELAY_JSON: &str = "FLODL_RELAY_JSON";
+pub const ENV_RELAY_JSON: &str = "FLODL_INTERNAL_RELAY_JSON";
 
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
 /// fdl-cli when invoking the user binary as a launcher; required by the
 /// ssh fan-out path. Local fork+exec doesn't consume this — the launcher
 /// re-execs `current_exe()` directly with its own argv.
-pub const ENV_FDL_CMD: &str = "FLODL_FDL_CMD";
+pub const ENV_FDL_CMD: &str = "FLODL_INTERNAL_FDL_CMD";
 
 /// Environment variable carrying the overlay-env name (e.g. `cluster`) so
 /// the remote `fdl <cmd>` invocation resolves the same overlay-merged
@@ -121,7 +121,7 @@ pub const ENV_FDL_ENV: &str = "FDL_ENV";
 ///
 /// JSON shape per host: `{ "bin": "<path-relative-to-host.path>",
 /// "ld_library_path": "<absolute path>" }`.
-pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
+pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_INTERNAL_PREBUILD_PER_HOST";
 
 /// Role this process plays in the cluster, decided by [`dispatch`].
 ///
@@ -178,8 +178,8 @@ pub fn dispatch() -> Result<Role> {
         // Any other combination is a misconfiguration. Loud error with
         // every bit named so the operator can see what's off.
         _ => Err(TensorError::new(&format!(
-            "cluster launcher: inconsistent env (FLODL_RELAY_JSON={}, \
-             FLODL_FULL_CLUSTER_JSON={}, FLODL_CLUSTER_JSON={}, FLODL_LOCAL_RANK={}). \
+            "cluster launcher: inconsistent env (FLODL_INTERNAL_RELAY_JSON={}, \
+             FLODL_FULL_CLUSTER_JSON={}, FLODL_INTERNAL_CLUSTER_JSON={}, FLODL_INTERNAL_LOCAL_RANK={}). \
              Expected: all-unset (single-device), slim+slot only (rank), \
              full only (launcher), or relay only (relay).",
             on_off(relay_set),

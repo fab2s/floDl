@@ -125,6 +125,43 @@ commands:
     }
 
     #[test]
+    fn validate_rejects_reserved_cluster_env_key() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().env.insert(
+            "CUDA_VISIBLE_DEVICES".into(),
+            "3".into(),
+        );
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+        assert!(err.contains("CUDA_VISIBLE_DEVICES"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_reserved_worker_env_key() {
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        cfg.cluster.as_mut().unwrap().workers[0].env.insert(
+            "FLODL_INTERNAL_LOCAL_RANK".into(),
+            "0".into(),
+        );
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_allows_non_reserved_env_key() {
+        // NCCL tuning + a user-facing FLODL_ var (no FLODL_INTERNAL_
+        // prefix) are legitimate cluster env entries.
+        let mut cfg: ProjectConfig =
+            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+        let c = cfg.cluster.as_mut().unwrap();
+        c.env.insert("NCCL_P2P_DISABLE".into(), "1".into());
+        c.env.insert("FLODL_DASHBOARD_BIND".into(), "0.0.0.0".into());
+        cfg.cluster.as_ref().unwrap().validate().expect("non-reserved env must pass");
+    }
+
+    #[test]
     fn validate_rejects_empty_hosts() {
         let mut cfg: ProjectConfig =
             serde_yaml::from_str(canonical_cluster_yaml()).unwrap();

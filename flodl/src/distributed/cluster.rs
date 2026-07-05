@@ -1,7 +1,7 @@
 //! Per-node cluster view for multi-host DDP.
 //!
 //! A [`LocalCluster`] is the per-node slice of the cluster topology, shipped
-//! by `fdl-cli` to each host via the `FLODL_CLUSTER_JSON` environment
+//! by `fdl-cli` to each host via the `FLODL_INTERNAL_CLUSTER_JSON` environment
 //! variable (hex-encoded JSON). It carries:
 //!
 //! - Controller coordinates (`controller.host`, `controller.port`) so every
@@ -43,7 +43,7 @@ use super::rendezvous::TcpRendezvous;
 /// the library reads it via [`LocalCluster::from_env`]. Presence of this var
 /// is also the recursion guard -- a remote `fdl <cmd>` invocation seeing it
 /// skips its own cluster-dispatch branch.
-pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
+pub const ENV_CLUSTER_JSON: &str = "FLODL_INTERNAL_CLUSTER_JSON";
 
 /// Environment variable that overrides the OS hostname for cluster lookup.
 ///
@@ -60,7 +60,40 @@ pub const ENV_HOST_OVERRIDE: &str = "FLODL_HOST_NAME";
 /// here. The launcher (`flodl-cli/src/cluster.rs`) injects a distinct value
 /// per child. The library uses it via [`LocalCluster::my_rank`] to pick the
 /// global rank and CUDA device for this process out of the envelope.
-pub const ENV_LOCAL_RANK: &str = "FLODL_LOCAL_RANK";
+pub const ENV_LOCAL_RANK: &str = "FLODL_INTERNAL_LOCAL_RANK";
+
+/// True if `key` must not appear in a user-supplied cluster/host `env`
+/// map (cluster-yml `env:` blocks or [`crate::distributed::ClusterBuilder::env`]
+/// / [`crate::distributed::HostBuilder::env`]).
+///
+/// The launcher splices the per-rank command environment as a shell
+/// assignment prefix and applies user env *after* its own built-ins, so
+/// a user key that collides with a built-in would win (shell last-wins)
+/// and silently break device mapping, rank identity, or the HMAC
+/// envelope. Two classes are reserved:
+///
+/// - Anything with the loud `FLODL_INTERNAL_` prefix: launcher-private
+///   transport / identity vars a user never sets. The prefix makes this
+///   self-documenting and future-proof (new internals are covered
+///   automatically).
+/// - A small set of names that are user-facing *elsewhere* but reserved
+///   inside a cluster env-map because the launcher sets them per-rank or
+///   they select global behavior: `CUDA_VISIBLE_DEVICES` (per-rank
+///   device pin; cannot be renamed — it is the vendor/driver contract),
+///   [`ENV_HOST_OVERRIDE`] (`FLODL_HOST_NAME`, a legit standalone
+///   override but launcher-set per rank here), and `FDL_ENV` (the
+///   overlay selector; a per-rank override would split-brain the
+///   config).
+///
+/// User-facing knobs like `FLODL_VERBOSITY` and `FLODL_DASHBOARD_BIND`
+/// are deliberately NOT reserved — they carry no `FLODL_INTERNAL_`
+/// prefix and are safe to set per cluster/host.
+pub fn is_reserved_cluster_env_key(key: &str) -> bool {
+    key.starts_with("FLODL_INTERNAL_")
+        || key == "CUDA_VISIBLE_DEVICES"
+        || key == ENV_HOST_OVERRIDE
+        || key == crate::distributed::launcher::ENV_FDL_ENV
+}
 
 thread_local! {
     /// Per-thread hostname override used by integration tests that spawn

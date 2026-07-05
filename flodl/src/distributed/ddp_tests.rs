@@ -304,7 +304,7 @@
         // Serialize against the cluster-env-mutating tests in other
         // modules (e.g. `cluster::tests`) on the SHARED crate mutex:
         // `Trainer::setup` calls `LocalCluster::from_env()`, which reads
-        // the process-global `FLODL_CLUSTER_JSON`. Without the shared
+        // the process-global `FLODL_INTERNAL_CLUSTER_JSON`. Without the shared
         // lock a concurrent writer's envelope (worker.host "master")
         // leaks in and the hostname check fails. Hold the guard for the
         // whole test and clear both cluster vars so `from_env` resolves

@@ -14,21 +14,21 @@
 //! fdl @cluster train
 //!   ↓ fdl-cli parses fdl.yml + fdl.cluster.yml overlay
 //!   ↓ fdl-cli calls prepare_cluster_env: sets FLODL_FULL_CLUSTER_JSON,
-//!     FLODL_FDL_CMD, FDL_ENV on its own process env
+//!     FLODL_INTERNAL_FDL_CMD, FDL_ENV on its own process env
 //!   ↓ fdl-cli falls through to normal RunScript / ExecCommand path
 //!   ↓ resolved command (e.g. `cargo run --release --bin my-trainer`) runs
 //!   ↓ my-trainer inherits env, flodl::launcher::dispatch detects Launcher
 //!   ↓ launcher fans out: ssh per remote host, fork+exec per local rank
-//!   ↓ each rank child has FLODL_CLUSTER_JSON + FLODL_LOCAL_RANK set
+//!   ↓ each rank child has FLODL_INTERNAL_CLUSTER_JSON + FLODL_INTERNAL_LOCAL_RANK set
 //!   ↓ rank-side flodl::launcher::dispatch returns Role::Rank, training runs
 //! ```
 //!
 //! Recursion guard: the launcher's ssh fan-out invokes `fdl <cmd>` on the
-//! remote, which re-enters fdl-cli with `FLODL_CLUSTER_JSON` set (not
+//! remote, which re-enters fdl-cli with `FLODL_INTERNAL_CLUSTER_JSON` set (not
 //! `FLODL_FULL_CLUSTER_JSON`). [`should_dispatch`](crate::cluster::should_dispatch)
 //! returns `false` in that case so the remote fdl-cli skips cluster setup
 //! and just runs the user binary normally — the user binary's launcher
-//! dispatch then detects `Role::Rank` (because `FLODL_LOCAL_RANK` is also
+//! dispatch then detects `Role::Rank` (because `FLODL_INTERNAL_LOCAL_RANK` is also
 //! set).
 
 use std::path::Path;
@@ -45,7 +45,7 @@ pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
 /// Env var name carrying the original fdl command name (e.g. `train`).
 /// Read by the launcher when it needs to invoke `fdl <cmd>` over ssh
 /// on remote hosts. Mirrors `flodl::distributed::launcher::ENV_FDL_CMD`.
-pub const ENV_FDL_CMD: &str = "FLODL_FDL_CMD";
+pub const ENV_FDL_CMD: &str = "FLODL_INTERNAL_FDL_CMD";
 
 /// Env var name picking the overlay env name (e.g. `cluster`). Set by
 /// fdl-cli at env-selector parsing time; propagated through to remote
@@ -56,7 +56,7 @@ pub const ENV_FDL_ENV: &str = "FDL_ENV";
 /// launcher (not fdl-cli) on each rank child. Kept here so the
 /// recursion guard can reference it by name. Mirrors
 /// `flodl::distributed::cluster::ENV_CLUSTER_JSON`.
-pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
+pub const ENV_CLUSTER_JSON: &str = "FLODL_INTERNAL_CLUSTER_JSON";
 
 /// Pre-resolved `name:ip` pairs (space-separated) for every cluster
 /// host, written by [`prepare_cluster_env`] using the controller's NSS
@@ -65,7 +65,7 @@ pub const ENV_CLUSTER_JSON: &str = "FLODL_CLUSTER_JSON";
 /// `--add-host name:ip` flag so the containerized launcher can SSH
 /// into cluster hosts without depending on the container's own
 /// resolver (which lacks `libnss-libvirt` etc.).
-pub const ENV_CLUSTER_EXTRA_HOSTS: &str = "FLODL_CLUSTER_EXTRA_HOSTS";
+pub const ENV_CLUSTER_EXTRA_HOSTS: &str = "FLODL_INTERNAL_CLUSTER_EXTRA_HOSTS";
 
 /// Controller's OS user name (resolved on the host by fdl-cli, before
 /// any docker spawn). The launcher in the container reads it as the
@@ -73,7 +73,7 @@ pub const ENV_CLUSTER_EXTRA_HOSTS: &str = "FLODL_CLUSTER_EXTRA_HOSTS";
 /// Bridges the container-vs-host user mismatch (containers ship a
 /// stock `ubuntu` UID-1000 user, but `ubuntu@<remote>` is rarely the
 /// account the user actually uses on cluster hosts).
-pub const ENV_HOST_USER: &str = "FLODL_HOST_USER";
+pub const ENV_HOST_USER: &str = "FLODL_INTERNAL_HOST_USER";
 
 /// Env var name overriding the OS hostname for cluster lookups.
 /// Mirrors `flodl::distributed::cluster::ENV_HOST_OVERRIDE`.
@@ -82,11 +82,30 @@ pub const ENV_HOST_OVERRIDE: &str = "FLODL_HOST_NAME";
 /// Env var name picking this rank's local-rank index within its host.
 /// Set by the launcher on rank children. Mirrors
 /// `flodl::distributed::cluster::ENV_LOCAL_RANK`.
-pub const ENV_LOCAL_RANK: &str = "FLODL_LOCAL_RANK";
+pub const ENV_LOCAL_RANK: &str = "FLODL_INTERNAL_LOCAL_RANK";
+
+/// True if `key` must not appear in a user-supplied cluster/host `env`
+/// map. Mirrors `flodl::distributed::cluster::is_reserved_cluster_env_key`
+/// (kept in lockstep — flodl-cli is decoupled from the library crate, so
+/// the reserved rule is duplicated, not imported). The launcher applies
+/// user env after its own built-ins (shell last-wins), so a launcher-
+/// owned key set via env would silently override device mapping / rank
+/// identity / the HMAC envelope. Reserved: the loud `FLODL_INTERNAL_`
+/// prefix (all launcher-private vars, future-proof) plus three names that
+/// are user-facing elsewhere but launcher-owned per-rank here
+/// (`CUDA_VISIBLE_DEVICES`, [`ENV_HOST_OVERRIDE`], [`ENV_FDL_ENV`]).
+/// User-facing knobs (`FLODL_VERBOSITY`, `FLODL_DASHBOARD_BIND`, NCCL
+/// tuning, `LD_LIBRARY_PATH`) are deliberately allowed.
+pub fn is_reserved_cluster_env_key(key: &str) -> bool {
+    key.starts_with("FLODL_INTERNAL_")
+        || key == "CUDA_VISIBLE_DEVICES"
+        || key == ENV_HOST_OVERRIDE
+        || key == ENV_FDL_ENV
+}
 
 /// Top-level cluster-dispatch decision.
 ///
-/// Returns `false` when `FLODL_CLUSTER_JSON` is set — that signals we're
+/// Returns `false` when `FLODL_INTERNAL_CLUSTER_JSON` is set — that signals we're
 /// a recursive fdl invocation on a remote host that the launcher's ssh
 /// fan-out reached, and we should fall through to normal dispatch.
 /// Otherwise delegates to [`config::cluster_dispatch_enabled`].
@@ -98,7 +117,7 @@ pub fn should_dispatch(project: &ProjectConfig, chain: &[Option<bool>]) -> bool 
 }
 
 /// Whether this fdl invocation is itself a spawned child of a launcher's
-/// ssh fan-out (`FLODL_CLUSTER_JSON` already set in env). Used as the
+/// ssh fan-out (`FLODL_INTERNAL_CLUSTER_JSON` already set in env). Used as the
 /// recursion guard everywhere cluster dispatch is evaluated.
 pub fn is_recursive_invocation() -> bool {
     std::env::var_os(ENV_CLUSTER_JSON).is_some()
@@ -640,7 +659,7 @@ mod tests {
 
     /// Env-mutating tests serialize via this mutex per
     /// `feedback_env_mutating_tests_mutex`. `should_dispatch` reads
-    /// `FLODL_CLUSTER_JSON` and `prepare_cluster_env` sets several
+    /// `FLODL_INTERNAL_CLUSTER_JSON` and `prepare_cluster_env` sets several
     /// vars; both classes are guarded by the same lock.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -669,7 +688,7 @@ commands:
         let project: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(
             !should_dispatch(&project, &[Some(true)]),
-            "recursion guard: must return false when FLODL_CLUSTER_JSON is set"
+            "recursion guard: must return false when FLODL_INTERNAL_CLUSTER_JSON is set"
         );
         unsafe {
             std::env::remove_var(ENV_CLUSTER_JSON);

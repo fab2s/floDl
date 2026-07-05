@@ -112,7 +112,7 @@ fn main() -> ExitCode {
     // commands with N>=2 GPUs trigger single-host envelope synthesis and
     // multi-process spawn. Non-cluster commands map `--gpus` to
     // `CUDA_VISIBLE_DEVICES` on the single child process. Recursive
-    // invocations (FLODL_CLUSTER_JSON set) shouldn't normally see this
+    // invocations (FLODL_INTERNAL_CLUSTER_JSON set) shouldn't normally see this
     // flag in their args -- the launcher strips it before re-exec'ing.
     let (args, gpus_spec) = match extract_gpus_flag(&args) {
         Ok(pair) => pair,

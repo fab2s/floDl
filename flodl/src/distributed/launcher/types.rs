@@ -48,7 +48,7 @@ pub struct SshConfig {
     /// SSH port. Maps to `ssh -p <port>`.
     pub port: Option<u16>,
     /// SSH login user. Maps to `ssh -l <user>`. Falls back to the
-    /// current user (or `FLODL_HOST_USER` from env) when `None`.
+    /// current user (or `FLODL_INTERNAL_HOST_USER` from env) when `None`.
     pub user: Option<String>,
     /// Identity file (private key) path. Maps to `ssh -i <path>`.
     pub identity_file: Option<String>,

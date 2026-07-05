@@ -1086,7 +1086,7 @@ pub enum RendezvousMsgWire {
         /// value across every rank when shards are consistent.
         dataset_sig: [u8; 32],
         /// Rank the controller assigned via worker-order × device-count
-        /// probe. Read from `FLODL_LOCAL_RANK` × envelope `worker.ranks`.
+        /// probe. Read from `FLODL_INTERNAL_LOCAL_RANK` × envelope `worker.ranks`.
         global_rank: u32,
         /// Worker host name (diagnostic; controller logs it in error
         /// messages).

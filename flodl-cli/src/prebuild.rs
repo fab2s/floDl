@@ -49,7 +49,7 @@ use crate::config::{ClusterConfig, ClusterWorker};
 /// worker.path>", "ld_library_path": "<absolute LD_LIBRARY_PATH>" }, ...
 /// }`. Hosts absent from the map fall back to the launcher's existing
 /// `fdl <cmd>` re-entry on the remote.
-pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
+pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_INTERNAL_PREBUILD_PER_HOST";
 
 /// Run pre-flight builds for every remote host in `cluster`. The
 /// controller itself is skipped — its build is handled by the normal

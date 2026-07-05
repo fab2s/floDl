@@ -24,7 +24,7 @@ use crate::models::ModelDef;
 /// constructed as usual.
 fn is_cluster_launcher() -> bool {
     std::env::var_os("FLODL_FULL_CLUSTER_JSON").is_some()
-        && std::env::var_os("FLODL_CLUSTER_JSON").is_none()
+        && std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_none()
 }
 
 /// Whether this process is a cluster rank child (slim envelope + rank
@@ -36,8 +36,8 @@ fn is_cluster_launcher() -> bool {
 /// Returns false on the launcher process (full envelope only) and on
 /// standalone single-host runs (neither envelope).
 fn is_cluster_rank() -> bool {
-    std::env::var_os("FLODL_CLUSTER_JSON").is_some()
-        && std::env::var_os("FLODL_LOCAL_RANK").is_some()
+    std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
+        && std::env::var_os("FLODL_INTERNAL_LOCAL_RANK").is_some()
 }
 
 /// One-line role banner for operator visibility. Printed once per run
@@ -49,7 +49,7 @@ fn role_banner() -> String {
     if is_cluster_launcher() {
         "role=launcher (fan-out, no training body)".to_string()
     } else if is_cluster_rank() {
-        let slot = std::env::var("FLODL_LOCAL_RANK").unwrap_or_else(|_| "?".to_string());
+        let slot = std::env::var("FLODL_INTERNAL_LOCAL_RANK").unwrap_or_else(|_| "?".to_string());
         format!(
             "role=rank slot={slot} (via_coord → cluster_coordinator)",
         )
@@ -125,13 +125,13 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let run_dir = format!("{}/{}/{}", config.output_dir, model_def.name, mode_str);
     // Shared-storage directory setup is the controller's job. The
     // launcher / single-host process creates `run_dir` once; worker
-    // ranks (FLODL_CLUSTER_JSON set by the launcher on each spawned
+    // ranks (FLODL_INTERNAL_CLUSTER_JSON set by the launcher on each spawned
     // rank child) find it ready and skip the create. Workers that
     // later write into the same tree (e.g. checkpoint files) operate
     // on dirs the controller already provisioned, so a worker's
     // shared mount can stay read-only-friendly without breaking
     // setup.
-    let is_worker_rank = std::env::var_os("FLODL_CLUSTER_JSON").is_some();
+    let is_worker_rank = std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some();
     if !is_worker_rank {
         std::fs::create_dir_all(&run_dir)
             .map_err(|e| TensorError::new(&format!("failed to create {run_dir}: {e}")))?;

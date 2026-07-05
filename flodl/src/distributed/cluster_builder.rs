@@ -170,6 +170,34 @@ impl ClusterBuilder {
                 }
             }
         }
+        // Reserved-env-key check: a user env map (cluster- or host-scope)
+        // must not carry a key the launcher owns per-rank — the launcher
+        // applies user env after its own built-ins (shell last-wins), so
+        // an override would silently break device mapping / rank identity /
+        // the HMAC envelope. Mirrors the YAML validator so the builder
+        // stays 1:1 with the file schema. See
+        // [`crate::distributed::is_reserved_cluster_env_key`].
+        for (k, _) in self.env.iter() {
+            if crate::distributed::is_reserved_cluster_env_key(k) {
+                return Err(TensorError::new(&format!(
+                    "ClusterBuilder: cluster-scope env key {k:?} is reserved \
+                     (launcher-owned) and cannot be set via env — it would \
+                     override the launcher's per-rank value"
+                )));
+            }
+        }
+        for w in &self.workers {
+            for (k, _) in w.env.iter() {
+                if crate::distributed::is_reserved_cluster_env_key(k) {
+                    return Err(TensorError::new(&format!(
+                        "ClusterBuilder: host {:?}: env key {k:?} is reserved \
+                         (launcher-owned) and cannot be set via env — it would \
+                         override the launcher's per-rank value",
+                        w.host,
+                    )));
+                }
+            }
+        }
         // Cross-worker rank check: union must be exactly 0..world_size.
         let mut all: Vec<usize> = self
             .workers
@@ -720,6 +748,55 @@ mod tests {
             .build()
             .expect("build succeeds");
         assert_eq!(cluster.env.get("K").map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn build_rejects_reserved_cluster_env_key() {
+        let err = ClusterBuilder::new()
+            .controller("localhost").done()
+            .env("CUDA_VISIBLE_DEVICES", "3") // reserved (launcher-owned)
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect_err("reserved cluster-scope env key must error");
+        assert!(err.to_string().contains("reserved"), "err: {err}");
+    }
+
+    #[test]
+    fn build_rejects_reserved_host_env_key() {
+        let err = ClusterBuilder::new()
+            .controller("localhost").done()
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+                .env("FLODL_INTERNAL_LOCAL_RANK", "0") // reserved prefix
+            .done()
+            .build()
+            .expect_err("reserved host-scope env key must error");
+        assert!(err.to_string().contains("reserved"), "err: {err}");
+    }
+
+    #[test]
+    fn build_allows_non_reserved_env_keys() {
+        ClusterBuilder::new()
+            .controller("localhost").done()
+            .env("NCCL_P2P_DISABLE", "1")
+            .env("FLODL_DASHBOARD_BIND", "0.0.0.0")
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+                .env("LD_LIBRARY_PATH", "/opt/custom/lib")
+            .done()
+            .build()
+            .expect("non-reserved env keys must pass");
     }
 
     #[test]

@@ -248,7 +248,7 @@ pub struct SshConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// SSH login user (`ssh -l <user>`). Defaults to the current user
-    /// (or `FLODL_HOST_USER` from the controller env).
+    /// (or `FLODL_INTERNAL_HOST_USER` from the controller env).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Identity file / private key (`ssh -i <path>`).
@@ -429,6 +429,33 @@ impl ClusterConfig {
         if self.workers.is_empty() {
             return Err("cluster.workers must be non-empty".into());
         }
+        // Reserved-env-key check: a user env map must not carry a key the
+        // launcher owns per-rank. The launcher applies user env after its
+        // own built-ins (shell last-wins), so an override would silently
+        // break device mapping / rank identity / the HMAC envelope. The
+        // reserved predicate lives in the library (single source of truth
+        // for the launcher-owned names).
+        for k in self.env.keys() {
+            if crate::cluster::is_reserved_cluster_env_key(k) {
+                return Err(format!(
+                    "cluster.env: key {k:?} is reserved (launcher-owned) and \
+                     cannot be set via env — it would override the launcher's \
+                     per-rank value"
+                ));
+            }
+        }
+        for (i, w) in self.workers.iter().enumerate() {
+            for k in w.env.keys() {
+                if crate::cluster::is_reserved_cluster_env_key(k) {
+                    return Err(format!(
+                        "cluster.workers[{i}] ({:?}): env key {k:?} is reserved \
+                         (launcher-owned) and cannot be set via env — it would \
+                         override the launcher's per-rank value",
+                        w.host,
+                    ));
+                }
+            }
+        }
         let multi_host = self.spans_multiple_hosts();
         for (i, w) in self.workers.iter().enumerate() {
             if w.host.trim().is_empty() {
@@ -535,7 +562,7 @@ impl ClusterConfig {
     /// The envelope strips launcher-only fields (`ssh*`), embeds derived
     /// world metadata (`world_size`, `num_workers`), and carries only
     /// the requested worker's slice. The launcher hex-encodes the
-    /// resulting JSON into `FLODL_CLUSTER_JSON` per ssh invocation, so
+    /// resulting JSON into `FLODL_INTERNAL_CLUSTER_JSON` per ssh invocation, so
     /// each remote process sees only itself + the controller
     /// coordinates.
     pub fn local_envelope_for(&self, worker: &ClusterWorker) -> Value {

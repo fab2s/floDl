@@ -400,7 +400,7 @@ pub(super) fn build_local_spawn_command(
 }
 
 /// Build the `Command` that fork+execs a local per-host relay child.
-/// Sets `FLODL_RELAY_JSON` (so the child detects `Role::Relay`) and strips
+/// Sets `FLODL_INTERNAL_RELAY_JSON` (so the child detects `Role::Relay`) and strips
 /// the launcher/rank role env vars. No CUDA scoping — the relay touches no
 /// GPU.
 pub(super) fn build_local_relay_command(
@@ -419,7 +419,7 @@ pub(super) fn build_local_relay_command(
 
 /// Build the bash command shipped via ssh to run a remote per-host relay
 /// child. Mirrors [`build_remote_bash_command`] but exports
-/// `FLODL_RELAY_JSON` instead of the rank envelope/slot and never scopes
+/// `FLODL_INTERNAL_RELAY_JSON` instead of the rank envelope/slot and never scopes
 /// CUDA.
 pub(super) fn build_remote_relay_bash_command(
     path: &str,
@@ -534,9 +534,9 @@ pub(super) fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Co
     }
     if let Some(u) = host.ssh.as_ref().and_then(|s| s.user.as_deref()) {
         c.arg("-l").arg(u);
-    } else if let Ok(host_user) = std::env::var("FLODL_HOST_USER") {
+    } else if let Ok(host_user) = std::env::var("FLODL_INTERNAL_HOST_USER") {
         // When the per-host ssh.user is unset, fall back to the
-        // controller's OS user (set by fdl-cli via FLODL_HOST_USER).
+        // controller's OS user (set by fdl-cli via FLODL_INTERNAL_HOST_USER).
         // Bridges the docker container's stock `ubuntu` UID-1000 user
         // vs. the user's actual remote account on cluster hosts.
         let trimmed = host_user.trim();
@@ -741,10 +741,13 @@ pub(super) fn build_remote_bash_command(
     }
     // Apply user-declared env: cluster-scope first, host-scope second
     // (host overrides cluster for matching keys). In a shell assignment
-    // prefix the LAST duplicate wins, so these could override the
-    // built-ins above — safe ONLY because reserved keys (FLODL_*,
-    // CUDA_VISIBLE_DEVICES) are rejected at config parse
-    // (`parse_env_block`).
+    // prefix the LAST duplicate wins, so these WOULD override the
+    // built-ins above — safe ONLY because launcher-owned keys (the
+    // `FLODL_INTERNAL_` prefix plus CUDA_VISIBLE_DEVICES / FLODL_HOST_NAME
+    // / FDL_ENV) are rejected before fan-out by
+    // `is_reserved_cluster_env_key` (enforced in fdl-cli's cluster
+    // `validate()` and `ClusterBuilder::build`). LD_LIBRARY_PATH is the
+    // one built-in intentionally left user-overridable (handled above).
     for (k, v) in cluster_env {
         s.push(' ');
         s.push_str(k);

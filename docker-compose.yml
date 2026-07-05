@@ -26,15 +26,15 @@ services:
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
       - FLODL_FULL_CLUSTER_JSON
-      - FLODL_FDL_CMD
+      - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
-      - FLODL_PREBUILD_PER_HOST
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
       # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
-      - FLODL_HOST_USER
+      - FLODL_INTERNAL_HOST_USER
       # Share the hf-hub cache with the hf-parity service so `fdl test-live`
       # reuses fixtures downloaded by `fdl flodl-hf parity bert*`. Repo-local,
       # gitignored, survives container rebuild.
@@ -87,15 +87,15 @@ services:
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
       - FLODL_FULL_CLUSTER_JSON
-      - FLODL_FDL_CMD
+      - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
-      - FLODL_PREBUILD_PER_HOST
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
       # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
-      - FLODL_HOST_USER
+      - FLODL_INTERNAL_HOST_USER
       # SSH-agent forwarding: launcher SSHes into remote cluster hosts
       # from inside this container. The host's agent socket is bind-
       # mounted at /ssh-agent (see volumes:) and re-exposed via
@@ -220,7 +220,7 @@ services:
     network_mode: host
     shm_size: 2gb
     # No env passthrough needed — the launcher SSHes in fresh and sets
-    # the slim envelope (FLODL_CLUSTER_JSON, FLODL_LOCAL_RANK) on the
+    # the slim envelope (FLODL_INTERNAL_CLUSTER_JSON, FLODL_INTERNAL_LOCAL_RANK) on the
     # SSH command line, exactly like the Pascal VM path.
     restart: unless-stopped
     deploy:
@@ -268,15 +268,15 @@ services:
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
       - FLODL_FULL_CLUSTER_JSON
-      - FLODL_FDL_CMD
+      - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
-      - FLODL_PREBUILD_PER_HOST
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
       # Controller's user name (host-side). Read by the launcher inside
       # the container as the default `ssh -l <user>` target when the
       # per-host `ssh.user:` is unset, bridges container's stock
       # `ubuntu` (UID 1000) identity vs. the user's actual remote
       # account.
-      - FLODL_HOST_USER
+      - FLODL_INTERNAL_HOST_USER
     deploy:
       resources:
         reservations:

@@ -7,7 +7,7 @@
 //!   synthesis of a single-host cluster envelope (master=127.0.0.1, lo
 //!   transport, one host with N ranks) and spawn-per-rank via the existing
 //!   launcher (see [`crate::cluster::prepare_cluster_env`]). The library
-//!   inside each spawned process reads the envelope from `FLODL_CLUSTER_JSON`
+//!   inside each spawned process reads the envelope from `FLODL_INTERNAL_CLUSTER_JSON`
 //!   and uses the same code path as multi-host. N = 1 is degenerate — no
 //!   synthesis, just runs single-process on that device.
 //!

@@ -60,7 +60,7 @@ pub use checkpoint_forge::load_consensus_checkpoint;
 /// Loader for the outer-optimizer momentum sidecar (`<stem>.outer.fdl`),
 /// used by the launcher on resume to re-seed the outer optimizer.
 pub use checkpoint_forge::load_outer_momentum;
-pub use cluster::{WorkerBlock, LocalCluster};
+pub use cluster::{WorkerBlock, LocalCluster, is_reserved_cluster_env_key};
 pub use launcher::{FullCluster, FullWorker, Role};
 pub use max_failure::MaxFailureThreshold;
 pub use outer_optimizer::{NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum};
