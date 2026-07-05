@@ -174,8 +174,6 @@ impl DdpHandle {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
-        use std::sync::atomic::AtomicBool;
-
         // `save_path` optional: persistence on unrecoverable failure
         // is opt-in. Unset = run normally, skip saves.
         let save_path = config.save_path.clone();
@@ -523,7 +521,6 @@ impl DdpHandle {
 
         Ok(DdpHandle {
             devices: vec![device],
-            shutdown: Arc::new(AtomicBool::new(false)),
             final_state: Some(final_state),
             metrics_rx: None,
             launcher_driver: None,

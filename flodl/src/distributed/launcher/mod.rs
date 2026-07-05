@@ -1056,7 +1056,19 @@ pub fn run_launcher_with_config(
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
     if let Some(err) = any_failure {
-        eprintln!("cluster launcher: {err}");
+        // Hard exit rather than `return Err(err)`: on a pre-rendezvous
+        // failure the coordinator thread never gets readers, so its tick loop
+        // never reaches `Ok(false)` and would keep the launcher process (and
+        // its container) alive after every rank child has exited. The
+        // coordinator has no external abort handle here — its `JoinHandle` is
+        // detached and it was moved into its thread — so we cannot stop it and
+        // unwind cleanly. Replacing this with a cooperative shutdown that
+        // surfaces the error through `DdpHandle::join` is tracked as F6.
+        // Consequence: a fatal cluster run exits the process with code 1; a
+        // library embedder cannot currently catch it via `join`.
+        eprintln!(
+            "cluster launcher: fatal failure, terminating process (exit 1): {err}"
+        );
         let _ = std::io::stderr().flush();
         std::process::exit(1);
     }

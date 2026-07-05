@@ -1,11 +1,10 @@
 //! `DdpHandle`: handle returned by `Trainer::builder().run()` / `Trainer::setup()`.
 //!
-//! Holds the shutdown signal plus, depending on topology, the launcher driver
-//! thread (cluster / multi-GPU auto-promote) or the inline single-GPU state.
-//! Provides `join`, `poll_metrics`, `next_metrics`, plus the `launch`
-//! constructor called from the builder.
+//! Holds, depending on topology, the launcher driver thread (cluster /
+//! multi-GPU auto-promote) or the inline single-GPU state. Provides `join`,
+//! `poll_metrics`, `next_metrics`, plus the `launch` constructor called from
+//! the builder.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -63,9 +62,17 @@ use super::coord_config::build_coord_config_from_builder;
 /// With fewer than 2 CUDA devices, training runs on the main thread with no
 /// coordinator or averaging. The API is identical; [`join`](Self::join) returns
 /// a [`TrainedState`] in both cases.
+///
+/// # Dropping without joining
+///
+/// [`join`](Self::join) is the intended terminal call. In launcher / cluster
+/// mode, dropping the handle without joining detaches the launcher driver
+/// thread: **training continues to completion in the background** rather than
+/// being torn down (there is no early-cancel signal today; a cooperative
+/// shutdown path is tracked separately). In single-GPU mode training has
+/// already finished by the time the handle exists, so a drop is a plain no-op.
 pub struct DdpHandle {
     pub(super) devices: Vec<Device>,
-    pub(super) shutdown: Arc<AtomicBool>,
     /// For single-GPU mode: final state captured inline during run_single().
     pub(super) final_state: Option<TrainedState>,
     /// Receiver for aggregated epoch metrics from the coordinator.
@@ -308,7 +315,6 @@ impl DdpHandle {
                     })?;
                 return Ok(DdpHandle {
                     devices: Vec::new(),
-                    shutdown: Arc::new(AtomicBool::new(false)),
                     final_state: None,
                     metrics_rx: Some(sink_rx),
                     launcher_driver: Some(driver),
@@ -601,12 +607,4 @@ impl DdpHandle {
         Err(TensorError::new("join: no trained state available"))
     }
 
-}
-
-impl Drop for DdpHandle {
-    fn drop(&mut self) {
-        // Signal shutdown if not already joined. The launcher driver thread
-        // observes this and tears down its ranks.
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
 }

@@ -9,7 +9,6 @@
 //!
 //! [`DdpHandle`]: super::DdpHandle
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::autograd::Variable;
@@ -243,7 +242,6 @@ impl DdpHandle {
 
         Ok(DdpHandle {
             devices: vec![device],
-            shutdown: Arc::new(AtomicBool::new(true)),
             final_state: Some(final_state),
             metrics_rx: Some(epoch_metrics_rx),
             launcher_driver: None,
