@@ -126,9 +126,8 @@ fn main() -> ExitCode {
     // override `FDL_ENV=X`. Every form must resolve to an existing overlay
     // or it is a loud error — there is no positional-env convention, so the
     // first bare token is always a command.
-    let cwd = env::current_dir().unwrap_or_default();
     let fdl_env_var = env::var("FDL_ENV").ok();
-    let (active_env, args) = match resolve_env(&args, &cwd, fdl_env_var.as_deref()) {
+    let (active_env, args) = match resolve_env(&args, fdl_env_var.as_deref()) {
         Ok(pair) => pair,
         Err(msg) => {
             cli_error!("{msg}");
@@ -241,8 +240,11 @@ fn main() -> ExitCode {
         "config" => cmd_config_show(&args[1..], active_env.as_deref()),
         "--help" | "-h" => {
             let cwd = env::current_dir().unwrap_or_default();
-            if let Some((project, root)) = load_project_config(&cwd, active_env.as_deref()) {
-                run::print_project_help(&project, &root, active_env.as_deref());
+            // Never let a bogus env selector block --help: degrade to base
+            // help when the overlay is missing (feedback_help_never_blocked).
+            let help_env = help_env_or_note(&cwd, active_env.as_deref());
+            if let Some((project, root)) = load_project_config(&cwd, help_env) {
+                run::print_project_help(&project, &root, help_env);
             } else {
                 print_usage();
             }
@@ -273,17 +275,21 @@ fn main() -> ExitCode {
 ///
 /// `@env` and `--env` are command-line selectors and rank equal; supplying
 /// both with *different* values is a loud conflict error, and either one
-/// overrides `FDL_ENV`. Every form must resolve to an existing
-/// `fdl.<env>.yml` overlay — a miss errors loudly rather than falling
-/// through. Because there is no positional-env convention, the first bare
-/// token is unconditionally a command (no command/env name collision is
-/// possible).
+/// overrides `FDL_ENV`. Because there is no positional-env convention, the
+/// first bare token is unconditionally a command (no command/env name
+/// collision is possible).
 ///
-/// `cwd` and `fdl_env` are injected for testability; `main` reads them from
-/// the process environment once at startup.
+/// Overlay EXISTENCE is deliberately NOT validated here — that happens at the
+/// config-load path ([`config::load_project_with_env`] →
+/// `resolve_config_layers`), which errors loudly for any command that actually
+/// consumes the config. Validating upfront would block `--help` and
+/// env-agnostic builtins (e.g. `fdl setup` with a stale `FDL_ENV`), so
+/// resolution and validation are kept separate (`feedback_help_never_blocked`).
+///
+/// `fdl_env` is injected for testability; `main` reads it from the process
+/// environment once at startup.
 fn resolve_env(
     args: &[String],
-    cwd: &std::path::Path,
     fdl_env: Option<&str>,
 ) -> Result<(Option<String>, Vec<String>), String> {
     // Strip both command-line selectors up front.
@@ -297,21 +303,17 @@ fn resolve_env(
                 "conflicting env selectors: `--env {f}` and `@{a}` — pick one"
             ));
         }
-        (Some(v), _) => Some((v, "--env")),
-        (None, Some(v)) => Some((v, "@<env>")),
+        (Some(v), _) | (None, Some(v)) => Some(v),
         (None, None) => None,
     };
 
-    // A command-line selector wins over the ambient `FDL_ENV`.
-    if let Some((env_name, source)) = cli_env {
-        validate_env_exists(&env_name, source, cwd)?;
+    // A command-line selector wins over the ambient `FDL_ENV`. Existence of
+    // the overlay is validated later, at the config-load path (see the fn doc).
+    if let Some(env_name) = cli_env {
         return Ok((Some(env_name), args));
     }
-
-    // Environment variable, if set and non-empty.
     if let Some(env_name) = fdl_env {
         if !env_name.is_empty() {
-            validate_env_exists(env_name, "FDL_ENV", cwd)?;
             return Ok((Some(env_name.to_string()), args));
         }
     }
@@ -486,27 +488,25 @@ fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), Stri
     Ok((out, env))
 }
 
-/// Confirm that `fdl.<env>.yml` exists next to the nearest base config,
-/// erroring with the source (`--env` or `FDL_ENV`) when it doesn't.
-fn validate_env_exists(
-    env_name: &str,
-    source: &str,
-    cwd: &std::path::Path,
-) -> Result<(), String> {
-    let base_config = config::find_config(cwd).ok_or_else(|| {
-        format!(
-            "{source} `{env_name}` set but no fdl.yml found in {} or parents",
-            cwd.display()
-        )
-    })?;
-    if overlay::find_env_file(&base_config, env_name).is_none() {
-        return Err(format!(
-            "{source} `{env_name}`: overlay not found \
-             (expected fdl.{env_name}.yml next to {})",
-            base_config.display()
-        ));
+/// For `--help` only: degrade to base help when the selected env's overlay is
+/// missing, rather than hard-erroring at config load. `--help` must always
+/// render (`feedback_help_never_blocked`); a typo'd `@env` / `FDL_ENV` should
+/// still show help, with a note. Returns the env to load with: the original
+/// `env` when its overlay exists (or there is no project), else `None` plus a
+/// stderr note. Overlay *content* errors still surface normally at load.
+fn help_env_or_note<'a>(cwd: &std::path::Path, env: Option<&'a str>) -> Option<&'a str> {
+    let name = env?;
+    match config::find_config(cwd) {
+        // Overlay present → merge it as usual.
+        Some(base) if overlay::find_env_file(&base, name).is_some() => Some(name),
+        // In a project but the overlay is missing → base help + note.
+        Some(_) => {
+            eprintln!("fdl: env `{name}` not found; showing base help");
+            None
+        }
+        // No project at all → load_project_config returns None → print_usage.
+        None => None,
     }
-    Ok(())
 }
 
 /// Thin wrapper over `parse_or_schema_from` that sets the program name

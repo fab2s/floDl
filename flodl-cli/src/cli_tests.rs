@@ -254,20 +254,17 @@
         assert!(env.is_none());
     }
 
-    // --- resolve_env: precedence + error paths ----------------------------
+    // --- resolve_env: precedence + resolution (NO overlay validation) ------
     //
-    // These exercise the full `@env` / `--env` / `FDL_ENV` composition with
-    // real fixture files on disk. Injecting `cwd` + `fdl_env` keeps them
-    // hermetic (no mutation of the process cwd or environment).
+    // resolve_env only RESOLVES + strips the selector; it does NOT check that
+    // the overlay exists (that is the config-load path's job — see
+    // config::load_project_with_env / resolve_config_layers). So these need no
+    // fixture files on disk. `fdl_env` is injected to keep them hermetic.
 
     #[test]
     fn resolve_env_at_sigil_resolves_and_strips() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.cluster.yml"), "");
-
         let (env, rest) =
-            resolve_env(&args(&["fdl", "@cluster", "probe"]), tmp.path(), None).unwrap();
+            resolve_env(&args(&["fdl", "@cluster", "probe"]), None).unwrap();
         assert_eq!(env.as_deref(), Some("cluster"));
         assert_eq!(rest, args(&["fdl", "probe"]));
     }
@@ -276,158 +273,123 @@
     fn resolve_env_at_sigil_after_command_not_consumed() {
         // Pre-command sigil only: `@cluster` after the command "probe" is the
         // command's own arg, so no env resolves and the token is preserved.
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.cluster.yml"), "");
-
         let (env, rest) =
-            resolve_env(&args(&["fdl", "probe", "@cluster"]), tmp.path(), None).unwrap();
+            resolve_env(&args(&["fdl", "probe", "@cluster"]), None).unwrap();
         assert!(env.is_none());
         assert_eq!(rest, args(&["fdl", "probe", "@cluster"]));
     }
 
     #[test]
-    fn resolve_env_at_sigil_errors_on_missing_overlay() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
+    fn resolve_env_does_not_validate_overlay_existence() {
+        // M21: resolve_env resolves a selector to its name WITHOUT checking the
+        // overlay exists — no upfront validation, so `--help` and env-agnostic
+        // builtins are never blocked. Existence is enforced later at the
+        // config-load path. Covers all three selector forms.
+        let (env, rest) = resolve_env(&args(&["fdl", "@nope", "test"]), None).unwrap();
+        assert_eq!(env.as_deref(), Some("nope"));
+        assert_eq!(rest, args(&["fdl", "test"]));
 
-        let err =
-            resolve_env(&args(&["fdl", "@nope", "test"]), tmp.path(), None).unwrap_err();
-        assert!(err.contains("nope"), "got: {err}");
-        assert!(err.contains("not found"), "got: {err}");
+        let (env, _) =
+            resolve_env(&args(&["fdl", "--env", "nope", "test"]), None).unwrap();
+        assert_eq!(env.as_deref(), Some("nope"));
+
+        let (env, _) = resolve_env(&args(&["fdl", "test"]), Some("nope")).unwrap();
+        assert_eq!(env.as_deref(), Some("nope"));
     }
 
     #[test]
     fn resolve_env_cli_selector_wins_over_env_var() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.prod.yml"), "");
-        touch(&tmp.path().join("fdl.stage.yml"), "");
-
         // `@prod` (command-line) beats FDL_ENV=stage.
         let (env, rest) =
-            resolve_env(&args(&["fdl", "@prod", "test"]), tmp.path(), Some("stage")).unwrap();
+            resolve_env(&args(&["fdl", "@prod", "test"]), Some("stage")).unwrap();
         assert_eq!(env.as_deref(), Some("prod"));
         assert_eq!(rest, args(&["fdl", "test"]));
     }
 
     #[test]
     fn resolve_env_at_and_flag_same_value_ok() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
-        let (env, rest) = resolve_env(
-            &args(&["fdl", "@ci", "--env", "ci", "test"]),
-            tmp.path(),
-            None,
-        )
-        .unwrap();
+        let (env, rest) =
+            resolve_env(&args(&["fdl", "@ci", "--env", "ci", "test"]), None).unwrap();
         assert_eq!(env.as_deref(), Some("ci"));
         assert_eq!(rest, args(&["fdl", "test"]));
     }
 
     #[test]
     fn resolve_env_at_and_flag_conflict_errors() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-        touch(&tmp.path().join("fdl.prod.yml"), "");
-
-        let err = resolve_env(
-            &args(&["fdl", "@ci", "--env", "prod", "test"]),
-            tmp.path(),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            resolve_env(&args(&["fdl", "@ci", "--env", "prod", "test"]), None).unwrap_err();
         assert!(err.contains("conflicting"), "got: {err}");
     }
 
     #[test]
     fn resolve_env_env_var_used_when_no_cli_selector() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.stage.yml"), "");
-
         let (env, rest) =
-            resolve_env(&args(&["fdl", "test"]), tmp.path(), Some("stage")).unwrap();
+            resolve_env(&args(&["fdl", "test"]), Some("stage")).unwrap();
         assert_eq!(env.as_deref(), Some("stage"));
         assert_eq!(rest, args(&["fdl", "test"]));
     }
 
     #[test]
     fn resolve_env_bare_overlay_name_is_not_consumed() {
-        // The retired positional convention: an overlay named like the
-        // first token is NO LONGER auto-selected. `ci` stays a command,
-        // env stays None — the `@` sigil is now the only positional form.
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
-        let (env, rest) = resolve_env(&args(&["fdl", "ci", "test"]), tmp.path(), None).unwrap();
+        // The retired positional convention: an overlay named like the first
+        // token is NOT auto-selected. `ci` stays a command, env stays None —
+        // the `@` sigil is the only positional form.
+        let (env, rest) = resolve_env(&args(&["fdl", "ci", "test"]), None).unwrap();
         assert!(env.is_none());
         assert_eq!(rest, args(&["fdl", "ci", "test"]));
     }
 
     #[test]
     fn resolve_env_at_sigil_after_dashdash_not_consumed() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
         // `@ci` past `--` is a literal arg, not an env selector.
         let (env, rest) =
-            resolve_env(&args(&["fdl", "run", "--", "@ci"]), tmp.path(), None).unwrap();
+            resolve_env(&args(&["fdl", "run", "--", "@ci"]), None).unwrap();
         assert!(env.is_none());
         assert_eq!(rest, args(&["fdl", "run", "--", "@ci"]));
     }
 
     #[test]
-    fn resolve_env_flag_errors_on_missing_overlay() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
-        let err = resolve_env(&args(&["fdl", "--env", "nope", "test"]), tmp.path(), None)
-            .unwrap_err();
-        assert!(err.contains("--env"), "got: {err}");
-        assert!(err.contains("nope"), "got: {err}");
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_env_env_var_errors_on_missing_overlay() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
-        let err = resolve_env(&args(&["fdl", "test"]), tmp.path(), Some("nope")).unwrap_err();
-        assert!(err.contains("FDL_ENV"), "got: {err}");
-        assert!(err.contains("nope"), "got: {err}");
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
-    #[test]
     fn resolve_env_equals_form_consumes_single_token() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
         let (env, rest) =
-            resolve_env(&args(&["fdl", "test", "--env=ci"]), tmp.path(), None).unwrap();
+            resolve_env(&args(&["fdl", "test", "--env=ci"]), None).unwrap();
         assert_eq!(env.as_deref(), Some("ci"));
         assert_eq!(rest, args(&["fdl", "test"]));
     }
 
     #[test]
     fn resolve_env_no_selector_returns_none() {
-        // `deploy` isn't an env overlay and there's no selector — leave it
-        // as the first positional command, env None.
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
+        // `deploy` isn't an env overlay and there's no selector — leave it as
+        // the first positional command, env None.
         let (env, rest) =
-            resolve_env(&args(&["fdl", "deploy", "--now"]), tmp.path(), None).unwrap();
+            resolve_env(&args(&["fdl", "deploy", "--now"]), None).unwrap();
         assert!(env.is_none());
         assert_eq!(rest, args(&["fdl", "deploy", "--now"]));
+    }
+
+    #[test]
+    fn load_path_still_errors_on_missing_overlay() {
+        // M21 moved overlay validation OUT of resolve_env, not away: the
+        // config-load path still errors loudly on a missing overlay, so a
+        // command that actually consumes the config (not --help / a builtin)
+        // fails with a clear message.
+        let tmp = TempDir::new();
+        touch(&tmp.path().join("fdl.yml"), "");
+        let base = tmp.path().join("fdl.yml");
+        let err = config::load_project_with_env(&base, Some("nope")).unwrap_err();
+        assert!(err.contains("nope"), "got: {err}");
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn help_env_or_note_degrades_on_missing_overlay() {
+        // M21 Option B: --help must always render. A present overlay passes
+        // through; a missing one degrades to base help (None); no env → None.
+        let tmp = TempDir::new();
+        touch(&tmp.path().join("fdl.yml"), "");
+        touch(&tmp.path().join("fdl.ci.yml"), "");
+        assert_eq!(help_env_or_note(tmp.path(), Some("ci")), Some("ci"));
+        assert_eq!(help_env_or_note(tmp.path(), Some("nope")), None);
+        assert_eq!(help_env_or_note(tmp.path(), None), None);
     }
 
     // ── --ansi / --no-ansi extraction ────────────────────────────────────
