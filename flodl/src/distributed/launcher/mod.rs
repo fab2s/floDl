@@ -82,7 +82,7 @@ use spawn::{
     load_prebuild_envelope, supervise_children, ElasticSupervision, build_local_spawn_command,
     build_ssh_spawn_command, cleanup_remote_hosts_parallel, build_remote_bash_command,
     build_local_relay_command, build_remote_relay_bash_command,
-    build_slim_envelope_for, forward_lines,
+    build_slim_envelope_for, forward_lines, RELAY_RANK_SENTINEL,
 };
 
 
@@ -844,11 +844,12 @@ pub fn run_launcher_with_config(
                     let p = prefix.clone();
                     forwarders.push(thread::spawn(move || forward_lines(err, p, true)));
                 }
-                // `usize::MAX` local-rank sentinel marks the relay child in
-                // supervision diagnostics (it has no rank slot).
+                // The relay child has no single rank slot (it carries the whole
+                // host's rank set); mark it with the relay sentinel so
+                // supervision prints "relay of <host>" instead of a raw number.
                 children.push((
                     host.host.clone(),
-                    usize::MAX,
+                    RELAY_RANK_SENTINEL,
                     host.ranks.clone(),
                     child,
                     forwarders,

@@ -126,8 +126,8 @@ pub(super) const SSH_OPTS: &[&str] = &[
 /// the driver never returns from: it holds the GPU and no pure-Rust
 /// mechanism reaps it, so it stays a manual `docker restart` / `ssh pkill`
 /// (the rig-hygiene backstop).
-/// One supervised child: host, local rank (or the relay's `usize::MAX`
-/// sentinel), the global ranks the child carries (reported dead on a
+/// One supervised child: host, local rank (or [`RELAY_RANK_SENTINEL`] for
+/// the relay), the global ranks the child carries (reported dead on a
 /// non-zero exit under elastic supervision), the process handle, and
 /// its output-forwarder threads.
 pub(super) type SupervisedChild = (
@@ -143,6 +143,44 @@ pub(super) type SupervisedChild = (
 /// latency; 100ms is imperceptible against that and cheap for a handful of
 /// watcher threads.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Local-rank slot value marking a per-host relay child (which carries a whole
+/// host's rank set, not a single rank). Formatted as `"relay"` in supervision
+/// diagnostics via [`child_label`] rather than leaking the raw sentinel.
+pub(super) const RELAY_RANK_SENTINEL: usize = usize::MAX;
+
+/// Human label for a supervised child in diagnostics: `"relay of <host>"` for
+/// the relay sentinel, `"rank <n> of <host>"` for a rank child.
+fn child_label(lr: usize, host: &str) -> String {
+    if lr == RELAY_RANK_SENTINEL {
+        format!("relay of {host}")
+    } else {
+        format!("rank {lr} of {host}")
+    }
+}
+
+/// Describe how a child ended. On Unix a signal death leaves `code()` == None;
+/// report the signal number instead of a meaningless `-1` so a SIGKILL/SIGSEGV
+/// is distinguishable from a normal non-zero exit in the logs.
+fn exit_status_desc(st: &ExitStatus) -> String {
+    match st.code() {
+        Some(c) => format!("status {c}"),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                match st.signal() {
+                    Some(sig) => format!("signal {sig}"),
+                    None => "unknown status".to_string(),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                "unknown status".to_string()
+            }
+        }
+    }
+}
 
 pub(super) fn supervise_children(
     children: Vec<SupervisedChild>,
@@ -212,11 +250,13 @@ pub(super) fn supervise_children(
         let failure_msg: Option<String> = match st {
             Ok(s) if s.success() => None,
             Ok(s) => Some(format!(
-                "cluster launcher: rank {lr} of {host} exited with status {}",
-                s.code().unwrap_or(-1)
+                "cluster launcher: {} exited with {}",
+                child_label(lr, &host),
+                exit_status_desc(&s),
             )),
             Err(e) => Some(format!(
-                "cluster launcher: wait on rank {lr} of {host} failed: {e}"
+                "cluster launcher: wait on {} failed: {e}",
+                child_label(lr, &host),
             )),
         };
         if let Some(msg) = failure_msg {
@@ -803,7 +843,48 @@ pub(super) fn forward_lines<R: std::io::Read>(stream: R, prefix: String, to_stde
                     println!("{prefix}{l}");
                 }
             }
+            // A non-UTF8 line is recoverable: skip it and keep forwarding the
+            // rest of the child's output (a single stray byte must not blind us
+            // to everything after it). A genuine IO error (pipe torn down) is
+            // terminal — stop, or we'd spin re-hitting the same error.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // L7: the relay's sentinel local-rank must render as "relay of <host>",
+    // not the raw usize::MAX integer, in supervision diagnostics.
+    #[test]
+    fn child_label_relay_sentinel_reads_as_relay() {
+        assert_eq!(child_label(RELAY_RANK_SENTINEL, "hostA"), "relay of hostA");
+        assert_eq!(child_label(3, "hostB"), "rank 3 of hostB");
+    }
+
+    // L6b: a signal death leaves ExitStatus::code() == None; report the signal
+    // number instead of a meaningless -1.
+    #[test]
+    fn exit_status_desc_reports_code_and_signal() {
+        let ok = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("spawn sh");
+        assert_eq!(exit_status_desc(&ok), "status 7");
+
+        // SIGKILL the child, then describe: code() is None, signal() is 9.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        child.kill().expect("kill");
+        let st = child.wait().expect("wait");
+        assert_eq!(exit_status_desc(&st), "signal 9");
     }
 }

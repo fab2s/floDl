@@ -266,7 +266,14 @@ impl DdpHandle {
         // staleness detector drops them post-registration
         // (`max_failure` applies) or the SSH client's broken
         // connection propagates pre-registration.
-        let worker_result: Result<TrainedState> = (move || -> Result<TrainedState> {
+        // Catch a panic (not just an Err) so the forensic death record is
+        // written either way — a bare panic would otherwise unwind straight to
+        // exit 101 with no `.death.json`, indistinguishable in a postmortem
+        // from a clean exit. AssertUnwindSafe is sound here: on a panic the
+        // captured state is never reused — we write the record and resume the
+        // unwind.
+        let worker_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            move || -> Result<TrainedState> {
             // Backend bootstrap — the ONE divergence between the rank
             // entries. NCCL: pin the device + init the comm on this
             // (main) thread (see the init-on-main doc above). CPU: dial
@@ -483,39 +490,57 @@ impl DdpHandle {
                     params: Vec::new(),
                     buffers: Vec::new(),
                 }))
-        })();
-        let final_state = match worker_result {
-            Ok(state) => state,
-            Err(e) => {
-                eprintln!("flodl cluster rank: rank failed: {e}");
-                // Last-gasp forensic record so a postmortem can tell this
-                // self-inflicted crash apart from a controller-driven
-                // ShutdownWithSave (which writes a CheckpointMeta). Best-
-                // effort and only when a save_path exists; a write failure
-                // is logged, never allowed to mask the original error.
-                if let Some(ref stem) = save_path {
-                    let record = crate::distributed::RankDeathRecord::new(
-                        global_rank,
-                        world_size,
-                        e.to_string(),
-                    );
-                    let path = crate::distributed::CheckpointBundle::rank_death_path(
-                        stem,
-                        global_rank,
-                    );
-                    match record.write_to_file(&path) {
-                        Ok(()) => eprintln!(
-                            "flodl cluster rank: wrote death record to {}",
-                            path.display()
-                        ),
-                        Err(werr) => eprintln!(
-                            "flodl cluster rank: failed to write death record \
-                             to {}: {werr}",
-                            path.display()
-                        ),
-                    }
+            },
+        ));
+        // Last-gasp forensic record so a postmortem can tell a self-inflicted
+        // crash (Err OR panic) apart from a controller-driven ShutdownWithSave
+        // (which writes a CheckpointMeta). Best-effort and only when a
+        // save_path exists; a write failure is logged, never allowed to mask
+        // the original cause.
+        let write_death_record = |reason: String| {
+            if let Some(ref stem) = save_path {
+                let record = crate::distributed::RankDeathRecord::new(
+                    global_rank,
+                    world_size,
+                    reason,
+                );
+                let path = crate::distributed::CheckpointBundle::rank_death_path(
+                    stem,
+                    global_rank,
+                );
+                match record.write_to_file(&path) {
+                    Ok(()) => eprintln!(
+                        "flodl cluster rank: wrote death record to {}",
+                        path.display()
+                    ),
+                    Err(werr) => eprintln!(
+                        "flodl cluster rank: failed to write death record \
+                         to {}: {werr}",
+                        path.display()
+                    ),
                 }
+            }
+        };
+        let final_state = match worker_outcome {
+            Ok(Ok(state)) => state,
+            Ok(Err(e)) => {
+                eprintln!("flodl cluster rank: rank failed: {e}");
+                write_death_record(e.to_string());
                 std::process::exit(1);
+            }
+            Err(panic) => {
+                // The default panic hook has already printed the message +
+                // backtrace; record the death, then resume the unwind so the
+                // panic still surfaces (exit 101) for the launcher's
+                // supervisor and any postmortem tooling.
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                eprintln!("flodl cluster rank: rank panicked: {msg}");
+                write_death_record(format!("panic: {msg}"));
+                std::panic::resume_unwind(panic);
             }
         };
 
