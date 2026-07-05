@@ -423,10 +423,23 @@ fn run_controller_rendezvous_with(
             )));
         }
         if streams[rank_idx].is_some() {
-            return Err(TensorError::new(&format!(
-                "rendezvous: duplicate Hello for rank {global_rank} from \
-                 {host_name:?} (peer {peer})"
-            )));
+            // Duplicate Hello for an already-slotted rank. This is reached
+            // ONLY inside the accept loop, i.e. BEFORE any Role frame is
+            // dispatched (Role/UID exchange runs after the loop completes), so
+            // the earlier connection was never told its role: the rank is
+            // simply re-announcing after a TCP blip dropped its first socket.
+            // Replace the stale (now-dead) stream with the live one rather than
+            // aborting the whole cohort over a transient reconnect. Do NOT
+            // re-count — the rank already filled its slot; only the underlying
+            // connection changed.
+            eprintln!(
+                "cluster launcher: rendezvous rank {global_rank} from \
+                 {host_name:?} (peer {peer}) reconnected before role dispatch; \
+                 replacing stale stream (transient TCP blip, not cohort-fatal)"
+            );
+            streams[rank_idx] = Some(stream);
+            last_progress = Instant::now();
+            continue;
         }
         streams[rank_idx] = Some(stream);
         accepted += 1;
@@ -765,6 +778,97 @@ mod tests {
         assert_eq!(rdv_b.local_ranks(), &[1usize]);
         assert_eq!(rdv_a.unique_id().as_bytes(), &stub_uid_bytes);
         assert_eq!(rdv_b.unique_id().as_bytes(), &stub_uid_bytes);
+    }
+
+    #[test]
+    fn duplicate_hello_reconnect_replaces_stream_not_cohort_fatal() {
+        // M11: a rank whose TCP connection blips mid-rendezvous reconnects and
+        // re-sends Hello. Before the fix the controller aborted the ENTIRE
+        // cohort on the duplicate Hello; now it replaces the stale stream
+        // (Role has not been dispatched yet) and completes rendezvous on the
+        // live reconnected connection. Driven at the raw-wire level so we can
+        // send two Hellos for the same rank from two different sockets.
+        let port = next_port();
+        let mut full = full_cluster_for_test(port);
+        full.salt = [0x77u8; 16];
+        let salt = full.salt;
+        let sig = [0x42u8; 32];
+        let stub_uid = [0xabu8; NCCL_UNIQUE_ID_BYTES];
+
+        // Controller is not co-located, so the designated (generator) rank is
+        // workers[0].ranks[0] = rank 0 (host-a).
+        let ctrl_handle =
+            thread::spawn(move || run_controller_rendezvous(&full, "test-controller-host"));
+
+        let connect = move || -> TcpStream {
+            let addr = format!("127.0.0.1:{port}");
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(&addr) {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    return s;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("could not connect to controller at {addr}");
+        };
+        let hello = |rank: u32, host: &str| RendezvousMsgWire::Hello {
+            dataset_sig: sig,
+            global_rank: rank,
+            host_name: host.to_string(),
+        };
+        // > RENDEZVOUS_POLL_INTERVAL (200ms) so the controller has accepted and
+        // read each Hello before the next connection arrives, making the
+        // duplicate deterministic.
+        let settle = Duration::from_millis(400);
+
+        // Rank 0's first (soon-stale) connection.
+        let mut conn0a = connect();
+        write_rendezvous_frame(&mut conn0a, &salt, &hello(0, "host-a")).unwrap();
+        thread::sleep(settle);
+
+        // Rank 0 reconnects after a "blip": duplicate Hello -> controller must
+        // REPLACE the stale stream, not abort.
+        let mut conn0b = connect();
+        write_rendezvous_frame(&mut conn0b, &salt, &hello(0, "host-a")).unwrap();
+        thread::sleep(settle);
+
+        // Rank 1 completes the cohort.
+        let mut conn1 = connect();
+        write_rendezvous_frame(&mut conn1, &salt, &hello(1, "host-b")).unwrap();
+
+        // Role must land on the LIVE (reconnected) rank-0 stream, and rank 0 is
+        // the generator: respond with the UID.
+        match read_rendezvous_frame(&mut conn0b, &salt).unwrap() {
+            RendezvousMsgWire::Role(RendezvousRole::Generate) => {}
+            other => panic!("rank 0 (live stream) expected Role::Generate, got {other:?}"),
+        }
+        write_rendezvous_frame(
+            &mut conn0b,
+            &salt,
+            &RendezvousMsgWire::Uid { uid_bytes: stub_uid.to_vec() },
+        )
+        .unwrap();
+
+        // Rank 1 waits, then receives the broadcast UID.
+        match read_rendezvous_frame(&mut conn1, &salt).unwrap() {
+            RendezvousMsgWire::Role(RendezvousRole::Wait) => {}
+            other => panic!("rank 1 expected Role::Wait, got {other:?}"),
+        }
+        match read_rendezvous_frame(&mut conn1, &salt).unwrap() {
+            RendezvousMsgWire::Uid { uid_bytes } => {
+                assert_eq!(uid_bytes, stub_uid.to_vec(), "rank 1 must receive the UID");
+            }
+            other => panic!("rank 1 expected Uid, got {other:?}"),
+        }
+
+        // The controller completed instead of aborting on the duplicate Hello.
+        ctrl_handle
+            .join()
+            .expect("controller thread")
+            .expect("rendezvous must complete despite the mid-rendezvous reconnect");
+
+        drop(conn0a);
     }
 
     #[test]
