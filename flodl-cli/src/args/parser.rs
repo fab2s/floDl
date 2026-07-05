@@ -223,6 +223,18 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
 
 /// Consume one flag — given the decl and optional inline value — and
 /// advance the argv cursor accordingly. Returns the new index.
+/// Whether `s` should be treated as a flag when deciding if the token after a
+/// value-taking option is that option's value.
+///
+/// A leading `-` marks a flag EXCEPT for a bare `-`/`--` and for negative
+/// numbers: `--lr -0.5` must consume `-0.5` as the value, not read it as a
+/// flag. This is unambiguous here because every flodl short flag is alphabetic
+/// (`-v`/`-q`/`-h`/`-V`/`-y`) — a `-<number>` token can only be a value.
+/// `f64::from_str` also accepts `-inf` / `-nan`, which are fine as values.
+fn is_flag_like(s: &str) -> bool {
+    s.starts_with('-') && s != "-" && s != "--" && s.parse::<f64>().is_err()
+}
+
 fn consume_flag(
     decl: &OptionDecl,
     inline_value: Option<String>,
@@ -249,7 +261,7 @@ fn consume_flag(
     let next_idx = i + 1;
     let next_is_flag = args
         .get(next_idx)
-        .map(|s| s.starts_with('-') && s != "-" && s != "--")
+        .map(|s| is_flag_like(s))
         .unwrap_or(true); // absent counts as "no value available"
 
     if !next_is_flag {
@@ -463,6 +475,47 @@ mod tests {
             Some(OptionState::WithValues(v)) => assert_eq!(v, &vec!["mlp".to_string()]),
             other => panic!("expected WithValues, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn is_flag_like_treats_negative_numbers_as_values() {
+        // M22: negative numbers (and bare -/--) are NOT flags for the purpose
+        // of value consumption; alphabetic short/long flags are.
+        assert!(is_flag_like("--verbose"));
+        assert!(is_flag_like("-v"));
+        assert!(!is_flag_like("-0.5"));
+        assert!(!is_flag_like("-5"));
+        assert!(!is_flag_like("-1e-3"));
+        assert!(!is_flag_like("-")); // bare dash: value/stdin sentinel
+        assert!(!is_flag_like("--")); // separator
+        assert!(!is_flag_like("mlp")); // plain positional value
+    }
+
+    #[test]
+    fn value_flag_consumes_space_separated_negative_number() {
+        // M22: `--lr -0.5` reads `-0.5` as the value, not a flag.
+        let spec = ArgsSpec {
+            options: vec![value("lr", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let out = parse(&spec, &argv(&["--lr", "-0.5"])).unwrap();
+        match out.options.get("lr") {
+            Some(OptionState::WithValues(v)) => assert_eq!(v, &vec!["-0.5".to_string()]),
+            other => panic!("expected WithValues([-0.5]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn value_flag_still_errors_when_next_is_a_real_flag() {
+        // A genuine flag after a value-requiring option is NOT consumed.
+        let spec = ArgsSpec {
+            options: vec![value("lr", None, false), flag("verbose", None)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["--lr", "--verbose"])).unwrap_err();
+        assert!(err.contains("requires a value"), "got: {err}");
     }
 
     #[test]
