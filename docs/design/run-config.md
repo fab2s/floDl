@@ -412,8 +412,8 @@ Three equivalent forms, all explicit; a command-line selector (`@` or
 `--env`) overrides the ambient `FDL_ENV`:
 
 ```bash
-fdl @ci test                 # @ sigil - scan-anywhere before --, also `fdl test @ci`
-fdl --env ci test            # flag - scan-anywhere: also `fdl test --env ci` / `--env=ci`
+fdl @ci test                 # @ sigil - pre-command position only (before the command)
+fdl --env ci test            # flag - position-independent: also `fdl test --env ci` / `--env=ci`
 FDL_ENV=ci fdl test          # environment variable, for CI runners + shell rc
 fdl local ddp-bench validate # env=local: `fdl @local ddp-bench validate`
 ```

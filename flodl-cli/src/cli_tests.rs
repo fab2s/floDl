@@ -206,11 +206,22 @@
     }
 
     #[test]
-    fn extract_at_env_scans_anywhere() {
-        // Position-independent, like --env: `fdl probe @cluster`.
+    fn extract_at_env_after_command_is_not_consumed() {
+        // `@<env>` is a PRE-COMMAND selector: an `@`-token after the command
+        // ("probe") belongs to the command and is forwarded verbatim.
         let (out, env) = extract_at_env(&args(&["fdl", "probe", "@cluster"])).unwrap();
-        assert_eq!(out, args(&["fdl", "probe"]));
-        assert_eq!(env.as_deref(), Some("cluster"));
+        assert_eq!(out, args(&["fdl", "probe", "@cluster"]));
+        assert!(env.is_none());
+    }
+
+    #[test]
+    fn extract_at_env_option_value_not_stolen() {
+        // M20: an `@`-prefixed OPTION VALUE after the command must not be
+        // mistaken for an env selector.
+        let (out, env) =
+            extract_at_env(&args(&["fdl", "train", "--tag", "@best"])).unwrap();
+        assert_eq!(out, args(&["fdl", "train", "--tag", "@best"]));
+        assert!(env.is_none());
     }
 
     #[test]
@@ -262,15 +273,17 @@
     }
 
     #[test]
-    fn resolve_env_at_sigil_scans_anywhere() {
+    fn resolve_env_at_sigil_after_command_not_consumed() {
+        // Pre-command sigil only: `@cluster` after the command "probe" is the
+        // command's own arg, so no env resolves and the token is preserved.
         let tmp = TempDir::new();
         touch(&tmp.path().join("fdl.yml"), "");
         touch(&tmp.path().join("fdl.cluster.yml"), "");
 
         let (env, rest) =
             resolve_env(&args(&["fdl", "probe", "@cluster"]), tmp.path(), None).unwrap();
-        assert_eq!(env.as_deref(), Some("cluster"));
-        assert_eq!(rest, args(&["fdl", "probe"]));
+        assert!(env.is_none());
+        assert_eq!(rest, args(&["fdl", "probe", "@cluster"]));
     }
 
     #[test]

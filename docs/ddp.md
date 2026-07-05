@@ -631,8 +631,8 @@ Conventions:
 Three equivalent forms (a command-line selector overrides `FDL_ENV`):
 
 ```bash
-fdl @cluster <cmd>            # @ sigil (scan-anywhere before --)
-fdl --env cluster <cmd>       # explicit flag
+fdl @cluster <cmd>            # @ sigil (pre-command position only)
+fdl --env cluster <cmd>       # explicit flag (position-independent)
 FDL_ENV=cluster fdl <cmd>     # environment variable
 ```
 

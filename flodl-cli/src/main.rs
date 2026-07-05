@@ -434,22 +434,30 @@ fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), St
 /// Strip a single `@<env>` selector token from `args`, returning the env
 /// name without the leading `@`.
 ///
-/// Scan-anywhere (`fdl @cluster probe` ≡ `fdl probe @cluster`) but stops at
-/// the first standalone `--`, so a literal `@`-prefixed argument can still
-/// be forwarded to an inner command after the separator. Index 0 (the
-/// program name) is never inspected. Errors on a bare `@` (no name) or on
-/// more than one `@`-token.
+/// The `@<env>` sigil is a PRE-COMMAND selector: it is recognized only among
+/// the tokens *before* the command (`fdl @cluster probe`), never after it.
+/// The first bare token (not a flag, not `@`-prefixed) is the command — from
+/// there on nothing is treated as an env selector, so an `@`-prefixed option
+/// value (`fdl train --tag @best`) or a positional the command owns is
+/// forwarded verbatim rather than mistaken for an env selector. A standalone
+/// `--` before the command also ends recognition. Index 0 (the program name)
+/// is never inspected. By the time this runs every other global flag has been
+/// stripped upstream (and `--env` inside `resolve_env`), so the first bare
+/// token really is the command. Errors on a bare `@` (no name) or on more
+/// than one `@`-token.
 fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     let mut out = Vec::with_capacity(args.len());
     let mut env: Option<String> = None;
-    let mut past_dashdash = false;
+    // Set once the command token (or a `--`) is reached: everything from there
+    // on is the command and its arguments, forwarded verbatim.
+    let mut command_seen = false;
     for (i, arg) in args.iter().enumerate() {
-        if i == 0 || past_dashdash {
+        if i == 0 || command_seen {
             out.push(arg.clone());
             continue;
         }
         if arg == "--" {
-            past_dashdash = true;
+            command_seen = true;
             out.push(arg.clone());
             continue;
         }
@@ -466,6 +474,12 @@ fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), Stri
             }
             env = Some(name.to_string());
             continue;
+        }
+        // First non-flag, non-`@` token = the command; end recognition. A
+        // leading global flag that survived upstream extraction starts with
+        // `-` and is tolerated (skipped) until the command is reached.
+        if !arg.starts_with('-') {
+            command_seen = true;
         }
         out.push(arg.clone());
     }
