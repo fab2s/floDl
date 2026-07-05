@@ -311,8 +311,9 @@ fn probe_remote_abi(worker: &ClusterWorker) -> Result<Vec<String>, String> {
         .and_then(|s| s.target.as_deref())
         .unwrap_or(&worker.host);
     let mut cmd = Command::new("ssh");
-    cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    // User ssh.options first (they win), then flodl's defaults (M17).
     apply_worker_ssh_opts(&mut cmd, worker);
+    cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     cmd.arg(target);
     // uname line, then the ldd banner (its version line lands on stderr
     // for glibc, stdout for some — capture both, sentinel-separated), then a

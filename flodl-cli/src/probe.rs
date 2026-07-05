@@ -219,6 +219,8 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
     // dialed on the default port 22 and the connect is refused (the
     // probe then reports the host red even though dispatch works fine).
     let mut cmd = Command::new("ssh");
+    // User ssh.options first (they win), then flodl's defaults (M17).
+    crate::cluster::apply_worker_ssh_opts(&mut cmd, worker);
     cmd.args([
         "-T",
         "-o",
@@ -228,7 +230,6 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
         "-o",
         "ServerAliveCountMax=3",
     ]);
-    crate::cluster::apply_worker_ssh_opts(&mut cmd, worker);
     cmd.arg(&ssh_target).arg(&remote_cmd);
     let output = cmd.output();
 

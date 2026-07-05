@@ -301,9 +301,15 @@ fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Str
 /// host is unreachable. Uses `BatchMode=yes` so a passphrase prompt
 /// doesn't hang the dispatch.
 /// Apply a worker's `ssh:` sub-block (port / user / identity_file /
-/// options) as flags on an `ssh` `Command`, in the canonical order.
-/// The caller pushes the connect-behavior flags (`-T`, BatchMode,
-/// timeouts), then this, then the target host + remote command.
+/// options) as flags on an `ssh` `Command`.
+///
+/// Call this BEFORE pushing flodl's default connect-behavior flags (`-T`,
+/// `BatchMode`, timeouts), then the target host + remote command. User
+/// `ssh.options` are emitted here first so they take precedence: OpenSSH uses
+/// the first value seen for each `-o`, so flodl's later defaults fill in only
+/// the options the user didn't set (M17). The one option flodl truly needs —
+/// `BatchMode=yes`, so its non-interactive ssh never hangs on a prompt — is
+/// still overridable, but [`batchmode_override_warning`] flags it loudly.
 ///
 /// Shared by cluster GPU-count dispatch ([`ssh_query_gpu_count`]) and
 /// `fdl probe`'s remote fan-out (`probe::probe_remote_via_ssh`) so both
@@ -323,10 +329,33 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
         if let Some(id) = ssh.identity_file.as_deref() {
             cmd.arg("-i").arg(id);
         }
+        if let Some(warning) = batchmode_override_warning(&ssh.options, &worker.host) {
+            eprintln!("{warning}");
+        }
         for opt in &ssh.options {
             cmd.arg("-o").arg(opt);
         }
     }
+}
+
+/// The warning message when a worker's `ssh.options` set `BatchMode` to a
+/// non-`yes` value, else `None`. flodl's remote ssh (dispatch + probes) is
+/// non-interactive, so a prompt hangs it; `BatchMode=yes` is the one truly
+/// required ssh option. Every other flodl default is freely overridable (M17).
+fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
+    opts.iter().find_map(|opt| {
+        let (k, v) = opt.split_once('=')?;
+        (k.trim().eq_ignore_ascii_case("BatchMode")
+            && !v.trim().eq_ignore_ascii_case("yes"))
+        .then(|| {
+            format!(
+                "fdl: host {host:?} ssh.options set `{}` — flodl's ssh is \
+                 non-interactive and will hang on any prompt (passphrase, \
+                 host-key). Proceeding as requested.",
+                opt.trim()
+            )
+        })
+    })
 }
 
 fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> {
@@ -336,6 +365,8 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         .and_then(|s| s.target.as_deref())
         .unwrap_or(&worker.host);
     let mut cmd = Command::new("ssh");
+    // User ssh.options first (they win), then flodl's defaults (M17).
+    apply_worker_ssh_opts(&mut cmd, worker);
     cmd.args([
         "-T",
         "-o",
@@ -343,7 +374,6 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         "-o",
         "ConnectTimeout=5",
     ]);
-    apply_worker_ssh_opts(&mut cmd, worker);
     cmd.arg(target);
     // Pipe to wc -l for a one-line numeric output; nvidia-smi's
     // error stream is silenced so a missing driver produces "0" cleanly

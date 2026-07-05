@@ -61,9 +61,13 @@ pub(super) fn load_prebuild_envelope() -> Result<BTreeMap<String, PerHostPrebuil
     })
 }
 
-/// SSH options shared by every remote host invocation. Match fdl-cli's
+/// SSH options shared by every remote host invocation. These are DEFAULTS:
+/// they are emitted AFTER the user's `ssh.options`, so a user's `-o` overrides
+/// any of the `-o` entries here (OpenSSH first-value-wins). Match fdl-cli's
 /// existing flodl-cli/src/cluster.rs constants verbatim:
-/// - `-T`: disable PTY (keeps stdout/stderr clean)
+/// - `-T`: disable PTY (keeps stdout/stderr clean; also load-bearing for the
+///   stdin-envelope protocol). A flag, not `-o`, so it is not user-overridable
+///   via `ssh.options` and is always enforced.
 /// - `ServerAliveInterval=10` + `ServerAliveCountMax=3`: client gives up
 ///   after ~30s of silence so a dead remote doesn't hang the controller
 /// - `BatchMode=yes`: fail fast on auth issues; no interactive prompts
@@ -497,7 +501,9 @@ pub(super) fn build_remote_relay_bash_command(
 /// - `host.ssh_port` → `-p <port>` (default: system ssh's 22)
 /// - `host.ssh_user` → `-l <user>` (default: current user)
 /// - `host.ssh_identity_file` → `-i <path>` (default: `~/.ssh/config` rules)
-/// - `host.ssh_options` → `-o Key=Value ...` (pass-through, in order)
+/// - `host.ssh_options` → `-o Key=Value ...` emitted BEFORE `SSH_OPTS` so the
+///   user's value wins per option (OpenSSH first-value-wins); flodl's defaults
+///   apply only to options the user didn't set (M17)
 /// - `host.ssh.as_deref().unwrap_or(&host.host)` → the connect target
 ///
 /// All fields are optional; when absent, the corresponding flag is
@@ -507,6 +513,21 @@ pub(super) fn build_remote_relay_bash_command(
 pub(super) fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
     let ssh_target = host.ssh_target();
     let mut c = Command::new("ssh");
+    // User `ssh.options` are emitted FIRST so they take precedence: OpenSSH
+    // uses the first value seen for each `-o` option, so flodl's `SSH_OPTS`
+    // below supply defaults only for options the user did not set. This lets a
+    // user override policy defaults like `StrictHostKeyChecking` for their own
+    // known_hosts discipline (M17). The one option flodl truly needs —
+    // `BatchMode=yes`, so a non-interactive ssh never hangs on a prompt — is
+    // still overridable, but with a loud warning.
+    if let Some(opts) = host.ssh.as_ref().map(|s| &s.options) {
+        if let Some(warning) = batchmode_override_warning(opts, &host.host) {
+            eprintln!("{warning}");
+        }
+        for opt in opts {
+            c.arg("-o").arg(opt);
+        }
+    }
     c.args(SSH_OPTS);
     if let Some(p) = host.ssh.as_ref().and_then(|s| s.port) {
         c.arg("-p").arg(p.to_string());
@@ -526,13 +547,31 @@ pub(super) fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Co
     if let Some(i) = host.ssh.as_ref().and_then(|s| s.identity_file.as_deref()) {
         c.arg("-i").arg(i);
     }
-    if let Some(opts) = host.ssh.as_ref().map(|s| &s.options) {
-        for opt in opts {
-            c.arg("-o").arg(opt);
-        }
-    }
     c.arg(ssh_target).arg(remote_cmd);
     c
+}
+
+/// The warning message when a user's `ssh.options` set `BatchMode` to a
+/// non-`yes` value, else `None`. `BatchMode=yes` is the one ssh option flodl
+/// truly requires: its ssh fan-out runs non-interactive (piped/absent stdin,
+/// no TTY via `-T`), so any prompt (passphrase, host-key) hangs the launcher.
+/// Every other flodl default (`StrictHostKeyChecking`, keepalives) is a free
+/// override. The caller surfaces this loudly but still honors the option — a
+/// genuinely unusual setup might need it.
+fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
+    opts.iter().find_map(|opt| {
+        let (k, v) = opt.split_once('=')?;
+        (k.trim().eq_ignore_ascii_case("BatchMode")
+            && !v.trim().eq_ignore_ascii_case("yes"))
+        .then(|| {
+            format!(
+                "flodl: host {host:?} ssh.options set `{}` — flodl's ssh \
+                 dispatch is non-interactive and will hang on any prompt \
+                 (passphrase, host-key). Proceeding as requested.",
+                opt.trim()
+            )
+        })
+    })
 }
 
 /// Pipe the hex-encoded cluster/relay envelope to a REMOTE child's stdin
@@ -886,5 +925,51 @@ mod tests {
         child.kill().expect("kill");
         let st = child.wait().expect("wait");
         assert_eq!(exit_status_desc(&st), "signal 9");
+    }
+
+    #[test]
+    fn batchmode_override_warning_flags_non_yes_only() {
+        let h = "host-a";
+        // Overriding BatchMode to anything but yes → warn (any case, spaces).
+        assert!(batchmode_override_warning(&["BatchMode=no".into()], h).is_some());
+        assert!(batchmode_override_warning(&["batchmode=No".into()], h).is_some());
+        assert!(batchmode_override_warning(&["BatchMode = ask".into()], h).is_some());
+        // BatchMode=yes, other options, and empty → no warning.
+        assert!(batchmode_override_warning(&["BatchMode=yes".into()], h).is_none());
+        assert!(batchmode_override_warning(&["BatchMode = yes".into()], h).is_none());
+        assert!(batchmode_override_warning(&["StrictHostKeyChecking=no".into()], h).is_none());
+        assert!(batchmode_override_warning(&[], h).is_none());
+    }
+
+    #[test]
+    fn build_ssh_spawn_command_user_options_precede_defaults() {
+        // M17: a user ssh.option must win over flodl's SSH_OPTS default. OpenSSH
+        // takes the first value per option, so the user's must be emitted first.
+        let v = serde_json::json!({
+            "controller": { "host": "ctl", "port": 1337, "path": "/p" },
+            "workers": [{
+                "host": "w1", "ranks": [0], "local_devices": [0],
+                "nccl_socket_ifname": "lo", "path": "/p", "arch": "precompiled/cu128",
+                "ssh": { "options": ["StrictHostKeyChecking=no"] }
+            }]
+        });
+        let full = FullCluster::from_value(&v).expect("valid cluster");
+        let cmd = build_ssh_spawn_command(&full.workers[0], "echo hi");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let user = args
+            .iter()
+            .position(|a| a == "StrictHostKeyChecking=no")
+            .expect("user ssh.option present");
+        let default = args
+            .iter()
+            .position(|a| a == "StrictHostKeyChecking=accept-new")
+            .expect("flodl default present");
+        assert!(
+            user < default,
+            "user ssh.option must precede flodl's default: {args:?}"
+        );
     }
 }
