@@ -800,16 +800,16 @@ pub fn exec_command(
     }
 }
 
-/// Join args into a shell-safe string.
+/// Join args into a single shell-safe string for the docker `bash -c "…"`
+/// path. Each token is POSIX-quoted via [`posix_quote`], so shell
+/// metacharacters in a value (`$`, backticks, globs, `;`, `|`, redirections,
+/// …) are passed literally rather than expanded or interpreted by the inner
+/// shell. The previous predicate only quoted tokens containing a space, `"`,
+/// or empty — leaving `$HOME`, `` `cmd` ``, `*.py`, `a;b` to be interpreted.
+/// Mirrors `exec_script`, which quotes through the same helper.
 fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|a| {
-            if a.contains(' ') || a.contains('"') || a.is_empty() {
-                format!("'{}'", a.replace('\'', "'\\''"))
-            } else {
-                a.clone()
-            }
-        })
+        .map(|a| posix_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1554,6 +1554,18 @@ mod tests {
     fn posix_quote_escapes_embedded_single_quotes() {
         assert_eq!(posix_quote("it's"), "'it'\\''s'");
         assert_eq!(posix_quote("'"), "''\\'''");
+    }
+
+    #[test]
+    fn shell_join_quotes_shell_metacharacters() {
+        // M23: safe tokens pass through bare and join with spaces; values with
+        // shell metacharacters ($, glob, ;) are single-quoted so the inner
+        // `bash -c "…"` treats them literally instead of expanding them.
+        let args: Vec<String> = ["--model", "mlp", "--tag", "$HOME", "*.py", "a;b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(shell_join(&args), "--model mlp --tag '$HOME' '*.py' 'a;b'");
     }
 
     #[test]
