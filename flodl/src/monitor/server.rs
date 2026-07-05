@@ -57,10 +57,55 @@ struct SharedState {
     gpu_init: Mutex<Option<String>>,
 }
 
+/// Loopback host literals that need no exposure warning.
+fn is_loopback_addr(a: &str) -> bool {
+    matches!(a, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Resolve the dashboard's bind address.
+///
+/// Defaults to loopback (`127.0.0.1`) so this unauthenticated metrics server is
+/// never exposed to the network unless the operator explicitly asks. Set
+/// `FLODL_DASHBOARD_BIND=<addr>` to widen it (e.g. `0.0.0.0` for LAN / remote
+/// access); a non-loopback value prints a loud no-auth warning, since the
+/// dashboard has no authentication and an SSH tunnel is the safer way to view
+/// it remotely.
+pub(crate) fn resolve_dashboard_bind() -> String {
+    match std::env::var("FLODL_DASHBOARD_BIND") {
+        Ok(a) if !a.trim().is_empty() => {
+            let addr = a.trim().to_string();
+            if !is_loopback_addr(&addr) {
+                eprintln!(
+                    "flodl: dashboard binding to {addr} — it has NO authentication, \
+                     so anyone who can reach that address can view training metrics. \
+                     Prefer an SSH tunnel: `ssh -L <port>:localhost:<port> <host>`."
+                );
+            }
+            addr
+        }
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+/// Whether the dashboard will bind loopback (the default). Mirrors
+/// [`resolve_dashboard_bind`]'s classification WITHOUT emitting the warning, so
+/// callers can tailor the printed URL (loopback → advise an SSH tunnel) without
+/// double-warning.
+pub(crate) fn dashboard_bind_is_loopback() -> bool {
+    match std::env::var("FLODL_DASHBOARD_BIND") {
+        Ok(a) => a.trim().is_empty() || is_loopback_addr(a.trim()),
+        Err(_) => true,
+    }
+}
+
 impl DashboardServer {
     /// Start the dashboard server on the given port.
+    ///
+    /// Binds loopback by default; widen via `FLODL_DASHBOARD_BIND`
+    /// (see [`resolve_dashboard_bind`]).
     pub fn start(port: u16) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+        let bind = resolve_dashboard_bind();
+        let listener = TcpListener::bind((bind.as_str(), port))?;
         let (tx, rx) = mpsc::channel::<ServerMsg>();
 
         let state = Arc::new(SharedState {
@@ -316,4 +361,21 @@ fn serve_history(stream: &mut TcpStream, state: &SharedState) {
         body,
     );
     let _ = stream.write_all(response.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_loopback_addr_classifies_bind_targets() {
+        // M18: loopback literals need no exposure warning; everything else
+        // (all-interfaces, a concrete LAN IP) does and is not "loopback".
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("::1"));
+        assert!(is_loopback_addr("localhost"));
+        assert!(!is_loopback_addr("0.0.0.0"));
+        assert!(!is_loopback_addr("192.168.1.5"));
+        assert!(!is_loopback_addr("::"));
+    }
 }

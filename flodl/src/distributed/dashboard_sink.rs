@@ -225,10 +225,23 @@ impl DashboardSink for ClusterDashboardSink {
         match mon.serve_local_unconditional(port) {
             Ok(()) => {
                 *bound = port;
-                eprintln!(
-                    "cluster dashboard: http://{}:{}",
-                    self.controller_host, port,
-                );
+                if crate::monitor::dashboard_bind_is_loopback() {
+                    // Loopback default: the URL below only works ON the
+                    // controller. Point remote viewers at an SSH tunnel rather
+                    // than implying network reachability the bind doesn't have.
+                    eprintln!(
+                        "cluster dashboard: http://localhost:{port} (bound on the \
+                         controller, loopback). View from another machine via \
+                         `ssh -L {port}:localhost:{port} {}`, or set \
+                         FLODL_DASHBOARD_BIND=0.0.0.0 to expose it (no auth).",
+                        self.controller_host,
+                    );
+                } else {
+                    eprintln!(
+                        "cluster dashboard: http://{}:{}",
+                        self.controller_host, port,
+                    );
+                }
             }
             Err(e) => {
                 eprintln!(

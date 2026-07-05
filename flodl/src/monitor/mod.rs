@@ -27,6 +27,7 @@ pub mod format;
 pub mod resources;
 pub mod timeline;
 mod server;
+pub(crate) use server::dashboard_bind_is_loopback;
 
 use std::fmt::Write;
 use std::time::{Duration, Instant};
