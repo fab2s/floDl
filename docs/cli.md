@@ -701,10 +701,12 @@ FDL_ENV=cluster fdl <cmd>    # env-var form
 
 **Pre-flight per-host build**: before fan-out, `fdl @cluster <cmd>`
 auto-builds the target binary locally for every remote host. Per-host
-`CARGO_TARGET_DIR=target/cluster/<host>/`, libtorch resolved from
+`CARGO_TARGET_DIR=target/cluster/<host>/<arch>/`, libtorch resolved from
 each host's `arch:` declaration, CUDA feature derived from the host's
-GPU arch metadata. Builds run in parallel per host; first failure
-aborts fan-out. Remote dispatch invokes the prebuilt binary directly -
+GPU arch metadata. (Keying the target dir on `arch` as well as `host`
+means changing a host's `arch:` rebuilds cleanly instead of reusing a
+binary linked against the old libtorch.) Builds run in parallel per
+host; first failure aborts fan-out. Remote dispatch invokes the prebuilt binary directly -
 no cargo, no rustc on remote.
 
 Pass `--no-prebuild` to skip the pre-flight phase (when binaries are

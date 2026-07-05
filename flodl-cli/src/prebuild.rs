@@ -9,12 +9,15 @@
 //! behaviour.
 //!
 //! This module runs `cargo build` LOCALLY on the controller, once per
-//! remote host, into per-host `target/cluster/<host>/` directories
-//! with the right libtorch bind-mounted. The shared mount delivers the
-//! resulting binary to the remote, which execs it directly (no cargo,
-//! no rust toolchain on remote). Per-host target dirs isolate cargo's
-//! fingerprint cache so a libtorch swap on one host doesn't invalidate
-//! anyone else's incremental build.
+//! remote host, into per-`(host, arch)` `target/cluster/<host>/<arch>/`
+//! directories with the right libtorch bind-mounted. The shared mount
+//! delivers the resulting binary to the remote, which execs it directly
+//! (no cargo, no rust toolchain on remote). Per-`(host, arch)` target
+//! dirs isolate cargo's fingerprint cache so a libtorch swap on one host
+//! doesn't invalidate anyone else's incremental build -- and so changing
+//! a host's own `arch:` builds fresh rather than reusing a binary linked
+//! against the old libtorch (in docker mode the container's
+//! `LIBTORCH_PATH` is a fixed mount point, invisible to cargo's cache).
 //!
 //! Convention: command name == binary name. `fdl @cluster ddp-bench`
 //! builds `--bin ddp-bench`. Features derive from the host's libtorch
@@ -59,7 +62,7 @@ pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_PREBUILD_PER_HOST";
 /// the host's libtorch advertises a CUDA version in `.arch`, `dev`
 /// otherwise). The build's env is overridden so:
 ///   - `LIBTORCH_HOST_PATH` points at the resolved host libtorch dir
-///   - `CARGO_TARGET_DIR` points at `target/cluster/<host>/`
+///   - `CARGO_TARGET_DIR` points at `target/cluster/<host>/<arch>/`
 ///
 /// Returns `Ok(())` on universal success. Returns `Err(combined_msg)`
 /// listing every host that failed (with its stderr tail) on any
@@ -368,6 +371,17 @@ fn probe_remote_abi(worker: &ClusterWorker) -> Result<Vec<String>, String> {
     Ok(warnings)
 }
 
+/// Collapse a libtorch `arch:` subpath (`precompiled/cu128`,
+/// `builds/sm61-sm120`) into a single path segment for use in the
+/// per-`(host, arch)` cargo target dir. Only the path separators need
+/// folding (`/` and, defensively, `\`); everything else in a libtorch
+/// variant name is already a safe path atom.
+fn arch_slug(arch: &str) -> String {
+    arch.chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect()
+}
+
 fn prebuild_one_worker(
     project_root: &Path,
     cmd_cwd: &Path,
@@ -413,7 +427,24 @@ fn prebuild_one_worker(
     // not arch-derived — the controller's toolchain builds every host.
     let (features_arg, _) = features_and_service_from_arch(arch);
     let cuda_version_for_image = cuda_version_from_arch(arch);
-    let target_dir_relative = format!("target/cluster/{}", worker.host);
+    // Key the target dir by host AND arch. Host alone is not enough: the
+    // `arch:` field selects the libtorch variant, but in docker mode that
+    // variant is bind-mounted onto the FIXED container path
+    // (`/usr/local/libtorch`, `Dockerfile` ENV LIBTORCH_PATH), so
+    // `LIBTORCH_PATH` inside the container never changes when `arch:`
+    // does. Change a host's `arch:` to a different torch/CUDA build in the
+    // same feature category (e.g. `precompiled/cu118` -> `precompiled/cu128`,
+    // both `--features cuda`) and nothing cargo fingerprints changes:
+    // cargo would reuse the stale binary linked against the OLD libtorch,
+    // which then execs at fan-out with the NEW `LD_LIBRARY_PATH` -> ABI
+    // mismatch (`undefined symbol`) or silently-wrong kernels. An env-only
+    // nudge can't fix it: the mount path is fixed, so build.rs re-emits the
+    // same `-L` string and cargo never relinks. A distinct target dir per
+    // (host, arch) is the only thing that forces the rebuild. `arch` is a
+    // libtorch subpath (`precompiled/cu128`, `builds/sm61-sm120`); slugify
+    // its `/` so it is a single path segment.
+    let target_dir_relative =
+        format!("target/cluster/{}/{}", worker.host, arch_slug(arch));
 
     // Two execution modes — docker-backed (controller has `docker:`
     // set in cluster.yml) or native cargo on the host filesystem.
@@ -707,6 +738,19 @@ mod tests {
         assert_eq!(cuda_version_from_arch("builds/sm61-sm120"), None);
         assert_eq!(cuda_version_from_arch("builds/sm80"), None);
         assert_eq!(cuda_version_from_arch("precompiled/cpu"), None);
+    }
+
+    #[test]
+    fn arch_slug_folds_path_separators_only() {
+        // A change of `arch:` must yield a DISTINCT slug so the per-host
+        // target dir keys on it — otherwise a docker-mode arch swap reuses
+        // a stale binary (M24). Different variants -> different slugs.
+        assert_eq!(arch_slug("precompiled/cu128"), "precompiled-cu128");
+        assert_eq!(arch_slug("precompiled/cu118"), "precompiled-cu118");
+        assert_ne!(arch_slug("precompiled/cu128"), arch_slug("precompiled/cu118"));
+        assert_eq!(arch_slug("builds/sm61-sm120"), "builds-sm61-sm120");
+        // Single-segment archs pass through unchanged.
+        assert_eq!(arch_slug("cpu"), "cpu");
     }
 
     #[test]
