@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -86,19 +89,24 @@ pub(super) const SSH_OPTS: &[&str] = &[
 
 /// Drain `children` concurrently and return the first failure (if any).
 ///
-/// One watcher thread per child blocks on `wait()` and posts the exit
+/// One watcher thread per child polls `try_wait()` and posts the exit
 /// status on an mpsc channel. The main loop receives events in
-/// completion order; on the first non-zero exit it sends SIGTERM to
-/// every still-running peer so NCCL-blocked ranks abort their retry
-/// loop and exit instead of hanging. Forwarder threads (one for each
-/// child's stdout / stderr) are joined after the corresponding child's
-/// pipes close. Returns `None` when every child exits cleanly,
-/// `Some(err)` attributing to the first failure otherwise.
+/// completion order; on the first non-zero exit it raises a shared
+/// kill-all flag and each still-running watcher SIGKILLs its own child so
+/// NCCL-blocked ranks abort their retry loop and exit instead of hanging.
+/// Forwarder threads (one for each child's stdout / stderr) are joined
+/// after the corresponding child's pipes close. Returns `None` when every
+/// child exits cleanly, `Some(err)` attributing to the first failure
+/// otherwise.
 ///
-/// `terminate_pid` shells out to `kill -TERM <pid>` rather than pulling
-/// `libc` in, which keeps `flodl`'s direct deps unchanged. The child
-/// `Child` value is owned by its watcher thread for the duration of
-/// `wait()`, so we capture the PID up front and signal by PID.
+/// Kills go through each watcher's owned `Child::kill()`, never a raw
+/// snapshotted PID: the kernel pins the PID as a zombie until the owning
+/// watcher reaps it, and `Child::kill()` refuses to signal an already-reaped
+/// child, so a kill can never race PID recycling onto an unrelated process.
+/// This is SIGKILL (std has no graceful terminate without `libc`, which
+/// `flodl` avoids as a direct dep); kill-all is the fatal pre-formation /
+/// no-coordinator teardown, and remote children still tear down gracefully
+/// via their ssh HUP trap when their local ssh process is killed here.
 ///
 /// # No parent-driven process-group sweep
 ///
@@ -130,6 +138,12 @@ pub(super) type SupervisedChild = (
     Vec<thread::JoinHandle<()>>,
 );
 
+/// Watcher poll cadence for `try_wait` / kill-flag observation. Children run
+/// for the whole training, so this only bounds exit-detection and kill-all
+/// latency; 100ms is imperceptible against that and cheap for a handful of
+/// watcher threads.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub(super) fn supervise_children(
     children: Vec<SupervisedChild>,
     elastic: Option<ElasticSupervision>,
@@ -137,13 +151,14 @@ pub(super) fn supervise_children(
     if children.is_empty() {
         return None;
     }
-    // Snapshot identity + PID for every child up front. Used both to
-    // attribute incoming events and to signal still-running peers when
-    // the kill-all path fires.
-    let pids: Vec<(String, usize, u32)> = children
-        .iter()
-        .map(|(host, lr, _, c, _)| (host.clone(), *lr, c.id()))
-        .collect();
+    // Kill-all signal, reuse-safe by construction. Instead of main signalling
+    // raw snapshotted PIDs (which race PID recycling — a child can exit, be
+    // reaped, and have its PID handed to an unrelated process before the
+    // signal lands), main sets this flag and each watcher SIGKILLs its OWN,
+    // still-unreaped `Child`. The kernel pins that PID as a zombie until the
+    // owning watcher reaps it, and `Child::kill()` refuses to signal an
+    // already-reaped child — so a kill can never hit a recycled PID.
+    let kill_all = Arc::new(AtomicBool::new(false));
 
     let (tx, rx) =
         mpsc::channel::<(String, usize, Vec<usize>, std::io::Result<ExitStatus>)>();
@@ -152,8 +167,31 @@ pub(super) fn supervise_children(
     for (host, lr, granks, mut child, fwd) in children {
         all_forwarders.extend(fwd);
         let txc = tx.clone();
+        let kill_flag = Arc::clone(&kill_all);
         watchers.push(thread::spawn(move || {
-            let st = child.wait();
+            // Poll instead of a blocking `wait()` so the kill-all flag can be
+            // observed while the child still runs. `kill()` goes through the
+            // owned `Child` (never a raw PID), so it is immune to PID reuse and
+            // is only ever issued before this watcher reaps the child.
+            let mut killed = false;
+            let st = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => {
+                        if !killed && kill_flag.load(Ordering::SeqCst) {
+                            // SIGKILL (std has no graceful terminate without
+                            // libc). Kill-all is only the fatal pre-formation /
+                            // no-coordinator teardown; remote children still
+                            // tear down gracefully via their ssh HUP trap when
+                            // their local ssh process dies here.
+                            let _ = child.kill();
+                            killed = true;
+                        }
+                        thread::sleep(WATCH_POLL_INTERVAL);
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
             // Channel send only fails if the receiver was dropped, which
             // only happens after the main loop has finished collecting
             // every expected event. Treat as best-effort.
@@ -211,15 +249,14 @@ pub(super) fn supervise_children(
                 any_failure = Some(TensorError::new(&msg));
                 if !terminated_peers {
                     terminated_peers = true;
-                    for (h, l, pid) in &pids {
-                        if !finished.contains(&(h.clone(), *l)) {
-                            eprintln!(
-                                "cluster launcher: terminating rank {l} of {h:?} (pid {pid}) \
-                                 after peer failure"
-                            );
-                            terminate_pid(*pid);
-                        }
-                    }
+                    // Signal every watcher to SIGKILL its own still-running
+                    // child. Reuse-safe (see `kill_all`): no raw PID leaves
+                    // this loop. Watchers already past their reap ignore it.
+                    eprintln!(
+                        "cluster launcher: peer failure — terminating all \
+                         still-running ranks"
+                    );
+                    kill_all.store(true, Ordering::SeqCst);
                 }
             } else {
                 eprintln!("{msg}");
@@ -290,39 +327,6 @@ pub(super) struct ElasticSupervision {
     pub cohort_formed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Send SIGTERM to `pid` via the `kill` binary (PATH-resolved). The
-/// child `Child` value is owned by its watcher thread for the duration
-/// of `wait()`, so calling `Child::kill()` is not available on main;
-/// shelling out by PID is the simplest portable path and avoids
-/// pulling `libc` into `flodl`'s direct deps. Best-effort: silently
-/// continue if the kill itself fails (caller is mid-error already, the
-/// peer might have just exited, etc.).
-pub(super) fn terminate_pid(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    // Escalation: a peer that ignores TERM (deadlock-spin, stuck CUDA
-    // ioctl) would otherwise hang `supervise_children`'s final
-    // `rx.recv()` loop forever — the launcher waits on every watcher's
-    // `child.wait()`, and a hung launcher is exactly the orphan-holder
-    // the kill was meant to prevent. Detached grace-then-KILL keeps
-    // terminate_pid itself non-blocking.
-    let pid_s = pid.to_string();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(10));
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(&pid_s)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    });
-}
 
 /// Build the `Command` that fork+execs a local rank child. Sets all the
 /// env vars the rank-side `LocalCluster::from_env` + `dispatch` expect,
