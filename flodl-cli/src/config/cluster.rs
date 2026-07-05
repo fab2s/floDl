@@ -350,17 +350,21 @@ pub struct ClusterWorker {
     /// host before training can fan out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
-    /// Docker compose service that wraps training on this host (e.g.
-    /// `cuda`, `dev`). When set, `fdl probe` skips host-level NCCL
-    /// discovery — NCCL ships inside the image, not on the host — and
-    /// reports "provided via Docker image `<svc>`" instead of erroring
-    /// on a missing `libnccl.so`. The host's libtorch (resolved via
-    /// the `<path>/libtorch/<arch>` convention) is still validated
-    /// because it's the bind-mount target, not container state.
-    /// Per-host (not global) because mixed deployments are
-    /// common: controller in Docker, worker bare-metal (or vice-versa).
-    /// Library ignores this field; consumed only by fdl-cli's probe /
-    /// deploy paths.
+    /// Names the docker compose service that provides this host's
+    /// runtime environment (e.g. `cuda`, `dev`). It does NOT wrap the
+    /// training exec: cluster fan-out runs each rank's binary directly
+    /// on the host over SSH (the pre-flight build is what runs in a
+    /// container, in the *controller's* [`ClusterController`] `docker`).
+    /// This field is a probe-time signal only: when set, `fdl probe`
+    /// skips host-level NCCL discovery — NCCL ships inside the image,
+    /// not on the host — and reports "provided via Docker image
+    /// `<svc>`" instead of erroring on a missing `libnccl.so`. The
+    /// host's libtorch (resolved via the `<path>/libtorch/<arch>`
+    /// convention) is still validated because it's the bind-mount
+    /// target, not container state. Per-host (not global) because mixed
+    /// deployments are common: controller in Docker, worker bare-metal
+    /// (or vice-versa). Library ignores this field; consumed only by
+    /// fdl-cli's probe / deploy paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<String>,
     /// Host-scoped env vars exported into every rank child spawned on

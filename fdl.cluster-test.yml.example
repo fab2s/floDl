@@ -43,6 +43,9 @@
 #   - `ssh:` launcher-only sub-block; tests ignore it.
 #   - `path:` project checkout dir on this host.
 #   - `arch:` libtorch variant subpath under `<path>/libtorch/`.
+#   - `data_path:` (optional) shared-storage root on this host
+#     (default `/flodl/data`); holds data + checkpoints + logs. Parsed
+#     but inert in tests (topology is read as data, not fanned out).
 
 cluster:
   controller:
@@ -57,6 +60,7 @@ cluster:
                                     # use bridge/LAN iface for multi-host
       path: /opt/flodl              # checkout path on this host
       arch: precompiled/cu128       # libtorch variant under <path>/libtorch/
+      # data_path: /flodl/data      # shared-storage root (default /flodl/data)
 
 # NOTE: do NOT add `cluster: true` to any commands here. That flag
 # triggers the production launcher path (process-per-rank fan-out
