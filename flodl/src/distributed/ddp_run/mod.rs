@@ -549,6 +549,15 @@ pub struct DdpRunConfig {
     /// receipt; see [`crate::distributed::CheckpointBundle`].
     /// Required for the via-coord cluster orchestrator entry;
     /// optional for non-cluster builds.
+    ///
+    /// **Multi-host: this stem must resolve to shared storage.** The
+    /// bundle is split across hosts and each piece is written on its
+    /// writer's host: each surviving worker writes its `.fdl` / `.optim`
+    /// on its own host, while the controller writes the `.meta.json`
+    /// sidecar (and reads it back on [`Self::resume_from`]) on ITS host.
+    /// A host-local path scatters the bundle and breaks resume. On a
+    /// genuine multi-host launch the framework prints a one-time reminder;
+    /// single-box multi-GPU is unaffected (one host owns every piece).
     pub save_path: Option<String>,
 
     /// Threshold for declaring a cluster run unrecoverable. When the
@@ -591,6 +600,10 @@ pub struct DdpRunConfig {
     /// [`crate::nn::load_checkpoint_file`] /
     /// [`crate::nn::optim::Stateful::load_state_file`] inside them).
     /// This field carries the controller-side trajectory only.
+    ///
+    /// Multi-host: like [`Self::save_path`], this stem must resolve to
+    /// shared storage visible to every host (the controller reads the
+    /// meta on its host; ranks re-seed from the same stem on theirs).
     ///
     /// `None` = fresh run. Builder sugar: [`DdpBuilder::resume_from`].
     pub resume_from: Option<String>,

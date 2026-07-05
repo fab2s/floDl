@@ -29,6 +29,15 @@ A shared filesystem accessible by every node in the cluster, hosting:
 - **Checkpoints** - written by ranks during training; read at resume.
   Bundle layout per
   [`CheckpointBundle`](../../flodl/src/distributed/checkpoint_meta.rs).
+  The bundle is **split across hosts** and each piece is written on its
+  writer's host: the elected checkpoint rank runs the user's
+  `checkpoint_fn` on its host, each surviving worker writes its
+  `.fdl` / `.optim` on its host, and the controller writes (and reads
+  back at resume) the `.meta.json` sidecar on its host. So a
+  `save_path` / `resume_from` that is *not* on this shared layer
+  scatters the bundle and breaks resume - which is exactly why
+  checkpoints belong here. flodl prints a one-time reminder on any
+  genuine multi-host launch with a checkpoint path set.
 
 This layer is **always on** and **cheap relative to compute**. A
 small file server, a NAS appliance, or a $20/month object-storage

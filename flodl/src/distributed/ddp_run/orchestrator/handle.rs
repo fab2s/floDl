@@ -202,6 +202,19 @@ impl DdpHandle {
             crate::distributed::launcher::Role::Launcher => {
                 let full = crate::distributed::launcher::FullCluster::from_env()?;
                 let world_size = full.world_size();
+                // One-time reminder: in a multi-host cluster the
+                // checkpoint/resume bundle is split across hosts and each
+                // piece is written on its writer's host, so the path must
+                // land on shared storage or resume breaks. Fires here (once,
+                // on the controller, before fan-out) only for genuine 2+-host
+                // clusters; single-box multi-GPU never trips it.
+                if let Some(msg) = checkpoint_shared_storage_warning(
+                    full.spans_multiple_workers(),
+                    config.save_path.as_deref(),
+                    config.resume_from.as_deref(),
+                ) {
+                    eprintln!("{msg}");
+                }
                 // Sink for aggregated EpochMetrics. The coord pushes
                 // each completed epoch's metrics here; the user's
                 // `DdpHandle::next_metrics()` polls them off. Wired
@@ -607,4 +620,97 @@ impl DdpHandle {
         Err(TensorError::new("join: no trained state available"))
     }
 
+}
+
+/// Build the one-time multi-host reminder that checkpoint/resume paths
+/// must live on shared storage, or `None` when it does not apply.
+///
+/// In a cluster the checkpoint/resume bytes are split across hosts and
+/// each write lands on whatever host the writer runs on: the elected
+/// `checkpoint_role` rank (and its failover targets) runs the user's
+/// `checkpoint_fn` on its own host; on `ShutdownWithSave` each surviving
+/// worker writes `<stem>.fdl`/`.optim` on its own host while the
+/// controller writes `<stem>.meta.json` on ITS host; and `resume_from`
+/// reads that meta on the controller. So a `save_path`/`resume_from`
+/// that is not on shared storage scatters the bundle and breaks resume
+/// -- the classic way in is a run that works single-host and silently
+/// breaks on scale-up when the elected rank happens to be remote.
+///
+/// This is a reminder, not a hard error: we cannot verify a path is
+/// shared from its string alone (a relative path under the shared
+/// project mount is fine; an absolute path on local disk is not), and we
+/// cannot force the user's `checkpoint_fn` to write shared. Single-worker
+/// clusters (single-box multi-GPU auto-promote) never see it -- every
+/// piece lands on the one host's disk, so there is nothing to share.
+fn checkpoint_shared_storage_warning(
+    spans_multiple_workers: bool,
+    save_path: Option<&str>,
+    resume_from: Option<&str>,
+) -> Option<String> {
+    if !spans_multiple_workers {
+        return None;
+    }
+    // Name whichever path(s) are set; if both are set and differ, name
+    // both so the operator can eyeball each.
+    let stem = match (save_path, resume_from) {
+        (Some(s), Some(r)) if s != r => {
+            format!("save_path {s:?} / resume_from {r:?}")
+        }
+        (Some(s), _) => format!("{s:?}"),
+        (_, Some(r)) => format!("{r:?}"),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "flodl cluster: checkpoint/resume path {stem} must resolve to SHARED \
+         storage visible to every host. In a multi-host cluster the elected \
+         checkpoint rank and each worker's save-on-failure write on their OWN \
+         host, while the controller writes the `.meta.json` sidecar and reads \
+         it back on resume on ITS host -- a host-local path scatters the \
+         bundle and breaks resume. If the path already resolves to shared \
+         storage (NAS / virtiofs / SSHFS / the shared project mount) on all \
+         hosts, ignore this."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_shared_storage_warning;
+
+    #[test]
+    fn no_warning_on_single_worker_cluster() {
+        // Single-box multi-GPU auto-promote: everything lands on one
+        // host's disk, so a save_path is fine.
+        assert!(
+            checkpoint_shared_storage_warning(false, Some("runs/ckpt"), None).is_none()
+        );
+    }
+
+    #[test]
+    fn no_warning_when_no_checkpoint_path_set() {
+        assert!(checkpoint_shared_storage_warning(true, None, None).is_none());
+    }
+
+    #[test]
+    fn warns_multi_host_with_save_path() {
+        let msg = checkpoint_shared_storage_warning(true, Some("runs/ckpt"), None)
+            .expect("multi-host + save_path must warn");
+        assert!(msg.contains("runs/ckpt"));
+        assert!(msg.contains("SHARED"));
+    }
+
+    #[test]
+    fn warns_multi_host_with_resume_only() {
+        let msg = checkpoint_shared_storage_warning(true, None, Some("runs/ckpt"))
+            .expect("multi-host + resume_from must warn");
+        assert!(msg.contains("runs/ckpt"));
+    }
+
+    #[test]
+    fn names_both_paths_when_they_differ() {
+        let msg =
+            checkpoint_shared_storage_warning(true, Some("out/save"), Some("in/resume"))
+                .expect("must warn");
+        assert!(msg.contains("out/save"));
+        assert!(msg.contains("in/resume"));
+    }
 }
