@@ -158,6 +158,16 @@
     }
 
     #[test]
+    fn extract_gpus_flag_stops_at_dashdash() {
+        // A `--gpus` after `--` is bound for the inner script, not fdl's own
+        // GPU selector; forward it (and its value) verbatim.
+        let (out, spec) =
+            extract_gpus_flag(&args(&["fdl", "run", "--", "--gpus", "0,1"])).unwrap();
+        assert_eq!(out, args(&["fdl", "run", "--", "--gpus", "0,1"]));
+        assert!(spec.is_none());
+    }
+
+    #[test]
     fn extract_gpus_flag_duplicate_errors() {
         let err =
             extract_gpus_flag(&args(&["fdl", "--gpus", "0,1", "--gpus", "2,3"])).unwrap_err();
@@ -443,6 +453,32 @@
     fn extract_ansi_flags_both_set_errors() {
         let err = extract_ansi_flags(&args(&["fdl", "--ansi", "--no-ansi"])).unwrap_err();
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_ansi_flags_stops_at_dashdash() {
+        // `--no-ansi` after `--` belongs to the inner script; don't consume it.
+        let (rest, choice) =
+            extract_ansi_flags(&args(&["fdl", "run", "--", "--no-ansi"])).unwrap();
+        assert_eq!(rest, args(&["fdl", "run", "--", "--no-ansi"]));
+        assert!(choice.is_none());
+    }
+
+    // --- extract_verbosity: `-v` family, scan-anywhere, `--` boundary --------
+
+    #[test]
+    fn extract_verbosity_strips_flag_before_dashdash() {
+        let (out, level) = extract_verbosity(&args(&["fdl", "-vv", "train"]));
+        assert_eq!(out, args(&["fdl", "train"]));
+        assert_eq!(level, Some(3));
+    }
+
+    #[test]
+    fn extract_verbosity_stops_at_dashdash() {
+        // `-v` after `--` is the inner script's flag, not fdl's verbosity.
+        let (out, level) = extract_verbosity(&args(&["fdl", "run", "--", "-v"]));
+        assert_eq!(out, args(&["fdl", "run", "--", "-v"]));
+        assert!(level.is_none());
     }
 
     #[test]

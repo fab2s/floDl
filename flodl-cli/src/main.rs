@@ -323,6 +323,10 @@ fn resolve_env(
 /// `--gpus 0,1` and `--gpus=0,1`. Errors on duplicate, missing value, or
 /// value that looks like another flag.
 ///
+/// Scan-anywhere, but stops at the first standalone `--`: a `--gpus` token
+/// past the separator is bound for the inner command and forwarded untouched
+/// (consistent with [`extract_env_flag`] and the other global-flag extractors).
+///
 /// Returns the args with `--gpus` (and its value) removed, plus the parsed
 /// [`gpus::GpusSpec`] when set.
 fn extract_gpus_flag(
@@ -333,6 +337,13 @@ fn extract_gpus_flag(
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if a == "--" {
+            // Everything from here on is bound for the inner command;
+            // forward it verbatim (consistent with the other global-flag
+            // extractors). A `--gpus` past the separator is the script's.
+            out.extend(args[i..].iter().cloned());
+            break;
+        }
         if a == "--gpus" {
             let value = args.get(i + 1).ok_or_else(|| {
                 "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)"
@@ -610,8 +621,21 @@ pub(crate) fn print_usage() {
 fn extract_verbosity(args: &[String]) -> (Vec<String>, Option<u8>) {
     let mut level: Option<u8> = None;
     let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
 
     for arg in args {
+        // A verbosity flag after the first standalone `--` is bound for the
+        // inner command; forward it (and everything after) verbatim, matching
+        // the other global-flag extractors.
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "-vvv" => level = Some(4), // Trace
             "-vv" => level = Some(3),  // Debug
@@ -691,15 +715,27 @@ fn extract_no_prebuild(args: &[String]) -> (Vec<String>, bool) {
 /// Strip `--ansi` / `--no-ansi` from `args`, returning a
 /// [`style::ColorChoice`] override when either was present. Errors if
 /// both are given (ambiguous). Scan-anywhere, consistent with `-v`
-/// and `--env` — global flags aren't position-locked.
+/// and `--env` — global flags aren't position-locked. Stops at the first
+/// standalone `--`, so an `--ansi` / `--no-ansi` past the separator is
+/// forwarded to the inner command untouched.
 fn extract_ansi_flags(
     args: &[String],
 ) -> Result<(Vec<String>, Option<style::ColorChoice>), String> {
     let mut ansi = false;
     let mut no_ansi = false;
     let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
 
     for arg in args {
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "--ansi" => ansi = true,
             "--no-ansi" => no_ansi = true,
