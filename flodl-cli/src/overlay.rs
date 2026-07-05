@@ -75,9 +75,10 @@ where
 
 // ── Discovery ───────────────────────────────────────────────────────────
 
-/// Config filename extensions in preference order. Mirrors `config::CONFIG_NAMES`
-/// but exposed here so overlay lookup matches sibling base files.
-const EXTENSIONS: &[&str] = &["yml", "yaml", "json"];
+/// Config filename extensions in preference order. Matches the order of
+/// `config::CONFIG_NAMES` (`fdl.yaml` before `fdl.yml`) so overlay resolution
+/// picks the same extension the base file would when both exist.
+const EXTENSIONS: &[&str] = &["yaml", "yml", "json"];
 
 /// Find a sibling overlay for `env` next to `base_config`.
 ///

@@ -215,14 +215,18 @@
     }
 
     #[test]
-    fn find_env_file_respects_extension_precedence() {
+    fn find_env_file_prefers_yaml_matching_base_precedence() {
+        // Extension precedence matches config::CONFIG_NAMES (`.yaml` before
+        // `.yml`), so overlay resolution picks the same extension the base file
+        // would when both siblings exist. (Previously overlay preferred `.yml`,
+        // diverging from the base — L10 #3.)
         let tmp = tempdir();
         std::fs::write(tmp.path().join("fdl.yml"), "").unwrap();
-        std::fs::write(tmp.path().join("fdl.ci.yml"), "# yml wins").unwrap();
-        std::fs::write(tmp.path().join("fdl.ci.yaml"), "# yaml loses").unwrap();
+        std::fs::write(tmp.path().join("fdl.ci.yml"), "# yml loses").unwrap();
+        std::fs::write(tmp.path().join("fdl.ci.yaml"), "# yaml wins").unwrap();
 
         let got = find_env_file(&tmp.path().join("fdl.yml"), "ci").unwrap();
-        assert_eq!(got.file_name().unwrap().to_str(), Some("fdl.ci.yml"));
+        assert_eq!(got.file_name().unwrap().to_str(), Some("fdl.ci.yaml"));
     }
 
     #[test]

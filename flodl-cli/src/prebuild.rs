@@ -21,9 +21,9 @@
 //! `.arch` (cuda=12.x → `--features cuda`, cuda=none → no features).
 //!
 //! Builds run in parallel across hosts (per-host target dirs ⇒ zero
-//! contention). First failure aborts the rest; remaining builds finish
-//! their current cargo invocation but their stderr is collected and
-//! surfaced together so the user sees every host's diagnostic.
+//! contention). All builds run to completion — there is no early abort:
+//! every host is joined and every failure is collected, then surfaced
+//! together so the user sees every host's diagnostic in one place.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -73,9 +73,14 @@ pub fn prebuild_remotes(
     cmd_name: &str,
     controller_host: &str,
 ) -> Result<(), String> {
-    // Workers whose `host` matches the controller's local hostname are
-    // skipped — they share the local cargo target dir via the
-    // controller's build, no remote step needed.
+    // Skip only the worker whose `host` LABEL equals the controller's local
+    // hostname — that entry is the controller building locally and sharing its
+    // cargo target dir, so it needs no remote step. This compares the logical
+    // host label, NOT resolved IPs, deliberately: a container or VM on the same
+    // physical machine (e.g. an `ssh.target: 127.0.0.1:2222` worker) is a
+    // DISTINCT build target with its own arch/libtorch and must get its own
+    // per-host build. Canonicalizing by IP would wrongly fold such a worker
+    // into the controller and break heterogeneous same-box rigs.
     let remotes: Vec<&ClusterWorker> = cluster
         .workers
         .iter()

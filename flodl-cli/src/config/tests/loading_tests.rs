@@ -105,3 +105,19 @@ fn resolve_config_layers_base_inherit_from_chain() {
     let layers = resolve_config_layers(&base, None).unwrap();
     assert_eq!(filenames(&layers), vec!["shared.yml", "fdl.yml"]);
 }
+
+#[test]
+fn load_project_with_env_empty_config_is_default() {
+    // L10 #4: an empty (or comments-only) fdl.yml merges to a null value.
+    // That is a valid "nothing configured" state — it must load as an
+    // all-defaults ProjectConfig, not fail with a cryptic serde
+    // "invalid type: unit value" error.
+    let tmp = TempDir::new();
+    let base = tmp.0.join("fdl.yml");
+    std::fs::write(&base, "# just a comment\n").unwrap();
+    let cfg = load_project_with_env(&base, None)
+        .expect("empty config must load as defaults, not error");
+    assert!(cfg.commands.is_empty());
+    assert!(cfg.cluster.is_none());
+    assert!(cfg.description.is_none());
+}

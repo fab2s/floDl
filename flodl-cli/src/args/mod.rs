@@ -75,14 +75,20 @@ pub fn parse_or_schema<T: FdlArgsTrait>() -> T {
 /// Used by the `fdl` driver itself when dispatching to sub-commands: each
 /// sub-command parses its own `args[2..]` tail without re-reading `env::args`.
 pub fn parse_or_schema_from<T: FdlArgsTrait>(argv: &[String]) -> T {
-    if argv.iter().any(|a| a == "--fdl-schema") {
+    // Only intercept `--fdl-schema` / `--help` when they appear BEFORE the
+    // first standalone `--`. A token after `--` is bound for the inner
+    // program (e.g. `bin train -- --help` asks the inner for its help), so
+    // scanning the whole argv would hijack it.
+    let scan_end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let before = &argv[..scan_end];
+    if before.iter().any(|a| a == "--fdl-schema") {
         let schema = T::schema();
         let json = serde_json::to_string_pretty(&schema)
             .expect("Schema serializes cleanly by construction");
         println!("{json}");
         std::process::exit(0);
     }
-    if argv.iter().any(|a| a == "--help" || a == "-h") {
+    if before.iter().any(|a| a == "--help" || a == "-h") {
         // `render_help_path` is context-aware: for a variant-shaped CLI,
         // `bin train --help` renders train's help, not the command list.
         // For a single struct it is identical to `render_help`.

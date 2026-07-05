@@ -135,6 +135,13 @@ pub fn load_project_with_env(
     let merged = crate::overlay::merge_layers(
         layers.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
     );
+    // An empty (or comments-only) fdl.yml — and empty overlays — merge to a
+    // null value. That is a valid "nothing configured" state, so return an
+    // all-defaults config instead of letting `from_str::<ProjectConfig>("null")`
+    // fail with a cryptic serde "invalid type: unit value" error.
+    if merged.is_null() {
+        return Ok(ProjectConfig::default());
+    }
     // Re-serialize so `from_str`'s parser tracks line/col through deserialize.
     // `from_value` discards positional info, leaving errors location-less.
     let merged_str = serde_yaml::to_string(&merged).map_err(|e| {
