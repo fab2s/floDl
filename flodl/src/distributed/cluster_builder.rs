@@ -56,6 +56,10 @@ use super::launcher::{FullCluster, FullWorker};
 pub struct ClusterBuilder {
     controller: super::launcher::FullController,
     workers: Vec<FullWorker>,
+    /// Cluster-scope env vars exported into every rank child on every
+    /// host. Mirrors the YAML cluster-scope `env:` block. Per-host
+    /// [`HostBuilder::env`] overrides matching keys.
+    env: std::collections::BTreeMap<String, String>,
     /// Host-finalization errors deferred from [`HostBuilder::done`] so the
     /// fluent chain stays infallible; surfaced as `Err` by
     /// [`ClusterBuilder::build`]. Required-field mistakes are user-input
@@ -84,6 +88,7 @@ impl ClusterBuilder {
                 data_path: None,
             },
             workers: Vec::new(),
+            env: std::collections::BTreeMap::new(),
             deferred_errors: Vec::new(),
         }
     }
@@ -103,6 +108,18 @@ impl ClusterBuilder {
     /// builder. The `name` argument identifies the worker.
     pub fn host(self, name: impl Into<String>) -> HostBuilder {
         HostBuilder::new(self, name.into())
+    }
+
+    /// Set a cluster-scope env var exported into every rank child on
+    /// every host. Mirrors the YAML cluster-scope `env:` block; the
+    /// common use is NCCL transport overrides on rigs where the default
+    /// transports fail (e.g. `.env("NCCL_P2P_DISABLE", "1")` +
+    /// `.env("NCCL_SHM_DISABLE", "1")` on a PCIe-passthrough VM). Call
+    /// repeatedly to accumulate; a later call with the same key wins.
+    /// Per-host [`HostBuilder::env`] overrides matching keys.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
     }
 
     /// Finalize. Validates that ranks across workers form
@@ -132,6 +149,27 @@ impl ClusterBuilder {
                 "ClusterBuilder: at least one worker required",
             ));
         }
+        // Explicit-devices length check: a host with explicit device
+        // indices must supply exactly one per rank (paired by position).
+        // Mirrors the YAML validator (config/cluster.rs) so the builder
+        // stays 1:1 with the file schema, and honors the promise in
+        // `HostBuilder::devices`'s doc that the length is checked here.
+        // `all_devices()` (unresolved "all") is exempt — its count is
+        // resolved at startup on the owning host.
+        for w in &self.workers {
+            if let Some(devs) = w.local_devices.as_deref() {
+                if devs.len() != w.ranks.len() {
+                    return Err(TensorError::new(&format!(
+                        "ClusterBuilder: host {:?}: devices ({}) and ranks ({}) \
+                         length mismatch — supply exactly one device index per \
+                         rank, or use all_devices()",
+                        w.host,
+                        devs.len(),
+                        w.ranks.len(),
+                    )));
+                }
+            }
+        }
         // Cross-worker rank check: union must be exactly 0..world_size.
         let mut all: Vec<usize> = self
             .workers
@@ -151,7 +189,7 @@ impl ClusterBuilder {
             controller: self.controller,
             workers: self.workers,
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
-            env: std::collections::BTreeMap::new(),
+            env: self.env,
         })
     }
 
@@ -322,6 +360,7 @@ pub struct HostBuilder {
     path: Option<String>,
     arch: Option<String>,
     ssh: Option<crate::distributed::launcher::SshConfig>,
+    env: std::collections::BTreeMap<String, String>,
 }
 
 impl HostBuilder {
@@ -335,6 +374,7 @@ impl HostBuilder {
             path: None,
             arch: None,
             ssh: None,
+            env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -429,6 +469,18 @@ impl HostBuilder {
         self
     }
 
+    /// Set a host-scoped env var exported into every rank child spawned
+    /// on this host. Mirrors the YAML per-worker `env:` block; overrides
+    /// matching keys from the cluster-scope [`ClusterBuilder::env`].
+    /// Useful for host-specific tuning (e.g. a different
+    /// `NCCL_SOCKET_IFNAME` or a custom `LD_LIBRARY_PATH` for a
+    /// non-standard CUDA install). Call repeatedly to accumulate; a
+    /// later call with the same key wins.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
     /// Finalize this host and return to the cluster builder.
     ///
     /// Missing required fields (`ranks`, `local_devices`,
@@ -466,7 +518,7 @@ impl HostBuilder {
             path: self.path.expect("checked above"),
             arch: self.arch,
             ssh: self.ssh,
-            env: std::collections::BTreeMap::new(),
+            env: self.env,
         };
         parent.workers.push(host);
         parent
@@ -614,5 +666,90 @@ mod tests {
         assert_eq!(cluster.controller.path, "/opt/flodl");
         assert_eq!(cluster.controller.docker.as_deref(), Some("cuda"));
         assert_eq!(cluster.controller.arch.as_deref(), Some("precompiled/cu128"));
+    }
+
+    #[test]
+    fn cluster_scope_env_flows_into_full_cluster() {
+        let cluster = ClusterBuilder::new()
+            .controller("localhost").done()
+            .env("NCCL_P2P_DISABLE", "1")
+            .env("NCCL_SHM_DISABLE", "1")
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect("build succeeds");
+        assert_eq!(cluster.env.get("NCCL_P2P_DISABLE").map(String::as_str), Some("1"));
+        assert_eq!(cluster.env.get("NCCL_SHM_DISABLE").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn host_scope_env_flows_into_worker() {
+        let cluster = ClusterBuilder::new()
+            .controller("localhost").done()
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+                .env("LD_LIBRARY_PATH", "/opt/custom/lib")
+            .done()
+            .build()
+            .expect("build succeeds");
+        assert_eq!(
+            cluster.workers[0].env.get("LD_LIBRARY_PATH").map(String::as_str),
+            Some("/opt/custom/lib"),
+        );
+    }
+
+    #[test]
+    fn repeated_env_key_last_wins() {
+        let cluster = ClusterBuilder::new()
+            .controller("localhost").done()
+            .env("K", "first")
+            .env("K", "second")
+            .host("h0")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect("build succeeds");
+        assert_eq!(cluster.env.get("K").map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn build_rejects_devices_ranks_length_mismatch() {
+        let err = ClusterBuilder::new()
+            .controller("localhost").done()
+            .host("h0")
+                .ranks([0, 1]) // 2 ranks
+                .devices([0])  // 1 device → mismatch
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect_err("devices/ranks length mismatch must error");
+        assert!(err.to_string().contains("length mismatch"), "err: {err}");
+    }
+
+    #[test]
+    fn build_allows_all_devices_without_length_check() {
+        // all_devices() is unresolved ("all") → exempt from the
+        // explicit-devices length check; count is resolved at startup.
+        ClusterBuilder::new()
+            .controller("localhost").done()
+            .host("h0")
+                .ranks([0, 1])
+                .all_devices()
+                .nccl_socket_ifname("lo")
+                .path("/tmp")
+            .done()
+            .build()
+            .expect("all_devices() bypasses the explicit-length check");
     }
 }
