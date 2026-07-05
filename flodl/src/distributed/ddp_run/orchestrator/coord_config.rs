@@ -75,6 +75,11 @@ pub(crate) fn build_coord_config_from_builder(
     if let Some(diff) = config.elche.max_batch_diff {
         el_che = el_che.with_max_batch_diff(diff);
     }
+    // Window-pressure anchor growth is a windowed-reduce optimization; Sync
+    // reduces every step (no window to amortize), so disable growth there.
+    // Leaving it on under Sync would inflate the telemetry anchor and the
+    // checkpointed ElCheState.anchor, mis-seeding a later Cadence resume.
+    el_che = el_che.with_window_growth_applicable(policy != ApplyPolicy::Sync);
 
     let mut coord_config = ClusterCoordinatorConfig::new(
         policy,

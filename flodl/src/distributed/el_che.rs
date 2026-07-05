@@ -274,6 +274,16 @@ pub struct ElChe {
     /// Count of consecutive `Stable` guard verdicts since the last non-Stable
     /// one; re-arms `growth_enabled` at `GROWTH_REARM_STABLE`.
     consecutive_stable: usize,
+    /// Whether window-pressure anchor growth applies at all under the active
+    /// reduce policy. Growth amortizes per-window fixed cost across a cadence
+    /// window; **Sync has no window** (it reduces every step, gated at
+    /// `steps >= 1`), so growth there is meaningless and would only inflate the
+    /// telemetry anchor and — worse — the checkpointed `ElCheState.anchor`,
+    /// mis-seeding a later Cadence resume. Set `false` for Sync (see
+    /// [`Self::with_window_growth_applicable`]); `true` for Cadence/Async.
+    /// Config-derived, NOT trajectory state: [`Self::restore_from_state`]
+    /// leaves it untouched.
+    window_growth_applicable: bool,
 }
 
 /// A staged window-pressure grow proposal awaiting a convergence-guard
@@ -333,6 +343,8 @@ impl ElChe {
             pending_window_fill_ms: vec![0.0; world_size],
             growth_enabled: true,
             consecutive_stable: 0,
+            // Default applicable; the coordinator flips this off for Sync.
+            window_growth_applicable: true,
         }
     }
 
@@ -518,6 +530,21 @@ impl ElChe {
     /// cap). Clamped to `[0.01, 0.50]`.
     pub fn with_overhead_target(mut self, target: f64) -> Self {
         self.overhead_target = target.clamp(0.01, 0.50);
+        self
+    }
+
+    /// Enable or disable window-pressure anchor growth for the active reduce
+    /// policy.
+    ///
+    /// Growth amortizes per-window fixed cost (reduce + fill) across a cadence
+    /// window, so it is only meaningful when reduces are *windowed*
+    /// (Cadence / Async). Under Sync the reduce fires every step, so there is
+    /// no window to amortize; leaving growth on there would inflate the
+    /// telemetry anchor and the checkpointed `ElCheState.anchor`, mis-seeding a
+    /// later Cadence resume. The coordinator calls this with `false` in Sync
+    /// mode and `true` otherwise. Default (unset): `true`.
+    pub fn with_window_growth_applicable(mut self, applicable: bool) -> Self {
+        self.window_growth_applicable = applicable;
         self
     }
 
@@ -1192,6 +1219,12 @@ impl ElChe {
     /// binding (a larger anchor delivers nothing at the cap and only
     /// detaches the anchor from the schedule).
     fn propose_anchor(&self, sync_ms: f64) -> Option<ProposedAnchor> {
+        if !self.window_growth_applicable {
+            // Sync policy: reduces fire every step, so there is no window to
+            // amortize. Never propose growth — it would only pollute the
+            // telemetry anchor and the checkpointed ElCheState.
+            return None;
+        }
         if !self.growth_enabled {
             return None;
         }
@@ -1423,6 +1456,38 @@ mod meta_nudge_tests {
             el.anchor(),
             20,
             "documents the H12 bug: an un-discarded grow overwrites the nudge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_growth_policy_tests {
+    use super::*;
+
+    // M2: window-pressure anchor growth must be exempt under Sync. Sync
+    // reduces every step (no window to amortize), so growth there only
+    // pollutes the telemetry anchor and the checkpointed ElCheState.anchor —
+    // mis-seeding a later Cadence resume. Build a state that WOULD grow under a
+    // windowed policy, then assert the Sync flag suppresses it.
+    #[test]
+    fn sync_policy_exempt_from_window_pressure_growth() {
+        let mut el = ElChe::new(2, 10);
+        el.anchor_rank = Some(0);
+        // smoothed_ms(0) = 1.0 → window_compute = anchor(10) * 1 = 10.
+        el.ms_per_batch_window[0].push(1.0);
+        // reduce_ms = 10 → fixed = 10, overhead = 10/(10+10) = 0.5 ≫ 0.05 target.
+
+        // Windowed policy (default applicable): growth fires.
+        assert!(
+            matches!(el.propose_anchor(10.0), Some(ProposedAnchor::Grow(n)) if n > 10),
+            "windowed policy should propose growth in this high-overhead state"
+        );
+
+        // Sync exemption: the identical state proposes nothing.
+        let el_sync = el.with_window_growth_applicable(false);
+        assert!(
+            el_sync.propose_anchor(10.0).is_none(),
+            "Sync must never propose window-pressure growth"
         );
     }
 }
