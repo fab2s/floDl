@@ -207,6 +207,19 @@ pub(crate) fn dispatch_config(
     };
 
     if let Some(cluster) = cluster_to_dispatch {
+        let controller = cluster::resolve_local_hostname();
+        // Pre-flight host readiness (see flodl-cli::prebuild). One ssh
+        // per remote host BEFORE any build, in both modes: always
+        // verifies the shared `data_path` is mounted + readable; when
+        // prebuilding, also runs the controller-vs-remote ABI gate. A
+        // missing declared mount or an ABI mismatch aborts loudly here
+        // rather than surfacing as a cryptic mid-run error on a remote
+        // rank. Runs even under `--no-prebuild` (mount-readiness is
+        // orthogonal to binary freshness).
+        if let Err(e) = prebuild::preflight_hosts(&cluster, &controller, !no_prebuild) {
+            cli_error!("{e}");
+            return ExitCode::FAILURE;
+        }
         // Pre-flight build (see flodl-cli::prebuild). Runs `cargo
         // build` locally for each remote host with that host's
         // libtorch + a per-host CARGO_TARGET_DIR, delivering the
@@ -215,7 +228,6 @@ pub(crate) fn dispatch_config(
         // handled by the normal dispatch path below (cargo run in
         // Docker against the local `.active`).
         if !no_prebuild {
-            let controller = cluster::resolve_local_hostname();
             if let Err(e) = prebuild::prebuild_remotes(
                 &project_root, &cmd_cwd, &cluster, cmd, &controller,
             ) {

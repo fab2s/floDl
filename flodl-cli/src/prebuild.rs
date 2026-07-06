@@ -51,6 +51,88 @@ use crate::config::{ClusterConfig, ClusterWorker};
 /// `fdl <cmd>` re-entry on the remote.
 pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_INTERNAL_PREBUILD_PER_HOST";
 
+/// Pre-fan-out readiness probe for every host, run BEFORE any build and
+/// in BOTH prebuild and `--no-prebuild` modes (mount-readiness is
+/// orthogonal to binary freshness). One ssh per remote host: always
+/// verifies the shared `data_path` is mounted + readable; when
+/// `prebuilding`, also runs the controller-vs-remote ABI gate (arch /
+/// libc / `pkill`). The controller is checked LOCALLY (no ssh — it is
+/// the build/dispatch host, so ABI is trivially satisfied).
+///
+/// A definitive failure aborts before fan-out with a per-host message:
+/// an ABI mismatch, or a missing EXPLICIT `data_path` (a declared shared
+/// mount that isn't there is a launch-breaking misconfig, matching
+/// `fdl probe`'s stance). Missing convention-default paths and
+/// unreachable hosts only warn. Running before the (multi-minute) builds
+/// means a bad host fails fast without wasting a build on a good one.
+///
+/// `controller_host` is the local hostname (its worker entry, if any, is
+/// covered by the local check and skipped from the ssh sweep).
+pub fn preflight_hosts(
+    cluster: &ClusterConfig,
+    controller_host: &str,
+    prebuilding: bool,
+) -> Result<(), String> {
+    // Controller: local shared-mount check (no ssh). Uses the controller
+    // block's `data_path`; a same-host worker entry is skipped below.
+    {
+        let dp = cluster.controller.effective_data_path().to_string();
+        let explicit = cluster.controller.data_path.is_some();
+        let dir_ok = Path::new(&dp).is_dir();
+        let read_ok = dir_ok && std::fs::read_dir(&dp).is_ok();
+        if let Some(w) =
+            check_remote_data_path(controller_host, &dp, explicit, dir_ok, read_ok)?
+        {
+            eprintln!("fdl: {w}");
+        }
+    }
+
+    // Remote workers: one ssh each, in parallel (probe latency stays flat
+    // regardless of host count).
+    let remotes: Vec<ClusterWorker> = cluster
+        .workers
+        .iter()
+        .filter(|w| w.host != controller_host)
+        .cloned()
+        .collect();
+    if remotes.is_empty() {
+        return Ok(());
+    }
+
+    let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::with_capacity(remotes.len());
+    for worker in remotes {
+        let warnings = Arc::clone(&warnings);
+        let errors = Arc::clone(&errors);
+        handles.push(thread::spawn(move || {
+            match preflight_one_host(&worker, prebuilding) {
+                Ok(ws) => warnings.lock().unwrap().extend(ws),
+                Err(e) => errors.lock().unwrap().push(e),
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    for w in warnings.lock().unwrap().iter() {
+        eprintln!("fdl: {w}");
+    }
+    let errs = Arc::try_unwrap(errors)
+        .map_err(|_| "internal: preflight error collector still referenced".to_string())?
+        .into_inner()
+        .map_err(|e| format!("internal: preflight errors mutex poisoned: {e}"))?;
+    if !errs.is_empty() {
+        return Err(format!(
+            "pre-flight host check failed on {} host(s):\n  {}",
+            errs.len(),
+            errs.join("\n  "),
+        ));
+    }
+    Ok(())
+}
+
 /// Run pre-flight builds for every remote host in `cluster`. The
 /// controller itself is skipped — its build is handled by the normal
 /// dispatch path (`cargo run` in Docker against the local `.active`).
@@ -231,7 +313,7 @@ enum AbiCheck {
 
 /// Compare the controller build environment against a remote host's
 /// `uname -m` + `ldd --version` output. Pure — no I/O — so it is
-/// directly unit-tested; [`probe_remote_abi`] supplies the live inputs.
+/// directly unit-tested; [`preflight_one_host`] supplies the live inputs.
 ///
 /// - **arch** must match exactly: an x86-64 binary is `Exec format
 ///   error` on aarch64. Hard error.
@@ -252,7 +334,7 @@ fn check_remote_abi(
     let remote_arch = remote_uname_m.trim();
     if remote_arch.is_empty() {
         // Couldn't read arch — treat as indeterminate, not a mismatch
-        // (see probe_remote_abi's unreachable-is-a-warning discipline).
+        // (see preflight_one_host's unreachable-is-a-warning discipline).
         return AbiCheck::Ok {
             warning: Some(format!(
                 "host {host:?}: could not read remote `uname -m`; skipping \
@@ -296,43 +378,103 @@ fn check_remote_abi(
     AbiCheck::Ok { warning }
 }
 
-/// SSH the remote, read `uname -m` + `ldd --version`, and run the
-/// [`check_remote_abi`] gate. Returns `Ok(Some(warning))` /
-/// `Ok(None)` on a compatible host, `Err(msg)` on a definitive
-/// incompatibility.
+/// Evaluate a host's shared-data-path readiness from probe results.
+/// `dir_ok` = the path exists and is a directory; `read_ok` = it is
+/// readable/listable. `explicit` = the host (or cluster.yml) declared
+/// `data_path:` rather than falling back to the convention default.
+///
+/// Pure — no I/O — so it is directly unit-tested; the local (controller)
+/// and remote (ssh) paths in [`preflight_hosts`] / [`preflight_one_host`]
+/// supply `dir_ok` / `read_ok`. Mirrors `probe::check_data_path`'s
+/// policy: a missing EXPLICIT path is launch-breaking (`Err`); a missing
+/// CONVENTION-default is a warning (users without shared storage are
+/// fine); a present-but-unreadable path is always an error.
+fn check_remote_data_path(
+    host: &str,
+    path: &str,
+    explicit: bool,
+    dir_ok: bool,
+    read_ok: bool,
+) -> Result<Option<String>, String> {
+    if !dir_ok {
+        if explicit {
+            return Err(format!(
+                "host {host:?}: shared data path `{path}` does not exist (or is \
+                 not a directory). flodl assumes a shared filesystem (NAS / SMB \
+                 / virtiofs / SSHFS) mounted at the same logical path on every \
+                 node — training reads data and writes checkpoints there. Mount \
+                 it, or correct `data_path:` in cluster.yml."
+            ));
+        }
+        return Ok(Some(format!(
+            "host {host:?}: convention shared-data path `{path}` not present (no \
+             `data_path:` declared). Ignore if you don't use shared storage; \
+             otherwise set `data_path:` per host or mount `{path}`."
+        )));
+    }
+    if !read_ok {
+        return Err(format!(
+            "host {host:?}: shared data path `{path}` exists but is not readable \
+             by the remote user. Check mount permissions / uid mapping."
+        ));
+    }
+    Ok(None)
+}
+
+/// One remote host's pre-fan-out readiness probe over a single ssh.
+///
+/// ALWAYS checks the shared `data_path` is mounted + readable. When
+/// `prebuilding`, ALSO gathers `uname -m` + `ldd --version` + `pkill`
+/// availability and runs the [`check_remote_abi`] gate — the ABI check
+/// only matters when a controller-built binary is shipped to the remote
+/// (the prebuild path); under `--no-prebuild` the remote re-enters
+/// `fdl <cmd>` and builds/runs natively, so arch/libc can't mismatch.
+/// Returns collected warnings on success, `Err(msg)` on a definitive
+/// failure (ABI mismatch, or a missing EXPLICIT data_path).
 ///
 /// UNREACHABLE-IS-A-WARNING: if the probe ssh itself fails (blip, host
-/// down), we return `Ok(Some(warning))` and proceed — today there is no
-/// pre-check at all, so a transient probe failure must never make things
-/// worse than the status quo; the real fan-out ssh surfaces a genuine
-/// connectivity error anyway. The probe only ever ADDS loud errors for
-/// definitive ABI mismatches.
-fn probe_remote_abi(worker: &ClusterWorker) -> Result<Vec<String>, String> {
+/// down), we return warnings and proceed — a transient probe failure
+/// must never make things worse than the status quo; the real fan-out
+/// ssh surfaces a genuine connectivity error anyway. The probe only ever
+/// ADDS loud errors for definitive mismatches / missing declared mounts.
+fn preflight_one_host(worker: &ClusterWorker, prebuilding: bool) -> Result<Vec<String>, String> {
     let target = worker
         .ssh
         .as_ref()
         .and_then(|s| s.target.as_deref())
         .unwrap_or(&worker.host);
+    let dp = worker.effective_data_path().to_string();
+    let dp_explicit = worker.data_path.is_some();
+
+    // One round-trip. data_path tests always; the ABI block (uname / ldd
+    // banner — its version line lands on stderr for glibc, stdout for
+    // some, so capture both — plus a `pkill` availability probe) only
+    // when prebuilding. All sentinel-delimited.
+    let mut script = format!(
+        "if [ -d {q} ]; then echo __FLODL_DP_DIR__=1; else echo __FLODL_DP_DIR__=0; fi; \
+         if [ -r {q} ]; then echo __FLODL_DP_READ__=1; else echo __FLODL_DP_READ__=0; fi",
+        q = posix_quote(&dp),
+    );
+    if prebuilding {
+        script.push_str(
+            "; echo __FLODL_ABI__; uname -m; echo __FLODL_LDD__; \
+             ldd --version 2>&1 | head -1; echo __FLODL_PKILL__; \
+             command -v pkill >/dev/null 2>&1 && echo present || echo absent",
+        );
+    }
+
     let mut cmd = Command::new("ssh");
     // User ssh.options first (they win), then flodl's defaults (M17).
     apply_worker_ssh_opts(&mut cmd, worker);
     cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     cmd.arg(target);
-    // uname line, then the ldd banner (its version line lands on stderr
-    // for glibc, stdout for some — capture both, sentinel-separated), then a
-    // `pkill` availability probe (belt-and-braces orphan-cleanup depends on
-    // it; see the warning below). All sentinel-delimited on one round-trip.
-    cmd.arg(
-        "uname -m; echo __FLODL_LDD__; ldd --version 2>&1 | head -1; \
-         echo __FLODL_PKILL__; command -v pkill >/dev/null 2>&1 \
-         && echo present || echo absent",
-    );
+    cmd.arg(&script);
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
             return Ok(vec![format!(
                 "host {:?}: remote pre-check ssh spawn failed ({e}); skipping \
-                 (a real mismatch would surface at fan-out)",
+                 (a real mismatch / missing mount would surface at fan-out)",
                 worker.host,
             )]);
         }
@@ -340,33 +482,51 @@ fn probe_remote_abi(worker: &ClusterWorker) -> Result<Vec<String>, String> {
     if !output.status.success() {
         return Ok(vec![format!(
             "host {:?}: remote pre-check ssh exited {}; skipping (a real \
-             mismatch would surface at fan-out)",
+             mismatch / missing mount would surface at fan-out)",
             worker.host, output.status,
         )]);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (uname_m, rest) = stdout
-        .split_once("__FLODL_LDD__")
-        .unwrap_or((stdout.as_ref(), ""));
-    let (ldd, pkill_field) = rest
-        .split_once("__FLODL_PKILL__")
-        .unwrap_or((rest, ""));
-    let controller_arch = std::env::consts::ARCH;
-    let mut warnings = match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
-        AbiCheck::Ok { warning } => warning.into_iter().collect::<Vec<_>>(),
-        AbiCheck::Incompatible(msg) => return Err(msg),
-    };
-    // Only warn on an EXPLICIT "absent" — an empty/garbled field (older
-    // remote, parse hiccup) is indeterminate and must not false-warn, mirroring
-    // the empty-arch discipline in `check_remote_abi`.
-    if pkill_field.trim() == "absent" {
-        warnings.push(format!(
-            "host {:?}: `pkill` not found on the remote — belt-and-braces \
-             orphan cleanup is disabled; teardown relies solely on the \
-             per-host trap wrapper (kills by known pid, no external tool). \
-             Install procps if you want pre-spawn stale-orphan clearing.",
-            worker.host,
-        ));
+
+    let mut warnings = Vec::new();
+    // data_path verdict (always). Exact-sentinel match: `=0` never
+    // matches `=1`, so a plain `contains` is unambiguous.
+    let dir_ok = stdout.contains("__FLODL_DP_DIR__=1");
+    let read_ok = stdout.contains("__FLODL_DP_READ__=1");
+    if let Some(w) = check_remote_data_path(&worker.host, &dp, dp_explicit, dir_ok, read_ok)? {
+        warnings.push(w);
+    }
+
+    // ABI verdict (prebuild path only).
+    if prebuilding {
+        let abi_part = stdout
+            .split_once("__FLODL_ABI__")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        let (uname_m, rest) = abi_part
+            .split_once("__FLODL_LDD__")
+            .unwrap_or((abi_part, ""));
+        let (ldd, pkill_field) = rest
+            .split_once("__FLODL_PKILL__")
+            .unwrap_or((rest, ""));
+        let controller_arch = std::env::consts::ARCH;
+        match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
+            AbiCheck::Ok { warning } => warnings.extend(warning),
+            AbiCheck::Incompatible(msg) => return Err(msg),
+        }
+        // Only warn on an EXPLICIT "absent" — an empty/garbled field
+        // (older remote, parse hiccup) is indeterminate and must not
+        // false-warn, mirroring the empty-arch discipline in
+        // `check_remote_abi`.
+        if pkill_field.trim() == "absent" {
+            warnings.push(format!(
+                "host {:?}: `pkill` not found on the remote — belt-and-braces \
+                 orphan cleanup is disabled; teardown relies solely on the \
+                 per-host trap wrapper (kills by known pid, no external tool). \
+                 Install procps if you want pre-spawn stale-orphan clearing.",
+                worker.host,
+            ));
+        }
     }
     Ok(warnings)
 }
@@ -410,14 +570,9 @@ fn prebuild_one_worker(
         ));
     }
     let host_path = controller_variant_dir.display().to_string();
-    // ABI pre-check BEFORE the (multi-minute) build: the prebuilt binary
-    // is exec'd directly on the remote via the shared mount, so a
-    // controller-vs-remote arch or libc mismatch would fail at fan-out
-    // with a cryptic `Exec format error`. Fail fast + loud here instead;
-    // a definitive mismatch aborts, an unreachable probe only warns.
-    for warning in probe_remote_abi(worker)? {
-        eprintln!("fdl: {warning}");
-    }
+    // ABI + shared-mount pre-checks ran earlier in `preflight_hosts`
+    // (one ssh per host, before any build), so by the time we reach the
+    // multi-minute build the host is already known compatible + mounted.
     // Derive features + docker service from the YAML-declared `arch:`
     // basename — single source of truth, no `.arch` metadata file
     // required. `cpu` is the only non-CUDA variant by convention; every
@@ -656,6 +811,38 @@ mod tests {
     fn abi_arch_mismatch_is_hard_incompatible() {
         let r = check_remote_abi("gv", "x86_64", "aarch64", "ldd (GNU libc) 2.31");
         assert!(matches!(r, AbiCheck::Incompatible(m) if m.contains("arch mismatch")));
+    }
+
+    #[test]
+    fn data_path_present_and_readable_is_clean() {
+        assert!(check_remote_data_path("h", "/flodl/data", true, true, true)
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn data_path_missing_explicit_is_hard_error() {
+        let err = check_remote_data_path("h", "/mnt/nas", true, false, false)
+            .expect_err("explicit missing must be a hard error");
+        assert!(err.contains("does not exist"), "err: {err}");
+        assert!(err.contains("/mnt/nas"), "err: {err}");
+    }
+
+    #[test]
+    fn data_path_missing_convention_default_is_warning() {
+        // explicit=false -> convention default /flodl/data not present ->
+        // warning (Ok), not a launch-breaking error.
+        let w = check_remote_data_path("h", "/flodl/data", false, false, false)
+            .expect("convention-default missing must be Ok(warning)")
+            .expect("should carry a warning");
+        assert!(w.contains("convention"), "warn: {w}");
+    }
+
+    #[test]
+    fn data_path_present_but_unreadable_is_hard_error() {
+        let err = check_remote_data_path("h", "/flodl/data", false, true, false)
+            .expect_err("present-but-unreadable must be a hard error regardless of explicit");
+        assert!(err.contains("not readable"), "err: {err}");
     }
 
     #[test]
