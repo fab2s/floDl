@@ -179,7 +179,12 @@ where
         )));
     }
 
-    let addr = format!("{}:{}", cluster.controller.host, cluster.controller.port);
+    // Bracket IPv6 literals: a bare `fe80::1` concatenated with `:port`
+    // is ambiguous and fails `ToSocketAddrs`; `[fe80::1]:port` is correct.
+    let addr = crate::distributed::wire::join_host_port(
+        &cluster.controller.host,
+        cluster.controller.port,
+    );
     let mut stream =
         crate::distributed::wire::connect_with_retry(addr.as_str(), "rendezvous")?;
     stream

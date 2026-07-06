@@ -484,3 +484,20 @@
         // Header is exactly 24 bytes (no payload).
         assert_eq!(buf.len(), 24);
     }
+
+    #[test]
+    fn join_host_port_brackets_ipv6_only() {
+        // IPv4 + hostnames: plain host:port.
+        assert_eq!(join_host_port("192.168.122.1", 1337), "192.168.122.1:1337");
+        assert_eq!(join_host_port("exa", 1337), "exa:1337");
+        assert_eq!(join_host_port("127.0.0.1", 22), "127.0.0.1:22");
+        // IPv6 literal: must be bracketed (a bare fe80::1:1337 is ambiguous).
+        assert_eq!(join_host_port("fe80::1", 1337), "[fe80::1]:1337");
+        assert_eq!(join_host_port("2001:db8::5", 29500), "[2001:db8::5]:29500");
+        assert_eq!(join_host_port("::1", 1337), "[::1]:1337");
+        // Already bracketed: left as-is (no double brackets).
+        assert_eq!(join_host_port("[fe80::1]", 1337), "[fe80::1]:1337");
+        // The result must round-trip through ToSocketAddrs for IPv6.
+        use std::net::ToSocketAddrs;
+        assert!(join_host_port("::1", 1337).to_socket_addrs().is_ok());
+    }

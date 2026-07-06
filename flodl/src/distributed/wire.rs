@@ -128,6 +128,24 @@ pub(crate) const WRITE_STALL_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
 
+/// Join a host and port into a dial string, bracketing IPv6 literals.
+///
+/// A bare IPv6 address (`fe80::1`) concatenated as `host:port` yields the
+/// ambiguous `fe80::1:1337`, which [`std::net::ToSocketAddrs`] rejects —
+/// the port-suffix form requires brackets: `[fe80::1]:1337`. Hostnames
+/// and IPv4 addresses (which never contain `:`) pass through unchanged,
+/// and an already-bracketed host is left as-is. The `(host, port)` tuple
+/// form of `ToSocketAddrs` avoids this, but a pre-formatted string is
+/// needed where the dial target must also `Display` (see
+/// [`connect_with_retry`]'s bounds).
+pub(crate) fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// TCP connect with the shared cluster retry budget. `what` names the
 /// dial for the error message (e.g. "relay upstream", "rendezvous").
 pub(crate) fn connect_with_retry<A>(

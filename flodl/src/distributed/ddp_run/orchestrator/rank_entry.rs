@@ -32,7 +32,7 @@ use super::DdpHandle;
 /// Parse `host:port`, falling back to DNS / `/etc/hosts` resolution.
 ///
 /// `SocketAddr::from_str` only accepts numeric IPs. In cluster mode the
-/// user's `controller_addr` is often a short hostname (e.g. `exa`) that
+/// controller's `host:` is often a short hostname (e.g. `exa`) that
 /// resolves through the host's `/etc/hosts` under `network_mode: host`.
 fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
