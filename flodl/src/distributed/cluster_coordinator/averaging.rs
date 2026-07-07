@@ -439,6 +439,16 @@ impl ClusterCoordinator {
                 // `finish_averaging_cpu` via the `cpu_avg_start` field
                 // so MSF / dashboard see the same `CpuAvgEnd
                 // { duration_ms }` payload shape on cluster runs.
+                //
+                // DELIBERATE SEMANTICS: this clock starts at the TRIGGER, so
+                // the derived sync_ms is the controller-perspective cost of
+                // the whole rendezvous — including each rank draining its
+                // in-flight batch (~1 batch, a stable additive term) and the
+                // snapshot transport from far ranks (the dominant term on a
+                // slow link, and exactly what the anchor must amortize). Do
+                // NOT narrow this to collect-complete → scatter-done: that
+                // would hide transport cost and under-grow the anchor for
+                // distant ranks.
                 self.cpu_avg_start = Some(Instant::now());
                 if let Some(ref tl) = self.timeline {
                     tl.event(crate::monitor::EventKind::CpuAvgStart);

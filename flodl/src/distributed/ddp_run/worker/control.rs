@@ -48,7 +48,7 @@ impl<M: Module> GpuWorker<M> {
     }
 
     /// Handle a single control message. Returns `true` on Shutdown.
-    pub(super) fn dispatch_control(&mut self, msg: ControlMsg) -> Result<bool> {
+    pub(crate) fn dispatch_control(&mut self, msg: ControlMsg) -> Result<bool> {
         // Instrumentation: count processed control messages to test
         // whether cpu mode carries more per-cycle control traffic.
         if self.prof_enabled {
@@ -56,6 +56,11 @@ impl<M: Module> GpuWorker<M> {
         }
         match msg {
             ControlMsg::RequestParams => {
+                // Record what this frame ships (see `steps_at_snapshot` on
+                // the struct): the matching `Update` subtracts exactly this,
+                // so overshoot steps taken during the averaging round-trip
+                // keep their mass credit for the next frame.
+                self.steps_at_snapshot = self.steps_since_avg;
                 // Instrumentation (gated): time the GPU→CPU readout — the
                 // per-window snapshot the CPU averaging path pays to
                 // publish weights for the reduce.
@@ -72,13 +77,22 @@ impl<M: Module> GpuWorker<M> {
             }
             ControlMsg::Update(avg) => {
                 self.load_averaged(&avg)?;
-                self.steps_since_avg = 0;
+                // Subtract the shipped count, don't zero: steps taken since
+                // the snapshot (cpu-async overshoot) survive the EASGD blend
+                // in `load_averaged` and must ride the next frame's mass.
+                // Marker reset so a spurious second Update subtracts 0.
+                self.steps_since_avg =
+                    self.steps_since_avg.saturating_sub(self.steps_at_snapshot);
+                self.steps_at_snapshot = 0;
             }
             ControlMsg::SyncNow => {
                 crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
                 let (divergence, post_norm, pre_norm) = self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
+                // NCCL sync is synchronous — nothing can step between the
+                // collective and this line; zero is exact here.
                 self.steps_since_avg = 0;
+                self.steps_at_snapshot = 0;
                 // Bump local_step and send a dedicated SyncAck so the
                 // coordinator's nccl_ack mechanism sees step_count > snapshot.
                 // Without this, a SyncNow processed in wait_for_epoch_plan

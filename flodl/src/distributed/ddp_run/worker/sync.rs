@@ -289,17 +289,30 @@ impl<M: Module> GpuWorker<M> {
     /// CPU individually (no-op for tensors already on CPU). Used on the CPU
     /// device and as the safety net if the pinned async path errors.
     fn read_params_passthrough(&self) -> (Vec<Tensor>, Vec<Tensor>) {
+        // SNAPSHOT NEVER ALIASES LIVE STORAGE. A CUDA-resident tensor gets a
+        // real copy from `to_device(CPU)`, but a CPU-resident one must be
+        // deep-copied explicitly: the shallow clone shares storage with the
+        // live param, and under Async the worker resumes training while the
+        // bridge thread is still serializing the snapshot — an aliased
+        // buffer ships torn floats (an element mix of adjacent optimizer
+        // steps that is a valid state of NO step). One host memcpy per
+        // window, the same cost class the CUDA path pays for its D2H. On a
+        // copy failure fall back to the alias — matches the `to_device`
+        // fallback below; sync/cadence consume the snapshot before training
+        // resumes, so the fallback is only torn where it was always torn.
+        fn cpu_detached(t: Tensor) -> Tensor {
+            if t.device() != Device::CPU {
+                return t.to_device(Device::CPU).unwrap_or(t);
+            }
+            Tensor::zeros_like(&t)
+                .and_then(|c| c.copy_(&t, false).map(|()| c))
+                .unwrap_or(t)
+        }
         let params = self.param_vars.iter()
-            .map(|v| {
-                let t = v.data();
-                if t.device() == Device::CPU { t } else { t.to_device(Device::CPU).unwrap_or(t) }
-            })
+            .map(|v| cpu_detached(v.data()))
             .collect();
         let buffers = self.buffer_list.iter()
-            .map(|b| {
-                let t = b.get();
-                if t.device() == Device::CPU { t } else { t.to_device(Device::CPU).unwrap_or(t) }
-            })
+            .map(|b| cpu_detached(b.get()))
             .collect();
         (params, buffers)
     }

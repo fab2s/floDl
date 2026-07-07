@@ -181,6 +181,17 @@ pub struct GpuWorker<M: Module> {
     nccl_sync_seq: usize,
     /// Batches since last averaging (for snapshot weighting).
     steps_since_avg: usize,
+    /// `steps_since_avg` captured when the last `RequestParams` snapshot
+    /// shipped — the step count whose work that frame carried. On `Update`
+    /// the counter subtracts THIS instead of zeroing: under cpu-async the
+    /// worker keeps training through the round-trip and the incoming
+    /// consensus is EASGD-blended, so the overshoot steps' work survives in
+    /// the params — their mass must ride the NEXT frame. Pre-snapshot steps
+    /// count fully despite sitting on a previous blend, so full credit for
+    /// the overshoot is the consistent accounting (zeroing was the
+    /// inconsistency). Under sync/cadence no steps land between snapshot and
+    /// Update, so subtract and zero coincide.
+    steps_at_snapshot: usize,
     current_version: u64,
     pub(super) current_epoch: usize,
     /// Queued epoch plan from coordinator (set if StartEpoch arrives during run_epoch_plan).
@@ -438,6 +449,19 @@ impl<M: Module> GpuWorker<M> {
     /// Current local step count.
     pub fn local_step(&self) -> usize {
         self.local_step
+    }
+
+    /// Test-only window into the mass counter (see `steps_at_snapshot`).
+    #[cfg(test)]
+    pub(crate) fn steps_since_avg(&self) -> usize {
+        self.steps_since_avg
+    }
+
+    /// Test-only setter simulating trained batches (the production
+    /// increment lives in the epoch-plan loop).
+    #[cfg(test)]
+    pub(crate) fn set_steps_since_avg(&mut self, n: usize) {
+        self.steps_since_avg = n;
     }
 
     /// Current model version (updated after loading averaged params).

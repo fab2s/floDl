@@ -80,6 +80,83 @@ fn test_worker_load_averaged() {
 }
 
 #[test]
+fn test_update_subtracts_snapshot_steps_not_zeroes() {
+    // cpu-async overshoot accounting: steps taken AFTER the snapshot but
+    // BEFORE the Update survive the EASGD blend, so their mass must stay in
+    // the counter for the next frame. Zeroing (the old behavior) dropped it.
+    let (mut worker, _ch) = make_test_worker();
+
+    // 5 steps trained, then the averaging trigger snapshots the params.
+    worker.set_steps_since_avg(5);
+    worker.dispatch_control(ControlMsg::RequestParams).unwrap();
+    // Overshoot: 3 more steps land while the averaging round-trips.
+    worker.set_steps_since_avg(worker.steps_since_avg() + 3);
+
+    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let update = AveragedParams {
+        params: vec![
+            Tensor::ones(&[2, 4], cpu).unwrap(),
+            Tensor::ones(&[2], cpu).unwrap(),
+        ],
+        buffers: vec![],
+        version: 1,
+    };
+    worker.dispatch_control(ControlMsg::Update(update)).unwrap();
+
+    // The 5 shipped steps are consumed; the 3 overshoot steps remain.
+    assert_eq!(worker.steps_since_avg(), 3, "overshoot steps must keep their mass credit");
+
+    // A spurious second Update must subtract 0 (marker was reset), not
+    // re-subtract the stale snapshot count.
+    let update2 = AveragedParams {
+        params: vec![
+            Tensor::ones(&[2, 4], cpu).unwrap(),
+            Tensor::ones(&[2], cpu).unwrap(),
+        ],
+        buffers: vec![],
+        version: 2,
+    };
+    worker.dispatch_control(ControlMsg::Update(update2)).unwrap();
+    assert_eq!(worker.steps_since_avg(), 3, "second Update without a snapshot subtracts nothing");
+}
+
+#[test]
+fn test_snapshot_never_aliases_live_params() {
+    // The snapshot must be a stable copy: mutating the live params after
+    // snapshot_params returns must not change the snapshot's contents. On
+    // CUDA the pinned-staging path always copied; on a CPU device the old
+    // passthrough returned storage-sharing clones — under Async the bridge
+    // thread serialized them while the worker kept training (torn floats).
+    let (mut worker, _ch) = make_test_worker();
+    let snap = worker.snapshot_params();
+    let before: f64 = snap.params[0].sum().unwrap().item().unwrap();
+
+    // Mutate the live weight in place (what an optimizer step does).
+    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let ones = Tensor::ones(&[2, 4], cpu).unwrap();
+    crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+        let live = worker.param_vars[0].data();
+        let src = if live.device() == Device::CPU {
+            ones
+        } else {
+            ones.to_device(live.device())?
+        };
+        live.copy_(&src, false)?;
+        Ok(())
+    })
+    .unwrap();
+    if let Device::CUDA(idx) = test_device() {
+        crate::tensor::cuda_synchronize(idx);
+    }
+
+    let after: f64 = snap.params[0].sum().unwrap().item().unwrap();
+    assert!(
+        (after - before).abs() < 1e-6,
+        "snapshot changed after live-param mutation (aliased storage): before={before} after={after}"
+    );
+}
+
+#[test]
 fn test_worker_load_averaged_wrong_count() {
     let (mut worker, _ch) = make_test_worker();
 
