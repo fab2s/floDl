@@ -24,6 +24,7 @@ mod gate;
 mod heartbeat;
 mod lost_broadcast;
 mod reduce_stall;
+mod shutdown_gate;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).
 pub(super) const TEST_SALT: SessionSalt = [

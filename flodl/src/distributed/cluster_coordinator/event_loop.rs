@@ -565,7 +565,7 @@ impl ClusterCoordinator {
     /// and a genuinely unreachable rank is already handled by heartbeat
     /// staleness. Headless test coordinators (no control streams) short-circuit
     /// before attempting any send.
-    fn emit_coord_heartbeat(&mut self) {
+    pub(super) fn emit_coord_heartbeat(&mut self) {
         if self.control_streams.is_empty() {
             return; // headless coord (test fixtures) — nothing to beacon to
         }
@@ -1001,6 +1001,26 @@ impl ClusterCoordinator {
                 }
                 // Give the chosen rank a tick to eval + ship EvalResult
                 // before Shutdown goes out (next tick, flag set → shutdown).
+                return;
+            }
+            // COORDINATOR-CONFIRMED EXIT: never broadcast `Shutdown`
+            // while an NCCL sync is still in flight. The final consensus
+            // reduce (or the last regular window's reduce) can have some
+            // ranks' collective kernels still running when another rank
+            // has already acked — NCCL's LL small-message protocol does
+            // not synchronize kernel completion across ranks. A rank
+            // that takes `Shutdown` at that point exits its process and
+            // destroys its NCCL comm mid-collective, stranding every
+            // peer in `synchronize()` at 100% GPU forever (observed as
+            // the ~1/6 end-of-run cadence wedge on the 3-rank rig). The
+            // per-rank control channel is FIFO, so gating the broadcast
+            // on all-alive-acked guarantees every rank has fully retired
+            // the collective before any rank can see `Shutdown`.
+            // Idempotent retry: this method runs every tick, so the
+            // broadcast fires on the first settled tick; a sync that
+            // never settles (rank wedged/lost mid-collective) is ended
+            // by `poll_nccl_reduce_stall`'s ceiling escalation instead.
+            if !self.nccl_sync_settled() {
                 return;
             }
             self.run_phase = RunPhase::ShutdownInitiated;

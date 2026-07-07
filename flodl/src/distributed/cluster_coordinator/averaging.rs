@@ -345,6 +345,20 @@ impl ClusterCoordinator {
                         }
                         self.drain_timing();
                         self.check_dead_ranks();
+                        // Keep the OUTBOUND liveness beacon alive too. This
+                        // wait's ceiling deliberately outlasts rank-death
+                        // attribution (heartbeat_timeout + 2s), but the
+                        // coord→rank heartbeat is normally emitted from
+                        // tick() — which this loop blocks. Without this,
+                        // every HEALTHY rank's coord-liveness watchdog fires
+                        // at heartbeat_timeout (the beacon has been silent
+                        // longer than the deadline, since the ceiling
+                        // exceeds it by design) and the whole cohort
+                        // self-destructs mid-wait — observed as an
+                        // intermittent cadence wedge whenever a mover's
+                        // completion frame arrived late. Throttled to 1s
+                        // internally, so per-iteration is cheap.
+                        self.emit_coord_heartbeat();
                         if !slow_wait_logged
                             && wait_start.elapsed().as_secs_f64() > 1.0
                         {
@@ -611,6 +625,41 @@ impl ClusterCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// Whether the last NCCL averaging cycle has fully settled: every
+    /// alive rank's post-collective `SyncAck` has landed (or no sync was
+    /// ever in flight). A rank's ack is sent AFTER its
+    /// `sync_now_nccl` stream-synchronize returns, so all-alive-acked
+    /// means every kernel of the collective has retired on every rank —
+    /// the only state in which it is safe to let any rank exit and tear
+    /// down its NCCL resources.
+    ///
+    /// This is the coordinator-confirmed-exit gate: `Shutdown` must not
+    /// be broadcast while this is false. NCCL kernel completion is not
+    /// globally synchronized (the LL small-message protocol can retire
+    /// one rank's kernel while its peers' kernels of the SAME collective
+    /// are still in flight), so an early-finishing rank that receives
+    /// `Shutdown`, exits its process, and destroys its comm strands the
+    /// peers in `synchronize()` at 100% GPU forever. Trivially true on
+    /// the CPU backend — its equivalent settle gate is
+    /// `cpu_avg_state == Idle`, enforced at the top of
+    /// `try_advance_or_shutdown_after_aggregate`.
+    ///
+    /// Uses the alive-acked form (`is_dead(r) || nccl_ack[r]`), not the
+    /// raw `nccl_sync_start.is_none()`: dead ranks never ack, so the
+    /// capture path can leave `nccl_sync_start` armed after a death even
+    /// though the surviving cohort has fully settled. A rank that exits
+    /// WITHOUT acking keeps this false by design — the stranded cohort
+    /// is then ended by `poll_nccl_reduce_stall`'s ceiling escalation,
+    /// not by a Shutdown that no parked rank could read anyway.
+    pub(super) fn nccl_sync_settled(&self) -> bool {
+        if !matches!(self.backend, AverageBackend::Nccl) {
+            return true;
+        }
+        self.nccl_sync_start.is_none()
+            || (0..self.world_size)
+                .all(|r| self.is_dead(r) || self.nccl_ack[r])
     }
 
     /// NCCL-backend re-rendezvous initiation. Called from
