@@ -127,6 +127,89 @@ pub(crate) const CONNECT_BACKOFF: std::time::Duration =
 pub(crate) const WRITE_STALL_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// Env var scaling every cluster network deadline together.
+///
+/// The wire budgets above (connect, write-stall) and their siblings
+/// (coord heartbeat staleness, rank coord-liveness, CPU reduce read
+/// deadline) are LAN-tuned defaults that also define ONE coherent
+/// notion of "gone" — a peer silent past ~30s. On a slow link (WAN /
+/// NAT hub-and-spoke — a declared target of the CPU controller path)
+/// that notion must stretch *uniformly*: scaling only one budget lets
+/// a slower axis declare a peer dead while a faster one still waits.
+/// So a single multiplier scales the whole set: `>1` for slow
+/// networks (`3` ≈ "gone" at 90s), `<1` for test rigs that want fast
+/// failure detection (floor 0.1 keeps every deadline above the 1s
+/// coord-heartbeat cadence, which deliberately does NOT scale — extra
+/// beacons on a slow link are harmless, only deadlines matter).
+///
+/// Read once per process (cached). The launcher forwards it to remote
+/// rank/relay children automatically (like `FLODL_VERBOSITY`), so
+/// setting it where `fdl` runs covers the whole cluster coherently —
+/// that is the canonical route. (A `cluster.env:` entry would reach
+/// rank children but not the controller-side coordinator: a split
+/// notion of "gone". The fan-out path validates it early and loudly;
+/// this reader warns-once and falls back to 1.0 so a library-only
+/// consumer with a bad value degrades to defaults instead of
+/// panicking mid-run.)
+pub(crate) const ENV_NET_TIMEOUT_SCALE: &str = "FLODL_NET_TIMEOUT_SCALE";
+
+/// Parse a `FLODL_NET_TIMEOUT_SCALE` value. Pure — unit-tested apart
+/// from the cached env reader. `None` (unset) is scale 1.0. Set values
+/// must be finite and ≥ 0.1.
+pub(crate) fn parse_net_timeout_scale(raw: Option<&str>) -> std::result::Result<f64, String> {
+    let Some(raw) = raw else { return Ok(1.0) };
+    let trimmed = raw.trim();
+    let parsed: f64 = trimmed.parse().map_err(|_| {
+        format!(
+            "{ENV_NET_TIMEOUT_SCALE}={trimmed:?} is not a number; expected a \
+             scale factor ≥ 0.1 (e.g. 3 for a slow WAN link, 0.5 for a \
+             fast-failure test rig)"
+        )
+    })?;
+    if !parsed.is_finite() || parsed < 0.1 {
+        return Err(format!(
+            "{ENV_NET_TIMEOUT_SCALE}={trimmed} is out of range; expected a \
+             finite scale factor ≥ 0.1 (0.1 keeps every deadline above the \
+             1s heartbeat cadence)"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// The process-wide network-timeout scale (cached on first read).
+/// Invalid values warn once and fall back to 1.0 — the cluster fan-out
+/// path has already validated loudly by the time library code runs.
+pub(crate) fn net_timeout_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let raw = std::env::var(ENV_NET_TIMEOUT_SCALE).ok();
+        match parse_net_timeout_scale(raw.as_deref()) {
+            Ok(s) => s,
+            Err(msg) => {
+                eprintln!("flodl: {msg}; using default scale 1.0");
+                1.0
+            }
+        }
+    })
+}
+
+/// [`CONNECT_ATTEMPTS`] scaled by [`net_timeout_scale`] (backoff pause
+/// stays fixed; the attempt count carries the scale).
+pub(crate) fn connect_attempts() -> u32 {
+    ((CONNECT_ATTEMPTS as f64 * net_timeout_scale()).ceil() as u32).max(1)
+}
+
+/// [`WRITE_STALL_TIMEOUT`] scaled by [`net_timeout_scale`].
+pub(crate) fn write_stall_timeout() -> std::time::Duration {
+    WRITE_STALL_TIMEOUT.mul_f64(net_timeout_scale())
+}
+
+/// Scale a whole-second deadline default by [`net_timeout_scale`],
+/// flooring at 1s. Used where the deadline is carried as `u64` seconds
+/// (coord heartbeat staleness, rank coord-liveness, reduce read).
+pub(crate) fn scaled_deadline_secs(base_secs: u64) -> u64 {
+    ((base_secs as f64 * net_timeout_scale()).ceil() as u64).max(1)
+}
 
 /// Join a host and port into a dial string, bracketing IPv6 literals.
 ///
@@ -155,8 +238,9 @@ pub(crate) fn connect_with_retry<A>(
 where
     A: std::net::ToSocketAddrs + std::fmt::Display + Copy,
 {
+    let attempts = connect_attempts();
     let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..CONNECT_ATTEMPTS {
+    for _ in 0..attempts {
         match std::net::TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
             Err(e) => {
@@ -166,9 +250,9 @@ where
         }
     }
     Err(TensorError::new(&format!(
-        "{what}: connect to {addr} failed after {CONNECT_ATTEMPTS} attempts \
+        "{what}: connect to {addr} failed after {attempts} attempts \
          (~{}s): {}",
-        CONNECT_ATTEMPTS as u64 * CONNECT_BACKOFF.as_millis() as u64 / 1000,
+        attempts as u64 * CONNECT_BACKOFF.as_millis() as u64 / 1000,
         last_err
             .map(|e| e.to_string())
             .unwrap_or_else(|| "no error captured".into()),

@@ -367,7 +367,7 @@ fn run_reduce_thread(
                 // elastic scatter below then declares that connection's
                 // ranks dead and continues with the survivors.
                 stream
-                    .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+                    .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
                     .map_err(|e| {
                         TensorError::new(&format!(
                             "cluster_controller: set_write_timeout: {e}"

@@ -120,6 +120,31 @@ security group must enumerate ports. The CPU-averaging backend has no
 mesh — it routes only through the controller — so it is the fallback
 for topologies where an all-to-all NCCL mesh is not achievable.
 
+### Network deadlines and `FLODL_NET_TIMEOUT_SCALE`
+
+flodl's transport deadlines are LAN-tuned defaults that together define
+**one coherent notion of "gone"** — a peer silent past ~30s:
+
+| Budget | Default | Detects |
+|---|---|---|
+| TCP connect (all cluster dials) | 60 × 500ms ≈ 30s | controller not up yet |
+| write-stall (every cluster socket) | 30s zero-progress | wedged peer / dead link |
+| coord heartbeat staleness (coord side) | 30s | silent rank |
+| coord-liveness (rank side) | 30s | wedged coordinator |
+| CPU reduce read deadline | 120s per-read silence | vanished controller mid-round |
+
+On a slower link (WAN, NAT hub-and-spoke — a declared target of the
+CPU-averaging path) set `FLODL_NET_TIMEOUT_SCALE` where you run `fdl`
+(e.g. `3` ≈ "gone" at 90s): it scales the whole set together and is
+forwarded to every remote rank/relay automatically, so the cluster
+keeps a single notion of "gone". Values below `1` (floor `0.1`) shrink
+the deadlines for fast-failure test rigs. An explicit
+`heartbeat_timeout_secs` on the trainer config overrides the heartbeat
+pair unscaled. SSH keepalives are a separate axis (ssh transport, not
+flodl wire): tune per host via `ssh.options:`
+(`["ServerAliveInterval=30", ...]`) — user options win over flodl's
+defaults.
+
 ## Principles
 
 These principles together produced the testing-convention slice and

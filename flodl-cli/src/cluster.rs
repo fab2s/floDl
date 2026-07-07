@@ -103,6 +103,43 @@ pub fn is_reserved_cluster_env_key(key: &str) -> bool {
         || key == ENV_FDL_ENV
 }
 
+/// Env var scaling every flodl cluster network deadline together
+/// (connect budget, write-stall, heartbeat staleness, coord-liveness,
+/// CPU reduce read). Mirrors `flodl::distributed::wire`'s constant +
+/// validation rule (kept in lockstep — flodl-cli is decoupled from the
+/// library crate). The library reader warns-and-defaults on a bad
+/// value; the cluster fan-out path calls
+/// [`validate_net_timeout_scale`] first so an explicit-but-invalid
+/// value errors loudly BEFORE any host is touched.
+pub const ENV_NET_TIMEOUT_SCALE: &str = "FLODL_NET_TIMEOUT_SCALE";
+
+/// Validate `FLODL_NET_TIMEOUT_SCALE` from the process env: unset is
+/// fine (scale 1.0); a set value must parse as a finite float ≥ 0.1.
+/// Mirrors the library's parse rule.
+pub fn validate_net_timeout_scale() -> Result<(), String> {
+    validate_net_timeout_scale_value(std::env::var(ENV_NET_TIMEOUT_SCALE).ok().as_deref())
+}
+
+/// Pure core of [`validate_net_timeout_scale`] (unit-testable without
+/// env mutation).
+fn validate_net_timeout_scale_value(raw: Option<&str>) -> Result<(), String> {
+    let Some(raw) = raw else { return Ok(()) };
+    let trimmed = raw.trim();
+    match trimmed.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.1 => Ok(()),
+        Ok(_) => Err(format!(
+            "{ENV_NET_TIMEOUT_SCALE}={trimmed} is out of range; expected a \
+             finite scale factor >= 0.1 (0.1 keeps every deadline above the \
+             1s heartbeat cadence)"
+        )),
+        Err(_) => Err(format!(
+            "{ENV_NET_TIMEOUT_SCALE}={trimmed:?} is not a number; expected a \
+             scale factor >= 0.1 (e.g. 3 for a slow WAN link, 0.5 for a \
+             fast-failure test rig)"
+        )),
+    }
+}
+
 /// Top-level cluster-dispatch decision.
 ///
 /// Returns `false` when `FLODL_INTERNAL_CLUSTER_JSON` is set — that signals we're
@@ -664,6 +701,19 @@ mod tests {
     /// `FLODL_INTERNAL_CLUSTER_JSON` and `prepare_cluster_env` sets several
     /// vars; both classes are guarded by the same lock.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn net_timeout_scale_validation_mirrors_library_rule() {
+        // Pure core — no env mutation needed.
+        assert!(validate_net_timeout_scale_value(None).is_ok());
+        assert!(validate_net_timeout_scale_value(Some("3")).is_ok());
+        assert!(validate_net_timeout_scale_value(Some("0.1")).is_ok());
+        assert!(validate_net_timeout_scale_value(Some(" 2.0 ")).is_ok());
+        assert!(validate_net_timeout_scale_value(Some("0.05")).is_err());
+        assert!(validate_net_timeout_scale_value(Some("-1")).is_err());
+        assert!(validate_net_timeout_scale_value(Some("inf")).is_err());
+        assert!(validate_net_timeout_scale_value(Some("abc")).is_err());
+    }
 
     #[test]
     fn should_dispatch_returns_false_when_cluster_json_set() {

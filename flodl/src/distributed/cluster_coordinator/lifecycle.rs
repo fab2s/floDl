@@ -156,7 +156,7 @@ impl ClusterCoordinator {
             // thread also drives the dead-rank detector that would
             // otherwise rescue the situation.
             stream
-                .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+                .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
                 .map_err(|e| {
                     TensorError::new(&format!(
                         "cluster_coordinator: set_write_timeout: {e}"

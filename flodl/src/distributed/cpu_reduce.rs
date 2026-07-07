@@ -48,7 +48,9 @@ use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 /// eval/checkpoint callback) never trips it; only true peer-death silence
 /// does. Sized to the coordinator's production stall ceiling (120s) so rank
 /// and coordinator agree on what "stalled" means. This is the in-band
-/// analogue of the relay's `fill_committed` starvation deadline.
+/// analogue of the relay's `fill_committed` starvation deadline. Scaled by
+/// `FLODL_NET_TIMEOUT_SCALE` at socket setup like the rest of the
+/// deadline set (see `wire::ENV_NET_TIMEOUT_SCALE`).
 const REDUCE_READ_DEADLINE_SECS: u64 = 120;
 
 /// Rank-side client for the CPU-averaging controller.
@@ -140,7 +142,7 @@ impl CpuReduceClient {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| TensorError::new(&format!("cpu_reduce: set_read_timeout: {e}")))?;
         stream
-            .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+            .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
             .map_err(|e| TensorError::new(&format!("cpu_reduce: set_write_timeout: {e}")))?;
 
         let mut client = CpuReduceClient {
@@ -163,7 +165,9 @@ impl CpuReduceClient {
         // a slow-but-live round.
         client
             .stream
-            .set_read_timeout(Some(Duration::from_secs(REDUCE_READ_DEADLINE_SECS)))
+            .set_read_timeout(Some(Duration::from_secs(
+                crate::distributed::wire::scaled_deadline_secs(REDUCE_READ_DEADLINE_SECS),
+            )))
             .map_err(|e| {
                 TensorError::new(&format!("cpu_reduce: set reduce read deadline: {e}"))
             })?;

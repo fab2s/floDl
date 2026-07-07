@@ -453,6 +453,14 @@ pub(super) fn build_remote_relay_bash_command(
         s.push('=');
         s.push_str(&shell_quote(&v));
     }
+    // Forward the network-timeout scale (relay write-stall/connect must
+    // share the cluster-wide notion of "gone"; see rank builder).
+    if let Ok(v) = std::env::var(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE) {
+        s.push(' ');
+        s.push_str(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE);
+        s.push('=');
+        s.push_str(&shell_quote(&v));
+    }
     if let Some(pb) = prebuild {
         if !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
             s.push(' ');
@@ -720,6 +728,16 @@ pub(super) fn build_remote_bash_command(
     if let Ok(v) = std::env::var(crate::log::ENV_VAR) {
         s.push(' ');
         s.push_str(crate::log::ENV_VAR);
+        s.push('=');
+        s.push_str(&shell_quote(&v));
+    }
+    // Forward the network-timeout scale for the same reason: the
+    // launcher's value is authoritative for the whole cluster (one
+    // coherent notion of "gone"); SSH children would otherwise fall
+    // back to 1.0 while the controller-side coordinator ran scaled.
+    if let Ok(v) = std::env::var(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE) {
+        s.push(' ');
+        s.push_str(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE);
         s.push('=');
         s.push_str(&shell_quote(&v));
     }

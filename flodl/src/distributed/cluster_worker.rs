@@ -472,7 +472,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // emitter instead of parking them — the bridges then unwind and
         // the rank exits rather than hanging silently.
         stream
-            .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT))
+            .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
             .map_err(|e| {
                 TensorError::new(&format!("cluster_worker: set_write_timeout: {e}"))
             })?;

@@ -207,6 +207,15 @@ pub(crate) fn dispatch_config(
     };
 
     if let Some(cluster) = cluster_to_dispatch {
+        // Loud early validation of the network-timeout scale: the
+        // library reader deep in flodl warns-and-defaults on a bad
+        // value (it cannot abort mid-run), so the fan-out path is
+        // where an explicit-but-invalid value must error, before any
+        // host is touched.
+        if let Err(e) = cluster::validate_net_timeout_scale() {
+            cli_error!("{e}");
+            return ExitCode::FAILURE;
+        }
         let controller = cluster::resolve_local_hostname();
         // Pre-flight host readiness (see flodl-cli::prebuild). One ssh
         // per remote host BEFORE any build, in both modes: always

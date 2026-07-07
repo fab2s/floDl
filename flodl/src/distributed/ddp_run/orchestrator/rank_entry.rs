@@ -424,8 +424,15 @@ impl DdpHandle {
                 // Mirror the coord's staleness threshold (same default) so the
                 // rank's coord-liveness deadline shares one timescale with the
                 // coordinator's rank-staleness detection.
-                coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or(
-                    crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+                // Explicit user heartbeat_timeout_secs wins UNSCALED (it
+                // overrides the coord side identically via coord_config);
+                // only the default stretches with FLODL_NET_TIMEOUT_SCALE,
+                // mirroring the coord-side scaled default so both liveness
+                // directions keep one notion of "gone".
+                coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or_else(
+                    || crate::distributed::wire::scaled_deadline_secs(
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+                    ),
                 ),
             };
 

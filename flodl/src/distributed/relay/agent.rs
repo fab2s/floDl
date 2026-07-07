@@ -163,7 +163,7 @@ impl RelayChannel {
             // the upstream_reader's demux write instead of parking it
             // (its per-write failures are already tolerated).
             let _ = stream
-                .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT));
+                .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
             let rank = kind.terminate_handshake(&mut stream, world_size, &salt)?;
             if !expected.contains(&rank) {
                 return Err(TensorError::new(&format!(
@@ -188,7 +188,7 @@ impl RelayChannel {
         // which flags relay shutdown — reachable teardown instead of a
         // parked writer holding the host hostage.
         let _ = upstream
-            .set_write_timeout(Some(crate::distributed::wire::WRITE_STALL_TIMEOUT));
+            .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
         MuxRecord::control(RelayControlMsg::Hello {
             host,
             ranks: ranks.clone(),

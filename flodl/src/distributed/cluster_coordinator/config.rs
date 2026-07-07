@@ -302,7 +302,10 @@ impl ClusterCoordinatorConfig {
             meta_controller: true,
             dead_ranks: None,
             reported_deaths: None,
-            heartbeat_timeout_secs: 30,
+            // 30s LAN default, scaled by FLODL_NET_TIMEOUT_SCALE so the
+            // coord-side staleness scan stretches with the rest of the
+            // deadline set (rank-side coord-liveness mirrors this).
+            heartbeat_timeout_secs: crate::distributed::wire::scaled_deadline_secs(30),
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
             local_ranks: Vec::new(),
             max_failure: None,

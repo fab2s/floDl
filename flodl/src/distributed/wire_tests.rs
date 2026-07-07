@@ -486,6 +486,37 @@
     }
 
     #[test]
+    fn net_timeout_scale_parse_accepts_valid_and_rejects_invalid() {
+        // Unset -> identity scale.
+        assert_eq!(parse_net_timeout_scale(None).unwrap(), 1.0);
+        // Slow-network stretch + test-rig shrink, whitespace tolerated.
+        assert_eq!(parse_net_timeout_scale(Some("3")).unwrap(), 3.0);
+        assert_eq!(parse_net_timeout_scale(Some("0.5")).unwrap(), 0.5);
+        assert_eq!(parse_net_timeout_scale(Some(" 2.0 ")).unwrap(), 2.0);
+        // Floor: 0.1 in, below out (would drop deadlines under the 1s
+        // heartbeat cadence).
+        assert_eq!(parse_net_timeout_scale(Some("0.1")).unwrap(), 0.1);
+        assert!(parse_net_timeout_scale(Some("0.05")).is_err());
+        assert!(parse_net_timeout_scale(Some("-1")).is_err());
+        assert!(parse_net_timeout_scale(Some("inf")).is_err());
+        assert!(parse_net_timeout_scale(Some("nan")).is_err());
+        assert!(parse_net_timeout_scale(Some("abc")).is_err());
+        assert!(parse_net_timeout_scale(Some("")).is_err());
+    }
+
+    #[test]
+    fn scaled_accessors_are_identity_at_default_scale() {
+        // No test in this suite sets FLODL_NET_TIMEOUT_SCALE, so the
+        // cached process scale is 1.0 — the scaled accessors must be
+        // byte-identical to the base constants (the default path must
+        // not drift).
+        assert_eq!(connect_attempts(), CONNECT_ATTEMPTS);
+        assert_eq!(write_stall_timeout(), WRITE_STALL_TIMEOUT);
+        assert_eq!(scaled_deadline_secs(30), 30);
+        assert_eq!(scaled_deadline_secs(120), 120);
+    }
+
+    #[test]
     fn join_host_port_brackets_ipv6_only() {
         // IPv4 + hostnames: plain host:port.
         assert_eq!(join_host_port("192.168.122.1", 1337), "192.168.122.1:1337");

@@ -20,6 +20,7 @@ services:
     hostname: ${HOSTNAME}
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects
@@ -81,6 +82,7 @@ services:
     network_mode: host
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects
@@ -262,6 +264,7 @@ services:
     network_mode: host
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects
