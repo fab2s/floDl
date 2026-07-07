@@ -26,7 +26,7 @@ services:
       # spawned user binary's `flodl::launcher::dispatch` detects
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
-      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
       - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
       - FLODL_INTERNAL_PREBUILD_PER_HOST
@@ -88,7 +88,7 @@ services:
       # spawned user binary's `flodl::launcher::dispatch` detects
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
-      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
       - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
       - FLODL_INTERNAL_PREBUILD_PER_HOST
@@ -270,7 +270,7 @@ services:
       # spawned user binary's `flodl::launcher::dispatch` detects
       # launcher role and fans out. Bare names = pass-through from
       # the docker compose caller's env (the fdl-cli process).
-      - FLODL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
       - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
       - FLODL_INTERNAL_PREBUILD_PER_HOST

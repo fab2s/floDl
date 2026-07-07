@@ -476,7 +476,7 @@ Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 validation, same launcher contract. `controller(...)` and `host(...)`
 are sibling sub-builders, matching the YAML's `controller:` /
 `workers[]:` shape. A `FullCluster` reaches the launcher the same way
-an overlay-driven cluster does (via `FLODL_FULL_CLUSTER_JSON`), so
+an overlay-driven cluster does (via `FLODL_INTERNAL_FULL_CLUSTER_JSON`), so
 `Trainer::run` accepts both.
 
 ### `ClusterBuilder::all_local_gpus()`

@@ -524,7 +524,7 @@ impl ClusterConfig {
     /// 2. probe device counts per worker
     /// 3. call `populate_ranks` to fill in
     /// 4. validate (now ranks are non-empty → shape checks run)
-    /// 5. serialize and ship via FLODL_FULL_CLUSTER_JSON
+    /// 5. serialize and ship via FLODL_INTERNAL_FULL_CLUSTER_JSON
     pub fn populate_ranks(&mut self, device_counts: &[usize]) -> Result<(), String> {
         if device_counts.len() != self.workers.len() {
             return Err(format!(

@@ -39,7 +39,7 @@ use crate::distributed::wire::SESSION_SALT_BYTES;
 
 /// Env var carrying the canonical-JSON cluster topology when `fdl-cli`
 /// activates an env overlay with a `cluster:` block. Mirrors the
-/// production `FLODL_FULL_CLUSTER_JSON` shape but distinct so it never
+/// production `FLODL_INTERNAL_FULL_CLUSTER_JSON` shape but distinct so it never
 /// triggers launcher mode in spawned binaries.
 pub const ENV_TESTING_CLUSTER_JSON: &str = "FLODL_TESTING_CLUSTER_JSON";
 

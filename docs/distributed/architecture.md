@@ -54,7 +54,7 @@ controller. The **coordinator** is the scheduler the ranks talk to.
 ```mermaid
 flowchart TB
     subgraph launchbox["Launcher process (no CUDA)"]
-        L["Role::Launcher<br/>reads FLODL_FULL_CLUSTER_JSON<br/>fan-out + exit"]
+        L["Role::Launcher<br/>reads FLODL_INTERNAL_FULL_CLUSTER_JSON<br/>fan-out + exit"]
     end
 
     subgraph coordhost["Controller host"]

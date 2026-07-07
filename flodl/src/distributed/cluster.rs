@@ -78,8 +78,9 @@ pub const ENV_LOCAL_RANK: &str = "FLODL_INTERNAL_LOCAL_RANK";
 ///   automatically).
 /// - A small set of names that are user-facing *elsewhere* but reserved
 ///   inside a cluster env-map because the launcher sets them per-rank or
-///   they select global behavior: `CUDA_VISIBLE_DEVICES` (per-rank
-///   device pin; cannot be renamed — it is the vendor/driver contract),
+///   they select global behavior: `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER` (per-rank
+///   device pin + the enumeration order it was derived under; cannot be
+///   renamed — they are the vendor/driver contract),
 ///   [`ENV_HOST_OVERRIDE`] (`FLODL_HOST_NAME`, a legit standalone
 ///   override but launcher-set per rank here), and `FDL_ENV` (the
 ///   overlay selector; a per-rank override would split-brain the
@@ -91,6 +92,7 @@ pub const ENV_LOCAL_RANK: &str = "FLODL_INTERNAL_LOCAL_RANK";
 pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
+        || key == "CUDA_DEVICE_ORDER"
         || key == ENV_HOST_OVERRIDE
         || key == crate::distributed::launcher::ENV_FDL_ENV
 }

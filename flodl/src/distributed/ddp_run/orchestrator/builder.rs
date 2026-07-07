@@ -86,7 +86,7 @@ where
     /// chosen rank's `eval_fn` result arrives over the wire.
     eval_result_fn: Option<EvalResultFn>,
     /// Programmatic cluster topology; promoted to the
-    /// `FLODL_FULL_CLUSTER_JSON` launcher contract at `.run()` (same
+    /// `FLODL_INTERNAL_FULL_CLUSTER_JSON` launcher contract at `.run()` (same
     /// precedence rules as `TrainerConfig::cluster`).
     cluster: Option<crate::distributed::launcher::FullCluster>,
     /// Outer optimizer applied to the consensus between reduce and
@@ -657,7 +657,7 @@ where
 
     /// Attach a programmatic cluster topology (parity with
     /// [`TrainerConfig::cluster`](crate::distributed::TrainerConfig::cluster)).
-    /// Promoted to the `FLODL_FULL_CLUSTER_JSON` env contract at
+    /// Promoted to the `FLODL_INTERNAL_FULL_CLUSTER_JSON` env contract at
     /// `.run()`; an already-set env var (fdl-cli) wins.
     pub fn cluster(mut self, c: crate::distributed::launcher::FullCluster) -> Self {
         self.cluster = Some(c);
@@ -674,7 +674,7 @@ where
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
     pub fn run(mut self) -> Result<DdpHandle> {
         // Programmatic cluster: the single promotion site. Converts
-        // `self.cluster` to the FLODL_FULL_CLUSTER_JSON env contract
+        // `self.cluster` to the FLODL_INTERNAL_FULL_CLUSTER_JSON env contract
         // fdl-cli uses, so `DdpHandle::launch`'s dispatch sees
         // Role::Launcher exactly as if fdl-cli had set it — but only
         // when this process holds no cluster role yet. An fdl-cli-set

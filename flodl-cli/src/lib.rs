@@ -61,7 +61,7 @@ pub mod completions;
 /// `fdl.yml` manifest loading, validation, and resolved-command types.
 pub mod config;
 
-/// Cluster-mode env preparation. fdl-cli sets `FLODL_FULL_CLUSTER_JSON`
+/// Cluster-mode env preparation. fdl-cli sets `FLODL_INTERNAL_FULL_CLUSTER_JSON`
 /// + `FLODL_INTERNAL_FDL_CMD` + `FDL_ENV` on its process env so the user binary
 /// inherits them and detects launcher role via
 /// `flodl::distributed::launcher::dispatch`. Fan-out, log fan-in, and

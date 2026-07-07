@@ -1,7 +1,7 @@
 //! Cluster topology model + JSON deserialization.
 //!
 //! Mirrors the `cluster.yml` schema that fdl-cli serializes into
-//! `FLODL_FULL_CLUSTER_JSON`; `FullCluster::from_env()` is the launcher-side
+//! `FLODL_INTERNAL_FULL_CLUSTER_JSON`; `FullCluster::from_env()` is the launcher-side
 //! entry point.
 
 use std::env;
@@ -309,7 +309,7 @@ impl FullCluster {
     /// round-trip: `FullCluster::from_value(&cluster.to_json()) == cluster`.
     /// Used by [`crate::distributed::Trainer::run`] to convert a
     /// programmatic [`crate::distributed::ClusterBuilder`] result into the
-    /// `FLODL_FULL_CLUSTER_JSON` env-var contract the launcher path
+    /// `FLODL_INTERNAL_FULL_CLUSTER_JSON` env-var contract the launcher path
     /// reads. `salt` is intentionally NOT serialized — the launcher
     /// generates a fresh session salt per run.
     pub fn to_json(&self) -> serde_json::Value {

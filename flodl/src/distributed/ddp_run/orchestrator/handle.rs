@@ -128,7 +128,7 @@ impl DdpHandle {
         // Auto-promote: when this process would otherwise enter
         // `Role::SingleDevice` (no cluster envelope in env) but
         // 2+ visible GPUs are present, synthesize a localhost cluster
-        // and set `FLODL_FULL_CLUSTER_JSON` so the dispatch below
+        // and set `FLODL_INTERNAL_FULL_CLUSTER_JSON` so the dispatch below
         // returns `Role::Launcher`. This makes `Trainer::run` /
         // `Trainer::builder().run()` "just work" for single-host
         // multi-GPU without any cluster yml or programmatic config —

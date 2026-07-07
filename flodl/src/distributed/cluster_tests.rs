@@ -483,6 +483,7 @@
         assert!(is_reserved_cluster_env_key("FLODL_INTERNAL_ANYTHING_NEW"));
         // Named exceptions: user-facing elsewhere, reserved in the env-map.
         assert!(is_reserved_cluster_env_key("CUDA_VISIBLE_DEVICES"));
+        assert!(is_reserved_cluster_env_key("CUDA_DEVICE_ORDER"));
         assert!(is_reserved_cluster_env_key(ENV_HOST_OVERRIDE)); // FLODL_HOST_NAME
         assert!(is_reserved_cluster_env_key("FDL_ENV"));
         // Deliberately NOT reserved: user-facing FLODL_ vars + arbitrary

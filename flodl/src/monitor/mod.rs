@@ -272,7 +272,7 @@ impl Monitor {
     /// cluster_worker to forward over the wire.
     ///
     /// Distinct from [`Self::in_launcher_process`]: the launcher
-    /// process has `FLODL_FULL_CLUSTER_JSON` (full topology) set but
+    /// process has `FLODL_INTERNAL_FULL_CLUSTER_JSON` (full topology) set but
     /// NOT `FLODL_INTERNAL_CLUSTER_JSON` (per-rank envelope); ranks have the
     /// per-rank envelope. Single-process / `Ddp::wrap`-thread has
     /// neither.
@@ -289,7 +289,7 @@ impl Monitor {
     /// Monitor on this process should NOT bind locally (or the sink
     /// would fight it for the port). Read together with
     /// [`Self::in_cluster_mode`]: launcher and rank are mutually
-    /// exclusive (per the `(FLODL_FULL_CLUSTER_JSON, FLODL_INTERNAL_CLUSTER_JSON)`
+    /// exclusive (per the `(FLODL_INTERNAL_FULL_CLUSTER_JSON, FLODL_INTERNAL_CLUSTER_JSON)`
     /// table in `launcher.rs`).
     fn in_launcher_process() -> bool {
         std::env::var_os(

@@ -23,7 +23,7 @@ use crate::models::ModelDef;
 /// runs (neither set), this returns false and the real datasets are
 /// constructed as usual.
 fn is_cluster_launcher() -> bool {
-    std::env::var_os("FLODL_FULL_CLUSTER_JSON").is_some()
+    std::env::var_os("FLODL_INTERNAL_FULL_CLUSTER_JSON").is_some()
         && std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_none()
 }
 

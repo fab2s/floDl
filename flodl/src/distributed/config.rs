@@ -446,15 +446,15 @@ pub struct TrainerConfig<M: Module> {
 
     /// Programmatic cluster topology. When `Some`, [`Trainer::run`]
     /// promotes this process to launcher role with the given cluster
-    /// (same effect as setting `FLODL_FULL_CLUSTER_JSON` via fdl-cli's
+    /// (same effect as setting `FLODL_INTERNAL_FULL_CLUSTER_JSON` via fdl-cli's
     /// overlay parsing — the launcher contract is single-shape).
     ///
     /// Three precedence cases at `Trainer::run` time:
-    /// - `FLODL_FULL_CLUSTER_JSON` already set in env (fdl-cli set
+    /// - `FLODL_INTERNAL_FULL_CLUSTER_JSON` already set in env (fdl-cli set
     ///   it before invoking the user binary) → that wins; this field
     ///   is ignored.
     /// - `cfg.cluster = Some(...)` and env unset → field wins; serializes
-    ///   into `FLODL_FULL_CLUSTER_JSON` and dispatch fires Launcher.
+    ///   into `FLODL_INTERNAL_FULL_CLUSTER_JSON` and dispatch fires Launcher.
     /// - Neither set + 2+ visible GPUs → auto-promote synthesizes a
     ///   localhost cluster via [`super::ClusterBuilder::all_local_gpus`].
     /// - Neither set + ≤1 GPU → single-device path.
@@ -563,7 +563,7 @@ impl<M: Module> TrainerConfig<M> {
     }
 
     /// Attach a programmatic cluster topology. See the field docs for
-    /// precedence with `FLODL_FULL_CLUSTER_JSON` env-var and the
+    /// precedence with `FLODL_INTERNAL_FULL_CLUSTER_JSON` env-var and the
     /// auto-promote path.
     pub fn cluster(mut self, c: FullCluster) -> Self {
         self.cluster = Some(c);

@@ -755,12 +755,12 @@ fn run() -> flodl::tensor::Result<()> {
             // rank child sees only one GPU via `CUDA_VISIBLE_DEVICES`
             // scoping; the cluster as a whole has the multi-GPU world.
             // - `FLODL_INTERNAL_CLUSTER_JSON` (slim) = rank child
-            // - `FLODL_FULL_CLUSTER_JSON` (full) = launcher process
+            // - `FLODL_INTERNAL_FULL_CLUSTER_JSON` (full) = launcher process
             //   (will SSH/fork ranks before training begins)
             // Either one means "don't bail on the local GPU count".
             let in_cluster =
                 std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
-                    || std::env::var_os("FLODL_FULL_CLUSTER_JSON").is_some();
+                    || std::env::var_os("FLODL_INTERNAL_FULL_CLUSTER_JSON").is_some();
             if mode.requires_multi_gpu() && gpu_count < 2 && !in_cluster {
                 eprintln!("  skipping {} (requires 2+ GPUs, have {})", mode, gpu_count);
                 continue;

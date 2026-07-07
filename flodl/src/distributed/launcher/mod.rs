@@ -23,7 +23,7 @@
 //! deliberately namespaced so a fdl-cli invocation in a cluster context
 //! never sets them both at the same time:
 //!
-//! - [`ENV_FULL_CLUSTER_JSON`] (`FLODL_FULL_CLUSTER_JSON`): hex-encoded
+//! - [`ENV_FULL_CLUSTER_JSON`] (`FLODL_INTERNAL_FULL_CLUSTER_JSON`): hex-encoded
 //!   JSON of the *full* cluster topology (all hosts + ranks + devices).
 //!   Set by fdl-cli when invoking the user binary as the launcher. The
 //!   launcher reads it once to drive fan-out; never propagated to rank
@@ -41,7 +41,7 @@
 //!
 //! Role detection table:
 //!
-//! | `FLODL_FULL_CLUSTER_JSON` | `FLODL_INTERNAL_CLUSTER_JSON` | `FLODL_INTERNAL_LOCAL_RANK` | Role |
+//! | `FLODL_INTERNAL_FULL_CLUSTER_JSON` | `FLODL_INTERNAL_CLUSTER_JSON` | `FLODL_INTERNAL_LOCAL_RANK` | Role |
 //! |---|---|---|---|
 //! | unset | unset | unset | [`Role::SingleDevice`] |
 //! | unset | set | set | [`Role::Rank`] |
@@ -90,7 +90,7 @@ use spawn::{
 /// launcher process. Set by fdl-cli; consumed only by [`dispatch`]. Not
 /// propagated to rank children (each child gets a slim per-host envelope
 /// instead via `FLODL_INTERNAL_CLUSTER_JSON`).
-pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
+pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_INTERNAL_FULL_CLUSTER_JSON";
 
 /// Environment variable carrying the per-host relay spec (hex-encoded
 /// JSON [`RelaySpec`]). Set by the launcher on the relay child it spawns
@@ -179,7 +179,7 @@ pub fn dispatch() -> Result<Role> {
         // every bit named so the operator can see what's off.
         _ => Err(TensorError::new(&format!(
             "cluster launcher: inconsistent env (FLODL_INTERNAL_RELAY_JSON={}, \
-             FLODL_FULL_CLUSTER_JSON={}, FLODL_INTERNAL_CLUSTER_JSON={}, FLODL_INTERNAL_LOCAL_RANK={}). \
+             FLODL_INTERNAL_FULL_CLUSTER_JSON={}, FLODL_INTERNAL_CLUSTER_JSON={}, FLODL_INTERNAL_LOCAL_RANK={}). \
              Expected: all-unset (single-device), slim+slot only (rank), \
              full only (launcher), or relay only (relay).",
             on_off(relay_set),

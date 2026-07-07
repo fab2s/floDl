@@ -38,7 +38,7 @@ Fluent builder mirroring `fdl.cluster.yml` 1:1 (same fields, same validation), f
 
 - **`flodl::ClusterBuilder::new()`** → `.controller("controller.example.com").port(1337).path("/srv/project").done().host("worker-a").devices([0, 1]).nccl_socket_ifname("enp1s0").ssh("worker-a.example.com").ssh_port(22).ssh_user("ubuntu").ssh_identity_file("/path/to/key").done().build()` → `FullCluster`. `.controller()` returns a `ControllerBuilder` (`.port()` / `.path()` / `.done()`); each `.host()` returns a `HostBuilder`; `.done()` returns the parent `ClusterBuilder` for chaining.
 - **`ClusterBuilder::all_local_gpus()`** ergonomic single-host helper: synthesizes a `FullCluster` from `sys::detect_gpus()` with a loopback controller and one worker pinning every visible CUDA device. The "I just want every local GPU as a rank, no yml" path.
-- **`TrainerConfig::cluster(full)`** wires a `FullCluster` directly into `Trainer::run`. The launcher env-var contract (`FLODL_FULL_CLUSTER_JSON`) is filled by `Trainer::run` if not already set by fdl-cli, so a programmatic cluster and an overlay-driven cluster reach the launcher the same way.
+- **`TrainerConfig::cluster(full)`** wires a `FullCluster` directly into `Trainer::run`. The launcher env-var contract (`FLODL_INTERNAL_FULL_CLUSTER_JSON`) is filled by `Trainer::run` if not already set by fdl-cli, so a programmatic cluster and an overlay-driven cluster reach the launcher the same way.
 
 #### `flodl::sys::detect_gpus`: CUDA-free GPU detection
 

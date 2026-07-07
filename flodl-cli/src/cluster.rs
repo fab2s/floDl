@@ -13,7 +13,7 @@
 //! ```text
 //! fdl @cluster train
 //!   ↓ fdl-cli parses fdl.yml + fdl.cluster.yml overlay
-//!   ↓ fdl-cli calls prepare_cluster_env: sets FLODL_FULL_CLUSTER_JSON,
+//!   ↓ fdl-cli calls prepare_cluster_env: sets FLODL_INTERNAL_FULL_CLUSTER_JSON,
 //!     FLODL_INTERNAL_FDL_CMD, FDL_ENV on its own process env
 //!   ↓ fdl-cli falls through to normal RunScript / ExecCommand path
 //!   ↓ resolved command (e.g. `cargo run --release --bin my-trainer`) runs
@@ -25,7 +25,7 @@
 //!
 //! Recursion guard: the launcher's ssh fan-out invokes `fdl <cmd>` on the
 //! remote, which re-enters fdl-cli with `FLODL_INTERNAL_CLUSTER_JSON` set (not
-//! `FLODL_FULL_CLUSTER_JSON`). [`should_dispatch`](crate::cluster::should_dispatch)
+//! `FLODL_INTERNAL_FULL_CLUSTER_JSON`). [`should_dispatch`](crate::cluster::should_dispatch)
 //! returns `false` in that case so the remote fdl-cli skips cluster setup
 //! and just runs the user binary normally — the user binary's launcher
 //! dispatch then detects `Role::Rank` (because `FLODL_INTERNAL_LOCAL_RANK` is also
@@ -40,7 +40,7 @@ use crate::config::{self, ClusterConfig, ProjectConfig};
 /// JSON of [`ClusterConfig`]). Set by fdl-cli on its own process env so
 /// the spawned user binary inherits it and detects launcher role.
 /// Mirrors `flodl::distributed::launcher::ENV_FULL_CLUSTER_JSON`.
-pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_FULL_CLUSTER_JSON";
+pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_INTERNAL_FULL_CLUSTER_JSON";
 
 /// Env var name carrying the original fdl command name (e.g. `train`).
 /// Read by the launcher when it needs to invoke `fdl <cmd>` over ssh
@@ -93,12 +93,14 @@ pub const ENV_LOCAL_RANK: &str = "FLODL_INTERNAL_LOCAL_RANK";
 /// identity / the HMAC envelope. Reserved: the loud `FLODL_INTERNAL_`
 /// prefix (all launcher-private vars, future-proof) plus three names that
 /// are user-facing elsewhere but launcher-owned per-rank here
-/// (`CUDA_VISIBLE_DEVICES`, [`ENV_HOST_OVERRIDE`], [`ENV_FDL_ENV`]).
+/// (`CUDA_VISIBLE_DEVICES` + `CUDA_DEVICE_ORDER`, [`ENV_HOST_OVERRIDE`],
+/// [`ENV_FDL_ENV`]).
 /// User-facing knobs (`FLODL_VERBOSITY`, `FLODL_DASHBOARD_BIND`, NCCL
 /// tuning, `LD_LIBRARY_PATH`) are deliberately allowed.
 pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
+        || key == "CUDA_DEVICE_ORDER"
         || key == ENV_HOST_OVERRIDE
         || key == ENV_FDL_ENV
 }

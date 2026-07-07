@@ -72,7 +72,7 @@ pub(crate) fn dispatch_config(
     // its merged config has a `cluster:` block, surface the canonical
     // JSON via `FLODL_TESTING_CLUSTER_JSON` so test binaries (and any
     // other consumer that wants the topology WITHOUT entering launcher
-    // mode) can read it. Distinct from `FLODL_FULL_CLUSTER_JSON` which
+    // mode) can read it. Distinct from `FLODL_INTERNAL_FULL_CLUSTER_JSON` which
     // is launcher-mode-only and gated on `cluster: true` commands —
     // this var is purely informational and never triggers fan-out.
     //

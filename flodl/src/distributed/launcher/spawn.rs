@@ -374,7 +374,7 @@ pub(super) struct ElasticSupervision {
 
 /// Build the `Command` that fork+execs a local rank child. Sets all the
 /// env vars the rank-side `LocalCluster::from_env` + `dispatch` expect,
-/// and strips `FLODL_FULL_CLUSTER_JSON` so the child detects `Role::Rank`.
+/// and strips `FLODL_INTERNAL_FULL_CLUSTER_JSON` so the child detects `Role::Rank`.
 pub(super) fn build_local_spawn_command(
     exe: &std::path::Path,
     user_args: &[String],
@@ -394,6 +394,12 @@ pub(super) fn build_local_spawn_command(
         )
         .env_remove(ENV_FULL_CLUSTER_JSON);
     if let Some(phys) = local_phys_device {
+        // Pin enumeration order alongside the device pin: CUDA's default
+        // FASTEST_FIRST ordering can renumber devices across driver
+        // versions / mixed-GPU hosts, silently remapping the
+        // `local_devices:` indices the pin was derived from. PCI_BUS_ID
+        // makes index → physical card stable.
+        cmd.env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
         cmd.env("CUDA_VISIBLE_DEVICES", phys.to_string());
     }
     cmd
@@ -742,8 +748,9 @@ pub(super) fn build_remote_bash_command(
         s.push_str(&shell_quote(&v));
     }
     if let Some(phys) = local_phys_device {
+        // PCI_BUS_ID alongside the pin — see build_local_spawn_command.
         s.push(' ');
-        s.push_str("CUDA_VISIBLE_DEVICES=");
+        s.push_str("CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=");
         s.push_str(&phys.to_string());
     }
     // Auto-prepend the prebuild's LD_LIBRARY_PATH (if any) BEFORE
@@ -761,8 +768,8 @@ pub(super) fn build_remote_bash_command(
     // (host overrides cluster for matching keys). In a shell assignment
     // prefix the LAST duplicate wins, so these WOULD override the
     // built-ins above — safe ONLY because launcher-owned keys (the
-    // `FLODL_INTERNAL_` prefix plus CUDA_VISIBLE_DEVICES / FLODL_HOST_NAME
-    // / FDL_ENV) are rejected before fan-out by
+    // `FLODL_INTERNAL_` prefix plus CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER
+    // / FLODL_HOST_NAME / FDL_ENV) are rejected before fan-out by
     // `is_reserved_cluster_env_key` (enforced in fdl-cli's cluster
     // `validate()` and `ClusterBuilder::build`). LD_LIBRARY_PATH is the
     // one built-in intentionally left user-overridable (handled above).
