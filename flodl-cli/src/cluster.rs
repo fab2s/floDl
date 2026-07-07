@@ -217,13 +217,28 @@ pub fn prepare_cluster_env(
     let (extra_hosts, host_warnings) = resolve_cluster_extra_hosts(cluster);
     warnings.extend(host_warnings);
 
+    // Controller user for the launcher's default `ssh -l`. On the rare
+    // double-failure (no USER, no whoami) leave the env UNSET — the
+    // launcher then omits `-l` and ssh applies its own defaults — and
+    // warn, instead of shipping a fabricated username into ssh auth.
+    let host_user = resolve_local_user();
+    if host_user.is_none() {
+        warnings.push(
+            "could not determine the controller's user (USER unset, whoami \
+             unavailable); ssh will use its own defaults — set `ssh.user:` \
+             per host in fdl.cluster.yml if remote accounts differ"
+                .to_string(),
+        );
+    }
     // SAFETY: main() has not spawned threads at this point in the
     // dispatch flow (mirrors gpus::apply_cuda_visible_devices's
     // invariant; documented in main.rs).
     unsafe {
         std::env::set_var(ENV_FULL_CLUSTER_JSON, &hex);
         std::env::set_var(ENV_FDL_CMD, cmd);
-        std::env::set_var(ENV_HOST_USER, resolve_local_user());
+        if let Some(u) = &host_user {
+            std::env::set_var(ENV_HOST_USER, u);
+        }
         if !extra_hosts.is_empty() {
             std::env::set_var(ENV_CLUSTER_EXTRA_HOSTS, extra_hosts.join(" "));
         }
@@ -640,28 +655,38 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// Resolve the controller's OS user name. Used to pre-populate
 /// [`ENV_HOST_USER`] before docker spawn, so the launcher inside the
 /// container can default `ssh -l <user>` to the host's identity.
-/// Falls through `USER` then `whoami` then `"unknown-user"`.
-pub fn resolve_local_user() -> String {
-    if let Ok(s) = std::env::var("USER") {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    Command::new("whoami")
-        .output()
-        .ok()
-        .and_then(|out| {
+/// Falls through `USER` then `whoami`; `None` when both fail — the
+/// caller then leaves [`ENV_HOST_USER`] unset and the launcher omits
+/// `-l` entirely, so ssh applies its own defaults (`ssh_config User`
+/// directives, the effective uid). Never fabricate a name: a made-up
+/// `-l unknown-user` produced a bare "Permission denied (publickey)"
+/// with no hint the username was invented.
+pub fn resolve_local_user() -> Option<String> {
+    resolve_user_from(
+        std::env::var("USER").ok().as_deref(),
+        Command::new("whoami").output().ok().and_then(|out| {
             if out.status.success() {
-                String::from_utf8(out.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                String::from_utf8(out.stdout).ok()
             } else {
                 None
             }
-        })
-        .unwrap_or_else(|| "unknown-user".to_string())
+        }),
+    )
+}
+
+/// Pure core of [`resolve_local_user`] (unit-testable without env
+/// mutation): first non-empty of the `USER` value and the `whoami`
+/// output, both trimmed.
+fn resolve_user_from(user_env: Option<&str>, whoami_out: Option<String>) -> Option<String> {
+    if let Some(s) = user_env {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    whoami_out
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the local OS hostname. Used by `gpus::synthesize_local_cluster`
@@ -713,6 +738,22 @@ mod tests {
         assert!(validate_net_timeout_scale_value(Some("-1")).is_err());
         assert!(validate_net_timeout_scale_value(Some("inf")).is_err());
         assert!(validate_net_timeout_scale_value(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn resolve_user_never_fabricates() {
+        // Pure core — no env mutation needed.
+        assert_eq!(resolve_user_from(Some("fab"), None).as_deref(), Some("fab"));
+        assert_eq!(resolve_user_from(Some(" fab \n"), None).as_deref(), Some("fab"));
+        // Empty USER falls through to whoami.
+        assert_eq!(
+            resolve_user_from(Some(""), Some("who\n".into())).as_deref(),
+            Some("who"),
+        );
+        assert_eq!(resolve_user_from(None, Some("who".into())).as_deref(), Some("who"));
+        // Double failure -> None (never a fabricated "unknown-user").
+        assert_eq!(resolve_user_from(None, None), None);
+        assert_eq!(resolve_user_from(Some("  "), Some("  ".into())), None);
     }
 
     #[test]

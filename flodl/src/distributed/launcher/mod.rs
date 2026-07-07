@@ -770,6 +770,16 @@ pub fn run_launcher_with_config(
     // failed.
     let spawn_result: Result<()> = (|| {
         for host in &full.workers {
+            // Orchestrator-only entry (empty `ranks`): declared in
+            // cluster.yml solely so fdl-cli's pre-flight can read its
+            // `docker:` / `arch:` — the launcher spawns nothing for it
+            // (the empty-ranks contract in types.rs). Without this guard
+            // a relay child was spawned for the host anyway: zero local
+            // ranks to serve, idling on loopback ports (possibly over
+            // ssh) waiting for connections that never come.
+            if host.ranks.is_empty() {
+                continue;
+            }
             // Spawn one transport relay per host (before its ranks), when the
             // via-coord routing is active. Ranks dial the relay's loopback
             // (+4/+5) instead of the controller directly. The relay child is

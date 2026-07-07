@@ -1334,6 +1334,20 @@ impl ElChe {
         // steps per epoch". Scale the counts down proportionally (keeping
         // the speed-derived ratio) so `sum(batch_counts) <= max_total`.
         // No-op when unset (threaded path) or already within bound.
+        //
+        // DEGENERATE CASE — the per-rank floor of 1 deliberately WINS over
+        // the cap: when `world_size > max_total` (more ranks than batches
+        // per epoch) the floored sum still exceeds `max_total`. This cannot
+        // alter training results: these counts are RATIOS the dispatcher
+        // apportions, not a contract — `final_window_alloc`
+        // (epoch_dispatch.rs) allocates exactly `pool.remaining()` by
+        // largest-remainder whenever the pool holds less than the schedule
+        // claims (which in this degenerate case is every window), so some
+        // ranks legitimately receive 0. A 0-step rank ships a TRUE-count,
+        // weight-0 frame that the consensus excludes (see
+        // `snapshot_params`'s batch_count contract), and the reduce divides
+        // by accepted mass, never by claims. Keeping the floor here keeps
+        // every rank's quota alive for the next window's rebalance.
         self.window_cap_binding = false;
         if let Some(max_total) = self.max_total_batches {
             let total: usize = self.batch_counts.iter().sum();
