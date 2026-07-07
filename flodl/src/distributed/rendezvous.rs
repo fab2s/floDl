@@ -291,6 +291,12 @@ fn run_controller_rendezvous_with(
         ));
     }
 
+    // Back-to-back runs on the fixed port block are safe as-is: Rust's
+    // `TcpListener::bind` sets SO_REUSEADDR on Unix, so TIME_WAIT remnants
+    // from a previous run's connections never block this bind (probed:
+    // rebind succeeds with the port verifiably in TIME_WAIT). A genuinely
+    // LIVE listener from a still-running launcher still fails loudly here
+    // (that would need SO_REUSEPORT) — the desirable double-run guard.
     let bind_addr = format!("0.0.0.0:{}", full.controller.port);
     let listener = TcpListener::bind(&bind_addr).map_err(|e| {
         TensorError::new(&format!(
