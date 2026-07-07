@@ -23,27 +23,40 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
     Tensor::empty(&t.shape(), opts)?.pin_memory()
 }
 
-/// Work-weighted in-place AllReduce of `param_tensors` across the NCCL
-/// cohort, in sum-and-count form: each rank scales its params by its own
-/// step count `n_i`, the cohort `ReduceOp::Sum`s them, and a SINGLE final
-/// divide by `Σn` yields `Σ nᵢ·Wᵢ / Σn` — the work-weighted consensus
-/// (matching the CPU path's sum-and-count). Deferring the divide to one
-/// final step keeps the op associative, so it composes with a future
-/// hierarchical reduce without averaging-of-averages.
+/// Work-weighted in-place AllReduce of the params across the NCCL
+/// cohort, as ONE fused collective: each rank's contribution is
+/// premultiplied INSIDE the collective by its normalized work factor
+/// `fᵢ = nᵢ^γ / Σn^γ` (`ncclRedOpCreatePreMulSum`), so the output is
+/// directly `Σ fᵢ·Wᵢ` — the work-weighted consensus. No pre-scale
+/// kernel, no post-divide kernel: the collective's own write is the
+/// last write, so there is nothing for the caller's divergence readout,
+/// outer-optimizer writeback, or next forward to race (the historical
+/// divide-race class is gone STRUCTURALLY, not fenced).
+///
+/// `γ` is the consensus allocation-weighting exponent (1.0 = plain
+/// work-weighting); it folds into the factor's numerator and the count
+/// collective (which sums `nᵢ^γ`), giving the NCCL path the same
+/// γ-aware weighting as the CPU backend.
 ///
 /// A rank that did 0 steps since the last sync still holds the previous
-/// consensus; it scales to zero and contributes nothing — but it STILL
-/// joins both collectives, so the cohort never stalls. If the WHOLE cohort
-/// is idle (`Σn == 0`), the params already equal the consensus and the
-/// param reduce is skipped (every rank sees the same gathered `Σn`, so the
-/// skip is collective-consistent).
+/// consensus; its factor is 0 and it contributes nothing — but it STILL
+/// joins both collectives, so the cohort never stalls. If the WHOLE
+/// cohort is idle (`Σn == 0`), the params already equal the consensus
+/// and the param reduce is skipped (every rank sees the same gathered
+/// `Σn`, so the skip is collective-consistent).
 ///
-/// A cheap scalar `ReduceOp::Sum` of the per-rank counts supplies `Σn` (a
-/// few bytes vs the multi-MB params). Running it on the SAME comm as the
-/// param reduce keeps `Σn` consistent with the live cohort across an
-/// abort-driven rebuild (it reflects the survivors). Mutates
-/// `param_tensors` in place; on an abort the caller restores them from the
-/// pre-sync scratch before retrying, so the scaling is recoverable.
+/// A cheap scalar `ReduceOp::Sum` of the per-rank counts supplies `Σn^γ`
+/// (a few bytes vs the multi-MB params) BEFORE the param collective —
+/// that is what lets each rank compute its pre-normalized factor.
+/// Running it on the SAME comm as the param reduce keeps `Σn` consistent
+/// with the live cohort across an abort-driven rebuild (it reflects the
+/// survivors). On an abort the caller restores params from the pre-sync
+/// scratch before retrying; the retry re-runs BOTH collectives on the
+/// rebuilt comm, deriving a fresh factor from the survivor cohort (the
+/// premul op is comm-bound and created per call).
+///
+/// Requires NCCL >= 2.11 (build + runtime; the shim errors loudly
+/// naming the found version).
 // 8 args: the `rank`/`seq` pair is collective-step diagnostic context
 // (-vvv ENTER/EXIT logging); a struct wrapper would obscure the hot path for
 // a private single-caller helper.
@@ -52,8 +65,8 @@ fn weighted_allreduce_nccl(
     comm: &crate::distributed::nccl::NcclRankComm,
     stream: Option<&crate::distributed::cuda_stream::CudaStream>,
     param_refs: &[&Tensor],
-    param_tensors: &[Tensor],
     n_i: f64,
+    gamma: f64,
     device: Device,
     rank: usize,
     seq: usize,
@@ -66,32 +79,23 @@ fn weighted_allreduce_nccl(
     // ENTER/EXIT of each collective per rank pins which one a stuck rank
     // parks in (NCCL busy-waits at 100% CPU with no peers).
     crate::debug!(
-        "  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i})"
+        "  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i}, gamma={gamma})"
     );
-    // STREAM-ORDER EVERYTHING ON THE COMM STREAM. The two in-place scalings
-    // below bracket the param all_reduce, and the all_reduce is explicitly
-    // enqueued on `stream` (the comm stream) — but tensor ops enqueue on the
-    // thread's CURRENT stream. Pool streams are created non-blocking
-    // (`cudaStreamNonBlocking`), so NOT even the legacy default stream
-    // implicitly orders against them: a rank that processes `SyncNow`
-    // BETWEEN chunks (default stream) is exposed exactly like one that
-    // syncs MID-CHUNK under `run_epoch_plan`'s compute-stream guard,
-    // where the scalings would enqueue on
-    // compute_stream while the all_reduce runs on the comm stream with NO
-    // ordering between them. The collective can then sum UNSCALED (or
-    // half-scaled) params — the consensus comes out ΣW/Σn instead of
-    // Σn·W/Σn — and every rank loads the corrupted average: intermittent
-    // (only when a sync lands mid-chunk) cohort-wide divergence → NaN.
-    // Cross-stream comm/compute interleaving around a live collective is
-    // also the documented deadlock class (see run_epoch_plan's stream
-    // notes). Pinning the WHOLE body (count tensor, both scalings, the
-    // collectives) to the comm stream makes the sequence totally ordered
-    // regardless of where the sync interrupts training. The pre-weighted
-    // `ReduceOp::Avg` was a single collective already on the comm stream,
-    // which is why this never bit before sum-and-count.
+    // γ-effective work: 0^γ = 0 keeps the zero-step semantics; γ = 1.0 is
+    // the identity (plain step count).
+    let n_eff = if gamma == 1.0 { n_i } else { n_i.powf(gamma) };
+    // STREAM-ORDER THE BODY ON THE COMM STREAM. Tensor ops (the count
+    // tensor below) enqueue on the thread's CURRENT stream while the
+    // collectives are enqueued on `stream` — and pool streams are
+    // non-blocking, so nothing implicitly orders them. Pinning the body
+    // to the comm stream keeps the sequence totally ordered regardless
+    // of where the sync interrupts training (mid-chunk vs between
+    // chunks). The historical scale/divide bookend kernels this guard
+    // used to protect are gone (premultiplied inside the collective);
+    // the guard remains for the count tensor and the readout ordering.
     let _stream_guard = stream.map(StreamGuard::new);
-    // Σn over the live cohort.
-    let count = Tensor::full(&[1], n_i, TensorOptions { device, ..Default::default() })?;
+    // Σn^γ over the live cohort.
+    let count = Tensor::full(&[1], n_eff, TensorOptions { device, ..Default::default() })?;
     let total_n = match stream {
         Some(s) => {
             comm.all_reduce_on_stream(&[&count], ReduceOp::Sum, s)?;
@@ -114,47 +118,32 @@ fn weighted_allreduce_nccl(
         );
         return Ok(());
     }
-    // Scale by raw nᵢ → Sum-reduce → divide once by Σn. The two scalings
-    // are torch ops mutating the requires_grad leaf params in place, so they
-    // MUST run under no_grad — otherwise libtorch raises "a leaf Variable
-    // that requires grad is being used in an in-place operation" (a
-    // c10::Error that crosses the FFI boundary as a hard crash). The raw
-    // NCCL all_reduce between them is untracked by autograd, so the guard
-    // around it is harmless. Mirrors `load_averaged`'s no_grad block.
-    let _no_grad = NoGradGuard::new();
-    Tensor::foreach_mul_scalar_(param_tensors, n_i)?;
+    // Pre-normalized per-rank factor: the collective output needs no
+    // post-divide. NCCL's premul scalar is f32 (matching the f32 params).
+    let factor = (n_eff / total_n) as f32;
     crate::debug!(
-        "  ddp-areduce: rank {rank} seq={seq} PARAM enter (nparams={})",
+        "  ddp-areduce: rank {rank} seq={seq} PARAM enter (nparams={}, factor={factor})",
         param_refs.len()
     );
     match stream {
         Some(s) => {
-            comm.all_reduce_on_stream(param_refs, ReduceOp::Sum, s)?;
-            // The divide is stream-ordered after the collective (both on
-            // the comm stream via the guard above); the EXIT FENCE below
-            // retires it before returning.
-            Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
-            // EXIT FENCE: this synchronize MUST come after the divide.
-            // The sync-entry fence's contract ("the weighted reduce
-            // retires everything before returning") is what lets the
+            comm.all_reduce_premul_sum(param_refs, factor, Some(s))?;
+            // EXIT FENCE: retire the collective before returning. The
+            // collective's own write is the LAST write to the params
+            // (no divide kernel follows anymore), so this synchronize
+            // is purely the entry-fence contract ("the weighted reduce
+            // retires everything before returning") that lets the
             // caller's divergence readout, the outer-optimizer
-            // writeback, and the next forward all run unfenced on THEIR
-            // streams — none of which are ordered against the comm
-            // stream (pool streams are non-blocking). A synchronize
-            // placed before the divide instead leaves the divide in
-            // flight at return: a per-sync-rare consensus-corruption
-            // race of the same class as the mid-chunk collective race
-            // documented at the entry fence. A wedged collective still
-            // parks the host here, where the NCCL watchdog's abort can
-            // free it.
+            // writeback, and the next forward run unfenced on THEIR
+            // streams. A wedged collective still parks the host here,
+            // where the NCCL watchdog's abort can free it.
             s.synchronize()?;
         }
         None => {
-            comm.all_reduce(param_refs, ReduceOp::Sum)?;
-            // No dedicated comm stream: collective and divide share the
-            // caller's current stream, so plain enqueue order fences
-            // them against every downstream consumer on that stream.
-            Tensor::foreach_mul_scalar_(param_tensors, 1.0 / total_n)?;
+            // No dedicated comm stream: the collective shares the
+            // caller's current stream, so plain enqueue order fences it
+            // against every downstream consumer on that stream.
+            comm.all_reduce_premul_sum(param_refs, factor, None)?;
         }
     }
     crate::debug!("  ddp-areduce: rank {rank} seq={seq} PARAM exit");
@@ -534,16 +523,18 @@ impl<M: Module> GpuWorker<M> {
             let comm = self.nccl_comm.as_ref().expect("nccl_comm present");
 
             let nccl_start = Instant::now();
-            // Work-weighted reduce (sum-and-count): scale by this rank's
-            // step count, Sum, divide once by Σn. Was an unweighted
+            // Work-weighted reduce: each rank premultiplies by its
+            // normalized work factor inside the collective (PreMulSum),
+            // yielding the consensus directly. Was an unweighted
             // ReduceOp::Avg, which over-represented idle / under-worked
-            // ranks under proportional sharding.
+            // ranks under proportional sharding, then a sum-and-count
+            // form with bookend scale/divide kernels.
             let attempt_result: Result<()> = weighted_allreduce_nccl(
                 comm,
                 self.comm_stream.as_ref(),
                 &param_refs,
-                &param_tensors,
                 n_i,
+                self.gamma,
                 device,
                 rank,
                 seq,

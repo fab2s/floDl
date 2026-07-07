@@ -268,6 +268,7 @@ impl<M: Module> GpuWorker<M> {
             nccl_sync_seq: 0,
             steps_since_avg: 0,
             steps_at_snapshot: 0,
+            gamma: config.gamma,
             current_version: 0,
             current_epoch: 0,
             pending_plan: None,

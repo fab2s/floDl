@@ -575,6 +575,71 @@ impl NcclRankComm {
         check_err(err)
     }
 
+    /// In-place work-weighted AllReduce: each rank's contribution is
+    /// premultiplied by ITS OWN `factor` inside the collective
+    /// (`ncclRedOpCreatePreMulSum`), so the output is `Σ fᵢ·xᵢ` with a
+    /// single collective and ZERO bookend kernels. With
+    /// `fᵢ = nᵢ^γ / Σn^γ` the output IS the work-weighted consensus —
+    /// no pre-scale, no post-divide, and therefore no divide kernel for
+    /// downstream consumers to race (the fence contract collapses to
+    /// "order after the collective").
+    ///
+    /// The dynamic reduction op is comm-bound and window-scoped: created
+    /// here, used for this batched collective, destroyed before
+    /// returning (communication-free, cheap). This composes with the
+    /// abort→rebuild path naturally — a rebuilt comm gets a fresh op on
+    /// its next window. Requires NCCL >= 2.11 at build and run time
+    /// (checked in the shim; errors loudly naming the found version).
+    ///
+    /// `tensors` must all be f32 (the premul scalar is created with
+    /// `ncclFloat32`; NCCL requires the scalar dtype to match).
+    ///
+    /// `stream`: `Some` enqueues on that CUDA stream (comm-stream
+    /// overlap), `None` uses the current stream.
+    pub fn all_reduce_premul_sum(
+        &self,
+        tensors: &[&Tensor],
+        factor: f32,
+        stream: Option<&CudaStream>,
+    ) -> Result<()> {
+        for (i, t) in tensors.iter().enumerate() {
+            if t.dtype() != crate::tensor::DType::Float32 {
+                return Err(crate::TensorError::new(&format!(
+                    "all_reduce_premul_sum: tensor {i} is {:?}, but the \
+                     PreMulSum scalar is f32 — NCCL requires matching dtypes",
+                    t.dtype(),
+                )));
+            }
+        }
+        // One issue-guard across create → collective → destroy: the op is
+        // comm-bound, and the abort path frees the comm — none of the
+        // three calls may race it (same contract as the other
+        // collectives; see NcclAbortHandle::lock_for_issue).
+        let _guard = self.abort_handle.lock_for_issue()?;
+        let mut op: i32 = 0;
+        let err = unsafe {
+            ffi::flodl_nccl_redop_premulsum_create_rank(self.handle, factor, &mut op)
+        };
+        check_err(err)?;
+        let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let stream_ptr = stream.map_or(ptr::null_mut(), |s| s.as_ptr());
+        let reduce_err = unsafe {
+            ffi::flodl_nccl_all_reduce_rank(
+                self.handle,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                stream_ptr,
+                op,
+            )
+        };
+        // Destroy the op regardless of the collective's outcome (it only
+        // frees comm-local state; enqueue has already happened). Surface
+        // the collective error first — it is the load-bearing one.
+        let destroy_err = unsafe { ffi::flodl_nccl_redop_destroy_rank(self.handle, op) };
+        check_err(reduce_err)?;
+        check_err(destroy_err)
+    }
+
     /// In-place AllReduce on an explicit CUDA stream.
     ///
     /// Same semantics as [`all_reduce`](Self::all_reduce), but NCCL work is

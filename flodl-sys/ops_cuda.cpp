@@ -536,6 +536,66 @@ extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
     }
 }
 
+extern "C" char* flodl_nccl_redop_premulsum_create_rank(void* handle,
+                                                         float scalar,
+                                                         int* op_out) {
+#if defined(NCCL_VERSION_CODE) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 11, 0)
+    auto* h = static_cast<FlodlNcclRankComm*>(handle);
+    try {
+        // Build headers can be newer than the LD_PRELOADed runtime lib;
+        // the symbol would resolve but misbehave. Check the loaded lib.
+        int runtime_version = 0;
+        ncclResult_t vres = ncclGetVersion(&runtime_version);
+        if (vres != ncclSuccess) {
+            return make_error(std::string("ncclGetVersion failed: ") +
+                              ncclGetErrorString(vres));
+        }
+        if (runtime_version < 21100) {
+            return make_error(
+                std::string("PreMulSum weighted reduce requires NCCL >= 2.11 "
+                            "at runtime; loaded libnccl reports version ") +
+                std::to_string(runtime_version) +
+                ". Upgrade the NCCL the run loads (LD_PRELOAD / system lib).");
+        }
+        ncclRedOp_t op;
+        float s = scalar; // ncclScalarHostImmediate: captured at create.
+        ncclResult_t result = ncclRedOpCreatePreMulSum(
+            &op, &s, ncclFloat32, ncclScalarHostImmediate, h->comm);
+        if (result != ncclSuccess) {
+            return make_error(
+                std::string("ncclRedOpCreatePreMulSum failed: ") +
+                ncclGetErrorString(result));
+        }
+        *op_out = static_cast<int>(op);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    }
+#else
+    (void)handle; (void)scalar; (void)op_out;
+    return make_error(
+        "flodl was built against NCCL headers < 2.11; the PreMulSum "
+        "weighted reduce requires NCCL >= 2.11. Rebuild against a newer "
+        "NCCL.");
+#endif
+}
+
+extern "C" char* flodl_nccl_redop_destroy_rank(void* handle, int op) {
+#if defined(NCCL_VERSION_CODE) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 11, 0)
+    auto* h = static_cast<FlodlNcclRankComm*>(handle);
+    ncclResult_t result =
+        ncclRedOpDestroy(static_cast<ncclRedOp_t>(op), h->comm);
+    if (result != ncclSuccess) {
+        return make_error(std::string("ncclRedOpDestroy failed: ") +
+                          ncclGetErrorString(result));
+    }
+    return nullptr;
+#else
+    (void)handle; (void)op;
+    return make_error("flodl was built against NCCL headers < 2.11");
+#endif
+}
+
 extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
                                              int ntensors, void* stream,
                                              int root) {
@@ -736,6 +796,16 @@ extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                               int ntensors, void* stream,
                                               int op) {
     (void)handle; (void)tensors; (void)ntensors; (void)stream; (void)op;
+    return make_error("NCCL requires a CUDA build");
+}
+extern "C" char* flodl_nccl_redop_premulsum_create_rank(void* handle,
+                                                         float scalar,
+                                                         int* op_out) {
+    (void)handle; (void)scalar; (void)op_out;
+    return make_error("NCCL requires a CUDA build");
+}
+extern "C" char* flodl_nccl_redop_destroy_rank(void* handle, int op) {
+    (void)handle; (void)op;
     return make_error("NCCL requires a CUDA build");
 }
 extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,

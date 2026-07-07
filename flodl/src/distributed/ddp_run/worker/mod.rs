@@ -192,6 +192,12 @@ pub struct GpuWorker<M: Module> {
     /// inconsistency). Under sync/cadence no steps land between snapshot and
     /// Update, so subtract and zero coincide.
     steps_at_snapshot: usize,
+    /// Consensus allocation-weighting exponent γ (1.0 = plain
+    /// work-weighting). The NCCL weighted reduce folds it into the
+    /// PreMulSum factor (`nᵢ^γ / Σn^γ`); the CPU path applies it in the
+    /// cluster-worker bridge's frame weighting. See
+    /// [`crate::distributed::ElCheConfig::gamma`].
+    gamma: f64,
     current_version: u64,
     pub(super) current_epoch: usize,
     /// Queued epoch plan from coordinator (set if StartEpoch arrives during run_epoch_plan).

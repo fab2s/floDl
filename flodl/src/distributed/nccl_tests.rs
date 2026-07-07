@@ -187,6 +187,67 @@
 
     #[test]
     #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    fn test_nccl_rank_comm_premul_sum_weighted_consensus() {
+        // PreMulSum: each rank premultiplies by ITS OWN factor inside the
+        // collective. With factors 0.75 / 0.25 over values 10 / 20 the
+        // output must be 0.75·10 + 0.25·20 = 12.5 on BOTH ranks — the
+        // work-weighted consensus with zero bookend kernels. Also
+        // exercises the full dynamic-op lifecycle (create → collective →
+        // destroy) and the f32 dtype guard. Skips on <2 GPUs (mirrors
+        // its sibling rank-comm tests); the cluster rig smokes exercise
+        // the same path at world 3.
+        if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let uid = NcclUniqueId::new().unwrap();
+        let uid0 = uid.clone();
+        let uid1 = uid;
+        let h0 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(0);
+            NcclRankComm::init_rank(0, 2, &uid0).unwrap()
+        });
+        let h1 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(1);
+            NcclRankComm::init_rank(1, 2, &uid1).unwrap()
+        });
+        let comm0 = h0.join().unwrap();
+        let comm1 = h1.join().unwrap();
+
+        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
+        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
+        let t0 = Tensor::full(&[64], 10.0, opts0).unwrap();
+        let t1 = Tensor::full(&[64], 20.0, opts1).unwrap();
+
+        // Non-f32 rejection is a pure pre-collective guard — safe to
+        // check on one rank without a matching collective on the peer.
+        let opts_i = TensorOptions { dtype: DType::Int64, device: Device::CUDA(0) };
+        let ti = Tensor::full(&[4], 1.0, opts_i).unwrap();
+        let err = comm0.all_reduce_premul_sum(&[&ti], 0.5, None).unwrap_err();
+        assert!(err.to_string().contains("f32"), "got: {err}");
+
+        let t0c = t0.clone();
+        let t1c = t1.clone();
+        let h0 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(0);
+            comm0.all_reduce_premul_sum(&[&t0c], 0.75, None).unwrap();
+        });
+        let h1 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(1);
+            comm1.all_reduce_premul_sum(&[&t1c], 0.25, None).unwrap();
+        });
+        h0.join().unwrap();
+        h1.join().unwrap();
+        crate::tensor::cuda_synchronize(0);
+        crate::tensor::cuda_synchronize(1);
+
+        let v0: f64 = t0.mean().unwrap().item().unwrap();
+        let v1: f64 = t1.mean().unwrap().item().unwrap();
+        assert!((v0 - 12.5).abs() < 1e-5, "rank0 consensus should be 12.5, got {v0}");
+        assert!((v1 - 12.5).abs() < 1e-5, "rank1 consensus should be 12.5, got {v1}");
+    }
+
+    #[test]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
     fn test_nccl_rank_comm_init_and_reduce() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());

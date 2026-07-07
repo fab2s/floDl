@@ -896,9 +896,28 @@ void flodl_nccl_destroy_rank(void* handle);
 // tensors: array of ntensors FlodlTensors (all on this rank's device).
 // ntensors: number of tensors to reduce (batched with ncclGroupStart/End).
 // stream: CUDA stream handle, or NULL for default stream.
-// op: 0=Sum, 1=Prod, 2=Max, 3=Min, 4=Avg
+// op: 0=Sum, 1=Prod, 2=Max, 3=Min, 4=Avg — or a dynamic op value from
+//     flodl_nccl_redop_premulsum_create_rank (passed through raw).
 char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                   int ntensors, void* stream, int op);
+
+// Create a PreMulSum reduction op bound to this rank's communicator:
+// each rank's contribution is premultiplied by ITS OWN `scalar` inside
+// the collective (result = sum of f_i * x_i). Scalar residence is
+// ncclScalarHostImmediate (the float is captured at create time), dtype
+// f32 — callers must reduce f32 tensors with it. The returned op value
+// is comm-bound and window-scoped: create per reduce window, pass as
+// `op` to flodl_nccl_all_reduce_rank, then destroy. Create/destroy are
+// communication-free and cheap (NCCL docs).
+// Requires NCCL >= 2.11 at BOTH build and run time (the loaded library
+// can differ from the build headers via LD_PRELOAD); errors loudly
+// naming the found version otherwise.
+char* flodl_nccl_redop_premulsum_create_rank(void* handle, float scalar,
+                                              int* op_out);
+
+// Destroy a dynamic reduction op created by
+// flodl_nccl_redop_premulsum_create_rank on the same communicator.
+char* flodl_nccl_redop_destroy_rank(void* handle, int op);
 
 // Broadcast on a single-rank communicator (cross-process / cross-host).
 // root rank's tensors are sent in-place to all other ranks.

@@ -1267,6 +1267,10 @@ unsafe extern "C" {
         handle: *mut c_void, tensors: *mut FlodlTensor, ntensors: i32,
         stream: *mut c_void, op: i32,
     ) -> *mut i8;
+    pub fn flodl_nccl_redop_premulsum_create_rank(
+        handle: *mut c_void, scalar: f32, op_out: *mut i32,
+    ) -> *mut i8;
+    pub fn flodl_nccl_redop_destroy_rank(handle: *mut c_void, op: i32) -> *mut i8;
     pub fn flodl_nccl_broadcast_rank(
         handle: *mut c_void, tensors: *mut FlodlTensor, ntensors: i32,
         stream: *mut c_void, root: i32,

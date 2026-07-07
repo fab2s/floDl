@@ -735,22 +735,14 @@ where
                 )));
             }
         }
-        // gamma: the consensus allocation-weighting exponent must be finite,
-        // and is currently wired only on the CPU averaging backend (the
-        // controller-forged consensus path). Loud-error rather than silently
-        // ignore a non-default gamma on NCCL, where the weighting site
-        // (in-place AllReduce) is not yet gamma-aware.
+        // gamma: the consensus allocation-weighting exponent must be
+        // finite. Wired on BOTH backends: the CPU path applies it in the
+        // cluster-worker bridge's frame weighting; the NCCL path folds it
+        // into the PreMulSum factor (nᵢ^γ / Σn^γ) inside the collective.
         let gamma = self.config.elche.gamma;
         if !gamma.is_finite() {
             return Err(crate::tensor::TensorError::new(&format!(
                 "DdpBuilder: gamma must be finite, got {gamma}"
-            )));
-        }
-        if gamma != 1.0 && self.backend == AverageBackend::Nccl {
-            return Err(crate::tensor::TensorError::new(&format!(
-                "DdpBuilder: gamma ({gamma}) is currently supported only on the \
-                 CPU averaging backend; the NCCL path is not yet gamma-aware. \
-                 Use a cpu-* mode, or leave gamma at 1.0 (plain work-weighting)."
             )));
         }
 
