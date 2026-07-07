@@ -285,7 +285,7 @@ pub fn run_controller_rendezvous(
     )
 }
 
-/// [`run_controller_rendezvous`] with a launcher-owned abort flag: the
+/// Controller-side rendezvous server with a launcher-owned abort flag: the
 /// accept loop re-checks it every poll interval and bails with a loud
 /// "aborted" error when set. Lets the launcher's failure path stop a
 /// pre-rendezvous server (ranks never dialed in) within one poll
@@ -299,7 +299,7 @@ pub(crate) fn run_controller_rendezvous_aborting(
     run_controller_rendezvous_with(full, local_host_name, RENDEZVOUS_IDLE_TIMEOUT, abort)
 }
 
-/// Inner body of [`run_controller_rendezvous`], parameterized by the
+/// Inner body of [`run_controller_rendezvous_aborting`], parameterized by the
 /// no-progress `idle_timeout` so tests can exercise the wedge-break
 /// ceiling without waiting the production [`RENDEZVOUS_IDLE_TIMEOUT`],
 /// and by the launcher's `abort` flag (see

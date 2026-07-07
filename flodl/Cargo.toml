@@ -51,6 +51,11 @@ path = "examples/quickstart/main.rs"
 doc-scrape-examples = false
 
 [[example]]
+name = "auto_promote"
+path = "examples/auto_promote/main.rs"
+doc-scrape-examples = false
+
+[[example]]
 name = "sine_wave"
 path = "examples/sine_wave/main.rs"
 doc-scrape-examples = false
