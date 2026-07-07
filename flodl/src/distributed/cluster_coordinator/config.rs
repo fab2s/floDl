@@ -83,6 +83,17 @@ pub struct ClusterCoordinatorConfig {
     /// policy. `None` when no external reporter exists.
     pub reported_deaths: Option<crate::distributed::cluster_coordinator::ReportedDeaths>,
 
+    /// Launcher-owned abort flag polled by the cohort-formation accept
+    /// loop ([`super::ClusterCoordinator::start_from_listener`]): when
+    /// set, a coord still waiting for relay connections bails with a
+    /// loud "aborted" error instead of blocking in `accept()` forever.
+    /// This is how the launcher's failure path can stop and JOIN a
+    /// pre-rendezvous coordinator thread and surface the original error
+    /// through `DdpHandle::join` (previously it had to
+    /// `process::exit(1)`). `None` (tests, standalone use) keeps the
+    /// plain blocking accept.
+    pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+
     /// Heartbeat staleness threshold (seconds). If a rank's last
     /// TimingMsg-frame arrival is older than this, the coord declares
     /// the rank dead. Default 30s. Ignored when `dead_ranks` is None.
@@ -305,6 +316,7 @@ impl ClusterCoordinatorConfig {
             // 30s LAN default, scaled by FLODL_NET_TIMEOUT_SCALE so the
             // coord-side staleness scan stretches with the rest of the
             // deadline set (rank-side coord-liveness mirrors this).
+            abort: None,
             heartbeat_timeout_secs: crate::distributed::wire::scaled_deadline_secs(30),
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
             local_ranks: Vec::new(),
@@ -543,6 +555,13 @@ impl ClusterCoordinatorConfig {
     }
 
     /// Override the heartbeat staleness threshold. Default 30s.
+    /// Attach the launcher's abort flag (see the field doc on
+    /// [`Self::abort`]).
+    pub fn abort_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.abort = Some(flag);
+        self
+    }
+
     pub fn heartbeat_timeout_secs(mut self, secs: u64) -> Self {
         self.heartbeat_timeout_secs = secs;
         self

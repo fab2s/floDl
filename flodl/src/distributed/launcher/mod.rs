@@ -399,6 +399,7 @@ pub fn run_launcher_with_config(
     full: FullCluster,
     mut coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
     outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
+    abort: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     claim_cluster_entry("launcher")?;
     // Fresh 128-bit session salt per launcher invocation. Becomes the
@@ -516,6 +517,12 @@ pub fn run_launcher_with_config(
     let reported_deaths: crate::distributed::cluster_coordinator::ReportedDeaths =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Infrastructure-thread handles, kept so the exit paths can JOIN them
+    // (with `abort` raised on failure) instead of leaving them detached —
+    // the reason the failure path used to be a process::exit(1).
+    let mut coord_driver: Option<thread::JoinHandle<()>> = None;
+    let mut rdv_driver: Option<thread::JoinHandle<()>> = None;
+
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
@@ -578,7 +585,14 @@ pub fn run_launcher_with_config(
         // populate it from `CheckpointMeta::epoch` via
         // `ClusterCoordinatorConfig::resume_from_meta`.
         let start_epoch = config.start_epoch;
-        let _ = thread::Builder::new()
+        // Attach the launcher's abort flag: the coord's cohort-formation
+        // accept loop polls it (a pre-rendezvous failure means relays
+        // never dial in), and the tick loop below checks it per
+        // iteration — together they make this thread joinable from the
+        // failure path instead of forcing process::exit(1).
+        config = config.abort_flag(Arc::clone(&abort));
+        let coord_abort = Arc::clone(&abort);
+        coord_driver = Some(thread::Builder::new()
             .name("flodl-cluster-coord".to_string())
             .spawn(move || {
                 match ClusterCoordinator::start(coord_bind_addr, coord_salt, config) {
@@ -625,6 +639,12 @@ pub fn run_launcher_with_config(
                         // 2ms keeps reduce latency negligible while the
                         // blocking recv yields the core between frames.
                         loop {
+                            // Launcher abort (failure path): bounded exit
+                            // within one 2ms drain, so the failure path can
+                            // join this thread and return Err.
+                            if coord_abort.load(std::sync::atomic::Ordering::SeqCst) {
+                                break;
+                            }
                             coord.drain_timing_blocking(
                                 std::time::Duration::from_millis(2),
                             );
@@ -651,7 +671,7 @@ pub fn run_launcher_with_config(
                 TensorError::new(&format!(
                     "cluster launcher: spawn coord thread failed: {e}"
                 ))
-            })?;
+            })?);
     }
 
     // Bootstrap rendezvous server (port +0). Controller binds, every rank
@@ -679,11 +699,12 @@ pub fn run_launcher_with_config(
         let rdv_full = full.clone();
         let rdv_me = me.clone();
         let formed_for_rdv = Arc::clone(&cohort_formed);
-        let _ = thread::Builder::new()
+        let rdv_abort = Arc::clone(&abort);
+        rdv_driver = Some(thread::Builder::new()
             .name("flodl-cluster-rendezvous".to_string())
             .spawn(move || {
-                match crate::distributed::rendezvous::run_controller_rendezvous(
-                    &rdv_full, &rdv_me,
+                match crate::distributed::rendezvous::run_controller_rendezvous_aborting(
+                    &rdv_full, &rdv_me, &rdv_abort,
                 ) {
                     Ok(()) => formed_for_rdv.store(true, std::sync::atomic::Ordering::SeqCst),
                     Err(e) => {
@@ -695,7 +716,7 @@ pub fn run_launcher_with_config(
                 TensorError::new(&format!(
                     "cluster launcher: spawn rendezvous thread failed: {e}"
                 ))
-            })?;
+            })?);
     }
 
     // For remote hosts, fdl-cli must have passed the original fdl command
@@ -1005,6 +1026,16 @@ pub fn run_launcher_with_config(
             }
         }
         cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
+        // Same cooperative infra teardown as the tail: wake the coord /
+        // rendezvous accept polls and join, so this early return leaves
+        // no parked infrastructure thread behind either.
+        abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = coord_driver.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = rdv_driver.take() {
+            let _ = h.join();
+        }
         return Err(e);
     }
     let _ = my_host_idx; // currently unused but kept for parity with future logic
@@ -1052,36 +1083,35 @@ pub fn run_launcher_with_config(
         eprintln!("cluster launcher: ClusterController shutdown failed: {e}");
     }
 
-    // Success path returns to the launcher_driver thread, which posts
-    // Ok(()) through DdpHandle::join so the caller's main thread reaches
-    // its end-of-run summary (e.g. ddp-bench's `done: loss=...` line)
-    // before the process terminates. Post-rendezvous + post-training the
-    // ClusterCoordinator shutdown closes its metrics-sink end, so
-    // next_metrics() drains cleanly without a hard process::exit.
-    //
-    // Failure path keeps process::exit(1): pre-rendezvous failures leave
-    // the coord ticking indefinitely (shutdown_workers never fires),
-    // which would otherwise keep the launcher process alive after every
-    // rank child has exited, and with it the docker container.
+    // Cooperative infrastructure teardown (both paths). Raise the abort
+    // flag, then JOIN the coordinator + rendezvous threads:
+    // - Success: both have typically exited already (coord tick returns
+    //   Ok(false) once every rank stream EOFs; the rendezvous thread is
+    //   short-lived) — the join is a no-wait formality that guarantees no
+    //   infrastructure thread outlives this call in a library embedder.
+    // - Failure: a pre-rendezvous failure used to leave both threads
+    //   parked in blocking accepts with detached JoinHandles, forcing a
+    //   process::exit(1) here (and making DdpHandle::join's Err arm
+    //   unreachable for launcher failures). The abort flag now wakes the
+    //   coord's cohort-formation accept poll, its tick loop, and the
+    //   rendezvous accept poll within one poll interval, so we can join
+    //   and RETURN the error — a library embedder catches it via
+    //   DdpHandle::join, and CLI consumers (fdl / ddp-bench) exit
+    //   non-zero through their own main.
+    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = coord_driver.take() {
+        let _ = h.join();
+    }
+    if let Some(h) = rdv_driver.take() {
+        let _ = h.join();
+    }
     use std::io::Write as _;
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
     if let Some(err) = any_failure {
-        // Hard exit rather than `return Err(err)`: on a pre-rendezvous
-        // failure the coordinator thread never gets readers, so its tick loop
-        // never reaches `Ok(false)` and would keep the launcher process (and
-        // its container) alive after every rank child has exited. The
-        // coordinator has no external abort handle here — its `JoinHandle` is
-        // detached and it was moved into its thread — so we cannot stop it and
-        // unwind cleanly. Replacing this with a cooperative shutdown that
-        // surfaces the error through `DdpHandle::join` is tracked as F6.
-        // Consequence: a fatal cluster run exits the process with code 1; a
-        // library embedder cannot currently catch it via `join`.
-        eprintln!(
-            "cluster launcher: fatal failure, terminating process (exit 1): {err}"
-        );
+        eprintln!("cluster launcher: fatal failure: {err}");
         let _ = std::io::stderr().flush();
-        std::process::exit(1);
+        return Err(err);
     }
     Ok(())
 }

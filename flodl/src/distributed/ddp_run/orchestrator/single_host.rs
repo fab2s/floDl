@@ -245,6 +245,7 @@ impl DdpHandle {
             final_state: Some(final_state),
             metrics_rx: Some(epoch_metrics_rx),
             launcher_driver: None,
+            launcher_abort: None,
             architecture_svg,
             graph_label,
             graph_hash,

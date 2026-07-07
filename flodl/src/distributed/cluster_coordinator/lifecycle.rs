@@ -91,10 +91,45 @@ impl ClusterCoordinator {
         let mut rank_to_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
         let mut conn_reads: Vec<TcpStream> = Vec::new();
         let mut covered = 0usize;
-        while covered < world_size {
-            let (mut stream, _peer) = listener.accept().map_err(|e| {
-                TensorError::new(&format!("cluster_coordinator: accept failed: {e}"))
+        // With a launcher abort flag attached, poll accept instead of
+        // blocking: on a pre-rendezvous failure the relays never dial in,
+        // and the launcher must be able to stop this loop, join the coord
+        // thread, and surface the original error through
+        // `DdpHandle::join` (see `ClusterCoordinatorConfig::abort`).
+        if config.abort.is_some() {
+            listener.set_nonblocking(true).map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster_coordinator: set_nonblocking failed: {e}"
+                ))
             })?;
+        }
+        while covered < world_size {
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if config
+                        .abort
+                        .as_ref()
+                        .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                    {
+                        return Err(TensorError::new(&format!(
+                            "cluster_coordinator: aborted by launcher before \
+                             cohort formed ({covered}/{world_size} ranks covered)"
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => {
+                    return Err(TensorError::new(&format!(
+                        "cluster_coordinator: accept failed: {e}"
+                    )));
+                }
+            };
+            // Accepted socket may inherit the listener's non-blocking flag
+            // on some platforms; flip it back so the handshake read timeout
+            // below is honored (a non-blocking socket ignores SO_RCVTIMEO).
+            let _ = stream.set_nonblocking(false);
             let _ = stream.set_nodelay(true);
             // 10s handshake timeout protects against a wedged relay.
             stream

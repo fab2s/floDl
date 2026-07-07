@@ -943,7 +943,12 @@ fn dispatch_launcher_or_continue() -> Result<()> {
             // a controller-driven cluster run pick `Trainer::builder`
             // which has the trampoline at `DdpHandle::launch`.
             let full = crate::distributed::launcher::FullCluster::from_env()?;
-            crate::distributed::launcher::run_launcher_with_config(full, None, None)?;
+            crate::distributed::launcher::run_launcher_with_config(
+                full,
+                None,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
             std::process::exit(0);
         }
         crate::distributed::launcher::Role::Relay => {

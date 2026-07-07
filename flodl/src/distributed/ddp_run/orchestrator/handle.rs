@@ -68,9 +68,10 @@ use super::coord_config::build_coord_config_from_builder;
 /// [`join`](Self::join) is the intended terminal call. In launcher / cluster
 /// mode, dropping the handle without joining detaches the launcher driver
 /// thread: **training continues to completion in the background** rather than
-/// being torn down (there is no early-cancel signal today; a cooperative
-/// shutdown path is tracked separately). In single-GPU mode training has
-/// already finished by the time the handle exists, so a drop is a plain no-op.
+/// being torn down — an accidental drop never cancels a long run. For an
+/// explicit cooperative cancel, call [`Self::shutdown`]. In single-GPU mode
+/// training has already finished by the time the handle exists, so a drop is
+/// a plain no-op.
 pub struct DdpHandle {
     pub(super) devices: Vec<Device>,
     /// For single-GPU mode: final state captured inline during run_single().
@@ -83,6 +84,11 @@ pub struct DdpHandle {
     /// code can poll [`Self::next_metrics`] between `run()` and
     /// `join()`. `None` outside launcher mode.
     pub(super) launcher_driver: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Cooperative-shutdown flag shared with the launcher's coordinator /
+    /// rendezvous threads. [`Self::shutdown`] raises it; the launcher's
+    /// accept polls and tick loop observe it within one poll interval.
+    /// `None` outside launcher mode.
+    pub(super) launcher_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Graph architecture SVG captured from the model (if it implements as_graph).
     pub(super) architecture_svg: Option<String>,
     /// Graph label (from as_graph().label()).
@@ -312,6 +318,11 @@ impl DdpHandle {
                         }
                     }
                 }
+                // Cooperative-shutdown flag shared with the launcher's
+                // infrastructure threads; DdpHandle::shutdown raises it.
+                let launcher_abort =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let abort_for_driver = Arc::clone(&launcher_abort);
                 let driver = std::thread::Builder::new()
                     .name("flodl-launcher-driver".to_string())
                     .spawn(move || {
@@ -319,6 +330,7 @@ impl DdpHandle {
                             full,
                             Some(coord_config),
                             outer_optimizer,
+                            abort_for_driver,
                         )
                     })
                     .map_err(|e| {
@@ -331,6 +343,7 @@ impl DdpHandle {
                     final_state: None,
                     metrics_rx: Some(sink_rx),
                     launcher_driver: Some(driver),
+                    launcher_abort: Some(launcher_abort),
                     architecture_svg: None,
                     graph_label: None,
                     graph_hash: None,
@@ -552,6 +565,28 @@ impl DdpHandle {
     /// `None`.
     pub fn next_metrics(&self) -> Option<EpochMetrics> {
         self.metrics_rx.as_ref().and_then(|rx| rx.recv().ok())
+    }
+
+    /// Cooperatively cancel a launcher-mode run and wait for teardown.
+    ///
+    /// Raises the shared abort flag observed by the launcher's
+    /// coordinator accept/tick loops and the rendezvous accept poll,
+    /// then joins the launcher driver like [`Self::join`]. Spawned rank
+    /// children observe the coordinator going away (control-stream EOF /
+    /// coord-liveness deadline) and self-terminate; the launcher's child
+    /// supervision reaps them before the driver returns.
+    ///
+    /// This is the EXPLICIT cancel — dropping the handle deliberately
+    /// does NOT cancel (see "Dropping without joining" on
+    /// [`DdpHandle`]): an accidental drop must never kill a long run.
+    ///
+    /// Single-GPU mode: training already completed inline; this is
+    /// equivalent to [`Self::join`].
+    pub fn shutdown(mut self) -> Result<TrainedState> {
+        if let Some(flag) = self.launcher_abort.take() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.join()
     }
 
     /// Wait for all training to complete and return the trained state.

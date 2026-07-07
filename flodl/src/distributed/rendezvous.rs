@@ -269,20 +269,46 @@ where
 /// rejected connections exceed [`MAX_REJECTED_CONNECTIONS`] (a scanner /
 /// misconfigured peer hammering the `0.0.0.0` listener). Without these
 /// ceilings a single absent rank would hang the whole cohort forever.
+/// Test-facing convenience without an abort flag; production goes
+/// through [`run_controller_rendezvous_aborting`] (the launcher always
+/// owns an abort flag now).
+#[cfg(test)]
 pub fn run_controller_rendezvous(
     full: &FullCluster,
     local_host_name: &str,
 ) -> Result<()> {
-    run_controller_rendezvous_with(full, local_host_name, RENDEZVOUS_IDLE_TIMEOUT)
+    run_controller_rendezvous_with(
+        full,
+        local_host_name,
+        RENDEZVOUS_IDLE_TIMEOUT,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// [`run_controller_rendezvous`] with a launcher-owned abort flag: the
+/// accept loop re-checks it every poll interval and bails with a loud
+/// "aborted" error when set. Lets the launcher's failure path stop a
+/// pre-rendezvous server (ranks never dialed in) within one poll
+/// interval and join its thread, instead of the server waiting out the
+/// full idle ceiling.
+pub(crate) fn run_controller_rendezvous_aborting(
+    full: &FullCluster,
+    local_host_name: &str,
+    abort: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    run_controller_rendezvous_with(full, local_host_name, RENDEZVOUS_IDLE_TIMEOUT, abort)
 }
 
 /// Inner body of [`run_controller_rendezvous`], parameterized by the
 /// no-progress `idle_timeout` so tests can exercise the wedge-break
-/// ceiling without waiting the production [`RENDEZVOUS_IDLE_TIMEOUT`].
+/// ceiling without waiting the production [`RENDEZVOUS_IDLE_TIMEOUT`],
+/// and by the launcher's `abort` flag (see
+/// [`run_controller_rendezvous_aborting`]).
 fn run_controller_rendezvous_with(
     full: &FullCluster,
     local_host_name: &str,
     idle_timeout: Duration,
+    abort: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let world_size = full.world_size();
     if world_size == 0 {
@@ -335,6 +361,12 @@ fn run_controller_rendezvous_with(
         let (mut stream, peer) = match listener.accept() {
             Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(TensorError::new(&format!(
+                        "rendezvous: aborted by launcher \
+                         ({accepted}/{world_size} ranks in)"
+                    )));
+                }
                 if last_progress.elapsed() > idle_timeout {
                     return Err(TensorError::new(&format!(
                         "rendezvous: timed out after {}s with no new rank \
@@ -709,6 +741,7 @@ mod tests {
             &full,
             "test-controller-host",
             Duration::from_secs(1),
+            &std::sync::atomic::AtomicBool::new(false),
         );
         let err = result.expect_err("must time out, not hang");
         assert!(
@@ -719,6 +752,30 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(15),
             "took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn controller_rendezvous_aborts_within_a_poll_interval() {
+        // The launcher's failure path sets the abort flag; the accept
+        // loop must bail on the next WouldBlock poll — well before the
+        // idle ceiling — so the launcher can join the thread and return
+        // Err instead of process::exit.
+        let full = full_cluster_for_test(next_port());
+        let abort = std::sync::atomic::AtomicBool::new(true); // pre-set
+        let start = Instant::now();
+        let err = run_controller_rendezvous_with(
+            &full,
+            "test-controller-host",
+            Duration::from_secs(120), // idle ceiling far away
+            &abort,
+        )
+        .expect_err("must abort, not wait for the idle ceiling");
+        assert!(err.to_string().contains("aborted"), "got: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "abort took too long: {:?}",
             start.elapsed()
         );
     }
