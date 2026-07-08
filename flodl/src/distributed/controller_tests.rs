@@ -10,13 +10,13 @@
         0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ];
 
-    /// Fake per-host relay: the controller now speaks the relay/mux
-    /// protocol (one connection per host carrying many ranks), so the test
-    /// peer is a relay, not a rank. Connects, sends `RelayHello` for
-    /// `ranks`, then per round forwards each rank's frame up (tagged
-    /// `MuxRecord::Data`) and collects each rank's averaged reply (demuxed
-    /// by tag). Returns, per rank (parallel to `ranks`), the averaged
-    /// frames received.
+    /// Fake per-host relay speaking the fold protocol: connects, sends
+    /// `RelayHello` for `ranks`, then per round folds its local ranks'
+    /// frames via [`sum_frames`] (exactly like the production relay) and
+    /// ships ONE `HostFrame` up, collecting the round's single
+    /// `Broadcast` consensus back. Returns, per rank (parallel to
+    /// `ranks`), the consensus frames received — replicated per rank the
+    /// way the production relay's fan-out delivers them.
     fn fake_relay(
         port: u16,
         ranks: Vec<u32>,
@@ -45,44 +45,31 @@
             }
         }
 
-        // Transpose rank-major frames into round-major so we drive the
-        // reduce loop one synchronized round at a time.
-        let rounds: Vec<Vec<(u32, &RoundFrame)>> = (0..n_rounds)
-            .map(|r| {
-                ranks
-                    .iter()
-                    .zip(&per_rank_frames)
-                    .map(|(rank, frames)| (*rank, &frames[r]))
-                    .collect()
-            })
-            .collect();
-
         let mut received: Vec<Vec<RoundFrame>> = ranks.iter().map(|_| Vec::new()).collect();
-        for round in &rounds {
-            // Forward each rank's frame up, tagged.
-            for (rank, frame) in round {
-                let mut buf = Vec::new();
-                write_round_frame(&mut buf, frame, &salt)?;
-                MuxRecord::data(*rank, buf).write_to(&mut stream, &salt)?;
-            }
-            // Collect one averaged reply per rank (tagged, any order).
-            for _ in 0..ranks.len() {
-                match MuxRecord::read_from(&mut stream, &salt)? {
-                    Some(MuxRecord::Data { rank, payload }) => {
-                        let frame = read_round_frame(&mut payload.as_slice(), &salt)?
-                            .ok_or_else(|| {
-                                TensorError::new("fake_relay: truncated averaged frame")
-                            })?;
-                        let idx = ranks.iter().position(|r| *r == rank).ok_or_else(|| {
-                            TensorError::new(&format!("fake_relay: reply for unknown rank {rank}"))
+        for r in 0..n_rounds {
+            // Fold the host's local contributions and ship ONE HostFrame.
+            let round_frames: Vec<&RoundFrame> =
+                per_rank_frames.iter().map(|frames| &frames[r]).collect();
+            let folded = sum_frames(&round_frames)?;
+            let mut buf = Vec::new();
+            write_round_frame(&mut buf, &folded, &salt)?;
+            MuxRecord::host_frame(buf).write_to(&mut stream, &salt)?;
+            // Collect the round's single Broadcast consensus; fan it out
+            // to every local rank slot like the production relay does.
+            match MuxRecord::read_from(&mut stream, &salt)? {
+                Some(MuxRecord::Broadcast { payload }) => {
+                    let frame = read_round_frame(&mut payload.as_slice(), &salt)?
+                        .ok_or_else(|| {
+                            TensorError::new("fake_relay: truncated consensus frame")
                         })?;
-                        received[idx].push(frame);
+                    for slot in received.iter_mut() {
+                        slot.push(frame.clone());
                     }
-                    other => {
-                        return Err(TensorError::new(&format!(
-                            "fake_relay: expected Data reply, got {other:?}"
-                        )));
-                    }
+                }
+                other => {
+                    return Err(TensorError::new(&format!(
+                        "fake_relay: expected Broadcast reply, got {other:?}"
+                    )));
                 }
             }
         }
@@ -472,11 +459,11 @@
             Some(MuxRecord::Control(RelayControlMsg::HelloAck)) => {}
             other => panic!("expected HelloAck, got {other:?}"),
         }
-        // Forward a Data record whose mux envelope is correctly keyed but
+        // Forward a HostFrame whose mux envelope is correctly keyed but
         // whose inner RoundFrame is rogue-keyed.
         let mut buf = Vec::new();
         write_round_frame(&mut buf, &one_tensor_frame(&[1.0, 2.0, 3.0]), &rogue_salt).unwrap();
-        MuxRecord::data(0, buf)
+        MuxRecord::host_frame(buf)
             .write_to(&mut stream, &controller_salt)
             .unwrap();
         // The controller errors on the inner HMAC and tears down; our next
@@ -518,28 +505,36 @@
         let (ctrl1, mut peer1) = pair();
         ctrl0.shutdown(Shutdown::Both).unwrap();
         let mut conn_writes = vec![ctrl0, ctrl1];
-        let rank_conn = vec![Some(0usize), Some(1usize), Some(1usize)];
+        let conn_ranks = vec![vec![0usize], vec![1usize, 2usize]];
         let dead = DeadRanks::new(3);
 
-        // Realized-work frames: values [0,1,2] at mass 1 each → consensus 1.0.
-        let frames: Vec<Option<RoundFrame>> = (0..3)
-            .map(|r| {
-                Some(RoundFrame {
-                    tensors: vec![TensorPayload {
-                        dtype: DTYPE_F32,
-                        shape: vec![1],
-                        bytes: f32_to_bytes(&[r as f32]),
-                    }],
-                    weight: 1.0,
-                    ..Default::default()
-                })
-            })
-            .collect();
+        // Folded host frames: conn 0 contributes value 0 at mass 1;
+        // conn 1's fold contributes 1+2=3 at mass 2 → consensus 1.0.
+        let frames: Vec<Option<RoundFrame>> = vec![
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![1],
+                    bytes: f32_to_bytes(&[0.0]),
+                }],
+                weight: 1.0,
+                ..Default::default()
+            }),
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![1],
+                    bytes: f32_to_bytes(&[3.0]),
+                }],
+                weight: 2.0,
+                ..Default::default()
+            }),
+        ];
 
         average_and_scatter(
             &frames,
             &mut conn_writes,
-            &rank_conn,
+            &conn_ranks,
             &dead,
             &TEST_SALT,
             None,
@@ -550,19 +545,178 @@
         assert!(dead.is_dead(0), "broken connection's rank must be declared dead");
         assert!(!dead.is_dead(1) && !dead.is_dead(2), "survivors stay alive");
 
-        // Both survivors received the consensus on the live connection.
-        for _ in 0..2 {
-            match MuxRecord::read_from(&mut peer1, &TEST_SALT).unwrap() {
-                Some(MuxRecord::Data { rank, payload }) => {
-                    assert!(rank == 1 || rank == 2, "unexpected rank {rank}");
-                    let frame = read_round_frame(&mut payload.as_slice(), &TEST_SALT)
-                        .unwrap()
-                        .expect("scattered frame");
-                    let vals = bytes_as_f32(&frame.tensors[0].bytes).unwrap();
-                    assert!((vals[0] - 1.0).abs() < 1e-6, "consensus, got {vals:?}");
-                    assert!((frame.weight - 3.0).abs() < 1e-9, "accepted mass rides down");
-                }
-                other => panic!("expected Data record, got {other:?}"),
+        // The live connection received the round's single consensus
+        // Broadcast (the relay fans it out locally).
+        match MuxRecord::read_from(&mut peer1, &TEST_SALT).unwrap() {
+            Some(MuxRecord::Broadcast { payload }) => {
+                let frame = read_round_frame(&mut payload.as_slice(), &TEST_SALT)
+                    .unwrap()
+                    .expect("scattered frame");
+                let vals = bytes_as_f32(&frame.tensors[0].bytes).unwrap();
+                assert!((vals[0] - 1.0).abs() < 1e-6, "consensus, got {vals:?}");
+                assert!((frame.weight - 3.0).abs() < 1e-9, "accepted mass rides down");
             }
+            other => panic!("expected Broadcast record, got {other:?}"),
         }
+    }
+
+    // ---- fold monoid (sum_frames) -------------------------------------------
+
+    /// The shared fold NEVER divides — masses and values are plain sums,
+    /// whatever the kind. Dividing in a fold tier would reintroduce
+    /// averaging-of-averages; only `reduce_realized_work` normalizes.
+    #[test]
+    fn sum_frames_is_a_pure_sum_with_summed_mass() {
+        let a = RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype: DTYPE_F32,
+                shape: vec![2],
+                bytes: f32_to_bytes(&[3.0, 6.0]),
+            }],
+            weight: 3.0,
+            ..Default::default()
+        };
+        let b = RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype: DTYPE_F32,
+                shape: vec![2],
+                bytes: f32_to_bytes(&[5.0, 10.0]),
+            }],
+            weight: 1.0,
+            ..Default::default()
+        };
+        let folded = sum_frames(&[&a, &b]).unwrap();
+        let vals = bytes_as_f32(&folded.tensors[0].bytes).unwrap();
+        assert_eq!(vals, vec![8.0, 16.0], "values sum, never divide");
+        assert!((folded.weight - 4.0).abs() < 1e-9, "masses sum");
+        assert_eq!(folded.kind, RoundKind::Model, "kind preserved");
+    }
+
+    /// Mixed kinds in one fold = desynced rounds; must error loudly, not
+    /// silently sum a Control gather into the model.
+    #[test]
+    fn sum_frames_rejects_kind_mismatch() {
+        let model = one_tensor_frame(&[1.0]);
+        let control = RoundFrame {
+            kind: RoundKind::Control,
+            ..one_tensor_frame(&[1.0])
+        };
+        let err = sum_frames(&[&model, &control]).unwrap_err();
+        assert!(err.to_string().contains("kind"), "got: {err}");
+    }
+
+    /// Associativity: folding per host first then reducing equals the
+    /// flat reduce over all rank frames (exact here — values chosen so
+    /// f32 addition order cannot bite).
+    #[test]
+    fn host_fold_then_reduce_matches_flat_reduce() {
+        let r0 = one_tensor_frame(&[1.0, 2.0]);
+        let r1 = one_tensor_frame(&[3.0, 4.0]);
+        let r2 = one_tensor_frame(&[5.0, 6.0]);
+        let flat = reduce_realized_work(&[
+            Some(r0.clone()),
+            Some(r1.clone()),
+            Some(r2.clone()),
+        ])
+        .unwrap();
+        let host_a = sum_frames(&[&r0, &r1]).unwrap();
+        let host_b = sum_frames(&[&r2]).unwrap();
+        let folded = reduce_realized_work(&[Some(host_a), Some(host_b)]).unwrap();
+        assert_eq!(
+            bytes_as_f32(&flat.tensors[0].bytes).unwrap(),
+            bytes_as_f32(&folded.tensors[0].bytes).unwrap(),
+        );
+        assert!((flat.weight - folded.weight).abs() < 1e-9);
+    }
+
+    /// A per-rank `Data` record on the data channel means a stale
+    /// (pre-fold) relay build; the controller must error loudly instead
+    /// of silently mis-accounting the round.
+    #[test]
+    fn rejects_per_rank_data_record_on_data_channel() {
+        let avg = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            1,
+            TEST_SALT,
+        )
+        .unwrap();
+        let port = avg.port();
+
+        let mut stream =
+            TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        MuxRecord::control(RelayControlMsg::Hello {
+            host: "stale".into(),
+            ranks: vec![0],
+        })
+        .write_to(&mut stream, &TEST_SALT)
+        .unwrap();
+        match MuxRecord::read_from(&mut stream, &TEST_SALT).unwrap() {
+            Some(MuxRecord::Control(RelayControlMsg::HelloAck)) => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        let mut buf = Vec::new();
+        write_round_frame(&mut buf, &one_tensor_frame(&[1.0]), &TEST_SALT).unwrap();
+        MuxRecord::data(0, buf).write_to(&mut stream, &TEST_SALT).unwrap();
+        // The controller errors on the stale record and tears down; wait
+        // for the connection close so shutdown() can't win the race and
+        // mask the error with a clean external-shutdown outcome.
+        let _ = MuxRecord::read_from(&mut stream, &TEST_SALT);
+        drop(stream);
+
+        let err = avg.shutdown().expect_err(
+            "a per-rank Data record on the data channel must surface as an error",
+        );
+        assert!(
+            err.to_string().contains("HostFrame"),
+            "expected the mixed-builds diagnostic, got: {err}"
+        );
+    }
+
+    /// Two hosts, each folding locally, one reduce round: the controller
+    /// accounts per connection and the consensus matches the flat
+    /// average over all three ranks. Exercises the real per-host round
+    /// barrier (both relays must deposit before either gets the
+    /// Broadcast).
+    #[test]
+    fn two_host_fold_average_one_round() {
+        let avg = ClusterController::start(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            3,
+            TEST_SALT,
+        )
+        .unwrap();
+        let port = avg.port();
+
+        // Host A carries ranks 0+1, host B carries rank 2. Equal-mass
+        // frames → consensus = plain mean (2, 3).
+        let host_a = std::thread::spawn(move || {
+            fake_relay(
+                port,
+                vec![0, 1],
+                TEST_SALT,
+                vec![
+                    vec![one_tensor_frame(&[1.0, 2.0])],
+                    vec![one_tensor_frame(&[2.0, 3.0])],
+                ],
+            )
+        });
+        let host_b = std::thread::spawn(move || {
+            fake_relay(
+                port,
+                vec![2],
+                TEST_SALT,
+                vec![vec![one_tensor_frame(&[3.0, 4.0])]],
+            )
+        });
+        let recv_a = host_a.join().unwrap().unwrap();
+        let recv_b = host_b.join().unwrap().unwrap();
+        avg.shutdown().unwrap();
+
+        let consensus = bytes_as_f32(&recv_a[0][0].tensors[0].bytes).unwrap();
+        assert_eq!(consensus, vec![2.0, 3.0]);
+        // Every rank on every host sees the identical consensus, with
+        // the full accepted mass riding down.
+        assert_eq!(recv_a[0][0], recv_a[1][0]);
+        assert_eq!(recv_a[0][0], recv_b[0][0]);
+        assert!((recv_b[0][0].weight - 3.0).abs() < 1e-9);
     }

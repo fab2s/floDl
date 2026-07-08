@@ -21,24 +21,29 @@
 //!   HMAC-authed end-to-end, so the loopback prefix carries no auth of
 //!   its own. The relay never parses the blob; it forwards opaque bytes.
 //!
-//! - **relay ↔ controller (network):** each blob is wrapped in a
-//!   [`MuxRecord`] that tags it with its originating `rank` so the
-//!   single per-host connection can carry every local rank's frames. The
-//!   mux header (including the routing-sensitive `rank` field) is
-//!   HMAC-authed with the session salt, mirroring the rest of the
-//!   cluster wire protocol — a flipped `rank` would misroute, so the tag
-//!   must be tamper-evident. The wrapped payload keeps its own
-//!   end-to-end HMAC, so the relay cannot tamper with tensor/control
-//!   bytes undetected.
+//! - **relay ↔ controller (network):** frames are wrapped in
+//!   [`MuxRecord`]s so the single per-host connection can carry the
+//!   host's traffic. The mux header (including the routing-sensitive
+//!   `rank` field where present) is HMAC-authed with the session salt,
+//!   mirroring the rest of the cluster wire protocol — a flipped `rank`
+//!   would misroute, so the tag must be tamper-evident.
 //!
-//! # Pure transport (v1)
+//! # Control channel: pure transport. Data channel: fold.
 //!
-//! The relay FORWARDS; it does not aggregate. Rank R's full reduce
-//! buffer crosses the wire untouched and the controller still does the
-//! flat sum over all ranks. The v1 win is connection count (N → 1 per
-//! host) and "address a node, not N GPUs", NOT bytes. Sum-and-count (the
-//! N×-fewer-bytes wire reduction) is a separate later layer that will
-//! live in the relay and is the only place that would parse the payload.
+//! On the **control channel** the relay FORWARDS: each rank's
+//! [`ControlFrame`] crosses untouched as a rank-tagged
+//! [`MuxRecord::Data`], and the payload keeps its end-to-end HMAC.
+//!
+//! On the **data channel** the relay FOLDS: it parses and verifies its
+//! local ranks' [`RoundFrame`]s, sums them element-wise (masses too),
+//! and sends ONE re-signed [`MuxRecord::HostFrame`] upstream per reduce
+//! round; the controller answers with ONE [`MuxRecord::Broadcast`]
+//! consensus that the relay fans out to every local rank. K local ranks
+//! therefore cost 1× the model bytes on the host uplink in each
+//! direction instead of K×. The relay is a trusted aggregation point on
+//! this leg — it holds the session salt (it terminates the rank
+//! handshakes with it), so frame authenticity inside the host is
+//! salt-scoped, not per-hop.
 //!
 //! [`RoundFrame`]: crate::distributed::controller::RoundFrame
 //! [`ControlFrame`]: crate::distributed::wire::ControlFrame
@@ -70,6 +75,12 @@ const MUX_HEADER_LEN: usize = 25;
 const REC_DATA: u8 = 0x01;
 /// Record kind: a relay-level control signal ([`RelayControlMsg`]).
 const REC_CONTROL: u8 = 0x02;
+/// Record kind: a relay-folded host frame (data channel, relay →
+/// controller). One per host per reduce round; no rank tag.
+const REC_HOST_FRAME: u8 = 0x03;
+/// Record kind: a host-wide consensus frame (data channel, controller →
+/// relay). The relay fans it out to every local alive rank; no rank tag.
+const REC_BROADCAST: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // Bincode helpers (local; mirror wire.rs's private pair)
@@ -120,6 +131,17 @@ pub enum RelayControlMsg {
     /// instead of waiting forever. Host death is signalled implicitly by
     /// the whole per-host connection EOFing, not by this message.
     RankExit { rank: u32 },
+    /// Controller → relay (data channel): `rank` has been declared dead
+    /// cluster-side (coordinator heartbeat staleness, scatter failure on
+    /// another host, ...). The relay drops the rank from its fold
+    /// barrier so a wedged-but-connected local rank cannot park the
+    /// host's fold forever — the exact mirror of the controller's own
+    /// `wait_for_round` re-evaluating [`DeadRanks`] every poll. Local
+    /// EOFs the relay observes itself; this covers the deaths only the
+    /// controller can see.
+    ///
+    /// [`DeadRanks`]: crate::distributed::controller::DeadRanks
+    DeclareDead { rank: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -134,12 +156,22 @@ pub enum RelayControlMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MuxRecord {
     /// A forwarded opaque frame for `rank` — the verbatim
-    /// [`crate::distributed::controller::RoundFrame`] (data channel) or
-    /// [`crate::distributed::wire::ControlFrame`] (control channel)
-    /// bytes, never parsed by the relay.
+    /// [`crate::distributed::wire::ControlFrame`] bytes (control
+    /// channel), never parsed by the relay.
     Data { rank: u32, payload: Vec<u8> },
     /// A relay-level control signal.
     Control(RelayControlMsg),
+    /// Data channel, relay → controller: the host's folded
+    /// [`crate::distributed::controller::RoundFrame`] for one reduce
+    /// round — the element-wise sum of every accepted local rank's
+    /// contribution, mass summed, re-signed by the relay. One per host
+    /// per round; carries no rank tag.
+    HostFrame { payload: Vec<u8> },
+    /// Data channel, controller → relay: the round's consensus
+    /// [`crate::distributed::controller::RoundFrame`], identical for
+    /// every rank. The relay writes it to each local alive rank's
+    /// loopback socket; carries no rank tag.
+    Broadcast { payload: Vec<u8> },
 }
 
 /// Hard ceiling on any length-prefixed payload (mux records and
@@ -165,6 +197,16 @@ impl MuxRecord {
         MuxRecord::Control(msg)
     }
 
+    /// Wrap a relay-folded host frame (data channel, up-leg).
+    pub fn host_frame(payload: Vec<u8>) -> Self {
+        MuxRecord::HostFrame { payload }
+    }
+
+    /// Wrap a host-wide consensus frame (data channel, down-leg).
+    pub fn broadcast(payload: Vec<u8>) -> Self {
+        MuxRecord::Broadcast { payload }
+    }
+
     /// `(record_kind, rank, payload_bytes)` for the wire header.
     fn parts(&self) -> Result<(u8, u32, std::borrow::Cow<'_, [u8]>)> {
         match self {
@@ -173,6 +215,12 @@ impl MuxRecord {
             }
             MuxRecord::Control(msg) => {
                 Ok((REC_CONTROL, 0, std::borrow::Cow::Owned(encode(msg)?)))
+            }
+            MuxRecord::HostFrame { payload } => {
+                Ok((REC_HOST_FRAME, 0, std::borrow::Cow::Borrowed(payload)))
+            }
+            MuxRecord::Broadcast { payload } => {
+                Ok((REC_BROADCAST, 0, std::borrow::Cow::Borrowed(payload)))
             }
         }
     }
@@ -304,6 +352,8 @@ impl MuxRecord {
         match kind {
             REC_DATA => Ok(MuxRecord::Data { rank, payload }),
             REC_CONTROL => Ok(MuxRecord::Control(decode(&payload)?)),
+            REC_HOST_FRAME => Ok(MuxRecord::HostFrame { payload }),
+            REC_BROADCAST => Ok(MuxRecord::Broadcast { payload }),
             other => Err(TensorError::new(&format!(
                 "relay_mux: unknown record kind 0x{other:02x}"
             ))),

@@ -1,10 +1,10 @@
-//! Per-host relay agent: the byte-router (transport only, v1).
+//! Per-host relay agent: byte-router on the control channel, fold
+//! station on the data channel.
 //!
 //! One [`RelayChannel`] runs per {data, control} channel per host. It
 //! terminates each local rank's handshake on a loopback listener exactly
-//! as the controller would, then multiplexes every local rank's frames
-//! over a single upstream connection to the real controller — tagging
-//! each forwarded frame with its rank ([`MuxRecord::Data`]) and emitting
+//! as the controller would, then multiplexes the host's traffic over a
+//! single upstream connection to the real controller, emitting
 //! [`RelayControlMsg::RankExit`] when a local rank disconnects.
 //!
 //! # Topology
@@ -18,34 +18,55 @@
 //! # Thread model (per channel)
 //!
 //! - **one rank-reader thread per local rank**: reads length-framed
-//!   blobs off the rank's loopback socket, wraps each as
-//!   `MuxRecord::Data{rank, blob}`, and pushes it to the outbound queue.
-//!   On EOF / error it pushes `RankExit{rank}` and exits.
+//!   blobs off the rank's loopback socket and pushes work to the
+//!   outbound queue. On EOF / error it pushes `RankExit{rank}` and
+//!   exits.
 //! - **one outbound-writer thread**: the *sole* writer of the upstream
 //!   connection (single-writer discipline — see
 //!   `feedback_no_locks_hot_path` / the historical two-writer HMAC race).
 //!   Drains the outbound queue, writes each [`MuxRecord`] upstream.
 //! - **one upstream-reader thread**: reads [`MuxRecord`]s from the
-//!   controller, and for each `Data{rank, blob}` writes the length-framed
-//!   blob to that rank's loopback socket. It is the sole writer of each
-//!   rank socket (single-writer per rank). On upstream EOF it flags
-//!   shutdown (controller gone → tear down the host).
+//!   controller and writes to the rank loopback sockets. It is the sole
+//!   writer of each rank socket (single-writer per rank). On upstream
+//!   EOF it flags shutdown (controller gone → tear down the host).
 //!
-//! The relay FORWARDS; it never parses a forwarded payload. Averaging
-//! math + snapshot path are untouched; this is pure transport.
+//! # Control channel: forward. Data channel: fold.
+//!
+//! On the **control channel** the relay never parses a forwarded
+//! payload: each blob crosses as a rank-tagged [`MuxRecord::Data`].
+//!
+//! On the **data channel** the relay is the first fold tier of the
+//! realized-work reduce. Rank readers parse and HMAC-verify each local
+//! [`RoundFrame`]; the depositor that completes the round (every local
+//! *alive* rank present) sums them element-wise — masses too — via
+//! [`controller::sum_frames`] (the fold NEVER divides; the controller
+//! divides exactly once) and ships ONE re-signed
+//! [`MuxRecord::HostFrame`] upstream. The controller's consensus comes
+//! back as ONE [`MuxRecord::Broadcast`], fanned out to every local
+//! alive rank. Local liveness is absorbed here: a rank EOF folds the
+//! remainder, and controller-side deaths arrive as
+//! [`RelayControlMsg::DeclareDead`] so a wedged-but-connected rank
+//! cannot park the host's fold (no fold deadline — dropping a reduce
+//! round silently is a correctness violation for Local SGD).
 //!
 //! [`MuxRecord`]: super::mux::MuxRecord
 //! [`MuxRecord::Data`]: super::mux::MuxRecord::Data
+//! [`MuxRecord::HostFrame`]: super::mux::MuxRecord::HostFrame
+//! [`MuxRecord::Broadcast`]: super::mux::MuxRecord::Broadcast
 //! [`RelayControlMsg::RankExit`]: super::mux::RelayControlMsg::RankExit
+//! [`RelayControlMsg::DeclareDead`]: super::mux::RelayControlMsg::DeclareDead
+//! [`RoundFrame`]: crate::distributed::controller::RoundFrame
+//! [`controller::sum_frames`]: crate::distributed::controller::sum_frames
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::distributed::controller::{self, RoundFrame};
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{Result, TensorError};
 
@@ -210,7 +231,7 @@ impl RelayChannel {
 
         // Phase 3: spawn the mux threads.
         let shutdown = Arc::new(AtomicBool::new(false));
-        let threads = spawn_mux(rank_streams, upstream, salt, Arc::clone(&shutdown))?;
+        let threads = spawn_mux(kind, rank_streams, upstream, salt, Arc::clone(&shutdown))?;
         Ok(RelayChannel { shutdown, threads })
     }
 
@@ -255,6 +276,167 @@ impl Drop for RelayChannel {
 
 
 // ---------------------------------------------------------------------------
+// Data-channel fold station
+// ---------------------------------------------------------------------------
+
+/// Host-local mirror of the controller's round collection: one slot per
+/// local rank, plus the local dead-set. The mutation that completes the
+/// round (a deposit, or a death that removes the last missing rank)
+/// takes the frames and performs the fold — no dedicated fold thread,
+/// no condvar, no deadline.
+struct FoldCtx {
+    inner: Mutex<FoldInner>,
+    /// Global rank ids served by this host (the fold barrier's roster).
+    local_ranks: Vec<u32>,
+    salt: SessionSalt,
+    /// Fold instrumentation: rounds folded, Σ bytes deposited by local
+    /// ranks, Σ bytes shipped upstream. Summarized once (Drop) so the
+    /// K→1 uplink reduction is observable on the rig.
+    rounds: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_up: AtomicU64,
+}
+
+struct FoldInner {
+    /// This round's parsed frame per local rank (`None` until
+    /// deposited; taken by the completing fold).
+    frames: HashMap<u32, RoundFrame>,
+    /// Local ranks out of the fold barrier: loopback EOF (observed
+    /// here) or controller-declared death ([`RelayControlMsg::DeclareDead`]).
+    dead: HashSet<u32>,
+}
+
+impl FoldCtx {
+    fn new(local_ranks: Vec<u32>, salt: SessionSalt) -> Self {
+        FoldCtx {
+            inner: Mutex::new(FoldInner {
+                frames: HashMap::with_capacity(local_ranks.len()),
+                dead: HashSet::new(),
+            }),
+            local_ranks,
+            salt,
+            rounds: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+        }
+    }
+
+    /// Deposit `rank`'s frame for the current round; fold + ship if this
+    /// completes it. Returns `Err` on protocol violations that must tear
+    /// the channel down (double deposit — the rank↔relay leg is a strict
+    /// ping-pong, so a second frame before the round folded means a
+    /// desynced stream).
+    fn deposit(
+        &self,
+        rank: u32,
+        frame: RoundFrame,
+        frame_bytes: u64,
+        tx: &mpsc::SyncSender<MuxRecord>,
+    ) -> Result<()> {
+        let taken = {
+            let mut inner = self.inner.lock().expect("relay fold lock poisoned");
+            if inner.dead.contains(&rank) {
+                // Late frame from a rank already out of the barrier
+                // (mirrors the controller's late-frame drop).
+                return Ok(());
+            }
+            if inner.frames.insert(rank, frame).is_some() {
+                return Err(TensorError::new(&format!(
+                    "relay fold: rank {rank} deposited twice in one round \
+                     (rank↔relay ping-pong violated; stream desynced)"
+                )));
+            }
+            self.bytes_in.fetch_add(frame_bytes, Ordering::Relaxed);
+            self.take_if_complete(&mut inner)
+        };
+        self.fold_and_ship(taken, tx)
+    }
+
+    /// Remove `rank` from the fold barrier (loopback EOF or
+    /// controller-declared death); fold + ship if the round is now
+    /// complete without it. Idempotent.
+    fn mark_dead(&self, rank: u32, tx: &mpsc::SyncSender<MuxRecord>) -> Result<()> {
+        let taken = {
+            let mut inner = self.inner.lock().expect("relay fold lock poisoned");
+            inner.dead.insert(rank);
+            // A frame it already deposited this round stays in — the
+            // rank realized that work; the controller-side accept
+            // ledger is what decides acceptance across hosts.
+            self.take_if_complete(&mut inner)
+        };
+        self.fold_and_ship(taken, tx)
+    }
+
+    /// Under the lock: if every local alive rank has deposited (and at
+    /// least one frame is present), take the round's frames.
+    fn take_if_complete(&self, inner: &mut FoldInner) -> Option<Vec<RoundFrame>> {
+        let complete = self
+            .local_ranks
+            .iter()
+            .all(|r| inner.dead.contains(r) || inner.frames.contains_key(r));
+        if !complete || inner.frames.is_empty() {
+            return None;
+        }
+        Some(inner.frames.drain().map(|(_, f)| f).collect())
+    }
+
+    /// Outside the lock: sum the taken frames, re-sign, ship upstream.
+    fn fold_and_ship(
+        &self,
+        taken: Option<Vec<RoundFrame>>,
+        tx: &mpsc::SyncSender<MuxRecord>,
+    ) -> Result<()> {
+        let Some(frames) = taken else {
+            return Ok(());
+        };
+        let refs: Vec<&RoundFrame> = frames.iter().collect();
+        let folded = controller::sum_frames(&refs)?;
+        let mut buf = Vec::new();
+        controller::write_round_frame(&mut buf, &folded, &self.salt)?;
+        self.rounds.fetch_add(1, Ordering::Relaxed);
+        self.bytes_up.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        tx.send(MuxRecord::host_frame(buf)).map_err(|_| {
+            TensorError::new("relay fold: outbound writer gone before fold shipped")
+        })
+    }
+
+    /// Fan the controller's consensus out to every local alive rank.
+    /// Per-write failures are tolerated exactly like the byte-router
+    /// path (a rank socket already gone means no one to deliver to).
+    fn fan_out(&self, payload: &[u8], rank_writes: &mut HashMap<u32, TcpStream>) {
+        let dead: Vec<u32> = {
+            let inner = self.inner.lock().expect("relay fold lock poisoned");
+            inner.dead.iter().copied().collect()
+        };
+        for rank in &self.local_ranks {
+            if dead.contains(rank) {
+                continue;
+            }
+            if let Some(w) = rank_writes.get_mut(rank) {
+                let _ = write_len_framed(w, payload);
+            }
+        }
+    }
+}
+
+impl Drop for FoldCtx {
+    fn drop(&mut self) {
+        let rounds = self.rounds.load(Ordering::Relaxed);
+        if rounds == 0 {
+            return;
+        }
+        let bytes_in = self.bytes_in.load(Ordering::Relaxed) as f64 / 1e6;
+        let bytes_up = self.bytes_up.load(Ordering::Relaxed) as f64 / 1e6;
+        let ratio = if bytes_up > 0.0 { bytes_in / bytes_up } else { 0.0 };
+        eprintln!(
+            "[relay-fold-prof] ranks={} rounds={rounds} | local={bytes_in:.2}MB \
+             uplink={bytes_up:.2}MB fold-ratio={ratio:.2}x",
+            self.local_ranks.len(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mux core
 // ---------------------------------------------------------------------------
 
@@ -269,11 +451,22 @@ impl Drop for RelayChannel {
 /// explicit `shutdown` store, upstream EOF (controller gone), or the last
 /// local rank exiting (host has no ranks left to serve).
 fn spawn_mux(
+    kind: ChannelKind,
     rank_streams: Vec<(u32, TcpStream)>,
     upstream: TcpStream,
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Vec<JoinHandle<()>>> {
+    // Data channel: the fold station shared by every rank reader (they
+    // deposit) and the upstream reader (deaths + consensus fan-out).
+    // Control channel: pure byte-router, no fold context.
+    let fold: Option<Arc<FoldCtx>> = match kind {
+        ChannelKind::Data => Some(Arc::new(FoldCtx::new(
+            rank_streams.iter().map(|(r, _)| *r).collect(),
+            salt,
+        ))),
+        ChannelKind::Control => None,
+    };
     // BOUNDED: per-rank reader threads pump full param-snapshot blobs
     // into this queue while a single blocking writer drains it to the
     // (possibly slow) upstream link. Unbounded, a slow upstream grew the
@@ -322,13 +515,17 @@ fn spawn_mux(
         );
     }
 
-    // Upstream reader (sole writer of each rank socket).
+    // Upstream reader (sole writer of each rank socket). On the data
+    // channel it also holds a queue sender: a `DeclareDead` it receives
+    // can complete the round and ship the fold from this thread.
     {
         let shutdown = Arc::clone(&shutdown);
+        let fold = fold.clone();
+        let tx = tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("flodl-relay-up".into())
-                .spawn(move || upstream_reader(up_read, rank_writes, salt, shutdown))
+                .spawn(move || upstream_reader(up_read, rank_writes, salt, shutdown, fold, tx))
                 .map_err(|e| TensorError::new(&format!("relay: spawn upstream reader: {e}")))?,
         );
     }
@@ -338,10 +535,11 @@ fn spawn_mux(
         let tx = tx.clone();
         let shutdown = Arc::clone(&shutdown);
         let active = Arc::clone(&active);
+        let fold = fold.clone();
         threads.push(
             thread::Builder::new()
                 .name(format!("flodl-relay-r{rank}"))
-                .spawn(move || rank_reader(rank, stream, tx, shutdown, active))
+                .spawn(move || rank_reader(rank, stream, tx, shutdown, active, fold))
                 .map_err(|e| TensorError::new(&format!("relay: spawn rank {rank} reader: {e}")))?,
         );
     }
@@ -352,30 +550,74 @@ fn spawn_mux(
     Ok(threads)
 }
 
-/// Rank-reader: loopback rank socket → outbound queue. Wraps each
-/// length-framed blob as `Data{rank, blob}`; emits `RankExit{rank}` on
-/// EOF/error then exits. The last reader to exit flags shutdown.
+/// Rank-reader: loopback rank socket → outbound queue.
+///
+/// Control channel (`fold` = None): wraps each length-framed blob as
+/// `Data{rank, blob}` untouched. Data channel (`fold` = Some): parses +
+/// HMAC-verifies the blob as a [`RoundFrame`] and deposits it into the
+/// host fold — the deposit that completes the round ships the folded
+/// `HostFrame` from this thread.
+///
+/// Emits `RankExit{rank}` on EOF/error then exits (on the data channel
+/// the rank also leaves the fold barrier, which may complete the round
+/// for the survivors). The last reader to exit flags shutdown.
 fn rank_reader(
     rank: u32,
     mut stream: TcpStream,
     tx: mpsc::SyncSender<MuxRecord>,
     shutdown: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    fold: Option<Arc<FoldCtx>>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         match try_read_len_framed(&mut stream) {
-            Ok(LenFramedRead::Blob(blob)) => {
-                if tx.send(MuxRecord::data(rank, blob)).is_err() {
-                    break; // outbound writer gone
+            Ok(LenFramedRead::Blob(blob)) => match &fold {
+                None => {
+                    if tx.send(MuxRecord::data(rank, blob)).is_err() {
+                        break; // outbound writer gone
+                    }
                 }
-            }
+                Some(ctx) => {
+                    // Parse + verify (the blob's end-to-end HMAC is
+                    // checked by read_round_frame; the relay holds the
+                    // session salt). Any failure here is a desynced or
+                    // corrupt local stream — tear the channel down
+                    // loudly rather than fold garbage.
+                    let parsed = controller::read_round_frame(
+                        &mut blob.as_slice(),
+                        &ctx.salt,
+                    );
+                    let deposit = match parsed {
+                        Ok(Some(frame)) => {
+                            ctx.deposit(rank, frame, blob.len() as u64, &tx)
+                        }
+                        Ok(None) => Err(TensorError::new(&format!(
+                            "relay fold: truncated RoundFrame from rank {rank}"
+                        ))),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = deposit {
+                        eprintln!("relay fold: rank {rank}: {e}");
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            },
             Ok(LenFramedRead::WouldBlock) => {
                 // idle tick — loop re-checks shutdown
             }
             Ok(LenFramedRead::Eof) => {
+                if let Some(ctx) = &fold {
+                    // Leave the fold barrier; this may complete the
+                    // round for the surviving local ranks.
+                    if let Err(e) = ctx.mark_dead(rank, &tx) {
+                        eprintln!("relay fold: rank {rank} exit-fold: {e}");
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                }
                 let _ = tx.send(MuxRecord::control(RelayControlMsg::RankExit { rank }));
                 break;
             }
@@ -383,6 +625,12 @@ fn rank_reader(
                 // Treat any read error as the rank being gone. RankExit is
                 // idempotent on the controller (declare_dead), so a
                 // spurious one during teardown is harmless.
+                if let Some(ctx) = &fold {
+                    if let Err(e) = ctx.mark_dead(rank, &tx) {
+                        eprintln!("relay fold: rank {rank} error-fold: {e}");
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                }
                 let _ = tx.send(MuxRecord::control(RelayControlMsg::RankExit { rank }));
                 break;
             }
@@ -422,13 +670,17 @@ fn outbound_writer(
 }
 
 /// Upstream reader: controller → loopback ranks. The SOLE writer of each
-/// rank socket. Demuxes `Data{rank, blob}` to the owning rank; flags
-/// shutdown on upstream EOF (controller gone).
+/// rank socket. Demuxes `Data{rank, blob}` to the owning rank; fans
+/// `Broadcast` consensus frames out to every local alive rank (data
+/// channel); applies `DeclareDead` to the fold barrier; flags shutdown
+/// on upstream EOF (controller gone).
 fn upstream_reader(
     mut up_read: TcpStream,
     mut rank_writes: HashMap<u32, TcpStream>,
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
+    fold: Option<Arc<FoldCtx>>,
+    tx: mpsc::SyncSender<MuxRecord>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -448,9 +700,42 @@ fn upstream_reader(
                 // mux HMAC, so this only happens on a benign post-exit
                 // race.
             }
+            Ok(MuxRead::Record(MuxRecord::Broadcast { payload })) => {
+                match &fold {
+                    Some(ctx) => ctx.fan_out(&payload, &mut rank_writes),
+                    None => {
+                        // Broadcast is a data-channel record; on the
+                        // control channel it means a desynced peer.
+                        eprintln!(
+                            "relay: Broadcast record on the control channel; \
+                             dropping (desynced controller?)"
+                        );
+                    }
+                }
+            }
+            Ok(MuxRead::Record(MuxRecord::Control(
+                RelayControlMsg::DeclareDead { rank },
+            ))) => {
+                if let Some(ctx) = &fold {
+                    // Controller-side death (heartbeat staleness, a
+                    // broken host elsewhere): drop the rank from the
+                    // fold barrier so it cannot park the host's fold.
+                    // May complete the round — the fold ships from
+                    // this thread via `tx`.
+                    if let Err(e) = ctx.mark_dead(rank, &tx) {
+                        eprintln!("relay fold: DeclareDead({rank}): {e}");
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
             Ok(MuxRead::Record(MuxRecord::Control(_))) => {
-                // No downstream relay-control signals defined in v1 beyond
-                // the HelloAck already consumed during startup. Ignore.
+                // Hello/HelloAck only occur at startup; ignore mid-stream.
+            }
+            Ok(MuxRead::Record(MuxRecord::HostFrame { .. })) => {
+                // Up-leg record; a controller never sends one. Drop with
+                // a diagnostic.
+                eprintln!("relay: unexpected HostFrame from controller; dropping");
             }
             Ok(MuxRead::WouldBlock) => {
                 // idle tick

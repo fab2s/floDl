@@ -1120,6 +1120,16 @@ fn relay_reader_loop(
             Ok(MuxRead::Record(MuxRecord::Control(_))) => {
                 // Hello/HelloAck occur only at startup; ignore mid-stream.
             }
+            Ok(MuxRead::Record(
+                MuxRecord::HostFrame { .. } | MuxRecord::Broadcast { .. },
+            )) => {
+                // Data-channel fold records; they never ride the control
+                // channel. Drop with a diagnostic.
+                eprintln!(
+                    "cluster_coordinator: relay reader: fold record on the \
+                     control channel; dropping"
+                );
+            }
             Ok(MuxRead::WouldBlock) => continue,
             Ok(MuxRead::Eof) => return, // relay connection closed
             Err(e) => {

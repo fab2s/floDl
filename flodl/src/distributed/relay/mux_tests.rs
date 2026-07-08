@@ -65,13 +65,44 @@ fn control_hello_round_trips() {
 
 #[test]
 fn control_rank_exit_and_ack_round_trip() {
-    for msg in [RelayControlMsg::RankExit { rank: 2 }, RelayControlMsg::HelloAck] {
+    for msg in [
+        RelayControlMsg::RankExit { rank: 2 },
+        RelayControlMsg::HelloAck,
+        RelayControlMsg::DeclareDead { rank: 4 },
+    ] {
         let rec = MuxRecord::control(msg.clone());
         let buf = write_one(&rec, &SALT_B);
         let mut cursor = &buf[..];
         let got = MuxRecord::read_from(&mut cursor, &SALT_B).unwrap().unwrap();
         assert_eq!(got, MuxRecord::Control(msg));
     }
+}
+
+#[test]
+fn host_frame_and_broadcast_round_trip() {
+    for rec in [
+        MuxRecord::host_frame(vec![0xF0, 0x1D]),
+        MuxRecord::broadcast(vec![0xCA, 0x5F]),
+        MuxRecord::host_frame(Vec::new()),
+        MuxRecord::broadcast(Vec::new()),
+    ] {
+        let buf = write_one(&rec, &SALT_A);
+        let mut cursor = &buf[..];
+        let got = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap().unwrap();
+        assert_eq!(got, rec);
+        assert!(cursor.is_empty(), "trailing bytes after record");
+    }
+}
+
+#[test]
+fn host_frame_tampered_payload_fails_hmac() {
+    let rec = MuxRecord::host_frame(vec![1, 2, 3, 4]);
+    let mut buf = write_one(&rec, &SALT_A);
+    let last = buf.len() - 1;
+    buf[last] ^= 0xFF;
+    let mut cursor = &buf[..];
+    let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
+    assert!(err.to_string().contains("HMAC verification failed"), "got: {err}");
 }
 
 #[test]

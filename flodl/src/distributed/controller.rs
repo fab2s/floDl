@@ -342,13 +342,14 @@ fn run_reduce_thread(
         .set_nonblocking(true)
         .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
 
-    let slots = Arc::new(ReduceSlots::new(world_size));
+    let slots = Arc::new(ReduceSlots::new());
     // Sole-writer half per relay connection (the reduce loop writes
     // replies); the matching read half is owned by a per-connection
     // reader thread. `rank_conn[rank]` indexes the connection carrying
-    // that rank.
+    // that rank; `conn_ranks[conn]` is the inverse map.
     let mut conn_writes: Vec<TcpStream> = Vec::new();
     let mut rank_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
+    let mut all_conn_ranks: Vec<Vec<usize>> = Vec::new();
     let mut reader_threads: Vec<JoinHandle<()>> = Vec::new();
     let mut covered = 0usize;
 
@@ -422,6 +423,9 @@ fn run_reduce_thread(
                     })?;
                 conn_writes.push(stream);
                 covered += conn_ranks.len();
+                let registered = slots.register_conn(conn_ranks.clone());
+                debug_assert_eq!(registered, conn_idx);
+                all_conn_ranks.push(conn_ranks.clone());
 
                 let slots_c = Arc::clone(&slots);
                 let dead_c = Arc::clone(&dead_ranks);
@@ -429,7 +433,10 @@ fn run_reduce_thread(
                 let t = thread::Builder::new()
                     .name(format!("flodl-controller-relay{conn_idx}"))
                     .spawn(move || {
-                        reduce_reader(read_half, conn_ranks, slots_c, dead_c, shutdown_c, salt)
+                        reduce_reader(
+                            read_half, conn_idx, conn_ranks, slots_c, dead_c, shutdown_c,
+                            salt,
+                        )
                     })
                     .map_err(|e| {
                         TensorError::new(&format!("cluster_controller: spawn reader: {e}"))
@@ -448,23 +455,44 @@ fn run_reduce_thread(
     }
     let _ = listener.set_nonblocking(false);
 
-    // Phase 2: reduce loop. Wait until every alive rank has deposited this
-    // round's frame, average (skipping dead ranks, dividing by the alive
-    // count), and scatter the averaged frame back tagged per rank down its
-    // owning relay connection. The reduce loop is the SOLE writer of every
-    // relay connection. Terminates when an alive rank's data connection
-    // closes (clean training-end exit), every rank is dead, or shutdown is
-    // signalled.
+    // Phase 2: reduce loop. Wait until every expected host connection has
+    // deposited its folded frame, reduce (dividing once by the accepted
+    // mass), and scatter ONE consensus Broadcast down each surviving
+    // connection — the relay fans it out to its local ranks. The reduce
+    // loop is the SOLE writer of every relay connection. Terminates when
+    // an alive rank's data connection closes (clean training-end exit),
+    // every rank is dead, or shutdown is signalled.
+    //
+    // Dead-diff forwarding: deaths declared cluster-side (coordinator
+    // heartbeat staleness, scatter failure on another host) must reach
+    // the owning relay's fold barrier, or a wedged-but-connected local
+    // rank parks that host's fold forever. Forwarded from the wait's
+    // poll hook — the only moment the reduce loop is otherwise idle and
+    // still the sole writer of the connections.
+    let mut forwarded_dead: Vec<bool> = vec![false; world_size];
     let outcome = loop {
         if shutdown.load(Ordering::SeqCst) {
             break Ok(());
         }
-        match slots.wait_for_round(&dead_ranks, &shutdown, REDUCE_POLL) {
+        let round = {
+            let conn_writes = &mut conn_writes;
+            let forwarded_dead = &mut forwarded_dead;
+            slots.wait_for_round(&dead_ranks, &shutdown, REDUCE_POLL, || {
+                forward_dead_diffs(
+                    &dead_ranks,
+                    forwarded_dead,
+                    &rank_conn,
+                    conn_writes,
+                    &salt,
+                );
+            })
+        };
+        match round {
             RoundOutcome::Frames(frames) => {
                 if let Err(e) = average_and_scatter(
                     &frames,
                     &mut conn_writes,
-                    &rank_conn,
+                    &all_conn_ranks,
                     &dead_ranks,
                     &salt,
                     forge.as_deref(),
@@ -492,16 +520,26 @@ fn run_reduce_thread(
 // ---------------------------------------------------------------------------
 
 /// Shared per-round frame collection, fed by the per-connection reader
-/// threads and drained by the reduce loop. One slot per rank.
+/// threads and drained by the reduce loop. One slot per CONNECTION
+/// (host relay): each relay folds its local ranks' contributions into a
+/// single [`MuxRecord::HostFrame`] per round, so the controller
+/// accounts per host, not per rank.
+///
+/// [`MuxRecord::HostFrame`]: crate::distributed::relay::mux::MuxRecord::HostFrame
 struct ReduceSlots {
     inner: Mutex<SlotsInner>,
     cv: Condvar,
 }
 
 struct SlotsInner {
-    /// This round's frame per rank (`None` until the rank's reader
-    /// deposits it; taken by the reduce loop once all alive ranks present).
+    /// This round's folded frame per connection (`None` until the
+    /// connection's reader deposits it; taken by the reduce loop once
+    /// every expected connection is present).
     frames: Vec<Option<RoundFrame>>,
+    /// Global ranks carried by each connection (from its `RelayHello`).
+    /// A connection is EXPECTED in a round while any of its ranks is
+    /// alive.
+    conn_ranks: Vec<Vec<usize>>,
     /// A reader observed an alive rank's data connection close (clean
     /// training-end exit, or a relay/host drop) — the reduce loop should
     /// terminate cleanly. Mirrors the pre-relay "alive-rank EOF → clean
@@ -514,7 +552,8 @@ struct SlotsInner {
 
 /// Outcome of one [`ReduceSlots::wait_for_round`] call.
 enum RoundOutcome {
-    /// Every alive rank's frame for this round (dead ranks are `None`).
+    /// Every expected connection's folded frame for this round
+    /// (connections whose ranks are all dead are `None`).
     Frames(Vec<Option<RoundFrame>>),
     /// Clean shutdown requested (alive-rank exit, all ranks dead, or the
     /// external shutdown flag).
@@ -524,10 +563,11 @@ enum RoundOutcome {
 }
 
 impl ReduceSlots {
-    fn new(world_size: usize) -> Self {
+    fn new() -> Self {
         ReduceSlots {
             inner: Mutex::new(SlotsInner {
-                frames: (0..world_size).map(|_| None).collect(),
+                frames: Vec::new(),
+                conn_ranks: Vec::new(),
                 shutdown: false,
                 error: None,
             }),
@@ -535,11 +575,21 @@ impl ReduceSlots {
         }
     }
 
-    /// A reader deposits `rank`'s frame for the current round.
-    fn deposit(&self, rank: usize, frame: RoundFrame) {
+    /// Register a relay connection carrying `ranks`; returns its slot
+    /// index. Called from the accept phase as relays hello in.
+    fn register_conn(&self, ranks: Vec<usize>) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        if rank < inner.frames.len() {
-            inner.frames[rank] = Some(frame);
+        inner.frames.push(None);
+        inner.conn_ranks.push(ranks);
+        inner.frames.len() - 1
+    }
+
+    /// A reader deposits its connection's folded frame for the current
+    /// round.
+    fn deposit(&self, conn: usize, frame: RoundFrame) {
+        let mut inner = self.inner.lock().unwrap();
+        if conn < inner.frames.len() {
+            inner.frames[conn] = Some(frame);
         }
         self.cv.notify_all();
     }
@@ -560,14 +610,22 @@ impl ReduceSlots {
         self.cv.notify_all();
     }
 
-    /// Block until every alive rank has deposited a frame, then take them
-    /// (leaving dead ranks `None`). Re-evaluates dead ranks every `poll`
-    /// so a coord-declared death (which carries no notify) is observed.
+    /// Block until every expected connection (one with ≥1 alive rank)
+    /// has deposited its folded frame, then take them (leaving
+    /// fully-dead connections `None`). Re-evaluates dead ranks every
+    /// `poll` so a coord-declared death (which carries no notify) is
+    /// observed. `on_poll` runs on every wake (deposit, shutdown, or
+    /// poll tick) OUTSIDE the slots lock — the reduce loop uses it to
+    /// forward newly-observed deaths to the owning relays, which must
+    /// happen while this wait is parked (a relay whose local rank was
+    /// declared dead cluster-side would otherwise hold its fold — and
+    /// this wait — forever).
     fn wait_for_round(
         &self,
         dead: &DeadRanks,
         external_shutdown: &AtomicBool,
         poll: Duration,
+        mut on_poll: impl FnMut(),
     ) -> RoundOutcome {
         let mut inner = self.inner.lock().unwrap();
         loop {
@@ -577,35 +635,45 @@ impl ReduceSlots {
             if let Some(e) = inner.error.take() {
                 return RoundOutcome::Error(e);
             }
-            let ws = inner.frames.len();
-            let alive: Vec<usize> = (0..ws).filter(|r| !dead.is_dead(*r)).collect();
-            if alive.is_empty() {
+            let n_conns = inner.frames.len();
+            let expected: Vec<usize> = (0..n_conns)
+                .filter(|c| inner.conn_ranks[*c].iter().any(|r| !dead.is_dead(*r)))
+                .collect();
+            if expected.is_empty() {
                 // Every rank dead/done → nothing left to reduce.
                 return RoundOutcome::Shutdown;
             }
-            if alive.iter().all(|r| inner.frames[*r].is_some()) {
-                let mut out: Vec<Option<RoundFrame>> = Vec::with_capacity(ws);
-                for r in 0..ws {
-                    if dead.is_dead(r) {
-                        inner.frames[r] = None;
-                        out.push(None);
+            if expected.iter().all(|c| inner.frames[*c].is_some()) {
+                let mut out: Vec<Option<RoundFrame>> = Vec::with_capacity(n_conns);
+                for c in 0..n_conns {
+                    if expected.contains(&c) {
+                        out.push(inner.frames[c].take());
                     } else {
-                        out.push(inner.frames[r].take());
+                        // Stale frame from a connection whose ranks all
+                        // died — clear it so it can't leak into a later
+                        // round.
+                        inner.frames[c] = None;
+                        out.push(None);
                     }
                 }
                 return RoundOutcome::Frames(out);
             }
+            drop(inner);
+            on_poll();
+            inner = self.inner.lock().unwrap();
             let (guard, _timeout) = self.cv.wait_timeout(inner, poll).unwrap();
             inner = guard;
         }
     }
 }
 
-/// Per-connection reader: demux `Data{rank}` records into the reduce
-/// slots, surface `RankExit` / EOF as clean shutdown for still-alive
-/// ranks, and parse the opaque RoundFrame payload from memory.
+/// Per-connection reader: deposit the relay's folded `HostFrame` into
+/// this connection's reduce slot, surface `RankExit` / EOF as clean
+/// shutdown for still-alive ranks, and parse the RoundFrame payload
+/// from memory.
 fn reduce_reader(
     mut read: TcpStream,
+    conn_idx: usize,
     ranks: Vec<usize>,
     slots: Arc<ReduceSlots>,
     dead_ranks: Arc<DeadRanks>,
@@ -617,17 +685,17 @@ fn reduce_reader(
             return;
         }
         match MuxRecord::try_read_from(&mut read, &salt) {
-            Ok(MuxRead::Record(MuxRecord::Data { rank, payload })) => {
-                let r = rank as usize;
-                if dead_ranks.is_dead(r) {
-                    continue; // late frame from a dead rank — drop
+            Ok(MuxRead::Record(MuxRecord::HostFrame { payload })) => {
+                if ranks.iter().all(|r| dead_ranks.is_dead(*r)) {
+                    continue; // late frame from a fully-dead host — drop
                 }
                 let mut slice = &payload[..];
                 match read_round_frame(&mut slice, &salt) {
-                    Ok(Some(frame)) => slots.deposit(r, frame),
+                    Ok(Some(frame)) => slots.deposit(conn_idx, frame),
                     Ok(None) => {
                         slots.set_error(TensorError::new(&format!(
-                            "cluster_controller: truncated RoundFrame payload for rank {r}"
+                            "cluster_controller: truncated HostFrame payload on \
+                             connection {conn_idx} (ranks {ranks:?})"
                         )));
                         return;
                     }
@@ -636,6 +704,17 @@ fn reduce_reader(
                         return;
                     }
                 }
+            }
+            Ok(MuxRead::Record(MuxRecord::Data { rank, .. })) => {
+                // Per-rank data records no longer exist on the data
+                // channel — the relay folds. Receiving one means a
+                // stale relay build is talking to this controller.
+                slots.set_error(TensorError::new(&format!(
+                    "cluster_controller: per-rank Data record (rank {rank}) on the \
+                     data channel; the relay is expected to fold local frames into \
+                     a HostFrame — mixed relay/controller builds?"
+                )));
+                return;
             }
             Ok(MuxRead::Record(MuxRecord::Control(RelayControlMsg::RankExit { rank }))) => {
                 // Alive rank's data connection closed: clean training-end
@@ -648,6 +727,13 @@ fn reduce_reader(
             }
             Ok(MuxRead::Record(MuxRecord::Control(_))) => {
                 // Hello/HelloAck only occur at startup; ignore mid-stream.
+            }
+            Ok(MuxRead::Record(MuxRecord::Broadcast { .. })) => {
+                // Down-leg record; a relay never sends one upstream.
+                eprintln!(
+                    "cluster_controller: unexpected Broadcast record from relay \
+                     {conn_idx}; dropping"
+                );
             }
             Ok(MuxRead::WouldBlock) => {}
             Ok(MuxRead::Eof) => {
@@ -668,13 +754,47 @@ fn reduce_reader(
     }
 }
 
-/// Average this round's alive-rank frames and scatter the result back,
-/// tagged per rank, down each rank's owning relay connection. The reduce
-/// loop is the sole writer of every connection.
+/// Forward newly-observed rank deaths to their owning relay connection
+/// as [`RelayControlMsg::DeclareDead`] so the relay drops the rank from
+/// its fold barrier. Best-effort per connection: a failed write means
+/// the connection itself is dying (elastic scatter / EOF handling own
+/// that); `forwarded` keeps each death forwarded exactly once.
+fn forward_dead_diffs(
+    dead_ranks: &DeadRanks,
+    forwarded: &mut [bool],
+    rank_conn: &[Option<usize>],
+    conn_writes: &mut [TcpStream],
+    salt: &SessionSalt,
+) {
+    for (rank, fwd) in forwarded.iter_mut().enumerate() {
+        if *fwd || !dead_ranks.is_dead(rank) {
+            continue;
+        }
+        *fwd = true;
+        let Some(ci) = rank_conn.get(rank).copied().flatten() else {
+            continue;
+        };
+        if let Err(e) = MuxRecord::control(RelayControlMsg::DeclareDead {
+            rank: rank as u32,
+        })
+        .write_to(&mut conn_writes[ci], salt)
+        {
+            crate::verbose!(
+                "  cluster_controller: DeclareDead({rank}) forward to relay \
+                 {ci} failed ({e}); connection presumed dying",
+            );
+        }
+    }
+}
+
+/// Reduce this round's folded host frames and scatter ONE consensus
+/// `Broadcast` down each surviving connection — the relay fans it out
+/// to its local alive ranks. The reduce loop is the sole writer of
+/// every connection.
 fn average_and_scatter(
     frames: &[Option<RoundFrame>],
     conn_writes: &mut [TcpStream],
-    rank_conn: &[Option<usize>],
+    conn_ranks: &[Vec<usize>],
     dead_ranks: &DeadRanks,
     salt: &SessionSalt,
     forge: Option<&crate::distributed::CheckpointForge>,
@@ -709,37 +829,32 @@ fn average_and_scatter(
         None => averaged,
     };
     // The consensus frame is identical for every rank; serialize once and
-    // forward the same bytes tagged per rank.
+    // forward the same bytes once per surviving connection.
     let mut buf: Vec<u8> = Vec::new();
     write_round_frame(&mut buf, &averaged, salt)?;
     // ELASTIC SCATTER: a write failure (including a zero-progress stall
     // tripping the socket's write timeout) marks that CONNECTION broken
     // and declares its ranks dead, and the scatter continues to the
     // surviving connections — one wedged host degrades membership
-    // instead of killing the run. `wait_for_round` recomputes the alive
-    // set every poll, and the realized-work reduce is exact over
-    // whatever cohort remains; if every connection breaks, the next
-    // round-wait sees an empty alive set and shuts down.
-    let mut conn_broken: Vec<bool> = vec![false; conn_writes.len()];
-    for (rank, conn) in rank_conn.iter().enumerate() {
-        if dead_ranks.is_dead(rank) {
-            continue;
-        }
-        let Some(ci) = conn else {
-            continue;
-        };
-        if conn_broken[*ci] {
-            dead_ranks.declare_dead(rank);
-            continue;
+    // instead of killing the run. `wait_for_round` recomputes the
+    // expected set every poll, and the realized-work reduce is exact
+    // over whatever cohort remains; if every connection breaks, the
+    // next round-wait sees an empty expected set and shuts down.
+    for (ci, ranks) in conn_ranks.iter().enumerate() {
+        if ranks.iter().all(|r| dead_ranks.is_dead(*r)) {
+            continue; // fully-dead host — no one to deliver to
         }
         if let Err(e) =
-            MuxRecord::data(rank as u32, buf.clone()).write_to(&mut conn_writes[*ci], salt)
+            MuxRecord::broadcast(buf.clone()).write_to(&mut conn_writes[ci], salt)
         {
             eprintln!(
-                "cluster_controller: scatter to rank {rank} failed ({e}); declaring                  its connection's ranks dead and continuing with survivors"
+                "cluster_controller: consensus broadcast to relay {ci} \
+                 (ranks {ranks:?}) failed ({e}); declaring its ranks dead and \
+                 continuing with survivors"
             );
-            conn_broken[*ci] = true;
-            dead_ranks.declare_dead(rank);
+            for r in ranks {
+                dead_ranks.declare_dead(*r);
+            }
         }
     }
     // FORGE TAP: scatter ranks first (they resume training ASAP), then — if the
@@ -1155,24 +1270,40 @@ pub(crate) fn write_round_frame<W: Write>(
 /// v1 supports only [`DTYPE_F32`]; loud error on other dtypes (so a
 /// future user wiring f16 here gets a clear pointer at where to add
 /// support, instead of silent garbage from byte-level summation).
-fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
-    let accepted: Vec<&RoundFrame> = frames.iter().filter_map(|f| f.as_ref()).collect();
-    if accepted.is_empty() {
+/// Element-wise sum of `frames`, masses summed, kind preserved — the
+/// associative fold monoid shared by the per-host relay fold
+/// ([`crate::distributed::relay`]) and the controller's final reduce.
+///
+/// NEVER divides. The divide-once-by-mass normalization belongs to the
+/// controller alone ([`reduce_realized_work`]); a fold layer that also
+/// divided would reintroduce averaging-of-averages. Associativity is
+/// what makes the recursion sound: summing host folds equals summing
+/// all rank frames in exact arithmetic (f32 addition order differs, so
+/// results are tolerance-identical, not byte-identical).
+///
+/// Loud error on any schema disagreement between frames — tensor count,
+/// dtype, shape, byte length, or [`RoundKind`]: every participant of a
+/// round sends the same kind by protocol, so a mismatch means desynced
+/// rounds, not a tolerable variation.
+pub(crate) fn sum_frames(frames: &[&RoundFrame]) -> Result<RoundFrame> {
+    let Some(ref_frame) = frames.first() else {
         return Err(TensorError::new(
-            "cluster_controller: reduce_realized_work called with no accepted frames \
-             (all participants dead — caller should not have reached this point)",
+            "cluster_controller: sum_frames called with no frames",
         ));
-    }
-    let w_sum: f64 = accepted.iter().map(|f| f.weight).sum();
-    let ref_frame = accepted[0];
-    // Adapter so the existing schema-validation + reduce code below
-    // can keep using its original variable names.
-    let frames: &[&RoundFrame] = &accepted;
+    };
+    let w_sum: f64 = frames.iter().map(|f| f.weight).sum();
     // Schema validation.
     for (i, f) in frames.iter().enumerate().skip(1) {
+        if f.kind != ref_frame.kind {
+            return Err(TensorError::new(&format!(
+                "cluster_controller: frame {i} kind {:?} != frame 0 kind {:?} \
+                 (desynced reduce rounds)",
+                f.kind, ref_frame.kind
+            )));
+        }
         if f.tensors.len() != ref_frame.tensors.len() {
             return Err(TensorError::new(&format!(
-                "cluster_controller: rank {i} sent {} tensors; rank 0 sent {}",
+                "cluster_controller: frame {i} carries {} tensors; frame 0 carries {}",
                 f.tensors.len(),
                 ref_frame.tensors.len()
             )));
@@ -1180,19 +1311,19 @@ fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
         for (ti, (a, b)) in ref_frame.tensors.iter().zip(f.tensors.iter()).enumerate() {
             if a.dtype != b.dtype {
                 return Err(TensorError::new(&format!(
-                    "cluster_controller: rank {i} tensor[{ti}] dtype {} != rank 0 dtype {}",
+                    "cluster_controller: frame {i} tensor[{ti}] dtype {} != frame 0 dtype {}",
                     b.dtype, a.dtype
                 )));
             }
             if a.shape != b.shape {
                 return Err(TensorError::new(&format!(
-                    "cluster_controller: rank {i} tensor[{ti}] shape {:?} != rank 0 shape {:?}",
+                    "cluster_controller: frame {i} tensor[{ti}] shape {:?} != frame 0 shape {:?}",
                     b.shape, a.shape
                 )));
             }
             if a.bytes.len() != b.bytes.len() {
                 return Err(TensorError::new(&format!(
-                    "cluster_controller: rank {i} tensor[{ti}] nbytes {} != rank 0 nbytes {}",
+                    "cluster_controller: frame {i} tensor[{ti}] nbytes {} != frame 0 nbytes {}",
                     b.bytes.len(),
                     a.bytes.len()
                 )));
@@ -1200,14 +1331,14 @@ fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
         }
     }
 
-    // Reduce per tensor.
+    // Sum per tensor.
     let mut out_tensors = Vec::with_capacity(ref_frame.tensors.len());
     for ti in 0..ref_frame.tensors.len() {
         let dtype = ref_frame.tensors[ti].dtype;
         if dtype != DTYPE_F32 {
             return Err(TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] dtype {dtype} not supported in v1 \
-                 (only DTYPE_F32 = 0 supported). Add other dtypes in controller.rs::reduce_average."
+                 (only DTYPE_F32 = 0 supported). Add other dtypes in controller.rs::sum_frames."
             )));
         }
         let shape = ref_frame.tensors[ti].shape.clone();
@@ -1226,17 +1357,6 @@ fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
                 *a += *x;
             }
         }
-        // Model frames normalize by the accepted realized-work mass;
-        // Control frames (gathers / broadcasts) stay a pure sum. A
-        // zero-mass Model round leaves the (zero) sum untouched — the
-        // `weight = 0.0` on the output tells receivers to keep their
-        // local state.
-        if matches!(ref_frame.kind, RoundKind::Model) && w_sum > 0.0 {
-            let inv = (1.0 / w_sum) as f32;
-            for a in &mut accum {
-                *a *= inv;
-            }
-        }
         out_tensors.push(TensorPayload {
             dtype: DTYPE_F32,
             shape,
@@ -1245,13 +1365,40 @@ fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
     }
     Ok(RoundFrame {
         tensors: out_tensors,
-        // The consensus frame carries the same kind as its inputs (all
-        // accepted ranks send the same kind in a round); preserve it so
-        // the forge tap and any downstream relay see model vs
-        // bookkeeping correctly.
+        // The summed frame carries the same kind as its inputs so the
+        // forge tap and the fold layers see model vs bookkeeping
+        // correctly.
         kind: ref_frame.kind,
         weight: w_sum,
     })
+}
+
+fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
+    let accepted: Vec<&RoundFrame> = frames.iter().filter_map(|f| f.as_ref()).collect();
+    if accepted.is_empty() {
+        return Err(TensorError::new(
+            "cluster_controller: reduce_realized_work called with no accepted frames \
+             (all participants dead — caller should not have reached this point)",
+        ));
+    }
+    let mut summed = sum_frames(&accepted)?;
+    // Model frames normalize by the accepted realized-work mass —
+    // exactly ONCE, here, regardless of how many fold layers summed
+    // below us. Control frames (gathers / broadcasts) stay a pure sum.
+    // A zero-mass Model round leaves the (zero) sum untouched — the
+    // `weight = 0.0` on the output tells receivers to keep their local
+    // state.
+    if matches!(summed.kind, RoundKind::Model) && summed.weight > 0.0 {
+        let inv = (1.0 / summed.weight) as f32;
+        for payload in &mut summed.tensors {
+            let mut vals = bytes_as_f32(&payload.bytes)?;
+            for v in &mut vals {
+                *v *= inv;
+            }
+            payload.bytes = f32_to_bytes(&vals);
+        }
+    }
+    Ok(summed)
 }
 
 fn bytes_as_f32(bytes: &[u8]) -> Result<Vec<f32>> {

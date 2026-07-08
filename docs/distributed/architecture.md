@@ -86,8 +86,13 @@ flowchart TB
 ```
 
 Local ranks (same host as the controller) talk over in-process channels;
-remote ranks talk loopback to their host's relay, which carries every local
-rank's frames over one connection as `MuxRecord` blobs tagged by rank.
+remote ranks talk loopback to their host's relay, which carries the host's
+traffic over one connection as `MuxRecord`s. On the control channel each
+rank's frames cross untouched, tagged by rank; on the data channel the relay
+is the first fold tier of the reduce — it sums its local ranks'
+contributions (masses included) into one `HostFrame` per round and fans the
+controller's single `Broadcast` consensus back out, so K local ranks cost 1×
+the model bytes on the host uplink per direction instead of K×.
 
 > Source: `launcher/mod.rs` (`Role`, `dispatch()`), `relay/agent.rs`
 > (`ChannelKind`), `relay/mux.rs` (`MuxRecord`, `RelayControlMsg`).
@@ -356,8 +361,10 @@ the wire `Update` directly.
 
 The wire types are otherwise 1:1 mirrors of the in-process types with tensor
 handles removed; the relay's `MuxRecord` wraps these into one connection per
-host, and `RelayControlMsg` (Hello / HelloAck / RankExit) manages the
-relay-to-controller leg.
+host (`Data` per-rank on the control channel; folded `HostFrame` up /
+`Broadcast` consensus down on the data channel), and `RelayControlMsg`
+(Hello / HelloAck / RankExit / DeclareDead) manages the relay-to-controller
+leg.
 
 > Source: `ddp_run/mod.rs` (`ControlMsg`, `TimingMsg`, `MetricsMsg`),
 > `controller.rs` (`RoundFrame`), `relay/mux.rs` (`MuxRecord`,
