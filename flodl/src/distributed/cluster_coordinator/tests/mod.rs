@@ -64,13 +64,18 @@ where
     })
 }
 
-/// Single-rank relay handshake toward the coordinator: send `Hello` for
-/// `[rank_id]`, expect `HelloAck`.
+/// Single-rank relay handshake toward the coordinator: send the
+/// channel-select magic and a `Hello` for `[rank_id]`, expect
+/// `HelloAck`.
 pub(super) fn relay_hello(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     rank_id: u32,
 ) -> Result<()> {
+    crate::distributed::wire::write_channel_magic(
+        stream,
+        crate::distributed::wire::CHANNEL_MAGIC_CONTROL,
+    )?;
     MuxRecord::control(RelayControlMsg::Hello {
         host: format!("test-r{rank_id}"),
         ranks: vec![rank_id],
@@ -369,8 +374,14 @@ fn handshake_rejects_wrong_salt_full_path() {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         )
         .unwrap();
-        // Wrong-salt relay Hello → the coord's mux-record HMAC fails
-        // server-side during the accept handshake.
+        // Correct channel magic (routing is pre-auth), then a wrong-salt
+        // relay Hello → the coord's mux-record HMAC fails server-side
+        // during the accept handshake.
+        crate::distributed::wire::write_channel_magic(
+            &mut s,
+            crate::distributed::wire::CHANNEL_MAGIC_CONTROL,
+        )
+        .unwrap();
         let _ = MuxRecord::control(RelayControlMsg::Hello {
             host: "rogue".into(),
             ranks: vec![0],

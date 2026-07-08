@@ -30,7 +30,11 @@
             .map_err(|e| TensorError::new(&format!("fake_relay: connect: {e}")))?;
         stream.set_nodelay(true).ok();
 
-        // Relay handshake.
+        // Channel-select magic, then the relay handshake.
+        crate::distributed::wire::write_channel_magic(
+            &mut stream,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+        )?;
         MuxRecord::control(RelayControlMsg::Hello {
             host: "test-host".into(),
             ranks: ranks.clone(),
@@ -213,6 +217,11 @@
 
         let mut s =
             TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        crate::distributed::wire::write_channel_magic(
+            &mut s,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+        )
+        .unwrap();
         MuxRecord::data(0, vec![1, 2, 3])
             .write_to(&mut s, &TEST_SALT)
             .unwrap();
@@ -239,6 +248,11 @@
 
         let mut s =
             TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        crate::distributed::wire::write_channel_magic(
+            &mut s,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+        )
+        .unwrap();
         MuxRecord::control(RelayControlMsg::Hello {
             host: "rogue".into(),
             ranks: vec![5], // >= world_size (1)
@@ -448,7 +462,12 @@
 
         let mut stream =
             TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
-        // Valid relay handshake (correct salt).
+        // Valid channel magic + relay handshake (correct salt).
+        crate::distributed::wire::write_channel_magic(
+            &mut stream,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+        )
+        .unwrap();
         MuxRecord::control(RelayControlMsg::Hello {
             host: "test".into(),
             ranks: vec![0],
@@ -644,6 +663,11 @@
 
         let mut stream =
             TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
+        crate::distributed::wire::write_channel_magic(
+            &mut stream,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+        )
+        .unwrap();
         MuxRecord::control(RelayControlMsg::Hello {
             host: "stale".into(),
             ranks: vec![0],

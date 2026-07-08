@@ -89,6 +89,63 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 /// breaking change to [`ControlFrame`] or to the wire-message types.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
+// ---------------------------------------------------------------------------
+// Channel-select magics (single-port mux)
+// ---------------------------------------------------------------------------
+//
+// Every cross-host dial toward the controller opens with one of these
+// 4-byte LE magics, making the connection self-describing: the
+// controller's single-port dispatcher
+// ([`PortMux`](crate::distributed::port_mux::PortMux)) peeks the magic
+// to route the connection, and the owning subsystem then consumes and
+// validates it as the first read on the accepted stream. The magic is
+// deliberately UNAUTHENTICATED (it precedes any HMAC'd frame): routing
+// is not security-sensitive — a spoofed magic only lands the connection
+// at a subsystem whose frame authentication rejects it, exactly as a
+// wrong port number did when each channel had its own listener.
+//
+// Rank↔relay loopback channels keep their dedicated per-host ports and
+// do NOT carry a channel magic — they never leave the host.
+
+/// NCCL bootstrap rendezvous (rank → controller).
+pub(crate) const CHANNEL_MAGIC_RENDEZVOUS: u32 = 0xF10D_17E0;
+
+/// CPU-reduce data channel (relay → controller).
+pub(crate) const CHANNEL_MAGIC_DATA: u32 = 0xF10D_17E1;
+
+/// Coordinator control channel (relay → controller).
+pub(crate) const CHANNEL_MAGIC_CONTROL: u32 = 0xF10D_17E2;
+
+/// Write the channel-select magic. First bytes on every cross-host
+/// dial, immediately after `connect`.
+pub(crate) fn write_channel_magic<W: Write>(w: &mut W, magic: u32) -> Result<()> {
+    w.write_all(&magic.to_le_bytes()).map_err(|e| {
+        TensorError::new(&format!("wire: writing channel magic failed: {e}"))
+    })
+}
+
+/// Consume the 4-byte channel-select magic from an accepted stream and
+/// require it to be `expected`. `what` names the accepting subsystem
+/// for the error message.
+pub(crate) fn expect_channel_magic<R: Read>(
+    r: &mut R,
+    expected: u32,
+    what: &str,
+) -> Result<()> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf).map_err(|e| {
+        TensorError::new(&format!("{what}: reading channel magic failed: {e}"))
+    })?;
+    let got = u32::from_le_bytes(buf);
+    if got != expected {
+        return Err(TensorError::new(&format!(
+            "{what}: channel magic 0x{got:08x} != 0x{expected:08x} \
+             (connection routed to the wrong channel?)"
+        )));
+    }
+    Ok(())
+}
+
 /// Hard cap on a ControlFrame payload. Control frames carry bincode
 /// messages in the bytes-to-KB range (the largest is an NCCL UID or a
 /// scalars map); anything bigger is a corrupt or hostile length field.

@@ -87,16 +87,25 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// Which control protocol the relay terminates toward its local ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
-    /// CPU-averaging data channel (`controller_port + 2`,
-    /// [`crate::distributed::controller`]). Bare handshake.
+    /// CPU-averaging data channel
+    /// ([`crate::distributed::controller`]). Bare handshake.
     Data,
-    /// Coordinator control channel (`controller_port + 3`,
-    /// [`crate::distributed::cluster_coordinator`]). Salt-authenticated
+    /// Coordinator control channel
+    /// ([`crate::distributed::cluster_coordinator`]). Salt-authenticated
     /// handshake.
     Control,
 }
 
 impl ChannelKind {
+    /// Channel-select magic this channel's upstream dial opens with
+    /// (routes the connection through the controller's single-port mux).
+    fn channel_magic(self) -> u32 {
+        match self {
+            ChannelKind::Data => crate::distributed::wire::CHANNEL_MAGIC_DATA,
+            ChannelKind::Control => crate::distributed::wire::CHANNEL_MAGIC_CONTROL,
+        }
+    }
+
     /// Terminate one rank's handshake on `stream` exactly as the
     /// controller would, returning the announced `rank_id`. The
     /// handshake is a fixed-size exchange (no length framing); the
@@ -210,6 +219,13 @@ impl RelayChannel {
         // parked writer holding the host hostage.
         let _ = upstream
             .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
+        // Channel-select magic first: the controller's single-port mux
+        // routes on it, and the owning subsystem validates it before the
+        // Hello.
+        crate::distributed::wire::write_channel_magic(
+            &mut upstream,
+            kind.channel_magic(),
+        )?;
         MuxRecord::control(RelayControlMsg::Hello {
             host,
             ranks: ranks.clone(),

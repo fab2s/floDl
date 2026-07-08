@@ -86,14 +86,16 @@
 #     resume paths must live here (see `save_path` / `resume_from`).
 #
 # `controller.port:` defaults to 1337 when omitted (replaces
-# PyTorch's MASTER_PORT default of 29500). Port `+1` is reserved for
-# the dashboard side-channel; `+2` / `+3` host ClusterController /
-# ClusterCoordinator. Pick a base port that leaves the `+3` slot free.
+# PyTorch's MASTER_PORT default of 29500). This single port carries
+# every cross-host channel (NCCL rendezvous, CPU-reduce data,
+# coordinator control) — connections route themselves with a
+# channel-select magic. Worker hosts derive `+4` / `+5` for their
+# host-local rank↔relay loopback channels; those never leave the host.
 
 cluster:
   controller:
-    host: 192.168.122.1               # rendezvous bind address (was `master_addr`)
-    port: 1337                        # rendezvous port (was `master_port`); default 1337
+    host: 192.168.122.1               # controller bind address (was `master_addr`)
+    port: 1337                        # controller port (was `master_port`); default 1337
     path: /opt/flodl                  # controller's view of the shared project root
     # docker: cuda                    # optional pre-flight build context
     # arch: precompiled/cu128         # optional libtorch variant for pre-flight

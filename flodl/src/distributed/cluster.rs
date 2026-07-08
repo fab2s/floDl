@@ -171,13 +171,15 @@ pub struct LocalCluster {
 /// Controller bind coordinates, shipped per rank inside the envelope.
 #[derive(Debug, Clone)]
 pub struct ControllerBlock {
-    /// Hostname or IP where the NCCL bootstrap rendezvous listens. Must
-    /// be reachable by every worker.
+    /// Hostname or IP where the controller's single accepting port
+    /// listens. Must be reachable by every worker.
     pub host: String,
 
-    /// TCP port for the rendezvous handshake. Port `port + 1` is
-    /// reserved for the future dashboard side-channel; `port + 2`/`+3`
-    /// are used by `ClusterController` / `ClusterCoordinator`.
+    /// The controller's single TCP port: NCCL rendezvous, CPU-reduce
+    /// data, and coordinator control all accept here, routed by each
+    /// connection's channel-select magic (see `port_mux`). Only the
+    /// host-local rank↔relay loopback channels use derived offsets
+    /// (`port + 4`/`+5`), which never leave the worker host.
     pub port: u16,
 }
 

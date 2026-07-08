@@ -88,9 +88,10 @@ pub struct CpuReduceClient {
 impl CpuReduceClient {
     /// Connect to the controller and complete the handshake.
     ///
-    /// `controller_addr` is typically `controller_addr:controller_port + 2` (the
-    /// CPU-averaging port reserved alongside `controller_port + 1` for the
-    /// future log side-channel). `rank_id` must be in `0..world_size`.
+    /// `controller_addr` is the host-local relay's data loopback
+    /// (`controller_port + 4` on `127.0.0.1`); the relay folds and
+    /// forwards to the controller's single mux port. `rank_id` must be
+    /// in `0..world_size`.
     ///
     /// `salt` is the 128-bit session salt the launcher generated and
     /// shipped via [`LocalCluster::salt`]; the controller side must use

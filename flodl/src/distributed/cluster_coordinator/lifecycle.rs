@@ -65,12 +65,6 @@ impl ClusterCoordinator {
         salt: SessionSalt,
         config: ClusterCoordinatorConfig,
     ) -> Result<Self> {
-        let world_size = config.world_size;
-        if world_size == 0 {
-            return Err(TensorError::new(
-                "cluster_coordinator: world_size must be > 0",
-            ));
-        }
         let bound_port = listener
             .local_addr()
             .map_err(|e| {
@@ -79,6 +73,31 @@ impl ClusterCoordinator {
                 ))
             })?
             .port();
+        let source = crate::distributed::port_mux::StreamSource::from_listener(
+            listener,
+            "cluster_coordinator",
+        )?;
+        Self::start_from_source(source, bound_port, salt, config)
+    }
+
+    /// Like [`Self::start_from_listener`] but accepting connections from
+    /// a pre-built [`StreamSource`] — the production entry, handed the
+    /// control leg of the launcher's single-port mux. `bound_port` is
+    /// carried for diagnostics ([`Self::bound_port`]).
+    ///
+    /// [`StreamSource`]: crate::distributed::port_mux::StreamSource
+    pub(crate) fn start_from_source(
+        source: crate::distributed::port_mux::StreamSource,
+        bound_port: u16,
+        salt: SessionSalt,
+        config: ClusterCoordinatorConfig,
+    ) -> Result<Self> {
+        let world_size = config.world_size;
+        if world_size == 0 {
+            return Err(TensorError::new(
+                "cluster_coordinator: world_size must be > 0",
+            ));
+        }
 
         // Accept per-host relay connections, each announcing the ranks it
         // carries via a `RelayHello`. Accept until every global rank is
@@ -91,22 +110,15 @@ impl ClusterCoordinator {
         let mut rank_to_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
         let mut conn_reads: Vec<TcpStream> = Vec::new();
         let mut covered = 0usize;
-        // With a launcher abort flag attached, poll accept instead of
-        // blocking: on a pre-rendezvous failure the relays never dial in,
-        // and the launcher must be able to stop this loop, join the coord
+        // Poll accept instead of blocking: on a pre-rendezvous failure the
+        // relays never dial in, and the launcher must be able to stop this
+        // loop (via `ClusterCoordinatorConfig::abort`), join the coord
         // thread, and surface the original error through
-        // `DdpHandle::join` (see `ClusterCoordinatorConfig::abort`).
-        if config.abort.is_some() {
-            listener.set_nonblocking(true).map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_coordinator: set_nonblocking failed: {e}"
-                ))
-            })?;
-        }
+        // `DdpHandle::join`.
         while covered < world_size {
-            let (mut stream, _peer) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            let mut stream = match source.try_accept("cluster_coordinator")? {
+                Some(s) => s,
+                None => {
                     if config
                         .abort
                         .as_ref()
@@ -120,16 +132,7 @@ impl ClusterCoordinator {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                Err(e) => {
-                    return Err(TensorError::new(&format!(
-                        "cluster_coordinator: accept failed: {e}"
-                    )));
-                }
             };
-            // Accepted socket may inherit the listener's non-blocking flag
-            // on some platforms; flip it back so the handshake read timeout
-            // below is honored (a non-blocking socket ignores SO_RCVTIMEO).
-            let _ = stream.set_nonblocking(false);
             let _ = stream.set_nodelay(true);
             // 10s handshake timeout protects against a wedged relay.
             stream
@@ -137,6 +140,12 @@ impl ClusterCoordinator {
                 .map_err(|e| {
                     TensorError::new(&format!("cluster_coordinator: set_read_timeout: {e}"))
                 })?;
+            // Channel-select magic, then the relay handshake.
+            crate::distributed::wire::expect_channel_magic(
+                &mut stream,
+                crate::distributed::wire::CHANNEL_MAGIC_CONTROL,
+                "cluster_coordinator",
+            )?;
             let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
                 Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
                     crate::verbose!(

@@ -273,7 +273,13 @@ fn spawn_fake_controller(
     thread::spawn(move || {
         let (mut up, _) = controller.accept().unwrap();
         up.set_nodelay(true).unwrap();
-        // Hello.
+        // Channel magic, then Hello.
+        crate::distributed::wire::expect_channel_magic(
+            &mut up,
+            crate::distributed::wire::CHANNEL_MAGIC_CONTROL,
+            "fake controller",
+        )
+        .unwrap();
         match MuxRecord::read_from(&mut up, &SALT).unwrap().unwrap() {
             MuxRecord::Control(RelayControlMsg::Hello { ranks, .. }) => {
                 hello_tx.send(ranks).unwrap();
@@ -311,6 +317,12 @@ fn relay_channel_data_channel_end_to_end() {
     let ctrl_thread = thread::spawn(move || {
         let (mut up, _) = controller.accept().unwrap();
         up.set_nodelay(true).unwrap();
+        crate::distributed::wire::expect_channel_magic(
+            &mut up,
+            crate::distributed::wire::CHANNEL_MAGIC_DATA,
+            "fake controller",
+        )
+        .unwrap();
         match MuxRecord::read_from(&mut up, &SALT).unwrap().unwrap() {
             MuxRecord::Control(RelayControlMsg::Hello { ranks, .. }) => {
                 hello_tx.send(ranks).unwrap();

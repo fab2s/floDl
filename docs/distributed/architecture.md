@@ -58,7 +58,7 @@ flowchart TB
     end
 
     subgraph coordhost["Controller host"]
-        C["cluster_coordinator<br/>(scheduler + averaging)<br/>control port +3 / data port +2"]
+        C["cluster_coordinator<br/>(scheduler + averaging)<br/>one mux port: rendezvous + data + control"]
     end
 
     subgraph host0["Host 0 (local)"]
@@ -109,8 +109,8 @@ collapses the post-reduce control round-trip.
 ```mermaid
 sequenceDiagram
     participant L as Launcher
-    participant C as Coordinator (control port +3)
-    participant D as CPU-avg star (data port +2)
+    participant C as Coordinator (control channel)
+    participant D as CPU-avg star (data channel)
     participant W as GpuWorker (rank)
 
     Note over L,W: Bootstrap (control channel, MsgKind::Rendezvous)
@@ -133,9 +133,9 @@ sequenceDiagram
 
     Note over C,W: Reduce (backend-dependent -- see view 4)
     alt AverageBackend::Cpu
-        C->>W: RequestParams (control port)
+        C->>W: RequestParams (control channel)
         W->>C: SnapshotReady { rank }
-        W-->>D: RoundFrame (this rank's params, data port +2)
+        W-->>D: RoundFrame (this rank's params, data channel)
         D->>D: sum + divide by world_size (reduce thread)
         D-->>W: averaged RoundFrame
         Note over W: param bridge synthesizes ControlMsg::Update(AveragedParams) -> load_averaged
@@ -154,8 +154,8 @@ sequenceDiagram
     W->>C: Exiting { rank }
 ```
 
-CPU averaging is a **data-channel star** (`ClusterController` / `CpuReduceClient`
-on data port +2): each rank ships its params as a `RoundFrame`, the controller
+CPU averaging is a **data-channel star** (`ClusterController` /
+`CpuReduceClient`): each rank ships its params as a `RoundFrame`, the controller
 sums and divides by `world_size`, and the averaged frame returns on the same
 channel - the scheduler's `Update { version, next_plan }` carries only the next
 schedule, never the weights. The scheduler stays free throughout (see view 3).
@@ -239,7 +239,7 @@ flowchart LR
         direction TB
         P1["Coord: RequestParams"] --> P2["Worker: snapshot_params<br/>async pinned D2H, single sync"]
         P2 --> P3["Worker: SnapshotReady"]
-        P3 --> P4["Worker param bridge: ship RoundFrame<br/>(CpuReduceClient, data port +2)"]
+        P3 --> P4["Worker param bridge: ship RoundFrame<br/>(CpuReduceClient, data channel)"]
         P4 --> P5["ClusterController: sum / world_size<br/>(reduce thread, NOT the scheduler)"]
         P5 --> P6["Worker: synthesized Update(AveragedParams)<br/>+ Coord Update { version, next_plan }"]
         P6 --> P7["Worker: load_averaged<br/>async GPU writeback"]

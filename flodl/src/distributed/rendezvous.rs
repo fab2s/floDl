@@ -33,7 +33,9 @@
 
 use std::env;
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
+#[cfg(test)]
+use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use crate::{Device, Result, TensorError};
@@ -194,6 +196,13 @@ where
             TensorError::new(&format!("rendezvous: setting timeouts failed: {e}"))
         })?;
 
+    // Channel-select magic first: the controller's single-port mux
+    // routes on it, and the rendezvous server validates it before the
+    // Hello frame.
+    crate::distributed::wire::write_channel_magic(
+        &mut stream,
+        crate::distributed::wire::CHANNEL_MAGIC_RENDEZVOUS,
+    )?;
     let hello = RendezvousMsgWire::Hello {
         dataset_sig,
         global_rank,
@@ -280,9 +289,26 @@ pub fn run_controller_rendezvous(
     run_controller_rendezvous_with(
         full,
         local_host_name,
+        bind_rendezvous_listener(full)?,
         RENDEZVOUS_IDLE_TIMEOUT,
         &std::sync::atomic::AtomicBool::new(false),
     )
+}
+
+/// Bind the rendezvous port directly (no mux). Test-side counterpart of
+/// the launcher's single-port bind; production hands
+/// [`run_controller_rendezvous_aborting`] a mux leg instead.
+#[cfg(test)]
+fn bind_rendezvous_listener(
+    full: &FullCluster,
+) -> Result<crate::distributed::port_mux::StreamSource> {
+    let bind_addr = format!("0.0.0.0:{}", full.controller.port);
+    let listener = TcpListener::bind(&bind_addr).map_err(|e| {
+        TensorError::new(&format!(
+            "rendezvous: controller failed to bind {bind_addr}: {e}"
+        ))
+    })?;
+    crate::distributed::port_mux::StreamSource::from_listener(listener, "rendezvous")
 }
 
 /// Controller-side rendezvous server with a launcher-owned abort flag: the
@@ -294,9 +320,16 @@ pub fn run_controller_rendezvous(
 pub(crate) fn run_controller_rendezvous_aborting(
     full: &FullCluster,
     local_host_name: &str,
+    source: crate::distributed::port_mux::StreamSource,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    run_controller_rendezvous_with(full, local_host_name, RENDEZVOUS_IDLE_TIMEOUT, abort)
+    run_controller_rendezvous_with(
+        full,
+        local_host_name,
+        source,
+        RENDEZVOUS_IDLE_TIMEOUT,
+        abort,
+    )
 }
 
 /// Inner body of [`run_controller_rendezvous_aborting`], parameterized by the
@@ -307,6 +340,7 @@ pub(crate) fn run_controller_rendezvous_aborting(
 fn run_controller_rendezvous_with(
     full: &FullCluster,
     local_host_name: &str,
+    source: crate::distributed::port_mux::StreamSource,
     idle_timeout: Duration,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
@@ -317,34 +351,14 @@ fn run_controller_rendezvous_with(
         ));
     }
 
-    // Back-to-back runs on the fixed port block are safe as-is: Rust's
-    // `TcpListener::bind` sets SO_REUSEADDR on Unix, so TIME_WAIT remnants
-    // from a previous run's connections never block this bind (probed:
-    // rebind succeeds with the port verifiably in TIME_WAIT). A genuinely
-    // LIVE listener from a still-running launcher still fails loudly here
-    // (that would need SO_REUSEPORT) — the desirable double-run guard.
-    let bind_addr = format!("0.0.0.0:{}", full.controller.port);
-    let listener = TcpListener::bind(&bind_addr).map_err(|e| {
-        TensorError::new(&format!(
-            "rendezvous: controller failed to bind {bind_addr}: {e}"
-        ))
-    })?;
-
+    let controller_at =
+        format!("{}:{}", full.controller.host, full.controller.port);
     let designated_rank = pick_designated_rank(full, local_host_name);
     eprintln!(
-        "cluster launcher: rendezvous server bound on {} (world_size={world_size}, generator=rank {designated_rank})",
-        listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| bind_addr.clone()),
+        "cluster launcher: rendezvous server up on port {} \
+         (world_size={world_size}, generator=rank {designated_rank})",
+        full.controller.port,
     );
-
-    // Non-blocking accept so the loop can enforce a wall-clock ceiling
-    // instead of parking forever in a blocking accept() when a rank never
-    // dials in. Accepted streams are flipped back to blocking below so
-    // their per-stream read/write timeouts take effect.
-    listener.set_nonblocking(true).map_err(|e| {
-        TensorError::new(&format!(
-            "rendezvous: controller failed to set non-blocking accept: {e}"
-        ))
-    })?;
 
     // Indexed by global_rank — each accepted stream slotted by the rank
     // it claims in its Hello. `None` until that rank arrives.
@@ -352,15 +366,16 @@ fn run_controller_rendezvous_with(
     let mut reference_sig: Option<[u8; 32]> = None;
 
     let mut accepted = 0usize;
-    // Pre-auth rejected connections (bad frame / non-Hello / setup fail).
+    // Pre-auth rejected connections (bad magic / bad frame / non-Hello /
+    // setup fail).
     let mut rejected = 0usize;
     // Resets on every successful slot fill; a window with no progress is
     // the wedge signature this ceiling exists to break.
     let mut last_progress = Instant::now();
     while accepted < world_size {
-        let (mut stream, peer) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        let mut stream = match source.try_accept("rendezvous")? {
+            Some(s) => s,
+            None => {
                 if abort.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(TensorError::new(&format!(
                         "rendezvous: aborted by launcher \
@@ -372,28 +387,41 @@ fn run_controller_rendezvous_with(
                         "rendezvous: timed out after {}s with no new rank \
                          connecting ({accepted}/{world_size} ranks in). Check \
                          that every rank process launched and can reach the \
-                         controller at {bind_addr}.",
+                         controller at {controller_at}.",
                         idle_timeout.as_secs(),
                     )));
                 }
                 std::thread::sleep(RENDEZVOUS_POLL_INTERVAL);
                 continue;
             }
-            Err(e) => {
-                return Err(TensorError::new(&format!(
-                    "rendezvous: controller accept failed: {e}"
-                )));
-            }
         };
-        // Accepted socket may inherit the listener's non-blocking flag;
-        // flip it back so the per-stream read/write timeouts below are
-        // honored (a non-blocking socket ignores SO_RCVTIMEO).
-        if stream.set_nonblocking(false).is_err()
-            || stream
-                .set_read_timeout(Some(IO_TIMEOUT))
-                .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-                .is_err()
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        if stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            .is_err()
         {
+            rejected += 1;
+            if rejected > MAX_REJECTED_CONNECTIONS {
+                return Err(rejected_cap_error(world_size, accepted));
+            }
+            continue;
+        }
+        // Channel-select magic (per-connection rejection like the frame
+        // checks below: a stray dialer condemns its connection, not the
+        // cohort).
+        if let Err(e) = crate::distributed::wire::expect_channel_magic(
+            &mut stream,
+            crate::distributed::wire::CHANNEL_MAGIC_RENDEZVOUS,
+            "rendezvous",
+        ) {
+            eprintln!(
+                "cluster launcher: rendezvous rejected connection from \
+                 {peer} ({e}); continuing to accept"
+            );
             rejected += 1;
             if rejected > MAX_REJECTED_CONNECTIONS {
                 return Err(rejected_cap_error(world_size, accepted));
@@ -740,6 +768,7 @@ mod tests {
         let result = run_controller_rendezvous_with(
             &full,
             "test-controller-host",
+            bind_rendezvous_listener(&full).unwrap(),
             Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
         );
@@ -768,6 +797,7 @@ mod tests {
         let err = run_controller_rendezvous_with(
             &full,
             "test-controller-host",
+            bind_rendezvous_listener(&full).unwrap(),
             Duration::from_secs(120), // idle ceiling far away
             &abort,
         )
@@ -871,9 +901,14 @@ mod tests {
         let connect = move || -> TcpStream {
             let addr = format!("127.0.0.1:{port}");
             for _ in 0..100 {
-                if let Ok(s) = TcpStream::connect(&addr) {
+                if let Ok(mut s) = TcpStream::connect(&addr) {
                     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                     s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    crate::distributed::wire::write_channel_magic(
+                        &mut s,
+                        crate::distributed::wire::CHANNEL_MAGIC_RENDEZVOUS,
+                    )
+                    .unwrap();
                     return s;
                 }
                 thread::sleep(Duration::from_millis(20));

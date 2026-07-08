@@ -223,8 +223,9 @@ Production users will want them separable:
 
 Cluster.yml gains optional separate addressing - `coordinator_addr`
 + `coordinator_port` distinct from `averager_addr` + `averager_port`.
-Falling back to `master_addr:master_port+2/+3` (current behavior)
-when both unset preserves the single-host dev path.
+Falling back to the controller's single mux port (current behavior:
+both channels accept there, routed by channel-select magic) when both
+unset preserves the single-host dev path.
 
 This separation also makes the cheap orchestrator a viable
 multi-tenant role: one always-on coordinator can sequence many

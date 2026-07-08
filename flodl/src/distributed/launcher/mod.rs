@@ -241,8 +241,10 @@ pub struct RelaySpec {
     pub host: String,
     /// Controller host the relay dials upstream.
     pub controller_host: String,
-    /// Controller base port: relay dials `+2` (data) / `+3` (control) and
-    /// binds loopback `+4` / `+5`.
+    /// Controller port: both upstream legs dial it directly (the
+    /// channel-select magic routes them through the controller's
+    /// single-port mux); the relay binds loopback `+4` (data) / `+5`
+    /// (control) for its local ranks.
     pub controller_port: u16,
     /// Global ranks this host carries (the relay's local rank set).
     pub ranks: Vec<u32>,
@@ -264,8 +266,8 @@ pub struct RelaySpec {
 
 /// Run this process as a per-host transport relay: bind the loopback data
 /// (`+4`) / control (`+5`) channels its local ranks dial, forward upstream
-/// to the controller's `+2` / `+3`, and stay up until every local rank
-/// disconnects (training finished). Touches no CUDA.
+/// to the controller's single mux port, and stay up until every local
+/// rank disconnects (training finished). Touches no CUDA.
 ///
 /// The caller (the dispatch site on [`Role::Relay`]) runs this and exits
 /// the process when it returns.
@@ -303,15 +305,18 @@ pub fn run_relay() -> Result<()> {
     );
 
     // Control channel (every backend uses it). Bind before accepting.
+    // Both upstream legs dial the controller's single mux port; the
+    // channel-select magic (written by `RelayChannel::start`) routes
+    // each connection to its subsystem.
     let (ctrl_listener, _) = RelayChannel::bind(loopback(RELAY_CONTROL_LOOPBACK_OFFSET)?)?;
-    let ctrl_upstream = resolve(&spec.controller_host, base.saturating_add(3))?;
+    let ctrl_upstream = resolve(&spec.controller_host, base)?;
 
     // Data channel (CPU backends only). Ranks connect to BOTH channels
     // (data first, then control in the CPU path), so the two accept loops
     // must run concurrently — the data relay runs on its own thread.
     let data_handle = if spec.data_channel {
         let (data_listener, _) = RelayChannel::bind(loopback(RELAY_DATA_LOOPBACK_OFFSET)?)?;
-        let data_upstream = resolve(&spec.controller_host, base.saturating_add(2))?;
+        let data_upstream = resolve(&spec.controller_host, base)?;
         let host = spec.host.clone();
         let ranks = spec.ranks.clone();
         let ws = spec.world_size;
@@ -425,22 +430,40 @@ pub fn run_launcher_with_config(
     // hostname match below), it is just no longer the expected default.
     let my_host_idx = full.workers.iter().position(|h| h.host == me);
 
-    // Start the ClusterController TCP server on controller_port + 2 so any rank
-    // using AverageBackend::Cpu can connect. Bound to 0.0.0.0 so remote
-    // ranks reach it; local ranks use the same address via loopback.
+    // Single-port mux: every controller-side channel (NCCL rendezvous,
+    // CPU-reduce data, coordinator control) accepts on ONE port —
+    // `controller.port` — and dialers route themselves with a
+    // channel-select magic (see `port_mux`). Bound to 0.0.0.0 so remote
+    // hosts reach it; local ranks use the same port via loopback.
     //
-    // Always started, even on NCCL-only clusters: the accept loop polls
-    // a shutdown flag every 20ms, so an unused ClusterController exits cleanly
-    // when launcher signals shutdown after children finish. Cost is one
-    // idle thread + one bound port.
-    let cpu_avg_port = full.controller.port.saturating_add(2);
-    let cpu_avg_addr: std::net::SocketAddr = format!("0.0.0.0:{cpu_avg_port}")
-        .parse()
-        .map_err(|e| {
-            TensorError::new(&format!(
-                "cluster launcher: invalid ClusterController bind addr 0.0.0.0:{cpu_avg_port}: {e}"
-            ))
-        })?;
+    // Back-to-back runs on the fixed port are safe as-is: Rust's
+    // `TcpListener::bind` sets SO_REUSEADDR on Unix, so TIME_WAIT
+    // remnants from a previous run's connections never block this bind
+    // (probed: rebind succeeds with the port verifiably in TIME_WAIT). A
+    // genuinely LIVE listener from a still-running launcher still fails
+    // loudly here (that would need SO_REUSEPORT) — the desirable
+    // double-run guard.
+    let mux_port = full.controller.port;
+    let mux_bind = format!("0.0.0.0:{mux_port}");
+    let mux_listener = std::net::TcpListener::bind(&mux_bind).map_err(|e| {
+        TensorError::new(&format!(
+            "cluster launcher: bind {mux_bind} failed: {e}"
+        ))
+    })?;
+    let (port_mux, mux_accept) = crate::distributed::port_mux::PortMux::start(
+        mux_listener,
+        Arc::clone(&abort),
+    )?;
+    let crate::distributed::port_mux::MuxAccept {
+        rendezvous: mux_rendezvous,
+        data: mux_data,
+        control: mux_control,
+    } = mux_accept;
+    eprintln!(
+        "cluster launcher: port mux bound on 0.0.0.0:{} \
+         (rendezvous + data + control)",
+        port_mux.port(),
+    );
     // Shared dead-rank ledger between ClusterController (CPU averaging
     // releases on heartbeat-stale) and ClusterCoordinator (NCCL
     // elastic-membership rendezvous trigger). Both consumers see the
@@ -462,24 +485,28 @@ pub fn run_launcher_with_config(
     if let Some(cfg) = coord_config.as_mut() {
         cfg.checkpoint_forge = Some(Arc::clone(&checkpoint_forge));
     }
+    // ClusterController on the mux's data leg. Always started, even on
+    // NCCL-only clusters: the accept loop polls a shutdown flag every
+    // 20ms, so an unused ClusterController exits cleanly when the
+    // launcher signals shutdown after children finish. Cost is one idle
+    // thread.
     let cpu_averager =
-        crate::distributed::controller::ClusterController::start_with_dead_ranks(
-            cpu_avg_addr,
+        crate::distributed::controller::ClusterController::start_from_source(
+            crate::distributed::port_mux::StreamSource::Mux(mux_data),
+            mux_port,
             full.world_size(),
             full.salt,
             Arc::clone(&dead_ranks_shared),
             Some(Arc::clone(&checkpoint_forge)),
             outer_optimizer,
         )?;
-    // Bound port stays the configured value (no kernel auto-assign here);
-    // log it once for diagnostics.
     eprintln!(
-        "cluster launcher: ClusterController bound on {} (world_size={})",
+        "cluster launcher: ClusterController up on port {} (world_size={})",
         cpu_averager.port(),
         full.world_size()
     );
 
-    // ClusterCoordinator spawn at controller_port + 3 for the elastic-
+    // ClusterCoordinator spawn on the mux's control leg for the elastic-
     // membership-aware NCCL path. `coord_config = Some(...)` means the
     // caller (the trampoline at `DdpHandle::launch`) built the
     // controller-scope config from the user's `DdpRunConfig` and wants
@@ -487,8 +514,8 @@ pub fn run_launcher_with_config(
     // (worker self-driven ElChe, no elastic membership) handles that
     // path entirely on the rank side.
     //
-    // The spawned thread blocks on `start_from_listener.accept()` until
-    // `world_size` ranks connect; if the via-coord routing isn't
+    // The spawned thread blocks in `start_from_source`'s accept loop
+    // until `world_size` ranks connect; if the via-coord routing isn't
     // exercised the thread sits idle until the launcher process exits
     // (process-exit kills the thread; no graceful shutdown plumbed yet).
     // Hoisted so `cluster_dashboard_sink.shutdown()` can fire after
@@ -536,15 +563,6 @@ pub fn run_launcher_with_config(
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
-        let coord_port = full.controller.port.saturating_add(3);
-        let coord_bind_addr: std::net::SocketAddr = format!("0.0.0.0:{coord_port}")
-            .parse()
-            .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster launcher: invalid ClusterCoordinator bind addr \
-                     0.0.0.0:{coord_port}: {e}"
-                ))
-            })?;
         // Launcher-side fields layered on top of the caller's config:
         // `local_ranks` (host-dependent: which global ranks are on the
         // launcher's host) and `dead_ranks` (shared ledger with the
@@ -586,9 +604,9 @@ pub fn run_launcher_with_config(
         let coord_salt = full.salt;
         let coord_world = full.world_size();
         eprintln!(
-            "cluster launcher: ClusterCoordinator spawning on {} (world_size={}, \
-             local_ranks={:?})",
-            coord_bind_addr, coord_world, local_ranks,
+            "cluster launcher: ClusterCoordinator spawning on port {} \
+             (world_size={}, local_ranks={:?})",
+            mux_port, coord_world, local_ranks,
         );
         // Capture the resume kickoff epoch before moving `config` into
         // `start()`. `start_epoch == 0` for fresh runs; resume runs
@@ -602,10 +620,14 @@ pub fn run_launcher_with_config(
         // failure path instead of forcing process::exit(1).
         config = config.abort_flag(Arc::clone(&abort));
         let coord_abort = Arc::clone(&abort);
+        let coord_source =
+            crate::distributed::port_mux::StreamSource::Mux(mux_control);
         coord_driver = Some(thread::Builder::new()
             .name("flodl-cluster-coord".to_string())
             .spawn(move || {
-                match ClusterCoordinator::start(coord_bind_addr, coord_salt, config) {
+                match ClusterCoordinator::start_from_source(
+                    coord_source, mux_port, coord_salt, config,
+                ) {
                     Ok(mut coord) => {
                         // Kickoff the first epoch dispatch. Without this,
                         // `tick()` never broadcasts `StartEpoch` to any
@@ -682,9 +704,14 @@ pub fn run_launcher_with_config(
                     "cluster launcher: spawn coord thread failed: {e}"
                 ))
             })?);
+    } else {
+        // No coordinator this run (legacy NCCL routing). Dropping the
+        // receiver makes the mux dispatcher reset any stray control
+        // dialer immediately instead of queueing it forever.
+        drop(mux_control);
     }
 
-    // Bootstrap rendezvous server (port +0). Controller binds, every rank
+    // Bootstrap rendezvous server (on the mux port). Every rank
     // dials in, the controller designates one rank as NCCL-UID generator
     // (default: a local-host worker's first rank if any, else
     // `workers[0].ranks[0]`), then broadcasts the UID. The controller
@@ -710,11 +737,13 @@ pub fn run_launcher_with_config(
         let rdv_me = me.clone();
         let formed_for_rdv = Arc::clone(&cohort_formed);
         let rdv_abort = Arc::clone(&abort);
+        let rdv_source =
+            crate::distributed::port_mux::StreamSource::Mux(mux_rendezvous);
         rdv_driver = Some(thread::Builder::new()
             .name("flodl-cluster-rendezvous".to_string())
             .spawn(move || {
                 match crate::distributed::rendezvous::run_controller_rendezvous_aborting(
-                    &rdv_full, &rdv_me, &rdv_abort,
+                    &rdv_full, &rdv_me, rdv_source, &rdv_abort,
                 ) {
                     Ok(()) => formed_for_rdv.store(true, std::sync::atomic::Ordering::SeqCst),
                     Err(e) => {
@@ -727,6 +756,11 @@ pub fn run_launcher_with_config(
                     "cluster launcher: spawn rendezvous thread failed: {e}"
                 ))
             })?);
+    } else {
+        // No rendezvous subsystem this run (CPU backend). Dropping the
+        // receiver makes the mux dispatcher reset any stray rendezvous
+        // dialer immediately instead of queueing it forever.
+        drop(mux_rendezvous);
     }
 
     // For remote hosts, fdl-cli must have passed the original fdl command

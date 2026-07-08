@@ -194,8 +194,8 @@ impl ClusterController {
     /// directly with a matching `CpuReduceClient`.
     ///
     /// Use `127.0.0.1:0` for tests (kernel-assigned port; read back via
-    /// [`Self::port`]). Use the cluster's `controller_addr:controller_port+2`
-    /// in production.
+    /// [`Self::port`]). Production goes through
+    /// [`Self::start_from_source`] with a leg of the single-port mux.
     // Production callers share a DeadRanks ledger (start_with_dead_ranks);
     // this standalone form is exercised by the controller tests.
     #[allow(dead_code)]
@@ -229,19 +229,6 @@ impl ClusterController {
         forge: Option<Arc<crate::distributed::CheckpointForge>>,
         outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     ) -> Result<Self> {
-        if world_size == 0 {
-            return Err(TensorError::new(
-                "cluster_controller: world_size must be > 0",
-            ));
-        }
-        if dead_ranks.world_size() != world_size {
-            return Err(TensorError::new(&format!(
-                "cluster_controller: dead_ranks world_size ({}) must match \
-                 controller world_size ({})",
-                dead_ranks.world_size(),
-                world_size,
-            )));
-        }
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
             TensorError::new(&format!(
                 "cluster_controller: bind {bind_addr} failed: {e}"
@@ -255,19 +242,51 @@ impl ClusterController {
                 ))
             })?
             .port();
-        // Short accept timeout so the worker thread can observe the
-        // shutdown flag between connections without blocking forever.
-        listener
-            .set_nonblocking(false)
-            .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
+        let source = crate::distributed::port_mux::StreamSource::from_listener(
+            listener,
+            "cluster_controller",
+        )?;
+        Self::start_from_source(
+            source, bound_port, world_size, salt, dead_ranks, forge,
+            outer_optimizer,
+        )
+    }
 
+    /// Like [`Self::start_with_dead_ranks`] but accepting connections
+    /// from a pre-built [`StreamSource`] — the production entry, handed
+    /// the data leg of the launcher's single-port mux. `bound_port` is
+    /// carried for diagnostics ([`Self::port`]).
+    ///
+    /// [`StreamSource`]: crate::distributed::port_mux::StreamSource
+    pub(crate) fn start_from_source(
+        source: crate::distributed::port_mux::StreamSource,
+        bound_port: u16,
+        world_size: usize,
+        salt: SessionSalt,
+        dead_ranks: Arc<DeadRanks>,
+        forge: Option<Arc<crate::distributed::CheckpointForge>>,
+        outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
+    ) -> Result<Self> {
+        if world_size == 0 {
+            return Err(TensorError::new(
+                "cluster_controller: world_size must be > 0",
+            ));
+        }
+        if dead_ranks.world_size() != world_size {
+            return Err(TensorError::new(&format!(
+                "cluster_controller: dead_ranks world_size ({}) must match \
+                 controller world_size ({})",
+                dead_ranks.world_size(),
+                world_size,
+            )));
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_cloned = Arc::clone(&shutdown);
         let handle = thread::Builder::new()
             .name(format!("flodl-cluster-controller:{bound_port}"))
             .spawn(move || {
                 run_reduce_thread(
-                    listener, world_size, salt, shutdown_cloned, dead_ranks, forge,
+                    source, world_size, salt, shutdown_cloned, dead_ranks, forge,
                     outer_optimizer,
                 )
             })
@@ -325,7 +344,7 @@ impl Drop for ClusterController {
 const REDUCE_POLL: Duration = Duration::from_millis(100);
 
 fn run_reduce_thread(
-    listener: TcpListener,
+    source: crate::distributed::port_mux::StreamSource,
     world_size: usize,
     salt: SessionSalt,
     shutdown: Arc<AtomicBool>,
@@ -338,9 +357,6 @@ fn run_reduce_thread(
     // leaves the reduce stream byte-for-byte as the plain weighted average.
     let mut outer_stepper = outer_optimizer
         .map(crate::distributed::outer_optimizer::OuterStepper::new);
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| TensorError::new(&format!("cluster_controller: set_nonblocking: {e}")))?;
 
     let slots = Arc::new(ReduceSlots::new());
     // Sole-writer half per relay connection (the reduce loop writes
@@ -360,8 +376,11 @@ fn run_reduce_thread(
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match listener.accept() {
-            Ok((mut stream, _peer)) => {
+        match source.try_accept("cluster_controller") {
+            Ok(None) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(Some(mut stream)) => {
                 let _ = stream.set_nodelay(true);
                 // Write-stall ceiling (fd-level): a wedged relay errors
                 // the reduce thread's scatter instead of parking it; the
@@ -374,8 +393,14 @@ fn run_reduce_thread(
                             "cluster_controller: set_write_timeout: {e}"
                         ))
                     })?;
-                // Relay handshake (blocking read — relays send Hello
-                // immediately on connect).
+                // Channel-select magic, then the relay handshake
+                // (blocking reads — relays send both immediately on
+                // connect).
+                crate::distributed::wire::expect_channel_magic(
+                    &mut stream,
+                    crate::distributed::wire::CHANNEL_MAGIC_DATA,
+                    "cluster_controller",
+                )?;
                 let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
                     Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
                         crate::verbose!(
@@ -443,17 +468,10 @@ fn run_reduce_thread(
                     })?;
                 reader_threads.push(t);
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => {
-                return Err(TensorError::new(&format!(
-                    "cluster_controller: accept failed: {e}"
-                )));
-            }
+            Err(e) => return Err(e),
         }
     }
-    let _ = listener.set_nonblocking(false);
+    drop(source);
 
     // Phase 2: reduce loop. Wait until every expected host connection has
     // deposited its folded frame, reduce (dividing once by the accepted
