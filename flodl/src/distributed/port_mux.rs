@@ -158,6 +158,9 @@ fn dispatch_one(
     data_tx: &Sender<TcpStream>,
     ctrl_tx: &Sender<TcpStream>,
 ) {
+    // Controller-side cleartext guard: a public peer on the mux port
+    // means training frames cross an uncontrolled network unencrypted.
+    crate::distributed::wire::warn_cleartext_public_peer("cluster controller", peer);
     // Accepted socket inherits the listener's non-blocking flag; flip it
     // back so the peek deadline below is honored via SO_RCVTIMEO.
     if stream.set_nonblocking(false).is_err() {

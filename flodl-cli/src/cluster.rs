@@ -1005,6 +1005,7 @@ commands:
                     target: Some("127.0.0.1".into()),
                     ..SshConfig::default()
                 }),
+                tunnel: false,
                 arch: None,
                 data_path: None,
                 docker: None,
@@ -1041,6 +1042,7 @@ commands:
                 nccl_socket_ifname: "lo".into(),
                 path: "/tmp".into(),
                 ssh: None,
+                tunnel: false,
                 arch: None,
                 data_path: None,
                 docker: None,

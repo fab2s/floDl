@@ -45,6 +45,20 @@
 #       identity_file: maps to `ssh -i <path>`
 #       options:       list of `-o Key=Value` directives, e.g.
 #                      `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`
+#   - `tunnel:` (optional, default false) routes this worker's training
+#     traffic through its fan-out SSH session instead of a direct TCP
+#     connection: the launcher adds a remote forward
+#     (`-R 127.0.0.1:<port>:127.0.0.1:<port>`) to the host's relay SSH
+#     session and points the host at `127.0.0.1:<controller.port>` --
+#     its loopback end of the tunnel. Cross-host traffic then rides the
+#     encrypted SSH session (flodl channels are HMAC-authenticated but
+#     cleartext otherwise -- flodl warns loudly when a cleartext channel
+#     touches a peer outside private address space). Requires a CPU
+#     ElChe mode (NCCL's peer-to-peer data plane cannot ride a
+#     controller tunnel) and a remote host; both validated loudly at
+#     launch. When EVERY remote worker is tunneled, the controller
+#     binds loopback only -- the training port is then unreachable
+#     except through sshd on the controller host.
 #   - `path:` is the project checkout dir on this host. fdl-cli cd's
 #     here before invoking the remote command. Heterogeneous mounts
 #     are fine (e.g. `/opt/flodl` on the controller, `/srv/flodl` in a

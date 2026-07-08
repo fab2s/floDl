@@ -176,6 +176,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             nccl_socket_ifname: "lo".to_string(),
             path,
             ssh: None,
+            tunnel: false,
             arch: None,
             data_path: None,
             docker: None,

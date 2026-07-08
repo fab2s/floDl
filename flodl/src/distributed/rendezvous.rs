@@ -189,6 +189,11 @@ where
     );
     let mut stream =
         crate::distributed::wire::connect_with_retry(addr.as_str(), "rendezvous")?;
+    // Dialer-side cleartext guard: a public controller address means
+    // this rank's frames cross an uncontrolled network unencrypted.
+    if let Ok(peer) = stream.peer_addr() {
+        crate::distributed::wire::warn_cleartext_public_peer("rendezvous", peer);
+    }
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))

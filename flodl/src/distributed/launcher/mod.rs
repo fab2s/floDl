@@ -410,6 +410,55 @@ pub(crate) fn claim_cluster_entry(role: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate `tunnel: true` topology and derive the controller bind
+/// scope. Returns whether the mux should bind loopback-only (every
+/// remote worker is tunneled, so training traffic can only arrive
+/// through sshd).
+///
+/// Loud errors (explicit selectors error; conventions warn):
+/// - tunnel on the launcher-local host — there is no SSH session to
+///   carry a forward, and loopback already reaches the controller;
+/// - tunnel under an NCCL backend — the NCCL data plane is
+///   peer-to-peer and cannot ride a controller tunnel (this also
+///   covers the no-coordinator legacy path, which has no relay
+///   session to attach the forward to).
+fn validate_tunnel_topology(
+    full: &FullCluster,
+    local_host_name: &str,
+    backend_is_nccl: bool,
+) -> Result<bool> {
+    let tunneled: Vec<&FullWorker> =
+        full.workers.iter().filter(|w| w.tunnel).collect();
+    if tunneled.is_empty() {
+        return Ok(false);
+    }
+    if let Some(local) = tunneled.iter().find(|w| w.host == local_host_name) {
+        return Err(TensorError::new(&format!(
+            "cluster launcher: worker {:?} sets `tunnel: true` but runs on \
+             the launcher host — there is no SSH session to carry a \
+             forward, and loopback already reaches the controller. Remove \
+             the flag from this host.",
+            local.host,
+        )));
+    }
+    if backend_is_nccl {
+        return Err(TensorError::new(&format!(
+            "cluster launcher: worker(s) {:?} set `tunnel: true` but the \
+             run uses an NCCL backend. NCCL's data plane is peer-to-peer \
+             and cannot ride a controller tunnel; tunnel mode requires a \
+             CPU ElChe mode (cpu_sync / cpu_cadence / cpu_async), whose \
+             traffic all flows through the per-host relay's single \
+             upstream connection.",
+            tunneled.iter().map(|w| w.host.as_str()).collect::<Vec<_>>(),
+        )));
+    }
+    Ok(full
+        .workers
+        .iter()
+        .filter(|w| w.host != local_host_name)
+        .all(|w| w.tunnel))
+}
+
 pub fn run_launcher_with_config(
     full: FullCluster,
     mut coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
@@ -430,11 +479,27 @@ pub fn run_launcher_with_config(
     // hostname match below), it is just no longer the expected default.
     let my_host_idx = full.workers.iter().position(|h| h.host == me);
 
+    // Backend, resolved before any bind/spawn decision: tunnel
+    // validation and the rendezvous/relay gating below all key off it.
+    // Unknown backend (no `coord_config`) defaults to NCCL, preserving
+    // prior behavior for non-coordinator paths.
+    let backend_is_nccl = coord_config
+        .as_ref()
+        .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Nccl))
+        .unwrap_or(true);
+
+    // Tunnel topology validation (loud, before anything binds or
+    // spawns) + the resulting controller bind scope.
+    let bind_loopback = validate_tunnel_topology(&full, &me, backend_is_nccl)?;
+
     // Single-port mux: every controller-side channel (NCCL rendezvous,
     // CPU-reduce data, coordinator control) accepts on ONE port —
     // `controller.port` — and dialers route themselves with a
     // channel-select magic (see `port_mux`). Bound to 0.0.0.0 so remote
     // hosts reach it; local ranks use the same port via loopback.
+    // EXCEPT when every remote worker rides an SSH tunnel: then the mux
+    // binds loopback only, so the port is unreachable except through
+    // sshd — the bind-scope side of the trust model.
     //
     // Back-to-back runs on the fixed port are safe as-is: Rust's
     // `TcpListener::bind` sets SO_REUSEADDR on Unix, so TIME_WAIT
@@ -444,7 +509,8 @@ pub fn run_launcher_with_config(
     // loudly here (that would need SO_REUSEPORT) — the desirable
     // double-run guard.
     let mux_port = full.controller.port;
-    let mux_bind = format!("0.0.0.0:{mux_port}");
+    let mux_bind_ip = if bind_loopback { "127.0.0.1" } else { "0.0.0.0" };
+    let mux_bind = format!("{mux_bind_ip}:{mux_port}");
     let mux_listener = std::net::TcpListener::bind(&mux_bind).map_err(|e| {
         TensorError::new(&format!(
             "cluster launcher: bind {mux_bind} failed: {e}"
@@ -460,10 +526,22 @@ pub fn run_launcher_with_config(
         control: mux_control,
     } = mux_accept;
     eprintln!(
-        "cluster launcher: port mux bound on 0.0.0.0:{} \
-         (rendezvous + data + control)",
+        "cluster launcher: port mux bound on {mux_bind_ip}:{} \
+         (rendezvous + data + control{})",
         port_mux.port(),
+        if bind_loopback { "; loopback-only, all workers tunneled" } else { "" },
     );
+
+    // Controller address AS SEEN FROM a given worker: tunneled workers
+    // dial their loopback end of the SSH forward; when the mux binds
+    // loopback-only, launcher-local workers must dial loopback too.
+    let controller_dial_host = |worker: &FullWorker| -> String {
+        if worker.tunnel || (bind_loopback && worker.host == me) {
+            "127.0.0.1".to_string()
+        } else {
+            full.controller.host.clone()
+        }
+    };
     // Shared dead-rank ledger between ClusterController (CPU averaging
     // releases on heartbeat-stale) and ClusterCoordinator (NCCL
     // elastic-membership rendezvous trigger). Both consumers see the
@@ -535,17 +613,12 @@ pub fn run_launcher_with_config(
         .as_ref()
         .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Cpu))
         .unwrap_or(false);
-    // The NCCL-UID bootstrap rendezvous (port +0) is dialed only by NCCL
-    // ranks. CPU-averaging ranks never connect, so spawning it on a CPU
+    // The NCCL-UID bootstrap rendezvous is dialed only by NCCL ranks.
+    // CPU-averaging ranks never connect, so spawning it on a CPU
     // backend just idles the accept loop to its timeout and logs a
     // spurious "rendezvous: timed out ... (0/N ranks in)" error while
-    // training proceeds fine over the control/data channels. Gate the
-    // spawn on the backend. Unknown backend (no `coord_config`) defaults
-    // to spawning, preserving prior behavior for non-coordinator paths.
-    let backend_is_nccl = coord_config
-        .as_ref()
-        .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Nccl))
-        .unwrap_or(true);
+    // training proceeds fine over the control/data channels. The spawn
+    // below is gated on `backend_is_nccl` (hoisted above the mux bind).
     // Elastic supervision context, captured before `coord_config` is
     // consumed. No coordinator → no elastic machinery to defer to →
     // supervision keeps the legacy first-failure kill-all.
@@ -853,7 +926,9 @@ pub fn run_launcher_with_config(
             if spawn_relays {
                 let spec = RelaySpec {
                     host: host.host.clone(),
-                    controller_host: full.controller.host.clone(),
+                    // Tunneled hosts dial their loopback end of the SSH
+                    // forward carried by this relay's own ssh session.
+                    controller_host: controller_dial_host(host),
                     controller_port: full.controller.port,
                     ranks: host.ranks.iter().map(|r| *r as u32).collect(),
                     salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
@@ -885,7 +960,14 @@ pub fn run_launcher_with_config(
                         &host.env,
                         prebuild_envelope.get(&host.host),
                     );
-                    build_ssh_spawn_command(host, &remote_cmd)
+                    // The relay session carries the host's training
+                    // tunnel when `tunnel: true` — see
+                    // `build_ssh_spawn_command`.
+                    build_ssh_spawn_command(
+                        host,
+                        &remote_cmd,
+                        host.tunnel.then_some(mux_port),
+                    )
                 } else {
                     build_local_relay_command(&exe, &user_args, &spec_hex)
                 };
@@ -935,7 +1017,11 @@ pub fn run_launcher_with_config(
                 ));
             }
             for local_rank in 0..host.ranks.len() {
-                let envelope = build_slim_envelope_for(&full, host);
+                let envelope = build_slim_envelope_for(
+                    &full,
+                    host,
+                    &controller_dial_host(host),
+                );
                 let envelope_hex = crate::distributed::cluster::hex_encode(
                     serde_json::to_string(&envelope)
                         .map_err(|e| {
@@ -977,7 +1063,9 @@ pub fn run_launcher_with_config(
                         local_phys,
                         prebuild_envelope.get(&host.host),
                     );
-                    build_ssh_spawn_command(host, &remote_cmd)
+                    // Rank sessions never carry the tunnel forward — the
+                    // host's relay session owns it (one `-R` per host).
+                    build_ssh_spawn_command(host, &remote_cmd, None)
                 } else {
                     build_local_spawn_command(
                         &exe,

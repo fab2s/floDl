@@ -573,8 +573,8 @@ rank-carrying host lives under **workers**.
 ```yaml
 cluster:
   controller:
-    host: 192.168.122.1           # rendezvous bind address
-    port: 1337                    # rendezvous port (default 1337)
+    host: 192.168.122.1           # controller bind address
+    port: 1337                    # the single controller port (default 1337)
     path: /opt/flodl              # controller's view of the shared project root
     # docker: cuda                # optional pre-flight build service
     # arch: precompiled/cu128     # optional libtorch variant for pre-flight build
@@ -596,6 +596,8 @@ cluster:
         options:
           - ProxyJump=bastion
           - StrictHostKeyChecking=no
+      # tunnel: true              # route training traffic through the SSH
+      #                           # session (CPU ElChe modes only; see below)
       local_devices: all          # probed at dispatch via SSH+nvidia-smi
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
@@ -625,6 +627,38 @@ Conventions:
 - `docker:` (optional) names the compose service for training on this
   host. Per-host: mixed deployments (controller in Docker, worker
   bare-metal) are common.
+- `tunnel:` (optional) routes this worker's training traffic through
+  its fan-out SSH session instead of a direct TCP connection - see
+  below.
+
+### One port, and tunneled workers
+
+All cross-host training traffic (NCCL bootstrap rendezvous, CPU-reduce
+data, coordinator control) accepts on the single `controller.port`;
+connections identify their channel with a 4-byte magic. The traffic is
+HMAC-authenticated but NOT encrypted, and flodl warns loudly whenever
+a cleartext channel touches a peer outside private address space
+(loopback / RFC1918 / link-local / CGNAT-shared).
+
+`tunnel: true` on a worker is the supported way to leave the private
+network: the launcher adds a remote forward
+(`-R 127.0.0.1:<port>:127.0.0.1:<port>`) to that host's relay SSH
+session and points the host at `127.0.0.1:<port>` - its loopback end
+of the tunnel. Everything the host sends then rides the (encrypted)
+SSH session; the fan-out credential is the only credential involved.
+Two constraints, both validated loudly at launch:
+
+- **CPU ElChe modes only** (`cpu_sync` / `cpu_cadence` / `cpu_async`).
+  NCCL's data plane is peer-to-peer between GPU hosts and cannot ride
+  a controller tunnel; CPU-mode traffic all flows through the per-host
+  relay's single upstream connection, which is exactly what the
+  forward carries.
+- **Remote hosts only** - the launcher host already reaches the
+  controller over loopback.
+
+When every remote worker sets `tunnel: true`, the controller binds
+loopback only: the training port is then unreachable except through
+sshd on the controller host.
 
 ### Activating the overlay
 

@@ -188,7 +188,7 @@
         // (controller/world_size/num_workers/worker with no ssh field).
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let worker = full.workers.iter().find(|h| h.host == "host-b").unwrap();
-        let env = build_slim_envelope_for(&full, worker);
+        let env = build_slim_envelope_for(&full, worker, &full.controller.host);
 
         assert_eq!(env["controller"]["host"], "192.168.122.1");
         assert_eq!(env["controller"]["port"], 29500);
@@ -206,8 +206,80 @@
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
         assert_eq!(env["worker"]["local_devices"], serde_json::json!([0]));
+    }
+
+    #[test]
+    fn tunnel_field_parses_defaults_false_and_round_trips() {
+        // Absent → false.
+        let c = FullCluster::from_value(&canonical_full_json()).unwrap();
+        assert!(!c.workers[0].tunnel);
+        assert!(!c.workers[1].tunnel);
+
+        // Explicit true parses and survives to_json → from_value.
+        let mut v = canonical_full_json();
+        v["workers"][1]["tunnel"] = json!(true);
+        let c = FullCluster::from_value(&v).unwrap();
+        assert!(!c.workers[0].tunnel);
+        assert!(c.workers[1].tunnel);
+        let back = FullCluster::from_value(&c.to_json()).unwrap();
+        assert!(back.workers[1].tunnel);
+
+        // Non-bool → loud error.
+        let mut v = canonical_full_json();
+        v["workers"][1]["tunnel"] = json!("yes");
+        let err = FullCluster::from_value(&v).unwrap_err();
+        assert!(err.to_string().contains("tunnel must be a boolean"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_topology_rejects_launcher_local_host() {
+        let mut v = canonical_full_json();
+        v["workers"][0]["tunnel"] = json!(true);
+        let full = FullCluster::from_value(&v).unwrap();
+        // host-a IS the launcher host here.
+        let err = validate_tunnel_topology(&full, "host-a", false).unwrap_err();
+        assert!(err.to_string().contains("launcher host"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_topology_rejects_nccl_backend() {
+        let mut v = canonical_full_json();
+        v["workers"][1]["tunnel"] = json!(true);
+        let full = FullCluster::from_value(&v).unwrap();
+        let err = validate_tunnel_topology(&full, "host-a", true).unwrap_err();
+        assert!(err.to_string().contains("NCCL"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_topology_bind_scope() {
+        // No tunnels → public bind.
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        assert!(!validate_tunnel_topology(&full, "host-a", false).unwrap());
+
+        // The only remote worker tunneled (host-a is launcher-local) →
+        // loopback bind.
+        let mut v = canonical_full_json();
+        v["workers"][1]["tunnel"] = json!(true);
+        let full = FullCluster::from_value(&v).unwrap();
+        assert!(validate_tunnel_topology(&full, "host-a", false).unwrap());
+
+        // Mixed: two remote workers, one tunneled → public bind (the
+        // direct worker still needs to reach the port).
+        let full = FullCluster::from_value(&v).unwrap();
+        assert!(!validate_tunnel_topology(&full, "some-other-launcher", false).unwrap());
+    }
+
+    #[test]
+    fn slim_envelope_honors_controller_dial_host() {
+        // Tunneled workers get their loopback end of the forward as the
+        // controller address; the configured host never leaks in.
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let worker = full.workers.iter().find(|h| h.host == "host-b").unwrap();
+        let env = build_slim_envelope_for(&full, worker, "127.0.0.1");
+        assert_eq!(env["controller"]["host"], "127.0.0.1");
+        assert_eq!(env["controller"]["port"], 29500);
     }
 
     #[test]
@@ -445,7 +517,7 @@
         // contract, validated end-to-end.
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
         let parsed = crate::distributed::cluster::LocalCluster::from_value(&env)
             .expect("slim envelope must parse via LocalCluster::from_value");
         assert_eq!(parsed.world_size(), 3);
@@ -470,7 +542,7 @@
         ];
         full = full.with_session_salt(salt);
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
         // Salt field must be present as a 32-char lowercase hex string.
         let hex = env
             .get("salt")

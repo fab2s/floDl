@@ -524,9 +524,31 @@ pub(super) fn build_remote_relay_bash_command(
 /// omitted and system ssh's defaults / `~/.ssh/config` rules apply —
 /// preserving backward compat for configs that pre-date the new
 /// fields.
-pub(super) fn build_ssh_spawn_command(host: &FullWorker, remote_cmd: &str) -> Command {
+///
+/// `tunnel_port`: when `Some`, this session carries the host's training
+/// tunnel — a remote forward (`-R 127.0.0.1:port:127.0.0.1:port`) binds
+/// the worker's loopback `port` to the controller's mux port, and
+/// `ExitOnForwardFailure=yes` makes a failed bind kill the session
+/// loudly instead of silently proceeding without the tunnel (the relay
+/// would otherwise dial a dead loopback port and time out confusingly).
+/// Exactly ONE session per host may carry the forward (a second `-R` on
+/// the same remote port would fail to bind) — the relay session, which
+/// outlives the ranks and carries all upstream traffic on CPU backends.
+pub(super) fn build_ssh_spawn_command(
+    host: &FullWorker,
+    remote_cmd: &str,
+    tunnel_port: Option<u16>,
+) -> Command {
     let ssh_target = host.ssh_target();
     let mut c = Command::new("ssh");
+    if let Some(port) = tunnel_port {
+        // Emitted BEFORE user `ssh.options` (first-value-wins), unlike the
+        // policy defaults below: without the forward this session is not a
+        // tunnel at all, so failing to bind it must kill the session — not
+        // a preference a stray option should silently disable.
+        c.arg("-R").arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"));
+        c.arg("-o").arg("ExitOnForwardFailure=yes");
+    }
     // User `ssh.options` are emitted FIRST so they take precedence: OpenSSH
     // uses the first value seen for each `-o` option, so flodl's `SSH_OPTS`
     // below supply defaults only for options the user did not set. This lets a
@@ -630,7 +652,7 @@ pub(super) fn cleanup_remote_host(host: &FullWorker, abs_bin: &str) {
         "pkill -TERM -f {q} >/dev/null 2>&1; sleep 1; \
          pkill -KILL -f {q} >/dev/null 2>&1; true",
     );
-    let _ = build_ssh_spawn_command(host, &payload)
+    let _ = build_ssh_spawn_command(host, &payload, None)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -854,8 +876,17 @@ pub(super) fn shell_quote(s: &str) -> String {
 /// Build the slim per-host envelope JSON the rank process consumes via
 /// [`LocalCluster::from_env`].
 ///
+/// `controller_dial_host` is the controller address AS SEEN FROM this
+/// worker: the configured `controller.host` normally, `127.0.0.1` for a
+/// tunneled worker (its loopback end of the SSH forward) and for every
+/// host when the controller binds loopback-only.
+///
 /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
-pub(super) fn build_slim_envelope_for(full: &FullCluster, worker: &FullWorker) -> serde_json::Value {
+pub(super) fn build_slim_envelope_for(
+    full: &FullCluster,
+    worker: &FullWorker,
+    controller_dial_host: &str,
+) -> serde_json::Value {
     use serde_json::Value;
     let mut host_obj = serde_json::Map::new();
     host_obj.insert("host".into(), Value::String(worker.host.clone()));
@@ -880,7 +911,10 @@ pub(super) fn build_slim_envelope_for(full: &FullCluster, worker: &FullWorker) -
     }
 
     let mut controller_obj = serde_json::Map::new();
-    controller_obj.insert("host".into(), Value::String(full.controller.host.clone()));
+    controller_obj.insert(
+        "host".into(),
+        Value::String(controller_dial_host.to_string()),
+    );
     controller_obj.insert("port".into(), Value::from(full.controller.port));
 
     let mut envelope = serde_json::Map::new();
@@ -982,7 +1016,7 @@ mod tests {
             }]
         });
         let full = FullCluster::from_value(&v).expect("valid cluster");
-        let cmd = build_ssh_spawn_command(&full.workers[0], "echo hi");
+        let cmd = build_ssh_spawn_command(&full.workers[0], "echo hi", None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -998,6 +1032,55 @@ mod tests {
         assert!(
             user < default,
             "user ssh.option must precede flodl's default: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_ssh_spawn_command_tunnel_adds_remote_forward() {
+        let v = serde_json::json!({
+            "controller": { "host": "ctl", "port": 1337, "path": "/p" },
+            "workers": [{
+                "host": "w1", "ranks": [0], "local_devices": [0],
+                "nccl_socket_ifname": "lo", "path": "/p",
+                "ssh": { "options": ["StrictHostKeyChecking=no"] },
+                "tunnel": true
+            }]
+        });
+        let full = FullCluster::from_value(&v).expect("valid cluster");
+
+        // Without a tunnel port: no forward, no ExitOnForwardFailure.
+        let cmd = build_ssh_spawn_command(&full.workers[0], "echo hi", None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "-R"), "unexpected -R: {args:?}");
+        assert!(
+            !args.iter().any(|a| a == "ExitOnForwardFailure=yes"),
+            "unexpected ExitOnForwardFailure: {args:?}"
+        );
+
+        // With one: `-R 127.0.0.1:port:127.0.0.1:port` and the
+        // fail-loud forward option, emitted BEFORE user options (this
+        // one is tunnel-critical, not a policy default).
+        let cmd = build_ssh_spawn_command(&full.workers[0], "echo hi", Some(1337));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let r_flag = args.iter().position(|a| a == "-R").expect("-R present");
+        assert_eq!(args[r_flag + 1], "127.0.0.1:1337:127.0.0.1:1337");
+        let forward_fail = args
+            .iter()
+            .position(|a| a == "ExitOnForwardFailure=yes")
+            .expect("ExitOnForwardFailure present");
+        let user = args
+            .iter()
+            .position(|a| a == "StrictHostKeyChecking=no")
+            .expect("user ssh.option present");
+        assert!(
+            forward_fail < user,
+            "tunnel-critical option must precede user options: {args:?}"
         );
     }
 }

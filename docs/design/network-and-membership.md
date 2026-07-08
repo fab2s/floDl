@@ -254,10 +254,19 @@ collapsed the wire bytes.
 ## Sequencing
 
 1. **Single-port mux** - small, self-contained, immediately makes
-   tunneling one-liner-cheap. No membership change.
-2. **Cleartext guard + fdl tunnel sugar** (`tunnel: true` per host:
-   fdl opens the `-L` forward as part of fan-out and points the
-   worker at loopback).
+   tunneling one-liner-cheap. No membership change. **Landed.**
+2. **Cleartext guard + fdl tunnel sugar** - loud warning whenever a
+   cleartext channel touches a peer outside private address space, and
+   `tunnel: true` per host. **Landed.** One mechanism note: for
+   fan-out-managed workers the forward is a *remote* forward (`-R`) on
+   the host's relay SSH session - the launcher→worker credential that
+   fan-out already requires - not a worker-side `ssh -L` (which would
+   need worker→controller SSH credentials on every host). The `-L`
+   form stays the shape for self-deployed workers in the join-protocol
+   world. Tunnel mode requires a CPU ElChe mode (NCCL's peer-to-peer
+   data plane cannot ride a controller tunnel); all-remotes-tunneled
+   flips the controller bind to loopback-only, the bind scope the
+   trust model keys on.
 3. **Join protocol + quorum knobs + observability** - the membership
    flip. Push fan-out reworked to start workers that dial in.
 4. **Host-tier scheduling** - its own arc, interface fixed above.

@@ -214,6 +214,11 @@ impl RelayChannel {
             "relay upstream",
         )?;
         let _ = upstream.set_nodelay(true);
+        // Dialer-side cleartext guard: a public controller address means
+        // this host's frames cross an uncontrolled network unencrypted.
+        if let Ok(peer) = upstream.peer_addr() {
+            crate::distributed::wire::warn_cleartext_public_peer("relay upstream", peer);
+        }
         // Write-stall ceiling: a wedged controller errors outbound_writer,
         // which flags relay shutdown — reachable teardown instead of a
         // parked writer holding the host hostage.

@@ -277,6 +277,7 @@ impl ClusterBuilder {
                 path: cwd,
                 arch: None,
                 ssh: None,
+                tunnel: false,
                 env: std::collections::BTreeMap::new(),
             }],
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
@@ -388,6 +389,7 @@ pub struct HostBuilder {
     path: Option<String>,
     arch: Option<String>,
     ssh: Option<crate::distributed::launcher::SshConfig>,
+    tunnel: bool,
     env: std::collections::BTreeMap<String, String>,
 }
 
@@ -402,6 +404,7 @@ impl HostBuilder {
             path: None,
             arch: None,
             ssh: None,
+            tunnel: false,
             env: std::collections::BTreeMap::new(),
         }
     }
@@ -497,6 +500,15 @@ impl HostBuilder {
         self
     }
 
+    /// Route this host's training traffic through its fan-out SSH
+    /// session (remote forward) instead of a direct TCP connection to
+    /// the controller. Requires a CPU ElChe mode and a remote host —
+    /// validated loudly at launch. Mirrors the YAML field `tunnel:`.
+    pub fn tunnel(mut self, tunnel: bool) -> Self {
+        self.tunnel = tunnel;
+        self
+    }
+
     /// Set a host-scoped env var exported into every rank child spawned
     /// on this host. Mirrors the YAML per-worker `env:` block; overrides
     /// matching keys from the cluster-scope [`ClusterBuilder::env`].
@@ -546,6 +558,7 @@ impl HostBuilder {
             path: self.path.expect("checked above"),
             arch: self.arch,
             ssh: self.ssh,
+            tunnel: self.tunnel,
             env: self.env,
         };
         parent.workers.push(host);

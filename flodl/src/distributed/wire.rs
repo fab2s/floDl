@@ -116,6 +116,69 @@ pub(crate) const CHANNEL_MAGIC_DATA: u32 = 0xF10D_17E1;
 /// Coordinator control channel (relay → controller).
 pub(crate) const CHANNEL_MAGIC_CONTROL: u32 = 0xF10D_17E2;
 
+// ---------------------------------------------------------------------------
+// Cleartext guard
+// ---------------------------------------------------------------------------
+
+/// Whether `ip` stays inside a controlled / non-public network scope:
+/// loopback, RFC1918 private, link-local, or RFC6598 shared address
+/// space (CGNAT — also the WireGuard/Tailscale overlay range, where the
+/// transport is already encrypted). IPv6: loopback, link-local
+/// (`fe80::/10`), unique-local (`fc00::/7`); IPv4-mapped addresses are
+/// classified by their inner IPv4.
+pub(crate) fn is_private_or_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // RFC 6598 shared address space (100.64.0.0/10).
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_or_local(std::net::IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // Unique-local fc00::/7.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Loud warning (never an error) when a cleartext channel touches a
+/// public peer: flodl's documented contract is a controlled / private
+/// network — frames are HMAC-authenticated but NOT encrypted, so params
+/// and gradients cross such a link readable. Tunnels are the supported
+/// way out (`tunnel: true` per host, or any encrypted overlay).
+/// Explicit selectors error; conventions warn — this is the convention
+/// side. Warned once per distinct peer IP per process so a chatty
+/// channel doesn't flood the log.
+pub(crate) fn warn_cleartext_public_peer(what: &str, peer: std::net::SocketAddr) {
+    if is_private_or_local(peer.ip()) {
+        return;
+    }
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut set) = warned.lock() {
+        if !set.insert(peer.ip()) {
+            return;
+        }
+    }
+    eprintln!(
+        "flodl: WARNING: {what} peer {peer} is outside any private network \
+         range and this channel is CLEARTEXT (frames are HMAC-authenticated, \
+         not encrypted) — params and gradients cross this link readable. \
+         flodl's documented contract is a controlled/private network; for \
+         anything else route the traffic through an SSH tunnel \
+         (`tunnel: true` on the worker in cluster.yml) or an encrypted \
+         overlay (WireGuard / VPN)."
+    );
+}
+
 /// Write the channel-select magic. First bytes on every cross-host
 /// dial, immediately after `connect`.
 pub(crate) fn write_channel_magic<W: Write>(w: &mut W, magic: u32) -> Result<()> {

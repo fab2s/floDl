@@ -318,6 +318,17 @@ pub struct ClusterWorker {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
+    /// Route this worker's training traffic through its fan-out SSH
+    /// session instead of a direct TCP connection to the controller:
+    /// the launcher adds a remote forward to the host's relay SSH
+    /// session and points the host at `127.0.0.1:<controller.port>`.
+    /// Requires a CPU ElChe mode (NCCL's peer-to-peer data plane cannot
+    /// ride a controller tunnel) and a remote host — validated loudly
+    /// at launch. When EVERY remote worker is tunneled, the controller
+    /// binds loopback only. Consumed by the library's launcher; fdl-cli
+    /// just carries it through the envelope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tunnel: bool,
     /// libtorch variant subpath under `<path>/libtorch/` on this host.
     /// E.g. `precompiled/cu128` for a Blackwell host on PT 2.10 cu128,
     /// `builds/sm61-sm120` for a Pascal host on a from-source build.

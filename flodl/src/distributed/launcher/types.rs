@@ -146,6 +146,16 @@ pub struct FullWorker {
     /// When `Some`, all fields inside are optional and fall back to
     /// system ssh defaults (or `~/.ssh/config` rules) when unset.
     pub ssh: Option<SshConfig>,
+    /// Route this host's training traffic through the fan-out SSH
+    /// session instead of a direct TCP connection to the controller.
+    /// The launcher adds a remote forward (`-R port:127.0.0.1:port`) to
+    /// the host's relay SSH session and points the host at
+    /// `127.0.0.1:<controller.port>` — its loopback end of the tunnel.
+    /// Requires a CPU ElChe mode (NCCL's peer-to-peer data plane cannot
+    /// ride a controller tunnel) and a remote host. When EVERY remote
+    /// worker is tunneled, the controller binds loopback only — the
+    /// port is then unreachable except through sshd.
+    pub tunnel: bool,
     /// Per-host env vars exported into this host's rank children.
     /// Override the cluster-scope [`FullCluster::env`] for matching
     /// keys. Use for host-specific tuning (e.g. an interface override
@@ -370,6 +380,9 @@ impl FullCluster {
                     }
                     o.insert("ssh".into(), serde_json::Value::Object(ssh_obj));
                 }
+                if h.tunnel {
+                    o.insert("tunnel".into(), serde_json::Value::Bool(true));
+                }
                 if !h.env.is_empty() {
                     let mut env_obj = serde_json::Map::new();
                     for (k, v) in &h.env {
@@ -555,6 +568,17 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         &format!("workers[{i}] ({name:?})"),
     )?;
 
+    let tunnel = match obj.get("tunnel") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: workers[{i}] ({name:?}): tunnel must be a \
+                 boolean, got {other}"
+            )));
+        }
+    };
+
     let env = parse_env_block(
         obj.get("env"),
         &format!("workers[{i}] ({name:?}).env"),
@@ -568,6 +592,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         path,
         arch,
         ssh,
+        tunnel,
         env,
     })
 }

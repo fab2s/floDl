@@ -555,3 +555,27 @@
         set_frame_ceiling(0);
         assert_eq!(frame_ceiling(), DEFAULT_FRAME_CEILING);
     }
+
+    #[test]
+    fn private_or_local_classification() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Controlled scopes: loopback, RFC1918, link-local, RFC6598
+        // shared space (also the WireGuard/Tailscale overlay range).
+        for a in [
+            "127.0.0.1", "10.0.0.1", "172.16.0.1", "172.31.255.255",
+            "192.168.122.1", "169.254.10.10", "100.64.0.1", "100.127.255.254",
+            "::1", "fe80::1", "fd00::1", "fc00::1",
+            // IPv4-mapped private classifies by the inner v4.
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(is_private_or_local(ip(a)), "{a} should be private/local");
+        }
+        // Public scopes → the cleartext guard fires.
+        for a in [
+            "8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.0",
+            "172.32.0.1", "2001:4860:4860::8888", "::ffff:8.8.8.8",
+        ] {
+            assert!(!is_private_or_local(ip(a)), "{a} should be public");
+        }
+    }

@@ -121,6 +121,7 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             path: String::new(),
             arch: None,
             ssh: None,
+            tunnel: false,
             env: std::collections::BTreeMap::new(),
         }],
         salt: [0u8; SESSION_SALT_BYTES],
