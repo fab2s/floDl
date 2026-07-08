@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 use crate::tensor::{Result, TensorError};
 
 use super::wire::{
-    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_RENDEZVOUS,
+    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_JOIN,
+    CHANNEL_MAGIC_RENDEZVOUS,
 };
 
 /// Poll cadence of the dispatcher's non-blocking accept loop.
@@ -53,6 +54,7 @@ pub(crate) struct MuxAccept {
     pub rendezvous: Receiver<TcpStream>,
     pub data: Receiver<TcpStream>,
     pub control: Receiver<TcpStream>,
+    pub join: Receiver<TcpStream>,
 }
 
 /// Owns the single accepting listener and its dispatcher thread.
@@ -85,13 +87,16 @@ impl PortMux {
         let (rdv_tx, rdv_rx) = channel();
         let (data_tx, data_rx) = channel();
         let (ctrl_tx, ctrl_rx) = channel();
+        let (join_tx, join_rx) = channel();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_c = Arc::clone(&shutdown);
         let handle = thread::Builder::new()
             .name(format!("flodl-port-mux:{bound_port}"))
             .spawn(move || {
-                dispatch_loop(listener, rdv_tx, data_tx, ctrl_tx, shutdown_c, abort);
+                dispatch_loop(
+                    listener, rdv_tx, data_tx, ctrl_tx, join_tx, shutdown_c, abort,
+                );
             })
             .map_err(|e| {
                 TensorError::new(&format!("port_mux: spawn dispatcher failed: {e}"))
@@ -99,7 +104,12 @@ impl PortMux {
 
         Ok((
             PortMux { shutdown, handle: Some(handle), bound_port },
-            MuxAccept { rendezvous: rdv_rx, data: data_rx, control: ctrl_rx },
+            MuxAccept {
+                rendezvous: rdv_rx,
+                data: data_rx,
+                control: ctrl_rx,
+                join: join_rx,
+            },
         ))
     }
 
@@ -124,6 +134,7 @@ fn dispatch_loop(
     rdv_tx: Sender<TcpStream>,
     data_tx: Sender<TcpStream>,
     ctrl_tx: Sender<TcpStream>,
+    join_tx: Sender<TcpStream>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
 ) {
@@ -145,7 +156,7 @@ fn dispatch_loop(
                 return;
             }
         };
-        dispatch_one(stream, peer, &rdv_tx, &data_tx, &ctrl_tx);
+        dispatch_one(stream, peer, &rdv_tx, &data_tx, &ctrl_tx, &join_tx);
     }
 }
 
@@ -157,6 +168,7 @@ fn dispatch_one(
     rdv_tx: &Sender<TcpStream>,
     data_tx: &Sender<TcpStream>,
     ctrl_tx: &Sender<TcpStream>,
+    join_tx: &Sender<TcpStream>,
 ) {
     // Controller-side cleartext guard: a public peer on the mux port
     // means training frames cross an uncontrolled network unencrypted.
@@ -195,6 +207,7 @@ fn dispatch_one(
         CHANNEL_MAGIC_RENDEZVOUS => (rdv_tx, "rendezvous"),
         CHANNEL_MAGIC_DATA => (data_tx, "data"),
         CHANNEL_MAGIC_CONTROL => (ctrl_tx, "control"),
+        CHANNEL_MAGIC_JOIN => (join_tx, "join"),
         other => {
             eprintln!(
                 "port_mux: dropping connection from {peer} (unknown channel \

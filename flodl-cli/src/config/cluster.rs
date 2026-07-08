@@ -141,6 +141,37 @@ pub struct ClusterController {
     /// [`DEFAULT_DATA_PATH`] applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
+    /// Join-window quorum knobs (dial-in membership). fdl-cli carries
+    /// the block through the launcher envelope verbatim; flodl owns
+    /// validation and the capacity-derived defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<ClusterJoin>,
+}
+
+/// `controller.join:` sub-block — per-field overrides for the
+/// membership window. All fields optional; unset keeps flodl's fan-out
+/// defaults (quorum = early-close target = configured capacity, window
+/// 300s, hard cap 600s, pre-shared-salt admission).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterJoin {
+    /// Quorum in ranks — the run cannot start below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rank_start: Option<usize>,
+    /// Join window in seconds; quorum reached early does NOT close it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_timeout: Option<u64>,
+    /// Early-close target in ranks: the window closes the moment this
+    /// many are in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ranks: Option<usize>,
+    /// Hard cap in seconds: quorum still unmet when it expires fails
+    /// the run loudly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_join_timeout: Option<u64>,
+    /// Accept joins without pre-shared-salt authentication on a
+    /// non-loopback bind (loudly warned by flodl).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_admission: Option<bool>,
 }
 
 impl ClusterController {

@@ -207,7 +207,6 @@ impl DdpHandle {
         match crate::distributed::launcher::dispatch()? {
             crate::distributed::launcher::Role::Launcher => {
                 let full = crate::distributed::launcher::FullCluster::from_env()?;
-                let world_size = full.world_size();
                 // One-time reminder: in a multi-host cluster the
                 // checkpoint/resume bundle is split across hosts and each
                 // piece is written on its writer's host, so the path must
@@ -227,19 +226,6 @@ impl DdpHandle {
                 // alongside `metrics_fn` (both fire on aggregation).
                 let (sink_tx, sink_rx) =
                     mpsc::channel::<EpochMetrics>();
-                let mut coord_config = build_coord_config_from_builder(
-                    policy,
-                    backend,
-                    &config,
-                    convergence_guard,
-                    metrics_fn,
-                    eval_result_fn,
-                    world_size,
-                    dataset.len(),
-                    batch_size,
-                    num_epochs,
-                )?;
-                coord_config = coord_config.metrics_sink_tx(sink_tx);
                 // Capture the static model schema (param/buffer names) for the
                 // controller-side consensus-checkpoint writer. Built on CPU in
                 // the launcher process — reads names only, touches no CUDA
@@ -247,11 +233,11 @@ impl DdpHandle {
                 // invariant). Best-effort: a factory that fails here just
                 // leaves the schema unset (consensus checkpoints degrade to
                 // meta-only); it does not abort the launch.
+                let mut model_schema: Option<crate::distributed::ModelSchema> = None;
                 match model_factory(Device::CPU) {
                     Ok(probe) => {
-                        coord_config = coord_config.model_schema(
-                            crate::distributed::ModelSchema::from_module(&probe),
-                        );
+                        model_schema =
+                            Some(crate::distributed::ModelSchema::from_module(&probe));
                         // Model-derived frame ceiling: the same CPU probe
                         // yields the exact wire footprint, replacing the
                         // 1 GiB default reject-threshold on every
@@ -339,6 +325,34 @@ impl DdpHandle {
                         }
                     }
                 }
+                // Controller-scope coordinator wiring. The config is
+                // built by a FACTORY at world-formation time (the join
+                // window decides the world size, not the config file),
+                // so everything it needs is captured here and sized
+                // there.
+                let dataset_len = dataset.len();
+                let coord_spec = crate::distributed::launcher::CoordSpec {
+                    backend,
+                    config_factory: Box::new(move |world_size| {
+                        let mut coord_config = build_coord_config_from_builder(
+                            policy,
+                            backend,
+                            &config,
+                            convergence_guard,
+                            metrics_fn,
+                            eval_result_fn,
+                            world_size,
+                            dataset_len,
+                            batch_size,
+                            num_epochs,
+                        )?;
+                        coord_config = coord_config.metrics_sink_tx(sink_tx);
+                        if let Some(schema) = model_schema {
+                            coord_config = coord_config.model_schema(schema);
+                        }
+                        Ok(coord_config)
+                    }),
+                };
                 // Cooperative-shutdown flag shared with the launcher's
                 // infrastructure threads; DdpHandle::shutdown raises it.
                 let launcher_abort =
@@ -349,7 +363,7 @@ impl DdpHandle {
                     .spawn(move || {
                         crate::distributed::launcher::run_launcher_with_config(
                             full,
-                            Some(coord_config),
+                            Some(coord_spec),
                             outer_optimizer,
                             abort_for_driver,
                         )
@@ -379,6 +393,19 @@ impl DdpHandle {
                     Ok(()) => std::process::exit(0),
                     Err(e) => {
                         eprintln!("cluster relay: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            crate::distributed::launcher::Role::Agent => {
+                // This process is a per-host worker agent (dial-in
+                // membership): join the controller's window, spawn +
+                // supervise this host's relay and rank children, exit.
+                // It never trains.
+                match crate::distributed::launcher::run_agent() {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("cluster agent: {e}");
                         std::process::exit(1);
                     }
                 }

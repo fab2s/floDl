@@ -1,61 +1,66 @@
-//! Cluster launcher: role detection + fan-out + controller orchestration.
+//! Cluster launcher: role detection, dial-in membership, fan-out sugar,
+//! controller orchestration.
 //!
 //! Slots transparently into [`Trainer::setup`] and friends on cluster-mode
-//! startup. Each user-binary invocation routes to one of three roles:
+//! startup. Each user-binary invocation routes to one of five roles:
 //!
 //! - **Launcher**: the parent process that fdl-cli execs after parsing
-//!   `fdl.yml`. Reads the full cluster topology, spawns one child per rank
-//!   (fork/exec for local hosts, ssh for remote), starts the controller
-//!   thread (TCP byte router for CPU averaging + log fan-in), waits for
-//!   every child to exit, then exits itself.
+//!   `fdl.yml`. Opens the membership join window (see the crate-internal
+//!   `distributed::membership` module), fans out ONE worker
+//!   agent per remote host over ssh (push-as-sugar: those agents dial back
+//!   in and join like any self-deployed worker would; local hosts run the
+//!   join in-process and keep their children direct), forms the world when
+//!   the window closes, starts the controller-side infrastructure sized to
+//!   it, ships each admitted worker its spawn artifacts, and supervises
+//!   until every child exits.
+//!
+//! - **Agent**: a per-host worker process (the one thing a deployment has
+//!   to start). Dials the controller's join channel, receives its rank
+//!   assignment + the spawn artifacts at world formation, then spawns and
+//!   supervises the host's relay + rank children. See [`run_agent`].
+//!
+//! - **Relay**: a per-host transport byte-router (spawned by the agent, or
+//!   directly by the launcher for its local host). See [`run_relay`].
 //!
 //! - **Rank**: a spawned child running the user's training code. Inherits
-//!   the slim per-host envelope and the rank-slot env var injected by the
-//!   launcher; existing [`Trainer::setup`] cluster-path logic handles the
-//!   rest (rendezvous, `Ddp::wrap`, training loop).
+//!   the slim per-host envelope and the rank-slot env var; existing
+//!   [`Trainer::setup`] cluster-path logic handles the rest (rendezvous,
+//!   `Ddp::wrap`, training loop). Envelopes are byte-identical whether the
+//!   host was fan-out-managed or self-deployed — ranks never know the join
+//!   protocol exists.
 //!
 //! - **Single-device**: no cluster envelope in env. Caller continues with
 //!   today's single-device path. Bit-identical to pre-cluster behavior.
 //!
 //! # Wire protocol (env vars)
 //!
-//! Two env vars distinguish the launcher and rank roles. The names are
-//! deliberately namespaced so a fdl-cli invocation in a cluster context
-//! never sets them both at the same time:
+//! One namespaced env var per spawned role; `dispatch` loud-errors on any
+//! combination:
 //!
 //! - [`ENV_FULL_CLUSTER_JSON`] (`FLODL_INTERNAL_FULL_CLUSTER_JSON`): hex-encoded
 //!   JSON of the *full* cluster topology (all hosts + ranks + devices).
 //!   Set by fdl-cli when invoking the user binary as the launcher. The
-//!   launcher reads it once to drive fan-out; never propagated to rank
-//!   children.
+//!   launcher reads it once to drive the window + fan-out; never
+//!   propagated to children.
+//!
+//! - [`ENV_AGENT_JSON`] (`FLODL_INTERNAL_AGENT_JSON`): hex-encoded
+//!   [`AgentSpec`] — controller address, optional pre-shared salt, device
+//!   scoping. The whole deployment payload of a dial-in worker.
+//!
+//! - [`ENV_RELAY_JSON`] (`FLODL_INTERNAL_RELAY_JSON`): hex-encoded
+//!   [`RelaySpec`], set on the relay child.
 //!
 //! - [`crate::distributed::cluster::ENV_CLUSTER_JSON`]
-//!   (`FLODL_INTERNAL_CLUSTER_JSON`): hex-encoded slim per-host envelope, mirroring
-//!   the existing rank-side wire format. Set by the launcher (not fdl-cli)
-//!   when spawning each rank child. Read by [`LocalCluster::from_env`].
+//!   (`FLODL_INTERNAL_CLUSTER_JSON`): hex-encoded slim per-host envelope, set
+//!   on each rank child. Read by [`LocalCluster::from_env`].
 //!
 //! - [`crate::distributed::cluster::ENV_LOCAL_RANK`] (`FLODL_INTERNAL_LOCAL_RANK`):
-//!   integer index into the slim envelope's `host.ranks`. Set by the
-//!   launcher when spawning each rank child. Read by
-//!   [`crate::distributed::cluster::LocalCluster::my_rank`].
+//!   integer index into the slim envelope's `host.ranks`, set on each rank
+//!   child. Read by [`crate::distributed::cluster::LocalCluster::my_rank`].
 //!
-//! Role detection table:
-//!
-//! | `FLODL_INTERNAL_FULL_CLUSTER_JSON` | `FLODL_INTERNAL_CLUSTER_JSON` | `FLODL_INTERNAL_LOCAL_RANK` | Role |
-//! |---|---|---|---|
-//! | unset | unset | unset | [`Role::SingleDevice`] |
-//! | unset | set | set | [`Role::Rank`] |
-//! | set | unset | unset | [`Role::Launcher`] (caller drives the fan-out) |
-//! | other combinations | | | loud error |
-//!
-//! # Design notes
-//!
-//! The "two-env-var" wire protocol is the smallest additive change to
-//! today's setup. Slim per-rank envelopes stay the same shape on the
-//! rank side, so [`LocalCluster::from_env`] needs no change. The new
-//! launcher-side parser ([`FullCluster::from_env`]) consumes the full
-//! topology in a separate path. A future cleanup could unify both
-//! shapes; for 4b the additive form keeps the blast radius small.
+//! Role detection table (see [`dispatch`]): exactly one of
+//! agent/relay/full set → that role; slim+slot → rank; all unset →
+//! single-device; anything else → loud error.
 //!
 //! [`Trainer::setup`]: crate::distributed::Trainer::setup
 //! [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
@@ -71,18 +76,20 @@ use crate::distributed::relay::agent::{ChannelKind, RelayChannel};
 use crate::distributed::relay::{RELAY_CONTROL_LOOPBACK_OFFSET, RELAY_DATA_LOOPBACK_OFFSET};
 use crate::tensor::{Result, TensorError};
 
+mod agent;
 mod spawn;
 mod types;
 #[cfg(test)]
 mod tests;
 
-pub use types::{SshConfig, FullCluster, FullController, FullWorker};
+pub use agent::{AgentSpec, run_agent};
+pub use types::{SshConfig, FullCluster, FullController, FullWorker, JoinKnobs};
 
 use spawn::{
-    load_prebuild_envelope, supervise_children, ElasticSupervision, build_local_spawn_command,
-    build_ssh_spawn_command, cleanup_remote_hosts_parallel, build_remote_bash_command,
-    build_local_relay_command, build_remote_relay_bash_command,
-    build_slim_envelope_for, forward_lines, RELAY_RANK_SENTINEL,
+    load_prebuild_envelope, supervise_children, ElasticSupervision,
+    build_ssh_spawn_command, cleanup_remote_hosts_parallel,
+    build_remote_agent_bash_command, build_slim_envelope_for, forward_lines,
+    AGENT_RANK_SENTINEL,
 };
 
 
@@ -97,6 +104,14 @@ pub const ENV_FULL_CLUSTER_JSON: &str = "FLODL_INTERNAL_FULL_CLUSTER_JSON";
 /// per host; consumed only by [`dispatch`] (→ [`Role::Relay`]) and
 /// [`run_relay`]. Mutually exclusive with the launcher/rank env vars.
 pub const ENV_RELAY_JSON: &str = "FLODL_INTERNAL_RELAY_JSON";
+
+/// Environment variable carrying the per-host worker-agent bootstrap
+/// spec (hex-encoded JSON [`AgentSpec`]). Set by the spawner of a
+/// dial-in worker — fan-out for managed hosts, a startup script or a
+/// human shell for self-deployed ones. Consumed only by [`dispatch`]
+/// (→ [`Role::Agent`]) and [`run_agent`]. Mutually exclusive with every
+/// other role env var.
+pub const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
 
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
@@ -153,6 +168,11 @@ pub enum Role {
     /// [`run_relay`] and exit the program when it returns. Touches no
     /// CUDA; multiplexes its local ranks' frames to the controller.
     Relay,
+    /// This process is a per-host worker agent (dial-in membership).
+    /// Caller must run [`run_agent`] and exit the program when it
+    /// returns. Touches no CUDA; joins the controller's window, then
+    /// spawns + supervises this host's relay and rank children.
+    Agent,
 }
 
 /// Detect this process's role from env vars. Pure function — no I/O,
@@ -165,23 +185,27 @@ pub enum Role {
 ///
 /// [`Trainer::setup`]: crate::distributed::Trainer::setup
 pub fn dispatch() -> Result<Role> {
+    let agent_set = env::var_os(ENV_AGENT_JSON).is_some();
     let relay_set = env::var_os(ENV_RELAY_JSON).is_some();
     let full_set = env::var_os(ENV_FULL_CLUSTER_JSON).is_some();
     let slim_set = env::var_os(crate::distributed::cluster::ENV_CLUSTER_JSON).is_some();
     let slot_set = env::var_os(crate::distributed::cluster::ENV_LOCAL_RANK).is_some();
 
-    match (relay_set, full_set, slim_set, slot_set) {
-        (false, false, false, false) => Ok(Role::SingleDevice),
-        (false, false, true, true) => Ok(Role::Rank),
-        (false, true, false, false) => Ok(Role::Launcher),
-        (true, false, false, false) => Ok(Role::Relay),
+    match (agent_set, relay_set, full_set, slim_set, slot_set) {
+        (false, false, false, false, false) => Ok(Role::SingleDevice),
+        (false, false, false, true, true) => Ok(Role::Rank),
+        (false, false, true, false, false) => Ok(Role::Launcher),
+        (false, true, false, false, false) => Ok(Role::Relay),
+        (true, false, false, false, false) => Ok(Role::Agent),
         // Any other combination is a misconfiguration. Loud error with
         // every bit named so the operator can see what's off.
         _ => Err(TensorError::new(&format!(
-            "cluster launcher: inconsistent env (FLODL_INTERNAL_RELAY_JSON={}, \
+            "cluster launcher: inconsistent env (FLODL_INTERNAL_AGENT_JSON={}, \
+             FLODL_INTERNAL_RELAY_JSON={}, \
              FLODL_INTERNAL_FULL_CLUSTER_JSON={}, FLODL_INTERNAL_CLUSTER_JSON={}, FLODL_INTERNAL_LOCAL_RANK={}). \
              Expected: all-unset (single-device), slim+slot only (rank), \
-             full only (launcher), or relay only (relay).",
+             full only (launcher), relay only (relay), or agent only (agent).",
+            on_off(agent_set),
             on_off(relay_set),
             on_off(full_set),
             on_off(slim_set),
@@ -367,23 +391,6 @@ fn on_off(b: bool) -> &'static str {
 }
 
 
-/// spawn a [`ClusterCoordinator`], fork rank children, wait for them to exit.
-///
-/// `coord_config` carries the user's controller-scope configuration — the
-/// guard, ElChe knobs, policy, partition ratios — assembled by the
-/// launcher-trampoline caller from the user's `DdpRunConfig`. `None`
-/// preserves the legacy "no coord spawn" path (rank-side via_coord
-/// routing is governed by `save_path` on `DdpRunConfig` per the
-/// `DdpHandle::launch` `auto_with` flip, not by an env var anymore).
-///
-/// Local hosts (`host.host == this_hostname`) get fork+exec of
-/// `current_exe()` with env vars set directly. Remote hosts get
-/// `ssh <target> bash -lc '<remote_cmd>'`, where `<remote_cmd>` exports
-/// env vars and execs `fdl <cmd>` — same shape fdl-cli used to use
-/// before this lift. Both produce identical child semantics (piped
-/// streams, `[host:dev:rN]` line-prefix on stdout/stderr).
-///
-/// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
 /// One-cluster-run-per-process latch. The launcher-side infrastructure
 /// (rendezvous listener, relay processes, coordinator, controller) is
 /// built for exactly ONE training session: the rendezvous closes after
@@ -459,42 +466,153 @@ fn validate_tunnel_topology(
         .all(|w| w.tunnel))
 }
 
+/// Fan-out derivation of the join-window quorum knobs: the configured
+/// topology IS the capacity fan-out just started, so by default the
+/// window closes the instant all of it is in (zero added latency vs the
+/// direct-spawn era) and the run cannot start below it (same
+/// all-or-nothing semantics). Every `controller.join:` field the user
+/// set overrides its derived default; the hard cap stretches to cover
+/// an enlarged window rather than failing validation.
+fn derive_join_config(
+    knobs: Option<&JoinKnobs>,
+    capacity: usize,
+) -> crate::distributed::membership::JoinConfig {
+    let defaults = crate::distributed::membership::JoinConfig::default();
+    let knobs = knobs.cloned().unwrap_or_default();
+    let join_timeout_secs = knobs.join_timeout_secs.unwrap_or(defaults.join_timeout_secs);
+    crate::distributed::membership::JoinConfig {
+        min_rank_start: knobs.min_rank_start.unwrap_or(capacity),
+        join_timeout_secs,
+        target_ranks: Some(knobs.target_ranks.unwrap_or(capacity)),
+        max_join_timeout_secs: knobs
+            .max_join_timeout_secs
+            .unwrap_or(defaults.max_join_timeout_secs.max(join_timeout_secs)),
+        open_admission: knobs.open_admission.unwrap_or(false),
+    }
+}
+
+/// Build the formed world's topology from the join-window membership.
+///
+/// Rank ids and device lists come from admission (they ARE the world);
+/// ssh/env/path/tunnel metadata carries over from the configured entry
+/// when the joiner matches one (fan-out hosts always do). A walk-in
+/// worker gets a minimal entry — the launcher never dials it, so
+/// transport fields stay empty.
+fn synthesize_world<'a>(
+    config: &FullCluster,
+    members: impl Iterator<Item = &'a crate::distributed::membership::JoinedMember>,
+    salt: crate::distributed::wire::SessionSalt,
+) -> FullCluster {
+    let workers: Vec<FullWorker> = members
+        .map(|m| match config.workers.iter().find(|w| w.host == m.host) {
+            Some(w) => FullWorker {
+                ranks: m.ranks.clone(),
+                local_devices: Some(m.local_devices.clone()),
+                ..w.clone()
+            },
+            None => FullWorker {
+                host: m.host.clone(),
+                ranks: m.ranks.clone(),
+                local_devices: Some(m.local_devices.clone()),
+                nccl_socket_ifname: String::new(),
+                path: String::new(),
+                arch: None,
+                ssh: None,
+                tunnel: false,
+                env: Default::default(),
+            },
+        })
+        .collect();
+    FullCluster {
+        controller: config.controller.clone(),
+        workers,
+        salt,
+        env: config.env.clone(),
+    }
+}
+
+/// A remote host's agent child during the join window: host name, the
+/// ssh process, and its output forwarders. Its global ranks are known
+/// only after formation, when it becomes a supervision entry.
+type RemoteAgentChild = (String, std::process::Child, Vec<thread::JoinHandle<()>>);
+
+/// A launcher-local host's in-process join: host name plus the thread
+/// that dials in and spawns the host's children (taken exactly once).
+type LocalJoin = (
+    String,
+    Option<thread::JoinHandle<Result<Vec<agent::HostChild>>>>,
+);
+
+/// Controller-scope coordinator wiring, handed to
+/// [`run_launcher_with_config`] by the launcher-trampoline caller.
+///
+/// `world_size` is known only when the join window closes, so the
+/// coordinator config is built by a factory at that moment instead of
+/// being passed pre-built — every per-rank structure (ElChe, heartbeat
+/// ledgers, callback roles) then sizes to the world that actually
+/// formed, not the world the config file promised. `backend` is
+/// duplicated out of the config because the launcher needs it BEFORE
+/// formation (tunnel validation, rendezvous gating, relay data-channel
+/// selection).
+pub struct CoordSpec {
+    /// Averaging backend of the run (must match what the factory bakes
+    /// into its config).
+    pub backend: crate::distributed::ddp_run::AverageBackend,
+    /// Builds the coordinator config for the formed world size.
+    pub config_factory: Box<
+        dyn FnOnce(
+                usize,
+            ) -> Result<
+                crate::distributed::cluster_coordinator::ClusterCoordinatorConfig,
+            > + Send,
+    >,
+}
+
+/// Run this process as the cluster launcher: open the join window, fan
+/// out one worker agent per configured host (push-as-sugar — the agents
+/// dial back in like any self-deployed worker would), form the world,
+/// start the controller-side infrastructure sized to it, ship each
+/// admitted worker its spawn artifacts, and supervise until the run
+/// ends.
+///
+/// `coord` carries the controller-scope coordinator wiring (see
+/// [`CoordSpec`]); `None` preserves the legacy no-coordinator NCCL
+/// routing (no relays, ranks dial the controller directly).
 pub fn run_launcher_with_config(
     full: FullCluster,
-    mut coord_config: Option<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>,
+    coord: Option<CoordSpec>,
     outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     abort: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    use crate::distributed::membership;
+
     claim_cluster_entry("launcher")?;
     // Fresh 128-bit session salt per launcher invocation. Becomes the
-    // HMAC key for every cross-process control + data frame; shipped
-    // to ranks via their slim envelope.
+    // HMAC key for every cross-process control + data frame; handed to
+    // workers at admission (pre-shared via the agent spec in rig mode,
+    // in the accept reply under open admission).
     let salt = crate::distributed::wire::generate_session_salt();
     let full = full.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
-    // Controller-not-in-workers is the canonical pattern post controller-active
-    // refactor: the controller drives orchestration, workers carry ranks.
-    // Co-locating the controller with a worker host is still supported (via
-    // hostname match below), it is just no longer the expected default.
-    let my_host_idx = full.workers.iter().position(|h| h.host == me);
-
     // Backend, resolved before any bind/spawn decision: tunnel
     // validation and the rendezvous/relay gating below all key off it.
-    // Unknown backend (no `coord_config`) defaults to NCCL, preserving
-    // prior behavior for non-coordinator paths.
-    let backend_is_nccl = coord_config
+    // Unknown backend (no `coord`) defaults to NCCL, preserving prior
+    // behavior for non-coordinator paths.
+    let backend_is_nccl = coord
         .as_ref()
         .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Nccl))
         .unwrap_or(true);
+    let has_coord = coord.is_some();
+    let relay_data_channel = has_coord && !backend_is_nccl;
 
     // Tunnel topology validation (loud, before anything binds or
     // spawns) + the resulting controller bind scope.
     let bind_loopback = validate_tunnel_topology(&full, &me, backend_is_nccl)?;
 
-    // Single-port mux: every controller-side channel (NCCL rendezvous,
-    // CPU-reduce data, coordinator control) accepts on ONE port —
-    // `controller.port` — and dialers route themselves with a
+    // Single-port mux: every controller-side channel (join, NCCL
+    // rendezvous, CPU-reduce data, coordinator control) accepts on ONE
+    // port — `controller.port` — and dialers route themselves with a
     // channel-select magic (see `port_mux`). Bound to 0.0.0.0 so remote
     // hosts reach it; local ranks use the same port via loopback.
     // EXCEPT when every remote worker rides an SSH tunnel: then the mux
@@ -524,10 +642,11 @@ pub fn run_launcher_with_config(
         rendezvous: mux_rendezvous,
         data: mux_data,
         control: mux_control,
+        join: mux_join,
     } = mux_accept;
     eprintln!(
         "cluster launcher: port mux bound on {mux_bind_ip}:{} \
-         (rendezvous + data + control{})",
+         (join + rendezvous + data + control{})",
         port_mux.port(),
         if bind_loopback { "; loopback-only, all workers tunneled" } else { "" },
     );
@@ -535,13 +654,312 @@ pub fn run_launcher_with_config(
     // Controller address AS SEEN FROM a given worker: tunneled workers
     // dial their loopback end of the SSH forward; when the mux binds
     // loopback-only, launcher-local workers must dial loopback too.
-    let controller_dial_host = |worker: &FullWorker| -> String {
-        if worker.tunnel || (bind_loopback && worker.host == me) {
+    let controller_host_cfg = full.controller.host.clone();
+    let launcher_host = me.clone();
+    let controller_dial_host = move |worker: &FullWorker| -> String {
+        if worker.tunnel || (bind_loopback && worker.host == launcher_host) {
             "127.0.0.1".to_string()
         } else {
-            full.controller.host.clone()
+            controller_host_cfg.clone()
         }
     };
+
+    // ------------------------------------------------------------------
+    // Membership window
+    // ------------------------------------------------------------------
+    let capacity = full.world_size();
+    let join_config = derive_join_config(
+        full.controller.join.as_ref(),
+        capacity,
+    );
+    let open_admission = membership::resolve_open_admission(&join_config, bind_loopback);
+    let gate_config = join_config.clone();
+    let gate_salt = salt;
+    let gate_abort = Arc::clone(&abort);
+    let gate_source = crate::distributed::port_mux::StreamSource::Mux(mux_join);
+    let gate = thread::Builder::new()
+        .name("flodl-join-gate".to_string())
+        .spawn(move || {
+            membership::run_join_window(
+                &gate_source,
+                &gate_config,
+                &gate_salt,
+                !open_admission,
+                None,
+                &gate_abort,
+            )
+        })
+        .map_err(|e| {
+            TensorError::new(&format!(
+                "cluster launcher: spawn join-gate thread failed: {e}"
+            ))
+        })?;
+
+    // ------------------------------------------------------------------
+    // Fan-out: one agent per remote host; local hosts join in-process
+    // ------------------------------------------------------------------
+    // For remote hosts, fdl-cli must have passed the original fdl command
+    // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent.
+    let has_remote = full
+        .workers
+        .iter()
+        .any(|h| h.host != me && !h.ranks.is_empty());
+    let fdl_cmd = if has_remote {
+        Some(env::var(ENV_FDL_CMD).map_err(|_| {
+            TensorError::new(&format!(
+                "cluster launcher: topology has remote hosts but {ENV_FDL_CMD} \
+                 is not set in env. fdl-cli must export the fdl command name \
+                 (e.g. {ENV_FDL_CMD}=train) when invoking the launcher."
+            ))
+        })?)
+    } else {
+        None
+    };
+    let overlay_env = env::var(ENV_FDL_ENV).ok().filter(|s| !s.trim().is_empty());
+    // Per-host pre-flight build envelope from fdl-cli. When a remote
+    // host has an entry, the remote dispatch substitutes the direct
+    // binary exec (no cargo on remote). Missing entry ⇒ legacy
+    // `fdl <cmd>` fallback (requires cargo on the remote).
+    let prebuild_envelope = load_prebuild_envelope()?;
+
+    // Collect (host, abs_bin) for every remote host that has a prebuild
+    // envelope entry. Used for both pre-spawn cleanup (clear orphans
+    // from a previous botched session before workers come up) and post-
+    // exit cleanup (catch anything the remote-side trap wrapper didn't
+    // reap — including the agent's own children, which run the same
+    // binary and therefore match the same pkill pattern).
+    let remote_cleanup_targets: Vec<(FullWorker, String)> = full
+        .workers
+        .iter()
+        .filter(|h| h.host != me)
+        .filter_map(|h| {
+            prebuild_envelope.get(&h.host).map(|pb| {
+                let abs_bin = format!(
+                    "{}/{}",
+                    h.path.trim_end_matches('/'),
+                    pb.bin,
+                );
+                (h.clone(), abs_bin)
+            })
+        })
+        .collect();
+
+    // Pre-spawn cleanup: SIGTERM/SIGKILL any leftover instance of this
+    // run's binary on each remote host. Self-heals across sessions:
+    // a previous launcher that died hard (SIGKILL, OOM, kernel panic)
+    // can leave orphans the trap wrapper couldn't reap. This pass
+    // guarantees a fresh start regardless.
+    cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
+
+    // Remote agents spawned during the window; their global ranks are
+    // known only after formation, so supervision entries are assembled
+    // then. Local hosts run the same join protocol on a thread and hand
+    // their children back — they stay DIRECT children of this process,
+    // so launcher supervision owns them first-hand exactly as before.
+    let mut remote_agents: Vec<RemoteAgentChild> = Vec::new();
+    let mut local_joins: Vec<LocalJoin> = Vec::new();
+    let salt_hex_for_agents = (!open_admission)
+        .then(|| crate::distributed::wire::salt_to_hex(&salt));
+    let spawn_result: Result<()> = (|| {
+        for host in &full.workers {
+            // Orchestrator-only entry (empty `ranks`): declared in
+            // cluster.yml solely so fdl-cli's pre-flight can read its
+            // `docker:` / `arch:` — no worker runs there.
+            if host.ranks.is_empty() {
+                continue;
+            }
+            let spec = agent::AgentSpec {
+                host: host.host.clone(),
+                controller_host: if host.host == me {
+                    // Local workers always reach the mux via loopback.
+                    "127.0.0.1".to_string()
+                } else {
+                    controller_dial_host(host)
+                },
+                controller_port: mux_port,
+                salt_hex: salt_hex_for_agents.clone(),
+                local_devices: host.local_devices.clone(),
+                libtorch: host.arch.clone().unwrap_or_default(),
+                dataset_sig_hex: None,
+            };
+            if host.host == me {
+                // Merged env for the local children (cluster-scope
+                // first, host-scope override) — same application the
+                // remote path gets via the agent command's bash prefix.
+                let mut extra_env = full.env.clone();
+                extra_env.extend(host.env.clone());
+                let host_name = host.host.clone();
+                let handle = thread::Builder::new()
+                    .name(format!("flodl-local-join:{host_name}"))
+                    .spawn(move || agent::join_and_spawn_local(spec, &extra_env))
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster launcher: spawn local join thread failed: {e}"
+                        ))
+                    })?;
+                local_joins.push((host.host.clone(), Some(handle)));
+            } else {
+                let spec_hex = spec.to_env_hex()?;
+                let remote_cmd = build_remote_agent_bash_command(
+                    &host.path,
+                    &host.host,
+                    overlay_env.as_deref(),
+                    fdl_cmd
+                        .as_deref()
+                        .expect("ENV_FDL_CMD presence enforced above when has_remote"),
+                    &env::args().skip(1).collect::<Vec<String>>(),
+                    &full.env,
+                    &host.env,
+                    prebuild_envelope.get(&host.host),
+                );
+                // The agent session carries the host's training tunnel
+                // when `tunnel: true` — the ONE ssh session per host.
+                let mut cmd = build_ssh_spawn_command(
+                    host,
+                    &remote_cmd,
+                    host.tunnel.then_some(mux_port),
+                );
+                // The spec (salt-bearing) rides stdin, never argv.
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = cmd.spawn().map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: spawn ssh agent for {:?} failed: {e}",
+                        host.host
+                    ))
+                })?;
+                spawn::pipe_envelope_to_child(&mut child, &spec_hex);
+                // Forward the agent's output RAW: the agent already
+                // prefixes its children (`[host:dev:rN]`, `[host:relay]`)
+                // and names the host in its own diagnostics — a launcher
+                // prefix here would double up on every training line.
+                let mut forwarders = Vec::with_capacity(2);
+                if let Some(out) = child.stdout.take() {
+                    forwarders.push(thread::spawn(move || {
+                        forward_lines(out, String::new(), false);
+                    }));
+                }
+                if let Some(err) = child.stderr.take() {
+                    forwarders.push(thread::spawn(move || {
+                        forward_lines(err, String::new(), true);
+                    }));
+                }
+                remote_agents.push((host.host.clone(), child, forwarders));
+            }
+        }
+        Ok(())
+    })();
+
+    // Teardown helper for every pre-supervision failure path: stop the
+    // window, reap agents + local join threads, clean remote hosts.
+    let teardown_early = |remote_agents: &mut Vec<RemoteAgentChild>,
+                          local_joins: &mut Vec<LocalJoin>| {
+        abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (_, child, forwarders) in remote_agents.drain(..) {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            for f in forwarders {
+                let _ = f.join();
+            }
+        }
+        for (_, handle) in local_joins.iter_mut() {
+            if let Some(h) = handle.take() {
+                // The gate aborts (Abort frame or dropped join leg), so
+                // the local join thread unblocks promptly; kill whatever
+                // it managed to spawn.
+                if let Ok(Ok(children)) = h.join() {
+                    for mut c in children {
+                        let _ = c.child.kill();
+                        let _ = c.child.wait();
+                        for f in c.forwarders {
+                            let _ = f.join();
+                        }
+                    }
+                }
+            }
+        }
+        cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
+    };
+
+    if let Err(e) = spawn_result {
+        eprintln!(
+            "cluster launcher: fan-out failed; tearing down {} agent(s): {e}",
+            remote_agents.len() + local_joins.len(),
+        );
+        teardown_early(&mut remote_agents, &mut local_joins);
+        let _ = gate.join();
+        return Err(e);
+    }
+
+    // Wait for the window while watching the agents: an agent that dies
+    // BEFORE the world forms can never join, so with fan-out's
+    // all-of-capacity target the window would otherwise idle to its hard
+    // cap — fail fast instead, matching the direct-spawn era's
+    // first-failure behavior.
+    let mut dead_agent: Option<String> = None;
+    let formed = loop {
+        if gate.is_finished() {
+            break gate.join().map_err(|_| {
+                TensorError::new("cluster launcher: join-gate thread panicked")
+            })?;
+        }
+        if dead_agent.is_none() {
+            for (host, child, _) in remote_agents.iter_mut() {
+                // ANY pre-formation agent exit is fatal — even a clean
+                // one (its ranks can never join, so the window would
+                // otherwise idle out its full hard cap; observed with an
+                // agent whose binary exited 0 through a pre-run gate).
+                if let Ok(Some(st)) = child.try_wait() {
+                    eprintln!(
+                        "cluster launcher: agent of {host:?} exited with \
+                         {st} before the world formed; aborting the window"
+                    );
+                    dead_agent = Some(host.clone());
+                    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let formed = match formed {
+        Ok(f) => f,
+        Err(e) => {
+            teardown_early(&mut remote_agents, &mut local_joins);
+            return Err(match dead_agent {
+                Some(host) => TensorError::new(&format!(
+                    "cluster launcher: agent of {host:?} died before the world \
+                     formed ({e})"
+                )),
+                None => e,
+            });
+        }
+    };
+
+    // World synthesis: the formed membership becomes the topology.
+    let membership::FormedWorld {
+        workers: formed_workers,
+        world_size,
+        snapshot: mut membership_state,
+    } = formed;
+    let world = synthesize_world(
+        &full,
+        formed_workers.iter().map(|aw| &aw.member),
+        salt,
+    );
+    let my_host_idx = world.workers.iter().position(|h| h.host == me);
+
+    // ------------------------------------------------------------------
+    // Controller-side infrastructure, sized to the formed world
+    // ------------------------------------------------------------------
+    let mut coord_config = match coord {
+        Some(spec) => Some((spec.config_factory)(world_size)?),
+        None => None,
+    };
+    let elastic_max_failure = coord_config.as_ref().and_then(|c| c.max_failure);
+
     // Shared dead-rank ledger between ClusterController (CPU averaging
     // releases on heartbeat-stale) and ClusterCoordinator (NCCL
     // elastic-membership rendezvous trigger). Both consumers see the
@@ -549,7 +967,7 @@ pub fn run_launcher_with_config(
     // runs — the cost is negligible (a Vec<AtomicBool>) and the wiring
     // keeps both backends pluggable.
     let dead_ranks_shared =
-        crate::distributed::controller::DeadRanks::new(full.world_size());
+        crate::distributed::controller::DeadRanks::new(world_size);
     // Consensus-checkpoint forge: holds the launch-captured model schema so the
     // controller reduce thread can write a named `.fdl` from the averaged
     // (name-less) frame. Shared with the coordinator (which arms it before a
@@ -572,8 +990,8 @@ pub fn run_launcher_with_config(
         crate::distributed::controller::ClusterController::start_from_source(
             crate::distributed::port_mux::StreamSource::Mux(mux_data),
             mux_port,
-            full.world_size(),
-            full.salt,
+            world_size,
+            salt,
             Arc::clone(&dead_ranks_shared),
             Some(Arc::clone(&checkpoint_forge)),
             outer_optimizer,
@@ -581,7 +999,7 @@ pub fn run_launcher_with_config(
     eprintln!(
         "cluster launcher: ClusterController up on port {} (world_size={})",
         cpu_averager.port(),
-        full.world_size()
+        world_size,
     );
 
     // ClusterCoordinator spawn on the mux's control leg for the elastic-
@@ -591,65 +1009,27 @@ pub fn run_launcher_with_config(
     // a coord spawned. `None` skips the coord — legacy NCCL routing
     // (worker self-driven ElChe, no elastic membership) handles that
     // path entirely on the rank side.
-    //
-    // The spawned thread blocks in `start_from_source`'s accept loop
-    // until `world_size` ranks connect; if the via-coord routing isn't
-    // exercised the thread sits idle until the launcher process exits
-    // (process-exit kills the thread; no graceful shutdown plumbed yet).
-    // Hoisted so `cluster_dashboard_sink.shutdown()` can fire after
-    // children exit (emits the SSE `complete` event so connected
-    // browsers stop the elapsed counter). `None` when coord_config is
-    // None — legacy NCCL routing path with no dashboard wiring.
     let mut dashboard_sink_outer:
         Option<Arc<dyn crate::distributed::DashboardSink>> = None;
-
-    // Decide relay spawn BEFORE `coord_config` is consumed below. A
-    // per-host relay is spawned whenever a coordinator is in play (the
-    // via-coord routing that uses the controller/coord channels). The
-    // data-channel relay is needed only for the CPU averaging backend
-    // (NCCL ranks never dial the data channel).
-    let spawn_relays = coord_config.is_some();
-    let relay_data_channel = coord_config
-        .as_ref()
-        .map(|c| matches!(c.backend, crate::distributed::ddp_run::AverageBackend::Cpu))
-        .unwrap_or(false);
-    // The NCCL-UID bootstrap rendezvous is dialed only by NCCL ranks.
-    // CPU-averaging ranks never connect, so spawning it on a CPU
-    // backend just idles the accept loop to its timeout and logs a
-    // spurious "rendezvous: timed out ... (0/N ranks in)" error while
-    // training proceeds fine over the control/data channels. The spawn
-    // below is gated on `backend_is_nccl` (hoisted above the mux bind).
-    // Elastic supervision context, captured before `coord_config` is
-    // consumed. No coordinator → no elastic machinery to defer to →
-    // supervision keeps the legacy first-failure kill-all.
-    let has_coord = coord_config.is_some();
-    let elastic_max_failure = coord_config.as_ref().and_then(|c| c.max_failure);
     let reported_deaths: crate::distributed::cluster_coordinator::ReportedDeaths =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Infrastructure-thread handles, kept so the exit paths can JOIN them
-    // (with `abort` raised on failure) instead of leaving them detached —
-    // the reason the failure path used to be a process::exit(1).
+    // (with `abort` raised on failure) instead of leaving them detached.
     let mut coord_driver: Option<thread::JoinHandle<()>> = None;
     let mut rdv_driver: Option<thread::JoinHandle<()>> = None;
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
-        // Launcher-side fields layered on top of the caller's config:
-        // `local_ranks` (host-dependent: which global ranks are on the
-        // launcher's host) and `dead_ranks` (shared ledger with the
-        // ClusterController already started above). The caller built
-        // the controller-scope fields (policy, ElChe, guard, etc.) but
-        // can't know these two — only the launcher does.
+        // Launcher-side fields layered on top of the factory's config:
+        // `local_ranks` (host-dependent: which global ranks landed on
+        // the launcher's host) and `dead_ranks` (shared ledger with the
+        // ClusterController already started above).
         let local_ranks: Vec<usize> = my_host_idx
-            .map(|i| full.workers[i].ranks.clone())
+            .map(|i| world.workers[i].ranks.clone())
             .unwrap_or_default();
         let dead_ranks = Arc::clone(&dead_ranks_shared);
-        // Fast external death reports from child supervision (below):
-        // the launcher knows a rank process exited within milliseconds;
-        // the coordinator drains this queue each tick through the same
-        // side-effect chain as heartbeat-staleness detection.
         config = config
             .local_ranks(local_ranks.clone())
             .dead_ranks(dead_ranks)
@@ -657,29 +1037,22 @@ pub fn run_launcher_with_config(
 
         // Controller-hosted live dashboard. The sink owns a Monitor
         // that binds the HTTP port lazily on the first rank-emitted
-        // `DashboardRegister` frame (the rank's `monitor.serve(port)`
-        // call from user code triggers that emit; absent that the sink
-        // stays idle and the dashboard is simply never served). The
-        // sink itself is cheap (an unbound Monitor + per-rank state
-        // maps) so we construct unconditionally and let the wire path
-        // decide whether to bind.
+        // `DashboardRegister` frame; absent that the sink stays idle
+        // and the dashboard is simply never served.
         let dashboard_sink: Arc<dyn crate::distributed::DashboardSink> =
             Arc::new(crate::distributed::ClusterDashboardSink::new(
-                Arc::new(full.clone()),
+                Arc::new(world.clone()),
                 me.clone(),
                 config.num_epochs,
             ));
         dashboard_sink_outer = Some(Arc::clone(&dashboard_sink));
         config = config.dashboard_sink(Arc::clone(&dashboard_sink));
-        // Heartbeat timeout: now flows from `DdpRunConfig.heartbeat_timeout_secs`
-        // through `build_coord_config_from_builder` — no env var override.
 
-        let coord_salt = full.salt;
-        let coord_world = full.world_size();
+        let coord_salt = salt;
         eprintln!(
             "cluster launcher: ClusterCoordinator spawning on port {} \
              (world_size={}, local_ranks={:?})",
-            mux_port, coord_world, local_ranks,
+            mux_port, world_size, local_ranks,
         );
         // Capture the resume kickoff epoch before moving `config` into
         // `start()`. `start_epoch == 0` for fresh runs; resume runs
@@ -705,9 +1078,7 @@ pub fn run_launcher_with_config(
                         // Kickoff the first epoch dispatch. Without this,
                         // `tick()` never broadcasts `StartEpoch` to any
                         // rank and workers idle indefinitely in
-                        // `wait_for_epoch_plan`. Mirrors the threaded
-                        // coordinator's `coord.send_all_plans(0)` in
-                        // `orchestrator.rs`; resume runs pass
+                        // `wait_for_epoch_plan`. Resume runs pass
                         // `start_epoch = meta.epoch` to continue from
                         // the saved trajectory point.
                         //
@@ -787,15 +1158,8 @@ pub fn run_launcher_with_config(
     // Bootstrap rendezvous server (on the mux port). Every rank
     // dials in, the controller designates one rank as NCCL-UID generator
     // (default: a local-host worker's first rank if any, else
-    // `workers[0].ranks[0]`), then broadcasts the UID. The controller
-    // cannot call `ncclGetUniqueId` itself — its process is
-    // orchestration-only — so it delegates to a rank, same pattern as
-    // elastic resize's `RequestNewNcclId` path.
+    // `workers[0].ranks[0]`), then broadcasts the UID.
     //
-    // Spawned as a short-lived thread that exits once every rank has
-    // its UID. If it errors, ranks fail to rendezvous and surface their
-    // own loud errors; we eprintln any failure here for diagnostics.
-    // Skipped entirely on CPU backends, which never dial it in.
     // Cohort-formation gate for elastic child supervision. Pre-formation
     // a rank death must kill-all (peers are blocked in NCCL's
     // connect-retry with no comm to abort and no rebuild machinery
@@ -806,7 +1170,7 @@ pub fn run_launcher_with_config(
     // ledger, so a pre-round death cannot wedge survivors).
     let cohort_formed = Arc::new(std::sync::atomic::AtomicBool::new(!backend_is_nccl));
     if backend_is_nccl {
-        let rdv_full = full.clone();
+        let rdv_full = world.clone();
         let rdv_me = me.clone();
         let formed_for_rdv = Arc::clone(&cohort_formed);
         let rdv_abort = Arc::clone(&abort);
@@ -836,324 +1200,176 @@ pub fn run_launcher_with_config(
         drop(mux_rendezvous);
     }
 
-    // For remote hosts, fdl-cli must have passed the original fdl command
-    // name so we can invoke `fdl <cmd>` over ssh. Loud error if absent.
-    let has_remote = full.workers.iter().any(|h| h.host != me);
-    let fdl_cmd = if has_remote {
-        Some(env::var(ENV_FDL_CMD).map_err(|_| {
-            TensorError::new(&format!(
-                "cluster launcher: topology has remote hosts but {ENV_FDL_CMD} \
-                 is not set in env. fdl-cli must export the fdl command name \
-                 (e.g. {ENV_FDL_CMD}=train) when invoking the launcher."
+    // ------------------------------------------------------------------
+    // Ship each admitted worker its spawn artifacts
+    // ------------------------------------------------------------------
+    // The envelope and relay spec are byte-identical to what the direct
+    // fan-out used to inject at spawn time; only the delivery changed
+    // (the join connection instead of env/stdin). The connection then
+    // stays open as the host control link: `RankExited` reports flow up
+    // it into the coordinator's fast death queue.
+    let frame_ceiling = crate::distributed::wire::frame_ceiling();
+    let mut rank_exit_readers: Vec<thread::JoinHandle<()>> = Vec::new();
+    for (idx, aw) in formed_workers.into_iter().enumerate() {
+        let worker = &world.workers[idx];
+        let member = aw.member;
+        let mut stream = aw.stream;
+        let dial_host = controller_dial_host(worker);
+        let envelope = build_slim_envelope_for(&world, worker, &dial_host);
+        let envelope_hex = crate::distributed::cluster::hex_encode(
+            serde_json::to_string(&envelope)
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: serialize slim envelope failed: {e}"
+                    ))
+                })?
+                .as_bytes(),
+        );
+        let relay_spec_hex = if has_coord {
+            let spec = RelaySpec {
+                host: member.host.clone(),
+                controller_host: dial_host,
+                controller_port: mux_port,
+                ranks: member.ranks.iter().map(|r| *r as u32).collect(),
+                salt_hex: crate::distributed::wire::salt_to_hex(&salt),
+                world_size,
+                data_channel: relay_data_channel,
+                frame_ceiling_bytes: frame_ceiling,
+            };
+            Some(crate::distributed::cluster::hex_encode(
+                serde_json::to_string(&spec)
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster launcher: serialize relay spec failed: {e}"
+                        ))
+                    })?
+                    .as_bytes(),
             ))
-        })?)
-    } else {
-        None
-    };
-    let overlay_env = env::var(ENV_FDL_ENV).ok().filter(|s| !s.trim().is_empty());
-    let user_args: Vec<String> = env::args().skip(1).collect();
-    let exe = env::current_exe().map_err(|e| {
-        TensorError::new(&format!(
-            "cluster launcher: current_exe() failed: {e}"
-        ))
-    })?;
-    // Per-host pre-flight build envelope from fdl-cli. When a remote
-    // host has an entry, the remote dispatch substitutes the direct
-    // binary exec (no cargo on remote). Missing entry ⇒ legacy
-    // `fdl <cmd>` fallback (requires cargo on the remote).
-    let prebuild_envelope = load_prebuild_envelope()?;
+        } else {
+            None
+        };
+        let msg = crate::distributed::wire::JoinMsgWire::WorldFormed {
+            envelope_hex,
+            relay_spec_hex,
+        };
+        let send = crate::distributed::wire::ControlFrame::encode(
+            &salt,
+            crate::distributed::wire::MsgKind::Join,
+            &msg,
+        )
+        .and_then(|f| f.write_to(&mut stream));
+        if let Err(e) = send {
+            // The worker died between admission and formation: a
+            // post-formation membership event. Report its ranks dead and
+            // let elastic membership (or the NCCL rendezvous idle
+            // timeout) take it from here.
+            eprintln!(
+                "cluster launcher: WorldFormed to {:?} failed ({e}); \
+                 reporting its rank(s) {:?} dead",
+                member.host, member.ranks,
+            );
+            if let Ok(mut q) = reported_deaths.lock() {
+                q.extend(member.ranks.iter().copied());
+            }
+            continue;
+        }
+        // Host control link reader: per-rank exit reports feed the
+        // coordinator's fast death queue (non-zero exits only — clean
+        // exits are handled by the normal Exiting control flow). EOF is
+        // the host closing shop; benign here because host-death shows up
+        // through agent exit (remote) or direct child exits (local).
+        let reader_deaths = Arc::clone(&reported_deaths);
+        let reader_salt = salt;
+        let reader_host = member.host.clone();
+        rank_exit_readers.push(thread::spawn(move || {
+            let _ = stream.set_read_timeout(None);
+            loop {
+                match crate::distributed::wire::ControlFrame::read_from(
+                    &mut stream,
+                    &reader_salt,
+                ) {
+                    Ok(Some(frame)) => {
+                        match frame.decode::<crate::distributed::wire::JoinMsgWire>() {
+                            Ok(crate::distributed::wire::JoinMsgWire::RankExited {
+                                rank,
+                                code,
+                            }) if code != 0 => {
+                                eprintln!(
+                                    "cluster launcher: host {reader_host:?} reports \
+                                     rank {rank} exited with code {code}; feeding \
+                                     elastic membership"
+                                );
+                                if let Ok(mut q) = reader_deaths.lock() {
+                                    q.push(rank as usize);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                crate::verbose!(
+                                    "  cluster launcher: control-link decode from \
+                                     {reader_host:?}: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        }));
+    }
 
-    // Collect (host, abs_bin) for every remote host that has a prebuild
-    // envelope entry. Used for both pre-spawn cleanup (clear orphans
-    // from a previous botched session before ranks come up) and post-
-    // exit cleanup (catch any rank whose remote-side trap wrapper
-    // didn't fire). Legacy `fdl <cmd>` re-entry path has no
-    // well-defined process signature to pkill on, so it's excluded.
-    let remote_cleanup_targets: Vec<(FullWorker, String)> = full
+    // ------------------------------------------------------------------
+    // Supervision
+    // ------------------------------------------------------------------
+    let ranks_by_host: std::collections::BTreeMap<String, Vec<usize>> = world
         .workers
         .iter()
-        .filter(|h| h.host != me)
-        .filter_map(|h| {
-            prebuild_envelope.get(&h.host).map(|pb| {
-                let abs_bin = format!(
-                    "{}/{}",
-                    h.path.trim_end_matches('/'),
-                    pb.bin,
-                );
-                (h.clone(), abs_bin)
-            })
-        })
+        .map(|w| (w.host.clone(), w.ranks.clone()))
         .collect();
-
-    // Pre-spawn cleanup: SIGTERM/SIGKILL any leftover instance of this
-    // run's binary on each remote host. Self-heals across sessions:
-    // a previous launcher that died hard (SIGKILL, OOM, kernel panic)
-    // can leave orphans the trap wrapper couldn't reap. This pass
-    // guarantees a fresh start regardless.
-    cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
-
-    // Spawn one child per rank across every host.
-    // (host, local-rank-or-relay-sentinel, global ranks this child
-    // carries, child handle, output forwarders). The global-ranks vec is
-    // what elastic supervision reports dead on a non-zero exit: one rank
-    // for a rank child, the host's whole rank set for its relay.
-    let mut children: Vec<spawn::SupervisedChild> =
-        Vec::with_capacity(full.world_size());
-    // Fan-out is all-or-nothing. Any spawn / serialize failure inside the
-    // closure takes the teardown path below instead of returning early:
-    // a bare `?` used to strand the already-spawned half of the cohort
-    // (local ranks, relays, remote SSH sessions) with the controller
-    // still up — on the programmatic path the caller's main() could keep
-    // running while orphaned ranks trained on against a run it thinks
-    // failed.
-    let spawn_result: Result<()> = (|| {
-        for host in &full.workers {
-            // Orchestrator-only entry (empty `ranks`): declared in
-            // cluster.yml solely so fdl-cli's pre-flight can read its
-            // `docker:` / `arch:` — the launcher spawns nothing for it
-            // (the empty-ranks contract in types.rs). Without this guard
-            // a relay child was spawned for the host anyway: zero local
-            // ranks to serve, idling on loopback ports (possibly over
-            // ssh) waiting for connections that never come.
-            if host.ranks.is_empty() {
-                continue;
+    let mut children: Vec<spawn::SupervisedChild> = Vec::new();
+    let mut collect_err: Option<TensorError> = None;
+    for (host, handle) in local_joins.iter_mut() {
+        let joined = handle
+            .take()
+            .expect("local join handle consumed once")
+            .join();
+        match joined {
+            Ok(Ok(host_children)) => {
+                let host_ranks = ranks_by_host.get(host).cloned().unwrap_or_default();
+                for hc in host_children {
+                    let granks = match hc.rank {
+                        Some(r) => vec![r as usize],
+                        None => host_ranks.clone(),
+                    };
+                    children.push((host.clone(), hc.slot, granks, hc.child, hc.forwarders));
+                }
             }
-            // Spawn one transport relay per host (before its ranks), when the
-            // via-coord routing is active. Ranks dial the relay's loopback
-            // (+4/+5) instead of the controller directly. The relay child is
-            // supervised alongside the ranks — it exits cleanly once its local
-            // ranks disconnect, and SIGTERM reaches it if a peer fails.
-            if spawn_relays {
-                let spec = RelaySpec {
-                    host: host.host.clone(),
-                    // Tunneled hosts dial their loopback end of the SSH
-                    // forward carried by this relay's own ssh session.
-                    controller_host: controller_dial_host(host),
-                    controller_port: full.controller.port,
-                    ranks: host.ranks.iter().map(|r| *r as u32).collect(),
-                    salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
-                    world_size: full.world_size(),
-                    data_channel: relay_data_channel,
-                    // The launcher's model probe installed the session
-                    // ceiling before this driver started (orchestrator
-                    // handle); reads the default when the probe failed.
-                    frame_ceiling_bytes: crate::distributed::wire::frame_ceiling(),
-                };
-                let spec_hex = crate::distributed::cluster::hex_encode(
-                    serde_json::to_string(&spec)
-                        .map_err(|e| {
-                            TensorError::new(&format!(
-                                "cluster launcher: serialize relay spec failed: {e}"
-                            ))
-                        })?
-                        .as_bytes(),
-                );
-                let is_remote = host.host != me;
-                let mut cmd = if is_remote {
-                    let remote_cmd = build_remote_relay_bash_command(
-                        &host.path,
-                        fdl_cmd
-                            .as_deref()
-                            .expect("ENV_FDL_CMD presence enforced above when has_remote"),
-                        &user_args,
-                        &full.env,
-                        &host.env,
-                        prebuild_envelope.get(&host.host),
-                    );
-                    // The relay session carries the host's training
-                    // tunnel when `tunnel: true` — see
-                    // `build_ssh_spawn_command`.
-                    build_ssh_spawn_command(
-                        host,
-                        &remote_cmd,
-                        host.tunnel.then_some(mux_port),
-                    )
-                } else {
-                    build_local_relay_command(&exe, &user_args, &spec_hex)
-                };
-                // Remote children read the salt-bearing envelope from stdin
-                // (see `pipe_envelope_to_child`); local children get it via
-                // `Command::env`.
-                cmd.stdin(if is_remote { Stdio::piped() } else { Stdio::null() })
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                if !is_remote {
-                    for (k, v) in &full.env {
-                        cmd.env(k, v);
-                    }
-                    for (k, v) in &host.env {
-                        cmd.env(k, v);
-                    }
-                }
-                let mut child = cmd.spawn().map_err(|e| {
-                    let kind = if is_remote { "ssh" } else { "local bash/exec" };
+            Ok(Err(e)) => {
+                collect_err.get_or_insert_with(|| {
                     TensorError::new(&format!(
-                        "cluster launcher: spawn {kind} relay for {:?} failed: {e}",
-                        host.host
+                        "cluster launcher: local worker {host:?} failed to spawn \
+                         its children: {e}"
                     ))
-                })?;
-                if is_remote {
-                    spawn::pipe_envelope_to_child(&mut child, &spec_hex);
-                }
-                let prefix = format!("[{}:relay] ", host.host);
-                let mut forwarders = Vec::with_capacity(2);
-                if let Some(out) = child.stdout.take() {
-                    let p = prefix.clone();
-                    forwarders.push(thread::spawn(move || forward_lines(out, p, false)));
-                }
-                if let Some(err) = child.stderr.take() {
-                    let p = prefix.clone();
-                    forwarders.push(thread::spawn(move || forward_lines(err, p, true)));
-                }
-                // The relay child has no single rank slot (it carries the whole
-                // host's rank set); mark it with the relay sentinel so
-                // supervision prints "relay of <host>" instead of a raw number.
-                children.push((
-                    host.host.clone(),
-                    RELAY_RANK_SENTINEL,
-                    host.ranks.clone(),
-                    child,
-                    forwarders,
-                ));
+                });
             }
-            for local_rank in 0..host.ranks.len() {
-                let envelope = build_slim_envelope_for(
-                    &full,
-                    host,
-                    &controller_dial_host(host),
-                );
-                let envelope_hex = crate::distributed::cluster::hex_encode(
-                    serde_json::to_string(&envelope)
-                        .map_err(|e| {
-                            TensorError::new(&format!(
-                                "cluster launcher: serialize slim envelope failed: {e}"
-                            ))
-                        })?
-                        .as_bytes(),
-                );
-
-                // Scope each rank's child to its assigned physical GPU
-                // via `CUDA_VISIBLE_DEVICES=<phys>`. Standard torchrun-
-                // style recipe: the child sees only one GPU, addresses it
-                // as CUDA(0). Required for multi-process CUDA on older CCs
-                // (Pascal/sm_61 surfaced this: dual-process where both
-                // ranks see both GPUs hits `cudaErrorNoKernelImageForDevice`
-                // sticky on the first allocation, even though kernels are
-                // present for sm_61 — the lazy module load picks the wrong
-                // context). `cluster::my_rank` honors the scoping by
-                // returning CUDA(0) when CUDA_VISIBLE_DEVICES is single-
-                // valued.
-                let local_phys = host
-                    .local_devices
-                    .as_ref()
-                    .and_then(|d| d.get(local_rank).copied());
-                let is_remote = host.host != me;
-                let mut cmd = if is_remote {
-                    let remote_cmd = build_remote_bash_command(
-                        &host.path,
-                        &host.host,
-                        local_rank,
-                        overlay_env.as_deref(),
-                        fdl_cmd
-                            .as_deref()
-                            .expect("ENV_FDL_CMD presence enforced above when has_remote"),
-                        &user_args,
-                        &full.env,
-                        &host.env,
-                        local_phys,
-                        prebuild_envelope.get(&host.host),
-                    );
-                    // Rank sessions never carry the tunnel forward — the
-                    // host's relay session owns it (one `-R` per host).
-                    build_ssh_spawn_command(host, &remote_cmd, None)
-                } else {
-                    build_local_spawn_command(
-                        &exe,
-                        &user_args,
-                        &envelope_hex,
-                        local_rank,
-                        local_phys,
-                    )
-                };
-                // Remote children read the salt-bearing envelope from stdin
-                // (see `pipe_envelope_to_child`); local children carry it
-                // via `Command::env` in build_local_spawn_command.
-                cmd.stdin(if is_remote { Stdio::piped() } else { Stdio::null() })
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                // Apply user-declared env from `full.env` (cluster-scope)
-                // first, then `host.env` (per-host override). This is
-                // last-write-wins over the built-ins the Command already
-                // carries — safe ONLY because reserved keys (FLODL_*,
-                // CUDA_VISIBLE_DEVICES) are rejected at config parse
-                // (`parse_env_block`), so no user key can reach here
-                // that would clobber launcher-owned rank identity. SSH
-                // path: same parse-time guarantee, bash-level apply in
-                // build_remote_bash_command.
-                if !is_remote {
-                    for (k, v) in &full.env {
-                        cmd.env(k, v);
-                    }
-                    for (k, v) in &host.env {
-                        cmd.env(k, v);
-                    }
-                }
-
-                let mut child = cmd.spawn().map_err(|e| {
-                    let kind = if is_remote { "ssh" } else { "local bash/exec" };
+            Err(_) => {
+                collect_err.get_or_insert_with(|| {
                     TensorError::new(&format!(
-                        "cluster launcher: spawn {kind} for rank {local_rank} of {:?} failed: {e}",
-                        host.host
+                        "cluster launcher: local join thread for {host:?} panicked"
                     ))
-                })?;
-                if is_remote {
-                    spawn::pipe_envelope_to_child(&mut child, &envelope_hex);
-                }
-
-                let global_rank = host.ranks[local_rank];
-                // Match the `[host:dev:rN]` identity the child would otherwise
-                // emit in-process (now suppressed to avoid a double prefix; see
-                // `GpuWorker::new`). `dev` = the physical CUDA device this rank is
-                // pinned to, falling back to the local rank slot when
-                // `local_devices` is unset.
-                let dev = local_phys.map(usize::from).unwrap_or(local_rank);
-                let prefix = format!("[{}:{dev}:r{global_rank}] ", host.host);
-                let mut forwarders = Vec::with_capacity(2);
-                if let Some(out) = child.stdout.take() {
-                    let prefix_clone = prefix.clone();
-                    forwarders.push(thread::spawn(move || {
-                        forward_lines(out, prefix_clone, false);
-                    }));
-                }
-                if let Some(err) = child.stderr.take() {
-                    let prefix_clone = prefix.clone();
-                    forwarders.push(thread::spawn(move || {
-                        forward_lines(err, prefix_clone, true);
-                    }));
-                }
-                children.push((
-                    host.host.clone(),
-                    local_rank,
-                    vec![global_rank],
-                    child,
-                    forwarders,
-                ));
+                });
             }
         }
-
-        Ok(())
-    })();
-    if let Err(e) = spawn_result {
-        eprintln!(
-            "cluster launcher: fan-out failed; terminating {} already-spawned \
-             child(ren) and cleaning up remote hosts: {e}",
-            children.len()
-        );
-        // Owned `Child` handles: kill + reap directly — no PID-reuse
-        // window (unlike the pid-based peer termination in supervise).
-        // SIGKILL on a local ssh client drops its connection; the remote
-        // cleanup pass below reaps whatever the trap wrapper misses.
+    }
+    for (host, child, forwarders) in remote_agents.drain(..) {
+        let granks = ranks_by_host.get(&host).cloned().unwrap_or_default();
+        children.push((host, AGENT_RANK_SENTINEL, granks, child, forwarders));
+    }
+    if let Some(e) = collect_err {
+        // A local worker failed post-formation: the world can't start
+        // coherently. Kill everything spawned and take the cooperative
+        // teardown path below.
+        eprintln!("{e}");
         for (_, _, _, mut child, forwarders) in children.drain(..) {
             let _ = child.kill();
             let _ = child.wait();
@@ -1162,9 +1378,6 @@ pub fn run_launcher_with_config(
             }
         }
         cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
-        // Same cooperative infra teardown as the tail: wake the coord /
-        // rendezvous accept polls and join, so this early return leaves
-        // no parked infrastructure thread behind either.
         abort.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(h) = coord_driver.take() {
             let _ = h.join();
@@ -1172,25 +1385,25 @@ pub fn run_launcher_with_config(
         if let Some(h) = rdv_driver.take() {
             let _ = h.join();
         }
+        for r in rank_exit_readers {
+            let _ = r.join();
+        }
         return Err(e);
     }
-    let _ = my_host_idx; // currently unused but kept for parity with future logic
 
     // Concurrent supervision: watch every child on its own thread and
     // collect exit events on an mpsc channel. The first non-zero exit
-    // triggers SIGTERM on every other still-running child. Without this,
-    // a peer that dies pre-rendezvous (e.g. SSH-spawned rank fails
-    // before NCCL init completes) leaves the surviving ranks blocked in
-    // NCCL's connect-retry loop forever, and the launcher's old
-    // sequential `wait()` never even reached the dead peer's status to
-    // react.
+    // pre-formation triggers SIGKILL on every other still-running child;
+    // post-formation, elastic membership owns the decision.
+    membership_state.phase = membership::ClusterPhase::Training;
+    membership::log_state(&membership_state);
     let any_failure = supervise_children(
         children,
         has_coord.then(|| ElasticSupervision {
             reported_deaths: Arc::clone(&reported_deaths),
             dead_ranks: Arc::clone(&dead_ranks_shared),
             max_failure: elastic_max_failure,
-            world_size: full.world_size(),
+            world_size,
             cohort_formed: Arc::clone(&cohort_formed),
         }),
     );
@@ -1200,7 +1413,8 @@ pub fn run_launcher_with_config(
     // that path waits for sshd's keepalive timeout (~30s) and only
     // triggers if SIGHUP is actually delivered (varies by sshd config).
     // This explicit pass fires immediately, so the user sees no leftover
-    // process on the remote when the launcher returns.
+    // process on the remote when the launcher returns — including agent
+    // children, which run the same binary and match the same pattern.
     cleanup_remote_hosts_parallel(remote_cleanup_targets);
 
     // All children exited; flush the dashboard's SSE `complete` event
@@ -1225,14 +1439,10 @@ pub fn run_launcher_with_config(
     //   Ok(false) once every rank stream EOFs; the rendezvous thread is
     //   short-lived) — the join is a no-wait formality that guarantees no
     //   infrastructure thread outlives this call in a library embedder.
-    // - Failure: a pre-rendezvous failure used to leave both threads
-    //   parked in blocking accepts with detached JoinHandles, forcing a
-    //   process::exit(1) here (and making DdpHandle::join's Err arm
-    //   unreachable for launcher failures). The abort flag now wakes the
-    //   coord's cohort-formation accept poll, its tick loop, and the
-    //   rendezvous accept poll within one poll interval, so we can join
-    //   and RETURN the error — a library embedder catches it via
-    //   DdpHandle::join, and CLI consumers (fdl / ddp-bench) exit
+    // - Failure: the abort flag wakes the coord's cohort-formation accept
+    //   poll, its tick loop, and the rendezvous accept poll within one
+    //   poll interval, so we can join and RETURN the error — a library
+    //   embedder catches it via DdpHandle::join, and CLI consumers exit
     //   non-zero through their own main.
     abort.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(h) = coord_driver.take() {
@@ -1241,6 +1451,17 @@ pub fn run_launcher_with_config(
     if let Some(h) = rdv_driver.take() {
         let _ = h.join();
     }
+    // Control-link readers exit on their stream EOFs (every worker is
+    // gone by now).
+    for r in rank_exit_readers {
+        let _ = r.join();
+    }
+    membership_state.phase = if any_failure.is_some() {
+        membership::ClusterPhase::Failed
+    } else {
+        membership::ClusterPhase::Done
+    };
+    membership::log_state(&membership_state);
     use std::io::Write as _;
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
@@ -1251,4 +1472,3 @@ pub fn run_launcher_with_config(
     }
     Ok(())
 }
-

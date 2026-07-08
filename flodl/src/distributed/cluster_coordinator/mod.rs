@@ -1172,7 +1172,8 @@ fn dispatch_control_frame(
             // stability (the enum value is part of the protocol surface).
             true
         }
-        MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous => {
+        MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous
+        | MsgKind::Join => {
             eprintln!(
                 "cluster_coordinator: reader r{rank} got unexpected MsgKind {:?} on \
                  rank→coord path; dropping",

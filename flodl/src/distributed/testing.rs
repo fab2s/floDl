@@ -112,6 +112,7 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             docker: None,
             arch: None,
             data_path: None,
+            join: None,
         },
         workers: vec![FullWorker {
             host: "localhost".to_string(),

@@ -101,10 +101,34 @@
 #
 # `controller.port:` defaults to 1337 when omitted (replaces
 # PyTorch's MASTER_PORT default of 29500). This single port carries
-# every cross-host channel (NCCL rendezvous, CPU-reduce data,
-# coordinator control) — connections route themselves with a
-# channel-select magic. Worker hosts derive `+4` / `+5` for their
+# every cross-host channel (membership join, NCCL rendezvous,
+# CPU-reduce data, coordinator control) — connections route themselves
+# with a channel-select magic. Worker hosts derive `+4` / `+5` for their
 # host-local rank↔relay loopback channels; those never leave the host.
+#
+# `controller.join:` (optional) tunes the membership window. Workers —
+# fan-out-managed AND self-deployed — dial in and JOIN the run; the
+# window decides when the world forms. Defaults are all-or-nothing over
+# the configured capacity: the run starts the instant every configured
+# rank is in, and cannot start below that. Override to allow degraded
+# starts or leave the door open for extra dial-in workers:
+#   min_rank_start:    quorum in ranks; the run cannot start below it
+#                      (default: the configured capacity)
+#   join_timeout:      window in seconds; quorum reached early does NOT
+#                      close it — late workers within it still join
+#                      (default 300)
+#   target_ranks:      the window closes the moment this many ranks are
+#                      in (default: the configured capacity; raise it to
+#                      wait for self-deployed workers)
+#   max_join_timeout:  hard cap in seconds; quorum still unmet when it
+#                      expires fails the run loudly (default 600, or the
+#                      window length when that is set higher)
+#   open_admission:    accept joins without the pre-shared session salt
+#                      on a non-loopback bind (loudly warned — any peer
+#                      that can reach the port can then join the run).
+#                      A loopback bind (all workers tunneled) is open by
+#                      construction: reachability through sshd IS the
+#                      authentication.
 
 cluster:
   controller:
@@ -114,6 +138,11 @@ cluster:
     # docker: cuda                    # optional pre-flight build context
     # arch: precompiled/cu128         # optional libtorch variant for pre-flight
     # data_path: /flodl/data          # shared-storage root (default /flodl/data)
+    # join:                           # membership-window overrides (see above)
+    #   min_rank_start: 2
+    #   join_timeout: 300
+    #   target_ranks: 4
+    #   max_join_timeout: 600
 
   workers:
     - host: node-a                    # worker identifier; default SSH target

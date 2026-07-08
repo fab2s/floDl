@@ -326,6 +326,20 @@ fn main() {
             }
         }
     }
+    // Per-host worker agent (dial-in membership): same short-circuit as
+    // the relay, for the same reason — the agent joins the controller's
+    // window and spawns this host's children; it must never fall into
+    // the harness's local GPU/mode gating (e.g. "cpu-sync requires 2+
+    // GPUs" evaluated against ONE host of a multi-host world).
+    if std::env::var_os(flodl::distributed::launcher::ENV_AGENT_JSON).is_some() {
+        match flodl::distributed::launcher::run_agent() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("ddp-bench agent: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);

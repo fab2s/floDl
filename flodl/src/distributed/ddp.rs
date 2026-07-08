@@ -962,6 +962,18 @@ fn dispatch_launcher_or_continue() -> Result<()> {
                 }
             }
         }
+        crate::distributed::launcher::Role::Agent => {
+            // Per-host worker agent (dial-in membership): join the
+            // controller's window, spawn + supervise this host's relay
+            // and rank children, exit. Never trains.
+            match crate::distributed::launcher::run_agent() {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("cluster agent: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         crate::distributed::launcher::Role::Rank
         | crate::distributed::launcher::Role::SingleDevice => Ok(()),
     }

@@ -109,6 +109,36 @@ pub struct FullController {
     pub docker: Option<String>,
     pub arch: Option<String>,
     pub data_path: Option<String>,
+    /// User overrides for the join-window quorum knobs (`join:`
+    /// sub-block). `None` / unset fields keep the fan-out defaults:
+    /// quorum = early-close target = the configured capacity (the
+    /// window closes the instant everything fan-out started is in, and
+    /// the run cannot start below it — the direct-spawn era's
+    /// all-or-nothing, unchanged unless asked for).
+    pub join: Option<JoinKnobs>,
+}
+
+/// Optional per-field overrides for the membership window, mirroring
+/// the `controller.join:` cluster.yml sub-block. Every field is
+/// optional; the launcher fills the gaps from its capacity-derived
+/// defaults. See the membership module for the window semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JoinKnobs {
+    /// Quorum in ranks — the run cannot start below it. Default: the
+    /// configured capacity.
+    pub min_rank_start: Option<usize>,
+    /// Join window in seconds (`join_timeout:`). Default 300.
+    pub join_timeout_secs: Option<u64>,
+    /// Early-close target in ranks. Default: the configured capacity;
+    /// set it higher (with a matching window) to leave room for
+    /// self-deployed workers to dial in alongside the managed rig.
+    pub target_ranks: Option<usize>,
+    /// Hard cap in seconds (`max_join_timeout:`). Default 600, raised
+    /// to `join_timeout` when that is set higher.
+    pub max_join_timeout_secs: Option<u64>,
+    /// Accept joins without pre-shared-salt authentication on a
+    /// non-loopback bind. Loudly warned; see the trust model.
+    pub open_admission: Option<bool>,
 }
 
 impl FullCluster {
@@ -254,6 +284,7 @@ impl FullCluster {
             .get("data_path")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let controller_join = parse_join_block(controller_val.get("join"))?;
 
         let workers_val = obj
             .get("workers")
@@ -295,6 +326,7 @@ impl FullCluster {
                 docker: controller_docker,
                 arch: controller_arch,
                 data_path: controller_data_path,
+                join: controller_join,
             },
             workers,
             // ENV_FULL_CLUSTER_JSON is the config snapshot fdl-cli ships;
@@ -415,6 +447,27 @@ impl FullCluster {
         }
         if let Some(s) = &self.controller.data_path {
             controller_obj.insert("data_path".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(j) = &self.controller.join {
+            let mut join_obj = serde_json::Map::new();
+            if let Some(n) = j.min_rank_start {
+                join_obj.insert("min_rank_start".into(), serde_json::Value::from(n));
+            }
+            if let Some(n) = j.join_timeout_secs {
+                join_obj.insert("join_timeout".into(), serde_json::Value::from(n));
+            }
+            if let Some(n) = j.target_ranks {
+                join_obj.insert("target_ranks".into(), serde_json::Value::from(n));
+            }
+            if let Some(n) = j.max_join_timeout_secs {
+                join_obj.insert("max_join_timeout".into(), serde_json::Value::from(n));
+            }
+            if let Some(b) = j.open_admission {
+                join_obj.insert("open_admission".into(), serde_json::Value::Bool(b));
+            }
+            if !join_obj.is_empty() {
+                controller_obj.insert("join".into(), serde_json::Value::Object(join_obj));
+            }
         }
         top.insert("controller".into(), serde_json::Value::Object(controller_obj));
         top.insert("workers".into(), serde_json::Value::Array(workers));
@@ -595,6 +648,69 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         tunnel,
         env,
     })
+}
+
+/// Parse a `controller.join:` sub-block into [`JoinKnobs`]. Missing /
+/// null yields `None` (all defaults); present fields are validated for
+/// type but NOT cross-field consistency — that happens once, against
+/// the capacity-filled config, in the membership gate.
+fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> {
+    let obj = match v {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(m)) => m,
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: controller.join must be a map \
+                 (min_rank_start, join_timeout, target_ranks, \
+                 max_join_timeout, open_admission), got {other}"
+            )));
+        }
+    };
+    let uint = |key: &str| -> Result<Option<u64>> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => match v.as_u64() {
+                Some(n) => Ok(Some(n)),
+                None => Err(TensorError::new(&format!(
+                    "cluster launcher: controller.join.{key} must be a \
+                     non-negative integer, got {v}"
+                ))),
+            },
+        }
+    };
+    let open_admission = match obj.get("open_admission") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: controller.join.open_admission must be a \
+                 boolean, got {other}"
+            )));
+        }
+    };
+    // Unknown keys are a config typo waiting to silently no-op a knob.
+    const KNOWN: [&str; 5] = [
+        "min_rank_start",
+        "join_timeout",
+        "target_ranks",
+        "max_join_timeout",
+        "open_admission",
+    ];
+    for k in obj.keys() {
+        if !KNOWN.contains(&k.as_str()) {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: controller.join.{k}: unknown field \
+                 (expected one of {KNOWN:?})"
+            )));
+        }
+    }
+    Ok(Some(JoinKnobs {
+        min_rank_start: uint("min_rank_start")?.map(|n| n as usize),
+        join_timeout_secs: uint("join_timeout")?,
+        target_ranks: uint("target_ranks")?.map(|n| n as usize),
+        max_join_timeout_secs: uint("max_join_timeout")?,
+        open_admission,
+    }))
 }
 
 /// Parse an `ssh:` sub-block. Expects a JSON object with optional

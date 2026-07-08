@@ -86,6 +86,7 @@ impl ClusterBuilder {
                 docker: None,
                 arch: None,
                 data_path: None,
+                join: None,
             },
             workers: Vec::new(),
             env: std::collections::BTreeMap::new(),
@@ -268,6 +269,7 @@ impl ClusterBuilder {
                 docker: None,
                 arch: None,
                 data_path: None,
+                join: None,
             },
             workers: vec![FullWorker {
                 host: hostname,
@@ -301,6 +303,7 @@ pub struct ControllerBuilder {
     docker: Option<String>,
     arch: Option<String>,
     data_path: Option<String>,
+    join: super::launcher::JoinKnobs,
 }
 
 impl ControllerBuilder {
@@ -313,6 +316,7 @@ impl ControllerBuilder {
             docker: None,
             arch: None,
             data_path: None,
+            join: super::launcher::JoinKnobs::default(),
         }
     }
 
@@ -354,6 +358,48 @@ impl ControllerBuilder {
         self
     }
 
+    /// Join-window quorum: the run cannot start below this many ranks.
+    /// Mirrors YAML `controller.join.min_rank_start`. Default: the
+    /// configured capacity (all-or-nothing).
+    pub fn min_rank_start(mut self, ranks: usize) -> Self {
+        self.join.min_rank_start = Some(ranks);
+        self
+    }
+
+    /// Join window in seconds; quorum reached early does NOT close it.
+    /// Mirrors YAML `controller.join.join_timeout`. Default 300.
+    pub fn join_timeout_secs(mut self, secs: u64) -> Self {
+        self.join.join_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Early-close target in ranks: the window closes the moment this
+    /// many are in. Mirrors YAML `controller.join.target_ranks`.
+    /// Default: the configured capacity; set it higher (with a matching
+    /// window) to leave room for self-deployed workers to dial in
+    /// alongside the managed rig.
+    pub fn target_ranks(mut self, ranks: usize) -> Self {
+        self.join.target_ranks = Some(ranks);
+        self
+    }
+
+    /// Hard cap in seconds: quorum still unmet when it expires fails
+    /// the run loudly. Mirrors YAML `controller.join.max_join_timeout`.
+    /// Default 600 (or the window length when that is set higher).
+    pub fn max_join_timeout_secs(mut self, secs: u64) -> Self {
+        self.join.max_join_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Accept joins without pre-shared-salt authentication on a
+    /// non-loopback bind (loudly warned — any peer that can reach the
+    /// port can then join, and therefore influence, the run). Mirrors
+    /// YAML `controller.join.open_admission`.
+    pub fn open_admission(mut self, open: bool) -> Self {
+        self.join.open_admission = Some(open);
+        self
+    }
+
     /// Finalize the controller and return to the cluster builder.
     pub fn done(self) -> ClusterBuilder {
         let cwd = std::env::current_dir()
@@ -361,6 +407,11 @@ impl ControllerBuilder {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_default();
         let mut parent = self.parent;
+        let join = if self.join == super::launcher::JoinKnobs::default() {
+            None
+        } else {
+            Some(self.join)
+        };
         parent.controller = super::launcher::FullController {
             host: self.host,
             port: self.port,
@@ -368,6 +419,7 @@ impl ControllerBuilder {
             docker: self.docker,
             arch: self.arch,
             data_path: self.data_path,
+            join,
         };
         parent
     }

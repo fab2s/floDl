@@ -153,11 +153,19 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// diagnostics via [`child_label`] rather than leaking the raw sentinel.
 pub(super) const RELAY_RANK_SENTINEL: usize = usize::MAX;
 
+/// Local-rank slot value marking a remote host's worker AGENT child (one
+/// ssh session per host; it carries the host's whole rank set like a
+/// relay, but lives on the far side of the connection).
+pub(super) const AGENT_RANK_SENTINEL: usize = usize::MAX - 1;
+
 /// Human label for a supervised child in diagnostics: `"relay of <host>"` for
-/// the relay sentinel, `"rank <n> of <host>"` for a rank child.
+/// the relay sentinel, `"agent of <host>"` for an agent, `"rank <n> of
+/// <host>"` for a rank child.
 fn child_label(lr: usize, host: &str) -> String {
     if lr == RELAY_RANK_SENTINEL {
         format!("relay of {host}")
+    } else if lr == AGENT_RANK_SENTINEL {
+        format!("agent of {host}")
     } else {
         format!("rank {lr} of {host}")
     }
@@ -392,7 +400,10 @@ pub(super) fn build_local_spawn_command(
             crate::distributed::cluster::ENV_LOCAL_RANK,
             local_rank.to_string(),
         )
-        .env_remove(ENV_FULL_CLUSTER_JSON);
+        .env_remove(ENV_FULL_CLUSTER_JSON)
+        // An agent-spawned rank child must not inherit the agent's role
+        // var — dispatch would reject the combination loudly.
+        .env_remove(super::ENV_AGENT_JSON);
     if let Some(phys) = local_phys_device {
         // Pin enumeration order alongside the device pin: CUDA's default
         // FASTEST_FIRST ordering can renumber devices across driver
@@ -419,94 +430,16 @@ pub(super) fn build_local_relay_command(
         .env(super::ENV_RELAY_JSON, relay_spec_hex)
         .env_remove(ENV_FULL_CLUSTER_JSON)
         .env_remove(crate::distributed::cluster::ENV_CLUSTER_JSON)
-        .env_remove(crate::distributed::cluster::ENV_LOCAL_RANK);
+        .env_remove(crate::distributed::cluster::ENV_LOCAL_RANK)
+        // An agent-spawned relay must not inherit the agent's role var —
+        // dispatch would reject the combination loudly.
+        .env_remove(super::ENV_AGENT_JSON);
     cmd
 }
 
-/// Build the bash command shipped via ssh to run a remote per-host relay
-/// child. Mirrors [`build_remote_bash_command`] but exports
-/// `FLODL_INTERNAL_RELAY_JSON` instead of the rank envelope/slot and never scopes
-/// CUDA.
-pub(super) fn build_remote_relay_bash_command(
-    path: &str,
-    fdl_cmd: &str,
-    user_args: &[String],
-    cluster_env: &std::collections::BTreeMap<String, String>,
-    host_env: &std::collections::BTreeMap<String, String>,
-    prebuild: Option<&PerHostPrebuild>,
-) -> String {
-    let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
-    let mut s = String::with_capacity(256);
-    // SALT HYGIENE: the relay spec carries the session salt too — pipe it
-    // via stdin rather than the argv-visible command string (see
-    // `build_remote_bash_command`).
-    s.push_str("IFS= read -r __FLODL_ENVELOPE\n");
-    s.push_str("cd ");
-    let remote_cwd: String = match prebuild {
-        Some(pb) if !pb.cwd_subpath.is_empty() => {
-            format!("{}/{}", path.trim_end_matches('/'), pb.cwd_subpath)
-        }
-        _ => path.to_string(),
-    };
-    s.push_str(&shell_quote(&remote_cwd));
-    s.push_str(" && ");
-    s.push_str(super::ENV_RELAY_JSON);
-    s.push_str("=\"$__FLODL_ENVELOPE\"");
-    // Forward verbosity so the relay's `-vvv` prof lines reach the user.
-    if let Ok(v) = std::env::var(crate::log::ENV_VAR) {
-        s.push(' ');
-        s.push_str(crate::log::ENV_VAR);
-        s.push('=');
-        s.push_str(&shell_quote(&v));
-    }
-    // Forward the network-timeout scale (relay write-stall/connect must
-    // share the cluster-wide notion of "gone"; see rank builder).
-    if let Ok(v) = std::env::var(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE) {
-        s.push(' ');
-        s.push_str(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE);
-        s.push('=');
-        s.push_str(&shell_quote(&v));
-    }
-    if let Some(pb) = prebuild {
-        if !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
-            s.push(' ');
-            s.push_str("LD_LIBRARY_PATH=");
-            s.push_str(&shell_quote(&pb.ld_library_path));
-        }
-    }
-    for (k, v) in cluster_env {
-        s.push(' ');
-        s.push_str(k);
-        s.push('=');
-        s.push_str(&shell_quote(v));
-    }
-    for (k, v) in host_env {
-        s.push(' ');
-        s.push_str(k);
-        s.push('=');
-        s.push_str(&shell_quote(v));
-    }
-    if let Some(pb) = prebuild {
-        s.push(' ');
-        let abs_bin = format!("{}/{}", path.trim_end_matches('/'), pb.bin);
-        s.push_str(&shell_quote(&abs_bin));
-    } else {
-        s.push_str(" fdl ");
-        s.push_str(&shell_quote(fdl_cmd));
-    }
-    for a in user_args {
-        s.push(' ');
-        s.push_str(&shell_quote(a));
-    }
-    // Same trap wrapper as ranks: forward signals to the backgrounded
-    // relay so launcher death / SIGTERM reaches it cleanly.
-    s.push_str(" &\n");
-    s.push_str("__flodl_pid=$!\n");
-    s.push_str("trap 'kill -TERM \"$__flodl_pid\" 2>/dev/null' HUP TERM INT\n");
-    s.push_str("wait \"$__flodl_pid\"\n");
-    s.push_str("exit $?\n");
-    s
-}
+// (The per-host relay used to have its own remote bash builder here; the
+// worker agent now spawns relays host-side, so the only remote-shipped
+// command is the agent's — see `build_remote_agent_bash_command`.)
 
 /// Build the `Command` that ssh's into a remote host and runs the given
 /// bash command string.
@@ -677,29 +610,30 @@ pub(super) fn cleanup_remote_hosts_parallel(remotes: Vec<(FullWorker, String)>) 
     }
 }
 
-/// Build the bash command shipped via ssh to the remote.
+/// Build the bash command shipped via ssh to run a remote host's worker
+/// agent — the ONE remote process fan-out starts per host; the agent
+/// dials in, joins, and spawns the host's relay + rank children itself.
 ///
 /// Single level of shell quoting: ssh delivers the string verbatim to
 /// the remote login shell, which parses it once. Every interpolated
-/// value is single-quoted via [`shell_quote`]. `exec` replaces the
-/// bash process so the remote returns fdl's exit code directly.
+/// value is single-quoted via [`shell_quote`].
 ///
-/// Mirrors fdl-cli's `build_remote_command` exactly (this is the move
-/// of that logic into flodl proper, per the 4b boundary lift).
+/// Everything exported here (env blocks, LD_LIBRARY_PATH,
+/// `FLODL_HOST_NAME`, verbosity, timeout scale) is INHERITED by the
+/// agent's children — that is the mechanism by which per-host env
+/// reaches remote ranks now.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_remote_bash_command(
+pub(super) fn build_remote_agent_bash_command(
     path: &str,
     host_name: &str,
-    local_rank: usize,
     overlay_env: Option<&str>,
     fdl_cmd: &str,
     user_args: &[String],
     cluster_env: &std::collections::BTreeMap<String, String>,
     host_env: &std::collections::BTreeMap<String, String>,
-    local_phys_device: Option<u8>,
     prebuild: Option<&PerHostPrebuild>,
 ) -> String {
-    use crate::distributed::cluster::{ENV_CLUSTER_JSON, ENV_HOST_OVERRIDE, ENV_LOCAL_RANK};
+    use crate::distributed::cluster::ENV_HOST_OVERRIDE;
 
     // host_env's LD_LIBRARY_PATH (if user-set) wins over the prebuild
     // default; lets the user augment with bare-metal libnccl paths
@@ -711,14 +645,15 @@ pub(super) fn build_remote_bash_command(
     let mut s = String::with_capacity(
         256 + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
     );
-    // SALT HYGIENE: the rank envelope carries the session salt (the HMAC
-    // key). Splicing it into the command string would leave it in the
-    // remote shell's argv — world-readable via `ps` / `/proc/<pid>/cmdline`
-    // for the whole run. Instead the launcher pipes the hex envelope on
-    // this ssh child's STDIN; we read it into a shell var here and expand
-    // it into the child's ENVIRONMENT (env-assignment prefix), which is
-    // only owner/root-readable via `/proc/<pid>/environ`. `-r` + empty IFS:
-    // the hex is one whitespace-free line, read verbatim.
+    // SALT HYGIENE: the agent spec may carry the pre-shared session salt
+    // (the HMAC key). Splicing it into the command string would leave it
+    // in the remote shell's argv — world-readable via `ps` /
+    // `/proc/<pid>/cmdline` for the whole run. Instead the launcher
+    // pipes the hex spec on this ssh child's STDIN; we read it into a
+    // shell var here and expand it into the child's ENVIRONMENT
+    // (env-assignment prefix), which is only owner/root-readable via
+    // `/proc/<pid>/environ`. `-r` + empty IFS: the hex is one
+    // whitespace-free line, read verbatim.
     s.push_str("IFS= read -r __FLODL_ENVELOPE\n");
     // Pick the remote cwd. With a prebuild envelope, the controller
     // built the command from `<project_root>/<cwd_subpath>` (e.g.
@@ -737,15 +672,14 @@ pub(super) fn build_remote_bash_command(
     };
     s.push_str(&shell_quote(&remote_cwd));
     s.push_str(" && ");
-    s.push_str(ENV_CLUSTER_JSON);
+    s.push_str(super::ENV_AGENT_JSON);
     s.push_str("=\"$__FLODL_ENVELOPE\" ");
+    // Logical host identity: the agent's children inherit it, so a
+    // machine whose `hostname` differs from its cluster.yml name still
+    // reports under the logical name everywhere.
     s.push_str(ENV_HOST_OVERRIDE);
     s.push('=');
     s.push_str(&shell_quote(host_name));
-    s.push(' ');
-    s.push_str(ENV_LOCAL_RANK);
-    s.push('=');
-    s.push_str(&local_rank.to_string());
     s.push(' ');
     // Forward the launcher's verbosity so `-vvv` (FLODL_VERBOSITY)
     // reaches the remote worker/coordinator processes — the local
@@ -768,12 +702,6 @@ pub(super) fn build_remote_bash_command(
         s.push_str(crate::distributed::wire::ENV_NET_TIMEOUT_SCALE);
         s.push('=');
         s.push_str(&shell_quote(&v));
-    }
-    if let Some(phys) = local_phys_device {
-        // PCI_BUS_ID alongside the pin — see build_local_spawn_command.
-        s.push(' ');
-        s.push_str("CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=");
-        s.push_str(&phys.to_string());
     }
     // Auto-prepend the prebuild's LD_LIBRARY_PATH (if any) BEFORE
     // host_env / cluster_env, so the user can override it via

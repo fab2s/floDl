@@ -116,6 +116,13 @@ pub(crate) const CHANNEL_MAGIC_DATA: u32 = 0xF10D_17E1;
 /// Coordinator control channel (relay → controller).
 pub(crate) const CHANNEL_MAGIC_CONTROL: u32 = 0xF10D_17E2;
 
+/// Membership join channel (worker agent → controller). Unlike the
+/// other channels this one can legitimately be dialed by a peer that
+/// does not hold the session salt yet — see
+/// [`membership`](crate::distributed::membership) for how admission
+/// keys its frames.
+pub(crate) const CHANNEL_MAGIC_JOIN: u32 = 0xF10D_17E3;
+
 // ---------------------------------------------------------------------------
 // Cleartext guard
 // ---------------------------------------------------------------------------
@@ -485,6 +492,10 @@ pub enum MsgKind {
     /// worker role assignment, and either-direction NCCL unique-id
     /// transport. Payload: [`RendezvousMsgWire`].
     Rendezvous = 0x06,
+    /// Membership join frame: worker agent ↔ controller on the join
+    /// channel (hello / accept / reject / world-formed / rank-exited /
+    /// abort). Payload: [`JoinMsgWire`].
+    Join = 0x07,
 }
 
 impl MsgKind {
@@ -497,6 +508,7 @@ impl MsgKind {
             0x04 => Ok(MsgKind::ParamSnapshotMeta),
             0x05 => Ok(MsgKind::Heartbeat),
             0x06 => Ok(MsgKind::Rendezvous),
+            0x07 => Ok(MsgKind::Join),
             _ => Err(TensorError::new(&format!(
                 "wire: unknown MsgKind tag 0x{v:08x}"
             ))),
@@ -1384,6 +1396,106 @@ pub enum RendezvousMsgWire {
     Uid {
         /// Raw 128-byte `NcclUniqueId` value.
         uid_bytes: Vec<u8>,
+    },
+}
+
+/// Wire-side membership message. Carried inside a [`ControlFrame`]
+/// tagged with [`MsgKind::Join`] on the join channel
+/// ([`CHANNEL_MAGIC_JOIN`]).
+///
+/// The join channel is the one channel a peer may dial WITHOUT holding
+/// the session salt yet (open admission hands the salt out in the
+/// reply), so its pre-admission frames — [`Self::Hello`],
+/// [`Self::Accept`], [`Self::Reject`] — are keyed by the trust mode:
+/// the session salt when it is pre-shared (fan-out rig mode; a hello
+/// keyed otherwise fails authentication and is rejected), or an
+/// all-zeros key in open-admission mode, where the MAC still enforces
+/// protocol conformance + integrity but authentication comes from the
+/// bind scope (loopback behind sshd) instead. Everything after
+/// admission — [`Self::WorldFormed`], [`Self::RankExited`],
+/// [`Self::Abort`] — is keyed with the session salt, binding the
+/// connection to the admitted identity.
+///
+/// Protocol version rides in every [`ControlFrame`] header
+/// (`CONTROL_PROTOCOL_VERSION`), so a version-skewed worker is rejected
+/// at the frame layer before its hello is even decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinMsgWire {
+    /// Worker agent → controller: request to join the forming world.
+    Hello {
+        /// Worker host name (member identity; duplicate joins under the
+        /// same name are rejected).
+        host: String,
+        /// Physical CUDA device ids this worker will run, one per rank
+        /// (already resolved on the worker — `"all"` shorthands never
+        /// cross the wire). The controller carries these into the
+        /// host's envelope so rank↔device pinning survives the dial-in
+        /// path unchanged.
+        local_devices: Vec<u8>,
+        /// GPU inventory, one label per device (informational: logged
+        /// and surfaced in the membership state, not validated).
+        gpus: Vec<String>,
+        /// libtorch variant label (informational, same as `gpus`).
+        libtorch: String,
+        /// 32-byte dataset signature; must match the controller's own.
+        /// A stale worker from a previous run is rejected at the door,
+        /// not discovered mid-epoch.
+        dataset_sig: [u8; 32],
+    },
+    /// Controller → worker agent: admitted. Carries the assigned global
+    /// rank ids (admission order — contiguous by construction).
+    Accept {
+        /// Global rank ids assigned to this worker's local GPUs.
+        ranks: Vec<u32>,
+        /// Session salt (hex) in open-admission mode, where the joiner
+        /// does not hold it yet. `None` when the salt was pre-shared —
+        /// re-sending it would put the secret on the wire for nothing.
+        salt_hex: Option<String>,
+        /// Seconds (already scaled) the worker should be prepared to
+        /// wait for [`Self::WorldFormed`] — the remaining hard-cap
+        /// budget at admission time, so the worker's read deadline
+        /// self-describes instead of guessing the controller's window
+        /// config.
+        formation_wait_secs: u64,
+    },
+    /// Controller → worker agent: join refused (version skew, dataset
+    /// mismatch, duplicate host, capacity abuse). The connection is
+    /// closed after this frame.
+    Reject {
+        /// Human-readable refusal reason, logged verbatim on the worker.
+        reason: String,
+    },
+    /// Controller → worker agent: the world is formed. Ships the exact
+    /// artifacts the fan-out launcher builds for a managed host — the
+    /// slim per-host envelope and the relay spec, both hex-encoded JSON
+    /// — so the agent spawns its relay + rank children verbatim and
+    /// everything downstream of world formation stays unchanged.
+    WorldFormed {
+        /// Hex-encoded slim per-host envelope JSON (the
+        /// `FLODL_INTERNAL_CLUSTER_JSON` payload for rank children).
+        envelope_hex: String,
+        /// Hex-encoded `RelaySpec` JSON (the `FLODL_INTERNAL_RELAY_JSON`
+        /// payload for the host's relay child). `None` when the run has
+        /// no coordinator (legacy NCCL routing) — ranks dial the
+        /// controller directly and no relay is spawned.
+        relay_spec_hex: Option<String>,
+    },
+    /// Worker agent → controller: one of this host's rank children
+    /// exited. Non-zero exits feed the controller's elastic dead-rank
+    /// machinery with per-rank granularity (the join connection's EOF
+    /// only signals whole-host death).
+    RankExited {
+        /// Global rank id of the exited child.
+        rank: u32,
+        /// Process exit code (negative when killed by a signal).
+        code: i32,
+    },
+    /// Controller → worker agent: the run is over before (or instead
+    /// of) world formation — window failed quorum, or the launcher
+    /// aborted. The agent tears down and exits.
+    Abort {
+        /// Human-readable cause, logged verbatim on the worker.
+        reason: String,
     },
 }
 

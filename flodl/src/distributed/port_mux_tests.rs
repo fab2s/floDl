@@ -44,12 +44,14 @@ fn routes_each_channel_by_magic_over_one_port() {
     let s1 = dial(port, CHANNEL_MAGIC_RENDEZVOUS, b"rdv");
     let s2 = dial(port, CHANNEL_MAGIC_DATA, b"data");
     let s3 = dial(port, CHANNEL_MAGIC_CONTROL, b"ctrl");
+    let s4 = dial(port, CHANNEL_MAGIC_JOIN, b"join");
 
     recv_and_check(&accept.rendezvous, CHANNEL_MAGIC_RENDEZVOUS, b"rdv");
     recv_and_check(&accept.data, CHANNEL_MAGIC_DATA, b"data");
     recv_and_check(&accept.control, CHANNEL_MAGIC_CONTROL, b"ctrl");
+    recv_and_check(&accept.join, CHANNEL_MAGIC_JOIN, b"join");
 
-    drop((s1, s2, s3));
+    drop((s1, s2, s3, s4));
 }
 
 #[test]

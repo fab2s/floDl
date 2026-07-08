@@ -1,6 +1,6 @@
     use super::*;
     use super::spawn::{
-        build_remote_bash_command, build_remote_relay_bash_command, build_slim_envelope_for,
+        build_remote_agent_bash_command, build_slim_envelope_for,
         shell_quote, supervise_children, PerHostPrebuild,
     };
     use serde_json::json;
@@ -31,35 +31,151 @@
     }
 
     #[test]
-    fn remote_relay_bash_command_exports_relay_env_only() {
-        let cmd = build_remote_relay_bash_command(
+    fn agent_bash_command_exports_agent_env_only() {
+        let cmd = build_remote_agent_bash_command(
             "/opt/flodl",
+            "pascal",
+            None,
             "ddp-bench",
             &["--model".into(), "resnet-graph".into()],
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             None,
         );
-        // Salt hygiene: the relay spec (salt-bearing) is read from stdin,
-        // not spliced into the argv-visible command string.
+        // Salt hygiene: the agent spec (salt-bearing in rig mode) is read
+        // from stdin, not spliced into the argv-visible command string.
         assert!(
             cmd.contains("IFS= read -r __FLODL_ENVELOPE"),
-            "relay envelope must be read from stdin: {cmd}"
+            "agent spec must be read from stdin: {cmd}"
         );
-        // Exports the relay spec from the stdin var and runs the binary...
+        // Exports the agent spec from the stdin var and runs the binary...
         assert!(
-            cmd.contains("FLODL_INTERNAL_RELAY_JSON=\"$__FLODL_ENVELOPE\""),
-            "relay env must expand the stdin var: {cmd}"
+            cmd.contains("FLODL_INTERNAL_AGENT_JSON=\"$__FLODL_ENVELOPE\""),
+            "agent env must expand the stdin var: {cmd}"
         );
+        // ...under the logical host identity its children inherit.
+        assert!(cmd.contains("FLODL_HOST_NAME='pascal'"), "missing host override: {cmd}");
         assert!(cmd.contains("cd '/opt/flodl'"), "missing cd: {cmd}");
         assert!(cmd.contains("fdl 'ddp-bench'"), "missing fdl cmd: {cmd}");
         assert!(cmd.contains("--model") && cmd.contains("resnet-graph"));
-        // ...but never the rank-role env vars or CUDA scoping.
+        // ...but never the rank/relay-role env vars or CUDA scoping (the
+        // agent resolves and pins devices host-side, per child).
         assert!(!cmd.contains("FLODL_INTERNAL_CLUSTER_JSON="), "leaked rank envelope: {cmd}");
         assert!(!cmd.contains("FLODL_INTERNAL_LOCAL_RANK="), "leaked rank slot: {cmd}");
-        assert!(!cmd.contains("CUDA_VISIBLE_DEVICES="), "relay must not scope CUDA: {cmd}");
+        assert!(!cmd.contains("FLODL_INTERNAL_RELAY_JSON="), "leaked relay spec: {cmd}");
+        assert!(!cmd.contains("CUDA_VISIBLE_DEVICES="), "agent must not scope CUDA: {cmd}");
         // Trap wrapper for clean signal forwarding.
         assert!(cmd.contains("trap ") && cmd.contains("__flodl_pid"), "missing trap: {cmd}");
+    }
+
+    #[test]
+    fn join_knobs_parse_round_trip_and_reject_typos() {
+        let mut val = canonical_full_json();
+        val["controller"]["join"] = json!({
+            "min_rank_start": 2,
+            "join_timeout": 120,
+            "open_admission": true,
+        });
+        let full = FullCluster::from_value(&val).unwrap();
+        let knobs = full.controller.join.as_ref().expect("join block parsed");
+        assert_eq!(knobs.min_rank_start, Some(2));
+        assert_eq!(knobs.join_timeout_secs, Some(120));
+        assert_eq!(knobs.target_ranks, None);
+        assert_eq!(knobs.max_join_timeout_secs, None);
+        assert_eq!(knobs.open_admission, Some(true));
+        // Symmetric round-trip through to_json.
+        let back = FullCluster::from_value(&full.to_json()).unwrap();
+        assert_eq!(back.controller.join, full.controller.join);
+
+        // A typo'd knob must not silently no-op.
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "join_timeout_secs": 120 });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("unknown field"), "got: {msg}");
+        // Wrong types are loud too.
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "min_rank_start": "two" });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("non-negative integer"), "got: {msg}");
+    }
+
+    #[test]
+    fn join_config_derivation_defaults_to_capacity_all_or_nothing() {
+        // No knobs: quorum = target = capacity, stock timeouts.
+        let cfg = super::derive_join_config(None, 3);
+        assert_eq!(cfg.min_rank_start, 3);
+        assert_eq!(cfg.target_ranks, Some(3));
+        assert_eq!(cfg.join_timeout_secs, 300);
+        assert_eq!(cfg.max_join_timeout_secs, 600);
+        assert!(!cfg.open_admission);
+
+        // Partial overrides keep the rest derived.
+        let knobs = JoinKnobs { min_rank_start: Some(2), ..Default::default() };
+        let cfg = super::derive_join_config(Some(&knobs), 3);
+        assert_eq!(cfg.min_rank_start, 2);
+        assert_eq!(cfg.target_ranks, Some(3));
+
+        // An enlarged window stretches the default hard cap instead of
+        // tripping the cap >= window validation.
+        let knobs = JoinKnobs { join_timeout_secs: Some(900), ..Default::default() };
+        let cfg = super::derive_join_config(Some(&knobs), 3);
+        assert_eq!(cfg.join_timeout_secs, 900);
+        assert_eq!(cfg.max_join_timeout_secs, 900);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn synthesized_world_reranks_config_hosts_and_admits_walk_ins() {
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let salt = [5u8; crate::distributed::wire::SESSION_SALT_BYTES];
+        // Admission order differs from config order, rank counts differ
+        // from the config's `ranks:` (capacity declaration only), and a
+        // walk-in host joined that no config entry describes.
+        let members = [
+            crate::distributed::membership::JoinedMember {
+                host: "host-b".into(),
+                ranks: vec![0, 1],
+                local_devices: vec![0, 1],
+                gpus: vec!["B".into(); 2],
+                libtorch: String::new(),
+                joined_at_secs: 0,
+            },
+            crate::distributed::membership::JoinedMember {
+                host: "cloud-worker".into(),
+                ranks: vec![2],
+                local_devices: vec![0],
+                gpus: vec!["C".into()],
+                libtorch: String::new(),
+                joined_at_secs: 1,
+            },
+            crate::distributed::membership::JoinedMember {
+                host: "host-a".into(),
+                ranks: vec![3],
+                local_devices: vec![1],
+                gpus: vec!["A".into()],
+                libtorch: String::new(),
+                joined_at_secs: 2,
+            },
+        ];
+        let world = super::synthesize_world(&full, members.iter(), salt);
+        assert_eq!(world.world_size(), 4);
+        assert_eq!(world.salt, salt);
+        // Admission order defines the worker order + rank assignment.
+        assert_eq!(world.workers[0].host, "host-b");
+        assert_eq!(world.workers[0].ranks, vec![0, 1]);
+        assert_eq!(world.workers[0].local_devices, Some(vec![0, 1]));
+        // Config metadata carries over for matching hosts.
+        let cfg_b = full.workers.iter().find(|w| w.host == "host-b").unwrap();
+        assert_eq!(world.workers[0].path, cfg_b.path);
+        assert_eq!(world.workers[0].nccl_socket_ifname, cfg_b.nccl_socket_ifname);
+        assert!(world.workers[0].ssh.is_some());
+        // Walk-ins get a minimal entry the launcher never dials.
+        assert_eq!(world.workers[1].host, "cloud-worker");
+        assert_eq!(world.workers[1].ranks, vec![2]);
+        assert!(world.workers[1].ssh.is_none());
+        assert!(!world.workers[1].tunnel);
+        assert_eq!(world.workers[2].host, "host-a");
+        assert_eq!(world.workers[2].ranks, vec![3]);
     }
 
     fn canonical_full_json() -> serde_json::Value {
@@ -302,28 +418,25 @@
     }
 
     #[test]
-    fn build_remote_bash_command_shape() {
+    fn agent_bash_command_shape() {
         let cluster_env = empty_env();
         let host_env = empty_env();
-        let s = build_remote_bash_command(
+        let s = build_remote_agent_bash_command(
             "/srv/flodl",
             "host-b",
-            0,
             Some("cluster"),
             "train",
             &["--epochs".to_string(), "10".to_string()],
             &cluster_env,
             &host_env,
             None,
-            None,
         );
         // Salt hygiene: the envelope is read from stdin, then expanded
         // into the child's env — never spliced into the argv string.
         assert!(s.starts_with("IFS= read -r __FLODL_ENVELOPE\n"));
         assert!(s.contains("cd '/srv/flodl' && "));
-        assert!(s.contains("FLODL_INTERNAL_CLUSTER_JSON=\"$__FLODL_ENVELOPE\""));
+        assert!(s.contains("FLODL_INTERNAL_AGENT_JSON=\"$__FLODL_ENVELOPE\""));
         assert!(s.contains("FLODL_HOST_NAME='host-b'"));
-        assert!(s.contains("FLODL_INTERNAL_LOCAL_RANK=0"));
         assert!(s.contains("FDL_ENV='cluster'"));
         assert!(s.contains("fdl 'train' '--epochs' '10' &\n"));
         // The trap forwards TERM, then escalates to KILL after a grace
@@ -337,19 +450,17 @@
     }
 
     #[test]
-    fn build_remote_bash_command_omits_fdl_env_when_none() {
+    fn agent_bash_command_omits_fdl_env_when_none() {
         let cluster_env = empty_env();
         let host_env = empty_env();
-        let s = build_remote_bash_command(
+        let s = build_remote_agent_bash_command(
             "/srv/flodl",
             "worker",
-            0,
             None,
             "train",
             &[],
             &cluster_env,
             &host_env,
-            None,
             None,
         );
         assert!(
@@ -359,7 +470,7 @@
     }
 
     #[test]
-    fn build_remote_bash_command_uses_trap_wrapper() {
+    fn agent_bash_command_uses_trap_wrapper() {
         // The trap wrapper is load-bearing: it keeps a bash process
         // alive on the remote after launch so that a connection-drop
         // SIGHUP from sshd reaches a shell that can signal the binary,
@@ -368,9 +479,9 @@
         // ddp-bench on the remote until manual pkill.
         let cluster_env = empty_env();
         let host_env = empty_env();
-        let s = build_remote_bash_command(
-            "/srv", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, None, None,
+        let s = build_remote_agent_bash_command(
+            "/srv", "w", None, "train", &[],
+            &cluster_env, &host_env, None,
         );
         assert!(s.contains(" fdl "), "missing `fdl` invocation: {s}");
         assert!(s.contains(" &\n"), "missing background `&`: {s}");
@@ -387,14 +498,14 @@
     }
 
     #[test]
-    fn build_remote_bash_command_quotes_dangerous_path() {
+    fn agent_bash_command_quotes_dangerous_path() {
         // Single quotes in the path must round-trip through the
         // single-quote-escape idiom.
         let cluster_env = empty_env();
         let host_env = empty_env();
-        let s = build_remote_bash_command(
-            "/srv/it's", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, None, None,
+        let s = build_remote_agent_bash_command(
+            "/srv/it's", "w", None, "train", &[],
+            &cluster_env, &host_env, None,
         );
         assert!(
             s.contains("cd '/srv/it'\\''s'"),
@@ -403,7 +514,7 @@
     }
 
     #[test]
-    fn build_remote_bash_command_uses_prebuild_binary_and_ld_path() {
+    fn agent_bash_command_uses_prebuild_binary_and_ld_path() {
         // When the prebuild envelope provides an entry for this host,
         // the remote dispatch must (a) emit LD_LIBRARY_PATH, (b) launch
         // the binary directly via `<bin>` (no `fdl` re-entry), and (c)
@@ -416,16 +527,14 @@
             ld_library_path: "/opt/libtorch/lib".into(),
             cwd_subpath: "ddp-bench".into(),
         };
-        let s = build_remote_bash_command(
+        let s = build_remote_agent_bash_command(
             "/srv/flodl",
             "worker",
-            0,
             None,
             "ddp-bench",
             &["--mode".into(), "nccl-sync".into()],
             &cluster_env,
             &host_env,
-            None,
             Some(&pb),
         );
         assert!(
@@ -452,7 +561,7 @@
     }
 
     #[test]
-    fn build_remote_bash_command_prebuild_yields_to_host_env_ld_path() {
+    fn agent_bash_command_prebuild_yields_to_host_env_ld_path() {
         // If the user sets LD_LIBRARY_PATH via host.env, the
         // auto-derived prebuild LD_LIBRARY_PATH must yield (the user's
         // value is the source of truth; e.g. they need extra paths
@@ -468,9 +577,9 @@
             ld_library_path: "/opt/libtorch/lib".into(),
             cwd_subpath: String::new(),
         };
-        let s = build_remote_bash_command(
-            "/srv", "w", 0, None, "ddp-bench", &[],
-            &cluster_env, &host_env, None, Some(&pb),
+        let s = build_remote_agent_bash_command(
+            "/srv", "w", None, "ddp-bench", &[],
+            &cluster_env, &host_env, Some(&pb),
         );
         // Only the host_env value should be present; the auto-derived
         // prebuild-only LD_LIBRARY_PATH must be suppressed.
@@ -485,7 +594,7 @@
     }
 
     #[test]
-    fn build_remote_bash_command_exports_cluster_and_host_env() {
+    fn agent_bash_command_exports_cluster_and_host_env() {
         // Cluster-scope and host-scope env vars round-trip into the
         // exported shell command. Host overrides cluster on key
         // collisions.
@@ -495,9 +604,9 @@
         let mut host_env = empty_env();
         host_env.insert("HOST_FLAG".into(), "host-val".into());
         host_env.insert("SHARED_FLAG".into(), "host-wins".into());
-        let s = build_remote_bash_command(
-            "/srv", "w", 0, None, "train", &[],
-            &cluster_env, &host_env, Some(1), None,
+        let s = build_remote_agent_bash_command(
+            "/srv", "w", None, "train", &[],
+            &cluster_env, &host_env, None,
         );
         assert!(s.contains("NCCL_P2P_DISABLE='1'"));
         assert!(s.contains("HOST_FLAG='host-val'"));
@@ -507,7 +616,6 @@
         let cluster_pos = s.find("SHARED_FLAG='cluster-wins'").unwrap();
         let host_pos = s.find("SHARED_FLAG='host-wins'").unwrap();
         assert!(cluster_pos < host_pos, "host env must export after cluster env");
-        assert!(s.contains("CUDA_VISIBLE_DEVICES=1"));
     }
 
     #[test]

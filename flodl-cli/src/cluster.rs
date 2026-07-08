@@ -963,6 +963,7 @@ commands:
                 docker: None,
                 arch: None,
                 data_path: None,
+                join: None,
             },
             workers: Vec::new(),
             env: std::collections::BTreeMap::new(),
@@ -994,6 +995,7 @@ commands:
                 docker: None,
                 arch: None,
                 data_path: None,
+                join: None,
             },
             workers: vec![ClusterWorker {
                 host: "nonexistent.invalid.".into(),
@@ -1034,6 +1036,7 @@ commands:
                 docker: None,
                 arch: None,
                 data_path: None,
+                join: None,
             },
             workers: vec![ClusterWorker {
                 host: "nonexistent.invalid.".into(),

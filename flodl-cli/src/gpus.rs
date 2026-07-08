@@ -168,6 +168,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             docker: None,
             arch: None,
             data_path: None,
+            join: None,
         },
         workers: vec![ClusterWorker {
             host: hostname,
