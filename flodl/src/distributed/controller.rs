@@ -1053,7 +1053,7 @@ pub(crate) fn read_round_frame<R: Read>(
     }
     let num_tensors = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
     // Unauthenticated until the trailing MAC verifies — bound before
-    // trusting (same discipline as the mux envelope's MAX_MUX_PAYLOAD).
+    // trusting (same discipline as the mux envelope's frame ceiling).
     if num_tensors > MAX_ROUND_FRAME_TENSORS {
         return Err(TensorError::new(&format!(
             "cluster_controller: frame claims {num_tensors} tensors \
@@ -1117,12 +1117,12 @@ pub(crate) fn read_round_frame<R: Read>(
         mac.update(nb);
         let nbytes = u64::from_le_bytes(nb) as usize;
         total_bytes = total_bytes.saturating_add(nbytes);
-        if total_bytes > crate::distributed::relay::mux::MAX_MUX_PAYLOAD {
+        if total_bytes > crate::distributed::wire::frame_ceiling() {
             return Err(TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] pushes frame past the \
                  {} byte ceiling; corrupt or hostile peer, or a model that \
                  has outgrown the frame ceiling",
-                crate::distributed::relay::mux::MAX_MUX_PAYLOAD
+                crate::distributed::wire::frame_ceiling()
             )));
         }
         // Incremental allocation: nbytes is unauthenticated until the

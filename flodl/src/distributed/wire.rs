@@ -103,6 +103,67 @@ pub const MAX_CONTROL_PAYLOAD: usize = 16 * 1024 * 1024;
 /// for one big up-front allocation.
 pub(crate) const READ_CHUNK: usize = 64 * 1024 * 1024;
 
+/// Default hard ceiling on any length-prefixed data-plane payload (mux
+/// records, len-framed blobs, RoundFrame tensor totals) when no
+/// model-derived bound has been installed. Length fields are
+/// UNAUTHENTICATED until the trailing MAC verifies, so a hostile or
+/// corrupt peer can claim up to `u32::MAX`; incremental allocation makes
+/// the attacker pay the bandwidth, this cap bounds the memory.
+pub(crate) const DEFAULT_FRAME_CEILING: usize = 1 << 30; // 1 GiB
+
+/// Floor for the model-derived frame ceiling: even a tiny model keeps a
+/// generous reject-threshold so bookkeeping frames, header slack, and
+/// future dtype growth never brush the bound.
+const FRAME_CEILING_FLOOR: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Session frame ceiling, installed once per process by
+/// [`set_frame_ceiling`]. `None` until then → [`DEFAULT_FRAME_CEILING`].
+static FRAME_CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The active hard ceiling for length-prefixed data-plane payloads.
+///
+/// Model-derived when the process has installed one (launcher: from its
+/// CPU probe; relay: from its `RelaySpec`; rank: from the model it
+/// builds), [`DEFAULT_FRAME_CEILING`] otherwise. Purely a local
+/// reject-threshold — no cross-process agreement is required, so a
+/// process still on the default merely rejects later than its peers.
+pub(crate) fn frame_ceiling() -> usize {
+    *FRAME_CEILING.get().unwrap_or(&DEFAULT_FRAME_CEILING)
+}
+
+/// Install the session frame ceiling. First caller wins (the value is
+/// derived deterministically from the model in every process, so a
+/// second call carries the same number); zero is ignored (unset relay
+/// spec field from a build that predates it).
+pub(crate) fn set_frame_ceiling(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if FRAME_CEILING.set(bytes).is_ok() {
+        crate::verbose!("  wire: frame ceiling set to {bytes} bytes (model-derived)");
+    }
+}
+
+/// Derive the frame ceiling from a model's wire footprint (Σ param +
+/// buffer bytes): ×2 margin for header slack / dtype growth / count
+/// gathers, floored at 64 MiB. The ×2 also covers the relay fold's
+/// `HostFrame`, which sums element-wise and never outgrows one rank's
+/// frame.
+pub(crate) fn derive_frame_ceiling(model_wire_bytes: usize) -> usize {
+    model_wire_bytes
+        .saturating_mul(2)
+        .max(FRAME_CEILING_FLOOR)
+}
+
+/// Σ bytes of `tensors` as they ride a `RoundFrame` (numel × element
+/// size; header slack is absorbed by [`derive_frame_ceiling`]'s margin).
+pub(crate) fn tensors_wire_bytes(tensors: &[crate::tensor::Tensor]) -> usize {
+    tensors
+        .iter()
+        .map(|t| t.numel().max(0) as usize * t.dtype().element_size())
+        .sum()
+}
+
 /// One shared TCP connect budget for every cluster dial (rank ->
 /// rendezvous, relay -> controller, worker -> coordinator, reduce
 /// client -> controller): ~30s of 500ms attempts. The four call sites

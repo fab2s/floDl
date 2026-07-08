@@ -252,6 +252,27 @@ impl DdpHandle {
                         coord_config = coord_config.model_schema(
                             crate::distributed::ModelSchema::from_module(&probe),
                         );
+                        // Model-derived frame ceiling: the same CPU probe
+                        // yields the exact wire footprint, replacing the
+                        // 1 GiB default reject-threshold on every
+                        // length-prefixed read in this process (the
+                        // controller lives here). The relay children get
+                        // it via `RelaySpec`; ranks derive the identical
+                        // value from the model they build. Set BEFORE the
+                        // driver spawns anything that reads frames.
+                        let params: Vec<crate::tensor::Tensor> = probe
+                            .parameters()
+                            .iter()
+                            .map(|p| p.variable.data())
+                            .collect();
+                        let buffers: Vec<crate::tensor::Tensor> =
+                            probe.buffers().iter().map(|b| b.get()).collect();
+                        let wire_bytes =
+                            crate::distributed::wire::tensors_wire_bytes(&params)
+                                + crate::distributed::wire::tensors_wire_bytes(&buffers);
+                        crate::distributed::wire::set_frame_ceiling(
+                            crate::distributed::wire::derive_frame_ceiling(wire_bytes),
+                        );
                     }
                     Err(e) => {
                         eprintln!(

@@ -15,6 +15,7 @@
             salt_hex: "0123456789abcdef0123456789abcdef".into(),
             world_size: 3,
             data_channel: true,
+            frame_ceiling_bytes: 0,
         }
     }
 

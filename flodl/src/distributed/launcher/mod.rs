@@ -254,6 +254,12 @@ pub struct RelaySpec {
     /// ranks never dial the data channel there, so an always-on data
     /// relay would block forever in `accept`.
     pub data_channel: bool,
+    /// Model-derived frame ceiling (bytes) for the relay's
+    /// length-prefixed readers, computed by the launcher's CPU probe.
+    /// `0` (or absent, via serde default) keeps the 1 GiB default —
+    /// purely a local reject-threshold, so no agreement is required.
+    #[serde(default)]
+    pub frame_ceiling_bytes: usize,
 }
 
 /// Run this process as a per-host transport relay: bind the loopback data
@@ -270,6 +276,10 @@ pub fn run_relay() -> Result<()> {
         .map_err(|e| TensorError::new(&format!("relay: spec hex-decode: {e}")))?;
     let spec: RelaySpec = serde_json::from_slice(&bytes)
         .map_err(|e| TensorError::new(&format!("relay: spec JSON parse: {e}")))?;
+    // Install the launcher-derived frame ceiling before any channel
+    // reads a frame (zero = unset → keep the default; set_frame_ceiling
+    // ignores it).
+    crate::distributed::wire::set_frame_ceiling(spec.frame_ceiling_bytes);
     let salt = crate::distributed::wire::salt_from_hex(&spec.salt_hex)?;
     let base = spec.controller_port;
 
@@ -815,6 +825,10 @@ pub fn run_launcher_with_config(
                     salt_hex: crate::distributed::wire::salt_to_hex(&full.salt),
                     world_size: full.world_size(),
                     data_channel: relay_data_channel,
+                    // The launcher's model probe installed the session
+                    // ceiling before this driver started (orchestrator
+                    // handle); reads the default when the probe failed.
+                    frame_ceiling_bytes: crate::distributed::wire::frame_ceiling(),
                 };
                 let spec_hex = crate::distributed::cluster::hex_encode(
                     serde_json::to_string(&spec)

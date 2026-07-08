@@ -326,6 +326,17 @@ impl DdpHandle {
                 .iter()
                 .map(|b| b.get())
                 .collect();
+            // Model-derived frame ceiling for this rank's length-prefixed
+            // readers, from the model just built — the same deterministic
+            // value the launcher probe and the relay spec carry (same
+            // factory, same binary). Installed BEFORE the first framed
+            // read (the bootstrap consensus below).
+            {
+                use crate::distributed::wire;
+                let wire_bytes = wire::tensors_wire_bytes(&initial_params_local)
+                    + wire::tensors_wire_bytes(&initial_buffers_local);
+                wire::set_frame_ceiling(wire::derive_frame_ceiling(wire_bytes));
+            }
             match (&nccl_comm, &mut cpu_client) {
                 (Some(comm), _) => {
                     // NCCL: in-place broadcast from rank 0.

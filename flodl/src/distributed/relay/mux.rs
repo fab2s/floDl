@@ -18,8 +18,7 @@
 //!   to the controller is length-delimited with a bare 4-byte prefix
 //!   ([`write_len_framed`] / [`read_len_framed`]). The blob is the
 //!   existing [`RoundFrame`] / [`ControlFrame`] bytes verbatim — already
-//!   HMAC-authed end-to-end, so the loopback prefix carries no auth of
-//!   its own. The relay never parses the blob; it forwards opaque bytes.
+//!   HMAC-authed, so the loopback prefix carries no auth of its own.
 //!
 //! - **relay ↔ controller (network):** frames are wrapped in
 //!   [`MuxRecord`]s so the single per-host connection can carry the
@@ -175,16 +174,15 @@ pub enum MuxRecord {
 }
 
 /// Hard ceiling on any length-prefixed payload (mux records and
-/// len-framed blobs). The length field is UNAUTHENTICATED until the
-/// trailing MAC verifies, so a hostile or corrupt peer can claim up to
+/// len-framed blobs): [`crate::distributed::wire::frame_ceiling`] — the
+/// model-derived session bound when the process has installed one
+/// (launcher probe / `RelaySpec` / rank model), a 1 GiB default
+/// otherwise. The length field is UNAUTHENTICATED until the trailing
+/// MAC verifies, so a hostile or corrupt peer can claim up to
 /// `u32::MAX` and force the reader to buffer it before rejection —
-/// incremental allocation makes the attacker pay the bandwidth, this
-/// cap bounds the memory. Sized with generous headroom over a full
-/// model params `RoundFrame` on the data channel; a legitimate model
-/// outgrowing it fails loudly here, naming this constant. A follow-up
-/// derives the exact bound from the model via the rendezvous handshake
-/// instead of a constant.
-pub(crate) const MAX_MUX_PAYLOAD: usize = 1 << 30; // 1 GiB
+/// incremental allocation makes the attacker pay the bandwidth, the
+/// ceiling bounds the memory.
+use crate::distributed::wire::frame_ceiling;
 
 impl MuxRecord {
     /// Tag an opaque frame blob with its originating rank.
@@ -324,10 +322,11 @@ impl MuxRecord {
         let rank = u32::from_le_bytes(hdr[9..13].try_into().unwrap());
         let payload_len = u32::from_le_bytes(hdr[13..17].try_into().unwrap()) as usize;
         let auth_tag = u64::from_le_bytes(hdr[17..25].try_into().unwrap());
-        if payload_len > MAX_MUX_PAYLOAD {
+        let ceiling = frame_ceiling();
+        if payload_len > ceiling {
             return Err(TensorError::new(&format!(
-                "relay_mux: record payload_len {payload_len} exceeds MAX_MUX_PAYLOAD \
-                 {MAX_MUX_PAYLOAD} (kind=0x{kind:02x}, rank={rank}); corrupt or \
+                "relay_mux: record payload_len {payload_len} exceeds the frame \
+                 ceiling {ceiling} (kind=0x{kind:02x}, rank={rank}); corrupt or \
                  hostile peer, or a model that has outgrown the frame ceiling"
             )));
         }
@@ -426,10 +425,11 @@ pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
         }
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MUX_PAYLOAD {
+    let ceiling = frame_ceiling();
+    if len > ceiling {
         return Err(TensorError::new(&format!(
-            "relay_mux: len-framed blob length {len} exceeds MAX_MUX_PAYLOAD \
-             {MAX_MUX_PAYLOAD}; corrupt or hostile peer"
+            "relay_mux: len-framed blob length {len} exceeds the frame ceiling \
+             {ceiling}; corrupt or hostile peer"
         )));
     }
     let body = crate::distributed::wire::read_exact_incremental(r, len)
@@ -451,10 +451,11 @@ pub fn try_read_len_framed<R: Read>(r: &mut R) -> Result<LenFramedRead> {
     // Committed: finish the prefix + body ignoring read timeouts.
     fill_committed(r, &mut len_buf[1..])?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MUX_PAYLOAD {
+    let ceiling = frame_ceiling();
+    if len > ceiling {
         return Err(TensorError::new(&format!(
-            "relay_mux: len-framed blob length {len} exceeds MAX_MUX_PAYLOAD \
-             {MAX_MUX_PAYLOAD}; corrupt or hostile peer"
+            "relay_mux: len-framed blob length {len} exceeds the frame ceiling \
+             {ceiling}; corrupt or hostile peer"
         )));
     }
     let body = fill_committed_incremental(r, len)?;

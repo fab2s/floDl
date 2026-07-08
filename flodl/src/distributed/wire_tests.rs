@@ -532,3 +532,26 @@
         use std::net::ToSocketAddrs;
         assert!(join_host_port("::1", 1337).to_socket_addrs().is_ok());
     }
+
+    #[test]
+    fn derive_frame_ceiling_floor_and_margin() {
+        // Tiny model: the 64 MiB floor wins so bookkeeping frames and
+        // header slack never brush the bound.
+        assert_eq!(derive_frame_ceiling(0), 64 * 1024 * 1024);
+        assert_eq!(derive_frame_ceiling(1_000_000), 64 * 1024 * 1024);
+        // Large model: x2 margin over the wire footprint.
+        assert_eq!(derive_frame_ceiling(100 * 1024 * 1024), 200 * 1024 * 1024);
+        // Absurd input saturates instead of overflowing.
+        assert_eq!(derive_frame_ceiling(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn frame_ceiling_defaults_when_unset() {
+        // No test in this binary installs a session ceiling (doing so
+        // would poison every other test through the process-wide
+        // OnceLock), so the accessor must serve the 1 GiB default.
+        assert_eq!(frame_ceiling(), DEFAULT_FRAME_CEILING);
+        // Zero is "unset" and must be ignored, not installed.
+        set_frame_ceiling(0);
+        assert_eq!(frame_ceiling(), DEFAULT_FRAME_CEILING);
+    }

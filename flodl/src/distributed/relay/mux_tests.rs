@@ -338,7 +338,7 @@ fn opaque_payload_is_not_parsed() {
     // ---- payload ceiling ----------------------------------------------------
 
     /// The length fields are unauthenticated until the MAC verifies; a
-    /// claimed length past MAX_MUX_PAYLOAD must be rejected before the
+    /// claimed length past the frame ceiling must be rejected before the
     /// reader commits to buffering it.
     #[test]
     fn oversized_len_framed_blob_is_rejected() {
@@ -348,7 +348,7 @@ fn opaque_payload_is_not_parsed() {
         let mut cursor = std::io::Cursor::new(bytes);
         let err = try_read_len_framed(&mut cursor).unwrap_err();
         assert!(
-            err.to_string().contains("MAX_MUX_PAYLOAD"),
+            err.to_string().contains("frame ceiling"),
             "got: {err}"
         );
     }
@@ -366,7 +366,7 @@ fn opaque_payload_is_not_parsed() {
         let mut cursor = std::io::Cursor::new(hdr);
         let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
         assert!(
-            err.to_string().contains("MAX_MUX_PAYLOAD"),
+            err.to_string().contains("frame ceiling"),
             "got: {err}"
         );
     }
