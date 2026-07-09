@@ -696,6 +696,76 @@
     }
 
     #[test]
+    fn test_set_data_loader_rejected_while_epoch_iterator_active() {
+        // Regression: replacing the loader mid-iteration used to drop it out
+        // from under the live epoch iterator (use-after-free); it must now
+        // fail loudly while the iterator holds the loader cell.
+        use crate::graph::FlowBuilder;
+        use crate::nn::Linear;
+
+        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+        let loader = DataLoader::from_dataset(make_data(20))
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+        model.set_data_loader(loader, "x").unwrap();
+
+        let active = model.epoch(0).activate();
+
+        // Metadata reads stay available while the iterator is active
+        // (cached at bind time, not routed through the loader cell).
+        assert_eq!(model.data_num_batches(), 4);
+        assert_eq!(model.data_batch_size(), 5);
+
+        let replacement = DataLoader::from_dataset(make_data(10))
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+        let err = model.set_data_loader(replacement, "x");
+        assert!(err.is_err(), "mid-iteration replace must be rejected");
+        assert!(
+            err.unwrap_err().to_string().contains("epoch iterator is active"),
+            "error should name the cause"
+        );
+
+        // Dropping the iterator releases the lease; rebinding works again.
+        drop(active);
+        let replacement = DataLoader::from_dataset(make_data(10))
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+        model.set_data_loader(replacement, "x").unwrap();
+        assert_eq!(model.data_num_batches(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "already active")]
+    fn test_second_active_epoch_iterator_panics() {
+        // Regression: two active iterators used to alias `&mut` into the
+        // same DataLoader; the second activation must fail loudly.
+        use crate::graph::FlowBuilder;
+        use crate::nn::Linear;
+
+        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
+            .build()
+            .unwrap();
+        let loader = DataLoader::from_dataset(make_data(20))
+            .batch_size(5)
+            .names(&["x", "y"])
+            .build()
+            .unwrap();
+        model.set_data_loader(loader, "x").unwrap();
+
+        let _first = model.epoch(0).activate();
+        let _second = model.epoch(0).activate(); // must panic
+    }
+
+    #[test]
     fn test_set_data_loader_invalid_input_name() {
         use crate::graph::FlowBuilder;
         use crate::nn::Linear;

@@ -137,6 +137,11 @@ pub struct Graph {
     pub(crate) training_step: Cell<usize>,
     // DataLoader binding for resident DDP (set by set_data_loader(), None by default)
     pub(crate) data_binding: RefCell<Option<DataLoaderBinding>>,
+    /// The bound DataLoader, in its OWN cell so an active epoch iterator can
+    /// hold it exclusively (see [`GraphEpochIterator::activate`]) while
+    /// `forward_batch` / `data_num_batches` keep reading the metadata in
+    /// `data_binding`. Set together with `data_binding` by `set_data_loader`.
+    pub(crate) data_loader: RefCell<Option<crate::data::DataLoader>>,
     // Per-batch loss closure for El Che (set by set_loss_fn(), None = legacy gather path)
     #[allow(clippy::type_complexity)]
     pub(crate) loss_fn: RefCell<Option<Box<dyn Fn(&LossContext) -> Result<Variable>>>>,
@@ -174,10 +179,10 @@ pub struct Graph {
 /// Binding between a `DataLoader` and a [`Graph`] for integrated training.
 ///
 /// Created by [`Graph::set_data_loader`]. Maps batch tensor names to
-/// graph inputs and stores the loader reference.
+/// graph inputs. The loader itself lives in `Graph::data_loader` (a
+/// separate cell) so an active epoch iterator can borrow it exclusively
+/// while this metadata stays readable.
 pub(crate) struct DataLoaderBinding {
-    /// The DataLoader.
-    pub loader: crate::data::DataLoader,
     /// Name of the batch field used as the primary forward input (e.g., "image").
     pub forward_input: String,
     /// Mappings from batch field names to graph Input port names.
@@ -191,6 +196,12 @@ pub(crate) struct DataLoaderBinding {
     /// `shard_input_map[i]` is the index into `Batch` that provides
     /// `self.inputs[i]`.
     pub shard_input_map: Vec<usize>,
+    /// Cached from the loader at bind time (fixed per loader config), so
+    /// `data_num_batches` / `data_batch_size` stay readable while an epoch
+    /// iterator holds the loader cell exclusively.
+    pub num_batches: usize,
+    /// See `num_batches`.
+    pub batch_size: usize,
 }
 
 impl Graph {
@@ -442,6 +453,7 @@ impl Graph {
             lr_scale: Cell::new(1.0),
             training_step: Cell::new(0),
             data_binding: RefCell::new(None),
+            data_loader: RefCell::new(None),
             loss_fn: RefCell::new(None),
             traces_validated: Cell::new(false),
             source_config: RefCell::new(None),
@@ -1215,27 +1227,46 @@ pub struct ActiveGraphEpochIterator<'a> {
     state: GraphEpochState<'a>,
     #[allow(dead_code)]
     graph: &'a Graph,
+    /// Holds the exclusive borrow of the Graph's loader cell for the
+    /// iterator's whole lifetime. Declared after `state` so the iterator
+    /// (which borrows the loader through a raw pointer) drops first.
+    _loader_guard: std::cell::RefMut<'a, Option<crate::data::DataLoader>>,
 }
 
 impl<'a> GraphEpochIterator<'a> {
     /// Activate the iterator (must be called to start iteration).
-    /// This resolves the borrow on the DataLoader binding.
+    /// Takes the exclusive borrow of the graph's DataLoader for the
+    /// iterator's lifetime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another epoch iterator is already active on this graph,
+    /// or if no data loader is bound.
     pub fn activate(self) -> ActiveGraphEpochIterator<'a> {
         match self {
             GraphEpochIterator::Single(graph, epoch) => {
-                // Need a mutable borrow to call epoch() on the inner DataLoader.
-                let mut binding = graph.data_binding.borrow_mut();
-                let binding = binding.as_mut().unwrap();
-                let loader_ptr = &mut binding.loader as *mut crate::data::DataLoader;
+                let mut guard = graph.data_loader.try_borrow_mut().expect(
+                    "Graph::epoch: an epoch iterator is already active on this graph",
+                );
+                let loader = guard
+                    .as_mut()
+                    .expect("Graph::epoch() requires set_data_loader() first");
+                let loader_ptr = loader as *mut crate::data::DataLoader;
 
-                // Safety: the DataLoader lives in the Graph's DataLoaderBinding.
-                // We create an EpochIterator that borrows from it. The Graph
-                // outlives the iterator. No concurrent mutation occurs during
-                // iteration.
+                // Safety: `guard` moves into the returned iterator and holds
+                // the RefCell's exclusive borrow for the iterator's whole
+                // lifetime. The loader is only reachable through that
+                // RefCell, so nothing can alias, replace, or drop it while
+                // `iter` borrows it: `set_data_loader` and a second
+                // `activate()` fail loudly on the dynamic borrow instead.
+                // The RefCell lives in the Graph, which `'a` keeps alive and
+                // in place, and moving the RefMut guard does not move the
+                // loader it points into.
                 let iter = unsafe { (*loader_ptr).epoch(epoch) };
                 ActiveGraphEpochIterator {
                     state: GraphEpochState::SingleActive(iter),
                     graph,
+                    _loader_guard: guard,
                 }
             }
         }

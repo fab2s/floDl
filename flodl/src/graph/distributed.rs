@@ -423,12 +423,25 @@ impl Graph {
         }
 
         let _ = loader_names; // keep the name list for the future iterator wiring
+
+        // Refuse to replace the loader while an epoch iterator holds it:
+        // the iterator owns the cell's exclusive borrow, and replacing the
+        // loader would drop it out from under the live iteration.
+        let mut loader_cell = self.data_loader.try_borrow_mut().map_err(|_| {
+            TensorError::new(
+                "set_data_loader: cannot replace the data loader while an epoch iterator is active",
+            )
+        })?;
+        let num_batches = loader.num_batches();
+        let batch_size = loader.batch_size();
+        *loader_cell = Some(loader);
         *self.data_binding.borrow_mut() = Some(DataLoaderBinding {
-            loader,
             forward_input: forward_input.to_string(),
             graph_inputs,
             target_names,
             shard_input_map,
+            num_batches,
+            batch_size,
         });
 
         Ok(())
@@ -495,24 +508,24 @@ impl Graph {
         GraphEpochIterator::Single(self, epoch)
     }
 
-    /// Number of batches per epoch (delegates to the attached DataLoader).
+    /// Number of batches per epoch (cached from the DataLoader at bind
+    /// time; readable while an epoch iterator is active).
     pub fn data_num_batches(&self) -> usize {
         self.data_binding
             .borrow()
             .as_ref()
             .expect("call set_data_loader first")
-            .loader
-            .num_batches()
+            .num_batches
     }
 
-    /// Batch size (delegates to the attached DataLoader).
+    /// Batch size (cached from the DataLoader at bind time; readable
+    /// while an epoch iterator is active).
     pub fn data_batch_size(&self) -> usize {
         self.data_binding
             .borrow()
             .as_ref()
             .expect("call set_data_loader first")
-            .loader
-            .batch_size()
+            .batch_size
     }
 
 
