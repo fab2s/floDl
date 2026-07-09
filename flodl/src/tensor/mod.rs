@@ -189,6 +189,14 @@ pub struct Tensor {
     pub(crate) handle: FlodlTensor,
 }
 
+/// View a typed slice as raw host bytes for the blob constructors.
+fn typed_bytes<T>(data: &[T]) -> &[u8] {
+    // Safety: u8 has alignment 1 and any initialized f32/f64/i64 slice is
+    // readable as `size_of_val(data)` plain bytes; the lifetime stays tied
+    // to the input slice.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
 // Safety: libtorch tensors are reference-counted internally and
 // thread-safe for read access. Mutations go through the shim which
 // creates new tensors.
@@ -290,68 +298,29 @@ impl Tensor {
         Ok(Self::from_raw(handle))
     }
 
-    /// Create a tensor from f32 data.
+    /// Create a tensor from f32 data. `data.len()` must equal the shape
+    /// product; a mismatch is a loud error.
     ///
     /// ```ignore
     /// let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU)?;
     /// assert_eq!(t.shape(), vec![2, 2]);
     /// ```
     pub fn from_f32(data: &[f32], shape: &[i64], device: Device) -> Result<Self> {
-        let mut shape = shape.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let (dt, di) = device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_from_blob(
-                data.as_ptr() as *mut c_void,
-                shape.as_mut_ptr(),
-                shape.len() as i32,
-                DType::Float32 as i32,
-                dt, di,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Self::from_raw(handle))
+        Self::from_blob_impl("Tensor::from_f32", typed_bytes(data), shape, DType::Float32, device)
     }
 
     /// Create a Float64 tensor from f64 data. Use when full double precision
     /// is needed (e.g. loss accumulation, high-precision metrics).
+    /// `data.len()` must equal the shape product; a mismatch is a loud error.
     pub fn from_f64(data: &[f64], shape: &[i64], device: Device) -> Result<Self> {
-        let mut shape = shape.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let (dt, di) = device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_from_blob(
-                data.as_ptr() as *mut c_void,
-                shape.as_mut_ptr(),
-                shape.len() as i32,
-                DType::Float64 as i32,
-                dt, di,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Self::from_raw(handle))
+        Self::from_blob_impl("Tensor::from_f64", typed_bytes(data), shape, DType::Float64, device)
     }
 
     /// Create an Int64 tensor from i64 data. Commonly used for class labels,
     /// token indices, and any integer indexing (e.g. `cross_entropy_loss` targets).
+    /// `data.len()` must equal the shape product; a mismatch is a loud error.
     pub fn from_i64(data: &[i64], shape: &[i64], device: Device) -> Result<Self> {
-        let mut shape = shape.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let (dt, di) = device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_from_blob(
-                data.as_ptr() as *mut c_void,
-                shape.as_mut_ptr(),
-                shape.len() as i32,
-                DType::Int64 as i32,
-                dt, di,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Self::from_raw(handle))
+        Self::from_blob_impl("Tensor::from_i64", typed_bytes(data), shape, DType::Int64, device)
     }
 
     /// Construct a tensor from raw little-endian host bytes at the
@@ -363,11 +332,39 @@ impl Tensor {
     /// safetensors that store dtype + raw bytes; for typed inputs use
     /// the dtype-specific helpers (`from_f32`, `from_f64`, `from_i64`).
     pub fn from_blob(data: &[u8], shape: &[i64], dtype: DType, device: Device) -> Result<Self> {
-        let numel: i64 = shape.iter().product();
-        let expected = numel as usize * dtype.element_size();
+        Self::from_blob_impl("Tensor::from_blob", data, shape, dtype, device)
+    }
+
+    /// Single validation home for every blob-style constructor. The length
+    /// check is load-bearing: the shim's `flodl_from_blob` receives only a
+    /// pointer and reads `numel × element_size` bytes trusting the caller,
+    /// so an unchecked mismatch is an out-of-bounds read. `ctx` names the
+    /// public constructor so errors point at the call the user wrote.
+    fn from_blob_impl(
+        ctx: &str,
+        data: &[u8],
+        shape: &[i64],
+        dtype: DType,
+        device: Device,
+    ) -> Result<Self> {
+        let numel = shape
+            .iter()
+            .try_fold(1i64, |acc, &d| if d < 0 { None } else { acc.checked_mul(d) })
+            .ok_or_else(|| {
+                TensorError::new(&format!(
+                    "{ctx}: invalid shape {shape:?} (negative or overflowing dimension)"
+                ))
+            })?;
+        let expected = (numel as usize)
+            .checked_mul(dtype.element_size())
+            .ok_or_else(|| {
+                TensorError::new(&format!(
+                    "{ctx}: invalid shape {shape:?} (byte size overflows usize)"
+                ))
+            })?;
         if data.len() != expected {
             return Err(TensorError::new(&format!(
-                "Tensor::from_blob: data is {} bytes, expected {expected} \
+                "{ctx}: data is {} bytes, expected {expected} \
                  (numel={numel} × {} bytes/elem for {dtype:?})",
                 data.len(),
                 dtype.element_size(),

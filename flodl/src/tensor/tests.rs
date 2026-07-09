@@ -58,6 +58,32 @@
     }
 
     #[test]
+    fn test_typed_constructors_length_mismatch_errors() {
+        // Regression: these used to hand the slice pointer to the shim
+        // unchecked, so a short slice was an out-of-bounds read.
+        let err = Tensor::from_f32(&[1.0], &[1000, 1000], test_device());
+        assert!(err.is_err(), "expected length mismatch error");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("from_f32"), "error should name the constructor: {msg}");
+
+        assert!(Tensor::from_f64(&[1.0, 2.0, 3.0], &[2, 2], test_device()).is_err());
+        assert!(Tensor::from_i64(&[1, 2, 3, 4, 5], &[2, 2], test_device()).is_err());
+    }
+
+    #[test]
+    fn test_from_blob_rejects_negative_and_overflowing_shape() {
+        let bytes = [0u8; 16];
+        assert!(
+            Tensor::from_blob(&bytes, &[-4], DType::Float32, test_device()).is_err(),
+            "negative dimension must error, not wrap"
+        );
+        assert!(
+            Tensor::from_blob(&bytes, &[i64::MAX, 8], DType::Float32, test_device()).is_err(),
+            "overflowing shape product must error, not wrap"
+        );
+    }
+
+    #[test]
     fn test_drop_frees_memory() {
         // Create and immediately drop -- verifies Drop doesn't crash.
         let _ = Tensor::zeros(&[1000, 1000], test_opts()).unwrap();
