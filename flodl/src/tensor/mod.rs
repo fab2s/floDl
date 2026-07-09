@@ -185,6 +185,18 @@ impl Default for TensorOptions {
 /// ```ignore
 /// let y = x.matmul(&w)?.add(&b)?.relu()?;
 /// ```
+///
+/// # Thread safety
+///
+/// `Tensor` is `Send + Sync`. Concurrent reads from multiple threads
+/// are safe: every non-suffixed op allocates a new output tensor. The
+/// `_`-suffixed in-place ops (`add_`, `copy_`, `zero_`, `fill_`,
+/// `fused_*`, `foreach_*_`, ...) mutate storage without synchronization,
+/// so a tensor being mutated must not be accessed from any other thread
+/// at the same time. A shallow [`Clone`] shares the same storage and
+/// counts as the same tensor for this rule. Share tensors across
+/// threads for reading; give each thread its own deep copy (or
+/// replica) when mutation is involved.
 pub struct Tensor {
     pub(crate) handle: FlodlTensor,
 }
@@ -197,9 +209,15 @@ fn typed_bytes<T>(data: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
-// Safety: libtorch tensors are reference-counted internally and
-// thread-safe for read access. Mutations go through the shim which
-// creates new tensors.
+// Safety: libtorch tensors are internally reference-counted with atomic
+// refcounts, and concurrent READS (ops that allocate new outputs) are
+// thread-safe. In-place ops (`add_`, `copy_`, `zero_`, `fused_*`,
+// `foreach_*_`, ...) mutate storage through `&self` WITHOUT
+// synchronization: callers must guarantee that a tensor being mutated is
+// not concurrently accessed from any other thread, including through
+// shallow clones, which share the same storage. flodl upholds this
+// internally by replication (each worker owns its tensors) and
+// single-consumer snapshot buffers, never by locking.
 unsafe impl Send for Tensor {}
 unsafe impl Sync for Tensor {}
 
