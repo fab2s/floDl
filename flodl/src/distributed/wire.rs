@@ -781,6 +781,11 @@ impl ControlFrame {
             ))
         })?;
         let actual = frame_mac(salt, kind, &payload);
+        // Timing-safe by construction: a u64 equality is one compare, no
+        // early-exit byte scan to probe. The computed tag in the error
+        // text below never crosses the wire — MAC failures are dropped
+        // without a reply on every accept path (a reject that echoed the
+        // valid tag for the attacker's payload would hand them a forgery).
         if actual != auth_tag {
             return Err(TensorError::new(&format!(
                 "wire: ControlFrame HMAC verification failed (computed \

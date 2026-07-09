@@ -492,8 +492,8 @@ fn build_native(archs: &str, install_path: &str, ctx: &Context, max_jobs: usize)
     }
 
     // Bundle cuDNN: copy system cuDNN libs into the install path so
-    // deploys to hosts without a system cuDNN install (e.g. the
-    // flodl-pascal VM) can still find libcudnn_graph.so.9 and the
+    // deploys to hosts without a system cuDNN install (e.g. a bare
+    // VM guest) can still find libcudnn_graph.so.9 and the
     // other sub-libs via libtorch's lib dir on LD_LIBRARY_PATH.
     // Best-effort on the native path: walks common cuDNN install
     // prefixes and copies the first match it finds. Silently skipped

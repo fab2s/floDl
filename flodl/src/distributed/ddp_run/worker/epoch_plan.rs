@@ -288,9 +288,8 @@ impl<M: Module> GpuWorker<M> {
             // `self.partition.len()` so a mid-epoch
             // `ControlMsg::ExtendPartition` (cluster-mode reshard
             // after a rank dies) injects extra batches and they get
-            // processed before the epoch completes. The prefetch
-            // branch above doesn't yet support this — see the comment
-            // in `dispatch_control`'s `ExtendPartition` arm.
+            // processed before the epoch completes — same contract as
+            // the prefetch branch above.
             let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
 
             let mut batch_idx: usize = 0;

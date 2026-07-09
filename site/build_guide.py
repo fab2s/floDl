@@ -59,7 +59,9 @@ LINK_REWRITES = [
     (r"\(tutorials/12-async-ddp\.md\)", "(/guide/async-ddp)"),
     (r"\(tutorials/13-data-loading\.md\)", "(/guide/data-loading)"),
     (r"\(tutorials/14-flodl-hf\.md\)", "(/guide/flodl-hf)"),
+    (r"\(cli\.md(#[^)]+)\)", r"(/guide/cli\1)"),
     (r"\(cli\.md\)", "(/guide/cli)"),
+    (r"\(design/trainer-execution-tiers\.md\)", "(https://github.com/flodl-labs/flodl/blob/main/docs/design/trainer-execution-tiers.md)"),
 ]
 
 NAV_LINE_RE = re.compile(

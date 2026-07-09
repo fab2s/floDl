@@ -17,7 +17,9 @@ form) or `Trainer::run(model_factory, optim_factory, train_fn, cfg)`
   `ClusterBuilder`).
 
 No code changes between tiers. Scaling is a configuration decision, not
-a code rewrite.
+a code rewrite. (For the API-tier rationale — universal builder, manual
+`Ddp::wrap` bypass, the deprecated self-driven setup tier — see the
+[trainer execution tiers design note](design/trainer-execution-tiers.md).)
 
 ---
 

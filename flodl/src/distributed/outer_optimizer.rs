@@ -394,10 +394,10 @@ impl OuterStepper {
         self.opt.checkpoint_state()
     }
 
-    /// Restore the outer optimizer's state on resume (delegates). Also seeds
-    /// `prev_global` to `None` is left untouched — the first post-resume
-    /// window re-anchors on the restored consensus, while the restored
-    /// momentum carries the accumulated drift.
+    /// Restore the outer optimizer's state on resume (delegates to the
+    /// variant). `prev_global` stays `None` — the first post-resume window
+    /// re-anchors on that window's consensus (zero outer gradient), while
+    /// the restored momentum carries the accumulated drift.
     pub fn load_checkpoint_state(&mut self, state: Vec<Tensor>) -> Result<()> {
         self.opt.load_checkpoint_state(state)
     }

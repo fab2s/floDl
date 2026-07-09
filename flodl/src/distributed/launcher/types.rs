@@ -26,11 +26,11 @@ use super::ENV_FULL_CLUSTER_JSON;
 ///
 /// ```yaml
 /// workers:
-///   - host: flodl-pascal
+///   - host: node-b
 ///     ssh:
-///       target: flodl-pascal.lan
+///       target: node-b.lan
 ///       port: 2222
-///       user: fab2s
+///       user: ubuntu
 ///       identity_file: ~/.ssh/id_ed25519
 ///       options:
 ///         - ProxyJump=bastion

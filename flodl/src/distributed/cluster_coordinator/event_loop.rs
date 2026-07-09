@@ -732,6 +732,14 @@ impl ClusterCoordinator {
                 }
                 progressive_completions.push((rank, msg.epoch));
             }
+            // Growth bound: entries drain in `aggregate_ready_epochs`,
+            // whose readiness recomputes `alive` per pass. A rank that
+            // stops reporting either stops heartbeating too (declared
+            // dead -> the epochs it was blocking aggregate without it)
+            // or is stuck mid-epoch (produces no further epochs, so the
+            // buffer stops growing). Metrics ride the same TCP control
+            // stream as liveness — silent loss without disconnect is
+            // not a failure mode this buffer needs to defend against.
             self.metrics_buffer
                 .entry(wire.epoch)
                 .or_default()

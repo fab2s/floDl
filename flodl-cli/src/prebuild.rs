@@ -267,7 +267,7 @@ pub fn prebuild_remotes(
 pub struct PerHostEnvelope {
     /// Path to the compiled binary, relative to the host's project
     /// checkout (`worker.path`). e.g.
-    /// `target/cluster/flodl-pascal/release/ddp-bench`.
+    /// `target/cluster/node-b/precompiled-cu128/release/train`.
     pub bin: String,
     /// Absolute path the launcher should set as `LD_LIBRARY_PATH` so
     /// the binary finds its libtorch at runtime. e.g.

@@ -120,8 +120,8 @@ pub struct ClusterController {
     ///
     /// On homogeneous-mount rigs the controller's view equals every
     /// worker's view; on heterogeneous rigs (different mount points
-    /// per host), the controller's value diverges (e.g. exa:
-    /// `/home/me/src/.../rdl` while Pascal sees `/mnt/rdl`).
+    /// per host), the controller's value diverges (e.g. the controller
+    /// sees `/opt/flodl` while a VM worker sees `/mnt/flodl`).
     pub path: String,
     /// Docker compose service the controller runs the pre-flight build
     /// inside (e.g. `cuda`, `dev`). Optional; affects build context
@@ -339,9 +339,9 @@ pub struct ClusterWorker {
     ///
     /// ```yaml
     /// ssh:
-    ///   target: flodl-pascal.lan   # ssh hostname/IP, default: host
+    ///   target: node-b.lan          # ssh hostname/IP, default: host
     ///   port: 2222                  # -p <port>
-    ///   user: fab2s                 # -l <user>
+    ///   user: ubuntu                # -l <user>
     ///   identity_file: ~/.ssh/key   # -i <path>
     ///   options:                    # -o <opt> (repeatable)
     ///     - ProxyJump=bastion

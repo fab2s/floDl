@@ -632,16 +632,17 @@ docs/design/trainer-execution-tiers.md)")]
     /// The framework owns the training loop, data pipeline, and epoch
     /// management. On multi-GPU hardware, each device gets its own model
     /// replica and optimizer, and a coordinator triggers periodic
-    /// parameter averaging based on the configured [`ApplyPolicy`] and
-    /// [`AverageBackend`]. On a single GPU, training runs on the main
-    /// thread with no coordination - the API is identical in both cases.
+    /// parameter averaging per the configured [`ElCheMode`] (set through
+    /// [`ElCheConfig`], e.g. `.elche(ElCheConfig::nccl_cadence())`). On a
+    /// single GPU, training runs on the main thread with no coordination
+    /// - the API is identical in both cases.
     ///
     /// Returns a [`DdpBuilder`] for fluent configuration. Call `.run()` to
     /// spawn training, then `.join()` on the returned [`DdpHandle`] to
     /// block until completion.
     ///
-    /// [`ApplyPolicy`]: crate::distributed::ApplyPolicy
-    /// [`AverageBackend`]: crate::distributed::AverageBackend
+    /// [`ElCheMode`]: crate::distributed::ElCheMode
+    /// [`ElCheConfig`]: crate::distributed::ElCheConfig
     ///
     /// # Example
     ///

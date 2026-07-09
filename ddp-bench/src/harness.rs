@@ -589,7 +589,8 @@ fn run_baseline_solo(
 // Unified DDP path (sync, cadence, async; nccl + cpu backends)
 // ---------------------------------------------------------------------------
 
-/// Run any DDP mode through `Trainer::builder` with thread-per-GPU.
+/// Run any DDP mode through `Trainer::builder` (process-per-rank on
+/// multi-GPU rigs, one process otherwise).
 ///
 /// Handles every `DdpMode::Builder { policy, backend }` combination
 /// (nccl-sync, nccl-cadence, cpu-sync, cpu-cadence, cpu-async).
@@ -1054,7 +1055,7 @@ fn run_unified(
     // consensus-reduce dispatch; the metric came back to `eval_result_fn`
     // and lives in `final_eval_cell` on the launcher. Print it there. Rank
     // children do NOT eval their own copy (that produced the redundant
-    // per-rank numbers). Single-host (threaded / single-GPU) keeps the
+    // per-rank numbers). Single-process runs (single GPU / CPU) keep the
     // in-process eval below — one process, one eval.
     if is_cluster_launcher() {
         if let Some(metric) = *final_eval_cell.lock().unwrap() {

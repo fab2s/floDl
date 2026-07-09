@@ -443,7 +443,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
 ring buffer) so a resumed run inherits ElChe's calibration. See
 [DDP Reference: Resume + checkpoints](../ddp.md#resume--checkpoints).
 
-## Manual control - `Ddp::wrap` (test-only)
+## Manual control - `Ddp::wrap` (expert bypass)
 
 For training patterns that need explicit per-step replica control - GAN
 discriminator vs generator, RL actor vs critic, progressive growing -

@@ -9,7 +9,8 @@ use flodl::distributed::{ApplyPolicy, AverageBackend};
 pub enum DdpMode {
     /// Single GPU, no DDP.
     Solo(usize),
-    /// Thread-per-GPU via `Trainer::builder()`.
+    /// Framework-managed DDP via `Trainer::builder()` (process-per-rank
+    /// on multi-GPU rigs).
     Builder {
         policy: ApplyPolicy,
         backend: AverageBackend,

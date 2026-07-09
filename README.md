@@ -780,7 +780,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 | **New to Rust** | [Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md) - 10 patterns in 15 minutes |
 | **Know Rust, new to DL** | [Tensors](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md) |
 | **Know PyTorch** | [Porting Guide](https://github.com/flodl-labs/flodl/blob/main/docs/porting.md) (or `/port` with AI) then [Graph Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/05-graph-builder.md) |
-| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md) then [DDP Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md) |
+| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md) then [Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md) |
 | **Bringing a HuggingFace model** | [HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md): load BERT, RoBERTa, DistilBERT, ALBERT, XLM-R, or DeBERTa-v2; classify, NER, QA, or fill-mask; fine-tune and round-trip back to the HF ecosystem |
 | **Just show me code** | [`quickstart`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/) |
 
@@ -797,7 +797,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 8. **[Utilities](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/08-utilities.md)** - checkpoints, clipping, freezing, initialization, scheduling, verbosity-gated logging
 9. **[Training Monitor](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/09-monitor.md)** - ETA, resource tracking, live dashboard
 10. **[Graph Tree](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/10-graph-tree.md)** - hierarchical composition, freeze/thaw, subgraph checkpoints
-11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** - Trainer::setup, El Che, auto-balancing, DataLoader integration
+11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** - Trainer::run / Trainer::builder, process-per-rank auto-promote, ElChe, DataLoader integration
 12. **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** - ElChe cadence, process-per-rank cluster, A/B testable backends
 13. **[Data Loading](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)** - DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
 14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** - load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::setup_head`, round-trip export to the HF ecosystem, PyTorch parity

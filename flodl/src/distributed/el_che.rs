@@ -196,8 +196,8 @@ pub struct ElChe {
     /// While binding, anchor GROWTH proposals are suppressed: the
     /// delivered window cannot actually grow, so a Grow would only
     /// ratchet the anchor toward `max_anchor` while every
-    /// anchor-derived quantity (telemetry, shrink hysteresis, nudge
-    /// arithmetic) quietly detaches from the schedule being run.
+    /// anchor-derived quantity (telemetry, nudge arithmetic) quietly
+    /// detaches from the schedule being run.
     window_cap_binding: bool,
     /// Maximum allowed batch difference between fastest and slowest worker.
     /// When set, workers that exceed this lead are throttled until the
@@ -235,9 +235,10 @@ pub struct ElChe {
     ///
     /// - [`Self::commit_proposed_anchor`] (Stable): apply the proposal
     ///   regardless of direction.
-    /// - [`Self::veto_proposed_growth`] (SuppressGrowth): apply the
-    ///   proposal if it's a shrink, drop it if it's a grow — divergence
-    ///   is rising, growth makes it worse, but shrink is safe.
+    /// - [`Self::veto_proposed_growth`] (SuppressGrowth): drop the
+    ///   pending grow and latch growth off until re-armed — divergence
+    ///   is rising and growth would make it worse (proposals are
+    ///   grow-only by design; see [`ProposedAnchor`]).
     /// - [`Self::discard_proposed_anchor`] (NudgeDown): drop the
     ///   proposal; the nudge supersedes it directly on the current
     ///   anchor.

@@ -495,7 +495,7 @@ fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> (Vec<String>, Vec<Str
         // actual connection uses ssh.target (or `host:` only as the
         // default ssh target, which is itself a system-ssh lookup, not
         // a process-controller-side NSS lookup). Workers reached via
-        // ~/.ssh/config aliases (e.g. `exa-cuda` mapping to
+        // ~/.ssh/config aliases (e.g. a `node-b` alias mapping to
         // 127.0.0.1:2222) routinely don't resolve via host NSS, and
         // surfacing the warning every run is noise.
         let has_explicit_ssh_target = w
