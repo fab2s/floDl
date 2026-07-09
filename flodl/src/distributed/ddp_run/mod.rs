@@ -1240,7 +1240,7 @@ pub(crate) enum ControlMsg {
 // ---------------------------------------------------------------------------
 
 /// Default base seed for deterministic per-epoch shuffling across the DDP
-/// paths (single-host fallback, cluster rank entry, threaded coordinator).
+/// paths (single-host fallback, cluster rank entry, coordinator dispatch).
 ///
 /// The epoch `e` permutation is `Rng::seed(SHUFFLE_BASE_SEED + e)` (see
 /// `make_partition` and [`crate::data::RandomSampler`]). Coverage-granular

@@ -98,6 +98,7 @@ impl DivergenceReport {
 
 /// Recommended cadence adjustment from the convergence guard.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum ConvergenceAction {
     /// No divergence concern. Cadence can grow normally.
     Stable,
@@ -110,12 +111,12 @@ pub enum ConvergenceAction {
 
 /// Clear the per-window NCCL-sync divergence accumulators after a reduce.
 ///
-/// Both the cluster coordinator and the threaded coordinator stash the
-/// most recent sync's per-rank divergence, per-rank pre-norm, and the
-/// scalar post-norm so the [`ConvergenceGuard`] can read them once, then
-/// must reset them to `None` before the next window opens (stale values
-/// would pin the anchor — see the divergence-reset invariant). Shared so
-/// the two coordinators cannot drift on what "reset" means.
+/// The coordinator stashes the most recent sync's per-rank divergence,
+/// per-rank pre-norm, and the scalar post-norm so the
+/// [`ConvergenceGuard`] can read them once, then must reset them to
+/// `None` before the next window opens (stale values would pin the
+/// anchor — see the divergence-reset invariant). Kept as one helper so
+/// every reset site agrees on what "reset" means.
 pub(crate) fn reset_divergence_signals(
     divergence: &mut [Option<f64>],
     pre_norm: &mut [Option<f64>],

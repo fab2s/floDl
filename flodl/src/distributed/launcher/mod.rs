@@ -154,6 +154,7 @@ pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_INTERNAL_PREBUILD_PER_HOST";
 /// - On [`Role::Rank`] / [`Role::SingleDevice`], the caller proceeds
 ///   with the training body.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Role {
     /// No cluster envelope in env. Continue with today's single-device
     /// training path.

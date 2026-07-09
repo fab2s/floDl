@@ -431,8 +431,7 @@ impl ClusterCoordinator {
 
     /// Check whether an averaging cycle should be triggered now.
     ///
-    /// Re-arm (the "previous cycle has settled" gate) is backend-split,
-    /// mirroring the threaded coordinator (`ddp_run/coordinator/mod.rs`):
+    /// Re-arm (the "previous cycle has settled" gate) is backend-split:
     ///
     /// - **NCCL**: `nccl_ack[r]` — set true once rank `r` reports a
     ///   `Batch`/`SyncAck` whose `step_count` exceeds the trigger-time

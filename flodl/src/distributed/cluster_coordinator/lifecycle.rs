@@ -395,13 +395,12 @@ impl ClusterCoordinator {
             metrics_buffer: std::collections::BTreeMap::new(),
             chunk_pools: std::collections::BTreeMap::new(),
             // Resolve progressive: explicit override wins, otherwise
-            // auto-on for Cadence/Async, off for Sync (matches the
-            // threaded coordinator's default).
+            // auto-on for Cadence/Async, off for Sync (Sync dispatches
+            // whole epochs; there is nothing to stream).
             progressive: config.progressive.unwrap_or(
                 !matches!(config.policy, ApplyPolicy::Sync),
             ),
-            // Floor for proportional chunk sizing after calibration —
-            // matches the threaded coordinator's default.
+            // Floor for proportional chunk sizing after calibration.
             min_chunk_batches: 4,
             final_window_plan: None,
             metrics_fn: config.metrics_fn.clone(),

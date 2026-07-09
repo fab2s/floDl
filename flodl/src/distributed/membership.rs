@@ -191,6 +191,7 @@ pub(crate) fn resolve_open_admission(config: &JoinConfig, bind_is_loopback: bool
 /// training. Serialized into the membership state for observability
 /// (`state.json`, `fdl status`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterPhase {
     /// Join window open, collecting workers.

@@ -49,7 +49,7 @@ One transport relay per remote host (`Role::Relay`, no CUDA) multiplexes its loc
 Collapses the policy × backend matrix into one user-facing enum and gathers everything `Trainer::run` needs into one struct. The chained `Trainer::builder(...)` form still exists and remains the right tool for callback-heavy setups; `TrainerConfig` is the data-bag form for config-driven launchers.
 
 - **`ElCheMode`** enum (in `flodl::distributed::config`): `NcclSync | NcclCadence | CpuSync | CpuCadence | CpuAsync`. Names match the ddp-bench / commit / design-doc vocabulary; internally splits into the legacy `(ApplyPolicy, AverageBackend)` pair. `NcclSync` is the degenerate ElChe case (anchor=1) so all five modes route through the same code path.
-- **`ElCheConfig`**: controller-scope tuning (mode, anchor, max_anchor, min_anchor, overhead_target, max_batch_diff, gamma, relax_up, partition_ratios, meta_controller, convergence_guard, easgd_alpha). Five preset constructors (`nccl_sync()`, `nccl_cadence()`, `cpu_sync()`, `cpu_cadence()`, `cpu_async()`) plus a builder chain.
+- **`ElCheConfig`**: controller-scope tuning (mode, anchor, max_anchor, min_anchor, overhead_target, max_batch_diff, max_overshoot, gamma, relax_up, partition_ratios, meta_controller, convergence_guard, divergence_threshold, no_divergence_guard, easgd_alpha). Five preset constructors (`nccl_sync()`, `nccl_cadence()`, `cpu_sync()`, `cpu_cadence()`, `cpu_async()`) plus a builder chain.
 - **`TrainerConfig<M>`**: umbrella struct gathering dataset / batch_size / num_epochs / elche / max_grad_norm / checkpoint_every / save_path / resume_from / callbacks (`checkpoint_fn`, `epoch_fn`, `metrics_fn`, `scheduler_fn`, `eval_fn`, `eval_result_fn`) / epoch_callback_policy / timeline / optional programmatic `cluster`. Both `Trainer::run` and `Trainer::builder().run()` accept it.
 - **`Trainer::run(model_factory, optim_factory, train_fn, cfg)`**: config-bag entry. Internally builds a `DdpBuilder`, sets the launcher env from `cfg.cluster` if present, and dispatches through the same launcher trampoline as fdl-cli-launched runs (one launcher contract; two construction paths).
 
@@ -91,7 +91,7 @@ The cadence balancer that shipped in 0.5.x grew load-bearing additions for produ
 - **Progressive warmup + 5% dead zone**: anchor decisions inside the dead zone (anchor differences smaller than 5% of current) are no-ops, reducing thrash on near-stable cadences.
 - **Window-pressure anchor auto-tune**: the anchor is tuned from per-window *fixed overhead* (reduce + window-fill measured against the bottleneck rank's window wall) toward `ElCheConfig::overhead_target` (default `0.05`), with a growth latch that only grows the anchor while pressure stays below target. Replaces the compute-only overhead signal on the cadence path.
 - **Delivered-cost scheduling**: ElChe calibrates on each rank's *delivered* cost — compute + data starvation + transport — not compute-only timing, so a rank on a slow link or a starving loader is no longer over-allocated and left idling at the barrier.
-- **Work-weighted consensus in-collective on NCCL**: the weighted average (`w_k` proportional to realized work, shaped by `ElCheConfig::gamma`) is applied inside the AllReduce via NCCL `PreMulSum` (NCCL >= 2.11 required), removing the bookend scale/divide kernels — and unlocking `gamma` on the NCCL backend (previously CPU-only).
+- **Work-weighted consensus averaging** (both backends): each rank's contribution is weighted by its realized work in the window (`w_k` proportional to steps delivered, shaped by `ElCheConfig::gamma`); ranks that delivered zero steps are excluded rather than diluting the consensus. On NCCL the weighting is applied inside the AllReduce via `PreMulSum` (NCCL >= 2.11 required), removing the bookend scale/divide kernels — and unlocking `gamma` on the NCCL backend.
 - **Convergence guard (`flodl::distributed::ddp_run::convergence`)**: `ConvergenceGuard` trait with three implementations:
   - **`NoGuard`** (passive baseline; always reports `Stable`).
   - **`TrendGuard`** (production default; three-rises-above-threshold rule on weight-space divergence, default threshold 0.05).
@@ -172,7 +172,7 @@ New `fdl probe` subcommand (`flodl-cli/src/probe.rs`) audits a host or a whole c
 
 `fdl.cluster.yml.example` and the matching `fdl.cluster-test.yml.example` (testing overlay) now codify the controller / worker separation. The orchestrator host fdl-cli runs on is never a NCCL rank; every rank-carrying host lives under `workers:`.
 
-- `controller:` block: `host` (rendezvous bind, was `master_addr`) / `port` (default 1337, replaces PyTorch's 29500; `+1` is the dashboard side-channel, `+2`/`+3` host controller/coordinator) / `path` (controller's view of the shared project root) / optional `docker:` / `arch:` for pre-flight build context.
+- `controller:` block: `host` (controller bind, was `master_addr`) / `port` (default 1337, replaces PyTorch's 29500 — the ONE port every cross-host channel shares; worker hosts derive `+4`/`+5` for their host-local rank↔relay loopbacks only) / `path` (controller's view of the shared project root) / optional `docker:` / `arch:` for pre-flight build context / optional `join:` quorum block (see dial-in membership).
 - `workers[]`: per-host entries with `host` (worker identifier and default ssh target, was `name`) / `local_devices` (explicit list or `all` shorthand probed at dispatch) / `nccl_socket_ifname` (required for multi-host) / `path` (project checkout dir) / `arch` (libtorch variant subpath under `<path>/libtorch/`) / optional `docker:` / `env:` / `ssh:` sub-block.
 - `ssh:` sub-block: groups `target` / `port` / `user` / `identity_file` / `options` (list of `-o Key=Value`) into one launcher-only block. Omit entirely to use system ssh + `~/.ssh/config` defaults.
 - `env:` blocks: cluster-scope `env:` applies to every rank child on every worker; per-worker `env:` overrides matching keys. Per-host CUDA_VISIBLE_DEVICES scoping for heterogeneous rigs.
@@ -231,6 +231,8 @@ These features came out of a forced heterogeneous topology: a rig crash and OS m
 
 #### Misc additions
 
+- **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.
+- **`FLODL_NET_TIMEOUT_SCALE`**: one env knob scales the whole cluster deadline set (handshakes, rendezvous, heartbeat windows, join window) — for slow rigs, congested CI, or debugger-attached runs.
 - **`flodl::distributed::chunk_pool`**: extracted from coordinator; reusable chunk-pool dispatch primitive for replaying training data across cluster ranks deterministically after a rank rejoin.
 - **Network-aware logging (`flodl::log`)**: rank-scope prefixes that survive the cluster fan-in (`[rank=N]`-style markers preserved when controller forwards logs to launcher stdout).
 - **Optimizer `state_dict_keys()`**: Adam / RMSprop / SGD expose state-dict key listings for checkpoint introspection.
@@ -275,6 +277,10 @@ The benchmark crate was overhauled to drive the new cluster path and to surface 
 
 `cluster_coordinator.rs` (4227 LOC), `ddp_run/orchestrator.rs` (3000+ LOC), `ddp_run/worker.rs` (2796 LOC), `ddp_run/tests.rs` (4368 LOC), `cluster_coordinator/tests.rs` (2964 LOC), `graph/graph_tests.rs` (2670 LOC), `flodl-cli/src/config.rs` (2995 LOC), `flodl-cli/src/main.rs` (1958 LOC) are now multi-file submodules. Tests for `flodl::autograd`, `flodl::nn`, `flodl::tensor`, `flodl::nn::checkpoint`, `flodl::graph::tree`, `flodl::distributed::cluster`, `controller`, `cpu_reduce`, `nccl`, `wire`, `flodl-hf::models::{bert, distilbert, deberta_v2}`, `flodl-hf::safetensors_io` were extracted to sibling `*_tests.rs` files. No behavior change; per-file diffs become reviewable again.
 
+#### Dashboard binds loopback by default
+
+The live training dashboard (an unauthenticated HTTP server) previously bound `0.0.0.0`: anyone who could reach the host could read training metrics. It now binds `127.0.0.1` by default; view it remotely through an SSH tunnel (`ssh -L <port>:localhost:<port> <host>`), or set `FLODL_DASHBOARD_BIND=<addr>` to widen the bind explicitly — a non-loopback value prints a loud no-auth warning.
+
 #### docs.rs gate: strict local pre-commit canonical check
 
 `make docs-rs` now runs a CI-parity pass with `RUSTDOCFLAGS="-D warnings"` against every published crate (`flodl`, `flodl-cli`, `flodl-hf`, `flodl-cli-macros`) on stable + nightly. It is the canonical strict pre-commit gate; `fdl doc` is the in-Docker CI-strict gate; `fdl ci` is the full CPU job orchestrator. Mismatches between the three were a recurring source of "docs build locally, fail on docs.rs" surprises.
@@ -287,12 +293,15 @@ The benchmark crate was overhauled to drive the new cluster path and to surface 
 ### Removed
 
 - The `0.3.0`-deprecated compatibility surface is gone: the `AsyncDdp` / `AsyncDdpBuilder` / `AsyncDdpConfig` type aliases and the `DdpHandle::auto()` / `DdpHandle::auto_with()` / `DdpHandle::builder()` constructors. All of them had pointed at `Trainer::builder()` for two minor releases; migrate any remaining call to `Trainer::builder(...)` (chained setters) or `Trainer::run(...)` (config bag).
+- **The NCCL async mode** (`ddp-bench`'s `nccl-async`, the `Async` policy on the NCCL backend). Cross-epoch lookahead on NCCL delivered near-zero real-world speedup over `nccl-cadence` while complicating the dispatch path; `cpu_async` is the genuine async mode (decoupled averaging on a separate channel). `ElCheMode` never carries an `NcclAsync` variant.
 
 ### Fixed
 
 Fixes below correct behavior that shipped in 0.5.x. Bugs born and fixed inside this release cycle carry no entry — the feature sections above describe the delivered state.
 
 - **NCCL communicator init from threads**: `ncclCommInitRank` must run on the main thread; the released thread-per-GPU engine (`Trainer::setup` multi-GPU) was occasionally calling it from a worker thread on heterogeneous-GPU rigs, corrupting the shared CUDA context. Production ranks are now separate processes (per-process `init_rank`); the surviving `Ddp::wrap` thread path uses init-on-main + `split()`.
+- **`fdl` argv handling**: the parser scanned the whole argv for `--fdl-schema` / `--help`, hijacking tokens meant for the command after `--`; negative numbers were rejected as space-separated option values (`--offset -5`); and `fdl run` passed user args to `docker` unquoted, so shell metacharacters in an argument could be interpreted. All three scoped/quoted correctly now.
+- **Empty `fdl.yml`**: an empty or comments-only config file failed to parse with a cryptic serde error instead of loading as the default project config.
 
 ## [0.5.3] - 2026-04-28
 
