@@ -669,27 +669,30 @@ impl Tensor {
     }
 
     /// Copy tensor data to a `Vec<f64>`. Moves to CPU if needed.
-    /// Float64 tensors are copied at full precision. All other dtypes
-    /// go through f32 (lossless for f16/bf16, and the best f32 can offer).
+    /// Non-Float64 dtypes are cast to f64 on device first: exact for
+    /// f16/bf16/f32/i32, and exact up to 2^53 for Int64 (the f64
+    /// mantissa limit).
     pub fn to_f64_vec(&self) -> Result<Vec<f64>> {
-        if self.dtype() == DType::Float64 {
-            let n = self.numel() as usize;
-            let mut buf = vec![0.0f64; n];
-            let bytes = (n * 8) as i64;
-            let err = unsafe {
-                ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes)
-            };
-            check_err(err)?;
-            Ok(buf)
-        } else {
-            let f32s = self.to_f32_vec()?;
-            Ok(f32s.into_iter().map(|v| v as f64).collect())
+        if self.dtype() != DType::Float64 {
+            return self.to_dtype(DType::Float64)?.to_f64_vec();
         }
+        let n = self.numel() as usize;
+        let mut buf = vec![0.0f64; n];
+        let bytes = (n * 8) as i64;
+        let err = unsafe {
+            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes)
+        };
+        check_err(err)?;
+        Ok(buf)
     }
 
     /// Copy tensor data to a `Vec<i64>`. Moves to CPU if needed.
-    /// Intended for Int64 tensors (indices, labels).
+    /// Non-Int64 dtypes are cast on device first; floats truncate
+    /// toward zero, like PyTorch's `.long()`.
     pub fn to_i64_vec(&self) -> Result<Vec<i64>> {
+        if self.dtype() != DType::Int64 {
+            return self.to_dtype(DType::Int64)?.to_i64_vec();
+        }
         let n = self.numel() as usize;
         let mut buf = vec![0i64; n];
         let bytes = (n * 8) as i64;
@@ -704,7 +707,8 @@ impl Tensor {
     ///
     /// The tensor must contain exactly one element (any shape is fine,
     /// e.g. `[1]`, `[1, 1]`, or `[]`). Returns an error otherwise.
-    /// Preserves full precision for Float64 tensors.
+    /// Works for every dtype; integer values above 2^53 lose precision
+    /// (the f64 mantissa limit, inherent to the return type).
     ///
     /// ```ignore
     /// let loss_val = loss_tensor.item()?;
@@ -717,21 +721,18 @@ impl Tensor {
                 self.numel(), self.shape()
             )));
         }
-        if self.dtype() == DType::Float64 {
-            let mut buf = [0.0f64; 1];
-            let err = unsafe {
-                ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, 8)
-            };
-            check_err(err)?;
-            Ok(buf[0])
-        } else {
-            let mut buf = [0.0f32; 1];
-            let err = unsafe {
-                ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, 4)
-            };
-            check_err(err)?;
-            Ok(buf[0] as f64)
+        if self.dtype() != DType::Float64 {
+            // Cast on device first: flodl_copy_data copies NATIVE bytes, so
+            // reading a non-f64 tensor into an f64 buffer would reinterpret
+            // bit patterns (or under-fill the buffer), not convert values.
+            return self.to_dtype(DType::Float64)?.item();
         }
+        let mut buf = [0.0f64; 1];
+        let err = unsafe {
+            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, 8)
+        };
+        check_err(err)?;
+        Ok(buf[0])
     }
 
     // --- Device ---

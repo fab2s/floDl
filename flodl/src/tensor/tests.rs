@@ -71,6 +71,53 @@
     }
 
     #[test]
+    fn test_item_all_dtypes() {
+        // Regression: the non-f64 branch used to memcpy NATIVE bytes into
+        // an f32 buffer — garbage-as-Ok for f16/bf16/i32, Err for i64.
+        let f16_one =
+            Tensor::from_blob(&0x3C00u16.to_le_bytes(), &[1], DType::Float16, test_device())
+                .unwrap();
+        assert_eq!(f16_one.item().unwrap(), 1.0);
+
+        let bf16_one =
+            Tensor::from_blob(&0x3F80u16.to_le_bytes(), &[1], DType::BFloat16, test_device())
+                .unwrap();
+        assert_eq!(bf16_one.item().unwrap(), 1.0);
+
+        let i64_t = Tensor::from_i64(&[42], &[1], test_device()).unwrap();
+        assert_eq!(i64_t.item().unwrap(), 42.0);
+
+        let i32_t = Tensor::from_i64(&[7], &[1], test_device())
+            .unwrap()
+            .to_dtype(DType::Int32)
+            .unwrap();
+        assert_eq!(i32_t.item().unwrap(), 7.0);
+
+        let f64_t = Tensor::from_f64(&[std::f64::consts::PI], &[1], test_device()).unwrap();
+        assert_eq!(f64_t.item().unwrap(), std::f64::consts::PI);
+    }
+
+    #[test]
+    fn test_to_i64_vec_casts_non_int64() {
+        // Regression: a Float32 input used to memcpy float bit patterns
+        // into the front of the i64 buffer and return Ok.
+        let f = Tensor::from_f32(&[1.9, -2.7, 3.0], &[3], test_device()).unwrap();
+        // Truncation toward zero, like PyTorch's .long().
+        assert_eq!(f.to_i64_vec().unwrap(), vec![1, -2, 3]);
+
+        let i = Tensor::from_i64(&[5, 6], &[2], test_device()).unwrap();
+        assert_eq!(i.to_i64_vec().unwrap(), vec![5, 6]);
+    }
+
+    #[test]
+    fn test_to_f64_vec_int64_full_precision() {
+        // Regression: the old f32 waypoint truncated integers above 2^24.
+        let big = (1i64 << 40) + 1;
+        let t = Tensor::from_i64(&[big], &[1], test_device()).unwrap();
+        assert_eq!(t.to_f64_vec().unwrap()[0] as i64, big);
+    }
+
+    #[test]
     fn test_from_blob_rejects_negative_and_overflowing_shape() {
         let bytes = [0u8; 16];
         assert!(
