@@ -34,6 +34,8 @@ extern "C" char* flodl_conv2d(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -59,6 +61,8 @@ extern "C" char* flodl_conv1d(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -85,6 +89,8 @@ extern "C" char* flodl_conv_transpose2d(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -111,6 +117,8 @@ extern "C" char* flodl_conv_transpose1d(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -130,6 +138,8 @@ extern "C" char* flodl_max_pool2d(FlodlTensor input, int64_t* kernel_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -148,6 +158,8 @@ extern "C" char* flodl_avg_pool2d(FlodlTensor input, int64_t* kernel_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -159,6 +171,8 @@ extern "C" char* flodl_adaptive_avg_pool2d(FlodlTensor input, int64_t* output_si
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -171,6 +185,8 @@ extern "C" char* flodl_adaptive_max_pool2d(FlodlTensor input, int64_t* output_si
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -188,6 +204,8 @@ extern "C" char* flodl_im2col(FlodlTensor input, int64_t* kernel_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -205,6 +223,8 @@ extern "C" char* flodl_col2im(FlodlTensor input, int64_t* output_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -223,6 +243,8 @@ extern "C" char* flodl_conv3d(FlodlTensor input, FlodlTensor weight, FlodlTensor
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -243,6 +265,8 @@ extern "C" char* flodl_conv_transpose3d(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -258,6 +282,8 @@ extern "C" char* flodl_max_pool1d(FlodlTensor input, int64_t kernel_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -272,6 +298,8 @@ extern "C" char* flodl_avg_pool1d(FlodlTensor input, int64_t kernel_size,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -296,6 +324,8 @@ extern "C" char* flodl_instance_norm(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -308,6 +338,8 @@ extern "C" char* flodl_pixel_shuffle(FlodlTensor input, int64_t upscale_factor,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -318,6 +350,8 @@ extern "C" char* flodl_pixel_unshuffle(FlodlTensor input, int64_t downscale_fact
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -334,6 +368,8 @@ extern "C" char* flodl_bilinear(FlodlTensor input1, FlodlTensor input2,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -348,6 +384,8 @@ extern "C" char* flodl_grid_sample(FlodlTensor input, FlodlTensor grid,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -384,6 +422,8 @@ extern "C" char* flodl_scaled_dot_product_attention(
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -395,6 +435,8 @@ extern "C" char* flodl_to_dtype(FlodlTensor t, int dtype, FlodlTensor* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -405,6 +447,8 @@ extern "C" char* flodl_all_finite(FlodlTensor t, int* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -417,6 +461,8 @@ extern "C" char* flodl_to_device(FlodlTensor t, int device_type,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -428,34 +474,61 @@ extern "C" char* flodl_to_device_async(FlodlTensor t, int device_type,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_cuda_is_available(void) {
+    try {
     return torch::cuda::is_available() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_is_available", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_is_available", nullptr);
+    }
 }
 
 extern "C" int flodl_cuda_device_count(void) {
+    try {
     return (int)torch::cuda::device_count();
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_device_count", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_device_count", nullptr);
+    }
 }
 
 extern "C" void flodl_set_current_device(int device_index) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     c10::cuda::set_device((c10::DeviceIndex)device_index);
 #else
     (void)device_index;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_set_current_device", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_set_current_device", nullptr);
+    }
 }
 
 extern "C" int flodl_get_current_device(void) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     return (int)c10::cuda::current_device();
 #else
     return 0;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_get_current_device", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_get_current_device", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_synchronize(int device_index) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     if (torch::cuda::is_available()) {
         c10::cuda::set_device((c10::DeviceIndex)device_index);
@@ -464,6 +537,11 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
 #else
     (void)device_index;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_synchronize", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_synchronize", nullptr);
+    }
 }
 
 // Force real symbol references to BOTH c10_cuda.so and libtorch_cuda.so
@@ -482,6 +560,7 @@ namespace torch { void CudaIPCCollect(); }
 #endif
 
 extern "C" int flodl_force_cuda_link(void) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     // c10_cuda.so dependency
     volatile int n = (int)c10::cuda::device_count();
@@ -492,12 +571,18 @@ extern "C" int flodl_force_cuda_link(void) {
 #else
     return 0;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_force_cuda_link", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_force_cuda_link", nullptr);
+    }
 }
 
 // --- CUDA memory info via cudaMemGetInfo ---
 
 extern "C" char* flodl_cuda_mem_info(int device_index,
                                     uint64_t* used_bytes, uint64_t* total_bytes) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
@@ -518,6 +603,11 @@ extern "C" char* flodl_cuda_mem_info(int device_index,
     (void)device_index; (void)used_bytes; (void)total_bytes;
     return make_error("CUDA not available (built without cuda feature)");
 #endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 // --- CUDA caching allocator stats ---
@@ -538,6 +628,8 @@ extern "C" char* flodl_cuda_alloc_bytes(int device_index,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 #else
     (void)device_index; (void)allocated_bytes;
@@ -560,6 +652,8 @@ extern "C" char* flodl_cuda_active_bytes(int device_index,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 #else
     (void)device_index; (void)active_bytes;
@@ -582,6 +676,8 @@ extern "C" char* flodl_cuda_peak_active_bytes(int device_index,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 #else
     (void)device_index; (void)peak_bytes;
@@ -604,6 +700,8 @@ extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 #else
     (void)device_index; (void)peak_bytes;
@@ -614,19 +712,31 @@ extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
 // Reset peak allocator statistics.
 // Equivalent to torch.cuda.reset_peak_memory_stats().
 extern "C" void flodl_cuda_reset_peak_stats(int device_index) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     c10::cuda::CUDACachingAllocator::resetPeakStats((c10::DeviceIndex)device_index);
 #else
     (void)device_index;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_reset_peak_stats", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_reset_peak_stats", nullptr);
+    }
 }
 
 // --- CUDA empty cache ---
 
 extern "C" void flodl_cuda_empty_cache(void) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_empty_cache", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_empty_cache", nullptr);
+    }
 }
 
 // --- GPU utilization via NVML (dynamically loaded) ---
@@ -661,6 +771,7 @@ namespace {
 #endif
 
 extern "C" int flodl_cuda_utilization(int device_index) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     nvml_try_load();
     if (!nvml.ok) return -1;
@@ -673,11 +784,17 @@ extern "C" int flodl_cuda_utilization(int device_index) {
     (void)device_index;
     return -1;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_utilization", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_utilization", nullptr);
+    }
 }
 
 // --- GPU device name ---
 
 extern "C" char* flodl_cuda_device_name(int device_index, char* buf, int buf_len) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
@@ -693,10 +810,16 @@ extern "C" char* flodl_cuda_device_name(int device_index, char* buf, int buf_len
     (void)device_index; (void)buf; (void)buf_len;
     return make_error("CUDA not available (built without cuda feature)");
 #endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 extern "C" char* flodl_cuda_compute_capability(int device_index,
                                                  int* major, int* minor) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
@@ -713,4 +836,9 @@ extern "C" char* flodl_cuda_compute_capability(int device_index,
     (void)device_index; (void)major; (void)minor;
     return make_error("CUDA not available (built without cuda feature)");
 #endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }

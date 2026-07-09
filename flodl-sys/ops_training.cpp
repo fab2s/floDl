@@ -28,11 +28,19 @@ extern "C" char* flodl_set_requires_grad(FlodlTensor t, int requires_grad,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_requires_grad(FlodlTensor t) {
+    try {
     return unwrap(t).requires_grad() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_requires_grad", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_requires_grad", nullptr);
+    }
 }
 
 // Force creation of the AccumulateGrad node for a leaf tensor with
@@ -73,14 +81,22 @@ extern "C" char* flodl_ensure_grad_accumulator(FlodlTensor t, void** handle_out)
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 // Delete a handle returned by flodl_ensure_grad_accumulator.
 // Safe to call with nullptr (no-op).
 extern "C" void flodl_grad_accumulator_delete(void* handle) {
+    try {
     if (handle != nullptr) {
         delete static_cast<std::shared_ptr<torch::autograd::Node>*>(handle);
+    }
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_grad_accumulator_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_grad_accumulator_delete", nullptr);
     }
 }
 
@@ -90,6 +106,8 @@ extern "C" char* flodl_backward(FlodlTensor t) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -104,6 +122,8 @@ extern "C" char* flodl_grad(FlodlTensor t, FlodlTensor* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -113,6 +133,8 @@ extern "C" char* flodl_set_grad(FlodlTensor t, FlodlTensor grad) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -125,13 +147,21 @@ extern "C" char* flodl_zero_grad(FlodlTensor t) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" void flodl_zero_grad_set_to_none(FlodlTensor t) {
+    try {
     auto& tensor = unwrap(t);
     if (tensor.grad().defined()) {
         tensor.mutable_grad().reset();
+    }
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_zero_grad_set_to_none", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_zero_grad_set_to_none", nullptr);
     }
 }
 
@@ -141,6 +171,8 @@ extern "C" char* flodl_detach(FlodlTensor t, FlodlTensor* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -150,25 +182,51 @@ extern "C" char* flodl_detach_(FlodlTensor t) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_is_leaf(FlodlTensor t) {
+    try {
     return unwrap(t).is_leaf() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_is_leaf", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_is_leaf", nullptr);
+    }
 }
 
 // --- Autograd context ---
 
 extern "C" void* flodl_no_grad_guard_new() {
+    try {
     return new torch::NoGradGuard();
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_no_grad_guard_new", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_no_grad_guard_new", nullptr);
+    }
 }
 
 extern "C" void flodl_no_grad_guard_delete(void* guard) {
+    try {
     delete static_cast<torch::NoGradGuard*>(guard);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_no_grad_guard_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_no_grad_guard_delete", nullptr);
+    }
 }
 
 extern "C" int flodl_is_grad_enabled() {
+    try {
     return torch::GradMode::is_enabled() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_is_grad_enabled", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_is_grad_enabled", nullptr);
+    }
 }
 
 // --- Autocast (automatic mixed precision) ---
@@ -204,18 +262,36 @@ static c10::DeviceType to_device_type_enum(int device_type) {
 }
 
 extern "C" void* flodl_autocast_guard_new(int device_type, int dtype) {
+    try {
     auto dev = to_device_type_enum(device_type);
     auto st = to_scalar_type(dtype);
     return new FlodlAutocastGuard(dev, st);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_autocast_guard_new", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_autocast_guard_new", nullptr);
+    }
 }
 
 extern "C" void flodl_autocast_guard_delete(void* guard) {
+    try {
     delete static_cast<FlodlAutocastGuard*>(guard);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_autocast_guard_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_autocast_guard_delete", nullptr);
+    }
 }
 
 extern "C" int flodl_is_autocast_enabled(int device_type) {
+    try {
     auto dev = to_device_type_enum(device_type);
     return at::autocast::is_autocast_enabled(dev) ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_is_autocast_enabled", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_is_autocast_enabled", nullptr);
+    }
 }
 
 // --- In-place operations ---
@@ -226,6 +302,8 @@ extern "C" char* flodl_add_(FlodlTensor t, FlodlTensor other) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -235,6 +313,8 @@ extern "C" char* flodl_sub_(FlodlTensor t, FlodlTensor other) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -244,6 +324,8 @@ extern "C" char* flodl_mul_scalar_(FlodlTensor t, double scalar) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -253,6 +335,8 @@ extern "C" char* flodl_add_scalar_(FlodlTensor t, double scalar) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -262,6 +346,8 @@ extern "C" char* flodl_zero_(FlodlTensor t) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -271,6 +357,8 @@ extern "C" char* flodl_mul_(FlodlTensor t, FlodlTensor other) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -280,6 +368,8 @@ extern "C" char* flodl_div_scalar_(FlodlTensor t, double scalar) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -289,6 +379,8 @@ extern "C" char* flodl_div_(FlodlTensor t, FlodlTensor other) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -298,6 +390,8 @@ extern "C" char* flodl_fill_(FlodlTensor t, double value) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -314,6 +408,8 @@ extern "C" char* flodl_linear(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -329,6 +425,8 @@ extern "C" char* flodl_gru_cell(FlodlTensor input, FlodlTensor hx,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -347,6 +445,8 @@ extern "C" char* flodl_lstm_cell(FlodlTensor input, FlodlTensor hx,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -408,6 +508,8 @@ extern "C" char* flodl_lstm(FlodlTensor input, FlodlTensor h_0, FlodlTensor c_0,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -433,6 +535,8 @@ extern "C" char* flodl_gru(FlodlTensor input, FlodlTensor h_0,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -455,11 +559,19 @@ extern "C" char* flodl_rnn_params_create(
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" void flodl_rnn_params_free(void* rp) {
+    try {
     delete static_cast<FlodlRnnParamsImpl*>(rp);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_rnn_params_free", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_rnn_params_free", nullptr);
+    }
 }
 
 extern "C" char* flodl_lstm_cached(
@@ -478,6 +590,8 @@ extern "C" char* flodl_lstm_cached(
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -496,27 +610,47 @@ extern "C" char* flodl_gru_cached(
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 // --- cuDNN benchmark ---
 
 extern "C" void flodl_set_cudnn_benchmark(int enable) {
+    try {
     at::globalContext().setBenchmarkCuDNN(enable != 0);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_set_cudnn_benchmark", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_set_cudnn_benchmark", nullptr);
+    }
 }
 
 // --- RNG seed ---
 
 extern "C" void flodl_manual_seed(uint64_t seed) {
+    try {
     torch::manual_seed(static_cast<int64_t>(seed));
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_manual_seed", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_manual_seed", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_manual_seed_all(uint64_t seed) {
+    try {
 #ifdef FLODL_BUILD_CUDA
     torch::cuda::manual_seed_all(static_cast<int64_t>(seed));
 #else
     (void)seed;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_manual_seed_all", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_manual_seed_all", nullptr);
+    }
 }
 
 // --- Meshgrid ---
@@ -540,6 +674,8 @@ extern "C" char* flodl_meshgrid(FlodlTensor* tensors, int count,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -553,6 +689,8 @@ extern "C" char* flodl_cdist(FlodlTensor x, FlodlTensor y, double p,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -568,6 +706,8 @@ extern "C" char* flodl_cosine_similarity(FlodlTensor a, FlodlTensor b,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -609,6 +749,8 @@ extern "C" char* flodl_adam_step(FlodlTensor param, FlodlTensor grad,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -644,6 +786,8 @@ extern "C" char* flodl_adam_step_batched(
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -707,9 +851,15 @@ extern "C" char* flodl_fused_adam_(
         double beta1, double beta2, double eps,
         double weight_decay, int64_t step,
         FlodlTensor grad_scale, FlodlTensor found_inf) {
+    try {
     return fused_adam_impl(params, grads, exp_avgs, exp_avg_sqs,
         count, lr, beta1, beta2, eps, weight_decay, step,
         grad_scale, found_inf, /*adamw=*/false);
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 extern "C" char* flodl_fused_adamw_(
@@ -719,9 +869,15 @@ extern "C" char* flodl_fused_adamw_(
         double beta1, double beta2, double eps,
         double weight_decay, int64_t step,
         FlodlTensor grad_scale, FlodlTensor found_inf) {
+    try {
     return fused_adam_impl(params, grads, exp_avgs, exp_avg_sqs,
         count, lr, beta1, beta2, eps, weight_decay, step,
         grad_scale, found_inf, /*adamw=*/true);
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 // --- Pinned memory ---
@@ -732,11 +888,19 @@ extern "C" char* flodl_pin_memory(FlodlTensor t, FlodlTensor* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_is_pinned(FlodlTensor t) {
+    try {
     return unwrap(t).is_pinned() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_is_pinned", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_is_pinned", nullptr);
+    }
 }
 
 // --- Memory format ---
@@ -747,21 +911,35 @@ extern "C" char* flodl_to_channels_last(FlodlTensor t, FlodlTensor* result) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_is_channels_last(FlodlTensor t) {
+    try {
     return unwrap(t).is_contiguous(at::MemoryFormat::ChannelsLast) ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_is_channels_last", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_is_channels_last", nullptr);
+    }
 }
 
 // --- Memory diagnostics ---
 
 extern "C" int flodl_malloc_trim() {
+    try {
 #ifdef __linux__
     return malloc_trim(0);
 #else
     return 0;
 #endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_malloc_trim", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_malloc_trim", nullptr);
+    }
 }
 
 // --- Fused clip_grad_norm (uses _foreach_* for batched kernels) ---
@@ -796,6 +974,8 @@ extern "C" char* flodl_clip_grad_norm(FlodlTensor* params, int count,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -809,6 +989,8 @@ extern "C" char* flodl_foreach_add_scalar_(FlodlTensor* tensors, int count, doub
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -820,6 +1002,8 @@ extern "C" char* flodl_foreach_mul_scalar_(FlodlTensor* tensors, int count, doub
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -831,6 +1015,8 @@ extern "C" char* flodl_foreach_zero_(FlodlTensor* tensors, int count) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -844,6 +1030,8 @@ extern "C" char* flodl_foreach_add_list_(FlodlTensor* tensors1, FlodlTensor* ten
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -859,6 +1047,8 @@ extern "C" char* flodl_foreach_norm(FlodlTensor* tensors, int count, double ord,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -872,6 +1062,8 @@ extern "C" char* flodl_foreach_lerp_scalar_(FlodlTensor* tensors1, FlodlTensor* 
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -883,12 +1075,15 @@ extern "C" char* flodl_foreach_sqrt_(FlodlTensor* tensors, int count) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 // --- Autograd diagnostics ---
 
 extern "C" int64_t flodl_autograd_node_count(FlodlTensor t) {
+    try {
     auto& tensor = unwrap(t);
     auto fn = tensor.grad_fn();
     if (!fn) return 0;
@@ -909,6 +1104,11 @@ extern "C" int64_t flodl_autograd_node_count(FlodlTensor t) {
         }
     }
     return static_cast<int64_t>(visited.size());
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_autograd_node_count", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_autograd_node_count", nullptr);
+    }
 }
 
 // --- Fused loss functions ---
@@ -920,6 +1120,8 @@ extern "C" char* flodl_mse_loss(FlodlTensor pred, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -933,6 +1135,8 @@ extern "C" char* flodl_cross_entropy_loss(FlodlTensor pred, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -945,6 +1149,8 @@ extern "C" char* flodl_bce_with_logits_loss(FlodlTensor pred, FlodlTensor target
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -957,6 +1163,8 @@ extern "C" char* flodl_bce_loss(FlodlTensor pred, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -967,6 +1175,8 @@ extern "C" char* flodl_l1_loss(FlodlTensor pred, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -979,6 +1189,8 @@ extern "C" char* flodl_smooth_l1_loss(FlodlTensor pred, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -991,6 +1203,8 @@ extern "C" char* flodl_kl_div_loss(FlodlTensor input, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1003,6 +1217,8 @@ extern "C" char* flodl_nll_loss(FlodlTensor input, FlodlTensor target,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1017,6 +1233,8 @@ extern "C" char* flodl_ctc_loss(FlodlTensor log_probs, FlodlTensor targets,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1042,6 +1260,8 @@ extern "C" char* flodl_batch_norm(FlodlTensor input, FlodlTensor weight,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1054,6 +1274,8 @@ extern "C" char* flodl_dropout(FlodlTensor input, double p, int training,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1064,6 +1286,8 @@ extern "C" char* flodl_feature_dropout(FlodlTensor input, double p, int training
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1085,6 +1309,8 @@ extern "C" char* flodl_embedding(FlodlTensor weight, FlodlTensor indices,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1103,6 +1329,8 @@ extern "C" char* flodl_embedding_bag(FlodlTensor weight, FlodlTensor indices,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -1114,5 +1342,7 @@ extern "C" char* flodl_copy_(FlodlTensor dst, FlodlTensor src, int non_blocking)
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }

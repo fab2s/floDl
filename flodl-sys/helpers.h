@@ -11,9 +11,23 @@
 
 #include "shim.h"
 #include <torch/torch.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// Exception firewall for extern "C" functions with no error-return
+// channel: a C++ exception unwinding through the C boundary into Rust is
+// undefined behavior, so contain it and fail loudly instead. Only
+// reachable when an invariant is already broken (bad handle, corrupted
+// CUDA context, allocation failure) — a defined, named abort beats UB.
+[[noreturn]] static inline void flodl_fatal(const char* fn, const char* what) {
+    fprintf(stderr, "flodl: fatal C++ exception in %s: %s\n",
+            fn, what ? what : "non-standard C++ exception");
+    fflush(stderr);
+    abort();
+}
 
 // Helper: convert a C++ exception to a malloc'd C string.
 static inline char* make_error(const std::string& msg) {

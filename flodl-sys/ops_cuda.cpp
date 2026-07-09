@@ -47,6 +47,8 @@ extern "C" char* flodl_cuda_graph_new(void** graph_out) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -77,6 +79,10 @@ extern "C" char* flodl_cuda_graph_capture_begin(void* graph, uint64_t pool_hi,
         at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream());
         g->capturing = false;
         return make_error(e.what());
+    } catch (...) {
+        at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream());
+        g->capturing = false;
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -98,6 +104,8 @@ extern "C" char* flodl_cuda_graph_capture_end(void* graph) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -108,6 +116,8 @@ extern "C" char* flodl_cuda_graph_replay(void* graph) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -118,24 +128,44 @@ extern "C" char* flodl_cuda_graph_reset(void* graph) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" void flodl_cuda_graph_delete(void* graph) {
+    try {
     delete static_cast<FlodlCudaGraph*>(graph);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_graph_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_graph_delete", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo) {
+    try {
     auto* g = static_cast<FlodlCudaGraph*>(graph);
     auto pool = g->graph.pool();
     *pool_hi = pool.first;
     *pool_lo = pool.second;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_graph_pool", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_graph_pool", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo) {
+    try {
     auto pool = at::cuda::graph_pool_handle();
     *pool_hi = pool.first;
     *pool_lo = pool.second;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_graph_pool_handle", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_graph_pool_handle", nullptr);
+    }
 }
 
 // --- CUDA Events ---
@@ -150,6 +180,8 @@ extern "C" char* flodl_cuda_event_new(int flags, void** event_out) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -159,6 +191,8 @@ extern "C" char* flodl_cuda_event_record(void* event) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -170,6 +204,8 @@ extern "C" char* flodl_cuda_event_record_on_stream(void* event, void* stream) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -179,6 +215,8 @@ extern "C" char* flodl_cuda_event_synchronize(void* event) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -190,15 +228,29 @@ extern "C" char* flodl_cuda_event_elapsed_time(void* start, void* end,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_cuda_event_query(void* event) {
+    try {
     return static_cast<at::cuda::CUDAEvent*>(event)->query() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_event_query", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_event_query", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_event_delete(void* event) {
+    try {
     delete static_cast<at::cuda::CUDAEvent*>(event);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_event_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_event_delete", nullptr);
+    }
 }
 
 // --- CUDA Streams ---
@@ -213,6 +265,8 @@ extern "C" char* flodl_cuda_stream_new(int device_index, int high_priority,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -222,6 +276,8 @@ extern "C" char* flodl_cuda_stream_synchronize(void* stream) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -233,33 +289,65 @@ extern "C" char* flodl_cuda_stream_wait_event(void* stream, void* event) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_cuda_stream_query(void* stream) {
+    try {
     return static_cast<at::cuda::CUDAStream*>(stream)->query() ? 1 : 0;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_stream_query", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_stream_query", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_stream_set_current(void* stream) {
+    try {
     at::cuda::setCurrentCUDAStream(
         *static_cast<at::cuda::CUDAStream*>(stream));
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_stream_set_current", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_stream_set_current", nullptr);
+    }
 }
 
 extern "C" void* flodl_cuda_stream_get_current(int device_index) {
+    try {
     auto stream = at::cuda::getCurrentCUDAStream(
         static_cast<c10::DeviceIndex>(device_index));
     auto* heap = new at::cuda::CUDAStream(stream);
     return static_cast<void*>(heap);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_stream_get_current", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_stream_get_current", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_stream_restore_default(int device_index) {
+    try {
     at::cuda::setCurrentCUDAStream(
         at::cuda::getDefaultCUDAStream(
             static_cast<c10::DeviceIndex>(device_index)));
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_stream_restore_default", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_stream_restore_default", nullptr);
+    }
 }
 
 extern "C" void flodl_cuda_stream_delete(void* stream) {
+    try {
     delete static_cast<at::cuda::CUDAStream*>(stream);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_stream_delete", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_stream_delete", nullptr);
+    }
 }
 
 // --- NCCL Collective Operations ---
@@ -316,11 +404,19 @@ extern "C" char* flodl_nccl_init(int ndev, const int* devlist,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" void flodl_nccl_destroy(void* handle) {
+    try {
     delete static_cast<FlodlNcclComms*>(handle);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_nccl_destroy", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_nccl_destroy", nullptr);
+    }
 }
 
 extern "C" char* flodl_nccl_all_reduce(void* handle, FlodlTensor* tensors,
@@ -365,6 +461,8 @@ extern "C" char* flodl_nccl_all_reduce(void* handle, FlodlTensor* tensors,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -409,11 +507,19 @@ extern "C" char* flodl_nccl_broadcast(void* handle, FlodlTensor* tensors,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" int flodl_nccl_size(void* handle) {
+    try {
     return static_cast<FlodlNcclComms*>(handle)->ndev;
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_nccl_size", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_nccl_size", nullptr);
+    }
 }
 
 // --- NCCL Per-Rank Operations (for multi-threaded DDP) ---
@@ -445,6 +551,8 @@ extern "C" char* flodl_nccl_get_unique_id(void* uid_out) {
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -468,14 +576,23 @@ extern "C" char* flodl_nccl_init_rank(int rank, int nranks, const void* uid,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
 extern "C" void flodl_nccl_destroy_rank(void* handle) {
+    try {
     delete static_cast<FlodlNcclRankComm*>(handle);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_nccl_destroy_rank", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_nccl_destroy_rank", nullptr);
+    }
 }
 
 extern "C" char* flodl_nccl_abort_rank(void* handle) {
+    try {
     auto* h = static_cast<FlodlNcclRankComm*>(handle);
     if (!h || !h->comm) return nullptr;
     // Idempotent: only abort once.
@@ -491,6 +608,11 @@ extern "C" char* flodl_nccl_abort_rank(void* handle) {
                           ncclGetErrorString(result));
     }
     return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
@@ -533,6 +655,8 @@ extern "C" char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -570,6 +694,8 @@ extern "C" char* flodl_nccl_redop_premulsum_create_rank(void* handle,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 #else
     (void)handle; (void)scalar; (void)op_out;
@@ -581,6 +707,7 @@ extern "C" char* flodl_nccl_redop_premulsum_create_rank(void* handle,
 }
 
 extern "C" char* flodl_nccl_redop_destroy_rank(void* handle, int op) {
+    try {
 #if defined(NCCL_VERSION_CODE) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 11, 0)
     auto* h = static_cast<FlodlNcclRankComm*>(handle);
     ncclResult_t result =
@@ -594,6 +721,11 @@ extern "C" char* flodl_nccl_redop_destroy_rank(void* handle, int op) {
     (void)handle; (void)op;
     return make_error("flodl was built against NCCL headers < 2.11");
 #endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
 }
 
 extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
@@ -635,6 +767,8 @@ extern "C" char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -660,6 +794,8 @@ extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
     }
 }
 
@@ -825,5 +961,11 @@ extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,
 // --- Utility ---
 
 extern "C" void flodl_free_string(char* s) {
+    try {
     free(s);
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_free_string", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_free_string", nullptr);
+    }
 }
