@@ -46,44 +46,58 @@ parameterize everything below:
 
 ## 1. Role topology
 
-A run is a tree of processes. The **launcher** never touches CUDA (it exits
-after fan-out); each **rank** is its own process owning one GPU; one **relay**
-per remote host multiplexes that host's ranks onto a single connection to the
-controller. The **coordinator** is the scheduler the ranks talk to.
+A run is a tree of processes formed by **dial-in membership**: the
+**launcher** (no CUDA) opens a join window on the controller port; one
+**agent** per worker host (no CUDA) dials in, joins, and — once the world
+forms — spawns its host's children: one **relay** multiplexing the host's
+ranks onto a single connection to the controller, plus one **rank** process
+per GPU. Ranks are assigned in admission order; `world_size` freezes at
+window close. Fan-out is sugar over this protocol (the launcher starts the
+agents over SSH, and its defaults close the window the instant every
+configured rank is in); a self-deployed agent with nothing but the
+controller address joins the same way. The **coordinator** is the scheduler
+the ranks talk to.
 
 ```mermaid
 flowchart TB
     subgraph launchbox["Launcher process (no CUDA)"]
-        L["Role::Launcher<br/>reads FLODL_INTERNAL_FULL_CLUSTER_JSON<br/>fan-out + exit"]
+        L["Role::Launcher<br/>join window -> world synthesis -> supervision"]
+        C["cluster_coordinator<br/>(scheduler + averaging)<br/>one mux port: join + rendezvous +<br/>data + control + HTTP status"]
     end
 
-    subgraph coordhost["Controller host"]
-        C["cluster_coordinator<br/>(scheduler + averaging)<br/>one mux port: rendezvous + data + control"]
-    end
-
-    subgraph host0["Host 0 (local)"]
+    subgraph host0["Host 0 (launcher-local)"]
         W0["Role::Rank GPU0<br/>GpuWorker"]
         W1["Role::Rank GPU1<br/>GpuWorker"]
     end
 
     subgraph host1["Host 1 (remote)"]
+        A1["Role::Agent<br/>dial-in join, no CUDA"]
         R1["Role::Relay<br/>mux, no CUDA"]
         W2["Role::Rank GPU0<br/>GpuWorker"]
         W3["Role::Rank GPU1<br/>GpuWorker"]
     end
 
-    L -.->|SSH spawn| W0
-    L -.->|SSH spawn| W1
-    L -.->|SSH spawn| R1
-    L -.->|SSH spawn| W2
-    L -.->|SSH spawn| W3
+    L -.->|ONE SSH session| A1
+    L -.->|local spawn<br/>(in-process join)| W0
+    L -.->|local spawn<br/>(in-process join)| W1
+    A1 -.->|spawns after WorldFormed| R1
+    A1 -.->|spawns after WorldFormed| W2
+    A1 -.->|spawns after WorldFormed| W3
 
+    A1 <-->|join channel stays open:<br/>host control link| C
     W0 <-->|in-process channels| C
     W1 <-->|in-process channels| C
     W2 <-->|loopback| R1
     W3 <-->|loopback| R1
     R1 <-->|one muxed TCP conn<br/>MuxRecord frames| C
 ```
+
+The agent's join connection stays open past formation as the **host control
+link**: the agent reports per-rank exits up it (`RankExited`, feeding the
+launcher's elastic supervision), the launcher sends `Abort` down it, and EOF
+means the whole host died. Launcher-local hosts run the same join protocol
+on a thread (dialing loopback), so their children stay direct launcher
+children — same supervision, no SSH.
 
 Local ranks (same host as the controller) talk over in-process channels;
 remote ranks talk loopback to their host's relay, which carries the host's
@@ -94,7 +108,13 @@ contributions (masses included) into one `HostFrame` per round and fans the
 controller's single `Broadcast` consensus back out, so K local ranks cost 1×
 the model bytes on the host uplink per direction instead of K×.
 
-> Source: `launcher/mod.rs` (`Role`, `dispatch()`), `relay/agent.rs`
+The mux port also answers plain HTTP GETs with the membership state as
+`state.json` (`fdl status`) — live from before the window opens, read-only,
+reachability = the port's bind scope.
+
+> Source: `launcher/mod.rs` (`Role`, `dispatch()`), `launcher/agent.rs`
+> (`AgentSpec`, `run_agent`), `membership.rs` (`MembershipLedger`,
+> `run_join_window`), `status.rs` (`serve_status`), `relay/agent.rs`
 > (`ChannelKind`), `relay/mux.rs` (`MuxRecord`, `RelayControlMsg`).
 
 ---
@@ -338,9 +358,10 @@ Every frame is tagged with a `MsgKind` and carried in an HMAC-signed
 | `ParamSnapshotMeta` | - | *(orphan / reserved)* | `ParamSnapshotMetaWire` deleted; tag kept for byte-layout stability, no-op on receipt |
 | `Heartbeat` | - | *(orphan / reserved)* | `HeartbeatWire` deleted; live liveness rides `TimingMsgWire::Heartbeat` on the `Timing` row |
 | `Rendezvous` | both | `RendezvousMsgWire` | Hello / Role / Uid bootstrap |
+| `Join` | agent <-> controller | `JoinMsgWire` | Hello / Accept / Reject / WorldFormed / RankExited / Abort — dial-in membership. Pre-admission frames are keyed by trust mode (pre-shared salt, or the zero key under open admission); post-admission frames always carry the session salt. |
 
 > Source: `wire.rs` (`MsgKind`, `ControlMsgWire`, `TimingMsgWire`,
-> `RendezvousMsgWire`).
+> `RendezvousMsgWire`, `JoinMsgWire`).
 
 ### In-process channels (local threads)
 

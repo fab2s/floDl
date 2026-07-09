@@ -55,6 +55,31 @@ fn routes_each_channel_by_magic_over_one_port() {
 }
 
 #[test]
+fn http_get_routes_to_status_leg_with_request_intact() {
+    let (_mux, accept, port) = start_test_mux();
+
+    // A plain HTTP client writes no flodl magic — the request line's
+    // leading "GET " IS the routing key, and unlike the flodl channels
+    // it must reach the consumer unconsumed (it is part of the request).
+    let request = b"GET /state.json HTTP/1.1\r\nHost: t\r\n\r\n";
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.set_nodelay(true).unwrap();
+    client.write_all(request).unwrap();
+
+    let mut routed = accept
+        .status
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HTTP GET routed to status leg");
+    routed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = vec![0u8; request.len()];
+    routed.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, request);
+    drop(client);
+}
+
+#[test]
 fn unknown_magic_dropped_and_dispatcher_continues() {
     let (_mux, accept, port) = start_test_mux();
 

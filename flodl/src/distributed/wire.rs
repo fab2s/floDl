@@ -123,6 +123,16 @@ pub(crate) const CHANNEL_MAGIC_CONTROL: u32 = 0xF10D_17E2;
 /// keys its frames.
 pub(crate) const CHANNEL_MAGIC_JOIN: u32 = 0xF10D_17E3;
 
+/// ASCII `"GET "` — the first four bytes of an HTTP GET request line.
+/// Not a flodl-minted magic: routing it lets plain HTTP clients
+/// (`fdl status`, curl, a browser) read the run's `state.json` from
+/// the same controller port every other channel shares. The status
+/// responder is read-only and serves membership metadata only — its
+/// trust follows bind scope exactly like join admission (a loopback
+/// bind is reachable only through sshd). See
+/// `distributed::status` for the responder.
+pub(crate) const CHANNEL_MAGIC_HTTP_GET: u32 = u32::from_le_bytes(*b"GET ");
+
 // ---------------------------------------------------------------------------
 // Cleartext guard
 // ---------------------------------------------------------------------------

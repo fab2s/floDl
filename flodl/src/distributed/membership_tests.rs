@@ -323,7 +323,10 @@ fn spawn_window(
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
         let source = StreamSource::from_listener(listener, "membership-test")?;
-        run_join_window(&source, &config, &salt, pre_shared_salt, None, &abort)
+        let status = crate::distributed::status::StatusBoard::new();
+        run_join_window(
+            &source, &config, &salt, pre_shared_salt, None, &abort, &status,
+        )
     });
     (port, handle)
 }

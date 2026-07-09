@@ -47,6 +47,7 @@ pub mod ddp_run;
 pub mod el_che;
 pub mod lr_event_meta;
 pub(crate) mod rendezvous;
+pub(crate) mod status;
 pub mod testing;
 pub(crate) mod wire;
 

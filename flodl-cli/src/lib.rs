@@ -91,6 +91,10 @@ pub mod diagnose;
 /// foundation for `fdl deploy` and the transparent launcher dispatch.
 pub mod probe;
 
+/// Live run status (`fdl status`): fetches the controller's
+/// `state.json` (membership + lifecycle phase) and pretty-prints it.
+pub mod status;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

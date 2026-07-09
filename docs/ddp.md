@@ -578,6 +578,12 @@ cluster:
     path: /opt/flodl              # controller's view of the shared project root
     # docker: cuda                # optional pre-flight build service
     # arch: precompiled/cu128     # optional libtorch variant for pre-flight build
+    # join:                       # membership-window overrides (see below)
+    #   min_rank_start: 2
+    #   join_timeout: 300
+    #   target_ranks: 4
+    #   max_join_timeout: 600
+    #   open_admission: false
 
   workers:
     - host: node-a                # worker identifier; default SSH target
@@ -631,14 +637,84 @@ Conventions:
   its fan-out SSH session instead of a direct TCP connection - see
   below.
 
+### Dial-in membership: the join window
+
+Workers **join** a run; the controller admits them. At launch the
+controller opens a join window on its port; every worker — fan-out-
+managed and self-deployed alike — dials in with a hello (host name,
+GPU inventory, libtorch variant, dataset signature) and is assigned
+its global ranks **in admission order** (contiguous by construction).
+When the window closes, the world freezes: `world_size` is whatever
+actually joined, and all coordination infrastructure (ElChe schedule,
+heartbeats, rendezvous) is sized to that world.
+
+`fdl @cluster <cmd>` fan-out is sugar over this protocol: it starts
+one worker agent per host over SSH, and those agents dial back in like
+any worker would. The defaults make fan-out behave exactly like a
+fixed topology — quorum and early-close target both default to the
+configured capacity, so the window closes the instant every configured
+rank is in (zero added latency) and the run cannot start below full
+strength.
+
+Override via `controller.join:` to allow degraded starts or to hold
+the window open for extra dial-in workers:
+
+| Knob | Meaning | Default |
+|---|---|---|
+| `min_rank_start` | Quorum in ranks; the run cannot start below it. | configured capacity |
+| `join_timeout` | Window in seconds. Quorum reached early does NOT close it — late workers within the window still join. | 300 |
+| `target_ranks` | The window closes the moment this many ranks are in. Raise it above capacity to wait for self-deployed workers. | configured capacity |
+| `max_join_timeout` | Hard cap in seconds; quorum still unmet when it expires fails the run loudly. | 600 (or the window length when set higher) |
+| `open_admission` | Accept joins without the pre-shared session salt on a non-loopback bind (loudly warned). | false |
+
+Admission is authenticated by the join frames' HMAC key: fan-out
+agents receive the per-run session salt through their SSH session, so
+a peer without it cannot join. A **loopback** bind (every remote
+worker tunneled) is open by construction — the only path to the port
+is through sshd, so reachability itself is the authentication, and the
+salt is handed out in the accept reply. `open_admission: true` extends
+that hand-out to a network bind: any peer that can reach the port can
+then join (and therefore influence) the run, which is why flodl warns
+loudly — sound only on a fully trusted segment.
+
+A **self-deployed worker** needs nothing but the controller address: a
+process started on any GPU host with `FLODL_INTERNAL_AGENT_JSON` set
+to the hex-encoded spec `{"host": "...", "controller_host": "...",
+"controller_port": 1337}` (see `AgentSpec` in the API docs) resolves
+its own GPUs, joins, receives the formed-world artifacts, and spawns
+its relay and rank children — the training code is byte-identical to
+the fan-out path. Pair it with `target_ranks` above the configured
+capacity (or a bare-bones one-host config) so the window waits for it.
+
+One contract for user binaries: `Trainer::run` dispatches the cluster
+roles (agent, relay, rank) internally, so a binary that goes straight
+to `Trainer::run` needs nothing. But a binary that **gates before**
+`Trainer::run` (checks GPU counts, parses modes, validates datasets,
+and possibly exits) must short-circuit the internal worker roles first
+— otherwise the worker agent falls into the gate on the remote host
+(seeing ONE host of a multi-host world) and exits without ever
+joining, and the window idles to its hard cap:
+
+```rust
+fn main() {
+    // Worker-role short-circuit BEFORE any gating/exit logic. Runs the
+    // relay/agent role and exits when this process is one; returns
+    // immediately otherwise.
+    flodl::distributed::launcher::exit_if_worker_role();
+    // ... your pre-run gating, then Trainer::run(...)
+}
+```
+
 ### One port, and tunneled workers
 
-All cross-host training traffic (NCCL bootstrap rendezvous, CPU-reduce
-data, coordinator control) accepts on the single `controller.port`;
-connections identify their channel with a 4-byte magic. The traffic is
-HMAC-authenticated but NOT encrypted, and flodl warns loudly whenever
-a cleartext channel touches a peer outside private address space
-(loopback / RFC1918 / link-local / CGNAT-shared).
+All cross-host traffic (membership join, NCCL bootstrap rendezvous,
+CPU-reduce data, coordinator control) accepts on the single
+`controller.port`; connections identify their channel with a 4-byte
+magic. The same port answers plain HTTP GETs with the run's membership
+state (see `fdl status` below). The traffic is HMAC-authenticated but
+NOT encrypted, and flodl warns loudly whenever a cleartext channel
+touches a peer outside private address space (loopback / RFC1918 /
+link-local / CGNAT-shared).
 
 `tunnel: true` on a worker is the supported way to leave the private
 network: the launcher adds a remote forward
@@ -713,6 +789,38 @@ Errors loudly on misconfig; the green path is silent enough to use as
 a CI smoke test. Returns non-zero on errors; zero on green or
 warnings-only. See [CLI reference](cli.md#fdl-probe) for the full
 field listing.
+
+### Live run status - `fdl status`
+
+While a run is up, the controller port answers plain HTTP GETs with
+the run's membership state as `state.json` — lifecycle phase
+(`waiting` / `forming` / `training` / `done` / `failed`), who has
+joined with what hardware, and the join-window countdowns while it is
+still open:
+
+```bash
+fdl @cluster status              # pretty summary from the overlay's controller
+fdl status --addr host[:port]    # explicit target (all a self-deployed
+                                 # worker's operator needs)
+fdl @cluster status --json       # raw state.json for scripts
+curl http://<controller>:1337/state.json   # no fdl required
+```
+
+```text
+cluster run @ 192.168.122.1:1337 — training
+  ranks: 3 joined across 2 host(s)   (quorum 3, target 3)
+  hosts:
+    node-a  ranks [0]     1x RTX 5060 Ti   libtorch precompiled/cu128  joined +0s
+    node-b  ranks [1, 2]  2x GTX 1060 6GB  libtorch builds/sm61-sm120  joined +1s
+```
+
+The endpoint is read-only and lives exactly as long as the launcher
+process: it is up from before the join window opens (so `waiting` and
+`forming` are observable), and connection-refused afterwards is the
+honest "no run listening" signal (`fdl status` exits 1 with a note).
+Reachability follows the port's bind scope — an all-tunneled run
+exposes it through sshd only. See
+[CLI reference](cli.md#fdl-status) for address resolution details.
 
 ---
 

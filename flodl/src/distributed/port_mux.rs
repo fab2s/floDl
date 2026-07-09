@@ -19,6 +19,13 @@
 //! condemns its own connection, never the run. Honest dialers write the
 //! magic immediately after `connect`, so sequential dispatch never
 //! stalls behind a legitimate peer.
+//!
+//! One channel is not flodl wire at all: a plain HTTP GET's leading
+//! `"GET "` bytes route to the status responder
+//! (`distributed::status`), which serves the run's membership state as
+//! `state.json` on this same port. For that leg the consumer does NOT
+//! strip a magic — the four bytes are part of the request line it
+//! reads.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,8 +37,8 @@ use std::time::{Duration, Instant};
 use crate::tensor::{Result, TensorError};
 
 use super::wire::{
-    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_JOIN,
-    CHANNEL_MAGIC_RENDEZVOUS,
+    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_HTTP_GET,
+    CHANNEL_MAGIC_JOIN, CHANNEL_MAGIC_RENDEZVOUS,
 };
 
 /// Poll cadence of the dispatcher's non-blocking accept loop.
@@ -55,6 +62,11 @@ pub(crate) struct MuxAccept {
     pub data: Receiver<TcpStream>,
     pub control: Receiver<TcpStream>,
     pub join: Receiver<TcpStream>,
+    /// Plain HTTP GETs (`fdl status`, curl, a browser) — an HTTP
+    /// request line's leading `"GET "` routes like any channel magic.
+    /// Unlike the flodl channels the consumer does NOT strip a magic:
+    /// the four bytes are part of the request it reads.
+    pub status: Receiver<TcpStream>,
 }
 
 /// Owns the single accepting listener and its dispatcher thread.
@@ -88,6 +100,7 @@ impl PortMux {
         let (data_tx, data_rx) = channel();
         let (ctrl_tx, ctrl_rx) = channel();
         let (join_tx, join_rx) = channel();
+        let (status_tx, status_rx) = channel();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_c = Arc::clone(&shutdown);
@@ -95,7 +108,8 @@ impl PortMux {
             .name(format!("flodl-port-mux:{bound_port}"))
             .spawn(move || {
                 dispatch_loop(
-                    listener, rdv_tx, data_tx, ctrl_tx, join_tx, shutdown_c, abort,
+                    listener, rdv_tx, data_tx, ctrl_tx, join_tx, status_tx,
+                    shutdown_c, abort,
                 );
             })
             .map_err(|e| {
@@ -109,6 +123,7 @@ impl PortMux {
                 data: data_rx,
                 control: ctrl_rx,
                 join: join_rx,
+                status: status_rx,
             },
         ))
     }
@@ -129,12 +144,14 @@ impl Drop for PortMux {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_loop(
     listener: TcpListener,
     rdv_tx: Sender<TcpStream>,
     data_tx: Sender<TcpStream>,
     ctrl_tx: Sender<TcpStream>,
     join_tx: Sender<TcpStream>,
+    status_tx: Sender<TcpStream>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
 ) {
@@ -156,12 +173,15 @@ fn dispatch_loop(
                 return;
             }
         };
-        dispatch_one(stream, peer, &rdv_tx, &data_tx, &ctrl_tx, &join_tx);
+        dispatch_one(
+            stream, peer, &rdv_tx, &data_tx, &ctrl_tx, &join_tx, &status_tx,
+        );
     }
 }
 
 /// Peek the channel magic and route the stream. Failures drop the
 /// connection (loudly), never the dispatcher.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_one(
     stream: TcpStream,
     peer: SocketAddr,
@@ -169,6 +189,7 @@ fn dispatch_one(
     data_tx: &Sender<TcpStream>,
     ctrl_tx: &Sender<TcpStream>,
     join_tx: &Sender<TcpStream>,
+    status_tx: &Sender<TcpStream>,
 ) {
     // Controller-side cleartext guard: a public peer on the mux port
     // means training frames cross an uncontrolled network unencrypted.
@@ -208,6 +229,7 @@ fn dispatch_one(
         CHANNEL_MAGIC_DATA => (data_tx, "data"),
         CHANNEL_MAGIC_CONTROL => (ctrl_tx, "control"),
         CHANNEL_MAGIC_JOIN => (join_tx, "join"),
+        CHANNEL_MAGIC_HTTP_GET => (status_tx, "status"),
         other => {
             eprintln!(
                 "port_mux: dropping connection from {peer} (unknown channel \

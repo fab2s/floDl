@@ -310,36 +310,14 @@ struct Cli {
 }
 
 fn main() {
-    // Per-host transport relay: the cluster launcher spawns this binary
-    // with `FLODL_INTERNAL_RELAY_JSON` set on one child per host. Short-circuit to
-    // the byte-router BEFORE any GPU enumeration / dataset parsing / the
-    // 2-GPU auto-promote path — the relay touches no CUDA and runs no
-    // bench. (User binaries using `Trainer::run` don't need this; the
-    // relay role is caught inside `run()`. ddp-bench needs it because its
-    // harness does GPU/mode/dataset work before reaching `Trainer::run`.)
-    if std::env::var_os(flodl::distributed::launcher::ENV_RELAY_JSON).is_some() {
-        match flodl::distributed::launcher::run_relay() {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("ddp-bench relay: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    // Per-host worker agent (dial-in membership): same short-circuit as
-    // the relay, for the same reason — the agent joins the controller's
-    // window and spawns this host's children; it must never fall into
-    // the harness's local GPU/mode gating (e.g. "cpu-sync requires 2+
-    // GPUs" evaluated against ONE host of a multi-host world).
-    if std::env::var_os(flodl::distributed::launcher::ENV_AGENT_JSON).is_some() {
-        match flodl::distributed::launcher::run_agent() {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("ddp-bench agent: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
+    // Worker-role short-circuit (relay / dial-in agent) BEFORE any GPU
+    // enumeration / dataset parsing / the 2-GPU auto-promote path.
+    // Binaries that go straight to `Trainer::run` don't need this — the
+    // dispatch inside `run()` catches every role. ddp-bench needs it
+    // because its harness does GPU/mode/dataset work first, and a
+    // worker-role process falling into that gating sees ONE host of a
+    // multi-host world and exits without ever joining.
+    flodl::distributed::launcher::exit_if_worker_role();
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);

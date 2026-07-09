@@ -517,17 +517,6 @@ pub(crate) struct FormedWorld {
     pub snapshot: MembershipSnapshot,
 }
 
-/// Debug-stream rendering of the membership state — the same JSON the
-/// `state.json` endpoint serves, so the log and the HTTP surface can
-/// never disagree.
-pub(crate) fn log_state(snapshot: &MembershipSnapshot) {
-    if crate::log::enabled(crate::log::Verbosity::Debug) {
-        if let Ok(js) = serde_json::to_string(snapshot) {
-            crate::debug!("cluster membership: state {js}");
-        }
-    }
-}
-
 /// Run the join window: accept connections from `source` (the mux's
 /// join leg), admit hellos against a fresh [`MembershipLedger`], and
 /// return the formed world when the window closes with quorum.
@@ -538,8 +527,10 @@ pub(crate) fn log_state(snapshot: &MembershipSnapshot) {
 /// accept reply. The caller decides based on bind scope + the
 /// `open_admission` knob — this function just executes the choice.
 ///
-/// Every join, reject, and transition emits a stderr log line; `abort`
-/// stops the window promptly (launcher failure path).
+/// Every join, reject, and transition emits a stderr log line and
+/// publishes the refreshed snapshot to `status` (the `state.json`
+/// source — see [`crate::distributed::status`]); `abort` stops the
+/// window promptly (launcher failure path).
 pub(crate) fn run_join_window(
     source: &StreamSource,
     config: &JoinConfig,
@@ -547,6 +538,7 @@ pub(crate) fn run_join_window(
     pre_shared_salt: bool,
     expected_dataset_sig: Option<[u8; 32]>,
     abort: &AtomicBool,
+    status: &crate::distributed::status::StatusBoard,
 ) -> Result<FormedWorld> {
     let mut ledger = MembershipLedger::new(config.clone(), expected_dataset_sig)?;
     let join_key = join_frame_key(!pre_shared_salt, salt);
@@ -568,6 +560,7 @@ pub(crate) fn run_join_window(
         cap.as_secs(),
         if pre_shared_salt { "pre-shared salt" } else { "open" },
     );
+    status.publish(&ledger.snapshot(ClusterPhase::Waiting, Duration::ZERO));
 
     loop {
         let elapsed = started.elapsed();
@@ -583,19 +576,23 @@ pub(crate) fn run_join_window(
                     members.len(),
                     elapsed.as_secs(),
                 );
-                log_state(&snapshot);
+                status.publish(&snapshot);
                 debug_assert_eq!(admitted.len(), members.len());
                 return Ok(FormedWorld { workers: admitted, world_size, snapshot });
             }
             WindowVerdict::Failed(why) => {
                 let msg = format!("cluster join: FAILED — {why}");
                 eprintln!("{msg}");
+                status.publish(&ledger.snapshot(ClusterPhase::Failed, elapsed));
                 abort_admitted(&mut admitted, salt, &why);
                 return Err(TensorError::new(&msg));
             }
         }
         if abort.load(Ordering::SeqCst) {
             let why = "launcher aborted before the world formed".to_string();
+            status.publish(
+                &ledger.snapshot(ClusterPhase::Failed, started.elapsed()),
+            );
             abort_admitted(&mut admitted, salt, &why);
             return Err(TensorError::new(&format!("cluster join: {why}")));
         }
@@ -646,9 +643,9 @@ pub(crate) fn run_join_window(
                         None => format!(", quorum {}", config.min_rank_start),
                     },
                 );
-                // Structured twin of the log line: the same snapshot
-                // that backs `state.json`, on the debug stream.
-                log_state(&ledger.snapshot(ClusterPhase::Waiting, started.elapsed()));
+                status.publish(
+                    &ledger.snapshot(ClusterPhase::Waiting, started.elapsed()),
+                );
                 admitted.push(AdmittedWorker { member, stream });
             }
             Err(why) => {

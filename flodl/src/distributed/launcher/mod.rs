@@ -230,6 +230,55 @@ pub(crate) fn role_env_pristine() -> bool {
     matches!(dispatch(), Ok(Role::SingleDevice))
 }
 
+/// One-call short-circuit for the internal per-host worker roles
+/// (transport relay, dial-in agent). Call it at the very top of
+/// `main()` in any binary that **gates before** [`Trainer::run`] —
+/// checks GPU counts, parses modes, validates datasets, and possibly
+/// exits. If this process was spawned as a relay or agent, the role
+/// runs to completion here and the process EXITS; otherwise the call
+/// returns immediately and your `main()` proceeds.
+///
+/// ```no_run
+/// // First statement of main():
+/// flodl::distributed::launcher::exit_if_worker_role();
+/// // ... your pre-run gating, then Trainer::run(...)
+/// ```
+///
+/// Why it matters: cluster fan-out re-enters the user binary on every
+/// host for these roles. A binary that goes straight to
+/// [`Trainer::run`] needs nothing — the dispatch inside `run()`
+/// catches every role. But gating logic ahead of `run()` executes in
+/// the worker-role processes too, sees ONE host of a multi-host world
+/// ("cpu-sync requires 2+ GPUs, have 1"), and exits without ever
+/// joining — leaving the controller's join window to idle out its
+/// hard cap.
+///
+/// Only the relay and agent roles are handled here: launcher and rank
+/// processes are MEANT to run your `main()` up to `Trainer::run`, so
+/// they pass through untouched.
+///
+/// [`Trainer::run`]: crate::distributed::Trainer::run
+pub fn exit_if_worker_role() {
+    if env::var_os(ENV_RELAY_JSON).is_some() {
+        match run_relay() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("flodl relay: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if env::var_os(ENV_AGENT_JSON).is_some() {
+        match run_agent() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("flodl agent: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// Promote a programmatic [`FullCluster`] to the
 /// [`ENV_FULL_CLUSTER_JSON`] env contract iff this process holds no
 /// cluster role yet (see [`role_env_pristine`]). Returns whether
@@ -643,13 +692,41 @@ pub fn run_launcher_with_config(
         data: mux_data,
         control: mux_control,
         join: mux_join,
+        status: mux_status,
     } = mux_accept;
     eprintln!(
         "cluster launcher: port mux bound on {mux_bind_ip}:{} \
-         (join + rendezvous + data + control{})",
+         (join + rendezvous + data + control + status{})",
         port_mux.port(),
         if bind_loopback { "; loopback-only, all workers tunneled" } else { "" },
     );
+
+    // Status endpoint: plain HTTP GETs on the mux port answer with the
+    // run's membership state as `state.json` (`fdl status`, curl, a
+    // browser). Live from here — BEFORE the join window opens — so the
+    // whole lifecycle is observable, `waiting`/`forming` included.
+    // Trust follows bind scope, exactly like join admission.
+    let status_board = crate::distributed::status::StatusBoard::new();
+    let mut status_server = {
+        let board = status_board.clone();
+        let source =
+            crate::distributed::port_mux::StreamSource::Mux(mux_status);
+        let abort_c = Arc::clone(&abort);
+        Some(
+            thread::Builder::new()
+                .name("flodl-status-http".to_string())
+                .spawn(move || {
+                    crate::distributed::status::serve_status(
+                        source, board, abort_c,
+                    );
+                })
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: spawn status responder failed: {e}"
+                    ))
+                })?,
+        )
+    };
 
     // Controller address AS SEEN FROM a given worker: tunneled workers
     // dial their loopback end of the SSH forward; when the mux binds
@@ -676,6 +753,7 @@ pub fn run_launcher_with_config(
     let gate_config = join_config.clone();
     let gate_salt = salt;
     let gate_abort = Arc::clone(&abort);
+    let gate_status = status_board.clone();
     let gate_source = crate::distributed::port_mux::StreamSource::Mux(mux_join);
     let gate = thread::Builder::new()
         .name("flodl-join-gate".to_string())
@@ -687,6 +765,7 @@ pub fn run_launcher_with_config(
                 !open_admission,
                 None,
                 &gate_abort,
+                &gate_status,
             )
         })
         .map_err(|e| {
@@ -890,6 +969,9 @@ pub fn run_launcher_with_config(
         );
         teardown_early(&mut remote_agents, &mut local_joins);
         let _ = gate.join();
+        if let Some(h) = status_server.take() {
+            let _ = h.join();
+        }
         return Err(e);
     }
 
@@ -928,6 +1010,9 @@ pub fn run_launcher_with_config(
         Ok(f) => f,
         Err(e) => {
             teardown_early(&mut remote_agents, &mut local_joins);
+            if let Some(h) = status_server.take() {
+                let _ = h.join();
+            }
             return Err(match dead_agent {
                 Some(host) => TensorError::new(&format!(
                     "cluster launcher: agent of {host:?} died before the world \
@@ -1388,6 +1473,9 @@ pub fn run_launcher_with_config(
         for r in rank_exit_readers {
             let _ = r.join();
         }
+        if let Some(h) = status_server.take() {
+            let _ = h.join();
+        }
         return Err(e);
     }
 
@@ -1396,7 +1484,7 @@ pub fn run_launcher_with_config(
     // pre-formation triggers SIGKILL on every other still-running child;
     // post-formation, elastic membership owns the decision.
     membership_state.phase = membership::ClusterPhase::Training;
-    membership::log_state(&membership_state);
+    status_board.publish(&membership_state);
     let any_failure = supervise_children(
         children,
         has_coord.then(|| ElasticSupervision {
@@ -1407,6 +1495,18 @@ pub fn run_launcher_with_config(
             cohort_formed: Arc::clone(&cohort_formed),
         }),
     );
+
+    // Terminal phase, published while the status endpoint is still up:
+    // the cleanup passes below can take seconds, and a `fdl status`
+    // poll landing in them should read `done`/`failed`, not a stale
+    // `training`. Once this function returns, the endpoint is gone and
+    // connection-refused becomes the (honest) "no run" signal.
+    membership_state.phase = if any_failure.is_some() {
+        membership::ClusterPhase::Failed
+    } else {
+        membership::ClusterPhase::Done
+    };
+    status_board.publish(&membership_state);
 
     // Post-exit cleanup: belt-and-braces ssh-pkill on every remote host.
     // The remote-side trap wrapper handles SIGHUP-on-disconnect, but
@@ -1456,12 +1556,9 @@ pub fn run_launcher_with_config(
     for r in rank_exit_readers {
         let _ = r.join();
     }
-    membership_state.phase = if any_failure.is_some() {
-        membership::ClusterPhase::Failed
-    } else {
-        membership::ClusterPhase::Done
-    };
-    membership::log_state(&membership_state);
+    if let Some(h) = status_server.take() {
+        let _ = h.join();
+    }
     use std::io::Write as _;
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();

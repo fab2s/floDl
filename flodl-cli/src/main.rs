@@ -8,12 +8,12 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
-    overlay, parse_or_schema_from, probe, run, setup, skill, style, update_check,
+    overlay, parse_or_schema_from, probe, run, setup, skill, status, style, update_check,
 };
 
 use builtins::{
     AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, ProbeArgs, SetupArgs,
-    SkillInstallArgs,
+    SkillInstallArgs, StatusArgs,
 };
 
 use std::env;
@@ -186,6 +186,11 @@ fn main() -> ExitCode {
                 cli.libtorch_path,
                 cli.docker,
             );
+            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        "status" => {
+            let cli: StatusArgs = parse_sub("fdl status", &args[1..]);
+            let code = status::run(cli.json, cli.addr.as_deref());
             if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "api-ref" => {

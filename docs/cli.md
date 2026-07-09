@@ -614,6 +614,33 @@ yourself before a cluster run; it is not invoked implicitly by fan-out.
 (The automatic pre-flight step `fdl @cluster <cmd>` performs is the
 per-host binary build, skippable with `--no-prebuild`.)
 
+### `fdl status`
+
+Live status of a running cluster: lifecycle phase (`waiting` /
+`forming` / `training` / `done` / `failed`), who has joined with what
+hardware, and the join-window countdowns while it is still open. The
+controller serves the state as `state.json` over plain HTTP on its
+training port, so no extra port or config is involved — and `curl`
+works where fdl isn't installed.
+
+```bash
+fdl @cluster status              # controller from the overlay's cluster.yml
+fdl status --addr host[:port]    # explicit controller (default port 1337)
+fdl @cluster status --json       # raw state.json for scripts
+curl http://<controller>:1337/state.json   # same truth, no fdl
+```
+
+Address resolution: `--addr` wins; otherwise the active env's
+`cluster.controller` (with a loopback retry, so all-tunneled runs are
+found when running on the controller box); otherwise the convention
+default `127.0.0.1:1337` (single-host auto-promoted runs), noted on
+stderr.
+
+Exit code: **0** when the state was fetched and printed, **1** when no
+endpoint answered. The endpoint lives exactly as long as the launcher
+process — connection-refused after a run ends is the expected "no run
+listening" signal, not a fault.
+
 ### `fdl nccl`
 
 Build NVIDIA's `libnccl` from source. Required for heterogeneous-rig

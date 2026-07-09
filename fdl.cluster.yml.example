@@ -106,6 +106,12 @@
 # with a channel-select magic. Worker hosts derive `+4` / `+5` for their
 # host-local rank↔relay loopback channels; those never leave the host.
 #
+# The same port also answers plain HTTP GETs with the run's membership
+# state as `state.json`: `fdl status` (or curl) shows the lifecycle
+# phase and who has joined, live from before the join window opens
+# through training. Read-only; reachability follows the port's bind
+# scope (an all-tunneled run exposes it through sshd only).
+#
 # `controller.join:` (optional) tunes the membership window. Workers —
 # fan-out-managed AND self-deployed — dial in and JOIN the run; the
 # window decides when the world forms. Defaults are all-or-nothing over
