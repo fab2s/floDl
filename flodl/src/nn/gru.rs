@@ -25,7 +25,10 @@ pub struct GRU {
     num_layers: usize,
     batch_first: bool,
     /// Cached cuDNN params — lives on C++ side, zero per-forward overhead.
-    rnn_params: RefCell<Option<RnnParams>>,
+    /// cuDNN param cache + the `data_generation` of every parameter it was
+    /// built from; rebuilt when any generation changes (i.e. `set_data`
+    /// replaced a parameter tensor: checkpoint load, cast, device move).
+    rnn_params: RefCell<Option<(RnnParams, Vec<u64>)>>,
 }
 
 impl GRU {
@@ -91,20 +94,37 @@ impl GRU {
             None => Tensor::zeros(&[nl, batch, hs], opts)?,
         };
 
-        // Lazily create C++ cached params on first forward (with cuDNN flatten).
-        // Subsequent forwards pass the opaque handle directly — zero overhead.
+        // Lazily create C++ cached params on first forward (with cuDNN
+        // flatten); rebuild whenever a parameter tensor was REPLACED
+        // (set_data: checkpoint load, dtype cast, device move) — the cache
+        // pins the tensors it was built from, so a stale cache keeps
+        // computing with the pre-replacement weights. In-place updates
+        // (optimizer steps, DDP copy_) write through the pinned tensors
+        // and keep the cache valid. Cache hits pass the opaque handle
+        // directly — the staleness check is an integer compare, no FFI.
         {
+            let cell_params = self.parameters();
+            let generations: Vec<u64> = cell_params.iter()
+                .map(|p| p.variable.data_generation())
+                .collect();
             let mut cache = self.rnn_params.borrow_mut();
-            if cache.is_none() {
-                let params: Vec<Tensor> = self.cells.iter()
-                    .flat_map(|cell| cell.parameters().into_iter().map(|p| p.variable.data()))
+            let stale = match cache.as_ref() {
+                Some((_, cached)) => *cached != generations,
+                None => true,
+            };
+            if stale {
+                let params: Vec<Tensor> = cell_params.iter()
+                    .map(|p| p.variable.data())
                     .collect();
-                *cache = Some(RnnParams::new(&params, 3, nl, self.batch_first, true)?);
+                *cache = Some((
+                    RnnParams::new(&params, 3, nl, self.batch_first, true)?,
+                    generations,
+                ));
             }
         }
         let cache = self.rnn_params.borrow();
         let (output, h_n) = input.data().gru_seq_cached(
-            &h0, cache.as_ref().unwrap(), nl, self.batch_first,
+            &h0, &cache.as_ref().unwrap().0, nl, self.batch_first,
         )?;
 
         Ok((Variable::wrap(output), Variable::wrap(h_n)))
@@ -142,6 +162,52 @@ mod tests {
 
         assert_eq!(output.shape(), vec![5, 3, 8]); // [seq, batch, hidden]
         assert_eq!(h_n.shape(), vec![2, 3, 8]);    // [layers, batch, hidden]
+    }
+
+    #[test]
+    fn test_gru_cache_rebuilds_after_set_data() {
+        // Regression: the cuDNN param cache pinned the tensors it was
+        // built from, so replacing params via set_data (the checkpoint-load
+        // path) left forward computing with the pre-load weights forever.
+        let dev = crate::tensor::test_device();
+        let opts = crate::tensor::test_opts();
+        let a = GRU::on_device(4, 6, 2, false, dev).unwrap();
+        let b = GRU::on_device(4, 6, 2, false, dev).unwrap();
+        let x = Variable::new(Tensor::randn(&[3, 2, 4], opts).unwrap(), false);
+
+        let out_a = a.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let _ = b.forward_seq(&x, None).unwrap(); // builds b's cache from its own init
+
+        // Replace b's params with a's — exactly what load_checkpoint does.
+        for (pa, pb) in a.parameters().iter().zip(b.parameters().iter()) {
+            pb.variable.set_data(pa.variable.data());
+        }
+        let out_b = b.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let max_diff = out_a
+            .iter()
+            .zip(&out_b)
+            .map(|(l, r)| (l - r).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "forward after set_data must use the new weights (max diff {max_diff})"
+        );
+
+        // In-place copy_ must NOT bump generations (cache stays valid;
+        // writes flow through the pinned tensors). Under NoGradGuard like
+        // every real in-place param update (optimizers, DDP load_averaged).
+        let gens_before: Vec<u64> =
+            b.parameters().iter().map(|p| p.variable.data_generation()).collect();
+        crate::autograd::no_grad(|| {
+            for p in b.parameters() {
+                let d = p.variable.data();
+                let src = Tensor::zeros_like(&d).unwrap();
+                d.copy_(&src, false).unwrap();
+            }
+        });
+        let gens_after: Vec<u64> =
+            b.parameters().iter().map(|p| p.variable.data_generation()).collect();
+        assert_eq!(gens_before, gens_after);
     }
 
     #[test]

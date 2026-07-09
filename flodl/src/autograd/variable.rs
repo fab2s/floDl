@@ -6,6 +6,10 @@ use crate::tensor::{DType, Device, Result, Tensor};
 
 pub(crate) struct VariableInner {
     pub data: Tensor,
+    /// Monotonic counter bumped every time `set_data` replaces the tensor.
+    /// Module-side caches built from parameter tensors (e.g. the GRU/LSTM
+    /// cuDNN param cache) key their validity on this.
+    pub data_generation: u64,
 }
 
 /// A differentiable variable wrapping a Tensor.
@@ -41,7 +45,7 @@ impl Variable {
             data
         };
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data })),
+            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
         }
     }
 
@@ -50,7 +54,7 @@ impl Variable {
     /// metadata from their inputs automatically).
     pub(crate) fn wrap(data: Tensor) -> Self {
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data })),
+            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
         }
     }
 
@@ -173,6 +177,8 @@ impl Variable {
 
     /// Replace the underlying tensor data (used by optimizers).
     /// Preserves the `requires_grad` flag from the current tensor.
+    /// Bumps [`data_generation`](Self::data_generation) so caches built
+    /// from the old tensor can detect the replacement.
     pub fn set_data(&self, data: Tensor) {
         let rg = self.requires_grad();
         let data = if rg {
@@ -180,7 +186,18 @@ impl Variable {
         } else {
             data
         };
-        self.inner.borrow_mut().data = data;
+        let mut inner = self.inner.borrow_mut();
+        inner.data = data;
+        inner.data_generation += 1;
+    }
+
+    /// Monotonic generation of the underlying tensor: incremented every
+    /// time [`set_data`](Self::set_data) replaces it (checkpoint load,
+    /// dtype cast, device move). In-place mutation (`copy_`, optimizer
+    /// steps) does not change it. Module caches built from parameter
+    /// tensors key their validity on this.
+    pub fn data_generation(&self) -> u64 {
+        self.inner.borrow().data_generation
     }
 
     /// Total number of elements in the tensor (product of all dimensions).
