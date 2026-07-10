@@ -810,12 +810,17 @@ impl Tensor {
 
     /// Get the accumulated gradient for this tensor, if any.
     /// Returns None if no gradient has been computed.
+    ///
+    /// Panics if the FFI call itself fails (broken tensor handle):
+    /// mapping that to `None` would be indistinguishable from "no
+    /// gradient yet" and make optimizers silently skip the parameter.
     pub fn grad(&self) -> Option<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_grad(self.handle, &mut handle) };
         if !err.is_null() {
+            let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
             unsafe { ffi::flodl_free_string(err) };
-            return None;
+            panic!("Tensor::grad failed: {msg}");
         }
         if handle.is_null() {
             None

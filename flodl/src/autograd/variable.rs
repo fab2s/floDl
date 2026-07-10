@@ -37,10 +37,18 @@ pub struct Variable {
 impl Variable {
     /// Create a leaf variable (parameter or input data).
     /// If `requires_grad` is true, libtorch will track operations for autodiff.
+    ///
+    /// # Panics
+    ///
+    /// Panics if gradient tracking cannot be enabled — e.g. on integer
+    /// dtypes (libtorch: only floating-point tensors can require
+    /// gradients). PyTorch raises the same error; silently returning a
+    /// non-tracking variable would train nothing for this parameter.
     pub fn new(data: Tensor, requires_grad: bool) -> Self {
         let data = if requires_grad {
             // Set requires_grad on the C++ tensor so libtorch tracks ops
-            data.set_requires_grad(true).unwrap_or(data)
+            data.set_requires_grad(true)
+                .unwrap_or_else(|e| panic!("Variable::new: cannot enable gradient tracking: {e}"))
         } else {
             data
         };
@@ -75,8 +83,15 @@ impl Variable {
 
     /// Replace the gradient tensor directly (e.g. for gradient clipping or unscaling).
     /// Equivalent to `param.grad = grad` in PyTorch.
+    ///
+    /// Panics if the FFI write fails (broken tensor handle): dropping the
+    /// write silently would let the optimizer step with the old gradient.
     pub fn set_grad(&self, grad: Tensor) {
-        let _ = self.inner.borrow().data.set_grad(&grad);
+        self.inner
+            .borrow()
+            .data
+            .set_grad(&grad)
+            .unwrap_or_else(|e| panic!("Variable::set_grad: gradient write failed: {e}"));
     }
 
     /// Whether this variable tracks gradients.
@@ -149,8 +164,15 @@ impl Variable {
 
     /// Zero out the accumulated gradient (fills `.grad()` with zeros).
     /// See also [`zero_grad_set_to_none`](Self::zero_grad_set_to_none) for the faster alternative.
+    ///
+    /// Panics if the FFI call fails (broken tensor handle): a silently
+    /// skipped zero would leak the previous step's gradient into the next.
     pub fn zero_grad(&self) {
-        let _ = self.inner.borrow().data.zero_grad();
+        self.inner
+            .borrow()
+            .data
+            .zero_grad()
+            .unwrap_or_else(|e| panic!("Variable::zero_grad failed: {e}"));
     }
 
     /// Null out the gradient instead of zeroing it. No CUDA kernel.
@@ -160,9 +182,17 @@ impl Variable {
 
     /// Detach from the computation graph. Returns a new leaf variable
     /// sharing the same data tensor (detached) with no gradient tracking.
+    ///
+    /// Panics if the FFI call fails (broken tensor handle): falling back
+    /// to the attached tensor would silently keep gradients flowing where
+    /// the caller asked to cut them.
     pub fn detach(&self) -> Variable {
-        let detached = self.inner.borrow().data.detach()
-            .unwrap_or_else(|_| self.inner.borrow().data.clone());
+        let detached = self
+            .inner
+            .borrow()
+            .data
+            .detach()
+            .unwrap_or_else(|e| panic!("Variable::detach failed: {e}"));
         Variable::wrap(detached)
     }
 
@@ -182,7 +212,10 @@ impl Variable {
     pub fn set_data(&self, data: Tensor) {
         let rg = self.requires_grad();
         let data = if rg {
-            data.set_requires_grad(true).unwrap_or(data)
+            // Silently dropping tracking here would freeze this parameter.
+            data.set_requires_grad(true).unwrap_or_else(|e| {
+                panic!("Variable::set_data: cannot keep gradient tracking on the replacement tensor: {e}")
+            })
         } else {
             data
         };

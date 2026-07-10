@@ -6,6 +6,16 @@
     }
 
     #[test]
+    #[should_panic(expected = "cannot enable gradient tracking")]
+    fn test_variable_new_int_requires_grad_panics() {
+        // Regression: this used to silently fall back to a NON-tracking
+        // variable (the model trained nothing for the param). PyTorch
+        // raises on requires_grad for integer dtypes; so do we now.
+        let t = Tensor::from_i64(&[1, 2, 3], &[3], crate::tensor::test_device()).unwrap();
+        let _ = Variable::new(t, true);
+    }
+
+    #[test]
     fn test_simple_gradient() {
         // y = 2*x, dy/dx = 2
         let x = Variable::new(from_f32(&[3.0], &[1]), true);
