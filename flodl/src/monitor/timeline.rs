@@ -553,15 +553,19 @@ impl Timeline {
         let mut prev_cpu: Option<CpuTimes> = None;
         let mut last_broadcast = Instant::now();
 
-        let n_gpus = {
-            #[cfg(feature = "cuda")]
-            {
-                crate::tensor::cuda_device_count().max(0) as usize
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                0usize
-            }
+        // GPU identity via nvidia-smi, live metrics via NVML, allocator
+        // stats gated on an existing CUDA context: the timeline poller
+        // must never initialize the CUDA runtime (it can run in the
+        // launcher, and a context would pin VRAM on every device).
+        // `(physical nvidia-smi index, total VRAM bytes)` per device;
+        // Vec position doubles as the CUDA runtime index.
+        let gpu_statics: Vec<(u8, u64)> = if cfg!(feature = "cuda") {
+            crate::sys::detect_gpus()
+                .into_iter()
+                .map(|g| (g.index, g.total_memory_mb * 1024 * 1024))
+                .collect()
+        } else {
+            Vec::new()
         };
 
         while !self.stop_flag.load(Ordering::SeqCst) {
@@ -587,23 +591,26 @@ impl Timeline {
             let (ram_used, ram_total) = read_meminfo().unwrap_or((0, 0));
 
             // Per-GPU
-            let mut gpus = Vec::with_capacity(n_gpus);
-            for i in 0..n_gpus {
-                #[cfg(feature = "cuda")]
-                let (compute_util, vram_used, vram_alloc, vram_total) = {
-                    let idx = i as i32;
-                    let util = crate::tensor::cuda_utilization_idx(idx)
-                        .map(|u| u as u8)
-                        .unwrap_or(0);
-                    let (used, total) = crate::tensor::cuda_memory_info_idx(idx).unwrap_or((0, 0));
-                    let alloc = crate::tensor::cuda_allocated_bytes_idx(idx).unwrap_or(0);
-                    (util, used, alloc, total)
+            let mut gpus = Vec::with_capacity(gpu_statics.len());
+            for (i, &(phys, total_static)) in gpu_statics.iter().enumerate() {
+                let compute_util = crate::tensor::cuda_utilization_idx(phys as i32)
+                    .map(|u| u as u8)
+                    .unwrap_or(0);
+                // Device-wide used/total via NVML (physical index);
+                // fall back to the nvidia-smi total when NVML is out.
+                let (vram_used, vram_total) =
+                    crate::tensor::cuda_nvml_memory_info_idx(phys as i32)
+                        .unwrap_or((0, total_static));
+                // Allocator reserved bytes: per-process, runtime index,
+                // and only readable where a CUDA context already exists.
+                let vram_alloc = if crate::tensor::cuda_has_primary_context(i as i32) {
+                    crate::tensor::cuda_allocated_bytes_idx(i as i32).unwrap_or(0)
+                } else {
+                    0
                 };
-                #[cfg(not(feature = "cuda"))]
-                let (compute_util, vram_used, vram_alloc, vram_total) = (0u8, 0u64, 0u64, 0u64);
 
                 gpus.push(GpuTimelineSample {
-                    device: i as u8,
+                    device: phys,
                     compute_util,
                     vram_used_bytes: vram_used,
                     vram_allocated_bytes: vram_alloc,

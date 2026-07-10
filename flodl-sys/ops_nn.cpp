@@ -10,6 +10,7 @@
 #ifdef FLODL_BUILD_CUDA
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/detail/CUDAHooksInterface.h>
 #endif
 
 // --- Convolution ---
@@ -746,6 +747,8 @@ namespace {
     typedef int nvml_ret_t;
     typedef void* nvml_device_t;
     struct NvmlUtil { unsigned int gpu; unsigned int memory; };
+    // Layout of nvmlMemory_t (v1 API): total/free/used in bytes.
+    struct NvmlMem { unsigned long long total; unsigned long long free_b; unsigned long long used; };
 
     struct NvmlState {
         bool tried = false;
@@ -753,6 +756,8 @@ namespace {
         nvml_ret_t (*init)(void) = nullptr;
         nvml_ret_t (*getHandle)(unsigned int, nvml_device_t*) = nullptr;
         nvml_ret_t (*getUtil)(nvml_device_t, NvmlUtil*) = nullptr;
+        // Optional: absent on exotic NVML builds; call sites null-check.
+        nvml_ret_t (*getMemInfo)(nvml_device_t, NvmlMem*) = nullptr;
     };
     static NvmlState nvml;
 
@@ -764,6 +769,7 @@ namespace {
         nvml.init      = (decltype(nvml.init))dlsym(lib, "nvmlInit_v2");
         nvml.getHandle = (decltype(nvml.getHandle))dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
         nvml.getUtil   = (decltype(nvml.getUtil))dlsym(lib, "nvmlDeviceGetUtilizationRates");
+        nvml.getMemInfo = (decltype(nvml.getMemInfo))dlsym(lib, "nvmlDeviceGetMemoryInfo");
         if (!nvml.init || !nvml.getHandle || !nvml.getUtil) return;
         nvml.ok = (nvml.init() == 0);
     }
@@ -788,6 +794,60 @@ extern "C" int flodl_cuda_utilization(int device_index) {
         flodl_fatal("flodl_cuda_utilization", e.what());
     } catch (...) {
         flodl_fatal("flodl_cuda_utilization", nullptr);
+    }
+}
+
+// Device-wide VRAM usage via NVML. `device_index` is the PHYSICAL
+// device index (nvidia-smi / NVML enumeration, independent of
+// CUDA_VISIBLE_DEVICES). Unlike cudaMemGetInfo this never creates a
+// CUDA context in the calling process, so it is safe from processes
+// that must not touch the CUDA runtime (launcher, pre-Trainer::run).
+// Returns 0 on success, -1 when NVML or the device is unavailable.
+extern "C" int flodl_cuda_nvml_mem_info(int device_index,
+                                        uint64_t* used_bytes,
+                                        uint64_t* total_bytes) {
+    try {
+#ifdef FLODL_BUILD_CUDA
+    nvml_try_load();
+    if (!nvml.ok || !nvml.getMemInfo) return -1;
+    nvml_device_t dev;
+    if (nvml.getHandle((unsigned int)device_index, &dev) != 0) return -1;
+    NvmlMem mem;
+    if (nvml.getMemInfo(dev, &mem) != 0) return -1;
+    *used_bytes = (uint64_t)mem.used;
+    *total_bytes = (uint64_t)mem.total;
+    return 0;
+#else
+    (void)device_index; (void)used_bytes; (void)total_bytes;
+    return -1;
+#endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_nvml_mem_info", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_nvml_mem_info", nullptr);
+    }
+}
+
+// Whether this process already holds a CUDA primary context on the
+// device (CUDA runtime index). Queries driver context state without
+// creating one — the same primitive PyTorch uses to decide whether
+// torch.cuda work has touched a device. Gate context-dependent reads
+// (caching-allocator stats) on this so monitoring never initializes
+// CUDA as a side effect. Returns 1 if a context exists, else 0.
+extern "C" int flodl_cuda_has_primary_context(int device_index) {
+    try {
+#ifdef FLODL_BUILD_CUDA
+    if (!torch::cuda::is_available()) return 0;
+    return at::detail::getCUDAHooks()
+        .hasPrimaryContext((c10::DeviceIndex)device_index) ? 1 : 0;
+#else
+    (void)device_index;
+    return 0;
+#endif
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_cuda_has_primary_context", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_cuda_has_primary_context", nullptr);
     }
 }
 

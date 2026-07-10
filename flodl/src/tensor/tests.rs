@@ -655,3 +655,39 @@
         // Device 0 should always be usable in a CUDA build
         assert!(usable.contains(&Device::CUDA(0)));
     }
+
+    #[test]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    fn test_cuda_primary_context_and_nvml_probes() {
+        if !test_device().is_cuda() { return; }
+        // Force a real CUDA touch on runtime device 0, then the
+        // context query must report it.
+        let _t = Tensor::zeros(&[4], TensorOptions {
+            dtype: DType::Float32,
+            device: Device::CUDA(0),
+        }).unwrap();
+        assert!(cuda_has_primary_context(0),
+            "primary context must exist after tensor work on the device");
+
+        // NVML memory info takes PHYSICAL indices; resolve them via
+        // sys::detect_gpus rather than assuming runtime == physical.
+        let gpus = crate::sys::detect_gpus();
+        assert!(!gpus.is_empty(), "detect_gpus should see the test GPU");
+        for g in &gpus {
+            let (used, total) = cuda_nvml_memory_info_idx(g.index as i32)
+                .expect("NVML memory info should be available on a CUDA rig");
+            assert!(total > 0, "device-wide VRAM total should be non-zero");
+            assert!(used <= total, "used VRAM cannot exceed total");
+        }
+    }
+
+    #[test]
+    fn test_cuda_has_primary_context_is_false_without_cuda_use() {
+        // In a process that has done no CUDA work the query must
+        // report false without erroring or initializing anything.
+        // Only assertable where no other test can have touched CUDA
+        // (CPU builds / CPU-only rigs); on CUDA rigs the parallel
+        // harness makes context presence nondeterministic.
+        if test_device().is_cuda() { return; }
+        assert!(!cuda_has_primary_context(0));
+    }

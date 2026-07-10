@@ -236,6 +236,12 @@ impl Monitor {
     /// `monitor.serve` / `monitor.log` exactly once, and the
     /// framework routes the visible side effects to the primary
     /// rank only.
+    ///
+    /// Never initializes the CUDA runtime: GPU identity comes from
+    /// nvidia-smi and live metrics from NVML, so constructing a
+    /// monitor before [`Trainer::run`](crate::distributed::Trainer::run)
+    /// is safe and does not violate the no-CUDA-before-`Trainer::run`
+    /// rule (this same code runs in the fan-out launcher process).
     pub fn new(total_epochs: usize) -> Self {
         let is_primary = Self::detect_is_primary();
         let hardware = crate::tensor::hardware_summary();

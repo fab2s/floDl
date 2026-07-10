@@ -577,6 +577,12 @@ unsafe extern "C" {
 
     pub fn flodl_cuda_utilization(device_index: i32) -> i32;
 
+    pub fn flodl_cuda_nvml_mem_info(
+        device_index: i32, used_bytes: *mut u64, total_bytes: *mut u64,
+    ) -> i32;
+
+    pub fn flodl_cuda_has_primary_context(device_index: i32) -> i32;
+
     pub fn flodl_cuda_device_name(
         device_index: i32, buf: *mut i8, buf_len: i32,
     ) -> *mut i8;
