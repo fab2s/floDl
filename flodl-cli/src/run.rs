@@ -588,19 +588,22 @@ pub(crate) fn compose_run_command(
 /// invocation. When `fdl @cluster-test-{nccl,cpu} <cmd>` activates an
 /// overlay with a `cluster:` block, the dispatcher sets
 /// `FLODL_TESTING_CLUSTER_JSON` in fdl-cli's own env (see
-/// `dispatch_config` in main.rs). This helper reads that variable and
-/// returns a ` -e NAME=VALUE` fragment so the inner cargo process can
-/// see it; without it, the env var dies at the docker boundary and
-/// `discover_test_cluster()` inside the container silently falls back
-/// to local autodetect.
+/// `dispatch_config` in main.rs). This helper checks that variable and
+/// returns a bare ` -e NAME` fragment (docker passes the value through
+/// from the environment the `sh -c` child inherits from this process)
+/// so the inner cargo process can see it; without it, the env var dies
+/// at the docker boundary and `discover_test_cluster()` inside the
+/// container silently falls back to local autodetect.
 ///
-/// The hex-encoded value contains only [0-9a-f] so no shell quoting is
-/// needed. Source of truth for the env-var name lives in
+/// The value never appears on the command line, so this stays correct
+/// even if the envelope encoding changes (today it is hex, which would
+/// be shell-safe inline; the bare form does not depend on that).
+/// Source of truth for the env-var name lives in
 /// `flodl::distributed::testing::ENV_TESTING_CLUSTER_JSON`; mirrored
 /// here as a literal because flodl-cli is zero-dep by policy.
 fn testing_cluster_env_arg() -> String {
     match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
-        Ok(v) => format!(" -e FLODL_TESTING_CLUSTER_JSON={v}"),
+        Ok(_) => " -e FLODL_TESTING_CLUSTER_JSON".to_string(),
         Err(_) => String::new(),
     }
 }
@@ -762,8 +765,14 @@ pub fn exec_command(
         // root resolves against the wrong cwd inside the container.
         let overlay = crate::cluster::cluster_compose_overlay_arg(project_root);
         let testing_env_arg = testing_cluster_env_arg();
+        // Quote the whole composed command for the outer `sh -c`,
+        // exactly like `exec_script`. A double-quoted wrapper would
+        // let the outer shell expand `$`/backticks inside it (host-side,
+        // defeating shell_join's quoting) and break on any `"` in an
+        // argument.
         let docker_cmd = format!(
-            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root}{testing_env_arg} {service} bash -c \"{inner}\"",
+            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root}{testing_env_arg} {service} bash -c {}",
+            posix_quote(&inner),
         );
         spawn_docker_shell(&docker_cmd, project_root)
     } else {
@@ -1554,6 +1563,26 @@ mod tests {
     fn posix_quote_escapes_embedded_single_quotes() {
         assert_eq!(posix_quote("it's"), "'it'\\''s'");
         assert_eq!(posix_quote("'"), "''\\'''");
+    }
+
+    #[test]
+    fn posix_quote_round_trips_shell_join_output() {
+        // The docker exec paths nest quoting: shell_join single-quotes
+        // each arg, then the whole `cd … && entry args` command is
+        // posix_quote'd again for the outer `sh -c`. The embedded
+        // single quotes must re-escape as '\'' so the inner bash sees
+        // the args byte-for-byte. A double-quoted wrapper ("{inner}")
+        // instead lets the OUTER shell expand $/backticks and breaks
+        // on any `"` in an arg.
+        let args: Vec<String> = ["--tag", "$HOME", "a\"b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let inner = format!("cd /workspace/bench && train {}", shell_join(&args));
+        assert_eq!(
+            posix_quote(&inner),
+            "'cd /workspace/bench && train --tag '\\''$HOME'\\'' '\\''a\"b'\\'''"
+        );
     }
 
     #[test]
