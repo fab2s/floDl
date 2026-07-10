@@ -773,7 +773,6 @@ cluster:
     path: /opt/flodl
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
       path: /opt/flodl
@@ -804,7 +803,6 @@ cluster:
     path: /opt/flodl
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
       path: /opt/flodl
@@ -844,7 +842,6 @@ cluster:
     path: /opt/flodl
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
       path: /opt/flodl
@@ -885,7 +882,6 @@ cluster:
     path: /opt/flodl
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: lo
       path: /opt/flodl

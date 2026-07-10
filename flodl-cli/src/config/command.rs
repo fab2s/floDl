@@ -67,7 +67,18 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     let merged = crate::overlay::merge_layers(
         layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
     );
-    let mut cfg: CommandConfig = serde_yaml::from_value(merged)
+    // Re-serialize so `from_str`'s parser tracks line/col through
+    // deserialize (`from_value` discards positional info). With
+    // `deny_unknown_fields` on the config structs, unknown-key errors
+    // carry a location this way. Positions refer to the merged
+    // document, not any single source file, when overlays are in play.
+    let merged_str = serde_yaml::to_string(&merged).map_err(|e| {
+        format!(
+            "{}: failed to re-serialize merged YAML for diagnostics: {e}",
+            base_path.display()
+        )
+    })?;
+    let mut cfg: CommandConfig = serde_yaml::from_str(&merged_str)
         .map_err(|e| format!("{}: {}", base_path.display(), e))?;
 
     if let Some(schema) = &cfg.schema {

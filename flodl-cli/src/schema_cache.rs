@@ -283,6 +283,25 @@ mod tests {
     }
 
     #[test]
+    fn read_cache_unknown_field_falls_back_to_none() {
+        // Version-skew guard: a schema emitted by a NEWER
+        // flodl-cli-macros than this fdl knows (extra field) must not
+        // parse partially (deny_unknown_fields) — and the probe layer
+        // degrades to "no cache" so help still renders from the inline
+        // yml schema or none.
+        let tmp = TestDir::new("sc");
+        let path = tmp.path().join("newer.json");
+        let body = r#"{
+            "options": {
+                "model": { "type": "string" }
+            },
+            "field_from_the_future": true
+        }"#;
+        fs::write(&path, body).unwrap();
+        assert!(read_cache(&path).is_none());
+    }
+
+    #[test]
     fn read_cache_rejects_validation_failure() {
         // A schema that clears validation at struct level but fails
         // semantic validation: shadowed fdl-level flag `--help`.

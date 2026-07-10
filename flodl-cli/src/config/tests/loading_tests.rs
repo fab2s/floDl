@@ -121,3 +121,97 @@ fn load_project_with_env_empty_config_is_default() {
     assert!(cfg.cluster.is_none());
     assert!(cfg.description.is_none());
 }
+
+#[test]
+fn load_project_rejects_unknown_root_key() {
+    // deny_unknown_fields: a mistyped root key errors at load, naming
+    // the field, instead of silently configuring nothing.
+    let tmp = TempDir::new();
+    let base = tmp.0.join("fdl.yml");
+    std::fs::write(&base, "descripton: typo\n").unwrap();
+    let err = load_project_with_env(&base, None).unwrap_err();
+    assert!(err.contains("unknown field `descripton`"), "got: {err}");
+    assert!(err.contains("description"), "should list valid fields: {err}");
+}
+
+#[test]
+fn load_project_rejects_unknown_key_from_env_overlay() {
+    // Overlays deep-merge as raw Values before the single typed parse,
+    // so strictness covers fdl.<env>.yml keys too.
+    let tmp = TempDir::new();
+    let base = tmp.0.join("fdl.yml");
+    let overlay = tmp.0.join("fdl.staging.yml");
+    std::fs::write(&base, "description: ok\n").unwrap();
+    std::fs::write(&overlay, "comands: {}\n").unwrap();
+    let err = load_project_with_env(&base, Some("staging")).unwrap_err();
+    assert!(err.contains("unknown field `comands`"), "got: {err}");
+}
+
+#[test]
+fn load_project_rejects_user_supplied_ranks() {
+    // `ranks:` looks load-bearing in a worker block but rank
+    // assignment is probe-computed; a user key must error loudly, with
+    // a message saying what to do (serde cannot catch this one: the
+    // field stays deserializable for the wire round-trip).
+    let tmp = TempDir::new();
+    let base = tmp.0.join("fdl.yml");
+    std::fs::write(
+        &base,
+        "cluster:\n\
+         \x20 controller:\n\
+         \x20   host: 127.0.0.1\n\
+         \x20   path: /tmp/x\n\
+         \x20 workers:\n\
+         \x20   - host: solo\n\
+         \x20     ranks: [0, 1]\n\
+         \x20     local_devices: all\n\
+         \x20     nccl_socket_ifname: lo\n\
+         \x20     path: /tmp/x\n",
+    )
+    .unwrap();
+    let err = load_project_with_env(&base, None).unwrap_err();
+    assert!(err.contains("`ranks:`"), "got: {err}");
+    assert!(err.contains("probed device counts"), "got: {err}");
+}
+
+#[test]
+fn broken_command_entry_is_scoped_not_load_fatal() {
+    // A typo INSIDE one command's block must not block the load (help
+    // and sibling commands keep working); it surfaces through kind()
+    // when that command is invoked.
+    let tmp = TempDir::new();
+    let base = tmp.0.join("fdl.yml");
+    std::fs::write(
+        &base,
+        "commands:\n\
+         \x20 good:\n\
+         \x20   run: echo ok\n\
+         \x20 broken:\n\
+         \x20   runn: echo typo\n",
+    )
+    .unwrap();
+    let cfg = load_project_with_env(&base, None)
+        .expect("one broken command must not fail the whole config");
+    assert!(cfg.commands["good"].kind().is_ok());
+    let err = cfg.commands["broken"].kind().unwrap_err();
+    assert!(err.contains("unknown field `runn`"), "got: {err}");
+}
+
+#[test]
+fn load_project_rejects_training_key_typo() {
+    // The audit's flagship case: `epoch:` instead of `epochs:` used to
+    // train with default epochs, silently.
+    let tmp = TempDir::new();
+    let cmd_dir = tmp.0.join("bench");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(
+        cmd_dir.join("fdl.yml"),
+        "entry: my-bench\ntraining:\n  epoch: 50\n",
+    )
+    .unwrap();
+    let err = load_command_with_env(&cmd_dir, None)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("unknown field `epoch`"), "got: {err}");
+    assert!(err.contains("epochs"), "should list valid fields: {err}");
+}

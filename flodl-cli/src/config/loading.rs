@@ -150,7 +150,7 @@ pub fn load_project_with_env(
             base_path.display()
         )
     })?;
-    serde_yaml::from_str::<ProjectConfig>(&merged_str).map_err(|e| {
+    let cfg = serde_yaml::from_str::<ProjectConfig>(&merged_str).map_err(|e| {
         let names: Vec<String> = layers
             .iter()
             .map(|(p, _)| {
@@ -179,7 +179,33 @@ pub fn load_project_with_env(
             context,
             env_hint
         )
-    })
+    })?;
+    reject_user_ranks(&cfg, base_path)?;
+    Ok(cfg)
+}
+
+/// Reject `ranks:` in user-authored worker blocks. The key looks
+/// load-bearing but never was: rank assignment is computed from probed
+/// device counts (`ClusterConfig::populate_ranks`). The field must stay
+/// deserializable for the canonical-JSON wire round-trip, so serde's
+/// `deny_unknown_fields` cannot catch it; this check runs on the
+/// user-YAML entry path only.
+fn reject_user_ranks(cfg: &ProjectConfig, base_path: &Path) -> Result<(), String> {
+    let Some(cluster) = &cfg.cluster else {
+        return Ok(());
+    };
+    for (i, w) in cluster.workers.iter().enumerate() {
+        if !w.ranks.is_empty() {
+            return Err(format!(
+                "{}: cluster.workers[{i}] ({:?}) declares `ranks:`, which is \
+                 not user configuration; ranks are computed from probed device \
+                 counts at launch. Remove the key.",
+                base_path.display(),
+                w.host,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Extract 3 lines of context around `line_no` (1-based) from the merged

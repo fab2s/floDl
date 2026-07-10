@@ -9,7 +9,13 @@ use serde::{Deserialize, Serialize};
 use super::cluster::{ClusterConfig, DdpConfig, OutputConfig, TrainingConfig};
 
 /// Root fdl.yaml at project root.
+///
+/// `deny_unknown_fields`: a mistyped key (e.g. `comands:`) errors at
+/// load, naming the field and listing the valid ones, instead of
+/// silently configuring nothing. Same rigor as the CLI's unknown-flag
+/// rejection; applies to every user-facing config struct below.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub description: Option<String>,
@@ -37,6 +43,7 @@ pub struct ProjectConfig {
 /// and optional structured config sections (ddp/training/output) that
 /// inline preset commands can override.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandConfig {
     #[serde(default)]
     pub description: Option<String>,
@@ -125,6 +132,14 @@ pub struct CommandSpec {
     /// (today's behavior). Has no effect when no `cluster:` block is
     /// declared at the project root.
     pub cluster: Option<bool>,
+    /// Per-entry parse failure, captured instead of failing the whole
+    /// `commands:` map. Unknown keys (`deny_unknown_fields`) and type
+    /// errors inside ONE command's block must not block `--help` or
+    /// sibling commands — validation stays scoped to the single thing
+    /// invoked. Surfaced through [`Self::kind`], which every dispatch
+    /// path consults, so the error fires exactly when this command is
+    /// used.
+    pub load_error: Option<String>,
 }
 
 /// What kind of command is this, resolved from a [`CommandSpec`].
@@ -147,6 +162,9 @@ impl CommandSpec {
     /// service wraps the inline run-script, so pairing it with a `path:`
     /// pointer or a preset entry is always silent-noop territory.
     pub fn kind(&self) -> Result<CommandKind, String> {
+        if let Some(e) = &self.load_error {
+            return Err(e.clone());
+        }
         if self.docker.is_some() && self.run.is_none() {
             return Err(
                 "command declares `docker:` without `run:`; \
@@ -207,6 +225,7 @@ impl<'de> Deserialize<'de> for CommandSpec {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Inner {
             #[serde(default)]
             description: Option<String>,
@@ -234,8 +253,19 @@ impl<'de> Deserialize<'de> for CommandSpec {
         if matches!(raw, serde_yaml::Value::Null) {
             return Ok(Self::default());
         }
-        let inner: Inner =
-            serde_yaml::from_value(raw).map_err(serde::de::Error::custom)?;
+        // A bad entry (unknown key via deny_unknown_fields, wrong type)
+        // is captured as `load_error` instead of failing the enclosing
+        // `commands:` map: help and sibling commands keep working, and
+        // `kind()` raises the error when THIS command is invoked.
+        let inner: Inner = match serde_yaml::from_value(raw) {
+            Ok(inner) => inner,
+            Err(e) => {
+                return Ok(Self {
+                    load_error: Some(e.to_string()),
+                    ..Self::default()
+                });
+            }
+        };
         Ok(Self {
             description: inner.description,
             run: inner.run,
@@ -247,6 +277,7 @@ impl<'de> Deserialize<'de> for CommandSpec {
             output: inner.output,
             options: inner.options,
             cluster: inner.cluster,
+            load_error: None,
         })
     }
 }
@@ -255,7 +286,13 @@ impl<'de> Deserialize<'de> for CommandSpec {
 
 /// The schema declared inline in a sub-command's fdl.yaml. Maps 1:1 to
 /// what `<entry> --fdl-schema` will later emit as JSON.
+/// `deny_unknown_fields` also applies to the `--fdl-schema` probe JSON:
+/// a schema emitted by a NEWER flodl-cli-macros than this fdl knows
+/// fails to parse rather than silently dropping the unknown field, and
+/// the probe layer falls back to the inline yml schema (or none) —
+/// help always renders (see `schema_cache`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<ArgSpec>,
@@ -309,6 +346,7 @@ pub struct Schema {
 
 /// A flag option, `--name` / `-x`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OptionSpec {
     #[serde(rename = "type")]
     pub ty: String,
@@ -332,6 +370,7 @@ pub struct OptionSpec {
 
 /// A positional argument.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArgSpec {
     pub name: String,
     #[serde(rename = "type")]

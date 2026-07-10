@@ -202,7 +202,6 @@ cluster:
     path: /tmp/test-solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [0]
       nccl_socket_ifname: \"\"
       path: /tmp/test-solo
@@ -251,7 +250,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0, 1]
       local_devices: all
       nccl_socket_ifname: lo
       path: /tmp/solo
@@ -273,7 +271,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: [3]
       nccl_socket_ifname: lo
       path: /tmp/solo
@@ -299,7 +296,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0, 1, 2, 3, 4]
       local_devices: all
       nccl_socket_ifname: lo
       path: /tmp/solo
@@ -322,7 +318,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: all
       nccl_socket_ifname: lo
       path: /tmp/solo
@@ -343,7 +338,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: all
       nccl_socket_ifname: lo
       path: /tmp/solo
@@ -365,7 +359,6 @@ cluster:
     path: /tmp/solo
   workers:
     - host: solo
-      ranks: [0]
       local_devices: every
       nccl_socket_ifname: lo
       path: /tmp/solo

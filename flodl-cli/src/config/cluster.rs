@@ -8,6 +8,7 @@ use serde_json::Value;
 
 /// DDP configuration. Maps 1:1 to flodl DdpConfig / DdpRunConfig.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DdpConfig {
     pub mode: Option<String>,
     pub policy: Option<String>,
@@ -31,6 +32,7 @@ pub struct DdpConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeedHint {
     pub slow_rank: usize,
     pub ratio: f64,
@@ -38,6 +40,7 @@ pub struct SpeedHint {
 
 /// Training scalars.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrainingConfig {
     pub epochs: Option<u32>,
     pub batch_size: Option<u32>,
@@ -48,6 +51,7 @@ pub struct TrainingConfig {
 
 /// Output settings.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub dir: Option<String>,
     pub timeline: Option<bool>,
@@ -82,6 +86,7 @@ fn default_controller_port() -> u16 {
 /// The library re-validates after reading; this validation runs earlier
 /// so errors surface before `fdl-cli` opens any SSH connection.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub controller: ClusterController,
     pub workers: Vec<ClusterWorker>,
@@ -101,10 +106,12 @@ pub struct ClusterConfig {
 /// pre-flight build context. The controller is the orchestrator host
 /// fdl-cli runs on; it is NOT a NCCL rank itself.
 ///
-/// Rejected fields (validator-enforced): `ranks`, `local_devices`,
-/// `ssh*` (controller is local to fdl-cli), per-controller `env` (use
-/// cluster-scope `env:` instead).
+/// Rejected fields (via `deny_unknown_fields`): `ranks`,
+/// `local_devices`, `ssh*` (controller is local to fdl-cli),
+/// per-controller `env` (use cluster-scope `env:` instead) — and any
+/// mistyped key.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterController {
     /// Bind address. Used as the rendezvous endpoint workers dial.
     /// What was `cluster.controller.host` in the pre-Refactor-2 schema.
@@ -153,6 +160,7 @@ pub struct ClusterController {
 /// defaults (quorum = early-close target = configured capacity, window
 /// 300s, hard cap 600s, pre-shared-salt admission).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterJoin {
     /// Quorum in ranks — the run cannot start below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,6 +278,7 @@ impl<'de> Deserialize<'de> for LocalDevices {
 /// fields optional; absent fields fall back to system ssh defaults or
 /// `~/.ssh/config` rules.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SshConfig {
     /// SSH target hostname / IP / alias. Defaults to the worker's
     /// `host` field when unset.
@@ -295,6 +304,7 @@ pub struct SshConfig {
 
 /// One worker (a physical host running one or more NCCL ranks).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterWorker {
     /// Hostname / identifier (was `name:` in the pre-Refactor-2 schema).
     /// Used for /etc/hosts resolution, `--add-host` injection, and as
@@ -312,10 +322,12 @@ pub struct ClusterWorker {
     /// `[counts[0]..counts[0]+counts[1])`, etc.
     ///
     /// Serialized into the wire format so the rank-side library reads
-    /// the post-probe assignment via `FullCluster::from_value`. Marked
-    /// `skip_deserializing` so any stale `ranks:` left over in older
-    /// YAML files is silently ignored (probe is authoritative).
-    #[serde(default, skip_deserializing)]
+    /// the post-probe assignment via `FullCluster::from_value`, and
+    /// deserializable so the canonical JSON round-trips. A `ranks:` key
+    /// in USER yaml is rejected loudly at load
+    /// (`loading::reject_user_ranks`): a user writing it expects it to
+    /// pin ranks, and it never did (probe is authoritative).
+    #[serde(default)]
     pub ranks: Vec<usize>,
     /// CUDA device indices paired by position with `ranks`, or `"all"`
     /// shorthand for auto-detect at startup. See [`LocalDevices`] for
