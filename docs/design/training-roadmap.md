@@ -251,6 +251,20 @@ the network with no shared filesystem.
   rank's error (elastic supervision already handles a dying rank), and
   checksums make corruption loud.
 
+**Two-stage prefetch (storage → RAM → VRAM):** today the prefetch
+worker serializes the dataset read and the H2D transfer in one thread,
+so per-batch cost is `t_read + t_transfer`. Splitting it into a reader
+stage (dataset → pinned-RAM ring, its own bound) and a transfer stage
+(pinned RAM → VRAM) overlaps the two: cost becomes
+`max(t_read, t_transfer)`, and the RAM ring absorbs read jitter. This
+pays exactly where this feature lives — network-backed reads with
+high, jittery `t_read` — and already helps on today's shared-storage
+mounts (NAS / virtiofs / S3-FUSE). It composes cleanly with the depth
+governor that sizes VRAM-side prefetch: the governor bounds the
+transfer stage (VRAM in-flight), the ring bounds the reader stage
+(RAM in-flight); the two limits are orthogonal by construction. Can
+land before the manifest/source work as a standalone improvement.
+
 **ElChe interaction:** this is the feature ElChe was shaped for. Fetch
 latency lands in per-rank delivered cost (compute + data + transport
 is already the scheduling signal), so a rank on a slow link gets a

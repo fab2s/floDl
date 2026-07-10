@@ -371,7 +371,7 @@ impl Graph {
     /// ```
     pub fn set_data_loader(
         &self,
-        loader: crate::data::DataLoader,
+        mut loader: crate::data::DataLoader,
         forward_input: &str,
     ) -> Result<()> {
         let loader_names: Vec<String> = loader.names().to_vec();
@@ -423,6 +423,21 @@ impl Graph {
         }
 
         let _ = loader_names; // keep the name list for the future iterator wiring
+
+        // Cover the params-proportional share of the first training
+        // step's allocations in the loader's streaming VRAM sizing:
+        // gradients (~1x parameter bytes) plus lazily created optimizer
+        // state (~2x for Adam-family m/v) do not exist when the loader
+        // first probes VRAM, but their size is known exactly from the
+        // model. Activations remain unknowable from parameter count and
+        // stay covered by the loader's first-fill discount. Never
+        // overrides a user-declared reserve; no-op for resident/CPU
+        // loaders.
+        let param_bytes: usize = crate::nn::Module::parameters(self)
+            .iter()
+            .map(|p| p.variable.data().nbytes())
+            .sum();
+        loader.set_activation_reserve_auto(param_bytes.saturating_mul(3));
 
         // Refuse to replace the loader while an epoch iterator holds it:
         // the iterator owns the cell's exclusive borrow, and replacing the

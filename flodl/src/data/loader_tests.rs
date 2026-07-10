@@ -1269,3 +1269,195 @@
         let iter = loader.epoch(0);
         assert_eq!(iter.len(), 5); // 4 full + 1 partial
     }
+
+    // ── Depth governor / adaptive sizing ─────────────────────────────
+
+    #[test]
+    fn test_governor_streaming_delivers_all_batches_across_epochs() {
+        // The in-flight gate must never wedge the pipeline: two full
+        // epochs through the governed streaming path deliver every
+        // batch, and the per-epoch counters stay coherent.
+        let data = make_data(24);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .build()
+            .unwrap();
+
+        for epoch in 0..2 {
+            let batches: Vec<Batch> = loader.epoch(epoch).map(|b| b.unwrap()).collect();
+            assert_eq!(batches.len(), 6);
+        }
+        match &loader.inner {
+            LoaderInner::Streaming(l) => {
+                use std::sync::atomic::Ordering;
+                assert_eq!(l.governor.consumed.load(Ordering::Relaxed), 6);
+                assert_eq!(l.governor.run_consumed.load(Ordering::Relaxed), 12);
+                assert!(l.governor.honest_resize_done.load(Ordering::Relaxed));
+            }
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }
+
+    #[test]
+    fn test_governor_honest_resize_fires_on_second_consumed_batch() {
+        // The honest resize is keyed to CONSUMPTION (first training
+        // step demonstrably done), not to epoch boundaries: it must
+        // fire inside the very first epoch.
+        let data = make_data(20);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .build()
+            .unwrap();
+
+        use std::sync::atomic::Ordering;
+        let g = std::sync::Arc::clone(loader_governor(&loader));
+        let mut iter = loader.epoch(0);
+        let _b1 = iter.next().unwrap().unwrap();
+        assert!(!g.honest_resize_done.load(Ordering::Relaxed));
+        let _b2 = iter.next().unwrap().unwrap();
+        assert!(g.honest_resize_done.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_governor_iterator_drop_mid_epoch_recovers() {
+        // Dropping an epoch iterator mid-epoch sets `abandoned`, which
+        // unblocks the worker's gate; the next epoch must run in full.
+        let data = make_data(40);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .prefetch(2)
+            .build()
+            .unwrap();
+
+        {
+            let mut iter = loader.epoch(0);
+            let _one = iter.next().unwrap().unwrap();
+            // drop mid-epoch
+        }
+        let batches: Vec<Batch> = loader.epoch(1).map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 10);
+    }
+
+    #[test]
+    fn test_user_pinned_depth_skips_honest_resize() {
+        // .prefetch(n) pins the governor: no adaptive resize may fire.
+        let data = make_data(20);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .prefetch(3)
+            .build()
+            .unwrap();
+
+        let batches: Vec<Batch> = loader.epoch(0).map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 5);
+        let g = loader_governor(&loader);
+        use std::sync::atomic::Ordering;
+        assert!(!g.honest_resize_done.load(Ordering::Relaxed));
+        assert_eq!(g.target.load(Ordering::Relaxed), 3);
+    }
+
+    fn loader_governor(loader: &DataLoader) -> &std::sync::Arc<crate::data::prefetch::GovernorCtl> {
+        match &loader.inner {
+            LoaderInner::Streaming(l) => &l.governor,
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }
+
+    #[test]
+    fn test_initial_fill_target_gradation() {
+        // Graduated first-fill discount by information available.
+        assert_eq!(initial_fill_target(30, ReserveSource::Bare), 10);
+        assert_eq!(initial_fill_target(30, ReserveSource::Auto), 15);
+        assert_eq!(initial_fill_target(30, ReserveSource::User), 30);
+        // Never zero, even when the budget rounds down to nothing.
+        assert_eq!(initial_fill_target(0, ReserveSource::Bare), 1);
+        assert_eq!(initial_fill_target(2, ReserveSource::Bare), 1);
+    }
+
+    #[test]
+    fn test_activation_reserve_user_beats_auto() {
+        let data = make_data(20);
+        let mut loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .activation_reserve(1 << 20)
+            .build()
+            .unwrap();
+
+        // Framework auto-wiring must not override the user's value.
+        loader.set_activation_reserve_auto(1 << 30);
+        match &loader.inner {
+            LoaderInner::Streaming(l) => {
+                assert_eq!(l.activation_reserve, 1 << 20);
+                assert_eq!(l.reserve_source, ReserveSource::User);
+            }
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+
+        // And auto fills the gap when nothing was declared.
+        let data = make_data(20);
+        let mut bare = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .build()
+            .unwrap();
+        bare.set_activation_reserve_auto(1 << 30);
+        match &bare.inner {
+            LoaderInner::Streaming(l) => {
+                assert_eq!(l.activation_reserve, 1 << 30);
+                assert_eq!(l.reserve_source, ReserveSource::Auto);
+            }
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }
+
+    #[test]
+    fn test_retry_on_oom_policy() {
+        use crate::data::prefetch::{retry_on_oom, OOM_RETRY_ATTEMPTS};
+
+        // Transient OOM: fails twice, then succeeds. Retried through.
+        let mut calls = 0;
+        let mut backoffs = 0;
+        let out: Result<usize> = retry_on_oom(
+            || {
+                calls += 1;
+                if calls <= 2 {
+                    Err(TensorError::new("CUDA out of memory"))
+                } else {
+                    Ok(7)
+                }
+            },
+            || backoffs += 1,
+        );
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls, 3);
+        assert_eq!(backoffs, 2);
+
+        // Non-OOM error: no retry, surfaces immediately.
+        let mut calls = 0;
+        let out: Result<usize> = retry_on_oom(
+            || {
+                calls += 1;
+                Err(TensorError::new("dataset index out of range"))
+            },
+            || panic!("must not back off on non-OOM errors"),
+        );
+        assert!(out.is_err());
+        assert_eq!(calls, 1);
+
+        // Persistent OOM: bounded retries, then the error surfaces.
+        let mut calls = 0;
+        let out: Result<usize> = retry_on_oom(
+            || {
+                calls += 1;
+                Err(TensorError::new("CUDA out of memory"))
+            },
+            || {},
+        );
+        assert!(out.unwrap_err().is_cuda_oom());
+        assert_eq!(calls, OOM_RETRY_ATTEMPTS + 1);
+    }

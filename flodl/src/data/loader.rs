@@ -87,6 +87,36 @@ pub(crate) fn prefetch_depth_from_vram(
     budget / batch_bytes
 }
 
+/// Where the streaming loader's activation reserve came from. Decides
+/// how much of the computed budget the FIRST fill may take: before the
+/// first training step, the VRAM probe cannot see activations,
+/// gradients, or lazily created optimizer state, so the fill is
+/// discounted by how much of that gap the reserve already covers.
+/// After the first step the probe is honest (the allocator retains
+/// those blocks) and the full budget applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReserveSource {
+    /// No information: reserve is 0, first fill takes 1/3 of budget.
+    Bare,
+    /// Framework-derived (3x parameter bytes via `Graph::set_data_loader`):
+    /// gradients (~1x) and lazy optimizer state (~2x, Adam-family) are
+    /// covered; activations are not. First fill takes 1/2.
+    Auto,
+    /// User-declared via `activation_reserve()`: full trust, no haircut.
+    User,
+}
+
+/// First-fill target from the computed full-budget depth: the graduated
+/// haircut for the sizing done before any training step has run.
+pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> usize {
+    let divisor = match source {
+        ReserveSource::Bare => 3,
+        ReserveSource::Auto => 2,
+        ReserveSource::User => 1,
+    };
+    (full_depth / divisor).max(1)
+}
+
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder
 // ---------------------------------------------------------------------------
@@ -104,6 +134,7 @@ pub struct DataLoaderBuilder {
     force_streaming: bool,
     names: Option<Vec<String>>,
     vram_max_usage: f64,
+    activation_reserve: Option<usize>,
 }
 
 impl DataLoaderBuilder {
@@ -119,6 +150,7 @@ impl DataLoaderBuilder {
             force_streaming: false,
             names: None,
             vram_max_usage: 0.90,
+            activation_reserve: None,
         }
     }
 
@@ -194,6 +226,26 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Bytes to reserve for forward/backward memory in streaming-mode
+    /// VRAM sizing (activations, gradients, lazily created optimizer
+    /// state).
+    ///
+    /// The adaptive prefetch sizes its buffer from a VRAM probe, and
+    /// before the first training step that probe cannot see step
+    /// memory: it does not exist yet. Setting an explicit reserve
+    /// deducts it from the prefetch budget and disables the
+    /// conservative first-fill discount entirely (full trust). When
+    /// unset, the loader falls back to a graduated first fill: 1/2 of
+    /// the budget when the framework derived a reserve from model size
+    /// ([`crate::graph::Graph::set_data_loader`] wires 3x parameter
+    /// bytes to cover gradients + optimizer state), 1/3 with no
+    /// information at all. From the second consumed batch on, the
+    /// probe is honest and the full budget applies either way.
+    pub fn activation_reserve(mut self, bytes: usize) -> Self {
+        self.activation_reserve = Some(bytes);
+        self
+    }
+
     /// Force streaming mode even when the dataset fits in memory.
     ///
     /// Useful for preserving VRAM headroom, testing the prefetch pipeline,
@@ -264,6 +316,7 @@ impl DataLoaderBuilder {
             force_streaming,
             names,
             vram_max_usage,
+            activation_reserve,
         } = self;
 
         let n = dataset.len();
@@ -320,12 +373,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, activation_reserve, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, activation_reserve, names)
         }
     }
 }
@@ -383,9 +436,14 @@ fn build_streaming(
     per_sample_bytes: usize,
     vram_max_usage: f64,
     user_set_depth: bool,
+    activation_reserve: Option<usize>,
     names: Vec<String>,
 ) -> Result<DataLoader> {
     let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
+    let (reserve, reserve_source) = match activation_reserve {
+        Some(bytes) => (bytes, ReserveSource::User),
+        None => (0, ReserveSource::Bare),
+    };
 
     Ok(DataLoader {
         inner: LoaderInner::Streaming(StreamingLoader {
@@ -399,6 +457,9 @@ fn build_streaming(
             per_sample_bytes,
             vram_max_usage,
             user_set_depth,
+            activation_reserve: reserve,
+            reserve_source,
+            governor: Arc::new(super::prefetch::GovernorCtl::new(prefetch_depth)),
         }),
     })
 }
@@ -552,18 +613,53 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => {}
             LoaderInner::Streaming(l) => {
-                l.worker.set_prefetch_depth(depth);
+                l.worker.set_prefetch_depth(depth.max(1));
+                // Apply immediately: the governor target is the live
+                // in-flight bound (the channel capacity, set above, only
+                // takes effect at the next epoch and acts as a ceiling).
+                l.governor
+                    .target
+                    .store(depth.max(1), std::sync::atomic::Ordering::Relaxed);
                 l.user_set_depth = true;
             }
         }
     }
 
-    /// Measure free VRAM and resize prefetch buffers to fill available space.
+    /// Bytes reserved for forward/backward memory in streaming-mode
+    /// VRAM sizing. Same contract as
+    /// [`DataLoaderBuilder::activation_reserve`]: an explicit value is
+    /// fully trusted (no first-fill discount). No-op for resident
+    /// loaders.
+    pub fn set_activation_reserve(&mut self, bytes: usize) {
+        if let LoaderInner::Streaming(l) = &mut self.inner {
+            l.activation_reserve = bytes;
+            l.reserve_source = ReserveSource::User;
+        }
+    }
+
+    /// Framework-derived reserve (`Graph::set_data_loader` wires 3x
+    /// parameter bytes: gradients ~1x + lazy optimizer state ~2x).
+    /// Never overrides a user-declared reserve; keeps the halved
+    /// first-fill discount since activations remain unaccounted for.
+    pub(crate) fn set_activation_reserve_auto(&mut self, bytes: usize) {
+        if let LoaderInner::Streaming(l) = &mut self.inner {
+            if l.reserve_source == ReserveSource::Bare {
+                l.activation_reserve = bytes;
+                l.reserve_source = ReserveSource::Auto;
+            }
+        }
+    }
+
+    /// Measure free VRAM and resize the prefetch in-flight target to
+    /// fill available space.
     ///
-    /// **This happens automatically** at every epoch boundary (epoch 1+).
-    /// The loader re-probes free VRAM each epoch and fills 90% of it.
-    /// You only need to call this manually if you want to resize at a
-    /// different point (e.g., mid-epoch during an AllReduce window).
+    /// **This happens automatically**: at every `epoch()` call, and
+    /// once mid-run after the first training step (when the probe
+    /// first sees activations/gradients/optimizer state). You only
+    /// need this manually to resize at a different point (e.g.,
+    /// mid-epoch during an AllReduce window) -- the target applies
+    /// immediately, capped for the current epoch by the channel
+    /// capacity chosen at its start.
     ///
     /// Calling this (or [`set_prefetch_depth`](DataLoader::set_prefetch_depth))
     /// disables automatic adaptation -- the loader assumes you're managing
@@ -578,8 +674,20 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => 0,
             LoaderInner::Streaming(l) => {
-                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, 0);
+                use std::sync::atomic::Ordering;
+                // Deduct the reserve only while the probe is still
+                // blind to step memory; afterwards it would double-count.
+                let reserve = if l.governor.honest_resize_done.load(Ordering::Relaxed) {
+                    0
+                } else {
+                    l.activation_reserve
+                };
+                let depth = prefetch_depth_from_vram(
+                    l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, reserve,
+                );
+                let depth = depth.max(1);
                 l.worker.set_prefetch_depth(depth);
+                l.governor.target.store(depth, Ordering::Relaxed);
                 l.user_set_depth = true;
                 depth
             }
@@ -662,18 +770,57 @@ pub(crate) struct StreamingLoader {
     /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
     /// Skips automatic adaptation so we don't override the user's choice.
     user_set_depth: bool,
+    /// Bytes deducted from the prefetch budget before the first
+    /// training step has run (see [`ReserveSource`]).
+    activation_reserve: usize,
+    /// Where the reserve came from; picks the first-fill discount.
+    reserve_source: ReserveSource,
+    /// Depth governor shared with the worker and the live epoch
+    /// iterator. The worker keeps at most `target` batches in flight;
+    /// the target is adjustable at any moment (epoch sizing, one-shot
+    /// honest resize, `auto_resize`, worker OOM halving).
+    governor: Arc<super::prefetch::GovernorCtl>,
 }
 
 impl StreamingLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
-        // Probe VRAM usage and size the prefetch buffer to fill up to cap.
-        // At epoch 0 this is the real signal: model is loaded, VRAM is known.
-        // At epoch N>0: re-probe in case conditions changed.
+        use std::sync::atomic::Ordering;
+
+        // Size the epoch. Two regimes, keyed to information rather than
+        // epoch count:
+        // - Before the first training step of the RUN, the VRAM probe
+        //   cannot see activations/gradients/lazy optimizer state, so
+        //   the initial target deducts the activation reserve and takes
+        //   the graduated first-fill discount. Once the consumer drains
+        //   its second batch (first step demonstrably done), the epoch
+        //   iterator re-probes and raises the target to the honest
+        //   budget mid-epoch.
+        // - After that, probes are honest (the allocator retains step
+        //   memory as "used"), so epoch starts take the full budget
+        //   with no reserve.
         if !self.user_set_depth {
-            let depth = prefetch_depth_from_vram(
+            // Reserve-free depth: the capacity ceiling for this epoch.
+            // Any later raise (honest resize, auto_resize) stays <= it,
+            // because "used" only grows once training runs.
+            let full = prefetch_depth_from_vram(
                 self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage, 0,
             );
-            self.worker.set_prefetch_depth(depth);
+            let target = if self.governor.honest_resize_done.load(Ordering::Relaxed) {
+                full.max(1)
+            } else {
+                let reserved = prefetch_depth_from_vram(
+                    self.per_sample_bytes,
+                    self.batch_size,
+                    self.device,
+                    self.vram_max_usage,
+                    self.activation_reserve,
+                );
+                initial_fill_target(reserved, self.reserve_source)
+            };
+            self.worker.set_prefetch_depth(full.max(2));
+            self.governor.begin_epoch(target);
+        } else {
+            self.governor.begin_epoch(self.worker.prefetch_depth());
         }
 
         let indices = self.sampler.indices(epoch);
@@ -690,13 +837,21 @@ impl StreamingLoader {
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already
         // closed (old batch_tx dropped by the worker when send fails or epoch ends).
-        let batch_rx = self.worker.start_epoch(indices, bs, self.drop_last);
+        let batch_rx =
+            self.worker
+                .start_epoch(indices, bs, self.drop_last, Arc::clone(&self.governor));
 
         EpochIterator {
             inner: EpochIteratorInner::Streaming(StreamingEpochIter {
                 batch_rx,
                 remaining: num_batches,
                 names: &self.names,
+                governor: Arc::clone(&self.governor),
+                adaptive: !self.user_set_depth,
+                per_sample_bytes: self.per_sample_bytes,
+                batch_size: self.batch_size,
+                device: self.device,
+                vram_max_usage: self.vram_max_usage,
             }),
         }
     }
@@ -735,6 +890,29 @@ struct StreamingEpochIter<'a> {
     batch_rx: std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>,
     remaining: usize,
     names: &'a [String],
+    /// Shared with the loader and worker: this side bumps `consumed`
+    /// per drained batch and performs the one-shot honest resize.
+    governor: Arc<super::prefetch::GovernorCtl>,
+    /// False when the user pinned the depth (no honest resize).
+    adaptive: bool,
+    // Sizing snapshot for the honest resize probe.
+    per_sample_bytes: usize,
+    batch_size: usize,
+    device: Device,
+    vram_max_usage: f64,
+}
+
+impl Drop for StreamingEpochIter<'_> {
+    fn drop(&mut self) {
+        // Unblock the worker's governor gate: `consumed` stops
+        // advancing once this iterator is gone, so an abandoned
+        // mid-epoch iterator would otherwise leave the worker waiting
+        // at the gate forever instead of reaching the failed send that
+        // ends the epoch.
+        self.governor
+            .abandoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl<'a> Iterator for EpochIterator<'a> {
@@ -791,6 +969,8 @@ impl<'a> ResidentEpochIter<'a> {
 
 impl StreamingEpochIter<'_> {
     fn next(&mut self) -> Option<Result<Batch>> {
+        use std::sync::atomic::Ordering;
+
         if self.remaining == 0 {
             return None;
         }
@@ -806,6 +986,31 @@ impl StreamingEpochIter<'_> {
                     if let Err(e) = event.synchronize() {
                         return Some(Err(e));
                     }
+                }
+                self.governor.consumed.fetch_add(1, Ordering::Relaxed);
+                let run_consumed =
+                    self.governor.run_consumed.fetch_add(1, Ordering::Relaxed) + 1;
+                // Honest resize, once per RUN: draining the second batch
+                // means the first batch's forward/backward/step have
+                // executed, so a probe now sees activations, gradients,
+                // and lazily created optimizer state as "used". Raise
+                // the target to the honest full budget (no reserve; the
+                // probe accounts for step memory itself). Keyed to
+                // consumption, not epoch boundaries, so single-pass
+                // training benefits too.
+                if self.adaptive
+                    && run_consumed >= 2
+                    && !self.governor.honest_resize_done.load(Ordering::Relaxed)
+                {
+                    self.governor.honest_resize_done.store(true, Ordering::Relaxed);
+                    let depth = prefetch_depth_from_vram(
+                        self.per_sample_bytes,
+                        self.batch_size,
+                        self.device,
+                        self.vram_max_usage,
+                        0,
+                    );
+                    self.governor.target.store(depth.max(1), Ordering::Relaxed);
                 }
                 Some(Ok(Batch::new(batch.tensors, self.names.to_vec())))
             }
