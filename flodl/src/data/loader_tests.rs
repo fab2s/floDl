@@ -1461,3 +1461,199 @@
         assert!(out.unwrap_err().is_cuda_oom());
         assert_eq!(calls, OOM_RETRY_ATTEMPTS + 1);
     }
+
+    #[test]
+    fn test_ring_slots_from_ram_budget_math() {
+        const GIB: u64 = 1 << 30;
+        // 1 MiB/sample x 1024 batch = 1 GiB per batch.
+        let per_sample = 1 << 20;
+        let bs = 1024;
+
+        // total 100 GiB, 60 available (40 used), cap 0.5 -> 10 GiB
+        // budget -> 10 ring slots.
+        let mem = Some((100 * GIB, 60 * GIB));
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, mem, 100), 10);
+
+        // Capped at the epoch's batch count.
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, mem, 3), 3);
+
+        // System already past the cap: no budget, single-stage.
+        let tight = Some((100 * GIB, 40 * GIB)); // 60 used > 50 cap
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, tight, 100), 0);
+
+        // 0.0 disables the reader stage outright, RAM info or not.
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.0, mem, 100), 0);
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.0, None, 100), 0);
+
+        // No RAM visibility: conservative fixed ring, epoch-capped.
+        assert_eq!(
+            ring_slots_from_ram(per_sample, bs, 0.50, None, 100),
+            RING_SLOTS_FALLBACK
+        );
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, None, 2), 2);
+
+        // Unpriceable batches: same conservative fallback.
+        assert_eq!(
+            ring_slots_from_ram(0, bs, 0.50, mem, 100),
+            RING_SLOTS_FALLBACK
+        );
+
+        // Fraction is capped at 0.90 even if a raw value sneaks past
+        // the builder clamp.
+        assert_eq!(
+            ring_slots_from_ram(per_sample, bs, 5.0, mem, 1000),
+            50 // cap 90 GiB - 40 used = 50 GiB budget
+        );
+    }
+
+    /// Batches identifiable by content: one Int64 tensor carrying the
+    /// requested indices.
+    struct IndexBatch {
+        n: usize,
+    }
+
+    impl BatchDataSet for IndexBatch {
+        fn len(&self) -> usize {
+            self.n
+        }
+        fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+            let v: Vec<i64> = indices.iter().map(|&i| i as i64).collect();
+            Ok(vec![Tensor::from_i64(&v, &[v.len() as i64], Device::CPU)?])
+        }
+    }
+
+    #[test]
+    fn test_two_stage_pipeline_delivers_all_batches_in_order() {
+        // Drive the worker directly with ring_slots > 0. The loader
+        // only enables the reader ring for CUDA targets (policy), but
+        // the mechanism is device-agnostic, so the full two-stage
+        // pipeline is exercised here on CPU: reader thread -> ring ->
+        // transfer stage -> batch channel, order preserved.
+        use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let governor = Arc::new(GovernorCtl::new(4));
+        governor.begin_epoch(4);
+
+        let rx = worker.start_epoch((0..10).collect(), 2, true, Arc::clone(&governor), 3);
+        let mut batches = Vec::new();
+        for _ in 0..5 {
+            let batch = rx.recv().unwrap().unwrap();
+            governor.consumed.fetch_add(1, Ordering::Relaxed);
+            batches.push(batch.tensors[0].to_i64_vec().unwrap());
+        }
+        assert_eq!(
+            batches,
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7], vec![8, 9]]
+        );
+        assert!(rx.recv().is_err(), "channel closes after the epoch");
+    }
+
+    #[test]
+    fn test_two_stage_respects_drop_last() {
+        use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let governor = Arc::new(GovernorCtl::new(8));
+        governor.begin_epoch(8);
+
+        // drop_last = false: the short remainder batch comes through.
+        let rx = worker.start_epoch((0..10).collect(), 3, false, Arc::clone(&governor), 2);
+        let mut lens = Vec::new();
+        while let Ok(b) = rx.recv() {
+            governor.consumed.fetch_add(1, Ordering::Relaxed);
+            lens.push(b.unwrap().tensors[0].shape()[0]);
+        }
+        assert_eq!(lens, vec![3, 3, 3, 1]);
+
+        // drop_last = true: the remainder is dropped by the reader.
+        governor.begin_epoch(8);
+        let rx = worker.start_epoch((0..10).collect(), 3, true, Arc::clone(&governor), 2);
+        let mut count = 0;
+        while let Ok(b) = rx.recv() {
+            governor.consumed.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(b.unwrap().tensors[0].shape()[0], 3);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_two_stage_abandoned_epoch_unwinds_and_recovers() {
+        // Abandoning an epoch mid-way must unwind BOTH stages (the
+        // transfer loop breaks at the gate, dropping the ring unwinds
+        // the reader), and the same worker must then run a fresh epoch
+        // in full.
+        use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 20 });
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let governor = Arc::new(GovernorCtl::new(4));
+        governor.begin_epoch(4);
+
+        let rx = worker.start_epoch((0..20).collect(), 2, true, Arc::clone(&governor), 2);
+        let _one = rx.recv().unwrap().unwrap();
+        governor.consumed.fetch_add(1, Ordering::Relaxed);
+        governor.abandoned.store(true, Ordering::Relaxed);
+        drop(rx);
+
+        // Fresh epoch on the same worker delivers everything. The cmd
+        // channel serializes epochs, so this also proves the previous
+        // epoch's reader thread was joined, not orphaned.
+        governor.begin_epoch(4);
+        let rx = worker.start_epoch((0..10).collect(), 2, true, Arc::clone(&governor), 2);
+        let mut count = 0;
+        while let Ok(b) = rx.recv() {
+            b.unwrap();
+            governor.consumed.fetch_add(1, Ordering::Relaxed);
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_ram_max_usage_builder() {
+        let data = make_data(20);
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .ram_max_usage(0.30)
+            .build()
+            .unwrap();
+        match &loader.inner {
+            LoaderInner::Streaming(l) => assert_eq!(l.ram_max_usage, 0.30),
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+
+        // Clamped to [0.0, 0.90] — 0.0 is a valid "off" value.
+        let data = make_data(20);
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .ram_max_usage(5.0)
+            .build()
+            .unwrap();
+        match &loader.inner {
+            LoaderInner::Streaming(l) => assert_eq!(l.ram_max_usage, 0.90),
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+        let data = make_data(20);
+        let loader = DataLoader::from_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .ram_max_usage(-1.0)
+            .build()
+            .unwrap();
+        match &loader.inner {
+            LoaderInner::Streaming(l) => assert_eq!(l.ram_max_usage, 0.0),
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }

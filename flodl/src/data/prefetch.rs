@@ -2,6 +2,22 @@
 //!
 //! Not part of the public API. Used by [`DataLoader`](super::DataLoader)
 //! when the dataset does not fit in VRAM.
+//!
+//! # Pipeline shape
+//!
+//! Single-stage (CPU targets, distributed `LoadBatch`): one worker
+//! thread fetches from the dataset and forwards on the batch channel;
+//! the channel itself is the read-ahead buffer.
+//!
+//! Two-stage (CUDA targets, `ring_slots > 0`): a reader thread fetches
+//! batches from the dataset into a bounded pageable-RAM ring; the
+//! worker thread drains the ring and runs the device transfer
+//! (pin + async H2D + completion event). Storage-read latency then
+//! overlaps the transfer stage's CPU work, raising the pipeline's
+//! throughput ceiling from `1/(t_read + t_transfer)` to
+//! `1/max(t_read, t_transfer)`, and the ring absorbs read jitter
+//! (network storage). The ring bounds RAM in flight; the depth
+//! governor independently bounds VRAM in flight.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -143,6 +159,11 @@ pub(crate) enum WorkerCmd {
         batch_tx: mpsc::SyncSender<Result<PrefetchedBatch>>,
         /// Depth governor shared with the loader and epoch iterator.
         governor: Arc<GovernorCtl>,
+        /// Reader-ring capacity in batches. `0` = single-stage pipeline
+        /// (fetch and transfer serialized on the worker thread); `> 0`
+        /// spawns a reader thread that stages batches in pageable RAM.
+        /// Sized by the loader from the host RAM budget.
+        ring_slots: usize,
     },
     /// Open a distributed epoch: install the batch sender, then wait for
     /// `LoadBatch` commands. The channel stays open until the next
@@ -201,13 +222,16 @@ impl PrefetchWorker {
     ///
     /// `prefetch_depth` is the channel CAPACITY (safety ceiling for the
     /// epoch); the effective in-flight bound is the governor's target,
-    /// adjustable mid-epoch.
+    /// adjustable mid-epoch. `ring_slots > 0` enables the two-stage
+    /// pipeline (see module docs); `0` keeps fetch + transfer on one
+    /// thread.
     pub fn start_epoch(
         &self,
         indices: Vec<usize>,
         batch_size: usize,
         drop_last: bool,
         governor: Arc<GovernorCtl>,
+        ring_slots: usize,
     ) -> mpsc::Receiver<Result<PrefetchedBatch>> {
         let (batch_tx, batch_rx) =
             mpsc::sync_channel::<Result<PrefetchedBatch>>(self.prefetch_depth);
@@ -218,6 +242,7 @@ impl PrefetchWorker {
             drop_last,
             batch_tx,
             governor,
+            ring_slots,
         });
 
         batch_rx
@@ -289,64 +314,35 @@ fn worker_loop(
                 drop_last,
                 batch_tx,
                 governor,
+                ring_slots,
             } => {
                 dist_tx = None; // close any distributed channel
 
-                let n = indices.len();
-                let mut start = 0;
-
-                while start < n {
-                    let end = (start + batch_size).min(n);
-                    if drop_last && (end - start) < batch_size {
-                        break;
-                    }
-
-                    // Governor gate: at most `target` batches in flight.
-                    if !governor_gate(&governor) {
-                        break; // epoch abandoned
-                    }
-
-                    let batch_indices = &indices[start..end];
-                    start = end;
-
-                    // Transient prefetch OOM (consumer will drain): free
-                    // the allocator cache, halve the in-flight target so
-                    // the overcommit self-heals instead of re-OOMing on
-                    // every batch, and give the consumer time to drain.
-                    let result = if device.is_cuda() {
-                        retry_on_oom(
-                            || {
-                                fetch_and_transfer(
-                                    &*dataset,
-                                    batch_indices,
-                                    device,
-                                    #[cfg(feature = "cuda")]
-                                    copy_stream.as_ref(),
-                                )
-                            },
-                            || {
-                                let t = governor.target.load(Ordering::Relaxed);
-                                governor.target.store((t / 2).max(1), Ordering::Relaxed);
-                                crate::tensor::cuda_empty_cache();
-                                thread::sleep(OOM_RETRY_SLEEP);
-                            },
-                        )
-                    } else {
-                        fetch_and_transfer(
-                            &*dataset,
-                            batch_indices,
-                            device,
-                            #[cfg(feature = "cuda")]
-                            copy_stream.as_ref(),
-                        )
-                    };
-
-                    // If the consumer dropped (epoch iterator dropped mid-epoch),
-                    // the send fails. We stop this epoch and wait for the next command.
-                    if batch_tx.send(result).is_err() {
-                        break;
-                    }
-                    governor.sent.fetch_add(1, Ordering::Relaxed);
+                if ring_slots > 0 {
+                    run_two_stage_epoch(
+                        &dataset,
+                        device,
+                        indices,
+                        batch_size,
+                        drop_last,
+                        &batch_tx,
+                        &governor,
+                        ring_slots,
+                        #[cfg(feature = "cuda")]
+                        copy_stream.as_ref(),
+                    );
+                } else {
+                    run_single_stage_epoch(
+                        &dataset,
+                        device,
+                        &indices,
+                        batch_size,
+                        drop_last,
+                        &batch_tx,
+                        &governor,
+                        #[cfg(feature = "cuda")]
+                        copy_stream.as_ref(),
+                    );
                 }
                 // batch_tx is dropped here, closing the epoch's channel.
             }
@@ -393,7 +389,191 @@ fn worker_loop(
     }
 }
 
+/// Single-stage epoch: fetch and transfer serialized on the worker
+/// thread. Used when `ring_slots == 0` (CPU targets, where the batch
+/// channel itself is the read-ahead buffer and there is no transfer
+/// stage to overlap; or a RAM budget too tight for a reader ring).
+#[allow(clippy::too_many_arguments)]
+fn run_single_stage_epoch(
+    dataset: &Arc<dyn BatchDataSet>,
+    device: Device,
+    indices: &[usize],
+    batch_size: usize,
+    drop_last: bool,
+    batch_tx: &mpsc::SyncSender<Result<PrefetchedBatch>>,
+    governor: &GovernorCtl,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+) {
+    let n = indices.len();
+    let mut start = 0;
+
+    while start < n {
+        let end = (start + batch_size).min(n);
+        if drop_last && (end - start) < batch_size {
+            break;
+        }
+
+        // Governor gate: at most `target` batches in flight.
+        if !governor_gate(governor) {
+            break; // epoch abandoned
+        }
+
+        let batch_indices = &indices[start..end];
+        start = end;
+
+        // Transient prefetch OOM (consumer will drain): free
+        // the allocator cache, halve the in-flight target so
+        // the overcommit self-heals instead of re-OOMing on
+        // every batch, and give the consumer time to drain.
+        let result = if device.is_cuda() {
+            retry_on_oom(
+                || {
+                    fetch_and_transfer(
+                        &**dataset,
+                        batch_indices,
+                        device,
+                        #[cfg(feature = "cuda")]
+                        copy_stream,
+                    )
+                },
+                || oom_backoff(governor),
+            )
+        } else {
+            fetch_and_transfer(
+                &**dataset,
+                batch_indices,
+                device,
+                #[cfg(feature = "cuda")]
+                copy_stream,
+            )
+        };
+
+        // If the consumer dropped (epoch iterator dropped mid-epoch),
+        // the send fails. We stop this epoch and wait for the next command.
+        if batch_tx.send(result).is_err() {
+            break;
+        }
+        governor.sent.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Two-stage epoch: a reader thread stages CPU-side batches in a
+/// bounded pageable ring; this thread drains the ring and runs the
+/// device transfer. See the module docs for the cost model.
+#[allow(clippy::too_many_arguments)]
+fn run_two_stage_epoch(
+    dataset: &Arc<dyn BatchDataSet>,
+    device: Device,
+    indices: Vec<usize>,
+    batch_size: usize,
+    drop_last: bool,
+    batch_tx: &mpsc::SyncSender<Result<PrefetchedBatch>>,
+    governor: &GovernorCtl,
+    ring_slots: usize,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+) {
+    let (ring_tx, ring_rx) = mpsc::sync_channel::<Result<Vec<Tensor>>>(ring_slots);
+    let reader_dataset = Arc::clone(dataset);
+    let reader = thread::spawn(move || {
+        reader_loop(reader_dataset, indices, batch_size, drop_last, ring_tx);
+    });
+
+    loop {
+        // Governor gate first: while the VRAM pipeline is full, ready
+        // batches wait in the pageable ring, not on the device.
+        if !governor_gate(governor) {
+            break; // epoch abandoned
+        }
+        let cpu_batch = match ring_rx.recv() {
+            Ok(b) => b,
+            Err(_) => break, // reader done: epoch exhausted
+        };
+
+        // Same transient-OOM patience as the single-stage path; only
+        // the transfer half retries (the batch is already in RAM).
+        let result = match cpu_batch {
+            Ok(tensors) => {
+                if device.is_cuda() {
+                    retry_on_oom(
+                        || {
+                            transfer_batch(
+                                &tensors,
+                                device,
+                                #[cfg(feature = "cuda")]
+                                copy_stream,
+                            )
+                        },
+                        || oom_backoff(governor),
+                    )
+                } else {
+                    transfer_batch(
+                        &tensors,
+                        device,
+                        #[cfg(feature = "cuda")]
+                        copy_stream,
+                    )
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        if batch_tx.send(result).is_err() {
+            break; // consumer dropped mid-epoch
+        }
+        governor.sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Dropping the ring receiver fails the reader's next send, so an
+    // early break (abandoned epoch, consumer gone) unwinds the reader
+    // too. Join before returning: the worker must not process the next
+    // command while a stale reader still holds the dataset.
+    drop(ring_rx);
+    let _ = reader.join();
+}
+
+/// Reader stage: fetch batches from the dataset in index order and push
+/// them into the ring. Pure dataset I/O — no pinning, no device work
+/// (the transfer stage pins, so the ring holds pageable RAM and the
+/// I/O wait here genuinely overlaps the transfer stage's CPU work).
+fn reader_loop(
+    dataset: Arc<dyn BatchDataSet>,
+    indices: Vec<usize>,
+    batch_size: usize,
+    drop_last: bool,
+    ring_tx: mpsc::SyncSender<Result<Vec<Tensor>>>,
+) {
+    let n = indices.len();
+    let mut start = 0;
+
+    while start < n {
+        let end = (start + batch_size).min(n);
+        if drop_last && (end - start) < batch_size {
+            break;
+        }
+
+        let result = dataset.get_batch(&indices[start..end]);
+        start = end;
+
+        // Errors travel the ring like batches (the consumer surfaces
+        // them); a failed send means the transfer stage is gone.
+        if ring_tx.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+/// Shared OOM back-off for both pipeline shapes: halve the in-flight
+/// target so the overcommit self-heals instead of re-OOMing on every
+/// batch, free the allocator cache, give the consumer time to drain.
+fn oom_backoff(governor: &GovernorCtl) {
+    let t = governor.target.load(Ordering::Relaxed);
+    governor.target.store((t / 2).max(1), Ordering::Relaxed);
+    crate::tensor::cuda_empty_cache();
+    thread::sleep(OOM_RETRY_SLEEP);
+}
+
 /// Fetch a batch from the dataset and transfer to the target device.
+/// Single-stage path: both halves serialized on the calling thread.
 fn fetch_and_transfer(
     dataset: &dyn BatchDataSet,
     indices: &[usize],
@@ -401,10 +581,26 @@ fn fetch_and_transfer(
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
     let tensors = dataset.get_batch(indices)?;
+    transfer_batch(
+        &tensors,
+        device,
+        #[cfg(feature = "cuda")]
+        copy_stream,
+    )
+}
 
+/// Transfer stage: move CPU-side batch tensors to the target device
+/// (pin + async H2D on the copy stream, completion event recorded).
+/// On a CPU target this is a pass-through (shallow clones: refcount
+/// bumps on shared storage, no data copy).
+fn transfer_batch(
+    tensors: &[Tensor],
+    device: Device,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return Ok(PrefetchedBatch {
-            tensors,
+            tensors: tensors.to_vec(),
             #[cfg(feature = "cuda")]
             ready_event: None,
         });
@@ -420,7 +616,7 @@ fn fetch_and_transfer(
 
         if let Some(stream) = copy_stream {
             let _guard = StreamGuard::new(stream);
-            for t in &tensors {
+            for t in tensors {
                 let pinned = t.pin_memory()?;
                 on_device.push(pinned.to_device_async(device)?);
             }
@@ -436,7 +632,7 @@ fn fetch_and_transfer(
         }
 
         // Fallback: synchronous transfer (no stream available)
-        for t in &tensors {
+        for t in tensors {
             let pinned = t.pin_memory()?;
             on_device.push(pinned.to_device(device)?);
         }
@@ -450,6 +646,8 @@ fn fetch_and_transfer(
     #[cfg(not(feature = "cuda"))]
     {
         // Without CUDA feature, just return CPU tensors
-        Ok(PrefetchedBatch { tensors })
+        Ok(PrefetchedBatch {
+            tensors: tensors.to_vec(),
+        })
     }
 }

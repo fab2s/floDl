@@ -229,6 +229,14 @@ These features came out of a forced heterogeneous topology: a rig crash and OS m
 
 `flodl/examples/flowbuilder_residual/`: minimal residual-block example showing the canonical `fork().also(...).merge()` pattern. Generated SVG (`site/assets/images/flowbuilder-residual.svg`) ships with the site assets for inline embedding in docs.
 
+#### Two-stage streaming prefetch: reader ring + `ram_max_usage`
+
+The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reader thread fetches batches from the dataset into a bounded pageable-RAM ring while the transfer thread pins and copies to the device. Storage-read latency (network shares, slow disks) overlaps transfer work instead of adding to it, raising the prefetch throughput ceiling from `1/(t_read + t_transfer)` to `1/max(t_read, t_transfer)`; the ring absorbs read jitter. This is a ceiling raise for read-bound pipelines — a pipeline that already keeps up gains nothing, by design.
+
+- **`DataLoaderBuilder::ram_max_usage(f)`** (default `0.50`, clamped `[0.0, 0.90]`, `0.0` = single-stage): fraction of total host RAM the system may reach while the reader stages ahead. The ring is sized at each `epoch()` against the kernel's `MemAvailable`, so every other process on the box is accounted for automatically; when the budget cannot fit one batch, the pipeline falls back to single-stage. Per-loader ceiling: multiple CUDA-target loaders on one host should each get a divided fraction.
+- **`flodl::sys::mem_info()`**: host RAM probe (`MemTotal` / `MemAvailable` from `/proc/meminfo`), CUDA-free like the rest of `flodl::sys`.
+- The VRAM depth governor and the RAM ring bound different resources and stay orthogonal: the governor caps device in-flight (transfer stage), the ring caps host-RAM in-flight (reader stage). CPU-target loaders keep the single-stage pipeline (their batch channel already is the read-ahead buffer), as does the coordinator-paced distributed batch path.
+
 #### Misc additions
 
 - **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.

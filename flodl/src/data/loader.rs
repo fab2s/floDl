@@ -117,6 +117,49 @@ pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> u
     (full_depth / divisor).max(1)
 }
 
+/// Reader-ring size when host RAM cannot be measured (non-Linux) or
+/// batches cannot be priced: small enough to be safe anywhere, still
+/// enough to pipeline reads against transfers and absorb some jitter.
+pub(crate) const RING_SLOTS_FALLBACK: usize = 4;
+
+/// Reader-ring capacity (in batches) for the two-stage prefetch
+/// pipeline, from the host RAM budget.
+///
+/// `ram_max_usage` is the fraction of **total** host RAM the whole
+/// system may reach while the reader stages ahead (default 0.50 —
+/// contrast with VRAM's 0.90: the host runs everything else too).
+/// `mem` is `(total_bytes, available_bytes)` from
+/// [`crate::sys::mem_info`]; `available` already accounts for every
+/// other process on the box, so the budget is the gap between current
+/// system usage and the cap, priced in batches.
+///
+/// Returns `0` (single-stage pipeline) when the reader stage is
+/// disabled (`ram_max_usage <= 0.0`) or the budget cannot fit even one
+/// batch. Capped at the epoch's batch count: buffering past the epoch
+/// buys nothing until cross-epoch prefetch lands.
+pub(crate) fn ring_slots_from_ram(
+    per_sample_bytes: usize,
+    batch_size: usize,
+    ram_max_usage: f64,
+    mem: Option<(u64, u64)>,
+    epoch_batches: usize,
+) -> usize {
+    if ram_max_usage <= 0.0 {
+        return 0;
+    }
+    let Some((total, available)) = mem else {
+        return RING_SLOTS_FALLBACK.min(epoch_batches);
+    };
+    let batch_bytes = per_sample_bytes.saturating_mul(batch_size) as u64;
+    if batch_bytes == 0 {
+        return RING_SLOTS_FALLBACK.min(epoch_batches);
+    }
+    let cap = (total as f64 * ram_max_usage.min(0.90)) as u64;
+    let used = total.saturating_sub(available);
+    let budget = cap.saturating_sub(used);
+    (budget / batch_bytes).min(epoch_batches as u64) as usize
+}
+
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder
 // ---------------------------------------------------------------------------
@@ -134,6 +177,7 @@ pub struct DataLoaderBuilder {
     force_streaming: bool,
     names: Option<Vec<String>>,
     vram_max_usage: f64,
+    ram_max_usage: f64,
     activation_reserve: Option<usize>,
 }
 
@@ -150,6 +194,7 @@ impl DataLoaderBuilder {
             force_streaming: false,
             names: None,
             vram_max_usage: 0.90,
+            ram_max_usage: 0.50,
             activation_reserve: None,
         }
     }
@@ -223,6 +268,32 @@ impl DataLoaderBuilder {
     /// can be loaded in any order. Clamped to `[0.50, 0.99]`.
     pub fn vram_max_usage(mut self, max_usage: f64) -> Self {
         self.vram_max_usage = max_usage.clamp(0.50, 0.99);
+        self
+    }
+
+    /// Maximum fraction of total host RAM the system may reach while
+    /// the reader stage buffers batches ahead (streaming mode, CUDA
+    /// targets).
+    ///
+    /// Default: 0.50. The streaming pipeline runs two stages on CUDA
+    /// targets: a reader thread fetches batches from the dataset into
+    /// a pageable-RAM ring while the transfer thread pins and copies
+    /// to the device, so storage-read latency (network shares, slow
+    /// disks) overlaps transfer work instead of adding to it. The ring
+    /// is sized at each `epoch()` from the gap between the host's
+    /// current memory usage (`MemAvailable`, which accounts for every
+    /// other process on the box) and this cap.
+    ///
+    /// The ceiling is **per loader**: each loader sizes its ring
+    /// independently, so when several rank processes with CUDA-target
+    /// loaders share one host, give each a divided fraction (e.g.
+    /// `0.50 / local_ranks`) — they cannot see each other's rings at
+    /// sizing time.
+    ///
+    /// `0.0` disables the reader stage (single-stage pipeline).
+    /// Clamped to `[0.0, 0.90]`.
+    pub fn ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.ram_max_usage = max_usage.clamp(0.0, 0.90);
         self
     }
 
@@ -316,6 +387,7 @@ impl DataLoaderBuilder {
             force_streaming,
             names,
             vram_max_usage,
+            ram_max_usage,
             activation_reserve,
         } = self;
 
@@ -373,12 +445,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, activation_reserve, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, activation_reserve, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, names)
         }
     }
 }
@@ -435,6 +507,7 @@ fn build_streaming(
     prefetch_depth: usize,
     per_sample_bytes: usize,
     vram_max_usage: f64,
+    ram_max_usage: f64,
     user_set_depth: bool,
     activation_reserve: Option<usize>,
     names: Vec<String>,
@@ -456,6 +529,7 @@ fn build_streaming(
             names,
             per_sample_bytes,
             vram_max_usage,
+            ram_max_usage,
             user_set_depth,
             activation_reserve: reserve,
             reserve_source,
@@ -767,6 +841,9 @@ pub(crate) struct StreamingLoader {
     per_sample_bytes: usize,
     /// Maximum fraction of total VRAM to use for prefetch.
     vram_max_usage: f64,
+    /// Host RAM ceiling for the reader-stage ring (see
+    /// [`DataLoaderBuilder::ram_max_usage`]). `0.0` = single-stage.
+    ram_max_usage: f64,
     /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
     /// Skips automatic adaptation so we don't override the user's choice.
     user_set_depth: bool,
@@ -834,12 +911,32 @@ impl StreamingLoader {
             n.div_ceil(bs)
         };
 
+        // Reader-ring sizing: CUDA targets only. On CPU targets the
+        // batch channel itself is the read-ahead buffer (no transfer
+        // stage to overlap), so the pipeline stays single-stage. The
+        // mechanism in the worker is device-agnostic; this is policy.
+        let ring_slots = if self.device.is_cuda() {
+            ring_slots_from_ram(
+                self.per_sample_bytes,
+                bs,
+                self.ram_max_usage,
+                crate::sys::mem_info().map(|m| (m.total_bytes, m.available_bytes)),
+                num_batches,
+            )
+        } else {
+            0
+        };
+
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already
         // closed (old batch_tx dropped by the worker when send fails or epoch ends).
-        let batch_rx =
-            self.worker
-                .start_epoch(indices, bs, self.drop_last, Arc::clone(&self.governor));
+        let batch_rx = self.worker.start_epoch(
+            indices,
+            bs,
+            self.drop_last,
+            Arc::clone(&self.governor),
+            ring_slots,
+        );
 
         EpochIterator {
             inner: EpochIteratorInner::Streaming(StreamingEpochIter {

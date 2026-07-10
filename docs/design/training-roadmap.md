@@ -251,19 +251,88 @@ the network with no shared filesystem.
   rank's error (elastic supervision already handles a dying rank), and
   checksums make corruption loud.
 
-**Two-stage prefetch (storage → RAM → VRAM):** today the prefetch
-worker serializes the dataset read and the H2D transfer in one thread,
-so per-batch cost is `t_read + t_transfer`. Splitting it into a reader
-stage (dataset → pinned-RAM ring, its own bound) and a transfer stage
-(pinned RAM → VRAM) overlaps the two: cost becomes
-`max(t_read, t_transfer)`, and the RAM ring absorbs read jitter. This
-pays exactly where this feature lives — network-backed reads with
-high, jittery `t_read` — and already helps on today's shared-storage
-mounts (NAS / virtiofs / S3-FUSE). It composes cleanly with the depth
-governor that sizes VRAM-side prefetch: the governor bounds the
-transfer stage (VRAM in-flight), the ring bounds the reader stage
-(RAM in-flight); the two limits are orthogonal by construction. Can
-land before the manifest/source work as a standalone improvement.
+**Two-stage prefetch (storage → RAM → VRAM) — LANDED:** the streaming
+prefetch pipeline runs two stages on CUDA targets: a reader thread
+fetches batches from the dataset into a bounded pageable-RAM ring
+while the transfer thread pins and copies to the device. The worker's
+batch-throughput ceiling rises from `1/(t_read + t_transfer)` to
+`1/max(t_read, t_transfer)` (the genuine overlap is between the
+reader's I/O wait and the transfer stage's pin memcpy — pinning stays
+transfer-side so the ring's currency is ordinary pageable RAM), and
+the ring absorbs read jitter. Honest scope: the batch channel already
+provides read-ahead, so this is a *ceiling raise* for read-bound
+pipelines (network shares, slow disks), not a speedup for pipelines
+that already keep up. Bounds are orthogonal by construction: the depth
+governor bounds VRAM in-flight (transfer stage), the ring bounds RAM
+in-flight (reader stage). The ring is sized per epoch from the host
+RAM budget — `ram_max_usage` (default 0.50, `0.0` = off) caps total
+system RAM usage, measured against `MemAvailable` so every other
+process on the box is accounted for automatically. CPU-target loaders
+stay single-stage (their batch channel *is* the read-ahead ring), as
+does the coordinator-paced distributed `LoadBatch` path (no index
+foresight, nothing to read ahead).
+
+**Tiered data plane (the arc this seeds).** The full design, in
+landing order; each increment stands alone:
+
+1. *Two-stage split + byte-budgeted ring* (landed, above).
+2. *RAM sample cache:* a read-through, sample-keyed cache at the
+   `DataSet::get(index)` layer. Batches are not reusable across
+   epochs (reshuffle changes their composition); samples are. This is
+   where a deep RAM budget belongs — a longer FIFO ring would waste
+   it. Pure `BatchDataSet` implementors (opaque batching) are the
+   explicit escape hatch and stay uncached.
+3. *Disk stage:* the same cache spills evicted samples to a local
+   drive buffer (size in GB, `0` = off); misses fall back to the
+   network source. Epoch 1 populates the tiers while training; later
+   epochs read local. Because the sampler's multi-epoch index stream
+   is computable at run start, eviction can be clairvoyant
+   (Belady-optimal: evict the entry whose next use is farthest away).
+4. *Schedule-aware reservations (the distributed half):* allocation is
+   constrained to per-rank reserved data — the controller reserves
+   spans of the precomputed shuffled order per rank (bootstrap: small
+   equal spans; converging to ElChe throughput ratios), and ElChe
+   allocates only within each rank's reservation. Prefetch then stages
+   each rank's reservation in certainty order (confirmed window →
+   estimated next windows → revocable margin last), which makes late
+   fetches structurally impossible away from epoch/training
+   boundaries; boundaries over-prefetch a little because the cost of a
+   wasted read is trivial next to a whole cohort waiting on one
+   starved rank at a barrier. Rebalancing moves reservation *tails*
+   between ranks (the margin-last ordering makes tails the natural
+   donor pool); a dead rank's unconsumed reservation redistributes to
+   survivors under the same rule. Constraining allocation to staged
+   data also keeps ElChe's delivered-cost signal clean: the data term
+   goes uniformly cheap in steady state, so the scheduler measures
+   true compute.
+
+Cross-cutting invariants for the arc:
+
+- *Reservation state changes ride the window boundary, never a
+  separate timer* (single-step-clock rule, extended to the data
+  plane); prefetch byte movement free-runs between boundaries, like
+  the param-snapshot D2H clock.
+- *Reserve-ahead is for data only.* Data buffers have exactly known
+  sizes (`per_sample_bytes`); model memory (activations, lazy
+  optimizer state) is unknowable before the first step, which is why
+  the VRAM governor stays reactive (honest resize) while RAM/disk
+  tiers plan ahead.
+- *Staging is host-scoped, rings are rank-scoped.* Ranks on one host
+  share the disk stage (deduplicated union of their reservations); RAM
+  rings and VRAM governors stay per rank process.
+- *Per-rank memory shares are consumption-proportional.* Splitting a
+  host's RAM/disk budget by ElChe throughput ratios gives every rank
+  the same seconds of lookahead (bytes_i / rate_i constant) — equal
+  time, not equal bytes. This matters acutely on hosts whose combined
+  VRAM exceeds host RAM, where pinned in-flight buffers alone are a
+  serious RAM draw; RAM there is a rate-matching flow buffer, not a
+  capacity tier (capacity lives on disk). The split belongs to the
+  wiring layer (the `Graph::set_data_loader` auto-wiring seam), since
+  a loader cannot see its siblings at sizing time.
+- *Watch-point:* transient allocation oscillation from cache state
+  (cold cache after reshuffle, network hiccup) feeding the
+  delivered-cost signal — expected self-stabilizing, to be measured on
+  the rig, not assumed.
 
 **ElChe interaction:** this is the feature ElChe was shaped for. Fetch
 latency lands in per-rank delivered cost (compute + data + transport
