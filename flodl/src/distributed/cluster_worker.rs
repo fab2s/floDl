@@ -261,6 +261,15 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
         ControlMsgWire::DeclareDead { .. } => Ok(Some(ControlMsg::DeclareDead)),
         ControlMsgWire::NewNcclSession { .. } => Ok(Some(ControlMsg::NewNcclSession)),
         ControlMsgWire::RequestNewNcclId => Ok(Some(ControlMsg::RequestNewNcclId)),
+        ControlMsgWire::StageAdvisory { epoch, spans } => {
+            Ok(Some(ControlMsg::StageAdvisory {
+                epoch: epoch as usize,
+                spans: spans
+                    .into_iter()
+                    .map(|(o, s)| (o as usize, s as usize))
+                    .collect(),
+            }))
+        }
         ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))

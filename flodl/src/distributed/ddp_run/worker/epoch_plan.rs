@@ -59,6 +59,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
                             ControlMsg::EpochAggregated(_) => "EpochAggregated",
                             ControlMsg::SaveConsensusModel { .. } => "SaveConsensusModel",
+                            ControlMsg::StageAdvisory { .. } => "StageAdvisory",
                         }
                     );
                     if self.dispatch_control(msg)? {

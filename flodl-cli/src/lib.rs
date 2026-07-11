@@ -46,8 +46,8 @@ extern crate self as flodl_cli;
 /// AI porting tools and as a machine-readable surface index.
 pub mod api_ref;
 
-/// Argv parsing primitives and the [`FdlArgsTrait`](args::FdlArgsTrait)
-/// contract that `#[derive(FdlArgs)]` implements.
+/// Argv parsing primitives and the [`FdlArgsTrait`] contract that
+/// `#[derive(FdlArgs)]` implements.
 pub mod args;
 
 /// Built-in `fdl` sub-commands (setup, install, completions, schema,

@@ -121,40 +121,45 @@ impl SampleCache {
         index: usize,
         fetch: impl FnOnce() -> Result<Vec<Tensor>>,
     ) -> Result<Vec<Tensor>> {
-        if let Some(hit) = self.slots.get(index).and_then(|s| s.get()) {
-            return Ok(hit.clone());
+        if let Some(staged) = self.lookup(index) {
+            return staged;
         }
-
-        if let Some(stage) = self.disk.get() {
-            if let Some(staged) = stage.read(index) {
-                return staged;
-            }
-        }
-
         let sample = fetch()?;
+        self.admit(index, &sample);
+        Ok(sample)
+    }
 
+    /// Tier lookup half of the read-through: RAM hit (shallow clones),
+    /// else disk read. `None` = not staged anywhere, caller fetches
+    /// from the source.
+    pub(crate) fn lookup(&self, index: usize) -> Option<Result<Vec<Tensor>>> {
+        if let Some(hit) = self.slots.get(index).and_then(|s| s.get()) {
+            return Some(Ok(hit.clone()));
+        }
+        self.disk.get().and_then(|stage| stage.read(index))
+    }
+
+    /// Admission half of the read-through: RAM while the budget allows,
+    /// overflow to the local-disk tier when RAM declines (at most once
+    /// per sample), so later reads hit disk speed instead of source
+    /// speed.
+    pub(crate) fn admit(&self, index: usize, sample: &[Tensor]) {
         let mut ram_admitted = false;
         if let Some(slot) = self.slots.get(index) {
             let sample_bytes: usize = sample.iter().map(|t| t.nbytes()).sum();
             if self.bytes.load(Ordering::Relaxed) + sample_bytes
                 <= self.budget.load(Ordering::Relaxed)
-                && slot.set(sample.clone()).is_ok()
+                && slot.set(sample.to_vec()).is_ok()
             {
                 self.bytes.fetch_add(sample_bytes, Ordering::Relaxed);
                 ram_admitted = true;
             }
         }
-
-        // Overflow admission: what RAM declines goes to local disk (at
-        // most once per sample), so later epochs read it at disk speed
-        // instead of source speed.
         if !ram_admitted {
             if let Some(stage) = self.disk.get() {
-                stage.admit(index, &sample);
+                stage.admit(index, sample);
             }
         }
-
-        Ok(sample)
     }
 }
 

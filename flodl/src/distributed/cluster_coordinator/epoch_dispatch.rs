@@ -235,6 +235,25 @@ impl ClusterCoordinator {
         // A tiny epoch (whole dataset < one window + crumb) is its own final
         // window: plan it before sizing so the per-rank sizes are coherent.
         self.refresh_final_window_plan(epoch);
+
+        // Reservation advisories: each rank's deterministic epoch stream
+        // (own span first, truing margins last) for its background
+        // stager. Best-effort — advisory frames never gate dispatch, and
+        // a rank without a stager ignores them.
+        for rank in 0..self.world_size {
+            let spans = self.advisory_spans_for_rank(epoch, rank);
+            if !spans.is_empty() {
+                let msg = crate::distributed::wire::ControlMsgWire::StageAdvisory {
+                    epoch: epoch as u64,
+                    spans: spans
+                        .iter()
+                        .map(|&(o, s)| (o as u64, s as u64))
+                        .collect(),
+                };
+                let _ = self.send_control(rank, &msg);
+            }
+        }
+
         let sizes: Vec<usize> = (0..self.world_size)
             .map(|r| self.compute_chunk_batches(r, epoch))
             .collect();
@@ -711,6 +730,41 @@ impl ClusterCoordinator {
             batches[i % n] += 1;
         }
         batches.iter().map(|&b| b * self.batch_size).collect()
+    }
+
+    /// Certainty-ordered advisory spans for `rank`'s stager: its own
+    /// reserved span first (deterministic for the whole epoch), then
+    /// every other span's tail — the truing margins, one reduce window
+    /// each, where the boundary can move under throughput drift. Spans
+    /// may overlap across ranks (margins are staged by several ranks
+    /// on purpose); allocation stays exclusive in the pool.
+    pub(super) fn advisory_spans_for_rank(
+        &self,
+        epoch: usize,
+        rank: usize,
+    ) -> Vec<(usize, usize)> {
+        let Some(pool) = self.chunk_pools.get(&epoch) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        let own = pool.reservation(rank);
+        if own.1 > 0 {
+            spans.push(own);
+        }
+        let counts = self.el_che.batch_counts();
+        for r in 0..self.world_size {
+            if r == rank {
+                continue;
+            }
+            let (start, len) = pool.reservation(r);
+            if len == 0 {
+                continue;
+            }
+            let margin = counts.get(r).copied().unwrap_or(0).max(1) * self.batch_size;
+            let m = margin.min(len);
+            spans.push((start + len - m, m));
+        }
+        spans
     }
 
     pub(super) fn compute_chunk_batches(&self, rank: usize, epoch: usize) -> usize {

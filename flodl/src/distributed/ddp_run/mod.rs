@@ -1156,6 +1156,15 @@ pub(crate) enum ControlMsg {
     /// this per re-rendezvous cycle (the lowest-numbered survivor).
     /// See `RequestNewNcclId`.
     RequestNewNcclId,
+    /// The rank's data-reservation view for an epoch: `(offset, size)`
+    /// spans into the global permutation in certainty order (own span
+    /// first, truing margins last). Forwarded to the background stager
+    /// so upcoming data is read ahead of the training frontier; purely
+    /// advisory (allocation stays `StartEpoch`-driven), latest wins.
+    StageAdvisory {
+        epoch: usize,
+        spans: Vec<(usize, usize)>,
+    },
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
     Throttle,

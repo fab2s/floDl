@@ -573,6 +573,7 @@ fn control_label(msg: &ControlMsgWire) -> &'static str {
         ControlMsgWire::Shutdown => "Shutdown",
         ControlMsgWire::ShutdownWithSave { .. } => "ShutdownWithSave",
         ControlMsgWire::EpochAggregated(_) => "EpochAggregated",
+        ControlMsgWire::StageAdvisory { .. } => "StageAdvisory",
         ControlMsgWire::SaveConsensusModel { .. } => "SaveConsensusModel",
         ControlMsgWire::CoordHeartbeat => "CoordHeartbeat",
     }

@@ -25,7 +25,7 @@
 //!
 //! Recursion guard: the launcher's ssh fan-out invokes `fdl <cmd>` on the
 //! remote, which re-enters fdl-cli with `FLODL_INTERNAL_CLUSTER_JSON` set (not
-//! `FLODL_INTERNAL_FULL_CLUSTER_JSON`). [`should_dispatch`](crate::cluster::should_dispatch)
+//! `FLODL_INTERNAL_FULL_CLUSTER_JSON`). `should_dispatch`
 //! returns `false` in that case so the remote fdl-cli skips cluster setup
 //! and just runs the user binary normally — the user binary's launcher
 //! dispatch then detects `Role::Rank` (because `FLODL_INTERNAL_LOCAL_RANK` is also

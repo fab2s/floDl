@@ -120,6 +120,40 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
 }
 
 #[test]
+fn advisory_spans_own_first_margins_last() {
+    // Reservation advisory geometry: world 2, total 100, batch 1 →
+    // equal spans [0,50) / [50,100); uncalibrated ElChe anchor 4 →
+    // window counts [4,4] → margins are 4-sample span tails.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        2,
+        ElChe::new(2, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(1);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.install_chunk_pool_for_test(0, 100);
+
+    let spans0 = coord.advisory_spans_for_rank(0, 0);
+    assert_eq!(spans0[0], (0, 50), "own span first");
+    assert_eq!(spans0[1], (96, 4), "then the other span's window-sized tail");
+    assert_eq!(spans0.len(), 2);
+
+    let spans1 = coord.advisory_spans_for_rank(0, 1);
+    assert_eq!(spans1[0], (50, 50));
+    assert_eq!(spans1[1], (46, 4));
+
+    // No pool for the epoch: no advisory.
+    assert!(coord.advisory_spans_for_rank(7, 0).is_empty());
+}
+
+#[test]
 fn resume_from_coverage_rejects_seed_mismatch() {
     // The contract rests on the same permutation: a seed change must error
     // loudly rather than silently re-train the wrong samples.

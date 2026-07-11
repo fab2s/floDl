@@ -178,6 +178,23 @@ impl<M: Module> GpuWorker<M> {
         // Note: activation_reserve=0 here because we haven't measured the
         // training activation peak yet. The first run_epoch_plan() will
         // force depth=0 (sync) to calibrate, then adjust on subsequent chunks.
+        //
+        // Reservation staging: wrap the dataset so the live prefetch path
+        // and the background stager share one sample-keyed tier. Dormant
+        // (budget 0, pass-through) until the coordinator's first
+        // StageAdvisory arrives, so non-progressive runs and tests never
+        // pay for it.
+        let stage_cache = Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(
+            super::stager::StagedBatchDataSet::new(dataset, Arc::clone(&stage_cache)),
+        );
+        let stager = Some(super::stager::spawn_stager(
+            Arc::clone(&dataset),
+            stage_cache,
+            config.seed,
+            config.world_size,
+        ));
+
         let total_batches = dataset.len() / config.batch_size.max(1);
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() && total_batches > 1 {
             let sample = dataset.get_batch(&[0])?;
@@ -281,6 +298,7 @@ impl<M: Module> GpuWorker<M> {
             eval_dataset,
             save_path: config.save_path.clone(),
             prefetch,
+            stager,
             per_sample_bytes,
             activation_peak_bytes: 0,
             max_grad_norm: config.max_grad_norm,

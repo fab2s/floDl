@@ -23,6 +23,7 @@ mod constructor;
 mod control;
 mod epoch_plan;
 mod reporting;
+mod stager;
 mod sync;
 
 // ---------------------------------------------------------------------------
@@ -265,6 +266,11 @@ pub struct GpuWorker<M: Module> {
     // -- Async prefetch (VRAM gauge) --
     /// Background prefetch worker for async H2D transfers (None on CPU).
     prefetch: Option<crate::data::prefetch::PrefetchWorker>,
+    /// Background reservation stager: warms the sample-keyed staging
+    /// tier (shared with `dataset`, which is the read-through wrapper)
+    /// from coordinator `StageAdvisory` frames. Dormant until the
+    /// first advisory.
+    stager: Option<stager::StagerHandle>,
     /// Bytes per sample (for VRAM gauge depth calculation).
     per_sample_bytes: usize,
     /// Measured activation peak (activations + gradients) from training.

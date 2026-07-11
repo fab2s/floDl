@@ -1042,6 +1042,19 @@ pub enum ControlMsgWire {
     /// on the same wall-clock timescale. Purely informational — the inbound
     /// bridge intercepts it and never forwards it to the inner worker.
     CoordHeartbeat,
+    /// The rank's data-reservation view for `epoch`: `(offset, size)`
+    /// spans into the epoch's global permutation, in certainty order —
+    /// the rank's own reserved span first, then the tails of the other
+    /// ranks' spans (the truing margins, whose final owner is
+    /// uncertain). Purely advisory for the worker's background stager:
+    /// staging may overlap across ranks near the boundaries, allocation
+    /// (`StartEpoch` chunks) never does, so stale or over-staged data
+    /// needs no invalidation — only allocated work executes. Latest
+    /// frame wins; workers without a stager ignore it.
+    StageAdvisory {
+        epoch: u64,
+        spans: Vec<(u64, u64)>,
+    },
 }
 
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain
