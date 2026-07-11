@@ -313,20 +313,22 @@ impl Drop for StagerHandle {
     }
 }
 
-/// The stager's RAM budget: the host's current headroom under a 50%
-/// total-usage cap, split consumption-proportionally among the ranks
-/// sharing this host — `budget_i ∝ rate_i` gives every rank the same
-/// seconds of lookahead (equal time, not equal bytes). Co-hosted ranks
-/// come from the cluster envelope when present; without one (thread
-/// DDP, single host without an envelope) every rank is assumed
-/// co-hosted — the conservative reading. `0` = do not stage.
+/// The stager's RAM budget: half of the host's currently available
+/// RAM (`MemAvailable`), split consumption-proportionally among the
+/// ranks sharing this host: `budget_i ∝ rate_i` gives every rank the
+/// same seconds of lookahead (equal time, not equal bytes).
+/// Available-based rather than total-anchored, so permanent fixtures
+/// (pinned VM memory, hugepages) never read as transient pressure and
+/// the budget self-adjusts per advisory as training allocates.
+/// Co-hosted ranks come from the cluster envelope when present;
+/// without one (thread DDP, single host without an envelope) every
+/// rank is assumed co-hosted, the conservative reading. `0` = do not
+/// stage.
 fn stager_ram_budget(rank: usize, world_size: usize, counts: &[usize]) -> usize {
     let Some(m) = crate::sys::mem_info() else {
         return 0;
     };
-    let cap = m.total_bytes / 2;
-    let used = m.total_bytes.saturating_sub(m.available_bytes);
-    let headroom = cap.saturating_sub(used);
+    let headroom = m.available_bytes / 2;
 
     let local_ranks: Vec<usize> = crate::distributed::cluster::LocalCluster::from_env()
         .ok()

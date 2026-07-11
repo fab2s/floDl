@@ -1469,16 +1469,18 @@
         let per_sample = 1 << 20;
         let bs = 1024;
 
-        // total 100 GiB, 60 available (40 used), cap 0.5 -> 10 GiB
-        // budget -> 10 ring slots.
-        let mem = Some((100 * GIB, 60 * GIB));
-        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, mem, 100), 10);
+        // 60 GiB available, share 0.5 -> 30 GiB budget -> 30 ring
+        // slots. Total RAM does not enter: only what is actually free
+        // is priced (permanent fixtures like pinned VM memory already
+        // fall out of MemAvailable).
+        let mem = Some(60 * GIB);
+        assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, mem, 100), 30);
 
         // Capped at the epoch's batch count.
         assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, mem, 3), 3);
 
-        // System already past the cap: no budget, single-stage.
-        let tight = Some((100 * GIB, 40 * GIB)); // 60 used > 50 cap
+        // Not enough free RAM for even one batch: single-stage.
+        let tight = Some(GIB); // 0.5 GiB budget < 1 GiB batch
         assert_eq!(ring_slots_from_ram(per_sample, bs, 0.50, tight, 100), 0);
 
         // 0.0 disables the reader stage outright, RAM info or not.
@@ -1502,7 +1504,7 @@
         // the builder clamp.
         assert_eq!(
             ring_slots_from_ram(per_sample, bs, 5.0, mem, 1000),
-            50 // cap 90 GiB - 40 used = 50 GiB budget
+            54 // 60 GiB available x 0.90 = 54 GiB budget
         );
     }
 

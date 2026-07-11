@@ -134,13 +134,14 @@ pub(crate) const RING_SLOTS_WITH_CACHE: usize = 8;
 /// Reader-ring capacity (in batches) for the two-stage prefetch
 /// pipeline, from the host RAM budget.
 ///
-/// `ram_max_usage` is the fraction of **total** host RAM the whole
-/// system may reach while the reader stages ahead (default 0.50 —
-/// contrast with VRAM's 0.90: the host runs everything else too).
-/// `mem` is `(total_bytes, available_bytes)` from
-/// [`crate::sys::mem_info`]; `available` already accounts for every
-/// other process on the box, so the budget is the gap between current
-/// system usage and the cap, priced in batches.
+/// `ram_max_usage` is the fraction of currently **available** host RAM
+/// the reader may claim (default 0.50, contrast with VRAM's 0.90: the
+/// host runs everything else too). `available` is `MemAvailable` from
+/// [`crate::sys::mem_info`]: it already excludes every other process on
+/// the box, including permanent fixtures (pinned VM memory, hugepages)
+/// that a total-anchored cap would misread as transient pressure. The
+/// budget is a slice of what is actually free, priced in batches, and
+/// self-adjusts at each `epoch()` probe as the box fills or drains.
 ///
 /// Returns `0` (single-stage pipeline) when the reader stage is
 /// disabled (`ram_max_usage <= 0.0`) or the budget cannot fit even one
@@ -150,22 +151,20 @@ pub(crate) fn ring_slots_from_ram(
     per_sample_bytes: usize,
     batch_size: usize,
     ram_max_usage: f64,
-    mem: Option<(u64, u64)>,
+    available: Option<u64>,
     epoch_batches: usize,
 ) -> usize {
     if ram_max_usage <= 0.0 {
         return 0;
     }
-    let Some((total, available)) = mem else {
+    let Some(available) = available else {
         return RING_SLOTS_FALLBACK.min(epoch_batches);
     };
     let batch_bytes = per_sample_bytes.saturating_mul(batch_size) as u64;
     if batch_bytes == 0 {
         return RING_SLOTS_FALLBACK.min(epoch_batches);
     }
-    let cap = (total as f64 * ram_max_usage.min(0.90)) as u64;
-    let used = total.saturating_sub(available);
-    let budget = cap.saturating_sub(used);
+    let budget = (available as f64 * ram_max_usage.min(0.90)) as u64;
     (budget / batch_bytes).min(epoch_batches as u64) as usize
 }
 
@@ -291,8 +290,8 @@ impl DataLoaderBuilder {
         self
     }
 
-    /// Maximum fraction of total host RAM the system may reach while
-    /// the reader stage buffers batches ahead (streaming mode, CUDA
+    /// Maximum fraction of **available** host RAM the reader stage may
+    /// claim while buffering batches ahead (streaming mode, CUDA
     /// targets).
     ///
     /// Default: 0.50. The streaming pipeline runs two stages on CUDA
@@ -300,9 +299,11 @@ impl DataLoaderBuilder {
     /// a pageable-RAM ring while the transfer thread pins and copies
     /// to the device, so storage-read latency (network shares, slow
     /// disks) overlaps transfer work instead of adding to it. The ring
-    /// is sized at each `epoch()` from the gap between the host's
-    /// current memory usage (`MemAvailable`, which accounts for every
-    /// other process on the box) and this cap.
+    /// is sized at each `epoch()` as this fraction of `MemAvailable`,
+    /// which already excludes every other process on the box, permanent
+    /// fixtures included (pinned VM memory, hugepages), so the budget
+    /// tracks what is actually free and self-adjusts as the box fills
+    /// or drains.
     ///
     /// The ceiling is **per loader**: each loader sizes its ring
     /// independently, so when several rank processes with CUDA-target
@@ -1044,7 +1045,7 @@ impl StreamingLoader {
         };
 
         // One RAM probe per epoch serves both RAM consumers below.
-        let mem = crate::sys::mem_info().map(|m| (m.total_bytes, m.available_bytes));
+        let mem = crate::sys::mem_info().map(|m| m.available_bytes);
 
         // Reader-ring sizing: CUDA targets only. On CPU targets the
         // batch channel itself is the read-ahead buffer (no transfer
@@ -1070,18 +1071,16 @@ impl StreamingLoader {
             0
         };
 
-        // Sample-cache budget refresh: same RAM cap as the ring,
-        // recomputed from the live probe once per epoch. The budget
-        // includes already-retained bytes (a shrinking headroom stops
-        // new admissions, never drops staged content) and leaves the
-        // ring its slice. Without RAM visibility the budget stays as
-        // it was (initially 0: no admissions on hosts we cannot
-        // measure).
+        // Sample-cache budget refresh: same available-RAM share as the
+        // ring, recomputed from the live probe once per epoch. The
+        // budget includes already-retained bytes (the probe no longer
+        // sees them as free, so a shrinking headroom stops new
+        // admissions, never drops staged content) and leaves the ring
+        // its slice. Without RAM visibility the budget stays as it was
+        // (initially 0: no admissions on hosts we cannot measure).
         if let Some(cache) = &self.sample_cache {
-            if let Some((total, available)) = mem {
-                let cap = (total as f64 * self.ram_max_usage.min(0.90)) as u64;
-                let used = total.saturating_sub(available);
-                let headroom = cap.saturating_sub(used);
+            if let Some(available) = mem {
+                let headroom = (available as f64 * self.ram_max_usage.min(0.90)) as u64;
                 let ring_bytes = (ring_slots as u64)
                     .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
                 let budget = (cache.bytes() as u64)

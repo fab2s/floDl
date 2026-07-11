@@ -265,9 +265,11 @@ pipelines (network shares, slow disks), not a speedup for pipelines
 that already keep up. Bounds are orthogonal by construction: the depth
 governor bounds VRAM in-flight (transfer stage), the ring bounds RAM
 in-flight (reader stage). The ring is sized per epoch from the host
-RAM budget — `ram_max_usage` (default 0.50, `0.0` = off) caps total
-system RAM usage, measured against `MemAvailable` so every other
-process on the box is accounted for automatically. CPU-target loaders
+RAM budget — `ram_max_usage` (default 0.50, `0.0` = off) is the
+fraction of the kernel's `MemAvailable` the reader may claim, so every
+other process on the box, permanent fixtures included (pinned VM
+memory, hugepages), is accounted for automatically and the budget
+self-adjusts as the box fills or drains. CPU-target loaders
 stay single-stage (their batch channel *is* the read-ahead ring), as
 does the coordinator-paced distributed `LoadBatch` path (no index
 foresight, nothing to read ahead).
@@ -318,8 +320,8 @@ stands alone:
    samples sit in which tier does not change the hit profile, so
    clairvoyance only becomes real when access turns non-uniform
    (reservation-constrained windows, increment 4).
-4. *Schedule-aware reservations (the distributed half; coordinator
-   ledger **landed**, wire + stager pending):* the epoch permutation
+4. *Schedule-aware reservations (the distributed half; **landed**,
+   rig-validated):* the epoch permutation
    is partitioned into contiguous per-rank spans sized by ElChe
    throughput ratios (equal until calibrated), and each rank's chunks
    come from the front of its own span via a per-rank cursor — the
@@ -359,9 +361,13 @@ stands alone:
    computable before its pool exists — margin-covered if ratios drift).
    Each rank's background stager walks the segments through the shared
    permutation into a sample-keyed tier the live prefetch path shares
-   read-through; its budget refreshes with each advisory as the host's
-   live RAM headroom split consumption-proportionally among co-hosted
-   ranks (envelope-derived; `budget ∝ rate` = equal lookahead time).
+   read-through; its budget refreshes with each advisory as half the
+   host's `MemAvailable` split consumption-proportionally among
+   co-hosted ranks (envelope-derived; `budget ∝ rate` = equal
+   lookahead time). Available-based on purpose: a total-anchored cap
+   reads permanent fixtures (pinned VM memory, hugepages) as pressure
+   and zeroes the budget on exactly the heterogeneous hosts staging is
+   for.
    Dormant until the first advisory. The beyond-pinned stream is
    **landed** as a bounded flow window with next-use-priority
    eviction: pinned declines land in the pool instead of wasting the
@@ -369,8 +375,14 @@ stands alone:
    drop-behind), admission evicts the farthest-next-use entry (keep
    what recurs soonest), the stager pauses before fetching past a
    full window, and positions re-key from each advisory on the window
-   clock. Remaining: the rig falsification (network bytes/epoch +
-   starvation stalls on Pascal/virtiofs).
+   clock. Rig validation (heterogeneous Blackwell + 2x Pascal-VM
+   cluster): no regression with staging active (cpu-cadence 59.0s
+   staged vs 60.6s off; nccl-cadence 68.3s vs 66.0s; evals identical
+   within noise), and a `FLODL_STAGER=off` kill-switch for A/B runs.
+   The bench dataset is RAM-resident, so this bounds the overhead at
+   zero without exercising the payoff; measuring the starvation win
+   needs a storage-backed bench dataset mode (queued) that reads the
+   shared mount per batch.
 5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
    tier up — when a dataset almost fits on device, keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between
