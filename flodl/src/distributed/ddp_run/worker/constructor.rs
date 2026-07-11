@@ -183,22 +183,35 @@ impl<M: Module> GpuWorker<M> {
         // and the background stager share one sample-keyed tier. Dormant
         // (budget 0, pass-through) until the coordinator's first
         // StageAdvisory arrives, so non-progressive runs and tests never
-        // pay for it.
-        let stage_cache = Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
-        let stream_pool = Arc::new(Mutex::new(super::stager::StreamPool::new()));
-        let dataset: Arc<dyn BatchDataSet> = Arc::new(super::stager::StagedBatchDataSet::new(
-            dataset,
-            Arc::clone(&stage_cache),
-            Arc::clone(&stream_pool),
-        ));
-        let stager = Some(super::stager::spawn_stager(
-            Arc::clone(&dataset),
-            stage_cache,
-            stream_pool,
-            config.seed,
-            config.rank,
-            config.world_size,
-        ));
+        // pay for it. `FLODL_STAGER=off` disables the whole layer (the
+        // dataset stays unwrapped): the A/B discriminator for staging
+        // benefit measurements and the operational escape hatch.
+        let stager_off = std::env::var("FLODL_STAGER")
+            .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+            .unwrap_or(false);
+        let (dataset, stager) = if stager_off {
+            crate::verbose!("  ddp-worker: rank {} stager disabled (FLODL_STAGER=off)", config.rank);
+            (dataset, None)
+        } else {
+            let stage_cache =
+                Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
+            let stream_pool = Arc::new(Mutex::new(super::stager::StreamPool::new()));
+            let dataset: Arc<dyn BatchDataSet> =
+                Arc::new(super::stager::StagedBatchDataSet::new(
+                    dataset,
+                    Arc::clone(&stage_cache),
+                    Arc::clone(&stream_pool),
+                ));
+            let stager = super::stager::spawn_stager(
+                Arc::clone(&dataset),
+                stage_cache,
+                stream_pool,
+                config.seed,
+                config.rank,
+                config.world_size,
+            );
+            (dataset, Some(stager))
+        };
 
         let total_batches = dataset.len() / config.batch_size.max(1);
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() && total_batches > 1 {

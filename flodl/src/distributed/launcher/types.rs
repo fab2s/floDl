@@ -811,13 +811,17 @@ fn parse_env_block(
                 // e.g. `CUDA_VISIBLE_DEVICES: "0"` pins every local rank
                 // to GPU 0 (NCCL duplicate-device failure, or silently
                 // permuted ranks). Rejected loudly at parse, never
-                // filtered at spawn.
-                if k.starts_with("FLODL_") || k == "CUDA_VISIBLE_DEVICES" {
+                // filtered at spawn. The rule is the canonical
+                // `is_reserved_cluster_env_key` (mirrored in fdl-cli):
+                // `FLODL_INTERNAL_*` + the launcher-owned specials.
+                // User-facing `FLODL_*` knobs (`FLODL_VERBOSITY`,
+                // `FLODL_STAGER`, NCCL tuning) are deliberately allowed.
+                if crate::distributed::cluster::is_reserved_cluster_env_key(k) {
                     return Err(TensorError::new(&format!(
                         "cluster launcher: {label}[{k:?}] is reserved \
                          (launcher-owned rank identity). GPU scoping belongs \
-                         in `local_devices:`; FLODL_* vars are set by the \
-                         launcher itself."
+                         in `local_devices:`; FLODL_INTERNAL_* vars are set \
+                         by the launcher itself."
                     )));
                 }
                 // Keys are interpolated unquoted into the remote shell's

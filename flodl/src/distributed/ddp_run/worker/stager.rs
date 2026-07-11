@@ -439,6 +439,19 @@ fn stager_loop(
             let stream_budget = share / 4;
             pinned_budget = share - stream_budget;
             cache.set_budget(pinned_budget);
+            let advised: usize = a
+                .segments
+                .iter()
+                .map(|(_, spans)| spans.iter().map(|&(_, s)| s).sum::<usize>())
+                .sum();
+            crate::verbose!(
+                "  stager: rank {rank} advisory | {} segment(s), {advised} samples, \
+                 pinned {}MB + stream {}MB, staged so far {}",
+                a.segments.len(),
+                pinned_budget >> 20,
+                stream_budget >> 20,
+                staged.load(Ordering::Relaxed),
+            );
             queue.clear();
             pos = 0;
             if share == 0 {
@@ -524,7 +537,13 @@ fn stager_loop(
                 pos += 1;
             }
             None => {
-                // Nothing to stage: block until the next advisory.
+                // Advised stream fully staged (or nothing advised yet):
+                // block until the next advisory.
+                crate::verbose!(
+                    "  stager: rank {rank} drained | staged {} total, cache {}MB",
+                    staged.load(Ordering::Relaxed),
+                    cache.bytes() >> 20,
+                );
                 match rx.recv() {
                     Ok(a) => pending = Some(a),
                     Err(_) => return,

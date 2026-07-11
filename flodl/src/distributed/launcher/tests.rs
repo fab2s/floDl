@@ -809,7 +809,15 @@
             val["env"] = serde_json::json!({ k: v });
             FullCluster::from_value(&val)
         };
-        for reserved in ["CUDA_VISIBLE_DEVICES", "FLODL_INTERNAL_LOCAL_RANK", "FLODL_ANYTHING"] {
+        // The canonical rule (`is_reserved_cluster_env_key`): the loud
+        // FLODL_INTERNAL_ prefix plus the launcher-owned specials.
+        for reserved in [
+            "CUDA_VISIBLE_DEVICES",
+            "CUDA_DEVICE_ORDER",
+            "FLODL_INTERNAL_LOCAL_RANK",
+            "FLODL_HOST_NAME",
+            "FDL_ENV",
+        ] {
             let err = with_env(reserved, "x").unwrap_err();
             assert!(
                 err.to_string().contains("reserved"),
@@ -823,8 +831,17 @@
                 "{bad:?}: expected charset rejection, got: {err}"
             );
         }
-        // The whole point of the env block stays available.
-        for ok in ["NCCL_DEBUG", "LD_PRELOAD", "LD_LIBRARY_PATH", "_UNDER"] {
+        // The whole point of the env block stays available — including
+        // user-facing FLODL_* knobs (verbosity, the stager kill-switch),
+        // which are deliberately NOT reserved.
+        for ok in [
+            "NCCL_DEBUG",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "_UNDER",
+            "FLODL_VERBOSITY",
+            "FLODL_STAGER",
+        ] {
             assert!(
                 with_env(ok, "x").is_ok(),
                 "{ok}: legitimate tuning key must be accepted"
