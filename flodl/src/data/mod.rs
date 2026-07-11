@@ -43,6 +43,7 @@ pub mod sampler;
 pub mod loader;
 pub mod datasets;
 pub(crate) mod prefetch;
+pub(crate) mod sample_cache;
 
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
@@ -145,8 +146,37 @@ pub trait BatchDataSet: Send + Sync {
 
 /// Adapter that promotes a [`DataSet`] into a [`BatchDataSet`] by calling
 /// [`get()`](DataSet::get) for each index and stacking position-wise.
+///
+/// Sample fetches go through a read-through
+/// [`SampleCache`](sample_cache::SampleCache): dormant (budget 0, pure
+/// pass-through) until the streaming loader installs a RAM budget at
+/// `epoch()`.
+/// Opaque [`BatchDataSet`] implementors bypass this adapter entirely
+/// and stay uncached by design.
 pub(crate) struct DataSetAdapter<D: DataSet> {
     pub(crate) inner: D,
+    cache: std::sync::Arc<sample_cache::SampleCache>,
+}
+
+impl<D: DataSet> DataSetAdapter<D> {
+    /// Adapter with a dormant, self-owned cache (test / internal use).
+    #[cfg(test)]
+    pub(crate) fn new(inner: D) -> Self {
+        let cache = std::sync::Arc::new(sample_cache::SampleCache::new(inner.len()));
+        DataSetAdapter { inner, cache }
+    }
+
+    /// Adapter sharing `cache` with the loader that will budget it.
+    pub(crate) fn with_cache(
+        inner: D,
+        cache: std::sync::Arc<sample_cache::SampleCache>,
+    ) -> Self {
+        DataSetAdapter { inner, cache }
+    }
+
+    fn fetch(&self, index: usize) -> Result<Vec<Tensor>> {
+        self.cache.get_or_fetch(index, || self.inner.get(index))
+    }
 }
 
 impl<D: DataSet> BatchDataSet for DataSetAdapter<D> {
@@ -162,7 +192,7 @@ impl<D: DataSet> BatchDataSet for DataSetAdapter<D> {
         let n = indices.len() as i64;
 
         // Fetch first sample to learn shapes and tensor count
-        let first = self.inner.get(indices[0])?;
+        let first = self.fetch(indices[0])?;
         let n_tensors = first.len();
 
         // Pre-allocate output tensors with batch dim prepended: [n, ...sample_shape]
@@ -189,7 +219,7 @@ impl<D: DataSet> BatchDataSet for DataSetAdapter<D> {
 
         // Fetch remaining samples one at a time: copy into pre-allocated output, then drop
         for (batch_idx, &idx) in indices.iter().enumerate().skip(1) {
-            let sample = self.inner.get(idx)?;
+            let sample = self.fetch(idx)?;
             if sample.len() != n_tensors {
                 return Err(crate::tensor::TensorError::new(&format!(
                     "DataSetAdapter: sample {} has {} tensors, expected {} (same as sample 0)",
@@ -404,7 +434,7 @@ mod tests {
     #[test]
     fn test_dataset_adapter_stacks_position_wise() {
         let data = make_simple_data(10);
-        let adapter = DataSetAdapter { inner: data };
+        let adapter = DataSetAdapter::new(data);
         let batch = adapter.get_batch(&[0, 1, 2]).unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].shape(), &[3, 4]); // 3 samples, 4 features
@@ -414,7 +444,7 @@ mod tests {
     #[test]
     fn test_dataset_adapter_multi_target() {
         let data = make_multi_target(20);
-        let adapter = DataSetAdapter { inner: data };
+        let adapter = DataSetAdapter::new(data);
         let batch = adapter.get_batch(&[5, 10, 15, 19]).unwrap();
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].shape(), &[4, 3, 8, 8]); // images
@@ -425,7 +455,7 @@ mod tests {
     #[test]
     fn test_dataset_adapter_single_item() {
         let data = make_simple_data(5);
-        let adapter = DataSetAdapter { inner: data };
+        let adapter = DataSetAdapter::new(data);
         let batch = adapter.get_batch(&[3]).unwrap();
         assert_eq!(batch[0].shape(), &[1, 4]);
         assert_eq!(batch[1].shape(), &[1, 2]);
@@ -434,7 +464,7 @@ mod tests {
     #[test]
     fn test_dataset_adapter_empty_indices() {
         let data = make_simple_data(5);
-        let adapter = DataSetAdapter { inner: data };
+        let adapter = DataSetAdapter::new(data);
         let batch = adapter.get_batch(&[]).unwrap();
         assert!(batch.is_empty());
     }

@@ -1619,6 +1619,147 @@
         assert_eq!(count, 5);
     }
 
+    /// Per-item dataset that counts `get()` calls (shared handle) and
+    /// returns the index as the sample value.
+    struct CountingData {
+        n: usize,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DataSet for CountingData {
+        fn len(&self) -> usize {
+            self.n
+        }
+        fn get(&self, index: usize) -> Result<Vec<Tensor>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![Tensor::from_f32(&[index as f32], &[1], Device::CPU)?])
+        }
+    }
+
+    fn loader_sample_cache(
+        loader: &DataLoader,
+    ) -> std::sync::Arc<crate::data::sample_cache::SampleCache> {
+        match &loader.inner {
+            LoaderInner::Streaming(l) => {
+                std::sync::Arc::clone(l.sample_cache.as_ref().expect("cache wired"))
+            }
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }
+
+    #[test]
+    fn test_sample_cache_serves_later_epochs_from_ram() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut loader = DataLoader::from_dataset(CountingData {
+            n: 12,
+            calls: std::sync::Arc::clone(&calls),
+        })
+        .batch_size(4)
+        .streaming()
+        .build()
+        .unwrap();
+        let cache = loader_sample_cache(&loader);
+
+        // Epoch 0 populates read-through: build probe (1) + 12 samples.
+        let batches: Vec<Batch> = loader.epoch(0).map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 13);
+
+        if cache.bytes() == 0 {
+            // Host genuinely has no RAM headroom under the cap right
+            // now; admission legitimately stayed closed. Nothing to
+            // assert about hits.
+            eprintln!("skipping cache-hit assertions: no RAM headroom on this host");
+            return;
+        }
+
+        // Later epochs read from the cache: zero new dataset calls.
+        for epoch in 1..3 {
+            let batches: Vec<Batch> = loader.epoch(epoch).map(|b| b.unwrap()).collect();
+            assert_eq!(batches.len(), 3);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 13, "epochs 1-2 fully cached");
+    }
+
+    #[test]
+    fn test_sample_cache_off_switch_refetches_every_epoch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut loader = DataLoader::from_dataset(CountingData {
+            n: 8,
+            calls: std::sync::Arc::clone(&calls),
+        })
+        .batch_size(4)
+        .streaming()
+        .sample_cache(false)
+        .build()
+        .unwrap();
+
+        match &loader.inner {
+            LoaderInner::Streaming(l) => assert!(l.sample_cache.is_none()),
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+
+        for epoch in 0..2 {
+            let batches: Vec<Batch> = loader.epoch(epoch).map(|b| b.unwrap()).collect();
+            assert_eq!(batches.len(), 2);
+        }
+        // Build probe (1) + 8 per epoch, nothing retained.
+        assert_eq!(calls.load(Ordering::Relaxed), 17);
+    }
+
+    #[test]
+    fn test_sample_cache_content_identical_across_epochs() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut loader = DataLoader::from_dataset(CountingData {
+            n: 8,
+            calls,
+        })
+        .batch_size(4)
+        .streaming()
+        .sampler(Box::new(SequentialSampler::new(8)))
+        .build()
+        .unwrap();
+
+        // Sequential order: cached epoch must reproduce the exact
+        // same values the read-through epoch delivered.
+        for epoch in 0..2 {
+            let values: Vec<f64> = loader
+                .epoch(epoch)
+                .map(|b| b.unwrap()[0].to_f64_vec().unwrap())
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(values, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        }
+    }
+
+    #[test]
+    fn test_batch_dataset_loader_has_no_sample_cache() {
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let data = PairBatch {
+            x: Tensor::randn(&[20, 4], opts).unwrap(),
+            y: Tensor::randn(&[20, 2], opts).unwrap(),
+        };
+        let loader = DataLoader::from_batch_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .build()
+            .unwrap();
+        match &loader.inner {
+            LoaderInner::Streaming(l) => assert!(
+                l.sample_cache.is_none(),
+                "opaque BatchDataSet loaders stay uncached by design"
+            ),
+            LoaderInner::Resident(_) => panic!("expected streaming loader"),
+        }
+    }
+
     #[test]
     fn test_ram_max_usage_builder() {
         let data = make_data(20);

@@ -237,6 +237,14 @@ The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reade
 - **`flodl::sys::mem_info()`**: host RAM probe (`MemTotal` / `MemAvailable` from `/proc/meminfo`), CUDA-free like the rest of `flodl::sys`.
 - The VRAM depth governor and the RAM ring bound different resources and stay orthogonal: the governor caps device in-flight (transfer stage), the ring caps host-RAM in-flight (reader stage). CPU-target loaders keep the single-stage pipeline (their batch channel already is the read-ahead buffer), as does the coordinator-paced distributed batch path.
 
+#### Sample cache: later epochs read from RAM, not storage
+
+`DataSet`-backed streaming loaders now retain samples in a read-through RAM cache as epoch 1 reads them; later epochs hit RAM instead of re-reading storage. The cache is keyed by sample identity, which makes staged content reshuffle-proof: a reshuffle changes only the access order, never the content set. When the budget covers the whole dataset, storage is read exactly once for the entire run.
+
+- **`DataLoaderBuilder::sample_cache(bool)`** (default enabled): the off switch for single-pass training over data far larger than RAM, where retained samples are never revisited. Opaque `BatchDataSet` loaders have no sample layer and are never cached (their batching is the dataset's own affair).
+- **Admission: fill until full, evict nothing.** Every epoch touches each sample exactly once in a fresh random order, so a cache holding K of N samples hits K/N of reads for any eviction policy; admit-until-full delivers that with zero eviction churn. A shrinking RAM budget stops new admissions but never drops staged content.
+- Shares the `ram_max_usage` budget with the reader ring: the ring is capped to a small flow-buffer depth while the cache is active (jitter absorption saturates fast; retained samples pay again on every later epoch), the cache gets the remaining headroom, refreshed each `epoch()` against `MemAvailable`. Lock-free: one `OnceLock` slot per sample, reads are a single atomic load.
+
 #### Misc additions
 
 - **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.

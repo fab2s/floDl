@@ -272,16 +272,37 @@ stay single-stage (their batch channel *is* the read-ahead ring), as
 does the coordinator-paced distributed `LoadBatch` path (no index
 foresight, nothing to read ahead).
 
-**Tiered data plane (the arc this seeds).** The full design, in
-landing order; each increment stands alone:
+**Tiered data plane (the arc this seeds).** One rule unifies the
+tiers: *staged bytes are reshuffle-invariant as long as staging is
+keyed by sample identity, not epoch position.* A reshuffle changes
+only the order function (the index stream, pure `seed + epoch`,
+computable arbitrarily far ahead — to end of training), never the
+content set. So each tier holds as much sample-keyed content as
+genuinely reservable, permanently; only the order-dependent artifacts
+(the in-flight stacked batches: reader ring + VRAM prefetch queue) are
+rebuilt per epoch, and they are deliberately the smallest layer.
+Resident mode is the existing embodiment of this rule at the VRAM tier
+(preload everything, re-fetch never, re-permute per epoch); the
+increments below extend it downward. Landing order; each increment
+stands alone:
 
 1. *Two-stage split + byte-budgeted ring* (landed, above).
-2. *RAM sample cache:* a read-through, sample-keyed cache at the
-   `DataSet::get(index)` layer. Batches are not reusable across
-   epochs (reshuffle changes their composition); samples are. This is
-   where a deep RAM budget belongs — a longer FIFO ring would waste
-   it. Pure `BatchDataSet` implementors (opaque batching) are the
-   explicit escape hatch and stay uncached.
+2. *RAM sample cache* (**landed**): a read-through, sample-keyed cache
+   at the `DataSet::get(index)` layer, inside the `DataSet` →
+   `BatchDataSet` adapter. Batches are not reusable across epochs
+   (reshuffle changes their composition); samples are. Admission is
+   fill-until-full with no eviction: every epoch touches each sample
+   exactly once in fresh random order, so a cache holding K of N
+   samples hits K/N for ANY eviction policy — admit-until-full gets
+   the same hit rate with zero churn. Shares the `ram_max_usage`
+   budget with the reader ring (ring capped to a flow-buffer depth
+   while the cache is active; budget refreshed per epoch against
+   `MemAvailable`; shrinking headroom stops new admissions but never
+   drops staged content). Lock-free (`OnceLock` slot per sample). Pure
+   `BatchDataSet` implementors (opaque batching) are the explicit
+   escape hatch and stay uncached; DDP rank workers drive their own
+   `PrefetchWorker` without a `DataLoader` and get cache wiring with
+   the reservation layer (increment 4), which owns per-rank budgets.
 3. *Disk stage:* the same cache spills evicted samples to a local
    drive buffer (size in GB, `0` = off); misses fall back to the
    network source. Epoch 1 populates the tiers while training; later
@@ -305,6 +326,13 @@ landing order; each increment stands alone:
    data also keeps ElChe's delivered-cost signal clean: the data term
    goes uniformly cheap in steady state, so the scheduler measures
    true compute.
+5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
+   tier up — when a dataset almost fits on device, keep K of N samples
+   VRAM-resident and stream the rest, completing the spectrum between
+   resident and streaming modes. The batch-assembly machinery exists
+   (resident mode's device-side gather); per-rank VRAM pools are what
+   the controller's compute-ratio reservations would size, hence the
+   sequencing after increment 4.
 
 Cross-cutting invariants for the arc:
 

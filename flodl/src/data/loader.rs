@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use super::prefetch::PrefetchWorker;
+use super::sample_cache::SampleCache;
 use super::sampler::{RandomSampler, Sampler, SequentialSampler};
 use super::{Batch, BatchDataSet, DataSet, DataSetAdapter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -122,6 +123,14 @@ pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> u
 /// enough to pipeline reads against transfers and absorb some jitter.
 pub(crate) const RING_SLOTS_FALLBACK: usize = 4;
 
+/// Reader-ring ceiling while the sample cache is active. The ring is a
+/// flow buffer: its value is jitter absorption, which saturates after
+/// a handful of batches, while every byte the retained tier (sample
+/// cache) holds pays again on every later epoch. So when both compete
+/// for the RAM budget, the ring is capped here and the cache gets the
+/// rest.
+pub(crate) const RING_SLOTS_WITH_CACHE: usize = 8;
+
 /// Reader-ring capacity (in batches) for the two-stage prefetch
 /// pipeline, from the host RAM budget.
 ///
@@ -179,6 +188,11 @@ pub struct DataLoaderBuilder {
     vram_max_usage: f64,
     ram_max_usage: f64,
     activation_reserve: Option<usize>,
+    /// Read-through sample cache created by `from_dataset` (None for
+    /// opaque `BatchDataSet` loaders). The adapter inside `dataset`
+    /// holds the other Arc.
+    pub(crate) sample_cache: Option<Arc<SampleCache>>,
+    sample_cache_enabled: bool,
 }
 
 impl DataLoaderBuilder {
@@ -196,6 +210,8 @@ impl DataLoaderBuilder {
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
             activation_reserve: None,
+            sample_cache: None,
+            sample_cache_enabled: true,
         }
     }
 
@@ -297,6 +313,30 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Enable / disable the read-through sample cache (streaming mode,
+    /// [`DataSet`]-backed loaders). Default: enabled.
+    ///
+    /// The cache retains samples in RAM as epoch 1 reads them, so later
+    /// epochs read at RAM speed instead of storage speed. It is keyed
+    /// by sample identity, which makes staged content reshuffle-proof:
+    /// a reshuffle changes only the order, never the content set. It
+    /// shares the [`ram_max_usage`](Self::ram_max_usage) budget with
+    /// the reader ring (the ring keeps a small flow-buffer slice, the
+    /// cache gets the rest) and never evicts — with every epoch
+    /// touching each sample exactly once in fresh random order, no
+    /// eviction policy beats filling until the budget is reached and
+    /// keeping what is there.
+    ///
+    /// Disable for single-pass training over a dataset far larger than
+    /// RAM, where retained samples are never revisited and the whole
+    /// budget is better spent on the reader ring. Opaque
+    /// [`BatchDataSet`] loaders have no sample layer and are never
+    /// cached; `ram_max_usage(0.0)` also stops all admissions.
+    pub fn sample_cache(mut self, enabled: bool) -> Self {
+        self.sample_cache_enabled = enabled;
+        self
+    }
+
     /// Bytes to reserve for forward/backward memory in streaming-mode
     /// VRAM sizing (activations, gradients, lazily created optimizer
     /// state).
@@ -389,7 +429,17 @@ impl DataLoaderBuilder {
             vram_max_usage,
             ram_max_usage,
             activation_reserve,
+            sample_cache,
+            sample_cache_enabled,
         } = self;
+
+        // The off switch drops the loader-side handle; the adapter's
+        // clone stays dormant (budget 0 = pure pass-through).
+        let sample_cache = if sample_cache_enabled {
+            sample_cache
+        } else {
+            None
+        };
 
         let n = dataset.len();
 
@@ -445,12 +495,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, names)
         }
     }
 }
@@ -510,6 +560,7 @@ fn build_streaming(
     ram_max_usage: f64,
     user_set_depth: bool,
     activation_reserve: Option<usize>,
+    sample_cache: Option<Arc<SampleCache>>,
     names: Vec<String>,
 ) -> Result<DataLoader> {
     let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
@@ -530,6 +581,7 @@ fn build_streaming(
             per_sample_bytes,
             vram_max_usage,
             ram_max_usage,
+            sample_cache,
             user_set_depth,
             activation_reserve: reserve,
             reserve_source,
@@ -590,14 +642,24 @@ impl DataLoader {
 impl DataLoader {
     /// Create a DataLoader from a per-item [`DataSet`].
     ///
-    /// Items are automatically stacked into batches.
+    /// Items are automatically stacked into batches. Sample fetches go
+    /// through a read-through RAM cache in streaming mode (see
+    /// [`DataLoaderBuilder::sample_cache`]).
     pub fn from_dataset<D: DataSet + 'static>(dataset: D) -> DataLoaderBuilder {
-        DataLoaderBuilder::new(Box::new(DataSetAdapter { inner: dataset }))
+        let cache = Arc::new(SampleCache::new(dataset.len()));
+        let mut builder = DataLoaderBuilder::new(Box::new(DataSetAdapter::with_cache(
+            dataset,
+            Arc::clone(&cache),
+        )));
+        builder.sample_cache = Some(cache);
+        builder
     }
 
     /// Create a DataLoader from a per-batch [`BatchDataSet`].
     ///
-    /// The dataset is responsible for returning properly batched tensors.
+    /// The dataset is responsible for returning properly batched
+    /// tensors. Batches are opaque to the loader, so the sample cache
+    /// does not apply (batching is the dataset's own affair).
     pub fn from_batch_dataset<D: BatchDataSet + 'static>(dataset: D) -> DataLoaderBuilder {
         DataLoaderBuilder::new(Box::new(dataset))
     }
@@ -844,6 +906,10 @@ pub(crate) struct StreamingLoader {
     /// Host RAM ceiling for the reader-stage ring (see
     /// [`DataLoaderBuilder::ram_max_usage`]). `0.0` = single-stage.
     ram_max_usage: f64,
+    /// Read-through sample cache shared with the adapter inside the
+    /// worker's dataset. `None` = opaque `BatchDataSet` loader or
+    /// `.sample_cache(false)`. Budgeted at each `epoch()`.
+    sample_cache: Option<Arc<SampleCache>>,
     /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
     /// Skips automatic adaptation so we don't override the user's choice.
     user_set_depth: bool,
@@ -911,21 +977,52 @@ impl StreamingLoader {
             n.div_ceil(bs)
         };
 
+        // One RAM probe per epoch serves both RAM consumers below.
+        let mem = crate::sys::mem_info().map(|m| (m.total_bytes, m.available_bytes));
+
         // Reader-ring sizing: CUDA targets only. On CPU targets the
         // batch channel itself is the read-ahead buffer (no transfer
         // stage to overlap), so the pipeline stays single-stage. The
         // mechanism in the worker is device-agnostic; this is policy.
+        // While the sample cache is active the ring is capped to a
+        // flow-buffer depth: jitter absorption saturates fast, retained
+        // samples pay again every later epoch.
         let ring_slots = if self.device.is_cuda() {
-            ring_slots_from_ram(
+            let sized = ring_slots_from_ram(
                 self.per_sample_bytes,
                 bs,
                 self.ram_max_usage,
-                crate::sys::mem_info().map(|m| (m.total_bytes, m.available_bytes)),
+                mem,
                 num_batches,
-            )
+            );
+            if self.sample_cache.is_some() {
+                sized.min(RING_SLOTS_WITH_CACHE)
+            } else {
+                sized
+            }
         } else {
             0
         };
+
+        // Sample-cache budget refresh: same RAM cap as the ring,
+        // recomputed from the live probe once per epoch. The budget
+        // includes already-retained bytes (a shrinking headroom stops
+        // new admissions, never drops staged content) and leaves the
+        // ring its slice. Without RAM visibility the budget stays as
+        // it was (initially 0: no admissions on hosts we cannot
+        // measure).
+        if let Some(cache) = &self.sample_cache {
+            if let Some((total, available)) = mem {
+                let cap = (total as f64 * self.ram_max_usage.min(0.90)) as u64;
+                let used = total.saturating_sub(available);
+                let headroom = cap.saturating_sub(used);
+                let ring_bytes = (ring_slots as u64)
+                    .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
+                let budget = (cache.bytes() as u64)
+                    .saturating_add(headroom.saturating_sub(ring_bytes));
+                cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
+            }
+        }
 
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already
