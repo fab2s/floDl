@@ -1,9 +1,26 @@
-//! Chunk pool for progressive dispatch.
+//! Chunk pool for progressive dispatch, with per-rank reservations.
 //!
-//! Tracks remaining unassigned samples for one epoch during progressive dispatch.
-//! Instead of sending the full partition at epoch start, the coordinator hands
-//! out small chunks from this pool. Each `take_chunk` advances a monotonic
-//! cursor, guaranteeing non-overlapping slices into the global permutation.
+//! Tracks remaining unassigned samples for one epoch during progressive
+//! dispatch. Instead of sending the full partition at epoch start, the
+//! coordinator hands out small chunks from this pool.
+//!
+//! # Reservations
+//!
+//! The epoch's permutation is partitioned into contiguous per-rank
+//! **spans** (sized by ElChe throughput ratios at pool creation; equal
+//! when uncalibrated). A rank's chunks come from the front of its own
+//! span via a per-rank cursor, so each rank's upcoming data is
+//! deterministic for the whole epoch — the basis for staging it ahead.
+//! When a rank exhausts its span while others lag (throughput drift
+//! beyond the reservation ratios), it **steals from the tail of the
+//! largest-residue span** (reservation truing: the boundary moves, the
+//! books stay exact). Tails are therefore the only region whose owner
+//! is uncertain — which is why the staging layer prefetches everyone's
+//! tails last, as margin.
+//!
+//! Non-overlap invariant: a span's owner consumes it front-to-back, a
+//! thief peels its tail back-to-front; they can meet but never cross,
+//! and spans are disjoint by construction.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -14,8 +31,12 @@ pub struct ChunkPool {
     #[allow(dead_code)]
     pub epoch: usize,
     pub total_samples: usize,
-    /// Next unassigned offset into the global permutation.
-    pub cursor: usize,
+    /// Per-rank reserved `(start, end)` spans — a partition of
+    /// `[0, total_samples)`. `end` moves down when a faster rank steals
+    /// the tail (truing).
+    spans: Vec<(usize, usize)>,
+    /// Per-rank: next unassigned offset within the rank's own span.
+    rank_cursor: Vec<usize>,
     /// Per-rank: samples dispatched (sum of all chunk sizes sent).
     pub dispatched: Vec<usize>,
     /// Per-rank: samples completed (from MetricsMsg.samples_processed).
@@ -37,11 +58,35 @@ pub struct ChunkPool {
 }
 
 impl ChunkPool {
+    /// Pool with equal per-rank spans (uncalibrated / test default).
     pub fn new(epoch: usize, total_samples: usize, world_size: usize) -> Self {
+        let base = total_samples / world_size.max(1);
+        let mut sizes = vec![base; world_size];
+        if let Some(last) = sizes.last_mut() {
+            *last += total_samples - base * world_size;
+        }
+        Self::new_with_spans(epoch, total_samples, &sizes)
+    }
+
+    /// Pool with per-rank reservation spans of the given sizes (must sum
+    /// to `total_samples`; the caller batch-aligns them). Spans are laid
+    /// out contiguously in rank order.
+    pub fn new_with_spans(epoch: usize, total_samples: usize, span_sizes: &[usize]) -> Self {
+        debug_assert_eq!(span_sizes.iter().sum::<usize>(), total_samples);
+        let world_size = span_sizes.len();
+        let mut spans = Vec::with_capacity(world_size);
+        let mut rank_cursor = Vec::with_capacity(world_size);
+        let mut at = 0usize;
+        for &s in span_sizes {
+            spans.push((at, at + s));
+            rank_cursor.push(at);
+            at += s;
+        }
         ChunkPool {
             epoch,
             total_samples,
-            cursor: 0,
+            spans,
+            rank_cursor,
             dispatched: vec![0; world_size],
             completed: vec![0; world_size],
             chunks_sent: vec![0; world_size],
@@ -51,13 +96,30 @@ impl ChunkPool {
         }
     }
 
-    /// Take the next chunk of `size` samples from the pool.
+    /// Unassigned samples left in a rank's own span.
+    pub fn residue(&self, rank: usize) -> usize {
+        self.spans[rank].1.saturating_sub(self.rank_cursor[rank])
+    }
+
+    /// The rank's remaining reserved stream: `(next_offset, len)` of the
+    /// unassigned front of its own span. The deterministic "will train
+    /// next" view the staging layer prefetches from.
+    #[allow(dead_code)]
+    pub fn reservation(&self, rank: usize) -> (usize, usize) {
+        (self.rank_cursor[rank], self.residue(rank))
+    }
+
+    /// Take the next chunk of `size` samples for `rank`.
     ///
     /// Returns `(offset, actual_size)` or `None` if the pool is exhausted.
-    /// Actual size may be smaller than requested if near the end.
-    /// Reclaimed ranges (a dead rank's forfeited chunks) are served first;
-    /// a chunk is always one contiguous slice, so at most one reclaimed
-    /// range is consumed per call (split if larger than `size`).
+    /// Actual size may be smaller than requested (own-span residue, a
+    /// reclaimed range, or a donor tail smaller than the ask); a chunk is
+    /// always one contiguous slice. Source order:
+    /// 1. reclaimed ranges (a dead rank's forfeited chunks) — coverage
+    ///    holes must close first;
+    /// 2. the front of the rank's own reserved span;
+    /// 3. truing: the tail of the largest-residue span (the rank
+    ///    out-ran its reservation; the boundary moves).
     pub fn take_chunk(&mut self, size: usize, rank: usize) -> Option<(usize, usize)> {
         if size > 0 {
             if let Some((off, range_size)) = self.reclaimed.pop_front() {
@@ -73,12 +135,31 @@ impl ChunkPool {
                 return Some((off, actual));
             }
         }
-        if self.cursor >= self.total_samples {
-            return None;
+
+        // Own span front.
+        let residue = self.residue(rank);
+        if residue > 0 {
+            let actual = size.min(residue);
+            let offset = self.rank_cursor[rank];
+            self.rank_cursor[rank] += actual;
+            self.dispatched[rank] += actual;
+            self.chunks_sent[rank] += 1;
+            if actual > 0 {
+                self.outstanding[rank].push_back((offset, actual));
+            }
+            return Some((offset, actual));
         }
-        let actual = size.min(self.total_samples - self.cursor);
-        let offset = self.cursor;
-        self.cursor += actual;
+
+        // Truing steal: peel the tail of the largest-residue span. The
+        // donor consumes front-to-back, the thief takes back-to-front —
+        // they can meet but never cross.
+        let donor = (0..self.spans.len())
+            .filter(|&r| r != rank)
+            .max_by_key(|&r| self.residue(r))
+            .filter(|&r| self.residue(r) > 0)?;
+        let actual = size.min(self.residue(donor));
+        self.spans[donor].1 -= actual;
+        let offset = self.spans[donor].1;
         self.dispatched[rank] += actual;
         self.chunks_sent[rank] += 1;
         if actual > 0 {
@@ -150,9 +231,14 @@ impl ChunkPool {
         }
         self.dispatched[rank] = self.dispatched[rank].saturating_sub(size);
         self.chunks_sent[rank] = self.chunks_sent[rank].saturating_sub(1);
-        if self.cursor == offset + size {
-            self.cursor -= size;
+        if self.rank_cursor[rank] == offset + size {
+            // The take came off the rank's own span front and nothing was
+            // taken from it since: rewind the cursor.
+            self.rank_cursor[rank] -= size;
         } else {
+            // A steal (or an own-span take followed by another): the range
+            // goes to reclaimed for re-dispatch — un-stealing a donor tail
+            // is not worth the bookkeeping for this rare transactional path.
             self.reclaimed.push_front((offset, size));
         }
     }
@@ -172,10 +258,10 @@ impl ChunkPool {
         reclaimed_total
     }
 
-    /// Samples not yet assigned to any rank (cursor residue plus any
-    /// forfeited ranges awaiting re-dispatch).
+    /// Samples not yet assigned to any rank (every span's residue plus
+    /// any forfeited ranges awaiting re-dispatch).
     pub fn remaining(&self) -> usize {
-        self.total_samples.saturating_sub(self.cursor)
+        (0..self.spans.len()).map(|r| self.residue(r)).sum::<usize>()
             + self.reclaimed.iter().map(|&(_, s)| s).sum::<usize>()
     }
 
@@ -235,8 +321,10 @@ impl ChunkPool {
     /// `docs/design/epoch-tail-allocation.md` (## Async).
     pub fn uncovered_ranges(&self) -> Vec<(usize, usize)> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        if self.cursor < self.total_samples {
-            ranges.push((self.cursor, self.total_samples - self.cursor));
+        for (r, &(_, end)) in self.spans.iter().enumerate() {
+            if self.rank_cursor[r] < end {
+                ranges.push((self.rank_cursor[r], end - self.rank_cursor[r]));
+            }
         }
         for q in &self.outstanding {
             ranges.extend(q.iter().copied().filter(|&(_, sz)| sz > 0));
@@ -275,9 +363,11 @@ impl ChunkPool {
     ) -> Self {
         let mut pool = ChunkPool::new(epoch, total_samples, world_size);
         // The covered region is settled and gone; only the holes remain to
-        // dispatch. Park the cursor past the end (no fresh samples) and stage
-        // the holes for the reclaimed-first `take_chunk` path.
-        pool.cursor = total_samples;
+        // dispatch. Empty every span (no fresh samples) and stage the holes
+        // for the reclaimed-first `take_chunk` path.
+        for r in 0..pool.spans.len() {
+            pool.rank_cursor[r] = pool.spans[r].1;
+        }
         pool.reclaimed = uncovered
             .iter()
             .copied()
@@ -290,7 +380,7 @@ impl ChunkPool {
     /// reported completion for everything dispatched to them. Forfeited
     /// ranges awaiting re-dispatch count as un-dispatched work.
     pub fn is_epoch_done(&self) -> bool {
-        self.cursor >= self.total_samples
+        (0..self.spans.len()).all(|r| self.residue(r) == 0)
             && self.reclaimed.is_empty()
             && self.dispatched.iter().zip(&self.completed).all(|(d, c)| c >= d)
     }
@@ -308,21 +398,25 @@ mod tests {
 
     #[test]
     fn chunk_pool_basic() {
+        // Equal spans: rank 0 owns [0,500), rank 1 owns [500,1000).
         let mut pool = ChunkPool::new(0, 1000, 2);
         assert_eq!(pool.remaining(), 1000);
         assert!(!pool.is_epoch_done());
 
-        // Take a chunk for rank 0
+        // Each rank's chunks come from the front of its own span.
         let (off, size) = pool.take_chunk(300, 0).unwrap();
         assert_eq!(off, 0);
         assert_eq!(size, 300);
         assert_eq!(pool.remaining(), 700);
 
-        // Take a chunk for rank 1
         let (off, size) = pool.take_chunk(200, 1).unwrap();
-        assert_eq!(off, 300);
+        assert_eq!(off, 500);
         assert_eq!(size, 200);
         assert_eq!(pool.remaining(), 500);
+
+        // The reservation view: what each rank will train next.
+        assert_eq!(pool.reservation(0), (300, 200));
+        assert_eq!(pool.reservation(1), (700, 300));
 
         // Not done yet (nothing completed)
         assert!(!pool.is_epoch_done());
@@ -330,58 +424,83 @@ mod tests {
 
     #[test]
     fn chunk_pool_exhaustion() {
+        // Spans: [0,50) / [50,100).
         let mut pool = ChunkPool::new(0, 100, 2);
 
-        // Take more than available: clamped
+        // Take more than the own-span residue: clamped to the span.
         let (off, size) = pool.take_chunk(80, 0).unwrap();
-        assert_eq!((off, size), (0, 80));
+        assert_eq!((off, size), (0, 50));
 
         let (off, size) = pool.take_chunk(50, 1).unwrap();
-        assert_eq!((off, size), (80, 20)); // only 20 left
+        assert_eq!((off, size), (50, 50));
 
-        // Pool exhausted
+        // Pool exhausted: nothing left to steal either.
         assert!(pool.take_chunk(10, 0).is_none());
         assert_eq!(pool.remaining(), 0);
+    }
+
+    #[test]
+    fn chunk_pool_take_steals_largest_residue_tail_when_span_exhausted() {
+        // Ratio spans: rank 0 owns [0,70), rank 1 owns [70,100).
+        let mut pool = ChunkPool::new_with_spans(0, 100, &[70, 30]);
+        assert_eq!(pool.reservation(0), (0, 70));
+        assert_eq!(pool.reservation(1), (70, 30));
+
+        // Rank 1 drains its own span, then out-runs it: the next chunk is
+        // peeled from the tail of rank 0's span (reservation truing).
+        assert_eq!(pool.take_chunk(30, 1).unwrap(), (70, 30));
+        assert_eq!(pool.take_chunk(20, 1).unwrap(), (50, 20));
+        assert_eq!(pool.reservation(0), (0, 50), "donor span shrank from the tail");
+
+        // Rank 0 still consumes its (reduced) span front-to-back.
+        assert_eq!(pool.take_chunk(60, 0).unwrap(), (0, 50));
+        // Everything dispatched exactly once.
+        assert!(pool.take_chunk(10, 0).is_none());
+        assert_eq!(pool.remaining(), 0);
+        pool.mark_completed(0, 50);
+        pool.mark_completed(1, 50);
+        assert!(pool.is_epoch_done());
     }
 
     #[test]
     fn chunk_pool_is_epoch_done() {
         let mut pool = ChunkPool::new(0, 100, 2);
 
-        pool.take_chunk(60, 0).unwrap();
-        pool.take_chunk(40, 1).unwrap();
+        pool.take_chunk(50, 0).unwrap();
+        pool.take_chunk(50, 1).unwrap();
         assert!(pool.take_chunk(1, 0).is_none()); // exhausted
 
         // All dispatched but nothing completed
         assert!(!pool.is_epoch_done());
 
         // Rank 0 completes
-        pool.mark_completed(0, 60);
+        pool.mark_completed(0, 50);
         assert!(!pool.is_epoch_done()); // rank 1 still pending
 
         // Rank 1 completes
-        pool.mark_completed(1, 40);
+        pool.mark_completed(1, 50);
         assert!(pool.is_epoch_done());
     }
 
     #[test]
     fn chunk_pool_incremental_completion() {
+        // Spans: [0,100) / [100,200).
         let mut pool = ChunkPool::new(0, 200, 2);
 
-        // Two chunks for rank 0
-        pool.take_chunk(50, 0).unwrap();
-        pool.take_chunk(50, 1).unwrap();
-        pool.take_chunk(60, 0).unwrap();
-        pool.take_chunk(40, 1).unwrap();
+        // Two chunks per rank, each from its own span.
+        assert_eq!(pool.take_chunk(50, 0).unwrap(), (0, 50));
+        assert_eq!(pool.take_chunk(50, 1).unwrap(), (100, 50));
+        assert_eq!(pool.take_chunk(50, 0).unwrap(), (50, 50));
+        assert_eq!(pool.take_chunk(50, 1).unwrap(), (150, 50));
         assert_eq!(pool.remaining(), 0);
 
         // Complete in stages
         pool.mark_completed(0, 50); // first chunk
         pool.mark_completed(1, 50);
-        assert!(!pool.is_epoch_done()); // rank 0 dispatched 110, only 50 done
+        assert!(!pool.is_epoch_done()); // rank 0 dispatched 100, only 50 done
 
-        pool.mark_completed(0, 60); // second chunk
-        pool.mark_completed(1, 40);
+        pool.mark_completed(0, 50); // second chunk
+        pool.mark_completed(1, 50);
         assert!(pool.is_epoch_done());
     }
 
@@ -458,42 +577,43 @@ mod tests {
 
     #[test]
     fn chunk_pool_forfeit_reclaims_in_flight() {
+        // Spans: [0,50) / [50,100).
         let mut pool = ChunkPool::new(0, 100, 2);
-        pool.take_chunk(40, 0).unwrap();
-        pool.take_chunk(60, 1).unwrap();
+        pool.take_chunk(50, 0).unwrap();
+        pool.take_chunk(50, 1).unwrap();
         assert_eq!(pool.remaining(), 0);
 
         // Rank 1 completes its first chunk... then dies with 0 in flight,
         // while rank 0 dies with its whole chunk in flight.
-        pool.mark_completed(1, 60);
+        pool.mark_completed(1, 50);
         assert_eq!(pool.forfeit(1), 0); // nothing outstanding
-        assert_eq!(pool.forfeit(0), 40);
+        assert_eq!(pool.forfeit(0), 50);
 
-        // The forfeited 40 samples are back in the pool.
-        assert_eq!(pool.remaining(), 40);
+        // The forfeited 50 samples are back in the pool.
+        assert_eq!(pool.remaining(), 50);
         assert_eq!(pool.in_flight(0), 0);
         assert!(!pool.is_epoch_done()); // reclaimed work pending
 
         // Survivor re-takes the exact forfeited range.
-        let (off, size) = pool.take_chunk(40, 1).unwrap();
-        assert_eq!((off, size), (0, 40));
-        pool.mark_completed(1, 40);
+        let (off, size) = pool.take_chunk(50, 1).unwrap();
+        assert_eq!((off, size), (0, 50));
+        pool.mark_completed(1, 50);
         assert!(pool.is_epoch_done());
     }
 
     #[test]
     fn chunk_pool_forfeit_split_reclaim() {
+        // Spans: [0,50) / [50,100). Rank 0 dies with its whole span in flight.
         let mut pool = ChunkPool::new(0, 100, 2);
-        pool.take_chunk(60, 0).unwrap();
-        assert_eq!(pool.forfeit(0), 60);
+        pool.take_chunk(50, 0).unwrap();
+        assert_eq!(pool.forfeit(0), 50);
 
         // Smaller takes split the reclaimed range.
         assert_eq!(pool.take_chunk(25, 1), Some((0, 25)));
         assert_eq!(pool.take_chunk(25, 1), Some((25, 25)));
-        assert_eq!(pool.take_chunk(25, 1), Some((50, 10))); // range tail
-        // Then back to the cursor for fresh samples.
-        assert_eq!(pool.take_chunk(25, 1), Some((60, 25)));
-        assert_eq!(pool.remaining(), 15);
+        // Then back to the survivor's own span for fresh samples.
+        assert_eq!(pool.take_chunk(25, 1), Some((50, 25)));
+        assert_eq!(pool.remaining(), 25);
     }
 
     #[test]
@@ -519,19 +639,20 @@ mod tests {
         assert_eq!(pool.remaining(), 100);
         assert_eq!(pool.in_flight(0), 0);
         assert_eq!(pool.chunks_sent[0], 0);
-        // The next take re-issues the same slice.
-        assert_eq!(pool.take_chunk(40, 1), Some((0, 40)));
+        // The rank's next take re-issues the same slice (cursor rewound).
+        assert_eq!(pool.take_chunk(40, 0), Some((0, 40)));
     }
 
     #[test]
     fn chunk_pool_rollback_take_after_other_take_reclaims() {
         let mut pool = ChunkPool::new(0, 100, 2);
-        let (off0, size0) = pool.take_chunk(40, 0).unwrap();
-        pool.take_chunk(30, 1).unwrap(); // cursor moved past rank 0's chunk
+        let (off0, size0) = pool.take_chunk(20, 0).unwrap(); // (0,20)
+        pool.take_chunk(20, 0).unwrap(); // (20,20) — rank 0's cursor moved on
         pool.rollback_take(0, off0, size0);
-        // Can't rewind the cursor; range is reclaimed for re-dispatch.
-        assert_eq!(pool.remaining(), 30 + 40);
-        assert_eq!(pool.take_chunk(40, 1), Some((0, 40)));
+        // Can't rewind the rank cursor past a later take; range is
+        // reclaimed for re-dispatch (to anyone).
+        assert_eq!(pool.remaining(), 100 - 40 + 20);
+        assert_eq!(pool.take_chunk(20, 1), Some((0, 20)));
     }
 
     #[test]
@@ -540,14 +661,15 @@ mod tests {
         // OLDER (non-back) one is rolled back. It must be found, removed,
         // and reclaimed — not silently dropped (which would leak its
         // samples) and not mis-accounted against the newest chunk.
-        let mut pool = ChunkPool::new(0, 100, 2);
+        // Spans: [0,100) / [100,200).
+        let mut pool = ChunkPool::new(0, 200, 2);
         let (off0, size0) = pool.take_chunk(40, 0).unwrap(); // rank 0: (0,40)
         pool.take_chunk(30, 0).unwrap(); // rank 0: (40,30) — now the back
         pool.rollback_take(0, off0, size0);
         // Newest chunk still in flight; only the rolled-back one is gone.
         assert_eq!(pool.in_flight(0), 30);
         assert_eq!(pool.chunks_sent[0], 1);
-        // The reclaimed range is served before the cursor.
+        // The reclaimed range is served before anyone's span.
         assert_eq!(pool.take_chunk(40, 1), Some((0, 40)));
     }
 
@@ -602,6 +724,7 @@ mod tests {
 
     #[test]
     fn chunk_pool_completion_after_forfeit_clamps() {
+        // Spans: [0,50) / [50,100).
         let mut pool = ChunkPool::new(0, 100, 2);
         pool.take_chunk(40, 0).unwrap();
         pool.forfeit(0);
@@ -609,12 +732,17 @@ mod tests {
         // underflow and the epoch must still complete.
         pool.mark_completed(0, 40);
         assert_eq!(pool.in_flight(0), 0);
+        // Survivor drains: reclaimed range, own span, then the dead
+        // rank's span residue via the tail-steal.
         let (off, size) = pool.take_chunk(40, 1).unwrap();
         assert_eq!((off, size), (0, 40));
         pool.mark_completed(1, 40);
         let (off, size) = pool.take_chunk(60, 1).unwrap();
-        assert_eq!((off, size), (40, 60));
-        pool.mark_completed(1, 60);
+        assert_eq!((off, size), (50, 50));
+        pool.mark_completed(1, 50);
+        let (off, size) = pool.take_chunk(60, 1).unwrap();
+        assert_eq!((off, size), (40, 10));
+        pool.mark_completed(1, 10);
         assert!(pool.is_epoch_done());
     }
 
@@ -638,29 +766,34 @@ mod tests {
 
     #[test]
     fn uncovered_ranges_includes_reclaimed() {
+        // Spans: [0,50) / [50,100).
         let mut pool = ChunkPool::new(0, 100, 2);
         pool.take_chunk(40, 0).unwrap(); // (0,40)
-        pool.take_chunk(20, 1).unwrap(); // (40,20)
-        pool.mark_completed(1, 20); // (40,60) covered
+        pool.take_chunk(20, 1).unwrap(); // (50,20)
+        pool.mark_completed(1, 20); // [50,70) covered
         pool.forfeit(0); // (0,40) back to reclaimed (uncovered)
-        // Uncovered: reclaimed (0,40) + tail [60,100). Not contiguous (gap is
-        // the covered [40,60)).
-        assert_eq!(pool.uncovered_ranges(), vec![(0, 40), (60, 40)]);
+        // Uncovered: reclaimed (0,40) + rank 0 span residue (40,10) —
+        // coalesced (0,50) — and rank 1 span residue (70,30). The gap is
+        // the covered [50,70).
+        assert_eq!(pool.uncovered_ranges(), vec![(0, 50), (70, 30)]);
     }
 
     #[test]
     fn from_coverage_dispatches_only_holes_each_once() {
         // Snapshot a partially-covered pool, reconstruct, and verify the
         // reconstructed pool serves EXACTLY the uncovered ranges, once.
+        // Spans: [0,33) / [33,66) / [66,100).
         let mut orig = ChunkPool::new(0, 100, 3);
         orig.take_chunk(30, 0).unwrap(); // (0,30)
-        orig.take_chunk(20, 1).unwrap(); // (30,20)
-        orig.take_chunk(10, 2).unwrap(); // (50,10)
+        orig.take_chunk(20, 1).unwrap(); // (33,20)
+        orig.take_chunk(10, 2).unwrap(); // (66,10)
         orig.mark_completed(0, 30); // (0,30) covered
-        orig.mark_completed(2, 10); // (50,10) covered
-        // Uncovered: rank 1 in-flight (30,20) + tail [60,100) = (60,40).
+        orig.mark_completed(2, 10); // (66,10) covered
+        // Uncovered: rank 0 residue (30,3) + rank 1 in-flight (33,20) +
+        // rank 1 residue (53,13) — coalesced (30,36) — and rank 2 residue
+        // (76,24).
         let uncovered = orig.uncovered_ranges();
-        assert_eq!(uncovered, vec![(30, 20), (60, 40)]);
+        assert_eq!(uncovered, vec![(30, 36), (76, 24)]);
 
         let mut resumed = ChunkPool::from_coverage(0, 100, 3, &uncovered);
         assert_eq!(resumed.remaining(), 60, "only the holes remain");
@@ -684,7 +817,7 @@ mod tests {
         // Exactly the holes covered once; the covered-at-snapshot samples never
         // re-served.
         for (i, &c) in covered.iter().enumerate() {
-            let in_hole = (30..50).contains(&i) || (60..100).contains(&i);
+            let in_hole = (30..66).contains(&i) || (76..100).contains(&i);
             assert_eq!(c, u32::from(in_hole), "sample {i}");
         }
     }

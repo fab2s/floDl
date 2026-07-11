@@ -254,6 +254,10 @@ The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reade
 - **Failure split**: a read error on the pack file surfaces (it is a real disk problem); a write error never fails training — the sample is already in hand — it latches the stage off loudly and the run continues source-backed. Budget-full is a plain decline, not a failure.
 - Requires the sample layer: `build()` errors loudly on an opaque `BatchDataSet` loader or with `sample_cache(false)`. Pays exactly when the source is slower than local disk (network mounts) and data is revisited; for a dataset already on local SSD the source is the disk and the stage buys nothing.
 
+#### Per-rank data reservations in progressive dispatch
+
+The progressive chunk pool now partitions each epoch's permutation into contiguous per-rank spans sized by ElChe throughput ratios (equal until calibrated), and serves each rank's chunks from the front of its own span instead of a shared arrival-order cursor. Each rank's upcoming data is thereby deterministic for the whole epoch — the foundation for staging it ahead of the training frontier. Throughput drift is absorbed by reservation truing: a rank that out-runs its span steals from the tail of the largest-residue span (the boundary moves, the coverage books stay exact). Training semantics are unchanged — a reservation table is a deterministic partition of the globally reshuffled order where the old cursor produced a nondeterministic one — and the dispatch discipline (one chunk in flight, schedule-exact window sizing, reduce/epoch barriers, coverage-granular checkpoint/resume, dead-rank reclaim) is untouched.
+
 #### Misc additions
 
 - **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.

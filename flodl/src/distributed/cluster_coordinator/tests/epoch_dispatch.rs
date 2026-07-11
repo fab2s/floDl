@@ -40,14 +40,16 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
     .checkpoint_at_epoch(2);
     let mut coord_a = ClusterCoordinator::for_test(cfg_a);
 
-    // Partial coverage on epoch 2: rank 0 completes (0,40); rank 1 has (40,30)
-    // still in flight. Covered = [0,40); uncovered = (40,30) in-flight + tail
-    // [70,100) → coalesced (40,60).
+    // Partial coverage on epoch 2 (reservation spans: rank 0 owns [0,50),
+    // rank 1 owns [50,100)): rank 0 completes (0,40); rank 1 has (50,30)
+    // still in flight. Covered = [0,40); uncovered = rank 0's span residue
+    // (40,10) + rank 1's in-flight (50,30) + rank 1's span residue (80,20)
+    // → coalesced (40,60).
     coord_a.install_chunk_pool_for_test(2, total);
     {
         let pool = coord_a.chunk_pools.get_mut(&2).unwrap();
         assert_eq!(pool.take_chunk(40, 0).unwrap(), (0, 40));
-        assert_eq!(pool.take_chunk(30, 1).unwrap(), (40, 30));
+        assert_eq!(pool.take_chunk(30, 1).unwrap(), (50, 30));
         pool.mark_completed(0, 40);
     }
     coord_a.rank_epoch[0] = 2;

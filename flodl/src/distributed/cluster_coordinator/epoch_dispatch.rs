@@ -223,12 +223,13 @@ impl ClusterCoordinator {
         epoch: usize,
     ) -> Result<Vec<crate::distributed::wire::EpochPlanWire>> {
         let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        let span_sizes = self.reservation_span_sizes(batch_total);
         self.chunk_pools.insert(
             epoch,
-            crate::distributed::chunk_pool::ChunkPool::new(
+            crate::distributed::chunk_pool::ChunkPool::new_with_spans(
                 epoch,
                 batch_total,
-                self.world_size,
+                &span_sizes,
             ),
         );
         // A tiny epoch (whole dataset < one window + crumb) is its own final
@@ -392,12 +393,13 @@ impl ClusterCoordinator {
 
         if !self.chunk_pools.contains_key(&next_epoch) {
             let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+            let span_sizes = self.reservation_span_sizes(batch_total);
             self.chunk_pools.insert(
                 next_epoch,
-                crate::distributed::chunk_pool::ChunkPool::new(
+                crate::distributed::chunk_pool::ChunkPool::new_with_spans(
                     next_epoch,
                     batch_total,
-                    self.world_size,
+                    &span_sizes,
                 ),
             );
             crate::verbose!("  ddp: streaming -> epoch {next_epoch} pool created");
@@ -682,6 +684,35 @@ impl ClusterCoordinator {
     /// ElChe gets enough averaging events to stabilise quickly.
     /// Post-calibration uses throughput-proportional sizing with a
     /// `min_chunk_batches` floor.
+    /// Per-rank reservation span sizes (samples, batch-aligned, summing
+    /// to `batch_total`) from ElChe's throughput ratios — equal split
+    /// until calibrated. The spans partition the epoch permutation so
+    /// each rank's upcoming data is deterministic for the whole epoch
+    /// (what the staging layer prefetches from); the pool's tail-steal
+    /// truing absorbs ratio drift, so a span is a reservation, not a
+    /// contract.
+    pub(super) fn reservation_span_sizes(&self, batch_total: usize) -> Vec<usize> {
+        let total_batches = batch_total / self.batch_size.max(1);
+        let counts = self.el_che.batch_counts();
+        let total_counts: usize = counts.iter().sum();
+        let calibrated = self.el_che.is_calibrated() || self.el_che.has_speed_hint();
+        let mut batches: Vec<usize> = if calibrated && total_counts > 0 {
+            counts
+                .iter()
+                .map(|&c| total_batches * c / total_counts)
+                .collect()
+        } else {
+            vec![total_batches / self.world_size.max(1); self.world_size]
+        };
+        // Hand the rounding remainder out round-robin so sizes sum exactly.
+        let assigned: usize = batches.iter().sum();
+        let n = batches.len().max(1);
+        for i in 0..total_batches.saturating_sub(assigned) {
+            batches[i % n] += 1;
+        }
+        batches.iter().map(|&b| b * self.batch_size).collect()
+    }
+
     pub(super) fn compute_chunk_batches(&self, rank: usize, epoch: usize) -> usize {
         let pool = match self.chunk_pools.get(&epoch) {
             Some(p) => p,

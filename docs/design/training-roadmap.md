@@ -318,23 +318,40 @@ stands alone:
    samples sit in which tier does not change the hit profile, so
    clairvoyance only becomes real when access turns non-uniform
    (reservation-constrained windows, increment 4).
-4. *Schedule-aware reservations (the distributed half):* allocation is
-   constrained to per-rank reserved data — the controller reserves
-   spans of the precomputed shuffled order per rank (bootstrap: small
-   equal spans; converging to ElChe throughput ratios), and ElChe
-   allocates only within each rank's reservation. Prefetch then stages
-   each rank's reservation in certainty order (confirmed window →
-   estimated next windows → revocable margin last), which makes late
-   fetches structurally impossible away from epoch/training
-   boundaries; boundaries over-prefetch a little because the cost of a
-   wasted read is trivial next to a whole cohort waiting on one
-   starved rank at a barrier. Rebalancing moves reservation *tails*
-   between ranks (the margin-last ordering makes tails the natural
-   donor pool); a dead rank's unconsumed reservation redistributes to
-   survivors under the same rule. Constraining allocation to staged
-   data also keeps ElChe's delivered-cost signal clean: the data term
-   goes uniformly cheap in steady state, so the scheduler measures
-   true compute.
+4. *Schedule-aware reservations (the distributed half; coordinator
+   ledger **landed**, wire + stager pending):* the epoch permutation
+   is partitioned into contiguous per-rank spans sized by ElChe
+   throughput ratios (equal until calibrated), and each rank's chunks
+   come from the front of its own span via a per-rank cursor — the
+   shared arrival-order cursor is gone from progressive dispatch, so
+   each rank's upcoming data is deterministic for the whole epoch.
+   Drift is absorbed by **truing**: a rank that out-runs its span
+   steals from the tail of the largest-residue span (the boundary
+   moves, the books stay exact; donor consumes front-to-back, thief
+   peels back-to-front, they can meet but never cross). Span tails are
+   therefore the only owner-uncertain region, which is why the staging
+   layer prefetches everyone's tails last, as margin — staging may
+   overlap across ranks near boundaries, allocation never does, and
+   staged-but-allocated-elsewhere bytes need **no invalidation
+   protocol at all**: only allocated work executes, so the allocation
+   ledger IS the invalidation, and unused staged data just ages out.
+   Global reshuffle semantics are byte-identical (a reservation table
+   is a deterministic partition of the shuffled order; the old cursor
+   produced one nondeterministically). The data plane itself is
+   epoch-blind: each rank's stream is the concatenation of its spans
+   across epochs, computable from the seed arbitrarily far ahead —
+   an epoch is where the order function switches, never a
+   data-movement event. On that concatenated stream, next-use
+   distances are known and non-uniform, so the streaming pool's
+   eviction is next-use-priority (keep what recurs soonest) — the
+   correctly-scoped return of the clairvoyance retired at the
+   single-tier level. Dead ranks: the unconsumed span redistributes
+   under the same truing rule. Keeping allocation inside staged data
+   also keeps ElChe's delivered-cost signal clean: the data term goes
+   uniformly cheap in steady state, so the scheduler measures true
+   compute. Remaining slices: reservation frame on the wire + the
+   worker stager feeding the tiers (certainty order = own stream
+   forward, margins last), then per-rank memory shares.
 5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
    tier up — when a dataset almost fits on device, keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between
