@@ -362,9 +362,15 @@ stands alone:
    read-through; its budget refreshes with each advisory as the host's
    live RAM headroom split consumption-proportionally among co-hosted
    ranks (envelope-derived; `budget ∝ rate` = equal lookahead time).
-   Dormant until the first advisory. Remaining slices:
-   next-use-priority eviction for the beyond-budget stream, and the
-   rig falsification.
+   Dormant until the first advisory. The beyond-pinned stream is
+   **landed** as a bounded flow window with next-use-priority
+   eviction: pinned declines land in the pool instead of wasting the
+   read, consumption pops entries (the frontier passing is the
+   drop-behind), admission evicts the farthest-next-use entry (keep
+   what recurs soonest), the stager pauses before fetching past a
+   full window, and positions re-key from each advisory on the window
+   clock. Remaining: the rig falsification (network bytes/epoch +
+   starvation stalls on Pascal/virtiofs).
 5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
    tier up — when a dataset almost fits on device, keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between

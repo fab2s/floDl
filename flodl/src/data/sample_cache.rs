@@ -86,6 +86,12 @@ impl SampleCache {
         self.bytes.load(Ordering::Relaxed)
     }
 
+    /// Whether the RAM tier holds this sample (no disk probe, no
+    /// clone — the cheap staged-already check).
+    pub(crate) fn contains_ram(&self, index: usize) -> bool {
+        self.slots.get(index).is_some_and(|s| s.get().is_some())
+    }
+
     /// Number of samples currently cached (test/diagnostic).
     #[cfg(test)]
     pub(crate) fn cached_count(&self) -> usize {

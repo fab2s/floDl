@@ -16,9 +16,10 @@
 //! pass-through) until the first advisory arrives — non-progressive
 //! runs, tests, and thread-based DDP never pay for it.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::data::sample_cache::SampleCache;
@@ -26,6 +27,124 @@ use crate::data::BatchDataSet;
 use crate::tensor::{Result, Tensor, TensorOptions};
 
 use super::super::make_partition;
+
+// ---------------------------------------------------------------------------
+// StreamPool (the flow window beyond the pinned tier)
+// ---------------------------------------------------------------------------
+
+/// Bounded pool for the beyond-pinned-budget portion of the advised
+/// stream. Where the pinned tier keeps a static set (optimal for what
+/// it holds: any K-set ties under a reshuffled scan), this pool is a
+/// sliding window over the known future: the stager fills it ahead of
+/// the training frontier, training consumption pops entries as the
+/// frontier passes (drop-behind), and admission under pressure evicts
+/// the entry whose next use in the advised stream is FARTHEST — keep
+/// what recurs soonest, throw away last what is needed first. Next-use
+/// positions are recomputed from each advisory (the window clock), so
+/// the priority is always against the current stream.
+pub(crate) struct StreamPool {
+    entries: HashMap<usize, StreamEntry>,
+    bytes: usize,
+    budget: usize,
+}
+
+struct StreamEntry {
+    rows: Vec<Tensor>,
+    bytes: usize,
+    /// Position of this sample's next use in the advised stream —
+    /// smaller = needed sooner. Refreshed on each advisory; entries
+    /// absent from the new stream get `usize::MAX` (evicted first).
+    next_use: usize,
+}
+
+impl StreamPool {
+    pub(crate) fn new() -> Self {
+        StreamPool {
+            entries: HashMap::new(),
+            bytes: 0,
+            budget: 0,
+        }
+    }
+
+    pub(crate) fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+    }
+
+    pub(crate) fn contains(&self, index: usize) -> bool {
+        self.entries.contains_key(&index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Pop-on-hit: consumption IS the drop-behind. The frontier passed
+    /// this sample; its slot goes to the lookahead.
+    pub(crate) fn take(&mut self, index: usize) -> Option<Vec<Tensor>> {
+        let entry = self.entries.remove(&index)?;
+        self.bytes -= entry.bytes;
+        Some(entry.rows)
+    }
+
+    /// Admit with next-use-priority eviction: make room by evicting
+    /// strictly-farther entries; decline when the pool is full of
+    /// sooner-needed samples (the caller pauses rather than fetching
+    /// past a full window). `false` = declined.
+    pub(crate) fn offer(&mut self, index: usize, rows: Vec<Tensor>, next_use: usize) -> bool {
+        let bytes: usize = rows.iter().map(|t| t.nbytes()).sum();
+        if bytes > self.budget {
+            return false;
+        }
+        while self.bytes + bytes > self.budget {
+            let farthest = match self
+                .entries
+                .iter()
+                .max_by_key(|(_, e)| e.next_use)
+                .map(|(&i, e)| (i, e.next_use))
+            {
+                Some(f) => f,
+                None => return false, // nothing held, still no room
+            };
+            if farthest.1 <= next_use {
+                return false; // everything held is needed sooner
+            }
+            let evicted = self.entries.remove(&farthest.0).expect("just found");
+            self.bytes -= evicted.bytes;
+        }
+        self.bytes += bytes;
+        self.entries.insert(
+            index,
+            StreamEntry {
+                rows,
+                bytes,
+                next_use,
+            },
+        );
+        true
+    }
+
+    /// Re-key every held entry's next-use position against a fresh
+    /// advised stream (called per advisory). Absent entries get
+    /// `usize::MAX`: not in the visible future, first to go.
+    pub(crate) fn refresh_positions(&mut self, positions: &HashMap<usize, usize>) {
+        for (idx, entry) in self.entries.iter_mut() {
+            entry.next_use = positions.get(idx).copied().unwrap_or(usize::MAX);
+        }
+    }
+
+    /// Whether a sample at stream position `next_use` (of estimated
+    /// size `bytes`) could currently be admitted.
+    fn has_room_for(&self, bytes: usize, next_use: usize) -> bool {
+        if bytes > self.budget {
+            return false;
+        }
+        if self.bytes + bytes <= self.budget {
+            return true;
+        }
+        self.entries.values().any(|e| e.next_use > next_use)
+    }
+}
 
 /// One reservation advisory: the rank's upcoming run-stream as
 /// `(epoch, spans)` segments in walk order — each segment's spans in
@@ -47,11 +166,22 @@ pub(crate) struct StageAdvisory {
 pub(crate) struct StagedBatchDataSet {
     inner: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
+    /// Flow window beyond the pinned tier. Consumption pops entries
+    /// (drop-behind).
+    stream: Arc<Mutex<StreamPool>>,
 }
 
 impl StagedBatchDataSet {
-    pub(crate) fn new(inner: Arc<dyn BatchDataSet>, cache: Arc<SampleCache>) -> Self {
-        StagedBatchDataSet { inner, cache }
+    pub(crate) fn new(
+        inner: Arc<dyn BatchDataSet>,
+        cache: Arc<SampleCache>,
+        stream: Arc<Mutex<StreamPool>>,
+    ) -> Self {
+        StagedBatchDataSet {
+            inner,
+            cache,
+            stream,
+        }
     }
 
     /// Owned single-row copy of row `j` (batch dim kept at 1). A plain
@@ -101,9 +231,15 @@ impl BatchDataSet for StagedBatchDataSet {
             match self.cache.lookup(idx) {
                 Some(hit) => rows.push(Some(hit?)),
                 None => {
-                    rows.push(None);
-                    missing.push(idx);
-                    missing_pos.push(pos);
+                    // Flow window next: a hit is popped — consumption
+                    // is the drop-behind.
+                    if let Some(row) = self.stream.lock().ok().and_then(|mut p| p.take(idx)) {
+                        rows.push(Some(row));
+                    } else {
+                        rows.push(None);
+                        missing.push(idx);
+                        missing_pos.push(pos);
+                    }
                 }
             }
         }
@@ -234,6 +370,7 @@ fn host_share(rank: usize, local_ranks: &[usize], counts: &[usize]) -> f64 {
 pub(crate) fn spawn_stager(
     dataset: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
+    stream: Arc<Mutex<StreamPool>>,
     base_seed: u64,
     rank: usize,
     world_size: usize,
@@ -243,7 +380,16 @@ pub(crate) fn spawn_stager(
     let staged_in_thread = Arc::clone(&staged);
 
     let join = std::thread::spawn(move || {
-        stager_loop(dataset, cache, rx, base_seed, rank, world_size, &staged_in_thread);
+        stager_loop(
+            dataset,
+            cache,
+            stream,
+            rx,
+            base_seed,
+            rank,
+            world_size,
+            &staged_in_thread,
+        );
     });
 
     StagerHandle {
@@ -257,6 +403,7 @@ pub(crate) fn spawn_stager(
 fn stager_loop(
     dataset: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
+    stream: Arc<Mutex<StreamPool>>,
     rx: mpsc::Receiver<StageAdvisory>,
     base_seed: u64,
     rank: usize,
@@ -265,6 +412,11 @@ fn stager_loop(
 ) {
     let dataset_len = dataset.len();
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    // Stream position of the queue front (the next-use priority key).
+    let mut pos: usize = 0;
+    let mut pinned_budget: usize = 0;
+    // Learned from the first staged sample; prices the room checks.
+    let mut sample_bytes: usize = 0;
     let mut pending: Option<StageAdvisory> = None;
 
     loop {
@@ -280,15 +432,22 @@ fn stager_loop(
         if let Some(a) = pending.take() {
             // Budget refresh rides the advisory (which rides the reduce
             // clock): live host headroom × this rank's consumption
-            // share among co-hosted ranks. A shrink stops new
-            // admissions, never drops staged content.
-            let budget = stager_ram_budget(rank, world_size, &a.counts);
-            cache.set_budget(budget);
+            // share among co-hosted ranks, split between the pinned
+            // tier and the flow window. A shrink stops new admissions,
+            // never drops staged content.
+            let share = stager_ram_budget(rank, world_size, &a.counts);
+            let stream_budget = share / 4;
+            pinned_budget = share - stream_budget;
+            cache.set_budget(pinned_budget);
             queue.clear();
-            if budget == 0 {
+            pos = 0;
+            if share == 0 {
                 // No headroom right now: reading ahead with nothing
                 // retained would spend source bandwidth for nothing.
                 // Stay alive — a later advisory may find room.
+                if let Ok(mut p) = stream.lock() {
+                    p.set_budget(0);
+                }
                 continue;
             }
             for &(epoch, ref spans) in &a.segments {
@@ -302,17 +461,67 @@ fn stager_loop(
                     ));
                 }
             }
+            // Re-key the flow window's next-use priorities against the
+            // fresh stream (first occurrence wins).
+            let mut positions: HashMap<usize, usize> = HashMap::new();
+            for (i, &idx) in queue.iter().enumerate() {
+                positions.entry(idx).or_insert(i);
+            }
+            if let Ok(mut p) = stream.lock() {
+                p.set_budget(stream_budget);
+                p.refresh_positions(&positions);
+            }
         }
 
-        match queue.pop_front() {
+        match queue.front().copied() {
             Some(idx) => {
-                // Read-through: the wrapper admits the row; the result
-                // itself is discarded. Errors are the training path's
-                // to surface (it reads the same source) — the stager
-                // just moves on.
-                if dataset.get_batch(&[idx]).is_ok() {
+                // Already staged in either tier: cheap skip, which is
+                // what makes the per-window stream re-walk affordable.
+                let in_stream = stream.lock().map(|p| p.contains(idx)).unwrap_or(false);
+                if cache.contains_ram(idx) || in_stream {
+                    queue.pop_front();
+                    pos += 1;
+                    staged.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Room check BEFORE fetching — never spend a source
+                // read on a sample nothing can retain. The flow window
+                // frees room as training consumes (pop-on-hit), so
+                // full-of-sooner-data means: wait for the frontier or
+                // the next advisory.
+                let pinned_room = cache.bytes() + sample_bytes <= pinned_budget;
+                let stream_room = stream
+                    .lock()
+                    .map(|p| p.has_room_for(sample_bytes.max(1), pos))
+                    .unwrap_or(false);
+                if !pinned_room && !stream_room {
+                    match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(a) => pending = Some(a),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    continue;
+                }
+
+                queue.pop_front();
+                // Read-through: the wrapper admits to the pinned tier
+                // while it has room; what pinned declined goes to the
+                // flow window with its next-use position. Errors are
+                // the training path's to surface (same source) — the
+                // stager moves on.
+                if let Ok(batch) = dataset.get_batch(&[idx]) {
+                    if sample_bytes == 0 {
+                        sample_bytes = batch.iter().map(|t| t.nbytes()).sum();
+                    }
+                    if !cache.contains_ram(idx) {
+                        if let Ok(mut p) = stream.lock() {
+                            let _ = p.offer(idx, batch, pos);
+                        }
+                    }
                     staged.fetch_add(1, Ordering::Relaxed);
                 }
+                pos += 1;
             }
             None => {
                 // Nothing to stage: block until the next advisory.
@@ -351,20 +560,79 @@ mod tests {
         }
     }
 
-    fn staged_setup(n: usize) -> (Arc<StagedBatchDataSet>, Arc<SampleCache>, Arc<AtomicUsize>) {
+    fn staged_setup(
+        n: usize,
+    ) -> (
+        Arc<StagedBatchDataSet>,
+        Arc<SampleCache>,
+        Arc<Mutex<StreamPool>>,
+        Arc<AtomicUsize>,
+    ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let inner: Arc<dyn BatchDataSet> = Arc::new(Probe {
             n,
             calls: Arc::clone(&calls),
         });
         let cache = Arc::new(SampleCache::new(n));
-        let staged = Arc::new(StagedBatchDataSet::new(inner, Arc::clone(&cache)));
-        (staged, cache, calls)
+        let stream = Arc::new(Mutex::new(StreamPool::new()));
+        let staged = Arc::new(StagedBatchDataSet::new(
+            inner,
+            Arc::clone(&cache),
+            Arc::clone(&stream),
+        ));
+        (staged, cache, stream, calls)
+    }
+
+    /// One-row sample as the pool stores it ([1, 1] f32).
+    fn row(v: f32) -> Vec<Tensor> {
+        vec![Tensor::from_f32(&[v], &[1, 1], Device::CPU).unwrap()]
+    }
+
+    #[test]
+    fn stream_pool_evicts_farthest_next_use() {
+        let mut pool = StreamPool::new();
+        pool.set_budget(8); // two 4-byte rows
+
+        assert!(pool.offer(10, row(10.0), 5));
+        assert!(pool.offer(11, row(11.0), 9));
+        assert_eq!(pool.len(), 2);
+
+        // Nearer sample evicts the farthest-needed entry (11 @ 9).
+        assert!(pool.offer(12, row(12.0), 2));
+        assert_eq!(pool.len(), 2);
+        assert!(pool.contains(10) && pool.contains(12));
+
+        // Farther than everything held: declined.
+        assert!(!pool.offer(13, row(13.0), 20));
+        assert!(!pool.has_room_for(4, 20));
+        assert!(pool.has_room_for(4, 1), "room by evicting a farther entry");
+
+        // Consumption pops (drop-behind) and frees room.
+        let r = pool.take(12).unwrap();
+        assert_eq!(r[0].to_f64_vec().unwrap(), vec![12.0]);
+        assert!(!pool.contains(12));
+        assert!(pool.offer(13, row(13.0), 20), "room after the frontier passed");
+    }
+
+    #[test]
+    fn stream_pool_refresh_rekeys_next_use() {
+        let mut pool = StreamPool::new();
+        pool.set_budget(8);
+        assert!(pool.offer(1, row(1.0), 3));
+        assert!(pool.offer(2, row(2.0), 4));
+
+        // New advised stream: sample 2 recurs at position 0, sample 1
+        // vanished (consumed, not visible ahead) → MAX, evicted first.
+        let positions: HashMap<usize, usize> = [(2usize, 0usize)].into_iter().collect();
+        pool.refresh_positions(&positions);
+        assert!(pool.offer(3, row(3.0), 7));
+        assert!(!pool.contains(1), "vanished-from-stream entry evicted first");
+        assert!(pool.contains(2), "soonest-recurring entry kept");
     }
 
     #[test]
     fn dormant_wrapper_is_pass_through() {
-        let (staged, cache, calls) = staged_setup(8);
+        let (staged, cache, _stream, calls) = staged_setup(8);
         // Budget 0: every batch is one bulk inner call, nothing retained.
         let b = staged.get_batch(&[1, 3, 5]).unwrap();
         assert_eq!(b[0].to_f64_vec().unwrap(), vec![1.0, 3.0, 5.0]);
@@ -374,7 +642,7 @@ mod tests {
 
     #[test]
     fn staged_rows_stitch_with_misses_in_order() {
-        let (staged, cache, calls) = staged_setup(8);
+        let (staged, cache, _stream, calls) = staged_setup(8);
         cache.set_budget(1 << 20);
 
         // Stage rows 2 and 5 the way the stager does.
@@ -397,10 +665,10 @@ mod tests {
 
     #[test]
     fn stager_walks_advisory_and_warms_shared_tier() {
-        let (staged, cache, calls) = staged_setup(12);
+        let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), 42, 0, 1);
+        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.

@@ -185,12 +185,16 @@ impl<M: Module> GpuWorker<M> {
         // StageAdvisory arrives, so non-progressive runs and tests never
         // pay for it.
         let stage_cache = Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
-        let dataset: Arc<dyn BatchDataSet> = Arc::new(
-            super::stager::StagedBatchDataSet::new(dataset, Arc::clone(&stage_cache)),
-        );
+        let stream_pool = Arc::new(Mutex::new(super::stager::StreamPool::new()));
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(super::stager::StagedBatchDataSet::new(
+            dataset,
+            Arc::clone(&stage_cache),
+            Arc::clone(&stream_pool),
+        ));
         let stager = Some(super::stager::spawn_stager(
             Arc::clone(&dataset),
             stage_cache,
+            stream_pool,
             config.seed,
             config.rank,
             config.world_size,
