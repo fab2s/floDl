@@ -500,7 +500,7 @@ pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
 }
 
 /// Read tensor data written by write_tensor_data.
-fn read_tensor_data<R: Read>(r: &mut R) -> Result<Tensor> {
+pub(crate) fn read_tensor_data<R: Read>(r: &mut R) -> Result<Tensor> {
     let ndim = read_u32(r)? as usize;
     let mut shape = vec![0i64; ndim];
     for s in &mut shape {

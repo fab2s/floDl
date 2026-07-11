@@ -193,6 +193,8 @@ pub struct DataLoaderBuilder {
     /// holds the other Arc.
     pub(crate) sample_cache: Option<Arc<SampleCache>>,
     sample_cache_enabled: bool,
+    disk_stage_bytes: u64,
+    disk_stage_dir: Option<std::path::PathBuf>,
 }
 
 impl DataLoaderBuilder {
@@ -212,6 +214,8 @@ impl DataLoaderBuilder {
             activation_reserve: None,
             sample_cache: None,
             sample_cache_enabled: true,
+            disk_stage_bytes: 0,
+            disk_stage_dir: None,
         }
     }
 
@@ -337,6 +341,37 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Local-disk overflow tier below the sample cache, sized in GB
+    /// (`0` = off, the default).
+    ///
+    /// Samples the RAM cache declines are staged once in an
+    /// append-only pack file on a local drive; later epochs read them
+    /// at disk speed instead of source speed. Pays exactly when the
+    /// source is slower than local disk (network mounts) and data is
+    /// revisited — for a dataset already on local SSD it buys nothing,
+    /// the source IS the disk. The pack file is ephemeral (removed
+    /// when the loader drops) and lives in the system temp directory
+    /// unless [`disk_stage_dir`](Self::disk_stage_dir) says otherwise;
+    /// a RAM-backed temp dir (tmpfs) triggers a loud warning, since a
+    /// stage that spends RAM defeats its purpose.
+    ///
+    /// Requires the sample layer: `build()` errors loudly on an opaque
+    /// [`BatchDataSet`] loader or with `sample_cache(false)`. Ignored
+    /// in resident mode (the dataset already lives on-device).
+    pub fn disk_stage(mut self, gb: u64) -> Self {
+        self.disk_stage_bytes = gb.saturating_mul(1 << 30);
+        self
+    }
+
+    /// Directory for the disk-stage pack file (default: the system
+    /// temp directory). Point this at a real local drive — not a
+    /// network mount (that would re-buy the latency the stage exists
+    /// to avoid) and not tmpfs (that spends RAM).
+    pub fn disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.disk_stage_dir = Some(dir.into());
+        self
+    }
+
     /// Bytes to reserve for forward/backward memory in streaming-mode
     /// VRAM sizing (activations, gradients, lazily created optimizer
     /// state).
@@ -431,6 +466,8 @@ impl DataLoaderBuilder {
             activation_reserve,
             sample_cache,
             sample_cache_enabled,
+            disk_stage_bytes,
+            disk_stage_dir,
         } = self;
 
         // The off switch drops the loader-side handle; the adapter's
@@ -440,6 +477,17 @@ impl DataLoaderBuilder {
         } else {
             None
         };
+
+        // disk_stage is an explicit knob: with no sample layer to
+        // stage, error loudly instead of silently doing nothing.
+        if disk_stage_bytes > 0 && sample_cache.is_none() {
+            return Err(TensorError::new(
+                "DataLoader: disk_stage requires the sample layer — a DataSet-backed \
+                 loader with the sample cache enabled. Opaque BatchDataSet loaders \
+                 have no per-sample access to stage; sample_cache(false) disables \
+                 the tier the stage overflows from.",
+            ));
+        }
 
         let n = dataset.len();
 
@@ -495,12 +543,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, names)
         }
     }
 }
@@ -561,8 +609,26 @@ fn build_streaming(
     user_set_depth: bool,
     activation_reserve: Option<usize>,
     sample_cache: Option<Arc<SampleCache>>,
+    disk_stage_bytes: u64,
+    disk_stage_dir: &Option<std::path::PathBuf>,
     names: Vec<String>,
 ) -> Result<DataLoader> {
+    // Local-disk overflow tier under the sample cache. Attached here,
+    // not in build(): the resident path never reads through the cache,
+    // so it must not create a pack file it would never use.
+    if disk_stage_bytes > 0 {
+        if let Some(cache) = &sample_cache {
+            let dir = disk_stage_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir);
+            cache.attach_disk(super::sample_cache::DiskStage::create(
+                &dir,
+                disk_stage_bytes,
+                dataset.len(),
+            )?);
+        }
+    }
+
     let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
     let (reserve, reserve_source) = match activation_reserve {
         Some(bytes) => (bytes, ReserveSource::User),

@@ -245,6 +245,15 @@ The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reade
 - **Admission: fill until full, evict nothing.** Every epoch touches each sample exactly once in a fresh random order, so a cache holding K of N samples hits K/N of reads for any eviction policy; admit-until-full delivers that with zero eviction churn. A shrinking RAM budget stops new admissions but never drops staged content.
 - Shares the `ram_max_usage` budget with the reader ring: the ring is capped to a small flow-buffer depth while the cache is active (jitter absorption saturates fast; retained samples pay again on every later epoch), the cache gets the remaining headroom, refreshed each `epoch()` against `MemAvailable`. Lock-free: one `OnceLock` slot per sample, reads are a single atomic load.
 
+#### Disk stage: a local-drive tier under the sample cache
+
+`DataLoaderBuilder::disk_stage(gb)` (default 0 = off) adds a local-disk overflow tier: samples the RAM cache declines are staged once in an append-only pack file, and later epochs read them at local-disk speed instead of source speed. With RAM + disk covering the dataset, a network-mounted source is read exactly once per run. Lookup cascades RAM → disk → source.
+
+- **One pack file, not one file per sample**: sequential append is every drive's fast path, and the offset index reuses the same lock-free set-once-slot pattern as the RAM tier (positioned reads, no shared seek state). The per-tensor layout reuses the checkpoint codec — one serialization format in the codebase, not two.
+- **`DataLoaderBuilder::disk_stage_dir(path)`** overrides the location (default: system temp dir). A RAM-backed directory (tmpfs — `/tmp` frequently is) triggers a loud warning, since a stage that spends RAM defeats its purpose. The pack file is ephemeral: removed when the loader drops.
+- **Failure split**: a read error on the pack file surfaces (it is a real disk problem); a write error never fails training — the sample is already in hand — it latches the stage off loudly and the run continues source-backed. Budget-full is a plain decline, not a failure.
+- Requires the sample layer: `build()` errors loudly on an opaque `BatchDataSet` loader or with `sample_cache(false)`. Pays exactly when the source is slower than local disk (network mounts) and data is revisited; for a dataset already on local SSD the source is the disk and the stage buys nothing.
+
 #### Misc additions
 
 - **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.

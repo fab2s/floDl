@@ -1761,6 +1761,72 @@
     }
 
     #[test]
+    fn test_disk_stage_wires_and_cleans_up() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut loader = DataLoader::from_dataset(CountingData {
+            n: 8,
+            calls,
+        })
+        .batch_size(4)
+        .streaming()
+        .disk_stage(1)
+        .disk_stage_dir(std::env::temp_dir().join("flodl-stage-tests"))
+        .build()
+        .unwrap();
+
+        let cache = loader_sample_cache(&loader);
+        let path = cache.disk().expect("disk stage attached").path().to_path_buf();
+        assert!(path.exists(), "pack file created at build");
+
+        // Epochs deliver normally through the cascaded cache.
+        for epoch in 0..2 {
+            let batches: Vec<Batch> = loader.epoch(epoch).map(|b| b.unwrap()).collect();
+            assert_eq!(batches.len(), 2);
+        }
+
+        drop(cache);
+        drop(loader);
+        assert!(!path.exists(), "pack file removed when the loader drops");
+    }
+
+    #[test]
+    fn test_disk_stage_errors_without_sample_layer() {
+        // Opaque BatchDataSet: no per-sample access to stage.
+        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let data = PairBatch {
+            x: Tensor::randn(&[20, 4], opts).unwrap(),
+            y: Tensor::randn(&[20, 2], opts).unwrap(),
+        };
+        let err = match DataLoader::from_batch_dataset(data)
+            .batch_size(4)
+            .streaming()
+            .disk_stage(1)
+            .build()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected disk_stage error on BatchDataSet loader"),
+        };
+        assert!(err.to_string().contains("disk_stage requires the sample layer"));
+
+        // sample_cache(false) disables the tier the stage overflows from.
+        use std::sync::atomic::AtomicUsize;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let err = match DataLoader::from_dataset(CountingData { n: 8, calls })
+            .batch_size(4)
+            .streaming()
+            .sample_cache(false)
+            .disk_stage(1)
+            .build()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected disk_stage error with sample_cache(false)"),
+        };
+        assert!(err.to_string().contains("disk_stage requires the sample layer"));
+    }
+
+    #[test]
     fn test_ram_max_usage_builder() {
         let data = make_data(20);
         let loader = DataLoader::from_dataset(data)

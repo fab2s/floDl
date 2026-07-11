@@ -303,12 +303,21 @@ stands alone:
    escape hatch and stay uncached; DDP rank workers drive their own
    `PrefetchWorker` without a `DataLoader` and get cache wiring with
    the reservation layer (increment 4), which owns per-rank budgets.
-3. *Disk stage:* the same cache spills evicted samples to a local
-   drive buffer (size in GB, `0` = off); misses fall back to the
-   network source. Epoch 1 populates the tiers while training; later
-   epochs read local. Because the sampler's multi-epoch index stream
-   is computable at run start, eviction can be clairvoyant
-   (Belady-optimal: evict the entry whose next use is farthest away).
+3. *Disk stage* (**landed**): a local-drive overflow tier under the
+   RAM cache (`disk_stage(gb)`, `0` = off; `disk_stage_dir` override
+   with a loud tmpfs warning). Nothing spills — the RAM tier never
+   evicts — the disk tier admits what RAM *declined*, once, at first
+   read: one append-only pack file (sequential append, lock-free
+   positioned reads, offsets in set-once slots; per-tensor layout
+   reuses the checkpoint codec) whose lookup cascades RAM → disk →
+   source. Ephemeral (removed on loader drop): persistent cross-run
+   staging needs dataset identity/invalidation and belongs to the
+   host-scoped stage in increment 4. An earlier sketch here proposed
+   Belady-clairvoyant eviction; the same K/N argument that settled the
+   RAM tier retires it — under a uniformly reshuffled scan, WHICH
+   samples sit in which tier does not change the hit profile, so
+   clairvoyance only becomes real when access turns non-uniform
+   (reservation-constrained windows, increment 4).
 4. *Schedule-aware reservations (the distributed half):* allocation is
    constrained to per-rank reserved data — the controller reserves
    spans of the precomputed shuffled order per rank (bootstrap: small
