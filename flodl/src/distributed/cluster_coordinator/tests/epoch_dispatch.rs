@@ -154,6 +154,39 @@ fn advisory_spans_own_first_margins_last() {
 }
 
 #[test]
+fn predicted_epoch_spans_match_table_and_stop_at_run_end() {
+    // The predicted next-epoch segment uses the same ratio table the
+    // pool will be built from (no pool exists yet); past the run's
+    // last epoch there is nothing to predict.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        2,
+        ElChe::new(2, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(2);
+    let coord = ClusterCoordinator::for_test(cfg);
+
+    // Same geometry as the live table: equal spans + window tails.
+    assert_eq!(
+        coord.predicted_epoch_spans(1, 0),
+        vec![(0, 50), (96, 4)],
+    );
+    assert_eq!(
+        coord.predicted_epoch_spans(1, 1),
+        vec![(50, 50), (46, 4)],
+    );
+    // Epoch 2 does not exist in a 2-epoch run.
+    assert!(coord.predicted_epoch_spans(2, 0).is_empty());
+}
+
+#[test]
 fn resume_from_coverage_rejects_seed_mismatch() {
     // The contract rests on the same permutation: a seed change must error
     // loudly rather than silently re-train the wrong samples.

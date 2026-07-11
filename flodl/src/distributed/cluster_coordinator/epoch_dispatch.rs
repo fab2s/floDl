@@ -236,23 +236,11 @@ impl ClusterCoordinator {
         // window: plan it before sizing so the per-rank sizes are coherent.
         self.refresh_final_window_plan(epoch);
 
-        // Reservation advisories: each rank's deterministic epoch stream
-        // (own span first, truing margins last) for its background
-        // stager. Best-effort — advisory frames never gate dispatch, and
-        // a rank without a stager ignores them.
-        for rank in 0..self.world_size {
-            let spans = self.advisory_spans_for_rank(epoch, rank);
-            if !spans.is_empty() {
-                let msg = crate::distributed::wire::ControlMsgWire::StageAdvisory {
-                    epoch: epoch as u64,
-                    spans: spans
-                        .iter()
-                        .map(|&(o, s)| (o as u64, s as u64))
-                        .collect(),
-                };
-                let _ = self.send_control(rank, &msg);
-            }
-        }
+        // Reservation advisories: each rank's deterministic run-stream
+        // (this epoch's spans + the predicted next epoch's) for its
+        // background stager. Best-effort — advisory frames never gate
+        // dispatch, and a rank without a stager ignores them.
+        self.emit_stage_advisories(epoch);
 
         let sizes: Vec<usize> = (0..self.world_size)
             .map(|r| self.compute_chunk_batches(r, epoch))
@@ -732,6 +720,88 @@ impl ClusterCoordinator {
         batches.iter().map(|&b| b * self.batch_size).collect()
     }
 
+    /// Emit every alive rank's `StageAdvisory`. Called at progressive
+    /// epoch start and re-emitted at reduce boundaries (from the
+    /// post-reduce wake path), so truing drift and ratio changes reach
+    /// the stagers on the window clock — reservation state changes
+    /// never get their own timer. Latest frame wins on the worker.
+    pub(super) fn emit_stage_advisories(&mut self, epoch: usize) {
+        for rank in 0..self.world_size {
+            if self.is_dead(rank) {
+                continue;
+            }
+            let mut segments: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+            let current = self.advisory_spans_for_rank(epoch, rank);
+            if !current.is_empty() {
+                segments.push((
+                    epoch as u64,
+                    current.iter().map(|&(o, s)| (o as u64, s as u64)).collect(),
+                ));
+            }
+            let predicted = self.predicted_epoch_spans(epoch + 1, rank);
+            if !predicted.is_empty() {
+                segments.push((
+                    (epoch + 1) as u64,
+                    predicted.iter().map(|&(o, s)| (o as u64, s as u64)).collect(),
+                ));
+            }
+            if segments.is_empty() {
+                continue;
+            }
+            let msg = crate::distributed::wire::ControlMsgWire::StageAdvisory {
+                counts: self
+                    .el_che
+                    .batch_counts()
+                    .iter()
+                    .map(|&c| c as u64)
+                    .collect(),
+                segments,
+            };
+            let _ = self.send_control(rank, &msg);
+        }
+    }
+
+    /// Predicted reservation spans for a FUTURE epoch whose pool does
+    /// not exist yet: the same ratio table the pool will be built from,
+    /// laid out over that epoch's permutation. The prediction can drift
+    /// from the eventual table if ratios move before the epoch starts —
+    /// margin-covered, and the advisory refresh at each reduce keeps
+    /// the head accurate. Empty past the run's last epoch.
+    pub(super) fn predicted_epoch_spans(
+        &self,
+        next_epoch: usize,
+        rank: usize,
+    ) -> Vec<(usize, usize)> {
+        if next_epoch >= self.num_epochs() || self.batch_size == 0 {
+            return Vec::new();
+        }
+        let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        if batch_total == 0 {
+            return Vec::new();
+        }
+        let sizes = self.reservation_span_sizes(batch_total);
+        let mut starts = Vec::with_capacity(sizes.len());
+        let mut at = 0usize;
+        for &s in &sizes {
+            starts.push(at);
+            at += s;
+        }
+        let counts = self.el_che.batch_counts();
+        let mut spans = Vec::new();
+        if sizes[rank] > 0 {
+            spans.push((starts[rank], sizes[rank]));
+        }
+        for r in 0..self.world_size {
+            if r == rank || sizes[r] == 0 {
+                continue;
+            }
+            let margin = counts.get(r).copied().unwrap_or(0).max(1) * self.batch_size;
+            let m = margin.min(sizes[r]);
+            spans.push((starts[r] + sizes[r] - m, m));
+        }
+        spans
+    }
+
     /// Certainty-ordered advisory spans for `rank`'s stager: its own
     /// reserved span first (deterministic for the whole epoch), then
     /// every other span's tail — the truing margins, one reduce window
@@ -938,6 +1008,12 @@ impl ClusterCoordinator {
             if !has_inflight {
                 self.dispatch_next_chunk(rank);
             }
+        }
+        // Reduce boundary = the reservation clock: refresh every rank's
+        // stage advisory so truing drift and ratio changes reach the
+        // stagers without a timer of their own.
+        if let Some(&epoch) = self.chunk_pools.keys().next_back() {
+            self.emit_stage_advisories(epoch);
         }
     }
 }

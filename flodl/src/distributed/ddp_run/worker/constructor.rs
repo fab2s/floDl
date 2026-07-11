@@ -192,6 +192,7 @@ impl<M: Module> GpuWorker<M> {
             Arc::clone(&dataset),
             stage_cache,
             config.seed,
+            config.rank,
             config.world_size,
         ));
 

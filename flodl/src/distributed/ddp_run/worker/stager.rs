@@ -27,12 +27,16 @@ use crate::tensor::{Result, Tensor, TensorOptions};
 
 use super::super::make_partition;
 
-/// One reservation advisory: certainty-ordered `(offset, size)` spans
-/// into `epoch`'s global permutation (own span first, truing margins
-/// last). Latest advisory wins.
+/// One reservation advisory: the rank's upcoming run-stream as
+/// `(epoch, spans)` segments in walk order — each segment's spans in
+/// certainty order (own span first, truing margins last), cross-epoch
+/// segments walking into the next epoch's permutation. `counts` is the
+/// current reduce-window schedule, used to split the host RAM budget
+/// consumption-proportionally among co-hosted ranks. Latest advisory
+/// wins.
 pub(crate) struct StageAdvisory {
-    pub epoch: usize,
-    pub spans: Vec<(usize, usize)>,
+    pub counts: Vec<usize>,
+    pub segments: Vec<(usize, Vec<(usize, usize)>)>,
 }
 
 /// `BatchDataSet` wrapper making `get_batch` read-through against the
@@ -173,18 +177,48 @@ impl Drop for StagerHandle {
     }
 }
 
-/// The stager's RAM budget: half the host's current headroom under a
-/// 50% total-usage cap, split by world size — the conservative reading
-/// of "several ranks may share this host" until the controller sends
-/// consumption-proportional shares. `0` = do not stage.
-fn stager_ram_budget(world_size: usize) -> usize {
+/// The stager's RAM budget: the host's current headroom under a 50%
+/// total-usage cap, split consumption-proportionally among the ranks
+/// sharing this host — `budget_i ∝ rate_i` gives every rank the same
+/// seconds of lookahead (equal time, not equal bytes). Co-hosted ranks
+/// come from the cluster envelope when present; without one (thread
+/// DDP, single host without an envelope) every rank is assumed
+/// co-hosted — the conservative reading. `0` = do not stage.
+fn stager_ram_budget(rank: usize, world_size: usize, counts: &[usize]) -> usize {
     let Some(m) = crate::sys::mem_info() else {
         return 0;
     };
     let cap = m.total_bytes / 2;
     let used = m.total_bytes.saturating_sub(m.available_bytes);
     let headroom = cap.saturating_sub(used);
-    usize::try_from(headroom / world_size.max(1) as u64).unwrap_or(usize::MAX)
+
+    let local_ranks: Vec<usize> = crate::distributed::cluster::LocalCluster::from_env()
+        .ok()
+        .flatten()
+        .map(|c| c.worker.ranks.clone())
+        .unwrap_or_else(|| (0..world_size).collect());
+    let share = host_share(rank, &local_ranks, counts);
+    usize::try_from((headroom as f64 * share) as u64).unwrap_or(usize::MAX)
+}
+
+/// This rank's fraction of its host's staging budget: its schedule
+/// count over the co-hosted ranks' total. Equal split when the
+/// schedule is empty/zero (pre-calibration) or the rank is not in the
+/// local list (defensive).
+fn host_share(rank: usize, local_ranks: &[usize], counts: &[usize]) -> f64 {
+    let n = local_ranks.len().max(1) as f64;
+    if !local_ranks.contains(&rank) {
+        return 1.0 / n;
+    }
+    let mine = counts.get(rank).copied().unwrap_or(0);
+    let total: usize = local_ranks
+        .iter()
+        .map(|&r| counts.get(r).copied().unwrap_or(0))
+        .sum();
+    if mine == 0 || total == 0 {
+        return 1.0 / n;
+    }
+    mine as f64 / total as f64
 }
 
 /// Spawn the background stager thread.
@@ -201,6 +235,7 @@ pub(crate) fn spawn_stager(
     dataset: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
     base_seed: u64,
+    rank: usize,
     world_size: usize,
 ) -> StagerHandle {
     let (tx, rx) = mpsc::channel::<StageAdvisory>();
@@ -208,7 +243,7 @@ pub(crate) fn spawn_stager(
     let staged_in_thread = Arc::clone(&staged);
 
     let join = std::thread::spawn(move || {
-        stager_loop(dataset, cache, rx, base_seed, world_size, &staged_in_thread);
+        stager_loop(dataset, cache, rx, base_seed, rank, world_size, &staged_in_thread);
     });
 
     StagerHandle {
@@ -218,16 +253,17 @@ pub(crate) fn spawn_stager(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stager_loop(
     dataset: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
     rx: mpsc::Receiver<StageAdvisory>,
     base_seed: u64,
+    rank: usize,
     world_size: usize,
     staged: &AtomicUsize,
 ) {
     let dataset_len = dataset.len();
-    let mut budget_installed = false;
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut pending: Option<StageAdvisory> = None;
 
@@ -242,25 +278,29 @@ fn stager_loop(
         }
 
         if let Some(a) = pending.take() {
-            if !budget_installed {
-                let budget = stager_ram_budget(world_size);
-                if budget == 0 {
-                    // No headroom: reading ahead with nothing retained
-                    // would spend source bandwidth for nothing.
-                    return;
-                }
-                cache.set_budget(budget);
-                budget_installed = true;
-            }
+            // Budget refresh rides the advisory (which rides the reduce
+            // clock): live host headroom × this rank's consumption
+            // share among co-hosted ranks. A shrink stops new
+            // admissions, never drops staged content.
+            let budget = stager_ram_budget(rank, world_size, &a.counts);
+            cache.set_budget(budget);
             queue.clear();
-            for &(offset, size) in &a.spans {
-                queue.extend(make_partition(
-                    offset,
-                    size,
-                    dataset_len,
-                    a.epoch,
-                    base_seed,
-                ));
+            if budget == 0 {
+                // No headroom right now: reading ahead with nothing
+                // retained would spend source bandwidth for nothing.
+                // Stay alive — a later advisory may find room.
+                continue;
+            }
+            for &(epoch, ref spans) in &a.segments {
+                for &(offset, size) in spans {
+                    queue.extend(make_partition(
+                        offset,
+                        size,
+                        dataset_len,
+                        epoch,
+                        base_seed,
+                    ));
+                }
             }
         }
 
@@ -360,29 +400,52 @@ mod tests {
         let (staged, cache, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), 42, 1);
-        // Advisory: own span (0,4) of epoch 0 + a margin span (8,2).
+        let handle = spawn_stager(dataset, Arc::clone(&cache), 42, 0, 1);
+        // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
+        // plus a cross-epoch segment into epoch 1 — the stager walks
+        // across the boundary without ceremony.
         handle.advise(StageAdvisory {
-            epoch: 0,
-            spans: vec![(0, 4), (8, 2)],
+            counts: vec![4],
+            segments: vec![(0, vec![(0, 4), (8, 2)]), (1, vec![(0, 2)])],
         });
 
         // Wait for the stager to drain the advisory.
         let mut waited = 0;
-        while handle.staged_count() < 6 && waited < 400 {
+        while handle.staged_count() < 8 && waited < 400 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             waited += 1;
         }
-        assert_eq!(handle.staged_count(), 6, "all advised samples staged");
+        assert_eq!(handle.staged_count(), 8, "all advised samples staged");
         assert!(cache.bytes() > 0, "tier warmed");
 
-        // The training path now hits the warm tier: a batch drawn from
-        // the advised region makes no inner call.
+        // The training path now hits the warm tier: batches drawn from
+        // the advised regions of BOTH epochs make no inner call.
         let before = calls.load(Ordering::Relaxed);
-        let plan = make_partition(0, 4, 12, 0, 42);
-        let _ = staged.get_batch(&plan).unwrap();
+        let plan_e0 = make_partition(0, 4, 12, 0, 42);
+        let _ = staged.get_batch(&plan_e0).unwrap();
+        let plan_e1 = make_partition(0, 2, 12, 1, 42);
+        let _ = staged.get_batch(&plan_e1).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), before, "served from the tier");
 
         drop(handle); // disconnect + join
+    }
+
+    #[test]
+    fn host_share_is_consumption_proportional() {
+        // Rank 1 does half the host's work → half the host's budget:
+        // equal lookahead time, not equal bytes.
+        let local = vec![0, 1, 2];
+        let counts = vec![10, 20, 10, 40]; // rank 3 is on another host
+        assert_eq!(host_share(1, &local, &counts), 0.5);
+        assert_eq!(host_share(0, &local, &counts), 0.25);
+
+        // Pre-calibration (zero counts) and foreign-rank fall back to
+        // an equal split.
+        assert_eq!(host_share(0, &local, &[0, 0, 0, 0]), 1.0 / 3.0);
+        assert_eq!(host_share(3, &local, &counts), 1.0 / 3.0);
+
+        // Lone rank on the host owns the whole budget regardless of
+        // the global schedule.
+        assert_eq!(host_share(3, &[3], &counts), 1.0);
     }
 }

@@ -1042,18 +1042,30 @@ pub enum ControlMsgWire {
     /// on the same wall-clock timescale. Purely informational — the inbound
     /// bridge intercepts it and never forwards it to the inner worker.
     CoordHeartbeat,
-    /// The rank's data-reservation view for `epoch`: `(offset, size)`
-    /// spans into the epoch's global permutation, in certainty order —
-    /// the rank's own reserved span first, then the tails of the other
-    /// ranks' spans (the truing margins, whose final owner is
-    /// uncertain). Purely advisory for the worker's background stager:
-    /// staging may overlap across ranks near the boundaries, allocation
+    /// The rank's data-reservation view: its upcoming run-stream as
+    /// `segments` — `(epoch, spans)` in walk order, each segment's
+    /// `(offset, size)` spans into that epoch's global permutation in
+    /// certainty order (the rank's own reserved span first, then the
+    /// tails of the other ranks' spans: the truing margins, whose final
+    /// owner is uncertain). Cross-epoch segments let the stager walk
+    /// into the next epoch while this one trains — the data plane is
+    /// epoch-blind, an epoch is just where the order function switches.
+    ///
+    /// `counts` is the current reduce-window schedule (batch counts per
+    /// rank): the consumption-rate snapshot a worker uses to split its
+    /// host's RAM budget consumption-proportionally among co-hosted
+    /// ranks (equal lookahead TIME, not equal bytes).
+    ///
+    /// Purely advisory for the worker's background stager: staging may
+    /// overlap across ranks near the boundaries, allocation
     /// (`StartEpoch` chunks) never does, so stale or over-staged data
-    /// needs no invalidation — only allocated work executes. Latest
-    /// frame wins; workers without a stager ignore it.
+    /// needs no invalidation — only allocated work executes. Emitted at
+    /// progressive epoch start and refreshed at reduce boundaries
+    /// (reservation state changes ride the window clock). Latest frame
+    /// wins; workers without a stager ignore it.
     StageAdvisory {
-        epoch: u64,
-        spans: Vec<(u64, u64)>,
+        counts: Vec<u64>,
+        segments: Vec<(u64, Vec<(u64, u64)>)>,
     },
 }
 

@@ -349,17 +349,22 @@ stands alone:
    under the same truing rule. Keeping allocation inside staged data
    also keeps ElChe's delivered-cost signal clean: the data term goes
    uniformly cheap in steady state, so the scheduler measures true
-   compute. The wire + stager half is **landed** too: the coordinator
+   compute. The wire + stager half is **landed**: the coordinator
    emits per-rank `StageAdvisory` frames at progressive epoch start
-   (own span first, window-sized margin tails last); each rank runs a
-   background stager that walks the advisory through the shared
+   and re-emits them at every reduce boundary (reservation state
+   changes ride the window clock — no timer of their own). Each frame
+   carries the current schedule plus run-stream segments: this epoch's
+   spans (own span first, window-sized margin tails last) and the
+   predicted next epoch's (same ratio table over the next permutation,
+   computable before its pool exists — margin-covered if ratios drift).
+   Each rank's background stager walks the segments through the shared
    permutation into a sample-keyed tier the live prefetch path shares
-   read-through (dormant until the first advisory — budget installs
-   then, conservatively `headroom/2/world_size` until
-   consumption-proportional shares land). Remaining slices: per-rank
-   memory shares from ElChe ratios + host topology (equal lookahead
-   time), advisory refresh on truing/cross-epoch, next-use-priority
-   eviction for the beyond-budget stream, and the rig falsification.
+   read-through; its budget refreshes with each advisory as the host's
+   live RAM headroom split consumption-proportionally among co-hosted
+   ranks (envelope-derived; `budget ∝ rate` = equal lookahead time).
+   Dormant until the first advisory. Remaining slices:
+   next-use-priority eviction for the beyond-budget stream, and the
+   rig falsification.
 5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
    tier up — when a dataset almost fits on device, keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between

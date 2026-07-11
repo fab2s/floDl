@@ -85,12 +85,12 @@ impl<M: Module> GpuWorker<M> {
                     self.steps_since_avg.saturating_sub(self.steps_at_snapshot);
                 self.steps_at_snapshot = 0;
             }
-            ControlMsg::StageAdvisory { epoch, spans } => {
+            ControlMsg::StageAdvisory { counts, segments } => {
                 // Purely advisory: forward to the background stager
                 // (latest wins there). Never blocks, never fails the
                 // control loop.
                 if let Some(stager) = &self.stager {
-                    stager.advise(super::stager::StageAdvisory { epoch, spans });
+                    stager.advise(super::stager::StageAdvisory { counts, segments });
                 }
             }
             ControlMsg::SyncNow => {

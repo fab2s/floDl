@@ -261,12 +261,20 @@ fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<ControlMsg>> {
         ControlMsgWire::DeclareDead { .. } => Ok(Some(ControlMsg::DeclareDead)),
         ControlMsgWire::NewNcclSession { .. } => Ok(Some(ControlMsg::NewNcclSession)),
         ControlMsgWire::RequestNewNcclId => Ok(Some(ControlMsg::RequestNewNcclId)),
-        ControlMsgWire::StageAdvisory { epoch, spans } => {
+        ControlMsgWire::StageAdvisory { counts, segments } => {
             Ok(Some(ControlMsg::StageAdvisory {
-                epoch: epoch as usize,
-                spans: spans
+                counts: counts.into_iter().map(|c| c as usize).collect(),
+                segments: segments
                     .into_iter()
-                    .map(|(o, s)| (o as usize, s as usize))
+                    .map(|(epoch, spans)| {
+                        (
+                            epoch as usize,
+                            spans
+                                .into_iter()
+                                .map(|(o, s)| (o as usize, s as usize))
+                                .collect(),
+                        )
+                    })
                     .collect(),
             }))
         }
