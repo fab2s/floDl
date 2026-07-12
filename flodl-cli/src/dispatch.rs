@@ -350,16 +350,17 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let base = std::env::temp_dir();
-            let unique = format!(
+            // Process-wide counter, NOT a timestamp: concurrent test
+            // threads can construct TempDirs within one SystemTime tick,
+            // and create_dir_all on the colliding path succeeds silently —
+            // two tests then share (and Drop-delete) one directory.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
                 "flodl-dispatch-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            );
-            let dir = base.join(unique);
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&dir).expect("tempdir creation");
             Self(dir)
         }
