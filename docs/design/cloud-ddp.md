@@ -253,7 +253,9 @@ only while H1 holds.
 
 flodl already separates the **averager** (data plane: the deterministic
 sum-and-count reduce) from the **controller** (control plane: ElChe
-scheduling). Both generalize to a tree, but differently.
+scheduling). Both generalize to a tree, but differently. The near-term
+seam-sharpening that keeps this generalization implementable is the
+[coordinator decomposition](coordinator-decomposition.md).
 
 - **Averager: recursive pre-summation.** Hosts sum their ranks; intermediate
   nodes sum hosts; the root sums sub-clusters. Sum-and-count is associative, so
@@ -280,6 +282,53 @@ it breaks the stability condition. The convergence guard is scale-invariant in
 mechanism (tightening a rank's cadence and tightening a sub-cluster's cadence
 are the same operation); only its thresholds scale with level, looser higher up
 because the aggregate is pre-smoothed.
+
+### Horizontal convergence checks (hypothesis)
+
+The vertical divergence path cannot see a unit stagnating in a local
+basin: a stuck unit looks *quiet*, not divergent. A horizontal check
+compares **siblings** to catch it, and the tree makes this cheap:
+
+- **No new wires.** Each level already receives one frame per child
+  per round, and a model frame divided by its carried realized-work
+  mass is that child's local consensus estimate. The comparison runs
+  at the fold moment, when the children's contributions coexist in
+  memory, as a parent-mediated observation over its direct children.
+  It stays inside the vertical cascade (no sideways coupling loop), so
+  the cascade stability argument above is untouched.
+- **Statistic sketch.** Per-layer-group delta norms plus cosine
+  alignment between sibling pseudo-gradients. Layers converge at
+  different rates, so per-layer separates two states a whole-model
+  norm confuses: "this layer has converged everywhere" (low movement,
+  low cross-sibling distance) versus "this unit's layer is parked in
+  its own basin" (low movement, high distance from siblings).
+- **Scale-matched detection.** Each level guards only its direct
+  children, so the check must run at *every* level: a stuck rank is
+  invisible in its host's aggregate one level up. Sensitivity is
+  highest low in the tree where windows are shortest; only slow
+  collective drift surfaces high.
+- **Blind spot: cousins.** Siblings under different parents are
+  compared only at their common ancestor's cadence. The gap is bounded
+  by that level's window and charged to the staleness budget; it is
+  the honest limit of "no new wires".
+- **Actuators.** A verdict fed into the same source-agnostic verdict
+  seam the convergence guard uses; potentially realized-work mass
+  modulation (a stuck unit has *high* realized work and *low* useful
+  movement, exactly the case mass-as-policy leaves open). A per-layer
+  verdict could eventually drive per-layer cadence (sync stable layers
+  rarely, contested layers often).
+- **The hard part.** Distinguishing "stuck in a bad basin" from
+  "exploring a different good basin", and permutation symmetry making
+  naive parameter-space distance between siblings partially
+  misleading. The mitigating hypothesis is that regular averaging
+  keeps units too close for symmetry to bite; whether that holds
+  decides if the statistic is signal or noise, and gates the idea.
+
+Nothing here is built. The present-day cost is two seam properties,
+both part of the
+[coordinator decomposition](coordinator-decomposition.md): the
+pre-fold frame list stays tappable by an observer, and verdict
+application into ElChe is source-agnostic.
 
 ### Resilience economics (hypothesis)
 
@@ -363,6 +412,9 @@ Before any of this is built, each must be validated, not assumed:
    recovery via checkpoint/resume meets the availability target.
 6. **Transport (extreme scale only):** control-plane streaming latency is
    amortized by large `H`, and a separate high-bandwidth data-plane path exists.
+7. **Horizontal detection:** sibling comparison at the fold separates basin
+   stagnation from healthy convergence, and the basin-ambiguity / permutation
+   caveat resolves as signal rather than noise.
 
 The depth-2 case of this structure already exists today: per-host relays
 (level-1 aggregation) under a single controller, with the inner/outer optimizer

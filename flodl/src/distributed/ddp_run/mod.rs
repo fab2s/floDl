@@ -1341,8 +1341,8 @@ pub struct WorkerConfig {
     /// [`crate::distributed::ElCheConfig::easgd_alpha`] for details.
     pub easgd_alpha: Option<f64>,
     /// Consensus allocation-weighting exponent `γ`: rank weighted `nₖ^γ` in
-    /// the CPU work-weighted average. `1.0` (default) = plain work-weighting,
-    /// byte-identical to pre-gamma behavior. See
+    /// the work-weighted average (both backends). `1.0` (default) = plain
+    /// work-weighting, byte-identical to pre-gamma behavior. See
     /// [`crate::distributed::ElCheConfig::gamma`].
     pub gamma: f64,
     /// Optional system timeline for high-frequency profiling.

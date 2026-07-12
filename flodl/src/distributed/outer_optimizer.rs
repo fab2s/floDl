@@ -362,7 +362,7 @@ impl OuterStepper {
                 // tensors are a meaningless zero sum. Pass it through so
                 // ranks see `weight == 0` and keep local state; do NOT
                 // step the outer optimizer on it.
-                if frame.weight <= 0.0 {
+                if !crate::distributed::realized_work::is_realized(frame.weight) {
                     return Ok(frame);
                 }
                 self.seen_params_this_window = true;

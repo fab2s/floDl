@@ -81,9 +81,12 @@ fn weighted_allreduce_nccl(
     crate::debug!(
         "  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i}, gamma={gamma})"
     );
-    // γ-effective work: 0^γ = 0 keeps the zero-step semantics; γ = 1.0 is
-    // the identity (plain step count).
-    let n_eff = if gamma == 1.0 { n_i } else { n_i.powf(gamma) };
+    // γ-effective work: `gamma_mass` owns the idle guard (an idle rank
+    // has zero mass for ANY γ — raw powf gives 0^0 = 1, a stale rank
+    // voting at full weight, or 0^{γ<0} = ∞, a NaN consensus) and the
+    // γ = 1.0 identity path. Shared with the CPU backend's frame
+    // weighting so the two cannot drift.
+    let n_eff = crate::distributed::realized_work::gamma_mass(n_i, gamma);
     // STREAM-ORDER THE BODY ON THE COMM STREAM. Tensor ops (the count
     // tensor below) enqueue on the thread's CURRENT stream while the
     // collectives are enqueued on `stream` — and pool streams are
@@ -110,7 +113,7 @@ fn weighted_allreduce_nccl(
     crate::debug!(
         "  ddp-areduce: rank {rank} seq={seq} COUNT exit (total_n={total_n})"
     );
-    if total_n <= 0.0 {
+    if !crate::distributed::realized_work::is_realized(total_n) {
         // Whole cohort idle since the last sync: consensus already holds.
         crate::debug!(
             "  ddp-areduce: rank {rank} seq={seq} SKIP param-reduce (total_n={total_n}) \

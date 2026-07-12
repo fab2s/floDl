@@ -200,10 +200,11 @@ pub struct ElCheConfig {
     /// (each rank equal regardless of steps); `γ = −1.0` equalizes
     /// per-step trust. A single knob sweeping data-volume ↔ per-step
     /// fairness, primarily a diagnostic for the source of the
-    /// heterogeneous-cadence regularization effect. Honored on the CPU
-    /// averaging backend; the builder loud-errors if set away from `1.0`
-    /// on an NCCL backend (not yet wired there). Idle ranks (`nₖ = 0`)
-    /// contribute zero weight for any `γ`.
+    /// heterogeneous-cadence regularization effect. Honored on BOTH
+    /// backends: the CPU path applies it in the frame weighting, the
+    /// NCCL path folds it into the fused PreMulSum factor. Idle ranks
+    /// (`nₖ = 0`) contribute zero mass for any `γ` (the idle guard in
+    /// the shared `realized_work` vocabulary).
     pub gamma: f64,
 }
 
@@ -318,7 +319,7 @@ impl ElCheConfig {
     pub fn max_overshoot(mut self, n: usize) -> Self { self.max_overshoot = Some(n); self }
     /// Set the consensus allocation-weighting exponent `γ` (see [`Self::gamma`]).
     /// `1.0` = plain work-weighting (default), `0.0` = unweighted average,
-    /// `−1.0` = per-step-equal. CPU backend only.
+    /// `−1.0` = per-step-equal. Honored on both backends.
     pub fn gamma(mut self, g: f64) -> Self { self.gamma = g; self }
 }
 

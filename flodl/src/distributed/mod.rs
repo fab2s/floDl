@@ -41,6 +41,7 @@ pub(crate) mod membership;
 pub mod nccl;
 pub mod outer_optimizer;
 pub(crate) mod port_mux;
+pub(crate) mod realized_work;
 pub(crate) mod relay;
 pub mod ddp;
 pub mod ddp_run;

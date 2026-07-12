@@ -1861,12 +1861,12 @@ fn param_bridge_loop(
         // Gamma allocation-weighting: rank k is weighted nₖ^γ (γ=1.0 = plain
         // work-weighting, byte-identical to pre-gamma; γ<1 compresses the
         // fast/over-allocated rank's dominance, γ=0 = unweighted average,
-        // γ<0 = per-step-equal). Idle ranks (nₖ=0) contribute zero weight for
-        // any γ. The normalizer Σ nₖ^γ is computed locally from the
-        // all-gathered `counts` vector (every rank holds it after the
-        // count-reduce), so no extra communication. Only the params consensus
-        // is gamma-weighted; buffers stay equal-weighted among movers.
-        let (my_w, _w_sum) = gamma_weights(n_i as f64, &counts, gamma);
+        // γ<0 = per-step-equal). Idle ranks (nₖ=0) contribute zero mass for
+        // any γ (the idle guard in `realized_work`). No local normalizer:
+        // the divisor rides the frames — the controller divides once by
+        // the mass it accepted. Only the params consensus is
+        // gamma-weighted; buffers stay equal-weighted among movers.
+        let my_w = crate::distributed::realized_work::gamma_mass(n_i as f64, gamma);
         let avg_params = if total_n == 0.0 {
             params.clone()
         } else {
@@ -1921,7 +1921,7 @@ fn param_bridge_loop(
         } else {
             let subset: Vec<Tensor> =
                 f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
-            let my_indicator = if n_i > 0 { 1.0 } else { 0.0 };
+            let my_indicator = crate::distributed::realized_work::mover_mass(n_i as f64);
             match sumcount_reduce(&mut client, &subset, my_indicator) {
                 Ok(reduced) => {
                     let mut merged = buffers.clone();
@@ -1986,64 +1986,6 @@ fn param_bridge_loop(
 /// one `(Σ w·T, Σ w)` pair and the root still divides exactly once — no
 /// averaging-of-averages. A zero-weight rank contributes a zeroed tensor
 /// but still joins the collective, so the cohort never stalls.
-/// Gamma allocation-weighting: this rank's consensus weight `nᵢ^γ` and the
-/// cohort normalizer `Σ nₖ^γ` over movers.
-///
-/// `n_i` is this rank's batch count this window; `counts` is the all-gathered
-/// per-rank count vector (so the normalizer needs no extra communication).
-/// Idle ranks (`nₖ = 0`) contribute zero weight for any `γ` (and `0^γ` is
-/// never evaluated). At `γ = 1.0` this is `(nᵢ, Σnₖ)` — plain work-weighting,
-/// byte-identical to pre-gamma behavior.
-pub(crate) fn gamma_weights(n_i: f64, counts: &[f64], gamma: f64) -> (f64, f64) {
-    let my_w = if n_i > 0.0 { n_i.powf(gamma) } else { 0.0 };
-    let w_sum: f64 = counts
-        .iter()
-        .filter(|&&c| c > 0.0)
-        .map(|&c| c.powf(gamma))
-        .sum();
-    (my_w, w_sum)
-}
-
-#[cfg(test)]
-mod gamma_tests {
-    use super::gamma_weights;
-
-    #[test]
-    fn gamma_one_is_plain_work_weighting() {
-        // γ=1: weight = nᵢ, normalizer = Σnₖ (idle excluded). Byte-identical
-        // to the pre-gamma path.
-        let counts = [2.0, 4.0, 0.0]; // rank 2 idle
-        let (w, s) = gamma_weights(4.0, &counts, 1.0);
-        assert_eq!(w, 4.0);
-        assert_eq!(s, 6.0); // 2 + 4, idle 0 excluded
-    }
-
-    #[test]
-    fn gamma_zero_is_unweighted_average() {
-        // γ=0: every mover weight 1, normalizer = mover count.
-        let counts = [2.0, 4.0];
-        let (w, s) = gamma_weights(4.0, &counts, 0.0);
-        assert_eq!(w, 1.0);
-        assert_eq!(s, 2.0);
-    }
-
-    #[test]
-    fn gamma_negative_one_is_per_step_equal() {
-        // γ=-1: weight = 1/nᵢ, normalizer = Σ 1/nₖ.
-        let counts = [2.0, 4.0];
-        let (w, s) = gamma_weights(4.0, &counts, -1.0);
-        assert!((w - 0.25).abs() < 1e-12);
-        assert!((s - 0.75).abs() < 1e-12); // 0.5 + 0.25
-    }
-
-    #[test]
-    fn idle_rank_gets_zero_weight() {
-        let counts = [2.0, 4.0, 0.0];
-        let (w, _) = gamma_weights(0.0, &counts, 0.5);
-        assert_eq!(w, 0.0);
-    }
-}
-
 /// Realized-work weighted reduce: ship `my_weight`-scaled tensors with
 /// the mass riding the SAME frame, so the controller's divisor is the
 /// summed mass of exactly the contributions it accepted into the round
@@ -2071,7 +2013,7 @@ pub(crate) fn sumcount_reduce(
         crate::distributed::controller::RoundKind::Model,
         my_weight,
     )?;
-    if realized <= 0.0 {
+    if !crate::distributed::realized_work::is_realized(realized) {
         crate::debug!(
             "cluster_worker: reduce round realized no work (mass 0); keeping local state"
         );

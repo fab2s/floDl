@@ -401,11 +401,12 @@
     // frame the controller scatters — which the checkpoint forge and the
     // controller-hosted outer optimizer consume — IS that consensus.
     //
-    // These drive the REAL rank-side math (`gamma_weights` +
+    // These drive the REAL rank-side math (`realized_work::gamma_mass` +
     // `sumcount_reduce`) through the true 3-tier path
     // (client → relay → controller), all-alive and after a death.
 
-    use crate::distributed::cluster_worker::{gamma_weights, sumcount_reduce};
+    use crate::distributed::cluster_worker::sumcount_reduce;
+    use crate::distributed::realized_work::gamma_mass;
     use crate::distributed::controller::DeadRanks;
     use crate::tensor::{Device, Tensor};
     use std::sync::Arc;
@@ -472,7 +473,7 @@
         let mut counts = vec![0.0f64; world];
         counts[rank] = n_i as f64;
         c.all_reduce_per_rank_f64(&mut counts).unwrap();
-        let (my_w, _w_sum) = gamma_weights(n_i as f64, &counts, gamma);
+        let my_w = gamma_mass(n_i as f64, gamma);
         let t = Tensor::from_f32(&[t_val], &[1], Device::CPU).unwrap();
         let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w)
             .unwrap()[0]

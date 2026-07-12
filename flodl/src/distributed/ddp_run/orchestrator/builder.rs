@@ -317,8 +317,8 @@ where
     /// Set the consensus allocation-weighting exponent `γ`: rank `k` is
     /// weighted `nₖ^γ` in the work-weighted average. `1.0` (default) is plain
     /// work-weighting, `0.0` an unweighted average, `−1.0` per-step-equal.
-    /// CPU averaging backend only (the builder errors at `.run()` if set away
-    /// from `1.0` on NCCL). See [`crate::distributed::ElCheConfig::gamma`].
+    /// Honored on both backends (CPU frame weighting; NCCL fused PreMulSum
+    /// factor). See [`crate::distributed::ElCheConfig::gamma`].
     pub fn gamma(mut self, g: f64) -> Self {
         self.config.elche.gamma = g;
         self

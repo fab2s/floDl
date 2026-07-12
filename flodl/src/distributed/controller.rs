@@ -999,6 +999,8 @@ pub struct RoundFrame {
     /// frames; the count-gather sets [`RoundKind::Control`] explicitly.
     pub kind: RoundKind,
     /// Realized-work mass, atomic with the contribution it scales.
+    /// Semantics (mass policies, idle guard, zero-mass round rule) live
+    /// in [`crate::distributed::realized_work`].
     ///
     /// Rank -> controller on [`RoundKind::Model`]: the sender's weight
     /// (params: `n_i^gamma` for `n_i` optimizer steps since the last
@@ -1402,11 +1404,14 @@ fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<RoundFrame> {
     let mut summed = sum_frames(&accepted)?;
     // Model frames normalize by the accepted realized-work mass —
     // exactly ONCE, here, regardless of how many fold layers summed
-    // below us. Control frames (gathers / broadcasts) stay a pure sum.
-    // A zero-mass Model round leaves the (zero) sum untouched — the
-    // `weight = 0.0` on the output tells receivers to keep their local
-    // state.
-    if matches!(summed.kind, RoundKind::Model) && summed.weight > 0.0 {
+    // below us (the divide-once law: see
+    // [`crate::distributed::realized_work`]). Control frames (gathers /
+    // broadcasts) stay a pure sum. A zero-mass Model round leaves the
+    // (zero) sum untouched — the `weight = 0.0` on the output tells
+    // receivers to keep their local state.
+    if matches!(summed.kind, RoundKind::Model)
+        && crate::distributed::realized_work::is_realized(summed.weight)
+    {
         let inv = (1.0 / summed.weight) as f32;
         for payload in &mut summed.tensors {
             let mut vals = bytes_as_f32(&payload.bytes)?;
