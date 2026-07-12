@@ -110,6 +110,18 @@ where
         self
     }
 
+    /// Set the training dataset from a per-sample
+    /// [`DataSet`](crate::data::DataSet) (the one-method `get(index)`
+    /// contract; alternative to [`dataset`](Self::dataset)).
+    ///
+    /// Batching, caching, and staging are the framework's job: rank
+    /// workers read samples through the shared staging tier and stage
+    /// them ahead of the training frontier per their reservations.
+    pub fn sample_dataset(mut self, dataset: impl crate::data::DataSet + 'static) -> Self {
+        self.dataset = Some(crate::data::batch_dataset_from(dataset));
+        self
+    }
+
     /// Set the batch size (required).
     pub fn batch_size(mut self, size: usize) -> Self {
         self.batch_size = Some(size);

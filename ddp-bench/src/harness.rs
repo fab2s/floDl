@@ -144,6 +144,18 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     };
 
     // Create dataset.
+    // The `--data-source disk` path only exists where a per-sample
+    // reader exists; an explicit flag silently falling back to RAM
+    // would invalidate the measurement it was set up for.
+    if config.data_source == crate::models::DataSource::Disk
+        && !crate::models::DISK_SOURCE_MODELS.contains(&model_def.name)
+    {
+        return Err(flodl::tensor::TensorError::new(&format!(
+            "--data-source disk is not supported by model '{}' (supported: {})",
+            model_def.name,
+            crate::models::DISK_SOURCE_MODELS.join(", "),
+        )));
+    }
     let load_start = Instant::now();
     let virtual_len = config.batches_per_epoch * config.batch_size;
     let pool_size = (config.batch_size * crate::data::POOL_MUL).min(virtual_len);
@@ -152,6 +164,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         data_dir: config.data_dir.clone(),
         virtual_len,
         pool_size,
+        data_source: config.data_source,
     };
     // Cluster-mode launcher: skip the real dataset load. The launcher
     // fans out to rank children and never reads training data; only
@@ -192,7 +205,14 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             model_def.name, mode_str, config.epochs, dataset.len(), actual_batches,
             config.batch_size, lr_note, baseline_tag,
         );
-        eprintln!("  data: {} samples, mode={preload_tag} ({load_ms}ms)", dataset.len());
+        let source_tag = match config.data_source {
+            crate::models::DataSource::Ram => "",
+            crate::models::DataSource::Disk => ", source=disk",
+        };
+        eprintln!(
+            "  data: {} samples, mode={preload_tag}{source_tag} ({load_ms}ms)",
+            dataset.len()
+        );
     } else {
         eprintln!(
             "\n=== {} / {} ({} epochs, {} batches x {}{}){} ===",

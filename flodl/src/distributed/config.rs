@@ -502,6 +502,19 @@ impl<M: Module> TrainerConfig<M> {
         }
     }
 
+    /// Like [`new`](Self::new), from a per-sample [`crate::data::DataSet`]
+    /// (the one-method `get(index)` contract).
+    ///
+    /// Batching, caching, and staging are the framework's job: samples
+    /// flow through the same read-through tiers the `DataLoader` uses,
+    /// and DDP rank workers stage them ahead of the training frontier
+    /// per their reservations. Implement `get()` (or use a shipped
+    /// reader like [`crate::data::datasets::Cifar10Disk`]) and hand it
+    /// here — no custom loader needed, at any dataset size.
+    pub fn from_dataset(dataset: impl crate::data::DataSet + 'static) -> Self {
+        Self::new(crate::data::batch_dataset_from(dataset))
+    }
+
     // -- Chained setters --------------------------------------------------
 
     /// Set the batch size.

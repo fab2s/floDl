@@ -160,6 +160,10 @@ pub struct RunConfig {
     pub seed: u64,
     pub output_dir: String,
     pub data_dir: std::path::PathBuf,
+    /// Where training data lives during the run (RAM tensors vs
+    /// per-sample reads from the raw files). See
+    /// [`crate::models::DataSource`].
+    pub data_source: crate::models::DataSource,
     pub monitor_port: Option<u16>,
     /// Explicit per-rank partition ratios for heterogeneous DDP. When set,
     /// passed to `DdpBuilder::partition_ratios` to disable the uniform

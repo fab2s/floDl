@@ -22,6 +22,21 @@ use flodl::tensor::{Device, Result, Tensor};
 
 use crate::config::ModelDefaults;
 
+/// Where the training data lives during the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    /// Parse the whole dataset into RAM tensors up front (default).
+    Ram,
+    /// Read per sample from the raw files through flodl's `DataSet`
+    /// layer, exercising the storage-read path the staging tiers
+    /// absorb. Honored by the CIFAR-10 models (`resnet`,
+    /// `resnet-graph`); other models error loudly.
+    Disk,
+}
+
+/// Model names whose dataset factory honors [`DataSource::Disk`].
+pub const DISK_SOURCE_MODELS: [&str; 2] = ["resnet", "resnet-graph"];
+
 /// Dataset configuration passed to each model's dataset factory.
 #[allow(dead_code)]
 pub struct DatasetConfig {
@@ -29,6 +44,7 @@ pub struct DatasetConfig {
     pub data_dir: PathBuf,
     pub virtual_len: usize,
     pub pool_size: usize,
+    pub data_source: DataSource,
 }
 
 /// A benchmark model definition.

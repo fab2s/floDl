@@ -379,10 +379,19 @@ stands alone:
    cluster): no regression with staging active (cpu-cadence 59.0s
    staged vs 60.6s off; nccl-cadence 68.3s vs 66.0s; evals identical
    within noise), and a `FLODL_STAGER=off` kill-switch for A/B runs.
-   The bench dataset is RAM-resident, so this bounds the overhead at
-   zero without exercising the payoff; measuring the starvation win
-   needs a storage-backed bench dataset mode (queued) that reads the
-   shared mount per batch.
+   Storage-backed validation (ddp-bench `--data-source disk`:
+   per-sample positioned reads from the raw CIFAR files through the
+   `DataSet` layer, the Pascal ranks reading over virtiofs): parity in
+   every cell — staged 59.6s vs unstaged 58.5s warm, and unchanged
+   under continuous guest page-cache drops — because per-sample read
+   cost on this rig sits orders of magnitude below the starvation
+   threshold (batch reads would need to approach per-batch compute,
+   here ~4ms/sample against µs-scale virtiofs round trips) and the
+   prefetch pipeline already overlaps sub-threshold latency. The
+   instrument measures honestly; the win itself becomes visible on
+   genuinely slow storage (network mounts with ms-scale reads) or
+   beds larger than RAM — both of which now train through the same
+   entry unchanged.
 5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
    tier up — when a dataset almost fits on device, keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between

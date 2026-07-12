@@ -75,7 +75,7 @@ const CIFAR10_TRAIN_BATCHES: [&str; 5] = [
 const CIFAR10_TEST_BATCH: &str = "test_batch.bin";
 
 /// Ensure CIFAR-10 archive is downloaded and extracted. Returns the cache dir.
-fn ensure_cifar10_extracted(data_dir: &Path) -> Result<std::path::PathBuf> {
+pub fn ensure_cifar10_extracted(data_dir: &Path) -> Result<std::path::PathBuf> {
     let dir = data_dir.join("cifar10");
     ensure_dir(&dir)?;
 

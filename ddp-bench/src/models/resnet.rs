@@ -54,8 +54,21 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
 }
 
 pub fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
-    let cifar = crate::download::ensure_cifar10(&cfg.data_dir)?;
-    Ok(Arc::new(cifar))
+    match cfg.data_source {
+        super::DataSource::Ram => {
+            let cifar = crate::download::ensure_cifar10(&cfg.data_dir)?;
+            Ok(Arc::new(cifar))
+        }
+        super::DataSource::Disk => {
+            // Same raw batch files, read per sample instead of parsed
+            // into RAM: every batch pays the storage read unless a
+            // tier above (sample cache, staging) absorbs it.
+            let dir = crate::download::ensure_cifar10_extracted(&cfg.data_dir)?;
+            let disk = flodl::data::datasets::Cifar10Disk::open_train(&dir)?;
+            eprintln!("  data source: disk ({})", dir.display());
+            Ok(flodl::data::batch_dataset_from(disk))
+        }
+    }
 }
 
 pub fn make_test_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {

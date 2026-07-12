@@ -61,6 +61,16 @@ let state: TrainedState = handle.join()?;  // params + buffers (CPU)
 into a fresh CPU model for inference, or continue training via
 `Trainer::builder(...).resume_from(stem)` (or `TrainerConfig::resume_from`).
 
+Per-sample datasets plug in the same way: implement
+`DataSet::get(index)` (or use a shipped disk-backed reader like
+`Cifar10Disk`) and hand it to `.sample_dataset(ds)` instead of
+`.dataset(ds)` — or `TrainerConfig::from_dataset(ds)` in the
+config-bag form. Batching, RAM caching, and reservation staging are
+the framework's job; rank workers read samples ahead of the training
+frontier through the shared staging tier, so storage-backed data
+(local files, network mounts) trains through the same entry as
+RAM-resident tensors.
+
 ### Graph-shape one-liner - `Trainer::setup`
 
 When the model is a flodl `Graph` and the training loop is yours:
@@ -284,6 +294,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.epoch_fn(f)` | `EpochFn<M>` | Per-epoch worker callback (`(epoch, &mut GpuWorker<M>)`). |
 | `.metrics_fn(f)` | `MetricsFn` | Host-side per-epoch callback (`&EpochMetrics`). |
 | `.scheduler_fn(f)` | `SchedulerFn` | Per-worker LR scheduler factory. |
+| `.sample_dataset(ds)` | `impl DataSet` | Per-sample alternative to `.dataset()`: implement `get(index)`, the framework batches, caches, and stages. `TrainerConfig::from_dataset(ds)` is the config-bag twin. |
 | `.eval_dataset(ds)` | `Arc<dyn BatchDataSet>` | Held-out data for evaluation. |
 | `.eval_fn(f)` | `EvalFn<M>` | Receives `(&M, &Tensor, &Tensor)`, returns `Result<f64>`. |
 | `.eval_result_fn(f)` | `EvalResultFn` | Controller-side `(epoch, scalar)` sink. |

@@ -42,11 +42,13 @@
 pub mod sampler;
 pub mod loader;
 pub mod datasets;
+pub mod records;
 pub(crate) mod prefetch;
 pub(crate) mod sample_cache;
 
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
+pub use records::FixedStrideRecords;
 pub(crate) use loader::prefetch_depth_from_vram;
 
 use crate::tensor::{Result, Tensor};
@@ -100,6 +102,20 @@ pub trait DataSet: Send + Sync {
     /// Whether the dataset is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl DataSet for std::sync::Arc<dyn DataSet> {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<Tensor>> {
+        (**self).get(index)
+    }
+
+    fn is_empty(&self) -> bool {
+        (**self).is_empty()
     }
 }
 
@@ -159,8 +175,10 @@ pub(crate) struct DataSetAdapter<D: DataSet> {
 }
 
 impl<D: DataSet> DataSetAdapter<D> {
-    /// Adapter with a dormant, self-owned cache (test / internal use).
-    #[cfg(test)]
+    /// Adapter with a dormant, self-owned cache (pass-through until a
+    /// loader installs a budget; nothing ever does for adapters built
+    /// via [`batch_dataset_from`] — the caching tier there is the DDP
+    /// worker's staging layer).
     pub(crate) fn new(inner: D) -> Self {
         let cache = std::sync::Arc::new(sample_cache::SampleCache::new(inner.len()));
         DataSetAdapter { inner, cache }
@@ -235,6 +253,18 @@ impl<D: DataSet> BatchDataSet for DataSetAdapter<D> {
 
         Ok(result)
     }
+}
+
+/// Promote a per-sample [`DataSet`] into an opaque [`BatchDataSet`].
+///
+/// Batches are assembled by fetching each index and stacking
+/// position-wise (`[n, ...sample_shape]`). Use this where an API takes
+/// a `BatchDataSet` and you have per-sample data; APIs with a native
+/// per-sample entry are better served directly ([`DataLoader::from_dataset`]
+/// budgets the read-through sample cache, and the DDP trainer entries
+/// stage per-sample through the reservation tier).
+pub fn batch_dataset_from(dataset: impl DataSet + 'static) -> std::sync::Arc<dyn BatchDataSet> {
+    std::sync::Arc::new(DataSetAdapter::new(dataset))
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +469,19 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].shape(), &[3, 4]); // 3 samples, 4 features
         assert_eq!(batch[1].shape(), &[3, 2]); // 3 samples, 2 targets
+    }
+
+    #[test]
+    fn test_batch_dataset_from_promotes_dataset() {
+        // The public promotion path (Trainer entries delegate here),
+        // including through an already-erased Arc<dyn DataSet>.
+        let erased: std::sync::Arc<dyn DataSet> =
+            std::sync::Arc::new(make_simple_data(10));
+        let batched = batch_dataset_from(erased);
+        assert_eq!(batched.len(), 10);
+        let batch = batched.get_batch(&[7, 8]).unwrap();
+        assert_eq!(batch[0].shape(), &[2, 4]);
+        assert_eq!(batch[1].shape(), &[2, 2]);
     }
 
     #[test]

@@ -50,6 +50,12 @@ struct Cli {
     #[option(default = "data")]
     data_dir: std::path::PathBuf,
 
+    /// Training data source: "ram" parses the dataset into memory up
+    /// front; "disk" reads per sample from the raw files through
+    /// flodl's DataSet layer (CIFAR-10 models: resnet, resnet-graph).
+    #[option(default = "ram")]
+    data_source: String,
+
     /// Live dashboard port.
     #[option]
     monitor: Option<u16>,
@@ -542,6 +548,16 @@ fn run() -> flodl::tensor::Result<()> {
         Some(spec) => Some(parse_partition_ratios(spec)?),
     };
 
+    let data_source = match cli.data_source.as_str() {
+        "ram" => models::DataSource::Ram,
+        "disk" => models::DataSource::Disk,
+        other => {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "--data-source must be \"ram\" or \"disk\", got \"{other}\""
+            )))
+        }
+    };
+
     // Convergence guard selection + flag-compatibility validation.
     // Loud errors when guard-specific flags don't match the chosen guard
     // (the `--guard <name>` selector is the source of truth).
@@ -788,6 +804,7 @@ fn run() -> flodl::tensor::Result<()> {
                 seed,
                 output_dir: output.clone(),
                 data_dir: data_dir.clone(),
+                data_source,
                 monitor_port,
                 partition_ratios: partition_ratios.clone(),
                 elche_relax_up: cli.elche_relax_up,
