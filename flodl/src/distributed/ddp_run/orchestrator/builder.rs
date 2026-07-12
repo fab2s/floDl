@@ -456,6 +456,16 @@ where
         self
     }
 
+    /// Enable / disable the device-resident sample pool on rank workers
+    /// (default: enabled). Leftover VRAM retains samples after the
+    /// first training step so later epochs gather them on device
+    /// instead of re-uploading; `FLODL_VRAM_POOL=off` is the runtime
+    /// kill-switch equivalent.
+    pub fn vram_pool(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_vram_pool(enabled);
+        self
+    }
+
     /// Attach a high-frequency system timeline for profiling DDP behavior.
     ///
     /// The coordinator and workers inject training events (sync, epoch,

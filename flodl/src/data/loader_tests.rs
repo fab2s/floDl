@@ -1418,12 +1418,17 @@
     #[test]
     fn test_retry_on_oom_policy() {
         use crate::data::prefetch::{retry_on_oom, OOM_RETRY_ATTEMPTS};
+        use crate::data::vram_pool::VramSamplePool;
 
-        // Transient OOM: fails twice, then succeeds. Retried through.
+        let mut pool = VramSamplePool::new(Device::CPU, false);
+
+        // Transient OOM: fails twice, then succeeds. Retried through,
+        // with the retry ordinal visible to the back-off.
         let mut calls = 0;
-        let mut backoffs = 0;
+        let mut backoffs = Vec::new();
         let out: Result<usize> = retry_on_oom(
-            || {
+            &mut pool,
+            |_pool| {
                 calls += 1;
                 if calls <= 2 {
                     Err(TensorError::new("CUDA out of memory"))
@@ -1431,20 +1436,21 @@
                     Ok(7)
                 }
             },
-            || backoffs += 1,
+            |_pool, attempt| backoffs.push(attempt),
         );
         assert_eq!(out.unwrap(), 7);
         assert_eq!(calls, 3);
-        assert_eq!(backoffs, 2);
+        assert_eq!(backoffs, vec![0, 1]);
 
         // Non-OOM error: no retry, surfaces immediately.
         let mut calls = 0;
         let out: Result<usize> = retry_on_oom(
-            || {
+            &mut pool,
+            |_pool| {
                 calls += 1;
                 Err(TensorError::new("dataset index out of range"))
             },
-            || panic!("must not back off on non-OOM errors"),
+            |_pool, _attempt| panic!("must not back off on non-OOM errors"),
         );
         assert!(out.is_err());
         assert_eq!(calls, 1);
@@ -1452,11 +1458,12 @@
         // Persistent OOM: bounded retries, then the error surfaces.
         let mut calls = 0;
         let out: Result<usize> = retry_on_oom(
-            || {
+            &mut pool,
+            |_pool| {
                 calls += 1;
                 Err(TensorError::new("CUDA out of memory"))
             },
-            || {},
+            |_pool, _attempt| {},
         );
         assert!(out.unwrap_err().is_cuda_oom());
         assert_eq!(calls, OOM_RETRY_ATTEMPTS + 1);

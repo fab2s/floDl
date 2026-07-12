@@ -158,6 +158,28 @@ impl<M: Module> GpuWorker<M> {
             false
         };
 
+        // First post-calibration plan boundary: the activation peak is
+        // measured, so the VRAM probe is honest — let the device sample
+        // pool take its one-shot budget decision, leaving a flow-buffer
+        // reserve for the batch channel (in-flight depth is a
+        // rate-matcher once a capacity tier is active).
+        if !self.vram_pool_budget_sent
+            && self.device.is_cuda()
+            && self.activation_peak_bytes > 0
+        {
+            if let Some(ref pw) = self.prefetch {
+                let batch_bytes = (self.per_sample_bytes * self.batch_size) as u64;
+                let flow = (pw.prefetch_depth() as u64)
+                    .min(crate::data::vram_pool::FLOW_RESERVE_BATCHES);
+                crate::debug!(
+                    "  ddp-worker: rank {} vram pool budget signal (reserve {}MB)",
+                    self.rank, (flow * batch_bytes) >> 20
+                );
+                pw.install_vram_pool_budget(flow * batch_bytes);
+                self.vram_pool_budget_sent = true;
+            }
+        }
+
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
         }

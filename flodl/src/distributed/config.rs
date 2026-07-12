@@ -391,6 +391,12 @@ pub struct TrainerConfig<M: Module> {
 
     /// Maximum gradient norm for per-worker clipping. `None` = no clipping.
     pub max_grad_norm: Option<f64>,
+    /// Device-resident sample pool on rank workers (default `true`):
+    /// leftover VRAM retains samples after the first training step so
+    /// later epochs gather them on device instead of re-uploading them.
+    /// Sizing is automatic; `FLODL_VRAM_POOL=off` in a worker's `env:`
+    /// block is the runtime kill-switch.
+    pub vram_pool: bool,
     /// Cluster-mode stop threshold: how many ranks may be lost (spot
     /// reclaims, hardware, network) before the run is declared
     /// unrecoverable and survivors save-and-shutdown. `None` (default)
@@ -482,6 +488,7 @@ impl<M: Module> TrainerConfig<M> {
             num_epochs: 1,
             elche: ElCheConfig::default(),
             max_grad_norm: None,
+            vram_pool: true,
             max_failure: None,
             checkpoint_every: None,
             save_path: None,
@@ -519,6 +526,10 @@ impl<M: Module> TrainerConfig<M> {
 
     /// Set the batch size.
     pub fn batch_size(mut self, n: usize) -> Self { self.batch_size = n; self }
+
+    /// Enable / disable the rank workers' device-resident sample pool
+    /// (see [`Self::vram_pool`]).
+    pub fn with_vram_pool(mut self, enabled: bool) -> Self { self.vram_pool = enabled; self }
 
     /// Set the outer optimizer (SlowMo / DiLoCo) applied to the consensus.
     /// The factory is invoked once per site (controller on CPU, per rank on

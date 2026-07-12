@@ -24,9 +24,13 @@
 //! VRAM's other tenants are the model (params, grads, optimizer state,
 //! activations — unknowable before the first training step) and the
 //! prefetch in-flight window (governed, reactive). The pool therefore
-//! stays dormant until the governor's post-first-step honest probe has
-//! fired, then takes one budget decision from measured free VRAM minus
-//! the governor's full in-flight reserve minus a safety margin. The
+//! stays dormant until the post-first-step honest probe (the
+//! governor's latch, or the rank worker's explicit signal on
+//! coordinator-paced paths), then takes one budget decision from
+//! measured free VRAM minus a flow-buffer in-flight reserve
+//! ([`FLOW_RESERVE_BATCHES`]) minus a safety margin — with a capacity
+//! tier active, prefetch depth is a rate-matcher, not a capacity
+//! claim, the same arbitration as the reader ring one tier down. The
 //! pool must never be the reason a training step OOMs: on transient
 //! data-plane OOM the governor's target halving runs first, slab
 //! eviction is the last resort.
@@ -52,6 +56,17 @@ const SLAB_BYTES: usize = 64 << 20;
 /// budget is decided: allocator variance, eval-time model copies, and
 /// anything else the one probe cannot see.
 const MARGIN_BYTES: u64 = 512 << 20;
+
+/// In-flight batches reserved for the prefetch pipeline when the pool
+/// sizes itself. With a capacity tier active, in-flight depth is a
+/// rate-matching flow buffer, not a capacity claim — the same
+/// arbitration as the reader ring's `RING_SLOTS_WITH_CACHE` cap one
+/// tier down. A pre-pool depth target computed against the whole free
+/// VRAM would otherwise starve the pool at its one-shot decision; if
+/// the prefetch overfills during the install epoch, the existing OOM
+/// backoff halves it and the next sizing probe (which sees pool bytes
+/// as used) rights the target for good.
+pub(crate) const FLOW_RESERVE_BATCHES: u64 = 16;
 
 /// One allocation unit of the pool: per data position, a device tensor
 /// of `[rows, ...sample_dims]`; `used` rows are filled so far.
@@ -116,10 +131,10 @@ impl VramSamplePool {
     }
 
     /// One-shot budget decision, gated on the governor's honest
-    /// (post-first-step) probe: free VRAM minus the governor's full
-    /// in-flight reserve minus [`MARGIN_BYTES`]. Called cheaply per
-    /// batch until it fires; a host that never trains (probe never
-    /// fires) never installs a budget.
+    /// (post-first-step) probe: free VRAM minus a flow-buffer in-flight
+    /// reserve minus [`MARGIN_BYTES`]. Called cheaply per batch until
+    /// it fires; a host that never trains (probe never fires) never
+    /// installs a budget.
     pub(crate) fn maybe_install(&mut self, governor: &GovernorCtl, batch: &[Tensor]) {
         if !self.enabled || self.decided {
             return;
@@ -130,13 +145,6 @@ impl VramSamplePool {
         {
             return;
         }
-        self.decided = true;
-
-        let Ok((free, _total)) =
-            crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
-        else {
-            return; // no probe, no budget: stay dormant
-        };
         let batch_bytes: u64 = batch
             .iter()
             .map(|t| (t.numel() as u64) * t.dtype().element_size() as u64)
@@ -145,7 +153,27 @@ impl VramSamplePool {
             .target
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(1) as u64;
-        let reserve = target * batch_bytes + MARGIN_BYTES;
+        self.install_with_reserve(target.min(FLOW_RESERVE_BATCHES) * batch_bytes);
+    }
+
+    /// One-shot budget decision from an explicit in-flight reserve, for
+    /// paths without a governor (coordinator-paced rank workers, where
+    /// the caller signals the post-first-step moment itself and knows
+    /// its channel depth). Idempotent after the first call.
+    pub(crate) fn install_with_reserve(&mut self, reserve_bytes: u64) {
+        if !self.enabled || self.decided {
+            return;
+        }
+        self.decided = true;
+
+        // The probe returns (used, total) — used first, not free.
+        let Ok((used, total)) =
+            crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+        else {
+            return; // no probe, no budget: stay dormant
+        };
+        let free = total.saturating_sub(used);
+        let reserve = reserve_bytes + MARGIN_BYTES;
         let budget = free.saturating_sub(reserve);
         if (budget as usize) < SLAB_BYTES {
             crate::verbose!(

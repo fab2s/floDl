@@ -278,6 +278,10 @@ pub struct GpuWorker<M: Module> {
     /// memory that forward/backward will need. Zero = not yet measured;
     /// first chunk runs sync to calibrate.
     activation_peak_bytes: usize,
+    /// One-shot latch: the device sample pool's budget install has been
+    /// signalled to the prefetch worker (first post-calibration plan
+    /// boundary, when the activation peak makes the VRAM probe honest).
+    vram_pool_budget_sent: bool,
     /// Maximum gradient norm for clipping (None = no clipping).
     max_grad_norm: Option<f64>,
     /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite

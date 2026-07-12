@@ -523,6 +523,13 @@ pub struct DdpRunConfig {
     /// spikes on any GPU are bounded before they propagate through
     /// AllReduce averaging.
     pub max_grad_norm: Option<f64>,
+    /// Enable the device-resident sample pool on rank workers: leftover
+    /// VRAM (measured after the first training step) retains samples so
+    /// later epochs gather them on device instead of re-uploading them.
+    /// Sizing is automatic; `FLODL_VRAM_POOL=off` (or `0`) in a
+    /// worker's `env:` block is the runtime kill-switch. Default:
+    /// `true`.
+    pub vram_pool: bool,
     /// Optional high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events (sync,
@@ -633,6 +640,7 @@ impl DdpRunConfig {
             snapshot_timeout_secs: 5,
             progressive_dispatch: None,
             max_grad_norm: None,
+            vram_pool: true,
             timeline: None,
             lr_scale_ratio: 1.0,
             save_path: None,
@@ -816,6 +824,13 @@ impl DdpRunConfig {
     /// propagating through AllReduce.
     pub fn with_max_grad_norm(mut self, max_norm: f64) -> Self {
         self.max_grad_norm = Some(max_norm);
+        self
+    }
+
+    /// Enable / disable the device-resident sample pool on rank
+    /// workers (see [`Self::vram_pool`]). Default: enabled.
+    pub fn with_vram_pool(mut self, enabled: bool) -> Self {
+        self.vram_pool = enabled;
         self
     }
 
@@ -1315,6 +1330,10 @@ pub struct WorkerConfig {
     pub seed: u64,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,
+    /// Device-resident sample pool on this worker (see
+    /// [`DdpRunConfig::vram_pool`]). `FLODL_VRAM_POOL=off` overrides at
+    /// runtime.
+    pub vram_pool: bool,
     /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
     /// local params with averaged consensus on the cpu-async path (current
     /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]

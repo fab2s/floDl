@@ -392,8 +392,8 @@ stands alone:
    genuinely slow storage (network mounts with ms-scale reads) or
    beds larger than RAM — both of which now train through the same
    entry unchanged.
-5. *Partial VRAM sample tier* (solo `DataLoader` half **landed**;
-   DDP wiring pending): the same rule one tier up — keep K of N samples
+5. *Partial VRAM sample tier* (**landed**, solo + DDP, rig-validated):
+   the same rule one tier up — keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between
    resident and streaming modes. Two carrots: the resident/streaming
    cliff becomes a slope (one byte over budget no longer costs the
@@ -423,24 +423,37 @@ stands alone:
      slab-chunked device tensors (a few hundred samples per slab,
      admitted in consumption order) because a single bulk tensor
      cannot be partially freed and per-sample tensors fragment.
-   - *Landing order:* the solo streaming `DataLoader` half is
-     **landed** — `VramSamplePool` + mixed-tier assembly at the
-     transfer seam (both pipeline shapes; the reader ring now carries
-     indices so the transfer stage can key the pool), `vram_pool(bool)`
-     knob, per-epoch telemetry, device-validated end to end (an
-     interleaved-coverage test proves gather + upload + stitch +
-     capture restore exact batch content across epochs, with the
-     telemetry arithmetic — hits, captures, pool size — matching the
-     coverage pattern exactly). Next: DDP rank workers,
-     reservation-aware (prefer own-span rows, margins last — the
-     compute-ratio reservations size per-rank pools, hence the
-     sequencing after increment 4); then eviction refinement
-     (next-use / own-span priority) only if measurement warrants.
-   - *Validation readout:* H2D bytes per epoch, not wall clock alone;
-     a weak-PCIe device (x1 riser) is the bed. That at-scale cell
-     rides the DDP wiring (rank workers are the path ddp-bench
-     exercises; the solo half is covered by the device tests and its
-     own telemetry).
+   - *Landing:* the solo streaming `DataLoader` half — `VramSamplePool`
+     + mixed-tier assembly at the transfer seam (both pipeline shapes;
+     the reader ring carries indices so the transfer stage can key the
+     pool), `vram_pool(bool)` knob, per-epoch telemetry,
+     device-validated end to end (an interleaved-coverage test proves
+     gather + upload + stitch + capture restore exact batch content
+     across epochs, with the telemetry arithmetic — hits, captures,
+     pool size — matching the coverage pattern exactly). Then the DDP
+     rank workers: the worker signals the budget moment itself at the
+     first post-calibration plan boundary (measured activation peak =
+     its honest probe), with `TrainerConfig::vram_pool` /
+     `DdpBuilder::vram_pool` knobs and a `FLODL_VRAM_POOL=off`
+     per-worker env kill-switch. Reservation-awareness comes free:
+     capture-at-delivery admits exactly the rows allocation delivered,
+     which IS the rank's reserved work. Eviction refinement (next-use
+     / own-span priority) remains contingent on measurement.
+   - *Rig verdict (heterogeneous 3-rank cluster, CIFAR/resnet):* the
+     fast rank serves 100% of rows on-device once the pool fills
+     (~400MB H2D saved per epoch), slow ranks ~95% (reservation-drift
+     misses keep being captured); pool-on beats pool-off like for like
+     (62.3s vs 63.5s cpu-cadence, lower reduce waits) with evals at
+     parity — modest on this transfer-light bed, by the same physics
+     as the storage tier: the win scales with the transfer cost it
+     absorbs. Landing this surfaced a released probe-inversion bug
+     (`(used, total)` read as `(free, total)`) that had silently kept
+     adaptive prefetch, resident-mode detection, and the rank workers'
+     async data pipeline at near-zero budgets on mostly-free devices —
+     fixed alongside (see CHANGELOG); the rank data pipeline now
+     actually overlaps H2D with compute, shifting per-rank profiles
+     (data time collapses into overlap; delivered-cost totals
+     conserved).
 
 Cross-cutting invariants for the arc:
 

@@ -37,8 +37,8 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     let idx = device.index() as i32;
 
     match crate::tensor::cuda_memory_info_idx(idx) {
-        Ok((free, total)) => {
-            let used = total.saturating_sub(free);
+        // The probe returns (used, total) — used first, not free.
+        Ok((used, total)) => {
             let cap = (total as f64 * VRAM_MAX_USAGE) as u64;
             let budget = cap.saturating_sub(used);
             total_bytes < budget
@@ -78,12 +78,12 @@ pub(crate) fn prefetch_depth_from_vram(
     }
 
     let idx = device.index() as i32;
-    let (free, total) = crate::tensor::cuda_memory_info_idx(idx)
-        .unwrap_or((0, 0));
+    // The probe returns (used, total) — used first, not free.
+    let (used, total) = crate::tensor::cuda_memory_info_idx(idx)
+        .unwrap_or((u64::MAX, 0));
 
-    let used = (total as usize).saturating_sub(free as usize);
     let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
-    let budget = cap.saturating_sub(used + activation_reserve);
+    let budget = cap.saturating_sub(used as usize + activation_reserve);
 
     budget / batch_bytes
 }

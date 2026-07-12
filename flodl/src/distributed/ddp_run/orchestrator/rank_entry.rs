@@ -246,6 +246,7 @@ impl DdpHandle {
 
         let timeline_for_thread = config.timeline.clone();
         let max_grad_norm = config.max_grad_norm;
+        let vram_pool = config.vram_pool;
         // EASGD blending is gated to Async at the single authoritative
         // point, `GpuWorker::new` (every worker path funnels through it),
         // which forces `None` for any non-async worker. Pass the configured
@@ -427,6 +428,7 @@ impl DdpHandle {
                     config.resume_from.as_deref(),
                 )?,
                 max_grad_norm,
+                vram_pool,
                 easgd_alpha,
                 gamma: config.elche.gamma,
                 timeline: timeline_for_thread,

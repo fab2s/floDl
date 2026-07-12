@@ -115,21 +115,26 @@ pub(crate) const OOM_RETRY_ATTEMPTS: usize = 10;
 pub(crate) const OOM_RETRY_SLEEP: Duration = Duration::from_millis(100);
 
 /// Retry `attempt` while it fails with a CUDA-OOM error, calling
-/// `on_oom` before each retry (empty-cache + target halving + sleep at
-/// the call site). Prefetch OOM is usually transient: the consumer
-/// frees batch tensors continuously, so the same allocation succeeds
-/// after a short drain. Non-OOM errors (real dataset failures) return
-/// immediately; exhausted retries return the last error.
+/// `on_oom` before each retry (empty-cache + target halving + slab
+/// eviction at the call sites). Prefetch OOM is usually transient: the
+/// consumer frees batch tensors continuously, so the same allocation
+/// succeeds after a short drain. Non-OOM errors (real dataset
+/// failures) return immediately; exhausted retries return the last
+/// error. The sample pool threads through both closures explicitly
+/// (`attempt` assembles through it, `on_oom` may evict from it —
+/// closure captures cannot share the borrow); `on_oom` also receives
+/// the retry ordinal so late attempts can escalate.
 pub(crate) fn retry_on_oom<T>(
-    mut attempt: impl FnMut() -> Result<T>,
-    mut on_oom: impl FnMut(),
+    pool: &mut VramSamplePool,
+    mut attempt: impl FnMut(&mut VramSamplePool) -> Result<T>,
+    mut on_oom: impl FnMut(&mut VramSamplePool, usize),
 ) -> Result<T> {
-    let mut result = attempt();
-    for _ in 0..OOM_RETRY_ATTEMPTS {
+    let mut result = attempt(pool);
+    for i in 0..OOM_RETRY_ATTEMPTS {
         match &result {
             Err(e) if e.is_cuda_oom() => {
-                on_oom();
-                result = attempt();
+                on_oom(pool, i);
+                result = attempt(pool);
             }
             _ => break,
         }
@@ -176,6 +181,13 @@ pub(crate) enum WorkerCmd {
     /// the channel from the preceding `StartDistributedEpoch`.
     LoadBatch {
         indices: Vec<usize>,
+    },
+    /// Install the device sample pool's budget (distributed mode, where
+    /// no governor exists to gate the decision): the caller signals its
+    /// post-first-step moment and passes the in-flight bytes to leave
+    /// reserved. Idempotent after the first decision.
+    InstallVramPool {
+        reserve_bytes: u64,
     },
     /// Shut down the worker.
     Stop,
@@ -271,6 +283,14 @@ impl PrefetchWorker {
         let _ = self.cmd_tx.send(WorkerCmd::LoadBatch { indices });
     }
 
+    /// Let the device sample pool take its one-shot budget decision
+    /// (distributed mode). Call after the first training step, when the
+    /// VRAM probe sees activations and optimizer state; `reserve_bytes`
+    /// is the in-flight buffer to leave for the batch channel.
+    pub fn install_vram_pool_budget(&self, reserve_bytes: u64) {
+        let _ = self.cmd_tx.send(WorkerCmd::InstallVramPool { reserve_bytes });
+    }
+
     /// Current prefetch depth (channel capacity for next epoch).
     pub fn prefetch_depth(&self) -> usize {
         self.prefetch_depth
@@ -362,30 +382,42 @@ fn worker_loop(
                 // batch_tx is dropped here, closing the epoch's channel.
             }
             WorkerCmd::StartDistributedEpoch { batch_tx } => {
+                // Epoch boundary on the coordinator-paced path: report
+                // the closing epoch's pool telemetry before the next
+                // one starts.
+                pool.epoch_report();
                 dist_tx = Some(batch_tx);
+            }
+            WorkerCmd::InstallVramPool { reserve_bytes } => {
+                pool.install_with_reserve(reserve_bytes);
             }
             WorkerCmd::LoadBatch { indices } => {
                 if let Some(ref tx) = dist_tx {
                     // Same transient-OOM patience as the epoch path; the
                     // coordinator paces in-flight batches here, so there
-                    // is no governor target to shrink. The pool stays
-                    // dormant on this path (no governor, so its honest
-                    // probe never fires) and passes batches through.
+                    // is no governor target to shrink — drain patience
+                    // first, then the pool's slab eviction is the only
+                    // remaining relief valve (last resort: only once
+                    // half the retry budget is spent).
                     let result = if device.is_cuda() {
                         retry_on_oom(
-                            || {
+                            &mut pool,
+                            |pool| {
                                 fetch_and_transfer(
                                     &*dataset,
                                     &indices,
                                     device,
-                                    &mut pool,
+                                    pool,
                                     #[cfg(feature = "cuda")]
                                     copy_stream.as_ref(),
                                 )
                             },
-                            || {
+                            |pool, attempt| {
                                 crate::tensor::cuda_empty_cache();
                                 thread::sleep(OOM_RETRY_SLEEP);
+                                if attempt >= OOM_RETRY_ATTEMPTS / 2 {
+                                    pool.evict_one_slab();
+                                }
                             },
                         )
                     } else {
@@ -403,7 +435,13 @@ fn worker_loop(
                     }
                 }
             }
-            WorkerCmd::Stop => break,
+            WorkerCmd::Stop => {
+                // Flush the last epoch's pool telemetry (the per-epoch
+                // report otherwise fires at the NEXT epoch start, which
+                // never comes).
+                pool.epoch_report();
+                break;
+            }
         }
     }
 }
@@ -597,35 +635,26 @@ fn pooled_transfer_with_retry(
     }
     pool.maybe_install(governor, tensors);
 
-    let mut result = transfer_batch(
-        indices,
-        tensors,
-        device,
+    retry_on_oom(
         pool,
-        #[cfg(feature = "cuda")]
-        copy_stream,
-    );
-    for _ in 0..OOM_RETRY_ATTEMPTS {
-        match &result {
-            Err(e) if e.is_cuda_oom() => {
-                let at_floor = governor.target.load(Ordering::Relaxed) <= 1;
-                oom_backoff(governor);
-                if at_floor {
-                    pool.evict_one_slab();
-                }
-                result = transfer_batch(
-                    indices,
-                    tensors,
-                    device,
-                    pool,
-                    #[cfg(feature = "cuda")]
-                    copy_stream,
-                );
+        |pool| {
+            transfer_batch(
+                indices,
+                tensors,
+                device,
+                pool,
+                #[cfg(feature = "cuda")]
+                copy_stream,
+            )
+        },
+        |pool, _attempt| {
+            let at_floor = governor.target.load(Ordering::Relaxed) <= 1;
+            oom_backoff(governor);
+            if at_floor {
+                pool.evict_one_slab();
             }
-            _ => break,
-        }
-    }
-    result
+        },
+    )
 }
 
 /// Fetch a batch from the dataset and transfer to the target device.

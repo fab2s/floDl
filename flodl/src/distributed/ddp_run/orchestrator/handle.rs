@@ -505,6 +505,7 @@ impl DdpHandle {
                 epoch_fn,
                 metrics_fn,
                 config.max_grad_norm,
+                config.vram_pool,
                 scheduler,
                 eval_fn,
                 eval_dataset,

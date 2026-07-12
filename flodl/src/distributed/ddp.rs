@@ -727,7 +727,8 @@ docs/design/trainer-execution-tiers.md)")]
             .dataset(cfg.dataset)
             .batch_size(cfg.batch_size)
             .num_epochs(cfg.num_epochs)
-            .elche(cfg.elche);
+            .elche(cfg.elche)
+            .vram_pool(cfg.vram_pool);
 
         if let Some(n) = cfg.max_grad_norm {
             b = b.max_grad_norm(n);
