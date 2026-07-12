@@ -89,7 +89,12 @@ fn timing_feed_all_or_none_falls_back_to_compute_scale() {
     // compute); rank 1 has none.
     set_delivered(&mut coord, &[80.0, 0.0], &[4, 0]);
 
-    let (ms, batches) = coord.timing_feed();
+    let report = coord.build_window_report(0.0);
+    assert!(
+        !report.delivered_coherent,
+        "a mover without a delivered sample must fail the coherence attestation",
+    );
+    let (ms, batches) = report.select_feed();
     assert_eq!(
         ms,
         vec![40.0, 100.0],
@@ -107,7 +112,9 @@ fn timing_feed_uses_delivered_when_window_complete() {
     // and must win (it carries the data/transport cost the balancer needs).
     set_delivered(&mut coord, &[80.0, 220.0], &[4, 4]);
 
-    let (ms, batches) = coord.timing_feed();
+    let report = coord.build_window_report(0.0);
+    assert!(report.delivered_coherent);
+    let (ms, batches) = report.select_feed();
     assert_eq!(ms, vec![80.0, 220.0], "complete window feeds delivered cost");
     assert_eq!(batches, vec![4, 4]);
 }
@@ -129,6 +136,11 @@ fn timing_feed_sync_keeps_compute_scale() {
     set_wall(&mut coord, &[10.0, 20.0]);
     set_delivered(&mut coord, &[99.0, 99.0], &[1, 1]);
 
-    let (ms, _) = coord.timing_feed();
+    let report = coord.build_window_report(0.0);
+    assert!(
+        !report.delivered_coherent,
+        "Sync must never attest the delivered scale",
+    );
+    let (ms, _) = report.select_feed();
     assert_eq!(ms, vec![10.0, 20.0], "Sync stays on the compute feed");
 }

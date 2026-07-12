@@ -46,17 +46,18 @@ impl ClusterCoordinator {
         };
         if let crate::distributed::lr_event_meta::MetaAction::NudgeDown { factor } = action {
             let old = self.el_che.anchor();
-            self.el_che.nudge_anchor_down(factor);
-            // Invalidate any grow proposal report_timing staged THIS cycle
-            // (computed from the pre-nudge anchor) and latch growth off —
-            // exactly what the guard's own NudgeDown branch does. Without
-            // this, a guard verdict of `Stable` later in `finish_averaging_head`
-            // calls `commit_proposed_anchor()`, which sets `anchor = n` (the
-            // pre-nudge grow target) and OVERWRITES the nudge we just applied,
-            // silently defeating the meta-controller in its intended-actuation
-            // window (it fires proactively on an LR cliff, BEFORE divergence
-            // rises, so guard-`Stable` + meta-`NudgeDown` is the common case).
-            self.el_che.discard_proposed_anchor();
+            // Second verdict producer, same seam. `NudgeDown` both nudges
+            // AND discards any grow proposal report_timing staged THIS
+            // cycle (computed from the pre-nudge anchor): without the
+            // discard, a guard verdict of `Stable` later in
+            // `finish_averaging_head` would commit that proposal and
+            // OVERWRITE the nudge, silently defeating the meta-controller
+            // in its intended-actuation window (it fires proactively on
+            // an LR cliff, BEFORE divergence rises, so guard-`Stable` +
+            // meta-`NudgeDown` is the common case).
+            self.el_che.apply_verdict(
+                crate::distributed::el_che::AnchorVerdict::NudgeDown { factor },
+            );
             let new = self.el_che.anchor();
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::MetaNudge {
@@ -174,7 +175,7 @@ impl ClusterCoordinator {
         // Time exclusion: absorb checkpoint elapsed out of this rank's
         // compute AND delivered accumulators so ElChe's rebalancer does
         // not see checkpoint cost as compute slowness in either balancer
-        // denominator (see `timing_feed`).
+        // denominator (see `build_window_report`).
         self.window.absorb_callback_cost(rank, elapsed_ms);
         match error {
             None => {
@@ -261,7 +262,7 @@ impl ClusterCoordinator {
     ) {
         // Time exclusion (parallel to checkpoint): absorb eval elapsed
         // out of both balancer denominators so ElChe's rebalancer does
-        // not interpret eval cost as compute slowness (see `timing_feed`).
+        // not interpret eval cost as compute slowness (see `build_window_report`).
         self.window.absorb_callback_cost(rank, elapsed_ms);
         // EWMA blend (alpha=0.3, same as checkpoint). Fires on every
         // report regardless of error: the closure wall-time is honest
@@ -297,7 +298,7 @@ impl ClusterCoordinator {
     pub(super) fn handle_epoch_fn_elapsed(&mut self, rank: usize, elapsed_ms: f64) {
         // Time exclusion (parallel to checkpoint / eval): absorb the
         // closure's elapsed out of both balancer denominators (see
-        // `timing_feed`).
+        // `build_window_report`).
         self.window.absorb_callback_cost(rank, elapsed_ms);
         let alpha = 0.3_f64;
         self.last_epoch_fn_elapsed_ms_ewma =

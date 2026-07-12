@@ -150,6 +150,109 @@ pub enum Phase {
     Mature,
 }
 
+/// Source-agnostic anchor verdict: what a convergence assessment asks
+/// ElChe to do with its window, regardless of who produced it (the
+/// convergence guard, the LR-aware meta-controller, or any future
+/// detector). ElChe applies the verdict via [`ElChe::apply_verdict`]
+/// and never learns the source; arbitration between competing verdict
+/// producers is the caller's, in one place.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum AnchorVerdict {
+    /// Convergence is clean: commit any pending window-pressure grow
+    /// proposal and count toward the growth re-arm latch. With
+    /// `relax_up`, additionally drift the anchor one batch toward
+    /// `max_anchor` (the async-mode opt-in; see
+    /// [`ElChe::relax_anchor_up`] for the drift-cap rules).
+    Stable {
+        /// Also relax the anchor upward by one (async opt-in).
+        relax_up: bool,
+    },
+    /// Divergence trending up: drop the pending grow proposal and latch
+    /// growth off until consecutive `Stable` verdicts re-arm it.
+    SuppressGrowth,
+    /// Sustained divergence (or a proactive prediction, e.g. an LR
+    /// cliff): shrink the anchor multiplicatively by `factor`
+    /// (0.5 = halve), drop the pending grow proposal, latch growth off.
+    NudgeDown {
+        /// Multiplicative anchor shrink factor, clamped to `[0.1, 1.0]`.
+        factor: f64,
+    },
+}
+
+/// One reduce window's observations, the event-shaped timing feed for
+/// [`ElChe::report_window`]. Built by the coordinator from its window
+/// ledger once per averaging cycle; owned values because it is a
+/// message, not a view.
+///
+/// Carries BOTH timing scales so the scale-selection policy (the
+/// mixed-scale inversion guard) lives in ElChe, next to the relative
+/// allocation model it protects:
+///
+/// - compute-only `(wall_ms, steps)` — always coherent across ranks;
+/// - marginal delivered `(delivered_ms, delivered_batches)` — carries
+///   data + transport cost; a rank without a delivered sample this
+///   window has `(0.0, 0)`.
+///
+/// `delivered_coherent` is the caller's attestation that the delivered
+/// scale is safe to use at all: the mode rides the delivered feed AND
+/// every alive mover has a delivered sample this window. The caller
+/// owns that predicate because it owns membership (dead ranks) and the
+/// ledger; ElChe owns what to do with it — feeding a PARTIAL delivered
+/// set would compare incomparable scales and invert the allocation
+/// (see [`WindowReport::select_feed`]).
+#[derive(Debug, Clone)]
+pub struct WindowReport {
+    /// Per-rank compute-only wall (ms) this window.
+    pub wall_ms: Vec<f64>,
+    /// Per-rank step counts this window (matched divisor for `wall_ms`).
+    pub steps: Vec<usize>,
+    /// Per-rank marginal delivered wall (ms) this window.
+    pub delivered_ms: Vec<f64>,
+    /// Per-rank marginal delivered batch counts (matched divisor for
+    /// `delivered_ms`).
+    pub delivered_batches: Vec<usize>,
+    /// Per-rank first-batch fill excess (ms) — the window-pressure
+    /// growth signal.
+    pub fill_ms: Vec<f64>,
+    /// The delivered scale is coherent this window (mode supports it
+    /// AND every alive mover has a delivered sample).
+    pub delivered_coherent: bool,
+    /// Duration (ms) of the sync that closed the window.
+    pub sync_ms: f64,
+}
+
+impl WindowReport {
+    /// The `(ms, batches)` pair ElChe schedules on this window — the
+    /// scale-selection policy. ElChe's allocation is RELATIVE, so the
+    /// per-rank scale must be uniform within a window: when the
+    /// delivered scale is not coherent, EVERY rank feeds the compute
+    /// scale (a uniformly compute-fed window is coherent; the next
+    /// window returns to delivered). When coherent, ranks with a
+    /// delivered sample feed delivered cost; ranks without one are
+    /// non-movers by the caller's attestation and fall back to their
+    /// (empty) compute pair, contributing `(0, 0)` on either scale.
+    pub fn select_feed(&self) -> (Vec<f64>, Vec<usize>) {
+        if !self.delivered_coherent {
+            return (self.wall_ms.clone(), self.steps.clone());
+        }
+        let mut ms = Vec::with_capacity(self.wall_ms.len());
+        let mut batches = Vec::with_capacity(self.wall_ms.len());
+        for r in 0..self.wall_ms.len() {
+            let has_sample =
+                self.delivered_batches[r] > 0 && self.delivered_ms[r] > 0.0;
+            if has_sample {
+                ms.push(self.delivered_ms[r]);
+                batches.push(self.delivered_batches[r]);
+            } else {
+                ms.push(self.wall_ms[r]);
+                batches.push(self.steps[r]);
+            }
+        }
+        (ms, batches)
+    }
+}
+
 pub struct ElChe {
     world_size: usize,
     /// Anchor batch count (slow device processes this many per step).
@@ -931,6 +1034,40 @@ impl ElChe {
         self.growth_enabled = false;
     }
 
+    /// Apply a source-agnostic [`AnchorVerdict`] — the ONE verdict seam.
+    ///
+    /// Every verdict producer (convergence guard, meta-controller,
+    /// future detectors) funnels through here; ElChe never learns the
+    /// source. The fine-grained anchor methods
+    /// ([`Self::commit_proposed_anchor`], [`Self::veto_proposed_growth`],
+    /// [`Self::discard_proposed_anchor`], [`Self::nudge_anchor_down`],
+    /// [`Self::relax_anchor_up`]) remain available as building blocks,
+    /// but orchestration code should speak verdicts.
+    ///
+    /// `NudgeDown` both discards the pending grow proposal AND nudges:
+    /// a proposal staged this cycle was computed from the pre-nudge
+    /// anchor, so a later `Stable` verdict committing it would silently
+    /// overwrite the nudge (the discard-then-nudge order is canonical;
+    /// the two operations touch disjoint state, so producers that
+    /// historically nudged first are unaffected).
+    pub fn apply_verdict(&mut self, verdict: AnchorVerdict) {
+        match verdict {
+            AnchorVerdict::Stable { relax_up } => {
+                self.commit_proposed_anchor();
+                if relax_up {
+                    self.relax_anchor_up();
+                }
+            }
+            AnchorVerdict::SuppressGrowth => {
+                self.veto_proposed_growth();
+            }
+            AnchorVerdict::NudgeDown { factor } => {
+                self.discard_proposed_anchor();
+                self.nudge_anchor_down(factor);
+            }
+        }
+    }
+
     /// Whether at least one timing measurement has been reported.
     pub fn is_calibrated(&self) -> bool {
         self.calibrated
@@ -965,6 +1102,24 @@ impl ElChe {
             .get(rank)
             .filter(|w| !w.is_empty())
             .map(|w| w.mean())
+    }
+
+    /// Ingest one reduce window's observations — the event-shaped feed.
+    ///
+    /// Stages the window-pressure fill, selects the timing scale via
+    /// [`WindowReport::select_feed`] (the mixed-scale inversion guard),
+    /// and feeds [`Self::report_timing`] when the window carries any
+    /// signal (an all-zero feed — e.g. a fully-idle window — reports
+    /// nothing, so no spurious zero-ms sample poisons the trust
+    /// windows). This is the coordinator's one timing entry point; the
+    /// lower-level [`Self::set_window_fill_ms`] + [`Self::report_timing`]
+    /// pair remains for callers that assemble their own feed.
+    pub fn report_window(&mut self, report: &WindowReport) {
+        self.set_window_fill_ms(&report.fill_ms);
+        let (ms, batches) = report.select_feed();
+        if ms.iter().any(|&m| m > 0.0) {
+            self.report_timing(&ms, &batches, report.sync_ms);
+        }
     }
 
     /// Report timing after a cadence step completes.
@@ -1471,6 +1626,122 @@ mod meta_nudge_tests {
             el.anchor(),
             20,
             "documents the H12 bug: an un-discarded grow overwrites the nudge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verdict_seam_tests {
+    use super::*;
+
+    // The seam must reproduce the guard branch exactly: NudgeDown both
+    // discards the staged (pre-nudge) grow proposal and nudges, so a
+    // later Stable commit has nothing stale to apply (H12 through the
+    // seam instead of the fine-grained methods).
+    #[test]
+    fn verdict_nudge_down_discards_and_nudges() {
+        let mut el = ElChe::new(2, 10);
+        el.proposed_anchor = Some(ProposedAnchor::Grow(20));
+        el.apply_verdict(AnchorVerdict::NudgeDown { factor: 0.5 });
+        assert_eq!(el.anchor(), 5);
+        el.apply_verdict(AnchorVerdict::Stable { relax_up: false });
+        assert_eq!(
+            el.anchor(),
+            5,
+            "the verdict's built-in discard must survive a later Stable commit"
+        );
+        assert!(!el.growth_enabled(), "NudgeDown latches growth off");
+    }
+
+    #[test]
+    fn verdict_stable_commits_pending_grow() {
+        let mut el = ElChe::new(2, 10);
+        el.proposed_anchor = Some(ProposedAnchor::Grow(20));
+        el.apply_verdict(AnchorVerdict::Stable { relax_up: false });
+        assert_eq!(el.anchor(), 20);
+    }
+
+    #[test]
+    fn verdict_stable_relax_up_drifts_anchor() {
+        let mut el = ElChe::new(2, 10);
+        el.apply_verdict(AnchorVerdict::Stable { relax_up: true });
+        assert_eq!(el.anchor(), 11, "relax_up drifts +1 toward max_anchor");
+        let mut el = ElChe::new(2, 10);
+        el.apply_verdict(AnchorVerdict::Stable { relax_up: false });
+        assert_eq!(el.anchor(), 10, "without relax_up the anchor holds");
+    }
+
+    #[test]
+    fn verdict_suppress_growth_drops_proposal_and_latches() {
+        let mut el = ElChe::new(2, 10);
+        el.proposed_anchor = Some(ProposedAnchor::Grow(20));
+        el.apply_verdict(AnchorVerdict::SuppressGrowth);
+        assert_eq!(el.anchor(), 10, "SuppressGrowth holds the anchor");
+        assert!(!el.growth_enabled());
+        el.apply_verdict(AnchorVerdict::Stable { relax_up: false });
+        assert_eq!(el.anchor(), 10, "the vetoed proposal is gone for good");
+    }
+}
+
+#[cfg(test)]
+mod report_window_tests {
+    use super::*;
+
+    fn report(
+        wall: &[f64],
+        steps: &[usize],
+        dms: &[f64],
+        dbatches: &[usize],
+        coherent: bool,
+    ) -> WindowReport {
+        WindowReport {
+            wall_ms: wall.to_vec(),
+            steps: steps.to_vec(),
+            delivered_ms: dms.to_vec(),
+            delivered_batches: dbatches.to_vec(),
+            fill_ms: vec![0.0; wall.len()],
+            delivered_coherent: coherent,
+            sync_ms: 1.0,
+        }
+    }
+
+    #[test]
+    fn coherent_report_feeds_the_delivered_scale() {
+        let mut el = ElChe::new(2, 4);
+        el.report_window(&report(
+            &[40.0, 100.0],
+            &[4, 4],
+            &[80.0, 220.0],
+            &[4, 4],
+            true,
+        ));
+        assert!(el.is_calibrated());
+        // 80/4 = 20 (delivered), not 40/4 = 10 (compute).
+        assert!((el.smoothed_ms_per_batch(0).unwrap() - 20.0).abs() < 1e-9);
+        assert!((el.smoothed_ms_per_batch(1).unwrap() - 55.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn incoherent_report_feeds_the_compute_scale() {
+        let mut el = ElChe::new(2, 4);
+        el.report_window(&report(
+            &[40.0, 100.0],
+            &[4, 4],
+            &[80.0, 0.0],
+            &[4, 0],
+            false,
+        ));
+        assert!((el.smoothed_ms_per_batch(0).unwrap() - 10.0).abs() < 1e-9);
+        assert!((el.smoothed_ms_per_batch(1).unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn all_zero_window_reports_nothing() {
+        let mut el = ElChe::new(2, 4);
+        el.report_window(&report(&[0.0, 0.0], &[0, 0], &[0.0, 0.0], &[0, 0], true));
+        assert!(
+            !el.is_calibrated(),
+            "a fully-idle window must not poison the trust windows"
         );
     }
 }

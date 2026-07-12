@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::distributed::ddp_run::convergence::{self, ConvergenceAction};
+use crate::distributed::el_che::{AnchorVerdict, WindowReport};
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
@@ -95,7 +96,7 @@ impl ClusterCoordinator {
     /// feed unchanged. Every alive mover (steps > 0) has a delivered
     /// sample this window (nonzero ms AND batches). This is both the
     /// all-or-none coherence predicate for the delivered feed in
-    /// [`Self::timing_feed`] and the settle condition for
+    /// [`Self::build_window_report`] and the settle condition for
     /// `trigger_averaging`'s pre-finish drain.
     pub(super) fn movers_delivered_complete(&self) -> bool {
         (0..self.world_size)
@@ -109,78 +110,55 @@ impl ClusterCoordinator {
             .all(|r| self.window.has_delivered_sample(r))
     }
 
-    pub(super) fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
-        // Delivered-cost feed: CPU Cadence/Async + NCCL Cadence. The danger
-        // this gate guards against is a PARTIAL delivered set at feed time:
-        // some ranks with a delivered sample this window and some without,
-        // where the per-rank fallback below MIXES delivered-ms
-        // (compute+data) for the former with compute-only wall-ms for the
-        // latter. Those scales are not comparable, so ElChe's
-        // relative-throughput allocation inverts — a slow rank that fell
-        // back to its lower compute-ms looks faster than a fast rank
-        // reporting full delivered cost, and gets
-        // over-allocated (rig: the x1-link Pascal drew ~73% of all steps,
-        // diverging to NaN once the single-clock barrier made `batch_counts`
-        // binding). Sync uses the compute-only (wall, steps)
-        // feed — stable and consistent across ranks.
-        //
-        // NCCL Cadence is transport-aware too: `pb_delivered_*` accumulates
-        // continuously per `Batch`, so it is present at the inline finish by
-        // construction — the completion-frame race that originally forced
-        // NCCL onto the compute-only feed is gone. Without the delivered
-        // feed, NCCL allocation is blind to data + transport (x1-link rig:
-        // shares [0.53, 0.235, 0.235] vs the true ~4.9× delivered ratio →
-        // fast rank ~45% idle at every barrier). NCCL Async stays excluded:
-        // overshoot streaming under the inline finish is unvalidated there.
-        let delivered_capable = match self.backend {
+    /// Whether this run's mode may ride the delivered timing scale at
+    /// all: CPU Cadence/Async + NCCL Cadence. NCCL Cadence is
+    /// transport-aware because the ledger's delivered pair accumulates
+    /// continuously per `Batch`, so it is present at the inline finish
+    /// by construction — the completion-frame race that originally
+    /// forced NCCL onto the compute-only feed is gone. Without the
+    /// delivered feed, NCCL allocation is blind to data + transport
+    /// (x1-link rig: shares [0.53, 0.235, 0.235] vs the true ~4.9×
+    /// delivered ratio → fast rank ~45% idle at every barrier). NCCL
+    /// Async stays excluded: overshoot streaming under the inline
+    /// finish is unvalidated there. Sync (non-progressive) always
+    /// feeds the compute-only scale.
+    fn delivered_capable(&self) -> bool {
+        match self.backend {
             AverageBackend::Cpu => {
                 matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
             }
             AverageBackend::Nccl => matches!(self.policy, ApplyPolicy::Cadence),
-        };
-        if !delivered_capable {
-            return (
-                self.window.wall_ms_all().to_vec(),
-                self.window.steps_all().to_vec(),
-            );
         }
-        // ALL-OR-NONE COHERENCE. ElChe's allocation is RELATIVE, so the
-        // per-rank scale must be uniform within a window. A single mover
-        // without a delivered sample this window (cold start, or a
-        // single-batch window the marginal skip dropped) must NOT be
-        // compared on compute-ms against
-        // peers reporting delivered-ms — the scales differ by exactly the
-        // data/transport share, so the relative allocation inverts (rig:
-        // equal-speed Pascals drifting to 0.33 vs 0.10 shares on cpu-async;
-        // the same inversion live on nccl the first window a frame lands
-        // late). When any alive mover lacks a delivered sample, feed the
-        // compute scale for EVERY rank — a uniformly compute-fed window is
-        // coherent, and the next window returns to delivered. Non-movers
-        // (quiesced tails, steps == 0) are exempt: they have no sample on
-        // either scale and contribute (0, 0) regardless.
-        if !self.movers_delivered_complete() {
-            return (
-                self.window.wall_ms_all().to_vec(),
-                self.window.steps_all().to_vec(),
-            );
+    }
+
+    /// Assemble this window's [`WindowReport`] from the ledger — the
+    /// event the coordinator feeds `ElChe::report_window` once per
+    /// averaging cycle.
+    ///
+    /// The `delivered_coherent` attestation is the coordinator's half
+    /// of the mixed-scale inversion guard (the scale-SELECTION half
+    /// lives in `WindowReport::select_feed`, next to ElChe's relative
+    /// allocation model): the delivered scale is only offered when the
+    /// mode supports it AND every alive mover has a delivered sample
+    /// this window ([`Self::movers_delivered_complete`] — the
+    /// coordinator owns that predicate because it owns membership and
+    /// the ledger). A single mover on the compute scale against peers
+    /// on delivered would invert the allocation (rig: equal-speed
+    /// Pascals drifting to 0.33 vs 0.10 shares on cpu-async; the
+    /// x1-link Pascal drawing ~73% of all steps and diverging to NaN).
+    pub(super) fn build_window_report(&self, sync_ms: f64) -> WindowReport {
+        WindowReport {
+            wall_ms: self.window.wall_ms_all().to_vec(),
+            steps: self.window.steps_all().to_vec(),
+            delivered_ms: self.window.delivered_ms_all().to_vec(),
+            delivered_batches: self.window.delivered_batches_all().to_vec(),
+            fill_ms: (0..self.world_size)
+                .map(|r| self.window.fill_excess_ms(r))
+                .collect(),
+            delivered_coherent: self.delivered_capable()
+                && self.movers_delivered_complete(),
+            sync_ms,
         }
-        let mut ms = Vec::with_capacity(self.world_size);
-        let mut batches = Vec::with_capacity(self.world_size);
-        for r in 0..self.world_size {
-            // REPORT-AT-SYNC: feed the per-batch-accumulated DELIVERED wall
-            // (marginal), present at the reduce by construction (no
-            // completion-frame race).
-            if self.window.has_delivered_sample(r) {
-                ms.push(self.window.delivered_ms(r));
-                batches.push(self.window.delivered_batches(r));
-            } else {
-                // Non-movers only (the all-movers check above guarantees
-                // every stepping rank has a delivered sample).
-                ms.push(self.window.wall_ms(r));
-                batches.push(self.window.steps(r));
-            }
-        }
-        (ms, batches)
     }
 
     /// `-vvv` delivered-vs-compute per-cycle dump (Cadence + Async — the
@@ -282,7 +260,7 @@ impl ClusterCoordinator {
             AverageBackend::Nccl => {
                 // TRANSPORT-AWARE FEED: pull the window's chunk-completion
                 // metrics into the delivered accounting BEFORE the inline
-                // `finish_averaging_nccl` consumes `timing_feed`. The gate
+                // `finish_averaging_nccl` consumes the window report. The gate
                 // fired because every rank hit its window — their completion
                 // frames are already queued (per-connection FIFO: the final
                 // Batch report and the MetricsMsg ride the same relay
@@ -315,7 +293,7 @@ impl ClusterCoordinator {
                 // unset — headless coordinators, non-elastic runs, unit
                 // tests that never send completion frames) a missing frame
                 // cannot be attributed to death, so the wait is capped SHORT
-                // and `timing_feed`'s all-or-none falls back to a coherent
+                // and the report's all-or-none falls back to a coherent
                 // compute-scale window. The cohort is barrier-parked while
                 // we wait — the only thing delayed is the reduce itself.
                 if self.progressive && matches!(self.policy, ApplyPolicy::Cadence) {
@@ -894,26 +872,15 @@ impl ClusterCoordinator {
         // batch_counts (when the next cycle is the LAST cycle of the
         // current epoch).
         self.maybe_apply_callback_slack_for_next_cycle();
-        // WINDOW-PRESSURE FILL signal: per-rank excess of the window's first
-        // batch over the steady-state marginal rate — the amortizable
-        // per-window fill the marginal feed excludes. Staged for ElChe's
-        // window-pressure grow term, consumed once inside `report_timing`.
-        // Zero when the window has no marginal sample (cold-start /
-        // single-batch window) — falls back to the reduce term.
-        let fill_ms: Vec<f64> = (0..self.world_size)
-            .map(|r| self.window.fill_excess_ms(r))
-            .collect();
-        self.el_che.set_window_fill_ms(&fill_ms);
-        let (feed_ms, feed_batches) = self.timing_feed();
-        if feed_ms.iter().any(|&ms| ms > 0.0) {
-            self.el_che.report_timing(
-                &feed_ms,
-                &feed_batches,
-                prev_sync_ms,
-            );
-            if !self.calibrated && self.el_che.is_calibrated() {
-                self.calibrated = true;
-            }
+        // ONE timing event per cycle: the window's observations (both
+        // scales + fill + the delivered-coherence attestation) go to
+        // ElChe as a WindowReport; scale selection and the fill staging
+        // happen inside `report_window` (a fully-idle window reports
+        // nothing, so no zero-ms sample poisons the trust windows).
+        let report_window = self.build_window_report(prev_sync_ms);
+        self.el_che.report_window(&report_window);
+        if !self.calibrated && self.el_che.is_calibrated() {
+            self.calibrated = true;
         }
         self.dump_delivered_timing(prev_sync_ms);
 
@@ -946,34 +913,30 @@ impl ClusterCoordinator {
         self.version += 1;
         self.avg_count += 1;
 
+        // Map the guard's action onto the source-agnostic verdict seam
+        // (`ElChe::apply_verdict`); the coordinator's own overshoot knob
+        // is mutated alongside — it is scheduling state ElChe does not
+        // own. On Stable, ElChe may grow the window to amortize sync
+        // cost; convergence is maintained separately by SuppressGrowth /
+        // NudgeDown pulling the anchor back when weight-space divergence
+        // rises — growth and convergence balance rather than being
+        // hard-disabled.
         match action {
             ConvergenceAction::Stable => {
-                // Guard verdict is Stable: ElChe may grow the window to
-                // amortize sync cost (do its best to meet the rendezvous
-                // efficiently). Convergence is maintained separately by
-                // the guard's SuppressGrowth / NudgeDown verdicts, which
-                // pull the anchor back when weight-space divergence rises
-                // — so growth and convergence balance rather than being
-                // hard-disabled. (Correction A's poison fix is what lets
-                // reduces fire at all, which is what feeds the guard the
-                // divergence signal it needs to do this.)
-                self.el_che.commit_proposed_anchor();
-                if self.policy == ApplyPolicy::Async {
-                    if self.overshoot_auto {
-                        self.max_overshoot =
-                            (self.max_overshoot + 1).min(self.overshoot_ceiling);
-                    }
-                    if self.elche_relax_up {
-                        self.el_che.relax_anchor_up();
-                    }
+                self.el_che.apply_verdict(AnchorVerdict::Stable {
+                    relax_up: self.policy == ApplyPolicy::Async
+                        && self.elche_relax_up,
+                });
+                if self.policy == ApplyPolicy::Async && self.overshoot_auto {
+                    self.max_overshoot =
+                        (self.max_overshoot + 1).min(self.overshoot_ceiling);
                 }
             }
             ConvergenceAction::SuppressGrowth => {
-                self.el_che.veto_proposed_growth();
+                self.el_che.apply_verdict(AnchorVerdict::SuppressGrowth);
             }
             ConvergenceAction::NudgeDown { factor } => {
-                self.el_che.discard_proposed_anchor();
-                self.el_che.nudge_anchor_down(factor);
+                self.el_che.apply_verdict(AnchorVerdict::NudgeDown { factor });
                 if self.overshoot_auto && self.policy == ApplyPolicy::Async {
                     self.max_overshoot = self.overshoot_initial;
                 }

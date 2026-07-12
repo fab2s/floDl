@@ -171,6 +171,11 @@ impl WindowLedger {
         self.delivered_ms[rank]
     }
 
+    /// Per-rank marginal delivered ms for the whole cohort.
+    pub(crate) fn delivered_ms_all(&self) -> &[f64] {
+        &self.delivered_ms
+    }
+
     /// Marginal delivered batch count for `rank` this window.
     pub(crate) fn delivered_batches(&self, rank: usize) -> usize {
         self.delivered_batches[rank]

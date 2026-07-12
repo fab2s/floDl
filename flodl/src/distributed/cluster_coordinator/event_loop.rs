@@ -69,7 +69,7 @@ impl ClusterCoordinator {
                 // delivered cost per the marginal rule (window's FIRST
                 // batch into the fill slot, batches 2..n into the
                 // marginal rate) — present at the reduce by construction
-                // (no completion-frame race). `timing_feed` and the
+                // (no completion-frame race). The window report and the
                 // window-pressure fill consume this.
                 self.window.record_batch(rank, batch_ms, data_ms);
                 self.last_step_count[rank] =
@@ -669,7 +669,7 @@ impl ClusterCoordinator {
     ///
     /// Split out so `trigger_averaging`'s NCCL arm can pull the CURRENT
     /// window's completions into the delivered accounting BEFORE its inline
-    /// `finish_averaging_nccl` consumes `timing_feed` — the staleness that
+    /// `finish_averaging_nccl` consumes the window report — the staleness that
     /// previously forced NCCL onto the compute-only feed (allocation blind
     /// to the x1-link data/transport cost → fast rank idle ~45% at the
     /// barrier). Aggregation — and its pool removal — stays in

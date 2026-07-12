@@ -78,6 +78,6 @@ pub use config::{ElCheConfig, ElCheMode, TrainerConfig};
 pub use ddp::{Ddp, HasGraph, Trainer};
 #[allow(deprecated)] // re-exported until the setup tier is removed
 pub use ddp::DdpConfig;
-pub use el_che::{ElChe, Phase};
+pub use el_che::{AnchorVerdict, ElChe, Phase, WindowReport};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
 pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker};
