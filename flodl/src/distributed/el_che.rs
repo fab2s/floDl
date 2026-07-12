@@ -137,6 +137,7 @@ impl RingBuffer {
     serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Phase {
     /// Initial fixed-size measurement period before any averaging-driven
     /// calibration. Same code path as the legacy "uncalibrated" branch;

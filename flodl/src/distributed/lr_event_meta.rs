@@ -86,6 +86,7 @@ impl Default for LrEventMetaConfig {
 /// configured clamps. When both watchers fire in the same cycle the factor
 /// is the multiplicative compound of the two effective factors.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum MetaAction {
     /// No action this cycle.
     Noop,

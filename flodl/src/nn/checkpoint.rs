@@ -555,24 +555,13 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
             Tensor::from_i64(&data, shape, Device::CPU)
         }
         DType::Float16 | DType::BFloat16 | DType::Int32 => {
-            // For f16/bf16/i32: load raw bytes via from_blob directly.
-            let mut shape_v = shape.to_vec();
-            let mut handle: flodl_sys::FlodlTensor = std::ptr::null_mut();
-            let (dev_type, dev_idx) = crate::tensor::Device::CPU.to_ffi();
-            let err = unsafe {
-                flodl_sys::flodl_from_blob(
-                    raw.as_ptr() as *mut std::ffi::c_void,
-                    shape_v.as_mut_ptr(),
-                    shape_v.len() as i32,
-                    dtype as i32,
-                    dev_type, dev_idx,
-                    &mut handle,
-                )
-            };
-            check_err_raw(err)?;
-            debug_assert!(!handle.is_null());
-            // Safety: from_blob clones the data in the shim, so handle is independent
-            Ok(unsafe { Tensor::from_raw_handle(handle) })
+            // No typed Vec waypoint for these (Rust has no native f16/bf16, and
+            // i32 would need its own reinterpret): hand the raw little-endian
+            // bytes straight to Tensor::from_blob, which the shim copies. Routing
+            // through from_blob (not raw flodl_from_blob) is load-bearing: it
+            // homes the `raw.len() == numel × element_size` check, so a truncated
+            // or corrupt checkpoint errors instead of driving an OOB read.
+            Tensor::from_blob(raw, shape, dtype, Device::CPU)
         }
     }
 }

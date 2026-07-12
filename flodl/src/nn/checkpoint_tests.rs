@@ -1080,3 +1080,26 @@
 
         std::fs::remove_file(&gz_path).ok();
     }
+
+    // NN2 regression: the f16/bf16/i32 branch of `tensor_from_raw_bytes` used to
+    // hand `raw.as_ptr()` straight to `flodl_from_blob`, which reads
+    // numel × element_size bytes trusting the caller — a short buffer from a
+    // truncated/corrupt checkpoint drove an out-of-bounds read. Routing through
+    // `Tensor::from_blob` homes the length check, so it errors instead.
+    #[test]
+    fn test_tensor_from_raw_bytes_rejects_truncated_low_precision() {
+        // shape [4] at f16 needs 4 × 2 = 8 bytes; hand it 4.
+        assert!(
+            tensor_from_raw_bytes(&[0u8; 4], &[4], DType::Float16).is_err(),
+            "truncated f16 buffer must be rejected, not read OOB",
+        );
+        // i32 mirrors: shape [4] needs 16 bytes; hand it 12.
+        assert!(
+            tensor_from_raw_bytes(&[0u8; 12], &[4], DType::Int32).is_err(),
+            "truncated i32 buffer must be rejected",
+        );
+        // Exact-length payload still round-trips (routing preserved).
+        let t = tensor_from_raw_bytes(&[0u8; 8], &[4], DType::Float16).unwrap();
+        assert_eq!(t.shape(), vec![4]);
+        assert_eq!(t.dtype(), DType::Float16);
+    }

@@ -256,14 +256,6 @@ impl Tensor {
         Self { handle }
     }
 
-    /// Wrap a raw handle (crate-visible). The Tensor takes ownership.
-    ///
-    /// # Safety
-    /// Caller must ensure the handle is valid and not owned elsewhere.
-    pub(crate) unsafe fn from_raw_handle(handle: FlodlTensor) -> Self {
-        Self::from_raw(handle)
-    }
-
     /// Access the raw handle (for passing to FFI in sibling modules).
     pub(crate) fn raw(&self) -> FlodlTensor {
         self.handle
