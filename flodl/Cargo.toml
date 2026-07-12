@@ -78,4 +78,9 @@ name = "flowbuilder_residual"
 path = "examples/flowbuilder_residual/main.rs"
 doc-scrape-examples = false
 
+[[example]]
+name = "regression"
+path = "examples/regression/main.rs"
+doc-scrape-examples = false
+
 [dev-dependencies]
