@@ -56,8 +56,13 @@
 //!   `shutdown` / outbound control-frame I/O.
 //! - `event_loop.rs` — `tick`, `process_timing_msg`, drain / throttle,
 //!   per-cycle metrics aggregator.
-//! - `averaging.rs` — `trigger_averaging`, `finish_averaging_{cpu,nccl}`,
-//!   NCCL re-rendezvous retry.
+//! - `averaging.rs` — the two policy hooks: `trigger_averaging`
+//!   dispatch + the window feed (`build_window_report`) and
+//!   `finish_averaging_head` feedback (ElChe verdicts + guard + meta).
+//! - `cycle_nccl.rs` / `cycle_cpu.rs` — per-backend averaging-cycle
+//!   transport mechanics (arming, stall backstops, state machine,
+//!   NCCL re-rendezvous). Constraints: interior waits keep the
+//!   coord→rank heartbeat beating; cycles own no cadence state.
 //! - `callback_roles.rs` — sticky "fastest rank" election,
 //!   `epoch_fn` / `eval_fn` / `checkpoint_fn` failover,
 //!   `dispatch_shutdown_with_save`.
@@ -88,6 +93,8 @@ use crate::tensor::{Result, TensorError};
 pub mod config;
 mod averaging;
 mod callback_roles;
+mod cycle_cpu;
+mod cycle_nccl;
 mod dead_ranks;
 mod epoch_dispatch;
 mod event_loop;
