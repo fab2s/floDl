@@ -45,6 +45,7 @@ pub mod datasets;
 pub mod records;
 pub(crate) mod prefetch;
 pub(crate) mod sample_cache;
+pub(crate) mod vram_pool;
 
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};

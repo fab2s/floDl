@@ -1536,7 +1536,7 @@
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
         let governor = Arc::new(GovernorCtl::new(4));
         governor.begin_epoch(4);
 
@@ -1555,13 +1555,67 @@
     }
 
     #[test]
+    fn test_vram_pool_mixed_assembly_preserves_batch_content() {
+        // Pool-enabled worker over content-identifiable batches. Epoch
+        // 1 covers only the even indices (fills the pool with them),
+        // epoch 2 interleaves even and odd, so on a CUDA device every
+        // epoch-2 batch mixes pooled rows (gathered on device) with
+        // fresh rows (uploaded) and the stitch must restore caller
+        // order exactly. On a CPU device the pool is pass-through and
+        // this degrades to a plain pipeline-order test.
+        use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let device = test_device();
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 20 });
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), device, 8, true);
+        let governor = Arc::new(GovernorCtl::new(4));
+        // The honest probe has "fired": the pool may take its budget
+        // decision at the first batch.
+        governor.honest_resize_done.store(true, Ordering::Relaxed);
+
+        let drain = |indices: Vec<usize>, batch_size: usize| -> Vec<Vec<i64>> {
+            governor.begin_epoch(4);
+            let rx = worker.start_epoch(indices, batch_size, true, Arc::clone(&governor), 2);
+            let mut batches = Vec::new();
+            while let Ok(b) = rx.recv() {
+                let b = b.unwrap();
+                #[cfg(feature = "cuda")]
+                if let Some(e) = &b.ready_event {
+                    e.synchronize().unwrap();
+                }
+                governor.consumed.fetch_add(1, Ordering::Relaxed);
+                batches.push(b.tensors[0].to_i64_vec().unwrap());
+            }
+            batches
+        };
+
+        // Epoch 1: evens only -> pool holds {0, 2, .., 18} afterwards.
+        let evens: Vec<usize> = (0..20).step_by(2).collect();
+        let got = drain(evens.clone(), 5);
+        assert_eq!(got.concat(), evens.iter().map(|&i| i as i64).collect::<Vec<_>>());
+
+        // Epoch 2: interleaved evens (pooled) and odds (fresh), out of
+        // order within each batch.
+        let mixed: Vec<usize> = vec![1, 0, 3, 2, 18, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15];
+        let got = drain(mixed.clone(), 4);
+        assert_eq!(got.concat(), mixed.iter().map(|&i| i as i64).collect::<Vec<_>>());
+
+        // Epoch 3: everything again (odds captured in epoch 2 now hit).
+        let all: Vec<usize> = (0..20).collect();
+        let got = drain(all.clone(), 4);
+        assert_eq!(got.concat(), all.iter().map(|&i| i as i64).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_two_stage_respects_drop_last() {
         use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
         use std::sync::atomic::Ordering;
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
         let governor = Arc::new(GovernorCtl::new(8));
         governor.begin_epoch(8);
 
@@ -1597,7 +1651,7 @@
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 20 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
         let governor = Arc::new(GovernorCtl::new(4));
         governor.begin_epoch(4);
 

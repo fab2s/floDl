@@ -194,6 +194,7 @@ pub struct DataLoaderBuilder {
     sample_cache_enabled: bool,
     disk_stage_bytes: u64,
     disk_stage_dir: Option<std::path::PathBuf>,
+    vram_pool_enabled: bool,
 }
 
 impl DataLoaderBuilder {
@@ -215,6 +216,7 @@ impl DataLoaderBuilder {
             sample_cache_enabled: true,
             disk_stage_bytes: 0,
             disk_stage_dir: None,
+            vram_pool_enabled: true,
         }
     }
 
@@ -339,6 +341,26 @@ impl DataLoaderBuilder {
     /// cached; `ram_max_usage(0.0)` also stops all admissions.
     pub fn sample_cache(mut self, enabled: bool) -> Self {
         self.sample_cache_enabled = enabled;
+        self
+    }
+
+    /// Enable / disable the device-resident sample pool (streaming
+    /// mode, CUDA targets). Default: enabled.
+    ///
+    /// The pool retains as many samples as fit in leftover VRAM
+    /// (measured after the first training step, under the same cap as
+    /// prefetch) and assembles batches by gathering retained rows on
+    /// device instead of uploading them — H2D traffic shrinks by the
+    /// hit rate, the middle ground between resident and streaming
+    /// modes. Samples enter by device-side capture from batches that
+    /// were uploaded anyway, so filling costs no extra transfers.
+    /// Sizing is automatic; there is no fraction knob.
+    ///
+    /// Disable for single-pass training (retained rows are never
+    /// revisited) or to keep every spare byte of VRAM for something
+    /// else.
+    pub fn vram_pool(mut self, enabled: bool) -> Self {
+        self.vram_pool_enabled = enabled;
         self
     }
 
@@ -469,6 +491,7 @@ impl DataLoaderBuilder {
             sample_cache_enabled,
             disk_stage_bytes,
             disk_stage_dir,
+            vram_pool_enabled,
         } = self;
 
         // The off switch drops the loader-side handle; the adapter's
@@ -544,12 +567,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(n))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names)
         }
     }
 }
@@ -612,6 +635,7 @@ fn build_streaming(
     sample_cache: Option<Arc<SampleCache>>,
     disk_stage_bytes: u64,
     disk_stage_dir: &Option<std::path::PathBuf>,
+    vram_pool_enabled: bool,
     names: Vec<String>,
 ) -> Result<DataLoader> {
     // Local-disk overflow tier under the sample cache. Attached here,
@@ -630,7 +654,8 @@ fn build_streaming(
         }
     }
 
-    let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
+    let worker =
+        PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth, vram_pool_enabled);
     let (reserve, reserve_source) = match activation_reserve {
         Some(bytes) => (bytes, ReserveSource::User),
         None => (0, ReserveSource::Bare),

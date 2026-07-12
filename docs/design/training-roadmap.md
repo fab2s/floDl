@@ -392,13 +392,55 @@ stands alone:
    genuinely slow storage (network mounts with ms-scale reads) or
    beds larger than RAM — both of which now train through the same
    entry unchanged.
-5. *Partial VRAM sample tier* (candidate, after 4): the same rule one
-   tier up — when a dataset almost fits on device, keep K of N samples
+5. *Partial VRAM sample tier* (solo `DataLoader` half **landed**;
+   DDP wiring pending): the same rule one tier up — keep K of N samples
    VRAM-resident and stream the rest, completing the spectrum between
-   resident and streaming modes. The batch-assembly machinery exists
-   (resident mode's device-side gather); per-rank VRAM pools are what
-   the controller's compute-ratio reservations would size, hence the
-   sequencing after increment 4.
+   resident and streaming modes. Two carrots: the resident/streaming
+   cliff becomes a slope (one byte over budget no longer costs the
+   whole dataset's residency), and the DDP rank path — which has no
+   resident mode at all, streaming every byte every epoch — gains its
+   only route to device residency (acute on weak PCIe links, where
+   the saved H2D is the delivered-cost data term). Locked shape:
+   - *Admission is capture-at-delivery.* Every sample crosses PCIe at
+     least once per epoch anyway; the pool copies rows
+     device-to-device from each just-uploaded batch into its slots
+     (prefetch stream, pre-augmentation, raw samples). Zero extra
+     H2D — epoch 1 fills the pool as a side effect, epochs 2+ gather
+     hits on device and upload only misses (the device twin of the
+     staged tier's mixed read-through assembly). Sample-keyed, so
+     reshuffle-invariant; admit-until-full with the K/N hit
+     guarantee.
+   - *Sizing is automatic, honest-probe-gated, conservative.* The
+     pool is dormant until the governor's one-shot honest resize has
+     run (post-first-step, when the allocator retains activation and
+     optimizer blocks and `free` is truthful), then fills from
+     measured free minus the governor's full in-flight reserve minus
+     a safety margin, under the existing `vram_max_usage` cap. No new
+     fraction knob; `vram_pool(false)` is the off switch.
+   - *The pool must never be why a step OOMs.* Training-step path
+     untouched; on transient data-plane OOM the existing governor
+     halving runs first, slab eviction is the last resort. Storage is
+     slab-chunked device tensors (a few hundred samples per slab,
+     admitted in consumption order) because a single bulk tensor
+     cannot be partially freed and per-sample tensors fragment.
+   - *Landing order:* the solo streaming `DataLoader` half is
+     **landed** — `VramSamplePool` + mixed-tier assembly at the
+     transfer seam (both pipeline shapes; the reader ring now carries
+     indices so the transfer stage can key the pool), `vram_pool(bool)`
+     knob, per-epoch telemetry, device-validated end to end (an
+     interleaved-coverage test proves gather + upload + stitch +
+     capture restore exact batch content across epochs, with the
+     telemetry arithmetic — hits, captures, pool size — matching the
+     coverage pattern exactly). Next: DDP rank workers,
+     reservation-aware (prefer own-span rows, margins last — the
+     compute-ratio reservations size per-rank pools, hence the
+     sequencing after increment 4); then eviction refinement
+     (next-use / own-span priority) only if measurement warrants.
+   - *Validation readout:* H2D bytes per epoch, not wall clock alone;
+     a weak-PCIe device (x1 riser) is the bed. That at-scale cell
+     rides the DDP wiring (rank workers are the path ddp-bench
+     exercises; the solo half is covered by the device tests and its
+     own telemetry).
 
 Cross-cutting invariants for the arc:
 

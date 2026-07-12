@@ -224,8 +224,12 @@ impl<M: Module> GpuWorker<M> {
             // Reset peak stats so first run_epoch_plan gets a clean baseline.
             crate::tensor::cuda_reset_peak_stats_idx(config.device.index() as i32);
             if depth > 0 {
+                // Rank workers drive coordinator-paced LoadBatch epochs
+                // (no governor, no honest probe to key a budget on), so
+                // the device sample pool stays off here; its wiring
+                // arrives with reservation-aware per-rank pool sizing.
                 let pw = crate::data::prefetch::PrefetchWorker::new(
-                    Arc::clone(&dataset), config.device, depth,
+                    Arc::clone(&dataset), config.device, depth, false,
                 );
                 (Some(pw), psb)
             } else {
