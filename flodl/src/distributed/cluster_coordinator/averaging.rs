@@ -64,13 +64,13 @@ impl ClusterCoordinator {
     /// ElChe derives `ms_per_batch[r] = ms[r] / batches[r]`.
     ///
     /// **Cadence and Async** (both progressive) feed the rank-reported
-    /// DELIVERED cost — `pb_delivered_ms_accum` (Σ per-batch
-    /// `batch_ms + data_ms` = compute + data) over its MATCHED batch count
-    /// `pb_delivered_batches`. Accumulated CONTINUOUSLY from each `Batch`
+    /// DELIVERED cost — the window ledger's marginal delivered ms (Σ
+    /// per-batch `batch_ms + data_ms` = compute + data) over its MATCHED
+    /// batch count. Accumulated CONTINUOUSLY from each `Batch`
     /// report (see `event_loop`), so it is present at the reduce by
     /// construction — no completion-frame race. ElChe then schedules
     /// per-rank windows on realized wall instead of the compute-only
-    /// `wall_ms_accum` (Σ per-batch `train_step` ms). This closes the
+    /// wall (Σ per-batch `train_step` ms). This closes the
     /// cpu-cadence idle (a data-starved rank's delivered cost rises, so the
     /// balancer stops over-allocating the fast rank) AND makes the nccl
     /// path data-/transport-aware — required when identical GPUs sit at
@@ -83,35 +83,30 @@ impl ClusterCoordinator {
     /// ITS OWN batch count yields a correct per-batch estimate — and a late
     /// batch leaking into the next window is benign (ms and count leak
     /// together). The accumulator is MARGINAL: the window's FIRST batch is
-    /// skipped (`steps_since_avg > 1` gate in `event_loop`) so the per-chunk
-    /// fixed fill cost never enters the quoted per-batch rate.
+    /// routed to the fill slot by `WindowLedger::record_batch` so the
+    /// per-chunk fixed fill cost never enters the quoted per-batch rate.
     ///
-    /// Per-rank fallback to `(wall_ms_accum, steps_since_avg)` when a rank
-    /// has no delivered sample this window (`pb_delivered_batches == 0` or
-    /// `pb_delivered_ms_accum == 0.0` — cold-start, or a single-batch window
-    /// whose only batch the marginal skip dropped) so no spurious zero /
-    /// zero-ms report poisons ElChe's trust window.
+    /// Per-rank fallback to the compute-only `(wall, steps)` pair when a
+    /// rank has no delivered sample this window (cold-start, or a
+    /// single-batch window whose only batch the marginal skip dropped) so
+    /// no spurious zero / zero-ms report poisons ElChe's trust window.
     ///
-    /// **Sync** (non-progressive) keeps the compute-only
-    /// `(wall_ms_accum, steps_since_avg)` feed unchanged. Every alive mover
-    /// (`steps_since_avg > 0`) has a delivered sample this window (nonzero
-    /// ms AND batches). This is both the all-or-none coherence predicate for
-    /// the delivered feed in [`Self::timing_feed`] and the settle condition
-    /// for `trigger_averaging`'s pre-finish drain.
+    /// **Sync** (non-progressive) keeps the compute-only `(wall, steps)`
+    /// feed unchanged. Every alive mover (steps > 0) has a delivered
+    /// sample this window (nonzero ms AND batches). This is both the
+    /// all-or-none coherence predicate for the delivered feed in
+    /// [`Self::timing_feed`] and the settle condition for
+    /// `trigger_averaging`'s pre-finish drain.
     pub(super) fn movers_delivered_complete(&self) -> bool {
         (0..self.world_size)
-            .filter(|&r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
-            .all(|r| {
-                // REPORT-AT-SYNC: the delivered sample is the per-batch
-                // accumulator (`pb_delivered_*`), present at the reduce by
-                // construction from the continuous `Batch` reports — so this
-                // is true for every stepping rank with >= 2 batches this
-                // window. A single-batch window (marginal skipped its only
-                // batch) leaves `pb_delivered_batches == 0` -> coherent
-                // compute-scale fallback for that (rare) window.
-                self.pb_delivered_batches[r] > 0
-                    && self.pb_delivered_ms_accum[r] > 0.0
-            })
+            .filter(|&r| !self.is_dead(r) && self.window.steps(r) > 0)
+            // REPORT-AT-SYNC: the delivered sample is present at the reduce
+            // by construction from the continuous `Batch` reports — true for
+            // every stepping rank with >= 2 batches this window. A
+            // single-batch window (marginal skipped its only batch) has no
+            // sample -> coherent compute-scale fallback for that (rare)
+            // window.
+            .all(|r| self.window.has_delivered_sample(r))
     }
 
     pub(super) fn timing_feed(&self) -> (Vec<f64>, Vec<usize>) {
@@ -126,9 +121,8 @@ impl ClusterCoordinator {
         // reporting full delivered cost, and gets
         // over-allocated (rig: the x1-link Pascal drew ~73% of all steps,
         // diverging to NaN once the single-clock barrier made `batch_counts`
-        // binding). Sync uses the compute-only
-        // `(wall_ms_accum, steps_since_avg)` feed — stable and consistent
-        // across ranks.
+        // binding). Sync uses the compute-only (wall, steps)
+        // feed — stable and consistent across ranks.
         //
         // NCCL Cadence is transport-aware too: `pb_delivered_*` accumulates
         // continuously per `Batch`, so it is present at the inline finish by
@@ -145,7 +139,10 @@ impl ClusterCoordinator {
             AverageBackend::Nccl => matches!(self.policy, ApplyPolicy::Cadence),
         };
         if !delivered_capable {
-            return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
+            return (
+                self.window.wall_ms_all().to_vec(),
+                self.window.steps_all().to_vec(),
+            );
         }
         // ALL-OR-NONE COHERENCE. ElChe's allocation is RELATIVE, so the
         // per-rank scale must be uniform within a window. A single mover
@@ -162,22 +159,25 @@ impl ClusterCoordinator {
         // (quiesced tails, steps == 0) are exempt: they have no sample on
         // either scale and contribute (0, 0) regardless.
         if !self.movers_delivered_complete() {
-            return (self.wall_ms_accum.clone(), self.steps_since_avg.clone());
+            return (
+                self.window.wall_ms_all().to_vec(),
+                self.window.steps_all().to_vec(),
+            );
         }
         let mut ms = Vec::with_capacity(self.world_size);
         let mut batches = Vec::with_capacity(self.world_size);
         for r in 0..self.world_size {
             // REPORT-AT-SYNC: feed the per-batch-accumulated DELIVERED wall
-            // (`pb_delivered_*`, marginal), present at the reduce by
-            // construction (no completion-frame race).
-            if self.pb_delivered_batches[r] > 0 && self.pb_delivered_ms_accum[r] > 0.0 {
-                ms.push(self.pb_delivered_ms_accum[r]);
-                batches.push(self.pb_delivered_batches[r]);
+            // (marginal), present at the reduce by construction (no
+            // completion-frame race).
+            if self.window.has_delivered_sample(r) {
+                ms.push(self.window.delivered_ms(r));
+                batches.push(self.window.delivered_batches(r));
             } else {
                 // Non-movers only (the all-movers check above guarantees
                 // every stepping rank has a delivered sample).
-                ms.push(self.wall_ms_accum[r]);
-                batches.push(self.steps_since_avg[r]);
+                ms.push(self.window.wall_ms(r));
+                batches.push(self.window.steps(r));
             }
         }
         (ms, batches)
@@ -201,8 +201,8 @@ impl ClusterCoordinator {
         };
         let compute_per_batch: Vec<f64> = (0..self.world_size)
             .map(|r| {
-                let n = self.steps_since_avg[r].max(1);
-                self.wall_ms_accum[r] / n as f64
+                let n = self.window.steps(r).max(1);
+                self.window.wall_ms(r) / n as f64
             })
             .collect();
         // The feed: rank-reported DELIVERED (compute+data), accumulated
@@ -210,8 +210,8 @@ impl ClusterCoordinator {
         // construction.
         let pb_delivered_per_batch: Vec<f64> = (0..self.world_size)
             .map(|r| {
-                let n = self.pb_delivered_batches[r].max(1);
-                self.pb_delivered_ms_accum[r] / n as f64
+                let n = self.window.delivered_batches(r).max(1);
+                self.window.delivered_ms(r) / n as f64
             })
             .collect();
         // Which feed did ElChe actually schedule on this cycle? `delivered`
@@ -230,9 +230,8 @@ impl ClusterCoordinator {
         let missing: Vec<usize> = (0..self.world_size)
             .filter(|&r| {
                 !self.is_dead(r)
-                    && self.steps_since_avg[r] > 0
-                    && !(self.pb_delivered_batches[r] > 0
-                        && self.pb_delivered_ms_accum[r] > 0.0)
+                    && self.window.steps(r) > 0
+                    && !self.window.has_delivered_sample(r)
             })
             .collect();
         eprintln!(
@@ -243,8 +242,8 @@ impl ClusterCoordinator {
             self.policy,
             r1(&pb_delivered_per_batch),
             r1(&compute_per_batch),
-            self.steps_since_avg,
-            self.pb_delivered_batches,
+            self.window.steps_all(),
+            self.window.delivered_batches_all(),
             self.el_che.batch_counts(),
             reduce_ms,
         );
@@ -478,7 +477,7 @@ impl ClusterCoordinator {
                 // accumulates super-linearly across missed rendezvous
                 // points). Liveness is a SEPARATE concern handled by
                 // the heartbeat fault detector; slow-but-alive ranks
-                // are absorbed by ElChe's per-rank `wall_ms_accum` /
+                // are absorbed by ElChe's per-rank wall /
                 // `batch_counts` rebalance on the next cycle.
                 self.cpu_avg_state = CpuAvgState::Pending;
             }
@@ -805,7 +804,7 @@ impl ClusterCoordinator {
     /// same-process latency, lowest correlated-failure risk).
     ///
     /// Tier 2: the surviving rank with the smallest observed
-    /// `wall_ms_accum / steps_since_avg` (per-batch wall, NOT
+    /// per-batch wall from the window ledger (NOT
     /// barrier-correlated — clean per-rank capacity proxy). Ties
     /// break by lowest global rank. When no rank has timing
     /// history yet, this collapses to "lowest surviving global rank"
@@ -842,12 +841,7 @@ impl ClusterCoordinator {
     /// the "fastest" picker — un-calibrated ranks shouldn't be
     /// preferred as UID generators.
     pub(super) fn per_rank_ms_per_batch(&self, r: usize) -> f64 {
-        let steps = self.steps_since_avg.get(r).copied().unwrap_or(0);
-        if steps == 0 {
-            return f64::INFINITY;
-        }
-        let wall = self.wall_ms_accum.get(r).copied().unwrap_or(0.0);
-        wall / steps as f64
+        self.window.per_batch_wall_ms(r)
     }
 
     /// Broadcast `NewNcclSession` to every survivor. Called from the
@@ -901,21 +895,13 @@ impl ClusterCoordinator {
         // current epoch).
         self.maybe_apply_callback_slack_for_next_cycle();
         // WINDOW-PRESSURE FILL signal: per-rank excess of the window's first
-        // batch (`first_batch_delivered_ms`) over the steady-state marginal
-        // rate (`pb_delivered_ms_accum / pb_delivered_batches`) — the
-        // amortizable per-window fill the marginal feed excludes. Staged for
-        // ElChe's window-pressure grow term, consumed once inside
-        // `report_timing`. Zero when the window has no marginal sample
-        // (cold-start / single-batch window) — falls back to the reduce term.
+        // batch over the steady-state marginal rate — the amortizable
+        // per-window fill the marginal feed excludes. Staged for ElChe's
+        // window-pressure grow term, consumed once inside `report_timing`.
+        // Zero when the window has no marginal sample (cold-start /
+        // single-batch window) — falls back to the reduce term.
         let fill_ms: Vec<f64> = (0..self.world_size)
-            .map(|r| {
-                let n = self.pb_delivered_batches[r];
-                if n == 0 || self.pb_delivered_ms_accum[r] <= 0.0 {
-                    return 0.0;
-                }
-                let marginal = self.pb_delivered_ms_accum[r] / n as f64;
-                (self.first_batch_delivered_ms[r] - marginal).max(0.0)
-            })
+            .map(|r| self.window.fill_excess_ms(r))
             .collect();
         self.el_che.set_window_fill_ms(&fill_ms);
         let (feed_ms, feed_batches) = self.timing_feed();
@@ -946,8 +932,8 @@ impl ClusterCoordinator {
             pre_norms: nccl_pre_norms,
             post_norm: self.nccl_sync_post_norm,
         };
-        let cycle_batches: usize = self.steps_since_avg.iter().sum();
-        let k_max = self.steps_since_avg.iter().copied().max().unwrap_or(0);
+        let cycle_batches: usize = self.window.total_steps();
+        let k_max = self.window.max_steps();
         let action = self.convergence_guard.report(&report, cycle_batches, k_max);
 
         // LR-aware meta-controller (OLD `observe_meta` parity): consult
@@ -1052,19 +1038,9 @@ impl ClusterCoordinator {
     /// atomic-dispatch fold so `cap_to_reduce_budget` sees the fresh
     /// window).
     fn finish_averaging_tail(&mut self) {
-        for a in &mut self.wall_ms_accum {
-            *a = 0.0;
-        }
-        // Delivered accumulator resets with the window.
-        for a in &mut self.pb_delivered_ms_accum {
-            *a = 0.0;
-        }
-        for n in &mut self.pb_delivered_batches {
-            *n = 0;
-        }
-        for f in &mut self.first_batch_delivered_ms {
-            *f = 0.0;
-        }
+        // Window timing (compute wall + delivered + fill) resets with the
+        // window; step counts reset backend-specifically (see callers).
+        self.window.reset_timing();
         for t in &mut self.throttled {
             *t = false;
         }
@@ -1108,9 +1084,7 @@ impl ClusterCoordinator {
             crate::verbose!("  ddp: SetGlobalStep broadcast incomplete: {e}");
         }
 
-        for s in &mut self.steps_since_avg {
-            *s = 0;
-        }
+        self.window.reset_steps();
 
         self.finish_averaging_tail();
         self.finish_pending_checkpoint_meta();
@@ -1131,9 +1105,7 @@ impl ClusterCoordinator {
         // a 1-batch chunk — off-schedule, and a fill-cost-inflated 1-batch
         // sample in the delivered feed. The reduce that brought us here IS
         // the window boundary; the new window's budget is fresh.
-        for s in &mut self.steps_since_avg {
-            *s = 0;
-        }
+        self.window.reset_steps();
         for rank in 0..self.world_size {
             // Dead ranks get nothing: their controller-side stream is shut,
             // and folding a chunk for them would ghost it.

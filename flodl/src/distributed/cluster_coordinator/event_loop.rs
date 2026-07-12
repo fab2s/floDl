@@ -64,29 +64,14 @@ impl ClusterCoordinator {
                 if rank >= self.world_size {
                     return; // ignore malformed; tests will fail loudly
                 }
-                self.steps_since_avg[rank] =
-                    self.steps_since_avg[rank].saturating_add(1);
-                self.wall_ms_accum[rank] += batch_ms;
-                // REPORT-AT-SYNC delivered feed: accumulate the rank-reported
-                // DELIVERED wall (compute + data) per batch, continuously —
-                // like `wall_ms_accum`, so it is present at the reduce by
-                // construction (no completion-frame race). MARGINAL: skip the
-                // window's FIRST batch (the per-chunk fill — control transit,
-                // plan pickup, prefetch spin-up, first-batch unpipelined H2D),
-                // crediting batches 2..n so the fixed fill never enters the
-                // per-batch rate. `steps_since_avg` was just incremented above,
-                // so `> 1` means "not the window's first batch".
-                // (`timing_feed` consumes this.)
-                if self.steps_since_avg[rank] > 1 {
-                    self.pb_delivered_ms_accum[rank] += batch_ms + data_ms;
-                    self.pb_delivered_batches[rank] += 1;
-                } else {
-                    // The window's FIRST batch carries the per-chunk FILL the
-                    // marginal feed above excludes. Capture its delivered cost
-                    // so `finish_averaging_head` can derive the fill (first −
-                    // marginal) and feed the window-pressure controller.
-                    self.first_batch_delivered_ms[rank] = batch_ms + data_ms;
-                }
+                // REPORT-AT-SYNC delivered feed: the ledger accumulates
+                // steps + compute wall continuously and routes the
+                // delivered cost per the marginal rule (window's FIRST
+                // batch into the fill slot, batches 2..n into the
+                // marginal rate) — present at the reduce by construction
+                // (no completion-frame race). `timing_feed` and the
+                // window-pressure fill consume this.
+                self.window.record_batch(rank, batch_ms, data_ms);
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
@@ -402,7 +387,7 @@ impl ClusterCoordinator {
             self.lost_broadcasts,
         );
         for r in 0..self.world_size {
-            let steps = self.steps_since_avg[r];
+            let steps = self.window.steps(r);
             let window = counts.get(r).copied().unwrap_or(0);
             let gate = if self.is_dead(r) {
                 "dead"
@@ -483,7 +468,7 @@ impl ClusterCoordinator {
             if matches!(self.backend, AverageBackend::Nccl) && !self.nccl_ack[r] {
                 return false;
             }
-            let steps = self.steps_since_avg[r];
+            let steps = self.window.steps(r);
             if steps > 0 {
                 any_mover = true;
             }
@@ -534,10 +519,10 @@ impl ClusterCoordinator {
         if self.active_count < self.world_size {
             return Ok(());
         }
-        let min_steps = self.steps_since_avg.iter().copied().min().unwrap_or(0);
+        let min_steps = self.window.min_steps();
         // Snapshot to avoid borrow-conflict on self.control_streams in send.
         let mut to_throttle: Vec<usize> = Vec::new();
-        for (rank, &steps) in self.steps_since_avg.iter().enumerate() {
+        for (rank, &steps) in self.window.steps_all().iter().enumerate() {
             let should = steps > min_steps + max_diff;
             if should && !self.throttled[rank] {
                 to_throttle.push(rank);
@@ -927,7 +912,7 @@ impl ClusterCoordinator {
     pub(super) fn needs_final_consensus_reduce(&self) -> bool {
         self.active_count >= 2
             && (0..self.world_size)
-                .any(|r| !self.is_dead(r) && self.steps_since_avg[r] > 0)
+                .any(|r| !self.is_dead(r) && self.window.steps(r) > 0)
     }
 
     pub(super) fn try_advance_or_shutdown_after_aggregate(&mut self) {

@@ -29,7 +29,8 @@
 //! # Responsibilities
 //!
 //! - Owns per-cluster scheduling state: ElChe, [`ConvergenceGuard`],
-//!   `steps_since_avg`, `wall_ms_accum`, `last_step_count`,
+//!   the per-rank window ledger (steps / wall / delivered / fill, see
+//!   `window_ledger`), `last_step_count`,
 //!   `nccl_sync_step` / `nccl_ack`, `nccl_sync_divergence` /
 //!   `pre_norm` / `post_norm`, `throttled`, `active_count`,
 //!   `version`, `avg_count`, `global_step`, `last_nccl_sync_ms`.
@@ -91,6 +92,7 @@ mod dead_ranks;
 mod epoch_dispatch;
 mod event_loop;
 mod lifecycle;
+mod window_ledger;
 #[cfg(test)]
 mod test_helpers;
 
@@ -439,30 +441,14 @@ pub struct ClusterCoordinator {
     /// Async-only: max batches a rank can run past the planned sync.
     max_overshoot: usize,
 
-    /// Per-rank steps since the last averaging cycle.
-    steps_since_avg: Vec<usize>,
-    /// Per-rank wall-clock ms accumulated since the last averaging cycle.
-    /// Sum of per-batch `Batch.batch_ms` (= `train_step` time) — COMPUTE
-    /// ONLY. Still the feed for the Sync policy and the per-batch
-    /// UID-generator tiebreak; superseded by `pb_delivered_ms_accum` for the
-    /// progressive (Cadence / Async) feed (see `timing_feed`).
-    wall_ms_accum: Vec<f64>,
-    /// Per-rank rank-reported DELIVERED wall accumulated CONTINUOUSLY from
-    /// each `Batch` (`batch_ms + data_ms`), with its matched batch count —
-    /// the ElChe Cadence timing feed. Mirrors how `wall_ms_accum`
-    /// accumulates, so it is present at sync by construction (no
-    /// completion-frame race). Reset per window in `finish_averaging_tail`.
-    /// See `timing_feed`.
-    pb_delivered_ms_accum: Vec<f64>,
-    pb_delivered_batches: Vec<usize>,
-    /// Per-rank delivered cost (`batch_ms + data_ms`) of the window's FIRST
-    /// batch — the one `pb_delivered_*` deliberately skips. Its excess over
-    /// the steady-state (marginal) rate is the per-window FILL (control
-    /// transit, plan pickup, prefetch spin-up, first-batch unpipelined H2D):
-    /// a fixed per-window cost that amortizes as the window grows. Fed to
-    /// `ElChe::set_window_fill_ms` before `report_timing` as the window-
-    /// pressure growth signal. Reset per window in `finish_averaging_tail`.
-    first_batch_delivered_ms: Vec<f64>,
+    /// Per-rank, per-window bookkeeping: steps, compute wall, delivered
+    /// (marginal) accumulators, first-batch fill. Advisory scheduling
+    /// state on the single step clock — the reduce's ground-truth
+    /// divisor rides the frames, never this ledger (see the
+    /// [`window_ledger`] module docs). Fill excess feeds
+    /// `ElChe::set_window_fill_ms`; timing resets ride
+    /// `finish_averaging_tail`, step resets are backend-specific.
+    window: window_ledger::WindowLedger,
     /// Per-rank most-recent batch duration (ms).
     last_batch_ms: Vec<f64>,
     /// Per-rank most-recent worker step counter.
@@ -685,7 +671,7 @@ pub struct ClusterCoordinator {
     /// rank's contribution. Use this as a *cycle latency* indicator
     /// only — do NOT feed it into ElChe or partition-balancing logic
     /// as a per-rank throughput proxy. Honest per-rank capacity
-    /// comes from `wall_ms_accum` / `steps_since_avg` (already excludes
+    /// comes from the window ledger's per-batch wall (already excludes
     /// the barrier wait) and [`Self::last_observed_upload_ms`] (the
     /// pre-barrier snapshot+upload marker).
     last_observed_sync_lag_ms: Vec<Option<f64>>,
@@ -936,7 +922,7 @@ impl ClusterCoordinator {
     }
 
     pub fn steps_since_avg(&self) -> &[usize] {
-        &self.steps_since_avg
+        self.window.steps_all()
     }
 
     pub fn avg_count(&self) -> u64 {

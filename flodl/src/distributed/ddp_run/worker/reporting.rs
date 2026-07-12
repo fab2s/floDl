@@ -62,7 +62,7 @@ impl<M: Module> GpuWorker<M> {
     /// Report the wall-time the rank just spent inside `epoch_fn`. Called
     /// by the cluster worker's main loop on the role rank after firing
     /// the user closure, so the coord can time-exclude callback cost from
-    /// `wall_ms_accum[rank]` and update `last_epoch_fn_elapsed_ms_ewma`.
+    /// the coord's window ledger and update `last_epoch_fn_elapsed_ms_ewma`.
     /// Fire-and-forget: a disconnected timing channel is non-fatal here
     /// (the loop is exiting anyway).
     pub fn report_epoch_fn_elapsed(&self, epoch: usize, elapsed_ms: f64) {

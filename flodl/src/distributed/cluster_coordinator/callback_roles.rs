@@ -171,21 +171,11 @@ impl ClusterCoordinator {
         elapsed_ms: f64,
         error: Option<String>,
     ) {
-        // Time exclusion: subtract checkpoint elapsed from this rank's
-        // wall_ms_accum so ElChe's rebalancer does not see checkpoint
-        // cost as compute slowness. Clamp at 0 to handle EWMA noise.
-        if rank < self.wall_ms_accum.len() {
-            self.wall_ms_accum[rank] =
-                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
-        // Symmetric exclusion from the Cadence delivered feed: the
-        // dispatch→completion window that contained this callback would
-        // otherwise charge its wall to the rank's per-batch cost. Keeps
-        // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.pb_delivered_ms_accum.len() {
-            self.pb_delivered_ms_accum[rank] =
-                (self.pb_delivered_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
+        // Time exclusion: absorb checkpoint elapsed out of this rank's
+        // compute AND delivered accumulators so ElChe's rebalancer does
+        // not see checkpoint cost as compute slowness in either balancer
+        // denominator (see `timing_feed`).
+        self.window.absorb_callback_cost(rank, elapsed_ms);
         match error {
             None => {
                 // Success path: update the EWMA (alpha=0.3 — same
@@ -254,7 +244,7 @@ impl ClusterCoordinator {
     /// Process an eval result from a worker. Mirrors
     /// [`Self::handle_checkpoint_result`] for the eval callback: fires
     /// the user's `eval_result_fn` (success path), time-excludes the
-    /// closure's wall-time from `wall_ms_accum[rank]` so ElChe does not
+    /// closure's wall-time from the window ledger so ElChe does not
     /// see eval cost as compute slowness, and updates
     /// `last_eval_elapsed_ms_ewma` for callback-aware partition
     /// scheduling. Unlike checkpoint, eval has no retry path — failed
@@ -269,21 +259,10 @@ impl ClusterCoordinator {
         elapsed_ms: f64,
         error: Option<String>,
     ) {
-        // Time exclusion (parallel to checkpoint): subtract from this
-        // rank's wall_ms_accum so ElChe's rebalancer does not interpret
-        // eval cost as compute slowness. Clamp at 0 to absorb fp drift.
-        if rank < self.wall_ms_accum.len() {
-            self.wall_ms_accum[rank] =
-                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
-        // Symmetric exclusion from the Cadence delivered feed: the
-        // dispatch→completion window that contained this callback would
-        // otherwise charge its wall to the rank's per-batch cost. Keeps
-        // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.pb_delivered_ms_accum.len() {
-            self.pb_delivered_ms_accum[rank] =
-                (self.pb_delivered_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
+        // Time exclusion (parallel to checkpoint): absorb eval elapsed
+        // out of both balancer denominators so ElChe's rebalancer does
+        // not interpret eval cost as compute slowness (see `timing_feed`).
+        self.window.absorb_callback_cost(rank, elapsed_ms);
         // EWMA blend (alpha=0.3, same as checkpoint). Fires on every
         // report regardless of error: the closure wall-time is honest
         // even when the metric is not.
@@ -316,18 +295,10 @@ impl ClusterCoordinator {
     /// autonomously, and the only coord-side bookkeeping is time
     /// exclusion + EWMA.
     pub(super) fn handle_epoch_fn_elapsed(&mut self, rank: usize, elapsed_ms: f64) {
-        if rank < self.wall_ms_accum.len() {
-            self.wall_ms_accum[rank] =
-                (self.wall_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
-        // Symmetric exclusion from the Cadence delivered feed: the
-        // dispatch→completion window that contained this callback would
-        // otherwise charge its wall to the rank's per-batch cost. Keeps
-        // callbacks out of both balancer denominators (see `timing_feed`).
-        if rank < self.pb_delivered_ms_accum.len() {
-            self.pb_delivered_ms_accum[rank] =
-                (self.pb_delivered_ms_accum[rank] - elapsed_ms).max(0.0);
-        }
+        // Time exclusion (parallel to checkpoint / eval): absorb the
+        // closure's elapsed out of both balancer denominators (see
+        // `timing_feed`).
+        self.window.absorb_callback_cost(rank, elapsed_ms);
         let alpha = 0.3_f64;
         self.last_epoch_fn_elapsed_ms_ewma =
             Some(match self.last_epoch_fn_elapsed_ms_ewma {

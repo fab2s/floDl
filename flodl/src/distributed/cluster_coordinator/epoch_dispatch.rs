@@ -332,7 +332,7 @@ impl ClusterCoordinator {
         // the reduce is coordinator-triggered, so NCCL needs this
         // software barrier exactly like CPU (see `reduce_step_budget`).
         let reduce_budget = self.reduce_step_budget(rank);
-        if reduce_budget > 0 && self.steps_since_avg[rank] >= reduce_budget {
+        if reduce_budget > 0 && self.window.steps(rank) >= reduce_budget {
             // Log once per HOLD episode (deduped via `dispatch_hold_logged`,
             // cleared at the reduce reset) — this branch re-fires every
             // dispatch attempt, so an unguarded log floods at ~150k lines/s.
@@ -340,7 +340,7 @@ impl ClusterCoordinator {
                 self.dispatch_hold_logged[rank] = true;
                 crate::debug!(
                     "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
-                    self.steps_since_avg[rank], reduce_budget,
+                    self.window.steps(rank), reduce_budget,
                 );
             }
             return;
@@ -941,7 +941,7 @@ impl ClusterCoordinator {
         let budget = self.reduce_step_budget(rank);
         if budget > 0 {
             let budget_remaining =
-                budget.saturating_sub(self.steps_since_avg[rank]).max(1);
+                budget.saturating_sub(self.window.steps(rank)).max(1);
             sized.min(budget_remaining)
         } else {
             sized

@@ -1008,7 +1008,7 @@ pub(crate) enum TimingMsg {
     /// `CheckpointResult`.
     /// Reported on success and failure; the coord decides the next
     /// action (retry on different live rank, give up + exhaust, time
-    /// exclusion from `wall_ms_accum`).
+    /// exclusion from the coord's window ledger).
     CheckpointResult {
         rank: usize,
         version: u64,
@@ -1018,7 +1018,7 @@ pub(crate) enum TimingMsg {
     /// Post-fire notice from the rank that ran `epoch_fn`. See
     /// `EpochFnElapsed`.
     /// Reported once per `epoch_fn` invocation; the coord time-excludes
-    /// it from `wall_ms_accum[rank]` and updates
+    /// it from the coord's window ledger and updates
     /// `last_epoch_fn_elapsed_ms_ewma` for callback-aware scheduling.
     EpochFnElapsed {
         rank: usize,

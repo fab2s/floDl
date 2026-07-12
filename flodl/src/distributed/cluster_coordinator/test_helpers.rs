@@ -132,11 +132,7 @@ impl ClusterCoordinator {
             calibrated,
             active_count: world_size,
             max_overshoot: config.overshoot_initial,
-            steps_since_avg: vec![0; world_size],
-            wall_ms_accum: vec![0.0; world_size],
-            pb_delivered_ms_accum: vec![0.0; world_size],
-            pb_delivered_batches: vec![0; world_size],
-            first_batch_delivered_ms: vec![0.0; world_size],
+            window: super::window_ledger::WindowLedger::new(world_size),
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
             nccl_sync_step: vec![0; world_size],
@@ -241,18 +237,18 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Test-only mutator for `wall_ms_accum[rank]`. Used by
+    /// Test-only mutator for the window ledger's compute wall. Used by
     /// `checkpoint_time_excluded_from_wall_ms_accum` to set a known
     /// starting state before invoking `handle_checkpoint_result`.
     #[cfg(test)]
     pub(crate) fn set_wall_ms_accum_for_test(&mut self, rank: usize, ms: f64) {
-        self.wall_ms_accum[rank] = ms;
+        self.window.set_wall_ms_for_test(rank, ms);
     }
 
-    /// Test-only accessor for `wall_ms_accum[rank]`.
+    /// Test-only accessor for the window ledger's compute wall.
     #[cfg(test)]
     pub(crate) fn wall_ms_accum_for_test(&self, rank: usize) -> f64 {
-        self.wall_ms_accum[rank]
+        self.window.wall_ms(rank)
     }
 
     /// Test-only accessor for `heartbeat_timeout_secs`.
@@ -399,7 +395,7 @@ impl ClusterCoordinator {
     /// timing-message path.
     #[cfg(test)]
     pub(crate) fn set_steps_since_avg_for_test(&mut self, rank: usize, n: usize) {
-        self.steps_since_avg[rank] = n;
+        self.window.set_steps_for_test(rank, n);
     }
 
     /// Force every rank's `nccl_ack` to `acked`. Used to prove the CPU

@@ -1133,7 +1133,7 @@ pub enum TimingMsgWire {
     ///
     /// `elapsed_ms` is the wall-time the eval closure took on the rank.
     /// Mirrors [`Self::CheckpointResult`] for symmetry: the coord
-    /// subtracts it from `wall_ms_accum[rank]` so ElChe does not
+    /// absorbs it out of the coord's window ledger so ElChe does not
     /// mis-attribute eval cost as compute slowness, and feeds it into
     /// `last_eval_elapsed_ms_ewma` for callback-aware partition
     /// scheduling.
@@ -1150,7 +1150,7 @@ pub enum TimingMsgWire {
     /// task: workers never decide on retry; they always report
     /// (success or failure) and let the controller pick the next
     /// action. `elapsed_ms` is the wall-time the closure took (used
-    /// by the coord to (a) subtract from `wall_ms_accum[rank]` so
+    /// by the coord to (a) absorb out of the window ledger so
     /// ElChe does not mis-attribute checkpoint cost as training
     /// slowness, and (b) feed a `last_checkpoint_elapsed_ms_ewma`
     /// reserved for v2 rendezvous-aware scheduling). Success carries
@@ -1183,7 +1183,7 @@ pub enum TimingMsgWire {
     /// inside its main loop on epoch boundaries; there is no
     /// coord-dispatched directive, only this post-fire report).
     ///
-    /// The coord subtracts `elapsed_ms` from `wall_ms_accum[rank]` so
+    /// The coord absorbs `elapsed_ms` out of the window ledger so
     /// ElChe does not mis-attribute epoch_fn cost as compute slowness,
     /// and feeds it into `last_epoch_fn_elapsed_ms_ewma` for
     /// callback-aware partition scheduling.

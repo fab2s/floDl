@@ -115,7 +115,7 @@ pub struct ClusterCoordinatorConfig {
     /// rank is same-process latency for the UID hand-off and has
     /// lower correlated-failure risk than a network peer. Defaults
     /// to empty (no preference; picker falls back to fastest
-    /// surviving network rank by `wall_ms_accum / steps_since_avg`,
+    /// surviving network rank by its window-ledger per-batch wall,
     /// breaking ties by lowest global rank).
     pub local_ranks: Vec<usize>,
 
