@@ -246,6 +246,8 @@ Augmentation is now a first-class, reproducible schedule concept instead of per-
 
 With `k = 1` and no transform, everything is byte-identical to before — the epoch permutation scheme is unchanged (and now lives in one place, `epoch_permutation`, shared by the solo sampler and the DDP partition expansion). The flow window's drop-behind became multiplicity-aware: a sample stays resident until its last advised pick instead of popping on first hit.
 
+`ddp-bench` exposes the pair as `--augment <k>` (schedule multiplicity) and `--augment-noise <amp>` (a `PickKey`-keyed additive input-noise transform, so the k views carry distinct bytes — the A/B arm for the keyed delivery path under real multi-rank runs).
+
 #### Sample cache: later epochs read from RAM, not storage
 
 `DataSet`-backed streaming loaders now retain samples in a read-through RAM cache as epoch 1 reads them; later epochs hit RAM instead of re-reading storage. The cache is keyed by sample identity, which makes staged content reshuffle-proof: a reshuffle changes only the access order, never the content set. When the budget covers the whole dataset, storage is read exactly once for the entire run.

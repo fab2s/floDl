@@ -249,4 +249,10 @@ pub struct RunConfig {
     /// Consensus allocation-weighting exponent `γ` (rank weighted `nₖ^γ`).
     /// `1.0` = plain work-weighting (default). CPU backend only.
     pub gamma: f64,
+    /// Augmentation multiplicity (`--augment`): each sample appears k
+    /// times per epoch as distinct schedule picks. 1 = off.
+    pub augment: usize,
+    /// Per-view additive input-noise amplitude (`--augment-noise`),
+    /// installed as a PickKey-keyed delivery transform. 0.0 = off.
+    pub augment_noise: f64,
 }

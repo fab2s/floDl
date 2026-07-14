@@ -303,6 +303,9 @@ let cfg = TrainerConfig::new(dataset)
 | `.checkpoint_at_epoch(n)` | `usize` | One-shot coverage-granular checkpoint at the epoch any rank first reaches (progressive modes). Pairs with `.save_path`. |
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
+| `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
+| `.with_augment(k)` | `usize` | Views per sample per epoch: the schedule becomes `len()*k` picks, sharded and balanced exactly like samples. Data variation comes from the transform. |
+| `.with_transform(f)` | closure | Deterministic delivery transform, keyed by `PickKey { sample, repeat, epoch, seed }` per row; runs on each rank after device transfer. The chained `DdpBuilder` twins are `.augment(k)` / `.transform(f)`. See the [data-loading tutorial](tutorials/13-data-loading.md#augmentation-repeated-picks--a-keyed-transform). |
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |
 
 `TrainerConfig::cluster(full)` is the seam for programmatic

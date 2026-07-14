@@ -199,6 +199,21 @@ struct Cli {
     #[option]
     gamma: Option<f64>,
 
+    /// Augmentation multiplicity: each sample appears k times per epoch
+    /// as distinct schedule picks (flodl `.augment(k)`) — the epoch's
+    /// work scales by k and the picks shard/balance exactly like
+    /// samples. 1 = off.
+    #[option]
+    augment: Option<usize>,
+
+    /// With `--augment`: per-view additive input-noise amplitude,
+    /// installed as a PickKey-keyed delivery transform (flodl
+    /// `.transform`) so the k views carry distinct bytes. 0.0 (default)
+    /// = no transform: `--augment` alone measures pure schedule
+    /// multiplicity (oversampling).
+    #[option]
+    augment_noise: Option<f64>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -822,6 +837,8 @@ fn run() -> flodl::tensor::Result<()> {
                 max_failure: cli.max_failure,
                 outer_optimizer: outer_opt_choice.clone(),
                 gamma: cli.gamma.unwrap_or(1.0),
+                augment: cli.augment.unwrap_or(1).max(1),
+                augment_noise: cli.augment_noise.unwrap_or(0.0),
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

@@ -233,6 +233,58 @@ The default is `true` to avoid a BatchNorm footgun: a final batch of
 size 1 produces NaN variance. Set to `false` for evaluation/inference
 where every sample matters.
 
+## Augmentation: repeated picks + a keyed transform
+
+flodl treats augmentation as two orthogonal, deterministic pieces
+instead of per-call randomness hidden in the dataset:
+
+```rust
+let loader = DataLoader::from_dataset(my_data)
+    .batch_size(64)
+    .augment(4)                       // each sample: 4 views per epoch
+    .transform(|mut rows, keys| {     // derive each view from its key
+        for (i, key) in keys.iter().enumerate() {
+            let mut rng = key.rng();  // same key = same bytes, every run
+            // e.g. flip row i when rng.bernoulli(0.5), crop offset from
+            // rng.usize(pad), noise from rng.f32() ...
+        }
+        Ok(rows)
+    })
+    .build()?;
+```
+
+- **`.augment(k)`** is pure scheduling: the epoch becomes a shuffle of
+  `len() * k` *picks*, so each sample appears `k` times, spread across
+  the epoch, and batch counts scale by `k`. Every pick fetches the same
+  raw bytes - staged once across the caching tiers - and counts as one
+  unit of work for DDP scheduling. Without a transform, `k > 1` is
+  plain oversampling.
+- **`.transform(f)`** runs at delivery, after device transfer, on every
+  batch. It receives the rows plus one `PickKey { sample, repeat,
+  epoch, seed }` per row; `key.rng()` gives a stateless RNG unique to
+  that view, so augmentation is exactly reproducible across runs, ranks,
+  and checkpoint resumes - statistically equivalent to stochastic
+  augmentation, strictly better for debugging. Both knobs exist on
+  `TrainerConfig` / `Trainer::builder` for DDP with identical semantics.
+
+### Why not augment inside `get()`?
+
+The PyTorch `__getitem__` habit - random crop/flip inside the dataset -
+breaks under flodl's staging tiers: the RAM sample cache, disk stage,
+and VRAM pool (all on by default) retain samples **by index** and
+re-serve those bytes on later epochs, so per-call randomness would be
+silently frozen at its first realization. `DataSet::get()` /
+`BatchDataSet::get_batch` therefore carry a purity contract: same
+index, same bytes, every call. Debug builds probe it (one double-fetch
+compare per run) and panic with an explanation if it is violated;
+release builds skip the probe.
+
+The payoff for keeping raw bytes in the tiers: a VRAM-pooled sample
+uploads once and derives all `k` views on device, and the transform can
+never corrupt the retained data - delivered batches are always freshly
+assembled storage. Keep transforms as tensor ops (they run on the
+target device); a transform that round-trips to host defeats residency.
+
 ## DDP integration
 
 Pass the dataset directly to `Trainer::builder` or `TrainerConfig` -
@@ -300,6 +352,14 @@ implement the trait and pass it.
 | `.sampler(Box<dyn Sampler>)` | - | Custom sampler (overrides shuffle) |
 | `.prefetch(usize)` | Auto | Override auto-detected prefetch depth |
 | `.vram_max_usage(f64)` | 0.90 | Max VRAM fraction for prefetch |
+| `.ram_max_usage(f64)` | 0.50 | Available-RAM fraction for the reader ring + sample cache |
+| `.sample_cache(bool)` | true | Read-through RAM sample cache (later epochs read from RAM) |
+| `.disk_stage(gb)` | 0 = off | Local-disk overflow tier under the sample cache |
+| `.disk_stage_dir(path)` | temp dir | Where the disk stage's pack file lives |
+| `.vram_pool(bool)` | true | Device-resident sample pool in leftover VRAM |
+| `.activation_reserve(bytes)` | Auto | Declared first-step VRAM reserve for prefetch sizing |
+| `.augment(usize)` | 1 | Views per sample per epoch (pick-space schedule) |
+| `.transform(fn)` | - | Deterministic delivery transform, keyed per `PickKey` |
 | `.streaming()` | Auto | Force streaming mode |
 | `.names(&[&str])` | Positional | Name batch tensor positions |
 | `.drop_last(bool)` | true | Drop incomplete final batch |

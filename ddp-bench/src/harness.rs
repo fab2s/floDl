@@ -688,6 +688,31 @@ fn run_unified(
     .backend(backend)
     .timeline(Arc::clone(timeline));
 
+    // Schedule augmentation: k views per sample per epoch, sharded and
+    // balanced like samples. With --augment-noise the views carry
+    // distinct bytes via a PickKey-keyed delivery transform — same
+    // pick, same bytes, on every rank and every run.
+    if config.augment > 1 {
+        builder = builder.augment(config.augment);
+    }
+    if config.augment_noise > 0.0 {
+        let sigma = config.augment_noise as f32;
+        builder = builder.transform(move |mut rows, keys| {
+            let shape = rows[0].shape();
+            let per_row: i64 = shape[1..].iter().product();
+            let mut noise = Vec::with_capacity((shape[0] * per_row) as usize);
+            for key in keys {
+                let mut rng = key.rng();
+                for _ in 0..per_row {
+                    noise.push((rng.f32() * 2.0 - 1.0) * sigma);
+                }
+            }
+            let n = Tensor::from_f32(&noise, &shape, rows[0].device())?;
+            rows[0] = rows[0].add(&n)?;
+            Ok(rows)
+        });
+    }
+
     // Cluster checkpoint / resume wiring. `save_path` sets the bundle stem the
     // consensus forge writes to; `checkpoint_at_epoch` arms a one-shot mid-run
     // snapshot at that epoch; `resume_from` seeds the controller's trajectory +
