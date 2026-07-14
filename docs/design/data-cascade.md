@@ -214,6 +214,11 @@ To build:
 
 1. **`DataSet::get()` = raw, pure contract** — document it, add a debug-mode
    purity check, and provide the augmentation seam (on-device `.map` / collate).
+   *Shipped 2026-07-14*: contract documented on both traits (with a
+   `should_panic` doctest as the executable spec), debug-build probes at the
+   two fetch choke points (`SampleCache::get_or_fetch` for `DataSet`,
+   prefetch `worker_loop` for `BatchDataSet` — one NaN-tolerant double-fetch
+   compare per run/worker, inert under `cfg(test)` and in release builds).
 2. **Augmentation as deterministic repeated picks** — pick-keyed stateless RNG;
    the permutation carries the multiplicity; ElChe and `realized_work` unchanged.
 3. **Wire next-use eviction into the persistent tiers** — reuse the advisory the

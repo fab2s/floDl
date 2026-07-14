@@ -301,6 +301,8 @@ The progressive chunk pool now partitions each epoch's permutation into contiguo
 
 ### Changed
 
+- **`DataSet::get` / `BatchDataSet::get_batch` purity contract, stated and probed**: both traits now document that sample content must be a pure function of the index — the staging cascade (RAM sample cache, disk stage, VRAM sample pool, all on by default) retains samples by index and re-serves them on later epochs, so per-call randomness (augmentation inside the dataset, the PyTorch `__getitem__` convention) is silently frozen at its first realization and served for the rest of the run. Debug builds now probe the contract — the first staged fetch is fetched twice and compared (NaN-tolerant), panicking with the full explanation on divergence; release builds skip the probe entirely. Augmentation belongs downstream of the loader as a deterministic on-device transform (e.g. a graph `.map` stage); first-class support for augmentation as deterministic repeated picks is designed in `docs/design/data-cascade.md`.
+
 #### Distributed layer: in-process thread-per-GPU DDP engine removed
 
 The in-process multi-replica DDP machinery on `Ddp`, `Graph::distribute`, and the `DataLoader::distributed` mode is no longer the production multi-GPU path. The new launcher trampoline + cluster coordinator path is the canonical one and auto-promotes on 2+ visible GPUs. `Trainer::run` / `Trainer::builder` always go through the cluster path on `cfg(not(test))` when multiple GPUs are visible.

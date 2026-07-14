@@ -67,6 +67,50 @@ use crate::tensor::{Result, Tensor};
 /// The loader handles batching (stacking), shuffling, device transfer,
 /// and prefetching automatically.
 ///
+/// # Purity: `get(index)` returns the raw sample, every time
+///
+/// `get` must be a **pure function of the index**: the same index always
+/// yields the same bytes, with no per-call randomness. The data plane
+/// retains samples **by index** across its staging tiers (RAM sample
+/// cache, disk stage, VRAM sample pool — all on by default) and re-serves
+/// the retained bytes on every later epoch, so a `get` that augments
+/// per call (the PyTorch `__getitem__` convention) would have its first
+/// realization silently frozen and served for the rest of the run.
+///
+/// Augmentation therefore does not belong in `get`. Apply it downstream
+/// of the loader as a deterministic on-device transform — e.g. a graph
+/// `.map` stage keyed by sample/step — so the raw sample stays resident
+/// once and each use derives its variant on device.
+///
+/// Debug builds probe this contract: the first staged fetch of a run is
+/// fetched twice and compared, and a divergence panics with this
+/// explanation. Release builds skip the probe entirely.
+///
+/// ```should_panic
+/// use flodl::data::{DataLoader, DataSet};
+/// use flodl::tensor::{Device, Result, Tensor};
+/// use std::sync::atomic::{AtomicU32, Ordering};
+///
+/// struct AugmentsInGet(AtomicU32);
+///
+/// impl DataSet for AugmentsInGet {
+///     fn len(&self) -> usize {
+///         4
+///     }
+///     fn get(&self, _index: usize) -> Result<Vec<Tensor>> {
+///         // Per-call randomness — the contract violation: the staged
+///         // copy would be frozen at whatever this returned first.
+///         let noise = self.0.fetch_add(1, Ordering::Relaxed) as f32;
+///         Ok(vec![Tensor::from_f32(&[noise], &[1], Device::CPU)?])
+///     }
+/// }
+///
+/// // Debug builds catch it at the first staged fetch.
+/// let _ = DataLoader::from_dataset(AugmentsInGet(AtomicU32::new(0)))
+///     .batch_size(2)
+///     .build();
+/// ```
+///
 /// # Thread safety
 ///
 /// Requires `Send + Sync` because a background thread calls `get()` while
@@ -140,6 +184,14 @@ impl DataSet for std::sync::Arc<dyn DataSet> {
 /// Each tensor in the returned `Vec` must have dimension 0 as the batch
 /// dimension, with length equal to `indices.len()`. The number of tensors
 /// and their shapes (beyond dim 0) must be consistent across calls.
+///
+/// Row content must be a **pure function of the row's index** — same
+/// purity contract as [`DataSet::get`], for the same reason: the staging
+/// tiers (notably the VRAM sample pool, on by default) retain rows by
+/// index and re-serve them on later epochs, so per-call randomness in
+/// `get_batch` is silently frozen at its first realization. Augmentation
+/// belongs downstream, as a deterministic on-device transform. Debug
+/// builds probe the contract once per prefetch worker.
 pub trait BatchDataSet: Send + Sync {
     /// Number of samples in the dataset.
     fn len(&self) -> usize;
@@ -154,6 +206,68 @@ pub trait BatchDataSet: Send + Sync {
     /// Whether the dataset is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Purity probe (debug builds)
+// ---------------------------------------------------------------------------
+
+/// Debug-build purity probe: compare two fetches of the same index and
+/// panic with the contract explanation if they diverge. The staging
+/// tiers retain samples by index, so an impure fetch is silently frozen
+/// at its first realization — a correctness bug worth a loud stop in
+/// debug builds. One probe per run/worker; it is a spot check, not a
+/// proof.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_fetch_pure(what: &str, first: &[Tensor], second: &[Tensor]) {
+    let identical = first.len() == second.len()
+        && first.iter().zip(second).all(|(a, b)| tensor_identical(a, b));
+    if identical {
+        return;
+    }
+    panic!(
+        "flodl data: {what} returned different content for the same index. \
+         It must be a pure function of the index: the staging cascade (RAM \
+         sample cache, disk stage, VRAM sample pool) retains samples by \
+         index and re-serves them on later epochs, so per-call randomness \
+         (e.g. augmentation inside the dataset, the PyTorch __getitem__ \
+         convention) is silently frozen at its first realization. Move \
+         augmentation out of the dataset and apply it downstream as a \
+         deterministic on-device transform (e.g. a graph `.map` stage). \
+         This probe runs in debug builds only."
+    );
+}
+
+/// Exact elementwise equality with a NaN-tolerant confirmation pass:
+/// `eq_tensor` is the fast device-side compare, but NaN != NaN would
+/// accuse a legitimately pure dataset that contains NaNs, so a mismatch
+/// is re-checked host-side treating NaN == NaN before declaring
+/// impurity. Unreadable tensors never accuse.
+#[cfg(debug_assertions)]
+fn tensor_identical(a: &Tensor, b: &Tensor) -> bool {
+    if a.shape() != b.shape() || a.dtype() != b.dtype() {
+        return false;
+    }
+    let n = a.numel();
+    if n == 0 {
+        return true;
+    }
+    let eq_count = a
+        .eq_tensor(b)
+        .and_then(|e| e.sum())
+        .and_then(|s| s.item());
+    match eq_count {
+        Ok(c) if c as i64 == n => true,
+        _ => match (a.to_f64_vec(), b.to_f64_vec()) {
+            (Ok(x), Ok(y)) => {
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(&y)
+                        .all(|(p, q)| p == q || (p.is_nan() && q.is_nan()))
+            }
+            _ => true,
+        },
     }
 }
 
@@ -408,6 +522,49 @@ impl std::fmt::Debug for Batch {
 mod tests {
     use super::*;
     use crate::tensor::test_opts;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pure function of the index")]
+    fn purity_probe_panics_on_divergent_fetches() {
+        use crate::tensor::Device;
+        let a = vec![Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap()];
+        let b = vec![Tensor::from_f32(&[1.0, 3.0], &[2], Device::CPU).unwrap()];
+        assert_fetch_pure("DataSet::get", &a, &b);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn purity_probe_accepts_identical_and_nan_content() {
+        use crate::tensor::Device;
+        // Identical values compare equal on the fast device path.
+        let a = vec![Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap()];
+        let b = vec![Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap()];
+        assert_fetch_pure("DataSet::get", &a, &b);
+
+        // NaN != NaN fails eq_tensor, but a pure dataset containing
+        // NaNs must not be accused: the NaN-tolerant host pass accepts.
+        let n1 =
+            vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
+        let n2 =
+            vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
+        assert_fetch_pure("DataSet::get", &n1, &n2);
+
+        // Empty tensors are trivially identical.
+        let e1 = vec![Tensor::from_f32(&[], &[0], Device::CPU).unwrap()];
+        let e2 = vec![Tensor::from_f32(&[], &[0], Device::CPU).unwrap()];
+        assert_fetch_pure("DataSet::get", &e1, &e2);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pure function of the index")]
+    fn purity_probe_panics_on_shape_divergence() {
+        use crate::tensor::Device;
+        let a = vec![Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap()];
+        let b = vec![Tensor::from_f32(&[1.0], &[1], Device::CPU).unwrap()];
+        assert_fetch_pure("DataSet::get", &a, &b);
+    }
 
     struct SimplePairs {
         x: Tensor,

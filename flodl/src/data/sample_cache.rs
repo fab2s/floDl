@@ -57,6 +57,13 @@ pub(crate) struct SampleCache {
     /// misses at local-disk speed instead of source speed. Attached at
     /// `build()` when `disk_stage(gb)` is set.
     disk: OnceLock<DiskStage>,
+    /// One purity probe per cache instance (debug builds): the first
+    /// fetched sample is fetched twice and compared, panicking on
+    /// divergence — see [`crate::data::assert_fetch_pure`]. Inert under
+    /// `cfg(test)` so the suite's fetch-count assertions stay exact
+    /// (the comparer is unit-tested directly).
+    #[cfg(all(debug_assertions, not(test)))]
+    purity_probed: AtomicBool,
 }
 
 impl SampleCache {
@@ -68,6 +75,8 @@ impl SampleCache {
             bytes: AtomicUsize::new(0),
             budget: AtomicUsize::new(0),
             disk: OnceLock::new(),
+            #[cfg(all(debug_assertions, not(test)))]
+            purity_probed: AtomicBool::new(false),
         }
     }
 
@@ -125,12 +134,18 @@ impl SampleCache {
     pub(crate) fn get_or_fetch(
         &self,
         index: usize,
-        fetch: impl FnOnce() -> Result<Vec<Tensor>>,
+        mut fetch: impl FnMut() -> Result<Vec<Tensor>>,
     ) -> Result<Vec<Tensor>> {
         if let Some(staged) = self.lookup(index) {
             return staged;
         }
         let sample = fetch()?;
+        #[cfg(all(debug_assertions, not(test)))]
+        if !self.purity_probed.swap(true, Ordering::Relaxed) {
+            if let Ok(second) = fetch() {
+                crate::data::assert_fetch_pure("DataSet::get", &sample, &second);
+            }
+        }
         self.admit(index, &sample);
         Ok(sample)
     }

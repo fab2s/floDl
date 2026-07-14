@@ -338,6 +338,20 @@ fn worker_loop(
     // Distributed epoch channel, kept alive across LoadBatch commands.
     let mut dist_tx: Option<mpsc::SyncSender<Result<PrefetchedBatch>>> = None;
 
+    // One purity probe per worker (debug builds): the retained tiers —
+    // and this worker's VRAM sample pool in particular — serve rows by
+    // index across epochs, so `get_batch` must be a pure function of
+    // the indices. See `crate::data::assert_fetch_pure`. Inert under
+    // `cfg(test)` so the suite's fetch-count assertions stay exact.
+    #[cfg(all(debug_assertions, not(test)))]
+    let mut purity_probed = false;
+    #[cfg(all(debug_assertions, not(test)))]
+    let probe_purity = |probe: &[usize]| {
+        if let (Ok(a), Ok(b)) = (dataset.get_batch(probe), dataset.get_batch(probe)) {
+            crate::data::assert_fetch_pure("BatchDataSet::get_batch", &a, &b);
+        }
+    };
+
     for cmd in &cmd_rx {
         match cmd {
             WorkerCmd::StartEpoch {
@@ -349,6 +363,12 @@ fn worker_loop(
                 ring_slots,
             } => {
                 dist_tx = None; // close any distributed channel
+
+                #[cfg(all(debug_assertions, not(test)))]
+                if !purity_probed && !indices.is_empty() {
+                    purity_probed = true;
+                    probe_purity(&indices[..batch_size.min(indices.len())]);
+                }
 
                 if ring_slots > 0 {
                     run_two_stage_epoch(
@@ -392,6 +412,11 @@ fn worker_loop(
                 pool.install_with_reserve(reserve_bytes);
             }
             WorkerCmd::LoadBatch { indices } => {
+                #[cfg(all(debug_assertions, not(test)))]
+                if !purity_probed && !indices.is_empty() {
+                    purity_probed = true;
+                    probe_purity(&indices);
+                }
                 if let Some(ref tx) = dist_tx {
                     // Same transient-OOM patience as the epoch path; the
                     // coordinator paces in-flight batches here, so there
