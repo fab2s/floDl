@@ -223,6 +223,20 @@ To build:
    the permutation carries the multiplicity; ElChe and `realized_work` unchanged.
 3. **Wire next-use eviction into the persistent tiers** — reuse the advisory the
    flow window already consumes; key eviction by remaining-picks-per-chunk.
+   *RAM tier shipped 2026-07-14*: `SampleCache` slots became evictable
+   (set-if-empty admission, `evict` empties for reuse); the policy lives in
+   the stager beside the flow window's — per advisory it snapshots residents
+   keyed by next-use in the fresh stream (absent = ∞, farthest-first victim
+   queue), and admission under pressure evicts strictly-farther residents,
+   declining when everything held is needed sooner. The solo path never
+   evicts (stable draw-set: any K-set ties, admit-until-full already
+   optimal). *Deliberately deferred*: the VRAM pool keeps admit-until-full —
+   its storage is slab-chunked (row-level Belady fights the slab design),
+   and with the purity contract in force its staleness is a hit-rate matter,
+   not correctness; revisit when pick multiplicity (item 2) raises the
+   stakes. Demote-on-evict (RAM→disk) awaits the disk stage reaching the
+   DDP path — today's evicted samples fall back to the source if they
+   return, which the Belady order makes the least-likely case.
 4. **Pick-vs-chunk accounting** — the window/coverage math counts picks (so
    augmentation multiplicity is honored by `window ≤ epoch` and `batch_counts`),
    while residency budgets count distinct resident chunks.

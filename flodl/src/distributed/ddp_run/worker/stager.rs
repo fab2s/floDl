@@ -401,6 +401,56 @@ pub(crate) fn spawn_stager(
     }
 }
 
+/// Snapshot the pinned tier's eviction candidates against a fresh
+/// advised stream: every resident keyed by its next-use position in
+/// the stream (absent = `usize::MAX`), ordered farthest-first, so the
+/// front is always the current best victim and each eviction is O(1).
+/// Samples admitted after the snapshot are current-window data — they
+/// simply are not candidates until the next advisory, which is the
+/// safe direction (retain a little too much, never evict what the
+/// snapshot proved is needed soon).
+fn stale_pinned_victims(
+    cache: &SampleCache,
+    positions: &HashMap<usize, usize>,
+) -> std::collections::VecDeque<(usize, usize)> {
+    let mut v: Vec<(usize, usize)> = cache
+        .resident_indices()
+        .into_iter()
+        .map(|i| (i, positions.get(&i).copied().unwrap_or(usize::MAX)))
+        .collect();
+    v.sort_unstable_by_key(|&(_, next_use)| std::cmp::Reverse(next_use));
+    v.into()
+}
+
+/// Make pinned room for a sample at stream position `pos` by evicting
+/// strictly-farther residents, farthest first — the same next-use
+/// order the flow window runs (Belady's MIN, realizable here because
+/// the advised pick stream is deterministic). Returns `false` when
+/// everything held is needed sooner than the incoming sample (the
+/// caller falls through to the flow window / pause). Prior-epoch
+/// leftovers carry next-use `usize::MAX` and go first — this is what
+/// keeps the pinned tier current under the coordinator's per-epoch
+/// re-partition instead of fossilizing its first-ever fill.
+fn evict_pinned_for(
+    cache: &SampleCache,
+    victims: &mut std::collections::VecDeque<(usize, usize)>,
+    pos: usize,
+    sample_bytes: usize,
+    budget: usize,
+) -> bool {
+    while cache.bytes() + sample_bytes > budget {
+        let Some(&(idx, next_use)) = victims.front() else {
+            return false;
+        };
+        if next_use <= pos {
+            return false;
+        }
+        victims.pop_front();
+        cache.evict(idx);
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stager_loop(
     dataset: Arc<dyn BatchDataSet>,
@@ -420,6 +470,10 @@ fn stager_loop(
     // Learned from the first staged sample; prices the room checks.
     let mut sample_bytes: usize = 0;
     let mut pending: Option<StageAdvisory> = None;
+    // Pinned-tier eviction candidates, farthest-next-use first;
+    // re-snapshotted per advisory against the fresh stream.
+    let mut victims: std::collections::VecDeque<(usize, usize)> =
+        std::collections::VecDeque::new();
 
     loop {
         // Latest advisory wins: drain the inbox.
@@ -435,8 +489,10 @@ fn stager_loop(
             // Budget refresh rides the advisory (which rides the reduce
             // clock): live host headroom × this rank's consumption
             // share among co-hosted ranks, split between the pinned
-            // tier and the flow window. A shrink stops new admissions,
-            // never drops staged content.
+            // tier and the flow window. A shrink stops new admissions;
+            // retained content drops only through next-use eviction —
+            // farthest-first, in favor of sooner-needed samples — never
+            // as a blanket flush.
             let share = stager_ram_budget(rank, world_size, &a.counts);
             let stream_budget = share / 4;
             pinned_budget = share - stream_budget;
@@ -459,7 +515,10 @@ fn stager_loop(
             if share == 0 {
                 // No headroom right now: reading ahead with nothing
                 // retained would spend source bandwidth for nothing.
-                // Stay alive — a later advisory may find room.
+                // Stay alive — a later advisory may find room. No
+                // victims either: a zero budget must not drain the
+                // retained tier (nothing is asking for its room).
+                victims.clear();
                 if let Ok(mut p) = stream.lock() {
                     p.set_budget(0);
                 }
@@ -486,6 +545,10 @@ fn stager_loop(
                 p.set_budget(stream_budget);
                 p.refresh_positions(&positions);
             }
+            // Same re-key for the pinned tier: snapshot its residents
+            // against the fresh stream so admission under pressure can
+            // evict in next-use order (prior-epoch leftovers first).
+            victims = stale_pinned_victims(&cache, &positions);
         }
 
         match queue.front().copied() {
@@ -501,11 +564,20 @@ fn stager_loop(
                 }
 
                 // Room check BEFORE fetching — never spend a source
-                // read on a sample nothing can retain. The flow window
-                // frees room as training consumes (pop-on-hit), so
+                // read on a sample nothing can retain. A full pinned
+                // tier first tries next-use eviction (stale residents
+                // make way for sooner-needed samples); the flow window
+                // frees room as training consumes (pop-on-hit); so
                 // full-of-sooner-data means: wait for the frontier or
                 // the next advisory.
-                let pinned_room = cache.bytes() + sample_bytes <= pinned_budget;
+                let pinned_room = cache.bytes() + sample_bytes <= pinned_budget
+                    || evict_pinned_for(
+                        &cache,
+                        &mut victims,
+                        pos,
+                        sample_bytes,
+                        pinned_budget,
+                    );
                 let stream_room = stream
                     .lock()
                     .map(|p| p.has_room_for(sample_bytes.max(1), pos))
@@ -649,6 +721,40 @@ mod tests {
         assert!(pool.offer(3, row(3.0), 7));
         assert!(!pool.contains(1), "vanished-from-stream entry evicted first");
         assert!(pool.contains(2), "soonest-recurring entry kept");
+    }
+
+    #[test]
+    fn pinned_tier_evicts_farthest_on_repartition() {
+        // Two 4-byte samples fill the 8-byte pinned budget.
+        let cache = SampleCache::new(8);
+        cache.set_budget(8);
+        cache.admit(1, &row(1.0));
+        cache.admit(2, &row(2.0));
+        assert_eq!(cache.cached_count(), 2);
+
+        // Fresh advisory: 2 recurs at position 0, 3 and 4 are
+        // upcoming, 1 vanished from the visible future (prior-epoch
+        // leftover) → next-use MAX → first victim.
+        let positions: HashMap<usize, usize> =
+            [(2usize, 0usize), (3, 1), (4, 2)].into_iter().collect();
+        let mut victims = stale_pinned_victims(&cache, &positions);
+        assert_eq!(victims.front().copied(), Some((1, usize::MAX)));
+
+        // Admitting 3 (stream pos 1): the leftover goes, the
+        // soonest-recurring resident stays.
+        assert!(evict_pinned_for(&cache, &mut victims, 1, 4, 8));
+        cache.admit(3, &row(3.0));
+        assert!(!cache.contains_ram(1), "prior-epoch leftover evicted");
+        assert!(cache.contains_ram(2), "soonest-recurring resident kept");
+        assert!(cache.contains_ram(3));
+
+        // Admitting 4 (stream pos 2): the only snapshot victim left is
+        // 2 at position 0 — needed sooner than the incoming — so the
+        // tier declines: full of sooner data, exactly the flow
+        // window's rule. (3 was admitted after the snapshot and is not
+        // a candidate until the next advisory — the safe direction.)
+        assert!(!evict_pinned_for(&cache, &mut victims, 2, 4, 8));
+        assert!(cache.contains_ram(2) && cache.contains_ram(3));
     }
 
     #[test]

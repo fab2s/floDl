@@ -8,25 +8,32 @@
 //! construction: the cache is keyed by sample identity, and a reshuffle
 //! changes only the order function, never the content set.
 //!
-//! # Admission policy: fill until full, evict nothing
+//! # Admission policy: fill until full; evict only under re-partition
 //!
-//! Each epoch touches every sample exactly once in a fresh random
-//! order, so for a cache holding K of N samples the expected hit rate
-//! is K/N for ANY eviction policy — no choice of which K to keep beats
-//! any other against a uniformly reshuffled scan. Admit-until-full
-//! delivers that same K/N with zero churn (no eviction traffic, no
-//! write contention after warm-up). Smarter eviction only becomes
-//! meaningful when a disk tier exists below (spill-vs-drop rather than
-//! keep-vs-drop).
+//! On the solo path each epoch touches every sample exactly once in a
+//! fresh random order, so for a cache holding K of N samples the
+//! expected hit rate is K/N for ANY eviction policy — no choice of
+//! which K to keep beats any other against a uniformly reshuffled
+//! scan. Admit-until-full delivers that same K/N with zero churn, and
+//! the solo loader therefore never evicts.
+//!
+//! Under the coordinator's per-epoch re-partition (the DDP staging
+//! path) the rank's assigned set changes every epoch, the K-set tie
+//! breaks, and the mechanism differs: [`SampleCache::evict`] empties a
+//! slot so a sooner-needed sample can take the room. The *policy* —
+//! Belady next-use order over the advisory's forward stream — lives in
+//! the stager, next to the flow window's identical policy; this module
+//! stays mechanism-only. See `docs/design/data-cascade.md`.
 //!
 //! # Concurrency
 //!
-//! Lock-free by construction: reads are one atomic load per lookup
-//! (`OnceLock::get`), writes are per-slot one-time. No global lock
-//! anywhere near the data path. The byte counter is advisory under
-//! concurrent writers (two racing inserts can overshoot the budget by
-//! less than one sample each); in practice a single reader thread
-//! populates it.
+//! Reads take a per-slot `RwLock` read guard — uncontended on the
+//! training path (writers are the staging side), one atomic
+//! acquisition per lookup, no global lock anywhere near the data path.
+//! Admission is set-if-empty under the slot's write lock (concurrent
+//! admitters never double-count); eviction takes the same write lock.
+//! The byte counter is advisory under concurrent writers (two racing
+//! inserts can overshoot the budget by less than one sample each).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -44,8 +51,12 @@ use crate::tensor::{Result, Tensor, TensorError};
 /// pure pass-through (two atomic loads of overhead) and nothing is
 /// retained.
 pub(crate) struct SampleCache {
-    /// One slot per sample index, set at most once.
-    slots: Vec<OnceLock<Vec<Tensor>>>,
+    /// One slot per sample index. Admission is set-if-empty (an
+    /// occupied slot declines, so concurrent admitters never
+    /// double-count); eviction empties a slot so a later admission can
+    /// refill it. Reads take the slot's read lock — uncontended on the
+    /// training path, since writers are the staging side.
+    slots: Vec<std::sync::RwLock<Option<Vec<Tensor>>>>,
     /// Bytes currently retained (sum of cached samples' nbytes).
     bytes: AtomicUsize,
     /// Admission ceiling in bytes. Includes already-retained bytes:
@@ -69,7 +80,7 @@ pub(crate) struct SampleCache {
 impl SampleCache {
     pub(crate) fn new(n: usize) -> Self {
         let mut slots = Vec::with_capacity(n);
-        slots.resize_with(n, OnceLock::new);
+        slots.resize_with(n, || std::sync::RwLock::new(None));
         SampleCache {
             slots,
             bytes: AtomicUsize::new(0),
@@ -98,13 +109,65 @@ impl SampleCache {
     /// Whether the RAM tier holds this sample (no disk probe, no
     /// clone — the cheap staged-already check).
     pub(crate) fn contains_ram(&self, index: usize) -> bool {
-        self.slots.get(index).is_some_and(|s| s.get().is_some())
+        self.slots
+            .get(index)
+            .is_some_and(|s| Self::read_slot(s).is_some())
     }
 
     /// Number of samples currently cached (test/diagnostic).
     #[cfg(test)]
     pub(crate) fn cached_count(&self) -> usize {
-        self.slots.iter().filter(|s| s.get().is_some()).count()
+        self.slots
+            .iter()
+            .filter(|s| Self::read_slot(s).is_some())
+            .count()
+    }
+
+    /// Indices currently resident in the RAM tier. One O(n) slot scan;
+    /// used by the stager once per advisory to snapshot eviction
+    /// candidates.
+    pub(crate) fn resident_indices(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| Self::read_slot(s).is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Evict the RAM copy of `index`, returning the bytes freed (0 if
+    /// nothing was resident). Data on the disk tier is untouched — an
+    /// evicted sample that was demoted there earlier still serves at
+    /// disk speed; one that was not falls back to the source if it
+    /// ever returns. Only the stager evicts (next-use order under the
+    /// coordinator's re-partition); the solo loader never does —
+    /// against a uniformly reshuffled scan of a stable draw-set, any
+    /// K-set ties, so admit-until-full is already optimal there.
+    pub(crate) fn evict(&self, index: usize) -> usize {
+        let Some(slot) = self.slots.get(index) else {
+            return 0;
+        };
+        let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+        let Some(sample) = guard.take() else {
+            return 0;
+        };
+        let freed: usize = sample.iter().map(|t| t.nbytes()).sum();
+        self.bytes.fetch_sub(freed, Ordering::Relaxed);
+        freed
+    }
+
+    /// Poison-tolerant slot read: a panicked writer cannot have left a
+    /// torn value (`Option` swaps are all-or-nothing), so recover the
+    /// guard rather than propagating the poison.
+    fn read_slot(
+        slot: &std::sync::RwLock<Option<Vec<Tensor>>>,
+    ) -> Option<std::sync::RwLockReadGuard<'_, Option<Vec<Tensor>>>> {
+        let guard = slot.read().unwrap_or_else(|p| p.into_inner());
+        if guard.is_some() {
+            Some(guard)
+        } else {
+            None
+        }
     }
 
     /// Install the admission ceiling. Called once per `epoch()` by the
@@ -154,8 +217,11 @@ impl SampleCache {
     /// else disk read. `None` = not staged anywhere, caller fetches
     /// from the source.
     pub(crate) fn lookup(&self, index: usize) -> Option<Result<Vec<Tensor>>> {
-        if let Some(hit) = self.slots.get(index).and_then(|s| s.get()) {
-            return Some(Ok(hit.clone()));
+        if let Some(slot) = self.slots.get(index) {
+            if let Some(guard) = Self::read_slot(slot) {
+                let hit = guard.as_ref().expect("read_slot returns occupied");
+                return Some(Ok(hit.clone()));
+            }
         }
         self.disk.get().and_then(|stage| stage.read(index))
     }
@@ -170,10 +236,13 @@ impl SampleCache {
             let sample_bytes: usize = sample.iter().map(|t| t.nbytes()).sum();
             if self.bytes.load(Ordering::Relaxed) + sample_bytes
                 <= self.budget.load(Ordering::Relaxed)
-                && slot.set(sample.to_vec()).is_ok()
             {
-                self.bytes.fetch_add(sample_bytes, Ordering::Relaxed);
-                ram_admitted = true;
+                let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+                if guard.is_none() {
+                    *guard = Some(sample.to_vec());
+                    self.bytes.fetch_add(sample_bytes, Ordering::Relaxed);
+                    ram_admitted = true;
+                }
             }
         }
         if !ram_admitted {
@@ -519,6 +588,39 @@ mod tests {
             assert_eq!(s[0].to_f64_vec().unwrap(), vec![idx as f64]);
         }
         assert_eq!(fetches, 6, "two hits, two re-fetches");
+    }
+
+    #[test]
+    fn evict_frees_room_for_readmission() {
+        let cache = SampleCache::new(4);
+        cache.set_budget(8); // two 4-byte samples
+
+        cache.admit(0, &sample(0.0));
+        cache.admit(1, &sample(1.0));
+        assert_eq!(cache.bytes(), 8);
+        cache.admit(2, &sample(2.0)); // declined: budget full
+        assert_eq!(cache.cached_count(), 2);
+
+        // Evict frees exactly the sample's bytes; a second evict of
+        // the same slot is a no-op.
+        assert_eq!(cache.evict(0), 4);
+        assert_eq!(cache.evict(0), 0);
+        assert_eq!(cache.evict(99), 0, "out-of-range is a no-op");
+        assert_eq!(cache.bytes(), 4);
+        assert!(!cache.contains_ram(0));
+        assert_eq!(cache.resident_indices(), vec![1]);
+
+        // The freed room admits new content, and the evicted index can
+        // itself be re-admitted later (slots are reusable, unlike the
+        // old set-once storage).
+        cache.admit(2, &sample(2.0));
+        assert!(cache.contains_ram(2));
+        assert_eq!(cache.evict(1), 4);
+        cache.admit(0, &sample(0.5));
+        assert!(cache.contains_ram(0));
+        let hit = cache.lookup(0).unwrap().unwrap();
+        assert_eq!(hit[0].to_f64_vec().unwrap(), vec![0.5]);
+        assert_eq!(cache.bytes(), 8);
     }
 
     #[test]
