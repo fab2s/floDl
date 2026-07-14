@@ -1470,6 +1470,32 @@
     }
 
     #[test]
+    fn test_sample_cache_budget_anchored_not_ratcheting() {
+        const GIB: u64 = 1 << 30;
+        let a0 = 100 * GIB; // MemAvailable before any admission
+        let r = 0.5;
+
+        // Multi-epoch simulation: the cache fills to its budget each
+        // epoch, the next probe sees what is left. The cap must hold at
+        // r*A0 — with the held bytes added back AFTER taking the share
+        // (held + r*available) it ratcheted toward all of A0 instead.
+        let mut held = 0u64;
+        for _ in 0..10 {
+            let available = a0 - held;
+            let budget = sample_cache_budget(available, held, 0, r);
+            assert_eq!(budget, (a0 as f64 * r) as u64, "cap must stay anchored");
+            held = held.max(budget);
+        }
+        assert_eq!(held, 50 * GIB, "admissions stop at r*A0, not A0");
+
+        // The ring's slice comes off the top; the share clamps at 0.90;
+        // a ring larger than the share saturates to 0 (no admissions).
+        assert_eq!(sample_cache_budget(100, 0, 10, 0.5), 40);
+        assert_eq!(sample_cache_budget(100, 0, 0, 1.5), 90);
+        assert_eq!(sample_cache_budget(10, 0, 100, 0.5), 0);
+    }
+
+    #[test]
     fn test_ring_slots_from_ram_budget_math() {
         const GIB: u64 = 1 << 30;
         // 1 MiB/sample x 1024 batch = 1 GiB per batch.

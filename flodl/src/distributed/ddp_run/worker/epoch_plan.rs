@@ -339,10 +339,17 @@ impl<M: Module> GpuWorker<M> {
                 total_loss += loss;
 
                 // After first batch: measure activation peak from CUDA stats.
-                // The peak includes model + batch + activations + gradients.
-                // Subtract baseline (model/optimizer/NCCL) and one batch to
-                // isolate the activation + gradient overhead. This is the
-                // reserve that prefetch_depth_from_vram must account for.
+                // `peak` and `current` are read at the same point — both
+                // include model, optimizer state, and the still-resident
+                // batch — so their difference is already the transient
+                // forward/backward/step overhead (activations + gradients)
+                // net of the batch. This is the reserve that
+                // prefetch_depth_from_vram must account for. The batch must
+                // not be subtracted again: it cancels between the two terms,
+                // and re-subtracting saturated the reserve to 0 whenever
+                // activations + gradients fit inside one batch — and 0 is
+                // the not-yet-measured sentinel, so the sync fallback and
+                // the VRAM-pool gate held for the whole run.
                 if measuring_peak && batch_idx == 0 {
                     if let Some(ref stream) = self.compute_stream {
                         let _ = stream.synchronize();
@@ -351,8 +358,10 @@ impl<M: Module> GpuWorker<M> {
                     if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
                         if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
                             let overhead = (peak as usize).saturating_sub(current as usize);
-                            let batch_bytes = self.per_sample_bytes * self.batch_size;
-                            self.activation_peak_bytes = overhead.saturating_sub(batch_bytes);
+                            // Floor a completed measurement to 1 byte so a
+                            // degenerate reading cannot collide with the
+                            // sentinel and re-arm calibration every chunk.
+                            self.activation_peak_bytes = overhead.max(1);
                         }
                     }
                     // Reset for ongoing monitoring in subsequent chunks.

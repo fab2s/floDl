@@ -251,14 +251,33 @@ impl ClusterCoordinator {
         let mut plans: Vec<crate::distributed::wire::EpochPlanWire> =
             Vec::with_capacity(self.world_size);
         for (rank, &batch_count) in sizes.iter().enumerate() {
-            if let Some(plan) = self.dispatch_next_chunk_with_batches(
+            // Best-effort per rank, same rationale as the non-progressive
+            // loop above: a fail-fast `?` here escalated one broken
+            // connection at kickoff into a fatal launcher Err — coordinator
+            // thread gone, every healthy rank watchdog-fired 30s later.
+            // The failed take is already rolled back inside
+            // `dispatch_next_chunk_with_batches`; heartbeat staleness reaps
+            // the rank and its span is redistributed.
+            let plan = match self.dispatch_next_chunk_with_batches(
                 rank, epoch, batch_count,
-            )? {
+            ) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    eprintln!(
+                        "flodl ddp: first chunk of epoch {epoch} send to \
+                         rank {rank} failed: {e}; continuing with \
+                         remaining ranks"
+                    );
+                    None
+                }
+            };
+            if let Some(plan) = plan {
                 plans.push(plan);
             } else {
-                // Rank received no work (e.g. world_size > batch_total).
-                // Push an empty plan so the returned Vec has world_size
-                // entries (callers / tests expect that shape).
+                // Rank received no work (e.g. world_size > batch_total) or
+                // its send failed. Push an empty plan so the returned Vec
+                // has world_size entries (callers / tests expect that
+                // shape).
                 plans.push(crate::distributed::wire::EpochPlanWire {
                     epoch: epoch as u64,
                     partition_offset: 0,

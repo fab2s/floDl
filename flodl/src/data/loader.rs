@@ -168,6 +168,27 @@ pub(crate) fn ring_slots_from_ram(
     (budget / batch_bytes).min(epoch_batches as u64) as usize
 }
 
+/// Sample-cache RAM budget: the same available-RAM share as the ring,
+/// recomputed from the live probe at each epoch boundary.
+///
+/// Bytes the cache already holds are no longer "available" to the
+/// probe, so they are added back before taking the share — the cap
+/// stays anchored to the total the run started with, not to what is
+/// left after admissions. Adding the FULL held bytes back after taking
+/// the share (`held + r*available`) is the ratchet to avoid: each
+/// epoch's cap then exceeds the held bytes by a share of the
+/// remainder, and the fixed point is all of MemAvailable. The ring's
+/// slice comes off the top.
+pub(crate) fn sample_cache_budget(
+    available: u64,
+    held_bytes: u64,
+    ring_bytes: u64,
+    ram_max_usage: f64,
+) -> u64 {
+    let total = available.saturating_add(held_bytes);
+    ((total as f64 * ram_max_usage.min(0.90)) as u64).saturating_sub(ring_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder
 // ---------------------------------------------------------------------------
@@ -1097,19 +1118,22 @@ impl StreamingLoader {
         };
 
         // Sample-cache budget refresh: same available-RAM share as the
-        // ring, recomputed from the live probe once per epoch. The
-        // budget includes already-retained bytes (the probe no longer
-        // sees them as free, so a shrinking headroom stops new
-        // admissions, never drops staged content) and leaves the ring
-        // its slice. Without RAM visibility the budget stays as it was
-        // (initially 0: no admissions on hosts we cannot measure).
+        // ring, recomputed from the live probe once per epoch (see
+        // `sample_cache_budget` for why held bytes are added back to
+        // the probe before taking the share). A shrinking budget stops
+        // new admissions, never drops staged content. Without RAM
+        // visibility the budget stays as it was (initially 0: no
+        // admissions on hosts we cannot measure).
         if let Some(cache) = &self.sample_cache {
             if let Some(available) = mem {
-                let headroom = (available as f64 * self.ram_max_usage.min(0.90)) as u64;
                 let ring_bytes = (ring_slots as u64)
                     .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
-                let budget = (cache.bytes() as u64)
-                    .saturating_add(headroom.saturating_sub(ring_bytes));
+                let budget = sample_cache_budget(
+                    available,
+                    cache.bytes() as u64,
+                    ring_bytes,
+                    self.ram_max_usage,
+                );
                 cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
             }
         }

@@ -120,6 +120,45 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
 }
 
 #[test]
+fn progressive_kickoff_is_best_effort_per_rank() {
+    // Headless coordinator: every send_control fails. First-chunk
+    // dispatch must not escalate a rank's send failure into an Err —
+    // the launcher treats Err as fatal, the coordinator thread dies,
+    // and every healthy rank self-destructs at the 30s watchdog. The
+    // kickoff logs, rolls back each failed take, and still returns
+    // world_size plans (empty for the failed ranks), exactly like the
+    // non-progressive loop.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let total = 100usize;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(1)
+    .progressive(true);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    let plans = coord
+        .dispatch_epoch(0)
+        .expect("headless send failures must not abort the kickoff");
+    assert_eq!(plans.len(), world_size, "one plan slot per rank");
+
+    // Every failed dispatch rolled back its pool take: no ghost
+    // in-flight chunk may survive a send that never reached the rank.
+    let pool = coord.chunk_pools.get(&0).expect("epoch 0 pool created");
+    assert_eq!(pool.remaining(), total);
+    assert!(!pool.is_epoch_done());
+}
+
+#[test]
 fn advisory_spans_own_first_margins_last() {
     // Reservation advisory geometry: world 2, total 100, batch 1 →
     // equal spans [0,50) / [50,100); uncalibrated ElChe anchor 4 →
