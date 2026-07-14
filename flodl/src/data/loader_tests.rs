@@ -1344,6 +1344,11 @@
     #[test]
     fn test_user_pinned_depth_skips_honest_resize() {
         // .prefetch(n) pins the governor: no adaptive resize may fire.
+        // The honest-probe latch still must: it marks "a probe now sees
+        // step memory", and the VRAM sample pool's one-shot budget
+        // decision (`maybe_install`) gates on it — a user-set depth
+        // used to leave the latch unset and silently disabled the pool
+        // tier for the whole run.
         let data = make_data(20);
         let mut loader = DataLoader::from_dataset(data)
             .batch_size(4)
@@ -1356,8 +1361,11 @@
         assert_eq!(batches.len(), 5);
         let g = loader_governor(&loader);
         use std::sync::atomic::Ordering;
-        assert!(!g.honest_resize_done.load(Ordering::Relaxed));
-        assert_eq!(g.target.load(Ordering::Relaxed), 3);
+        assert!(
+            g.honest_resize_done.load(Ordering::Relaxed),
+            "honest-probe latch must fire under a user-set depth"
+        );
+        assert_eq!(g.target.load(Ordering::Relaxed), 3, "depth stays pinned");
     }
 
     fn loader_governor(loader: &DataLoader) -> &std::sync::Arc<crate::data::prefetch::GovernorCtl> {

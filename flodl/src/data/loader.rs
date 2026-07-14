@@ -1298,27 +1298,35 @@ impl StreamingEpochIter<'_> {
                 self.governor.consumed.fetch_add(1, Ordering::Relaxed);
                 let run_consumed =
                     self.governor.run_consumed.fetch_add(1, Ordering::Relaxed) + 1;
-                // Honest resize, once per RUN: draining the second batch
-                // means the first batch's forward/backward/step have
-                // executed, so a probe now sees activations, gradients,
-                // and lazily created optimizer state as "used". Raise
-                // the target to the honest full budget (no reserve; the
-                // probe accounts for step memory itself). Keyed to
-                // consumption, not epoch boundaries, so single-pass
-                // training benefits too.
-                if self.adaptive
-                    && run_consumed >= 2
+                // Honest-probe latch, once per RUN: draining the second
+                // batch means the first batch's forward/backward/step
+                // have executed, so a probe now sees activations,
+                // gradients, and lazily created optimizer state as
+                // "used". Keyed to consumption, not epoch boundaries, so
+                // single-pass training benefits too. The latch must be
+                // set regardless of who owns the depth — it marks probe
+                // honesty, and the VRAM sample pool's one-shot budget
+                // decision (`maybe_install`) gates on it; an explicit
+                // `.prefetch(N)` must pin the in-flight depth, not
+                // silently disable the pool tier.
+                if run_consumed >= 2
                     && !self.governor.honest_resize_done.load(Ordering::Relaxed)
                 {
                     self.governor.honest_resize_done.store(true, Ordering::Relaxed);
-                    let depth = prefetch_depth_from_vram(
-                        self.per_sample_bytes,
-                        self.batch_size,
-                        self.device,
-                        self.vram_max_usage,
-                        0,
-                    );
-                    self.governor.target.store(depth.max(1), Ordering::Relaxed);
+                    // Honest resize of the in-flight target: adaptive
+                    // mode only — a user-set depth stays exactly where
+                    // the user put it. Full budget, no reserve (the
+                    // probe accounts for step memory itself).
+                    if self.adaptive {
+                        let depth = prefetch_depth_from_vram(
+                            self.per_sample_bytes,
+                            self.batch_size,
+                            self.device,
+                            self.vram_max_usage,
+                            0,
+                        );
+                        self.governor.target.store(depth.max(1), Ordering::Relaxed);
+                    }
                 }
                 Some(Ok(Batch::new(batch.tensors, self.names.to_vec())))
             }
