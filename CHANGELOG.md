@@ -237,6 +237,15 @@ The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reade
 - **`flodl::sys::mem_info()`**: host RAM probe (`MemTotal` / `MemAvailable` from `/proc/meminfo`), CUDA-free like the rest of `flodl::sys`.
 - The VRAM depth governor and the RAM ring bound different resources and stay orthogonal: the governor caps device in-flight (transfer stage), the ring caps host-RAM in-flight (reader stage). CPU-target loaders keep the single-stage pipeline (their batch channel already is the read-ahead buffer), as does the coordinator-paced distributed batch path.
 
+#### Augmentation as deterministic repeated picks
+
+Augmentation is now a first-class, reproducible schedule concept instead of per-call randomness hidden in the dataset. Two orthogonal knobs, on `DataLoaderBuilder` (solo) and `TrainerConfig` / `DdpBuilder` (DDP) alike:
+
+- **`.augment(k)`** — each sample appears `k` times per epoch, spread by the shuffle. Pure scheduling: the epoch permutation runs over the pick space `len() * k`, and a pick decodes intrinsically as `(pick / k, pick % k)` = (sample, repeat) — so the decode survives re-partition, rank death, and resume with no side tables. Every pick fetches the same raw bytes (staged once across the tiers) and counts as one unit of realized work; ElChe, the coordinator ledger, the wire format, and coverage-granular resume all run in pick space unchanged. Composes with the built-in samplers; combining with a custom sampler errors loudly.
+- **`.transform(f)`** — the deterministic delivery transform, the sanctioned home for augmentation. Receives each delivered batch (raw rows, already on the target device, freshly assembled) plus one `PickKey { sample, repeat, epoch, seed }` per row; derive per-view randomness from `PickKey::rng()` (stateless, frozen mixing constants — checkpointed runs reproduce their augmentation exactly). Runs live on every delivery and never writes back: the staging tiers (RAM cache, disk stage, VRAM pool) retain raw samples only, so a VRAM-pooled sample uploads once and derives its `k` views on device. Batch assembly always materializes fresh storage, so even an in-place transform cannot corrupt the retained raw bytes.
+
+With `k = 1` and no transform, everything is byte-identical to before — the epoch permutation scheme is unchanged (and now lives in one place, `epoch_permutation`, shared by the solo sampler and the DDP partition expansion). The flow window's drop-behind became multiplicity-aware: a sample stays resident until its last advised pick instead of popping on first hit.
+
 #### Sample cache: later epochs read from RAM, not storage
 
 `DataSet`-backed streaming loaders now retain samples in a read-through RAM cache as epoch 1 reads them; later epochs hit RAM instead of re-reading storage. The cache is keyed by sample identity, which makes staged content reshuffle-proof: a reshuffle changes only the access order, never the content set. When the budget covers the whole dataset, storage is read exactly once for the entire run.

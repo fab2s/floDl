@@ -461,6 +461,37 @@ where
     /// first training step so later epochs gather them on device
     /// instead of re-uploading; `FLODL_VRAM_POOL=off` is the runtime
     /// kill-switch equivalent.
+    /// Augmentation multiplicity (see [`DdpRunConfig::augment`]).
+    pub fn augment(mut self, k: usize) -> Self {
+        self.config = self.config.with_augment(k);
+        self
+    }
+
+    /// Delivery transform, keyed per pick (see
+    /// [`DdpRunConfig::transform`]).
+    pub fn transform(
+        mut self,
+        f: impl Fn(
+                Vec<crate::tensor::Tensor>,
+                &[crate::data::PickKey],
+            ) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.config = self.config.with_transform(f);
+        self
+    }
+
+    /// Delivery transform, pre-built (the [`TrainerConfig`] bridge and
+    /// any caller already holding a [`crate::data::TransformFn`]).
+    ///
+    /// [`TrainerConfig`]: crate::distributed::TrainerConfig
+    pub fn transform_fn(mut self, f: crate::data::TransformFn) -> Self {
+        self.config.transform = Some(f);
+        self
+    }
+
     pub fn vram_pool(mut self, enabled: bool) -> Self {
         self.config = self.config.with_vram_pool(enabled);
         self

@@ -193,6 +193,17 @@ pub(crate) fn sample_cache_budget(
 // DataLoaderBuilder
 // ---------------------------------------------------------------------------
 
+/// Pick-space context shared by both loader modes: augmentation
+/// multiplicity, the shuffle seed (which keys the transform), and the
+/// delivery transform itself. At `augment = 1` with no transform this
+/// is inert — picks and sample ids coincide.
+#[derive(Clone)]
+pub(crate) struct PickCtx {
+    pub(crate) augment: usize,
+    pub(crate) seed: u64,
+    pub(crate) transform: Option<crate::data::TransformFn>,
+}
+
 /// Builder for [`DataLoader`]. Constructed via
 /// [`DataLoader::from_dataset`] or [`DataLoader::from_batch_dataset`].
 pub struct DataLoaderBuilder {
@@ -216,6 +227,9 @@ pub struct DataLoaderBuilder {
     disk_stage_bytes: u64,
     disk_stage_dir: Option<std::path::PathBuf>,
     vram_pool_enabled: bool,
+    no_shuffle: bool,
+    augment: usize,
+    transform: Option<crate::data::TransformFn>,
 }
 
 impl DataLoaderBuilder {
@@ -238,6 +252,9 @@ impl DataLoaderBuilder {
             disk_stage_bytes: 0,
             disk_stage_dir: None,
             vram_pool_enabled: true,
+            no_shuffle: false,
+            augment: 1,
+            transform: None,
         }
     }
 
@@ -274,16 +291,55 @@ impl DataLoaderBuilder {
     /// When `false`, uses [`SequentialSampler`] (indices in order every epoch).
     /// This is overridden if [`sampler`](DataLoaderBuilder::sampler) is called.
     pub fn shuffle(mut self, shuffle: bool) -> Self {
-        if !shuffle {
-            let n = self.dataset.len();
-            self.sampler = Some(Box::new(SequentialSampler::new(n)));
-        }
+        self.no_shuffle = !shuffle;
         self
     }
 
     /// Custom sampler. Overrides the [`shuffle`](DataLoaderBuilder::shuffle) setting.
     pub fn sampler(mut self, sampler: Box<dyn Sampler>) -> Self {
         self.sampler = Some(sampler);
+        self
+    }
+
+    /// Augmentation multiplicity: each sample appears `k` times per
+    /// epoch, spread by the shuffle. Default: 1.
+    ///
+    /// Pure scheduling — every one of the `k` picks fetches the same
+    /// raw bytes (staged once across the tiers); data variation comes
+    /// exclusively from the [`transform`](DataLoaderBuilder::transform),
+    /// keyed per pick. Without a transform, `k > 1` is plain
+    /// oversampling (`k` identical views per epoch). An epoch is one
+    /// pass over the `len() * k` picks, so batch counts scale by `k`.
+    ///
+    /// Composes with the built-in samplers only; combining with
+    /// [`sampler`](DataLoaderBuilder::sampler) is a build error.
+    pub fn augment(mut self, k: usize) -> Self {
+        self.augment = k.max(1);
+        self
+    }
+
+    /// Deterministic per-batch transform applied at delivery — the
+    /// sanctioned home for augmentation (see [`PickKey`]).
+    ///
+    /// Receives the delivered rows (raw bytes, already on the target
+    /// device, freshly assembled — never aliasing the staging tiers)
+    /// and one [`PickKey`] per row. Must be a pure function of
+    /// `(rows, keys)` and preserve the row count; derive per-view
+    /// randomness from [`PickKey::rng`]. Runs live on every delivery:
+    /// the tiers retain raw samples only, and each pick re-derives its
+    /// view — for a VRAM-pooled sample that is one upload and `k`
+    /// on-device realizations.
+    ///
+    /// [`PickKey`]: crate::data::PickKey
+    /// [`PickKey::rng`]: crate::data::PickKey::rng
+    pub fn transform(
+        mut self,
+        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> Result<Vec<Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.transform = Some(crate::data::TransformFn::new(f));
         self
     }
 
@@ -513,7 +569,22 @@ impl DataLoaderBuilder {
             disk_stage_bytes,
             disk_stage_dir,
             vram_pool_enabled,
+            no_shuffle,
+            augment,
+            transform,
         } = self;
+
+        // Augmentation is pick-space scheduling over the built-in
+        // samplers; a custom sampler owns its own index stream, so the
+        // combination has no defined meaning — error loudly.
+        if augment > 1 && sampler.is_some() {
+            return Err(TensorError::new(
+                "DataLoader: augment(k) composes with the built-in samplers only \
+                 (the schedule becomes a shuffle of len()*k picks). A custom \
+                 sampler owns its index stream; emit repeated indices from it \
+                 directly if you need multiplicity, or drop the custom sampler.",
+            ));
+        }
 
         // The off switch drops the loader-side handle; the adapter's
         // clone stays dormant (budget 0 = pure pass-through).
@@ -565,10 +636,23 @@ impl DataLoaderBuilder {
         // Wrap in Arc early so both paths can share it, and OOM fallback
         // from resident to streaming keeps the dataset alive.
         let dataset: Arc<dyn BatchDataSet> = Arc::from(dataset);
-        let shuffle = sampler.is_none();
+        let shuffle = sampler.is_none() && !no_shuffle;
+        // The schedule runs over PICKS: n samples × augment views,
+        // shuffled as one space so a sample's k views spread across
+        // the epoch instead of clustering.
+        let picks = n * augment;
+        let pick_ctx = PickCtx {
+            augment,
+            seed,
+            transform,
+        };
 
-        let sampler = sampler.unwrap_or_else(|| {
-            Box::new(RandomSampler::new(n, seed))
+        let sampler = sampler.unwrap_or_else(|| -> Box<dyn Sampler> {
+            if no_shuffle {
+                Box::new(SequentialSampler::new(picks))
+            } else {
+                Box::new(RandomSampler::new(picks, seed))
+            }
         });
 
         let user_set_depth = prefetch_depth.is_some();
@@ -577,23 +661,23 @@ impl DataLoaderBuilder {
         // model allocation. User override skips adaptive sizing.
         let streaming_depth = prefetch_depth.unwrap_or(BOOTSTRAP_PREFETCH);
         if use_resident {
-            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone()) {
+            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone(), pick_ctx.clone()) {
                 Ok(loader) => Ok(loader),
                 Err(e) if device.is_cuda() && e.is_cuda_oom() => {
                     // VRAM estimate was wrong, fall back to streaming.
                     // Recreate sampler since build_resident consumed it.
                     let sampler: Box<dyn Sampler> = if shuffle {
-                        Box::new(RandomSampler::new(n, seed))
+                        Box::new(RandomSampler::new(picks, seed))
                     } else {
-                        Box::new(SequentialSampler::new(n))
+                        Box::new(SequentialSampler::new(picks))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
         }
     }
 }
@@ -605,6 +689,7 @@ fn build_resident(
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 ) -> Result<DataLoader> {
     let n = dataset.len();
     let all_indices: Vec<usize> = (0..n).collect();
@@ -636,6 +721,7 @@ fn build_resident(
             sampler,
             drop_last,
             names,
+            pick_ctx,
         }),
     })
 }
@@ -658,6 +744,7 @@ fn build_streaming(
     disk_stage_dir: &Option<std::path::PathBuf>,
     vram_pool_enabled: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 ) -> Result<DataLoader> {
     // Local-disk overflow tier under the sample cache. Attached here,
     // not in build(): the resident path never reads through the cache,
@@ -675,8 +762,13 @@ fn build_streaming(
         }
     }
 
-    let worker =
-        PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth, vram_pool_enabled);
+    let worker = PrefetchWorker::new(
+        Arc::clone(&dataset),
+        device,
+        prefetch_depth,
+        vram_pool_enabled,
+        pick_ctx.augment,
+    );
     let (reserve, reserve_source) = match activation_reserve {
         Some(bytes) => (bytes, ReserveSource::User),
         None => (0, ReserveSource::Bare),
@@ -699,9 +791,11 @@ fn build_streaming(
             activation_reserve: reserve,
             reserve_source,
             governor: Arc::new(super::prefetch::GovernorCtl::new(prefetch_depth)),
+            pick_ctx,
         }),
     })
 }
+
 
 // ---------------------------------------------------------------------------
 // DataLoader
@@ -958,12 +1052,17 @@ pub(crate) struct ResidentLoader {
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 }
 
 impl ResidentLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
-        let indices = self.sampler.indices(epoch);
-        let n = indices.len();
+        // The sampler yields PICKS; the resident data is stored by
+        // sample id, so the gather runs on the decoded ids (the same
+        // sample id may appear several times in one batch — that is
+        // augmentation, and index_select handles repeats natively).
+        let picks = self.sampler.indices(epoch);
+        let n = picks.len();
         let bs = self.batch_size;
 
         // Compute batch boundaries
@@ -979,7 +1078,8 @@ impl ResidentLoader {
         }
 
         // Build index tensor on the target device (i64 for index_select)
-        let i64_indices: Vec<i64> = indices.iter().map(|&i| i as i64).collect();
+        let k = self.pick_ctx.augment.max(1) as i64;
+        let i64_indices: Vec<i64> = picks.iter().map(|&i| i as i64 / k).collect();
         let perm = Tensor::from_i64(
             &i64_indices,
             &[i64_indices.len() as i64],
@@ -994,6 +1094,9 @@ impl ResidentLoader {
                 batch_ranges,
                 pos: 0,
                 names: &self.names,
+                picks,
+                pick_ctx: &self.pick_ctx,
+                epoch,
             }),
         }
     }
@@ -1036,6 +1139,7 @@ pub(crate) struct StreamingLoader {
     /// the target is adjustable at any moment (epoch sizing, one-shot
     /// honest resize, `auto_resize`, worker OOM halving).
     governor: Arc<super::prefetch::GovernorCtl>,
+    pick_ctx: PickCtx,
 }
 
 impl StreamingLoader {
@@ -1160,6 +1264,8 @@ impl StreamingLoader {
                 batch_size: self.batch_size,
                 device: self.device,
                 vram_max_usage: self.vram_max_usage,
+                pick_ctx: &self.pick_ctx,
+                epoch,
             }),
         }
     }
@@ -1192,6 +1298,11 @@ struct ResidentEpochIter<'a> {
     batch_ranges: Vec<(usize, usize)>,
     pos: usize,
     names: &'a [String],
+    /// The epoch's pick stream (perm holds the decoded sample ids;
+    /// picks key the transform).
+    picks: Vec<usize>,
+    pick_ctx: &'a PickCtx,
+    epoch: usize,
 }
 
 struct StreamingEpochIter<'a> {
@@ -1208,6 +1319,8 @@ struct StreamingEpochIter<'a> {
     batch_size: usize,
     device: Device,
     vram_max_usage: f64,
+    pick_ctx: &'a PickCtx,
+    epoch: usize,
 }
 
 impl Drop for StreamingEpochIter<'_> {
@@ -1271,6 +1384,24 @@ impl<'a> ResidentEpochIter<'a> {
             }
         }
 
+        // Delivery transform: keyed per pick, on the freshly gathered
+        // rows (index_select allocates — resident data is never
+        // aliased into the batch).
+        if let Some(ref f) = self.pick_ctx.transform {
+            let batch_picks = &self.picks[start..start + len];
+            tensors = match crate::data::apply_transform(
+                f,
+                tensors,
+                batch_picks,
+                self.pick_ctx.augment,
+                self.epoch,
+                self.pick_ctx.seed,
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+
         Some(Ok(Batch::new(tensors, self.names.to_vec())))
     }
 }
@@ -1328,7 +1459,25 @@ impl StreamingEpochIter<'_> {
                         self.governor.target.store(depth.max(1), Ordering::Relaxed);
                     }
                 }
-                Some(Ok(Batch::new(batch.tensors, self.names.to_vec())))
+                // Delivery transform: after the copy event, so the ops
+                // are ordered against the async H2D; keyed by the
+                // batch's picks, on freshly assembled rows.
+                let tensors = if let Some(ref f) = self.pick_ctx.transform {
+                    match crate::data::apply_transform(
+                        f,
+                        batch.tensors,
+                        &batch.picks,
+                        self.pick_ctx.augment,
+                        self.epoch,
+                        self.pick_ctx.seed,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e)),
+                    }
+                } else {
+                    batch.tensors
+                };
+                Some(Ok(Batch::new(tensors, self.names.to_vec())))
             }
             Ok(Err(e)) => Some(Err(e)),
             Err(_) => {

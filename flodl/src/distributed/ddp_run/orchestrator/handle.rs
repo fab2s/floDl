@@ -330,7 +330,9 @@ impl DdpHandle {
                 // window decides the world size, not the config file),
                 // so everything it needs is captured here and sized
                 // there.
-                let dataset_len = dataset.len();
+                // Schedule space: picks (samples × augment views) — the
+                // coordinator's whole ledger runs in this space.
+                let dataset_len = dataset.len() * config.augment.max(1);
                 let coord_spec = crate::distributed::launcher::CoordSpec {
                     backend,
                     config_factory: Box::new(move |world_size| {
@@ -506,6 +508,8 @@ impl DdpHandle {
                 metrics_fn,
                 config.max_grad_norm,
                 config.vram_pool,
+                config.augment,
+                config.transform.clone(),
                 scheduler,
                 eval_fn,
                 eval_dataset,

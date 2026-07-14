@@ -9,7 +9,7 @@
 //! Custom samplers (weighted, stratified, curriculum learning) implement
 //! the [`Sampler`] trait directly.
 
-use crate::rng::Rng;
+
 
 /// Controls the order in which dataset indices are visited each epoch.
 ///
@@ -75,10 +75,7 @@ impl Sampler for RandomSampler {
     }
 
     fn indices(&mut self, epoch: usize) -> Vec<usize> {
-        let mut rng = Rng::seed(self.seed.wrapping_add(epoch as u64));
-        let mut idx: Vec<usize> = (0..self.n).collect();
-        rng.shuffle(&mut idx);
-        idx
+        crate::rng::epoch_permutation(self.seed, epoch, self.n)
     }
 }
 

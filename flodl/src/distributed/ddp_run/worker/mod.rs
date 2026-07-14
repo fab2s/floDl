@@ -171,6 +171,13 @@ pub struct GpuWorker<M: Module> {
     pub(super) partition: Vec<usize>,
     batch_size: usize,
     base_seed: u64,
+    /// Augmentation multiplicity: the partition is a PICK stream and a
+    /// pick decodes as `(pick / augment, pick % augment)`.
+    augment: usize,
+    /// Delivery transform, keyed per pick (see
+    /// [`crate::data::TransformFn`]). Applied after device transfer,
+    /// before the training step.
+    transform: Option<crate::data::TransformFn>,
 
     // -- Training state --
     local_step: usize,

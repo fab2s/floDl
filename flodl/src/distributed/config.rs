@@ -398,6 +398,15 @@ pub struct TrainerConfig<M: Module> {
     /// Sizing is automatic; `FLODL_VRAM_POOL=off` in a worker's `env:`
     /// block is the runtime kill-switch.
     pub vram_pool: bool,
+    /// Augmentation multiplicity: each sample appears `k` times per
+    /// epoch in the shared shuffle (pick space `dataset.len() * k`).
+    /// Pure scheduling — data variation comes exclusively from
+    /// [`Self::transform`], keyed per pick. Default: `1`.
+    pub augment: usize,
+    /// Deterministic delivery transform (the augmentation seam), keyed
+    /// by [`crate::data::PickKey`] and applied on each rank at its
+    /// delivery point, on freshly assembled raw rows. Default: `None`.
+    pub transform: Option<crate::data::TransformFn>,
     /// Cluster-mode stop threshold: how many ranks may be lost (spot
     /// reclaims, hardware, network) before the run is declared
     /// unrecoverable and survivors save-and-shutdown. `None` (default)
@@ -490,6 +499,8 @@ impl<M: Module> TrainerConfig<M> {
             elche: ElCheConfig::default(),
             max_grad_norm: None,
             vram_pool: true,
+            augment: 1,
+            transform: None,
             max_failure: None,
             checkpoint_every: None,
             save_path: None,
@@ -531,6 +542,21 @@ impl<M: Module> TrainerConfig<M> {
     /// Enable / disable the rank workers' device-resident sample pool
     /// (see [`Self::vram_pool`]).
     pub fn with_vram_pool(mut self, enabled: bool) -> Self { self.vram_pool = enabled; self }
+
+    /// Augmentation multiplicity (see [`Self::augment`]).
+    pub fn with_augment(mut self, k: usize) -> Self { self.augment = k.max(1); self }
+
+    /// Delivery transform (see [`Self::transform`]).
+    pub fn with_transform(
+        mut self,
+        f: impl Fn(Vec<crate::tensor::Tensor>, &[crate::data::PickKey]) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.transform = Some(crate::data::TransformFn::new(f));
+        self
+    }
 
     /// Set the outer optimizer (SlowMo / DiLoCo) applied to the consensus.
     /// The factory is invoked once per site (controller on CPU, per rank on

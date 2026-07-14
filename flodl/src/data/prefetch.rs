@@ -149,6 +149,10 @@ pub(crate) fn retry_on_oom<T>(
 /// A single prefetched batch, ready on the target device.
 pub(crate) struct PrefetchedBatch {
     pub tensors: Vec<Tensor>,
+    /// The batch's PICK stream (schedule-space): the consumer keys the
+    /// delivery transform from these. The rows themselves were fetched
+    /// and pooled by the decoded sample ids.
+    pub picks: Vec<usize>,
     /// Event recorded after async H2D copy. Consumer waits on this.
     #[cfg(feature = "cuda")]
     pub ready_event: Option<crate::distributed::cuda_event::CudaEvent>,
@@ -222,11 +226,12 @@ impl PrefetchWorker {
         device: Device,
         prefetch_depth: usize,
         vram_pool: bool,
+        augment: usize,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
 
         let handle = thread::spawn(move || {
-            worker_loop(dataset, device, cmd_rx, vram_pool);
+            worker_loop(dataset, device, cmd_rx, vram_pool, augment);
         });
 
         PrefetchWorker {
@@ -321,6 +326,7 @@ fn worker_loop(
     device: Device,
     cmd_rx: mpsc::Receiver<WorkerCmd>,
     vram_pool: bool,
+    augment: usize,
 ) {
     // Create a dedicated CUDA stream for H2D transfers (lives across epochs).
     #[cfg(feature = "cuda")]
@@ -347,7 +353,8 @@ fn worker_loop(
     let mut purity_probed = false;
     #[cfg(all(debug_assertions, not(test)))]
     let probe_purity = |probe: &[usize]| {
-        if let (Ok(a), Ok(b)) = (dataset.get_batch(probe), dataset.get_batch(probe)) {
+        let samples = crate::data::picks_to_samples(probe, augment);
+        if let (Ok(a), Ok(b)) = (dataset.get_batch(&samples), dataset.get_batch(&samples)) {
             crate::data::assert_fetch_pure("BatchDataSet::get_batch", &a, &b);
         }
     };
@@ -381,6 +388,7 @@ fn worker_loop(
                         &governor,
                         ring_slots,
                         &mut pool,
+                        augment,
                         #[cfg(feature = "cuda")]
                         copy_stream.as_ref(),
                     );
@@ -394,6 +402,7 @@ fn worker_loop(
                         &batch_tx,
                         &governor,
                         &mut pool,
+                        augment,
                         #[cfg(feature = "cuda")]
                         copy_stream.as_ref(),
                     );
@@ -431,6 +440,7 @@ fn worker_loop(
                                 fetch_and_transfer(
                                     &*dataset,
                                     &indices,
+                                    augment,
                                     device,
                                     pool,
                                     #[cfg(feature = "cuda")]
@@ -449,6 +459,7 @@ fn worker_loop(
                         fetch_and_transfer(
                             &*dataset,
                             &indices,
+                            augment,
                             device,
                             &mut pool,
                             #[cfg(feature = "cuda")]
@@ -485,6 +496,7 @@ fn run_single_stage_epoch(
     batch_tx: &mpsc::SyncSender<Result<PrefetchedBatch>>,
     governor: &GovernorCtl,
     pool: &mut VramSamplePool,
+    augment: usize,
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
 ) {
     let n = indices.len();
@@ -501,14 +513,18 @@ fn run_single_stage_epoch(
             break; // epoch abandoned
         }
 
-        let batch_indices = &indices[start..end];
+        // The schedule is picks; fetching and pooling key by the
+        // decoded sample ids.
+        let batch_picks = &indices[start..end];
+        let samples = crate::data::picks_to_samples(batch_picks, augment);
         start = end;
 
         // Fetch once (RAM-side, cannot OOM the device), then transfer
         // with the shared VRAM-pressure patience.
-        let result = dataset.get_batch(batch_indices).and_then(|tensors| {
+        let result = dataset.get_batch(&samples).and_then(|tensors| {
             pooled_transfer_with_retry(
-                batch_indices,
+                batch_picks,
+                &samples,
                 &tensors,
                 device,
                 governor,
@@ -541,13 +557,14 @@ fn run_two_stage_epoch(
     governor: &GovernorCtl,
     ring_slots: usize,
     pool: &mut VramSamplePool,
+    augment: usize,
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
 ) {
     let (ring_tx, ring_rx) =
         mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
     let reader_dataset = Arc::clone(dataset);
     let reader = thread::spawn(move || {
-        reader_loop(reader_dataset, indices, batch_size, drop_last, ring_tx);
+        reader_loop(reader_dataset, indices, batch_size, drop_last, ring_tx, augment);
     });
 
     loop {
@@ -564,15 +581,19 @@ fn run_two_stage_epoch(
         // Same transient-OOM patience as the single-stage path; only
         // the transfer half retries (the batch is already in RAM).
         let result = match cpu_batch {
-            Ok((batch_indices, tensors)) => pooled_transfer_with_retry(
-                &batch_indices,
-                &tensors,
-                device,
-                governor,
-                pool,
-                #[cfg(feature = "cuda")]
-                copy_stream,
-            ),
+            Ok((batch_picks, tensors)) => {
+                let samples = crate::data::picks_to_samples(&batch_picks, augment);
+                pooled_transfer_with_retry(
+                    &batch_picks,
+                    &samples,
+                    &tensors,
+                    device,
+                    governor,
+                    pool,
+                    #[cfg(feature = "cuda")]
+                    copy_stream,
+                )
+            }
             Err(e) => Err(e),
         };
 
@@ -600,6 +621,7 @@ fn reader_loop(
     batch_size: usize,
     drop_last: bool,
     ring_tx: mpsc::SyncSender<Result<(Vec<usize>, Vec<Tensor>)>>,
+    augment: usize,
 ) {
     let n = indices.len();
     let mut start = 0;
@@ -610,12 +632,15 @@ fn reader_loop(
             break;
         }
 
-        // Indices ride the ring with the rows: the transfer stage
-        // keys the device sample pool by them.
-        let batch_indices = &indices[start..end];
+        // PICKS ride the ring with the rows (the transfer stage keys
+        // the device sample pool by their decoded ids, the consumer
+        // keys the transform by the picks); the fetch itself runs on
+        // the decoded sample ids.
+        let batch_picks = &indices[start..end];
+        let samples = crate::data::picks_to_samples(batch_picks, augment);
         let result = dataset
-            .get_batch(batch_indices)
-            .map(|tensors| (batch_indices.to_vec(), tensors));
+            .get_batch(&samples)
+            .map(|tensors| (batch_picks.to_vec(), tensors));
         start = end;
 
         // Errors travel the ring like batches (the consumer surfaces
@@ -641,7 +666,8 @@ fn oom_backoff(governor: &GovernorCtl) {
 /// already at its floor, the sample pool gives a slab back — the last
 /// resort, so pool residency is never what keeps the pipeline OOMing.
 fn pooled_transfer_with_retry(
-    indices: &[usize],
+    picks: &[usize],
+    samples: &[usize],
     tensors: &[Tensor],
     device: Device,
     governor: &GovernorCtl,
@@ -650,7 +676,8 @@ fn pooled_transfer_with_retry(
 ) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return transfer_batch(
-            indices,
+            picks,
+            samples,
             tensors,
             device,
             pool,
@@ -664,7 +691,8 @@ fn pooled_transfer_with_retry(
         pool,
         |pool| {
             transfer_batch(
-                indices,
+                picks,
+                samples,
                 tensors,
                 device,
                 pool,
@@ -687,14 +715,17 @@ fn pooled_transfer_with_retry(
 /// thread.
 fn fetch_and_transfer(
     dataset: &dyn BatchDataSet,
-    indices: &[usize],
+    picks: &[usize],
+    augment: usize,
     device: Device,
     pool: &mut VramSamplePool,
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
-    let tensors = dataset.get_batch(indices)?;
+    let samples = crate::data::picks_to_samples(picks, augment);
+    let tensors = dataset.get_batch(&samples)?;
     transfer_batch(
-        indices,
+        picks,
+        &samples,
         &tensors,
         device,
         pool,
@@ -712,7 +743,8 @@ fn fetch_and_transfer(
 /// On a CPU target this is a pass-through (shallow clones: refcount
 /// bumps on shared storage, no data copy).
 fn transfer_batch(
-    indices: &[usize],
+    picks: &[usize],
+    samples: &[usize],
     tensors: &[Tensor],
     device: Device,
     pool: &mut VramSamplePool,
@@ -721,6 +753,7 @@ fn transfer_batch(
     if !device.is_cuda() {
         return Ok(PrefetchedBatch {
             tensors: tensors.to_vec(),
+            picks: picks.to_vec(),
             #[cfg(feature = "cuda")]
             ready_event: None,
         });
@@ -734,7 +767,7 @@ fn transfer_batch(
         if let Some(stream) = copy_stream {
             let _guard = StreamGuard::new(stream);
             let on_device =
-                assemble_on_device(indices, tensors, device, pool, /* async_copy */ true)?;
+                assemble_on_device(samples, tensors, device, pool, /* async_copy */ true)?;
 
             // Record completion event on the copy stream
             let event = CudaEvent::new(CudaEventFlags::DisableTiming)?;
@@ -742,26 +775,29 @@ fn transfer_batch(
 
             return Ok(PrefetchedBatch {
                 tensors: on_device,
+                picks: picks.to_vec(),
                 ready_event: Some(event),
             });
         }
 
         // Fallback: synchronous transfer (no stream available)
         let on_device =
-            assemble_on_device(indices, tensors, device, pool, /* async_copy */ false)?;
+            assemble_on_device(samples, tensors, device, pool, /* async_copy */ false)?;
         Ok(PrefetchedBatch {
             tensors: on_device,
+            picks: picks.to_vec(),
             ready_event: None,
         })
     }
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = indices;
+        let _ = samples;
         let _ = pool;
         // Without CUDA feature, just return CPU tensors
         Ok(PrefetchedBatch {
             tensors: tensors.to_vec(),
+            picks: picks.to_vec(),
         })
     }
 }

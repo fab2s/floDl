@@ -221,6 +221,15 @@ To build:
    compare per run/worker, inert under `cfg(test)` and in release builds).
 2. **Augmentation as deterministic repeated picks** — pick-keyed stateless RNG;
    the permutation carries the multiplicity; ElChe and `realized_work` unchanged.
+   *Shipped 2026-07-15*: `.augment(k)` (pick space `len()*k`, intrinsic decode
+   `pick / k` / `pick % k`) + `.transform(f)` keyed by
+   `PickKey { sample, repeat, epoch, seed }` with a frozen-constant stateless
+   RNG, on both the solo builder and `TrainerConfig`/`DdpBuilder`. The
+   permutation scheme was unified into one `epoch_permutation` home shared by
+   the solo sampler and the DDP partition expansion. The transform runs at
+   delivery on freshly assembled rows (tested: an in-place transform cannot
+   reach the retained raw bytes), and the flow window's drop-behind became
+   remaining-picks-aware (pop at the last advised pick).
 3. **Wire next-use eviction into the persistent tiers** — reuse the advisory the
    flow window already consumes; key eviction by remaining-picks-per-chunk.
    *RAM tier shipped 2026-07-14*: `SampleCache` slots became evictable
@@ -240,6 +249,11 @@ To build:
 4. **Pick-vs-chunk accounting** — the window/coverage math counts picks (so
    augmentation multiplicity is honored by `window ≤ epoch` and `batch_counts`),
    while residency budgets count distinct resident chunks.
+   *Shipped 2026-07-15, and it landed exactly as designed*: setting
+   `total_samples = len()*k` at the three schedule roots (rank entry,
+   single-host fallback, coordinator spec) was the entire accounting change —
+   ElChe, `realized_work`, the wire format, and coverage/resume needed no
+   edits. Residency stays keyed by decoded sample id at every tier.
 
 ## Findings resolved
 

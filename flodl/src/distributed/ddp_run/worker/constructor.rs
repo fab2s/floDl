@@ -209,11 +209,14 @@ impl<M: Module> GpuWorker<M> {
                 config.seed,
                 config.rank,
                 config.world_size,
+                config.augment,
             );
             (dataset, Some(stager))
         };
 
-        let total_batches = dataset.len() / config.batch_size.max(1);
+        // The epoch's work is picks (samples × augment views).
+        let total_batches =
+            dataset.len() * config.augment.max(1) / config.batch_size.max(1);
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() && total_batches > 1 {
             let sample = dataset.get_batch(&[0])?;
             let psb: usize = sample.iter().map(|t| t.nbytes()).sum();
@@ -251,6 +254,7 @@ impl<M: Module> GpuWorker<M> {
                 let pw = crate::data::prefetch::PrefetchWorker::new(
                     Arc::clone(&dataset), config.device, depth,
                     config.vram_pool && !pool_off,
+                    config.augment,
                 );
                 (Some(pw), psb)
             } else {
@@ -324,6 +328,8 @@ impl<M: Module> GpuWorker<M> {
             partition: Vec::new(), // filled by first StartEpoch from coordinator
             batch_size: config.batch_size,
             base_seed: config.seed,
+            augment: config.augment.max(1),
+            transform: config.transform.clone(),
             local_step: 0,
             nccl_sync_seq: 0,
             steps_since_avg: 0,

@@ -90,6 +90,22 @@ impl Rng {
     }
 }
 
+/// The epoch permutation every scheduling consumer shares: a
+/// deterministic shuffle of `0..picks` seeded by `seed + epoch`.
+/// `RandomSampler` (solo) and the coordinator's partition expansion
+/// (DDP) both call this — one scheme, one home — so the stager's warm
+/// hits and coverage-granular resume stay aligned with the training
+/// order by construction. The output is a stream of PICKS: with
+/// augmentation, `picks = samples * k` and a pick decodes as
+/// `(pick / k, pick % k)` = (sample, repeat); at `k = 1` picks and
+/// samples coincide and the scheme is byte-identical to what shipped.
+pub(crate) fn epoch_permutation(seed: u64, epoch: usize, picks: usize) -> Vec<usize> {
+    let mut rng = Rng::seed(seed.wrapping_add(epoch as u64));
+    let mut all: Vec<usize> = (0..picks).collect();
+    rng.shuffle(&mut all);
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +228,18 @@ mod tests {
         let std = var.sqrt();
         assert!((2.95..3.05).contains(&mean), "normal mean = {mean}");
         assert!((0.47..0.53).contains(&std), "normal std = {std}");
+    }
+
+    #[test]
+    fn epoch_permutation_matches_the_released_scheme() {
+        // The shared scheme must stay byte-identical to what shipped —
+        // coverage-granular resume and the stager's warm hits both
+        // depend on `Rng::seed(seed + epoch)` over `0..picks` exactly.
+        let (seed, epoch, n) = (42u64, 3usize, 100usize);
+        let mut rng = Rng::seed(seed.wrapping_add(epoch as u64));
+        let mut expected: Vec<usize> = (0..n).collect();
+        rng.shuffle(&mut expected);
+        assert_eq!(epoch_permutation(seed, epoch, n), expected);
     }
 
     #[test]

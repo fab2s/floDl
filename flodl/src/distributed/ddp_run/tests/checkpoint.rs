@@ -227,6 +227,8 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         initial_params: tmp_params,
         initial_buffers: tmp_buffers,
         total_samples: 16,
+        augment: 1,
+        transform: None,
         batch_size: 4,
         seed: 42,
         max_grad_norm: None,

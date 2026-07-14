@@ -88,7 +88,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::rng::Rng;
 use crate::tensor::{Device, Result, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -530,6 +529,16 @@ pub struct DdpRunConfig {
     /// worker's `env:` block is the runtime kill-switch. Default:
     /// `true`.
     pub vram_pool: bool,
+    /// Augmentation multiplicity: each sample appears `k` times per
+    /// epoch in the shared shuffle (pick space `len()*k`). Pure
+    /// scheduling — data variation comes from `transform`, keyed per
+    /// pick. Default: `1`.
+    pub augment: usize,
+    /// Deterministic delivery transform applied on each rank, keyed by
+    /// [`crate::data::PickKey`] — the sanctioned augmentation seam.
+    /// Runs at the worker's delivery point on freshly assembled rows;
+    /// the staging tiers retain raw samples only. Default: `None`.
+    pub transform: Option<crate::data::TransformFn>,
     /// Optional high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events (sync,
@@ -641,6 +650,8 @@ impl DdpRunConfig {
             progressive_dispatch: None,
             max_grad_norm: None,
             vram_pool: true,
+            augment: 1,
+            transform: None,
             timeline: None,
             lr_scale_ratio: 1.0,
             save_path: None,
@@ -831,6 +842,24 @@ impl DdpRunConfig {
     /// workers (see [`Self::vram_pool`]). Default: enabled.
     pub fn with_vram_pool(mut self, enabled: bool) -> Self {
         self.vram_pool = enabled;
+        self
+    }
+
+    /// Augmentation multiplicity (see [`Self::augment`]).
+    pub fn with_augment(mut self, k: usize) -> Self {
+        self.augment = k.max(1);
+        self
+    }
+
+    /// Delivery transform (see [`Self::transform`]).
+    pub fn with_transform(
+        mut self,
+        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> crate::tensor::Result<Vec<Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.transform = Some(crate::data::TransformFn::new(f));
         self
     }
 
@@ -1320,10 +1349,16 @@ pub struct WorkerConfig {
     pub initial_params: Vec<Tensor>,
     /// Initial buffer tensors in pinned CPU memory.
     pub initial_buffers: Vec<Tensor>,
-    /// Total number of samples in the dataset.
+    /// Total number of PICKS in an epoch (`dataset.len() * augment`) —
+    /// the schedule space every partition offset/size lives in.
     pub total_samples: usize,
-    /// Batch size.
+    /// Batch size (in picks).
     pub batch_size: usize,
+    /// Augmentation multiplicity (see [`DdpRunConfig::augment`]); a
+    /// pick decodes as `(pick / augment, pick % augment)`.
+    pub augment: usize,
+    /// Delivery transform (see [`DdpRunConfig::transform`]).
+    pub transform: Option<crate::data::TransformFn>,
     /// RNG base seed for deterministic shuffling; the epoch `e` permutation is
     /// `Rng::seed(seed + e)`. Defaults to [`SHUFFLE_BASE_SEED`] at every
     /// construction site.
@@ -1394,10 +1429,10 @@ fn make_partition(
     epoch: usize,
     seed: u64,
 ) -> Vec<usize> {
-    // Deterministic global shuffle (same seed = same permutation for all ranks)
-    let mut rng = Rng::seed(seed.wrapping_add(epoch as u64));
-    let mut all: Vec<usize> = (0..total).collect();
-    rng.shuffle(&mut all);
+    // Deterministic global shuffle (same seed = same permutation for
+    // all ranks) — the one scheme shared with the solo RandomSampler.
+    // `total` counts PICKS (samples × augment); see epoch_permutation.
+    let all = crate::rng::epoch_permutation(seed, epoch, total);
 
     // This rank's consecutive slice
     let end = (offset + size).min(total);

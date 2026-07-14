@@ -111,4 +111,4 @@ pub use graph::{
 };
 pub use worker::CpuWorker;
 #[cfg(feature = "rng")]
-pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, Batch};
+pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, Batch, PickKey, TransformFn};

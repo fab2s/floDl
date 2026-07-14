@@ -88,9 +88,11 @@ impl<M: Module> GpuWorker<M> {
         train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
     ) -> Result<bool> {
         self.current_epoch = plan.epoch;
+        // Pick space: the coordinator's offsets/sizes and this
+        // expansion must agree on `dataset.len() * augment` total.
         self.partition = make_partition(
             plan.partition_offset, plan.partition_size,
-            self.dataset.len(), plan.epoch, self.base_seed,
+            self.dataset.len() * self.augment.max(1), plan.epoch, self.base_seed,
         );
 
         let num_batches = self.partition.len() / self.batch_size;
@@ -279,7 +281,22 @@ impl<M: Module> GpuWorker<M> {
                     }
                 }
 
-                let (loss, ms) = self.train_step(&prefetched.tensors, train_fn)?;
+                // Delivery transform: after the copy dependency is
+                // installed, keyed by the batch's picks.
+                let tensors = if let Some(ref f) = self.transform {
+                    crate::data::apply_transform(
+                        f,
+                        prefetched.tensors,
+                        &prefetched.picks,
+                        self.augment,
+                        plan.epoch,
+                        self.base_seed,
+                    )?
+                } else {
+                    prefetched.tensors
+                };
+
+                let (loss, ms) = self.train_step(&tensors, train_fn)?;
                 compute_ms_diag += ms;
                 batch_done += 1;
                 total_loss += loss;
@@ -319,14 +336,29 @@ impl<M: Module> GpuWorker<M> {
             while batch_idx < self.partition.len() / self.batch_size {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
-                let indices = &self.partition[start..end];
+                // The partition is a PICK stream; fetch by the decoded
+                // sample ids, key the transform by the picks.
+                let picks = &self.partition[start..end];
+                let samples = crate::data::picks_to_samples(picks, self.augment);
                 let data_start = Instant::now();
-                let batch = self.dataset.get_batch(indices)?;
+                let batch = self.dataset.get_batch(&samples)?;
 
                 let batch: Vec<Tensor> = if self.device.is_cuda() {
                     batch.into_iter()
                         .map(|t| t.to_device(self.device))
                         .collect::<Result<Vec<_>>>()?
+                } else {
+                    batch
+                };
+                let batch: Vec<Tensor> = if let Some(ref f) = self.transform {
+                    crate::data::apply_transform(
+                        f,
+                        batch,
+                        picks,
+                        self.augment,
+                        plan.epoch,
+                        self.base_seed,
+                    )?
                 } else {
                     batch
                 };

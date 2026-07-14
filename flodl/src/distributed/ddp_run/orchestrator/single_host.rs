@@ -46,6 +46,8 @@ impl DdpHandle {
         metrics_fn: Option<MetricsFn>,
         max_grad_norm: Option<f64>,
         vram_pool: bool,
+        augment: usize,
+        transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
         eval_fn: Option<EvalFn<M>>,
         eval_dataset: Option<Arc<dyn BatchDataSet>>,
@@ -61,7 +63,8 @@ impl DdpHandle {
     {
         crate::verbose!("  ddp: single device ({device:?}) | no coordination");
 
-        let total_samples = dataset.len();
+        // Schedule space: picks (samples × augment views).
+        let total_samples = dataset.len() * augment.max(1);
         let tmp_model = model_factory(device)?;
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
@@ -94,6 +97,8 @@ impl DdpHandle {
             initial_buffers,
             total_samples,
             batch_size,
+            augment: augment.max(1),
+            transform,
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
             vram_pool,

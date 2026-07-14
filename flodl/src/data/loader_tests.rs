@@ -850,6 +850,129 @@
     }
 
     #[test]
+    fn test_augment_schedules_k_views_per_sample() {
+        // augment(2) on 8 samples, batch 4: an epoch is 16 picks = 4
+        // batches, and every sample id appears exactly twice — the
+        // realized-work constant is the augmented permutation length.
+        for streaming in [false, true] {
+            let mut b = DataLoader::from_dataset(SequentialData { n: 8 })
+                .batch_size(4)
+                .augment(2);
+            if streaming {
+                b = b.streaming();
+            }
+            let mut loader = b.build().unwrap();
+            assert_eq!(loader.is_resident(), !streaming);
+
+            let mut counts: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            let mut batches = 0;
+            for batch in loader.epoch(0) {
+                for v in batch.unwrap()[0].to_f64_vec().unwrap() {
+                    *counts.entry(v as usize).or_insert(0) += 1;
+                }
+                batches += 1;
+            }
+            assert_eq!(batches, 4, "streaming={streaming}: 16 picks / 4");
+            assert_eq!(counts.len(), 8, "streaming={streaming}");
+            assert!(
+                counts.values().all(|&c| c == 2),
+                "streaming={streaming}: each sample exactly k views: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transform_keys_views_and_reproduces() {
+        // The transform derives each view from its PickKey: with
+        // augment(2) and offset = repeat*100, every sample shows up
+        // once raw and once shifted — and the whole realized stream is
+        // identical across loaders (deterministic augmentation).
+        let build = || {
+            DataLoader::from_dataset(SequentialData { n: 8 })
+                .batch_size(4)
+                .streaming()
+                .augment(2)
+                .transform(|rows, keys| {
+                    let offs: Vec<f32> =
+                        keys.iter().map(|k| k.repeat as f32 * 100.0).collect();
+                    let o = Tensor::from_f32(
+                        &offs,
+                        &[offs.len() as i64, 1],
+                        Device::CPU,
+                    )?;
+                    Ok(vec![rows[0].add(&o)?])
+                })
+                .build()
+                .unwrap()
+        };
+        let collect = |loader: &mut DataLoader| -> Vec<f64> {
+            let mut out = Vec::new();
+            for batch in loader.epoch(0) {
+                out.extend(batch.unwrap()[0].to_f64_vec().unwrap());
+            }
+            out
+        };
+        let (mut l1, mut l2) = (build(), build());
+        let (v1, v2) = (collect(&mut l1), collect(&mut l2));
+        assert_eq!(v1, v2, "same config = identical realized stream");
+
+        let mut got: Vec<i64> = v1.iter().map(|&x| x as i64).collect();
+        got.sort_unstable();
+        let mut expected: Vec<i64> = (0..8).flat_map(|i| [i, i + 100]).collect();
+        expected.sort_unstable();
+        assert_eq!(got, expected, "one raw view + one shifted view per sample");
+    }
+
+    #[test]
+    fn test_transform_never_writes_back_to_the_tiers() {
+        // An in-place transform on the delivered rows must not corrupt
+        // the retained raw samples: batch assembly materializes fresh
+        // storage, so every epoch shows exactly ONE application, never
+        // accumulation through the sample cache.
+        let mut loader = DataLoader::from_dataset(SequentialData { n: 8 })
+            .batch_size(4)
+            .streaming()
+            .transform(|rows, _keys| {
+                rows[0].add_scalar_(1000.0)?;
+                Ok(rows)
+            })
+            .build()
+            .unwrap();
+        for epoch in 0..3 {
+            let mut vals: Vec<i64> = Vec::new();
+            for batch in loader.epoch(epoch) {
+                vals.extend(
+                    batch.unwrap()[0]
+                        .to_f64_vec()
+                        .unwrap()
+                        .into_iter()
+                        .map(|v| v as i64),
+                );
+            }
+            vals.sort_unstable();
+            assert_eq!(
+                vals,
+                (1000..1008).collect::<Vec<_>>(),
+                "epoch {epoch}: exactly one application on raw bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_augment_rejects_custom_sampler() {
+        let result = DataLoader::from_dataset(SequentialData { n: 8 })
+            .batch_size(4)
+            .sampler(Box::new(SequentialSampler::new(8)))
+            .augment(2)
+            .build();
+        match result {
+            Err(e) => assert!(format!("{e}").contains("augment")),
+            Ok(_) => panic!("augment + custom sampler must error loudly"),
+        }
+    }
+
+    #[test]
     fn test_resident_prefetch_depth_is_zero() {
         let data = SequentialData { n: 20 };
         let mut loader = DataLoader::from_dataset(data)
@@ -1577,7 +1700,7 @@
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false, 1);
         let governor = Arc::new(GovernorCtl::new(4));
         governor.begin_epoch(4);
 
@@ -1610,7 +1733,7 @@
 
         let device = test_device();
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 20 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), device, 8, true);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), device, 8, true, 1);
         let governor = Arc::new(GovernorCtl::new(4));
         // The honest probe has "fired": the pool may take its budget
         // decision at the first batch.
@@ -1656,7 +1779,7 @@
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 10 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false, 1);
         let governor = Arc::new(GovernorCtl::new(8));
         governor.begin_epoch(8);
 
@@ -1692,7 +1815,7 @@
         use std::sync::Arc;
 
         let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 20 });
-        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false);
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false, 1);
         let governor = Arc::new(GovernorCtl::new(4));
         governor.begin_epoch(4);
 

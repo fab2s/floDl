@@ -210,6 +210,162 @@ pub trait BatchDataSet: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Picks: augmentation as repeated indices + the keyed transform seam
+// ---------------------------------------------------------------------------
+
+/// The identity of one scheduled use of a sample — the key the
+/// transform seam derives its per-view randomness from.
+///
+/// With `.augment(k)` every sample appears `k` times per epoch in the
+/// shuffled schedule; each appearance is one *pick*, and `repeat` says
+/// which of the `k` views this delivery is. The same `(sample, repeat,
+/// epoch, seed)` always keys the same bytes — augmentation stays
+/// deterministic and reproducible, statistically equivalent to
+/// per-call randomness without ever violating the raw-sample purity
+/// contract on [`DataSet::get`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PickKey {
+    /// Sample (chunk) id — what the staging tiers key by.
+    pub sample: usize,
+    /// Which of the epoch's `k` views of this sample, in `0..k`.
+    pub repeat: u32,
+    /// Epoch number.
+    pub epoch: u64,
+    /// The run's shuffle seed.
+    pub seed: u64,
+}
+
+impl PickKey {
+    pub(crate) fn from_pick(pick: usize, augment: usize, epoch: u64, seed: u64) -> Self {
+        let k = augment.max(1);
+        PickKey {
+            sample: pick / k,
+            repeat: (pick % k) as u32,
+            epoch,
+            seed,
+        }
+    }
+
+    /// A deterministic RNG unique to this pick: same key, same stream,
+    /// every run. The mixing constants are frozen — checkpointed runs
+    /// reproduce their augmentation across flodl versions.
+    pub fn rng(&self) -> crate::rng::Rng {
+        let mut h = self
+            .seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(self.epoch.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        h ^= (self.sample as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^= u64::from(self.repeat).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        h ^= h >> 33;
+        crate::rng::Rng::seed(h)
+    }
+}
+
+type TransformInner = dyn Fn(Vec<Tensor>, &[PickKey]) -> Result<Vec<Tensor>> + Send + Sync;
+
+/// The deterministic per-batch transform applied at delivery — the
+/// sanctioned home for augmentation. Receives the delivered rows (raw,
+/// already on the target device, freshly assembled — never aliasing
+/// the staging tiers) and one [`PickKey`] per row; must be a pure
+/// function of `(rows, keys)` and preserve the row count. Runs live on
+/// every delivery: retained tiers hold raw samples only, and each pick
+/// re-derives its view. Construct via the `transform(..)` builder
+/// setters (or [`TransformFn::new`]).
+#[derive(Clone)]
+pub struct TransformFn(std::sync::Arc<TransformInner>);
+
+impl TransformFn {
+    pub fn new(
+        f: impl Fn(Vec<Tensor>, &[PickKey]) -> Result<Vec<Tensor>> + Send + Sync + 'static,
+    ) -> Self {
+        TransformFn(std::sync::Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for TransformFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransformFn(..)")
+    }
+}
+
+/// Decode a pick stream into the sample (chunk) ids the data plane
+/// fetches and stages by. At `augment = 1` this is the identity.
+pub(crate) fn picks_to_samples(picks: &[usize], augment: usize) -> Vec<usize> {
+    let k = augment.max(1);
+    if k == 1 {
+        return picks.to_vec();
+    }
+    picks.iter().map(|&p| p / k).collect()
+}
+
+/// Apply the delivery transform: build one key per pick and hand the
+/// batch over. Callers pass the PICK stream (not decoded sample ids).
+pub(crate) fn apply_transform(
+    transform: &TransformFn,
+    tensors: Vec<Tensor>,
+    picks: &[usize],
+    augment: usize,
+    epoch: usize,
+    seed: u64,
+) -> Result<Vec<Tensor>> {
+    let keys: Vec<PickKey> = picks
+        .iter()
+        .map(|&p| PickKey::from_pick(p, augment, epoch as u64, seed))
+        .collect();
+    // Determinism probe (debug builds, once per process): the same
+    // keys must yield the same bytes — a transform drawing from global
+    // RNG instead of `PickKey::rng` silently breaks reproducibility
+    // and the seed-computable-ahead property the data plane relies on.
+    // Inputs are deep-copied first (the transform may mutate in place).
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TRANSFORM_PROBED: AtomicBool = AtomicBool::new(false);
+        if !TRANSFORM_PROBED.swap(true, Ordering::Relaxed) {
+            if let (Ok(c1), Ok(c2)) = (deep_copy_rows(&tensors), deep_copy_rows(&tensors)) {
+                if let (Ok(a), Ok(b)) =
+                    ((transform.0)(c1, &keys), (transform.0)(c2, &keys))
+                {
+                    let identical = a.len() == b.len()
+                        && a.iter().zip(&b).all(|(x, y)| tensor_identical(x, y));
+                    assert!(
+                        identical,
+                        "flodl data: the delivery transform returned different \
+                         content for the same PickKeys. It must be a pure \
+                         function of (rows, keys) — derive per-view randomness \
+                         from PickKey::rng(), never from global RNG state, or \
+                         augmentation stops being reproducible and the \
+                         schedule stops being computable ahead. This probe \
+                         runs in debug builds only."
+                    );
+                }
+            }
+        }
+    }
+    (transform.0)(tensors, &keys)
+}
+
+/// Owned deep copies for the determinism probe: the transform may
+/// mutate its input in place, so each probe application needs its own
+/// storage.
+#[cfg(all(debug_assertions, not(test)))]
+fn deep_copy_rows(rows: &[Tensor]) -> Result<Vec<Tensor>> {
+    rows.iter()
+        .map(|t| {
+            let out = Tensor::empty(
+                &t.shape(),
+                crate::tensor::TensorOptions {
+                    dtype: t.dtype(),
+                    device: t.device(),
+                },
+            )?;
+            out.copy_(t, false)?;
+            Ok(out)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Purity probe (debug builds)
 // ---------------------------------------------------------------------------
 
@@ -522,6 +678,33 @@ impl std::fmt::Debug for Batch {
 mod tests {
     use super::*;
     use crate::tensor::test_opts;
+
+    #[test]
+    fn pick_key_decode_and_rng_determinism() {
+        // Intrinsic decode: pick / k = sample, pick % k = repeat.
+        let k = PickKey::from_pick(7, 3, 5, 42);
+        assert_eq!((k.sample, k.repeat), (2, 1));
+        // k = 1: picks and samples coincide, repeat is always 0.
+        let k1 = PickKey::from_pick(7, 1, 5, 42);
+        assert_eq!((k1.sample, k1.repeat), (7, 0));
+
+        // Same key = same stream, every run.
+        let mut r1 = PickKey::from_pick(7, 3, 5, 42).rng();
+        let mut r2 = PickKey::from_pick(7, 3, 5, 42).rng();
+        let a: Vec<f64> = (0..8).map(|_| r1.f64()).collect();
+        let b: Vec<f64> = (0..8).map(|_| r2.f64()).collect();
+        assert_eq!(a, b);
+
+        // Any component change = a different stream (repeat here: the
+        // whole point of keyed views).
+        let mut r3 = PickKey {
+            repeat: 2,
+            ..PickKey::from_pick(7, 3, 5, 42)
+        }
+        .rng();
+        let c: Vec<f64> = (0..8).map(|_| r3.f64()).collect();
+        assert_ne!(a, c);
+    }
 
     #[test]
     #[cfg(debug_assertions)]

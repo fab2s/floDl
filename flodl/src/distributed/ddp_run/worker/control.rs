@@ -201,7 +201,9 @@ impl<M: Module> GpuWorker<M> {
                 let extra = make_partition(
                     partition_offset,
                     partition_size,
-                    self.dataset.len(),
+                    // Pick space: must agree with the coordinator's
+                    // ledger and run_epoch_plan's own expansion.
+                    self.dataset.len() * self.augment.max(1),
                     self.current_epoch,
                     self.base_seed,
                 );

@@ -180,7 +180,8 @@ impl DdpHandle {
 
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
-        let total_samples = dataset.len();
+        // Schedule space: picks (samples × augment views).
+        let total_samples = dataset.len() * config.augment.max(1);
 
         let fires_callbacks =
             rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
@@ -419,6 +420,8 @@ impl DdpHandle {
                 initial_buffers,
                 total_samples,
                 batch_size,
+                augment: config.augment.max(1),
+                transform: config.transform.clone(),
                 // On resume, read the shuffle seed from the checkpoint meta so
                 // this rank reproduces the recorded epoch permutation exactly;
                 // a fresh run falls back to SHUFFLE_BASE_SEED. The coordinator

@@ -55,6 +55,10 @@ struct StreamEntry {
     /// smaller = needed sooner. Refreshed on each advisory; entries
     /// absent from the new stream get `usize::MAX` (evicted first).
     next_use: usize,
+    /// Picks of this sample remaining in the advised horizon. `take`
+    /// decrements and only pops at the last one — plain pop-on-hit is
+    /// the multiplicity-1 special case. Re-keyed per advisory.
+    remaining: usize,
 }
 
 impl StreamPool {
@@ -79,10 +83,18 @@ impl StreamPool {
         self.entries.len()
     }
 
-    /// Pop-on-hit: consumption IS the drop-behind. The frontier passed
-    /// this sample; its slot goes to the lookahead.
+    /// Consumption: decrement the sample's remaining advised picks and
+    /// pop at the last one — the frontier fully passed this sample and
+    /// its slot goes to the lookahead. A sample with picks still ahead
+    /// (augmentation repeats, cross-epoch reappearance) stays resident
+    /// and serves a clone.
     pub(crate) fn take(&mut self, index: usize) -> Option<Vec<Tensor>> {
-        let entry = self.entries.remove(&index)?;
+        let entry = self.entries.get_mut(&index)?;
+        if entry.remaining > 1 {
+            entry.remaining -= 1;
+            return Some(entry.rows.clone());
+        }
+        let entry = self.entries.remove(&index).expect("just found");
         self.bytes -= entry.bytes;
         Some(entry.rows)
     }
@@ -90,8 +102,15 @@ impl StreamPool {
     /// Admit with next-use-priority eviction: make room by evicting
     /// strictly-farther entries; decline when the pool is full of
     /// sooner-needed samples (the caller pauses rather than fetching
-    /// past a full window). `false` = declined.
-    pub(crate) fn offer(&mut self, index: usize, rows: Vec<Tensor>, next_use: usize) -> bool {
+    /// past a full window). `remaining` = the sample's picks in the
+    /// advised horizon (1 without augmentation). `false` = declined.
+    pub(crate) fn offer(
+        &mut self,
+        index: usize,
+        rows: Vec<Tensor>,
+        next_use: usize,
+        remaining: usize,
+    ) -> bool {
         let bytes: usize = rows.iter().map(|t| t.nbytes()).sum();
         if bytes > self.budget {
             return false;
@@ -119,17 +138,24 @@ impl StreamPool {
                 rows,
                 bytes,
                 next_use,
+                remaining: remaining.max(1),
             },
         );
         true
     }
 
-    /// Re-key every held entry's next-use position against a fresh
-    /// advised stream (called per advisory). Absent entries get
-    /// `usize::MAX`: not in the visible future, first to go.
-    pub(crate) fn refresh_positions(&mut self, positions: &HashMap<usize, usize>) {
+    /// Re-key every held entry's next-use position and remaining picks
+    /// against a fresh advised stream (called per advisory). Absent
+    /// entries get `usize::MAX` / 1: not in the visible future, first
+    /// to go, popped on the next hit.
+    pub(crate) fn refresh_positions(
+        &mut self,
+        positions: &HashMap<usize, usize>,
+        counts: &HashMap<usize, usize>,
+    ) {
         for (idx, entry) in self.entries.iter_mut() {
             entry.next_use = positions.get(idx).copied().unwrap_or(usize::MAX);
+            entry.remaining = counts.get(idx).copied().unwrap_or(1).max(1);
         }
     }
 
@@ -376,6 +402,7 @@ pub(crate) fn spawn_stager(
     base_seed: u64,
     rank: usize,
     world_size: usize,
+    augment: usize,
 ) -> StagerHandle {
     let (tx, rx) = mpsc::channel::<StageAdvisory>();
     let staged = Arc::new(AtomicUsize::new(0));
@@ -390,6 +417,7 @@ pub(crate) fn spawn_stager(
             base_seed,
             rank,
             world_size,
+            augment,
             &staged_in_thread,
         );
     });
@@ -460,9 +488,14 @@ fn stager_loop(
     base_seed: u64,
     rank: usize,
     world_size: usize,
+    augment: usize,
     staged: &AtomicUsize,
 ) {
     let dataset_len = dataset.len();
+    // Advisory spans live in PICK space (samples × augment); the tiers
+    // key by the decoded sample ids.
+    let k = augment.max(1);
+    let pick_total = dataset_len * k;
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // Stream position of the queue front (the next-use priority key).
     let mut pos: usize = 0;
@@ -474,6 +507,9 @@ fn stager_loop(
     // re-snapshotted per advisory against the fresh stream.
     let mut victims: std::collections::VecDeque<(usize, usize)> =
         std::collections::VecDeque::new();
+    // Remaining advised picks per sample (this advisory's horizon);
+    // prices the flow window's retention.
+    let mut sample_counts: HashMap<usize, usize> = HashMap::new();
 
     loop {
         // Latest advisory wins: drain the inbox.
@@ -529,32 +565,43 @@ fn stager_loop(
                     queue.extend(make_partition(
                         offset,
                         size,
-                        dataset_len,
+                        pick_total,
                         epoch,
                         base_seed,
                     ));
                 }
             }
             // Re-key the flow window's next-use priorities against the
-            // fresh stream (first occurrence wins).
+            // fresh stream, per decoded SAMPLE: first occurrence =
+            // next-use, occurrence count = remaining picks in the
+            // horizon (augmentation repeats + cross-epoch reuse).
             let mut positions: HashMap<usize, usize> = HashMap::new();
-            for (i, &idx) in queue.iter().enumerate() {
-                positions.entry(idx).or_insert(i);
+            let mut counts: HashMap<usize, usize> = HashMap::new();
+            for (i, &pick) in queue.iter().enumerate() {
+                let sample = pick / k;
+                positions.entry(sample).or_insert(i);
+                *counts.entry(sample).or_insert(0) += 1;
             }
             if let Ok(mut p) = stream.lock() {
                 p.set_budget(stream_budget);
-                p.refresh_positions(&positions);
+                p.refresh_positions(&positions, &counts);
             }
             // Same re-key for the pinned tier: snapshot its residents
             // against the fresh stream so admission under pressure can
             // evict in next-use order (prior-epoch leftovers first).
             victims = stale_pinned_victims(&cache, &positions);
+            sample_counts = counts;
         }
 
         match queue.front().copied() {
-            Some(idx) => {
+            Some(pick) => {
+                // The queue walks picks; the tiers key by sample.
+                let idx = pick / k;
                 // Already staged in either tier: cheap skip, which is
-                // what makes the per-window stream re-walk affordable.
+                // what makes the per-window stream re-walk affordable
+                // (and what makes augmentation repeats free: the bytes
+                // are resident once, every later pick of the sample
+                // skips here).
                 let in_stream = stream.lock().map(|p| p.contains(idx)).unwrap_or(false);
                 if cache.contains_ram(idx) || in_stream {
                     queue.pop_front();
@@ -603,7 +650,9 @@ fn stager_loop(
                     }
                     if !cache.contains_ram(idx) {
                         if let Ok(mut p) = stream.lock() {
-                            let _ = p.offer(idx, batch, pos);
+                            let remaining =
+                                sample_counts.get(&idx).copied().unwrap_or(1);
+                            let _ = p.offer(idx, batch, pos, remaining);
                         }
                     }
                     staged.fetch_add(1, Ordering::Relaxed);
@@ -686,17 +735,17 @@ mod tests {
         let mut pool = StreamPool::new();
         pool.set_budget(8); // two 4-byte rows
 
-        assert!(pool.offer(10, row(10.0), 5));
-        assert!(pool.offer(11, row(11.0), 9));
+        assert!(pool.offer(10, row(10.0), 5, 1));
+        assert!(pool.offer(11, row(11.0), 9, 1));
         assert_eq!(pool.len(), 2);
 
         // Nearer sample evicts the farthest-needed entry (11 @ 9).
-        assert!(pool.offer(12, row(12.0), 2));
+        assert!(pool.offer(12, row(12.0), 2, 1));
         assert_eq!(pool.len(), 2);
         assert!(pool.contains(10) && pool.contains(12));
 
         // Farther than everything held: declined.
-        assert!(!pool.offer(13, row(13.0), 20));
+        assert!(!pool.offer(13, row(13.0), 20, 1));
         assert!(!pool.has_room_for(4, 20));
         assert!(pool.has_room_for(4, 1), "room by evicting a farther entry");
 
@@ -704,23 +753,51 @@ mod tests {
         let r = pool.take(12).unwrap();
         assert_eq!(r[0].to_f64_vec().unwrap(), vec![12.0]);
         assert!(!pool.contains(12));
-        assert!(pool.offer(13, row(13.0), 20), "room after the frontier passed");
+        assert!(pool.offer(13, row(13.0), 20, 1), "room after the frontier passed");
     }
 
     #[test]
     fn stream_pool_refresh_rekeys_next_use() {
         let mut pool = StreamPool::new();
         pool.set_budget(8);
-        assert!(pool.offer(1, row(1.0), 3));
-        assert!(pool.offer(2, row(2.0), 4));
+        assert!(pool.offer(1, row(1.0), 3, 1));
+        assert!(pool.offer(2, row(2.0), 4, 1));
 
         // New advised stream: sample 2 recurs at position 0, sample 1
         // vanished (consumed, not visible ahead) → MAX, evicted first.
         let positions: HashMap<usize, usize> = [(2usize, 0usize)].into_iter().collect();
-        pool.refresh_positions(&positions);
-        assert!(pool.offer(3, row(3.0), 7));
+        pool.refresh_positions(&positions, &HashMap::new());
+        assert!(pool.offer(3, row(3.0), 7, 1));
         assert!(!pool.contains(1), "vanished-from-stream entry evicted first");
         assert!(pool.contains(2), "soonest-recurring entry kept");
+    }
+
+    #[test]
+    fn stream_pool_retains_until_last_advised_pick() {
+        // With augmentation a sample has several picks in the advised
+        // horizon: consumption decrements and only the LAST advised
+        // pick pops — plain pop-on-hit is the multiplicity-1 case.
+        let mut pool = StreamPool::new();
+        pool.set_budget(8);
+
+        assert!(pool.offer(1, row(1.0), 3, 2));
+        let first = pool.take(1).unwrap();
+        assert_eq!(first[0].to_f64_vec().unwrap(), vec![1.0]);
+        assert!(pool.contains(1), "one advised pick left: retained");
+        let second = pool.take(1).unwrap();
+        assert_eq!(second[0].to_f64_vec().unwrap(), vec![1.0]);
+        assert!(!pool.contains(1), "last pick pops (drop-behind)");
+
+        // A fresh advisory re-keys remaining for the next horizon.
+        assert!(pool.offer(2, row(2.0), 0, 1));
+        let positions: HashMap<usize, usize> = [(2usize, 1usize)].into_iter().collect();
+        let counts: HashMap<usize, usize> = [(2usize, 3usize)].into_iter().collect();
+        pool.refresh_positions(&positions, &counts);
+        let _ = pool.take(2).unwrap();
+        let _ = pool.take(2).unwrap();
+        assert!(pool.contains(2), "re-keyed to 3 picks: two takes retain");
+        let _ = pool.take(2).unwrap();
+        assert!(!pool.contains(2));
     }
 
     #[test]
@@ -795,7 +872,7 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1);
+        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.
