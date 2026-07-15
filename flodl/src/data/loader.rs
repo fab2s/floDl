@@ -52,42 +52,6 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
 /// at `epoch()` time when free VRAM reflects actual model allocation.
 const BOOTSTRAP_PREFETCH: usize = 4;
 
-/// Compute prefetch depth from VRAM usage cap.
-///
-/// `max_usage` is the fraction of **total** VRAM to use (default 0.90).
-/// The prefetch budget is the gap between current usage and the cap,
-/// minus `activation_reserve` bytes reserved for forward/backward
-/// activation memory and gradients.
-///
-/// Called at each `epoch()` boundary. By that point the model, optimizer,
-/// and any other allocations are done, so current usage is the real baseline.
-pub(crate) fn prefetch_depth_from_vram(
-    per_sample_bytes: usize,
-    batch_size: usize,
-    device: Device,
-    max_usage: f64,
-    activation_reserve: usize,
-) -> usize {
-    if !device.is_cuda() {
-        return 2; // CPU: just double-buffer
-    }
-
-    let batch_bytes = per_sample_bytes * batch_size;
-    if batch_bytes == 0 {
-        return 2;
-    }
-
-    let idx = device.index() as i32;
-    // The probe returns (used, total) — used first, not free.
-    let (used, total) = crate::tensor::cuda_memory_info_idx(idx)
-        .unwrap_or((u64::MAX, 0));
-
-    let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
-    let budget = cap.saturating_sub(used as usize + activation_reserve);
-
-    budget / batch_bytes
-}
-
 /// Where the streaming loader's activation reserve came from. Decides
 /// how much of the computed budget the FIRST fill may take: before the
 /// first training step, the VRAM probe cannot see activations,
@@ -118,76 +82,14 @@ pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> u
     (full_depth / divisor).max(1)
 }
 
-/// Reader-ring size when host RAM cannot be measured (non-Linux) or
-/// batches cannot be priced: small enough to be safe anywhere, still
-/// enough to pipeline reads against transfers and absorb some jitter.
-pub(crate) const RING_SLOTS_FALLBACK: usize = 4;
-
-/// Reader-ring ceiling while the sample cache is active. The ring is a
-/// flow buffer: its value is jitter absorption, which saturates after
-/// a handful of batches, while every byte the retained tier (sample
-/// cache) holds pays again on every later epoch. So when both compete
-/// for the RAM budget, the ring is capped here and the cache gets the
-/// rest.
-pub(crate) const RING_SLOTS_WITH_CACHE: usize = 8;
-
-/// Reader-ring capacity (in batches) for the two-stage prefetch
-/// pipeline, from the host RAM budget.
-///
-/// `ram_max_usage` is the fraction of currently **available** host RAM
-/// the reader may claim (default 0.50, contrast with VRAM's 0.90: the
-/// host runs everything else too). `available` is `MemAvailable` from
-/// [`crate::sys::mem_info`]: it already excludes every other process on
-/// the box, including permanent fixtures (pinned VM memory, hugepages)
-/// that a total-anchored cap would misread as transient pressure. The
-/// budget is a slice of what is actually free, priced in batches, and
-/// self-adjusts at each `epoch()` probe as the box fills or drains.
-///
-/// Returns `0` (single-stage pipeline) when the reader stage is
-/// disabled (`ram_max_usage <= 0.0`) or the budget cannot fit even one
-/// batch. Capped at the epoch's batch count: buffering past the epoch
-/// buys nothing until cross-epoch prefetch lands.
-pub(crate) fn ring_slots_from_ram(
-    per_sample_bytes: usize,
-    batch_size: usize,
-    ram_max_usage: f64,
-    available: Option<u64>,
-    epoch_batches: usize,
-) -> usize {
-    if ram_max_usage <= 0.0 {
-        return 0;
-    }
-    let Some(available) = available else {
-        return RING_SLOTS_FALLBACK.min(epoch_batches);
-    };
-    let batch_bytes = per_sample_bytes.saturating_mul(batch_size) as u64;
-    if batch_bytes == 0 {
-        return RING_SLOTS_FALLBACK.min(epoch_batches);
-    }
-    let budget = (available as f64 * ram_max_usage.min(0.90)) as u64;
-    (budget / batch_bytes).min(epoch_batches as u64) as usize
-}
-
-/// Sample-cache RAM budget: the same available-RAM share as the ring,
-/// recomputed from the live probe at each epoch boundary.
-///
-/// Bytes the cache already holds are no longer "available" to the
-/// probe, so they are added back before taking the share — the cap
-/// stays anchored to the total the run started with, not to what is
-/// left after admissions. Adding the FULL held bytes back after taking
-/// the share (`held + r*available`) is the ratchet to avoid: each
-/// epoch's cap then exceeds the held bytes by a share of the
-/// remainder, and the fixed point is all of MemAvailable. The ring's
-/// slice comes off the top.
-pub(crate) fn sample_cache_budget(
-    available: u64,
-    held_bytes: u64,
-    ring_bytes: u64,
-    ram_max_usage: f64,
-) -> u64 {
-    let total = available.saturating_add(held_bytes);
-    ((total as f64 * ram_max_usage.min(0.90)) as u64).saturating_sub(ring_bytes)
-}
+// Budget policy (ring sizing, cache budget, prefetch depth) lives in
+// `data::budget` — one law shared with the DDP worker/stager paths.
+// Re-exported here for this module's call sites and its test file.
+pub(crate) use super::budget::{
+    prefetch_depth_from_vram, ring_slots_from_ram, sample_cache_budget, RING_SLOTS_WITH_CACHE,
+};
+#[cfg(test)]
+pub(crate) use super::budget::RING_SLOTS_FALLBACK;
 
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder

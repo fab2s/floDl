@@ -68,6 +68,17 @@ const MARGIN_BYTES: u64 = 512 << 20;
 /// as used) rights the target for good.
 pub(crate) const FLOW_RESERVE_BATCHES: u64 = 16;
 
+/// The flow-buffer reserve carved out of free VRAM when the pool sizes
+/// itself: the in-flight channel's claim, capped at
+/// [`FLOW_RESERVE_BATCHES`]. THE single definition — both budget-signal
+/// paths (governor-gated solo [`VramSamplePool::maybe_install`] and the
+/// coordinator-paced worker's explicit install) price the reserve
+/// through it, so the channel and the pool can never disagree on who
+/// owns the free VRAM.
+pub(crate) fn flow_reserve_bytes(in_flight_depth: u64, batch_bytes: u64) -> u64 {
+    in_flight_depth.min(FLOW_RESERVE_BATCHES) * batch_bytes
+}
+
 /// One allocation unit of the pool: per data position, a device tensor
 /// of `[rows, ...sample_dims]`; `used` rows are filled so far.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -153,7 +164,7 @@ impl VramSamplePool {
             .target
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(1) as u64;
-        self.install_with_reserve(target.min(FLOW_RESERVE_BATCHES) * batch_bytes);
+        self.install_with_reserve(flow_reserve_bytes(target, batch_bytes));
     }
 
     /// One-shot budget decision from an explicit in-flight reserve, for

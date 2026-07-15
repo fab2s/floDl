@@ -539,6 +539,16 @@ pub struct DdpRunConfig {
     /// Runs at the worker's delivery point on freshly assembled rows;
     /// the staging tiers retain raw samples only. Default: `None`.
     pub transform: Option<crate::data::TransformFn>,
+    /// Fraction of **total** VRAM each rank worker may use for its data
+    /// plane (prefetch channel + device sample pool), clamped to
+    /// `[0.50, 0.99]` at the sizing sites. Default: `0.90` (the solo
+    /// loader's `vram_max_usage` default).
+    pub vram_max_usage: f64,
+    /// Fraction of currently **available** host RAM each rank's staging
+    /// tiers may retain (co-hosted ranks split it consumption-
+    /// proportionally); `0.0` disables staging retention. Default:
+    /// `0.50` (the solo loader's `ram_max_usage` default).
+    pub ram_max_usage: f64,
     /// Optional high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events (sync,
@@ -652,6 +662,8 @@ impl DdpRunConfig {
             vram_pool: true,
             augment: 1,
             transform: None,
+            vram_max_usage: 0.90,
+            ram_max_usage: 0.50,
             timeline: None,
             lr_scale_ratio: 1.0,
             save_path: None,
@@ -860,6 +872,20 @@ impl DdpRunConfig {
             + 'static,
     ) -> Self {
         self.transform = Some(crate::data::TransformFn::new(f));
+        self
+    }
+
+    /// VRAM share for each rank's data plane (see
+    /// [`Self::vram_max_usage`]).
+    pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {
+        self.vram_max_usage = max_usage.clamp(0.50, 0.99);
+        self
+    }
+
+    /// Host-RAM share for each rank's staging tiers (see
+    /// [`Self::ram_max_usage`]).
+    pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.ram_max_usage = max_usage.clamp(0.0, 0.90);
         self
     }
 
@@ -1369,6 +1395,12 @@ pub struct WorkerConfig {
     /// [`DdpRunConfig::vram_pool`]). `FLODL_VRAM_POOL=off` overrides at
     /// runtime.
     pub vram_pool: bool,
+    /// VRAM share for this worker's data plane (see
+    /// [`DdpRunConfig::vram_max_usage`]).
+    pub vram_max_usage: f64,
+    /// Host-RAM share for this worker's staging tiers (see
+    /// [`DdpRunConfig::ram_max_usage`]).
+    pub ram_max_usage: f64,
     /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
     /// local params with averaged consensus on the cpu-async path (current
     /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]

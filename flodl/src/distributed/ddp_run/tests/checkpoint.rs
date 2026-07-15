@@ -229,6 +229,8 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         total_samples: 16,
         augment: 1,
         transform: None,
+        vram_max_usage: 0.90,
+        ram_max_usage: 0.50,
         batch_size: 4,
         seed: 42,
         max_grad_norm: None,

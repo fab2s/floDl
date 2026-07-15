@@ -508,6 +508,8 @@ impl DdpHandle {
                 metrics_fn,
                 config.max_grad_norm,
                 config.vram_pool,
+                config.vram_max_usage,
+                config.ram_max_usage,
                 config.augment,
                 config.transform.clone(),
                 scheduler,

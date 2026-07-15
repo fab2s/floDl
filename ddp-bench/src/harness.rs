@@ -695,6 +695,14 @@ fn run_unified(
     if config.augment > 1 {
         builder = builder.augment(config.augment);
     }
+    // Data-plane memory knobs (unified budget policy A/B levers).
+    // Unset preserves the library defaults (0.90 / 0.50).
+    if let Some(f) = config.vram_max_usage {
+        builder = builder.vram_max_usage(f);
+    }
+    if let Some(f) = config.ram_max_usage {
+        builder = builder.ram_max_usage(f);
+    }
     if config.augment_noise > 0.0 {
         let sigma = config.augment_noise as f32;
         builder = builder.transform(move |mut rows, keys| {

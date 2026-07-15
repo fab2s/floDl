@@ -304,6 +304,8 @@ let cfg = TrainerConfig::new(dataset)
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
+| `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` — same knob as the solo loader's `vram_max_usage`. |
+| `.with_ram_max_usage(f)` | `f64` | Fraction of available host RAM each rank's staging tiers may retain; co-hosted ranks split it in proportion to their schedule share. Default `0.50`, clamped to `[0.0, 0.90]`; `0.0` disables staging retention. Same knob as the solo loader's `ram_max_usage`. |
 | `.with_augment(k)` | `usize` | Views per sample per epoch: the schedule becomes `len()*k` picks, sharded and balanced exactly like samples. Data variation comes from the transform. |
 | `.with_transform(f)` | closure | Deterministic delivery transform, keyed by `PickKey { sample, repeat, epoch, seed }` per row; runs on each rank after device transfer. The chained `DdpBuilder` twins are `.augment(k)` / `.transform(f)`. See the [data-loading tutorial](tutorials/13-data-loading.md#augmentation-repeated-picks--a-keyed-transform). |
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |

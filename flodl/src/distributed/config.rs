@@ -407,6 +407,17 @@ pub struct TrainerConfig<M: Module> {
     /// by [`crate::data::PickKey`] and applied on each rank at its
     /// delivery point, on freshly assembled raw rows. Default: `None`.
     pub transform: Option<crate::data::TransformFn>,
+    /// Fraction of **total** VRAM each rank worker may use for its
+    /// data plane (prefetch channel + device sample pool), clamped to
+    /// `[0.50, 0.99]`. Default `0.90` — same knob and default as
+    /// `DataLoaderBuilder::vram_max_usage` on the solo path.
+    pub vram_max_usage: f64,
+    /// Fraction of currently **available** host RAM (`MemAvailable`)
+    /// each rank's staging tiers may retain, clamped to `[0.0, 0.90]`;
+    /// co-hosted ranks split the share consumption-proportionally.
+    /// `0.0` disables staging. Default `0.50` — same knob and default
+    /// as `DataLoaderBuilder::ram_max_usage` on the solo path.
+    pub ram_max_usage: f64,
     /// Cluster-mode stop threshold: how many ranks may be lost (spot
     /// reclaims, hardware, network) before the run is declared
     /// unrecoverable and survivors save-and-shutdown. `None` (default)
@@ -501,6 +512,8 @@ impl<M: Module> TrainerConfig<M> {
             vram_pool: true,
             augment: 1,
             transform: None,
+            vram_max_usage: 0.90,
+            ram_max_usage: 0.50,
             max_failure: None,
             checkpoint_every: None,
             save_path: None,
@@ -545,6 +558,19 @@ impl<M: Module> TrainerConfig<M> {
 
     /// Augmentation multiplicity (see [`Self::augment`]).
     pub fn with_augment(mut self, k: usize) -> Self { self.augment = k.max(1); self }
+
+    /// VRAM share for each rank's data plane (see [`Self::vram_max_usage`]).
+    pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {
+        self.vram_max_usage = max_usage.clamp(0.50, 0.99);
+        self
+    }
+
+    /// Host-RAM share for each rank's staging tiers (see
+    /// [`Self::ram_max_usage`]).
+    pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
 
     /// Delivery transform (see [`Self::transform`]).
     pub fn with_transform(

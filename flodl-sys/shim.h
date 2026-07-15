@@ -50,6 +50,7 @@ int flodl_dtype(FlodlTensor t);
 int flodl_device_type(FlodlTensor t);
 int flodl_device_index(FlodlTensor t);
 int64_t flodl_numel(FlodlTensor t);
+int64_t flodl_storage_nbytes(FlodlTensor t);
 
 // --- Data access ---
 

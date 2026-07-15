@@ -210,6 +210,7 @@ impl<M: Module> GpuWorker<M> {
                 config.rank,
                 config.world_size,
                 config.augment,
+                config.ram_max_usage,
             );
             (dataset, Some(stager))
         };
@@ -217,12 +218,18 @@ impl<M: Module> GpuWorker<M> {
         // The epoch's work is picks (samples × augment views).
         let total_batches =
             dataset.len() * config.augment.max(1) / config.batch_size.max(1);
+        // Device sample pool switch: builder/config knob AND the
+        // `FLODL_VRAM_POOL=off` runtime kill-switch (A/B runs).
+        let pool_off = std::env::var("FLODL_VRAM_POOL")
+            .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+            .unwrap_or(false);
+        let vram_pool_enabled = config.vram_pool && !pool_off;
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() && total_batches > 1 {
             let sample = dataset.get_batch(&[0])?;
             let psb: usize = sample.iter().map(|t| t.nbytes()).sum();
             drop(sample);
             let depth = crate::data::prefetch_depth_from_vram(
-                psb, config.batch_size, config.device, 0.90, 0,
+                psb, config.batch_size, config.device, config.vram_max_usage, 0,
             ).min(512);
             crate::debug!(
                 "  ddp-worker: rank {} constructor prefetch sizing: psb={} depth={} (used, total)={:?}",
@@ -236,11 +243,7 @@ impl<M: Module> GpuWorker<M> {
                 // governor, so the worker signals the pool's budget
                 // moment itself at the first post-calibration plan
                 // boundary (activation peak measured = the honest
-                // probe). `FLODL_VRAM_POOL=off` is the runtime
-                // kill-switch for A/B runs.
-                let pool_off = std::env::var("FLODL_VRAM_POOL")
-                    .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
-                    .unwrap_or(false);
+                // probe).
                 if config.vram_pool && pool_off {
                     crate::verbose!(
                         "  ddp-worker: rank {} vram pool disabled (FLODL_VRAM_POOL=off)",
@@ -249,11 +252,11 @@ impl<M: Module> GpuWorker<M> {
                 }
                 crate::debug!(
                     "  ddp-worker: rank {} prefetch depth={} vram_pool={}",
-                    config.rank, depth, config.vram_pool && !pool_off
+                    config.rank, depth, vram_pool_enabled
                 );
                 let pw = crate::data::prefetch::PrefetchWorker::new(
                     Arc::clone(&dataset), config.device, depth,
-                    config.vram_pool && !pool_off,
+                    vram_pool_enabled,
                     config.augment,
                 );
                 (Some(pw), psb)
@@ -349,8 +352,12 @@ impl<M: Module> GpuWorker<M> {
             prefetch,
             stager,
             per_sample_bytes,
+            vram_max_usage: config.vram_max_usage,
             activation_peak_bytes: 0,
-            vram_pool_budget_sent: false,
+            // Nothing to signal when the pool is off: pre-latch so the
+            // install boundary (and its flow-reserve depth collapse)
+            // never runs for a disabled pool.
+            vram_pool_budget_sent: !vram_pool_enabled,
             max_grad_norm: config.max_grad_norm,
             // EASGD elastic blending is an Async-only concept: Sync and
             // Cadence MUST full-overwrite to the consensus each window. Gate

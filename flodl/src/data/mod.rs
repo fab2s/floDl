@@ -43,6 +43,7 @@ pub mod sampler;
 pub mod loader;
 pub mod datasets;
 pub mod records;
+pub(crate) mod budget;
 pub(crate) mod prefetch;
 pub(crate) mod sample_cache;
 pub(crate) mod vram_pool;
@@ -50,7 +51,7 @@ pub(crate) mod vram_pool;
 pub use sampler::{Sampler, RandomSampler, SequentialSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
 pub use records::FixedStrideRecords;
-pub(crate) use loader::prefetch_depth_from_vram;
+pub(crate) use budget::prefetch_depth_from_vram;
 
 use crate::tensor::{Result, Tensor};
 

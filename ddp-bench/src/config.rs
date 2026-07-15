@@ -255,4 +255,11 @@ pub struct RunConfig {
     /// Per-view additive input-noise amplitude (`--augment-noise`),
     /// installed as a PickKey-keyed delivery transform. 0.0 = off.
     pub augment_noise: f64,
+    /// VRAM share for each rank's data plane (`--vram-max-usage`).
+    /// `None` preserves the library default (0.90).
+    pub vram_max_usage: Option<f64>,
+    /// Host-RAM share for each rank's staging tiers
+    /// (`--ram-max-usage`). `None` preserves the library default
+    /// (0.50).
+    pub ram_max_usage: Option<f64>,
 }

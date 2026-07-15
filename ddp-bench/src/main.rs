@@ -214,6 +214,20 @@ struct Cli {
     #[option]
     augment_noise: Option<f64>,
 
+    /// Fraction of total VRAM each rank's data plane may use (flodl
+    /// `.vram_max_usage`, clamped to [0.50, 0.99]). Default 0.90.
+    /// A/B lever for the unified budget policy.
+    #[option]
+    vram_max_usage: Option<f64>,
+
+    /// Fraction of available host RAM each rank's staging tiers may
+    /// retain (flodl `.ram_max_usage`, clamped to [0.0, 0.90]);
+    /// co-hosted ranks split it by schedule share. Default 0.50; 0.0
+    /// disables staging retention. A/B lever for the unified budget
+    /// policy.
+    #[option]
+    ram_max_usage: Option<f64>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -839,6 +853,8 @@ fn run() -> flodl::tensor::Result<()> {
                 gamma: cli.gamma.unwrap_or(1.0),
                 augment: cli.augment.unwrap_or(1).max(1),
                 augment_noise: cli.augment_noise.unwrap_or(0.0),
+                vram_max_usage: cli.vram_max_usage,
+                ram_max_usage: cli.ram_max_usage,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

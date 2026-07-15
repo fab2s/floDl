@@ -228,6 +228,20 @@ extern "C" int64_t flodl_numel(FlodlTensor t) {
     }
 }
 
+extern "C" int64_t flodl_storage_nbytes(FlodlTensor t) {
+    try {
+    const auto& tensor = unwrap(t);
+    if (!tensor.has_storage()) {
+        return tensor.numel() * tensor.element_size();
+    }
+    return static_cast<int64_t>(tensor.storage().nbytes());
+    } catch (const std::exception& e) {
+        flodl_fatal("flodl_storage_nbytes", e.what());
+    } catch (...) {
+        flodl_fatal("flodl_storage_nbytes", nullptr);
+    }
+}
+
 // --- Data access ---
 
 extern "C" char* flodl_copy_data(FlodlTensor t, void* buffer,

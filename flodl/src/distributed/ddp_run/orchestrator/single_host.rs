@@ -46,6 +46,8 @@ impl DdpHandle {
         metrics_fn: Option<MetricsFn>,
         max_grad_norm: Option<f64>,
         vram_pool: bool,
+        vram_max_usage: f64,
+        ram_max_usage: f64,
         augment: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
@@ -102,6 +104,8 @@ impl DdpHandle {
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
             vram_pool,
+            vram_max_usage,
+            ram_max_usage,
             // Single-GPU fallback never goes through the cpu-async load_averaged
             // path, so EASGD alpha is irrelevant here. None keeps the
             // current-behavior copy_ path in case the code path changes.

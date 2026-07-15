@@ -364,6 +364,8 @@ implement the trait and pass it.
 | `.names(&[&str])` | Positional | Name batch tensor positions |
 | `.drop_last(bool)` | true | Drop incomplete final batch |
 
+Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vram_max_usage` / `with_ram_max_usage` (or the chained `DdpBuilder` twins `.vram_max_usage()` / `.ram_max_usage()`) — and govern each rank's prefetch channel, device sample pool, and staging tiers with the same defaults and clamps. One sizing policy serves both paths; co-hosted ranks split the host-RAM share in proportion to their schedule.
+
 ## DataLoader methods
 
 | Method | Description |

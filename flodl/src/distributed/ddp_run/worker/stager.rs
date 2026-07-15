@@ -78,6 +78,13 @@ impl StreamPool {
         self.entries.contains_key(&index)
     }
 
+    /// Bytes currently retained; anchors the per-advisory budget probe
+    /// (held bytes are added back to `MemAvailable` before taking the
+    /// share — see [`crate::data::budget::anchored_ram_budget`]).
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -104,6 +111,11 @@ impl StreamPool {
     /// sooner-needed samples (the caller pauses rather than fetching
     /// past a full window). `remaining` = the sample's picks in the
     /// advised horizon (1 without augmentation). `false` = declined.
+    ///
+    /// Retention is priced by [`crate::data::budget::retain_rows`] —
+    /// same law as the pinned tier: oversized views are materialized
+    /// rather than pinning a transient backing buffer for the window's
+    /// lifetime, kept views are charged their full storage bytes.
     pub(crate) fn offer(
         &mut self,
         index: usize,
@@ -111,7 +123,9 @@ impl StreamPool {
         next_use: usize,
         remaining: usize,
     ) -> bool {
-        let bytes: usize = rows.iter().map(|t| t.nbytes()).sum();
+        let Ok((rows, bytes)) = crate::data::budget::retain_rows(&rows) else {
+            return false;
+        };
         if bytes > self.budget {
             return false;
         }
@@ -339,30 +353,42 @@ impl Drop for StagerHandle {
     }
 }
 
-/// The stager's RAM budget: half of the host's currently available
-/// RAM (`MemAvailable`), split consumption-proportionally among the
-/// ranks sharing this host: `budget_i ∝ rate_i` gives every rank the
-/// same seconds of lookahead (equal time, not equal bytes).
-/// Available-based rather than total-anchored, so permanent fixtures
-/// (pinned VM memory, hugepages) never read as transient pressure and
-/// the budget self-adjusts per advisory as training allocates.
-/// Co-hosted ranks come from the cluster envelope when present;
-/// without one (thread DDP, single host without an envelope) every
-/// rank is assumed co-hosted, the conservative reading. `0` = do not
-/// stage.
-fn stager_ram_budget(rank: usize, world_size: usize, counts: &[usize]) -> usize {
+/// The stager's RAM budget: this rank's consumption share of the
+/// host's anchored `MemAvailable` budget — the same law and the same
+/// `ram_max_usage` knob as the solo loader (default 0.50), see
+/// [`crate::data::budget::stager_ram_budget`]. `held_bytes` (what this
+/// rank's tiers already retain) anchors the share so the budget does
+/// not self-collapse as the tiers fill. The consumption-proportional
+/// split (`budget_i ∝ rate_i`) gives every rank the same seconds of
+/// lookahead (equal time, not equal bytes). Available-based rather
+/// than total-anchored, so permanent fixtures (pinned VM memory,
+/// hugepages) never read as transient pressure. Co-hosted ranks come
+/// from the cluster envelope when present; without one (thread DDP,
+/// single host without an envelope) every rank is assumed co-hosted,
+/// the conservative reading. `0` = do not stage.
+fn stager_ram_budget(
+    rank: usize,
+    world_size: usize,
+    counts: &[usize],
+    ram_max_usage: f64,
+    held_bytes: u64,
+) -> usize {
     let Some(m) = crate::sys::mem_info() else {
         return 0;
     };
-    let headroom = m.available_bytes / 2;
-
     let local_ranks: Vec<usize> = crate::distributed::cluster::LocalCluster::from_env()
         .ok()
         .flatten()
         .map(|c| c.worker.ranks.clone())
         .unwrap_or_else(|| (0..world_size).collect());
     let share = host_share(rank, &local_ranks, counts);
-    usize::try_from((headroom as f64 * share) as u64).unwrap_or(usize::MAX)
+    usize::try_from(crate::data::budget::stager_ram_budget(
+        m.available_bytes,
+        held_bytes,
+        ram_max_usage,
+        share,
+    ))
+    .unwrap_or(usize::MAX)
 }
 
 /// This rank's fraction of its host's staging budget: its schedule
@@ -395,6 +421,7 @@ fn host_share(rank: usize, local_ranks: &[usize], counts: &[usize]) -> f64 {
 /// (latest wins, checked between samples). The tier budget installs on
 /// the first advisory; if the host has no headroom the thread exits
 /// and staging stays off.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_stager(
     dataset: Arc<dyn BatchDataSet>,
     cache: Arc<SampleCache>,
@@ -403,6 +430,7 @@ pub(crate) fn spawn_stager(
     rank: usize,
     world_size: usize,
     augment: usize,
+    ram_max_usage: f64,
 ) -> StagerHandle {
     let (tx, rx) = mpsc::channel::<StageAdvisory>();
     let staged = Arc::new(AtomicUsize::new(0));
@@ -418,6 +446,7 @@ pub(crate) fn spawn_stager(
             rank,
             world_size,
             augment,
+            ram_max_usage,
             &staged_in_thread,
         );
     });
@@ -489,6 +518,7 @@ fn stager_loop(
     rank: usize,
     world_size: usize,
     augment: usize,
+    ram_max_usage: f64,
     staged: &AtomicUsize,
 ) {
     let dataset_len = dataset.len();
@@ -500,7 +530,12 @@ fn stager_loop(
     // Stream position of the queue front (the next-use priority key).
     let mut pos: usize = 0;
     let mut pinned_budget: usize = 0;
-    // Learned from the first staged sample; prices the room checks.
+    // Running max of retained sample cost, re-priced after every
+    // fetch; prices the room checks. A max (not first-seen) keeps the
+    // checks conservative on variable-size datasets (NLP sequences,
+    // mixed resolutions): a small first sample must not let the walk
+    // fetch large later ones that no tier can retain — at most one
+    // fetch is spent per new maximum.
     let mut sample_bytes: usize = 0;
     let mut pending: Option<StageAdvisory> = None;
     // Pinned-tier eviction candidates, farthest-next-use first;
@@ -523,15 +558,19 @@ fn stager_loop(
 
         if let Some(a) = pending.take() {
             // Budget refresh rides the advisory (which rides the reduce
-            // clock): live host headroom × this rank's consumption
-            // share among co-hosted ranks, split between the pinned
-            // tier and the flow window. A shrink stops new admissions;
-            // retained content drops only through next-use eviction —
+            // clock): live host headroom, anchored by what the tiers
+            // already retain, × this rank's consumption share among
+            // co-hosted ranks, split between the pinned tier and the
+            // flow window. A shrink stops new admissions; retained
+            // content drops only through next-use eviction —
             // farthest-first, in favor of sooner-needed samples — never
             // as a blanket flush.
-            let share = stager_ram_budget(rank, world_size, &a.counts);
-            let stream_budget = share / 4;
-            pinned_budget = share - stream_budget;
+            let held =
+                cache.bytes() as u64 + stream.lock().map(|p| p.bytes() as u64).unwrap_or(0);
+            let share =
+                stager_ram_budget(rank, world_size, &a.counts, ram_max_usage, held);
+            let (pinned, stream_budget) = crate::data::budget::split_stager_budget(share);
+            pinned_budget = pinned;
             cache.set_budget(pinned_budget);
             let advised: usize = a
                 .segments
@@ -645,9 +684,8 @@ fn stager_loop(
                 // the training path's to surface (same source) — the
                 // stager moves on.
                 if let Ok(batch) = dataset.get_batch(&[idx]) {
-                    if sample_bytes == 0 {
-                        sample_bytes = batch.iter().map(|t| t.nbytes()).sum();
-                    }
+                    sample_bytes = sample_bytes
+                        .max(crate::data::budget::retained_cost_estimate(&batch));
                     if !cache.contains_ram(idx) {
                         if let Ok(mut p) = stream.lock() {
                             let remaining =
@@ -872,7 +910,7 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1);
+        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.

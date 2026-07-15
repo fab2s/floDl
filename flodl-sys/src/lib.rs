@@ -86,6 +86,7 @@ unsafe extern "C" {
     pub fn flodl_device_type(t: FlodlTensor) -> i32;
     pub fn flodl_device_index(t: FlodlTensor) -> i32;
     pub fn flodl_numel(t: FlodlTensor) -> i64;
+    pub fn flodl_storage_nbytes(t: FlodlTensor) -> i64;
 
     // --- Data access ---
 

@@ -57,7 +57,9 @@ pub(crate) struct SampleCache {
     /// refill it. Reads take the slot's read lock — uncontended on the
     /// training path, since writers are the staging side.
     slots: Vec<std::sync::RwLock<Option<Vec<Tensor>>>>,
-    /// Bytes currently retained (sum of cached samples' nbytes).
+    /// Bytes currently retained (sum of cached samples' retained cost —
+    /// see [`crate::data::budget::retain_rows`]: storage bytes for kept
+    /// views, logical bytes for materialized ones).
     bytes: AtomicUsize,
     /// Admission ceiling in bytes. Includes already-retained bytes:
     /// the per-epoch refresh computes `bytes() + headroom`, so a
@@ -151,7 +153,10 @@ impl SampleCache {
         let Some(sample) = guard.take() else {
             return 0;
         };
-        let freed: usize = sample.iter().map(|t| t.nbytes()).sum();
+        // Free exactly what admission charged: the same pricing on the
+        // same stored rows (materialized rows own their storage, kept
+        // views were charged their full storage bytes).
+        let freed = crate::data::budget::retained_cost_estimate(&sample);
         self.bytes.fetch_sub(freed, Ordering::Relaxed);
         freed
     }
@@ -186,8 +191,9 @@ impl SampleCache {
     /// Cached tensors share storage with every clone handed out; the
     /// adapter's stacking path only reads them (`copy_` out of the
     /// sample into the batch row), never mutates. Datasets returning
-    /// views into their own buffers cache the view (no byte
-    /// duplication; `nbytes` accounting is conservative).
+    /// views get [`crate::data::budget::retain_rows`] pricing: views
+    /// with oversized backing storage are materialized at admission,
+    /// the rest are cached as views and charged their storage bytes.
     ///
     /// A disk-tier READ error propagates (the pack file is ours; a
     /// failed read is a real disk problem the user must see). Disk
@@ -230,18 +236,26 @@ impl SampleCache {
     /// overflow to the local-disk tier when RAM declines (at most once
     /// per sample), so later reads hit disk speed instead of source
     /// speed.
+    ///
+    /// Retention is priced by [`crate::data::budget::retain_rows`]:
+    /// oversized views are materialized (never pin a transient backing
+    /// buffer many times their size), everything else is charged its
+    /// full storage bytes. A failed materializing copy declines the
+    /// admission rather than retain unpriced bytes.
     pub(crate) fn admit(&self, index: usize, sample: &[Tensor]) {
         let mut ram_admitted = false;
         if let Some(slot) = self.slots.get(index) {
-            let sample_bytes: usize = sample.iter().map(|t| t.nbytes()).sum();
-            if self.bytes.load(Ordering::Relaxed) + sample_bytes
+            let estimate = crate::data::budget::retained_cost_estimate(sample);
+            if self.bytes.load(Ordering::Relaxed) + estimate
                 <= self.budget.load(Ordering::Relaxed)
             {
-                let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
-                if guard.is_none() {
-                    *guard = Some(sample.to_vec());
-                    self.bytes.fetch_add(sample_bytes, Ordering::Relaxed);
-                    ram_admitted = true;
+                if let Ok((rows, cost)) = crate::data::budget::retain_rows(sample) {
+                    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(rows);
+                        self.bytes.fetch_add(cost, Ordering::Relaxed);
+                        ram_admitted = true;
+                    }
                 }
             }
         }
@@ -557,6 +571,41 @@ mod tests {
         assert_eq!(fetches, 3, "budget 0: nothing retained, every call fetches");
         assert_eq!(cache.bytes(), 0);
         assert_eq!(cache.cached_count(), 0);
+    }
+
+    #[test]
+    fn admit_materializes_oversized_views_and_prices_honestly() {
+        let cache = SampleCache::new(4);
+        cache.set_budget(1 << 20);
+
+        // A 32-byte row viewing a 256-byte buffer: retaining the view
+        // would pin the whole buffer while `nbytes` claims 32 — the
+        // F3 under-count. Admission must materialize and charge the
+        // logical size.
+        let base = Tensor::from_f32(
+            &(0..64).map(|i| i as f32).collect::<Vec<_>>(),
+            &[8, 8],
+            Device::CPU,
+        )
+        .unwrap();
+        let row = base.select(0, 1).unwrap();
+        assert!(row.storage_nbytes() >= 256);
+
+        cache.admit(0, std::slice::from_ref(&row));
+        assert_eq!(cache.bytes(), 32, "charged logical bytes, not the view");
+        let got = cache.lookup(0).unwrap().unwrap();
+        assert_eq!(
+            got[0].storage_nbytes(),
+            32,
+            "stored copy owns its storage (base buffer not pinned)"
+        );
+        assert_eq!(
+            got[0].to_f64_vec().unwrap(),
+            row.to_f64_vec().unwrap(),
+            "materialized bytes match the view"
+        );
+        assert_eq!(cache.evict(0), 32, "eviction frees what admission charged");
+        assert_eq!(cache.bytes(), 0);
     }
 
     #[test]

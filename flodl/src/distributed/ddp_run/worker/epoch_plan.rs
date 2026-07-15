@@ -143,16 +143,30 @@ impl<M: Module> GpuWorker<M> {
         //
         // If activation peak hasn't been measured yet, force depth=0 (sync
         // fallback) so the first chunk can calibrate safely.
+        let install_pool_budget = !self.vram_pool_budget_sent
+            && self.device.is_cuda()
+            && self.activation_peak_bytes > 0;
         let use_prefetch = if let Some(ref mut pw) = self.prefetch {
             if self.activation_peak_bytes == 0 && self.device.is_cuda() {
                 pw.set_prefetch_depth(0);
                 false
             } else {
                 let vram_depth = crate::data::prefetch_depth_from_vram(
-                    self.per_sample_bytes, self.batch_size, self.device, 0.90,
-                    self.activation_peak_bytes,
+                    self.per_sample_bytes, self.batch_size, self.device,
+                    self.vram_max_usage, self.activation_peak_bytes,
                 );
-                let depth = vram_depth.min(num_batches);
+                let mut depth = vram_depth.min(num_batches);
+                // On the pool-install chunk the channel collapses to
+                // the flow reserve: the pool is about to budget
+                // `free − reserve`, and a channel sized against that
+                // same free VRAM would claim the bytes twice (transient
+                // install-chunk OOM). From the next plan boundary the
+                // probe sees pool bytes as used and the depth re-sizes
+                // honestly.
+                if install_pool_budget {
+                    depth =
+                        depth.min(crate::data::vram_pool::FLOW_RESERVE_BATCHES as usize);
+                }
                 pw.set_prefetch_depth(depth);
                 depth > 0
             }
@@ -164,20 +178,21 @@ impl<M: Module> GpuWorker<M> {
         // measured, so the VRAM probe is honest — let the device sample
         // pool take its one-shot budget decision, leaving a flow-buffer
         // reserve for the batch channel (in-flight depth is a
-        // rate-matcher once a capacity tier is active).
-        if !self.vram_pool_budget_sent
-            && self.device.is_cuda()
-            && self.activation_peak_bytes > 0
-        {
+        // rate-matcher once a capacity tier is active). The channel
+        // depth was collapsed to the reserve above, so both sides of
+        // the install agree on who owns the free VRAM.
+        if install_pool_budget {
             if let Some(ref pw) = self.prefetch {
                 let batch_bytes = (self.per_sample_bytes * self.batch_size) as u64;
-                let flow = (pw.prefetch_depth() as u64)
-                    .min(crate::data::vram_pool::FLOW_RESERVE_BATCHES);
+                let reserve = crate::data::vram_pool::flow_reserve_bytes(
+                    pw.prefetch_depth() as u64,
+                    batch_bytes,
+                );
                 crate::debug!(
                     "  ddp-worker: rank {} vram pool budget signal (reserve {}MB)",
-                    self.rank, (flow * batch_bytes) >> 20
+                    self.rank, reserve >> 20
                 );
-                pw.install_vram_pool_budget(flow * batch_bytes);
+                pw.install_vram_pool_budget(reserve);
                 self.vram_pool_budget_sent = true;
             }
         }

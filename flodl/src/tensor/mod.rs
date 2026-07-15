@@ -611,6 +611,18 @@ impl Tensor {
         self.numel() as usize * self.dtype().element_size()
     }
 
+    /// Size in bytes of the underlying storage buffer. Like
+    /// `tensor.untyped_storage().nbytes()` in PyTorch.
+    ///
+    /// For a tensor that owns its data this equals [`nbytes`](Self::nbytes)
+    /// (up to alignment). For a **view** (`select`/`narrow`/`slice`) it is
+    /// the size of the whole backing buffer — which is what a clone of the
+    /// view actually keeps alive. Retention accounting must price views by
+    /// this, not by their logical size.
+    pub fn storage_nbytes(&self) -> usize {
+        unsafe { ffi::flodl_storage_nbytes(self.handle) as usize }
+    }
+
     /// Element data type of this tensor. Like `tensor.dtype` in PyTorch.
     pub fn dtype(&self) -> DType {
         DType::from_raw(unsafe { ffi::flodl_dtype(self.handle) })

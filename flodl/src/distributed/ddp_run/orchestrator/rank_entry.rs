@@ -432,6 +432,8 @@ impl DdpHandle {
                 )?,
                 max_grad_norm,
                 vram_pool,
+                vram_max_usage: config.vram_max_usage,
+                ram_max_usage: config.ram_max_usage,
                 easgd_alpha,
                 gamma: config.elche.gamma,
                 timeline: timeline_for_thread,

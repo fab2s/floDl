@@ -456,11 +456,6 @@ where
         self
     }
 
-    /// Enable / disable the device-resident sample pool on rank workers
-    /// (default: enabled). Leftover VRAM retains samples after the
-    /// first training step so later epochs gather them on device
-    /// instead of re-uploading; `FLODL_VRAM_POOL=off` is the runtime
-    /// kill-switch equivalent.
     /// Augmentation multiplicity (see [`DdpRunConfig::augment`]).
     pub fn augment(mut self, k: usize) -> Self {
         self.config = self.config.with_augment(k);
@@ -492,8 +487,32 @@ where
         self
     }
 
+    /// Enable / disable the device-resident sample pool on rank workers
+    /// (default: enabled). Leftover VRAM retains samples after the
+    /// first training step so later epochs gather them on device
+    /// instead of re-uploading; `FLODL_VRAM_POOL=off` is the runtime
+    /// kill-switch equivalent.
     pub fn vram_pool(mut self, enabled: bool) -> Self {
         self.config = self.config.with_vram_pool(enabled);
+        self
+    }
+
+    /// VRAM share for each rank's data plane — prefetch channel +
+    /// device sample pool (see [`DdpRunConfig::vram_max_usage`]).
+    /// Same knob as `DataLoaderBuilder::vram_max_usage` on the solo
+    /// path; default `0.90`, clamped to `[0.50, 0.99]`.
+    pub fn vram_max_usage(mut self, max_usage: f64) -> Self {
+        self.config = self.config.with_vram_max_usage(max_usage);
+        self
+    }
+
+    /// Host-RAM share for each rank's staging tiers (see
+    /// [`DdpRunConfig::ram_max_usage`]). Same knob as
+    /// `DataLoaderBuilder::ram_max_usage` on the solo path; default
+    /// `0.50`, clamped to `[0.0, 0.90]`; `0.0` disables staging
+    /// retention.
+    pub fn ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.config = self.config.with_ram_max_usage(max_usage);
         self
     }
 

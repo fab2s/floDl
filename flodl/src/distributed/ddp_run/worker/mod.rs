@@ -280,6 +280,10 @@ pub struct GpuWorker<M: Module> {
     stager: Option<stager::StagerHandle>,
     /// Bytes per sample (for VRAM gauge depth calculation).
     per_sample_bytes: usize,
+    /// VRAM share for this worker's data plane (see
+    /// [`super::WorkerConfig::vram_max_usage`]); feeds the per-plan
+    /// prefetch-depth sizing.
+    vram_max_usage: f64,
     /// Measured activation peak (activations + gradients) from training.
     /// Used as a reserve in the VRAM gauge so prefetch doesn't fill
     /// memory that forward/backward will need. Zero = not yet measured;

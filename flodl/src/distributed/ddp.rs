@@ -729,6 +729,8 @@ docs/design/trainer-execution-tiers.md)")]
             .num_epochs(cfg.num_epochs)
             .elche(cfg.elche)
             .vram_pool(cfg.vram_pool)
+            .vram_max_usage(cfg.vram_max_usage)
+            .ram_max_usage(cfg.ram_max_usage)
             .augment(cfg.augment);
         if let Some(f) = cfg.transform {
             b = b.transform_fn(f);
