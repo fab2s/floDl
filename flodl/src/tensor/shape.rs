@@ -262,7 +262,7 @@ impl Tensor {
             tensors.push(Tensor::from_raw(handle));
         }
         if !results_ptr.is_null() {
-            unsafe { ffi::flodl_free_string(results_ptr as *mut i8) };
+            unsafe { ffi::flodl_free_string(results_ptr as *mut std::ffi::c_char) };
         }
         Ok(tensors)
     }
@@ -281,7 +281,7 @@ impl Tensor {
             tensors.push(Tensor::from_raw(handle));
         }
         if !results_ptr.is_null() {
-            unsafe { ffi::flodl_free_string(results_ptr as *mut i8) };
+            unsafe { ffi::flodl_free_string(results_ptr as *mut std::ffi::c_char) };
         }
         Ok(tensors)
     }
@@ -310,7 +310,7 @@ impl Tensor {
         if !results_ptr.is_null() {
             // Free the C-allocated array (tensors are now owned by Rust).
             // flodl_free_string is just free() -- safe for any malloc'd pointer.
-            unsafe { ffi::flodl_free_string(results_ptr as *mut i8) };
+            unsafe { ffi::flodl_free_string(results_ptr as *mut std::ffi::c_char) };
         }
         Ok(tensors)
     }
@@ -355,7 +355,7 @@ impl Tensor {
             out.push(Tensor::from_raw(handle));
         }
         if !results_ptr.is_null() {
-            unsafe { ffi::flodl_free_string(results_ptr as *mut i8) };
+            unsafe { ffi::flodl_free_string(results_ptr as *mut std::ffi::c_char) };
         }
         Ok(out)
     }

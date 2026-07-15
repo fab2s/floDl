@@ -146,7 +146,11 @@ impl std::error::Error for TensorError {}
 pub type Result<T> = std::result::Result<T, TensorError>;
 
 /// Convert a C error string to Result. Frees the C string.
-pub(crate) fn check_err(err: *mut i8) -> Result<()> {
+///
+/// `*mut c_char`, not `*mut i8`: `c_char` is `i8` on x86_64 but `u8` on
+/// Linux aarch64 — typing the FFI surface with `c_char` end to end is
+/// what keeps `CStr::from_ptr` compiling on both without per-site casts.
+pub(crate) fn check_err(err: *mut std::ffi::c_char) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {

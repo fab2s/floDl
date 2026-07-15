@@ -835,7 +835,7 @@ pub(crate) fn io_err(e: impl std::fmt::Display) -> TensorError {
     TensorError::new(&format!("io: {}", e))
 }
 
-fn check_err_raw(err: *mut i8) -> Result<()> {
+fn check_err_raw(err: *mut std::ffi::c_char) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {

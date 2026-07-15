@@ -188,7 +188,9 @@ pub fn cuda_synchronize(device_index: u8) {
 
 /// Returns the GPU device name for the given index (e.g. "NVIDIA GeForce GTX 1060 6GB").
 pub fn cuda_device_name_idx(device: i32) -> Option<String> {
-    let mut buf = [0i8; 256];
+    // `c_char` (i8 on x86_64, u8 on Linux aarch64) so the FFI buffer
+    // type matches on every platform.
+    let mut buf = [0 as std::ffi::c_char; 256];
     let err = unsafe { ffi::flodl_cuda_device_name(device, buf.as_mut_ptr(), 256) };
     if err.is_null() {
         let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
