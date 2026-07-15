@@ -536,3 +536,24 @@ fn test_graph_no_scheduler_leaves_lr_alone() {
     // training_step still increments (it's a per-step counter, scheduler-independent).
     assert_eq!(graph.training_step(), 1);
 }
+
+/// The Module↔Graph downcast seam: `GraphExt::as_graph` must recover
+/// the graph behind `dyn Module` (identity — pointer-equal), forward
+/// through `Box<dyn Module>`, and reject plain leaf modules. This is
+/// the contract that replaced the trait-level `Module::as_graph` hook
+/// when `nn` was de-cycled from `graph`.
+#[test]
+fn graph_ext_downcasts_graph_and_rejects_leaves() {
+    use crate::graph::GraphExt;
+
+    let graph = FlowBuilder::from(Doubler).build().unwrap();
+    let as_dyn: &dyn Module = &graph;
+    let recovered = as_dyn.as_graph().expect("Graph must downcast to itself");
+    assert!(std::ptr::eq(recovered, &graph), "identity, not a copy");
+
+    let boxed: Box<dyn Module> = Box::new(FlowBuilder::from(Doubler).build().unwrap());
+    assert!(boxed.as_graph().is_some(), "Box<dyn Module> forwards as_any");
+
+    let leaf: &dyn Module = &Doubler;
+    assert!(leaf.as_graph().is_none(), "leaf modules present nothing");
+}

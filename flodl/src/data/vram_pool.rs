@@ -396,7 +396,10 @@ impl VramSamplePool {
         true
     }
 
-    /// Per-epoch telemetry line (verbose); resets the counters.
+    /// Telemetry line (verbose); resets the counters. Fires once per
+    /// epoch-start command, which is one EPOCH on the solo loader and
+    /// one dispatched CHUNK on the coordinator-paced DDP path — the
+    /// line names neither so it cannot mislabel either.
     pub(crate) fn epoch_report(&mut self) {
         if !self.active() && self.hit_rows + self.miss_rows == 0 {
             return;
@@ -406,7 +409,7 @@ impl VramSamplePool {
             return;
         }
         crate::verbose!(
-            "vram-pool: {:?} epoch | {}/{} rows served on-device ({}MB H2D saved), {} captured, {} pooled",
+            "vram-pool: {:?} served {}/{} rows on-device ({}MB H2D saved), {} captured, {} pooled",
             self.device,
             self.hit_rows,
             seen,

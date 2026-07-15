@@ -68,6 +68,31 @@ pub struct LossContext<'a> {
     pub traces: &'a HashMap<String, Vec<Variable>>,
 }
 
+/// Graph-side view of any [`Module`](crate::nn::Module): `.as_graph()`
+/// recovers the [`Graph`] behind a `dyn Module` when there is one.
+///
+/// This is where the graph↔module downcast lives — the `Module` trait
+/// itself stays graph-agnostic (its [`as_any`](crate::nn::Module::as_any)
+/// identity hook carries no graph vocabulary), and this blanket
+/// extension turns that hook back into the ergonomic `.as_graph()`
+/// call wherever `GraphExt` is in scope (it is re-exported at the
+/// crate root, so `use flodl::*` brings it in).
+///
+/// Returns `Some` for [`Graph`] itself and for transparent wrappers
+/// that present their inner graph through `as_any`; `None` for plain
+/// leaf modules.
+pub trait GraphExt {
+    /// Downcast to [`Graph`] for hierarchical tree composition and
+    /// graph-aware framework paths.
+    fn as_graph(&self) -> Option<&Graph>;
+}
+
+impl<M: crate::nn::Module + ?Sized> GraphExt for M {
+    fn as_graph(&self) -> Option<&Graph> {
+        self.as_any().and_then(|a| a.downcast_ref::<Graph>())
+    }
+}
+
 pub use flow::FlowBuilder;
 pub use loop_node::LoopBuilder;
 pub use map::MapBuilder;

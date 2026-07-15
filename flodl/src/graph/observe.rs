@@ -2,7 +2,7 @@ use crate::autograd::Variable;
 use crate::tensor::{Result, TensorError};
 
 use super::trend::{Trend, TrendGroup};
-use super::Graph;
+use super::{Graph, GraphExt};
 
 /// Reduction strategy for non-scalar tagged outputs in collect_with().
 pub enum Reduce {

@@ -545,7 +545,10 @@ impl DdpHandle {
         &self.devices
     }
 
-    /// Graph architecture SVG, if the model implements [`Module::as_graph()`].
+    /// Graph architecture SVG, if the model presents a graph through
+    /// [`Module::as_any`] (see [`crate::graph::GraphExt::as_graph`]).
+    ///
+    /// [`Module::as_any`]: crate::nn::Module::as_any
     ///
     /// Captured automatically from the model factory at launch time.
     /// Pass to [`Monitor::set_svg()`](crate::monitor::Monitor::set_svg) to

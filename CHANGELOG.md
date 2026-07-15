@@ -321,6 +321,15 @@ The progressive chunk pool now partitions each epoch's permutation into contiguo
 
 ### Changed
 
+#### `Module` trait de-cycled from `graph` and `distributed`
+
+The `nn::Module` trait no longer names types from higher layers — a `Linear` no longer transitively knows what a DDP metrics struct or a `Graph` is. Two changes, one of them BC-relevant:
+
+- **`Module::as_graph` → `Module::as_any` + `graph::GraphExt`** (BC-relevant): the trait's `as_graph(&self) -> Option<&Graph>` hook is replaced by a graph-agnostic opt-in identity hook `as_any(&self) -> Option<&dyn Any>` (default `None`; composite types return `Some(self)`, transparent wrappers may present their inner composite). The ergonomic `.as_graph()` call survives unchanged as `flodl::graph::GraphExt` — a blanket extension over every `Module`, re-exported at the crate root, so `use flodl::*` code keeps compiling verbatim. Migration is only needed for external `Module` impls that *overrode* `as_graph`: override `as_any` instead (return the graph you used to return, as `&dyn Any`).
+- **`EpochMetrics` moved to the leaf `flodl::metrics` module** (BC-transparent): the type `Module::aggregated_metrics_slot` is typed against is plain metrics data, not distributed vocabulary, and now lives below every consumer. `flodl::EpochMetrics` and `flodl::distributed::EpochMetrics` remain valid re-exports of the same type — no path breaks, no behavior change.
+
+The remaining `graph` → `distributed` edge (`Graph`'s embedded `cluster_ddp` / `cluster_el_che` state behind `Graph::step`) is the engine of the deprecated `Trainer::setup` tier and is documented as tier-scoped: it leaves wholesale when that tier is removed rather than growing an abstraction seam.
+
 - **`DataSet::get` / `BatchDataSet::get_batch` purity contract, stated and probed**: both traits now document that sample content must be a pure function of the index — the staging cascade (RAM sample cache, disk stage, VRAM sample pool, all on by default) retains samples by index and re-serves them on later epochs, so per-call randomness (augmentation inside the dataset, the PyTorch `__getitem__` convention) is silently frozen at its first realization and served for the rest of the run. Debug builds now probe the contract — the first staged fetch is fetched twice and compared (NaN-tolerant), panicking with the full explanation on divergence; release builds skip the probe entirely. Augmentation belongs downstream of the loader as a deterministic on-device transform (e.g. a graph `.map` stage); first-class support for augmentation as deterministic repeated picks is designed in `docs/design/data-cascade.md`.
 
 #### Distributed layer: in-process thread-per-GPU DDP engine removed

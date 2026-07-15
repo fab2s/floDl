@@ -107,7 +107,6 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::autograd::Variable;
-use crate::graph::Graph;
 use crate::tensor::Result;
 
 /// The core module trait: forward pass + parameter access.
@@ -211,9 +210,17 @@ pub trait Module {
     /// case the loop runner falls back to the legacy [`Module::trace`] path.
     fn as_loop_body(&self) -> Option<&dyn LoopBody> { None }
 
-    /// Upcast to [`Graph`] for hierarchical tree composition.
-    /// Override in Graph to enable subgraph nesting with label-path addressing.
-    fn as_graph(&self) -> Option<&Graph> { None }
+    /// Opt-in identity hook for framework downcasts.
+    ///
+    /// Override to return `Some(self)` in composite types the framework
+    /// needs to recognize behind `dyn Module` (e.g. `Graph` for
+    /// hierarchical tree composition — see `flodl::graph::GraphExt`,
+    /// whose `.as_graph()` sugar downcasts through this hook).
+    /// Transparent wrappers may return their *inner* composite instead
+    /// of `self` — the contract is "the object this module presents to
+    /// the framework", not strict identity. Default: `None` (plain
+    /// leaf module, nothing to present).
+    fn as_any(&self) -> Option<&dyn std::any::Any> { None }
 
     /// SHA-256 hex hash of module architecture for checkpoint validation.
     /// Override in composite modules (Graph) that compute a deterministic
@@ -233,22 +240,22 @@ pub trait Module {
     fn detach_state(&self) {}
 
     /// Hand the framework the model's shared slot for coord-broadcast
-    /// aggregated [`crate::distributed::EpochMetrics`]. The cluster-
+    /// aggregated [`crate::metrics::EpochMetrics`]. The cluster-
     /// rank worker setup calls this at construction and stores the
     /// returned `Arc` clone alongside its own — both ends then point
     /// at the same `Mutex`, so the bridge thread's writes are visible
     /// to the user's main-thread reads (`Graph::latest_metrics`,
-    /// `Graph::aggregated_gpu_tabs`).
+    /// `Graph::aggregated_gpu_tabs` — with `Graph` = `flodl::graph::Graph`).
     ///
     /// Default: `None` (model doesn't expose a slot; the worker
-    /// creates a private one). [`Graph`] overrides to return its
+    /// creates a private one). `Graph` overrides to return its
     /// owned slot so user code sees the aggregated view through the
     /// same `Graph` reference it already passes to
     /// [`crate::monitor::Monitor::log`].
     fn aggregated_metrics_slot(
         &self,
     ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
     >> {
         None
     }
@@ -285,8 +292,8 @@ impl Module for Box<dyn Module> {
     fn as_loop_body(&self) -> Option<&dyn LoopBody> {
         (**self).as_loop_body()
     }
-    fn as_graph(&self) -> Option<&Graph> {
-        (**self).as_graph()
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        (**self).as_any()
     }
     fn structural_hash(&self) -> Option<String> {
         (**self).structural_hash()
@@ -300,7 +307,7 @@ impl Module for Box<dyn Module> {
     fn aggregated_metrics_slot(
         &self,
     ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
     >> {
         (**self).aggregated_metrics_slot()
     }

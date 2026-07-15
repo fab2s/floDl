@@ -1059,7 +1059,7 @@ fn enable_cluster_el_che(
 /// User-side training code keeps working through the original `head`
 /// reference because `head.compute_loss` / `head.graph().forward_multi`
 /// route through the graph's cluster-aware short-circuits to the local
-/// replica's graph (which [`HeadReplica::as_graph`] exposes).
+/// replica's graph (which `HeadReplica` presents through `as_any`).
 #[allow(deprecated)]
 fn setup_head_cluster<H, F, G, O>(
     graph: &Graph,
@@ -1124,9 +1124,10 @@ impl HasGraph for Graph {
 /// wrappers don't implement `Module` directly (their true forward is
 /// multi-input via [`Graph::forward_multi`], which doesn't fit the
 /// single-Variable `Module::forward` signature). `HeadReplica` delegates
-/// every Module method through to the inner graph and overrides
-/// [`Module::as_graph`] so DDP's multi-input replica paths downcast
-/// cleanly rather than hitting the single-input fallback.
+/// every Module method through to the inner graph and presents that
+/// graph through [`Module::as_any`] so DDP's multi-input replica paths
+/// downcast cleanly (via [`crate::graph::GraphExt::as_graph`]) rather
+/// than hitting the single-input fallback.
 struct HeadReplica<H: HasGraph + 'static> {
     head: H,
 }
@@ -1146,7 +1147,10 @@ impl<H: HasGraph + 'static> Module for HeadReplica<H> {
     fn buffers(&self) -> Vec<Buffer> { self.head.graph().buffers() }
     fn name(&self) -> &str { "head_replica" }
     fn set_training(&self, training: bool) { self.head.graph().set_training(training); }
-    fn as_graph(&self) -> Option<&Graph> { Some(self.head.graph()) }
+    // Present the inner graph, not `self`: the hook's contract is "the
+    // object this module shows the framework", which for a transparent
+    // head wrapper is the graph it delegates to.
+    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self.head.graph()) }
 }
 
 // ---------------------------------------------------------------------------

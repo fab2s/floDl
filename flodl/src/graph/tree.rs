@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::autograd::Variable;
 use crate::nn::{self, Buffer, Module, Parameter};
 use crate::tensor::{Result, TensorError};
-use super::Graph;
+use super::{Graph, GraphExt};
 use super::trend::Trend;
 
 /// What a label path resolves to.

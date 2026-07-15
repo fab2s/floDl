@@ -18,6 +18,7 @@ use crate::distributed::ddp_run::{
     self, ApplyPolicy, CheckpointFn, EpochFn, EvalFn, EvalResultFn, MetricsFn, TrainedState,
     WorkerConfig,
 };
+use crate::graph::GraphExt;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor};
 

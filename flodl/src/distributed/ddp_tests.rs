@@ -25,6 +25,38 @@
 
     // -- Cluster ElChe state tests ------------------------------------------
 
+    /// `HeadReplica` presents its INNER graph through `Module::as_any`
+    /// (delegation, not identity), so DDP's multi-input replica paths
+    /// downcast to the graph the wrapper delegates to. This is the one
+    /// wrapper in the codebase exercising the hook's "present what you
+    /// delegate to" latitude.
+    #[test]
+    fn head_replica_presents_inner_graph() {
+        use crate::graph::{FlowBuilder, GraphExt};
+        use crate::nn::{Identity, Module};
+
+        struct Head {
+            graph: crate::graph::Graph,
+        }
+        impl HasGraph for Head {
+            fn graph(&self) -> &crate::graph::Graph {
+                &self.graph
+            }
+        }
+
+        let replica = HeadReplica {
+            head: Head {
+                graph: FlowBuilder::from(Identity).build().unwrap(),
+            },
+        };
+        // Pointer taken AFTER construction — moving `head` into the
+        // wrapper relocates the graph.
+        let inner: *const crate::graph::Graph = &replica.head.graph;
+        let as_dyn: &dyn Module = &replica;
+        let seen = as_dyn.as_graph().expect("wrapper presents its graph");
+        assert!(std::ptr::eq(seen, inner), "inner graph, not the wrapper");
+    }
+
     #[test]
     fn cluster_el_che_state_defaults() {
         let cfg = DdpConfig::new();

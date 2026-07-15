@@ -9,6 +9,7 @@ use hmac_sha256::Hash as Sha256;
 
 use super::node::*;
 use super::profile;
+use super::GraphExt;
 use super::LossContext;
 use crate::autograd::Variable;
 use crate::nn::{Buffer, Module, Parameter};
@@ -755,18 +756,20 @@ impl Graph {
     /// Inputs are in declaration order: From entry first, then each Input.
     ///
     /// In cluster mode, routes to the local replica's graph (via
-    /// [`Module::as_graph`]) so the replica's parameters drive the forward.
-    /// Loud error if the replica does not expose a graph — `forward_multi`
-    /// is graph-specific and has no meaningful fallback.
+    /// [`GraphExt::as_graph`]) so the
+    /// replica's parameters drive the forward. Loud error if the
+    /// replica does not expose a graph — `forward_multi` is
+    /// graph-specific and has no meaningful fallback.
     pub fn forward_multi(&self, inputs: &[Variable]) -> Result<Variable> {
         if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
             return match replica.as_graph() {
                 Some(g) => g.forward_multi(inputs),
                 None => Err(TensorError::new(
                     "forward_multi: cluster-mode replica does not expose a Graph \
-                     (Module::as_graph returned None) — multi-input forward has \
-                     no fallback. Wrap the model in something that implements \
-                     as_graph (e.g. HeadReplica for HasGraph wrappers).",
+                     (GraphExt::as_graph returned None) — multi-input forward has \
+                     no fallback. Wrap the model in something that presents its \
+                     graph through Module::as_any (e.g. HeadReplica for HasGraph \
+                     wrappers).",
                 )),
             };
         }
@@ -1104,7 +1107,9 @@ pub(crate) fn sidecar_config_path(checkpoint: &str) -> PathBuf {
 impl Module for Graph {
     fn name(&self) -> &str { "graph" }
 
-    fn as_graph(&self) -> Option<&Graph> { Some(self) }
+    // The identity hook behind `GraphExt::as_graph` — framework code
+    // holding `dyn Module` downcasts through this to reach the graph.
+    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }
 
     /// Expose Graph's shared aggregated-metrics slot to the cluster-
     /// rank worker setup. The worker stores an `Arc` clone of THIS
@@ -1114,7 +1119,7 @@ impl Module for Graph {
     fn aggregated_metrics_slot(
         &self,
     ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
     >> {
         Some(std::sync::Arc::clone(&self.aggregated_metrics))
     }

@@ -27,6 +27,7 @@
 
 pub mod log;
 pub mod sys;
+pub mod metrics;
 pub mod tensor;
 pub mod autograd;
 pub mod nn;
@@ -101,7 +102,7 @@ pub use distributed::{
 #[allow(deprecated)] // re-exported until the setup tier is removed
 pub use distributed::DdpConfig;
 pub use graph::{
-    FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,
+    FlowBuilder, MergeOp, Graph, GraphExt, LossContext, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,

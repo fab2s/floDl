@@ -9,6 +9,17 @@ use super::LossContext;
 // ---------------------------------------------------------------------------
 // Distributed Data Parallel + optimizer integration
 // ---------------------------------------------------------------------------
+//
+// COUPLING NOTE (tier-scoped, audit C3): the `cluster_ddp` /
+// `cluster_el_che` state embedded in `Graph` — and the cluster branches
+// of `Graph::step` below — are the engine of the DEPRECATED
+// `Trainer::setup` self-driven tier (`ClusterElCheState::from_config`
+// takes the deprecated `DdpConfig`; every `set_cluster_ddp` caller is
+// the setup family). The `Trainer::run` / builder tier never routes
+// through them. This is graph/'s only remaining import of distributed
+// types; it leaves wholesale when the setup tier is removed
+// (docs/design/trainer-execution-tiers.md), so no abstraction seam is
+// built for it on purpose.
 
 impl Graph {
     /// Attach cluster-mode DDP state (process-per-rank).
