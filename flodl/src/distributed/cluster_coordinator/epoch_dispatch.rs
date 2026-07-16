@@ -7,6 +7,18 @@ use crate::tensor::{Result, TensorError};
 
 use super::ClusterCoordinator;
 
+/// One rank's pre-composed post-reduce `Update` payload: the folded
+/// next-window chunk (Cadence atomic dispatch; `None` otherwise) plus
+/// the rollback token to un-take it if the send fails. Composed by
+/// [`ClusterCoordinator::compose_window_plans`] so dispatch policy
+/// lives here, not in the transport file that ships the frames.
+pub(super) struct PlannedUpdate {
+    pub(super) rank: usize,
+    pub(super) next_plan: Option<crate::distributed::wire::EpochPlanWire>,
+    /// `rank_epoch[rank]` before the take — restored on rollback.
+    pub(super) prev_epoch: usize,
+}
+
 impl ClusterCoordinator {
     /// Compute per-rank partition sizes for one epoch.
     ///
@@ -498,8 +510,9 @@ impl ClusterCoordinator {
     ///
     /// Two callers ship the resulting plan differently:
     /// [`Self::dispatch_next_chunk_with_batches`] wraps it in a
-    /// `StartEpoch` control frame; the atomic-dispatch path in
-    /// `finish_averaging_cpu` folds it into the post-reduce `Update`
+    /// `StartEpoch` control frame; the atomic-dispatch path
+    /// ([`Self::compose_window_plans`], consumed by
+    /// `finish_averaging_cpu`) folds it into the post-reduce `Update`
     /// frame so the rank starts its next window without a separate
     /// control round-trip.
     pub(super) fn take_next_chunk_plan(
@@ -522,6 +535,68 @@ impl ClusterCoordinator {
             partition_offset: offset as u64,
             partition_size: actual_size as u64,
         })
+    }
+
+    /// Pre-compose the post-reduce dispatch plans for every live rank —
+    /// the dispatch-policy half of the CPU finalize, computed HERE so
+    /// the transport file (`cycle_cpu.rs`) only ships frames and never
+    /// composes plans (audit I2). Each entry carries its own rollback
+    /// token ([`PlannedUpdate::prev_epoch`]) so a failed `Update` send
+    /// un-takes exactly that rank's chunk via
+    /// [`Self::rollback_planned_update`].
+    ///
+    /// Resets the per-window step counters FIRST: the fold sizes the
+    /// next chunk via `compute_chunk_batches`, whose
+    /// `cap_to_reduce_budget` reads `steps_since_avg`. With the reset
+    /// deferred until after the fold (the old order), the cap saw the
+    /// JUST-CLOSED window's full step count, `budget_remaining`
+    /// bottomed out at the `.max(1)` floor, and every epoch tail folded
+    /// a 1-batch chunk — off-schedule, and a fill-cost-inflated 1-batch
+    /// sample in the delivered feed. The reduce that brought us here IS
+    /// the window boundary; the new window's budget is fresh.
+    ///
+    /// Only [`ApplyPolicy::Cadence`] folds chunks (atomic dispatch);
+    /// other policies get `next_plan: None` entries so the `Update`
+    /// fan-out still reaches every live rank. Dead ranks get no entry
+    /// at all: their controller-side stream is shut, and folding a
+    /// chunk for them would ghost it.
+    ///
+    /// Per-rank takes are independent (per-rank reservation spans), so
+    /// composing all plans before any send is equivalent to the old
+    /// interleaved take-send loop — same 0..world_size take order,
+    /// same per-rank rollback on failure.
+    pub(super) fn compose_window_plans(&mut self) -> Vec<PlannedUpdate> {
+        self.window.reset_steps();
+        let fold = matches!(self.policy, ApplyPolicy::Cadence);
+        let mut planned = Vec::with_capacity(self.world_size);
+        for rank in 0..self.world_size {
+            if self.is_dead(rank) {
+                continue;
+            }
+            let prev_epoch = self.rank_epoch[rank];
+            let next_plan = if fold {
+                self.fold_next_chunk_for_rank(rank)
+            } else {
+                None
+            };
+            planned.push(PlannedUpdate { rank, next_plan, prev_epoch });
+        }
+        planned
+    }
+
+    /// Undo one [`PlannedUpdate`] whose `Update` frame could not be
+    /// delivered: the folded chunk (if any) is returned to the pool and
+    /// the rank's epoch bookkeeping restored. No-op for a plan-less
+    /// entry.
+    pub(super) fn rollback_planned_update(&mut self, planned: &PlannedUpdate) {
+        if let Some(plan) = &planned.next_plan {
+            self.rollback_chunk_take(
+                planned.rank,
+                plan.epoch as usize,
+                plan,
+                planned.prev_epoch,
+            );
+        }
     }
 
     /// atomic-dispatch: compute + take `rank`'s next reduce-window chunk

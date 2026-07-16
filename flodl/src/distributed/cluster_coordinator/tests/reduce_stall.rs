@@ -18,8 +18,8 @@ fn nccl_reduce_stall_past_ceiling_escalates() {
     let mut coord = ClusterCoordinator::for_test(cfg_sync_nccl(2).timeline(tl.clone()));
 
     // A sync broadcast 50ms ago that no rank has acked yet, cohort alive.
-    coord.nccl_sync_start = Some(Instant::now() - Duration::from_millis(50));
-    coord.nccl_ack = vec![false, false];
+    coord.cycle.started_at = Some(Instant::now() - Duration::from_millis(50));
+    coord.cycle.acked = vec![false, false];
 
     coord
         .poll_nccl_reduce_stall_with(Duration::from_millis(1))
@@ -27,7 +27,7 @@ fn nccl_reduce_stall_past_ceiling_escalates() {
 
     // Escalation entered: the in-flight marker is disarmed so it fires once.
     assert!(
-        coord.nccl_sync_start.is_none(),
+        coord.cycle.started_at.is_none(),
         "stall escalation disarms the in-flight sync marker",
     );
     // And it actually reached dispatch_shutdown_with_save: that broadcasts
@@ -46,15 +46,15 @@ fn nccl_reduce_stall_past_ceiling_escalates() {
 #[test]
 fn nccl_reduce_stall_fresh_sync_is_not_a_stall() {
     let mut coord = ClusterCoordinator::for_test(cfg_sync_nccl(2));
-    coord.nccl_sync_start = Some(Instant::now());
-    coord.nccl_ack = vec![false, false];
+    coord.cycle.started_at = Some(Instant::now());
+    coord.cycle.acked = vec![false, false];
 
     coord
         .poll_nccl_reduce_stall_with(Duration::from_secs(3600))
         .unwrap();
 
     assert!(
-        coord.nccl_sync_start.is_some(),
+        coord.cycle.started_at.is_some(),
         "a sync well within the ceiling must not escalate",
     );
 }
@@ -63,16 +63,16 @@ fn nccl_reduce_stall_fresh_sync_is_not_a_stall() {
 fn nccl_reduce_stall_all_acked_is_capture_paths_job() {
     let mut coord = ClusterCoordinator::for_test(cfg_sync_nccl(2));
     // Old broadcast but every rank has acked: not a stall — the elapsed
-    // capture path takes nccl_sync_start, not this escalation.
-    coord.nccl_sync_start = Some(Instant::now() - Duration::from_millis(50));
-    coord.nccl_ack = vec![true, true];
+    // capture path takes the cycle's `started_at`, not this escalation.
+    coord.cycle.started_at = Some(Instant::now() - Duration::from_millis(50));
+    coord.cycle.acked = vec![true, true];
 
     coord
         .poll_nccl_reduce_stall_with(Duration::from_millis(1))
         .unwrap();
 
     assert!(
-        coord.nccl_sync_start.is_some(),
+        coord.cycle.started_at.is_some(),
         "an all-acked sync is not escalated here",
     );
 }
@@ -80,15 +80,15 @@ fn nccl_reduce_stall_all_acked_is_capture_paths_job() {
 #[test]
 fn nccl_reduce_stall_noop_on_cpu_backend() {
     let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2));
-    coord.nccl_sync_start = Some(Instant::now() - Duration::from_millis(50));
-    coord.nccl_ack = vec![false, false];
+    coord.cycle.started_at = Some(Instant::now() - Duration::from_millis(50));
+    coord.cycle.acked = vec![false, false];
 
     coord
         .poll_nccl_reduce_stall_with(Duration::from_millis(1))
         .unwrap();
 
     assert!(
-        coord.nccl_sync_start.is_some(),
+        coord.cycle.started_at.is_some(),
         "the CPU backend's ceiling lives in poll_cpu_averaging, not here",
     );
 }

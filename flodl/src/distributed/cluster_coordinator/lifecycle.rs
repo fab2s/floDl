@@ -13,7 +13,7 @@ use crate::distributed::wire::{ControlFrame, ControlMsgWire, MsgKind, SessionSal
 use crate::tensor::{Result, TensorError};
 
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState,
+    ClusterCoordinator, ClusterCoordinatorConfig,
     RunPhase, initial_callback_role, relay_reader_loop,
 };
 
@@ -309,15 +309,8 @@ impl ClusterCoordinator {
             window: super::window_ledger::WindowLedger::new(world_size),
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
-            nccl_sync_step: vec![0; world_size],
-            nccl_ack: vec![true; world_size],
-            nccl_sync_divergence: vec![None; world_size],
-            nccl_sync_pre_norm: vec![None; world_size],
-            nccl_sync_post_norm: None,
-            throttled: vec![false; world_size],
+            cycle: super::cycle_state::AvgCycleState::new(config.backend, world_size),
             dispatch_hold_logged: vec![false; world_size],
-            last_nccl_sync_ms: 0.0,
-            nccl_sync_start: None,
             // Per-epoch d-aggregator identity values; see field docs on
             // `ClusterCoordinator` + threaded `coordinator/cpu_avg.rs`.
             epoch_d_min: f64::INFINITY,
@@ -332,7 +325,6 @@ impl ClusterCoordinator {
                 None
             },
             last_lr_per_rank: vec![None; world_size],
-            cpu_avg_state: CpuAvgState::Idle,
             lost_broadcasts: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             stall_last_global_step: 0,
@@ -375,8 +367,6 @@ impl ClusterCoordinator {
             checkpoint_forge: config.checkpoint_forge.clone(),
             pending_checkpoint_coverage: None,
             shutdown_with_save_dispatched: false,
-            last_observed_sync_lag_ms: vec![None; world_size],
-            last_observed_upload_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             last_dispatched_epoch: None,
@@ -412,7 +402,6 @@ impl ClusterCoordinator {
             salt,
             timeline: config.timeline.clone(),
             sync_start: None,
-            cpu_avg_start: None,
             dashboard_sink: config.dashboard_sink.clone(),
         })
     }

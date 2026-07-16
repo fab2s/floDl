@@ -45,7 +45,7 @@ fn cadence_gate_fires_on_batch_counts_even_with_pathological_slow_ms() {
     );
 
     // Set per-rank state so the gate's preamble passes
-    // (`nccl_ack` true is the default in `for_test`; `is_dead` false
+    // (the cycle's acks rest true in a fresh coord; `is_dead` false
     // for every rank in a fresh ledger; `steps_since_avg[r] > 0` for
     // each rank means the early-return guard clears).
     for (r, &c) in counts.iter().enumerate() {
@@ -109,12 +109,13 @@ fn cadence_gate_does_not_fire_below_batch_counts() {
 #[test]
 fn cpu_rearm_is_independent_of_nccl_ack() {
     // Regression guard for the CPU averaging stall: the CPU backend
-    // re-arms via `cpu_avg_state == Idle`, NOT `nccl_ack`. The cluster
-    // rewrite had forced CPU re-arm onto `nccl_ack` and the bridge faked
-    // a `usize::MAX / 2` step_count to satisfy it, which poisoned
-    // `last_step_count` and wedged the gate after a few cycles. Here we
-    // pin `nccl_ack` all-false (the wedged state) and assert the CPU
-    // gate STILL fires once each rank completed its `batch_counts`.
+    // re-arms via its Idle phase, NOT the ack slots (then named
+    // `nccl_ack`). The cluster rewrite had forced CPU re-arm onto the
+    // acks and the bridge faked a `usize::MAX / 2` step_count to
+    // satisfy them, which poisoned `last_step_count` and wedged the
+    // gate after a few cycles. Here we pin the acks all-false (the
+    // wedged state) and assert the CPU gate STILL fires once each rank
+    // completed its `batch_counts`.
     let world_size = 2;
     let mut coord = ClusterCoordinator::for_test(
         ClusterCoordinatorConfig::new(
@@ -133,23 +134,23 @@ fn cpu_rearm_is_independent_of_nccl_ack() {
     for (r, &c) in counts.iter().enumerate() {
         coord.set_steps_since_avg_for_test(r, c);
     }
-    // The poisoned NCCL re-arm state: no rank's `nccl_ack` is set.
+    // The poisoned NCCL re-arm state: no rank's ack is set.
     coord.set_all_nccl_ack_for_test(false);
 
     assert!(
         coord.should_average(),
-        "CPU re-arm must NOT depend on `nccl_ack` — the cycle is Idle and \
-         every rank completed its batch_counts, so the gate must fire \
-         even with `nccl_ack` all-false",
+        "CPU re-arm must NOT depend on the ack slots — the cycle is Idle \
+         and every rank completed its batch_counts, so the gate must \
+         fire even with the acks all-false",
     );
 }
 
 #[test]
 fn cpu_gate_blocks_while_cycle_in_flight() {
-    // The `cpu_avg_state` re-arm gate: while a CPU averaging cycle is
+    // The CPU-phase re-arm gate: while a CPU averaging cycle is
     // Pending (snapshots / TCP all-reduce in flight), `should_average`
     // must not re-trigger, even though every rank has met its quota and
-    // `nccl_ack` is all-true. `poll_cpu_averaging` returns the state to
+    // the acks are all-true. `poll_cpu_averaging` returns the phase to
     // `Idle` on finalize, which is what re-opens the gate.
     let world_size = 2;
     let mut coord = ClusterCoordinator::for_test(

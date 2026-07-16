@@ -30,10 +30,10 @@
 //!
 //! - Owns per-cluster scheduling state: ElChe, [`ConvergenceGuard`],
 //!   the per-rank window ledger (steps / wall / delivered / fill, see
-//!   `window_ledger`), `last_step_count`,
-//!   `nccl_sync_step` / `nccl_ack`, `nccl_sync_divergence` /
-//!   `pre_norm` / `post_norm`, `throttled`, `active_count`,
-//!   `version`, `avg_count`, `global_step`, `last_nccl_sync_ms`.
+//!   `window_ledger`), `last_step_count`, the averaging-cycle state
+//!   (step snapshot / acks / divergence evidence / CPU machine, see
+//!   `cycle_state`), `active_count`, `version`, `avg_count`,
+//!   `global_step`.
 //! - Drives averaging decisions: [`ClusterCoordinator::should_average`],
 //!   [`ClusterCoordinator::trigger_averaging`] (NCCL),
 //!   [`ClusterCoordinator::check_throttle`],
@@ -63,6 +63,8 @@
 //!   transport mechanics (arming, stall backstops, state machine,
 //!   NCCL re-rendezvous). Constraints: interior waits keep the
 //!   coord→rank heartbeat beating; cycles own no cadence state.
+//! - `cycle_state.rs` — the cycle's state: shared evidence slots +
+//!   the per-backend machine (`ClusterCoordinator::cycle`).
 //! - `callback_roles.rs` — sticky "fastest rank" election,
 //!   `epoch_fn` / `eval_fn` / `checkpoint_fn` failover,
 //!   `dispatch_shutdown_with_save`.
@@ -95,6 +97,7 @@ mod averaging;
 mod callback_roles;
 mod cycle_cpu;
 mod cycle_nccl;
+mod cycle_state;
 mod dead_ranks;
 mod epoch_dispatch;
 mod event_loop;
@@ -288,34 +291,6 @@ fn initial_callback_role(
 // ClusterCoordinator
 // ---------------------------------------------------------------------------
 
-/// CPU-backend averaging state machine. Restores cycle-1 guard-verdict
-/// correctness on the CPU path: the worker bridges compute the
-/// AllReduce + weight-space divergence and emit
-/// [`crate::distributed::wire::TimingMsgWire::SyncAck`] with the
-/// divergence triple; the coordinator now waits for all of those
-/// SyncAcks (via this state) before calling
-/// [`ClusterCoordinator::finish_averaging_cpu`], so the guard sees real
-/// divergence instead of the all-Nones sentinel that
-/// `unwrap_or(0.0)` collapses to zero.
-///
-/// **Wait policy:** the coordinator waits **indefinitely** for every
-/// rank's SyncAck. Dropping a CPU averaging cycle is a correctness
-/// violation for Local SGD (per-rank drift accumulates super-linearly
-/// across missed rendezvous points), so the only safe response to a
-/// stalled rank is to keep waiting. **Liveness detection lives outside
-/// the averaging path**: heartbeats feed the coordinator independently
-/// and surface dead ranks as fatal training errors. Slow (but live)
-/// ranks are absorbed by ElChe on the next cycle, which rebalances
-/// [`crate::distributed::ddp::ElChe::batch_counts`] from the observed
-/// wall-time. Confirmed rank death triggers elastic averaging via
-/// rendezvous rebuild on the shrunken survivor cohort; the dead rank's
-/// remaining partition is resharded onto survivors via
-/// [`ControlMsgWire::ExtendPartition`].
-///
-/// NCCL backend keeps the synchronous trigger → finish pattern (OLD
-/// `Coordinator::finish_averaging_nccl` parity).
-///
-/// [`ControlMsgWire::ExtendPartition`]: crate::distributed::wire::ControlMsgWire::ExtendPartition
 /// Drained payload of the per-epoch d-aggregator. Mirrors the threaded
 /// coord's `EpochDSummary` (ddp_run/coordinator/cpu_avg.rs) line-for-line
 /// so MSF analysis sees the same `DivergenceEpoch` shape on both paths.
@@ -340,19 +315,6 @@ impl EpochDSummary {
             self.d_sum / self.count as f64
         }
     }
-}
-
-#[derive(Debug)]
-enum CpuAvgState {
-    /// No averaging cycle in flight.
-    Idle,
-    /// `trigger_averaging` broadcast `RequestParams` and is waiting for
-    /// every rank's bridge SyncAck to populate `nccl_sync_divergence` /
-    /// `nccl_sync_pre_norm` / `nccl_sync_post_norm`.
-    /// `poll_cpu_averaging` transitions back to `Idle` once `nccl_ack`
-    /// is all-true (finalizes the cycle). No deadline — see the
-    /// type-level docstring above for the rationale.
-    Pending,
 }
 
 /// Hard wall-budget for an in-flight NCCL re-rendezvous to complete.
@@ -460,31 +422,18 @@ pub struct ClusterCoordinator {
     last_batch_ms: Vec<f64>,
     /// Per-rank most-recent worker step counter.
     last_step_count: Vec<usize>,
-    /// Per-rank: `last_step_count` snapshot at the time SyncNow was sent.
-    nccl_sync_step: Vec<usize>,
-    /// Per-rank: true once a post-sync timing message has arrived.
-    nccl_ack: Vec<bool>,
-    /// Per-rank: weight-space divergence reported in the last SyncAck.
-    nccl_sync_divergence: Vec<Option<f64>>,
-    /// Per-rank: pre-AllReduce L2 norm from the last SyncAck.
-    nccl_sync_pre_norm: Vec<Option<f64>>,
-    /// Post-AllReduce L2 norm (identical across ranks; populated by the
-    /// first rank's SyncAck).
-    nccl_sync_post_norm: Option<f64>,
-    /// Per-rank: True if a Throttle has been sent and not yet cleared.
-    throttled: Vec<bool>,
+    /// The in-flight averaging cycle's state: shared evidence slots
+    /// (trigger instant, step snapshot, acks, divergence/norm triple,
+    /// measured lag/upload latencies, last completed sync wall) plus
+    /// the per-backend machine (CPU Pending phase + throttle ledger;
+    /// NCCL finishes inline and has neither). See [`cycle_state`].
+    cycle: cycle_state::AvgCycleState,
     /// Per-rank dedupe for the `-vvv` "reduce barrier HOLD" log. The barrier
     /// re-checks every `dispatch_next_chunk` call (many per tick), so logging
     /// each hit floods the log (~150k lines/s) and steals tick CPU. Log once
     /// per HOLD episode: set when logged, cleared at the reduce reset
     /// (`finish_averaging_*`) so the next window's first HOLD logs again.
     dispatch_hold_logged: Vec<bool>,
-    /// Wall-time (ms) of the last completed NCCL sync; fed to ElChe as
-    /// `sync_ms` on the next `report_timing` call.
-    last_nccl_sync_ms: f64,
-    /// Instant the most recent SyncNow was emitted.
-    nccl_sync_start: Option<Instant>,
-
     /// Per-epoch d-aggregator. Each call to [`Self::finish_averaging_nccl`]
     /// / [`Self::finish_averaging_cpu`] feeds the cycle's `d_raw` +
     /// `k_max` into [`Self::update_epoch_d_aggregator`]; the
@@ -521,8 +470,6 @@ pub struct ClusterCoordinator {
     /// first LR update from that rank arrives.
     last_lr_per_rank: Vec<Option<f64>>,
 
-    /// CPU-backend averaging state machine. See [`CpuAvgState`].
-    cpu_avg_state: CpuAvgState,
     /// Count of best-effort control broadcasts that failed to reach one
     /// or more live ranks over the run (dropped `SyncNow` /
     /// `RequestParams` / `Throttle` / `SetGlobalStep` / `DeclareDead` /
@@ -668,42 +615,6 @@ pub struct ClusterCoordinator {
     /// `check_dead_ranks` ticks — once survivors are persisting state,
     /// repeat broadcasts are noise.
     shutdown_with_save_dispatched: bool,
-    /// Per-rank wall-time (ms) from the most recent averaging cycle's
-    /// `RequestParams` broadcast to that rank's SyncAck arrival.
-    /// Populated by [`Self::process_timing_msg`]'s SyncAck arm.
-    ///
-    /// **Caveat: barrier-correlated, NOT per-rank capacity.** A rank's
-    /// bridge blocks inside the AllReduce barrier until every rank
-    /// arrives, so individual lag values converge toward the slowest
-    /// rank's contribution. Use this as a *cycle latency* indicator
-    /// only — do NOT feed it into ElChe or partition-balancing logic
-    /// as a per-rank throughput proxy. Honest per-rank capacity
-    /// comes from the window ledger's per-batch wall (already excludes
-    /// the barrier wait) and [`Self::last_observed_upload_ms`] (the
-    /// pre-barrier snapshot+upload marker).
-    last_observed_sync_lag_ms: Vec<Option<f64>>,
-
-    /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
-    /// rank's `SnapshotReady`
-    /// arrival — captured by the SnapshotReady handler in
-    /// [`Self::process_timing_msg`].
-    ///
-    /// Honest per-rank capacity signal: the rank emits SnapshotReady
-    /// AFTER snapshot+upload but BEFORE entering the AllReduce barrier
-    /// (see the param bridge in `cluster_worker.rs`), so this lag is
-    /// not contaminated by the slowest-rank barrier wait that pollutes
-    /// `last_observed_sync_lag_ms`.
-    ///
-    /// Cleared (per-rank slot reset to `None`) at the start of every
-    /// new cycle by [`Self::trigger_averaging`] so the values reflect
-    /// the in-flight cycle only. `None` means the rank never reported
-    /// SnapshotReady this cycle (NCCL backend — there's no
-    /// snapshot+upload step — or a dead rank that exited mid-cycle).
-    ///
-    /// Currently exposed via [`Self::last_observed_upload_ms`] for
-    /// telemetry + planned ElChe consumption; the rebalancer is not
-    /// yet wired to read this.
-    last_observed_upload_ms: Vec<Option<f64>>,
 
     /// Checkpoint bundle stem for the controller-side `.meta.json`
     /// write on `ShutdownWithSave`. Mirrors
@@ -894,13 +805,6 @@ pub struct ClusterCoordinator {
     /// finalizes. `Some` between `trigger_averaging` and the matching
     /// `finish_averaging_*`; `None` outside a cycle.
     sync_start: Option<std::time::Instant>,
-    /// Wall-clock start of the current CPU-averaging Pending window
-    /// (CPU backend only). Set at the same site `cpu_avg_state` flips
-    /// to `Pending`; consumed by `poll_cpu_averaging` to compute the
-    /// `CpuAvgEnd { duration_ms }` payload. Always `None` on the NCCL
-    /// backend — `CpuAvgStart` / `CpuAvgEnd` only fire for CPU
-    /// averaging, matching the threaded coordinator's event semantics.
-    cpu_avg_start: Option<std::time::Instant>,
     /// Optional controller-side dashboard sink. When the launcher
     /// hosts a live dashboard, it constructs a concrete
     /// [`crate::distributed::DashboardSink`] and threads it through
@@ -972,7 +876,7 @@ impl ClusterCoordinator {
     /// late-arriving stragglers). Reset at the start of every
     /// averaging cycle.
     pub fn last_observed_upload_ms(&self) -> &[Option<f64>] {
-        &self.last_observed_upload_ms
+        &self.cycle.upload_ms
     }
 
     /// Borrow per-rank current-epoch state for diagnostics / tests.

@@ -10,7 +10,7 @@ use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::{ControlMsgWire, TimingMsgWire};
 use crate::tensor::Result;
 
-use super::{ClusterCoordinator, CpuAvgState, RunPhase};
+use super::{ClusterCoordinator, RunPhase};
 
 /// Coord→rank liveness-beacon cadence. Matches the rank→coord
 /// `HEARTBEAT_CADENCE_MS` (1s): frequent enough that a rank's default 30s
@@ -77,16 +77,7 @@ impl ClusterCoordinator {
                 self.last_batch_ms[rank] = batch_ms;
                 let _ = batch_loss; // monitoring only in this slice
                 let _ = param_norm;
-                if let Some(div) = sync_divergence {
-                    self.nccl_sync_divergence[rank] = Some(div);
-                }
-                if rank < self.nccl_ack.len()
-                    && !self.nccl_ack[rank]
-                    && step_count > self.nccl_sync_step[rank]
-                {
-                    self.nccl_ack[rank] = true;
-                    self.capture_nccl_sync_elapsed_if_complete();
-                }
+                self.cycle.note_batch_ack(rank, step_count, sync_divergence);
             }
             TimingMsgWire::SyncAck {
                 rank,
@@ -100,52 +91,21 @@ impl ClusterCoordinator {
                 if rank >= self.world_size {
                     return;
                 }
-                // Only the NCCL path uses `step_count` (for re-arm and
-                // global-step tracking). The CPU bridge's `SyncAck` has
-                // no meaningful step_count — the inner worker doesn't
-                // bump `local_step` on `RequestParams` — so folding it
-                // here would poison `last_step_count` and, through the
-                // next `nccl_sync_step` snapshot, permanently wedge the
-                // NCCL re-arm gate. CPU re-arm runs off `cpu_avg_state`.
-                if matches!(self.backend, AverageBackend::Nccl) {
+                // The cycle machine knows whether a SyncAck's
+                // `step_count` is meaningful: only the NCCL path folds
+                // it (for re-arm and global-step tracking); the CPU
+                // bridge's SyncAck carries none, and folding it would
+                // poison `last_step_count` — see
+                // `AvgCycleState::sync_ack_step_meaningful` for the
+                // full story (that bug happened once).
+                if self.cycle.sync_ack_step_meaningful() {
                     self.last_step_count[rank] =
                         self.last_step_count[rank].max(step_count);
                 }
-                if let Some(div) = divergence {
-                    self.nccl_sync_divergence[rank] = Some(div);
-                }
-                if let Some(p) = pre_norm {
-                    self.nccl_sync_pre_norm[rank] = Some(p);
-                }
-                if let Some(p) = post_norm {
-                    match self.nccl_sync_post_norm {
-                        None => self.nccl_sync_post_norm = Some(p),
-                        Some(prev) => debug_assert!(
-                            (prev - p).abs() <= 1e-6 * prev.abs().max(1.0),
-                            "post_norm rank-disagreement: prev={prev} new={p} (rank {rank})"
-                        ),
-                    }
-                }
-                if rank < self.nccl_ack.len()
-                    && !self.nccl_ack[rank]
-                    && step_count > self.nccl_sync_step[rank]
-                {
-                    self.nccl_ack[rank] = true;
-                    // Per-rank sync lag (wall time from
-                    // `RequestParams` / `SyncNow` broadcast to this
-                    // rank's SyncAck). Captured BEFORE
-                    // `capture_nccl_sync_elapsed_if_complete` takes
-                    // `nccl_sync_start` on the all-acked transition.
-                    // Feeds the adaptive CPU deadline computed in the
-                    // NEXT `trigger_averaging`.
-                    if let Some(start) = self.nccl_sync_start {
-                        if rank < self.last_observed_sync_lag_ms.len() {
-                            self.last_observed_sync_lag_ms[rank] =
-                                Some(start.elapsed().as_secs_f64() * 1000.0);
-                        }
-                    }
-                    self.capture_nccl_sync_elapsed_if_complete();
-                }
+                // Divergence / norm evidence, the ack gate, and the
+                // per-rank sync-lag capture all live on the cycle.
+                self.cycle
+                    .note_sync_ack(rank, step_count, divergence, pre_norm, post_norm);
             }
             TimingMsgWire::Exiting { rank } => {
                 // Clean-exit latch: decrement exactly once, and remember the
@@ -181,22 +141,15 @@ impl ClusterCoordinator {
                 // bridge in cluster_worker.rs), so the measurement is
                 // clean of slowest-rank barrier contamination — the
                 // exact "honest per-rank capacity" signal flagged on
-                // `last_observed_sync_lag_ms` as "planned upload-
+                // the barrier-correlated sync-lag slot as "planned upload-
                 // completion marker".
                 //
-                // `nccl_sync_start` is the broadcast anchor; if the
-                // cycle has already finalized (all SyncAcks in,
-                // `capture_nccl_sync_elapsed_if_complete` took the
-                // anchor), this frame is a late-arriving stragger
-                // and we drop it — `last_observed_upload_ms[rank]`
-                // keeps the prior value or None.
-                let rank = rank as usize;
-                if rank < self.last_observed_upload_ms.len() {
-                    if let Some(start) = self.nccl_sync_start {
-                        self.last_observed_upload_ms[rank] =
-                            Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                }
+                // The cycle's `started_at` is the broadcast anchor; if
+                // the cycle has already finalized (all SyncAcks in,
+                // the elapsed capture took the anchor), this frame is
+                // a late-arriving straggler and is dropped — the
+                // upload slot keeps its prior value or None.
+                self.cycle.note_snapshot_ready(rank as usize);
             }
             TimingMsgWire::NewNcclIdGenerated { rank, uid_bytes } => {
                 let rank = rank as usize;
@@ -374,11 +327,11 @@ impl ClusterCoordinator {
     pub(super) fn dump_stall_state(&self, stalled_secs: f64) {
         let counts = self.el_che.batch_counts();
         eprintln!(
-            "[stall-watch] STALL {:.0}s no reduce | cpu_avg_state={:?} \
+            "[stall-watch] STALL {:.0}s no reduce | cycle={:?} \
              active={}/{} last_agg_epoch={:?} avg_count={} global_step={} \
              lost_broadcasts={}",
             stalled_secs,
-            self.cpu_avg_state,
+            self.cycle.machine,
             self.active_count,
             self.world_size,
             self.last_aggregated_epoch,
@@ -418,21 +371,20 @@ impl ClusterCoordinator {
     ///
     /// Re-arm (the "previous cycle has settled" gate) is backend-split:
     ///
-    /// - **NCCL**: `nccl_ack[r]` — set true once rank `r` reports a
-    ///   `Batch`/`SyncAck` whose `step_count` exceeds the trigger-time
-    ///   snapshot, proving it processed the previous `SyncNow`.
-    /// - **CPU**: `cpu_avg_state == Idle` — the deferred
-    ///   `poll_cpu_averaging` only returns to `Idle` after it has
-    ///   finalized the previous cycle. The CPU path does NOT consult
-    ///   `nccl_ack`: the bridge's `SyncAck` carries no meaningful
-    ///   `step_count`, so gating CPU on `nccl_ack` (and faking a large
-    ///   `step_count` to satisfy it) poisoned `last_step_count` and
+    /// - **NCCL**: the cycle's ack slot — set true once rank `r`
+    ///   reports a `Batch`/`SyncAck` whose `step_count` exceeds the
+    ///   trigger-time snapshot, proving it processed the previous
+    ///   `SyncNow`.
+    /// - **CPU**: the machine's phase back at `Idle` — the deferred
+    ///   `poll_cpu_averaging` only returns there after it has finalized
+    ///   the previous cycle. The CPU path does NOT consult the ack
+    ///   slots: the bridge's `SyncAck` carries no meaningful
+    ///   `step_count`, so gating CPU on the acks (and faking a large
+    ///   `step_count` to satisfy them) poisoned `last_step_count` and
     ///   permanently wedged the re-arm gate after the warmup window.
     pub fn should_average(&self) -> bool {
         // CPU re-arm: don't re-trigger while a cycle is still in flight.
-        if matches!(self.backend, AverageBackend::Cpu)
-            && !matches!(self.cpu_avg_state, CpuAvgState::Idle)
-        {
+        if self.cycle.cpu_pending() {
             return false;
         }
         // active_count must be > 0 — if every rank is dead, training
@@ -464,8 +416,8 @@ impl ClusterCoordinator {
             if self.is_dead(r) {
                 continue;
             }
-            // NCCL re-arm only; CPU re-arms via `cpu_avg_state` above.
-            if matches!(self.backend, AverageBackend::Nccl) && !self.nccl_ack[r] {
+            // NCCL re-arm only; CPU re-arms via the Pending phase above.
+            if matches!(self.backend, AverageBackend::Nccl) && !self.cycle.acked[r] {
                 return false;
             }
             let steps = self.window.steps(r);
@@ -524,13 +476,13 @@ impl ClusterCoordinator {
         let mut to_throttle: Vec<usize> = Vec::new();
         for (rank, &steps) in self.window.steps_all().iter().enumerate() {
             let should = steps > min_steps + max_diff;
-            if should && !self.throttled[rank] {
+            if should && !self.cycle.is_throttled(rank) {
                 to_throttle.push(rank);
             }
         }
         for rank in to_throttle {
             self.send_control(rank, &ControlMsgWire::Throttle)?;
-            self.throttled[rank] = true;
+            self.cycle.set_throttled(rank);
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::Throttle { rank });
             }
@@ -599,7 +551,7 @@ impl ClusterCoordinator {
         // No-op on NCCL backend (state stays `Idle`).
         self.poll_cpu_averaging()?;
         // NCCL twin: escalate an alive-but-wedged in-flight collective
-        // (SyncNow broadcast, `nccl_ack` never completing) past its
+        // (SyncNow broadcast, acks never completing) past its
         // ceiling. No-op on CPU backend and whenever no sync is in flight.
         self.poll_nccl_reduce_stall()?;
         if self.should_average() {
@@ -884,14 +836,14 @@ impl ClusterCoordinator {
         // Calling it here directly would race with bridge SyncAcks: the
         // worker batch loop is async in cluster mode (Batch send and
         // MetricsMsg are not serialized against RequestParams/SyncAck),
-        // so MetricsMsg can land while `cpu_avg_state == Pending` and
+        // so MetricsMsg can land while the CPU cycle is still Pending and
         // shutting workers down at that point would drop the in-flight
         // cycle.
     }
 
     /// Post-aggregation epoch transition. Once an epoch has aggregated
     /// AND any in-flight averaging cycle has finalized
-    /// (`cpu_avg_state == Idle`), either dispatch the next epoch
+    /// (CPU phase back at `Idle`), either dispatch the next epoch
     /// (non-progressive, non-Async) or broadcast `Shutdown` (final
     /// epoch). Idempotent: tracks `last_dispatched_epoch` so repeated
     /// ticks past the final aggregate don't re-broadcast `Shutdown`,
@@ -927,7 +879,7 @@ impl ClusterCoordinator {
         // pending SyncAck round-trip) or shutting workers down (which
         // would drop the cycle and leave the divergence guard with
         // all-Nones — see `end_to_end_sync_cpu_smoke` regression).
-        if !matches!(self.cpu_avg_state, CpuAvgState::Idle) {
+        if self.cycle.cpu_pending() {
             return;
         }
         let next = latest + 1;
@@ -947,7 +899,7 @@ impl ClusterCoordinator {
             // RequestParams) until `Shutdown`, so the collective completes
             // with full participation; mpsc is FIFO so the reduce frame is
             // dequeued before `Shutdown`, and `sync_now_nccl` synchronizes
-            // before returning. The `cpu_avg_state == Idle` gate above plus
+            // before returning. The CPU-phase-Idle gate above plus
             // the per-tick `try_advance` let the async CPU reduce finalize
             // (which resets `steps_since_avg`) before this re-enters and
             // shuts down; NCCL's finish is inline so its reset lands at once.

@@ -24,8 +24,8 @@ fn shutdown_waits_for_inflight_sync_to_settle() {
     // Final epoch aggregated; a sync is in flight with rank 1's ack
     // still missing (its collective kernel has not retired yet).
     coord.last_aggregated_epoch = Some(0);
-    coord.nccl_sync_start = Some(Instant::now());
-    coord.nccl_ack = vec![true, false];
+    coord.cycle.started_at = Some(Instant::now());
+    coord.cycle.acked = vec![true, false];
 
     coord.try_advance_or_shutdown_after_aggregate();
 
@@ -37,7 +37,7 @@ fn shutdown_waits_for_inflight_sync_to_settle() {
 
     // Rank 1's ack lands (collective fully retired everywhere): the
     // next tick releases the broadcast.
-    coord.nccl_ack = vec![true, true];
+    coord.cycle.acked = vec![true, true];
     coord.try_advance_or_shutdown_after_aggregate();
 
     assert_eq!(
@@ -49,13 +49,13 @@ fn shutdown_waits_for_inflight_sync_to_settle() {
 
 #[test]
 fn shutdown_immediate_when_no_sync_in_flight() {
-    // Cold `nccl_ack` (all-false, never synced) must NOT block shutdown
-    // when no sync is in flight — the gate keys on `nccl_sync_start`,
+    // Cold acks (all-false, never synced) must NOT block shutdown
+    // when no sync is in flight — the gate keys on the cycle's `started_at`,
     // not the raw ack array.
     let mut coord = ClusterCoordinator::for_test(cfg_sync_nccl(2).num_epochs(1));
     coord.last_aggregated_epoch = Some(0);
-    coord.nccl_sync_start = None;
-    coord.nccl_ack = vec![false, false];
+    coord.cycle.started_at = None;
+    coord.cycle.acked = vec![false, false];
 
     coord.try_advance_or_shutdown_after_aggregate();
 
@@ -80,8 +80,8 @@ fn shutdown_gate_dead_rank_counts_as_settled() {
             .dead_ranks(dead_ranks),
     );
     coord.last_aggregated_epoch = Some(0);
-    coord.nccl_sync_start = Some(Instant::now());
-    coord.nccl_ack = vec![true, false];
+    coord.cycle.started_at = Some(Instant::now());
+    coord.cycle.acked = vec![true, false];
 
     coord.try_advance_or_shutdown_after_aggregate();
 

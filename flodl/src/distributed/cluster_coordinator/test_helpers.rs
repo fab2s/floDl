@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::{SessionSalt, TimingMsgWire};
 
+use super::cycle_state::AvgCycleState;
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig, CpuAvgState,
+    ClusterCoordinator, ClusterCoordinatorConfig,
     NcclRendezvousPending, RunPhase, initial_callback_role,
 };
 
@@ -85,11 +86,11 @@ impl ClusterCoordinator {
     }
 
     /// Test-only peek at the per-rank observed sync-lag history (ms).
-    /// See [`Self::last_observed_sync_lag_ms`] for the caveat about
-    /// barrier correlation.
+    /// See [`AvgCycleState::sync_lag_ms`] for the caveat about barrier
+    /// correlation.
     #[cfg(test)]
     pub(crate) fn last_observed_sync_lag_ms_for_test(&self) -> &[Option<f64>] {
-        &self.last_observed_sync_lag_ms
+        &self.cycle.sync_lag_ms
     }
 
     /// Build a headless ClusterCoordinator for unit-testing internal
@@ -135,15 +136,8 @@ impl ClusterCoordinator {
             window: super::window_ledger::WindowLedger::new(world_size),
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],
-            nccl_sync_step: vec![0; world_size],
-            nccl_ack: vec![true; world_size],
-            nccl_sync_divergence: vec![None; world_size],
-            nccl_sync_pre_norm: vec![None; world_size],
-            nccl_sync_post_norm: None,
-            throttled: vec![false; world_size],
+            cycle: AvgCycleState::new(config.backend, world_size),
             dispatch_hold_logged: vec![false; world_size],
-            last_nccl_sync_ms: 0.0,
-            nccl_sync_start: None,
             epoch_d_min: f64::INFINITY,
             epoch_d_max: f64::NEG_INFINITY,
             epoch_d_sum: 0.0,
@@ -156,7 +150,6 @@ impl ClusterCoordinator {
                 None
             },
             last_lr_per_rank: vec![None; world_size],
-            cpu_avg_state: CpuAvgState::Idle,
             lost_broadcasts: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             stall_last_global_step: 0,
@@ -199,8 +192,6 @@ impl ClusterCoordinator {
             checkpoint_forge: config.checkpoint_forge.clone(),
             pending_checkpoint_coverage: None,
             shutdown_with_save_dispatched: false,
-            last_observed_sync_lag_ms: vec![None; world_size],
-            last_observed_upload_ms: vec![None; world_size],
             rank_epoch: vec![0; world_size],
             last_aggregated_epoch: None,
             last_dispatched_epoch: None,
@@ -232,7 +223,6 @@ impl ClusterCoordinator {
             salt,
             timeline: config.timeline.clone(),
             sync_start: None,
-            cpu_avg_start: None,
             dashboard_sink: config.dashboard_sink.clone(),
         }
     }
@@ -398,17 +388,18 @@ impl ClusterCoordinator {
         self.window.set_steps_for_test(rank, n);
     }
 
-    /// Force every rank's `nccl_ack` to `acked`. Used to prove the CPU
-    /// re-arm path is independent of `nccl_ack` (the NCCL-only token).
+    /// Force every rank's cycle ack to `acked`. Used to prove the CPU
+    /// re-arm path is independent of the ack slots (the NCCL re-arm
+    /// token).
     pub(crate) fn set_all_nccl_ack_for_test(&mut self, acked: bool) {
-        for a in &mut self.nccl_ack {
+        for a in &mut self.cycle.acked {
             *a = acked;
         }
     }
 
-    /// Put the CPU averaging state machine into `Pending` (a cycle in
-    /// flight). Used to assert the `cpu_avg_state` re-arm gate.
+    /// Put the CPU averaging machine into `Pending` (a cycle in
+    /// flight). Used to assert the CPU-phase re-arm gate.
     pub(crate) fn set_cpu_avg_pending_for_test(&mut self) {
-        self.cpu_avg_state = CpuAvgState::Pending;
+        self.cycle.begin_cpu_pending(Instant::now());
     }
 }

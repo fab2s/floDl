@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use crate::distributed::ddp_run::convergence::{self, ConvergenceAction};
+use crate::distributed::ddp_run::convergence::ConvergenceAction;
 use crate::distributed::el_che::{AnchorVerdict, WindowReport};
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
@@ -265,8 +265,7 @@ impl ClusterCoordinator {
     /// here is backend-independent; the per-backend middle (NCCL
     /// `SetGlobalStep` vs CPU fold + `Update` fan-out) follows it.
     pub(super) fn finish_averaging_head(&mut self) {
-        let prev_sync_ms = self.last_nccl_sync_ms;
-        self.last_nccl_sync_ms = 0.0;
+        let prev_sync_ms = self.cycle.take_last_sync_ms();
         // Snapshot anchor BEFORE the guard verdict + meta-nudge so the
         // post-cycle `AnchorChanged` event captures the cycle's net
         // change. Mirrors threaded `coordinator/cpu_avg.rs:230`.
@@ -288,21 +287,7 @@ impl ClusterCoordinator {
         }
         self.dump_delivered_timing(prev_sync_ms);
 
-        let nccl_pre_norms: Option<Vec<f64>> =
-            if self.nccl_sync_pre_norm.iter().all(|p| p.is_some()) {
-                Some(self.nccl_sync_pre_norm.iter().map(|p| p.unwrap()).collect())
-            } else {
-                None
-            };
-        let report = convergence::DivergenceReport {
-            deltas: self
-                .nccl_sync_divergence
-                .iter()
-                .map(|d| d.unwrap_or(0.0))
-                .collect(),
-            pre_norms: nccl_pre_norms,
-            post_norm: self.nccl_sync_post_norm,
-        };
+        let report = self.cycle.divergence_report();
         let cycle_batches: usize = self.window.total_steps();
         let k_max = self.window.max_steps();
         let action = self.convergence_guard.report(&report, cycle_batches, k_max);
@@ -408,17 +393,11 @@ impl ClusterCoordinator {
         // Window timing (compute wall + delivered + fill) resets with the
         // window; step counts reset backend-specifically (see callers).
         self.window.reset_timing();
-        for t in &mut self.throttled {
-            *t = false;
-        }
+        self.cycle.clear_throttled();
         for h in &mut self.dispatch_hold_logged {
             *h = false;
         }
-        crate::distributed::ddp_run::convergence::reset_divergence_signals(
-            &mut self.nccl_sync_divergence,
-            &mut self.nccl_sync_pre_norm,
-            &mut self.nccl_sync_post_norm,
-        );
+        self.cycle.reset_divergence_signals();
         // Overshoot gate is open again — kick any rank still sitting in
         // `wait_for_epoch_plan` (gated, or just finished its last chunk
         // before the cycle) so progressive dispatch doesn't stall until

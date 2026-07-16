@@ -22,15 +22,6 @@ use crate::tensor::{Result, TensorError};
 use super::{ClusterCoordinator, NcclRendezvousPending};
 
 impl ClusterCoordinator {
-    pub(super) fn capture_nccl_sync_elapsed_if_complete(&mut self) {
-        if self.nccl_ack.iter().all(|&a| a) {
-            if let Some(start) = self.nccl_sync_start.take() {
-                self.last_nccl_sync_ms =
-                    start.elapsed().as_secs_f64() * 1000.0;
-            }
-        }
-    }
-
     /// NCCL arm of [`Self::trigger_averaging`]: the transport mechanics
     /// of one NCCL cycle — the deterministic window-completion wait
     /// (which MUST keep the coord→rank heartbeat beating; see the
@@ -129,7 +120,7 @@ impl ClusterCoordinator {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            self.nccl_sync_start = Some(Instant::now());
+            self.cycle.arm(Instant::now(), &self.last_step_count);
             // Best-effort: a rank whose send failed has a broken
             // connection — its heartbeats ride the same stream, so
             // dead-rank detection fires shortly and the NCCL
@@ -141,10 +132,6 @@ impl ClusterCoordinator {
                      relying on dead-rank recovery"
                 );
             }
-            for rank in 0..self.world_size {
-                self.nccl_sync_step[rank] = self.last_step_count[rank];
-                self.nccl_ack[rank] = false;
-            }
             self.finish_averaging_nccl()?;
         Ok(())
     }
@@ -154,20 +141,21 @@ impl ClusterCoordinator {
     /// the bridge SyncAcks, so its wedge backstop lives there. The NCCL
     /// backend has no such state — `finish_averaging_nccl` runs inline at
     /// trigger and the cohort re-arms only when every rank reports a
-    /// post-`SyncNow` `Batch`/`SyncAck` (setting `nccl_ack`). A rank wedged
-    /// in the in-place collective (NCCL deadlock, or a peer parked at the
-    /// barrier whose heartbeat thread still ticks so dead-rank detection
-    /// never fires) leaves `nccl_sync_start` armed and `nccl_ack`
-    /// incomplete forever — the same quiet-wedge signature, with no
-    /// equivalent backstop until now.
+    /// post-`SyncNow` `Batch`/`SyncAck` (setting the cycle's ack slot). A
+    /// rank wedged in the in-place collective (NCCL deadlock, or a peer
+    /// parked at the barrier whose heartbeat thread still ticks so
+    /// dead-rank detection never fires) leaves the cycle's `started_at`
+    /// armed and its acks incomplete forever — the same quiet-wedge
+    /// signature, with no equivalent backstop until now.
     ///
     /// Past the same generous ceiling (10x the heartbeat timeout, ≥300s,
     /// which dwarfs any real NCCL AllReduce) with the cohort alive but not
     /// fully acked, escalate to save-and-shutdown so an overnight run ends
     /// as a diagnosed checkpoint rather than a silent hang. Disarms
-    /// `nccl_sync_start` so the escalation fires once. Healthy cycles take
-    /// `nccl_sync_start` via `capture_nccl_sync_elapsed_if_complete` long
-    /// before the ceiling, so this never trips on a sound rig.
+    /// `started_at` so the escalation fires once. Healthy cycles take
+    /// `started_at` via the all-acked elapsed capture
+    /// (`AvgCycleState::capture_sync_elapsed_if_complete`) long before
+    /// the ceiling, so this never trips on a sound rig.
     pub(super) fn poll_nccl_reduce_stall(&mut self) -> Result<()> {
         // 10x the heartbeat timeout (default 300s) dwarfs any real NCCL
         // AllReduce, so a healthy rig can never hit it. Mirrors
@@ -185,16 +173,15 @@ impl ClusterCoordinator {
         if !matches!(self.backend, AverageBackend::Nccl) {
             return Ok(());
         }
-        // Only meaningful while a sync is in flight: `nccl_sync_start` is
-        // set at `SyncNow` broadcast and taken once every alive rank acks.
-        let Some(start) = self.nccl_sync_start else {
+        // Only meaningful while a sync is in flight: the cycle's
+        // `started_at` is set at `SyncNow` broadcast and taken once
+        // every alive rank acks.
+        let Some(start) = self.cycle.started_at else {
             return Ok(());
         };
         // Re-arm pending, not stalled: the all-acked transition is the
         // capture path's job, not an escalation.
-        let all_alive_acked =
-            (0..self.world_size).all(|r| self.is_dead(r) || self.nccl_ack[r]);
-        if all_alive_acked {
+        if self.cycle.all_alive_acked(|r| self.is_dead(r)) {
             return Ok(());
         }
         if start.elapsed() > ceiling {
@@ -205,7 +192,7 @@ impl ClusterCoordinator {
                 ceiling.as_secs(),
             );
             self.dump_stall_state(start.elapsed().as_secs_f64());
-            self.nccl_sync_start = None;
+            self.cycle.started_at = None;
             if let Err(e) = self
                 .dispatch_shutdown_with_save(crate::distributed::SaveReason::ReduceStall)
             {
@@ -236,9 +223,9 @@ impl ClusterCoordinator {
     /// `cpu_avg_state == Idle`, enforced at the top of
     /// `try_advance_or_shutdown_after_aggregate`.
     ///
-    /// Uses the alive-acked form (`is_dead(r) || nccl_ack[r]`), not the
-    /// raw `nccl_sync_start.is_none()`: dead ranks never ack, so the
-    /// capture path can leave `nccl_sync_start` armed after a death even
+    /// Uses the alive-acked form (`is_dead(r) || acked[r]`), not the
+    /// raw `started_at.is_none()`: dead ranks never ack, so the
+    /// capture path can leave `started_at` armed after a death even
     /// though the surviving cohort has fully settled. A rank that exits
     /// WITHOUT acking keeps this false by design — the stranded cohort
     /// is then ended by `poll_nccl_reduce_stall`'s ceiling escalation,
@@ -247,9 +234,8 @@ impl ClusterCoordinator {
         if !matches!(self.backend, AverageBackend::Nccl) {
             return true;
         }
-        self.nccl_sync_start.is_none()
-            || (0..self.world_size)
-                .all(|r| self.is_dead(r) || self.nccl_ack[r])
+        self.cycle.started_at.is_none()
+            || self.cycle.all_alive_acked(|r| self.is_dead(r))
     }
 
     /// NCCL-backend re-rendezvous initiation. Called from
