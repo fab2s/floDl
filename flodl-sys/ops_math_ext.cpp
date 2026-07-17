@@ -577,23 +577,34 @@ extern "C" char* flodl_unique(FlodlTensor t, int sorted, int return_inverse,
                               FlodlTensor* output,
                               FlodlTensor* inverse_indices) {
     try {
+        // Global dedup for both sorted values; `sorted` only controls output
+        // ordering (unsorted order is kernel-defined, as in PyTorch).
+        auto [out, inv, _counts] = at::_unique2(unwrap(t), sorted != 0,
+                                                return_inverse != 0, false);
+        *output = wrap(out);
+        if (return_inverse != 0)
+            *inverse_indices = wrap(inv);
+        else
+            *inverse_indices = nullptr;
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
+extern "C" char* flodl_unique_consecutive(FlodlTensor t, int return_inverse,
+                                          FlodlTensor* output,
+                                          FlodlTensor* inverse_indices) {
+    try {
         auto [out, inv, _counts] = torch::unique_consecutive(
             unwrap(t), return_inverse != 0, false);
-        if (sorted != 0) {
-            auto [sout, sinv, _sc] = at::_unique2(unwrap(t), sorted != 0,
-                                                   return_inverse != 0, false);
-            *output = wrap(sout);
-            if (return_inverse != 0)
-                *inverse_indices = wrap(sinv);
-            else
-                *inverse_indices = nullptr;
-        } else {
-            *output = wrap(out);
-            if (return_inverse != 0)
-                *inverse_indices = wrap(inv);
-            else
-                *inverse_indices = nullptr;
-        }
+        *output = wrap(out);
+        if (return_inverse != 0)
+            *inverse_indices = wrap(inv);
+        else
+            *inverse_indices = nullptr;
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());

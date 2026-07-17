@@ -241,6 +241,17 @@ impl Graph {
             });
         }
 
+        // Port-name resolution: a name that isn't among the node's declared
+        // ports is a wiring bug (silently routing to port 0 would train on
+        // wrong data), so it errors like an unknown node does.
+        fn port_index(ports: &[String], port: &str, node: &str, what: &str) -> Result<usize> {
+            ports.iter().position(|p| p == port).ok_or_else(|| {
+                TensorError::new(&format!(
+                    "unknown {what} port {port:?} on node {node:?} (declared ports: {ports:?})"
+                ))
+            })
+        }
+
         // Convert to indexed storage
         let mut nodes = Vec::with_capacity(node_map.len());
         let mut node_index = HashMap::with_capacity(node_map.len());
@@ -283,11 +294,12 @@ impl Graph {
         let mut tag_capture: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
         for (name, node_ref) in &tags {
             if let Some(&ni) = node_index.get(&node_ref.node_id) {
-                let port_idx = nodes[ni]
-                    .output_ports
-                    .iter()
-                    .position(|p| p == &node_ref.port)
-                    .unwrap_or(0);
+                let port_idx = port_index(
+                    &nodes[ni].output_ports,
+                    &node_ref.port,
+                    &node_ref.node_id,
+                    &format!("tag {name:?} output"),
+                )?;
                 tag_names_map.insert(name.clone(), (ni, port_idx));
                 tag_capture
                     .entry(ni)
@@ -346,11 +358,12 @@ impl Graph {
         for (si, fr) in forward_refs.iter().enumerate() {
             if let Some(&ni) = node_index.get(&fr.writer_id) {
                 state[si].writer_ni = ni;
-                let port_idx = nodes[ni]
-                    .output_ports
-                    .iter()
-                    .position(|p| p == &fr.writer_port)
-                    .unwrap_or(0);
+                let port_idx = port_index(
+                    &nodes[ni].output_ports,
+                    &fr.writer_port,
+                    &fr.writer_id,
+                    "state-writer output",
+                )?;
                 state_writers.entry(ni).or_default().push((si, port_idx));
             }
         }
@@ -361,16 +374,18 @@ impl Graph {
         for edge in &edges {
             let from_ni = node_index[&edge.from_node];
             let to_ni = node_index[&edge.to_node];
-            let from_port_idx = nodes[from_ni]
-                .output_ports
-                .iter()
-                .position(|p| p == &edge.from_port)
-                .unwrap_or(0);
-            let to_port_idx = nodes[to_ni]
-                .input_ports
-                .iter()
-                .position(|p| p == &edge.to_port)
-                .unwrap_or(0);
+            let from_port_idx = port_index(
+                &nodes[from_ni].output_ports,
+                &edge.from_port,
+                &edge.from_node,
+                "edge source",
+            )?;
+            let to_port_idx = port_index(
+                &nodes[to_ni].input_ports,
+                &edge.to_port,
+                &edge.to_node,
+                "edge target",
+            )?;
             routes_from[from_ni].push(Route {
                 from_port_idx,
                 to_node_idx: to_ni,
@@ -383,25 +398,27 @@ impl Graph {
             .iter()
             .map(|ep| {
                 let ni = node_index[&ep.node_id];
-                let port_idx = nodes[ni]
-                    .input_ports
-                    .iter()
-                    .position(|p| p == &ep.port)
-                    .unwrap_or(0);
-                InputRoute {
+                let port_idx = port_index(
+                    &nodes[ni].input_ports,
+                    &ep.port,
+                    &ep.node_id,
+                    "graph input",
+                )?;
+                Ok(InputRoute {
                     node_idx: ni,
                     port_idx,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Pre-compute output location
         let output_node_idx = node_index[&outputs[0].node_id];
-        let output_port_idx = nodes[output_node_idx]
-            .output_ports
-            .iter()
-            .position(|p| p == &outputs[0].port)
-            .unwrap_or(0);
+        let output_port_idx = port_index(
+            &nodes[output_node_idx].output_ports,
+            &outputs[0].port,
+            &outputs[0].node_id,
+            "graph output",
+        )?;
 
         // Pre-compute input port counts and allocate execution buffers
         let node_input_count: Vec<usize> = nodes.iter().map(|nd| nd.input_ports.len()).collect();

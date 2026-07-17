@@ -1,5 +1,12 @@
 //! Shape manipulation operations: reshape, transpose, expand, permute,
 //! narrow, select, squeeze, unsqueeze, flatten, cat, stack, repeat, pad, chunk, batches, meshgrid.
+//!
+//! View semantics (PyTorch parity): `transpose`, `permute`, `narrow`, `select`,
+//! `squeeze`, and `unsqueeze` return views sharing the source storage; `reshape`
+//! and `flatten` return a view when the layout allows, a copy otherwise. In-place
+//! ops on a view write through to the source — that is what makes slice-write
+//! idioms like `t.narrow(0, i, 1)?.copy_(&src)` work. [`Tensor::contiguous`]
+//! copies only when the layout is non-contiguous (also PyTorch semantics).
 
 use std::ptr;
 use flodl_sys::{self as ffi, FlodlTensor};
@@ -8,6 +15,7 @@ use super::{Tensor, TensorError, check_err, Result};
 impl Tensor {
     /// Reshape to a new shape (must have same total elements).
     /// Use -1 for one inferred dimension.
+    /// Returns a view when the layout allows, a copy otherwise.
     ///
     /// ```ignore
     /// let flat = t.reshape(&[-1])?; // [2, 3] -> [6]
@@ -22,7 +30,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Swap two dimensions.
+    /// Swap two dimensions. Returns a view (shares storage).
     ///
     /// ```ignore
     /// let t = x.transpose(0, 1)?; // [M, N] -> [N, M]
@@ -45,7 +53,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Permute dimensions.
+    /// Permute dimensions. Returns a view (shares storage).
     pub fn permute(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -56,7 +64,8 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Narrow (slice) along a dimension: returns a view.
+    /// Narrow (slice) along a dimension. Returns a view (shares storage),
+    /// so `t.narrow(0, i, 1)?.copy_(&src)` writes into `t`.
     pub fn narrow(&self, dim: i32, start: i64, length: i64) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
@@ -77,6 +86,7 @@ impl Tensor {
     }
 
     /// Select a single index along a dimension (reduces that dim).
+    /// Returns a view (shares storage).
     pub fn select(&self, dim: i32, index: i64) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_select(self.handle, dim, index, &mut handle) };
@@ -84,7 +94,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Squeeze (remove) a dimension of size 1.
+    /// Squeeze (remove) a dimension of size 1. Returns a view (shares storage).
     pub fn squeeze(&self, dim: i32) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_squeeze(self.handle, dim, &mut handle) };
@@ -92,7 +102,7 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Unsqueeze (insert) a dimension of size 1.
+    /// Unsqueeze (insert) a dimension of size 1. Returns a view (shares storage).
     pub fn unsqueeze(&self, dim: i32) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_unsqueeze(self.handle, dim, &mut handle) };
@@ -113,6 +123,7 @@ impl Tensor {
     }
 
     /// Flatten dimensions `[start_dim..=end_dim]` into one.
+    /// Returns a view when the layout allows, a copy otherwise.
     pub fn flatten(&self, start_dim: i32, end_dim: i32) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_flatten(self.handle, start_dim, end_dim, &mut handle) };
@@ -409,6 +420,34 @@ mod tests {
         let s = t.select(0, 1).unwrap();
         assert_eq!(s.shape(), vec![3]);
         assert_eq!(s.to_f32_vec().unwrap(), vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_shape_ops_view_semantics_write_through() {
+        // View semantics are deterministic (PyTorch parity), never
+        // layout-dependent: narrow aliases along EVERY dim, not just the
+        // ones whose slice happens to be contiguous.
+        let t = Tensor::zeros(&[2, 3], test_opts()).unwrap();
+        let row = Tensor::from_f32(&[7.0, 8.0, 9.0], &[1, 3], test_device()).unwrap();
+        t.narrow(0, 1, 1).unwrap().copy_(&row, false).unwrap();
+        assert_eq!(t.to_f32_vec().unwrap(), vec![0.0, 0.0, 0.0, 7.0, 8.0, 9.0]);
+
+        let col = Tensor::from_f32(&[5.0, 6.0], &[2, 1], test_device()).unwrap();
+        t.narrow(1, 0, 1).unwrap().copy_(&col, false).unwrap();
+        assert_eq!(t.to_f32_vec().unwrap(), vec![5.0, 0.0, 0.0, 6.0, 8.0, 9.0]);
+
+        // transpose is a view: writing through it lands in the source.
+        let u = Tensor::zeros(&[2, 2], test_opts()).unwrap();
+        u.transpose(0, 1).unwrap().narrow(0, 0, 1).unwrap().fill_(3.0).unwrap();
+        // Column 0 of u was filled via row 0 of the transpose.
+        assert_eq!(u.to_f32_vec().unwrap(), vec![3.0, 0.0, 3.0, 0.0]);
+
+        // Readout of a non-contiguous view stays in logical order
+        // (copy-out makes its own contiguous copy at the point of use).
+        let v = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
+        let tr = v.transpose(0, 1).unwrap();
+        assert!(!tr.is_contiguous());
+        assert_eq!(tr.to_f32_vec().unwrap(), vec![1.0, 3.0, 2.0, 4.0]);
     }
 
     #[test]

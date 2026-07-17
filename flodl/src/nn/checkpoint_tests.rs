@@ -570,6 +570,90 @@
     }
 
     #[test]
+    fn test_migrate_file_in_place() {
+        // src == dst must be safe: the destination rides a tmp + rename, so
+        // the source is fully read before anything replaces it. The old
+        // direct File::create(dst) truncated the source before the read.
+        let old_params = vec![
+            ("old/weight".to_string(), Parameter::new(
+                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
+        ];
+        let path = std::env::temp_dir()
+            .join(format!("test_migrate_in_place_{}.fdl", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = std::io::BufWriter::new(f);
+            save_checkpoint_versioned(&mut w, 1, &old_params, &[]);
+        }
+
+        let new_params = vec![
+            ("new/weight".to_string(), Parameter::new(
+                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
+        ];
+        let report = migrate_checkpoint_file(&path, &path, &new_params, &[]).unwrap();
+        assert_eq!(report.remapped.len(), 1);
+        assert!(report.is_complete());
+        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+
+        let vp = vec![
+            ("new/weight".to_string(), Parameter::new(
+                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
+        ];
+        let load_report = load_checkpoint_file(&path, &vp, &[], None).unwrap();
+        assert_eq!(load_report.loaded.len(), 1);
+        let expected = old_params[0].1.variable.data().to_f32_vec().unwrap();
+        let got = vp[0].1.variable.data().to_f32_vec().unwrap();
+        assert_eq!(expected, got);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_rejects_lying_headers_without_allocating() {
+        // Untrusted header lengths must error, never allocate what the
+        // header claims: a 2^60 byte_count on a truncated file previously
+        // aborted the process on the allocation.
+        let header = |name_len: u32| {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"FDLC");
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&[0u8; 32]);
+            buf.extend_from_slice(&1u32.to_le_bytes()); // one entry
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf
+        };
+        let msg = |buf: &[u8]| match load_checkpoint(
+            &mut std::io::Cursor::new(buf), &[], &[], None,
+        ) {
+            Ok(_) => panic!("corrupt checkpoint must be rejected"),
+            Err(e) => e.to_string(),
+        };
+
+        // Absurd payload claim, zero payload bytes present.
+        let mut buf = header(1);
+        buf.push(b'w');
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim = 1
+        buf.extend_from_slice(&4i64.to_le_bytes()); // shape [4]
+        buf.push(3u8); // Float32 tag
+        buf.extend_from_slice(&(1u64 << 60).to_le_bytes());
+        let m = msg(&buf);
+        assert!(m.contains("payload truncated"), "{m}");
+
+        // Name-length bomb.
+        let m = msg(&header(u32::MAX));
+        assert!(m.contains("entry name length"), "{m}");
+
+        // Rank bomb.
+        let mut buf = header(1);
+        buf.push(b'w');
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let m = msg(&buf);
+        assert!(m.contains("tensor rank"), "{m}");
+    }
+
+    #[test]
     fn test_migrate_display() {
         let report = MigrateReport {
             unchanged: vec!["shared/weight".to_string()],

@@ -19,6 +19,66 @@ fn test_flowbuilder_new() {
 }
 
 #[test]
+fn test_unknown_port_name_errors_at_build() {
+    // A port name that isn't among the node's declared ports must fail the
+    // build loudly instead of silently routing to port 0 (which would train
+    // on wrong data). FlowBuilder can't produce such an edge today, so this
+    // drives Graph::build directly.
+    use crate::graph::node::{DEFAULT_INPUT, DEFAULT_OUTPUT, Edge, ExposedPort, Node};
+    use indexmap::IndexMap;
+    use std::collections::HashSet;
+
+    let mk_node = |id: &str| Node {
+        id: id.to_string(),
+        input_ports: vec![DEFAULT_INPUT.to_string()],
+        output_ports: vec![DEFAULT_OUTPUT.to_string()],
+        run: Box::new(|inputs| Ok(inputs.to_vec())),
+        module: None,
+        ref_forward: None,
+        trace_buf: None,
+        named_trace_buf: None,
+        loop_ports: None,
+    };
+    let mut nodes = IndexMap::new();
+    nodes.insert("a".to_string(), mk_node("a"));
+    nodes.insert("b".to_string(), mk_node("b"));
+
+    let result = Graph::build(
+        nodes,
+        vec![Edge {
+            from_node: "a".into(),
+            from_port: DEFAULT_OUTPUT.into(),
+            to_node: "b".into(),
+            to_port: "bogus".into(),
+        }],
+        vec![ExposedPort {
+            name: "input".into(),
+            node_id: "a".into(),
+            port: DEFAULT_INPUT.into(),
+        }],
+        vec![ExposedPort {
+            name: "output".into(),
+            node_id: "b".into(),
+            port: DEFAULT_OUTPUT.into(),
+        }],
+        HashMap::new(),
+        Vec::new(),
+        HashMap::new(),
+        None,
+        HashSet::new(),
+        false,
+    );
+    let msg = match result {
+        Ok(_) => panic!("build must reject the unknown port"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("bogus") && msg.contains("edge target") && msg.contains("\"b\""),
+        "error must name the port, the resolution kind, and the node: {msg}"
+    );
+}
+
+#[test]
 fn test_forward_ref() {
     // Forward reference: using() before tag(). State carries between forward() calls.
     // Graph: entry → NilSafeAdd.Using("memory") → Identity.Tag("memory")

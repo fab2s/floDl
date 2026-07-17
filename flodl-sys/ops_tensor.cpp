@@ -1104,11 +1104,14 @@ extern "C" char* flodl_all(FlodlTensor t, FlodlTensor* result) {
 }
 
 // --- Shape operations ---
+// These return views sharing the source storage whenever libtorch does
+// (PyTorch parity). Consumers needing owned contiguous bytes make their own
+// copy at the point of use (see flodl_copy_data).
 
 extern "C" char* flodl_reshape(FlodlTensor t, int64_t* shape, int ndim,
                               FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).reshape(make_shape(shape, ndim)).contiguous());
+        *result = wrap(unwrap(t).reshape(make_shape(shape, ndim)));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1120,7 +1123,7 @@ extern "C" char* flodl_reshape(FlodlTensor t, int64_t* shape, int ndim,
 extern "C" char* flodl_transpose(FlodlTensor t, int dim0, int dim1,
                                 FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).transpose(dim0, dim1).contiguous());
+        *result = wrap(unwrap(t).transpose(dim0, dim1));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1132,7 +1135,7 @@ extern "C" char* flodl_transpose(FlodlTensor t, int dim0, int dim1,
 extern "C" char* flodl_permute(FlodlTensor t, int64_t* dims, int ndim,
                               FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).permute(torch::IntArrayRef(dims, ndim)).contiguous());
+        *result = wrap(unwrap(t).permute(torch::IntArrayRef(dims, ndim)));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1144,7 +1147,7 @@ extern "C" char* flodl_permute(FlodlTensor t, int64_t* dims, int ndim,
 extern "C" char* flodl_select(FlodlTensor t, int dim, int64_t index,
                              FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).select(dim, index).contiguous());
+        *result = wrap(unwrap(t).select(dim, index));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1156,7 +1159,7 @@ extern "C" char* flodl_select(FlodlTensor t, int dim, int64_t index,
 extern "C" char* flodl_narrow(FlodlTensor t, int dim, int64_t start,
                              int64_t length, FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).narrow(dim, start, length).contiguous());
+        *result = wrap(unwrap(t).narrow(dim, start, length));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1167,7 +1170,7 @@ extern "C" char* flodl_narrow(FlodlTensor t, int dim, int64_t start,
 
 extern "C" char* flodl_squeeze(FlodlTensor t, int dim, FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).squeeze(dim).contiguous());
+        *result = wrap(unwrap(t).squeeze(dim));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1178,7 +1181,7 @@ extern "C" char* flodl_squeeze(FlodlTensor t, int dim, FlodlTensor* result) {
 
 extern "C" char* flodl_unsqueeze(FlodlTensor t, int dim, FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).unsqueeze(dim).contiguous());
+        *result = wrap(unwrap(t).unsqueeze(dim));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -1190,7 +1193,7 @@ extern "C" char* flodl_unsqueeze(FlodlTensor t, int dim, FlodlTensor* result) {
 extern "C" char* flodl_flatten(FlodlTensor t, int start_dim, int end_dim,
                               FlodlTensor* result) {
     try {
-        *result = wrap(unwrap(t).flatten(start_dim, end_dim).contiguous());
+        *result = wrap(unwrap(t).flatten(start_dim, end_dim));
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());

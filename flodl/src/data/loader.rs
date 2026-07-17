@@ -988,12 +988,20 @@ impl ResidentLoader {
         // Build index tensor on the target device (i64 for index_select)
         let k = self.pick_ctx.augment.max(1) as i64;
         let i64_indices: Vec<i64> = picks.iter().map(|&i| i as i64 / k).collect();
-        let perm = Tensor::from_i64(
+        let perm = match Tensor::from_i64(
             &i64_indices,
             &[i64_indices.len() as i64],
             self.device,
-        )
-        .expect("failed to create permutation tensor");
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                return EpochIterator {
+                    inner: EpochIteratorInner::Failed(Some(TensorError::new(&format!(
+                        "resident loader: failed to upload the epoch permutation: {e}"
+                    )))),
+                }
+            }
+        };
 
         EpochIterator {
             inner: EpochIteratorInner::Resident(ResidentEpochIter {
@@ -1197,6 +1205,11 @@ pub struct EpochIterator<'a> {
 enum EpochIteratorInner<'a> {
     Resident(ResidentEpochIter<'a>),
     Streaming(StreamingEpochIter<'a>),
+    /// Epoch setup failed before the first batch (e.g. the resident path's
+    /// permutation-tensor upload). `epoch()` cannot return `Result` without
+    /// breaking every training loop, but `Item = Result<Batch>` already is
+    /// the error channel — the failure is delivered as the first item.
+    Failed(Option<TensorError>),
 }
 
 struct ResidentEpochIter<'a> {
@@ -1251,6 +1264,7 @@ impl<'a> Iterator for EpochIterator<'a> {
         match &mut self.inner {
             EpochIteratorInner::Resident(iter) => iter.next(),
             EpochIteratorInner::Streaming(iter) => iter.next(),
+            EpochIteratorInner::Failed(err) => err.take().map(Err),
         }
     }
 
@@ -1262,6 +1276,10 @@ impl<'a> Iterator for EpochIterator<'a> {
             }
             EpochIteratorInner::Streaming(iter) => {
                 (iter.remaining, Some(iter.remaining))
+            }
+            EpochIteratorInner::Failed(err) => {
+                let n = usize::from(err.is_some());
+                (n, Some(n))
             }
         }
     }

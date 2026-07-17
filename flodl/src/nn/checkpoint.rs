@@ -128,22 +128,13 @@ pub(crate) fn save_checkpoint_from_raw<W: Write>(
 }
 
 /// File wrapper for [`save_checkpoint_from_raw`]: gzips when `path` ends in
-/// `.gz`, matching [`save_checkpoint_file`].
+/// `.gz` and writes atomically (tmp + rename), matching [`save_checkpoint_file`].
 pub(crate) fn save_checkpoint_from_raw_file(
     path: &str,
     entries: &[RawCheckpointEntry<'_>],
     structural_hash: Option<&str>,
 ) -> Result<()> {
-    let f = std::fs::File::create(path).map_err(io_err)?;
-    if path.ends_with(".gz") {
-        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        save_checkpoint_from_raw(&mut w, entries, structural_hash)?;
-        w.finish().map_err(io_err)?;
-        Ok(())
-    } else {
-        let mut w = std::io::BufWriter::new(f);
-        save_checkpoint_from_raw(&mut w, entries, structural_hash)
-    }
+    write_file_atomic(path, |mut w| save_checkpoint_from_raw(&mut w, entries, structural_hash))
 }
 
 /// Load a checkpoint, matching entries by qualified name against both
@@ -201,20 +192,13 @@ pub fn load_checkpoint<R: Read>(
         std::collections::HashMap::with_capacity(count);
 
     for _ in 0..count {
-        let name_len = read_u32(r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-        let ndim = read_u32(r)? as usize;
-        let mut shape = vec![0i64; ndim];
-        for s in &mut shape { *s = read_i64(r)?; }
+        let name = read_name(r)?;
+        let shape = read_shape(r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let dtype = dtype_from_tag(tag[0])?;
         let byte_count = read_u64(r)? as usize;
-        let mut raw = vec![0u8; byte_count];
-        r.read_exact(&mut raw).map_err(io_err)?;
+        let raw = read_payload(r, byte_count)?;
         ckpt.insert(name, (shape, dtype, raw));
     }
 
@@ -276,38 +260,41 @@ pub fn load_checkpoint<R: Read>(
     Ok(LoadReport { loaded, skipped, missing })
 }
 
-/// Save checkpoint to a file path. Uses gzip compression if path ends with `.gz`.
-pub fn save_checkpoint_file(
+/// Atomic file write shared by every checkpoint writer: stream into
+/// `<path>.tmp`, then rename over the final path.
+///
+/// A crash mid-write (SIGKILL, disk-full, power loss) then never leaves a
+/// torn `<path>` that resume could mistake for valid — it leaves a stale
+/// `.tmp` instead, which resume ignores. gzip is chosen from the FINAL
+/// extension, not the tmp name, so the `.tmp` suffix cannot defeat `.gz`
+/// detection. Rename within a single directory is atomic on POSIX.
+pub(crate) fn write_file_atomic<T>(
     path: &str,
-    params: &[(String, Parameter)],
-    buffers: &[(String, Buffer)],
-    structural_hash: Option<&str>,
-) -> Result<()> {
-    // Atomic write: stream into `<path>.tmp`, then rename over the final path.
-    // A crash mid-write (SIGKILL, disk-full, power loss) then never leaves a
-    // torn `<path>` that resume could mistake for valid — it leaves a stale
-    // `.tmp` instead, which resume ignores. gzip is chosen from the FINAL
-    // extension, not the tmp name, so the `.tmp` suffix cannot defeat `.gz`
-    // detection. Rename within a single directory is atomic on POSIX.
+    write: impl FnOnce(&mut dyn Write) -> Result<T>,
+) -> Result<T> {
     let is_gz = path.ends_with(".gz");
     let tmp = format!("{path}.tmp");
-    let write_result = (|| -> Result<()> {
+    let write_result = (|| -> Result<T> {
         let f = std::fs::File::create(&tmp).map_err(io_err)?;
         if is_gz {
             let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-            save_checkpoint(&mut w, params, buffers, structural_hash)?;
+            let v = write(&mut w)?;
             w.finish().map_err(io_err)?;
-            Ok(())
+            Ok(v)
         } else {
             let mut w = std::io::BufWriter::new(f);
-            save_checkpoint(&mut w, params, buffers, structural_hash)?;
+            let v = write(&mut w)?;
             // Explicit flush so a write error surfaces here rather than being
             // swallowed by BufWriter's drop-flush after we've already renamed.
-            w.flush().map_err(io_err)
+            w.flush().map_err(io_err)?;
+            Ok(v)
         }
     })();
     match write_result {
-        Ok(()) => std::fs::rename(&tmp, path).map_err(io_err),
+        Ok(v) => {
+            std::fs::rename(&tmp, path).map_err(io_err)?;
+            Ok(v)
+        }
         Err(e) => {
             // Best-effort cleanup so a failed write doesn't litter a stale
             // `.tmp`; the write error is what the caller needs to see.
@@ -315,6 +302,16 @@ pub fn save_checkpoint_file(
             Err(e)
         }
     }
+}
+
+/// Save checkpoint to a file path. Uses gzip compression if path ends with `.gz`.
+pub fn save_checkpoint_file(
+    path: &str,
+    params: &[(String, Parameter)],
+    buffers: &[(String, Buffer)],
+    structural_hash: Option<&str>,
+) -> Result<()> {
+    write_file_atomic(path, |mut w| save_checkpoint(&mut w, params, buffers, structural_hash))
 }
 
 /// Load checkpoint from a file path. Detects gzip from `.gz` extension.
@@ -377,15 +374,9 @@ pub fn checkpoint_keys(path: &str) -> Result<Vec<String>> {
     let count = read_u32(&mut r)? as usize;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
-        let name_len = read_u32(&mut r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        keys.push(String::from_utf8_lossy(&name_bytes).into_owned());
-        // Skip ndim, shape, dtype tag, byte_count + raw payload.
-        let ndim = read_u32(&mut r)? as usize;
-        for _ in 0..ndim {
-            let _ = read_i64(&mut r)?;
-        }
+        keys.push(read_name(&mut r)?);
+        // Skip shape, dtype tag, byte_count + raw payload.
+        let _ = read_shape(&mut r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let byte_count = read_u64(&mut r)? as usize;
@@ -501,19 +492,14 @@ pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
 
 /// Read tensor data written by write_tensor_data.
 pub(crate) fn read_tensor_data<R: Read>(r: &mut R) -> Result<Tensor> {
-    let ndim = read_u32(r)? as usize;
-    let mut shape = vec![0i64; ndim];
-    for s in &mut shape {
-        *s = read_i64(r)?;
-    }
+    let shape = read_shape(r)?;
 
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag).map_err(io_err)?;
     let dtype = dtype_from_tag(tag[0])?;
 
     let byte_count = read_u64(r)? as usize;
-    let mut raw = vec![0u8; byte_count];
-    r.read_exact(&mut raw).map_err(io_err)?;
+    let raw = read_payload(r, byte_count)?;
 
     tensor_from_raw_bytes(&raw, &shape, dtype)
 }
@@ -642,20 +628,13 @@ fn read_raw_checkpoint<R: Read>(r: &mut R) -> Result<Vec<RawEntry>> {
     let mut entries = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let name_len = read_u32(r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-        let ndim = read_u32(r)? as usize;
-        let mut shape = vec![0i64; ndim];
-        for s in &mut shape { *s = read_i64(r)?; }
+        let name = read_name(r)?;
+        let shape = read_shape(r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let dtype = dtype_from_tag(tag[0])?;
         let byte_count = read_u64(r)? as usize;
-        let mut raw = vec![0u8; byte_count];
-        r.read_exact(&mut raw).map_err(io_err)?;
+        let raw = read_payload(r, byte_count)?;
 
         entries.push(RawEntry { name, shape, dtype, raw });
     }
@@ -791,7 +770,9 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
 
 /// Migrate a checkpoint file. Detects gzip from `.gz` extension on both paths.
 ///
-/// Source and destination must be different paths.
+/// In-place migration (`src == dst`) is safe: the destination is written to
+/// a temporary file and renamed over `dst` only after the source has been
+/// fully read (the same atomic tmp + rename every checkpoint writer uses).
 pub fn migrate_checkpoint_file(
     src: &str,
     dst: &str,
@@ -799,40 +780,77 @@ pub fn migrate_checkpoint_file(
     buffers: &[(String, Buffer)],
 ) -> Result<MigrateReport> {
     let sf = std::fs::File::open(src).map_err(io_err)?;
-    let df = std::fs::File::create(dst).map_err(io_err)?;
-
-    match (src.ends_with(".gz"), dst.ends_with(".gz")) {
-        (true, true) => {
+    write_file_atomic(dst, |mut w| {
+        if src.ends_with(".gz") {
             let mut r = flate2::read::GzDecoder::new(sf);
-            let mut w = flate2::write::GzEncoder::new(df, flate2::Compression::default());
-            let report = migrate_checkpoint(&mut r, &mut w, params, buffers)?;
-            w.finish().map_err(io_err)?;
-            Ok(report)
-        }
-        (true, false) => {
-            let mut r = flate2::read::GzDecoder::new(sf);
-            let mut w = std::io::BufWriter::new(df);
+            migrate_checkpoint(&mut r, &mut w, params, buffers)
+        } else {
+            let mut r = std::io::BufReader::new(sf);
             migrate_checkpoint(&mut r, &mut w, params, buffers)
         }
-        (false, true) => {
-            let mut r = std::io::BufReader::new(sf);
-            let mut w = flate2::write::GzEncoder::new(df, flate2::Compression::default());
-            let report = migrate_checkpoint(&mut r, &mut w, params, buffers)?;
-            w.finish().map_err(io_err)?;
-            Ok(report)
-        }
-        (false, false) => {
-            let mut r = std::io::BufReader::new(sf);
-            let mut w = std::io::BufWriter::new(df);
-            migrate_checkpoint(&mut r, &mut w, params, buffers)
-        }
-    }
+    })
 }
 
 // --- Shared helpers ---
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> TensorError {
     TensorError::new(&format!("io: {}", e))
+}
+
+/// Bound on serialized entry names — checkpoint keys are code identifiers;
+/// anything bigger is corruption, not data.
+const MAX_NAME_LEN: usize = 64 * 1024;
+/// Bound on tensor rank in a checkpoint header.
+const MAX_NDIM: usize = 64;
+
+/// Read a length-prefixed entry name. The length is untrusted header data:
+/// without the cap a corrupt file allocates up to 4 GiB before reading a byte.
+fn read_name<R: Read>(r: &mut R) -> Result<String> {
+    let name_len = read_u32(r)? as usize;
+    if name_len > MAX_NAME_LEN {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: entry name length {name_len} exceeds {MAX_NAME_LEN}"
+        )));
+    }
+    let mut name_bytes = vec![0u8; name_len];
+    r.read_exact(&mut name_bytes).map_err(io_err)?;
+    Ok(String::from_utf8_lossy(&name_bytes).into_owned())
+}
+
+/// Read a rank-prefixed shape, rank capped for the same reason as names.
+fn read_shape<R: Read>(r: &mut R) -> Result<Vec<i64>> {
+    let ndim = read_u32(r)? as usize;
+    if ndim > MAX_NDIM {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: tensor rank {ndim} exceeds {MAX_NDIM}"
+        )));
+    }
+    let mut shape = vec![0i64; ndim];
+    for s in &mut shape {
+        *s = read_i64(r)?;
+    }
+    Ok(shape)
+}
+
+/// Read a payload whose length comes from the untrusted header. The
+/// allocation grows with the bytes actually present (`take` + `read_to_end`),
+/// so a header claiming 2^60 bytes on a truncated file errors at EOF instead
+/// of aborting the process on the allocation.
+fn read_payload<R: Read>(r: &mut R, byte_count: usize) -> Result<Vec<u8>> {
+    const PREALLOC_CAP: usize = 16 << 20;
+    let mut raw = Vec::with_capacity(byte_count.min(PREALLOC_CAP));
+    let n = r
+        .by_ref()
+        .take(byte_count as u64)
+        .read_to_end(&mut raw)
+        .map_err(io_err)?;
+    if n != byte_count {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: payload truncated: header claims {byte_count} bytes, \
+             {n} present"
+        )));
+    }
+    Ok(raw)
 }
 
 fn check_err_raw(err: *mut std::ffi::c_char) -> Result<()> {

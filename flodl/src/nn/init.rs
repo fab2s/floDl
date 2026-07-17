@@ -1,4 +1,33 @@
-use crate::tensor::{Device, Result, Tensor, TensorOptions};
+use crate::tensor::{Device, Result, Tensor, TensorError, TensorOptions};
+
+/// Validate grouped-convolution channel arithmetic (shared by all six
+/// conv / conv-transpose constructors). PyTorch parity: `groups` must be
+/// positive and divide both channel counts — `groups = 0` would be an i64
+/// division by zero, and a non-dividing value would silently truncate the
+/// weight shape (integer division) into a wrong-shaped kernel.
+pub(crate) fn validate_conv_groups(
+    what: &str,
+    in_channels: i64,
+    out_channels: i64,
+    groups: i64,
+) -> Result<()> {
+    if groups < 1 {
+        return Err(TensorError::new(&format!(
+            "{what}: groups must be a positive integer, got {groups}"
+        )));
+    }
+    if in_channels % groups != 0 {
+        return Err(TensorError::new(&format!(
+            "{what}: in_channels ({in_channels}) must be divisible by groups ({groups})"
+        )));
+    }
+    if out_channels % groups != 0 {
+        return Err(TensorError::new(&format!(
+            "{what}: out_channels ({out_channels}) must be divisible by groups ({groups})"
+        )));
+    }
+    Ok(())
+}
 
 /// Kaiming uniform initialization.
 ///

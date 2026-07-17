@@ -148,6 +148,7 @@ impl Conv2d {
         stride: [i64; 2], padding: [i64; 2], dilation: [i64; 2],
         groups: i64, device: Device,
     ) -> Result<Self> {
+        super::init::validate_conv_groups("Conv2d", in_channels, out_channels, groups)?;
         let shape = [out_channels, in_channels / groups, kernel_size, kernel_size];
         let fan_in = (in_channels / groups) * kernel_size * kernel_size;
 
@@ -282,6 +283,26 @@ mod tests {
         assert_eq!(y.shape(), vec![1, 8, 8, 8]);
         // Weight: [8, 4/2, 3, 3] = [8, 2, 3, 3]
         assert_eq!(conv.weight.variable.shape(), vec![8, 2, 3, 3]);
+    }
+
+    #[test]
+    fn test_conv2d_invalid_groups_error() {
+        // groups = 0 was an i64 division-by-zero panic in a Result-returning
+        // constructor; non-dividing groups silently truncated the weight
+        // shape. Both must error loudly (PyTorch parity), in all 6 variants
+        // via the shared validator — Conv2d stands in for the family.
+        let msg = |r: Result<Conv2d>| match r {
+            Ok(_) => panic!("invalid groups must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        let m = msg(Conv2d::configure(4, 8, 3).with_groups(0).done());
+        assert!(m.contains("groups must be a positive integer"), "{m}");
+
+        let m = msg(Conv2d::configure(4, 8, 3).with_groups(3).done());
+        assert!(m.contains("in_channels (4) must be divisible by groups (3)"), "{m}");
+
+        let m = msg(Conv2d::configure(4, 6, 3).with_groups(4).done());
+        assert!(m.contains("out_channels (6) must be divisible by groups (4)"), "{m}");
     }
 
     #[test]

@@ -682,6 +682,10 @@ unsafe extern "C" {
         t: FlodlTensor, sorted: i32, return_inverse: i32,
         output: *mut FlodlTensor, inverse_indices: *mut FlodlTensor,
     ) -> *mut c_char;
+    pub fn flodl_unique_consecutive(
+        t: FlodlTensor, return_inverse: i32,
+        output: *mut FlodlTensor, inverse_indices: *mut FlodlTensor,
+    ) -> *mut c_char;
     pub fn flodl_searchsorted(
         sorted_seq: FlodlTensor, values: FlodlTensor,
         result: *mut FlodlTensor,

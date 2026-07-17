@@ -83,6 +83,56 @@ struct GroupMeta {
     range: std::ops::Range<usize>,
 }
 
+/// Serialize the group table: `count(u32) | (lr(f64), start(i64), end(i64))*`.
+/// One codec for every grouped optimizer's `save_state`.
+fn write_groups<W: Write>(w: &mut W, groups: &[GroupMeta]) -> Result<()> {
+    use crate::nn::checkpoint::{write_f64_le, write_i64_le, write_u32_le};
+    write_u32_le(w, groups.len() as u32)?;
+    for g in groups {
+        write_f64_le(w, g.lr)?;
+        write_i64_le(w, g.range.start as i64)?;
+        write_i64_le(w, g.range.end as i64)?;
+    }
+    Ok(())
+}
+
+/// Read and validate the group table against the optimizer's param count.
+///
+/// Every builder's `build()` produces a contiguous ascending partition of
+/// `0..n_params`, and `step()` updates ONLY group-covered params — so a table
+/// violating that invariant would index out of bounds in a fused kernel at
+/// the next `step()`, or worse, silently skip parameters. A corrupt `.optim`
+/// file errors here at load instead.
+fn read_groups<R: Read>(r: &mut R, n_params: usize, what: &str) -> Result<Vec<GroupMeta>> {
+    use crate::nn::checkpoint::{read_f64_le, read_i64_le, read_u32_le};
+    let ng = read_u32_le(r)? as usize;
+    let mut groups = Vec::with_capacity(ng.min(1024));
+    let mut expected_start = 0i64;
+    for i in 0..ng {
+        let lr = read_f64_le(r)?;
+        let start = read_i64_le(r)?;
+        let end = read_i64_le(r)?;
+        if start != expected_start || end < start || end > n_params as i64 {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "{what}: corrupt optimizer state: group {i} range {start}..{end} \
+                 (expected a contiguous partition of 0..{n_params})"
+            )));
+        }
+        expected_start = end;
+        groups.push(GroupMeta {
+            lr,
+            range: start as usize..end as usize,
+        });
+    }
+    if ng > 0 && expected_start != n_params as i64 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{what}: corrupt optimizer state: groups cover 0..{expected_start} \
+             of {n_params} params"
+        )));
+    }
+    Ok(groups)
+}
+
 /// Save/load training state (learning rates, momentum buffers, step counters).
 /// Implement for optimizers and other stateful training components.
 pub trait Stateful {
@@ -100,30 +150,7 @@ pub trait Stateful {
     /// so every artifact in an NCCL consensus checkpoint commits atomically.
     /// gzip is chosen from the FINAL extension, not the tmp name.
     fn save_state_file(&self, path: &str) -> Result<()> {
-        let io_err =
-            |e: std::io::Error| crate::tensor::TensorError::new(&format!("io: {}", e));
-        let is_gz = path.ends_with(".gz");
-        let tmp = format!("{path}.tmp");
-        let write_result = (|| -> Result<()> {
-            let f = std::fs::File::create(&tmp).map_err(io_err)?;
-            if is_gz {
-                let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-                self.save_state(&mut w)?;
-                w.finish().map_err(io_err)?;
-                Ok(())
-            } else {
-                let mut w = std::io::BufWriter::new(f);
-                self.save_state(&mut w)?;
-                w.flush().map_err(io_err)
-            }
-        })();
-        match write_result {
-            Ok(()) => std::fs::rename(&tmp, path).map_err(io_err),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        crate::nn::checkpoint::write_file_atomic(path, |mut w| self.save_state(&mut w))
     }
 
     /// Load state from a file. Detects gzip from `.gz` extension.

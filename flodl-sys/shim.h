@@ -149,6 +149,8 @@ char* flodl_count_nonzero_dim(FlodlTensor t, int dim, FlodlTensor* result);
 char* flodl_nonzero(FlodlTensor t, FlodlTensor* result);
 char* flodl_unique(FlodlTensor t, int sorted, int return_inverse,
                   FlodlTensor* output, FlodlTensor* inverse_indices);
+char* flodl_unique_consecutive(FlodlTensor t, int return_inverse,
+                              FlodlTensor* output, FlodlTensor* inverse_indices);
 char* flodl_searchsorted(FlodlTensor sorted_seq, FlodlTensor values,
                         FlodlTensor* result);
 

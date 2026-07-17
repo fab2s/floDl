@@ -709,13 +709,35 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
-    /// Unique elements. Returns (output, inverse_indices).
+    /// Unique elements (global dedup). Returns (output, inverse_indices).
     /// If `return_inverse` is false, inverse_indices is empty.
+    ///
+    /// `sorted` controls output ordering only; with `sorted = false` the
+    /// order is kernel-defined (PyTorch `torch.unique` semantics). For
+    /// adjacent-run dedup, use [`Tensor::unique_consecutive`].
     pub fn unique(&self, sorted: bool, return_inverse: bool) -> Result<(Tensor, Tensor)> {
         let mut output: FlodlTensor = ptr::null_mut();
         let mut inverse: FlodlTensor = ptr::null_mut();
         let err = unsafe {
             ffi::flodl_unique(self.handle, sorted as i32, return_inverse as i32, &mut output, &mut inverse)
+        };
+        check_err(err)?;
+        let inv = if inverse.is_null() {
+            Tensor::from_i64(&[], &[0], super::Device::CPU)?
+        } else {
+            Tensor::from_raw(inverse)
+        };
+        Ok((Tensor::from_raw(output), inv))
+    }
+
+    /// Eliminate consecutive duplicates only (PyTorch `torch.unique_consecutive`):
+    /// `[1, 1, 2, 2, 1]` -> `[1, 2, 1]`. Returns (output, inverse_indices).
+    /// If `return_inverse` is false, inverse_indices is empty.
+    pub fn unique_consecutive(&self, return_inverse: bool) -> Result<(Tensor, Tensor)> {
+        let mut output: FlodlTensor = ptr::null_mut();
+        let mut inverse: FlodlTensor = ptr::null_mut();
+        let err = unsafe {
+            ffi::flodl_unique_consecutive(self.handle, return_inverse as i32, &mut output, &mut inverse)
         };
         check_err(err)?;
         let inv = if inverse.is_null() {

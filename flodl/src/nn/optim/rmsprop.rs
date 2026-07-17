@@ -7,7 +7,7 @@ use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
     write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    write_u32_le, read_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -236,12 +236,7 @@ impl Stateful for RMSprop {
             write_tensor_state(w, self.buf[i].as_ref())?;
         }
         // Groups
-        write_u32_le(w, self.groups.len() as u32)?;
-        for g in &self.groups {
-            write_f64_le(w, g.lr)?;
-            write_i64_le(w, g.range.start as i64)?;
-            write_i64_le(w, g.range.end as i64)?;
-        }
+        super::write_groups(w, &self.groups)?;
         Ok(())
     }
 
@@ -263,14 +258,7 @@ impl Stateful for RMSprop {
             self.buf[i] = read_tensor_state(r, dev)?;
         }
         // Groups
-        let ng = read_u32_le(r)? as usize;
-        self.groups.clear();
-        for _ in 0..ng {
-            let lr = read_f64_le(r)?;
-            let start = read_i64_le(r)? as usize;
-            let end = read_i64_le(r)? as usize;
-            self.groups.push(GroupMeta { lr, range: start..end });
-        }
+        self.groups = super::read_groups(r, self.params.len(), "RMSprop")?;
         Ok(())
     }
 }

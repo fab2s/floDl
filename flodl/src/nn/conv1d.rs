@@ -148,6 +148,7 @@ impl Conv1d {
         stride: i64, padding: i64, dilation: i64,
         groups: i64, device: Device,
     ) -> Result<Self> {
+        super::init::validate_conv_groups("Conv1d", in_channels, out_channels, groups)?;
         let shape = [out_channels, in_channels / groups, kernel_size];
         let fan_in = (in_channels / groups) * kernel_size;
 

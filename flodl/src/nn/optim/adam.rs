@@ -220,12 +220,7 @@ impl Stateful for Adam {
             write_tensor_state(w, self.v[i].as_ref())?;
         }
         // Groups
-        write_u32_le(w, self.groups.len() as u32)?;
-        for g in &self.groups {
-            write_f64_le(w, g.lr)?;
-            write_i64_le(w, g.range.start as i64)?;
-            write_i64_le(w, g.range.end as i64)?;
-        }
+        super::write_groups(w, &self.groups)?;
         Ok(())
     }
 
@@ -244,14 +239,7 @@ impl Stateful for Adam {
             self.v[i] = read_tensor_state(r, dev)?;
         }
         // Groups
-        let ng = read_u32_le(r)? as usize;
-        self.groups.clear();
-        for _ in 0..ng {
-            let lr = read_f64_le(r)?;
-            let start = read_i64_le(r)? as usize;
-            let end = read_i64_le(r)? as usize;
-            self.groups.push(GroupMeta { lr, range: start..end });
-        }
+        self.groups = super::read_groups(r, self.params.len(), "Adam")?;
         Ok(())
     }
 }
@@ -601,6 +589,46 @@ mod tests {
         assert_eq!(opt2.t, opt.t);
         assert!((opt2.groups[0].lr - 0.01).abs() < 1e-12);
         assert!((opt2.groups[1].lr - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_load_state_rejects_corrupt_group_ranges() {
+        // A corrupt group table must error at load, not restore ranges that
+        // index out of bounds at the next step() (or silently skip params).
+        let p1 = make_param("w1", &[3, 2]);
+        let p2 = make_param("w2", &[3, 2]);
+        let mut opt = Adam::with_groups()
+            .group(std::slice::from_ref(&p1), 0.01)
+            .group(std::slice::from_ref(&p2), 0.05)
+            .build();
+
+        let mut buf = Vec::new();
+        opt.save_state(&mut buf).unwrap();
+
+        // The last 8 bytes are the final group's `end` (i64 LE) — inflate it
+        // past the param count.
+        let n = buf.len();
+        buf[n - 8..].copy_from_slice(&999i64.to_le_bytes());
+
+        let err = opt
+            .load_state(&mut std::io::Cursor::new(&buf))
+            .expect_err("inflated group range must be rejected");
+        assert!(
+            err.to_string().contains("corrupt optimizer state"),
+            "unexpected error: {err}"
+        );
+
+        // Non-contiguous coverage (a gap would silently skip params): patch
+        // the SECOND group's start (bytes n-16..n-8) to overlap group 0.
+        let mut buf2 = Vec::new();
+        opt.save_state(&mut buf2).unwrap();
+        let n2 = buf2.len();
+        buf2[n2 - 16..n2 - 8].copy_from_slice(&0i64.to_le_bytes());
+        buf2[n2 - 8..].copy_from_slice(&2i64.to_le_bytes());
+        let err2 = opt
+            .load_state(&mut std::io::Cursor::new(&buf2))
+            .expect_err("non-contiguous group table must be rejected");
+        assert!(err2.to_string().contains("corrupt optimizer state"));
     }
 
     #[test]

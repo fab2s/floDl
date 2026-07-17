@@ -694,6 +694,25 @@
     }
 
     #[test]
+    fn test_unique_unsorted_is_global_dedup() {
+        // sorted=false must still dedup globally (PyTorch parity), not
+        // adjacent-runs only: [1, 2, 1] has exactly 2 unique values.
+        let t = Tensor::from_f32(&[1.0, 2.0, 1.0], &[3], test_device()).unwrap();
+        let (u, _) = t.unique(false, false).unwrap();
+        let mut uv = u.to_f32_vec().unwrap();
+        uv.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(uv, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_unique_consecutive() {
+        let t = Tensor::from_f32(&[1.0, 1.0, 2.0, 2.0, 1.0], &[5], test_device()).unwrap();
+        let (u, inv) = t.unique_consecutive(true).unwrap();
+        assert_eq!(u.to_f32_vec().unwrap(), vec![1.0, 2.0, 1.0]);
+        assert_eq!(inv.to_i64_vec().unwrap(), vec![0, 0, 1, 1, 2]);
+    }
+
+    #[test]
     fn test_searchsorted() {
         let sorted = Tensor::from_f32(&[1.0, 3.0, 5.0, 7.0], &[4], test_device()).unwrap();
         let vals = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], test_device()).unwrap();
