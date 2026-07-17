@@ -74,14 +74,11 @@
 //!   chunk-pool scheduling.
 //! - `test_helpers.rs` — `#[cfg(test)]` constructors and accessors.
 
-use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Instant;
-
-use hmac_sha256::HMAC;
 
 use crate::distributed::ddp::ElChe;
 use crate::distributed::ddp_run::convergence::ConvergenceGuard;
@@ -90,7 +87,6 @@ use crate::distributed::relay::mux::{MuxRead, MuxRecord, RelayControlMsg};
 use crate::distributed::wire::{
     ControlFrame, MsgKind, SessionSalt, TimingMsgWire,
 };
-use crate::tensor::{Result, TensorError};
 
 pub mod config;
 mod averaging;
@@ -137,130 +133,6 @@ pub(super) enum RunPhase {
     /// post-aggregate hook; the broadcast must not refire on later ticks
     /// before the readers observe stream close.
     ShutdownInitiated,
-}
-
-// ---------------------------------------------------------------------------
-// Control-channel handshake
-// ---------------------------------------------------------------------------
-
-/// Rank → coordinator handshake magic (mirrors
-/// [`crate::distributed::wire::CONTROL_HANDSHAKE_MAGIC_RANK`]).
-pub(crate) const CTRL_HS_RANK: u32 = crate::distributed::wire::CONTROL_HANDSHAKE_MAGIC_RANK;
-
-/// Coordinator → rank handshake-ack magic.
-pub(crate) const CTRL_HS_ACK: u32 = crate::distributed::wire::CONTROL_HANDSHAKE_MAGIC_ACK;
-
-/// Wire-version used inside the handshake bytes.
-pub(crate) const CTRL_HS_VERSION: u32 = crate::distributed::wire::CONTROL_PROTOCOL_VERSION;
-
-/// Handshake byte layout (rank → coordinator):
-///
-/// ```text
-/// u32 magic       = CTRL_HS_RANK
-/// u32 version     = CTRL_HS_VERSION
-/// u32 rank_id     (0..world_size)
-/// u32 world_size  (rank's view; coordinator validates)
-/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..16])
-/// ```
-///
-/// Total: 24 bytes. The HMAC proves the rank shares the launcher's
-/// session salt; mismatched salts surface here before any control
-/// frame round-trip.
-const HS_RANK_BYTES: usize = 24;
-
-/// Handshake-ack layout (coordinator → rank):
-///
-/// ```text
-/// u32 magic       = CTRL_HS_ACK
-/// u32 version     = CTRL_HS_VERSION
-/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..8])
-/// ```
-///
-/// Total: 16 bytes.
-const HS_ACK_BYTES: usize = 16;
-
-fn hmac_first8(salt: &SessionSalt, bytes: &[u8]) -> [u8; 8] {
-    let full: [u8; 32] = HMAC::mac(bytes, salt.as_slice());
-    full[0..8].try_into().unwrap()
-}
-
-/// Worker-side companion to [`read_handshake_rank`]. Exported at
-/// crate visibility for use by [`crate::distributed::cluster_worker`].
-#[allow(dead_code)]
-pub(crate) fn write_handshake_rank(
-    stream: &mut TcpStream,
-    rank_id: u32,
-    world_size: u32,
-    salt: &SessionSalt,
-) -> Result<()> {
-    let mut buf = [0u8; HS_RANK_BYTES];
-    buf[0..4].copy_from_slice(&CTRL_HS_RANK.to_le_bytes());
-    buf[4..8].copy_from_slice(&CTRL_HS_VERSION.to_le_bytes());
-    buf[8..12].copy_from_slice(&rank_id.to_le_bytes());
-    buf[12..16].copy_from_slice(&world_size.to_le_bytes());
-    let tag = hmac_first8(salt, &buf[0..16]);
-    buf[16..24].copy_from_slice(&tag);
-    stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("cluster_coordinator: handshake write: {e}"))
-    })
-}
-
-/// Read and validate the rank-side control-channel handshake (salt-
-/// authenticated), returning the announced `rank_id`. Exposed at crate
-/// visibility so the per-host relay ([`crate::distributed::relay`]) can
-/// terminate the handshake toward its local ranks as the coordinator does.
-pub(crate) fn read_handshake_rank(
-    stream: &mut TcpStream,
-    expected_world_size: u32,
-    salt: &SessionSalt,
-) -> Result<u32> {
-    let mut buf = [0u8; HS_RANK_BYTES];
-    stream.read_exact(&mut buf).map_err(|e| {
-        TensorError::new(&format!("cluster_coordinator: handshake read: {e}"))
-    })?;
-    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if magic != CTRL_HS_RANK {
-        return Err(TensorError::new(&format!(
-            "cluster_coordinator: handshake magic 0x{magic:08x} != 0x{CTRL_HS_RANK:08x}"
-        )));
-    }
-    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != CTRL_HS_VERSION {
-        return Err(TensorError::new(&format!(
-            "cluster_coordinator: handshake version {version} != {CTRL_HS_VERSION}"
-        )));
-    }
-    let rank_id = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-    let world_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-    if world_size != expected_world_size {
-        return Err(TensorError::new(&format!(
-            "cluster_coordinator: handshake world_size {world_size} != expected {expected_world_size}"
-        )));
-    }
-    let expected_tag = hmac_first8(salt, &buf[0..16]);
-    let got_tag: [u8; 8] = buf[16..24].try_into().unwrap();
-    if expected_tag != got_tag {
-        return Err(TensorError::new(
-            "cluster_coordinator: handshake HMAC verification failed; \
-             session salt disagreement (rank from a different training session, \
-             or wrong key configured)",
-        ));
-    }
-    Ok(rank_id)
-}
-
-/// Write the coordinator-side control-channel handshake ack (salt-
-/// authenticated). Exposed at crate visibility for the per-host relay
-/// (see [`read_handshake_rank`]).
-pub(crate) fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
-    let mut buf = [0u8; HS_ACK_BYTES];
-    buf[0..4].copy_from_slice(&CTRL_HS_ACK.to_le_bytes());
-    buf[4..8].copy_from_slice(&CTRL_HS_VERSION.to_le_bytes());
-    let tag = hmac_first8(salt, &buf[0..8]);
-    buf[8..16].copy_from_slice(&tag);
-    stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("cluster_coordinator: handshake ack write: {e}"))
-    })
 }
 
 /// Initial value for the coord's three role-rank fields

@@ -1689,6 +1689,52 @@
     }
 
     #[test]
+    fn test_straggling_sent_increment_cannot_wedge_next_epoch() {
+        // Regression for the full-suite `test_streaming_multiple_epochs`
+        // wedge: the worker counts `sent` AFTER publishing a batch, so a
+        // consumer that consumed the batch, dropped the epoch, and armed
+        // the next one inside that window had the straggling increment
+        // counted against the FRESH epoch. At `target=1` (the
+        // pre-honest-resize CPU depth) `governor_gate` then saw
+        // `sent=1, consumed=0` forever — worker spinning in its 1ms
+        // sleep, consumer parked in `recv`, deadlock. The fix moves the
+        // counter reset into the worker's `StartEpoch` processing,
+        // ordered after any straggler by the command channel.
+        //
+        // Deterministic form of the race: inject the straggler after
+        // the consumer-side arm. Old protocol (consumer-side reset)
+        // wedges and the recv below times out; new protocol wipes the
+        // straggler at `StartEpoch` receipt and the batch arrives.
+        use crate::data::prefetch::{GovernorCtl, PrefetchWorker};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dataset: Arc<dyn BatchDataSet> = Arc::new(IndexBatch { n: 4 });
+        let worker = PrefetchWorker::new(Arc::clone(&dataset), Device::CPU, 8, false, 1);
+        let governor = Arc::new(GovernorCtl::new(1));
+
+        // Epoch 0: one batch, consumed cleanly.
+        governor.begin_epoch(1);
+        let rx = worker.start_epoch((0..4).collect(), 4, false, Arc::clone(&governor), 0);
+        rx.recv().unwrap().unwrap();
+        governor.consumed.fetch_add(1, Ordering::Relaxed);
+        drop(rx);
+
+        // Epoch 1: arm, then land the straggling `sent` increment the
+        // preempted worker would emit at exactly this point.
+        governor.begin_epoch(1);
+        governor.sent.fetch_add(1, Ordering::Relaxed);
+
+        let rx = worker.start_epoch((0..4).collect(), 4, false, Arc::clone(&governor), 0);
+        let batch = rx.recv_timeout(std::time::Duration::from_secs(30));
+        assert!(
+            batch.is_ok(),
+            "epoch after a straggling sent increment must still deliver \
+             (governor gate wedged on leaked in-flight accounting)",
+        );
+    }
+
+    #[test]
     fn test_two_stage_pipeline_delivers_all_batches_in_order() {
         // Drive the worker directly with ring_slots > 0. The loader
         // only enables the reader ring for CUDA targets (policy), but

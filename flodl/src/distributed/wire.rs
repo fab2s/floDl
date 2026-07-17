@@ -64,6 +64,7 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 
 use hmac_sha256::HMAC;
 use serde::{Deserialize, Serialize};
@@ -577,6 +578,160 @@ fn frame_mac(salt: &SessionSalt, kind: MsgKind, payload: &[u8]) -> u64 {
     macd.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     macd.extend_from_slice(payload);
     hmac_sha256_64(salt, &macd)
+}
+
+// ---------------------------------------------------------------------------
+// Control-channel handshake codec
+// ---------------------------------------------------------------------------
+//
+// The salt-authenticated hello exchanged before any ControlFrame flows:
+// rank → coordinator/relay announce (`write_handshake_rank` /
+// `read_handshake_rank`), coordinator/relay → rank ack
+// (`write_handshake_ack` / `read_handshake_ack`). Both ends of both
+// directions live here so the byte layouts have exactly one home
+// (audit I4 — this codec previously lived in `cluster_coordinator` with
+// a duplicated ack-reader in `cluster_worker`).
+
+/// Handshake byte layout (rank → coordinator):
+///
+/// ```text
+/// u32 magic       = CONTROL_HANDSHAKE_MAGIC_RANK
+/// u32 version     = CONTROL_PROTOCOL_VERSION
+/// u32 rank_id     (0..world_size)
+/// u32 world_size  (rank's view; coordinator validates)
+/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..16])
+/// ```
+///
+/// Total: 24 bytes. The HMAC proves the rank shares the launcher's
+/// session salt; mismatched salts surface here before any control
+/// frame round-trip.
+const HS_RANK_BYTES: usize = 24;
+
+/// Handshake-ack layout (coordinator → rank):
+///
+/// ```text
+/// u32 magic       = CONTROL_HANDSHAKE_MAGIC_ACK
+/// u32 version     = CONTROL_PROTOCOL_VERSION
+/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..8])
+/// ```
+///
+/// Total: 16 bytes.
+const HS_ACK_BYTES: usize = 16;
+
+/// First 8 MAC bytes as raw bytes — the handshake's on-wire tag form.
+/// Identical bytes to [`hmac_sha256_64`]`(..).to_le_bytes()` (that
+/// helper is `u64::from_le_bytes` over the same leading 8 bytes).
+fn hmac_first8(salt: &SessionSalt, bytes: &[u8]) -> [u8; 8] {
+    hmac_sha256_64(salt, bytes).to_le_bytes()
+}
+
+/// Rank-side handshake write (rank → coordinator/relay).
+pub(crate) fn write_handshake_rank(
+    stream: &mut TcpStream,
+    rank_id: u32,
+    world_size: u32,
+    salt: &SessionSalt,
+) -> Result<()> {
+    let mut buf = [0u8; HS_RANK_BYTES];
+    buf[0..4].copy_from_slice(&CONTROL_HANDSHAKE_MAGIC_RANK.to_le_bytes());
+    buf[4..8].copy_from_slice(&CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    buf[8..12].copy_from_slice(&rank_id.to_le_bytes());
+    buf[12..16].copy_from_slice(&world_size.to_le_bytes());
+    let tag = hmac_first8(salt, &buf[0..16]);
+    buf[16..24].copy_from_slice(&tag);
+    stream.write_all(&buf).map_err(|e| {
+        TensorError::new(&format!("wire: handshake write: {e}"))
+    })
+}
+
+/// Read and validate the rank-side control-channel handshake (salt-
+/// authenticated), returning the announced `rank_id`. Used by the
+/// coordinator's accept loop and by the per-host relay
+/// ([`crate::distributed::relay`]), which terminates the handshake
+/// toward its local ranks as the coordinator does.
+pub(crate) fn read_handshake_rank(
+    stream: &mut TcpStream,
+    expected_world_size: u32,
+    salt: &SessionSalt,
+) -> Result<u32> {
+    let mut buf = [0u8; HS_RANK_BYTES];
+    stream.read_exact(&mut buf).map_err(|e| {
+        TensorError::new(&format!("wire: handshake read: {e}"))
+    })?;
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if magic != CONTROL_HANDSHAKE_MAGIC_RANK {
+        return Err(TensorError::new(&format!(
+            "wire: handshake magic 0x{magic:08x} != 0x{CONTROL_HANDSHAKE_MAGIC_RANK:08x}"
+        )));
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != CONTROL_PROTOCOL_VERSION {
+        return Err(TensorError::new(&format!(
+            "wire: handshake version {version} != {CONTROL_PROTOCOL_VERSION}"
+        )));
+    }
+    let rank_id = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    let world_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    if world_size != expected_world_size {
+        return Err(TensorError::new(&format!(
+            "wire: handshake world_size {world_size} != expected {expected_world_size}"
+        )));
+    }
+    let expected_tag = hmac_first8(salt, &buf[0..16]);
+    let got_tag: [u8; 8] = buf[16..24].try_into().unwrap();
+    if expected_tag != got_tag {
+        return Err(TensorError::new(
+            "wire: handshake HMAC verification failed; \
+             session salt disagreement (rank from a different training session, \
+             or wrong key configured)",
+        ));
+    }
+    Ok(rank_id)
+}
+
+/// Coordinator/relay-side handshake ack write (salt-authenticated).
+pub(crate) fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
+    let mut buf = [0u8; HS_ACK_BYTES];
+    buf[0..4].copy_from_slice(&CONTROL_HANDSHAKE_MAGIC_ACK.to_le_bytes());
+    buf[4..8].copy_from_slice(&CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    let tag = hmac_first8(salt, &buf[0..8]);
+    buf[8..16].copy_from_slice(&tag);
+    stream.write_all(&buf).map_err(|e| {
+        TensorError::new(&format!("wire: handshake ack write: {e}"))
+    })
+}
+
+/// Rank-side handshake-ack read + validation (the worker's half of
+/// [`write_handshake_ack`]).
+pub(crate) fn read_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
+    let mut buf = [0u8; HS_ACK_BYTES];
+    stream.read_exact(&mut buf).map_err(|e| {
+        TensorError::new(&format!(
+            "wire: handshake ack read failed: {e} \
+             (coordinator may have rejected our handshake)"
+        ))
+    })?;
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if magic != CONTROL_HANDSHAKE_MAGIC_ACK {
+        return Err(TensorError::new(&format!(
+            "wire: handshake ack magic 0x{magic:08x} != 0x{CONTROL_HANDSHAKE_MAGIC_ACK:08x}"
+        )));
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != CONTROL_PROTOCOL_VERSION {
+        return Err(TensorError::new(&format!(
+            "wire: handshake ack version {version} != {CONTROL_PROTOCOL_VERSION}"
+        )));
+    }
+    let expected_tag = hmac_first8(salt, &buf[0..8]);
+    let got: [u8; 8] = buf[8..16].try_into().unwrap();
+    if expected_tag != got {
+        return Err(TensorError::new(
+            "wire: handshake ack HMAC verification failed; \
+             session salt disagreement (worker holds a different salt than coordinator)",
+        ));
+    }
+    Ok(())
 }
 
 /// Generate a fresh random session salt from the OS-seeded thread RNG.

@@ -81,13 +81,32 @@ impl GovernorCtl {
         }
     }
 
-    /// Reset per-epoch state and install the epoch's initial target.
-    /// Run-level state (`run_consumed`, `honest_resize_done`) persists.
+    /// Consumer-side epoch arm: clear the abandon latch and install the
+    /// epoch's initial target. The in-flight counters are NOT reset
+    /// here — that happens worker-side in [`Self::reset_flight_counters`]
+    /// when the `StartEpoch` command is processed. Splitting the reset
+    /// this way closes a lost-batch race: the worker increments `sent`
+    /// AFTER publishing a batch, so a consumer-side reset could land in
+    /// that window and the straggling increment would count against the
+    /// NEXT epoch (`sent=1, consumed=0` with nothing in flight — at
+    /// `target=1`, the pre-honest-resize CPU depth, `governor_gate`
+    /// then spins forever while the consumer blocks in `recv`; the
+    /// full-suite `test_streaming_multiple_epochs` wedge).
     pub(crate) fn begin_epoch(&self, target: usize) {
-        self.sent.store(0, Ordering::Relaxed);
-        self.consumed.store(0, Ordering::Relaxed);
         self.abandoned.store(false, Ordering::Relaxed);
         self.target.store(target.max(1), Ordering::Relaxed);
+    }
+
+    /// Worker-side per-epoch counter reset, called at `StartEpoch`
+    /// receipt. Safe by construction: the worker's own `sent`
+    /// increments are program-ordered before it, and every consumer
+    /// increment for the prior epoch happens-before the consumer's
+    /// `StartEpoch` send (whose receipt orders this reset after them) —
+    /// no straggling increment can cross into the fresh epoch.
+    /// Run-level state (`run_consumed`, `honest_resize_done`) persists.
+    pub(crate) fn reset_flight_counters(&self) {
+        self.sent.store(0, Ordering::Relaxed);
+        self.consumed.store(0, Ordering::Relaxed);
     }
 }
 
@@ -155,7 +174,7 @@ pub(crate) struct PrefetchedBatch {
     pub picks: Vec<usize>,
     /// Event recorded after async H2D copy. Consumer waits on this.
     #[cfg(feature = "cuda")]
-    pub ready_event: Option<crate::distributed::cuda_event::CudaEvent>,
+    pub ready_event: Option<crate::tensor::cuda_event::CudaEvent>,
 }
 
 /// Commands sent to the persistent worker thread.
@@ -331,7 +350,7 @@ fn worker_loop(
     // Create a dedicated CUDA stream for H2D transfers (lives across epochs).
     #[cfg(feature = "cuda")]
     let copy_stream = if device.is_cuda() {
-        crate::distributed::cuda_stream::CudaStream::new(device, false).ok()
+        crate::tensor::cuda_stream::CudaStream::new(device, false).ok()
     } else {
         None
     };
@@ -370,6 +389,12 @@ fn worker_loop(
                 ring_slots,
             } => {
                 dist_tx = None; // close any distributed channel
+
+                // Per-epoch counter reset lives HERE, not in the
+                // consumer's `begin_epoch` — see
+                // `GovernorCtl::reset_flight_counters` for the
+                // straggling-`sent` race a consumer-side reset loses.
+                governor.reset_flight_counters();
 
                 #[cfg(all(debug_assertions, not(test)))]
                 if !purity_probed && !indices.is_empty() {
@@ -497,7 +522,7 @@ fn run_single_stage_epoch(
     governor: &GovernorCtl,
     pool: &mut VramSamplePool,
     augment: usize,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) {
     let n = indices.len();
     let mut start = 0;
@@ -558,7 +583,7 @@ fn run_two_stage_epoch(
     ring_slots: usize,
     pool: &mut VramSamplePool,
     augment: usize,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) {
     let (ring_tx, ring_rx) =
         mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
@@ -672,7 +697,7 @@ fn pooled_transfer_with_retry(
     device: Device,
     governor: &GovernorCtl,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return transfer_batch(
@@ -719,7 +744,7 @@ fn fetch_and_transfer(
     augment: usize,
     device: Device,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
     let samples = crate::data::picks_to_samples(picks, augment);
     let tensors = dataset.get_batch(&samples)?;
@@ -748,7 +773,7 @@ fn transfer_batch(
     tensors: &[Tensor],
     device: Device,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return Ok(PrefetchedBatch {
@@ -761,8 +786,8 @@ fn transfer_batch(
 
     #[cfg(feature = "cuda")]
     {
-        use crate::distributed::cuda_event::{CudaEvent, CudaEventFlags};
-        use crate::distributed::cuda_stream::StreamGuard;
+        use crate::tensor::cuda_event::{CudaEvent, CudaEventFlags};
+        use crate::tensor::cuda_stream::StreamGuard;
 
         if let Some(stream) = copy_stream {
             let _guard = StreamGuard::new(stream);

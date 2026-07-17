@@ -29,7 +29,7 @@ use crate::tensor::{
     check_err, current_cuda_device, set_current_cuda_device,
     Device, Result, Tensor, TensorError,
 };
-use super::cuda_stream::CudaStream;
+use crate::tensor::cuda_stream::CudaStream;
 
 /// NCCL reduction operation.
 #[derive(Clone, Copy, Debug)]

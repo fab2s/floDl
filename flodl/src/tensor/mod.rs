@@ -10,11 +10,15 @@
 //! ```
 
 mod cuda;
+pub mod cuda_event;
+pub mod cuda_stream;
 mod ops;
 mod shape;
 mod nn_ops;
 
 pub use cuda::*;
+pub use cuda_event::{CudaEvent, CudaEventFlags};
+pub use cuda_stream::{CudaStream, StreamGuard};
 
 pub use nn_ops::RnnParams;
 

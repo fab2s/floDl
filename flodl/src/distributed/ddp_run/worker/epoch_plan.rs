@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use crate::autograd::Variable;
-use crate::distributed::cuda_stream::StreamGuard;
+use crate::tensor::cuda_stream::StreamGuard;
 use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 

@@ -510,7 +510,7 @@ fn fold_declare_dead_unblocks_the_barrier() {
 
 #[test]
 fn relay_channel_control_channel_end_to_end() {
-    use crate::distributed::cluster_coordinator::write_handshake_rank;
+    use crate::distributed::wire::write_handshake_rank;
 
     let (listener, relay_port) = RelayChannel::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let controller = TcpListener::bind("127.0.0.1:0").unwrap();

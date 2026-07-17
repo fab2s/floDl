@@ -136,7 +136,7 @@ pub trait Module {
         for child in &subs {
             walk_modules_visited(child.as_ref(), &mut visited, &mut |m| {
                 for p in m.parameters() {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
+                    let ptr = p.variable.id();
                     if seen.insert(ptr) {
                         params.push(p);
                     }
@@ -160,7 +160,7 @@ pub trait Module {
         for child in &subs {
             walk_modules_visited(child.as_ref(), &mut visited, &mut |m| {
                 for b in m.buffers() {
-                    let ptr = Rc::as_ptr(&b.inner) as usize;
+                    let ptr = b.id();
                     if seen.insert(ptr) {
                         bufs.push(b);
                     }

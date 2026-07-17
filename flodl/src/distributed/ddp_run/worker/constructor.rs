@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::autograd::{NoGradGuard, Variable};
 use crate::data::BatchDataSet;
-use crate::distributed::cuda_event::{CudaEvent, CudaEventFlags};
-use crate::distributed::cuda_stream::{CudaStream, StreamGuard};
+use crate::tensor::cuda_event::{CudaEvent, CudaEventFlags};
+use crate::tensor::cuda_stream::{CudaStream, StreamGuard};
 use crate::distributed::nccl::NcclRankComm;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};

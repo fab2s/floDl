@@ -124,12 +124,12 @@ impl ChannelKind {
                 Ok(rank as u32)
             }
             ChannelKind::Control => {
-                let rank = crate::distributed::cluster_coordinator::read_handshake_rank(
+                let rank = crate::distributed::wire::read_handshake_rank(
                     stream,
                     world_size as u32,
                     salt,
                 )?;
-                crate::distributed::cluster_coordinator::write_handshake_ack(stream, salt)?;
+                crate::distributed::wire::write_handshake_ack(stream, salt)?;
                 Ok(rank)
             }
         }

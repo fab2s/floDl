@@ -842,7 +842,7 @@ impl Graph {
 
                 let mut name_idx: HashMap<String, usize> = HashMap::new();
                 for p in params {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
+                    let ptr = p.variable.id();
                     if !seen.insert(ptr) {
                         continue;
                     }
@@ -889,7 +889,7 @@ impl Graph {
 
                 let mut name_idx: HashMap<String, usize> = HashMap::new();
                 for b in bufs {
-                    let ptr = Rc::as_ptr(&b.inner) as usize;
+                    let ptr = b.id();
                     if !seen.insert(ptr) {
                         continue;
                     }
@@ -1148,7 +1148,7 @@ impl Module for Graph {
         for &ni in &self.order {
             if let Some(ref module) = self.nodes[ni].module {
                 for p in module.parameters() {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
+                    let ptr = p.variable.id();
                     if seen.insert(ptr) {
                         params.push(p);
                     }
@@ -1173,7 +1173,7 @@ impl Module for Graph {
                     &mut HashSet::new(),
                     &mut |m: &dyn crate::nn::Module| {
                         for b in m.buffers() {
-                            let ptr = Rc::as_ptr(&b.inner) as usize;
+                            let ptr = b.id();
                             if seen.insert(ptr) {
                                 bufs.push(b);
                             }

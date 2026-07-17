@@ -61,7 +61,6 @@
 //!   few batches, verify weights converge to consensus. Runs via
 //!   `fdl cuda-test-nccl` on a multi-GPU rig.
 
-use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -70,58 +69,20 @@ use std::time::Duration;
 
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
-use crate::distributed::cluster_coordinator::{write_handshake_rank, CTRL_HS_ACK, CTRL_HS_VERSION};
+use crate::distributed::wire::{read_handshake_ack, write_handshake_rank};
 use crate::distributed::ddp_run::{
     CheckpointFn, ControlMsg, EpochFn, EpochPlan, EvalFn, GpuWorker, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::NcclRankComm;
 use crate::distributed::relay::mux::{try_read_len_framed, write_len_framed, LenFramedRead};
 use crate::distributed::wire::{
-    hmac_sha256_64, ControlFrame, ControlMsgWire, MsgKind, SessionSalt,
+    ControlFrame, ControlMsgWire, MsgKind, SessionSalt,
     TimingMsgWire,
 };
 #[cfg(test)]
 use crate::distributed::wire::EpochPlanWire;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
-
-// ---------------------------------------------------------------------------
-// Handshake (worker side)
-// ---------------------------------------------------------------------------
-
-const HS_ACK_BYTES: usize = 16;
-
-fn read_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
-    let mut buf = [0u8; HS_ACK_BYTES];
-    stream.read_exact(&mut buf).map_err(|e| {
-        TensorError::new(&format!(
-            "cluster_worker: handshake ack read failed: {e} \
-             (coordinator may have rejected our handshake)"
-        ))
-    })?;
-    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if magic != CTRL_HS_ACK {
-        return Err(TensorError::new(&format!(
-            "cluster_worker: handshake ack magic 0x{magic:08x} != 0x{CTRL_HS_ACK:08x}"
-        )));
-    }
-    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != CTRL_HS_VERSION {
-        return Err(TensorError::new(&format!(
-            "cluster_worker: handshake ack version {version} != {CTRL_HS_VERSION}"
-        )));
-    }
-    let full = hmac_sha256_64(salt, &buf[0..8]);
-    let expected = full.to_le_bytes();
-    let got: [u8; 8] = buf[8..16].try_into().unwrap();
-    if expected != got {
-        return Err(TensorError::new(
-            "cluster_worker: handshake ack HMAC verification failed; \
-             session salt disagreement (worker holds a different salt than coordinator)",
-        ));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Bridge helpers (mpsc ↔ TCP)

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crate::autograd::{NoGradGuard, Variable};
-use crate::distributed::cuda_stream::StreamGuard;
+use crate::tensor::cuda_stream::StreamGuard;
 use crate::distributed::nccl::ReduceOp;
 use crate::nn::Module;
 use crate::tensor::{Device, Result, Tensor, TensorError, TensorOptions};
@@ -63,7 +63,7 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
 #[allow(clippy::too_many_arguments)]
 fn weighted_allreduce_nccl(
     comm: &crate::distributed::nccl::NcclRankComm,
-    stream: Option<&crate::distributed::cuda_stream::CudaStream>,
+    stream: Option<&crate::tensor::cuda_stream::CudaStream>,
     param_refs: &[&Tensor],
     n_i: f64,
     gamma: f64,

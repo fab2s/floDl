@@ -199,11 +199,23 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     let preload_tag = if mode.requires_multi_gpu() { "cpu" } else { "gpu-preload" };
     let baseline_tag = if model_def.needs_baseline_eval { " [baseline-eval]" } else { "" };
+    // Surface the augmentation arm in the banner: an A/B log where the
+    // augmented arm is indistinguishable from control at a glance is a
+    // provenance hazard.
+    let augment_tag = if config.augment > 1 {
+        if config.augment_noise > 0.0 {
+            format!(", augment={}x noise={}", config.augment, config.augment_noise)
+        } else {
+            format!(", augment={}x", config.augment)
+        }
+    } else {
+        String::new()
+    };
     if real_data {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}){} ===",
+            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}{}){} ===",
             model_def.name, mode_str, config.epochs, dataset.len(), actual_batches,
-            config.batch_size, lr_note, baseline_tag,
+            config.batch_size, augment_tag, lr_note, baseline_tag,
         );
         let source_tag = match config.data_source {
             crate::models::DataSource::Ram => "",
@@ -215,9 +227,9 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         );
     } else {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} batches x {}{}){} ===",
-            model_def.name, mode_str, config.epochs, actual_batches, config.batch_size, lr_note,
-            baseline_tag,
+            "\n=== {} / {} ({} epochs, {} batches x {}{}{}){} ===",
+            model_def.name, mode_str, config.epochs, actual_batches, config.batch_size,
+            augment_tag, lr_note, baseline_tag,
         );
         eprintln!("  data: pool={pool_size}, virtual={virtual_len}, mode={preload_tag} ({load_ms}ms)");
     }

@@ -75,6 +75,16 @@ impl Variable {
         self.inner.borrow().data.clone()
     }
 
+    /// Stable identity of the shared autograd cell: clones of the same
+    /// `Variable` return the same id, independent copies differ. This
+    /// is what parameter collection dedups on (a module graph can reach
+    /// the same shared parameter through several paths). Valid only
+    /// while some clone is alive — ids can be recycled after the last
+    /// clone drops.
+    pub fn id(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
+    }
+
     /// Get the accumulated gradient, if any.
     /// Reads from the C++ tensor's .grad() field.
     pub fn grad(&self) -> Option<Tensor> {
@@ -121,7 +131,7 @@ impl Variable {
     /// handle that keeps the node alive; store it for the lifetime of
     /// the worker.
     ///
-    /// Call this under a [`StreamGuard`](crate::distributed::cuda_stream::StreamGuard)
+    /// Call this under a [`StreamGuard`](crate::tensor::cuda_stream::StreamGuard)
     /// on the training compute stream during DDP worker setup so that
     /// gradient accumulation runs on the same stream as subsequent
     /// forward/backward passes. Without this, the node is created

@@ -9,7 +9,9 @@
 
 pub(crate) use super::*;
 pub(crate) use crate::distributed::ddp_run::ApplyPolicy;
-pub(crate) use crate::distributed::wire::{ControlMsgWire, MetricsMsgWire, TimingMsgWire};
+pub(crate) use crate::distributed::wire::{ControlMsgWire, MetricsMsgWire, TimingMsgWire, read_handshake_rank, write_handshake_rank};
+pub(crate) use crate::tensor::{Result, TensorError};
+pub(crate) use std::io::Read;
 pub(crate) use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::atomic::AtomicBool;
