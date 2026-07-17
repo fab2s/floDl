@@ -258,7 +258,7 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
 ///                      = <host.path>/libtorch/<host.arch>     (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
-fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
+fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
     // CPU path is always the same.
@@ -267,7 +267,7 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
         "./libtorch/precompiled/cpu".into(),
     ));
 
-    if let Some((info, host_path)) = resolve_libtorch(project_root) {
+    if let Some((info, host_path)) = resolve_libtorch(project_root)? {
         env.push(("LIBTORCH_HOST_PATH".into(), host_path));
 
         // CUDA version from .arch metadata.
@@ -289,7 +289,7 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
         }
     }
 
-    env
+    Ok(env)
 }
 
 /// Resolve `(LibtorchInfo, host_path)` for `libtorch_env`.
@@ -303,24 +303,30 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
 ///   2. `project_root/libtorch/.active` (or `.active.<case>` via the
 ///      `FDL_LIBTORCH_CASE` env var). Standalone single-host default.
 ///
-/// Returns `None` only when neither path resolves — the caller (env
+/// Returns `Ok(None)` only when neither path resolves — the caller (env
 /// builder) then omits `LIBTORCH_HOST_PATH`, which surfaces as a
 /// libtorch-missing error from the downstream cargo/Docker invocation.
+/// `Err` when an active `FDL_ENV` overlay fails to load (see
+/// [`resolve_libtorch_from_overlay`]).
 fn resolve_libtorch(
     project_root: &Path,
-) -> Option<(libtorch::detect::LibtorchInfo, String)> {
-    if let Some(resolved) = resolve_libtorch_from_overlay(project_root) {
-        return Some(resolved);
+) -> Result<Option<(libtorch::detect::LibtorchInfo, String)>, String> {
+    if let Some(resolved) = resolve_libtorch_from_overlay(project_root)? {
+        return Ok(Some(resolved));
     }
-    let info = libtorch::detect::read_active(project_root)?;
+    let Some(info) = libtorch::detect::read_active(project_root) else {
+        return Ok(None);
+    };
     let host_path = format!("./libtorch/{}", info.path);
-    Some((info, host_path))
+    Ok(Some((info, host_path)))
 }
 
 /// Try to resolve libtorch from the active cluster overlay's current-
-/// host entry. Returns `None` if no overlay is active, the overlay has
-/// no `cluster:` block, the current host isn't listed, or the entry's
-/// `arch:` is unset.
+/// host entry. `Ok(None)` when the overlay legitimately doesn't apply
+/// (no `FDL_ENV`, no `cluster:` block, the current host isn't listed,
+/// or the entry's `arch:` is unset). `Err` when `FDL_ENV` is set but the
+/// config cannot be loaded — the user asked for that env, so silently
+/// falling back to `.active` could select the wrong libtorch.
 ///
 /// Convention: libtorch lives at `<host.path>/libtorch/<host.arch>`
 /// on every host. The controller's view uses `<host.path>` directly
@@ -329,23 +335,38 @@ fn resolve_libtorch(
 /// own `path:` IS the controller's view.
 fn resolve_libtorch_from_overlay(
     project_root: &Path,
-) -> Option<(libtorch::detect::LibtorchInfo, String)> {
-    let env_name = std::env::var("FDL_ENV").ok()?;
-    if env_name.trim().is_empty() {
-        return None;
+) -> Result<Option<(libtorch::detect::LibtorchInfo, String)>, String> {
+    let Ok(env_name) = std::env::var("FDL_ENV") else {
+        return Ok(None);
+    };
+    let env_name = env_name.trim();
+    if env_name.is_empty() {
+        return Ok(None);
     }
-    let cfg = config::load_project_with_env(
-        &project_root.join("fdl.yml"),
-        Some(env_name.trim()),
-    ).ok()?;
-    let cluster = cfg.cluster?;
+    // Same discovery set as `find_config` (fdl.yaml / fdl.yml / fdl.json) —
+    // a hardcoded fdl.yml here silently skipped fdl.yaml projects.
+    let base_path = config::find_config_in(project_root).ok_or_else(|| {
+        format!(
+            "FDL_ENV={env_name} is set but no fdl config file exists in {}",
+            project_root.display()
+        )
+    })?;
+    let cfg = config::load_project_with_env(&base_path, Some(env_name))
+        .map_err(|e| format!("FDL_ENV={env_name}: cannot resolve the overlay: {e}"))?;
+    let Some(cluster) = cfg.cluster else {
+        return Ok(None);
+    };
     let host_name = crate::cluster::resolve_local_hostname();
-    let entry = cluster.workers.iter().find(|w| w.host == host_name)?;
-    let arch = entry.arch.as_ref()?;
+    let Some(entry) = cluster.workers.iter().find(|w| w.host == host_name) else {
+        return Ok(None);
+    };
+    let Some(arch) = entry.arch.as_ref() else {
+        return Ok(None);
+    };
     let variant_dir = std::path::PathBuf::from(&entry.path)
         .join("libtorch")
         .join(arch);
-    resolve_libtorch_at(&variant_dir)
+    Ok(resolve_libtorch_at(&variant_dir))
 }
 
 /// Resolve a `libtorch_path:` value (from cluster.yml) into
@@ -410,7 +431,13 @@ pub(crate) fn resolve_libtorch_at(
 /// `environment:` section in docker-compose.yml (bare variable name
 /// passes the host value through when set, ignored otherwise).
 fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
-    let env_vars = libtorch_env(project_root);
+    let env_vars = match libtorch_env(project_root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("fdl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", command])
@@ -1541,6 +1568,61 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FDL_ENV is process-global; tests that set it must not interleave.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "fdl-run-test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn overlay_libtorch_finds_fdl_yaml_spelling() {
+        // The resolver previously hardcoded `fdl.yml` while config
+        // discovery accepts fdl.yaml / fdl.yml / fdl.json — an fdl.yaml
+        // project under FDL_ENV silently fell back to `.active`.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("yaml-spelling");
+        std::fs::write(dir.join("fdl.yaml"), "description: base\n").unwrap();
+        std::fs::write(
+            dir.join("fdl.testenv.yaml"),
+            "cluster:\n  controller:\n    host: 127.0.0.1\n    port: 29500\n    path: /opt/flodl\n  workers:\n    - host: not-this-host\n      local_devices: [0]\n      nccl_socket_ifname: lo\n      path: /opt/flodl\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("FDL_ENV", "testenv") };
+        // Loads through fdl.yaml + overlay; current host isn't listed →
+        // legitimate Ok(None), NOT an Err and NOT a hardcoded-name miss.
+        let resolved = resolve_libtorch_from_overlay(&dir);
+        unsafe { std::env::remove_var("FDL_ENV") };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(resolved, Ok(None)), "{resolved:?}");
+    }
+
+    #[test]
+    fn overlay_libtorch_load_failure_is_loud() {
+        // A broken overlay under FDL_ENV must error, not silently fall
+        // back to `.active` (wrong libtorch on heterogeneous rigs).
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("broken-overlay");
+        std::fs::write(dir.join("fdl.yml"), "description: base\n").unwrap();
+        // FDL_ENV names an overlay that doesn't exist -> load error.
+        unsafe { std::env::set_var("FDL_ENV", "missing-env") };
+        let resolved = resolve_libtorch_from_overlay(&dir);
+        unsafe { std::env::remove_var("FDL_ENV") };
+        std::fs::remove_dir_all(&dir).ok();
+        let err = match resolved {
+            Ok(v) => panic!("expected Err, got Ok({v:?})"),
+            Err(e) => e,
+        };
+        assert!(err.contains("missing-env"), "{err}");
+    }
 
     #[test]
     fn posix_quote_passes_safe_strings_through() {

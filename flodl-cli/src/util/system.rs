@@ -320,8 +320,30 @@ pub fn platform_tag() -> Option<String> {
     }
 }
 
+/// Escape a string for embedding in a JSON string literal. Complete per
+/// RFC 8259: backslash, quote, and every control char below 0x20. The
+/// hand-rolled predecessors missed `\t` / `\r` — one control character in
+/// a GPU name or mount path produced invalid JSON, which broke cluster
+/// probe fan-in.
 pub fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("\\u{:04x}", c as u32),
+                );
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

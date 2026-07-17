@@ -86,9 +86,24 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Locate the project config inside `dir` only — no walk-up, no
+/// example-copy prompt. For resolvers that already hold the project root
+/// and must not block on interactive prompts.
+pub fn find_config_in(dir: &Path) -> Option<PathBuf> {
+    CONFIG_NAMES.iter().map(|n| dir.join(n)).find(|c| c.is_file())
+}
+
 /// Prompt the user to copy an example config to the real path.
 /// Returns true if the copy succeeded.
 pub(super) fn try_copy_example(example: &Path, target: &Path) -> bool {
+    // Never prompt without a terminal: in CI, shell completions, or any
+    // piped context the prompt is invisible and `read_line` hits EOF,
+    // which the Y-default would treat as consent — silently adopting the
+    // example as the live config. Non-interactive callers just use the
+    // example file directly, copying nothing.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return false;
+    }
     let example_name = example.file_name().unwrap_or_default().to_string_lossy();
     let target_name = target.file_name().unwrap_or_default().to_string_lossy();
     eprintln!(

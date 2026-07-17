@@ -10,6 +10,7 @@ use crate::util::system::GpuInfo;
 // ---------------------------------------------------------------------------
 
 /// Metadata about an installed libtorch variant (from `.arch` file).
+#[derive(Debug)]
 pub struct LibtorchInfo {
     /// Relative path from project root (e.g. "precompiled/cu128", "builds/sm61-sm120").
     pub path: String,

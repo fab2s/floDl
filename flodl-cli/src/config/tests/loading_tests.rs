@@ -215,3 +215,30 @@ fn load_project_rejects_training_key_typo() {
     assert!(err.contains("unknown field `epoch`"), "got: {err}");
     assert!(err.contains("epochs"), "should list valid fields: {err}");
 }
+
+#[test]
+fn try_copy_example_never_prompts_without_a_terminal() {
+    // Under `cargo test` stdin is not a TTY. The old code prompted anyway
+    // and read EOF as the Y-default — silently copying the example into a
+    // live config from CI, shell completions, or any piped context.
+    let tmp = TempDir::new();
+    let example = tmp.0.join("fdl.yml.example");
+    let target = tmp.0.join("fdl.yml");
+    std::fs::write(&example, "description: example\n").unwrap();
+
+    assert!(!loading::try_copy_example(&example, &target));
+    assert!(
+        !target.exists(),
+        "non-interactive context must not create a config file"
+    );
+}
+
+#[test]
+fn find_config_in_accepts_all_spellings() {
+    for name in ["fdl.yaml", "fdl.yml", "fdl.json"] {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join(name), "{}\n").unwrap();
+        let found = find_config_in(&tmp.0).expect(name);
+        assert_eq!(found.file_name().unwrap().to_str().unwrap(), name);
+    }
+}

@@ -11,6 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::util::system::escape_json;
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -804,14 +806,6 @@ fn category_title(cat: &str) -> &str {
         "data" => "Data",
         other => other,
     }
-}
-
-fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "")
-        .replace('\t', "\\t")
 }
 
 // ---------------------------------------------------------------------------

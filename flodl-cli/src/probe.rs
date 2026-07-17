@@ -418,6 +418,21 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
         }
     }
 
+    // Shape guard: the current emitter always writes these keys. Their
+    // complete absence means the remote fdl speaks a different probe
+    // schema (version skew) — surface that instead of letting the lenient
+    // per-field defaults masquerade as "no GPUs" / "not ready".
+    for key in ["gpus", "ready"] {
+        if v.get(key).is_none() {
+            report.issues.push(format!(
+                "remote probe JSON has no {key:?} field — the remote fdl \
+                 likely speaks a different probe schema (version skew); \
+                 update fdl on `{}`",
+                worker.host
+            ));
+        }
+    }
+
     Ok(report)
 }
 
@@ -1429,6 +1444,52 @@ mod tests {
         let warns = v["warnings"].as_array().expect("warnings: []");
         assert_eq!(warns.len(), 1);
         assert_eq!(v["nccl"]["via_docker"].as_str(), Some("cuda"));
+    }
+
+    #[test]
+    fn json_survives_control_chars_in_names_and_paths() {
+        // A tab / CR in a GPU name or mount path previously produced
+        // invalid JSON that broke cluster probe fan-in.
+        let r = ProbeReport {
+            host: "h\tost".into(),
+            gpus: vec![GpuInfo {
+                index: 0,
+                name: "Weird\tGPU \"X\"\r\n".into(),
+                sm_major: 8,
+                sm_minor: 6,
+                total_memory_mb: 1024,
+            }],
+            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
+            data_path: DataPathStatus {
+                path: PathBuf::from("/mnt/na\ts"), exists: true, readable: true,
+                fs_type: Some("virtio\u{1}fs".into()), skipped: false,
+            },
+            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            issues: vec!["line1\nline2\ttabbed".into()],
+            warnings: vec![],
+        };
+        let j = report_to_json_object(&r);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("emit valid JSON");
+        assert_eq!(v["gpus"][0]["name"].as_str(), Some("Weird\tGPU \"X\"\r\n"));
+        assert_eq!(v["data_path"]["fs_type"].as_str(), Some("virtio\u{1}fs"));
+        assert_eq!(v["issues"][0].as_str(), Some("line1\nline2\ttabbed"));
+    }
+
+    #[test]
+    fn parse_remote_json_flags_schema_skew() {
+        // A remote fdl speaking a different probe schema must surface as
+        // version skew, not parse as a healthy zero-GPU host.
+        let worker: ClusterWorker = serde_yaml::from_str(
+            "host: pascal\nlocal_devices: [0]\nnccl_socket_ifname: lo\npath: /opt/flodl",
+        )
+        .expect("minimal worker");
+        let report = parse_remote_json(r#"{"something":"else"}"#, &worker)
+            .expect("valid JSON parses");
+        assert!(
+            report.issues.iter().any(|i| i.contains("version skew")),
+            "issues: {:?}",
+            report.issues
+        );
     }
 
     #[test]
