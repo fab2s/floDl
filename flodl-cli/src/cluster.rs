@@ -638,7 +638,12 @@ pub fn cluster_compose_overlay_arg(project_root: &Path) -> String {
 
     // base docker-compose.yml first, then our overlay second, so the
     // overlay's extra_hosts merges into the base service definitions.
-    format!(" -f docker-compose.yml -f {}", overlay_path.display())
+    // Quoted: this string is spliced into an `sh -c` command line, so a
+    // project path with a space would otherwise shatter the parse.
+    format!(
+        " -f docker-compose.yml -f {}",
+        crate::util::shell::posix_quote(&overlay_path.display().to_string())
+    )
 }
 
 /// Hex-encode raw bytes (lowercase, no separators). Companion to the

@@ -1407,10 +1407,14 @@ impl StreamingEpochIter<'_> {
             }
             Ok(Err(e)) => Some(Err(e)),
             Err(_) => {
-                // Channel closed (worker stopped or panicked)
+                // Channel closed. Dataset errors AND dataset panics are
+                // reported per-batch (see `guarded_get_batch`), so the
+                // worker dying is flodl's own fault — say so.
                 self.remaining = 0;
                 Some(Err(TensorError::new(
-                    "DataLoader: prefetch worker stopped unexpectedly",
+                    "DataLoader: prefetch worker stopped unexpectedly \
+                     (dataset errors are reported per-batch, so this is \
+                     likely a flodl bug — please report it)",
                 )))
             }
         }

@@ -459,6 +459,51 @@
     }
 
     #[test]
+    fn test_dataset_panic_is_an_err_batch_not_a_dead_loader() {
+        // A panic in user dataset code must surface as an Err batch
+        // carrying the panic message — and the worker must survive it,
+        // so the NEXT epoch still works. Previously the worker thread
+        // died (payload discarded) and every later epoch failed with a
+        // generic "worker stopped unexpectedly".
+        struct PanicsOnce {
+            n: usize,
+        }
+        impl DataSet for PanicsOnce {
+            fn len(&self) -> usize {
+                self.n
+            }
+            fn get(&self, index: usize) -> Result<Vec<Tensor>> {
+                if index == 7 {
+                    panic!("user dataset bug: bad record {index}");
+                }
+                Ok(vec![Tensor::from_f32(&[index as f32], &[1], Device::CPU)?])
+            }
+        }
+
+        let mut loader = DataLoader::from_dataset(PanicsOnce { n: 8 })
+            .batch_size(4)
+            .shuffle(false)
+            .drop_last(false)
+            .sample_cache(false)
+            .streaming()
+            .build()
+            .unwrap();
+
+        // Epoch 0, sequential: batch 0 = samples 0..4 (fine), batch 1
+        // hits sample 7 -> Err carrying the panic message.
+        let results: Vec<Result<Batch>> = loader.epoch(0).collect();
+        assert!(results.iter().any(|r| matches!(
+            r,
+            Err(e) if e.to_string().contains("panicked") && e.to_string().contains("bad record 7")
+        )), "expected a panic-carrying Err batch, got: {:?}",
+            results.iter().map(|r| r.as_ref().map(|_| "ok").map_err(|e| e.to_string())).collect::<Vec<_>>());
+
+        // The worker survived: the next epoch's clean batch still arrives.
+        let first = loader.epoch(1).next().unwrap();
+        assert!(first.is_ok(), "worker must survive a dataset panic: {:?}", first.err());
+    }
+
+    #[test]
     fn test_streaming_sequential() {
         let mut loader = DataLoader::from_dataset(SequentialData { n: 10 })
             .batch_size(3)

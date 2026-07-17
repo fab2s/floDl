@@ -211,11 +211,33 @@ pub struct TimelineBroadcast {
     pub events: Vec<TimelineEvent>,
 }
 
+/// Full-resolution sample archive cap (~14 h at the default 100 ms poll).
+/// The archive grows at poll rate for the life of the run; without a cap a
+/// multi-day run accumulates tens of millions of samples. Trimmed
+/// oldest-first in 10% blocks; the first trim prints a one-time notice.
+const MAX_TIMELINE_SAMPLES: usize = 500_000;
+/// Event archive cap (events are training-driven and far sparser).
+const MAX_TIMELINE_EVENTS: usize = 100_000;
+static TRIM_NOTICE: AtomicBool = AtomicBool::new(false);
+
+fn trim_archive<T>(buf: &mut Vec<T>, cap: usize, what: &str) {
+    if buf.len() > cap {
+        buf.drain(..cap / 10);
+        if !TRIM_NOTICE.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "flodl monitor: timeline {what} archive reached its cap ({cap});                  oldest entries are being dropped — lower the poll rate or export                  periodically for full multi-day resolution"
+            );
+        }
+    }
+}
+
 /// High-frequency system profiler for training diagnostics.
 ///
 /// Captures CPU, RAM, and per-GPU metrics at configurable intervals plus
 /// training events. Thread-safe: wrap in `Arc` and share across coordinator
-/// and worker threads.
+/// and worker threads. The in-memory archives are capped (500k samples,
+/// ~14 h at the default 100 ms poll); oldest entries are trimmed past the
+/// cap with a one-time notice.
 ///
 /// Polling and broadcasting are decoupled: samples are collected at
 /// `poll_interval_ms` (default 100ms) for full-resolution post-hoc analysis,
@@ -305,8 +327,11 @@ impl Timeline {
         }
 
         self.stop_flag.store(false, Ordering::SeqCst);
-        let tl = Arc::clone(self);
-        *handle = Some(thread::spawn(move || tl.poll_loop()));
+        // The poller holds only a Weak: a strong Arc here would keep an
+        // abandoned timeline (dropped without stop()) alive forever —
+        // Drop could never run and the thread never exited.
+        let weak = Arc::downgrade(self);
+        *handle = Some(thread::spawn(move || Self::poll_loop(weak)));
     }
 
     /// Stop background polling and join the thread.
@@ -322,7 +347,11 @@ impl Timeline {
     pub fn event(&self, kind: EventKind) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let evt = TimelineEvent { elapsed_ms, kind };
-        self.events.lock().unwrap().push(evt.clone());
+        {
+            let mut events = self.events.lock().unwrap();
+            events.push(evt.clone());
+            trim_archive(&mut events, MAX_TIMELINE_EVENTS, "event");
+        }
         self.pending_events.lock().unwrap().push(evt);
     }
 
@@ -547,9 +576,14 @@ impl Timeline {
     // Internal
     // -----------------------------------------------------------------------
 
-    fn poll_loop(&self) {
-        let interval = Duration::from_millis(self.poll_interval_ms);
-        let broadcast_interval = Duration::from_millis(self.broadcast_interval_ms);
+    fn poll_loop(weak: std::sync::Weak<Self>) {
+        let (interval, broadcast_interval) = match weak.upgrade() {
+            Some(tl) => (
+                Duration::from_millis(tl.poll_interval_ms),
+                Duration::from_millis(tl.broadcast_interval_ms),
+            ),
+            None => return,
+        };
         let mut prev_cpu: Option<CpuTimes> = None;
         let mut last_broadcast = Instant::now();
 
@@ -568,8 +602,16 @@ impl Timeline {
             Vec::new()
         };
 
-        while !self.stop_flag.load(Ordering::SeqCst) {
-            let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        loop {
+            // Re-acquire per tick: a failed upgrade means every user Arc
+            // is gone — the timeline was abandoned without stop(), so the
+            // poller exits (letting Drop run) instead of pinning it.
+            let Some(tl) = weak.upgrade() else { return };
+            let this = tl.as_ref();
+            if this.stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let elapsed_ms = this.start.elapsed().as_millis() as u64;
 
             // CPU utilization (delta)
             let cur_cpu = read_cpu_times();
@@ -626,23 +668,27 @@ impl Timeline {
                 gpus,
             };
 
-            // Store in full-resolution archive
-            self.samples.lock().unwrap().push(sample.clone());
+            // Store in full-resolution archive (capped)
+            {
+                let mut samples = this.samples.lock().unwrap();
+                samples.push(sample.clone());
+                trim_archive(&mut samples, MAX_TIMELINE_SAMPLES, "sample");
+            }
             // Buffer for next broadcast
-            self.pending_samples.lock().unwrap().push(sample);
+            this.pending_samples.lock().unwrap().push(sample);
 
             // Broadcast to subscribers at the slower interval
             if last_broadcast.elapsed() >= broadcast_interval {
-                self.flush_broadcast();
+                this.flush_broadcast();
                 last_broadcast = Instant::now();
             }
 
             // Sleep in small increments to check stop flag
             let wake = Instant::now() + interval;
             while Instant::now() < wake {
-                if self.stop_flag.load(Ordering::SeqCst) {
+                if this.stop_flag.load(Ordering::SeqCst) {
                     // Final broadcast before exit
-                    self.flush_broadcast();
+                    this.flush_broadcast();
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));

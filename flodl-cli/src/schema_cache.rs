@@ -172,32 +172,7 @@ fn find_docker_compose_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// POSIX-quote a single token so it survives `bash -c` as one argument.
-/// Local copy to avoid pulling `run.rs` into `schema_cache.rs` for one
-/// helper.
-fn posix_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | '@' | ',')
-    });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+use crate::util::shell::posix_quote;
 
 #[cfg(test)]
 mod tests {

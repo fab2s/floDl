@@ -196,11 +196,7 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
     // remote PATH may not have `fdl`, hence the absolute path.
     let quoted = remote_args
         .iter()
-        .map(|a| {
-            // Conservative single-quote escape — fine for absolute
-            // paths and known-good flags. No backslash interpretation.
-            format!("'{}'", a.replace('\'', "'\\''"))
-        })
+        .map(|a| crate::util::shell::posix_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
     // cd into the remote host's project path BEFORE invoking fdl so
@@ -209,8 +205,8 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
     // dir (typically ~) and either misses the project root or
     // resolves a stale local fdl install.
     let remote_cmd = format!(
-        "cd '{}' && {quoted}",
-        worker.path.replace('\'', "'\\''"),
+        "cd {} && {quoted}",
+        crate::util::shell::posix_quote(&worker.path),
     );
 
     // Honor the worker's `ssh:` sub-block (port / user / identity_file /

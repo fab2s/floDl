@@ -777,31 +777,7 @@ fn cuda_version_from_arch(arch: &str) -> Option<String> {
     Some(format!("{major}.{minor}"))
 }
 
-/// Single-quote a string for `sh -c` so embedded spaces/quotes don't
-/// break the outer shell parse. Local copy to avoid `pub(crate)`
-/// promotion of `run::posix_quote`.
-fn posix_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ',' | '=' | ':')
-    });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+use crate::util::shell::posix_quote;
 
 #[cfg(test)]
 mod tests {

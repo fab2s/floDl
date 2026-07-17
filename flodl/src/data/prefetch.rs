@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::tensor::{Device, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor, TensorError};
 use super::vram_pool::VramSamplePool;
 use super::BatchDataSet;
 
@@ -232,6 +232,11 @@ pub(crate) struct PrefetchWorker {
     cmd_tx: mpsc::Sender<WorkerCmd>,
     handle: Option<JoinHandle<()>>,
     prefetch_depth: usize,
+    /// Teardown latch: lets `Drop` unwedge a worker blocked in a batch
+    /// send to a consumer that stopped draining without dropping its
+    /// receiver — without it that join hung forever (see
+    /// [`send_or_stop`]).
+    stop: Arc<AtomicBool>,
 }
 
 impl PrefetchWorker {
@@ -248,15 +253,18 @@ impl PrefetchWorker {
         augment: usize,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+        let stop = Arc::new(AtomicBool::new(false));
 
+        let worker_stop = stop.clone();
         let handle = thread::spawn(move || {
-            worker_loop(dataset, device, cmd_rx, vram_pool, augment);
+            worker_loop(dataset, device, cmd_rx, vram_pool, augment, &worker_stop);
         });
 
         PrefetchWorker {
             cmd_tx,
             handle: Some(handle),
             prefetch_depth,
+            stop,
         }
     }
 
@@ -329,6 +337,9 @@ impl PrefetchWorker {
 
 impl Drop for PrefetchWorker {
     fn drop(&mut self) {
+        // Latch first: a worker blocked in a batch send abandons it and
+        // gets back to the command channel, where Stop awaits.
+        self.stop.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(WorkerCmd::Stop);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -346,6 +357,7 @@ fn worker_loop(
     cmd_rx: mpsc::Receiver<WorkerCmd>,
     vram_pool: bool,
     augment: usize,
+    stop: &AtomicBool,
 ) {
     // Create a dedicated CUDA stream for H2D transfers (lives across epochs).
     #[cfg(feature = "cuda")]
@@ -414,6 +426,7 @@ fn worker_loop(
                         ring_slots,
                         &mut pool,
                         augment,
+                        stop,
                         #[cfg(feature = "cuda")]
                         copy_stream.as_ref(),
                     );
@@ -428,6 +441,7 @@ fn worker_loop(
                         &governor,
                         &mut pool,
                         augment,
+                        stop,
                         #[cfg(feature = "cuda")]
                         copy_stream.as_ref(),
                     );
@@ -491,8 +505,10 @@ fn worker_loop(
                             copy_stream.as_ref(),
                         )
                     };
-                    if tx.send(result).is_err() {
-                        dist_tx = None; // consumer dropped
+                    match send_or_stop(tx, result, stop) {
+                        SendOutcome::Sent => {}
+                        SendOutcome::Disconnected => dist_tx = None, // consumer dropped
+                        SendOutcome::Stopping => return,
                     }
                 }
             }
@@ -509,6 +525,41 @@ fn worker_loop(
 
 /// Single-stage epoch: fetch and transfer serialized on the worker
 /// thread. Used when `ring_slots == 0` (CPU targets, where the batch
+/// Outcome of a stop-aware batch send.
+enum SendOutcome {
+    Sent,
+    /// Receiver gone (consumer dropped) — end the epoch as before.
+    Disconnected,
+    /// Teardown latch fired while the channel was full: the consumer is
+    /// alive but stopped draining, and `Drop` is waiting on the join. A
+    /// plain blocking `send` here deadlocked the teardown forever.
+    Stopping,
+}
+
+/// Send with teardown patience: block in bounded slices, re-checking the
+/// worker stop latch between attempts, so `PrefetchWorker::drop` can
+/// always reclaim a worker wedged against a non-draining consumer.
+fn send_or_stop(
+    tx: &mpsc::SyncSender<Result<PrefetchedBatch>>,
+    result: Result<PrefetchedBatch>,
+    stop: &AtomicBool,
+) -> SendOutcome {
+    let mut pending = result;
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => return SendOutcome::Sent,
+            Err(mpsc::TrySendError::Disconnected(_)) => return SendOutcome::Disconnected,
+            Err(mpsc::TrySendError::Full(v)) => {
+                if stop.load(Ordering::Relaxed) {
+                    return SendOutcome::Stopping;
+                }
+                pending = v;
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// channel itself is the read-ahead buffer and there is no transfer
 /// stage to overlap; or a RAM budget too tight for a reader ring).
 #[allow(clippy::too_many_arguments)]
@@ -522,6 +573,7 @@ fn run_single_stage_epoch(
     governor: &GovernorCtl,
     pool: &mut VramSamplePool,
     augment: usize,
+    stop: &AtomicBool,
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) {
     let n = indices.len();
@@ -546,7 +598,7 @@ fn run_single_stage_epoch(
 
         // Fetch once (RAM-side, cannot OOM the device), then transfer
         // with the shared VRAM-pressure patience.
-        let result = dataset.get_batch(&samples).and_then(|tensors| {
+        let result = guarded_get_batch(dataset.as_ref(), &samples).and_then(|tensors| {
             pooled_transfer_with_retry(
                 batch_picks,
                 &samples,
@@ -559,10 +611,12 @@ fn run_single_stage_epoch(
             )
         });
 
-        // If the consumer dropped (epoch iterator dropped mid-epoch),
-        // the send fails. We stop this epoch and wait for the next command.
-        if batch_tx.send(result).is_err() {
-            break;
+        // Consumer dropped (send disconnected) ends the epoch; the
+        // teardown latch (send_or_stop) unwedges a full channel whose
+        // consumer stopped draining without dropping it.
+        match send_or_stop(batch_tx, result, stop) {
+            SendOutcome::Sent => {}
+            SendOutcome::Disconnected | SendOutcome::Stopping => break,
         }
         governor.sent.fetch_add(1, Ordering::Relaxed);
     }
@@ -583,6 +637,7 @@ fn run_two_stage_epoch(
     ring_slots: usize,
     pool: &mut VramSamplePool,
     augment: usize,
+    stop: &AtomicBool,
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) {
     let (ring_tx, ring_rx) =
@@ -622,8 +677,11 @@ fn run_two_stage_epoch(
             Err(e) => Err(e),
         };
 
-        if batch_tx.send(result).is_err() {
-            break; // consumer dropped mid-epoch
+        // A break on either outcome unwinds through the ring teardown
+        // below, so the reader is joined even on the stop-latch path.
+        match send_or_stop(batch_tx, result, stop) {
+            SendOutcome::Sent => {}
+            SendOutcome::Disconnected | SendOutcome::Stopping => break,
         }
         governor.sent.fetch_add(1, Ordering::Relaxed);
     }
@@ -663,8 +721,7 @@ fn reader_loop(
         // the decoded sample ids.
         let batch_picks = &indices[start..end];
         let samples = crate::data::picks_to_samples(batch_picks, augment);
-        let result = dataset
-            .get_batch(&samples)
+        let result = guarded_get_batch(dataset.as_ref(), &samples)
             .map(|tensors| (batch_picks.to_vec(), tensors));
         start = end;
 
@@ -735,6 +792,32 @@ fn pooled_transfer_with_retry(
     )
 }
 
+/// Fetch through the user's dataset with a panic firewall: a panic in
+/// `get_batch` (a bug in user dataset code) becomes an `Err` batch
+/// carrying the panic message, exactly like a dataset `Err` does — the
+/// worker thread survives and later epochs keep working. Without this
+/// the thread died with the payload discarded, and every subsequent
+/// epoch failed with a generic "worker stopped" that pointed at flodl
+/// instead of the dataset.
+fn guarded_get_batch(dataset: &dyn BatchDataSet, samples: &[usize]) -> Result<Vec<Tensor>> {
+    // AssertUnwindSafe: after a panic the dataset is only ever read
+    // again, and the fetch-purity contract (`assert_fetch_pure`)
+    // already requires reads to be index-pure.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dataset.get_batch(samples))) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            Err(TensorError::new(&format!(
+                "dataset panicked in get_batch: {msg}"
+            )))
+        }
+    }
+}
+
 /// Fetch a batch from the dataset and transfer to the target device.
 /// Distributed `LoadBatch` path: both halves serialized on the calling
 /// thread.
@@ -747,7 +830,7 @@ fn fetch_and_transfer(
     #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
 ) -> Result<PrefetchedBatch> {
     let samples = crate::data::picks_to_samples(picks, augment);
-    let tensors = dataset.get_batch(&samples)?;
+    let tensors = guarded_get_batch(dataset, &samples)?;
     transfer_batch(
         picks,
         &samples,
@@ -894,4 +977,48 @@ fn assemble_on_device(
     let miss_samples: Vec<usize> = misses.iter().map(|&p| indices[p]).collect();
     pool.capture(&miss_samples, &uploaded)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TinyBatch;
+    impl BatchDataSet for TinyBatch {
+        fn len(&self) -> usize {
+            64
+        }
+        fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+            let vals: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
+            Ok(vec![Tensor::from_f32(
+                &vals,
+                &[vals.len() as i64],
+                Device::CPU,
+            )?])
+        }
+    }
+
+    #[test]
+    fn drop_unwedges_worker_blocked_on_full_channel() {
+        // Consumer keeps the receiver alive but stops draining: once the
+        // channel fills, the worker wedges in the batch send. Drop must
+        // still complete via the teardown latch — a plain blocking send
+        // made this join hang forever.
+        let w = PrefetchWorker::new(Arc::new(TinyBatch), Device::CPU, 1, false, 1);
+        let rx = w.start_distributed_epoch();
+        w.load_batch(vec![0]); // fills the depth-1 channel
+        w.load_batch(vec![1]); // worker wedges in this send
+        w.load_batch(vec![2]);
+        thread::sleep(Duration::from_millis(200));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(w);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("PrefetchWorker::drop hung — teardown latch failed");
+        drop(rx);
+    }
 }

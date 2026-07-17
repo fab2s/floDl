@@ -470,33 +470,7 @@ fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
 
 // ── Run-kind execution ──────────────────────────────────────────────────
 
-/// POSIX-quote a single token so it round-trips through `sh -c` / `bash
-/// -c` as one argument. Empty strings become `''`; tokens containing
-/// only safe characters pass through unchanged; everything else is
-/// wrapped in single quotes with embedded `'` escaped as `'\''`.
-pub(crate) fn posix_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | '@' | ',')
-    });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub(crate) use crate::util::shell::posix_quote;
 
 /// Split `s` on the first whitespace-bounded `--` token, returning the
 /// halves with that token removed. Trim each half. When no such token is
@@ -776,7 +750,10 @@ pub fn exec_command(
         let inner = if workdir.is_empty() || workdir == "." {
             format!("{entry} {args_str}")
         } else {
-            format!("cd {container_root}/{workdir} && {entry} {args_str}")
+            format!(
+                "cd {} && {entry} {args_str}",
+                posix_quote(&format!("{container_root}/{workdir}"))
+            )
         };
 
         if preset_name.is_some() {
@@ -797,8 +774,12 @@ pub fn exec_command(
         // let the outer shell expand `$`/backticks inside it (host-side,
         // defeating shell_join's quoting) and break on any `"` in an
         // argument.
+        // FDL_PROJECT_ROOT is quoted too: this whole string goes through
+        // `sh -c`, and a container root with a space would otherwise
+        // splice the env value across arguments.
         let docker_cmd = format!(
-            "docker compose{overlay} run --rm -e FDL_PROJECT_ROOT={container_root}{testing_env_arg} {service} bash -c {}",
+            "docker compose{overlay} run --rm -e {}{testing_env_arg} {service} bash -c {}",
+            posix_quote(&format!("FDL_PROJECT_ROOT={container_root}")),
             posix_quote(&inner),
         );
         spawn_docker_shell(&docker_cmd, project_root)
