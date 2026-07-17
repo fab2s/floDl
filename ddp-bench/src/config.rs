@@ -262,4 +262,12 @@ pub struct RunConfig {
     /// (`--ram-max-usage`). `None` preserves the library default
     /// (0.50).
     pub ram_max_usage: Option<f64>,
+    /// Pinned RAM sample retention in each rank's staging tier
+    /// (`--sample-cache`): `false` pins the retained cache at zero and
+    /// hands the whole staging share to the flow window. `None` =
+    /// library default (enabled).
+    pub sample_cache: Option<bool>,
+    /// Local-disk overflow tier under each rank's sample cache in GB
+    /// (`--disk-stage`). `None` = library default (off).
+    pub disk_stage_gb: Option<u64>,
 }

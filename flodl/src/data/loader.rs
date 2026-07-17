@@ -153,7 +153,7 @@ impl DataLoaderBuilder {
             sample_cache_enabled: true,
             disk_stage_bytes: 0,
             disk_stage_dir: None,
-            vram_pool_enabled: true,
+            vram_pool_enabled: super::vram_pool::VRAM_POOL_DEFAULT,
             no_shuffle: false,
             augment: 1,
             transform: None,
@@ -475,6 +475,12 @@ impl DataLoaderBuilder {
             augment,
             transform,
         } = self;
+
+        // `FLODL_VRAM_POOL=off` runtime kill-switch — same parse as
+        // the DDP rank workers (audit D7: it used to be honored only
+        // there, so a scripted A/B silently no-op'ed on the solo path).
+        let vram_pool_enabled =
+            vram_pool_enabled && !super::vram_pool::vram_pool_env_off();
 
         // Augmentation is pick-space scheduling over the built-in
         // samplers; a custom sampler owns its own index stream, so the

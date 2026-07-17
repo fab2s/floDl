@@ -228,6 +228,20 @@ struct Cli {
     #[option]
     ram_max_usage: Option<f64>,
 
+    /// Pinned RAM sample retention in each rank's staging tier
+    /// (flodl `.sample_cache`): "false"/"off" pins the retained cache
+    /// at zero — the flow window keeps the whole staging share.
+    /// Default: library default (enabled). A/B lever for retention
+    /// benefit.
+    #[option]
+    sample_cache: Option<bool>,
+
+    /// Local-disk overflow tier under each rank's sample cache, in GB
+    /// (flodl `.disk_stage`): samples the RAM budget declines spill to
+    /// an ephemeral per-rank pack file. Default: library default (off).
+    #[option]
+    disk_stage: Option<u64>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -855,6 +869,8 @@ fn run() -> flodl::tensor::Result<()> {
                 augment_noise: cli.augment_noise.unwrap_or(0.0),
                 vram_max_usage: cli.vram_max_usage,
                 ram_max_usage: cli.ram_max_usage,
+                sample_cache: cli.sample_cache,
+                disk_stage_gb: cli.disk_stage,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

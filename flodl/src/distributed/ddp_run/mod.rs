@@ -490,6 +490,17 @@ pub struct DdpRunConfig {
     /// proportionally); `0.0` disables staging retention. Default:
     /// `0.50` (the solo loader's `ram_max_usage` default).
     pub ram_max_usage: f64,
+    /// Pinned RAM sample retention in each rank's staging tier (see
+    /// [`crate::distributed::TrainerConfig::sample_cache`]). `false`
+    /// pins the read-through cache's budget to zero; the flow window
+    /// keeps the whole staging share. Default: `true`.
+    pub sample_cache: bool,
+    /// Local-disk overflow tier under each rank's sample cache, in GB
+    /// (see [`crate::distributed::TrainerConfig::disk_stage_gb`]).
+    /// Default: `0` (off).
+    pub disk_stage_gb: u64,
+    /// Directory for the disk-stage pack file (default: system temp dir).
+    pub disk_stage_dir: Option<std::path::PathBuf>,
     /// Optional high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events (sync,
@@ -600,11 +611,14 @@ impl DdpRunConfig {
             snapshot_timeout_secs: 5,
             progressive_dispatch: None,
             max_grad_norm: None,
-            vram_pool: true,
+            vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
             augment: 1,
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            sample_cache: true,
+            disk_stage_gb: 0,
+            disk_stage_dir: None,
             timeline: None,
             lr_scale_ratio: 1.0,
             save_path: None,
@@ -827,6 +841,24 @@ impl DdpRunConfig {
     /// [`Self::ram_max_usage`]).
     pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Pinned RAM sample retention (see [`Self::sample_cache`]).
+    pub fn with_sample_cache(mut self, enabled: bool) -> Self {
+        self.sample_cache = enabled;
+        self
+    }
+
+    /// Local-disk overflow tier in GB (see [`Self::disk_stage_gb`]).
+    pub fn with_disk_stage(mut self, gb: u64) -> Self {
+        self.disk_stage_gb = gb;
+        self
+    }
+
+    /// Disk-stage directory (see [`Self::disk_stage_dir`]).
+    pub fn with_disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.disk_stage_dir = Some(dir.into());
         self
     }
 
@@ -1342,6 +1374,14 @@ pub struct WorkerConfig {
     /// Host-RAM share for this worker's staging tiers (see
     /// [`DdpRunConfig::ram_max_usage`]).
     pub ram_max_usage: f64,
+    /// Pinned RAM sample retention in this worker's staging tier (see
+    /// [`DdpRunConfig::sample_cache`]).
+    pub sample_cache: bool,
+    /// Local-disk overflow tier under this worker's sample cache, in
+    /// GB (see [`DdpRunConfig::disk_stage_gb`]).
+    pub disk_stage_gb: u64,
+    /// Directory for the disk-stage pack file (default: system temp dir).
+    pub disk_stage_dir: Option<std::path::PathBuf>,
     /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
     /// local params with averaged consensus on the cpu-async path (current
     /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]

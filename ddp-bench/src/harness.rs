@@ -715,6 +715,12 @@ fn run_unified(
     if let Some(f) = config.ram_max_usage {
         builder = builder.ram_max_usage(f);
     }
+    if let Some(b) = config.sample_cache {
+        builder = builder.sample_cache(b);
+    }
+    if let Some(gb) = config.disk_stage_gb {
+        builder = builder.disk_stage(gb);
+    }
     if config.augment_noise > 0.0 {
         let sigma = config.augment_noise as f32;
         builder = builder.transform(move |mut rows, keys| {

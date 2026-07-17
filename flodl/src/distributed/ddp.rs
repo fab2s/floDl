@@ -731,7 +731,12 @@ docs/design/trainer-execution-tiers.md)")]
             .vram_pool(cfg.vram_pool)
             .vram_max_usage(cfg.vram_max_usage)
             .ram_max_usage(cfg.ram_max_usage)
+            .sample_cache(cfg.sample_cache)
+            .disk_stage(cfg.disk_stage_gb)
             .augment(cfg.augment);
+        if let Some(dir) = cfg.disk_stage_dir {
+            b = b.disk_stage_dir(dir);
+        }
         if let Some(f) = cfg.transform {
             b = b.transform_fn(f);
         }

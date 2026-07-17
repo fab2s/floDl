@@ -431,6 +431,7 @@ pub(crate) fn spawn_stager(
     world_size: usize,
     augment: usize,
     ram_max_usage: f64,
+    sample_cache: bool,
 ) -> StagerHandle {
     let (tx, rx) = mpsc::channel::<StageAdvisory>();
     let staged = Arc::new(AtomicUsize::new(0));
@@ -447,6 +448,7 @@ pub(crate) fn spawn_stager(
             world_size,
             augment,
             ram_max_usage,
+            sample_cache,
             &staged_in_thread,
         );
     });
@@ -519,6 +521,7 @@ fn stager_loop(
     world_size: usize,
     augment: usize,
     ram_max_usage: f64,
+    sample_cache: bool,
     staged: &AtomicUsize,
 ) {
     let dataset_len = dataset.len();
@@ -569,7 +572,16 @@ fn stager_loop(
                 cache.bytes() as u64 + stream.lock().map(|p| p.bytes() as u64).unwrap_or(0);
             let share =
                 stager_ram_budget(rank, world_size, &a.counts, ram_max_usage, held);
-            let (pinned, stream_budget) = crate::data::budget::split_stager_budget(share);
+            // `sample_cache=false` pins the retained tier at zero and
+            // hands the whole staging share to the flow window (the
+            // TrainerConfig/DdpBuilder knob mirroring the solo
+            // loader's `sample_cache(false)` — audit D3). The disk
+            // tier, if attached, still admits what RAM declines.
+            let (pinned, stream_budget) = if sample_cache {
+                crate::data::budget::split_stager_budget(share)
+            } else {
+                (0, share)
+            };
             pinned_budget = pinned;
             cache.set_budget(pinned_budget);
             let advised: usize = a
@@ -910,7 +922,7 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5);
+        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5, true);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.

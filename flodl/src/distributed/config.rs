@@ -418,6 +418,24 @@ pub struct TrainerConfig<M: Module> {
     /// `0.0` disables staging. Default `0.50` — same knob and default
     /// as `DataLoaderBuilder::ram_max_usage` on the solo path.
     pub ram_max_usage: f64,
+    /// Pinned RAM sample retention on rank workers (default `true`):
+    /// the staging tier's read-through cache keeps fetched samples for
+    /// later epochs within the [`Self::ram_max_usage`] budget. `false`
+    /// pins that cache's budget to zero — the flow window (in-order
+    /// stream staging) keeps the whole staging share and nothing is
+    /// retained across epochs. Same knob as
+    /// `DataLoaderBuilder::sample_cache` on the solo path.
+    pub sample_cache: bool,
+    /// Local-disk overflow tier under each rank's sample cache, in GB
+    /// (default `0` = off): samples evicted from (or never admitted to)
+    /// the RAM budget spill to an ephemeral per-rank pack file and read
+    /// back from local disk instead of the (possibly remote) source.
+    /// Same knob as `DataLoaderBuilder::disk_stage` on the solo path.
+    pub disk_stage_gb: u64,
+    /// Directory for the disk-stage pack file (default: the system
+    /// temp dir). Point it at a fast local drive when `/tmp` is small
+    /// or RAM-backed. Same knob as `DataLoaderBuilder::disk_stage_dir`.
+    pub disk_stage_dir: Option<std::path::PathBuf>,
     /// Cluster-mode stop threshold: how many ranks may be lost (spot
     /// reclaims, hardware, network) before the run is declared
     /// unrecoverable and survivors save-and-shutdown. `None` (default)
@@ -509,11 +527,14 @@ impl<M: Module> TrainerConfig<M> {
             num_epochs: 1,
             elche: ElCheConfig::default(),
             max_grad_norm: None,
-            vram_pool: true,
+            vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
             augment: 1,
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            sample_cache: true,
+            disk_stage_gb: 0,
+            disk_stage_dir: None,
             max_failure: None,
             checkpoint_every: None,
             save_path: None,
@@ -569,6 +590,25 @@ impl<M: Module> TrainerConfig<M> {
     /// [`Self::ram_max_usage`]).
     pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Pinned RAM sample retention on rank workers (see
+    /// [`Self::sample_cache`]).
+    pub fn with_sample_cache(mut self, enabled: bool) -> Self {
+        self.sample_cache = enabled;
+        self
+    }
+
+    /// Local-disk overflow tier in GB (see [`Self::disk_stage_gb`]).
+    pub fn with_disk_stage(mut self, gb: u64) -> Self {
+        self.disk_stage_gb = gb;
+        self
+    }
+
+    /// Disk-stage directory (see [`Self::disk_stage_dir`]).
+    pub fn with_disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.disk_stage_dir = Some(dir.into());
         self
     }
 

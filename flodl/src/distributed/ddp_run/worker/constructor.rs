@@ -191,10 +191,34 @@ impl<M: Module> GpuWorker<M> {
             .unwrap_or(false);
         let (dataset, stager) = if stager_off {
             crate::verbose!("  ddp-worker: rank {} stager disabled (FLODL_STAGER=off)", config.rank);
+            if config.disk_stage_gb > 0 {
+                crate::verbose!(
+                    "  ddp-worker: rank {} disk_stage ignored (the disk tier \
+                     lives under the stager's cache, and the stager is off)",
+                    config.rank
+                );
+            }
             (dataset, None)
         } else {
             let stage_cache =
                 Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
+            // Local-disk overflow tier under the stager's cache — the
+            // same RAM → disk → source cascade the solo loader builds
+            // (`DataLoaderBuilder::disk_stage`): samples the RAM budget
+            // declines spill to an ephemeral per-rank pack file (the
+            // pack name is pid-unique, so co-hosted ranks sharing a
+            // directory never collide).
+            if config.disk_stage_gb > 0 {
+                let dir = config
+                    .disk_stage_dir
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir);
+                stage_cache.attach_disk(crate::data::sample_cache::DiskStage::create(
+                    &dir,
+                    config.disk_stage_gb.saturating_mul(1 << 30),
+                    dataset.len(),
+                )?);
+            }
             let stream_pool = Arc::new(Mutex::new(super::stager::StreamPool::new()));
             let dataset: Arc<dyn BatchDataSet> =
                 Arc::new(super::stager::StagedBatchDataSet::new(
@@ -211,6 +235,7 @@ impl<M: Module> GpuWorker<M> {
                 config.world_size,
                 config.augment,
                 config.ram_max_usage,
+                config.sample_cache,
             );
             (dataset, Some(stager))
         };
@@ -219,10 +244,9 @@ impl<M: Module> GpuWorker<M> {
         let total_batches =
             dataset.len() * config.augment.max(1) / config.batch_size.max(1);
         // Device sample pool switch: builder/config knob AND the
-        // `FLODL_VRAM_POOL=off` runtime kill-switch (A/B runs).
-        let pool_off = std::env::var("FLODL_VRAM_POOL")
-            .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
-            .unwrap_or(false);
+        // `FLODL_VRAM_POOL=off` runtime kill-switch (A/B runs) — one
+        // shared parse with the solo loader (audit D7).
+        let pool_off = crate::data::vram_pool::vram_pool_env_off();
         let vram_pool_enabled = config.vram_pool && !pool_off;
         let (prefetch, per_sample_bytes) = if config.device.is_cuda() && total_batches > 1 {
             let sample = dataset.get_batch(&[0])?;

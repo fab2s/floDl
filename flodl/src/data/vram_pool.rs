@@ -68,6 +68,24 @@ const MARGIN_BYTES: u64 = 512 << 20;
 /// as used) rights the target for good.
 pub(crate) const FLOW_RESERVE_BATCHES: u64 = 16;
 
+/// The pool's default-on switch — ONE definition for the three config
+/// surfaces that expose the knob (`DataLoaderBuilder::vram_pool`,
+/// `DdpRunConfig::vram_pool`, `TrainerConfig::vram_pool`), so the
+/// default cannot drift between the solo and DDP paths (audit D7).
+pub(crate) const VRAM_POOL_DEFAULT: bool = true;
+
+/// The `FLODL_VRAM_POOL=off` (or `=0`) runtime kill-switch — the A/B
+/// discriminator for pool-benefit measurements and the operational
+/// escape hatch. ONE parse for every path: the solo loader
+/// (`DataLoaderBuilder::build`) and the DDP rank worker both consult
+/// this, so an A/B run scripted via the env var behaves identically on
+/// both (it used to be honored only by the DDP constructor — audit D7).
+pub(crate) fn vram_pool_env_off() -> bool {
+    std::env::var("FLODL_VRAM_POOL")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        .unwrap_or(false)
+}
+
 /// The flow-buffer reserve carved out of free VRAM when the pool sizes
 /// itself: the in-flight channel's claim, capped at
 /// [`FLOW_RESERVE_BATCHES`]. THE single definition — both budget-signal

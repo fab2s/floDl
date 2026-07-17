@@ -49,6 +49,9 @@ impl DdpHandle {
         vram_pool: bool,
         vram_max_usage: f64,
         ram_max_usage: f64,
+        sample_cache: bool,
+        disk_stage_gb: u64,
+        disk_stage_dir: Option<std::path::PathBuf>,
         augment: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
@@ -107,6 +110,9 @@ impl DdpHandle {
             vram_pool,
             vram_max_usage,
             ram_max_usage,
+            sample_cache,
+            disk_stage_gb,
+            disk_stage_dir,
             // Single-GPU fallback never goes through the cpu-async load_averaged
             // path, so EASGD alpha is irrelevant here. None keeps the
             // current-behavior copy_ path in case the code path changes.

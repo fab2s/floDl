@@ -516,6 +516,31 @@ where
         self
     }
 
+    /// Pinned RAM sample retention in each rank's staging tier (see
+    /// [`DdpRunConfig::sample_cache`]). Same knob as
+    /// `DataLoaderBuilder::sample_cache` on the solo path; default
+    /// enabled.
+    pub fn sample_cache(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_sample_cache(enabled);
+        self
+    }
+
+    /// Local-disk overflow tier under each rank's sample cache, in GB
+    /// (see [`DdpRunConfig::disk_stage_gb`]). Same knob as
+    /// `DataLoaderBuilder::disk_stage` on the solo path; default off.
+    pub fn disk_stage(mut self, gb: u64) -> Self {
+        self.config = self.config.with_disk_stage(gb);
+        self
+    }
+
+    /// Disk-stage directory (see [`DdpRunConfig::disk_stage_dir`]).
+    /// Same knob as `DataLoaderBuilder::disk_stage_dir` on the solo
+    /// path; default: the system temp dir.
+    pub fn disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.config = self.config.with_disk_stage_dir(dir);
+        self
+    }
+
     /// Attach a high-frequency system timeline for profiling DDP behavior.
     ///
     /// The coordinator and workers inject training events (sync, epoch,

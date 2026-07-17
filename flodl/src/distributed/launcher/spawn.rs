@@ -346,13 +346,32 @@ pub(super) fn supervise_children(
                     )));
                 }
             }
-            if any_failure.is_none() && (dead > 0 || tolerated_deaths > 0) {
-                eprintln!(
-                    "cluster launcher: run completed DEGRADED — {dead} of {} \
-                     ranks lost along the way (tolerated by elastic \
-                     membership); survivors carried the full workload",
-                    e.world_size,
-                );
+            if any_failure.is_none() {
+                if dead > 0 {
+                    eprintln!(
+                        "cluster launcher: run completed DEGRADED — {dead} of {} \
+                         ranks lost along the way (tolerated by elastic \
+                         membership); survivors carried the full workload",
+                        e.world_size,
+                    );
+                } else if tolerated_deaths > 0 {
+                    // Supervision tolerated a non-zero child exit that the
+                    // coordinator never registered as a rank death — the
+                    // report landed after it stopped ticking, i.e. in the
+                    // teardown window, AFTER the run had already drained to
+                    // completion. No work was redistributed and nothing was
+                    // lost, so this is NOT a degraded run; calling it one
+                    // (with the self-contradictory "0 of N ranks lost")
+                    // mislabeled healthy runs. Still worth a line: a rank
+                    // exiting non-zero at teardown is a signal the operator
+                    // may want to chase.
+                    eprintln!(
+                        "cluster launcher: run completed; {tolerated_deaths} \
+                         child exit(s) in the teardown window were tolerated \
+                         (never registered as rank deaths) — full workload \
+                         delivered, nothing redistributed",
+                    );
+                }
             }
         }
     }
