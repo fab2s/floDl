@@ -1847,7 +1847,7 @@ fn param_bridge_loop(
         // pre_norm / post_norm) computed before the buffer reduce so
         // a later buffer error path can't mask the params triple.
         let (divergence, post_norm, pre_norm) =
-            match compute_divergence(scratch, &avg_params) {
+            match crate::distributed::divergence::divergence_triple(scratch, &avg_params) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!(
@@ -1983,69 +1983,6 @@ pub(crate) fn sumcount_reduce(
     Ok(consensus)
 }
 
-/// Compute the weight-space divergence triple
-/// `(||pre - post|| / ||post||, post_norm, pre_norm)`.
-///
-/// Mirrors
-/// [`CpuReduceClient::average_params_with_divergence`](
-/// crate::distributed::cpu_reduce::CpuReduceClient::average_params_with_divergence
-/// ) but accepts pre and post as separate slices — the param bridge
-/// keeps `post` (averaged) in a freshly returned vector rather than
-/// mutating snapshot tensors in place, so the math stays correct
-/// regardless of whether snapshot tensors share storage with the
-/// inner GpuWorker's live params (true on CPU device, false on
-/// CUDA + to_device(CPU) hop).
-///
-/// **Mutates `pre` in place** (subtracts `post`); the caller treats
-/// `pre` as scratch that is overwritten by each round.
-fn compute_divergence(
-    pre: &[Tensor],
-    post: &[Tensor],
-) -> Result<(f64, Option<f64>, Option<f64>)> {
-    if pre.is_empty() {
-        return Ok((0.0, None, None));
-    }
-    if pre.len() != post.len() {
-        return Err(TensorError::new(&format!(
-            "compute_divergence: pre.len() ({}) must equal post.len() ({})",
-            pre.len(),
-            post.len(),
-        )));
-    }
-
-    // pre_norm BEFORE the foreach_add_list_ subtracts post from scratch.
-    let pre_norm_tensors = Tensor::foreach_norm(pre, 2.0)?;
-    let mut pre_sq = 0.0f64;
-    for n in &pre_norm_tensors {
-        let v: f64 = n.item()?;
-        pre_sq += v * v;
-    }
-    let pre_norm = pre_sq.sqrt();
-
-    // scratch[i] += -1 * post[i]  →  scratch[i] = pre - post.
-    Tensor::foreach_add_list_(pre, post, -1.0)?;
-    let diff_norms = Tensor::foreach_norm(pre, 2.0)?;
-    let post_norms = Tensor::foreach_norm(post, 2.0)?;
-
-    let mut diff_sq = 0.0f64;
-    for n in &diff_norms {
-        let v: f64 = n.item()?;
-        diff_sq += v * v;
-    }
-    let mut post_sq = 0.0f64;
-    for n in &post_norms {
-        let v: f64 = n.item()?;
-        post_sq += v * v;
-    }
-    let post_norm = post_sq.sqrt();
-    let divergence = if post_norm > 1e-10 {
-        diff_sq.sqrt() / post_norm
-    } else {
-        0.0
-    };
-
-    Ok((divergence, Some(post_norm), Some(pre_norm)))
-}
 
 // ---------------------------------------------------------------------------
 // Tests

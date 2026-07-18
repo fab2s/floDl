@@ -31,6 +31,7 @@ pub mod cluster_worker;
 pub mod config;
 pub(crate) mod controller;
 pub(crate) mod cpu_reduce;
+pub(crate) mod divergence;
 pub mod dashboard_sink;
 pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;

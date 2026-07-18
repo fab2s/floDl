@@ -497,40 +497,11 @@ impl CpuReduceClient {
             dst.copy_(src, false)?;
         }
 
-        // pre_norm BEFORE the next foreach mutates scratch in place.
-        let pre_norm_tensors = Tensor::foreach_norm(scratch, 2.0)?;
-        let mut pre_sq = 0.0f64;
-        for n in &pre_norm_tensors {
-            let v: f64 = n.item()?;
-            pre_sq += v * v;
-        }
-        let pre_norm = pre_sq.sqrt();
-
-        // scratch[i] += -1 * params[i]  →  scratch[i] = pre - post.
+        // Divergence triple from the shared math (scratch = pre snapshot,
+        // params = post-AllReduce). One definition across backends so the
+        // convergence guard's cross-backend comparison stays honest.
         let param_owned: Vec<Tensor> = params.iter().map(|t| (*t).clone()).collect();
-        Tensor::foreach_add_list_(scratch, &param_owned, -1.0)?;
-
-        let diff_norms = Tensor::foreach_norm(scratch, 2.0)?;
-        let post_norms = Tensor::foreach_norm(&param_owned, 2.0)?;
-
-        let mut diff_sq = 0.0f64;
-        for n in &diff_norms {
-            let v: f64 = n.item()?;
-            diff_sq += v * v;
-        }
-        let mut post_sq = 0.0f64;
-        for n in &post_norms {
-            let v: f64 = n.item()?;
-            post_sq += v * v;
-        }
-        let post_norm = post_sq.sqrt();
-        let divergence = if post_norm > 1e-10 {
-            diff_sq.sqrt() / post_norm
-        } else {
-            0.0
-        };
-
-        Ok((divergence, Some(post_norm), Some(pre_norm)))
+        crate::distributed::divergence::divergence_triple(scratch, &param_owned)
     }
 
 }
