@@ -81,6 +81,7 @@ use crate::distributed::wire::{
 use crate::distributed::wire_convert::{
     control_wire_to_msg, metrics_msg_to_wire, timing_msg_to_wire,
 };
+use crate::distributed::nccl_session::PendingNcclSession;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
@@ -92,22 +93,6 @@ use crate::tensor::{Device, Result, Tensor, TensorError};
 /// bridge threads that translate between the OLD mpsc channels and
 /// the new control-channel `ControlFrame` wire protocol.
 ///
-/// Mailbox slot for the most-recent coord-broadcast NCCL session.
-/// Updated by the inbound bridge on each `NewNcclSession` arrival;
-/// consumed by the main thread (post-comm-abort) when rebuilding the
-/// NCCL comm. Slot semantics: latest write wins; old values are
-/// silently overwritten on each new session.
-///
-/// Fields are populated by the inbound bridge but currently unread;
-/// the consumer is the sync_now_nccl retry path in a follow-on slice.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct PendingNcclSession {
-    pub uid_bytes: Vec<u8>,
-    pub new_rank: usize,
-    pub new_world_size: usize,
-}
-
 /// NOT Send (the inner [`GpuWorker`] holds `Rc<RefCell<...>>`).
 /// Construct and run on the same thread.
 pub struct ClusterWorker<M: Module> {

@@ -146,7 +146,7 @@ pub struct GpuWorker<M: Module> {
     /// `None` outside cluster mode (standalone single-process NCCL has
     /// no rendezvous channel).
     nccl_session_mailbox: Option<
-        Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
+        Arc<Mutex<Option<crate::distributed::nccl_session::PendingNcclSession>>>,
     >,
     /// Cluster-mode local dead-rank ledger (a clone of the
     /// `cluster_worker`'s ledger). Polled by `wait_for_nccl_session` to
@@ -521,7 +521,7 @@ impl<M: Module> GpuWorker<M> {
     /// single-process NCCL setups.
     pub(crate) fn attach_nccl_session_mailbox(
         &mut self,
-        mailbox: Arc<Mutex<Option<crate::distributed::cluster_worker::PendingNcclSession>>>,
+        mailbox: Arc<Mutex<Option<crate::distributed::nccl_session::PendingNcclSession>>>,
     ) {
         self.nccl_session_mailbox = Some(mailbox);
     }

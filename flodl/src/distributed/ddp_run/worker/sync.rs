@@ -716,7 +716,7 @@ impl<M: Module> GpuWorker<M> {
     /// rather than hanging indefinitely.
     pub(super) fn wait_for_nccl_session(
         &self,
-    ) -> Result<crate::distributed::cluster_worker::PendingNcclSession> {
+    ) -> Result<crate::distributed::nccl_session::PendingNcclSession> {
         let mailbox = self.nccl_session_mailbox.as_ref().ok_or_else(|| {
             TensorError::new(
                 "sync_now_nccl: NCCL aborted but no session mailbox attached; \

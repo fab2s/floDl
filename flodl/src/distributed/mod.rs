@@ -32,6 +32,7 @@ pub mod config;
 pub(crate) mod controller;
 pub(crate) mod cpu_reduce;
 pub(crate) mod divergence;
+pub(crate) mod nccl_session;
 pub(crate) mod wire_convert;
 pub mod dashboard_sink;
 pub(crate) mod cluster_dashboard_emit;
