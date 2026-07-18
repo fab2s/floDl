@@ -39,7 +39,9 @@ pub mod tree;
 pub mod verbose;
 #[allow(clippy::module_inception)]
 mod graph;
+mod checkpoint;
 mod distributed;
+mod execution;
 
 use std::collections::HashMap;
 
@@ -107,6 +109,7 @@ pub use observe::Reduce;
 pub use tree::PathKind;
 pub use snapshot::ModelSnapshot;
 pub use graph::*;
+pub use execution::{ActiveGraphEpochIterator, GraphEpochIterator};
 
 /// Merge operation for combining split branches.
 pub enum MergeOp {

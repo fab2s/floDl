@@ -3,7 +3,8 @@ use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 
 use super::node::DEFAULT_INPUT;
-use super::graph::{Graph, DataLoaderBinding, GraphEpochIterator};
+use super::execution::GraphEpochIterator;
+use super::graph::{DataLoaderBinding, Graph};
 use super::LossContext;
 
 // ---------------------------------------------------------------------------

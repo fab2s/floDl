@@ -360,7 +360,7 @@ fn test_graph_checkpoint_hash_mismatch() {
 
 #[test]
 fn test_save_checkpoint_emits_sidecar_when_source_config_set() {
-    use crate::graph::graph::sidecar_config_path;
+    use crate::graph::checkpoint::sidecar_config_path;
 
     let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
         .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
@@ -386,7 +386,7 @@ fn test_save_checkpoint_emits_sidecar_when_source_config_set() {
 
 #[test]
 fn test_save_checkpoint_no_sidecar_when_source_config_unset() {
-    use crate::graph::graph::sidecar_config_path;
+    use crate::graph::checkpoint::sidecar_config_path;
 
     let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
         .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
@@ -410,7 +410,7 @@ fn test_save_checkpoint_no_sidecar_when_source_config_unset() {
 
 #[test]
 fn test_sidecar_path_strips_fdl_and_gz() {
-    use crate::graph::graph::sidecar_config_path;
+    use crate::graph::checkpoint::sidecar_config_path;
 
     assert_eq!(
         sidecar_config_path("/tmp/model.fdl"),
@@ -428,7 +428,7 @@ fn test_sidecar_path_strips_fdl_and_gz() {
 
 #[test]
 fn test_clear_source_config_disables_sidecar() {
-    use crate::graph::graph::sidecar_config_path;
+    use crate::graph::checkpoint::sidecar_config_path;
 
     let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
         .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
