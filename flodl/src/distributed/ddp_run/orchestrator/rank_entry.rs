@@ -323,6 +323,9 @@ impl DdpHandle {
                 .iter()
                 .map(|p| p.variable.data())
                 .collect();
+            crate::distributed::ddp_run::ensure_trainable_params(
+                initial_params_local.len(), "ddp: cluster rank",
+            )?;
             let initial_buffers_local: Vec<Tensor> = tmp_model
                 .buffers()
                 .iter()

@@ -1058,15 +1058,25 @@ impl Tensor {
     /// On CUDA, this launches a single multi-tensor kernel instead of ~4N
     /// separate kernels for N parameters. On CPU, falls back to a fused loop.
     ///
+    /// - `steps[i]` is param i's own step count (libtorch's per-param
+    ///   `state_steps`): bias correction is computed per param, so a param
+    ///   that starts updating late corrects from its first step, not the
+    ///   global one. Must have the same length as `params`.
     /// - `grad_scale` / `found_inf`: pass `None` to skip mixed-precision integration.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_adam_(
         params: &[Tensor], grads: &[Tensor], exp_avgs: &[Tensor], exp_avg_sqs: &[Tensor],
         lr: f64, beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        weight_decay: f64, steps: &[i64],
         grad_scale: Option<&Tensor>, found_inf: Option<&Tensor>,
     ) -> Result<()> {
         if params.is_empty() { return Ok(()); }
+        if steps.len() != params.len() {
+            return Err(TensorError::new(&format!(
+                "fused_adam_: steps length {} does not match params length {}",
+                steps.len(), params.len()
+            )));
+        }
         let count = params.len() as i32;
         let mut p = Self::handles(params);
         let mut g = Self::handles(grads);
@@ -1077,7 +1087,7 @@ impl Tensor {
         let err = unsafe {
             ffi::flodl_fused_adam_(
                 p.as_mut_ptr(), g.as_mut_ptr(), m.as_mut_ptr(), v.as_mut_ptr(),
-                count, lr, beta1, beta2, eps, weight_decay, step, gs, fi,
+                count, lr, beta1, beta2, eps, weight_decay, steps.as_ptr(), gs, fi,
             )
         };
         check_err(err)
@@ -1092,10 +1102,16 @@ impl Tensor {
     pub fn fused_adamw_(
         params: &[Tensor], grads: &[Tensor], exp_avgs: &[Tensor], exp_avg_sqs: &[Tensor],
         lr: f64, beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        weight_decay: f64, steps: &[i64],
         grad_scale: Option<&Tensor>, found_inf: Option<&Tensor>,
     ) -> Result<()> {
         if params.is_empty() { return Ok(()); }
+        if steps.len() != params.len() {
+            return Err(TensorError::new(&format!(
+                "fused_adamw_: steps length {} does not match params length {}",
+                steps.len(), params.len()
+            )));
+        }
         let count = params.len() as i32;
         let mut p = Self::handles(params);
         let mut g = Self::handles(grads);
@@ -1106,7 +1122,7 @@ impl Tensor {
         let err = unsafe {
             ffi::flodl_fused_adamw_(
                 p.as_mut_ptr(), g.as_mut_ptr(), m.as_mut_ptr(), v.as_mut_ptr(),
-                count, lr, beta1, beta2, eps, weight_decay, step, gs, fi,
+                count, lr, beta1, beta2, eps, weight_decay, steps.as_ptr(), gs, fi,
             )
         };
         check_err(err)

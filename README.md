@@ -687,7 +687,9 @@ path, autograd tracking, and graph execution.
 |------|-------------|
 | `clip_grad_norm` / `clip_grad_value` | Fused gradient clipping (2 kernels total via foreach ops) |
 | `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoints, structural hash, partial loading, `LoadReport` |
+| `save_state_file` / `load_state_file` | Optimizer state save/load (`.optim`, self-identifying header, gzip-aware, atomic) |
 | `migrate_checkpoint` | Remap parameter names across versions |
+| `migrate_optim_state_file` | Convert an old optimizer `.optim` file to the current format |
 | `Parameter::freeze` / `unfreeze` | Per-parameter gradient control |
 | `GradScaler` | Dynamic loss scaling for fp16 training |
 | `cast_parameters` | Cast model parameters to any dtype |

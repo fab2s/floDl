@@ -106,6 +106,10 @@ impl<M: Module> GpuWorker<M> {
         };
         let params = model.parameters();
         let buffers = model.buffers();
+        crate::distributed::ddp_run::ensure_trainable_params(
+            params.len(),
+            &format!("GpuWorker rank {}", config.rank),
+        )?;
 
         // Copy initial params into model variables on compute_stream
         // (no_grad: leaf tensors with requires_grad).

@@ -939,19 +939,26 @@ let report = load_checkpoint(&mut reader, &named, &buffers, hash)?;
 
 ### Full training resume (model + optimizer)
 
-Optimizers implement the `Stateful` trait for save/load:
+Optimizers implement the `Stateful` trait for save/load. Use the file
+helpers — they write a self-identifying header (so a file can't be loaded
+into the wrong optimizer), commit atomically, and gzip when the path ends
+in `.gz`:
 
 ```rust
 // Save
 model.save_checkpoint("model.fdl")?;
-let mut f = File::create("optimizer.fdl")?;
-optimizer.save_state(&mut f)?;
+optimizer.save_state_file("optimizer.optim")?;
 
 // Load
 let report = model.load_checkpoint("model.fdl")?;
-let mut f = File::open("optimizer.fdl")?;
-optimizer.load_state(&mut f)?;
+optimizer.load_state_file("optimizer.optim")?;
 ```
+
+`Optimizer::save_state_to(path)` is the object-safe save (callable through
+`&dyn Optimizer`, e.g. the cluster save-on-failure sidecar); loading needs
+the concrete type via `load_state_file`. `save_state`/`load_state` (raw
+`&mut Write` / `&mut Read`) are available for custom I/O, but they write no
+header — pair them only with each other, not with `load_state_file`.
 
 ### Migrating checkpoints across versions
 
@@ -986,6 +993,35 @@ The migration matches entries by exact name first, then by shape+dtype in
 positional order. `MigrateReport::is_complete()` returns `true` when nothing
 was dropped or missing. Only works for the same model architecture - if you
 changed the architecture, retrain.
+
+### Migrating optimizer state across versions
+
+The optimizer `.optim` format gained a self-identifying `FDLO` header and
+per-parameter step counts. An optimizer state file written by an earlier
+flodl (no header) is rejected on load with a message pointing here; convert
+it once with `migrate_optim_state_file()`. Unlike checkpoint migration, this
+needs no model — just the paths and the optimizer kind that wrote the file
+(the old format carried no type tag, so you supply it):
+
+```rust
+use flodl::nn::{migrate_optim_state_file, StateKind};
+
+// Convert an old optimizer state file to the current format.
+// In-place (src == dst) is safe; gzip is picked from each path's extension.
+migrate_optim_state_file(
+    "optimizer.optim",       // old file (pre-header)
+    "optimizer.optim",       // in-place, or a new path
+    StateKind::Adam,         // the optimizer that wrote it
+)?;
+
+// Now it loads normally:
+optimizer.load_state_file("optimizer.optim")?;
+```
+
+For Adam/AdamW the old single global step is expanded into per-parameter
+steps (exact for parameters trained from step 0). `SGD`, `RMSprop`, and
+`GradScaler` convert verbatim under the new header; `Adagrad`, `RAdam`, and
+`NAdam` never had a pre-header format, so they need no migration.
 
 ## Device Placement
 

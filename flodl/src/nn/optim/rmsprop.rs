@@ -224,6 +224,8 @@ impl Optimizer for RMSprop {
 }
 
 impl Stateful for RMSprop {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::RMSprop }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;

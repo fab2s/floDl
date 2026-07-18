@@ -61,11 +61,12 @@ pub use rng::Rng;
 pub use autograd::{Variable, no_grad, is_grad_enabled, NoGradGuard, max_pool2d, adaptive_avg_pool2d, grid_sample, scaled_dot_product_attention, embedding, embedding_bag};
 pub use nn::{
     Module, NamedInputModule, LoopBody, TraceEmit, forward_via_step,
-    Parameter, Buffer, Linear, Optimizer, Stateful,
+    Parameter, Buffer, Linear, Optimizer, Stateful, StateKind,
     SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder,
     RMSprop, RMSpropBuilder, Adagrad, AdagradBuilder, RAdam, NAdam,
     save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
-    migrate_checkpoint, migrate_checkpoint_file, checkpoint_version, checkpoint_keys,
+    migrate_checkpoint, migrate_checkpoint_file, migrate_optim_state_file,
+    checkpoint_version, checkpoint_keys,
     LoadReport, MigrateReport,
     GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled,
     Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU,

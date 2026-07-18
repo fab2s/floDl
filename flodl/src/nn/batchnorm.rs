@@ -95,10 +95,6 @@ impl Module for BatchNorm2d {
     fn set_training(&self, training: bool) {
         self.inner.set_training(training);
     }
-
-    fn move_to_device(&self, device: crate::tensor::Device) {
-        self.inner.move_to_device(device);
-    }
 }
 
 impl Module for BatchNorm {
@@ -139,11 +135,6 @@ impl Module for BatchNorm {
 
     fn set_training(&self, training: bool) {
         self.training.set(training);
-    }
-
-    fn move_to_device(&self, device: crate::tensor::Device) {
-        let _ = self.running_mean.to_device(device);
-        let _ = self.running_var.to_device(device);
     }
 }
 

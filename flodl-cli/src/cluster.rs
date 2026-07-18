@@ -726,13 +726,7 @@ pub fn resolve_local_hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Env-mutating tests serialize via this mutex per
-    /// `feedback_env_mutating_tests_mutex`. `should_dispatch` reads
-    /// `FLODL_INTERNAL_CLUSTER_JSON` and `prepare_cluster_env` sets several
-    /// vars; both classes are guarded by the same lock.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    use crate::util::test_env::env_lock;
 
     #[test]
     fn net_timeout_scale_validation_mirrors_library_rule() {
@@ -765,8 +759,8 @@ mod tests {
 
     #[test]
     fn should_dispatch_returns_false_when_cluster_json_set() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // SAFETY: serialized via ENV_MUTEX above.
+        let _guard = env_lock();
+        // SAFETY: serialized via env_lock() above.
         unsafe {
             std::env::set_var(ENV_CLUSTER_JSON, "deadbeef");
         }
@@ -796,7 +790,7 @@ commands:
 
     #[test]
     fn should_dispatch_delegates_when_env_unset() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var(ENV_CLUSTER_JSON);
         }
@@ -832,7 +826,7 @@ commands:
 
     #[test]
     fn prepare_cluster_env_sets_required_vars() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // Clear env first so we observe what prepare_cluster_env sets.
         unsafe {
             std::env::remove_var(ENV_FULL_CLUSTER_JSON);
@@ -875,7 +869,7 @@ commands:
 
     #[test]
     fn prepare_cluster_env_skips_fdl_env_when_blank() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var(ENV_FDL_ENV);
         }
@@ -954,7 +948,7 @@ commands:
 
     #[test]
     fn prepare_cluster_env_validates_cluster() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // Empty controller.host → validate() fails → prepare_cluster_env errors.
         let cluster = ClusterConfig {
             controller: crate::config::ClusterController {

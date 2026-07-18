@@ -798,7 +798,7 @@ static char* fused_adam_impl(FlodlTensor* params, FlodlTensor* grads,
                               FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
                               int count, double lr,
                               double beta1, double beta2, double eps,
-                              double weight_decay, int64_t step,
+                              double weight_decay, const int64_t* steps_in,
                               FlodlTensor grad_scale, FlodlTensor found_inf,
                               bool adamw) {
     try {
@@ -812,10 +812,14 @@ static char* fused_adam_impl(FlodlTensor* params, FlodlTensor* grads,
         // No amsgrad support — empty list
         std::vector<at::Tensor> max_v_list;
 
-        // state_steps: float32 scalar tensors on same device as params
-        auto step_val = torch::tensor((float)step,
-            torch::dtype(torch::kFloat32).device(p_list[0].device()));
-        std::vector<at::Tensor> steps(count, step_val);
+        // state_steps: per-param float32 scalar tensors on the param's
+        // device — bias correction is computed per param from these.
+        std::vector<at::Tensor> steps;
+        steps.reserve(count);
+        for (int i = 0; i < count; i++) {
+            steps.push_back(torch::tensor((float)steps_in[i],
+                torch::dtype(torch::kFloat32).device(p_list[i].device())));
+        }
 
         auto gs = grad_scale
             ? c10::optional<at::Tensor>(unwrap(grad_scale))
@@ -849,11 +853,11 @@ extern "C" char* flodl_fused_adam_(
         FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
         int count, double lr,
         double beta1, double beta2, double eps,
-        double weight_decay, int64_t step,
+        double weight_decay, const int64_t* steps,
         FlodlTensor grad_scale, FlodlTensor found_inf) {
     try {
     return fused_adam_impl(params, grads, exp_avgs, exp_avg_sqs,
-        count, lr, beta1, beta2, eps, weight_decay, step,
+        count, lr, beta1, beta2, eps, weight_decay, steps,
         grad_scale, found_inf, /*adamw=*/false);
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -867,11 +871,11 @@ extern "C" char* flodl_fused_adamw_(
         FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
         int count, double lr,
         double beta1, double beta2, double eps,
-        double weight_decay, int64_t step,
+        double weight_decay, const int64_t* steps,
         FlodlTensor grad_scale, FlodlTensor found_inf) {
     try {
     return fused_adam_impl(params, grads, exp_avgs, exp_avg_sqs,
-        count, lr, beta1, beta2, eps, weight_decay, step,
+        count, lr, beta1, beta2, eps, weight_decay, steps,
         grad_scale, found_inf, /*adamw=*/true);
     } catch (const std::exception& e) {
         return make_error(e.what());

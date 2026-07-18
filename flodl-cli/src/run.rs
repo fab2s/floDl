@@ -1549,9 +1549,7 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // FDL_ENV is process-global; tests that set it must not interleave.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::util::test_env::env_lock;
 
     fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1569,7 +1567,7 @@ mod tests {
         // The resolver previously hardcoded `fdl.yml` while config
         // discovery accepts fdl.yaml / fdl.yml / fdl.json — an fdl.yaml
         // project under FDL_ENV silently fell back to `.active`.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let dir = unique_tmp_dir("yaml-spelling");
         std::fs::write(dir.join("fdl.yaml"), "description: base\n").unwrap();
         std::fs::write(
@@ -1590,7 +1588,7 @@ mod tests {
     fn overlay_libtorch_load_failure_is_loud() {
         // A broken overlay under FDL_ENV must error, not silently fall
         // back to `.active` (wrong libtorch on heterogeneous rigs).
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let dir = unique_tmp_dir("broken-overlay");
         std::fs::write(dir.join("fdl.yml"), "description: base\n").unwrap();
         // FDL_ENV names an overlay that doesn't exist -> load error.

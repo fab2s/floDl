@@ -129,6 +129,24 @@ pub fn drain_scalars() -> HashMap<String, (f64, usize)> {
     SCALAR_ACCUM.with(|acc| std::mem::take(&mut *acc.borrow_mut()))
 }
 
+/// Loud guard for the "custom leaf module forgot to override
+/// `Module::parameters()`" footgun: the trait default returns an empty list
+/// for modules without sub-modules, so a forgotten override reaches the
+/// trainer as a model with nothing to train and every step becomes a silent
+/// no-op. Every training entry (single-device path, process ranks, thread
+/// workers, manual `Ddp::wrap`) calls this right after its first model build.
+pub(crate) fn ensure_trainable_params(n_params: usize, entry: &str) -> Result<()> {
+    if n_params == 0 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{entry}: model has zero trainable parameters — nothing to train. \
+             If this is a custom leaf module, note that Module::parameters() \
+             defaults to an empty list; override it to return the module's \
+             parameters."
+        )));
+    }
+    Ok(())
+}
+
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
 ///

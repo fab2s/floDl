@@ -1488,3 +1488,33 @@
         let m = eq.mean().unwrap().item().unwrap();
         assert!((m - 2.0 / 3.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn test_move_to_device_default_moves_params_and_buffers() {
+        // The trait default must actually move everything reachable through
+        // parameters()/buffers() — a bare module outside a Graph has no
+        // other mover (the old default was a silent no-op).
+        let dev = crate::tensor::test_device();
+
+        let lin = Linear::new(4, 2).unwrap(); // built on CPU
+        lin.move_to_device(dev);
+        for p in lin.parameters() {
+            assert_eq!(p.variable.data().device(), dev, "param '{}' not moved", p.name);
+            assert!(p.variable.requires_grad(), "param '{}' lost grad tracking", p.name);
+        }
+        let x = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], dev).unwrap(), false,
+        );
+        lin.forward(&x).unwrap();
+
+        // BatchNorm holds running stats as buffers — the default covers
+        // them too (its hand-rolled override is gone).
+        let bn = BatchNorm::new(4).unwrap();
+        bn.move_to_device(dev);
+        for p in bn.parameters() {
+            assert_eq!(p.variable.data().device(), dev);
+        }
+        for b in bn.buffers() {
+            assert_eq!(b.get().device(), dev);
+        }
+    }

@@ -75,6 +75,9 @@ impl DdpHandle {
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
             .collect();
+        crate::distributed::ddp_run::ensure_trainable_params(
+            initial_params.len(), "ddp: single device",
+        )?;
         let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
             .map(|b| b.get())
             .collect();

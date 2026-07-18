@@ -68,9 +68,13 @@ impl Variable {
 
     /// Get the underlying tensor data (shallow clone sharing storage).
     ///
-    /// The returned `Tensor` shares the same memory as the variable's data.
-    /// In-place mutations on either side will be visible to both. If you need
-    /// an independent copy, call `.data().copy()` instead.
+    /// The returned `Tensor` shares the same memory as the variable's data —
+    /// the same aliasing semantics as PyTorch's `.data`. In-place mutations
+    /// on either side will be visible to both. If you need an independent
+    /// copy, call `.data().copy()` instead. Because the share counts as the
+    /// same tensor for concurrency purposes, the thread-safety rules on
+    /// [`Tensor`](crate::tensor::Tensor#thread-safety) apply across it: never
+    /// mutate in place while any other thread accesses the variable.
     pub fn data(&self) -> Tensor {
         self.inner.borrow().data.clone()
     }

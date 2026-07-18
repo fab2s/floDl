@@ -199,6 +199,8 @@ impl GradScaler {
 }
 
 impl Stateful for GradScaler {
+    fn state_kind(&self) -> crate::nn::StateKind { crate::nn::StateKind::GradScaler }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_f64_le(w, self.scale)?;
         write_i64_le(w, self.steps_since_growth)?;

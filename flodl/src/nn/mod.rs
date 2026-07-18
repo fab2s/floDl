@@ -69,7 +69,7 @@ pub use loss::{
     triplet_margin_loss, cosine_embedding_loss,
     hinge_embedding_loss, margin_ranking_loss, poisson_nll_loss,
 };
-pub use optim::{Optimizer, Stateful, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder, RMSprop, RMSpropBuilder, Adagrad, AdagradBuilder, RAdam, NAdam};
+pub use optim::{Optimizer, Stateful, StateKind, migrate_optim_state_file, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder, RMSprop, RMSpropBuilder, Adagrad, AdagradBuilder, RAdam, NAdam};
 pub use checkpoint::{
     save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
     migrate_checkpoint, migrate_checkpoint_file, checkpoint_version, checkpoint_keys,
@@ -124,7 +124,12 @@ pub trait Module {
     fn forward(&self, input: &Variable) -> Result<Variable>;
     /// Return this module's learnable parameters.
     /// Default: recursively collects from `sub_modules()` with pointer dedup.
-    /// Leaf modules should override to return their own parameters.
+    ///
+    /// Leaf modules holding parameters MUST override this — for a module
+    /// with no sub-modules the default returns an empty list, so a
+    /// forgotten override reaches training as a model with nothing to
+    /// train. Trainer entries reject zero-parameter models loudly for
+    /// exactly this reason.
     fn parameters(&self) -> Vec<Parameter> {
         let subs = self.sub_modules();
         if subs.is_empty() {
@@ -179,8 +184,44 @@ pub trait Module {
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> { vec![] }
 
     /// Move all parameters and buffers to the given device.
-    /// Override in modules like BatchNorm that hold non-parameter state.
-    fn move_to_device(&self, _device: crate::tensor::Device) {}
+    ///
+    /// The default moves everything reachable through [`Module::parameters`]
+    /// and [`Module::buffers`], so it covers leaf and composite modules
+    /// alike. Parameters are re-leafed on the way (detach → move →
+    /// [`Variable::set_data`](crate::autograd::Variable::set_data), the same
+    /// recipe as `Graph::set_device`), which also bumps their data
+    /// generation so parameter-derived caches (cuDNN flattened RNN weights)
+    /// rebuild. Already-on-device tensors are skipped, so repeated or
+    /// overlapping moves are cheap no-ops.
+    ///
+    /// Panics if a move fails: a half-moved model would otherwise only
+    /// surface later as a confusing cross-device op error far from the
+    /// cause. Override in modules holding device-resident state reachable
+    /// through neither accessor.
+    fn move_to_device(&self, device: crate::tensor::Device) {
+        for p in self.parameters() {
+            let data = p.variable.data();
+            if data.device() != device {
+                let moved = data
+                    .detach()
+                    .and_then(|d| d.to_device(device))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Module::move_to_device: failed to move parameter '{}' to {device:?}: {e}",
+                            p.name
+                        )
+                    });
+                p.variable.set_data(moved);
+            }
+        }
+        for b in self.buffers() {
+            if b.get().device() != device {
+                b.to_device(device).unwrap_or_else(|e| {
+                    panic!("Module::move_to_device: failed to move buffer to {device:?}: {e}")
+                });
+            }
+        }
+    }
 
     /// Set training/eval mode. Affects Dropout, BatchNorm, etc.
     /// Override in modules with mode-dependent behavior.

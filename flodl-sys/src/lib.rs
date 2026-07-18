@@ -1036,7 +1036,7 @@ unsafe extern "C" {
         exp_avgs: *mut FlodlTensor, exp_avg_sqs: *mut FlodlTensor,
         count: i32, lr: f64,
         beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        weight_decay: f64, steps: *const i64,
         grad_scale: FlodlTensor, found_inf: FlodlTensor,
     ) -> *mut c_char;
 
@@ -1045,7 +1045,7 @@ unsafe extern "C" {
         exp_avgs: *mut FlodlTensor, exp_avg_sqs: *mut FlodlTensor,
         count: i32, lr: f64,
         beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        weight_decay: f64, steps: *const i64,
         grad_scale: FlodlTensor, found_inf: FlodlTensor,
     ) -> *mut c_char;
 

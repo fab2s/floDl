@@ -1,11 +1,17 @@
 //! RAdam (Rectified Adam) optimizer.
 
+use std::io::{Read, Write};
+
 use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
+use crate::nn::checkpoint::{
+    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
+    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+};
 use crate::nn::parameter::Parameter;
 
-use super::Optimizer;
+use super::{Optimizer, Stateful};
 
 /// RAdam optimizer (Liu et al., 2020).
 ///
@@ -21,7 +27,9 @@ pub struct RAdam {
     weight_decay: f64,
     m: Vec<Option<crate::tensor::Tensor>>,
     v: Vec<Option<crate::tensor::Tensor>>,
-    step_count: u64,
+    /// Per-param step counts, incremented only when the param has a grad
+    /// (bias correction + rectification follow each param's own steps).
+    steps: Vec<i64>,
 }
 
 impl RAdam {
@@ -32,7 +40,7 @@ impl RAdam {
         RAdam {
             params: params.iter().map(|p| p.variable.clone()).collect(),
             lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.0,
-            m: vec![None; n], v: vec![None; n], step_count: 0,
+            m: vec![None; n], v: vec![None; n], steps: vec![0; n],
         }
     }
 
@@ -43,19 +51,21 @@ impl RAdam {
 impl Optimizer for RAdam {
     fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
-        self.step_count += 1;
-        let t = self.step_count as f64;
         let b1 = self.beta1;
         let b2 = self.beta2;
-        let b1t = b1.powf(t);
-        let b2t = b2.powf(t);
         // Maximum length of approximated SMA
         let rho_inf = 2.0 / (1.0 - b2) - 1.0;
-        let rho_t = rho_inf - 2.0 * t * b2t / (1.0 - b2t);
 
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
                 if let Some(mut grad) = param.grad() {
+                    // Per-param step: bias correction + variance
+                    // rectification restart for a late-unfrozen param.
+                    self.steps[i] += 1;
+                    let t = self.steps[i] as f64;
+                    let b1t = b1.powf(t);
+                    let b2t = b2.powf(t);
+                    let rho_t = rho_inf - 2.0 * t * b2t / (1.0 - b2t);
                     let data = param.data().detach()?;
                     if self.weight_decay > 0.0 {
                         grad = grad.add(&data.mul_scalar(self.weight_decay)?)?;
@@ -96,7 +106,7 @@ impl Optimizer for RAdam {
     }
 
     fn reset_state(&mut self) {
-        // Moment estimates back to fresh, step counter to 0 (rectification
+        // Moment estimates back to fresh, step counts to 0 (rectification
         // schedule restarts). Lengths preserved for per-param indexing.
         for slot in &mut self.m {
             *slot = None;
@@ -104,7 +114,9 @@ impl Optimizer for RAdam {
         for slot in &mut self.v {
             *slot = None;
         }
-        self.step_count = 0;
+        for s in &mut self.steps {
+            *s = 0;
+        }
     }
 
     fn zero_grad(&self) {
@@ -112,6 +124,60 @@ impl Optimizer for RAdam {
     }
 
     fn set_lr(&mut self, lr: f64) { self.lr = lr; }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
+}
+
+impl Stateful for RAdam {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::RAdam }
+
+    fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
+        write_u32_le(w, self.params.len() as u32)?;
+        write_f64_le(w, self.lr)?;
+        write_f64_le(w, self.beta1)?;
+        write_f64_le(w, self.beta2)?;
+        write_f64_le(w, self.eps)?;
+        write_f64_le(w, self.weight_decay)?;
+        for i in 0..self.params.len() {
+            write_tensor_state(w, self.m[i].as_ref())?;
+            write_tensor_state(w, self.v[i].as_ref())?;
+            write_i64_le(w, self.steps[i])?;
+        }
+        // Empty group table: RAdam has no group support yet, but the
+        // slot keeps the payload shape uniform with grouped optimizers.
+        super::write_groups(w, &[])?;
+        Ok(())
+    }
+
+    fn load_state<R: Read>(&mut self, r: &mut R) -> Result<()> {
+        let count = read_u32_le(r)? as usize;
+        if count != self.params.len() {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "RAdam: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+            )));
+        }
+        self.lr = read_f64_le(r)?;
+        self.beta1 = read_f64_le(r)?;
+        self.beta2 = read_f64_le(r)?;
+        self.eps = read_f64_le(r)?;
+        self.weight_decay = read_f64_le(r)?;
+        for i in 0..self.params.len() {
+            let dev = self.params[i].data().device();
+            self.m[i] = read_tensor_state(r, dev)?;
+            self.v[i] = read_tensor_state(r, dev)?;
+            self.steps[i] = read_i64_le(r)?;
+        }
+        let groups = super::read_groups(r, self.params.len(), "RAdam")?;
+        if !groups.is_empty() {
+            return Err(crate::tensor::TensorError::new(
+                "RAdam: state file carries a group table, but this flodl's \
+                 RAdam has no parameter-group support",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

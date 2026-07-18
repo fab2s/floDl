@@ -168,6 +168,7 @@ impl Ddp {
             .into_iter()
             .map(|p| p.variable)
             .collect();
+        crate::distributed::ddp_run::ensure_trainable_params(params.len(), "Ddp::wrap")?;
         let buffers: Vec<Buffer> = model.buffers();
 
         Ok(Ddp { comms, device, params, buffers })
@@ -196,6 +197,7 @@ impl Ddp {
             .into_iter()
             .map(|p| p.variable)
             .collect();
+        crate::distributed::ddp_run::ensure_trainable_params(params.len(), "Ddp::from_comm")?;
         let buffers: Vec<Buffer> = model.buffers();
         Ok(Ddp { comms, device, params, buffers })
     }

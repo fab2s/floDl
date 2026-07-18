@@ -638,6 +638,9 @@ char* flodl_adam_step_batched(FlodlTensor* params, FlodlTensor* grads,
 // --- Fused Adam/AdamW (multi-tensor, single kernel on CUDA) ---
 // Uses libtorch's at::_fused_adam_ / at::_fused_adamw_ to perform the
 // complete Adam update across ALL params in one kernel launch on CUDA.
+// steps[i] is param i's own step count (libtorch's per-param state_steps;
+// bias correction is per-param, so late-unfrozen params correct from
+// their first step, not the global one).
 // grad_scale / found_inf: pass NULL to skip (no mixed precision).
 
 // _fused_adam_: L2 weight decay (adds wd*param to gradient).
@@ -645,7 +648,7 @@ char* flodl_fused_adam_(FlodlTensor* params, FlodlTensor* grads,
                          FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
                          int count, double lr,
                          double beta1, double beta2, double eps,
-                         double weight_decay, int64_t step,
+                         double weight_decay, const int64_t* steps,
                          FlodlTensor grad_scale, FlodlTensor found_inf);
 
 // _fused_adamw_: decoupled weight decay (param *= 1 - lr*wd).
@@ -653,7 +656,7 @@ char* flodl_fused_adamw_(FlodlTensor* params, FlodlTensor* grads,
                           FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
                           int count, double lr,
                           double beta1, double beta2, double eps,
-                          double weight_decay, int64_t step,
+                          double weight_decay, const int64_t* steps,
                           FlodlTensor grad_scale, FlodlTensor found_inf);
 
 // --- Pinned memory ---

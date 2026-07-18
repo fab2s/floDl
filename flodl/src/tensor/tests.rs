@@ -337,7 +337,7 @@
         Tensor::fused_adamw_(
             std::slice::from_ref(&p2), std::slice::from_ref(&g),
             std::slice::from_ref(&m2), std::slice::from_ref(&v2),
-            lr, beta1, beta2, eps, wd, 1, None, None,
+            lr, beta1, beta2, eps, wd, &[1], None, None,
         ).unwrap();
 
         let p1_data = p1.to_f32_vec().unwrap();
@@ -366,7 +366,7 @@
         Tensor::fused_adamw_(
             std::slice::from_ref(&p), std::slice::from_ref(&g),
             std::slice::from_ref(&m), std::slice::from_ref(&v),
-            0.001, 0.9, 0.999, 1e-8, 0.0, 1, None, None,
+            0.001, 0.9, 0.999, 1e-8, 0.0, &[1], None, None,
         ).unwrap();
 
         let p_data = p.to_f32_vec().unwrap();
@@ -390,7 +390,7 @@
             Tensor::fused_adamw_(
                 std::slice::from_ref(&p), std::slice::from_ref(&g),
                 std::slice::from_ref(&m), std::slice::from_ref(&v),
-                0.01, 0.9, 0.999, 1e-8, 0.0, step, None, None,
+                0.01, 0.9, 0.999, 1e-8, 0.0, &[step], None, None,
             ).unwrap();
         }
 
@@ -403,8 +403,8 @@
 
     #[test]
     fn test_fused_adam_empty_is_noop() {
-        Tensor::fused_adamw_(&[], &[], &[], &[], 0.001, 0.9, 0.999, 1e-8, 0.0, 1, None, None).unwrap();
-        Tensor::fused_adam_(&[], &[], &[], &[], 0.001, 0.9, 0.999, 1e-8, 0.0, 1, None, None).unwrap();
+        Tensor::fused_adamw_(&[], &[], &[], &[], 0.001, 0.9, 0.999, 1e-8, 0.0, &[], None, None).unwrap();
+        Tensor::fused_adam_(&[], &[], &[], &[], 0.001, 0.9, 0.999, 1e-8, 0.0, &[], None, None).unwrap();
     }
 
     // --- foreach ops tests ---

@@ -20,7 +20,11 @@ use super::{GroupMeta, Optimizer, Stateful};
 /// Adam optimizer with bias correction (Kingma & Ba, 2014).
 ///
 /// Maintains per-parameter first and second moment estimates with
-/// bias correction. Default betas: (0.9, 0.999), eps: 1e-8.
+/// per-parameter bias correction (PyTorch-parity `state_steps`): a
+/// parameter that only starts receiving gradients at step N — e.g.
+/// unfrozen mid-run for fine-tuning — bias-corrects from ITS first
+/// step, not the optimizer's global one.
+/// Default betas: (0.9, 0.999), eps: 1e-8.
 ///
 /// ```ignore
 /// let mut optim = Adam::new(&model.parameters(), 0.001);
@@ -33,7 +37,8 @@ pub struct Adam {
     eps: f64,
     m: Vec<Option<crate::tensor::Tensor>>,
     v: Vec<Option<crate::tensor::Tensor>>,
-    t: usize,
+    /// Per-param step counts, incremented only when the param has a grad.
+    steps: Vec<i64>,
     groups: Vec<GroupMeta>,
 }
 
@@ -49,7 +54,7 @@ impl Adam {
             eps: 1e-8,
             m: vec![None; n],
             v: vec![None; n],
-            t: 0,
+            steps: vec![0; n],
             groups: vec![],
         }
     }
@@ -113,7 +118,7 @@ impl AdamBuilder {
             eps: self.eps,
             m: vec![None; n],
             v: vec![None; n],
-            t: 0,
+            steps: vec![0; n],
             groups,
         }
     }
@@ -126,7 +131,7 @@ impl Optimizer for Adam {
     }
 
     fn reset_state(&mut self) {
-        // First + second moment estimates back to fresh, step counter to 0
+        // First + second moment estimates back to fresh, step counts to 0
         // (bias correction restarts). Lengths preserved for per-param indexing.
         for slot in &mut self.m {
             *slot = None;
@@ -134,7 +139,9 @@ impl Optimizer for Adam {
         for slot in &mut self.v {
             *slot = None;
         }
-        self.t = 0;
+        for s in &mut self.steps {
+            *s = 0;
+        }
     }
 
     fn zero_grad(&self) {
@@ -163,8 +170,6 @@ impl Optimizer for Adam {
 
 impl Adam {
     fn adam_update(&mut self, weight_decay: f64) -> Result<()> {
-        self.t += 1;
-
         no_grad(|| {
             // Determine effective groups (single group if none configured)
             let effective_groups: Vec<(f64, std::ops::Range<usize>)> = if self.groups.is_empty() {
@@ -178,6 +183,7 @@ impl Adam {
                 let mut g_tensors = Vec::new();
                 let mut m_tensors = Vec::new();
                 let mut v_tensors = Vec::new();
+                let mut step_vals = Vec::new();
 
                 for i in range.clone() {
                     if let Some(grad) = self.params[i].grad() {
@@ -188,11 +194,15 @@ impl Adam {
                         if self.v[i].is_none() {
                             self.v[i] = Some(crate::tensor::Tensor::zeros_like(&grad)?);
                         }
+                        // Per-param step: a param unfrozen at global step N
+                        // bias-corrects from its own first step.
+                        self.steps[i] += 1;
 
                         p_tensors.push(self.params[i].data());
                         g_tensors.push(grad);
                         m_tensors.push(self.m[i].as_ref().unwrap().clone());
                         v_tensors.push(self.v[i].as_ref().unwrap().clone());
+                        step_vals.push(self.steps[i]);
                     }
                 }
 
@@ -201,7 +211,7 @@ impl Adam {
                     crate::tensor::Tensor::fused_adamw_(
                         &p_tensors, &g_tensors, &m_tensors, &v_tensors,
                         *lr, self.beta1, self.beta2, self.eps,
-                        weight_decay, self.t as i64, None, None,
+                        weight_decay, &step_vals, None, None,
                     )?;
                 }
             }
@@ -211,13 +221,15 @@ impl Adam {
 }
 
 impl Stateful for Adam {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::Adam }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;
-        write_i64_le(w, self.t as i64)?;
         for i in 0..self.params.len() {
             write_tensor_state(w, self.m[i].as_ref())?;
             write_tensor_state(w, self.v[i].as_ref())?;
+            write_i64_le(w, self.steps[i])?;
         }
         // Groups
         super::write_groups(w, &self.groups)?;
@@ -232,11 +244,11 @@ impl Stateful for Adam {
             )));
         }
         self.lr = read_f64_le(r)?;
-        self.t = read_i64_le(r)? as usize;
         for i in 0..self.params.len() {
             let dev = self.params[i].data().device();
             self.m[i] = read_tensor_state(r, dev)?;
             self.v[i] = read_tensor_state(r, dev)?;
+            self.steps[i] = read_i64_le(r)?;
         }
         // Groups
         self.groups = super::read_groups(r, self.params.len(), "Adam")?;
@@ -329,7 +341,7 @@ impl AdamWBuilder {
                 eps: self.eps,
                 m: vec![None; n],
                 v: vec![None; n],
-                t: 0,
+                steps: vec![0; n],
                 groups,
             },
             weight_decay: self.weight_decay,
@@ -365,6 +377,8 @@ impl Optimizer for AdamW {
 }
 
 impl Stateful for AdamW {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::AdamW }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_f64_le(w, self.weight_decay)?;
         self.adam.save_state(w)
@@ -586,7 +600,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&buf);
         opt2.load_state(&mut cursor).unwrap();
 
-        assert_eq!(opt2.t, opt.t);
+        assert_eq!(opt2.steps, opt.steps);
         assert!((opt2.groups[0].lr - 0.01).abs() < 1e-12);
         assert!((opt2.groups[1].lr - 0.05).abs() < 1e-12);
     }
@@ -789,5 +803,285 @@ mod tests {
 
         assert_eq!(after_first, after_second,
             "second step without backward should not change params");
+    }
+
+    #[test]
+    fn test_late_unfrozen_param_bias_corrects_from_its_first_step() {
+        // A param that receives its first gradient at global step N must
+        // bias-correct from ITS step 1, not the optimizer's global count —
+        // with a shared global t its first update lands ~3x too large
+        // (m-hat under-boosted 10x, v-hat denominator under-boosted ~31x).
+        let dev = crate::tensor::test_device();
+        let a = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "a");
+        let b = Parameter::new(Tensor::from_f32(&[3.0, 4.0], &[2], dev).unwrap(), "b");
+        let mut opt = Adam::new(&[a.clone(), b.clone()], 0.01);
+
+        let ga = Tensor::from_f32(&[0.5, -0.5], &[2], dev).unwrap();
+        for _ in 0..5 {
+            a.variable.set_grad(ga.clone());
+            opt.step().unwrap();
+            opt.zero_grad();
+        }
+
+        // b's first gradient arrives at global step 6.
+        let gb = Tensor::from_f32(&[0.3, -0.2], &[2], dev).unwrap();
+        b.variable.set_grad(gb.clone());
+        opt.step().unwrap();
+        let b_after = b.variable.data().to_f32_vec().unwrap();
+
+        // Reference: a fresh Adam taking its first step on an identical param.
+        let b_ref = Parameter::new(Tensor::from_f32(&[3.0, 4.0], &[2], dev).unwrap(), "b_ref");
+        let mut opt_ref = Adam::new(std::slice::from_ref(&b_ref), 0.01);
+        b_ref.variable.set_grad(gb.clone());
+        opt_ref.step().unwrap();
+        let ref_after = b_ref.variable.data().to_f32_vec().unwrap();
+
+        for i in 0..2 {
+            assert!(
+                (b_after[i] - ref_after[i]).abs() < 1e-6,
+                "late-unfrozen update must match a fresh first step: \
+                 got {}, expected {}",
+                b_after[i], ref_after[i]
+            );
+        }
+        assert_eq!(opt.steps, vec![5, 1], "per-param step counts");
+    }
+
+    fn state_tmp(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("flodl_optim_state_{}_{}", std::process::id(), name))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn test_state_file_roundtrip_with_header_and_steps() {
+        let dev = crate::tensor::test_device();
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.02);
+        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        opt.step().unwrap();
+
+        let path = state_tmp("adam_roundtrip.optim");
+        opt.save_state_to(&path).unwrap();
+
+        let mut opt2 = Adam::new(std::slice::from_ref(&p), 0.5);
+        opt2.load_state_file(&path).unwrap();
+        assert_eq!(opt2.steps, opt.steps);
+        assert!((opt2.lr - 0.02).abs() < 1e-12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_state_file_kind_mismatch_is_rejected() {
+        use super::super::SGD;
+        let dev = crate::tensor::test_device();
+        let p = Parameter::new(Tensor::from_f32(&[1.0], &[1], dev).unwrap(), "w");
+        let sgd = SGD::new(std::slice::from_ref(&p), 0.01, 0.9);
+        let path = state_tmp("sgd_into_adam.optim");
+        sgd.save_state_to(&path).unwrap();
+
+        let mut adam = Adam::new(std::slice::from_ref(&p), 0.01);
+        let err = adam
+            .load_state_file(&path)
+            .expect_err("SGD state must not load into Adam");
+        let msg = err.to_string();
+        assert!(msg.contains("written by SGD"), "unexpected: {msg}");
+        assert!(msg.contains("Adam"), "unexpected: {msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hand-built pre-header Adam stream: `count | lr | t | (m,v)* | ng=0`.
+    fn old_format_adam_bytes(dev: crate::tensor::Device) -> Vec<u8> {
+        let mut old = Vec::new();
+        write_u32_le(&mut old, 1).unwrap();
+        write_f64_le(&mut old, 0.02).unwrap();
+        write_i64_le(&mut old, 7).unwrap();
+        let m = Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap();
+        let v = Tensor::from_f32(&[0.3, 0.4], &[2], dev).unwrap();
+        write_tensor_state(&mut old, Some(&m)).unwrap();
+        write_tensor_state(&mut old, Some(&v)).unwrap();
+        write_u32_le(&mut old, 0).unwrap();
+        old
+    }
+
+    #[test]
+    fn test_pre_header_state_file_is_rejected_with_converter_pointer() {
+        let dev = crate::tensor::test_device();
+        let path = state_tmp("adam_old_format.optim");
+        std::fs::write(&path, old_format_adam_bytes(dev)).unwrap();
+
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.01);
+        let err = opt
+            .load_state_file(&path)
+            .expect_err("pre-header file must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("migrate_optim_state_file"), "unexpected: {msg}");
+        assert!(msg.contains("Adam"), "unexpected: {msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_migrate_optim_state_file_expands_global_t_to_per_param_steps() {
+        use super::super::{StateKind, migrate_optim_state_file};
+        let dev = crate::tensor::test_device();
+        let src = state_tmp("adam_migrate_src.optim");
+        let dst = state_tmp("adam_migrate_dst.optim");
+        std::fs::write(&src, old_format_adam_bytes(dev)).unwrap();
+
+        migrate_optim_state_file(&src, &dst, StateKind::Adam).unwrap();
+
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.5);
+        opt.load_state_file(&dst).unwrap();
+        assert_eq!(opt.steps, vec![7], "old global t expands to every param");
+        assert!((opt.lr - 0.02).abs() < 1e-12);
+        let m = opt.m[0].as_ref().unwrap().to_f32_vec().unwrap();
+        let v = opt.v[0].as_ref().unwrap().to_f32_vec().unwrap();
+        assert_eq!(m, vec![0.1, 0.2]);
+        assert_eq!(v, vec![0.3, 0.4]);
+
+        // A second migrate on the converted file must refuse (already headed).
+        let err = migrate_optim_state_file(&dst, &dst, StateKind::Adam)
+            .expect_err("already-converted file must be refused");
+        assert!(err.to_string().contains("already"), "unexpected: {err}");
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn test_migrate_optim_state_file_adamw_weight_decay_prefix() {
+        use super::super::{StateKind, migrate_optim_state_file};
+        let dev = crate::tensor::test_device();
+        // Old AdamW stream = weight_decay(f64) | old Adam stream.
+        let mut old = Vec::new();
+        write_f64_le(&mut old, 0.04).unwrap();
+        old.extend_from_slice(&old_format_adam_bytes(dev));
+        let src = state_tmp("adamw_migrate_src.optim");
+        let dst = state_tmp("adamw_migrate_dst.optim");
+        std::fs::write(&src, &old).unwrap();
+
+        migrate_optim_state_file(&src, &dst, StateKind::AdamW).unwrap();
+
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = AdamW::new(std::slice::from_ref(&p), 0.5, 0.9);
+        opt.load_state_file(&dst).unwrap();
+        assert!((opt.weight_decay - 0.04).abs() < 1e-12);
+        assert_eq!(opt.adam.steps, vec![7]);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn test_migrate_verbatim_sgd_roundtrips() {
+        // SGD's payload did not change this cycle, so it takes the migrate
+        // verbatim branch: the migrated file is exactly a 12-byte FDLO header
+        // followed by the old payload byte-for-byte. Raw `save_state` writes
+        // that pre-header payload, so it faithfully stands in for an old file.
+        use super::super::{migrate_optim_state_file, StateKind, SGD};
+        let dev = crate::tensor::test_device();
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(), "w");
+        let mut sgd = SGD::new(std::slice::from_ref(&p), 0.05, 0.9);
+        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2, 0.3], &[3], dev).unwrap());
+        sgd.step().unwrap(); // populate the velocity buffer
+
+        let mut old = Vec::new();
+        sgd.save_state(&mut old).unwrap();
+        let src = state_tmp("sgd_verbatim_src.optim");
+        let dst = state_tmp("sgd_verbatim_dst.optim");
+        std::fs::write(&src, &old).unwrap();
+
+        migrate_optim_state_file(&src, &dst, StateKind::Sgd).unwrap();
+
+        let migrated = std::fs::read(&dst).unwrap();
+        assert_eq!(
+            &migrated[12..], &old[..],
+            "SGD payload must migrate verbatim under the 12-byte FDLO header"
+        );
+
+        // And the migrated file loads.
+        let mut sgd2 = SGD::new(std::slice::from_ref(&p), 0.99, 0.0);
+        sgd2.load_state_file(&dst).unwrap();
+        assert!((sgd2.lr() - 0.05).abs() < 1e-12);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn test_migrate_verbatim_rmsprop_roundtrips() {
+        // Same verbatim branch, a different payload shape (alpha/eps/momentum
+        // + v/buf tensors) to confirm the copy is shape-agnostic.
+        use super::super::{migrate_optim_state_file, StateKind, RMSprop};
+        let dev = crate::tensor::test_device();
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = RMSprop::new(std::slice::from_ref(&p), 0.01);
+        p.variable.set_grad(Tensor::from_f32(&[0.3, -0.1], &[2], dev).unwrap());
+        opt.step().unwrap();
+
+        let mut old = Vec::new();
+        opt.save_state(&mut old).unwrap();
+        let src = state_tmp("rmsprop_verbatim_src.optim");
+        let dst = state_tmp("rmsprop_verbatim_dst.optim");
+        std::fs::write(&src, &old).unwrap();
+
+        migrate_optim_state_file(&src, &dst, StateKind::RMSprop).unwrap();
+
+        let migrated = std::fs::read(&dst).unwrap();
+        assert_eq!(&migrated[12..], &old[..], "RMSprop payload must migrate verbatim");
+
+        let mut opt2 = RMSprop::new(std::slice::from_ref(&p), 0.99);
+        opt2.load_state_file(&dst).unwrap();
+        assert!((opt2.lr() - 0.01).abs() < 1e-12);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn test_migrate_in_place_old_adam_file() {
+        // Genuine in-place (src == dst) conversion of an OLD file: the source
+        // must be fully read before the atomic rename replaces it. (The
+        // existing double-migrate test only covers the already-headed refusal.)
+        use super::super::{migrate_optim_state_file, StateKind};
+        let dev = crate::tensor::test_device();
+        let path = state_tmp("adam_in_place.optim");
+        std::fs::write(&path, old_format_adam_bytes(dev)).unwrap();
+
+        migrate_optim_state_file(&path, &path, StateKind::Adam).unwrap();
+
+        let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
+        let mut opt = Adam::new(std::slice::from_ref(&p), 0.5);
+        opt.load_state_file(&path).unwrap();
+        assert_eq!(opt.steps, vec![7], "in-place migrate must preserve the payload");
+        assert!((opt.lr - 0.02).abs() < 1e-12);
+        // No stray .tmp left behind.
+        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_migrate_rejects_kinds_that_never_had_a_format() {
+        // Adagrad/RAdam/NAdam gained Stateful only under the FDLO header, so
+        // there is no pre-header file to convert — asking is a loud error, not
+        // a silent no-op that could emit a bogus "converted" file.
+        use super::super::{migrate_optim_state_file, StateKind};
+        let src = state_tmp("never_had_format_src.optim");
+        let dst = state_tmp("never_had_format_dst.optim");
+        std::fs::write(&src, [0u8; 16]).unwrap();
+        for kind in [StateKind::Adagrad, StateKind::RAdam, StateKind::NAdam] {
+            let err = migrate_optim_state_file(&src, &dst, kind)
+                .expect_err("kinds with no pre-header format must be rejected");
+            assert!(
+                err.to_string().contains("nothing to migrate"),
+                "unexpected error for {kind:?}: {err}"
+            );
+        }
+        assert!(!std::path::Path::new(&dst).exists(), "no output file on rejection");
+        let _ = std::fs::remove_file(&src);
     }
 }

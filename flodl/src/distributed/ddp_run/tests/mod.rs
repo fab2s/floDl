@@ -237,3 +237,16 @@ pub(super) fn make_test_worker_with(
 // In-process coordinator test fixtures lived here. They were removed with
 // the in-process orchestration engine; the process-per-rank path is covered
 // by `cluster_coordinator/tests/` and `cluster_worker_tests.rs`.
+
+#[test]
+fn test_zero_param_model_is_rejected_loudly() {
+    // A custom leaf module that forgets to override Module::parameters()
+    // reaches the trainer with an empty parameter list; every training
+    // entry rejects that instead of silently training nothing.
+    let err = super::ensure_trainable_params(0, "ddp: single device")
+        .expect_err("zero-parameter model must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("zero trainable parameters"), "unexpected: {msg}");
+    assert!(msg.contains("Module::parameters()"), "unexpected: {msg}");
+    super::ensure_trainable_params(1, "ddp: single device").unwrap();
+}

@@ -133,15 +133,155 @@ fn read_groups<R: Read>(r: &mut R, n_params: usize, what: &str) -> Result<Vec<Gr
     Ok(groups)
 }
 
+/// Identifies which component wrote a serialized state stream.
+///
+/// Stored in the state-file header so a file can never be positionally
+/// misparsed by the wrong optimizer, and passed to
+/// [`migrate_optim_state_file`] to identify pre-header files (the old
+/// format carries no self-identification).
+///
+/// On-disk tags are stable — never renumber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateKind {
+    /// [`SGD`]
+    Sgd,
+    /// [`Adam`]
+    Adam,
+    /// [`AdamW`]
+    AdamW,
+    /// [`RMSprop`]
+    RMSprop,
+    /// [`Adagrad`]
+    Adagrad,
+    /// [`RAdam`]
+    RAdam,
+    /// [`NAdam`]
+    NAdam,
+    /// [`crate::nn::GradScaler`]
+    GradScaler,
+}
+
+impl StateKind {
+    fn tag(self) -> u32 {
+        match self {
+            StateKind::Sgd => 1,
+            StateKind::Adam => 2,
+            StateKind::AdamW => 3,
+            StateKind::RMSprop => 4,
+            StateKind::Adagrad => 5,
+            StateKind::RAdam => 6,
+            StateKind::NAdam => 7,
+            StateKind::GradScaler => 8,
+        }
+    }
+
+    fn from_tag(tag: u32) -> Option<StateKind> {
+        Some(match tag {
+            1 => StateKind::Sgd,
+            2 => StateKind::Adam,
+            3 => StateKind::AdamW,
+            4 => StateKind::RMSprop,
+            5 => StateKind::Adagrad,
+            6 => StateKind::RAdam,
+            7 => StateKind::NAdam,
+            8 => StateKind::GradScaler,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            StateKind::Sgd => "SGD",
+            StateKind::Adam => "Adam",
+            StateKind::AdamW => "AdamW",
+            StateKind::RMSprop => "RMSprop",
+            StateKind::Adagrad => "Adagrad",
+            StateKind::RAdam => "RAdam",
+            StateKind::NAdam => "NAdam",
+            StateKind::GradScaler => "GradScaler",
+        }
+    }
+}
+
+/// State-file header magic: `FDLO(4) | version(u32) | kind tag(u32)`.
+pub(crate) const STATE_MAGIC: [u8; 4] = *b"FDLO";
+/// Current state-file format version.
+pub(crate) const STATE_VERSION: u32 = 1;
+
+/// Write the state-file header for `kind`.
+fn write_state_header<W: Write>(w: &mut W, kind: StateKind) -> Result<()> {
+    use crate::nn::checkpoint::write_u32_le;
+    w.write_all(&STATE_MAGIC).map_err(|e| {
+        crate::tensor::TensorError::new(&format!("io: {}", e))
+    })?;
+    write_u32_le(w, STATE_VERSION)?;
+    write_u32_le(w, kind.tag())?;
+    Ok(())
+}
+
+/// Read and validate the state-file header against the loading component.
+fn read_state_header<R: Read>(r: &mut R, expected: StateKind, path: &str) -> Result<()> {
+    use crate::nn::checkpoint::read_u32_le;
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).map_err(|e| {
+        crate::tensor::TensorError::new(&format!("{path}: io: {}", e))
+    })?;
+    if magic != STATE_MAGIC {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{path}: not a current flodl optimizer state file (missing FDLO \
+             header). If this file was written by an earlier flodl, convert \
+             it once with flodl::nn::migrate_optim_state_file(src, dst, \
+             StateKind::{:?}) — the old format carries no type tag, so the \
+             kind must be supplied.",
+            expected
+        )));
+    }
+    let version = read_u32_le(r)?;
+    if version > STATE_VERSION {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{path}: state file version {version} is newer than this flodl \
+             supports (max {STATE_VERSION}) — upgrade flodl to load it"
+        )));
+    }
+    let tag = read_u32_le(r)?;
+    let found = StateKind::from_tag(tag).ok_or_else(|| {
+        crate::tensor::TensorError::new(&format!(
+            "{path}: unknown state kind tag {tag} (corrupt file, or written \
+             by a newer flodl)"
+        ))
+    })?;
+    if found != expected {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{path}: state file was written by {} but is being loaded into {}",
+            found.name(), expected.name()
+        )));
+    }
+    Ok(())
+}
+
 /// Save/load training state (learning rates, momentum buffers, step counters).
 /// Implement for optimizers and other stateful training components.
 pub trait Stateful {
+    /// Which component this state stream belongs to — written into the
+    /// file header by [`save_state_file`](Stateful::save_state_file) and
+    /// validated by [`load_state_file`](Stateful::load_state_file) so a
+    /// file can never be positionally misparsed by the wrong optimizer.
+    fn state_kind(&self) -> StateKind;
+
     /// Serialize optimizer state (lr, momentum buffers, etc.) to a writer.
+    ///
+    /// Raw payload only — the file header is written by
+    /// [`save_state_file`](Stateful::save_state_file), so wrapper
+    /// optimizers (AdamW) can delegate to their inner payload without
+    /// double headers.
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()>;
-    /// Restore optimizer state from a reader.
+    /// Restore optimizer state from a raw payload stream (no header).
     fn load_state<R: Read>(&mut self, r: &mut R) -> Result<()>;
 
     /// Save state to a file. Uses gzip compression if path ends with `.gz`.
+    ///
+    /// Writes the `FDLO | version | kind` header, then the
+    /// [`save_state`](Stateful::save_state) payload.
     ///
     /// Atomic: streams into `<path>.tmp` then renames over the final path, so
     /// a crash mid-write never leaves a torn `<stem>.optim` that resume could
@@ -150,22 +290,146 @@ pub trait Stateful {
     /// so every artifact in an NCCL consensus checkpoint commits atomically.
     /// gzip is chosen from the FINAL extension, not the tmp name.
     fn save_state_file(&self, path: &str) -> Result<()> {
-        crate::nn::checkpoint::write_file_atomic(path, |mut w| self.save_state(&mut w))
+        let kind = self.state_kind();
+        crate::nn::checkpoint::write_file_atomic(path, |mut w| {
+            write_state_header(&mut w, kind)?;
+            self.save_state(&mut w)
+        })
     }
 
     /// Load state from a file. Detects gzip from `.gz` extension.
+    ///
+    /// Validates the `FDLO` header first: files from before the header
+    /// existed are rejected with a pointer to
+    /// [`migrate_optim_state_file`], and files written by a different
+    /// optimizer are rejected by kind.
     fn load_state_file(&mut self, path: &str) -> Result<()> {
         let f = std::fs::File::open(path).map_err(|e| {
             crate::tensor::TensorError::new(&format!("io: {}", e))
         })?;
+        let expected = self.state_kind();
         if path.ends_with(".gz") {
             let mut r = flate2::read::GzDecoder::new(f);
+            read_state_header(&mut r, expected, path)?;
             self.load_state(&mut r)
         } else {
             let mut r = std::io::BufReader::new(f);
+            read_state_header(&mut r, expected, path)?;
             self.load_state(&mut r)
         }
     }
+}
+
+/// Convert a pre-header optimizer state file (flodl ≤ 0.5.x) to the
+/// current `FDLO`-headed format.
+///
+/// The old format carries no self-identification, so the `kind` of the
+/// optimizer that wrote it must be supplied — the loader's error message
+/// names the right one. In-place conversion (`src == dst`) is safe: the
+/// destination is streamed into a temporary file and renamed over `dst`
+/// only at the end (the same atomic recipe every state writer uses).
+/// gzip is detected from each path's `.gz` extension independently.
+///
+/// For Adam/AdamW files the old single global step counter is expanded
+/// into the current per-parameter step counts (every param gets the
+/// global value — exact for params that trained from step 0, and the old
+/// behavior's best available truth for the rest). Other kinds convert
+/// verbatim under the new header. [`StateKind::Adagrad`], `RAdam` and
+/// `NAdam` never had a pre-header format — passing them errors.
+pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result<()> {
+    use crate::nn::checkpoint::{read_u32_le, write_f64_le};
+
+    if matches!(kind, StateKind::Adagrad | StateKind::RAdam | StateKind::NAdam) {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "migrate_optim_state_file: {} had no serialized state format \
+             before the FDLO header — nothing to migrate",
+            kind.name()
+        )));
+    }
+
+    let f = std::fs::File::open(src).map_err(|e| {
+        crate::tensor::TensorError::new(&format!("{src}: io: {}", e))
+    })?;
+    let mut r: Box<dyn Read> = if src.ends_with(".gz") {
+        Box::new(flate2::read::GzDecoder::new(f))
+    } else {
+        Box::new(std::io::BufReader::new(f))
+    };
+
+    // Old-format check: a headed file starts with the magic; the old
+    // payloads start with a param count (SGD/Adam/RMSprop), the low half
+    // of a weight-decay f64 (AdamW) or of a power-of-two scale (GradScaler)
+    // — none of which collide with `FDLO`.
+    let mut first = [0u8; 4];
+    r.read_exact(&mut first).map_err(|e| {
+        crate::tensor::TensorError::new(&format!("{src}: io: {}", e))
+    })?;
+    if first == STATE_MAGIC {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "migrate_optim_state_file: {src} already has the current FDLO \
+             header — nothing to migrate"
+        )));
+    }
+
+    let io_err = |e: std::io::Error| {
+        crate::tensor::TensorError::new(&format!("io: {}", e))
+    };
+
+    // Transform the old Adam payload (count | lr | t | (m,v)* | groups)
+    // into the current one (count | lr | (m,v,step)* | groups), expanding
+    // the global t into per-param steps. `count` was already consumed by
+    // the magic sniff.
+    fn migrate_adam_payload<R: Read, W: Write>(
+        r: &mut R, w: &mut W, count: u32,
+    ) -> Result<()> {
+        use crate::nn::checkpoint::{
+            read_f64_le, read_i64_le, read_tensor_state,
+            write_f64_le, write_i64_le, write_u32_le, write_tensor_state,
+        };
+        write_u32_le(w, count)?;
+        let lr = read_f64_le(r)?;
+        write_f64_le(w, lr)?;
+        let t = read_i64_le(r)?;
+        for _ in 0..count {
+            let m = read_tensor_state(r, crate::tensor::Device::CPU)?;
+            let v = read_tensor_state(r, crate::tensor::Device::CPU)?;
+            write_tensor_state(w, m.as_ref())?;
+            write_tensor_state(w, v.as_ref())?;
+            write_i64_le(w, t)?;
+        }
+        std::io::copy(r, w).map_err(|e| {
+            crate::tensor::TensorError::new(&format!("io: {}", e))
+        })?;
+        Ok(())
+    }
+
+    crate::nn::checkpoint::write_file_atomic(dst, |mut w| {
+        write_state_header(&mut w, kind)?;
+        match kind {
+            StateKind::Adam => {
+                migrate_adam_payload(&mut r, &mut w, u32::from_le_bytes(first))?;
+            }
+            StateKind::AdamW => {
+                // Old AdamW payload = weight_decay(f64) | Adam payload;
+                // `first` holds the f64's low half.
+                let mut rest = [0u8; 4];
+                r.read_exact(&mut rest).map_err(io_err)?;
+                let mut wd = [0u8; 8];
+                wd[..4].copy_from_slice(&first);
+                wd[4..].copy_from_slice(&rest);
+                write_f64_le(&mut w, f64::from_le_bytes(wd))?;
+                let count = read_u32_le(&mut r)?;
+                migrate_adam_payload(&mut r, &mut w, count)?;
+            }
+            _ => {
+                // SGD / RMSprop / GradScaler payloads are unchanged —
+                // re-emit verbatim under the new header.
+                w.write_all(&first).map_err(io_err)?;
+                std::io::copy(&mut r, &mut w).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

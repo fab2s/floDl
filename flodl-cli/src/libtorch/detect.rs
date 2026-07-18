@@ -149,16 +149,11 @@ pub fn set_active(root: &Path, variant: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test_env::env_lock;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // `FDL_LIBTORCH_CASE` is a process-wide env var, so tests that
-    // mutate it must serialize against each other — cargo's default
-    // parallel test harness would otherwise interleave set/remove
-    // calls across threads.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
     // Per-process counter so concurrent test binaries don't collide
     // on the unique-suffix algorithm.
     static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -211,8 +206,8 @@ mod tests {
 
     #[test]
     fn read_active_default_pointer() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // SAFETY: serialized via ENV_MUTEX.
+        let _guard = env_lock();
+        // SAFETY: serialized via env_lock().
         unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
         let root = make_root();
         fs::write(
@@ -226,7 +221,7 @@ mod tests {
 
     #[test]
     fn fdl_libtorch_case_selects_alternate_pointer() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let root = make_root();
         fs::write(
             root.path().join("libtorch/.active"),
@@ -236,10 +231,10 @@ mod tests {
             root.path().join("libtorch/.active.alt"),
             "precompiled/v1\n",
         ).unwrap();
-        // SAFETY: serialized via ENV_MUTEX.
+        // SAFETY: serialized via env_lock().
         unsafe { std::env::set_var("FDL_LIBTORCH_CASE", "alt"); }
         let info = read_active(root.path()).expect("read_active");
-        // SAFETY: serialized via ENV_MUTEX.
+        // SAFETY: serialized via env_lock().
         unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
         assert_eq!(info.path, "precompiled/v1");
         assert_eq!(info.torch_version.as_deref(), Some("1.0"));
@@ -247,17 +242,17 @@ mod tests {
 
     #[test]
     fn fdl_libtorch_case_missing_file_returns_none_loudly() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let root = make_root();
         fs::write(
             root.path().join("libtorch/.active"),
             "builds/v2\n",
         ).unwrap();
         // No `.active.nonexistent` file.
-        // SAFETY: serialized via ENV_MUTEX.
+        // SAFETY: serialized via env_lock().
         unsafe { std::env::set_var("FDL_LIBTORCH_CASE", "nonexistent"); }
         let info = read_active(root.path());
-        // SAFETY: serialized via ENV_MUTEX.
+        // SAFETY: serialized via env_lock().
         unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
         assert!(info.is_none(),
             "explicit case with missing file must not silently fall back to .active");
@@ -265,7 +260,7 @@ mod tests {
 
     #[test]
     fn read_active_from_resolves_pointer_directly() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let root = make_root();
         let pointer = root.path().join("libtorch/.active.alt");
         fs::write(&pointer, "builds/v2\n").unwrap();
