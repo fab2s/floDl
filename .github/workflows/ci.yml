@@ -82,7 +82,18 @@ jobs:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-        run: cargo test -- --nocapture
+        run: cargo test -- --nocapture --skip leakcheck
+
+      # Process-global leak tests (they read the process-wide live-tensor
+      # count / RSS) are meaningless under the parallel harness — a
+      # concurrent test's tensors inflate the delta. Run them isolated,
+      # single-threaded. Name filter: `leakcheck`.
+      - name: Leak tests (serial)
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: cargo test leakcheck -- --test-threads=1 --nocapture
 
       - name: Clippy
         env:

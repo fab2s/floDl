@@ -13,17 +13,22 @@ commands:
   test:
     description: Run all CPU tests
     run: cargo test
-    append: -- --nocapture
+    append: -- --nocapture --skip leakcheck
     docker: dev
   test-release:
     description: Run tests in release mode
     run: cargo test --release
-    append: -- --nocapture
+    append: -- --nocapture --skip leakcheck
     docker: dev
   test-live:
     description: Run live tests (network / external resources; `#[ignore]` + name ending in `_live`)
     run: cargo test live
     append: -- --nocapture --ignored
+    docker: dev
+  leak-test:
+    description: Run the process-global leak tests single-threaded (name contains `leakcheck`)
+    run: cargo test leakcheck
+    append: -- --nocapture --test-threads=1
     docker: dev
   check:
     description: Type check without building
@@ -39,7 +44,7 @@ commands:
     docker: dev
   ci:
     description: Run the full CI CPU job locally (build + test + clippy + doc)
-    run: cargo build && cargo test -- --nocapture && cargo clippy -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
+    run: cargo build && cargo test -- --nocapture --skip leakcheck && cargo test leakcheck -- --test-threads=1 --nocapture && cargo clippy -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
     docker: dev
   shell:
     description: Interactive shell in dev container

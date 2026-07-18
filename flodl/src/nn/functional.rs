@@ -129,7 +129,7 @@ mod tests {
     /// Mimics the fbrl training pattern: forward → gaussian_blur_2d → loss → backward,
     /// repeated many times. RSS should stay roughly flat.
     #[test]
-    fn test_gaussian_blur_no_ram_leak() {
+    fn test_gaussian_blur_no_ram_leak_leakcheck() {
         if crate::tensor::test_device() != crate::tensor::Device::CPU { return; }
         use crate::nn::{Linear, Module, Adam, Optimizer};
 

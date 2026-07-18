@@ -830,7 +830,7 @@
     }
 
     #[test]
-    fn test_backward_frees_grad_fn_chain() {
+    fn test_backward_frees_grad_fn_chain_leakcheck() {
         if crate::tensor::test_device() != Device::CPU { return; }
         // Verify that backward() + detach_() doesn't leak C++ autograd Nodes.
         // Simulates a training loop: multiple loss terms per step, many steps.
@@ -880,7 +880,7 @@
     /// Phased leak isolation: measures handle count and RSS growth for
     /// each training phase independently. Run with --nocapture to see output.
     #[test]
-    fn test_leak_isolation_phases() {
+    fn test_leak_isolation_phases_leakcheck() {
         if crate::tensor::test_device() != Device::CPU { return; }
         use crate::nn::{Module, Linear, clip_grad_norm, cross_entropy_loss};
         use crate::nn::optim::{Adam, Optimizer};
@@ -993,7 +993,7 @@
     /// Graph-with-loop leak test: simulates FBRL pattern (graph loops, tags,
     /// multiple loss terms, optimizer). Run with --nocapture to see diagnostics.
     #[test]
-    fn test_graph_loop_leak() {
+    fn test_graph_loop_leak_leakcheck() {
         if crate::tensor::test_device() != Device::CPU { return; }
         use crate::nn::{Module, Linear, cross_entropy_loss, clip_grad_norm};
         use crate::nn::optim::{Adam, Optimizer};
