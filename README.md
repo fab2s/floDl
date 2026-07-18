@@ -806,13 +806,17 @@ supports. If `nvidia-smi` works, floDl trains on it.
 
 ### Examples
 
-- [`quickstart`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/quickstart/) - build, train, and monitor a model with residual connections
-- [`sine_wave`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/sine_wave/) - sine regression with monitor, checkpoint round-trip
-- [`mixed_precision`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/mixed_precision/) - float16 training with `GradScaler`
-- [`transfer_learning`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/transfer_learning/) - checkpoint, partial load, freeze, fine-tune
-- [`schedulers`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/schedulers/) - warmup + cosine + plateau composition
-- [`observation`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/observation/) - collect, flush, trend queries, early stopping
-- [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/) - every graph builder method in one graph
+- [`quickstart`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/quickstart/): build, train, and monitor a model with residual connections
+- [`sine_wave`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/sine_wave/): sine regression with monitor, checkpoint round-trip
+- [`regression`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/regression/): linear and logistic regression as `Linear` plus the right loss
+- [`mixed_precision`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/mixed_precision/): float16 training with `GradScaler`
+- [`transfer_learning`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/transfer_learning/): checkpoint, partial load, freeze, fine-tune
+- [`schedulers`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/schedulers/): warmup + cosine + plateau composition
+- [`observation`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/observation/): collect, flush, trend queries, early stopping
+- [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/): every graph builder method in one graph
+- [`flowbuilder_residual`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/flowbuilder_residual/): MLP classifier with a tagged residual block via FlowBuilder
+- [`bio/dnaseq_conv1d`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dnaseq_conv1d/): DNA Conv1D motif classifier (synthetic ChIP-seq peak annotation)
+- [`bio/dna_autoencoder`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dna_autoencoder/): DNA convolutional autoencoder with checkpoint round-trip
 
 ### Porting from PyTorch
 
