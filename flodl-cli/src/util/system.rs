@@ -347,3 +347,71 @@ pub fn escape_json(s: &str) -> String {
     }
     out
 }
+
+/// Convert a `;`-separated CUDA capability list into a variant directory
+/// name: `"6.1;12.0"` -> `"sm61-sm120"`, `"12.0"` -> `"sm120"`. Shared by
+/// the libtorch and NCCL source builders so their variant paths cannot drift.
+pub fn arch_dir_name(archs: &str) -> String {
+    archs
+        .split(';')
+        .map(|cap| {
+            let clean = cap.replace('.', "");
+            format!("sm{}", clean)
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arch_dir_name, escape_json};
+
+    #[test]
+    fn escape_json_passes_through_plain_ascii() {
+        assert_eq!(escape_json("hello world 123"), "hello world 123");
+    }
+
+    #[test]
+    fn escape_json_escapes_quotes_and_backslashes() {
+        // A Windows-style path with quotes is the realistic hazard for the
+        // probe/diagnose JSON output this feeds.
+        assert_eq!(escape_json(r#"C:\a\b"#), r#"C:\\a\\b"#);
+        assert_eq!(escape_json(r#"say "hi""#), r#"say \"hi\""#);
+    }
+
+    #[test]
+    fn escape_json_escapes_named_control_chars() {
+        assert_eq!(escape_json("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(escape_json("\u{08}\u{0C}"), "\\b\\f");
+    }
+
+    #[test]
+    fn escape_json_uescapes_other_control_chars() {
+        // < 0x20 with no short form -> \uXXXX (lowercase, 4 hex digits).
+        assert_eq!(escape_json("\u{01}"), "\\u0001");
+        assert_eq!(escape_json("\u{1f}"), "\\u001f");
+    }
+
+    #[test]
+    fn escape_json_leaves_non_ascii_unescaped() {
+        // >= 0x20 passes through verbatim, including multibyte UTF-8.
+        assert_eq!(escape_json("café — 日本"), "café — 日本");
+    }
+
+    #[test]
+    fn arch_dir_name_single() {
+        assert_eq!(arch_dir_name("12.0"), "sm120");
+    }
+
+    #[test]
+    fn arch_dir_name_multi() {
+        assert_eq!(arch_dir_name("6.1;12.0"), "sm61-sm120");
+    }
+
+    #[test]
+    fn arch_dir_name_strips_all_dots() {
+        // A three-component cap and a two-digit minor both flatten correctly.
+        assert_eq!(arch_dir_name("7.5"), "sm75");
+        assert_eq!(arch_dir_name("8.0;8.6;9.0"), "sm80-sm86-sm90");
+    }
+}

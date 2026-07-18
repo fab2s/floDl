@@ -738,3 +738,31 @@ commands:
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|e| format!("cannot write {}: {}", path, e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_name;
+
+    #[test]
+    fn validate_name_accepts_alnum_hyphen_underscore() {
+        for ok in ["my_project", "my-project", "Proj123", "a", "x_1-2"] {
+            assert!(validate_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        let err = validate_name("").unwrap_err();
+        assert!(err.contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn validate_name_rejects_disallowed_chars() {
+        // Spaces, dots, and path separators are the realistic footguns
+        // (a project name becomes a directory + a crate name).
+        for bad in ["my project", "my.project", "a/b", "../evil", "name!"] {
+            let err = validate_name(bad).unwrap_err();
+            assert!(err.contains("only letters"), "{bad:?} -> unexpected: {err}");
+        }
+    }
+}

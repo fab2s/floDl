@@ -188,19 +188,6 @@ fn version_dir_part(tag: &str) -> String {
     tag.to_string()
 }
 
-/// Convert "6.1;12.0" -> "sm61-sm120" for directory naming. Matches the
-/// existing convention from `fdl libtorch build`.
-fn arch_dir_name(archs: &str) -> String {
-    archs
-        .split(';')
-        .map(|cap| {
-            let clean = cap.replace('.', "");
-            format!("sm{}", clean)
-        })
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 /// Convert "6.1;12.0" -> "-gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_120,code=sm_120"
 /// for the NVCC_GENCODE build arg.
 fn arch_gencode(archs: &str) -> String {
@@ -242,7 +229,7 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
         None => detect_arch_list()?,
     };
 
-    let arch_dir = arch_dir_name(&archs);
+    let arch_dir = system::arch_dir_name(&archs);
     let gencode = arch_gencode(&archs);
     let version_short = version_dir_part(&tag);
     let install_path = ctx.root.join(format!(
@@ -398,16 +385,6 @@ fn extract_artifacts(image_tag: &str, install_path: &PathBuf) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn arch_dir_name_single() {
-        assert_eq!(arch_dir_name("12.0"), "sm120");
-    }
-
-    #[test]
-    fn arch_dir_name_multi() {
-        assert_eq!(arch_dir_name("6.1;12.0"), "sm61-sm120");
-    }
 
     #[test]
     fn arch_gencode_single() {

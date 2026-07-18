@@ -98,18 +98,6 @@ fn detect_arch_list() -> Result<String, String> {
     Ok(caps.join(";"))
 }
 
-/// Convert "6.1;12.0" -> "sm61-sm120" for directory naming.
-fn arch_dir_name(archs: &str) -> String {
-    archs
-        .split(';')
-        .map(|cap| {
-            let clean = cap.replace('.', "");
-            format!("sm{}", clean)
-        })
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 // ---------------------------------------------------------------------------
 // Native toolchain detection
 // ---------------------------------------------------------------------------
@@ -237,7 +225,7 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
         None => detect_arch_list()?,
     };
 
-    let arch_dir = arch_dir_name(&archs);
+    let arch_dir = system::arch_dir_name(&archs);
     let install_path = ctx.root.join(format!("libtorch/builds/{}", arch_dir));
     let variant_id = format!("builds/{}", arch_dir);
 
