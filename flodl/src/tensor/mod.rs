@@ -59,7 +59,17 @@ impl DType {
             ffi::FLODL_FLOAT64 => DType::Float64,
             ffi::FLODL_INT32 => DType::Int32,
             ffi::FLODL_INT64 => DType::Int64,
-            _ => DType::Float32,
+            // An unknown code means the Rust dtype table and the shim's
+            // disagree — a build/ABI mismatch (rebuild flodl-sys), NOT a
+            // runtime condition. Silently masquerading as Float32 would
+            // hand back a wrong-typed tensor (the TF3/TF15 silent-wrong-
+            // answer family); `dtype()` is an infallible hot accessor, so
+            // promoting it to `Result` is rejected as ABI churn (TF6). A
+            // defined, named panic beats a silent wrong answer.
+            other => panic!(
+                "flodl: unknown dtype code {other} from the C++ shim — the \
+                 Rust and flodl-sys dtype tables disagree; rebuild flodl-sys"
+            ),
         }
     }
 

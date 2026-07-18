@@ -22,6 +22,12 @@
 use std::process::Command;
 
 /// One GPU's identity + capability + VRAM, as reported by `nvidia-smi`.
+///
+/// NOTE: `GpuInfo` + the nvidia-smi enumeration (`detect_gpus_raw` /
+/// `parse_gpu_csv_row`) are intentionally duplicated in
+/// `flodl_cli::util::system`. flodl-cli cannot depend on flodl (it must build
+/// without libtorch), so the two can't share a module — keep the query column
+/// order + parse in sync with that copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuInfo {
     /// `nvidia-smi`'s device index (0-based). Matches the index libtorch
@@ -170,8 +176,11 @@ fn parse_meminfo_kb(rest: &str) -> Option<u64> {
 /// through [`detect_gpus`] which honors `CUDA_VISIBLE_DEVICES`.
 fn detect_gpus_raw() -> Vec<GpuInfo> {
     let output = match Command::new("nvidia-smi")
+        // `name` is queried LAST: it is the only field that can contain the
+        // `", "` separator, so with it last `splitn(4, ", ")` keeps the whole
+        // name (commas and all) in the final cell — no CSV parser needed.
         .args([
-            "--query-gpu=index,name,compute_cap,memory.total",
+            "--query-gpu=index,compute_cap,memory.total,name",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -196,26 +205,39 @@ fn detect_gpus_raw() -> Vec<GpuInfo> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .lines()
+        .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(4, ", ").collect();
-            if parts.len() < 4 {
-                return None;
+            let parsed = parse_gpu_csv_row(line);
+            if parsed.is_none() {
+                // A malformed row = a GPU silently dropped. Leave a trace.
+                eprintln!("flodl sys: could not parse an nvidia-smi GPU row, skipping: {line:?}");
             }
-            let index: u8 = parts[0].trim().parse().ok()?;
-            let name = parts[1].trim().to_string();
-            let cap_parts: Vec<&str> = parts[2].trim().split('.').collect();
-            let sm_major: u32 = cap_parts.first()?.parse().ok()?;
-            let sm_minor: u32 = cap_parts.get(1)?.parse().ok()?;
-            let total_memory_mb: u64 = parts[3].trim().parse().ok()?;
-            Some(GpuInfo {
-                index,
-                name,
-                sm_major,
-                sm_minor,
-                total_memory_mb,
-            })
+            parsed
         })
         .collect()
+}
+
+/// Parse one `index, compute_cap, memory.total, name` CSV row (nvidia-smi
+/// `--format=csv,noheader,nounits`; `name` is last so an embedded ", " stays
+/// intact — the first three cells are comma-free). None on any bad field.
+fn parse_gpu_csv_row(line: &str) -> Option<GpuInfo> {
+    let parts: Vec<&str> = line.splitn(4, ", ").collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let index: u8 = parts[0].trim().parse().ok()?;
+    let cap_parts: Vec<&str> = parts[1].trim().split('.').collect();
+    let sm_major: u32 = cap_parts.first()?.parse().ok()?;
+    let sm_minor: u32 = cap_parts.get(1)?.parse().ok()?;
+    let total_memory_mb: u64 = parts[2].trim().parse().ok()?;
+    let name = parts[3].trim().to_string();
+    Some(GpuInfo {
+        index,
+        name,
+        sm_major,
+        sm_minor,
+        total_memory_mb,
+    })
 }
 
 #[cfg(test)]
@@ -349,5 +371,31 @@ mod tests {
         // drops missing indices instead of inventing them.
         let _g = CudaVisibleGuard::set("99");
         assert!(detect_gpus().is_empty());
+    }
+
+    #[test]
+    fn parse_gpu_csv_row_parses_a_well_formed_row() {
+        // Column order: index, compute_cap, memory.total, name.
+        let g = parse_gpu_csv_row("1, 6.1, 6078, NVIDIA GeForce GTX 1060 6GB").unwrap();
+        assert_eq!(g.index, 1);
+        assert_eq!(g.name, "NVIDIA GeForce GTX 1060 6GB");
+        assert_eq!(g.sm_major, 6);
+        assert_eq!(g.sm_minor, 1);
+        assert_eq!(g.total_memory_mb, 6078);
+    }
+
+    #[test]
+    fn parse_gpu_csv_row_keeps_comma_in_name() {
+        // `name` last => an embedded ", " stays in the final cell (splitn(4)
+        // stops after 3 separators) rather than truncating the row.
+        let g = parse_gpu_csv_row("0, 8.0, 81920, NVIDIA A100, 80GB").unwrap();
+        assert_eq!(g.name, "NVIDIA A100, 80GB");
+        assert_eq!(g.total_memory_mb, 81920);
+    }
+
+    #[test]
+    fn parse_gpu_csv_row_rejects_malformed() {
+        assert!(parse_gpu_csv_row("0, 8.9, three").is_none());
+        assert!(parse_gpu_csv_row("x, 8.9, 24564, name").is_none());
     }
 }

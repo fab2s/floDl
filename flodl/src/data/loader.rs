@@ -251,7 +251,11 @@ impl DataLoaderBuilder {
     /// Use this to set a specific depth instead. Disables automatic
     /// per-epoch adaptation.
     ///
-    /// Set to 0 for synchronous loading (no background thread).
+    /// The streaming loader always runs a background prefetch thread; a
+    /// depth of `0` is clamped to `1`, not switched to synchronous loading.
+    /// Synchronous, single-threaded loading is the *resident* path, chosen
+    /// automatically when the dataset fits in VRAM (it is not selectable
+    /// here).
     pub fn prefetch(mut self, depth: usize) -> Self {
         self.prefetch_depth = Some(depth);
         self
