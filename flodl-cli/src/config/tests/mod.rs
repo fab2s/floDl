@@ -99,7 +99,7 @@ impl Drop for TempDir {
     }
 }
 
-pub(super) fn filenames(layers: &[(PathBuf, serde_yaml::Value)]) -> Vec<String> {
+pub(super) fn filenames(layers: &[(PathBuf, serde_yaml_ng::Value)]) -> Vec<String> {
     layers
         .iter()
         .map(|(p, _)| {

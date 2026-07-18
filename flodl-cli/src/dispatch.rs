@@ -544,7 +544,7 @@ mod tests {
             #[serde(default)]
             commands: BTreeMap<String, CommandSpec>,
         }
-        serde_yaml::from_str::<Root>(yaml)
+        serde_yaml_ng::from_str::<Root>(yaml)
             .expect("parse top-level commands")
             .commands
     }

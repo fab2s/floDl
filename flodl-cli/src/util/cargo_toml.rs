@@ -1,7 +1,8 @@
 //! Minimal text-based Cargo.toml editor.
 //!
-//! flodl-cli is zero-external-crate by policy, so we don't pull in the
-//! `toml` / `toml_edit` crates just to append a dependency. The editor
+//! flodl-cli keeps external deps minimal (the serde ecosystem only), so
+//! we don't pull in the `toml` / `toml_edit` crates just to append a
+//! dependency. The editor
 //! is intentionally narrow: append a dep to `[dependencies]` if it
 //! isn't already declared, preserving every other byte of the file.
 //!

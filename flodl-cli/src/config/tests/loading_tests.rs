@@ -74,13 +74,13 @@ fn resolve_config_layers_merged_value_matches_chain() {
     let m = merged.as_mapping().unwrap();
     // Last writer wins on `value`.
     assert_eq!(
-        m.get(serde_yaml::Value::String("value".into())).unwrap(),
-        &serde_yaml::Value::String("ci".into())
+        m.get(serde_yaml_ng::Value::String("value".into())).unwrap(),
+        &serde_yaml_ng::Value::String("ci".into())
     );
     // Each layer's unique key survives.
-    assert!(m.contains_key(serde_yaml::Value::String("keep_base".into())));
-    assert!(m.contains_key(serde_yaml::Value::String("keep_cloud".into())));
-    assert!(m.contains_key(serde_yaml::Value::String("keep_ci".into())));
+    assert!(m.contains_key(serde_yaml_ng::Value::String("keep_base".into())));
+    assert!(m.contains_key(serde_yaml_ng::Value::String("keep_cloud".into())));
+    assert!(m.contains_key(serde_yaml_ng::Value::String("keep_ci".into())));
 }
 
 #[test]

@@ -8,7 +8,7 @@ use super::*;
     #[test]
     fn cluster_overlay_parses() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).expect("parse cluster overlay");
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).expect("parse cluster overlay");
         // Simulate fdl-cli's post-probe rank population. Ranks aren't in the
         // user YAML schema anymore — see `ClusterWorker::ranks` doc.
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
@@ -44,7 +44,7 @@ use super::*;
     #[test]
     fn cluster_block_optional() {
         let yaml = "commands: { foo: { run: \"echo hi\" } }\n";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse without cluster");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse without cluster");
         assert!(cfg.cluster.is_none());
         // CommandSpec cluster defaults to None.
         assert_eq!(cfg.commands.get("foo").and_then(|c| c.cluster), None);
@@ -70,12 +70,12 @@ commands:
   train:
     cluster: true
 ";
-        let base: serde_yaml::Value = serde_yaml::from_str(base_yaml).unwrap();
-        let overlay: serde_yaml::Value = serde_yaml::from_str(overlay_yaml).unwrap();
+        let base: serde_yaml_ng::Value = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: serde_yaml_ng::Value = serde_yaml_ng::from_str(overlay_yaml).unwrap();
         let merged = crate::overlay::deep_merge(base, overlay);
-        let merged_yaml = serde_yaml::to_string(&merged).unwrap();
+        let merged_yaml = serde_yaml_ng::to_string(&merged).unwrap();
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(&merged_yaml).expect("merged config parses");
+            serde_yaml_ng::from_str(&merged_yaml).expect("merged config parses");
         // Post-probe: solo has 1 device → 1 rank.
         cfg.cluster.as_mut().unwrap().populate_ranks(&[1]).unwrap();
         let cluster = cfg.cluster.as_ref().expect("cluster: from overlay");
@@ -94,7 +94,7 @@ commands:
         // cross-worker `0..world_size` check. Pre-probe (all empty) skips
         // this branch; the corruption simulates a populate_ranks bug.
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![1, 1];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
@@ -104,7 +104,7 @@ commands:
     #[test]
     fn validate_rejects_rank_gap() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].ranks = vec![2, 3];
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
@@ -116,7 +116,7 @@ commands:
         // Post-probe: shrink local_devices to mismatch the populated ranks
         // count. Real-world this would surface a populate_ranks bug.
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         cfg.cluster.as_mut().unwrap().workers[1].local_devices =
             LocalDevices::Explicit(vec![0]);
@@ -127,7 +127,7 @@ commands:
     #[test]
     fn validate_rejects_reserved_cluster_env_key() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_mut().unwrap().env.insert(
             "CUDA_VISIBLE_DEVICES".into(),
             "3".into(),
@@ -140,7 +140,7 @@ commands:
     #[test]
     fn validate_rejects_reserved_worker_env_key() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_mut().unwrap().workers[0].env.insert(
             "FLODL_INTERNAL_LOCAL_RANK".into(),
             "0".into(),
@@ -154,7 +154,7 @@ commands:
         // NCCL tuning + a user-facing FLODL_ var (no FLODL_INTERNAL_
         // prefix) are legitimate cluster env entries.
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         let c = cfg.cluster.as_mut().unwrap();
         c.env.insert("NCCL_P2P_DISABLE".into(), "1".into());
         c.env.insert("FLODL_DASHBOARD_BIND".into(), "0.0.0.0".into());
@@ -164,7 +164,7 @@ commands:
     #[test]
     fn validate_rejects_empty_hosts() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_mut().unwrap().workers.clear();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("non-empty"), "got: {err}");
@@ -173,7 +173,7 @@ commands:
     #[test]
     fn validate_rejects_missing_socket_ifname_when_multi_host() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_mut().unwrap().workers[0].nccl_socket_ifname = String::new();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("nccl_socket_ifname"), "got: {err}");
@@ -183,7 +183,7 @@ commands:
     #[test]
     fn validate_rejects_empty_path() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_mut().unwrap().workers[0].path = String::new();
         let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
         assert!(err.contains("path"), "got: {err}");
@@ -206,21 +206,21 @@ cluster:
       nccl_socket_ifname: \"\"
       path: /tmp/test-solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.cluster.as_ref().unwrap().validate().expect("single-host with empty ifname must pass");
     }
 
     #[test]
     fn validate_passes_canonical() {
         let cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         cfg.cluster.as_ref().unwrap().validate().expect("canonical topology must validate");
     }
 
     #[test]
     fn canonical_json_stable_and_round_trips() {
         let cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
         let json = cluster.canonical_json().expect("serialize");
 
@@ -254,7 +254,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let host = &cfg.cluster.unwrap().workers[0];
         assert_eq!(host.local_devices, LocalDevices::All);
         assert!(host.local_devices.is_all());
@@ -275,7 +275,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let host = &cfg.cluster.unwrap().workers[0];
         assert_eq!(host.local_devices, LocalDevices::Explicit(vec![3]));
         assert!(!host.local_devices.is_all());
@@ -300,7 +300,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.cluster
             .as_ref()
             .unwrap()
@@ -322,7 +322,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = cfg.cluster.unwrap();
         let env = cluster.local_envelope_for(&cluster.workers[0]);
         assert_eq!(env["worker"]["local_devices"], serde_json::json!("all"));
@@ -342,7 +342,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = cfg.cluster.unwrap();
         let json = cluster.canonical_json().unwrap();
         let parsed: ClusterConfig = serde_json::from_str(&json).unwrap();
@@ -363,7 +363,7 @@ cluster:
       nccl_socket_ifname: lo
       path: /tmp/solo
 ";
-        let err = serde_yaml::from_str::<ProjectConfig>(yaml).unwrap_err();
+        let err = serde_yaml_ng::from_str::<ProjectConfig>(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("local_devices") && msg.contains("every"),
@@ -374,7 +374,7 @@ cluster:
     #[test]
     fn local_envelope_strips_ssh_adds_world_metadata() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().unwrap();
         let worker = &cluster.workers[1];
@@ -402,7 +402,7 @@ cluster:
     #[test]
     fn local_envelope_omits_optional_arch() {
         let cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         let mut cluster = cfg.cluster.unwrap();
         cluster.workers[0].arch = None;
         let env = cluster.local_envelope_for(&cluster.workers[0]);
@@ -415,7 +415,7 @@ cluster:
     #[test]
     fn local_envelope_first_worker_carries_rank_zero() {
         let mut cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         populate_canonical_ranks(cfg.cluster.as_mut().unwrap());
         let cluster = cfg.cluster.as_ref().unwrap();
         let host_a = &cluster.workers[0];
@@ -430,7 +430,7 @@ cluster:
     #[test]
     fn ssh_target_defaults_to_name() {
         let cfg: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         let cluster = cfg.cluster.as_ref().unwrap();
         assert_eq!(cluster.ssh_target(&cluster.workers[0]), "host-a"); // no ssh: → name
         assert_eq!(cluster.ssh_target(&cluster.workers[1]), "host-b"); // explicit
@@ -506,7 +506,7 @@ cluster:
     fn cluster_dispatch_enabled_requires_cluster_block() {
         // Even with leaf cluster: true, dispatching is disabled when no
         // cluster topology is declared at root.
-        let no_cluster: ProjectConfig = serde_yaml::from_str(
+        let no_cluster: ProjectConfig = serde_yaml_ng::from_str(
             "commands: { foo: { run: \"echo hi\" } }\n",
         )
         .unwrap();
@@ -517,7 +517,7 @@ cluster:
     #[test]
     fn cluster_dispatch_enabled_when_block_and_chain_agree() {
         let with_cluster: ProjectConfig =
-            serde_yaml::from_str(canonical_cluster_yaml()).unwrap();
+            serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();
         assert!(cluster_dispatch_enabled(&with_cluster, &[Some(true)]));
         assert!(cluster_dispatch_enabled(&with_cluster, &[Some(true), None]));
         // Cluster block present but chain says false → not enabled.

@@ -778,7 +778,7 @@ cluster:
 commands:
   x: { cluster: true, run: \"echo hi\" }
 ";
-        let project: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(
             !should_dispatch(&project, &[Some(true)]),
             "recursion guard: must return false when FLODL_INTERNAL_CLUSTER_JSON is set"
@@ -808,7 +808,7 @@ cluster:
 commands:
   x: { run: \"echo hi\" }
 ";
-        let project: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(!should_dispatch(&project, &[None]));
         assert!(should_dispatch(&project, &[Some(true)]));
     }
@@ -847,7 +847,7 @@ cluster:
 commands:
   train: { cluster: true, run: \"true\" }
 ";
-        let project: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = project.cluster.as_ref().unwrap();
         prepare_cluster_env(cluster, Some("cluster"), "train").expect("prepare OK");
 
@@ -887,7 +887,7 @@ cluster:
 commands:
   train: { cluster: true, run: \"true\" }
 ";
-        let project: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = project.cluster.as_ref().unwrap();
         // None overlay → no FDL_ENV var set.
         prepare_cluster_env(cluster, None, "train").unwrap();

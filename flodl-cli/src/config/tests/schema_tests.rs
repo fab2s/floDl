@@ -271,7 +271,7 @@ fn command_spec_kind_allows_docker_with_run() {
 fn command_spec_deserialize_from_null() {
     let yaml = "cmd: ~";
     let map: BTreeMap<String, CommandSpec> =
-        serde_yaml::from_str(yaml).expect("null must deserialize to default");
+        serde_yaml_ng::from_str(yaml).expect("null must deserialize to default");
     let spec = map.get("cmd").expect("cmd missing");
     assert!(spec.run.is_none() && spec.path.is_none());
     assert_eq!(spec.kind().unwrap(), CommandKind::Path);
@@ -282,14 +282,14 @@ fn command_config_arg_name_deserializes_kebab_case() {
     // YAML uses `arg-name:`, Rust field is `arg_name`.
     let yaml = "arg-name: recipe\nentry: echo\n";
     let cfg: CommandConfig =
-        serde_yaml::from_str(yaml).expect("arg-name must parse");
+        serde_yaml_ng::from_str(yaml).expect("arg-name must parse");
     assert_eq!(cfg.arg_name.as_deref(), Some("recipe"));
 }
 
 #[test]
 fn command_config_arg_name_defaults_to_none() {
     let cfg: CommandConfig =
-        serde_yaml::from_str("entry: echo\n").expect("minimal cfg must parse");
+        serde_yaml_ng::from_str("entry: echo\n").expect("minimal cfg must parse");
     assert!(cfg.arg_name.is_none());
 }
 

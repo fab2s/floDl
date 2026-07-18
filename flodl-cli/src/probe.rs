@@ -1370,7 +1370,7 @@ mod tests {
     fn parse_remote_json_flags_schema_skew() {
         // A remote fdl speaking a different probe schema must surface as
         // version skew, not parse as a healthy zero-GPU host.
-        let worker: ClusterWorker = serde_yaml::from_str(
+        let worker: ClusterWorker = serde_yaml_ng::from_str(
             "host: pascal\nlocal_devices: [0]\nnccl_socket_ifname: lo\npath: /opt/flodl",
         )
         .expect("minimal worker");

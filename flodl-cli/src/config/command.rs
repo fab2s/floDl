@@ -72,13 +72,13 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     // `deny_unknown_fields` on the config structs, unknown-key errors
     // carry a location this way. Positions refer to the merged
     // document, not any single source file, when overlays are in play.
-    let merged_str = serde_yaml::to_string(&merged).map_err(|e| {
+    let merged_str = serde_yaml_ng::to_string(&merged).map_err(|e| {
         format!(
             "{}: failed to re-serialize merged YAML for diagnostics: {e}",
             base_path.display()
         )
     })?;
-    let mut cfg: CommandConfig = serde_yaml::from_str(&merged_str)
+    let mut cfg: CommandConfig = serde_yaml_ng::from_str(&merged_str)
         .map_err(|e| format!("{}: {}", base_path.display(), e))?;
 
     if let Some(schema) = &cfg.schema {

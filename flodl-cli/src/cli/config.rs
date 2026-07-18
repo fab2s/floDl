@@ -413,7 +413,7 @@ pub(crate) fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> Exit
                 .to_string()
         })
         .collect();
-    let values: Vec<serde_yaml::Value> =
+    let values: Vec<serde_yaml_ng::Value> =
         layers.iter().map(|(_, v)| v.clone()).collect();
 
     let annotated = overlay::merge_layers_annotated(&values);

@@ -217,7 +217,7 @@ impl CommandSpec {
 
 // Custom Deserialize so that `commands: { name: ~ }` (YAML null) and
 // `commands: { name: }` (empty value) both deserialize to a default
-// `CommandSpec`. Without this, serde_yaml errors on null because a
+// `CommandSpec`. Without this, serde_yaml_ng errors on null because a
 // struct expects a map.
 impl<'de> Deserialize<'de> for CommandSpec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -249,15 +249,15 @@ impl<'de> Deserialize<'de> for CommandSpec {
             cluster: Option<bool>,
         }
 
-        let raw = serde_yaml::Value::deserialize(deserializer)?;
-        if matches!(raw, serde_yaml::Value::Null) {
+        let raw = serde_yaml_ng::Value::deserialize(deserializer)?;
+        if matches!(raw, serde_yaml_ng::Value::Null) {
             return Ok(Self::default());
         }
         // A bad entry (unknown key via deny_unknown_fields, wrong type)
         // is captured as `load_error` instead of failing the enclosing
         // `commands:` map: help and sibling commands keep working, and
         // `kind()` raises the error when THIS command is invoked.
-        let inner: Inner = match serde_yaml::from_value(raw) {
+        let inner: Inner = match serde_yaml_ng::from_value(raw) {
             Ok(inner) => inner,
             Err(e) => {
                 return Ok(Self {

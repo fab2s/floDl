@@ -2,7 +2,7 @@
     use std::collections::BTreeMap;
 
     fn yaml(s: &str) -> Value {
-        serde_yaml::from_str(s).expect("test fixture must parse")
+        serde_yaml_ng::from_str(s).expect("test fixture must parse")
     }
 
     /// Build `Vec<String>` from string literals — shorter than repeating
@@ -425,7 +425,7 @@
 
     #[test]
     fn render_inline_short_scalar_list() {
-        // `serde_yaml::Number::to_string` preserves `1.0` as `1.0`.
+        // `serde_yaml_ng::Number::to_string` preserves `1.0` as `1.0`.
         let layers = vec![yaml("ratios: [1.5, 1.0]\n")];
         let node = merge_layers_annotated(&layers);
         let out = render_no_color(&node, &labels(&["fdl.yml"]));

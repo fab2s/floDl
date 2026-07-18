@@ -186,7 +186,7 @@ fn parse_compose_project_mounts(
         Ok(t) => t,
         Err(_) => return std::collections::HashMap::new(),
     };
-    let doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
+    let doc: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&text) {
         Ok(d) => d,
         Err(_) => return std::collections::HashMap::new(),
     };
@@ -222,7 +222,7 @@ fn parse_compose_project_mounts(
 /// Inside a service's `volumes:` sequence, find the entry that
 /// bind-mounts the project root (host path `.` or `./`) and return the
 /// container-side target path.
-fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
+fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
     for entry in volumes {
         if let Some(s) = entry.as_str() {
             // Short form: "host:container[:options]". Docker-compose's
@@ -238,10 +238,10 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
         } else if let Some(m) = entry.as_mapping() {
             // Long form: { type: bind, source: ., target: /workspace }.
             let source = m
-                .get(serde_yaml::Value::String("source".into()))
+                .get(serde_yaml_ng::Value::String("source".into()))
                 .and_then(|v| v.as_str());
             let target = m
-                .get(serde_yaml::Value::String("target".into()))
+                .get(serde_yaml_ng::Value::String("target".into()))
                 .and_then(|v| v.as_str());
             if matches!(source, Some(".") | Some("./")) {
                 if let Some(t) = target {
@@ -585,7 +585,8 @@ pub(crate) fn compose_run_command(
 /// be shell-safe inline; the bare form does not depend on that).
 /// Source of truth for the env-var name lives in
 /// `flodl::distributed::testing::ENV_TESTING_CLUSTER_JSON`; mirrored
-/// here as a literal because flodl-cli is zero-dep by policy.
+/// here as a literal because flodl-cli is decoupled from the flodl
+/// library crate by policy (it must build without libtorch).
 fn testing_cluster_env_arg() -> String {
     match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
         Ok(_) => " -e FLODL_TESTING_CLUSTER_JSON".to_string(),
@@ -1765,7 +1766,7 @@ mod tests {
     // ── resolve_libtorch_at: 3-shape libtorch_path: resolution ──────────
     //
     // Each test builds a synthetic libtorch dir under a per-test scratch
-    // path (zero-deps policy precludes `tempfile`) and feeds the path
+    // path (the minimal-deps policy precludes pulling in `tempfile`) and feeds the path
     // through `resolve_libtorch_at`. Variant names (`precompiled/v1`,
     // `builds/v2`) are deliberately abstract — the resolver is structural,
     // not rig-aware.

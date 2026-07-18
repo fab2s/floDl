@@ -159,13 +159,13 @@ pub fn load_project_with_env(
     }
     // Re-serialize so `from_str`'s parser tracks line/col through deserialize.
     // `from_value` discards positional info, leaving errors location-less.
-    let merged_str = serde_yaml::to_string(&merged).map_err(|e| {
+    let merged_str = serde_yaml_ng::to_string(&merged).map_err(|e| {
         format!(
             "{}: failed to re-serialize merged YAML for diagnostics: {e}",
             base_path.display()
         )
     })?;
-    let cfg = serde_yaml::from_str::<ProjectConfig>(&merged_str).map_err(|e| {
+    let cfg = serde_yaml_ng::from_str::<ProjectConfig>(&merged_str).map_err(|e| {
         let names: Vec<String> = layers
             .iter()
             .map(|(p, _)| {
@@ -244,13 +244,13 @@ fn extract_context(text: &str, line_no: usize) -> String {
     out
 }
 
-/// Load the raw merged [`serde_yaml::Value`] for a config + optional env
+/// Load the raw merged [`serde_yaml_ng::Value`] for a config + optional env
 /// overlay. Exposed so callers like `fdl config show` can inspect the
 /// resolved view before it is deserialized into a strongly-typed struct.
 pub fn load_merged_value(
     base_path: &Path,
     env: Option<&str>,
-) -> Result<serde_yaml::Value, String> {
+) -> Result<serde_yaml_ng::Value, String> {
     let layers = resolve_config_layers(base_path, env)?;
     Ok(crate::overlay::merge_layers(
         layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
@@ -268,7 +268,7 @@ pub fn load_merged_value(
 pub fn resolve_config_layers(
     base_path: &Path,
     env: Option<&str>,
-) -> Result<Vec<(PathBuf, serde_yaml::Value)>, String> {
+) -> Result<Vec<(PathBuf, serde_yaml_ng::Value)>, String> {
     let mut layers = crate::overlay::resolve_chain(base_path)?;
     if let Some(name) = env {
         match crate::overlay::find_env_file(base_path, name) {

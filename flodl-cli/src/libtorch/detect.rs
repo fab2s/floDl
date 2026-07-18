@@ -215,7 +215,8 @@ mod tests {
     static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// Hand-rolled scratch dir under the system temp dir + RAII
-    /// cleanup. flodl-cli is zero-external-crate by policy so we
+    /// cleanup. flodl-cli keeps external deps minimal (the serde
+    /// ecosystem only — no utility crates like `tempfile`) so we
     /// cannot pull in `tempfile`.
     struct Scratch(PathBuf);
     impl Scratch {

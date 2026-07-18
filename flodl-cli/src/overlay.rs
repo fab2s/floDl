@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_yaml::{Mapping, Value};
+use serde_yaml_ng::{Mapping, Value};
 
 // ── Deep-merge ──────────────────────────────────────────────────────────
 
@@ -154,7 +154,7 @@ pub enum AnnotatedNode {
     Leaf { value: Value, source: usize },
     /// Mapping node. `entries` preserves insertion order matching
     /// [`deep_merge`]'s re-key-to-end behaviour (overridden keys move to
-    /// the tail of the map, matching the final `serde_yaml` serialisation).
+    /// the tail of the map, matching the final `serde_yaml_ng` serialisation).
     Map { entries: Vec<(Value, AnnotatedNode)> },
 }
 
@@ -592,9 +592,9 @@ fn format_scalar(v: &Value) -> String {
         Value::String(s) => format_string(s),
         Value::Sequence(_) | Value::Mapping(_) => {
             // Shouldn't be called with a container — defensive fallback.
-            serde_yaml::to_string(v).unwrap_or_default().trim().to_string()
+            serde_yaml_ng::to_string(v).unwrap_or_default().trim().to_string()
         }
-        Value::Tagged(t) => serde_yaml::to_string(&**t)
+        Value::Tagged(t) => serde_yaml_ng::to_string(&**t)
             .unwrap_or_default()
             .trim()
             .to_string(),
@@ -654,7 +654,7 @@ pub fn load_value(path: &Path) -> Result<Value, String> {
     match ext {
         "json" => serde_json::from_str::<Value>(&content)
             .map_err(|e| format!("{}: {}", path.display(), e)),
-        _ => serde_yaml::from_str::<Value>(&content)
+        _ => serde_yaml_ng::from_str::<Value>(&content)
             .map_err(|e| format!("{}: {}", path.display(), e)),
     }
 }
