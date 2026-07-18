@@ -3,7 +3,7 @@
 
 use std::ptr;
 use flodl_sys::{self as ffi, FlodlTensor};
-use super::{Tensor, check_err, Result};
+use super::{Tensor, check_err, Result, ffi_call};
 
 /// Persistent cache of RNN parameter tensors on the C++ side.
 ///
@@ -170,13 +170,8 @@ impl Tensor {
 
     /// Fused linear: `y = input @ weight^T + bias` (single ATen kernel).
     pub fn linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
         let bias_handle = bias.map_or(ptr::null_mut(), |b| b.handle);
-        let err = unsafe {
-            ffi::flodl_linear(self.handle, weight.handle, bias_handle, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_linear, self.handle, weight.handle, bias_handle)
     }
 
     /// Fused GRU cell: single ATen `gru_cell` kernel.
@@ -187,17 +182,12 @@ impl Tensor {
         w_ih: &Tensor, w_hh: &Tensor,
         b_ih: &Tensor, b_hh: &Tensor,
     ) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_gru_cell(
+        ffi_call!(
+            flodl_gru_cell,
                 self.handle, hx.handle,
                 w_ih.handle, w_hh.handle,
                 b_ih.handle, b_hh.handle,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        )
     }
 
     /// Fused LSTM cell: single ATen `lstm_cell` kernel.
@@ -366,13 +356,8 @@ impl Tensor {
 
     /// Adaptive average pooling to target spatial size.
     pub fn adaptive_avg_pool2d(&self, output_size: [i64; 2]) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
         let mut os = output_size;
-        let err = unsafe {
-            ffi::flodl_adaptive_avg_pool2d(self.handle, os.as_mut_ptr(), &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_adaptive_avg_pool2d, self.handle, os.as_mut_ptr())
     }
 
     /// Grid sampling (bilinear/nearest interpolation).
@@ -395,12 +380,7 @@ impl Tensor {
     /// Fused MSE loss: single libtorch kernel.
     /// reduction: 0=None, 1=Mean, 2=Sum.
     pub fn mse_loss(&self, target: &Tensor, reduction: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_mse_loss(self.handle, target.handle, reduction, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_mse_loss, self.handle, target.handle, reduction)
     }
 
     /// Fused cross-entropy loss: single libtorch kernel.
@@ -411,16 +391,11 @@ impl Tensor {
         &self, target: &Tensor, reduction: i64,
         ignore_index: i64, label_smoothing: f64,
     ) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_cross_entropy_loss(
+        ffi_call!(
+            flodl_cross_entropy_loss,
                 self.handle, target.handle,
                 reduction, ignore_index, label_smoothing,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        )
     }
 
     /// Binary cross-entropy loss from probabilities (NOT logits).
@@ -454,12 +429,7 @@ impl Tensor {
     /// Fused L1 loss: single libtorch kernel.
     /// reduction: 0=None, 1=Mean, 2=Sum.
     pub fn l1_loss(&self, target: &Tensor, reduction: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_l1_loss(self.handle, target.handle, reduction, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_l1_loss, self.handle, target.handle, reduction)
     }
 
     /// Fused Smooth L1 (Huber) loss: single libtorch kernel.
@@ -493,12 +463,7 @@ impl Tensor {
     /// `input`: log-probabilities `[N, C]` (output of log_softmax).
     /// `target`: class indices `[N]` (Int64).
     pub fn nll_loss(&self, target: &Tensor, reduction: i64, ignore_index: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_nll_loss(self.handle, target.handle, reduction, ignore_index, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_nll_loss, self.handle, target.handle, reduction, ignore_index)
     }
 
     /// CTC (Connectionist Temporal Classification) loss for sequence-to-sequence.
@@ -550,22 +515,12 @@ impl Tensor {
 
     /// Fused dropout: single libtorch kernel with inverted scaling.
     pub fn dropout(&self, p: f64, training: bool) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_dropout(self.handle, p, training as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_dropout, self.handle, p, training as i32)
     }
 
     /// Fused 2D feature dropout: drops entire channels.
     pub fn feature_dropout(&self, p: f64, training: bool) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_feature_dropout(self.handle, p, training as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_feature_dropout, self.handle, p, training as i32)
     }
 
     /// Fused scaled dot-product attention via libtorch's
@@ -592,17 +547,12 @@ impl Tensor {
         let mask_handle = attn_mask.map_or(ptr::null_mut(), |m| m.handle);
         // Sentinel: non-positive scale means "use default".
         let scale_arg = scale.filter(|&s| s > 0.0).unwrap_or(-1.0);
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_scaled_dot_product_attention(
+        ffi_call!(
+            flodl_scaled_dot_product_attention,
                 query.handle, key.handle, value.handle,
                 mask_handle,
                 dropout_p, if is_causal { 1 } else { 0 }, scale_arg,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        )
     }
 
     /// Plain embedding lookup using libtorch's native `at::embedding`.
@@ -616,17 +566,12 @@ impl Tensor {
     pub fn embedding(
         weight: &Tensor, indices: &Tensor, padding_idx: i64,
     ) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_embedding(
+        ffi_call!(
+            flodl_embedding,
                 weight.handle, indices.handle,
                 padding_idx,
                 /*scale_grad_by_freq=*/0, /*sparse=*/0,
-                &mut handle,
-            )
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        )
     }
 
     /// Fused embedding lookup + reduction (sum / mean / max).
@@ -799,13 +744,8 @@ impl Tensor {
 
     /// Adaptive max pooling (returns values only, not indices).
     pub fn adaptive_max_pool2d(&self, output_size: [i64; 2]) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
         let mut os = output_size;
-        let err = unsafe {
-            ffi::flodl_adaptive_max_pool2d(self.handle, os.as_mut_ptr(), &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_adaptive_max_pool2d, self.handle, os.as_mut_ptr())
     }
 
     /// Instance normalization.
@@ -832,22 +772,12 @@ impl Tensor {
 
     /// Pixel shuffle: rearranges `[N, C*r^2, H, W]` to `[N, C, H*r, W*r]`.
     pub fn pixel_shuffle(&self, upscale_factor: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_pixel_shuffle(self.handle, upscale_factor, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_pixel_shuffle, self.handle, upscale_factor)
     }
 
     /// Pixel unshuffle: inverse of pixel_shuffle.
     pub fn pixel_unshuffle(&self, downscale_factor: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_pixel_unshuffle(self.handle, downscale_factor, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_pixel_unshuffle, self.handle, downscale_factor)
     }
 
     /// Bilinear transformation: `x1^T A x2 + b`.

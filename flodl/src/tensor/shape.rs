@@ -10,7 +10,7 @@
 
 use std::ptr;
 use flodl_sys::{self as ffi, FlodlTensor};
-use super::{Tensor, TensorError, check_err, Result};
+use super::{Tensor, TensorError, check_err, Result, ffi_call};
 
 impl Tensor {
     /// Reshape to a new shape (must have same total elements).
@@ -22,12 +22,7 @@ impl Tensor {
     /// ```
     pub fn reshape(&self, shape: &[i64]) -> Result<Tensor> {
         let mut shape = shape.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_reshape(self.handle, shape.as_mut_ptr(), shape.len() as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_reshape, self.handle, shape.as_mut_ptr(), shape.len() as i32)
     }
 
     /// Swap two dimensions. Returns a view (shares storage).
@@ -36,78 +31,46 @@ impl Tensor {
     /// let t = x.transpose(0, 1)?; // [M, N] -> [N, M]
     /// ```
     pub fn transpose(&self, dim0: i32, dim1: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_transpose(self.handle, dim0, dim1, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_transpose, self.handle, dim0, dim1)
     }
 
     /// Broadcast to a larger shape.
     pub fn expand(&self, shape: &[i64]) -> Result<Tensor> {
         let mut shape = shape.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_expand(self.handle, shape.as_mut_ptr(), shape.len() as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_expand, self.handle, shape.as_mut_ptr(), shape.len() as i32)
     }
 
     /// Permute dimensions. Returns a view (shares storage).
     pub fn permute(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_permute(self.handle, dims.as_mut_ptr(), dims.len() as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_permute, self.handle, dims.as_mut_ptr(), dims.len() as i32)
     }
 
     /// Narrow (slice) along a dimension. Returns a view (shares storage),
     /// so `t.narrow(0, i, 1)?.copy_(&src)` writes into `t`.
     pub fn narrow(&self, dim: i32, start: i64, length: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_narrow(self.handle, dim, start, length, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_narrow, self.handle, dim, start, length)
     }
 
     /// Scatter a narrow slice back into a tensor (for narrow backward).
     pub fn narrow_scatter(&self, src: &Tensor, dim: i32, start: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_narrow_scatter(self.handle, src.handle, dim, start, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_narrow_scatter, self.handle, src.handle, dim, start)
     }
 
     /// Select a single index along a dimension (reduces that dim).
     /// Returns a view (shares storage).
     pub fn select(&self, dim: i32, index: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_select(self.handle, dim, index, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_select, self.handle, dim, index)
     }
 
     /// Squeeze (remove) a dimension of size 1. Returns a view (shares storage).
     pub fn squeeze(&self, dim: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_squeeze(self.handle, dim, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_squeeze, self.handle, dim)
     }
 
     /// Unsqueeze (insert) a dimension of size 1. Returns a view (shares storage).
     pub fn unsqueeze(&self, dim: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_unsqueeze(self.handle, dim, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_unsqueeze, self.handle, dim)
     }
 
     /// Insert multiple dimensions of size 1.
@@ -125,18 +88,12 @@ impl Tensor {
     /// Flatten dimensions `[start_dim..=end_dim]` into one.
     /// Returns a view when the layout allows, a copy otherwise.
     pub fn flatten(&self, start_dim: i32, end_dim: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_flatten(self.handle, start_dim, end_dim, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_flatten, self.handle, start_dim, end_dim)
     }
 
     /// Concatenate two tensors along a dimension.
     pub fn cat(&self, other: &Tensor, dim: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_cat2(self.handle, other.handle, dim, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_cat2, self.handle, other.handle, dim)
     }
 
     /// Concatenate multiple tensors along an existing dimension.
@@ -175,12 +132,7 @@ impl Tensor {
     /// Repeat the tensor along each dimension.
     pub fn repeat(&self, repeats: &[i64]) -> Result<Tensor> {
         let mut repeats = repeats.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_repeat(self.handle, repeats.as_mut_ptr(), repeats.len() as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_repeat, self.handle, repeats.as_mut_ptr(), repeats.len() as i32)
     }
 
     /// Constant-value padding. Padding format matches PyTorch: [left, right, top, bottom, ...].
@@ -217,45 +169,28 @@ impl Tensor {
     /// Reverse the order of elements along the given dimensions.
     pub fn flip(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_flip(self.handle, dims.as_mut_ptr(), dims.len() as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_flip, self.handle, dims.as_mut_ptr(), dims.len() as i32)
     }
 
     /// Roll elements along a dimension by `shift` positions.
     pub fn roll(&self, shift: i64, dim: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_roll(self.handle, shift, dim, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_roll, self.handle, shift, dim)
     }
 
     /// Extract the diagonal of a 2D tensor, or a diagonal from a batch.
     pub fn diagonal(&self, offset: i64, dim1: i32, dim2: i32) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_diagonal(self.handle, offset, dim1, dim2, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_diagonal, self.handle, offset, dim1, dim2)
     }
 
     /// Move a dimension from `src` to `dst`.
     pub fn movedim(&self, src: i64, dst: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_movedim(self.handle, src, dst, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_movedim, self.handle, src, dst)
     }
 
     /// Repeat tensor by tiling the given number of times per dimension.
     pub fn tile(&self, reps: &[i64]) -> Result<Tensor> {
         let mut reps_buf = reps.to_vec();
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_tile(self.handle, reps_buf.as_mut_ptr(), reps.len() as i32, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_tile, self.handle, reps_buf.as_mut_ptr(), reps.len() as i32)
     }
 
     /// Split tensor into pieces of `split_size` along a dimension.
@@ -299,10 +234,7 @@ impl Tensor {
 
     /// Return a contiguous copy if the tensor is not already contiguous.
     pub fn contiguous(&self) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_contiguous(self.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_contiguous, self.handle)
     }
 
     /// Split tensor into chunks along a dimension.

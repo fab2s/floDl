@@ -166,6 +166,31 @@ pub(crate) fn check_err(err: *mut std::ffi::c_char) -> Result<()> {
     }
 }
 
+/// Call a single-output-tensor FFI op and wrap the result.
+///
+/// Every wrapper for an FFI op that produces one output tensor shares the
+/// same four-line body: null out-handle → `unsafe` call with `&mut handle`
+/// appended as the last argument → `check_err(...)?` → `Ok(Tensor::from_raw(handle))`.
+/// This macro is that body. The op's own input arguments are forwarded
+/// verbatim, so it fits unary, binary, scalar, and multi-arg wrappers
+/// alike. Used as a method's tail expression, leaving the signature and
+/// doc as plain, checked, greppable source:
+///
+/// ```ignore
+/// pub fn add(&self, other: &Tensor) -> Result<Tensor> {
+///     ffi_call!(flodl_add, self.handle, other.handle)
+/// }
+/// ```
+macro_rules! ffi_call {
+    ($ffi:ident $(, $arg:expr)* $(,)?) => {{
+        let mut handle: flodl_sys::FlodlTensor = ::std::ptr::null_mut();
+        let err = unsafe { flodl_sys::$ffi($($arg,)* &mut handle) };
+        $crate::tensor::check_err(err)?;
+        Ok($crate::tensor::Tensor::from_raw(handle))
+    }};
+}
+pub(crate) use ffi_call;
+
 /// Options for tensor creation.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorOptions {
@@ -409,42 +434,27 @@ impl Tensor {
 
     /// Create a tensor of zeros with the same shape, dtype, and device as `t`.
     pub fn zeros_like(t: &Tensor) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_zeros_like(t.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_zeros_like, t.handle)
     }
 
     /// Create a tensor of ones with the same shape, dtype, and device as `t`.
     pub fn ones_like(t: &Tensor) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_ones_like(t.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_ones_like, t.handle)
     }
 
     /// Create a tensor filled with `value`, same shape/dtype/device as `t`.
     pub fn full_like(t: &Tensor, value: f64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_full_like(t.handle, value, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_full_like, t.handle, value)
     }
 
     /// Create a tensor with uniform random values in [0, 1), same shape/dtype/device as `t`.
     pub fn rand_like(t: &Tensor) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_rand_like(t.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_rand_like, t.handle)
     }
 
     /// Create a tensor with standard normal random values, same shape/dtype/device as `t`.
     pub fn randn_like(t: &Tensor) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_randn_like(t.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_randn_like, t.handle)
     }
 
     // --- Random ---
@@ -579,19 +589,13 @@ impl Tensor {
     /// One-hot encode an Int64 tensor of class indices.
     /// Returns a Float32 tensor with shape `[..., num_classes]`.
     pub fn one_hot(&self, num_classes: i64) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_one_hot(self.handle, num_classes, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_one_hot, self.handle, num_classes)
     }
 
     /// Sample 0/1 from Bernoulli distribution with given probabilities.
     /// `self` contains probabilities in [0, 1].
     pub fn bernoulli(&self) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_bernoulli(self.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_bernoulli, self.handle)
     }
 
     // --- Metadata ---
@@ -800,12 +804,7 @@ impl Tensor {
     /// storage but has the grad flag set. This enables libtorch's native
     /// autograd tracking for all subsequent operations.
     pub fn set_requires_grad(&self, requires_grad: bool) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_set_requires_grad(self.handle, requires_grad as i32, &mut handle)
-        };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_set_requires_grad, self.handle, requires_grad as i32)
     }
 
     /// Check whether this tensor requires gradient computation.
@@ -917,10 +916,7 @@ impl Tensor {
     /// Detach from the computation graph. Returns a new tensor that shares
     /// storage but has no autograd history.
     pub fn detach(&self) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_detach(self.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_detach, self.handle)
     }
 
     /// In-place detach: sever the grad_fn chain on this tensor without
@@ -1234,10 +1230,7 @@ impl Tensor {
     /// Pinned memory enables async CPU->GPU transfers via `cudaMemcpyAsync`.
     /// Only valid for CPU tensors. Returns a new tensor in pinned memory.
     pub fn pin_memory(&self) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_pin_memory(self.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_pin_memory, self.handle)
     }
 
     /// Returns true if this tensor is stored in pinned (page-locked) memory.
@@ -1250,10 +1243,7 @@ impl Tensor {
     /// Convert to channels-last (NHWC) memory format. Only meaningful for 4D tensors.
     /// This is the Rust equivalent of `tensor.to(memory_format=torch.channels_last)`.
     pub fn to_channels_last(&self) -> Result<Tensor> {
-        let mut handle: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_to_channels_last(self.handle, &mut handle) };
-        check_err(err)?;
-        Ok(Tensor::from_raw(handle))
+        ffi_call!(flodl_to_channels_last, self.handle)
     }
 
     /// Returns true if this tensor is contiguous in channels-last format.
