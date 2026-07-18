@@ -399,26 +399,10 @@ pub(crate) fn resolve_libtorch_at(
         return Some((info, host_path));
     }
     if path.join("lib").is_dir() {
-        let mut info = libtorch::detect::LibtorchInfo {
-            path: path.display().to_string(),
-            torch_version: None,
-            cuda_version: None,
-            archs: None,
-            source: None,
-        };
-        if let Ok(content) = std::fs::read_to_string(path.join(".arch")) {
-            for line in content.lines() {
-                if let Some(v) = line.strip_prefix("torch=") {
-                    info.torch_version = Some(v.into());
-                } else if let Some(v) = line.strip_prefix("cuda=") {
-                    info.cuda_version = Some(v.into());
-                } else if let Some(v) = line.strip_prefix("archs=") {
-                    info.archs = Some(v.into());
-                } else if let Some(v) = line.strip_prefix("source=") {
-                    info.source = Some(v.into());
-                }
-            }
-        }
+        let info = libtorch::detect::libtorch_info_from_dir(
+            path.display().to_string(),
+            path,
+        );
         let host_path = path.display().to_string();
         return Some((info, host_path));
     }

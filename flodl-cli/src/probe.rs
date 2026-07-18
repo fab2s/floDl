@@ -658,38 +658,18 @@ fn libtorch_status_from_info(
         Some(i) => libtorch_root.join(&i.path).join("lib").is_dir(),
         None => false,
     };
-    let mut archs_match: Vec<(u8, bool)> = Vec::new();
-    if let Some(i) = &info {
-        if let Some(archs) = &i.archs {
-            for g in gpus {
-                archs_match.push((g.index, detect::arch_compatible(g, archs)));
-            }
-            for g in gpus {
-                if !detect::arch_compatible(g, archs) {
-                    issues.push(format!(
-                        "GPU {} ({}, {}) not covered by libtorch archs `{}`.",
-                        g.index,
-                        g.short_name(),
-                        g.sm_version(),
-                        archs
-                    ));
-                }
-            }
-        } else {
+    let archs_match = match &info {
+        Some(i) => detect::arch_coverage(i, gpus, issues),
+        None => {
             issues.push(
-                "libtorch is present but `.arch` metadata is missing — \
-                 cannot verify GPU compatibility."
+                "libtorch pointer file did not resolve to a configured \
+                 variant (file empty or missing). Check the `.active*` \
+                 content names a real subdir under `libtorch/`."
                     .into(),
             );
+            Vec::new()
         }
-    } else {
-        issues.push(
-            "libtorch pointer file did not resolve to a configured \
-             variant (file empty or missing). Check the `.active*` \
-             content names a real subdir under `libtorch/`."
-                .into(),
-        );
-    }
+    };
     LibtorchStatus { info, valid_dir, archs_match }
 }
 
@@ -742,49 +722,8 @@ fn check_libtorch_at(
             archs_match: Vec::new(),
         };
     }
-    let mut info = LibtorchInfo {
-        path: dir.display().to_string(),
-        torch_version: None,
-        cuda_version: None,
-        archs: None,
-        source: None,
-    };
-    if let Ok(content) = std::fs::read_to_string(dir.join(".arch")) {
-        for line in content.lines() {
-            if let Some(v) = line.strip_prefix("torch=") {
-                info.torch_version = Some(v.into());
-            } else if let Some(v) = line.strip_prefix("cuda=") {
-                info.cuda_version = Some(v.into());
-            } else if let Some(v) = line.strip_prefix("archs=") {
-                info.archs = Some(v.into());
-            } else if let Some(v) = line.strip_prefix("source=") {
-                info.source = Some(v.into());
-            }
-        }
-    }
-    let mut archs_match = Vec::new();
-    if let Some(archs) = &info.archs {
-        for g in gpus {
-            archs_match.push((g.index, detect::arch_compatible(g, archs)));
-        }
-        for g in gpus {
-            if !detect::arch_compatible(g, archs) {
-                issues.push(format!(
-                    "GPU {} ({}, {}) not covered by libtorch archs `{}`.",
-                    g.index,
-                    g.short_name(),
-                    g.sm_version(),
-                    archs
-                ));
-            }
-        }
-    } else {
-        issues.push(format!(
-            "libtorch at `{}` is present but `.arch` metadata is \
-             missing — cannot verify GPU compatibility.",
-            dir.display()
-        ));
-    }
+    let info = detect::libtorch_info_from_dir(dir.display().to_string(), dir);
+    let archs_match = detect::arch_coverage(&info, gpus, issues);
     LibtorchStatus { info: Some(info), valid_dir: true, archs_match }
 }
 
@@ -808,28 +747,8 @@ fn check_libtorch(
                 if variant.is_empty() {
                     None
                 } else {
-                    let mut info = LibtorchInfo {
-                        path: variant.clone(),
-                        torch_version: None,
-                        cuda_version: None,
-                        archs: None,
-                        source: None,
-                    };
-                    let arch_file = root.join(&variant).join(".arch");
-                    if let Ok(c) = std::fs::read_to_string(arch_file) {
-                        for line in c.lines() {
-                            if let Some(v) = line.strip_prefix("torch=") {
-                                info.torch_version = Some(v.into());
-                            } else if let Some(v) = line.strip_prefix("cuda=") {
-                                info.cuda_version = Some(v.into());
-                            } else if let Some(v) = line.strip_prefix("archs=") {
-                                info.archs = Some(v.into());
-                            } else if let Some(v) = line.strip_prefix("source=") {
-                                info.source = Some(v.into());
-                            }
-                        }
-                    }
-                    Some(info)
+                    let arch_dir = root.join(&variant);
+                    Some(detect::libtorch_info_from_dir(variant, &arch_dir))
                 }
             }
             None => None,
@@ -848,42 +767,18 @@ fn check_libtorch(
         None => false,
     };
 
-    let mut archs_match: Vec<(u8, bool)> = Vec::new();
-    if let Some(i) = &info {
-        if let Some(archs) = &i.archs {
-            for g in gpus {
-                archs_match.push((g.index, detect::arch_compatible(g, archs)));
-            }
-            // Report any GPU not covered as an issue.
-            for g in gpus {
-                if !detect::arch_compatible(g, archs) {
-                    issues.push(format!(
-                        "GPU {} ({}, {}) not covered by libtorch archs `{}`. \
-                         Rebuild libtorch with this arch or activate a \
-                         compatible variant.",
-                        g.index,
-                        g.short_name(),
-                        g.sm_version(),
-                        archs
-                    ));
-                }
-            }
-        } else {
+    let archs_match = match &info {
+        Some(i) => detect::arch_coverage(i, gpus, issues),
+        None => {
             issues.push(
-                "libtorch is present but `.arch` metadata is missing — \
-                 cannot verify GPU compatibility. Place an `.arch` file \
-                 in the variant directory (cuda=, torch=, archs=, source=)."
+                "libtorch not configured — `libtorch/.active` missing or \
+                 empty. Run `fdl libtorch download` or `fdl libtorch build` \
+                 to provision a variant."
                     .into(),
             );
+            Vec::new()
         }
-    } else {
-        issues.push(
-            "libtorch not configured — `libtorch/.active` missing or \
-             empty. Run `fdl libtorch download` or `fdl libtorch build` \
-             to provision a variant."
-                .into(),
-        );
-    }
+    };
 
     LibtorchStatus { info, valid_dir, archs_match }
 }

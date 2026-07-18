@@ -77,7 +77,18 @@ pub fn read_active_from(pointer: &Path, libtorch_root: &Path) -> Option<Libtorch
     if path.is_empty() {
         return None;
     }
-    let arch_path = libtorch_root.join(&path).join(".arch");
+    let arch_dir = libtorch_root.join(&path);
+    Some(libtorch_info_from_dir(path, &arch_dir))
+}
+
+/// Build a [`LibtorchInfo`] for a variant directory: `path` is the string
+/// recorded in the info (a relative variant path like `precompiled/cu128`
+/// or an absolute directory), `arch_dir` is the directory whose `.arch`
+/// file supplies the metadata. The four metadata fields stay `None` when
+/// the `.arch` file is absent or unreadable. One home for the parse that
+/// `read_active_from`, `run::resolve_libtorch_at`, and probe's
+/// `check_libtorch*` all used to copy inline.
+pub(crate) fn libtorch_info_from_dir(path: String, arch_dir: &Path) -> LibtorchInfo {
     let mut info = LibtorchInfo {
         path,
         torch_version: None,
@@ -85,20 +96,65 @@ pub fn read_active_from(pointer: &Path, libtorch_root: &Path) -> Option<Libtorch
         archs: None,
         source: None,
     };
-    if let Ok(content) = fs::read_to_string(arch_path) {
-        for line in content.lines() {
-            if let Some(val) = line.strip_prefix("torch=") {
-                info.torch_version = Some(val.to_string());
-            } else if let Some(val) = line.strip_prefix("cuda=") {
-                info.cuda_version = Some(val.to_string());
-            } else if let Some(val) = line.strip_prefix("archs=") {
-                info.archs = Some(val.to_string());
-            } else if let Some(val) = line.strip_prefix("source=") {
-                info.source = Some(val.to_string());
-            }
+    if let Ok(content) = fs::read_to_string(arch_dir.join(".arch")) {
+        parse_arch_into(&content, &mut info);
+    }
+    info
+}
+
+/// Fill a [`LibtorchInfo`]'s metadata fields from `.arch` file content
+/// (`torch=` / `cuda=` / `archs=` / `source=` lines; unknown lines ignored).
+fn parse_arch_into(content: &str, info: &mut LibtorchInfo) {
+    for line in content.lines() {
+        if let Some(val) = line.strip_prefix("torch=") {
+            info.torch_version = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("cuda=") {
+            info.cuda_version = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("archs=") {
+            info.archs = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("source=") {
+            info.source = Some(val.to_string());
         }
     }
-    Some(info)
+}
+
+/// Record per-GPU arch coverage for a resolved variant and push a loud,
+/// actionable issue for every GPU the libtorch build does not cover — or a
+/// single issue when the variant carries no `.arch` metadata. Returns
+/// `(gpu_index, covered)` pairs in GPU order. One home for the coverage
+/// loop probe's three `check_libtorch*` paths used to copy inline (with
+/// drifted wording).
+pub(crate) fn arch_coverage(
+    info: &LibtorchInfo,
+    gpus: &[GpuInfo],
+    issues: &mut Vec<String>,
+) -> Vec<(u8, bool)> {
+    let mut archs_match = Vec::new();
+    if let Some(archs) = &info.archs {
+        for g in gpus {
+            let ok = arch_compatible(g, archs);
+            archs_match.push((g.index, ok));
+            if !ok {
+                issues.push(format!(
+                    "GPU {} ({}, {}) not covered by libtorch archs `{}`. \
+                     Rebuild libtorch with this arch or activate a \
+                     compatible variant.",
+                    g.index,
+                    g.short_name(),
+                    g.sm_version(),
+                    archs
+                ));
+            }
+        }
+    } else {
+        issues.push(
+            "libtorch is present but `.arch` metadata is missing — cannot \
+             verify GPU compatibility. Place an `.arch` file in the variant \
+             directory (cuda=, torch=, archs=, source=)."
+                .into(),
+        );
+    }
+    archs_match
 }
 
 /// List all installed libtorch variants under `<root>/libtorch/`.
