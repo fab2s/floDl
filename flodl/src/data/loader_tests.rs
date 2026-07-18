@@ -504,6 +504,56 @@
     }
 
     #[test]
+    fn test_dataset_err_mid_epoch_is_an_err_batch_not_a_dead_loader() {
+        // The firewall's sibling to the panic case: a dataset that RETURNS
+        // `Err` (rather than panicking) mid-epoch must ALSO surface as an
+        // Err batch carrying the message AND leave the worker alive, so the
+        // next epoch still works. `guarded_get_batch` documents these two
+        // paths as behaving identically ("a panic ... becomes an Err batch
+        // ... exactly like a dataset Err does"): the panic branch is
+        // `Err(payload)`, the explicit-Err branch is `Ok(Err(e))`. Only the
+        // former was tested; this locks the latter.
+        struct ErrsOnce {
+            n: usize,
+        }
+        impl DataSet for ErrsOnce {
+            fn len(&self) -> usize {
+                self.n
+            }
+            fn get(&self, index: usize) -> Result<Vec<Tensor>> {
+                if index == 7 {
+                    return Err(TensorError::new(&format!(
+                        "user dataset error: bad record {index}"
+                    )));
+                }
+                Ok(vec![Tensor::from_f32(&[index as f32], &[1], Device::CPU)?])
+            }
+        }
+
+        let mut loader = DataLoader::from_dataset(ErrsOnce { n: 8 })
+            .batch_size(4)
+            .shuffle(false)
+            .drop_last(false)
+            .sample_cache(false)
+            .streaming()
+            .build()
+            .unwrap();
+
+        // Epoch 0, sequential: batch 0 = samples 0..4 (fine), batch 1 hits
+        // sample 7 -> Err carrying the dataset's own message.
+        let results: Vec<Result<Batch>> = loader.epoch(0).collect();
+        assert!(results.iter().any(|r| matches!(
+            r,
+            Err(e) if e.to_string().contains("bad record 7")
+        )), "expected a dataset-Err-carrying Err batch, got: {:?}",
+            results.iter().map(|r| r.as_ref().map(|_| "ok").map_err(|e| e.to_string())).collect::<Vec<_>>());
+
+        // The worker survived: the next epoch's clean batch still arrives.
+        let first = loader.epoch(1).next().unwrap();
+        assert!(first.is_ok(), "worker must survive a dataset Err: {:?}", first.err());
+    }
+
+    #[test]
     fn test_streaming_sequential() {
         let mut loader = DataLoader::from_dataset(SequentialData { n: 10 })
             .batch_size(3)
