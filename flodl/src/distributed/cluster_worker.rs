@@ -71,7 +71,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::wire::{read_handshake_ack, write_handshake_rank};
 use crate::distributed::ddp_run::{
-    CheckpointFn, ControlMsg, EpochFn, EpochPlan, EvalFn, GpuWorker, TimingMsg, WorkerConfig,
+    ControlMsg, EpochFn, EpochPlan, GpuWorker, RankCallbacks, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::NcclRankComm;
 use crate::distributed::relay::mux::{try_read_len_framed, write_len_framed, LenFramedRead};
@@ -148,7 +148,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
     /// All `Send` ingredients must be passed in; the closures run on
     /// the spawning thread because `GpuWorker<M>` is not `Send`.
     #[allow(clippy::too_many_arguments)]
-    pub fn connect_and_build<F, G, O>(
+    pub(crate) fn connect_and_build<F, G, O>(
         coord_addr: SocketAddr,
         cpu_client: Option<crate::distributed::cpu_reduce::CpuReduceClient>,
         rank_id: u32,
@@ -158,19 +158,20 @@ impl<M: Module + 'static> ClusterWorker<M> {
         optim_factory: G,
         dataset: Arc<dyn BatchDataSet>,
         nccl_comm: Option<NcclRankComm>,
-        checkpoint_fn: Option<CheckpointFn<M>>,
-        epoch_fn: Option<EpochFn<M>>,
-        eval_fn: Option<EvalFn<M>>,
-        eval_dataset: Option<Arc<dyn BatchDataSet>>,
-        outer_optimizer_factory: Option<
-            crate::distributed::outer_optimizer::OuterOptimizerFactory,
-        >,
+        rank_callbacks: RankCallbacks<M>,
     ) -> Result<Self>
     where
         F: FnOnce(Device) -> Result<M>,
         G: FnOnce(&[Parameter]) -> O,
         O: Optimizer + 'static,
     {
+        let RankCallbacks {
+            checkpoint_fn,
+            epoch_fn,
+            eval_fn,
+            eval_dataset,
+            outer_optimizer_factory,
+        } = rank_callbacks;
         if rank_id as usize >= config.world_size {
             return Err(TensorError::new(&format!(
                 "cluster_worker: rank_id {rank_id} >= world_size {}",

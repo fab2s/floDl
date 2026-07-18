@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::{
-    ApplyPolicy, AverageBackend, CheckpointFn, DdpRunConfig, EpochCallbackPolicy,
-    EpochFn, EvalFn, SchedulerFn, TrainedState, WorkerConfig,
+    ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy,
+    RankCallbacks, SchedulerFn, TrainedState, WorkerConfig,
 };
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -159,13 +159,7 @@ impl DdpHandle {
         num_epochs: usize,
         config: DdpRunConfig,
         scheduler_fn: Option<SchedulerFn>,
-        epoch_fn: Option<EpochFn<M>>,
-        checkpoint_fn: Option<CheckpointFn<M>>,
-        eval_fn: Option<EvalFn<M>>,
-        eval_dataset: Option<Arc<dyn BatchDataSet>>,
-        outer_optimizer_factory: Option<
-            crate::distributed::outer_optimizer::OuterOptimizerFactory,
-        >,
+        rank_callbacks: RankCallbacks<M>,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -174,6 +168,13 @@ impl DdpHandle {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
+        let RankCallbacks {
+            checkpoint_fn,
+            epoch_fn,
+            eval_fn,
+            eval_dataset,
+            outer_optimizer_factory,
+        } = rank_callbacks;
         // `save_path` optional: persistence on unrecoverable failure
         // is opt-in. Unset = run normally, skip saves.
         let save_path = config.save_path.clone();
@@ -477,11 +478,13 @@ impl DdpHandle {
                     optim_factory,
                     dataset,
                     nccl_comm,
-                    checkpoint_fn_for_thread,
-                    epoch_fn_for_thread,
-                    eval_fn_for_thread,
-                    eval_dataset_for_thread,
-                    outer_optimizer_factory,
+                    RankCallbacks {
+                        checkpoint_fn: checkpoint_fn_for_thread,
+                        epoch_fn: epoch_fn_for_thread,
+                        eval_fn: eval_fn_for_thread,
+                        eval_dataset: eval_dataset_for_thread,
+                        outer_optimizer_factory,
+                    },
                 )?;
 
             if let Some(f) = scheduler_fn {

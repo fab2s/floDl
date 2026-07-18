@@ -14,7 +14,7 @@ use crate::tensor::{Device, Result, Tensor};
 
 use crate::distributed::ddp_run::{
     ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard, DdpRunConfig,
-    EpochCallbackPolicy, EpochFn, EpochMetrics, EvalCadence, EvalFn, EvalResultFn,
+    EpochCallbackPolicy, EpochFn, EpochMetrics, EvalCadence, EvalFn, EvalResultFn, RankCallbacks,
     MetricsFn, SchedulerFn,
 };
 use crate::distributed::ddp_run::worker::GpuWorker;
@@ -874,15 +874,17 @@ where
             self.policy,
             self.backend,
             self.config,
-            self.checkpoint_fn,
-            self.epoch_fn,
+            RankCallbacks {
+                checkpoint_fn: self.checkpoint_fn,
+                epoch_fn: self.epoch_fn,
+                eval_fn: self.eval_fn,
+                eval_dataset: self.eval_dataset,
+                outer_optimizer_factory: self.outer_optimizer_factory,
+            },
             self.metrics_fn,
             self.scheduler_fn,
             self.convergence_guard,
-            self.eval_fn,
-            self.eval_dataset,
             self.eval_result_fn,
-            self.outer_optimizer_factory,
         )
     }
 }

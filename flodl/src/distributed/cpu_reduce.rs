@@ -213,11 +213,6 @@ impl CpuReduceClient {
         Ok(())
     }
 
-    /// This rank's id, as told to the controller.
-    pub fn rank_id(&self) -> u32 {
-        self.rank_id
-    }
-
     /// Cluster world_size, as told to the controller.
     pub fn world_size(&self) -> u32 {
         self.world_size
@@ -301,6 +296,12 @@ impl CpuReduceClient {
     /// Convenience: equal-weight mean over the accepted cohort. Each
     /// rank contributes mass `1.0`, so the consensus is the plain mean
     /// of exactly the frames the controller accepted into the round.
+    ///
+    /// No production caller (the param bridge uses the mass-weighted
+    /// [`all_reduce_weighted`](Self::all_reduce_weighted) directly); retained
+    /// as the entry the `two_rank_tensor_average` relay integration test
+    /// drives through the RoundFrame reduce path.
+    #[allow(dead_code)]
     pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
         Ok(self
             .all_reduce_weighted(tensors, RoundKind::Model, 1.0)?
@@ -444,64 +445,6 @@ impl CpuReduceClient {
             *dst = src as f64;
         }
         Ok(())
-    }
-
-    /// AllReduce-average tensors and return this rank's weight-space
-    /// divergence triple `(divergence, post_norm, pre_norm)`.
-    ///
-    /// CPU-routed counterpart to
-    /// [`Ddp::average_params_with_divergence`](crate::distributed::Ddp::average_params_with_divergence).
-    /// Same divergence math (`||W_pre − W_post|| / ||W_post||`,
-    /// `pre_norm = sqrt(Σᵢ ||scratchᵢ||²)`,
-    /// `post_norm = sqrt(Σᵢ ||paramsᵢ||²)`) — only the reduce primitive
-    /// switches from in-place NCCL AllReduce to TCP round-trip via
-    /// [`Self::all_reduce_tensors`].
-    ///
-    /// Unlike NCCL's in-place AllReduce, `all_reduce_tensors` returns
-    /// *new* averaged tensors, so the caller's `params` are mutated via
-    /// a `copy_` step in this method to make the post-AllReduce values
-    /// visible downstream (`foreach_norm` on `params` then reads the
-    /// averaged state).
-    ///
-    /// `scratch` must have the same length as `params` (allocate via the
-    /// cluster-rank helper's pre-loop step, e.g. `zeros_like` per param).
-    ///
-    /// All ranks must call concurrently.
-    pub fn average_params_with_divergence(
-        &mut self,
-        params: &[&Tensor],
-        scratch: &[Tensor],
-    ) -> Result<(f64, Option<f64>, Option<f64>)> {
-        if params.is_empty() {
-            return Ok((0.0, None, None));
-        }
-        if scratch.len() != params.len() {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: average_params_with_divergence: scratch.len() \
-                 ({}) must equal params.len() ({})",
-                scratch.len(),
-                params.len(),
-            )));
-        }
-
-        // Snapshot pre-sync params into scratch.
-        for (dst, src) in scratch.iter().zip(params.iter()) {
-            dst.copy_(src, false)?;
-        }
-
-        // CPU AllReduce-Avg: returns new averaged tensors; copy into
-        // live params so post-AllReduce values are visible to the
-        // foreach_norm pass + downstream training.
-        let averaged = self.all_reduce_tensors(params)?;
-        for (dst, src) in params.iter().zip(&averaged) {
-            dst.copy_(src, false)?;
-        }
-
-        // Divergence triple from the shared math (scratch = pre snapshot,
-        // params = post-AllReduce). One definition across backends so the
-        // convergence guard's cross-backend comparison stays honest.
-        let param_owned: Vec<Tensor> = params.iter().map(|t| (*t).clone()).collect();
-        crate::distributed::divergence::divergence_triple(scratch, &param_owned)
     }
 
 }

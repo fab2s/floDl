@@ -336,11 +336,7 @@
                     |params| crate::nn::SGD::new(params, 0.01, 0.0),
                     dataset,
                     Some(comm),
-                    None,
-                    None,
-                    None, // no eval_fn
-                    None, // no eval_dataset
-                    None, // no outer optimizer
+                    RankCallbacks::default(),
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -539,11 +535,7 @@
                     |params| crate::nn::SGD::new(params, 0.01, 0.0),
                     dataset,
                     Some(comm),
-                    None,
-                    None,
-                    None, // no eval_fn
-                    None, // no eval_dataset
-                    None, // no outer optimizer
+                    RankCallbacks::default(),
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -750,11 +742,7 @@
                     |params| crate::nn::SGD::new(params, 0.01, 0.0),
                     dataset,
                     None, // no NCCL comm — CPU averaging via the bridge
-                    None,
-                    None,
-                    None, // no eval_fn
-                    None, // no eval_dataset
-                    None, // no outer optimizer
+                    RankCallbacks::default(),
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));
@@ -1089,11 +1077,7 @@
                     |params| crate::nn::SGD::new(params, 0.01, 0.0),
                     dataset,
                     None, // no NCCL
-                    None, // no checkpoint
-                    None, // no epoch_fn
-                    None, // no eval_fn
-                    None, // no eval_dataset
-                    None, // no outer optimizer
+                    RankCallbacks::default(),
                 )?;
                 worker.run_until_shutdown(mse_train).map(|_| ())
             }));

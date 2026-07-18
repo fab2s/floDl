@@ -14,8 +14,8 @@ use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use crate::distributed::ddp_run::{
-    ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard, DdpRunConfig, EpochFn,
-    EpochMetrics, EvalFn, EvalResultFn, MetricsFn, SchedulerFn, TrainedState,
+    ApplyPolicy, AverageBackend, ConvergenceGuard, DdpRunConfig, RankCallbacks,
+    EpochMetrics, EvalResultFn, MetricsFn, SchedulerFn, TrainedState,
 };
 use super::coord_config::build_coord_config_from_builder;
 
@@ -112,17 +112,11 @@ impl DdpHandle {
         policy: ApplyPolicy,
         backend: AverageBackend,
         config: DdpRunConfig,
-        checkpoint_fn: Option<CheckpointFn<M>>,
-        epoch_fn: Option<EpochFn<M>>,
+        rank_callbacks: RankCallbacks<M>,
         metrics_fn: Option<MetricsFn>,
         scheduler_fn: Option<SchedulerFn>,
         convergence_guard: Option<Box<dyn ConvergenceGuard>>,
-        eval_fn: Option<EvalFn<M>>,
-        eval_dataset: Option<Arc<dyn BatchDataSet>>,
         eval_result_fn: Option<EvalResultFn>,
-        outer_optimizer_factory: Option<
-            crate::distributed::outer_optimizer::OuterOptimizerFactory,
-        >,
     ) -> Result<Self>
     where
         F: Fn(Device) -> Result<M> + Send + Sync + 'static,
@@ -279,7 +273,7 @@ impl DdpHandle {
                 // untouched. Constructed here, off any CUDA context, so it
                 // honors the "no CUDA before training" launcher invariant.
                 let mut outer_optimizer =
-                    outer_optimizer_factory.as_ref().map(|f| f());
+                    rank_callbacks.outer_optimizer_factory.as_ref().map(|f| f());
                 // Resume: re-seed the outer optimizer's momentum from
                 // `<stem>.outer.fdl` (the outer momentum lives controller-side,
                 // so the launcher restores it, not the ranks). Skipped when not
@@ -465,11 +459,7 @@ impl DdpHandle {
                     num_epochs,
                     config,
                     scheduler_fn,
-                    epoch_fn,
-                    checkpoint_fn,
-                    eval_fn,
-                    eval_dataset,
-                    outer_optimizer_factory,
+                    rank_callbacks,
                 );
                 return match dispatch_result {
                     Ok(h) => Ok(h),
@@ -499,10 +489,14 @@ impl DdpHandle {
         if devices.len() < 2 {
             let dev = devices.first().copied().unwrap_or(Device::CPU);
             let scheduler = scheduler_fn.map(|f| f(1));
+            // Single-device path uses the rank callbacks minus the outer
+            // optimizer (there is no cross-rank averaging to steer here).
+            let RankCallbacks { checkpoint_fn, epoch_fn, eval_fn, eval_dataset, .. } =
+                rank_callbacks;
             return Self::run_single(
                 &model_factory, &optim_factory, &train_fn,
                 dataset, batch_size, num_epochs, dev,
-                checkpoint_fn.as_ref().cloned(),
+                checkpoint_fn,
                 config.checkpoint_every,
                 epoch_fn,
                 metrics_fn,

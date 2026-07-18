@@ -246,6 +246,39 @@ pub type EvalResultFn = std::sync::Arc<
 /// `Vec<f64>` per param group.
 pub type SchedulerFn = Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>;
 
+/// The rank-executed callbacks, bundled.
+///
+/// These five thread verbatim down the rank chain (`launch` →
+/// `run_cluster_rank_via_coord` → `ClusterWorker::connect_and_build`)
+/// before the worker consumes them; the coordinator-side callbacks
+/// (`metrics_fn`, `scheduler_fn`, `convergence_guard`, `eval_result_fn`)
+/// branch off to the coordinator and stay separate. Bundling only this
+/// verbatim subset keeps each signature honest — no layer carries a
+/// callback it doesn't run. Moved (not cloned) through the chain.
+pub(crate) struct RankCallbacks<M: crate::nn::Module> {
+    pub checkpoint_fn: Option<CheckpointFn<M>>,
+    pub epoch_fn: Option<EpochFn<M>>,
+    pub eval_fn: Option<EvalFn<M>>,
+    pub eval_dataset: Option<Arc<dyn crate::data::BatchDataSet>>,
+    pub outer_optimizer_factory:
+        Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
+}
+
+// Hand-written (not derived) so it doesn't require `M: Default` — every
+// field is `None` regardless of `M`. The all-`None` bundle is the
+// "no callbacks" case (tests, callback-free runs).
+impl<M: crate::nn::Module> Default for RankCallbacks<M> {
+    fn default() -> Self {
+        RankCallbacks {
+            checkpoint_fn: None,
+            epoch_fn: None,
+            eval_fn: None,
+            eval_dataset: None,
+            outer_optimizer_factory: None,
+        }
+    }
+}
+
 /// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
 /// `checkpoint_fn`, and future `eval_fn`).
 ///
