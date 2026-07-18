@@ -413,6 +413,38 @@ fn slice_batch(gpu_data: &[Tensor], start: usize, end: usize, device: Device) ->
         .collect::<Result<Vec<_>>>()
 }
 
+/// Sample-weighted mean of `eval_fn` over `data`, batched by `bs`, under
+/// `no_grad`. A trailing partial batch (`< bs`) is dropped — every bench
+/// eval site did this. The caller owns the model's eval/train mode toggle.
+///
+/// This is THE bench evaluation loop. It was copied four ways (solo
+/// per-epoch, unified final, the per-epoch `eval_fn` callback, the solo
+/// fallback); any drift between copies silently corrupts the published
+/// speedup / eval tables, so there is exactly one now.
+fn eval_weighted(
+    model: &dyn Module,
+    data: &[Tensor],
+    bs: usize,
+    device: Device,
+    eval_fn: fn(&dyn Module, &[Tensor]) -> Result<f64>,
+) -> Result<f64> {
+    flodl::autograd::no_grad(|| -> Result<f64> {
+        let n = data[0].shape()[0] as usize;
+        let mut total_metric = 0.0;
+        let mut samples = 0usize;
+        for start in (0..n).step_by(bs) {
+            let end = (start + bs).min(n);
+            if end - start < bs {
+                break;
+            }
+            let batch = slice_batch(data, start, end, device)?;
+            total_metric += eval_fn(model, &batch)? * (end - start) as f64;
+            samples += end - start;
+        }
+        Ok(if samples > 0 { total_metric / samples as f64 } else { 0.0 })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Solo GPU
 // ---------------------------------------------------------------------------
@@ -529,20 +561,7 @@ fn run_baseline_solo(
                 model.eval();
                 let eval_start = Instant::now();
                 let eval_data = test_gpu_data.as_deref().unwrap_or(&gpu_data);
-                let eval_n = eval_data[0].shape()[0] as usize;
-                let avg = flodl::autograd::no_grad(|| -> Result<f64> {
-                    let mut total_metric = 0.0;
-                    let mut eval_samples = 0usize;
-                    for batch_start in (0..eval_n).step_by(bs) {
-                        let end = (batch_start + bs).min(eval_n);
-                        if end - batch_start < bs { break; }
-                        let batch = slice_batch(eval_data, batch_start, end, device)?;
-                        let metric = eval_fn(model.as_ref(), &batch)?;
-                        total_metric += metric * (end - batch_start) as f64;
-                        eval_samples += end - batch_start;
-                    }
-                    Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
-                })?;
+                let avg = eval_weighted(model.as_ref(), eval_data, bs, device, eval_fn)?;
                 let eval_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
                 total_eval_ms += eval_ms;
                 model.train();
@@ -917,20 +936,7 @@ fn run_unified(
             let prev_epoch = epoch - 1;
             let model: &Box<dyn Module> = worker.model();
             model.eval();
-            let result = flodl::autograd::no_grad(|| -> Result<f64> {
-                let n = test_data[0].shape()[0] as usize;
-                let mut total_metric = 0.0;
-                let mut samples = 0usize;
-                for batch_start in (0..n).step_by(bs) {
-                    let end = (batch_start + bs).min(n);
-                    if end - batch_start < bs { break; }
-                    let batch = slice_batch(&test_data, batch_start, end, device)?;
-                    let metric = eval_fn(model.as_ref(), &batch)?;
-                    total_metric += metric * (end - batch_start) as f64;
-                    samples += end - batch_start;
-                }
-                Ok(if samples > 0 { total_metric / samples as f64 } else { 0.0 })
-            });
+            let result = eval_weighted(model.as_ref(), &test_data, bs, device, eval_fn);
             model.train();
             if let Ok(metric) = result {
                 let _ = eval_tx_efn.send((prev_epoch, metric));
@@ -980,21 +986,7 @@ fn run_unified(
                     .map(|p| p.variable.data().device())
                     .unwrap_or(Device::CPU);
                 let data = preload_full_dataset(ds, device)?;
-                let n = data[0].shape()[0] as usize;
-                flodl::autograd::no_grad(|| -> Result<f64> {
-                    let mut total = 0.0;
-                    let mut samples = 0usize;
-                    for start in (0..n).step_by(bs) {
-                        let end = (start + bs).min(n);
-                        if end - start < bs {
-                            break;
-                        }
-                        let batch = slice_batch(&data, start, end, device)?;
-                        total += eval_fn(model.as_ref(), &batch)? * (end - start) as f64;
-                        samples += end - start;
-                    }
-                    Ok(if samples > 0 { total / samples as f64 } else { 0.0 })
-                })
+                eval_weighted(model.as_ref(), &data, bs, device, eval_fn)
             });
     }
 
@@ -1158,22 +1150,8 @@ fn run_unified(
         // Load test data (or fall back to training data).
         let eval_dataset = test_dataset.as_ref().unwrap_or(&dataset);
         let eval_data = preload_full_dataset(eval_dataset.as_ref(), device)?;
-        let n = eval_data[0].shape()[0] as usize;
         let bs = config.batch_size;
-
-        let avg = flodl::autograd::no_grad(|| -> Result<f64> {
-            let mut total_metric = 0.0;
-            let mut eval_samples = 0usize;
-            for batch_start in (0..n).step_by(bs) {
-                let end = (batch_start + bs).min(n);
-                if end - batch_start < bs { break; }
-                let batch = slice_batch(&eval_data, batch_start, end, device)?;
-                let metric = eval_fn(model.as_ref(), &batch)?;
-                total_metric += metric * (end - batch_start) as f64;
-                eval_samples += end - batch_start;
-            }
-            Ok(if eval_samples > 0 { total_metric / eval_samples as f64 } else { 0.0 })
-        })?;
+        let avg = eval_weighted(model.as_ref(), &eval_data, bs, device, eval_fn)?;
 
         let line = format!("final eval={avg:.4}");
         eprintln!("    {line}");
