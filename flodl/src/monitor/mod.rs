@@ -1057,8 +1057,29 @@ impl Monitor {
 
     /// Serialize an epoch record to JSON from a stored record.
     fn epoch_record_to_json(&self, record: &EpochRecord) -> String {
-        let epoch_display = record.epoch + 1;
+        self.epoch_json(record, record.epoch + 1, None)
+    }
 
+    /// Serialize the latest epoch record to JSON (no serde), with a live ETA.
+    fn epoch_to_json(&self, epoch: usize) -> String {
+        let record = &self.epochs[self.epochs.len() - 1];
+        let epoch_display = epoch + 1;
+        // ETA only while epochs remain (not on the final epoch).
+        let eta = if epoch_display < self.total_epochs {
+            let elapsed = self.start_time.elapsed().as_secs_f64();
+            let per_epoch = elapsed / epoch_display as f64;
+            Some(per_epoch * (self.total_epochs - epoch_display) as f64)
+        } else {
+            None
+        };
+        self.epoch_json(record, epoch_display, eta)
+    }
+
+    /// Shared epoch-record JSON body: `{ epoch, total, duration [, eta] +
+    /// metrics + resources + gpus }` (no serde). `eta` (seconds) is emitted
+    /// only when present and finite — the sole difference between the
+    /// stored-record and live-latest serializers.
+    fn epoch_json(&self, record: &EpochRecord, epoch_display: usize, eta: Option<f64>) -> String {
         let mut b = String::with_capacity(512);
         b.push('{');
         let _ = write!(
@@ -1069,37 +1090,10 @@ impl Monitor {
             record.duration_secs,
         );
 
-        Self::write_metrics(&mut b, &record.metrics);
-        Self::write_resources(&mut b, &record.resources);
-        Self::write_gpus(&mut b, &record.resources, &record.gpu_metrics);
-
-        b.push('}');
-        b
-    }
-
-    /// Serialize an epoch record to JSON (no serde).
-    fn epoch_to_json(&self, epoch: usize) -> String {
-        let record = &self.epochs[self.epochs.len() - 1];
-
-        let mut b = String::with_capacity(512);
-        b.push('{');
-        let _ = write!(
-            b,
-            "\"epoch\":{},\"total\":{},\"duration\":{:.4}",
-            epoch + 1,
-            self.total_epochs,
-            record.duration_secs,
-        );
-
-        // ETA
-        let epoch_display = epoch + 1;
-        if epoch_display < self.total_epochs && epoch_display > 0 {
-            let elapsed = self.start_time.elapsed().as_secs_f64();
-            let per_epoch = elapsed / epoch_display as f64;
-            let remaining = per_epoch * (self.total_epochs - epoch_display) as f64;
-            if remaining.is_finite() {
-                let _ = write!(b, ",\"eta\":{:.1}", remaining);
-            }
+        if let Some(remaining) = eta
+            && remaining.is_finite()
+        {
+            let _ = write!(b, ",\"eta\":{:.1}", remaining);
         }
 
         Self::write_metrics(&mut b, &record.metrics);

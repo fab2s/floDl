@@ -445,6 +445,30 @@ fn eval_weighted(
     })
 }
 
+/// One solo training step: forward via `train_fn`, apply this batch's LR
+/// from `scheduler` (if any), then zero / backward / step. Returns the
+/// scalar loss. Shared by `run_baseline_solo`'s real-data and pooled-batch
+/// loops so the step logic (LR-schedule point, grad-reset order) can't
+/// drift between them and skew the published solo baseline.
+fn train_step(
+    model: &dyn Module,
+    optimizer: &mut dyn Optimizer,
+    scheduler: Option<&dyn flodl::nn::Scheduler>,
+    train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
+    batch: &[Tensor],
+    global_batch: usize,
+) -> Result<f64> {
+    let loss = train_fn(model, batch)?;
+    let loss_val = loss.item()?;
+    if let Some(sched) = scheduler {
+        optimizer.set_lr(sched.lr(global_batch));
+    }
+    optimizer.zero_grad();
+    loss.backward()?;
+    optimizer.step()?;
+    Ok(loss_val)
+}
+
 // ---------------------------------------------------------------------------
 // Solo GPU
 // ---------------------------------------------------------------------------
@@ -528,17 +552,14 @@ fn run_baseline_solo(
                     batch
                 };
 
-                let loss = (model_def.train_fn)(model.as_ref(), &batch)?;
-                let loss_val = loss.item()?;
-
-                if let Some(ref sched) = scheduler {
-                    optimizer.set_lr(sched.lr(global_batch));
-                }
-                optimizer.zero_grad();
-                loss.backward()?;
-                optimizer.step()?;
-
-                total_loss += loss_val;
+                total_loss += train_step(
+                    model.as_ref(),
+                    &mut *optimizer,
+                    scheduler.as_deref(),
+                    model_def.train_fn,
+                    &batch,
+                    global_batch,
+                )?;
                 batch_count += 1;
                 global_batch += 1;
             }
@@ -606,17 +627,14 @@ fn run_baseline_solo(
             for batch_idx in 0..batches_per_epoch {
                 let batch = &gpu_pool[batch_idx % pool_len];
 
-                let loss = (model_def.train_fn)(model.as_ref(), batch)?;
-                let loss_val = loss.item()?;
-
-                if let Some(ref sched) = scheduler {
-                    optimizer.set_lr(sched.lr(global_batch));
-                }
-                optimizer.zero_grad();
-                loss.backward()?;
-                optimizer.step()?;
-
-                total_loss += loss_val;
+                total_loss += train_step(
+                    model.as_ref(),
+                    &mut *optimizer,
+                    scheduler.as_deref(),
+                    model_def.train_fn,
+                    batch,
+                    global_batch,
+                )?;
                 global_batch += 1;
             }
 

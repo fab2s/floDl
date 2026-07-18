@@ -834,56 +834,38 @@ impl Graph {
     /// (e.g. `"linear_1"`). When a node has multiple parameters with the same
     /// name, suffixes `_0`, `_1`, ... are appended to disambiguate.
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        // Build reverse map: node_idx → tag name
-        let mut idx_to_tag: HashMap<usize, String> = HashMap::new();
-        for (tag, &(ni, _)) in &self.tag_names {
-            // First tag wins (deterministic because we only need one prefix)
-            idx_to_tag.entry(ni).or_insert_with(|| tag.clone());
-        }
-
-        let mut result = Vec::new();
-        let mut seen = HashSet::new();
-
-        for &ni in &self.order {
-            if let Some(ref module) = self.nodes[ni].module {
-                let prefix = idx_to_tag.get(&ni)
-                    .cloned()
-                    .unwrap_or_else(|| self.nodes[ni].id.clone());
-
-                let params = module.parameters();
-                // Check for duplicate param names within this node
-                let mut name_counts: HashMap<String, usize> = HashMap::new();
-                for p in &params {
-                    *name_counts.entry(p.name.clone()).or_insert(0) += 1;
-                }
-
-                let mut name_idx: HashMap<String, usize> = HashMap::new();
-                for p in params {
-                    let ptr = p.variable.id();
-                    if !seen.insert(ptr) {
-                        continue;
-                    }
-
-                    let qualified = if name_counts[&p.name] > 1 {
-                        let idx = name_idx.entry(p.name.clone()).or_insert(0);
-                        let q = format!("{}/{}_{}", prefix, p.name, idx);
-                        *idx += 1;
-                        q
-                    } else {
-                        format!("{}/{}", prefix, p.name)
-                    };
-
-                    result.push((qualified, p));
-                }
-            }
-        }
-
-        result
+        self.named_items(
+            |m| m.parameters(),
+            |p| p.variable.id(),
+            |p| p.name.clone(),
+        )
     }
 
     /// Return buffers with qualified names, using the same prefix logic
     /// as `named_parameters()`.
     pub fn named_buffers(&self) -> Vec<(String, Buffer)> {
+        self.named_items(
+            |m| m.buffers(),
+            |b| b.id(),
+            |b| b.name.clone(),
+        )
+    }
+
+    /// Shared body of [`named_parameters`](Self::named_parameters) and
+    /// [`named_buffers`](Self::named_buffers): walk nodes in execution
+    /// order, prefix each item by its node's tag (first tag wins) or node
+    /// ID, dedup by identity (`id_of`), and disambiguate same-named items
+    /// within a node with `_0`/`_1`/... suffixes. `collect` pulls the
+    /// items from a module; `id_of`/`name_of` read an item's identity and
+    /// name (the only points where `Parameter` and `Buffer` differ).
+    fn named_items<T>(
+        &self,
+        collect: impl Fn(&dyn crate::nn::Module) -> Vec<T>,
+        id_of: impl Fn(&T) -> usize,
+        name_of: impl Fn(&T) -> String,
+    ) -> Vec<(String, T)> {
+        // Reverse map: node_idx → tag name (first tag wins; deterministic
+        // because we only need one prefix).
         let mut idx_to_tag: HashMap<usize, String> = HashMap::new();
         for (tag, &(ni, _)) in &self.tag_names {
             idx_to_tag.entry(ni).or_insert_with(|| tag.clone());
@@ -898,29 +880,29 @@ impl Graph {
                     .cloned()
                     .unwrap_or_else(|| self.nodes[ni].id.clone());
 
-                let bufs = module.buffers();
+                let items = collect(module.as_ref());
+                // Count duplicate names within this node.
                 let mut name_counts: HashMap<String, usize> = HashMap::new();
-                for b in &bufs {
-                    *name_counts.entry(b.name.clone()).or_insert(0) += 1;
+                for it in &items {
+                    *name_counts.entry(name_of(it)).or_insert(0) += 1;
                 }
 
                 let mut name_idx: HashMap<String, usize> = HashMap::new();
-                for b in bufs {
-                    let ptr = b.id();
-                    if !seen.insert(ptr) {
+                for it in items {
+                    if !seen.insert(id_of(&it)) {
                         continue;
                     }
-
-                    let qualified = if name_counts[&b.name] > 1 {
-                        let idx = name_idx.entry(b.name.clone()).or_insert(0);
-                        let q = format!("{}/{}_{}", prefix, b.name, idx);
+                    let name = name_of(&it);
+                    let qualified = if name_counts[&name] > 1 {
+                        let idx = name_idx.entry(name.clone()).or_insert(0);
+                        let q = format!("{}/{}_{}", prefix, name, idx);
                         *idx += 1;
                         q
                     } else {
-                        format!("{}/{}", prefix, b.name)
+                        format!("{}/{}", prefix, name)
                     };
 
-                    result.push((qualified, b));
+                    result.push((qualified, it));
                 }
             }
         }
