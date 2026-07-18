@@ -792,6 +792,8 @@ supports. If `nvidia-smi` works, floDl trains on it.
 - [`schedulers`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/schedulers/) — warmup + cosine + plateau composition
 - [`observation`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/observation/) — collect, flush, trend queries, early stopping
 - [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/) — every graph builder method in one graph
+- [`bio/dnaseq_conv1d`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dnaseq_conv1d/): DNA Conv1D motif classifier (synthetic ChIP-seq peak annotation)
+- [`bio/dna_autoencoder`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dna_autoencoder/): DNA convolutional autoencoder with checkpoint round-trip
 
 ### Porting from PyTorch
 

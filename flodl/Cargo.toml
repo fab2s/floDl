@@ -83,4 +83,14 @@ name = "regression"
 path = "examples/regression/main.rs"
 doc-scrape-examples = false
 
+[[example]]
+name = "dnaseq_conv1d"
+path = "examples/bio/dnaseq_conv1d/main.rs"
+doc-scrape-examples = false
+
+[[example]]
+name = "dna_autoencoder"
+path = "examples/bio/dna_autoencoder/main.rs"
+doc-scrape-examples = false
+
 [dev-dependencies]
