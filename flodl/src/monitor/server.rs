@@ -336,10 +336,14 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
             Some(j) => j.clone(),
             None => "null".to_string(),
         };
-        let inject = format!(
-            "<script>const LIVE_LABEL={};const LIVE_HASH={};const LIVE_HARDWARE={};const LIVE_META={};const LIVE_GPU_INIT={};</script>\n",
+        // Neutralize any </script> in the injected DATA before wrapping it
+        // in the tag — the HTML parser would otherwise close the block early
+        // on a label/hash/hardware/metadata value containing </script>.
+        let consts = super::neutralize_script_close(&format!(
+            "const LIVE_LABEL={};const LIVE_HASH={};const LIVE_HARDWARE={};const LIVE_META={};const LIVE_GPU_INIT={};",
             label_js, hash_js, hw_js, meta_js, gpu_init_js,
-        );
+        ));
+        let inject = format!("<script>{}</script>\n", consts);
         DASHBOARD_HTML.replace("<script>", &format!("{}<script>", inject))
     } else {
         DASHBOARD_HTML.to_string()

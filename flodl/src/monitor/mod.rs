@@ -880,20 +880,16 @@ impl Monitor {
             let _ = write!(data_json, "{}", self.epoch_record_to_json(record));
         }
         data_json.push(']');
-        // Prevent HTML parser from seeing </script> in embedded JSON
-        let data_json = data_json
-            .replace("</script", "<\\/script")
-            .replace("</SCRIPT", "<\\/SCRIPT");
 
-        // SVG as a JS string literal (template literal for safe escaping)
+        // SVG as a JS template literal (backtick / ${ escaping is
+        // template-literal safety; the </script> neutralization is applied
+        // once to the whole assembled block below).
         let svg_js = match &self.svg_snapshot {
             Some(svg) => {
                 let escaped = svg
                     .replace('\\', "\\\\")
                     .replace('`', "\\`")
-                    .replace("${", "\\${")
-                    .replace("</script", "<\\/script")
-                    .replace("</SCRIPT", "<\\/SCRIPT");
+                    .replace("${", "\\${");
                 format!("`{}`", escaped)
             }
             None => "null".to_string(),
@@ -909,11 +905,7 @@ impl Monitor {
             None => "null".to_string(),
         };
         let meta_js = match &self.metadata {
-            Some(v) => {
-                v.to_string()
-                    .replace("</script", "<\\/script")
-                    .replace("</SCRIPT", "<\\/SCRIPT")
-            }
+            Some(v) => v.to_string(),
             None => "null".to_string(),
         };
 
@@ -927,9 +919,12 @@ impl Monitor {
             .map(|e| Self::gpu_init_json(&e.resources.gpus))
             .unwrap_or_else(|| "null".to_string());
 
-        // Inject archive constants before the main <script> tag
-        let archive_block = format!(
-            "<script>\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n</script>",
+        // Inject archive constants before the main <script> tag. Neutralize
+        // </script> once across the whole assembled body (a value in any
+        // constant — data, svg, label, hash, metadata, hardware — could
+        // otherwise close the tag early; the HTML parser ignores JS quoting).
+        let archive_consts = format!(
+            "\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
             data_json,
             svg_js,
             format_eta(total_time),
@@ -939,6 +934,7 @@ impl Monitor {
             hw_js,
             gpu_init_js,
         );
+        let archive_block = format!("<script>{}</script>", neutralize_script_close(&archive_consts));
 
         let template = include_str!("dashboard.html");
         let html = template
@@ -1121,6 +1117,22 @@ fn digit_count(n: usize) -> usize {
     ((n as f64).log10().floor() as usize) + 1
 }
 
+/// Neutralize `</script>` in data destined for an inline `<script>` block.
+///
+/// The HTML parser scans for `</script` literally, ignorant of JS string
+/// or template-literal quoting, so a data value containing `</script>`
+/// closes the tag early even inside `"..."` or `` `...` ``. This must run
+/// on the whole assembled script body (every injected constant), not
+/// per-value. `<\/script` is transparent everywhere it can land: JSON
+/// (`\/` decodes to `/`), JS string, and template literal all render it as
+/// `</script`. Both dashboard emitters — the live server's `serve_html`
+/// and the static-report archive block — route their injected constants
+/// through this one function so the escape set can't drift between them.
+pub(crate) fn neutralize_script_close(body: &str) -> String {
+    body.replace("</script", "<\\/script")
+        .replace("</SCRIPT", "<\\/SCRIPT")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1144,37 @@ mod tests {
         monitor.log(1, Duration::from_millis(90), &[("loss", 1.2)]);
         assert_eq!(monitor.history().len(), 2);
         assert_eq!(monitor.history()[1].epoch, 1);
+    }
+
+    #[test]
+    fn test_neutralize_script_close() {
+        assert_eq!(neutralize_script_close("a</script>b"), "a<\\/script>b");
+        assert_eq!(neutralize_script_close("x</SCRIPT>y"), "x<\\/SCRIPT>y");
+        assert_eq!(neutralize_script_close("safe data"), "safe data");
+    }
+
+    #[test]
+    fn test_archive_html_neutralizes_script_close_in_data() {
+        // A label or metadata value containing </script> must not break out
+        // of the injected <script> block. Before the fix the label/hash/
+        // hardware constants were embedded without </script> neutralization.
+        let mut monitor = Monitor::new(10);
+        monitor.set_identity(Some("evil</script><script>alert(1)</script>"), None);
+        monitor.set_metadata(serde_json::json!({
+            "note": "meta</script><img src=x onerror=alert(2)>"
+        }));
+        monitor.log(0, Duration::from_millis(100), &[("loss", 1.0)]);
+
+        let html = monitor.build_archive().unwrap();
+
+        // The malicious payloads survive only in neutralized form.
+        assert!(html.contains("evil<\\/script><script>alert(1)<\\/script>"),
+            "label </script> not neutralized");
+        assert!(html.contains("meta<\\/script>"), "metadata </script> not neutralized");
+        // No raw breakout: the ONLY </script> occurrences are structural
+        // closing tags, never immediately preceded by our payload text.
+        assert!(!html.contains("evil</script>"), "raw label breakout present");
+        assert!(!html.contains("meta</script>"), "raw metadata breakout present");
     }
 
     #[test]
