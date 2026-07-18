@@ -444,6 +444,14 @@ mod test_helpers {
         }).unwrap();
         Parameter::new(t, name)
     }
+
+    /// Per-process-unique temp path for `.optim` state-file round-trip tests.
+    pub(super) fn state_tmp(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("flodl_optim_state_{}_{}", std::process::id(), name))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 #[cfg(test)]

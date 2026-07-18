@@ -187,8 +187,45 @@ impl Stateful for Adagrad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_helpers::make_param;
+    use super::super::test_helpers::{make_param, state_tmp};
     use crate::tensor::Tensor;
+
+    #[test]
+    fn test_adagrad_state_file_roundtrip() {
+        // Locks the Stateful impl added for Adagrad: per-param steps + lr
+        // round-trip through the .optim header.
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = Adagrad::new(std::slice::from_ref(&p), 0.02);
+        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        opt.step().unwrap();
+
+        let path = state_tmp("adagrad_roundtrip.optim");
+        opt.save_state_to(&path).unwrap();
+
+        let mut opt2 = Adagrad::new(std::slice::from_ref(&p), 0.5);
+        opt2.load_state_file(&path).unwrap();
+        assert_eq!(opt2.steps, opt.steps);
+        assert!((opt2.lr - 0.02).abs() < 1e-12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_adagrad_reset_state_clears_accum_and_steps() {
+        // reset_state must wipe the accumulated squared-grad sums and the
+        // per-param step counters (lr_decay schedule restarts).
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = Adagrad::new(std::slice::from_ref(&p), 0.01);
+        for _ in 0..3 {
+            p.variable.set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
+            opt.step().unwrap();
+        }
+        assert!(opt.steps.iter().any(|&s| s > 0), "warm-up should advance steps");
+        opt.reset_state();
+        assert!(opt.steps.iter().all(|&s| s == 0), "steps must reset to 0");
+        assert!(opt.state_sum.iter().all(|s| s.is_none()), "state_sum must be cleared");
+    }
 
     #[test]
     fn test_adagrad_steps() {

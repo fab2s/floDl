@@ -393,7 +393,7 @@ impl Stateful for AdamW {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_helpers::make_param;
+    use super::super::test_helpers::{make_param, state_tmp};
     use crate::tensor::Tensor;
 
     #[test]
@@ -845,13 +845,6 @@ mod tests {
             );
         }
         assert_eq!(opt.steps, vec![5, 1], "per-param step counts");
-    }
-
-    fn state_tmp(name: &str) -> String {
-        std::env::temp_dir()
-            .join(format!("flodl_optim_state_{}_{}", std::process::id(), name))
-            .to_string_lossy()
-            .into_owned()
     }
 
     #[test]

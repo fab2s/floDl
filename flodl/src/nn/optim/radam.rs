@@ -183,8 +183,47 @@ impl Stateful for RAdam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_helpers::make_param;
+    use super::super::test_helpers::{make_param, state_tmp};
     use crate::tensor::Tensor;
+
+    #[test]
+    fn test_radam_state_file_roundtrip() {
+        // Locks the Stateful impl added for RAdam: save after a step, load
+        // into a freshly-constructed optimizer (different lr), and the
+        // per-param steps + lr must round-trip through the .optim header.
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = RAdam::new(std::slice::from_ref(&p), 0.02);
+        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        opt.step().unwrap();
+
+        let path = state_tmp("radam_roundtrip.optim");
+        opt.save_state_to(&path).unwrap();
+
+        let mut opt2 = RAdam::new(std::slice::from_ref(&p), 0.5);
+        opt2.load_state_file(&path).unwrap();
+        assert_eq!(opt2.steps, opt.steps);
+        assert!((opt2.lr - 0.02).abs() < 1e-12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_radam_reset_state_clears_moments_and_steps() {
+        // reset_state (DiLoCo disposable-inner) must wipe the moment
+        // estimates and per-param step counters.
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = RAdam::new(std::slice::from_ref(&p), 0.01);
+        for _ in 0..3 {
+            p.variable.set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
+            opt.step().unwrap();
+        }
+        assert!(opt.steps.iter().any(|&s| s > 0), "warm-up should advance steps");
+        opt.reset_state();
+        assert!(opt.steps.iter().all(|&s| s == 0), "steps must reset to 0");
+        assert!(opt.m.iter().all(|s| s.is_none()), "m must be cleared");
+        assert!(opt.v.iter().all(|s| s.is_none()), "v must be cleared");
+    }
 
     #[test]
     fn test_radam_steps() {

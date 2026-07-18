@@ -211,6 +211,40 @@ mod tests {
     }
 
     #[test]
+    fn test_gru_checkpoint_roundtrip_forward_matches() {
+        // End-to-end user path: save_checkpoint(a) -> load_checkpoint into a
+        // freshly-initialized b -> b's forward must match a's. Complements
+        // the set_data cache test: this drives the FULL checkpoint codec +
+        // named-param mapping, and load_checkpoint's internal set_data is
+        // what must trigger the cuDNN cache rebuild.
+        use crate::nn::checkpoint::{load_checkpoint, save_checkpoint};
+        let dev = crate::tensor::test_device();
+        let opts = crate::tensor::test_opts();
+        let a = GRU::on_device(4, 6, 2, false, dev).unwrap();
+        let b = GRU::on_device(4, 6, 2, false, dev).unwrap();
+        let x = Variable::new(Tensor::randn(&[3, 2, 4], opts).unwrap(), false);
+
+        let out_a = a.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let _ = b.forward_seq(&x, None).unwrap(); // build b's cache from its own init
+
+        // Index-named pairs: same order in a and b, so load maps by name.
+        let named = |m: &GRU| -> Vec<(String, crate::nn::Parameter)> {
+            m.parameters().into_iter().enumerate().map(|(i, p)| (i.to_string(), p)).collect()
+        };
+        let mut buf = Vec::new();
+        save_checkpoint(&mut buf, &named(&a), &[], None).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        load_checkpoint(&mut cursor, &named(&b), &[], None).unwrap();
+
+        let out_b = b.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let max_diff = out_a.iter().zip(&out_b).map(|(l, r)| (l - r).abs()).fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "forward after checkpoint load must match source (max diff {max_diff})"
+        );
+    }
+
+    #[test]
     fn test_gru_batch_first() {
         let dev = crate::tensor::test_device();
         let opts = crate::tensor::test_opts();

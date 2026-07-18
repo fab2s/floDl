@@ -199,10 +199,10 @@ pub fn triplet_margin_loss(
     let d_pos = anchor.sub(positive)?.pow_scalar(2.0)?.sum_dim(1, false)?.sqrt()?;
     let d_neg = anchor.sub(negative)?.pow_scalar(2.0)?.sum_dim(1, false)?.sqrt()?;
     let diff = d_pos.sub(&d_neg)?.add_scalar(margin)?;
-    let zero = Variable::wrap(Tensor::zeros(&diff.shape(), crate::tensor::TensorOptions {
-        dtype: crate::tensor::DType::Float32,
-        device: diff.data().device(),
-    })?);
+    // Match the input dtype (zeros_like inherits dtype+device+shape) so a
+    // Float64 loss stays Float64 rather than relying on implicit promotion
+    // of a hardcoded Float32 operand.
+    let zero = Variable::wrap(Tensor::zeros_like(&diff.data())?);
     diff.maximum(&zero)?.mean()
 }
 
@@ -219,16 +219,10 @@ pub fn cosine_embedding_loss(
 ) -> Result<Variable> {
     let cos = x1.cosine_similarity(x2, 1, 1e-8)?;
     // For label=1: 1 - cos; for label=-1: max(0, cos - margin)
-    let ones = Variable::wrap(Tensor::ones(&cos.shape(), crate::tensor::TensorOptions {
-        dtype: crate::tensor::DType::Float32,
-        device: cos.data().device(),
-    })?);
+    let ones = Variable::wrap(Tensor::ones_like(&cos.data())?);
     let loss_pos = ones.sub(&cos)?;
     let cos_minus_margin = cos.add_scalar(-margin)?;
-    let zero = Variable::wrap(Tensor::zeros(&cos.shape(), crate::tensor::TensorOptions {
-        dtype: crate::tensor::DType::Float32,
-        device: cos.data().device(),
-    })?);
+    let zero = Variable::wrap(Tensor::zeros_like(&cos.data())?);
     let loss_neg = cos_minus_margin.maximum(&zero)?;
     // label is +1 or -1: use (1+label)/2 as mask for positive, (1-label)/2 for negative
     let label_pos = label.add_scalar(1.0)?.mul_scalar(0.5)?;
@@ -248,10 +242,7 @@ pub fn hinge_embedding_loss(
     margin: f64,
 ) -> Result<Variable> {
     let margin_minus_x = input.neg()?.add_scalar(margin)?;
-    let zero = Variable::wrap(Tensor::zeros(&input.shape(), crate::tensor::TensorOptions {
-        dtype: crate::tensor::DType::Float32,
-        device: input.data().device(),
-    })?);
+    let zero = Variable::wrap(Tensor::zeros_like(&input.data())?);
     let loss_neg = margin_minus_x.maximum(&zero)?;
     let label_pos = label.add_scalar(1.0)?.mul_scalar(0.5)?;
     let label_neg = label.neg()?.add_scalar(1.0)?.mul_scalar(0.5)?;
@@ -273,10 +264,7 @@ pub fn margin_ranking_loss(
     let diff = x1.sub(x2)?;
     let neg_label_diff = label.neg()?.mul(&diff)?;
     let shifted = neg_label_diff.add_scalar(margin)?;
-    let zero = Variable::wrap(Tensor::zeros(&shifted.shape(), crate::tensor::TensorOptions {
-        dtype: crate::tensor::DType::Float32,
-        device: shifted.data().device(),
-    })?);
+    let zero = Variable::wrap(Tensor::zeros_like(&shifted.data())?);
     shifted.maximum(&zero)?.mean()
 }
 
@@ -338,6 +326,45 @@ mod tests {
         let n = Variable::new(Tensor::from_f32(&[0.0, 1.0], &[1, 2], test_device()).unwrap(), false);
         let loss = triplet_margin_loss(&a, &p, &n, 2.0).unwrap();
         assert!(loss.item().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_comparison_losses_preserve_float64() {
+        // These four losses build a zero/ones comparison operand internally
+        // (for the max(0, ...) hinge). It must inherit the input's dtype:
+        // documented as "Float (Float32 or Float64)", so a Float64 input must
+        // yield a Float64 loss, not silently ride on implicit promotion of a
+        // hardcoded Float32 operand. Also checks the value matches the
+        // Float32 path (triplet == the 0.727... the Float32 test asserts).
+        use crate::tensor::DType;
+        let dev = test_device();
+        let f64v = |d: &[f64], s: &[i64]| {
+            Variable::new(Tensor::from_f64(d, s, dev).unwrap(), false)
+        };
+
+        let a = f64v(&[1.0, 0.0], &[1, 2]);
+        let p = f64v(&[0.9, 0.1], &[1, 2]);
+        let n = f64v(&[0.0, 1.0], &[1, 2]);
+        let triplet = triplet_margin_loss(&a, &p, &n, 2.0).unwrap();
+        assert_eq!(triplet.data().dtype(), DType::Float64);
+        assert!((triplet.item().unwrap() - 0.7272077938642143).abs() < 1e-9);
+
+        let label = f64v(&[1.0], &[1]);
+        let cosine = cosine_embedding_loss(&a, &p, &label, 0.5).unwrap();
+        assert_eq!(cosine.data().dtype(), DType::Float64);
+        assert!(cosine.item().unwrap().is_finite());
+
+        let x = f64v(&[0.3, 0.7], &[2]);
+        let l2 = f64v(&[1.0, -1.0], &[2]);
+        let hinge = hinge_embedding_loss(&x, &l2, 1.0).unwrap();
+        assert_eq!(hinge.data().dtype(), DType::Float64);
+        assert!(hinge.item().unwrap().is_finite());
+
+        let x1 = f64v(&[0.3, 0.7], &[2]);
+        let x2 = f64v(&[0.1, 0.9], &[2]);
+        let mr = margin_ranking_loss(&x1, &x2, &l2, 0.5).unwrap();
+        assert_eq!(mr.data().dtype(), DType::Float64);
+        assert!(mr.item().unwrap().is_finite());
     }
 
     #[test]
