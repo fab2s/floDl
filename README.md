@@ -815,6 +815,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 - [`observation`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/observation/): collect, flush, trend queries, early stopping
 - [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/): every graph builder method in one graph
 - [`flowbuilder_residual`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/flowbuilder_residual/): MLP classifier with a tagged residual block via FlowBuilder
+- [`auto_promote`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/auto_promote/): the same plain training code auto-scaling CPU → 1 GPU → N-GPU DDP, zero distributed code
 - [`bio/dnaseq_conv1d`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dnaseq_conv1d/): DNA Conv1D motif classifier (synthetic ChIP-seq peak annotation)
 - [`bio/dna_autoencoder`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dna_autoencoder/): DNA convolutional autoencoder with checkpoint round-trip
 

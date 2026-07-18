@@ -3,9 +3,9 @@
 //! Neither is a dedicated module. In the PyTorch idiom that flodl follows,
 //! both are just a `Linear` layer paired with the right loss:
 //!
-//!   * linear regression   = `Linear` + `mse_loss`
-//!   * logistic regression = `Linear` + `bce_with_logits_loss` (binary)
-//!                            or `Linear` + `cross_entropy_loss` (multiclass)
+//! * linear regression   = `Linear` + `mse_loss`
+//! * logistic regression = `Linear` + `bce_with_logits_loss` (binary)
+//!   or `Linear` + `cross_entropy_loss` (multiclass)
 //!
 //! This example fits both on synthetic data and checks that the learned
 //! parameters recover the ground truth.

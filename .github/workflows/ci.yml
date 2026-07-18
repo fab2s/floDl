@@ -100,7 +100,7 @@ jobs:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-        run: cargo clippy -- -W clippy::all
+        run: cargo clippy --all-targets -- -W clippy::all
 
       - name: Doc (strict, fails on warnings)
         # Clippy doesn't lint doc comments -- rustdoc is the only validator
@@ -188,4 +188,4 @@ jobs:
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
-            cargo clippy --features cuda -- -W clippy::all
+            cargo clippy --features cuda --all-targets -- -W clippy::all
