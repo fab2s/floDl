@@ -514,6 +514,11 @@ void flodl_cuda_synchronize(int device_index);
 // Returns error string on failure (caller must free), NULL on success.
 char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
+// NVML-backed variant of the above (queries the driver directly rather than
+// libtorch's allocator view). Returns 0 on success, -1 if NVML is
+// unavailable or the query fails.
+int flodl_cuda_nvml_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
+
 // Query bytes currently handed out by libtorch's CUDA caching allocator.
 // This can exceed physical VRAM when unified memory spills to host RAM.
 // spill = max(0, allocated - vram_total).
@@ -539,6 +544,10 @@ void flodl_cuda_empty_cache(void);
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.
 int flodl_cuda_utilization(int device_index);
+
+// Whether the given device has an active CUDA primary context (i.e. CUDA
+// has been initialized on it). Returns 1 if present, 0 if not, -1 on error.
+int flodl_cuda_has_primary_context(int device_index);
 
 // Query GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
 // Writes into caller-provided buffer. Returns error string on failure.

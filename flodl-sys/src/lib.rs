@@ -8,6 +8,11 @@
 
 use std::ffi::{c_char, c_void};
 
+/// Parses `shim.h` + this file and asserts the two `extern "C"` surfaces
+/// match (ABI). Guards the hand-written bindings against silent drift.
+#[cfg(test)]
+mod ffi_parity;
+
 /// Opaque handle to a `torch::Tensor` on the C++ side.
 pub type FlodlTensor = *mut c_void;
 
