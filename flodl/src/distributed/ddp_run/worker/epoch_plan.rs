@@ -1,6 +1,7 @@
 //! Epoch-plan lifecycle: `wait_for_epoch_plan`, `run_epoch_plan`, and `write_checkpoint_bundle`.
 
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::autograd::Variable;
 use crate::tensor::cuda_stream::StreamGuard;
@@ -11,6 +12,72 @@ use super::super::{
     ControlMsg, EpochPlan, make_partition,
 };
 use super::GpuWorker;
+
+/// Per-epoch training cursor, extracted from `run_epoch_plan`'s locals so the
+/// batch loop can be driven one primitive at a time
+/// (`begin_epoch` -> `next_batch_inner` -> `after_step` -> `end_epoch`).
+///
+/// The managed tier re-expresses `run_epoch_plan` on these primitives (one
+/// code path); the cooperative `Worker` tier wedges the user's forward +
+/// backward between `next_batch_inner` and `after_step`. This is a plain
+/// value: it borrows nothing from the worker (the prefetch `Receiver` is
+/// owned; the background prefetch thread stays owned by `GpuWorker`), so a
+/// `next_batch_inner(&mut self, &mut EpochState)` call is borrow-clean and the
+/// worker can carry it as `Option<EpochState>` in the cooperative tier.
+pub(super) struct EpochState {
+    /// The epoch this chunk belongs to (from the coordinator's `EpochPlan`).
+    plan_epoch: usize,
+    /// Batches consumed so far this chunk. The loop bound is re-read off the
+    /// live `partition.len()` each call, so a mid-epoch `ExtendPartition`
+    /// reshard is picked up transparently.
+    batch_done: usize,
+    total_loss: f64,
+    /// Sum of per-batch compute wall (the `train_step` window). Feeds
+    /// `share_complete_ms` and the run-level prof split.
+    compute_ms_total: f64,
+    /// Sum of per-batch data wall (prefetch stall / synchronous fetch).
+    data_starve_ms_total: f64,
+    /// The most recent batch's data wall, stamped by `next_batch_inner` and
+    /// read by `after_step` for the per-batch `report_timing`.
+    last_data_ms: f64,
+    epoch_start: Instant,
+    /// Anchor for the verbose per-chunk timing-breakdown line (prefetch path).
+    chunk_diag_start: Instant,
+    /// CUDA async prefetch path (vs the synchronous fetch fallback).
+    use_prefetch: bool,
+    /// Sync path only: the activation peak is still uncalibrated, so measure
+    /// it after this chunk's first `train_step`.
+    measuring_peak: bool,
+    /// Set when a control drain saw `Shutdown` — the caller must skip
+    /// `end_epoch` (no coverage report on a shutdown mid-chunk), matching the
+    /// historical `return Ok(true)`.
+    shutdown: bool,
+    /// Prefetch path: the bounded batch channel from `start_distributed_epoch`
+    /// (the background prefetch thread fills it). `None` on the sync path.
+    batch_rx: Option<mpsc::Receiver<Result<crate::data::prefetch::PrefetchedBatch>>>,
+}
+
+impl EpochState {
+    /// A no-work chunk (partition shorter than one batch): `next_batch_inner`
+    /// yields `None` immediately and `end_epoch` still emits the coordinator's
+    /// "done" signal. Matches the historical `num_batches == 0` early return.
+    fn empty(plan_epoch: usize) -> Self {
+        EpochState {
+            plan_epoch,
+            batch_done: 0,
+            total_loss: 0.0,
+            compute_ms_total: 0.0,
+            data_starve_ms_total: 0.0,
+            last_data_ms: 0.0,
+            epoch_start: Instant::now(),
+            chunk_diag_start: Instant::now(),
+            use_prefetch: false,
+            measuring_peak: false,
+            shutdown: false,
+            batch_rx: None,
+        }
+    }
+}
 
 impl<M: Module> GpuWorker<M> {
     /// Block until the coordinator sends a StartEpoch or Shutdown.
@@ -82,11 +149,42 @@ impl<M: Module> GpuWorker<M> {
     /// batches are loaded synchronously.
     ///
     /// Returns `true` if a Shutdown was received mid-plan.
+    ///
+    /// Re-expressed on the extracted per-epoch primitives
+    /// (`begin_epoch` -> `next_batch_inner` -> `train_step` -> `after_step` ->
+    /// `end_epoch`) so the managed tier here and the cooperative `Worker` tier
+    /// run one and the same code path — the only difference being who writes
+    /// the loop and where the user's forward + backward sits.
     pub fn run_epoch_plan(
         &mut self,
         plan: &EpochPlan,
         train_fn: &impl Fn(&M, &[Tensor]) -> Result<Variable>,
     ) -> Result<bool> {
+        let mut st = self.begin_epoch(plan)?;
+        while let Some(batch) = self.next_batch_inner(&mut st)? {
+            let (loss, ms) = self.train_step(&batch, train_fn)?;
+            self.after_step(&mut st, loss, ms)?;
+            if st.shutdown {
+                return Ok(true); // Shutdown drained in after_step (bottom).
+            }
+        }
+        if st.shutdown {
+            return Ok(true); // Shutdown drained in next_batch_inner (top / wait).
+        }
+        self.end_epoch(&mut st)?;
+        Ok(false)
+    }
+
+    /// Per-epoch setup: resolve this rank's partition, calibrate the
+    /// activation-peak / prefetch-depth / VRAM-pool budget, fire the
+    /// `EpochStart` timeline event, and (on the prefetch path) open the batch
+    /// channel and submit every batch for async H2D. Returns the epoch cursor.
+    ///
+    /// A partition shorter than one batch produces an [`EpochState::empty`]:
+    /// no setup, no timeline events, `next_batch_inner` yields nothing, and
+    /// `end_epoch` still reports the coordinator's "done" signal (the
+    /// historical `num_batches == 0` early return).
+    pub(super) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
         self.current_epoch = plan.epoch;
         // Pick space: the coordinator's offsets/sizes and this
         // expansion must agree on `dataset.len() * augment` total.
@@ -97,9 +195,7 @@ impl<M: Module> GpuWorker<M> {
 
         let num_batches = self.partition.len() / self.batch_size;
         if num_batches == 0 {
-            // Still report so coordinator gets the "done" signal.
-            let _ = self.report_epoch(0.0, 0, 0.0, 0.0, 0.0, 0.0);
-            return Ok(false);
+            return Ok(EpochState::empty(plan.epoch));
         }
 
         // ALL CUDA work must avoid the default stream and device-wide sync.
@@ -110,6 +206,9 @@ impl<M: Module> GpuWorker<M> {
         // it blocks waiting for comm_stream which waits for this rank -> deadlock.
         //
         // Solution: use compute_stream for all ops, sync compute_stream only.
+        // The guard is owned (see `StreamGuard`), so it does not borrow `self`
+        // and each primitive re-installs its own for exactly its CUDA work —
+        // current-stream is compute_stream during every op, as before.
         let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
 
         // NOTE: cuda_empty_cache() was here to defragment VRAM between chunks,
@@ -136,6 +235,11 @@ impl<M: Module> GpuWorker<M> {
             }
             crate::tensor::cuda_reset_peak_stats_idx(idx);
         }
+
+        // Sync-path activation-peak calibration marker: captured after the
+        // recalc above (which is a no-op while the peak is still 0), matching
+        // the historical placement at the top of the sync branch.
+        let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
 
         // Recalculate prefetch depth at each plan boundary (VRAM may vary).
         // Cap at num_batches: no point buffering more than the chunk contains.
@@ -201,234 +305,277 @@ impl<M: Module> GpuWorker<M> {
             tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
         }
         let epoch_start = Instant::now();
-        let mut total_loss = 0.0;
-        // Per-chunk timing accumulators populated by both prefetch and sync
-        // paths. Read at chunk end to populate MetricsMsg fields and feed
-        // the balancer with an honest tput signal.
-        let mut compute_ms_total = 0.0_f64;
-        let mut data_starve_ms_total = 0.0_f64;
 
-        if use_prefetch {
-            // CUDA async path: prefetch with VRAM gauge.
+        // Prefetch path: open the batch channel and submit all batch indices
+        // for async H2D now (the background worker fills the channel; a
+        // mid-epoch ExtendPartition submits its own extra batches).
+        let batch_rx = if use_prefetch {
             let prefetch = self.prefetch.as_ref().unwrap();
             // start_distributed_epoch creates a fresh bounded channel whose
             // capacity equals the prefetch depth (VRAM budget). The prefetch
             // thread fills it; SyncSender blocks when VRAM is full.
-            let batch_rx = prefetch.start_distributed_epoch();
-
-            // Submit all batch indices for async H2D transfer
+            let rx = prefetch.start_distributed_epoch();
             for batch_idx in 0..num_batches {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;
                 prefetch.load_batch(self.partition[start..end].to_vec());
             }
+            Some(rx)
+        } else {
+            None
+        };
 
-            // Consume prefetched batches as they become ready. Loop
-            // bound is re-evaluated each iteration off
-            // `self.partition.len()` so a mid-epoch
-            // `ControlMsg::ExtendPartition` (cluster-mode reshard
-            // after a rank dies) injects extra batches and they get
-            // processed before the epoch completes. The
-            // `ExtendPartition` arm also submits the new batches to
-            // the prefetch worker's load queue, so the background
-            // worker has work to feed this consumer.
-            let mut batch_done = 0usize;
-            let chunk_diag_start = Instant::now();
-            let mut prefetch_wait_diag = std::time::Duration::ZERO;
-            let mut compute_ms_diag = 0.0_f64;
-            while batch_done < self.partition.len() / self.batch_size {
-                // Interleave control message processing with prefetch waiting.
-                // SyncNow can arrive at any time; if we block on batch_rx.recv()
-                // the peer enters AllReduce waiting for us -> deadlock.
-                // Use recv_timeout to periodically check for control messages.
-                if self.handle_control()? {
-                    return Ok(true);
-                }
-                let wait_start = Instant::now();
-                // Stuck-detector (debug): if we spin here waiting for a
-                // prefetched batch that never arrives, dump the worker's
-                // state once so the tight-window fold freeze can be
-                // pinned (is the worker starved mid-chunk after an Update/
-                // StartEpoch landed?). ~3s of consecutive 10ms timeouts.
-                let mut stuck_polls: u32 = 0;
-                let mut stuck_dumped = false;
-                let prefetched = loop {
-                    match batch_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                        Ok(batch) => break batch
-                            .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if self.handle_control()? {
-                                return Ok(true);
-                            }
-                            stuck_polls += 1;
-                            if self.prof_enabled && stuck_polls >= 300 && !stuck_dumped {
-                                stuck_dumped = true;
-                                eprintln!(
-                                    "[worker-stuck] rank={} STUCK in prefetch recv >{:.0}s | \
-                                     batch_done={} target={} epoch={} partition_len={} \
-                                     steps_since_avg={} pending_plan={:?}",
-                                    self.rank,
-                                    wait_start.elapsed().as_secs_f64(),
-                                    batch_done,
-                                    self.partition.len() / self.batch_size,
-                                    plan.epoch,
-                                    self.partition.len(),
-                                    self.steps_since_avg,
-                                    self.pending_plan.as_ref().map(|p| (p.epoch, p.partition_offset, p.partition_size)),
-                                );
-                            }
+        Ok(EpochState {
+            plan_epoch: plan.epoch,
+            batch_done: 0,
+            total_loss: 0.0,
+            compute_ms_total: 0.0,
+            data_starve_ms_total: 0.0,
+            last_data_ms: 0.0,
+            epoch_start,
+            chunk_diag_start: Instant::now(),
+            use_prefetch,
+            measuring_peak,
+            shutdown: false,
+            batch_rx,
+        })
+    }
+
+    /// Yield the next device-ready, transformed batch for this chunk, or
+    /// `None` at the shard end. Drains control while waiting on the prefetch
+    /// path (a blocking `recv` would deadlock a peer's AllReduce), stamps the
+    /// batch's data wall into the cursor for `after_step`'s `report_timing`,
+    /// and advances the consumed count. On a `Shutdown` seen while waiting it
+    /// sets `st.shutdown` and returns `None` (the caller skips `end_epoch`).
+    ///
+    /// The returned batch is **owned** and borrows nothing from the worker, so
+    /// the cooperative tier can run the user's forward + backward against it
+    /// while still calling `&mut self` worker methods.
+    pub(super) fn next_batch_inner(
+        &mut self,
+        st: &mut EpochState,
+    ) -> Result<Option<Vec<Tensor>>> {
+        // Loop bound re-read off the live partition each call, so a mid-epoch
+        // `ExtendPartition` reshard is consumed before the shard completes.
+        if st.batch_done >= self.partition.len() / self.batch_size {
+            return Ok(None);
+        }
+
+        if st.use_prefetch {
+            // Guard installed before the control drain so a SyncNow-driven
+            // collective's divergence readout runs on compute_stream, not the
+            // default stream (the deadlock hazard the epoch-scoped guard used
+            // to cover). Owned: does not borrow self, so handle_control's
+            // `&mut self` call below is fine.
+            let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+            // Interleave control message processing with prefetch waiting.
+            // SyncNow can arrive at any time; if we block on batch_rx.recv()
+            // the peer enters AllReduce waiting for us -> deadlock.
+            if self.handle_control()? {
+                st.shutdown = true;
+                return Ok(None);
+            }
+
+            let wait_start = Instant::now();
+            // Stuck-detector (debug): if we spin here waiting for a
+            // prefetched batch that never arrives, dump the worker's
+            // state once so the tight-window fold freeze can be
+            // pinned (is the worker starved mid-chunk after an Update/
+            // StartEpoch landed?). ~3s of consecutive 10ms timeouts.
+            let mut stuck_polls: u32 = 0;
+            let mut stuck_dumped = false;
+            let prefetched = loop {
+                let rx = st.batch_rx.as_ref().expect("prefetch path has a batch_rx");
+                match rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(batch) => break batch
+                        .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if self.handle_control()? {
+                            st.shutdown = true;
+                            return Ok(None);
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err(TensorError::new("prefetch channel closed"));
+                        stuck_polls += 1;
+                        if self.prof_enabled && stuck_polls >= 300 && !stuck_dumped {
+                            stuck_dumped = true;
+                            eprintln!(
+                                "[worker-stuck] rank={} STUCK in prefetch recv >{:.0}s | \
+                                 batch_done={} target={} epoch={} partition_len={} \
+                                 steps_since_avg={} pending_plan={:?}",
+                                self.rank,
+                                wait_start.elapsed().as_secs_f64(),
+                                st.batch_done,
+                                self.partition.len() / self.batch_size,
+                                st.plan_epoch,
+                                self.partition.len(),
+                                self.steps_since_avg,
+                                self.pending_plan.as_ref().map(|p| (p.epoch, p.partition_offset, p.partition_size)),
+                            );
                         }
                     }
-                };
-                let batch_data = wait_start.elapsed();
-                prefetch_wait_diag += batch_data;
-                // Per-batch DATA wall for the delivered feed (prefetch stall).
-                let data_ms_batch = batch_data.as_secs_f64() * 1000.0;
-
-                // Ensure compute stream waits for async H2D copy to finish
-                #[cfg(feature = "cuda")]
-                if let Some(ref event) = prefetched.ready_event {
-                    if let Some(ref stream) = self.compute_stream {
-                        stream.wait_event(event)?;
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TensorError::new("prefetch channel closed"));
                     }
                 }
+            };
+            // Per-batch DATA wall for the delivered feed (prefetch stall).
+            st.last_data_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+            st.data_starve_ms_total += st.last_data_ms;
 
-                // Delivery transform: after the copy dependency is
-                // installed, keyed by the batch's picks.
-                let tensors = if let Some(ref f) = self.transform {
-                    crate::data::apply_transform(
-                        f,
-                        prefetched.tensors,
-                        &prefetched.picks,
-                        self.augment,
-                        plan.epoch,
-                        self.base_seed,
-                    )?
-                } else {
-                    prefetched.tensors
-                };
-
-                let (loss, ms) = self.train_step(&tensors, train_fn)?;
-                compute_ms_diag += ms;
-                batch_done += 1;
-                total_loss += loss;
-                let norm = if self.steps_since_avg % 10 == 0 {
-                    self.compute_param_norm().ok()
-                } else {
-                    None
-                };
-                let _ = self.report_timing(ms, data_ms_batch, norm, loss, None);
-                if self.handle_control()? {
-                    return Ok(true); // Shutdown
+            // Ensure compute stream waits for async H2D copy to finish
+            #[cfg(feature = "cuda")]
+            if let Some(ref event) = prefetched.ready_event {
+                if let Some(ref stream) = self.compute_stream {
+                    stream.wait_event(event)?;
                 }
             }
-            let chunk_total_ms = chunk_diag_start.elapsed().as_secs_f64() * 1000.0;
-            let prefetch_ms = prefetch_wait_diag.as_secs_f64() * 1000.0;
-            let other_ms = chunk_total_ms - prefetch_ms - compute_ms_diag;
-            crate::verbose!(
-                "  ddp-worker-diag: rank {} chunk={} batches | total={:.0}ms compute={:.0}ms prefetch_wait={:.0}ms other(sync/ctrl)={:.0}ms",
-                self.rank, batch_done, chunk_total_ms, compute_ms_diag, prefetch_ms, other_ms,
-            );
-            compute_ms_total = compute_ms_diag;
-            data_starve_ms_total = prefetch_ms;
-            crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, plan.epoch, batch_done);
+
+            // Delivery transform: after the copy dependency is
+            // installed, keyed by the batch's picks.
+            let tensors = if let Some(ref f) = self.transform {
+                crate::data::apply_transform(
+                    f,
+                    prefetched.tensors,
+                    &prefetched.picks,
+                    self.augment,
+                    st.plan_epoch,
+                    self.base_seed,
+                )?
+            } else {
+                prefetched.tensors
+            };
+            st.batch_done += 1;
+            Ok(Some(tensors))
         } else {
             // Sync path: load one batch at a time, move to device if needed.
             // Used for CPU devices, or CUDA when VRAM is too tight for prefetch.
-            //
-            // The loop bound is re-evaluated each iteration off
-            // `self.partition.len()` so a mid-epoch
-            // `ControlMsg::ExtendPartition` (cluster-mode reshard
-            // after a rank dies) injects extra batches and they get
-            // processed before the epoch completes — same contract as
-            // the prefetch branch above.
-            let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
+            let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
 
-            let mut batch_idx: usize = 0;
-            while batch_idx < self.partition.len() / self.batch_size {
-                let start = batch_idx * self.batch_size;
-                let end = start + self.batch_size;
-                // The partition is a PICK stream; fetch by the decoded
-                // sample ids, key the transform by the picks.
-                let picks = &self.partition[start..end];
-                let samples = crate::data::picks_to_samples(picks, self.augment);
-                let data_start = Instant::now();
-                let batch = self.dataset.get_batch(&samples)?;
+            let batch_idx = st.batch_done;
+            let start = batch_idx * self.batch_size;
+            let end = start + self.batch_size;
+            // The partition is a PICK stream; fetch by the decoded
+            // sample ids, key the transform by the picks. Own the picks so no
+            // borrow of `self.partition` is held across the fetch.
+            let picks: Vec<usize> = self.partition[start..end].to_vec();
+            let samples = crate::data::picks_to_samples(&picks, self.augment);
+            let data_start = Instant::now();
+            let batch = self.dataset.get_batch(&samples)?;
 
-                let batch: Vec<Tensor> = if self.device.is_cuda() {
-                    batch.into_iter()
-                        .map(|t| t.to_device(self.device))
-                        .collect::<Result<Vec<_>>>()?
-                } else {
-                    batch
-                };
-                let batch: Vec<Tensor> = if let Some(ref f) = self.transform {
-                    crate::data::apply_transform(
-                        f,
-                        batch,
-                        picks,
-                        self.augment,
-                        plan.epoch,
-                        self.base_seed,
-                    )?
-                } else {
-                    batch
-                };
-                // Per-batch DATA wall for the delivered feed (fetch+to-device).
-                let data_ms_batch = data_start.elapsed().as_secs_f64() * 1000.0;
-                data_starve_ms_total += data_ms_batch;
+            let batch: Vec<Tensor> = if self.device.is_cuda() {
+                batch.into_iter()
+                    .map(|t| t.to_device(self.device))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                batch
+            };
+            let batch: Vec<Tensor> = if let Some(ref f) = self.transform {
+                crate::data::apply_transform(
+                    f,
+                    batch,
+                    &picks,
+                    self.augment,
+                    st.plan_epoch,
+                    self.base_seed,
+                )?
+            } else {
+                batch
+            };
+            // Per-batch DATA wall for the delivered feed (fetch+to-device).
+            st.last_data_ms = data_start.elapsed().as_secs_f64() * 1000.0;
+            st.data_starve_ms_total += st.last_data_ms;
+            st.batch_done += 1;
+            Ok(Some(batch))
+        }
+    }
 
-                let (loss, ms) = self.train_step(&batch, train_fn)?;
-                compute_ms_total += ms;
-                total_loss += loss;
+    /// The framework-owned bookkeeping that follows a training step: sync-path
+    /// activation-peak calibration (first batch), the periodic param-norm, the
+    /// per-batch `report_timing`, and the bottom-of-loop control drain. Feeds
+    /// the compute wall and loss into the cursor.
+    ///
+    /// `loss` / `ms` come from the step just executed (`train_step` in the
+    /// managed tier, the user's forward + backward + `optimizer_step_and_bookkeep`
+    /// in the cooperative tier). Runs under its own owned `compute_stream`
+    /// guard so the param-norm and any control-driven collective see
+    /// current-stream == compute_stream, exactly as the old epoch-scoped guard.
+    pub(super) fn after_step(
+        &mut self,
+        st: &mut EpochState,
+        loss: f64,
+        ms: f64,
+    ) -> Result<()> {
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+        st.compute_ms_total += ms;
+        st.total_loss += loss;
 
-                // After first batch: measure activation peak from CUDA stats.
-                // `peak` and `current` are read at the same point — both
-                // include model, optimizer state, and the still-resident
-                // batch — so their difference is already the transient
-                // forward/backward/step overhead (activations + gradients)
-                // net of the batch. This is the reserve that
-                // prefetch_depth_from_vram must account for. The batch must
-                // not be subtracted again: it cancels between the two terms,
-                // and re-subtracting saturated the reserve to 0 whenever
-                // activations + gradients fit inside one batch — and 0 is
-                // the not-yet-measured sentinel, so the sync fallback and
-                // the VRAM-pool gate held for the whole run.
-                if measuring_peak && batch_idx == 0 {
-                    if let Some(ref stream) = self.compute_stream {
-                        let _ = stream.synchronize();
-                    }
-                    let idx = self.device.index() as i32;
-                    if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
-                        if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
-                            let overhead = (peak as usize).saturating_sub(current as usize);
-                            // Floor a completed measurement to 1 byte so a
-                            // degenerate reading cannot collide with the
-                            // sentinel and re-arm calibration every chunk.
-                            self.activation_peak_bytes = overhead.max(1);
-                        }
-                    }
-                    // Reset for ongoing monitoring in subsequent chunks.
-                    crate::tensor::cuda_reset_peak_stats_idx(idx);
-                }
-
-                let norm = if self.steps_since_avg % 10 == 0 {
-                    self.compute_param_norm().ok()
-                } else {
-                    None
-                };
-                let _ = self.report_timing(ms, data_ms_batch, norm, loss, None);
-                if self.handle_control()? {
-                    return Ok(true); // Shutdown
-                }
-                batch_idx += 1;
+        // After the first batch (sync path only): measure activation peak from
+        // CUDA stats. `peak` and `current` are read at the same point — both
+        // include model, optimizer state, and the still-resident batch — so
+        // their difference is already the transient forward/backward/step
+        // overhead (activations + gradients) net of the batch. This is the
+        // reserve that prefetch_depth_from_vram must account for. The batch
+        // must not be subtracted again: it cancels between the two terms, and
+        // re-subtracting saturated the reserve to 0 whenever activations +
+        // gradients fit inside one batch — and 0 is the not-yet-measured
+        // sentinel, so the sync fallback and the VRAM-pool gate held for the
+        // whole run. `st.batch_done == 1` == the first batch just processed.
+        if st.measuring_peak && st.batch_done == 1 {
+            if let Some(ref stream) = self.compute_stream {
+                let _ = stream.synchronize();
             }
+            let idx = self.device.index() as i32;
+            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
+                if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
+                    let overhead = (peak as usize).saturating_sub(current as usize);
+                    // Floor a completed measurement to 1 byte so a degenerate
+                    // reading cannot collide with the sentinel and re-arm
+                    // calibration every chunk.
+                    self.activation_peak_bytes = overhead.max(1);
+                }
+            }
+            // Reset for ongoing monitoring in subsequent chunks.
+            crate::tensor::cuda_reset_peak_stats_idx(idx);
         }
 
-        let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
+        let norm = if self.steps_since_avg % 10 == 0 {
+            self.compute_param_norm().ok()
+        } else {
+            None
+        };
+        let _ = self.report_timing(ms, st.last_data_ms, norm, loss, None);
+        if self.handle_control()? {
+            st.shutdown = true; // Shutdown
+        }
+        Ok(())
+    }
+
+    /// End-of-chunk accounting: the verbose prefetch timing breakdown, the
+    /// run-level prof sums, and `report_epoch` (coverage + `avg_loss`, with the
+    /// batch count re-read off the live partition so an `ExtendPartition`
+    /// reshard is reflected). An empty chunk still emits the "done" signal.
+    pub(super) fn end_epoch(&mut self, st: &mut EpochState) -> Result<()> {
+        if st.use_prefetch {
+            let chunk_total_ms = st.chunk_diag_start.elapsed().as_secs_f64() * 1000.0;
+            let prefetch_ms = st.data_starve_ms_total;
+            let other_ms = chunk_total_ms - prefetch_ms - st.compute_ms_total;
+            crate::verbose!(
+                "  ddp-worker-diag: rank {} chunk={} batches | total={:.0}ms compute={:.0}ms prefetch_wait={:.0}ms other(sync/ctrl)={:.0}ms",
+                self.rank, st.batch_done, chunk_total_ms, st.compute_ms_total, prefetch_ms, other_ms,
+            );
+            crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, st.plan_epoch, st.batch_done);
+        }
+
+        // Recompute batch count from current partition length so an
+        // `ExtendPartition`-driven reshard (cluster-mode dead-rank
+        // recovery) is reflected in `avg_loss` and the report.
+        let num_batches = self.partition.len() / self.batch_size;
+        if num_batches == 0 {
+            // Still report so coordinator gets the "done" signal.
+            let _ = self.report_epoch(0.0, 0, 0.0, 0.0, 0.0, 0.0);
+            return Ok(());
+        }
+
+        let epoch_ms = st.epoch_start.elapsed().as_secs_f64() * 1000.0;
         // Honest balancer denominator: time the rank spent on its assigned
         // work (compute + data wait), excluding any post-completion idle
         // waiting at a sync barrier. epoch_ms includes that idle on the
@@ -436,33 +583,29 @@ impl<M: Module> GpuWorker<M> {
         // share_complete_ms is computed from the rank's own pipeline times
         // (compute_ms_total + data_starve_ms_total), so it tracks the
         // rank's actual capacity, not how long it idles for peers.
-        let share_complete_ms = compute_ms_total + data_starve_ms_total;
+        let share_complete_ms = st.compute_ms_total + st.data_starve_ms_total;
         // Instrumentation (gated): accumulate run-level compute/data so
         // the teardown worker-prof can split run_epoch into compute /
         // data / other(ctrl/sync/transport) — the last being what
         // ElChe's share_complete_ms denominator omits.
         if self.prof_enabled {
-            self.compute_ms_run_total += compute_ms_total;
-            self.data_ms_run_total += data_starve_ms_total;
+            self.compute_ms_run_total += st.compute_ms_total;
+            self.data_ms_run_total += st.data_starve_ms_total;
         }
-        // Recompute batch count from current partition length so an
-        // `ExtendPartition`-driven reshard (cluster-mode dead-rank
-        // recovery) is reflected in `avg_loss` and the report.
-        let num_batches = self.partition.len() / self.batch_size;
-        let avg_loss = total_loss / num_batches as f64;
+        let avg_loss = st.total_loss / num_batches as f64;
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochEnd {
-                epoch: plan.epoch,
+                epoch: st.plan_epoch,
                 loss: avg_loss,
                 lr: self.optimizer.lr(),
             });
         }
         let _ = self.report_epoch(
             avg_loss, num_batches, epoch_ms,
-            share_complete_ms, compute_ms_total, data_starve_ms_total,
+            share_complete_ms, st.compute_ms_total, st.data_starve_ms_total,
         );
 
-        Ok(false)
+        Ok(())
     }
 
     /// Write the checkpoint bundle for an unrecoverable-failure save.

@@ -118,6 +118,42 @@ the controller are the ones whose *step shape* differs:
 These keep the raw per-rank primitive `Ddp::wrap` (manual collectives, you own
 everything). Bypass is a deliberate escape hatch, not a fallback.
 
+### Future: a controller-serviced bypass
+
+`Ddp::wrap` today is controller-*less* by construction: the user owns
+everything, including the services (data partition, failure handling) they
+must then hand-roll. That is heavier than the divergent-step-shape cases
+actually require, because **the controller is not monolithic**. Its services
+split by their coupling to the step shape:
+
+- **Step-shape-independent** (orthogonal to what one step does): data
+  partition + cost-based rebalancing, elastic membership / dead-rank consensus
+  / reshard, role election (eval / checkpoint on one elected rank), checkpoint
+  orchestration, and the unified dashboard.
+- **Step-shape-coupled**: ElChe's *sync half* — the gated, work-weighted
+  AllReduce cadence. This is the only part that genuinely cannot auto-drive a
+  custom step: a divergent shape (two optimizers, custom collectives) owns its
+  own sync points, and "cadence" over an unknown shape is undefined.
+
+So a future **controller-serviced bypass** could keep the step-shape-independent
+services running automatically while the user owns the step and its
+collectives, by *inverting the ElChe clock*: the user syncs on their own
+schedule and *reports* per-step delivered cost, and the controller rebalances
+the partition at those user-reported boundaries (ElChe's partition-balancing,
+the part that matters on a heterogeneous rig, without its cadence-dictation).
+This preserves both load-bearing invariants: the single-step-clock rule holds
+(it becomes the user's clock, reported up), and the determinism rule holds as
+long as the controller rebalances on the AllReduce'd cost vector, never a
+per-rank-local value.
+
+This is a design direction, not a commitment, and it is a larger arc than the
+cooperative tier (which reuses the controller's authoritative clock; this one
+re-contracts it). **Implementation note for the cooperative tier:** keep the
+controller's step-shape-independent services (partition, membership, role
+election, checkpoint) reachable independently of the ElChe sync-cadence, so
+this seam stays open. Do not fuse "get my shard / report my cost / am-I-the-
+elected-rank" into the same call that performs the gated reduce.
+
 ## Why "the collective as a whole" is enough (data parallel)
 
 In data-parallel DDP the ranks are *replicas*: same model, different data,

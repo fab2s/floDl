@@ -830,6 +830,31 @@ impl<M: Module> GpuWorker<M> {
         // Backward
         loss.backward()?;
 
+        // Gradient clip + LR schedule + optimizer step + zero_grad + counters.
+        self.optimizer_step_and_bookkeep()?;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        Ok((loss_val, elapsed_ms))
+    }
+
+    /// The post-backward tail of a training step: gradient clipping, per-batch
+    /// LR schedule, the fused optimizer step, `zero_grad`, and the step
+    /// counters. Assumes the gradients for this step are already populated
+    /// (the caller ran forward + `backward`).
+    ///
+    /// Split out of [`Self::train_step`] so the cooperative execution tier can
+    /// run the user's own forward + backward and then hand control back here
+    /// for the framework-owned bookkeeping the coordinator's schedule depends
+    /// on (`steps_since_avg`, `local_step`, the LR trajectory). `train_step`
+    /// remains the single-call form (forward + backward + this tail).
+    ///
+    /// Installs its own `compute_stream` guard so the optimizer kernels arrive
+    /// on the same stream as the `AccumulateGrad` nodes (see the guard note in
+    /// `train_step`). It nests harmlessly inside `train_step`'s guard, and is
+    /// self-sufficient when the cooperative `Worker::step` drives it directly.
+    pub(crate) fn optimizer_step_and_bookkeep(&mut self) -> Result<()> {
+        let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
+
         // Per-worker gradient clipping (before optimizer step).
         if let Some(max_norm) = self.max_grad_norm {
             let params: Vec<Tensor> = self.model.parameters()
@@ -858,8 +883,6 @@ impl<M: Module> GpuWorker<M> {
 
         self.local_step += 1;
         self.steps_since_avg += 1;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        Ok((loss_val, elapsed_ms))
+        Ok(())
     }
 }
