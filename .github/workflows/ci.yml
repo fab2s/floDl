@@ -35,6 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cheap, toolchain-free gate: the embedded skill assets baked into
+      # the fdl binary (flodl-cli/assets/skills/) must match the ai/
+      # sources, else a released fdl ships a stale /port skill. Fails the
+      # PR before any build work. Fix locally with `make sync-skills`.
+      - name: Skill assets in sync with ai/
+        run: sh ci/release/09-skill-assets.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

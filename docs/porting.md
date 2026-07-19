@@ -233,25 +233,14 @@ let handle = Trainer::builder(
 let state = handle.join()?;  // averaged params + buffers
 ```
 
-### Trainer::setup: setup only, your loop
+### Your own loop
 
-`Trainer::setup` runs device replication + optimizer setup +
-training-mode toggle in one call; the loop stays yours.
-
-```rust
-let model = build_model()?;
-Trainer::setup(&model, |dev| build_model_on(dev), |p| Adam::new(p, 0.001))?;
-
-for epoch in 0..num_epochs {
-    for batch in loader.epoch(epoch) {
-        let batch = batch?;
-        let pred = model.forward(&batch[0].into())?;
-        let loss = cross_entropy_loss(&pred, &batch["label"].into())?;
-        loss.backward()?;
-        model.step()?;  // AllReduce + buffer sync + optimizer + zero_grad
-    }
-}
-```
+The self-driven `Trainer::setup()` tier (framework does replication +
+optimizer setup, you keep the loop) is deprecated; its user-owned-loop
+ergonomics return later as a cooperative tier on the controller engine.
+For now, reach for `Trainer::builder(...).run()` above when you want the
+framework to own the loop, or `Ddp::wrap` (see [Multi-GPU](#multi-gpu-ddp))
+for explicit per-rank gradient-sync / broadcast control.
 
 ### Fully manual: closest port from PyTorch
 
@@ -273,11 +262,11 @@ for epoch in 0..num_epochs {
 ## Multi-GPU (DDP)
 
 The `Trainer` tiers in [Training loop](#training-loop) above already cover
-the multi-GPU story: both `Trainer::builder` and `Trainer::setup`
-auto-detect available CUDA devices and fall back to single-GPU/CPU when
-fewer than 2 GPUs are present. The same code runs on CPU, single GPU,
-and multi-GPU with no process-group setup, no `torchrun`, no `mp.spawn`,
-and no `DistributedSampler`.
+the multi-GPU story: `Trainer::builder(...).run()` / `Trainer::run(...)`
+auto-detect visible CUDA devices, training inline on 0-1 GPU and
+auto-promoting to the process-per-rank path on 2+. The same code runs on
+CPU, single GPU, and multi-GPU with no process-group setup, no `torchrun`,
+no `mp.spawn`, and no `DistributedSampler`.
 
 For DDP-specific knobs (cadence × backend, ElChe tuning), pass an
 `ElCheConfig` to `.elche(...)`:

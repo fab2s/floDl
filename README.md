@@ -191,9 +191,11 @@ Trainer::builder(
     .join()?;
 ```
 
-`Trainer::setup` (own the loop, framework owns the setup) is the
-in-between tier. See [Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
-for all three tiers.
+For an explicit loop, `Ddp::wrap` gives per-rank gradient-sync control
+and a fully-manual single-device loop is the lowest tier. See
+[Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
+for all three tiers. (The self-driven `Trainer::setup` tier is deprecated
+pending its cooperative-tier replacement.)
 
 ## The Graph Builder
 
@@ -744,7 +746,7 @@ codegen-units = 1
 |-----------|-------------|
 | `Trainer::builder(...).run()` | Universal entry. Same call scales from CPU to multi-host cluster. |
 | `Trainer::run(..., TrainerConfig)` | Config-bag form - same launcher, data-driven setup. |
-| `Trainer::setup(&graph, ...)` | Graph one-liner; you keep the training loop. |
+| `Ddp::wrap(&model, device, rank, &rdv)` | Low-level per-rank gradient-sync for manual control (GAN/RL). |
 | `ElCheMode` | `NcclSync/Cadence`, `CpuSync/Cadence/Async`. Default `NcclCadence`. |
 | `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
 | `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |

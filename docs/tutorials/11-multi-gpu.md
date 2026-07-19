@@ -109,34 +109,27 @@ if gpus.is_empty() {
 `detect_gpus()` honors `CUDA_VISIBLE_DEVICES`, so the result matches
 the view that the auto-promote path and child processes will see.
 
-## Graph one-liner - `Trainer::setup`
+## Graph models: the same entry
 
-When your model is a flodl `Graph` and you want to keep the training
-loop visible, `Trainer::setup` distributes + sets the optimizer +
-enables training mode in one call:
+A flodl `Graph` (any `FlowBuilder`) is a `Module`, so it trains through
+the same `Trainer::builder(...).run()` / `Trainer::run(...)` entry shown
+above - just return the built graph from the `model_factory` closure:
 
 ```rust
-let model: Graph = build_model()?;        // any FlowBuilder graph
-
-Trainer::setup(
-    &model,
-    |dev| build_model_on(dev),
-    |p|   Adam::new(p, 1e-3),
-)?;
-
-// Same loop on 1 or N GPUs.
-for (input_t, target_t) in &batches {
-    let input  = Variable::new(input_t.clone(),  false);
-    let target = Variable::new(target_t.clone(), false);
-    let loss   = cross_entropy_loss(&model.forward(&input)?, &target)?;
-    loss.backward()?;
-    model.step()?;        // AllReduce + buffer sync + optimizer + zero_grad
+fn build_model(device: Device) -> Result<Box<dyn Module>> {
+    let g = FlowBuilder::from(/* ... */).build()?;
+    Ok(Box::new(g))
 }
+// then: Trainer::builder(build_model, |p| Adam::new(p, 1e-3), train_step)
+//           .dataset(dataset).batch_size(64).num_epochs(5).run()?;
 ```
 
-`Trainer::setup_head` is the analogue for `flodl-hf` task-head
-wrappers (any type implementing `HasGraph`). Same loop, byte-identical
-between `setup` and `setup_head`.
+`flodl-hf` task-head wrappers (any type implementing `HasGraph`)
+currently train through `Trainer::setup_head` - see
+[HuggingFace Integration](14-flodl-hf.md). The self-driven
+`Trainer::setup` tier that used to appear here is deprecated (its
+user-owned-loop ergonomics return later as a cooperative tier); for an
+explicit per-rank loop use `Ddp::wrap`.
 
 ## PyTorch comparison
 
@@ -477,8 +470,7 @@ elastic membership, controller-driven checkpoint retry.
 |---|---|
 | `Trainer::builder(model_fn, opt_fn, step).run()` | Universal - any Module, any tier (CPU / 1 GPU / N GPUs / cluster). |
 | `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag - useful for config-driven launchers. |
-| `Trainer::setup(&graph, factory, opt_fn)` | Graph-shaped one-liner; you keep the training loop. |
-| `Trainer::setup_head(&head, factory, opt_fn)` | `flodl-hf` task-head wrapper analog. |
+| `Trainer::setup_head(&head, factory, opt_fn)` | Current `flodl-hf` task-head entry (deprecated pending the cooperative tier). |
 | `Ddp::wrap(&model, device, global_rank, &rdv)` | Low-level per-rank gradient-sync primitive for manual control (GAN/RL); production multi-GPU auto-promotes to processes. |
 
 | Knob | Lives on | Common values |

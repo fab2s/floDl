@@ -98,16 +98,19 @@ Before writing code, decide:
    modules for complex projects.
 
 5. **Distributed?** If Step 3 flagged a Distributed block, route the
-   training loop through flodl's DDP entry points instead of the manual
+   training loop through flodl's one training entry instead of the manual
    `forward / backward / step` loop. flodl unifies data loading and
    training under DDP:
-   - **Graph model** -> `Trainer::setup(&model, &builder, |p| Adam::new(p, lr))?`.
-     Training loop becomes `for batch in model.epoch(e) { ...
-     loss.backward()?; model.step()?; }`. Same loop runs on 1 or N GPUs.
-   - **Non-Graph Module** -> `Trainer::builder(model_factory, optim_factory,
-     train_fn).dataset(...).batch_size(...).num_epochs(...).run()?`.
-     Thread-per-GPU. `.policy(ApplyPolicy::Cadence)` and
-     `.backend(AverageBackend::Nccl)` are swappable for A/B testing.
+   - `Trainer::builder(model_factory, optim_factory, train_fn)
+     .dataset(...).batch_size(...).num_epochs(...).run()?` (or the
+     config-bag `Trainer::run(model_factory, optim_factory, train_fn, cfg)`).
+     Any model works: a `Graph` is just a `Module`, so return it from
+     `model_factory`. It auto-detects GPUs: 0-1 trains inline, 2+
+     auto-promotes to process-per-rank. Tune DDP cadence with
+     `.elche(ElCheConfig::nccl_cadence())` (five modes).
+   - For explicit per-rank gradient-sync / broadcast control, use
+     `Ddp::wrap(&model, device, rank, &rendezvous)?`. (The self-driven
+     `Trainer::setup()` tier is deprecated.)
    - See `ai/skills/port/guide.md` Phase 3 "Distributed Training" for the
      full mapping and `docs/ddp.md` for the reference.
 

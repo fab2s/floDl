@@ -10,7 +10,7 @@
 
 COMPOSE = docker compose
 
-.PHONY: docs-rs site site-stop test-init release-check clean
+.PHONY: docs-rs site site-stop sync-skills test-init release-check clean
 
 # --- docs.rs validation (host-side mkdir + nightly toolchain) ---
 #
@@ -78,6 +78,19 @@ site:
 
 site-stop:
 	$(COMPOSE) down jekyll
+
+# --- Skill assets: sync the ai/ skill sources into the crate ---
+#
+# flodl-cli/assets/skills/ is the copy include_str!'d into the fdl binary
+# (the out-of-repo fallback for `fdl skill install`). crates.io only
+# packages the crate dir, so the copy must live under flodl-cli/. `make
+# site` refreshes it automatically as a side effect; this is the explicit
+# form. ci/release/09-skill-assets.sh fails release on drift.
+sync-skills:
+	@cp ai/skills/port/guide.md          flodl-cli/assets/skills/port-guide.md
+	@cp ai/skills/port/instructions.md   flodl-cli/assets/skills/port-instructions.md
+	@cp ai/adapters/claude/port-skill.md flodl-cli/assets/skills/claude-port.md
+	@echo "synced flodl-cli/assets/skills/ from ai/"
 
 # --- Smoke test: init.sh end-to-end ---
 #

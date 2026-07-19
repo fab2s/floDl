@@ -246,39 +246,26 @@ Same launcher trampoline as `Trainer::builder(...).run()`. Pick
 whichever shape matches your call site. Full setter surface in [DDP
 Reference: `TrainerConfig<M>`](../ddp.md#trainerconfigm--the-umbrella).
 
-## Decomposing Trainer: keep your loop, share the setup
+## Keep your own loop
 
-When you want explicit control of the training loop (multi-stage losses,
-per-step observation hooks, conditional backward, custom gradient
-clipping placement), `Trainer::setup` exposes the setup tier of the
-framework-managed mode without taking over the loop. It runs the same
-hardware detection, GPU replication, optimizer creation, and
-training-mode toggle as `Trainer::builder`; the loop is yours.
+Want explicit control of the training loop (multi-stage losses, per-step
+observation hooks, conditional backward, custom gradient-clipping
+placement)? The self-driven `Trainer::setup` tier that used to fill this
+slot - framework does device replication + optimizer setup, you keep the
+loop, auto-scaling 1-or-N GPU - is **deprecated**; its user-owned-loop
+ergonomics return later as a cooperative tier on the controller engine
+(see [trainer-execution-tiers](../design/trainer-execution-tiers.md)).
+Until then, pick one:
 
-```rust
-let model = build_model()?;
+- **Framework owns the loop** (recommended): `Trainer::builder(...).run()`
+  above; the `train_step` closure is your forward + loss.
+- **Explicit per-rank control** (multi-GPU): `Ddp::wrap(&model, device,
+  rank, &rendezvous)?`, calling `sync_params()` / `all_reduce_gradients()`
+  yourself (see [Multi-GPU](11-multi-gpu.md)).
+- **Single-device manual loop**: the pattern below.
 
-// One call: pick best device, replicate across GPUs if available, set
-// per-replica optimizer, enable training mode. Auto-tuned El Che
-// cadence on heterogeneous multi-GPU.
-Trainer::setup(
-    &model,
-    |dev| build_model_on(dev),
-    |p| Adam::new(p, 0.001),
-)?;
-
-// Loop is yours. Same code on CPU, single GPU, multi-GPU.
-for (input_t, target_t) in &batches {
-    let input = Variable::new(input_t.clone(), false);
-    let target = Variable::new(target_t.clone(), false);
-    let loss = mse_loss(&model.forward(&input)?, &target)?;
-    loss.backward()?;
-    model.step()?;  // AllReduce + buffer sync + optimizer + zero_grad
-}
-```
-
-Task-head wrappers (e.g. `flodl-hf`'s `BertForSequenceClassification`)
-use the matching `Trainer::setup_head` entry. See
+`flodl-hf` task-head wrappers (e.g. `BertForSequenceClassification`)
+currently train through `Trainer::setup_head` - see
 [HuggingFace Integration](14-flodl-hf.md) for a fine-tune walkthrough.
 
 ## The Training Loop
@@ -286,8 +273,9 @@ use the matching `Trainer::setup_head` entry. See
 When you can't or don't want to use `Trainer` (non-Graph custom code,
 single-device prototype, or you're learning the mechanics), the manual
 pattern is: **forward -> loss -> zero_grad -> backward -> clip -> step**.
-The same six steps run inside `Trainer::setup`'s `model.step()`; the
-`train_step` closure of `Trainer::builder` is the forward + loss portion.
+The framework runs these same six steps for you inside
+`Trainer::builder(...).run()`; the `train_step` closure is the forward +
+loss portion.
 
 ```rust
 model.train();

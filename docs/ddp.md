@@ -71,32 +71,27 @@ frontier through the shared staging tier, so storage-backed data
 (local files, network mounts) trains through the same entry as
 RAM-resident tensors.
 
-### Graph-shape one-liner - `Trainer::setup`
+### Graph models: the same entry
 
-When the model is a flodl `Graph` and the training loop is yours:
+A flodl `Graph` (any `FlowBuilder`) is a `Module`, so it trains through the
+exact entry above - just return the built graph from the `model_factory`
+closure:
 
 ```rust
-let model: Graph = build_model()?;   // any FlowBuilder graph
-
-Trainer::setup(
-    &model,
-    |dev| build_model_on(dev),       // per-replica factory
-    |p|   Adam::new(p, 1e-3),        // per-replica optimizer
-)?;
-
-// Same loop on 1 or N GPUs.
-for (input_t, target_t) in &batches {
-    let input  = Variable::new(input_t.clone(),  false);
-    let target = Variable::new(target_t.clone(), false);
-    let loss   = cross_entropy_loss(&model.forward(&input)?, &target)?;
-    loss.backward()?;
-    model.step()?;                  // AllReduce + buffers + optimizer + zero_grad
+fn build_model(device: Device) -> Result<Box<dyn Module>> {
+    let g = FlowBuilder::from(Linear::on_device(784, 10, device)?)
+        .through(GELU)
+        .build()?;
+    Ok(Box::new(g))
 }
+// then: Trainer::builder(build_model, |p| Adam::new(p, 1e-3), train_step)
+//           .dataset(dataset).batch_size(64).num_epochs(5).run()?;
 ```
 
-`Trainer::setup_head` is the analogue for `flodl-hf` task-head wrappers
-(implements `HasGraph`); the loop stays byte-identical between
-`setup` / `setup_head`.
+`flodl-hf` task-head wrappers train the same way (return the wrapper from
+`model_factory`). The self-driven `Trainer::setup` / `Trainer::setup_head`
+tier that used to appear here is deprecated (see the entry note at the top
+of this doc); for an explicit per-rank loop use `Ddp::wrap`.
 
 ### Config-bag form - `Trainer::run`
 

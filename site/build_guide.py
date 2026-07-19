@@ -15,12 +15,25 @@ Run before Jekyll: python3 site/build_guide.py
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STUBS_DIR = os.path.join(REPO_ROOT, "site", "_stubs")
 GUIDE_DIR = os.path.join(REPO_ROOT, "site", "guide")
+
+# Embedded skill assets: flodl-cli/assets/skills/ is the copy include_str!'d
+# into the fdl binary (the out-of-repo fallback for `fdl skill install`).
+# crates.io only packages the crate dir, so it cannot include_str! ../../ai/;
+# this keeps the in-crate copy fresh from the ai/ sources as a side effect of
+# every site build. Also available as `make sync-skills` and enforced at
+# release by ci/release/09-skill-assets.sh. Keep the three lists in sync.
+SKILL_ASSETS = [
+    ("ai/skills/port/guide.md", "flodl-cli/assets/skills/port-guide.md"),
+    ("ai/skills/port/instructions.md", "flodl-cli/assets/skills/port-instructions.md"),
+    ("ai/adapters/claude/port-skill.md", "flodl-cli/assets/skills/claude-port.md"),
+]
 
 # Link rewrites: (pattern, replacement)
 # Order matters — anchored variants before bare filenames.
@@ -159,10 +172,24 @@ def inject_last_modified(frontmatter, iso_ts):
     return "".join(lines)
 
 
+def sync_skill_assets():
+    """Copy the ai/ skill sources into the crate's embedded-asset dir."""
+    for src_rel, dst_rel in SKILL_ASSETS:
+        src = os.path.join(REPO_ROOT, src_rel)
+        dst = os.path.join(REPO_ROOT, dst_rel)
+        if not os.path.isfile(src):
+            print(f"error: skill source not found: {src}", file=sys.stderr)
+            sys.exit(1)
+        shutil.copyfile(src, dst)
+    print(f"synced {len(SKILL_ASSETS)} skill assets into flodl-cli/assets/skills/ from ai/")
+
+
 def main():
     if not os.path.isdir(STUBS_DIR):
         print(f"error: {STUBS_DIR} not found", file=sys.stderr)
         sys.exit(1)
+
+    sync_skill_assets()
 
     os.makedirs(GUIDE_DIR, exist_ok=True)
     count = 0

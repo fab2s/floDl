@@ -321,6 +321,7 @@ The progressive chunk pool now partitions each epoch's permutation into contiguo
 - **Optimizer `state_dict_keys()`**: Adam / RMSprop / SGD expose state-dict key listings for checkpoint introspection.
 - **Optimizer state persistence now covers every optimizer**: `Adagrad`, `RAdam`, and `NAdam` gained `Stateful` (save/load of moments, per-parameter step counts, and hyperparameters), so `Optimizer::save_state_to` no longer returns "unsupported" for them — the cluster save-on-unrecoverable-failure flow can now persist any optimizer's `.optim` sidecar and resume faithfully instead of silently restarting their moment estimates. Their state files are born under the new self-identifying `FDLO` header (see Fixed), so no migration ever applies to them.
 - **Scaled CUDA NCCL communicator wiring**: `NcclComms` better handles N-rank topologies; `NcclRankComm::split` is the per-thread comm seam used by the `Ddp::wrap` / cluster-worker thread-test path (production ranks use per-process `NcclRankComm::init_rank`).
+- **`Tensor::copy()`**: a deep-copy primitive that allocates fresh storage (the flodl spelling of PyTorch's deep `.clone()`). flodl's `Clone` is a *shallow* alias sharing storage (libtorch's copy constructor), so an in-place op through one handle is visible through every alias; `Tensor::copy()` returns an independent, owned duplicate for the cases that need it (optimizer state seeded from a gradient, snapshots held across later mutation). The `Clone` and `Variable::data` docs now flag the shallow-vs-PyTorch divergence and point to it.
 
 ### Changed
 

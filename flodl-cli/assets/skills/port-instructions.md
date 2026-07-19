@@ -45,6 +45,14 @@ If fdl is not available, read `flodl/src/lib.rs` and explore the source
 tree to understand what's available. Focus on `flodl/src/nn/` for modules
 and `flodl/src/graph/flow.rs` for the FlowBuilder.
 
+For the CLI surface (project setup, libtorch, fdl.yml dispatch, the
+`fdl flodl-hf` sub-commands, etc.), use `fdl --help` recursively:
+`fdl --help` lists top-level commands, `fdl <cmd> --help` drills into
+one, `fdl <cmd> <sub> --help` drills further. Help text is
+auto-generated from the source via `#[derive(FdlArgs)]`, so it reflects
+the user's installed version and is the most reliable source for the
+current CLI surface.
+
 ## Step 2: Read the Porting Guide
 
 Read the porting guide at `ai/skills/port/guide.md` for the complete
@@ -61,6 +69,10 @@ Read the entire PyTorch script. Classify every block:
 - **Optimizer**: optimizer and scheduler setup
 - **Checkpoint**: save/load patterns
 - **Inference**: eval mode, no_grad blocks
+- **Distributed**: `torch.distributed.*`, `DistributedDataParallel`,
+  `DataParallel`, `torchrun` launcher, `mp.spawn`, `init_process_group`,
+  `dist.barrier`, `dist.all_reduce`. Flag this explicitly -- it changes
+  the target entry point in Step 4.
 - **Utility**: logging, metrics, visualization
 
 List what you found before starting to port.
@@ -84,6 +96,23 @@ Before writing code, decide:
 
 4. **Project structure**: One `src/main.rs` for simple scripts. Separate
    modules for complex projects.
+
+5. **Distributed?** If Step 3 flagged a Distributed block, route the
+   training loop through flodl's one training entry instead of the manual
+   `forward / backward / step` loop. flodl unifies data loading and
+   training under DDP:
+   - `Trainer::builder(model_factory, optim_factory, train_fn)
+     .dataset(...).batch_size(...).num_epochs(...).run()?` (or the
+     config-bag `Trainer::run(model_factory, optim_factory, train_fn, cfg)`).
+     Any model works: a `Graph` is just a `Module`, so return it from
+     `model_factory`. It auto-detects GPUs: 0-1 trains inline, 2+
+     auto-promotes to process-per-rank. Tune DDP cadence with
+     `.elche(ElCheConfig::nccl_cadence())` (five modes).
+   - For explicit per-rank gradient-sync / broadcast control, use
+     `Ddp::wrap(&model, device, rank, &rendezvous)?`. (The self-driven
+     `Trainer::setup()` tier is deprecated.)
+   - See `ai/skills/port/guide.md` Phase 3 "Distributed Training" for the
+     full mapping and `docs/ddp.md` for the reference.
 
 ## Step 5: Generate the Port
 

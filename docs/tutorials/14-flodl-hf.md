@@ -389,6 +389,12 @@ mode; on multi-GPU hosts it auto-distributes via the factory closure
 below is byte-identical for 1 or N GPUs. See
 [Multi-GPU DDP](11-multi-gpu.md) for the multi-device story.
 
+> **Note:** the self-driven setup tier (`Trainer::setup` / `setup_head`)
+> is deprecated pending its cooperative-tier replacement on the
+> controller engine; it still works, and remains the current entry for
+> `flodl-hf` task-head wrappers (which implement `HasGraph`). See
+> [`docs/design/trainer-execution-tiers.md`](../design/trainer-execution-tiers.md).
+
 ### 3. Train
 
 ```rust

@@ -103,6 +103,7 @@ Read the entire PyTorch script and classify each block by intent:
 | Inference | `model.eval(); with torch.no_grad()` | eval mode, no_grad |
 | Device management | `.to(device)`, `.cuda()` | device transfers |
 | Mixed precision | `torch.cuda.amp` | autocast, GradScaler |
+| Distributed training | `DistributedDataParallel`, `DataParallel`, `torch.distributed`, `torchrun`, `mp.spawn` | `init_process_group`, `dist.barrier`, `dist.all_reduce`, DDP wrapping |
 
 ## Phase 3: Map by Intent
 
@@ -324,6 +325,84 @@ for epoch in 0..num_epochs {
 }
 ```
 
+### Distributed Training (DDP)
+
+flodl has ONE training entry that runs everywhere: `Trainer::builder(...).run()`
+(chained form) or `Trainer::run(model_factory, optim_factory, train_fn, cfg)`
+(config-bag form). It auto-detects visible CUDA devices: 0-1 GPUs train
+inline on a single device; 2+ GPUs auto-promote to the process-per-rank DDP
+path (the launcher re-execs your binary as per-rank children and drives the
+cluster coordinator). The same code runs on CPU, one GPU, N GPUs on a host,
+and multi-host clusters, with no `init_process_group`, no `torchrun`, no
+`mp.spawn`, and no `DistributedSampler`.
+
+```python
+# PyTorch
+dist.init_process_group("nccl", rank=rank, world_size=world_size)
+model = model.to(rank)
+model = DistributedDataParallel(model, device_ids=[rank])
+sampler = DistributedSampler(dataset)
+loader = DataLoader(dataset, batch_size=32, sampler=sampler)
+
+for epoch in range(num_epochs):
+    sampler.set_epoch(epoch)
+    for batch in loader:
+        optimizer.zero_grad()
+        loss = criterion(model(batch[0]), batch[1])
+        loss.backward()
+        optimizer.step()
+```
+
+```rust
+// flodl -- the framework owns the loop (backward, optimizer, gradient sync).
+// model_factory: one model per replica, built on the given device.
+fn build_model(device: Device) -> Result<Box<dyn Module>> {
+    let model = FlowBuilder::from(/* ... */).build()?;
+    Ok(Box::new(model))
+}
+
+// Canonical step closure: forward + loss, nothing else.
+fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+    let input = Variable::new(batch[0].clone(), false);
+    let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
+    cross_entropy_loss(&model.forward(&input)?, &target)
+}
+
+let handle = Trainer::builder(build_model, |p| Adam::new(p, 1e-3), train_step)
+    .dataset(dataset)
+    .batch_size(32)
+    .num_epochs(num_epochs)
+    .elche(ElCheConfig::nccl_cadence())   // DDP cadence x backend (the default)
+    .run()?;                              // inline on 0-1 GPU, process-per-rank on 2+
+
+let state = handle.join()?;               // trained params + buffers
+```
+
+**Key translations:**
+
+| PyTorch | flodl |
+|---------|-------|
+| `dist.init_process_group(...)` | handled inside `Trainer::run` (auto-promote) |
+| `DistributedDataParallel(model, device_ids=[rank])` | `Trainer::builder(build, opt, step).run()?` |
+| `DistributedSampler(dataset)` | Built-in: the DataLoader is DDP-aware, partitions automatically |
+| `sampler.set_epoch(epoch)` | Not needed (deterministic per-epoch partitioning) |
+| `torchrun --nproc_per_node=N` / `mp.spawn` | Not needed (`Trainer::run` auto-promotes to process-per-rank) |
+| `dist.all_reduce(tensor)` / `dist.barrier()` | handled inside the framework loop |
+
+**Heterogeneous clusters:** flodl's ElChe cadence auto-detects per-GPU
+speed and lets faster cards run ahead while the slow one anchors
+synchronization. Tune it with `.elche(ElCheConfig::...)` (five modes:
+`nccl_sync` / `nccl_cadence` / `cpu_sync` / `cpu_cadence` / `cpu_async`).
+
+**Manual per-rank control:** for explicit gradient-sync / parameter-broadcast
+control (GAN, RL, progressive), drop to `Ddp::wrap(&model, device, rank,
+&rendezvous)?` and call `sync_params()` / `all_reduce_gradients()` yourself.
+(The self-driven `Trainer::setup()` tier is deprecated; its user-owned-loop
+ergonomics return later as a cooperative tier on the controller engine.)
+
+For the full DDP surface (policies, backends, convergence guard, metrics,
+live monitor integration, troubleshooting), see `docs/ddp.md`.
+
 ### Data Loading
 
 ```python
@@ -427,7 +506,7 @@ After generating the port:
 - Variables wrap tensors with gradient tracking
 - `&variable` for read access in loss functions
 - `.clone()` = shallow copy (shares storage; UNLIKE PyTorch's deep `.clone()`)
-- `.copy()` = deep copy (independent storage; the PyTorch `.clone()` equivalent) — use when you keep a value while the original may be mutated in place
+- `.copy()` = deep copy (independent storage; the PyTorch `.clone()` equivalent). Use when you keep a value while the original may be mutated in place.
 - `.detach()` to break gradient graph (also shares storage)
 
 ### Builder Pattern
