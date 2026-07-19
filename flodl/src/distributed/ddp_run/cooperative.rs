@@ -75,6 +75,20 @@ pub struct Worker<M: Module> {
     /// The controller signalled shutdown (seen in `next_batch`'s wait or in
     /// `step`'s control drain); `next_epoch` returns `None` from here on.
     shutdown: bool,
+    /// Set by `finish` so the Drop guard knows the run ended cleanly. Without
+    /// it, dropping a cluster rank's `Worker` mid-run (user loop errored /
+    /// panicked) writes a death record and exits to unblock peers.
+    finished: bool,
+    /// Forensic context for the Drop guard: `Some` on a cluster rank, `None` on
+    /// a single device (no peers to unblock, nothing to record).
+    forensics: Option<RankForensics>,
+}
+
+/// Death-record context carried by a cluster-rank `Worker` for its Drop guard.
+struct RankForensics {
+    save_path: Option<String>,
+    global_rank: usize,
+    world_size: usize,
 }
 
 enum WorkerInner<M: Module> {
@@ -89,11 +103,7 @@ enum WorkerInner<M: Module> {
     /// Coordinator-driven rank (multi-GPU / cluster). The `ClusterWorker` owns
     /// the bridge threads; the plan cursor (`wait_for_epoch_plan` +
     /// `fire_epoch_callback`) and the teardown come from its step-wise methods.
-    ///
-    /// Constructed by `DdpHandle::into_worker` (wired in the next PR); the
-    /// method arms below are the cooperative API over it, validated by the
-    /// live 2-GPU equivalence test.
-    #[allow(dead_code)]
+    /// Constructed by `DdpHandle::run_cluster_rank_worker` via `into_worker`.
     Cluster(ClusterWorker<M>),
 }
 
@@ -101,10 +111,6 @@ impl<M: Module + 'static> Worker<M> {
     /// Wrap a bare [`GpuWorker`] as a single-device cooperative worker.
     /// No coordinator; epoch plans are synthesized locally over the whole
     /// dataset for `num_epochs`.
-    // `allow(dead_code)`: exercised by the cooperative unit tests now, and by
-    // `DdpHandle::into_worker` in the next PR (non-test builds have no caller
-    // until then).
-    #[allow(dead_code)]
     pub(crate) fn single(
         worker: GpuWorker<M>,
         num_epochs: usize,
@@ -122,13 +128,21 @@ impl<M: Module + 'static> Worker<M> {
             compute_start: None,
             active_guard: None,
             shutdown: false,
+            finished: false,
+            forensics: None, // single device: no peers to unblock
         }
     }
 
     /// Wrap a coordinator-connected [`ClusterWorker`] as a cooperative rank.
-    /// Constructed by `DdpHandle::into_worker` (wired in the next PR).
-    #[allow(dead_code)]
-    pub(crate) fn cluster(cluster: ClusterWorker<M>) -> Self {
+    /// The forensic context (`save_path` / rank / world size) arms the Drop
+    /// guard so an un-`finish()`ed drop writes a death record and exits to
+    /// unblock peers.
+    pub(crate) fn cluster(
+        cluster: ClusterWorker<M>,
+        save_path: Option<String>,
+        global_rank: usize,
+        world_size: usize,
+    ) -> Self {
         Worker {
             inner: WorkerInner::Cluster(cluster),
             epoch_state: None,
@@ -136,6 +150,12 @@ impl<M: Module + 'static> Worker<M> {
             compute_start: None,
             active_guard: None,
             shutdown: false,
+            finished: false,
+            forensics: Some(RankForensics {
+                save_path,
+                global_rank,
+                world_size,
+            }),
         }
     }
 
@@ -339,6 +359,8 @@ impl<M: Module + 'static> Worker<M> {
     /// inference. Closes any epoch left in flight, then runs the rank teardown
     /// (cluster) or captures the final snapshot (single-device).
     pub fn finish(mut self) -> Result<TrainedState> {
+        // Disarm the Drop guard: a clean finish, not a dropped-mid-run rank.
+        self.finished = true;
         // Release any lingering per-batch guard before the final accounting.
         self.active_guard = None;
         if let Some(mut st) = self.epoch_state.take() {
@@ -347,8 +369,10 @@ impl<M: Module + 'static> Worker<M> {
             }
         }
 
-        match self.inner {
-            WorkerInner::Single { mut worker, .. } => {
+        // Borrow (never move) self.inner — `Worker` has a Drop impl, so moving
+        // a field out is illegal; teardown / snapshot both take `&mut`.
+        match &mut self.inner {
+            WorkerInner::Single { worker, .. } => {
                 let snap = worker.snapshot_params();
                 Ok(TrainedState {
                     params: snap
@@ -363,7 +387,7 @@ impl<M: Module + 'static> Worker<M> {
                         .collect::<Result<Vec<_>>>()?,
                 })
             }
-            WorkerInner::Cluster(mut cluster) => {
+            WorkerInner::Cluster(cluster) => {
                 // Snapshot tensors already land on CPU (snapshot_params'
                 // contract). `None` (worker errored before send_final_snapshot)
                 // falls back to an empty state, matching the via_coord path.
@@ -378,6 +402,58 @@ impl<M: Module + 'static> Worker<M> {
                         buffers: Vec::new(),
                     }))
             }
+        }
+    }
+}
+
+impl<M: Module> Drop for Worker<M> {
+    /// Blocked-peer-hang protection for the cooperative cluster tier. A rank
+    /// whose `Worker` is dropped WITHOUT `finish()` (the user's loop returned
+    /// `Err` and propagated, or panicked) is a self-inflicted rank death: write
+    /// the forensic record and exit non-zero so the launcher's supervisor
+    /// SIGTERMs the peers — mirroring the managed rank entry's `catch_unwind` +
+    /// `process::exit(1)`. A clean `finish()` disarms this; the single-device
+    /// path has no `forensics` (no peers), so it is a plain no-op.
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(f) = self.forensics.take() else {
+            return; // single-device: nothing to record, no peers to unblock
+        };
+        let panicking = std::thread::panicking();
+        let reason = if panicking {
+            "cooperative Worker dropped during a panic (user loop panicked)".to_string()
+        } else {
+            "cooperative Worker dropped without finish() (user loop returned Err)".to_string()
+        };
+        if let Some(stem) = &f.save_path {
+            let record = crate::distributed::RankDeathRecord::new(
+                f.global_rank,
+                f.world_size,
+                reason.clone(),
+            );
+            let path =
+                crate::distributed::CheckpointBundle::rank_death_path(stem, f.global_rank);
+            match record.write_to_file(&path) {
+                Ok(()) => eprintln!(
+                    "flodl cluster rank: wrote death record to {}",
+                    path.display()
+                ),
+                Err(werr) => eprintln!(
+                    "flodl cluster rank: failed to write death record to {}: {werr}",
+                    path.display()
+                ),
+            }
+        }
+        if panicking {
+            // Let the unwind continue to terminate the process (exit 101); the
+            // panic hook already printed the payload. Calling process::exit
+            // here would mask that with exit(1).
+            eprintln!("flodl cluster rank: {reason}");
+        } else {
+            eprintln!("flodl cluster rank: {reason}; exiting to unblock peers");
+            std::process::exit(1);
         }
     }
 }

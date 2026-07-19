@@ -16,7 +16,7 @@ use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::worker::GpuWorker;
 use crate::distributed::ddp_run::{
     self, ApplyPolicy, CheckpointFn, EpochFn, EvalFn, EvalResultFn, MetricsFn, TrainedState,
-    WorkerConfig,
+    Worker, WorkerConfig,
 };
 use crate::graph::GraphExt;
 use crate::nn::{Module, Optimizer, Parameter};
@@ -272,5 +272,114 @@ impl DdpHandle {
             graph_hash,
             training_meta,
         })
+    }
+
+    /// Single-device cooperative entry: build a bare [`GpuWorker`] and wrap it
+    /// in a [`Worker`] the user drives. This is `run_single`'s worker
+    /// construction **minus** the `for epoch` loop and its per-epoch metrics /
+    /// checkpoint / eval cadence — in the cooperative tier the user owns the
+    /// loop, so those side tasks are the user's to fire (there is no controller
+    /// on a single device to elect a rank for them). `checkpoint_fn` / `eval_fn`
+    /// / `eval_dataset` are still handed to the worker so a custom loop can
+    /// reach them.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_single_worker<F, M, G, O>(
+        model_factory: &F,
+        optim_factory: &G,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        device: Device,
+        checkpoint_fn: Option<CheckpointFn<M>>,
+        max_grad_norm: Option<f64>,
+        vram_pool: bool,
+        vram_max_usage: f64,
+        ram_max_usage: f64,
+        sample_cache: bool,
+        disk_stage_gb: u64,
+        disk_stage_dir: Option<std::path::PathBuf>,
+        augment: usize,
+        transform: Option<crate::data::TransformFn>,
+        scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
+        eval_fn: Option<EvalFn<M>>,
+        eval_dataset: Option<Arc<dyn BatchDataSet>>,
+    ) -> Result<Worker<M>>
+    where
+        F: Fn(Device) -> Result<M>,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O,
+        O: Optimizer + 'static,
+    {
+        crate::verbose!("  ddp: single device ({device:?}) | cooperative | no coordination");
+
+        // Schedule space: picks (samples × augment views).
+        let total_samples = dataset.len() * augment.max(1);
+        let tmp_model = model_factory(device)?;
+        let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
+            .map(|p| p.variable.data())
+            .collect();
+        crate::distributed::ddp_run::ensure_trainable_params(
+            initial_params.len(), "ddp: single device",
+        )?;
+        let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
+            .map(|b| b.get())
+            .collect();
+        drop(tmp_model);
+
+        let config = WorkerConfig {
+            rank: 0,
+            world_size: 1,
+            device,
+            initial_params,
+            initial_buffers,
+            total_samples,
+            batch_size,
+            augment: augment.max(1),
+            transform,
+            seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
+            max_grad_norm,
+            vram_pool,
+            vram_max_usage,
+            ram_max_usage,
+            sample_cache,
+            disk_stage_gb,
+            disk_stage_dir,
+            easgd_alpha: None,
+            gamma: 1.0,
+            timeline: None,
+            policy: ApplyPolicy::Sync, // single device: no divergence measurement
+            save_path: None,
+            coord_liveness_timeout_secs:
+                crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+        };
+
+        // The worker holds the sender ends; the cooperative Worker never drains
+        // the receivers (report_timing / report_epoch sends fail silently once
+        // the WorkerChannels drop — the single-device path reports to no one).
+        let (worker_endpoints, _worker_channels) = GpuWorker::<M>::channels();
+        let (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx) = worker_endpoints;
+
+        let mut worker = GpuWorker::new(
+            &config,
+            model_factory,
+            optim_factory,
+            dataset,
+            None, // no NCCL for single device
+            checkpoint_fn,
+            eval_fn,
+            eval_dataset,
+            timing_tx,
+            metrics_tx,
+            param_tx,
+            final_param_tx,
+            control_rx,
+            None, // single device: no averaging, no outer optimizer
+        )?;
+
+        if let Some(sched) = scheduler {
+            worker.set_scheduler(sched);
+        }
+
+        Ok(Worker::single(worker, num_epochs, total_samples))
     }
 }

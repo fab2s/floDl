@@ -100,6 +100,58 @@ pub struct DdpHandle {
 }
 
 impl DdpHandle {
+    /// Auto-promote a single-host multi-GPU run with no cluster envelope:
+    /// synthesize a localhost cluster and set `FLODL_INTERNAL_FULL_CLUSTER_JSON`
+    /// so the launcher trampoline (`dispatch()`) returns `Role::Launcher`. This
+    /// makes `Trainer::builder().run()` / `.into_worker()` "just work" for
+    /// single-host multi-GPU without any cluster yml or programmatic config,
+    /// on the canonical process-per-rank path.
+    ///
+    /// No-op when: any cluster-role env var is already set (fdl-cli overlay,
+    /// programmatic `cfg.cluster`, or this process IS a spawned rank/relay
+    /// child re-entering the user binary); `detect_gpus()` returns <2; or
+    /// compiled `cfg(test)` (flodl's own tests use `Ddp::wrap`). `detect_gpus()`
+    /// respects `CUDA_VISIBLE_DEVICES`. Shared by `launch` + `into_worker`.
+    fn maybe_auto_promote() -> Result<()> {
+        #[cfg(not(test))]
+        {
+            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
+            // Role-env gate shared with the programmatic-cluster promotion in
+            // `DdpBuilder::run`: covers ALL role vars, including the relay's. A
+            // relay child spawned on this very host sees >=2 GPUs too —
+            // re-promoting inside it poisoned its env and killed the cohort at
+            // dispatch ("inconsistent env").
+            if crate::distributed::launcher::role_env_pristine() {
+                let gpus = crate::sys::detect_gpus();
+                if gpus.len() >= 2 {
+                    match crate::distributed::ClusterBuilder::all_local_gpus() {
+                        Ok(full) => {
+                            let hex = crate::distributed::cluster::hex_encode(
+                                full.to_json().to_string().as_bytes(),
+                            );
+                            // SAFETY: called from main() before any user-spawned
+                            // threads; matches the invariant documented for
+                            // fdl-cli's `prepare_cluster_env`.
+                            unsafe {
+                                std::env::set_var(ENV_FULL_CLUSTER_JSON, hex);
+                            }
+                        }
+                        Err(e) => {
+                            // `all_local_gpus` errors when no GPUs are visible —
+                            // but we just checked >=2. The only realistic failure
+                            // is `hostname(1)` failing; surface it loudly rather
+                            // than silently falling back to single-device.
+                            return Err(crate::tensor::TensorError::new(&format!(
+                                "auto-promote multi-GPU failed: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Internal launcher shared by the builder (`DdpBuilder::run`).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn launch<F, M, G, O, T>(
@@ -149,45 +201,7 @@ impl DdpHandle {
         //
         // `detect_gpus()` respects `CUDA_VISIBLE_DEVICES`, so production
         // callers that want to scope down also have that lever.
-        #[cfg(not(test))]
-        {
-            use crate::distributed::launcher::ENV_FULL_CLUSTER_JSON;
-            // Role-env gate shared with the programmatic-cluster
-            // promotion in `DdpBuilder::run`: covers ALL role vars,
-            // including the relay's. A relay child spawned on this
-            // very host sees >=2 GPUs too — re-promoting inside it
-            // poisoned its env and killed the cohort at dispatch
-            // ("inconsistent env").
-            if crate::distributed::launcher::role_env_pristine() {
-                let gpus = crate::sys::detect_gpus();
-                if gpus.len() >= 2 {
-                    match crate::distributed::ClusterBuilder::all_local_gpus() {
-                        Ok(full) => {
-                            let hex = crate::distributed::cluster::hex_encode(
-                                full.to_json().to_string().as_bytes(),
-                            );
-                            // SAFETY: DdpHandle::launch is called from
-                            // main() before any user-spawned threads;
-                            // matches the invariant documented for
-                            // fdl-cli's `prepare_cluster_env`.
-                            unsafe {
-                                std::env::set_var(ENV_FULL_CLUSTER_JSON, hex);
-                            }
-                        }
-                        Err(e) => {
-                            // `all_local_gpus` errors when no GPUs are
-                            // visible — but we just checked >=2. The
-                            // only realistic failure is `hostname(1)`
-                            // failing; surface it loudly rather than
-                            // silently falling back to single-device.
-                            return Err(crate::tensor::TensorError::new(&format!(
-                                "auto-promote multi-GPU failed: {e}"
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        Self::maybe_auto_promote()?;
 
         // Launcher trampoline. In launcher mode this process is the
         // fan-out orchestrator — no training body to run here. Build
@@ -529,6 +543,169 @@ impl DdpHandle {
             "in-process multi-GPU training has been removed: on 2+ GPUs use \
              Trainer::run / Trainer::builder().run() (process-per-rank \
              auto-promote), or Ddp::wrap for manual thread-based DDP",
+        ))
+    }
+
+    /// Cooperative-tier entry: returns a [`Worker`](crate::distributed::ddp_run::Worker)
+    /// the user drives (own the epoch/batch loop) while the controller stays
+    /// authoritative — the "missing middle" between `run()` (framework owns the
+    /// loop) and `Ddp::wrap` (user owns everything). Same role trampoline as
+    /// [`Self::launch`]; only Rank + SingleDevice return a `Worker`.
+    ///
+    /// Launcher / Relay / Agent **never train**: those processes drive the
+    /// fan-out (or the per-host relay/agent) and then exit — the user's loop
+    /// runs only on the rank processes (and the single-device fallback). So
+    /// this returns a `Worker` solely on Rank + SingleDevice; the other roles
+    /// terminate the process, exactly as the managed path does.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(super) fn into_worker<F, M, G, O, T>(
+        model_factory: F,
+        optim_factory: G,
+        train_fn: T,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        num_epochs: usize,
+        policy: ApplyPolicy,
+        backend: AverageBackend,
+        config: DdpRunConfig,
+        rank_callbacks: RankCallbacks<M>,
+        metrics_fn: Option<MetricsFn>,
+        scheduler_fn: Option<SchedulerFn>,
+        convergence_guard: Option<Box<dyn ConvergenceGuard>>,
+        eval_result_fn: Option<EvalResultFn>,
+    ) -> Result<crate::distributed::ddp_run::Worker<M>>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+        T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
+    {
+        Self::maybe_auto_promote()?;
+
+        // Non-training roles (Launcher / Relay / Agent) are handled exactly as
+        // the managed `launch` handles them — reuse it. Launcher returns a
+        // `DdpHandle` holding the driver (join it, then exit — the launcher
+        // never runs the user's loop); Relay/Agent `process::exit` inside
+        // `launch` and never return. This branch diverges, so it does not move
+        // the training params away from the Rank/SingleDevice paths below.
+        if matches!(
+            crate::distributed::launcher::dispatch()?,
+            crate::distributed::launcher::Role::Launcher
+                | crate::distributed::launcher::Role::Relay
+                | crate::distributed::launcher::Role::Agent
+        ) {
+            let mut handle = Self::launch(
+                model_factory,
+                optim_factory,
+                train_fn,
+                dataset,
+                batch_size,
+                num_epochs,
+                policy,
+                backend,
+                config,
+                rank_callbacks,
+                metrics_fn,
+                scheduler_fn,
+                convergence_guard,
+                eval_result_fn,
+            )?;
+            // Only the Launcher role returns here (Relay/Agent exited inside
+            // `launch`). Join the launcher driver, then exit: the launcher
+            // process has no cooperative loop to hand back to the user.
+            if let Some(driver) = handle.launcher_driver.take() {
+                match driver.join() {
+                    Ok(Ok(())) => std::process::exit(0),
+                    Ok(Err(e)) => {
+                        eprintln!("flodl cluster launcher: {e}");
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        eprintln!("flodl cluster launcher: driver thread panicked");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+
+        // Rank context: a spawned rank re-entering the user binary. Mirror
+        // `launch`'s cluster-rank detection, but return a cooperative `Worker`
+        // over the connected `ClusterWorker` instead of self-driving the loop.
+        match crate::distributed::cluster::LocalCluster::from_env() {
+            Ok(Some(cluster)) => {
+                if let Err(e) =
+                    crate::distributed::launcher::claim_cluster_entry("rank")
+                {
+                    eprintln!("flodl cluster rank: {e}");
+                    std::process::exit(1);
+                }
+                return match Self::run_cluster_rank_worker(
+                    cluster,
+                    policy,
+                    backend,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    batch_size,
+                    config,
+                    scheduler_fn,
+                    rank_callbacks,
+                ) {
+                    Ok(worker) => Ok(worker),
+                    Err(e) => {
+                        // Pre-rendezvous setup failure: fatal at the rank-process
+                        // level (see the managed rank entry's rationale). Exit
+                        // non-zero so the launcher's supervisor SIGTERMs peers.
+                        eprintln!("flodl cluster rank: pre-rendezvous setup failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            Ok(None) => {
+                // Not a cluster rank; fall through to single-device.
+            }
+            Err(e) => {
+                eprintln!("flodl cluster rank: envelope parse failed: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // Single-device fallback: no coordinator, cooperative loop over a bare
+        // GpuWorker. Mirrors `launch`'s single-GPU branch.
+        let devices = crate::tensor::usable_cuda_devices();
+        if devices.len() < 2 {
+            let dev = devices.first().copied().unwrap_or(Device::CPU);
+            let scheduler = scheduler_fn.map(|f| f(1));
+            let RankCallbacks { checkpoint_fn, eval_fn, eval_dataset, .. } =
+                rank_callbacks;
+            return Self::run_single_worker(
+                &model_factory, &optim_factory,
+                dataset, batch_size, num_epochs, dev,
+                checkpoint_fn,
+                config.max_grad_norm,
+                config.vram_pool,
+                config.vram_max_usage,
+                config.ram_max_usage,
+                config.sample_cache,
+                config.disk_stage_gb,
+                config.disk_stage_dir.clone(),
+                config.augment,
+                config.transform.clone(),
+                scheduler,
+                eval_fn,
+                eval_dataset,
+            );
+        }
+
+        // 2+ visible GPUs, no cluster envelope, no launcher role: unreachable
+        // in production (auto-promote handled it); reachable only under
+        // cfg(test) where auto-promote is gated off.
+        Err(crate::tensor::TensorError::new(
+            "in-process multi-GPU has been removed: on 2+ GPUs use \
+             Trainer::builder().into_worker() (process-per-rank auto-promote), \
+             or Ddp::wrap for manual thread-based DDP",
         ))
     }
 

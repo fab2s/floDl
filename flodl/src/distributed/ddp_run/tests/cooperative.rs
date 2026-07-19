@@ -198,6 +198,47 @@ fn worker_sync_now_drains_reduce_in_step() {
 }
 
 #[test]
+fn builder_into_worker_single_device_trains() {
+    // End-to-end through the public entry: Trainer::builder(...).into_worker()
+    // → DdpHandle::into_worker → run_single_worker → cooperative loop. Exercises
+    // finalize_and_extract + the role dispatch's single-device fallback.
+    //
+    // Under cfg(test) auto-promote is gated off, so on a 2+-GPU rig
+    // into_worker would hit the "in-process multi-GPU removed" error (the
+    // cluster path needs process-per-rank, not unit-testable). Skip there; the
+    // single-device path is device-agnostic and covered on CPU / single GPU.
+    if crate::tensor::usable_cuda_devices().len() >= 2 {
+        return;
+    }
+    use crate::distributed::Trainer;
+    let total = 16;
+    let dataset: Arc<dyn BatchDataSet> = Arc::new(DeterministicDataset { n: total });
+    let mut w = Trainer::builder(
+        |d| Linear::on_device(4, 2, d),
+        |p| crate::nn::SGD::new(p, 0.01, 0.0),
+        mse_train,
+    )
+    .dataset(dataset)
+    .batch_size(4)
+    .num_epochs(2)
+    .into_worker()
+    .unwrap();
+
+    let mut steps = 0usize;
+    while let Some(_plan) = w.next_epoch().unwrap() {
+        while let Some(batch) = w.next_batch().unwrap() {
+            let loss = mse_train(w.model(), &batch).unwrap();
+            loss.backward().unwrap();
+            w.step(&loss).unwrap();
+            steps += 1;
+        }
+    }
+    assert_eq!(steps, 2 * (total / 4));
+    let state = w.finish().unwrap();
+    assert_eq!(state.params.len(), 2, "Linear: weight + bias");
+}
+
+#[test]
 fn cooperative_worker_matches_managed_run_epoch_plan() {
     // The load-bearing test: driving the cooperative loop (next_epoch /
     // next_batch / user fwd+bwd / step) produces the same trained params as the

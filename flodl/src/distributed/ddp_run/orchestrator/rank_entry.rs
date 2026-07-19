@@ -22,7 +22,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::{
     ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy,
-    RankCallbacks, SchedulerFn, TrainedState, WorkerConfig,
+    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig,
 };
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -79,6 +79,37 @@ fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
 /// re-break rotation, so the cost is intrinsic, not an oversight. Keep
 /// captured state lean (e.g. `Arc` shared handles, not cloned datasets)
 /// if a callback closure is heavy.
+/// Last-gasp forensic record so a postmortem can tell a self-inflicted rank
+/// crash (Err / panic / cooperative `Worker` dropped without `finish()`) apart
+/// from a controller-driven `ShutdownWithSave` (which writes a `CheckpointMeta`).
+/// Best-effort and only when a `save_path` exists; a write failure is logged,
+/// never allowed to mask the original cause. Shared by the managed rank entry
+/// (`run_cluster_rank_via_coord`), the cooperative setup-failure path
+/// (`run_cluster_rank_worker`), and the cooperative `Worker`'s Drop guard.
+pub(crate) fn write_rank_death_record(
+    save_path: Option<&str>,
+    global_rank: usize,
+    world_size: usize,
+    reason: String,
+) {
+    let Some(stem) = save_path else {
+        return;
+    };
+    let record =
+        crate::distributed::RankDeathRecord::new(global_rank, world_size, reason);
+    let path = crate::distributed::CheckpointBundle::rank_death_path(stem, global_rank);
+    match record.write_to_file(&path) {
+        Ok(()) => eprintln!(
+            "flodl cluster rank: wrote death record to {}",
+            path.display()
+        ),
+        Err(werr) => eprintln!(
+            "flodl cluster rank: failed to write death record to {}: {werr}",
+            path.display()
+        ),
+    }
+}
+
 fn rank_fires_callbacks(
     policy: EpochCallbackPolicy,
     _global_rank: usize,
@@ -526,35 +557,10 @@ impl DdpHandle {
                 }))
             },
         ));
-        // Last-gasp forensic record so a postmortem can tell a self-inflicted
-        // crash (Err OR panic) apart from a controller-driven ShutdownWithSave
-        // (which writes a CheckpointMeta). Best-effort and only when a
-        // save_path exists; a write failure is logged, never allowed to mask
-        // the original cause.
-        let write_death_record = |reason: String| {
-            if let Some(ref stem) = save_path {
-                let record = crate::distributed::RankDeathRecord::new(
-                    global_rank,
-                    world_size,
-                    reason,
-                );
-                let path = crate::distributed::CheckpointBundle::rank_death_path(
-                    stem,
-                    global_rank,
-                );
-                match record.write_to_file(&path) {
-                    Ok(()) => eprintln!(
-                        "flodl cluster rank: wrote death record to {}",
-                        path.display()
-                    ),
-                    Err(werr) => eprintln!(
-                        "flodl cluster rank: failed to write death record \
-                         to {}: {werr}",
-                        path.display()
-                    ),
-                }
-            }
-        };
+        // Last-gasp forensic record (see `write_rank_death_record`): tells a
+        // self-inflicted crash apart from a controller-driven ShutdownWithSave.
+        let write_death_record =
+            |reason: String| write_rank_death_record(save_path.as_deref(), global_rank, world_size, reason);
         let final_state = match worker_outcome {
             Ok(Ok(state)) => state,
             Ok(Err(e)) => {
@@ -589,5 +595,268 @@ impl DdpHandle {
             graph_hash: None,
             training_meta,
         })
+    }
+
+    /// Cooperative cluster-rank entry: build + connect the
+    /// [`ClusterWorker`](crate::distributed::cluster_worker::ClusterWorker)
+    /// exactly as [`Self::run_cluster_rank_via_coord`] does up through
+    /// `connect_and_build` (backend bootstrap, initial-state broadcast, bridges,
+    /// scheduler, outer-momentum resume), then wrap it in a [`Worker`] the user
+    /// drives — instead of self-driving `run_until_shutdown`. No `train_fn`
+    /// (the user supplies forward+loss in their loop); the reduce still rides
+    /// the coordinator's `SyncNow` drained inside `Worker::step`.
+    ///
+    /// **Failure model.** A pre-rendezvous setup failure writes the forensic
+    /// death record here and returns `Err` (the caller exits non-zero to
+    /// unblock peers). A *training-loop* failure is caught by the `Worker`'s
+    /// Drop guard (un-`finish()`ed drop → death record + exit), so the
+    /// blocked-peer-hang protection the managed path gets from its
+    /// `catch_unwind` is preserved across the user-owned loop.
+    ///
+    /// The bootstrap here mirrors `run_cluster_rank_via_coord`'s; keep the two
+    /// in sync (a shared `build_cluster_worker` extraction is a candidate
+    /// cleanup once the cooperative cluster path is rig-proven).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_cluster_rank_worker<F, M, G, O>(
+        cluster: crate::distributed::cluster::LocalCluster,
+        policy: ApplyPolicy,
+        backend: AverageBackend,
+        model_factory: F,
+        optim_factory: G,
+        dataset: Arc<dyn BatchDataSet>,
+        batch_size: usize,
+        config: DdpRunConfig,
+        scheduler_fn: Option<SchedulerFn>,
+        rank_callbacks: RankCallbacks<M>,
+    ) -> Result<Worker<M>>
+    where
+        F: Fn(Device) -> Result<M> + Send + Sync + 'static,
+        M: Module + 'static,
+        G: Fn(&[Parameter]) -> O + Send + Sync + 'static,
+        O: Optimizer + 'static,
+    {
+        let RankCallbacks {
+            checkpoint_fn,
+            epoch_fn,
+            eval_fn,
+            eval_dataset,
+            outer_optimizer_factory,
+        } = rank_callbacks;
+        let save_path = config.save_path.clone();
+
+        let (global_rank, device) = cluster.my_rank()?;
+        let world_size = cluster.world_size();
+        let total_samples = dataset.len() * config.augment.max(1);
+
+        // Bootstrap can fail before the Worker (and its Drop guard) exists;
+        // write the forensic record here on Err so a setup failure is as
+        // traceable as a managed-path failure. `?` short-circuits are wrapped
+        // in this closure so every early Err funnels through the record write.
+        let build = || -> Result<crate::distributed::cluster_worker::ClusterWorker<M>> {
+            let fires_callbacks = rank_fires_callbacks(
+                config.epoch_callback_policy, global_rank, world_size,
+            )?;
+            let epoch_fn = if fires_callbacks { epoch_fn } else { None };
+            let checkpoint_fn = if fires_callbacks { checkpoint_fn } else { None };
+            let eval_fn = if fires_callbacks { eval_fn } else { None };
+            let eval_dataset = if fires_callbacks { eval_dataset } else { None };
+
+            // Ranks reach the coordinator through their host-local relay's
+            // control loopback (+5); the CPU backend's reduce channel rides the
+            // relay's data loopback (+4). Same addressing as the managed path.
+            let coord_port = cluster.controller.port.saturating_add(
+                crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET,
+            );
+            let coord_addr =
+                parse_or_resolve_socket_addr(&format!("127.0.0.1:{coord_port}"))?;
+            let controller_addr_str = match backend {
+                AverageBackend::Cpu => {
+                    let controller_port = cluster.controller.port.saturating_add(
+                        crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET,
+                    );
+                    Some(format!("127.0.0.1:{controller_port}"))
+                }
+                AverageBackend::Nccl => None,
+            };
+            let session_salt = cluster.salt;
+            let dataset_sig = [0u8; 32];
+
+            // Backend bootstrap (the one divergence): NCCL inits the comm on
+            // this main thread (init-on-main); CPU dials the relay data loopback.
+            #[cfg(feature = "cuda")]
+            if matches!(backend, AverageBackend::Nccl) {
+                if let crate::tensor::Device::CUDA(idx) = device {
+                    crate::tensor::set_current_cuda_device(idx);
+                }
+            }
+            let nccl_comm = match backend {
+                AverageBackend::Nccl => {
+                    let rdv = cluster.rendezvous(dataset_sig)?;
+                    let comm = crate::distributed::nccl::NcclRankComm::init_rank(
+                        global_rank, world_size, rdv.unique_id(),
+                    )?;
+                    drop(rdv);
+                    Some(comm)
+                }
+                AverageBackend::Cpu => None,
+            };
+            let mut cpu_client = match &controller_addr_str {
+                Some(addr) => Some(crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                    parse_or_resolve_socket_addr(addr)?,
+                    global_rank as u32,
+                    world_size as u32,
+                    session_salt,
+                )?),
+                None => None,
+            };
+
+            // Build tmp model, broadcast initial state from rank 0, pin to CPU.
+            let tmp_model = model_factory(device)?;
+            let initial_params_local: Vec<Tensor> = tmp_model
+                .parameters().iter().map(|p| p.variable.data()).collect();
+            crate::distributed::ddp_run::ensure_trainable_params(
+                initial_params_local.len(), "ddp: cluster rank",
+            )?;
+            let initial_buffers_local: Vec<Tensor> = tmp_model
+                .buffers().iter().map(|b| b.get()).collect();
+            {
+                use crate::distributed::wire;
+                let wire_bytes = wire::tensors_wire_bytes(&initial_params_local)
+                    + wire::tensors_wire_bytes(&initial_buffers_local);
+                wire::set_frame_ceiling(wire::derive_frame_ceiling(wire_bytes));
+            }
+            match (&nccl_comm, &mut cpu_client) {
+                (Some(comm), _) => {
+                    if !initial_params_local.is_empty() {
+                        let refs: Vec<&Tensor> = initial_params_local.iter().collect();
+                        comm.broadcast(&refs, 0)?;
+                    }
+                    if !initial_buffers_local.is_empty() {
+                        let refs: Vec<&Tensor> = initial_buffers_local.iter().collect();
+                        comm.broadcast(&refs, 0)?;
+                    }
+                }
+                (None, Some(client)) => {
+                    if !initial_params_local.is_empty() {
+                        let refs: Vec<&Tensor> = initial_params_local.iter().collect();
+                        let broadcast = client.broadcast_from_root(&refs, 0)?;
+                        crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+                            for (dst, src) in initial_params_local.iter().zip(&broadcast) {
+                                dst.copy_(src, false)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    // f32 buffers only (CPU reduce transport is f32-only;
+                    // non-f32 buffers are deterministic counters — see the
+                    // managed path for the full rationale).
+                    let f32_buffers: Vec<&Tensor> = initial_buffers_local
+                        .iter().filter(|b| b.dtype() == DType::Float32).collect();
+                    if !f32_buffers.is_empty() {
+                        let broadcast = client.broadcast_from_root(&f32_buffers, 0)?;
+                        crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
+                            for (dst, src) in f32_buffers.iter().zip(&broadcast) {
+                                dst.copy_(src, false)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
+                (None, None) => {
+                    return Err(TensorError::new(
+                        "run_cluster_rank_worker: neither NCCL comm nor CPU reduce \
+                         client was constructed (backend bootstrap bug)",
+                    ));
+                }
+            }
+
+            let initial_params: Vec<Tensor> = initial_params_local.iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            let initial_buffers: Vec<Tensor> = initial_buffers_local.iter()
+                .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
+                .collect::<Result<Vec<_>>>()?;
+            drop(tmp_model);
+
+            let worker_config = WorkerConfig {
+                rank: global_rank,
+                world_size,
+                device,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                batch_size,
+                augment: config.augment.max(1),
+                transform: config.transform.clone(),
+                seed: crate::distributed::ddp_run::resolve_shuffle_seed(
+                    config.resume_from.as_deref(),
+                )?,
+                max_grad_norm: config.max_grad_norm,
+                vram_pool: config.vram_pool,
+                vram_max_usage: config.vram_max_usage,
+                ram_max_usage: config.ram_max_usage,
+                sample_cache: config.sample_cache,
+                disk_stage_gb: config.disk_stage_gb,
+                disk_stage_dir: config.disk_stage_dir.clone(),
+                easgd_alpha: config.elche.easgd_alpha,
+                gamma: config.elche.gamma,
+                timeline: config.timeline.clone(),
+                policy,
+                save_path: save_path.clone(),
+                coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or_else(
+                    || crate::distributed::wire::scaled_deadline_secs(
+                        crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+                    ),
+                ),
+            };
+
+            let mut cluster_worker =
+                crate::distributed::cluster_worker::ClusterWorker::connect_and_build(
+                    coord_addr,
+                    cpu_client,
+                    global_rank as u32,
+                    session_salt,
+                    worker_config,
+                    model_factory,
+                    optim_factory,
+                    dataset,
+                    nccl_comm,
+                    RankCallbacks {
+                        checkpoint_fn,
+                        epoch_fn,
+                        eval_fn,
+                        eval_dataset,
+                        outer_optimizer_factory,
+                    },
+                )?;
+
+            if let Some(f) = scheduler_fn {
+                cluster_worker.inner_mut().set_scheduler(f(world_size));
+            }
+            if let Some(stem) = config.resume_from.as_ref() {
+                if let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem) {
+                    eprintln!(
+                        "cluster_worker: rank {global_rank} outer-momentum resume \
+                         failed ({e}); starting from zero momentum"
+                    );
+                }
+            }
+            Ok(cluster_worker)
+        };
+
+        match build() {
+            Ok(cluster_worker) => Ok(Worker::cluster(
+                cluster_worker,
+                save_path,
+                global_rank,
+                world_size,
+            )),
+            Err(e) => {
+                write_rank_death_record(
+                    save_path.as_deref(), global_rank, world_size, e.to_string(),
+                );
+                Err(e)
+            }
+        }
     }
 }

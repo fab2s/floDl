@@ -770,20 +770,82 @@ where
     ///
     /// Panics if `dataset`, `batch_size`, or `num_epochs` were not set.
     pub fn run(mut self) -> Result<DdpHandle> {
+        let (dataset, batch_size, num_epochs) = self.finalize_and_extract()?;
+        DdpHandle::launch(
+            self.model_factory,
+            self.optim_factory,
+            self.train_fn,
+            dataset,
+            batch_size,
+            num_epochs,
+            self.policy,
+            self.backend,
+            self.config,
+            RankCallbacks {
+                checkpoint_fn: self.checkpoint_fn,
+                epoch_fn: self.epoch_fn,
+                eval_fn: self.eval_fn,
+                eval_dataset: self.eval_dataset,
+                outer_optimizer_factory: self.outer_optimizer_factory,
+            },
+            self.metrics_fn,
+            self.scheduler_fn,
+            self.convergence_guard,
+            self.eval_result_fn,
+        )
+    }
+
+    /// Cooperative-tier entry: same configuration + validation as [`Self::run`],
+    /// but returns a [`Worker`](crate::distributed::ddp_run::Worker) the user
+    /// drives instead of the framework-driven [`DdpHandle`]. See the module
+    /// docs on `Worker` for the loop shape. The controller stays authoritative,
+    /// so the trained model matches `run()`.
+    pub fn into_worker(mut self) -> Result<crate::distributed::ddp_run::Worker<M>> {
+        let (dataset, batch_size, num_epochs) = self.finalize_and_extract()?;
+        DdpHandle::into_worker(
+            self.model_factory,
+            self.optim_factory,
+            self.train_fn,
+            dataset,
+            batch_size,
+            num_epochs,
+            self.policy,
+            self.backend,
+            self.config,
+            RankCallbacks {
+                checkpoint_fn: self.checkpoint_fn,
+                epoch_fn: self.epoch_fn,
+                eval_fn: self.eval_fn,
+                eval_dataset: self.eval_dataset,
+                outer_optimizer_factory: self.outer_optimizer_factory,
+            },
+            self.metrics_fn,
+            self.scheduler_fn,
+            self.convergence_guard,
+            self.eval_result_fn,
+        )
+    }
+
+    /// Shared prelude for [`Self::run`] and [`Self::into_worker`]: promote a
+    /// programmatic cluster, extract the required dataset / batch_size /
+    /// num_epochs (panicking if unset, as documented on each entry), validate
+    /// the config, and reconcile the canonical `ElCheMode`. Returns the three
+    /// extracted values; the builder's remaining fields flow into the chosen
+    /// entry point.
+    fn finalize_and_extract(
+        &mut self,
+    ) -> Result<(Arc<dyn BatchDataSet>, usize, usize)> {
         // Programmatic cluster: the single promotion site. Converts
         // `self.cluster` to the FLODL_INTERNAL_FULL_CLUSTER_JSON env contract
-        // fdl-cli uses, so `DdpHandle::launch`'s dispatch sees
-        // Role::Launcher exactly as if fdl-cli had set it — but only
-        // when this process holds no cluster role yet. An fdl-cli-set
-        // envelope wins (overlay-resolved view matches the yml on
-        // disk), and rank / relay children re-entering the user binary
-        // keep their spawned role instead of poisoning their env
-        // (which made every child die at dispatch with
-        // "inconsistent env").
+        // fdl-cli uses, so the dispatch below sees Role::Launcher exactly as if
+        // fdl-cli had set it — but only when this process holds no cluster role
+        // yet. An fdl-cli-set envelope wins; rank / relay children re-entering
+        // the user binary keep their spawned role instead of poisoning their
+        // env (which made every child die at dispatch with "inconsistent env").
         if let Some(full) = &self.cluster {
             crate::distributed::launcher::promote_programmatic_cluster(full);
         }
-        let dataset = self.dataset.expect("DdpBuilder: dataset is required");
+        let dataset = self.dataset.take().expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
         let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
 
@@ -864,28 +926,7 @@ where
                     .easgd_alpha;
         }
 
-        DdpHandle::launch(
-            self.model_factory,
-            self.optim_factory,
-            self.train_fn,
-            dataset,
-            batch_size,
-            num_epochs,
-            self.policy,
-            self.backend,
-            self.config,
-            RankCallbacks {
-                checkpoint_fn: self.checkpoint_fn,
-                epoch_fn: self.epoch_fn,
-                eval_fn: self.eval_fn,
-                eval_dataset: self.eval_dataset,
-                outer_optimizer_factory: self.outer_optimizer_factory,
-            },
-            self.metrics_fn,
-            self.scheduler_fn,
-            self.convergence_guard,
-            self.eval_result_fn,
-        )
+        Ok((dataset, batch_size, num_epochs))
     }
 }
 
