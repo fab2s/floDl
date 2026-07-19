@@ -19,6 +19,31 @@ fn test_flowbuilder_new() {
 }
 
 #[test]
+fn test_deferred_error_carries_chain_position() {
+    // A deferred builder error (here: `merge` on a single, unsplit stream)
+    // must name where in the chain it happened, not just the bare guard
+    // message. Without the position stamp, a failure among many chained
+    // calls is unlocatable (GD15).
+    let dev = crate::tensor::test_device();
+    let result = FlowBuilder::from(Linear::on_device(4, 8, dev).unwrap())
+        .through(Linear::on_device(8, 8, dev).unwrap())
+        .merge(MergeOp::Add) // illegal: only one open stream
+        .build();
+
+    let msg = result.err().expect("expected build to fail").to_string();
+    assert!(
+        msg.contains("merge requires multiple streams"),
+        "expected the guard message; got: {msg}"
+    );
+    // The stamp names the most recently built node, whose id encodes the
+    // module type + its global sequence number (e.g. `Linear_2`).
+    assert!(
+        msg.contains("after node '"),
+        "GD15: deferred error must carry chain position; got: {msg}"
+    );
+}
+
+#[test]
 fn test_unknown_port_name_errors_at_build() {
     // A port name that isn't among the node's declared ports must fail the
     // build loudly instead of silently routing to port 0 (which would train

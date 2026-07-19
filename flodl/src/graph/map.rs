@@ -52,7 +52,7 @@ impl MapBuilder {
                 fb
             }
             None => {
-                fb.err = Some(format!(
+                fb.fail(format!(
                     "Map.over({:?}) references unknown tag; Map requires a backward reference",
                     tag
                 ));
@@ -72,7 +72,7 @@ impl MapBuilder {
             return Self::err_if_bad(fb);
         }
         if n < 1 {
-            fb.err = Some(format!("Map.slices requires n >= 1 (got {})", n));
+            fb.fail(format!("Map.slices requires n >= 1 (got {})", n));
             return fb;
         }
 
@@ -116,7 +116,7 @@ impl MapBuilder {
 
     fn err_if_bad(mut fb: FlowBuilder) -> FlowBuilder {
         if fb.err.is_none() {
-            fb.err = Some("map requires single stream".into());
+            fb.fail("map requires single stream");
         }
         fb
     }
