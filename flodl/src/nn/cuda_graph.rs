@@ -177,8 +177,11 @@ where
         f()?;
     }
 
-    // Synchronize before capture.
-    crate::tensor::cuda_synchronize(0);
+    // Synchronize before capture — on the CURRENT device, not a hardcoded
+    // device 0. Capture runs `f` on whatever device is current (the model's);
+    // syncing device 0 on a multi-GPU rig would let capture start before the
+    // real capture device's warmup work has drained.
+    crate::tensor::cuda_synchronize(crate::tensor::current_cuda_device());
 
     // Capture: capture_begin switches to a side stream internally,
     // and capture_end restores the default stream.

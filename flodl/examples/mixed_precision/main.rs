@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let params = model.parameters();
 
     // Cast parameters to float16 for reduced memory and faster matmuls.
-    cast_parameters(&params, DType::Float16);
+    cast_parameters(&params, DType::Float16)?;
     println!("Parameters cast to float16");
 
     let mut optimizer = Adam::new(&params, 0.001);
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     monitor.finish();
 
     // Cast back to float32 for inference or checkpointing.
-    cast_parameters(&params, DType::Float32);
+    cast_parameters(&params, DType::Float32)?;
     println!("Parameters cast back to float32 for export");
 
     Ok(())

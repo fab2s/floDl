@@ -68,7 +68,7 @@ pub use nn::{
     migrate_checkpoint, migrate_checkpoint_file, migrate_optim_state_file,
     checkpoint_version, checkpoint_keys,
     LoadReport, MigrateReport,
-    GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled,
+    GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled, is_autocast_enabled_for,
     Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU,
     LeakyReLU, ELU, Softplus, Mish,
     SELU, Hardswish, Hardsigmoid, PReLU,

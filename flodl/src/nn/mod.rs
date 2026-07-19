@@ -75,7 +75,7 @@ pub use checkpoint::{
     migrate_checkpoint, migrate_checkpoint_file, checkpoint_version, checkpoint_keys,
     LoadReport, MigrateReport,
 };
-pub use amp::{GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled};
+pub use amp::{GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled, is_autocast_enabled_for};
 pub use clip::{clip_grad_norm, clip_grad_value};
 pub use scheduler::{Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler, ExponentialLR, MultiStepLR, OneCycleLR, CyclicLR};
 pub use dropout::{Dropout, Dropout2d, AlphaDropout};

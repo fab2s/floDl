@@ -292,7 +292,7 @@
         let cfg = mini_config();
         let dev = Device::CPU;
         let graph = DebertaV2Model::on_device(&cfg, dev).unwrap();
-        cast_parameters(&graph.parameters(), DType::Float16);
+        cast_parameters(&graph.parameters(), DType::Float16).unwrap();
         graph.eval();
 
         let batch = 1;

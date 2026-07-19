@@ -988,12 +988,12 @@
         let params = model.parameters();
         assert_eq!(params[0].variable.data().dtype(), DType::Float32);
 
-        amp::cast_parameters(&params, DType::Float64);
+        amp::cast_parameters(&params, DType::Float64).unwrap();
         assert_eq!(params[0].variable.data().dtype(), DType::Float64);
         assert_eq!(params[1].variable.data().dtype(), DType::Float64);
 
         // Round-trip back
-        amp::cast_parameters(&params, DType::Float32);
+        amp::cast_parameters(&params, DType::Float32).unwrap();
         assert_eq!(params[0].variable.data().dtype(), DType::Float32);
     }
 

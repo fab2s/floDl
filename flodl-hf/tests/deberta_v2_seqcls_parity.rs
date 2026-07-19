@@ -58,7 +58,7 @@ fn deberta_v2_seqcls_parity_vs_pytorch_live() {
     let head = DebertaV2ForSequenceClassification::from_pretrained(MODEL_ID).unwrap();
     // microsoft/deberta-v3-base lineage ships f16; cast to f32 to match
     // the f32 reference fixture (same pattern as deberta_v2_parity.rs).
-    cast_parameters(&head.graph().parameters(), DType::Float32);
+    cast_parameters(&head.graph().parameters(), DType::Float32).unwrap();
     head.graph().eval();
 
     let out = head.graph()
