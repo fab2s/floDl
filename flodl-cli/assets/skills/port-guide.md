@@ -426,8 +426,9 @@ After generating the port:
 - Tensors use reference counting (cheap clone, shared storage)
 - Variables wrap tensors with gradient tracking
 - `&variable` for read access in loss functions
-- `.clone()` for shallow copy (shares underlying data)
-- `.detach()` to break gradient graph
+- `.clone()` = shallow copy (shares storage; UNLIKE PyTorch's deep `.clone()`)
+- `.copy()` = deep copy (independent storage; the PyTorch `.clone()` equivalent) — use when you keep a value while the original may be mutated in place
+- `.detach()` to break gradient graph (also shares storage)
 
 ### Builder Pattern
 Conv layers, data loaders, and some optimizers use builders:

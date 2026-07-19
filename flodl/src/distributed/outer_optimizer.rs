@@ -270,10 +270,11 @@ impl OuterOptimizer for NesterovMomentum {
         for i in 0..n {
             let g = prev_global[i].sub(&consensus[i])?;
             // v = mu * v_prev + g  (mu*0 + g = g on a fresh buffer). On the
-            // fresh branch `mul_scalar(1.0)` makes an independent copy of g
-            // (NOT a shared-storage clone) so the buffer and g stay distinct.
+            // fresh branch `copy()` makes an independent deep copy of g
+            // (NOT a shared-storage shallow clone) so the buffer and g
+            // stay distinct.
             let v = if fresh {
-                g.mul_scalar(1.0)?
+                g.copy()?
             } else {
                 self.velocity[i].mul_scalar(self.mu)?.add(&g)?
             };

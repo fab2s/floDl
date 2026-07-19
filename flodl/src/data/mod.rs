@@ -351,19 +351,7 @@ pub(crate) fn apply_transform(
 /// storage.
 #[cfg(all(debug_assertions, not(test)))]
 fn deep_copy_rows(rows: &[Tensor]) -> Result<Vec<Tensor>> {
-    rows.iter()
-        .map(|t| {
-            let out = Tensor::empty(
-                &t.shape(),
-                crate::tensor::TensorOptions {
-                    dtype: t.dtype(),
-                    device: t.device(),
-                },
-            )?;
-            out.copy_(t, false)?;
-            Ok(out)
-        })
-        .collect()
+    rows.iter().map(|t| t.copy()).collect()
 }
 
 // ---------------------------------------------------------------------------

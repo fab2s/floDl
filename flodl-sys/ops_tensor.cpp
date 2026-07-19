@@ -166,6 +166,18 @@ extern "C" char* flodl_shallow_clone(FlodlTensor t, FlodlTensor* result) {
     }
 }
 
+extern "C" char* flodl_deep_clone(FlodlTensor t, FlodlTensor* result) {
+    try {
+        auto* src = reinterpret_cast<torch::Tensor*>(t);
+        *result = new torch::Tensor(src->clone());  // Deep copy: fresh storage.
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
 // --- Tensor metadata ---
 
 extern "C" int flodl_ndim(FlodlTensor t) {

@@ -82,6 +82,7 @@ unsafe extern "C" {
 
     pub fn flodl_free_tensor(t: FlodlTensor);
     pub fn flodl_shallow_clone(t: FlodlTensor, result: *mut FlodlTensor) -> *mut c_char;
+    pub fn flodl_deep_clone(t: FlodlTensor, result: *mut FlodlTensor) -> *mut c_char;
 
     // --- Tensor metadata ---
 

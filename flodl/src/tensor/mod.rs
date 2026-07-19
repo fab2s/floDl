@@ -274,9 +274,20 @@ impl Drop for Tensor {
 }
 
 impl Clone for Tensor {
-    /// Shallow clone: creates a new C++ Tensor handle sharing the same
-    /// TensorImpl (and thus the same data storage). Cheap — just bumps
-    /// libtorch's internal refcount.
+    /// Shallow clone: a new C++ Tensor handle sharing the same TensorImpl
+    /// (and thus the same data storage). Cheap — just bumps libtorch's
+    /// internal refcount, no data copied. Safe for the common case
+    /// (reads, passing tensors around) because out-of-place ops allocate
+    /// fresh outputs and never mutate their inputs.
+    ///
+    /// **Aliasing warning.** Storage is SHARED, so an in-place op (`_`
+    /// suffix: `add_`, `copy_`, `mul_scalar_`, fused optimizer kernels,
+    /// ...) through either handle mutates both. Unlike PyTorch, where
+    /// `.clone()` is a *deep* copy, flodl's `Clone` is shallow (Rust's
+    /// `Clone` trait is the cheap-share default here). When you need an
+    /// independent, owned duplicate — optimizer state seeded from a
+    /// gradient, a snapshot held across later mutation — use
+    /// [`Tensor::copy`](Self::copy) instead.
     ///
     /// # Panics
     ///
@@ -946,6 +957,22 @@ impl Tensor {
     pub fn detach_(&self) -> Result<()> {
         let err = unsafe { ffi::flodl_detach_(self.handle) };
         check_err(err)
+    }
+
+    /// Deep copy: a new tensor with its OWN storage, holding the same
+    /// data. Unlike [`Clone`](Tensor#impl-Clone) (which is *shallow* — a
+    /// new handle aliasing the same storage) and unlike [`detach`](Self::detach)
+    /// (which also shares storage), the returned tensor is fully
+    /// independent: a later in-place op (`add_`, `copy_`, `mul_scalar_`,
+    /// fused optimizer kernels, ...) on either side does not affect the
+    /// other.
+    ///
+    /// This is the flodl spelling of PyTorch's deep `.clone()`. Reach for
+    /// it whenever you keep a value while the original (or a shared alias)
+    /// may be mutated in place later: optimizer state seeded from a
+    /// gradient, an EMA / snapshot of weights, a view you want to own.
+    pub fn copy(&self) -> Result<Tensor> {
+        ffi_call!(flodl_deep_clone, self.handle)
     }
 
     // --- In-place operations ---

@@ -171,7 +171,7 @@ impl Optimizer for RMSprop {
                                 b.add_(&update)?;
                                 b
                             }
-                            None => update.mul_scalar(1.0)?,
+                            None => update.copy()?,
                         };
                         let scaled = b.mul_scalar(lr)?;
                         data.sub_(&scaled)?;

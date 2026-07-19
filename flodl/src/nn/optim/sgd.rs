@@ -147,9 +147,10 @@ impl Optimizer for SGD {
                                 v.add_(&grad)?;
                                 v
                             }
-                            // mul_scalar creates a new tensor with independent storage,
-                            // unlike clone() which shares storage with grad
-                            None => grad.mul_scalar(1.0)?,
+                            // Deep copy: independent storage, unlike the
+                            // shallow clone() which shares storage with grad
+                            // (a later in-place update would corrupt grad).
+                            None => grad.copy()?,
                         };
                         // data -= lr * v
                         let scaled = v.mul_scalar(lr)?;

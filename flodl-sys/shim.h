@@ -41,6 +41,7 @@ char* flodl_expand(FlodlTensor t, int64_t* new_shape, int ndim,
 
 void flodl_free_tensor(FlodlTensor t);
 char* flodl_shallow_clone(FlodlTensor t, FlodlTensor* result);
+char* flodl_deep_clone(FlodlTensor t, FlodlTensor* result);
 
 // --- Tensor metadata ---
 

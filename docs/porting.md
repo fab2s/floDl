@@ -309,6 +309,7 @@ for results on mixed consumer hardware.
 |---------|---------|-------|
 | Error handling | Exceptions | `Result<T>` with `?` operator |
 | Memory | Garbage collected | Reference counted (cheap clone) |
+| Tensor copy | `.clone()` is a deep copy | `.clone()` is *shallow* (shares storage); use `.copy()` for a deep, independent copy |
 | Model composition | `nn.Sequential` / manual `forward()` | `FlowBuilder` (declarative data flow) |
 | Training mode | `model.train()` | `model.train()` |
 | Eval mode | `model.eval()` | `model.eval()` |

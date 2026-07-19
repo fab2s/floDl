@@ -174,7 +174,9 @@ let b = a;       // a is "moved" into b - a is no longer valid
 
 // Fix: clone if you need both
 let a = Tensor::zeros(&[2, 3], opts)?;
-let b = a.clone();  // b is a shallow copy (shared storage, like PyTorch)
+let b = a.clone();  // shallow: b shares a's storage (an in-place op on one
+                    // is seen by the other). UNLIKE PyTorch's deep .clone();
+                    // use a.copy() for an independent, owned copy.
 // both a and b are valid
 ```
 

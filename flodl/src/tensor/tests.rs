@@ -13,6 +13,24 @@
     }
 
     #[test]
+    fn test_copy_is_deep_clone_is_shallow() {
+        // The TF9 invariant, pinned: `clone()` aliases storage, `copy()`
+        // is an independent deep copy. An in-place mutation of the source
+        // is visible through a shallow clone but never through a copy.
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap();
+        let shallow = a.clone();
+        let deep = a.copy().unwrap();
+
+        let ones = Tensor::from_f32(&[1.0, 1.0, 1.0], &[3], test_device()).unwrap();
+        a.add_(&ones).unwrap();
+
+        // Shallow clone shares storage -> sees the mutation.
+        assert_eq!(shallow.to_f32_vec().unwrap(), vec![2.0, 3.0, 4.0]);
+        // Deep copy is independent -> unchanged.
+        assert_eq!(deep.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
     fn test_nbytes() {
         let f32_t = Tensor::zeros(&[2, 3], test_opts()).unwrap();
         assert_eq!(f32_t.nbytes(), 6 * 4); // 6 elements * 4 bytes
