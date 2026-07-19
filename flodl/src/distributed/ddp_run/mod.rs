@@ -70,10 +70,12 @@
 
 mod worker;
 pub(crate) use worker::NcclAbortSlot;
+mod cooperative;
 mod orchestrator;
 mod shared;
 pub mod convergence;
 
+pub use cooperative::{StepOutcome, Worker};
 pub use worker::*;
 pub(crate) use shared::{
     aggregate_epoch_metrics, equal_sizes, ratio_to_sizes, throughput_sizes,

@@ -781,7 +781,18 @@ impl<M: Module> GpuWorker<M> {
     /// that measures it changes. The `pending_param_h2d` flag avoids
     /// per-batch synchronize overhead on batches that don't follow an Update.
     /// No-op on CPU (no streams).
-    pub(super) fn sync_before_forward(&mut self) -> Result<()> {
+    /// An owned `compute_stream` guard, or `None` on CPU. The cooperative
+    /// [`Worker`](crate::distributed::ddp_run::Worker) holds this across the
+    /// user's forward + backward so the gradient-producing kernels arrive on
+    /// the same stream as the `AccumulateGrad` nodes (pinned to `compute_stream`
+    /// in `GpuWorker::new`) — the guarantee `train_step`'s internal guard gives
+    /// the managed tier. Without it libtorch warns about an AccumulateGrad
+    /// stream mismatch (and CUDA-graph capture would break).
+    pub(crate) fn compute_stream_guard(&self) -> Option<StreamGuard> {
+        self.compute_stream.as_ref().map(StreamGuard::new)
+    }
+
+    pub(crate) fn sync_before_forward(&mut self) -> Result<()> {
         if self.pending_param_h2d
             && let Some(stream) = &self.comm_stream
         {

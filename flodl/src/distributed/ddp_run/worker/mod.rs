@@ -26,6 +26,10 @@ mod reporting;
 mod stager;
 mod sync;
 
+/// Per-epoch training cursor, driven step-wise by the cooperative
+/// [`Worker`](crate::distributed::ddp_run::Worker) tier.
+pub(crate) use epoch_plan::EpochState;
+
 // ---------------------------------------------------------------------------
 // GpuWorker
 // ---------------------------------------------------------------------------

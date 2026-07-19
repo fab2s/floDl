@@ -16,6 +16,7 @@ pub(crate) use std::sync::mpsc;
 
 mod builder_and_resume;
 mod checkpoint;
+mod cooperative;
 mod worker;
 
 #[test]

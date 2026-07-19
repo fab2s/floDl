@@ -126,6 +126,12 @@ pub struct ClusterWorker<M: Module> {
     /// `wait_for_epoch_plan` and `run_epoch_plan` on each epoch
     /// transition.
     epoch_fn: Option<EpochFn<M>>,
+    /// Last epoch for which `epoch_fn` was fired, so the callback fires once
+    /// per epoch transition (not per progressive-dispatch chunk). `usize::MAX`
+    /// sentinel so epoch 0 always fires. Shared by `run_until_shutdown`'s loop
+    /// and the cooperative tier's step-wise `next_plan`, both via
+    /// [`Self::fire_epoch_callback`].
+    last_epoch_fired: usize,
     /// Receiver for the final parameter snapshot the inner GpuWorker
     /// emits via [`crate::distributed::ddp_run::GpuWorker::send_final_snapshot`]
     /// at end-of-training. Taken in `run_until_shutdown` and drained
@@ -499,6 +505,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             local_dead_ranks,
             nccl_session_mailbox,
             epoch_fn,
+            last_epoch_fired: usize::MAX,
             final_param_rx: final_param_rx_for_handle,
         })
     }
@@ -552,35 +559,18 @@ impl<M: Module + 'static> ClusterWorker<M> {
     where
         T: Fn(&M, &[Tensor]) -> Result<Variable>,
     {
-        // Inner is set in connect_and_build; only `run_until_shutdown`
-        // takes it out. Unwrap is safe here.
-        let mut inner = self
-            .inner
-            .take()
-            .expect("inner GpuWorker present at run_until_shutdown");
+        // Inner stays in `self.inner` throughout (accessed via `inner_mut()`),
+        // so the epoch-fire and teardown are shared, step-wise-callable methods
+        // (`fire_epoch_callback`, `teardown`) used both here and by the
+        // cooperative tier. `epoch_fn` / `last_epoch_fired` live on `self`.
 
-        // Controller-driven role assignment: every cluster worker can
-        // have `epoch_fn = Some(...)` regardless of policy. The runtime
-        // gate is `inner.epoch_callback_role() == Some(inner.rank())`,
-        // set by the coord's wire-pushed `ControlMsg::SetEpochCallbackRole`.
-        // Workers without the role skip the fire; on
-        // `EpochCallbackPolicy::Fastest` re-resolve (e.g. after rank
-        // death), the coord broadcasts a fresh role and the worker
-        // picks it up before the next epoch boundary.
-        // Move epoch_fn out of `self` so the loop body can borrow it
-        // without colliding with `self.bridges` teardown below.
-        let epoch_fn = self.epoch_fn.take();
-        // `usize::MAX` sentinel so the first plan (epoch 0) always
-        // triggers a fire-check.
-        let mut last_epoch_fired: usize = usize::MAX;
-
-        // Instrumentation (gated on `-vvv` via `inner.prof_enabled()`):
+        // Instrumentation (gated on `-vvv` via `prof_enabled()`):
         // split each rank's wall into time in `run_epoch_plan` (compute +
         // data + in-chunk control) vs blocked in `wait_for_epoch_plan`
         // (reduce-barrier / next-dispatch wait). Teardown stderr summary
         // separates "compute" from "waiting at the barrier" to locate the
         // cpu-cadence idle. All collection below is `if prof`-guarded.
-        let prof = inner.prof_enabled();
+        let prof = self.inner().prof_enabled();
         let mut wait_ns: u128 = 0;
         let mut run_ns: u128 = 0;
         // Split the between-chunk wait at the moment averaged params land
@@ -595,14 +585,16 @@ impl<M: Module + 'static> ClusterWorker<M> {
 
         let exit_clean = (|| -> Result<bool> {
             loop {
-                let prev_update = if prof { inner.last_update_at() } else { None };
+                let prev_update = if prof { self.inner().last_update_at() } else { None };
                 let w0 = std::time::Instant::now();
-                let plan = inner.wait_for_epoch_plan()?;
+                // Inline the wait (NOT `next_plan`) so the prof split can
+                // isolate the barrier wait from the epoch_fn fire.
+                let plan = self.inner_mut().wait_for_epoch_plan()?;
                 if prof {
                     let w_elapsed = w0.elapsed().as_nanos();
                     wait_ns += w_elapsed;
                     // If an Update landed during this wait, split at it.
-                    match inner.last_update_at() {
+                    match self.inner().last_update_at() {
                         Some(u) if Some(u) != prev_update && u >= w0 => {
                             let pre = u.duration_since(w0).as_nanos();
                             wait_pre_update_ns += pre;
@@ -618,25 +610,9 @@ impl<M: Module + 'static> ClusterWorker<M> {
                         // by construction: `StartEpoch` arrives after the
                         // controller's `finish_averaging_*` completes the
                         // prior cycle's bookkeeping.
-                        if plan.epoch != last_epoch_fired {
-                            last_epoch_fired = plan.epoch;
-                            let is_role = inner.epoch_callback_role()
-                                == Some(inner.rank());
-                            if is_role {
-                                if let Some(ref f) = epoch_fn {
-                                    let start = std::time::Instant::now();
-                                    f(plan.epoch, &mut inner);
-                                    let elapsed_ms =
-                                        start.elapsed().as_secs_f64() * 1000.0;
-                                    inner.report_epoch_fn_elapsed(
-                                        plan.epoch,
-                                        elapsed_ms,
-                                    );
-                                }
-                            }
-                        }
+                        self.fire_epoch_callback(plan.epoch);
                         let r0 = std::time::Instant::now();
-                        let shutdown = inner.run_epoch_plan(&plan, &train_fn)?;
+                        let shutdown = self.inner_mut().run_epoch_plan(&plan, &train_fn)?;
                         if prof {
                             run_ns += r0.elapsed().as_nanos();
                         }
@@ -653,6 +629,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // with the wait split into pre-Update (reduce + slow-rank wait)
         // vs post-Update (dispatch wait) + the GPU←CPU writeback cost.
         if prof {
+            let inner = self.inner();
             let run_s = run_ns as f64 / 1e9;
             let wait_s = wait_ns as f64 / 1e9;
             let pre_s = wait_pre_update_ns as f64 / 1e9;
@@ -696,6 +673,55 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 ctrl_msgs,
             );
         }
+
+        let final_snapshot = self.teardown();
+        exit_clean.map(|_| final_snapshot)
+    }
+
+    /// Fire the user's `epoch_fn` once per epoch transition, on the
+    /// controller-elected callback rank. Idempotent per epoch via
+    /// `last_epoch_fired` (so progressive-dispatch chunks of the same epoch
+    /// don't re-fire). Shared by `run_until_shutdown`'s loop and the
+    /// cooperative tier's `Worker::next_epoch`.
+    ///
+    /// Controller-driven role assignment: every cluster worker can have
+    /// `epoch_fn = Some(...)` regardless of policy. The runtime gate is
+    /// `epoch_callback_role() == Some(rank())`, set by the coord's wire-pushed
+    /// `ControlMsg::SetEpochCallbackRole`. Non-role workers skip the fire; on
+    /// `EpochCallbackPolicy::Fastest` re-resolve (e.g. after rank death) the
+    /// coord broadcasts a fresh role picked up before the next boundary.
+    pub(crate) fn fire_epoch_callback(&mut self, epoch: usize) {
+        if epoch == self.last_epoch_fired {
+            return;
+        }
+        self.last_epoch_fired = epoch;
+        // Disjoint field borrows: `self.inner` (mut) alongside `self.epoch_fn`
+        // (shared) — both accessed as fields, not via `inner_mut()` (which
+        // would borrow all of `self`).
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("inner GpuWorker present until teardown");
+        if inner.epoch_callback_role() != Some(inner.rank()) {
+            return;
+        }
+        if let Some(ref f) = self.epoch_fn {
+            let start = std::time::Instant::now();
+            f(epoch, inner);
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            inner.report_epoch_fn_elapsed(epoch, elapsed_ms);
+        }
+    }
+
+    /// End-of-run teardown: drain any queued shutdown-save, abort NCCL, publish
+    /// and drain the final snapshot, drop the inner (disconnecting the bridge
+    /// senders), signal the bridges, and join them. Returns the rank's final
+    /// [`crate::distributed::ddp_run::ParamSnapshot`] when one was captured
+    /// (best-effort). Called at the end of `run_until_shutdown` (managed) and
+    /// from the cooperative tier's `Worker::finish`.
+    pub(crate) fn teardown(&mut self) -> Option<crate::distributed::ddp_run::ParamSnapshot> {
+        // `?`: already torn down (inner taken) -> nothing to snapshot.
+        let mut inner = self.inner.take()?;
 
         // On error exit (e.g. lone NCCL survivor bailing out of
         // `wait_for_nccl_session`), the coord may have queued
@@ -754,7 +780,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             let _ = handle.join();
         }
 
-        exit_clean.map(|_| final_snapshot)
+        final_snapshot
     }
 }
 

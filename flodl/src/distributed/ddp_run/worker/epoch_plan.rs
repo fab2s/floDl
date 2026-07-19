@@ -24,7 +24,7 @@ use super::GpuWorker;
 /// owned; the background prefetch thread stays owned by `GpuWorker`), so a
 /// `next_batch_inner(&mut self, &mut EpochState)` call is borrow-clean and the
 /// worker can carry it as `Option<EpochState>` in the cooperative tier.
-pub(super) struct EpochState {
+pub(crate) struct EpochState {
     /// The epoch this chunk belongs to (from the coordinator's `EpochPlan`).
     plan_epoch: usize,
     /// Batches consumed so far this chunk. The loop bound is re-read off the
@@ -76,6 +76,14 @@ impl EpochState {
             shutdown: false,
             batch_rx: None,
         }
+    }
+
+    /// Whether a control drain (in `next_batch_inner` while waiting, or in
+    /// `after_step`) saw `Shutdown`. The cooperative `Worker` reads this to
+    /// decide whether to skip `end_epoch` (no coverage report on a mid-chunk
+    /// shutdown) and to surface the shutdown up its own loop.
+    pub(crate) fn shutdown(&self) -> bool {
+        self.shutdown
     }
 }
 
@@ -184,7 +192,7 @@ impl<M: Module> GpuWorker<M> {
     /// no setup, no timeline events, `next_batch_inner` yields nothing, and
     /// `end_epoch` still reports the coordinator's "done" signal (the
     /// historical `num_batches == 0` early return).
-    pub(super) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
+    pub(crate) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
         self.current_epoch = plan.epoch;
         // Pick space: the coordinator's offsets/sizes and this
         // expansion must agree on `dataset.len() * augment` total.
@@ -351,7 +359,7 @@ impl<M: Module> GpuWorker<M> {
     /// The returned batch is **owned** and borrows nothing from the worker, so
     /// the cooperative tier can run the user's forward + backward against it
     /// while still calling `&mut self` worker methods.
-    pub(super) fn next_batch_inner(
+    pub(crate) fn next_batch_inner(
         &mut self,
         st: &mut EpochState,
     ) -> Result<Option<Vec<Tensor>>> {
@@ -498,7 +506,7 @@ impl<M: Module> GpuWorker<M> {
     /// in the cooperative tier). Runs under its own owned `compute_stream`
     /// guard so the param-norm and any control-driven collective see
     /// current-stream == compute_stream, exactly as the old epoch-scoped guard.
-    pub(super) fn after_step(
+    pub(crate) fn after_step(
         &mut self,
         st: &mut EpochState,
         loss: f64,
@@ -553,7 +561,7 @@ impl<M: Module> GpuWorker<M> {
     /// run-level prof sums, and `report_epoch` (coverage + `avg_loss`, with the
     /// batch count re-read off the live partition so an `ExtendPartition`
     /// reshard is reflected). An empty chunk still emits the "done" signal.
-    pub(super) fn end_epoch(&mut self, st: &mut EpochState) -> Result<()> {
+    pub(crate) fn end_epoch(&mut self, st: &mut EpochState) -> Result<()> {
         if st.use_prefetch {
             let chunk_total_ms = st.chunk_diag_start.elapsed().as_secs_f64() * 1000.0;
             let prefetch_ms = st.data_starve_ms_total;
