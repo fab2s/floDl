@@ -233,7 +233,11 @@ fn main() -> ExitCode {
             let shell = args.get(2).map(String::as_str).unwrap_or("bash");
             let cwd = env::current_dir().unwrap_or_default();
             let project = load_project_config(&cwd, active_env.as_deref());
-            completions::generate(shell, project.as_ref().map(|(p, r)| (p, r.as_path())));
+            completions::generate(
+                shell,
+                project.as_ref().map(|(p, r)| (p, r.as_path())),
+                active_env.as_deref(),
+            );
             ExitCode::SUCCESS
         }
         "autocomplete" => {
