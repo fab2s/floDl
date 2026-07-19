@@ -107,6 +107,33 @@ static inline std::vector<at::Tensor> unwrap_list(FlodlTensor* tensors, int coun
     return result;
 }
 
+// Helper: wrap a tensor vector into a malloc'd FlodlTensor[] the caller
+// (Rust) owns (free each element with flodl_free_tensor, then free() the
+// array). Returns nullptr on malloc failure. Leak-safe: if wrapping throws
+// mid-loop (bad_alloc), every element allocated so far AND the array are
+// freed before the exception propagates, so the error path leaks nothing.
+// Allocates at least one slot so malloc(0) can't be mistaken for OOM.
+static inline FlodlTensor* wrap_list(const std::vector<torch::Tensor>& tensors) {
+    int n = (int)tensors.size();
+    FlodlTensor* arr =
+        (FlodlTensor*)malloc(sizeof(FlodlTensor) * (n > 0 ? n : 1));
+    if (!arr) {
+        return nullptr;
+    }
+    for (int i = 0; i < n; i++) {
+        try {
+            arr[i] = wrap(tensors[i]);
+        } catch (...) {
+            for (int j = 0; j < i; j++) {
+                delete reinterpret_cast<torch::Tensor*>(arr[j]);
+            }
+            free(arr);
+            throw;
+        }
+    }
+    return arr;
+}
+
 // Helper: build IntArrayRef from C array.
 static inline torch::IntArrayRef make_shape(int64_t* shape, int ndim) {
     return torch::IntArrayRef(shape, ndim);

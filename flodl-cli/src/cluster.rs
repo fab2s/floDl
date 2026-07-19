@@ -606,7 +606,17 @@ pub fn cluster_compose_overlay_arg(project_root: &Path) -> String {
     let mut entries = String::new();
     for pair in &pairs {
         entries.push_str("      - \"");
-        entries.push_str(pair);
+        // Escape for a YAML double-quoted scalar so a `\` or `"` in the
+        // value can't break out of the entry. Hostnames/IPs shouldn't
+        // contain these, but the `host:` half comes from user-authored
+        // cluster.yml, so don't trust it into a quoted string unescaped.
+        for ch in pair.chars() {
+            match ch {
+                '\\' => entries.push_str("\\\\"),
+                '"' => entries.push_str("\\\""),
+                _ => entries.push(ch),
+            }
+        }
         entries.push_str("\"\n");
     }
 

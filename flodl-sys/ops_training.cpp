@@ -664,12 +664,11 @@ extern "C" char* flodl_meshgrid(FlodlTensor* tensors, int count,
             vec.push_back(unwrap(tensors[i]));
         }
         auto grids = torch::meshgrid(vec, "ij");
-        int n = (int)grids.size();
-        *result_count = n;
-        FlodlTensor* arr = (FlodlTensor*)malloc(n * sizeof(FlodlTensor));
-        for (int i = 0; i < n; i++) {
-            arr[i] = new torch::Tensor(grids[i]);
+        FlodlTensor* arr = wrap_list(grids);
+        if (!arr) {
+            return make_error("flodl_meshgrid: malloc failed");
         }
+        *result_count = (int)grids.size();
         *results = arr;
         return nullptr;
     } catch (const std::exception& e) {

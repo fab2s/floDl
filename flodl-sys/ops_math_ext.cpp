@@ -805,16 +805,15 @@ extern "C" char* flodl_chunk(FlodlTensor t, int chunks, int dim,
                              FlodlTensor** results, int* count) {
     try {
         auto chunks_vec = torch::chunk(unwrap(t), chunks, dim);
-        int n = (int)chunks_vec.size();
-        auto* arr = (FlodlTensor*)malloc(sizeof(FlodlTensor) * n);
+        std::vector<torch::Tensor> contig;
+        contig.reserve(chunks_vec.size());
+        for (auto& c : chunks_vec) { contig.push_back(c.contiguous()); }
+        FlodlTensor* arr = wrap_list(contig);
         if (!arr) {
-            return make_error("malloc failed");
-        }
-        for (int i = 0; i < n; i++) {
-            arr[i] = wrap(chunks_vec[i].contiguous());
+            return make_error("flodl_chunk: malloc failed");
         }
         *results = arr;
-        *count = n;
+        *count = (int)contig.size();
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -926,16 +925,15 @@ extern "C" char* flodl_split(FlodlTensor t, int64_t split_size, int dim,
                               FlodlTensor** results, int* count) {
     try {
         auto splits = torch::split(unwrap(t), split_size, dim);
-        int n = (int)splits.size();
-        auto* arr = (FlodlTensor*)malloc(sizeof(FlodlTensor) * n);
+        std::vector<torch::Tensor> contig;
+        contig.reserve(splits.size());
+        for (auto& s : splits) { contig.push_back(s.contiguous()); }
+        FlodlTensor* arr = wrap_list(contig);
         if (!arr) {
-            return make_error("malloc failed");
-        }
-        for (int i = 0; i < n; i++) {
-            arr[i] = wrap(splits[i].contiguous());
+            return make_error("flodl_split: malloc failed");
         }
         *results = arr;
-        *count = n;
+        *count = (int)contig.size();
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
@@ -948,16 +946,15 @@ extern "C" char* flodl_unbind(FlodlTensor t, int dim,
                                FlodlTensor** results, int* count) {
     try {
         auto slices = torch::unbind(unwrap(t), dim);
-        int n = (int)slices.size();
-        auto* arr = (FlodlTensor*)malloc(sizeof(FlodlTensor) * n);
+        std::vector<torch::Tensor> contig;
+        contig.reserve(slices.size());
+        for (auto& s : slices) { contig.push_back(s.contiguous()); }
+        FlodlTensor* arr = wrap_list(contig);
         if (!arr) {
-            return make_error("malloc failed");
-        }
-        for (int i = 0; i < n; i++) {
-            arr[i] = wrap(slices[i].contiguous());
+            return make_error("flodl_unbind: malloc failed");
         }
         *results = arr;
-        *count = n;
+        *count = (int)contig.size();
         return nullptr;
     } catch (const std::exception& e) {
         return make_error(e.what());
