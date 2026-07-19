@@ -277,6 +277,16 @@ impl Clone for Tensor {
     /// Shallow clone: creates a new C++ Tensor handle sharing the same
     /// TensorImpl (and thus the same data storage). Cheap — just bumps
     /// libtorch's internal refcount.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying FFI clone fails. This is deliberate: the
+    /// `Clone` trait signature has no error channel, and the only way a
+    /// refcount-bump clone fails is an unrecoverable condition (allocation
+    /// failure / corrupt handle). Per flodl's panic policy, a defined named
+    /// panic is used where there is no `Result` channel and the failure is
+    /// unrecoverable; fallible tensor ops that CAN return `Result` do so
+    /// instead of panicking.
     fn clone(&self) -> Self {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_shallow_clone(self.handle, &mut handle) };
@@ -1180,7 +1190,12 @@ impl Tensor {
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_add_list_(tensors1: &[Tensor], tensors2: &[Tensor], alpha: f64) -> Result<()> {
         if tensors1.is_empty() { return Ok(()); }
-        assert_eq!(tensors1.len(), tensors2.len(), "foreach_add_list_: list length mismatch");
+        if tensors1.len() != tensors2.len() {
+            return Err(TensorError::new(&format!(
+                "foreach_add_list_: list length mismatch ({} vs {})",
+                tensors1.len(), tensors2.len(),
+            )));
+        }
         let mut h1: Vec<FlodlTensor> = tensors1.iter().map(|t| t.handle).collect();
         let mut h2: Vec<FlodlTensor> = tensors2.iter().map(|t| t.handle).collect();
         let err = unsafe {
@@ -1211,7 +1226,12 @@ impl Tensor {
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_lerp_scalar_(tensors1: &[Tensor], tensors2: &[Tensor], weight: f64) -> Result<()> {
         if tensors1.is_empty() { return Ok(()); }
-        assert_eq!(tensors1.len(), tensors2.len(), "foreach_lerp_scalar_: list length mismatch");
+        if tensors1.len() != tensors2.len() {
+            return Err(TensorError::new(&format!(
+                "foreach_lerp_scalar_: list length mismatch ({} vs {})",
+                tensors1.len(), tensors2.len(),
+            )));
+        }
         let mut h1: Vec<FlodlTensor> = tensors1.iter().map(|t| t.handle).collect();
         let mut h2: Vec<FlodlTensor> = tensors2.iter().map(|t| t.handle).collect();
         let err = unsafe {

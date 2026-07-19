@@ -106,7 +106,9 @@ fn gate_route(
         .collect::<Result<Vec<_>>>()?;
 
     if expert_outs.is_empty() {
-        panic!("gate: no experts (n={})", n_experts);
+        return Err(crate::tensor::TensorError::new(&format!(
+            "gate: no experts to route to (n={n_experts})"
+        )));
     }
 
     // Vectorized combination: stack → broadcast multiply → sum

@@ -569,8 +569,9 @@ impl Graph {
         // Scope the borrow so it is released before calling methods that re-borrow.
         let (forward_input_name, shard_input_map) = {
             let guard = self.data_binding.borrow();
-            let binding = guard.as_ref()
-                .expect("call set_data_loader before forward_batch");
+            let binding = guard.as_ref().ok_or_else(|| {
+                TensorError::new("Graph::forward_batch: call set_data_loader() first")
+            })?;
             (binding.forward_input.clone(), binding.shard_input_map.clone())
         };
 

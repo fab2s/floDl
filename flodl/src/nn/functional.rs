@@ -45,7 +45,11 @@ impl Module for GaussianBlur {
 /// ```
 pub fn gaussian_blur_2d(input: &Variable, sigma: f64) -> Result<Variable> {
     let shape = input.shape();
-    assert!(shape.len() == 4, "gaussian_blur_2d expects [B, C, H, W], got {:?}", shape);
+    if shape.len() != 4 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "gaussian_blur_2d expects a 4-D [B, C, H, W] input, got shape {shape:?}"
+        )));
+    }
     let channels = shape[1];
     let device = input.device();
 
@@ -92,6 +96,16 @@ pub fn gaussian_blur_2d(input: &Variable, sigma: f64) -> Result<Variable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gaussian_blur_non_4d_is_err_not_panic() {
+        // Wrong-rank runtime input at a Result-returning boundary surfaces as
+        // Err (was an assert! panic).
+        let opts = crate::tensor::test_opts();
+        let input = Variable::new(Tensor::randn(&[3, 16, 16], opts).unwrap(), false);
+        let err = gaussian_blur_2d(&input, 1.0).unwrap_err();
+        assert!(err.to_string().contains("4-D"), "unexpected: {err}");
+    }
 
     #[test]
     fn test_gaussian_blur_preserves_shape() {

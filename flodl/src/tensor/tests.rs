@@ -510,6 +510,17 @@
         Tensor::foreach_sqrt_(&[]).unwrap();
     }
 
+    #[test]
+    fn foreach_list_length_mismatch_is_err_not_panic() {
+        // Mismatched list lengths surface as Err (was an assert_eq! panic),
+        // matching cat_many/stack — consistent fallible-op policy.
+        let dev = test_device();
+        let a = Tensor::ones(&[2], TensorOptions { device: dev, ..Default::default() }).unwrap();
+        let b = Tensor::ones(&[2], TensorOptions { device: dev, ..Default::default() }).unwrap();
+        assert!(Tensor::foreach_add_list_(&[a.clone(), b.clone()], std::slice::from_ref(&a), 1.0).is_err());
+        assert!(Tensor::foreach_lerp_scalar_(std::slice::from_ref(&a), &[a.clone(), b.clone()], 0.5).is_err());
+    }
+
     // --- Tier 2 creation ops ---
 
     #[test]
