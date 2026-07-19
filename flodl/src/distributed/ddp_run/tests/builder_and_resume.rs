@@ -296,7 +296,7 @@ fn test_epoch_fn_called_per_epoch() {
     // This test uses a tiny dataset (100 samples / batch 4 → 25
     // batches, planned share ~12 per rank) where the overshoot cap
     // exceeds the per-rank share. Under progressive mode (Cadence /
-    // Async, see coordinator/mod.rs:405) a fast rank can legally drain
+    // Async) a fast rank can legally drain
     // the whole pool, leaving the slow rank with no `StartEpoch` plan
     // for that epoch — which means fewer than `num_epochs * world`
     // epoch_fn firings. Expected behaviour at this scale, not a bug.

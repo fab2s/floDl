@@ -80,8 +80,7 @@ impl ClusterCoordinator {
             // the in-place collective so the slots stay None
             // throughout.
             self.cycle.reset_upload_markers();
-            // CpuAvgStart: open the Pending window. Mirrors threaded
-            // `coordinator/cpu_avg.rs:634`. Closed in
+            // CpuAvgStart: open the Pending window. Closed in
             // `finish_averaging_cpu` via the machine's `pending_since`
             // so MSF / dashboard see the same `CpuAvgEnd
             // { duration_ms }` payload shape on cluster runs.

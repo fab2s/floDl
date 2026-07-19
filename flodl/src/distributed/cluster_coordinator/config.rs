@@ -269,8 +269,7 @@ pub struct ClusterCoordinatorConfig {
     /// Optional [`crate::monitor::Timeline`] shared with the user-side
     /// harness. When set, `trigger_averaging` and `finish_averaging_*`
     /// emit `SyncStart` / `SyncEnd` events so the launcher's
-    /// `summary.sync_count` reflects real averaging activity. Mirrors
-    /// the threaded coord's `timeline` field.
+    /// `summary.sync_count` reflects real averaging activity.
     /// Without it the cluster path leaves `sync_count` at 0 even when
     /// NCCL / CPU allreduces are firing — cosmetic in `done:`, but
     /// also breaks any analyzer that derives "did this run sync?" from

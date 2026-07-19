@@ -127,9 +127,9 @@ impl ClusterCoordinator {
         // on the rank selected by [`EpochCallbackPolicy`]; others have
         // `checkpoint_fn = None` and treat the frame as a no-op. The
         // version reflects "model state at the end of epoch N-1", which
-        // matches the threaded-path semantic `(epoch + 1) % every == 0`
-        // (where the `+1` is the same off-by-one as treating epoch as
-        // a 0-indexed counter).
+        // matches the `(epoch + 1) % every == 0` checkpoint-cadence
+        // semantic (where the `+1` is the same off-by-one as treating
+        // epoch as a 0-indexed counter).
         if epoch > 0 {
             if let Some(every) = self.checkpoint_every {
                 if every > 0 && epoch % every == 0 {
@@ -1082,8 +1082,7 @@ impl ClusterCoordinator {
     /// nothing drives `dispatch_next_chunk` for the stalled rank (no
     /// MetricsMsg arrives from a rank sitting in `wait_for_epoch_plan`).
     ///
-    /// Mirrors threaded `coordinator/cpu_avg.rs:376-387` / `:544-553`,
-    /// and the post-epoch hook at the tail of
+    /// Runs from the post-epoch hook at the tail of
     /// `try_advance_or_shutdown_after_aggregate`. The
     /// dispatched `StartEpoch` queues after the just-broadcast
     /// `SyncNow` / `Update` in each rank's control stream, so a fast

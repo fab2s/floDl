@@ -1,7 +1,7 @@
-//! Cluster worker: TCP-driven wrapper around the OLD threaded
+//! Cluster worker: TCP-driven wrapper around the
 //! [`crate::distributed::ddp_run::GpuWorker`].
 //!
-//! Reuses every OLD GpuWorker method unchanged (`train_step`,
+//! Reuses every GpuWorker method unchanged (`train_step`,
 //! `sync_now_nccl`, `load_averaged`, `run_epoch_plan`,
 //! `wait_for_epoch_plan`, `report_timing`, `report_epoch`,
 //! `snapshot_params`, EASGD blend, prefetch + DataLoader integration,
@@ -11,7 +11,7 @@
 //! 1. **Connect + handshake to the cluster coordinator over TCP**,
 //!    matching the handshake bytes defined by
 //!    [`cluster_coordinator`](crate::distributed::cluster_coordinator).
-//! 2. **Bridge the OLD mpsc channels to TCP** via two background
+//! 2. **Bridge the GpuWorker's mpsc channels to TCP** via two background
 //!    threads (one inbound, one outbound). The inner GpuWorker still
 //!    sees mpsc senders/receivers; the bridges translate to and from
 //!    `ControlFrame`s on the wire.
@@ -90,8 +90,8 @@ use crate::tensor::{Device, Result, Tensor, TensorError};
 // ---------------------------------------------------------------------------
 
 /// TCP-driven training worker. Wraps an inner [`GpuWorker`] with
-/// bridge threads that translate between the OLD mpsc channels and
-/// the new control-channel `ControlFrame` wire protocol.
+/// bridge threads that translate between the GpuWorker's mpsc channels
+/// and the control-channel `ControlFrame` wire protocol.
 ///
 /// NOT Send (the inner [`GpuWorker`] holds `Rc<RefCell<...>>`).
 /// Construct and run on the same thread.
@@ -124,7 +124,7 @@ pub struct ClusterWorker<M: Module> {
     /// non-chosen ranks receive `None` so they skip the firing cost.
     /// Invoked from [`Self::run_until_shutdown`] between
     /// `wait_for_epoch_plan` and `run_epoch_plan` on each epoch
-    /// transition (matches the threaded path's fire-point).
+    /// transition.
     epoch_fn: Option<EpochFn<M>>,
     /// Receiver for the final parameter snapshot the inner GpuWorker
     /// emits via [`crate::distributed::ddp_run::GpuWorker::send_final_snapshot`]
@@ -571,7 +571,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // without colliding with `self.bridges` teardown below.
         let epoch_fn = self.epoch_fn.take();
         // `usize::MAX` sentinel so the first plan (epoch 0) always
-        // triggers a fire-check — mirrors the threaded path's behavior.
+        // triggers a fire-check.
         let mut last_epoch_fired: usize = usize::MAX;
 
         // Instrumentation (gated on `-vvv` via `inner.prof_enabled()`):
@@ -711,8 +711,8 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // SyncNow whose peer died would block snapshot_params' stream
         // synchronize forever (the error-exit path can get here with a
         // collective still in flight and no DeclareDead ever arriving —
-        // e.g. the coord died with the peer). Mirrors the threaded
-        // path's exit sequence; idempotent with the watchdog's abort.
+        // e.g. the coord died with the peer). Idempotent with the
+        // watchdog's abort.
         inner.abort_nccl();
 
         // Even on error, try to gracefully report exit + drop senders

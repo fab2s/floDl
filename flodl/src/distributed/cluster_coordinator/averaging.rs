@@ -20,8 +20,7 @@ use super::{ClusterCoordinator, EpochDSummary};
 impl ClusterCoordinator {
     /// Per-AllReduce d-aggregator update. Called once per
     /// `finish_averaging_{nccl,cpu}` after the convergence guard's
-    /// `d_raw` + `k_max` are known. Mirrors threaded
-    /// `coordinator/cpu_avg.rs::update_epoch_d_aggregator`.
+    /// `d_raw` + `k_max` are known.
     pub(super) fn update_epoch_d_aggregator(&mut self, d_raw: f64, k_max: usize) {
         self.epoch_d_count += 1;
         self.epoch_d_sum += d_raw;
@@ -37,8 +36,7 @@ impl ClusterCoordinator {
 
     /// Drain the epoch d-aggregator + reset to identity. Called from
     /// the post-aggregate hook to build the `DivergenceEpoch` event
-    /// payload. Mirrors threaded
-    /// `coordinator/cpu_avg.rs::take_epoch_d_summary`.
+    /// payload.
     pub(super) fn take_epoch_d_summary(&mut self) -> EpochDSummary {
         let snap = EpochDSummary {
             count: self.epoch_d_count,
@@ -238,8 +236,7 @@ impl ClusterCoordinator {
         // Open a SyncStart window on the shared timeline so the user-
         // side `summary.sync_count` reflects this averaging cycle.
         // `sync_start` records wall-clock for the matching SyncEnd's
-        // `duration_ms` in `finish_averaging_*`. Mirrors the threaded
-        // coord (ddp_run/coordinator/cpu_avg.rs:124).
+        // `duration_ms` in `finish_averaging_*`.
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::SyncStart);
         }
@@ -268,7 +265,7 @@ impl ClusterCoordinator {
         let prev_sync_ms = self.cycle.take_last_sync_ms();
         // Snapshot anchor BEFORE the guard verdict + meta-nudge so the
         // post-cycle `AnchorChanged` event captures the cycle's net
-        // change. Mirrors threaded `coordinator/cpu_avg.rs:230`.
+        // change.
         let old_anchor = self.el_che.anchor();
         // Stage per-rank callback slack BEFORE report_timing so the
         // recompute inside ElChe applies it to the next cycle's
@@ -343,7 +340,6 @@ impl ClusterCoordinator {
         // `try_advance_or_shutdown_after_aggregate`. Lambda fields are
         // intentionally None — analyze.rs recomputes guard-specific
         // λ̂ from observables now that the guard pipeline is plural.
-        // Mirrors threaded `coordinator/cpu_avg.rs:299-334`.
         let d_raw = report.max_relative_delta();
         self.update_epoch_d_aggregator(d_raw, k_max);
         let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);

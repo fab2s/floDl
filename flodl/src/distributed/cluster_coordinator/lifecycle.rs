@@ -312,7 +312,7 @@ impl ClusterCoordinator {
             cycle: super::cycle_state::AvgCycleState::new(config.backend, world_size),
             dispatch_hold_logged: vec![false; world_size],
             // Per-epoch d-aggregator identity values; see field docs on
-            // `ClusterCoordinator` + threaded `coordinator/cpu_avg.rs`.
+            // `ClusterCoordinator`.
             epoch_d_min: f64::INFINITY,
             epoch_d_max: f64::NEG_INFINITY,
             epoch_d_sum: 0.0,

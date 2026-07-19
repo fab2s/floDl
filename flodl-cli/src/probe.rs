@@ -103,7 +103,7 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
     for worker in &cluster.workers {
         let r = if worker.host == local {
             // Local rank: probe in-process, honor the host's data_path,
-            // libtorch_path, and docker service (if set in cluster.yml).
+            // arch (libtorch variant), and docker service (if set in cluster.yml).
             // Matches the remote-probe path so the local rank's report
             // shape is identical to the SSH-probed remotes. Only pass an
             // explicit data_path_override when the host declared one;
@@ -139,8 +139,9 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
 }
 
 /// SSH to `host` and run `fdl probe --json` there. The remote `fdl`
-/// is resolved as `{worker.path}/target/release/fdl` (release build on
-/// shared storage). Returns a synthetic `ProbeReport` carrying any
+/// is invoked bare and resolved by the remote shell's PATH (each host
+/// owns its own `fdl` install; the controller does not reach into the
+/// remote's build tree). Returns a synthetic `ProbeReport` carrying any
 /// SSH/parse failure in `issues` when the remote call fails — caller
 /// treats those as red verdicts.
 fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport {
@@ -192,8 +193,8 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
         remote_args.push("--docker".into());
         remote_args.push(svc.clone());
     }
-    // Quote each remote arg into a single shell-safe command string;
-    // remote PATH may not have `fdl`, hence the absolute path.
+    // Quote each remote arg into a single shell-safe command string
+    // (paths and options may contain spaces / metacharacters).
     let quoted = remote_args
         .iter()
         .map(|a| crate::util::shell::posix_quote(a))
@@ -683,7 +684,7 @@ fn libtorch_status_from_info(
 ///    `libtorch/.active.blackwell`) — reads the pointer and resolves
 ///    the variant relative to the file's parent directory. Used for
 ///    heterogeneous rigs where each host's `cluster.yml` entry sets
-///    `libtorch_path:` to a different case file.
+///    `arch:` to a different case-file subpath (e.g. `.active.blackwell`).
 /// 3. **Direct variant dir** (has `lib/libtorch.so` + optional
 ///    `.arch`) — used as-is.
 fn check_libtorch_at(

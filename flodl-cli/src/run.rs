@@ -295,10 +295,11 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
 /// Resolve `(LibtorchInfo, host_path)` for `libtorch_env`.
 ///
 /// Priority:
-///   1. Cluster overlay's per-host `libtorch_path:` (when `FDL_ENV` is
+///   1. Cluster overlay's per-host `arch:` (when `FDL_ENV` is
 ///      set, the merged config has a `cluster:` block, AND the current
-///      hostname matches an entry). Lets each host in a shared-checkout
-///      heterogeneous rig pick its own libtorch without flipping the
+///      hostname matches an entry). Resolved via the convention
+///      `<host.path>/libtorch/<arch>`, so each host in a shared-checkout
+///      heterogeneous rig picks its own libtorch without flipping the
 ///      global `.active`.
 ///   2. `project_root/libtorch/.active` (or `.active.<case>` via the
 ///      `FDL_LIBTORCH_CASE` env var). Standalone single-host default.
@@ -369,7 +370,8 @@ fn resolve_libtorch_from_overlay(
     Ok(resolve_libtorch_at(&variant_dir))
 }
 
-/// Resolve a `libtorch_path:` value (from cluster.yml) into
+/// Resolve a libtorch variant dir (the per-host `arch:` applied as
+/// `<path>/libtorch/<arch>`) into
 /// `(LibtorchInfo, absolute host path for Docker bind mount)`. Accepts
 /// the same three shapes as `probe::check_libtorch_at`:
 ///   1. Pointer file `.active*` — read pointer, resolve variant against
@@ -1763,7 +1765,7 @@ mod tests {
         );
     }
 
-    // ── resolve_libtorch_at: 3-shape libtorch_path: resolution ──────────
+    // ── resolve_libtorch_at: 3-shape libtorch variant resolution ────────
     //
     // Each test builds a synthetic libtorch dir under a per-test scratch
     // path (the minimal-deps policy precludes pulling in `tempfile`) and feeds the path

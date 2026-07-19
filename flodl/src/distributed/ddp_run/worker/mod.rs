@@ -338,10 +338,11 @@ pub struct GpuWorker<M: Module> {
     /// SINGLE-CONSUMER INVARIANT: the returned [`ParamSnapshot`] shares
     /// storage with these buffers, so each reduce window must FULLY consume
     /// its snapshot before the next `snapshot_params` overwrites them. The
-    /// coordinator's CPU-averaging state machine guarantees this
-    /// (Idle -> Collecting -> Computing -> Idle, one `RequestParams` per
-    /// cycle, the worker re-snapshots only after the resulting `Update`
-    /// round-trips back), so reuse never aliases an in-flight snapshot.
+    /// coordinator's CPU-averaging cadence guarantees this: it issues
+    /// one `RequestParams` per cycle and the worker re-snapshots only
+    /// after the resulting `Update` round-trips back (the `CpuAvgPhase`
+    /// Idle -> Pending -> Idle cycle), so reuse never aliases an
+    /// in-flight snapshot.
     /// Empty on CPU device / non-CPU-averaging setups (the readout falls
     /// back to a per-tensor passthrough).
     snapshot_pinned_params: Vec<Tensor>,

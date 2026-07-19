@@ -232,8 +232,8 @@ pub type EvalResultFn = std::sync::Arc<
 
 /// Scheduler factory type: `(world_size) -> Arc<dyn Scheduler>`.
 ///
-/// Called once per rank-process (or once per worker thread in the threaded
-/// path) to construct the per-batch LR scheduler. The `world_size` argument
+/// Called once per rank-process to construct the per-batch LR
+/// scheduler. The `world_size` argument
 /// is provided so user-supplied factories can scale base LR by replica
 /// count (Goyal et al. linear-scaling) without re-implementing the math.
 ///
@@ -1013,8 +1013,7 @@ pub(crate) enum TimingMsg {
         lr: f64,
     },
     /// Periodic liveness signal from a cluster worker's heartbeat
-    /// thread. Cluster-only; OLD threaded path never emits these.
-    /// See `Heartbeat` for
+    /// thread. Cluster-only. See `Heartbeat` for
     /// the failure-detection rationale.
     Heartbeat {
         /// Which rank sent this.

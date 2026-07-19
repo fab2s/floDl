@@ -359,7 +359,7 @@ pub struct ElChe {
     /// prefetch spin-up, first-batch unpipelined H2D — the cost the
     /// marginal-anchor allocation feed deliberately excludes (batch 1
     /// skipped). It is the window-pressure signal: a fixed per-window cost
-    /// that amortizes as the window grows. `0.0` (threaded path, or before
+    /// that amortizes as the window grows. `0.0` (unset, e.g. before
     /// any coordinator report) makes window-pressure fall back to the
     /// reduce-overhead term alone. Indexed by the elected anchor rank in
     /// `propose_anchor`. Zeroed in `report_timing` after the proposal so a
@@ -867,7 +867,7 @@ impl ElChe {
     /// allocation feed excludes. The coordinator computes it from the
     /// per-window timing and sets it before [`Self::report_timing`]; left
     /// unset (all-zero), window-pressure falls back to the reduce-overhead
-    /// term alone (threaded path).
+    /// term alone.
     ///
     /// Silently no-ops on a length mismatch (matches the rest of the
     /// builder/setter shape: a caller off-by-one must not crash a running
@@ -1490,7 +1490,7 @@ impl ElChe {
         // collapse to <1/epoch and the schedule no longer "knows how many
         // steps per epoch". Scale the counts down proportionally (keeping
         // the speed-derived ratio) so `sum(batch_counts) <= max_total`.
-        // No-op when unset (threaded path) or already within bound.
+        // No-op when unset or already within bound.
         //
         // DEGENERATE CASE — the per-rank floor of 1 deliberately WINS over
         // the cap: when `world_size > max_total` (more ranks than batches

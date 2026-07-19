@@ -156,8 +156,8 @@ impl<M: Module> GpuWorker<M> {
                 // fresh UID and replies through the timing
                 // channel); they should not reach the inner
                 // GpuWorker. If one slips through (e.g. via test
-                // wiring), drop silently — the OLD threaded path
-                // has no comm-replacement surface to act on it.
+                // wiring), drop silently — the inner GpuWorker has no
+                // comm-replacement surface to act on it.
             }
             ControlMsg::ShutdownWithSave { reason } => {
                 // Cluster-mode unrecoverable-failure persistence.

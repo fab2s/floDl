@@ -770,7 +770,7 @@ impl ClusterCoordinator {
             // when at least one AllReduce contributed a sample. Lambda
             // fields are intentionally None — `ddp-bench/src/analyze/msf.rs`
             // recomputes guard-specific λ̂ from the per-event Divergence
-            // observables. Mirrors threaded `coordinator/mod.rs:934-951`.
+            // observables.
             let snap = self.take_epoch_d_summary();
             if snap.count > 0
                 && let Some(ref tl) = self.timeline
@@ -850,11 +850,9 @@ impl ClusterCoordinator {
     /// and a still-pending CPU cycle simply defers the call until the
     /// next tick once the cycle finalizes.
     ///
-    /// Mirrors threaded `Coordinator::on_epoch_aggregated` (see
-    /// `ddp_run/coordinator/mod.rs:924`) but split from
-    /// `drain_metrics_and_aggregate` because the cluster path is
-    /// async: workers can post-send `MetricsMsg` while the previous
-    /// batch's bridge SyncAck is still in transit.
+    /// Split from `drain_metrics_and_aggregate` because the cluster
+    /// path is async: workers can post-send `MetricsMsg` while the
+    /// previous batch's bridge SyncAck is still in transit.
     /// Whether end-of-training must force one final consensus reduce
     /// before shutdown: at least two alive ranks (a lone survivor's weights
     /// are already canonical, and NCCL needs `world_size >= 2`) AND some
@@ -983,9 +981,7 @@ impl ClusterCoordinator {
             // at averaging — but reset alone doesn't kick a stalled
             // rank back into motion. After every epoch aggregate, walk
             // alive ranks and dispatch_next_chunk to any with no
-            // in-flight chunks across any pool. Mirrors threaded
-            // `Coordinator::on_epoch_aggregated` (ddp_run/coordinator/
-            // mod.rs:978-988). Without this, multi-epoch progressive
+            // in-flight chunks across any pool. Without this, multi-epoch progressive
             // runs (cpu-cadence, cpu-async, nccl-cadence)
             // wedge after epoch 0 once the calibrated `batch_counts`
             // pulls the fast rank past its planned + max_overshoot

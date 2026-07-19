@@ -1,13 +1,11 @@
-//! Cluster coordinator: process-model port of the OLD threaded
-//! `ddp_run::coordinator::Coordinator`.
+//! Cluster coordinator: the process-model coordinator that drives
+//! averaging for a cluster of remote rank processes.
 //!
 //! Owns the per-cluster scheduling state (ElChe, ConvergenceGuard,
 //! per-rank wall-time accumulation, sync acknowledgments) and drives
-//! averaging decisions for the cluster. Where the OLD design used
-//! `mpsc::{Sender, Receiver}` to talk to in-process worker threads,
-//! this type talks to remote rank processes over TCP. The state
-//! machine and decision logic are ported literally; only the I/O
-//! changes.
+//! averaging decisions for the cluster. Talks to remote rank
+//! processes over TCP (the scheduling state machine and decision
+//! logic are I/O-agnostic; only the transport is TCP).
 //!
 //! # Architecture
 //!
@@ -42,7 +40,8 @@
 //!   [`ClusterCoordinator::shutdown`] (accept loop + per-rank reader
 //!   threads).
 //! - Drives epoch dispatch (with progressive chunk-pool support),
-//!   CPU 3-phase averaging, heartbeat fault detection, metrics
+//!   CPU asynchronous averaging (the Idle/Pending cadence window),
+//!   heartbeat fault detection, metrics
 //!   aggregation, and meta-controller observe wiring.
 //!
 //! # File layout (internal)
@@ -163,9 +162,8 @@ fn initial_callback_role(
 // ClusterCoordinator
 // ---------------------------------------------------------------------------
 
-/// Drained payload of the per-epoch d-aggregator. Mirrors the threaded
-/// coord's `EpochDSummary` (ddp_run/coordinator/cpu_avg.rs) line-for-line
-/// so MSF analysis sees the same `DivergenceEpoch` shape on both paths.
+/// Drained payload of the per-epoch d-aggregator, shaped so MSF
+/// analysis sees a consistent `DivergenceEpoch` regardless of backend.
 /// `count == 0` means no AllReduce happened in the epoch (e.g. final
 /// pure-Sync epoch with one batch per rank) and the caller should skip
 /// emission rather than ship a snapshot of identity values.
@@ -252,9 +250,8 @@ struct NcclRendezvousPending {
 pub type ReportedDeaths = std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
 
 
-/// Process-model coordinator: ports the OLD threaded
-/// `ddp_run::coordinator::Coordinator` to talk to remote rank
-/// processes over TCP.
+/// Process-model coordinator: drives the per-cluster scheduling state
+/// machine while talking to remote rank processes over TCP.
 ///
 /// Hand off control of one TCP control channel + one reader thread per
 /// rank. Drive the state machine via [`Self::tick`] from the
@@ -314,16 +311,14 @@ pub struct ClusterCoordinator {
     /// to identity values (min=+∞, max=-∞, sum/count/last=0) so
     /// `take_epoch_d_summary` distinguishes "no AllReduce this epoch"
     /// (count=0 ⇒ skip emit) from "at least one sample observed".
-    /// Mirrors threaded `coordinator/cpu_avg.rs`'s `epoch_d_*` fields
-    /// + `update_epoch_d_aggregator` / `take_epoch_d_summary` helpers.
     epoch_d_min: f64,
     epoch_d_max: f64,
     epoch_d_sum: f64,
     epoch_d_count: usize,
-    /// Most-recent `d_raw` sample in the current epoch. Threaded path
-    /// uses this as the `d_at_epoch_end` payload field on
-    /// `EventKind::DivergenceEpoch` so MSF analysis can read the last
-    /// observation of the epoch without scanning all per-event samples.
+    /// Most-recent `d_raw` sample in the current epoch. Surfaced as the
+    /// `d_at_epoch_end` payload field on `EventKind::DivergenceEpoch`
+    /// so MSF analysis can read the last observation of the epoch
+    /// without scanning all per-event samples.
     epoch_last_d: f64,
     /// `k_max` from the most-recent AllReduce in the current epoch.
     /// Companion to `epoch_last_d`; surfaced as `k_at_epoch_end`.
@@ -588,8 +583,7 @@ pub struct ClusterCoordinator {
     /// reported at least once for non-progressive, or the epoch's
     /// `ChunkPool::is_epoch_done()` returns true for progressive).
     /// `BTreeMap` rather than `HashMap` so progressive aggregation
-    /// walks epochs in ascending order, matching the threaded
-    /// coordinator's ordering invariant.
+    /// walks epochs in ascending order.
     metrics_buffer: std::collections::BTreeMap<
         u64,
         Vec<crate::distributed::ddp_run::MetricsMsg>,
@@ -689,7 +683,7 @@ pub struct ClusterCoordinator {
 
 impl ClusterCoordinator {
     // -----------------------------------------------------------------
-    // Public accessors (mirror the OLD coordinator's getters)
+    // Public accessors
     // -----------------------------------------------------------------
 
     pub fn bound_port(&self) -> u16 {

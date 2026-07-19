@@ -451,8 +451,9 @@ impl CpuReduceClient {
 // NOTE: an `AsyncCpuReduceClient` (split read/write, background reader
 // thread) used to live here. It had zero production users — cpu-async
 // rides the same blocking param bridge as sync/cadence (the worker's
-// non-blocking behavior comes from the coordinator's 3-phase state
-// machine, not a rank-side split client) — so it was removed rather
+// non-blocking behavior comes from the coordinator's asynchronous
+// CPU-averaging cadence (the `CpuAvgPhase` Idle/Pending window), not a
+// rank-side split client) — so it was removed rather
 // than shipped dead. Recover from git history if a rank-side async
 // client is ever wanted.
 

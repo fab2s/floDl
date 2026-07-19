@@ -68,7 +68,8 @@ pub fn read_active(root: &Path) -> Option<LibtorchInfo> {
 ///
 /// Used by [`read_active`] (default `.active`), by callers that have
 /// the pointer file path directly (e.g. cluster.yml's per-host
-/// `libtorch_path:` set to `…/libtorch/.active.<case>`), and by tests
+/// `arch:` naming a case pointer, resolving to
+/// `…/libtorch/.active.<case>`), and by tests
 /// that need to validate a pointer-file shape without setting the
 /// `FDL_LIBTORCH_CASE` env var.
 pub fn read_active_from(pointer: &Path, libtorch_root: &Path) -> Option<LibtorchInfo> {
