@@ -33,6 +33,7 @@ impl ClusterCoordinator {
             | TimingMsgWire::SyncAck { rank, .. }
             | TimingMsgWire::Exiting { rank }
             | TimingMsgWire::LrUpdate { rank, .. }
+            | TimingMsgWire::Intent { rank, .. }
             | TimingMsgWire::Heartbeat { rank, .. }
             | TimingMsgWire::SnapshotReady { rank }
             | TimingMsgWire::NewNcclIdGenerated { rank, .. }
@@ -128,6 +129,22 @@ impl ClusterCoordinator {
                 // The meta-controller is consulted on every averaging
                 // cycle via `observe_meta`; per-message work is just
                 // recording the latest LR.
+            }
+            TimingMsgWire::Intent { rank, kind } => {
+                // Cooperative-tier user intent (request, not command). Set the
+                // cohort-wide pending flag; `dispatch_epoch` folds it into the
+                // role-elected eval / checkpoint dispatch at the next epoch
+                // boundary (never mid-window), on the elected rank — so the
+                // requesting `rank` only matters for the liveness tick above.
+                let _ = rank;
+                match kind {
+                    crate::distributed::wire::IntentKind::EvalNow => {
+                        self.pending_eval_intent = true;
+                    }
+                    crate::distributed::wire::IntentKind::CheckpointNow => {
+                        self.pending_checkpoint_intent = true;
+                    }
+                }
             }
             TimingMsgWire::Heartbeat { .. } => {
                 // Liveness slot already refreshed above; nothing

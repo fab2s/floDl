@@ -490,3 +490,61 @@ fn checkpoint_role_failover_on_rank_death() {
     );
 }
 
+
+// -----------------------------------------------------------------
+// Cooperative-tier intent channel (Worker::request_eval /
+// request_checkpoint): the request arrives as TimingMsgWire::Intent,
+// sets a cohort-wide pending flag, and dispatch_epoch folds it into
+// the role-elected dispatch at the next epoch boundary (then clears),
+// independent of any configured cadence.
+// -----------------------------------------------------------------
+
+/// Pure unit test: an `Intent` frame sets the matching pending flag,
+/// and the next `dispatch_epoch` (epoch > 0) folds + clears it — with
+/// NO eval/checkpoint cadence configured, so the dispatch fires purely
+/// from the folded intent.
+#[test]
+fn cooperative_intent_sets_and_folds() {
+    use crate::distributed::wire::IntentKind;
+    let world_size = 2;
+    let cfg = cfg_sync_cpu(world_size)
+        .total_samples(8)
+        .batch_size(4)
+        .num_epochs(3);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    assert!(!coord.pending_eval_intent_for_test());
+    assert!(!coord.pending_checkpoint_intent_for_test());
+
+    // Intents from any rank set the cohort-wide flags (the requesting
+    // rank is irrelevant — the controller's policy elects where the
+    // folded task runs).
+    coord.process_timing_msg(TimingMsgWire::Intent {
+        rank: 1,
+        kind: IntentKind::EvalNow,
+    });
+    coord.process_timing_msg(TimingMsgWire::Intent {
+        rank: 0,
+        kind: IntentKind::CheckpointNow,
+    });
+    assert!(
+        coord.pending_eval_intent_for_test(),
+        "EvalNow intent must set the pending flag"
+    );
+    assert!(
+        coord.pending_checkpoint_intent_for_test(),
+        "CheckpointNow intent must set the pending flag"
+    );
+
+    // The next epoch boundary folds both (send_control is best-effort
+    // without a live rank connection; the fold + clear runs regardless).
+    let _ = coord.dispatch_epoch(1);
+    assert!(
+        !coord.pending_eval_intent_for_test(),
+        "dispatch_epoch must fold + clear the eval intent"
+    );
+    assert!(
+        !coord.pending_checkpoint_intent_for_test(),
+        "dispatch_epoch must fold + clear the checkpoint intent"
+    );
+}

@@ -1224,6 +1224,20 @@ pub enum ControlMsgWire {
     },
 }
 
+/// A cooperative-tier user intent, flowing rank/user -> controller as a
+/// **request, not a command**: the controller folds it into its next coherent
+/// dispatch (the role-elected `ExecuteEvalCallback` / `Checkpoint` at the next
+/// epoch boundary), on the rank its policy elects. See
+/// [`Worker::request_eval`](crate::distributed::ddp_run::Worker::request_eval).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentKind {
+    /// "Evaluate at the next occasion" — folds into the eval-cadence dispatch.
+    EvalNow,
+    /// "Checkpoint at the next occasion" — folds into the checkpoint-cadence
+    /// dispatch.
+    CheckpointNow,
+}
+
 /// Wire-side mirror of [`ddp_run::TimingMsg`]. All fields are plain
 /// data; the OLD type was already serde-compatible in shape.
 ///
@@ -1258,6 +1272,15 @@ pub enum TimingMsgWire {
     LrUpdate {
         rank: u64,
         lr: f64,
+    },
+    /// Cooperative-tier user intent (request, not command): the sending rank
+    /// asks the controller to eval / checkpoint at its next coherent dispatch.
+    /// The controller folds it into the role-elected dispatch at the next epoch
+    /// boundary (never mid-window); the requesting rank is irrelevant to WHERE
+    /// it runs (the controller's policy elects that). See [`IntentKind`].
+    Intent {
+        rank: u64,
+        kind: IntentKind,
     },
     /// Periodic worker-emitted liveness signal. Fires on a fixed cadence
     /// from the cluster worker's heartbeat thread independent of

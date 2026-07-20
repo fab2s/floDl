@@ -1014,6 +1014,18 @@ pub(crate) enum TimingMsg {
         /// Current optimizer learning rate.
         lr: f64,
     },
+    /// Cooperative-tier user intent (request, not command) from
+    /// [`Worker::request_eval`](Worker::request_eval) /
+    /// [`request_checkpoint`](Worker::request_checkpoint). Fire-and-forget on
+    /// `timing_tx`; the controller folds it into its next coherent
+    /// role-elected dispatch. No-op on the single-device path (no controller).
+    Intent {
+        /// Which rank made the request (diagnostic; the controller's policy,
+        /// not this rank, decides where the folded task runs).
+        rank: usize,
+        /// What the user asked for.
+        kind: crate::distributed::wire::IntentKind,
+    },
     /// Periodic liveness signal from a cluster worker's heartbeat
     /// thread. Cluster-only. See `Heartbeat` for
     /// the failure-detection rationale.

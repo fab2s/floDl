@@ -165,6 +165,14 @@
             },
             TimingMsgWire::Exiting { rank: 3 },
             TimingMsgWire::LrUpdate { rank: 0, lr: 1e-3 },
+            TimingMsgWire::Intent {
+                rank: 0,
+                kind: crate::distributed::wire::IntentKind::EvalNow,
+            },
+            TimingMsgWire::Intent {
+                rank: 2,
+                kind: crate::distributed::wire::IntentKind::CheckpointNow,
+            },
             TimingMsgWire::CheckpointResult {
                 rank: 1,
                 version: 7,

@@ -350,6 +350,8 @@ impl ClusterCoordinator {
                 config.epoch_callback_policy,
                 world_size,
             ),
+            pending_eval_intent: false,
+            pending_checkpoint_intent: false,
             epoch_callback_role: initial_callback_role(
                 config.epoch_callback_policy,
                 world_size,

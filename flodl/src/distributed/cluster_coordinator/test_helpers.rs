@@ -175,6 +175,8 @@ impl ClusterCoordinator {
                 config.epoch_callback_policy,
                 world_size,
             ),
+            pending_eval_intent: false,
+            pending_checkpoint_intent: false,
             epoch_callback_role: initial_callback_role(
                 config.epoch_callback_policy,
                 world_size,
@@ -297,6 +299,14 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn eval_role_for_test(&self) -> usize {
         self.eval_role
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_eval_intent_for_test(&self) -> bool {
+        self.pending_eval_intent
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_checkpoint_intent_for_test(&self) -> bool {
+        self.pending_checkpoint_intent
     }
     #[cfg(test)]
     pub(crate) fn epoch_callback_role_for_test(&self) -> usize {

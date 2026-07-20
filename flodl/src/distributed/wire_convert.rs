@@ -61,6 +61,10 @@ pub(crate) fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             rank: rank as u64,
             step_count: step_count as u64,
         },
+        TimingMsg::Intent { rank, kind } => TimingMsgWire::Intent {
+            rank: rank as u64,
+            kind,
+        },
         TimingMsg::SnapshotReady { rank } => TimingMsgWire::SnapshotReady {
             rank: rank as u64,
         },

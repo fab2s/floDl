@@ -131,56 +131,63 @@ impl ClusterCoordinator {
         // semantic (where the `+1` is the same off-by-one as treating
         // epoch as a 0-indexed counter).
         if epoch > 0 {
-            if let Some(every) = self.checkpoint_every {
-                if every > 0 && epoch % every == 0 {
-                    // Targeted dispatch: the coord's `checkpoint_role`
-                    // is the sticky assignee; the worker no-ops unless
-                    // `target_rank == self.rank`. Stays addressed to
-                    // the SAME live rank across checkpoints until that
-                    // rank fails or dies, at which point the
-                    // controller fails over.
-                    let target = self.checkpoint_role;
-                    let msg = ControlMsgWire::Checkpoint {
-                        version: epoch as u64,
-                        target_rank: target as u64,
-                    };
-                    // Best-effort: a missed checkpoint is a gap in the
-                    // checkpoint series, not a reason to halt training
-                    // (the role failover machinery re-targets on death).
-                    if let Err(e) = self.send_control(target, &msg) {
-                        eprintln!(
-                            "flodl ddp: checkpoint dispatch to rank {target} \
-                             failed at epoch {epoch}: {e}"
-                        );
-                    }
+            // Checkpoint fires on the cadence OR on a folded user intent
+            // (`Worker::request_checkpoint`) — the intent is a request the
+            // controller services at this coherent boundary, cleared once
+            // folded.
+            let checkpoint_by_cadence = self
+                .checkpoint_every
+                .is_some_and(|every| every > 0 && epoch % every == 0);
+            if checkpoint_by_cadence || self.pending_checkpoint_intent {
+                self.pending_checkpoint_intent = false;
+                // Targeted dispatch: the coord's `checkpoint_role`
+                // is the sticky assignee; the worker no-ops unless
+                // `target_rank == self.rank`. Stays addressed to
+                // the SAME live rank across checkpoints until that
+                // rank fails or dies, at which point the
+                // controller fails over.
+                let target = self.checkpoint_role;
+                let msg = ControlMsgWire::Checkpoint {
+                    version: epoch as u64,
+                    target_rank: target as u64,
+                };
+                // Best-effort: a missed checkpoint is a gap in the
+                // checkpoint series, not a reason to halt training
+                // (the role failover machinery re-targets on death).
+                if let Err(e) = self.send_control(target, &msg) {
+                    eprintln!(
+                        "flodl ddp: checkpoint dispatch to rank {target} \
+                         failed at epoch {epoch}: {e}"
+                    );
                 }
             }
-            // Eval cadence: dispatch `ExecuteEvalCallback` to the
-            // current `eval_role` when the boundary aligns with
-            // `eval_every_epochs`. Targeted (parallels the
-            // `Checkpoint` dispatch above): the role is sticky across
-            // cadences, re-resolved only on rank death when policy
-            // is `Fastest`.
-            if let Some(every) = self.eval_every_epochs {
-                if every > 0 && epoch % every == 0 {
-                    // schedule_id derived from epoch for now (one eval
-                    // per cadence); a richer scheduler would mint a
-                    // monotonic counter to disambiguate concurrent
-                    // dispatches.
-                    let target = self.eval_role;
-                    let msg = ControlMsgWire::ExecuteEvalCallback {
-                        schedule_id: epoch as u64,
-                        epoch: epoch as u64,
-                        target_rank: target as u64,
-                    };
-                    // Best-effort, same rationale as the checkpoint
-                    // dispatch above.
-                    if let Err(e) = self.send_control(target, &msg) {
-                        eprintln!(
-                            "flodl ddp: eval dispatch to rank {target} \
-                             failed at epoch {epoch}: {e}"
-                        );
-                    }
+            // Eval fires on the cadence (`eval_every_epochs`) OR on a folded
+            // user intent (`Worker::request_eval`). Targeted to the current
+            // `eval_role` (parallels the `Checkpoint` dispatch above): the role
+            // is sticky across cadences, re-resolved only on rank death when
+            // policy is `Fastest`.
+            let eval_by_cadence = self
+                .eval_every_epochs
+                .is_some_and(|every| every > 0 && epoch % every == 0);
+            if eval_by_cadence || self.pending_eval_intent {
+                self.pending_eval_intent = false;
+                // schedule_id derived from epoch for now (one eval
+                // per cadence); a richer scheduler would mint a
+                // monotonic counter to disambiguate concurrent
+                // dispatches.
+                let target = self.eval_role;
+                let msg = ControlMsgWire::ExecuteEvalCallback {
+                    schedule_id: epoch as u64,
+                    epoch: epoch as u64,
+                    target_rank: target as u64,
+                };
+                // Best-effort, same rationale as the checkpoint
+                // dispatch above.
+                if let Err(e) = self.send_control(target, &msg) {
+                    eprintln!(
+                        "flodl ddp: eval dispatch to rank {target} \
+                         failed at epoch {epoch}: {e}"
+                    );
                 }
             }
         }

@@ -105,6 +105,18 @@ impl<M: Module> GpuWorker<M> {
         res
     }
 
+    /// Emit a cooperative-tier user intent (eval / checkpoint request) to the
+    /// controller on `timing_tx`. Fire-and-forget: a disconnected channel is
+    /// non-fatal (single-device has no controller listening, so the send just
+    /// drops — the request is a no-op there, as documented on
+    /// [`Worker::request_eval`](crate::distributed::ddp_run::Worker::request_eval)).
+    pub(crate) fn report_intent(&self, kind: crate::distributed::wire::IntentKind) {
+        let _ = self.timing_tx.send(TimingMsg::Intent {
+            rank: self.rank,
+            kind,
+        });
+    }
+
     /// Compute the L2 norm of all model parameters.
     ///
     /// Uses `Tensor::foreach_norm` for a single batched CUDA kernel instead

@@ -191,6 +191,29 @@ impl<M: Module + 'static> Worker<M> {
             .and_then(|g| (*g).clone())
     }
 
+    /// Ask the controller to run the eval callback at its next coherent
+    /// occasion (a **request, not a command**): the intent flows to the
+    /// controller, which folds it into the role-elected `ExecuteEvalCallback`
+    /// dispatch at the next epoch boundary — on the rank its policy elects, not
+    /// necessarily this one. The user expresses intent; the controller decides
+    /// *when* and *which rank*, preserving the collective's coherence.
+    ///
+    /// Fire-and-forget. **No-op on the single-device path** (no controller to
+    /// service it — drive eval directly in your loop there).
+    pub fn request_eval(&self) {
+        self.worker_ref()
+            .report_intent(crate::distributed::wire::IntentKind::EvalNow);
+    }
+
+    /// Ask the controller to checkpoint at its next coherent occasion (a
+    /// request, not a command; see [`Self::request_eval`]). Folds into the
+    /// role-elected `Checkpoint` dispatch at the next epoch boundary.
+    /// Fire-and-forget; no-op on the single-device path.
+    pub fn request_checkpoint(&self) {
+        self.worker_ref()
+            .report_intent(crate::distributed::wire::IntentKind::CheckpointNow);
+    }
+
     /// Advance to the next epoch. `Some(plan)` opens an epoch (the plan is the
     /// coordinator's — or, single-device, the whole dataset); `None` ends the
     /// training loop (all epochs done, or the controller signalled shutdown).

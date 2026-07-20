@@ -442,6 +442,17 @@ pub struct ClusterCoordinator {
     /// Sticky assignee for `ControlMsgWire::ExecuteEvalCallback`.
     /// Same resolution + failover semantics as `checkpoint_role`.
     eval_role: usize,
+    /// Cooperative-tier user intent, pending until the next coherent dispatch.
+    /// Set when a rank sends `TimingMsgWire::Intent { kind: EvalNow }`
+    /// (`Worker::request_eval`); folded (OR'd) into the eval-cadence dispatch at
+    /// the next epoch boundary, then cleared. A single bool, not per-rank: the
+    /// request is cohort-wide ("eval at the next occasion"), dispatched to the
+    /// elected `eval_role` regardless of who asked.
+    pending_eval_intent: bool,
+    /// Checkpoint counterpart of [`Self::pending_eval_intent`]
+    /// (`Worker::request_checkpoint`); folded into the checkpoint-cadence
+    /// dispatch at the next epoch boundary.
+    pending_checkpoint_intent: bool,
     /// Sticky assignee for `epoch_fn` (worker fires autonomously at
     /// each epoch transition; this is pushed to workers via
     /// `ControlMsgWire::SetEpochCallbackRole` rather than per-event
