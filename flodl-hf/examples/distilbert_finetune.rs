@@ -28,7 +28,7 @@
 //! cargo run --release --example distilbert_finetune
 //! ```
 
-use flodl::{clip_grad_norm, Adam, Device, Module, Result, Tensor, TensorError, Trainer, Variable};
+use flodl::{clip_grad_norm, Adam, Device, Module, Result, Tensor, TensorError, Variable};
 use flodl_hf::models::distilbert::DistilBertForSequenceClassification;
 use flodl_hf::tokenizer::HfTokenizer;
 
@@ -45,26 +45,17 @@ fn main() -> Result<()> {
     let head = DistilBertForSequenceClassification::from_pretrained(model_repo)?;
     let tok = HfTokenizer::from_pretrained(tok_repo)?;
 
-    // Wire the optimizer and training mode through `Trainer::setup_head`.
-    // On CPU or a single GPU this is a thin wrapper; on multi-GPU hosts
-    // the same call auto-distributes, so the loop below is identical for
-    // 1 or N devices. The factory closure is only invoked for additional
-    // replica devices.
+    // Attach the optimizer and enter training mode directly on the head's
+    // graph. This is a single-device / CPU fine-tune, so the loop below drives
+    // `head.graph()` directly.
     //
-    // NOTE: the setup tier is deprecated pending its cooperative-tier
-    // replacement on the controller engine (the user-owned loop below is
-    // exactly the shape that tier keeps); it still works until then. See
+    // For MULTI-device or multi-host fine-tuning, use the cooperative
+    // `Trainer::builder(...).into_worker()` loop instead — the controller then
+    // owns cadence / partition / gradient averaging across replicas. See
+    // `examples/distilbert_finetune_ddp.rs` and
     // docs/design/trainer-execution-tiers.md.
-    let replica_config = head.config().clone();
-    let num_labels = head.labels().len() as i64;
-    #[allow(deprecated)]
-    Trainer::setup_head(
-        &head,
-        move |dev| DistilBertForSequenceClassification::on_device(
-            &replica_config, num_labels, dev,
-        ),
-        |p| Adam::new(p, 5e-5),
-    )?;
+    head.graph().set_optimizer(|p| Adam::new(p, 5e-5));
+    head.graph().set_training(true);
 
     // Tiny domain-specific dataset. Swap this for a real one by
     // feeding a `DataSet` through `DataLoader::new` - the training

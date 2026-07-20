@@ -148,6 +148,44 @@
         assert!(keys.iter().any(|k| k == "classifier.bias"));
     }
 
+    /// The seq-classification head implements [`flodl::Module`] by delegating
+    /// every method to its inner [`flodl::Graph`] (the trait defaults introspect
+    /// the head struct's own fields and would find nothing — training a
+    /// zero-parameter model). This delegation is what lets the head train as
+    /// `M` through `Trainer::builder(...).into_worker()` (see
+    /// `examples/distilbert_finetune_ddp.rs`).
+    #[test]
+    fn seqcls_head_module_delegates_to_graph() {
+        use flodl::Module;
+        let config = DistilBertConfig {
+            num_labels: Some(2),
+            ..DistilBertConfig::distilbert_base_uncased()
+        };
+        let head =
+            DistilBertForSequenceClassification::on_device(&config, 2, Device::CPU).unwrap();
+        let g = head.graph();
+        assert!(
+            !head.parameters().is_empty(),
+            "Module::parameters must be non-empty (else the optimizer trains nothing)"
+        );
+        assert_eq!(
+            head.parameters().len(),
+            g.parameters().len(),
+            "Module::parameters must delegate to the inner graph"
+        );
+        assert_eq!(
+            head.buffers().len(),
+            g.buffers().len(),
+            "Module::buffers must delegate to the inner graph"
+        );
+        assert!(
+            head.as_any()
+                .and_then(|a| a.downcast_ref::<flodl::Graph>())
+                .is_some(),
+            "Module::as_any must present the inner Graph (DDP multi-input replica path)"
+        );
+    }
+
     /// `DistilBertForTokenClassification` adds 2 head keys: `classifier.{w,b}`.
     #[test]
     fn tokencls_head_adds_two_keys() {
