@@ -235,6 +235,16 @@ pub struct GpuWorker<M: Module> {
     /// (cold-start, single-GPU runs that never trigger coord-side
     /// aggregation).
     aggregated_metrics: Arc<Mutex<Option<EpochMetrics>>>,
+    /// Cooperative-tier full metrics stream. `None` in managed / setup mode
+    /// (no accumulation, zero cost). When armed by
+    /// [`Self::enable_metrics_stream`] (only on the cooperative `Worker`
+    /// cluster path), every `EpochAggregated` frame is *also* forwarded here,
+    /// not just folded into the latest-only `aggregated_metrics` slot — so the
+    /// user's [`crate::distributed::Worker::poll_metrics`] drains the same
+    /// per-epoch series the managed [`crate::distributed::DdpHandle::poll_metrics`]
+    /// gets from the coordinator's launcher-side sink. Fed from
+    /// `dispatch_control`, so it populates from both `step` and `next_plan`.
+    metrics_stream_tx: Option<mpsc::Sender<EpochMetrics>>,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.

@@ -85,6 +85,13 @@ pub struct Worker<M: Module> {
     /// Forensic context for the Drop guard: `Some` on a cluster rank, `None` on
     /// a single device (no peers to unblock, nothing to record).
     forensics: Option<RankForensics>,
+    /// Full per-epoch metrics stream, armed only on the cluster path. Fed by
+    /// the worker's `dispatch_control` (during `step` / `next_plan`) with every
+    /// coordinator-broadcast aggregated epoch — the same series the managed
+    /// [`DdpHandle::poll_metrics`](super::DdpHandle::poll_metrics) receives.
+    /// Drained non-blocking via [`Self::poll_metrics`]. `None` on the
+    /// single-device path (no coordinator aggregates).
+    metrics_rx: Option<std::sync::mpsc::Receiver<EpochMetrics>>,
 }
 
 /// Death-record context carried by a cluster-rank `Worker` for its Drop guard.
@@ -133,6 +140,7 @@ impl<M: Module + 'static> Worker<M> {
             shutdown: false,
             finished: false,
             forensics: None, // single device: no peers to unblock
+            metrics_rx: None, // no coordinator aggregates on a single device
         }
     }
 
@@ -141,11 +149,16 @@ impl<M: Module + 'static> Worker<M> {
     /// guard so an un-`finish()`ed drop writes a death record and exits to
     /// unblock peers.
     pub(crate) fn cluster(
-        cluster: ClusterWorker<M>,
+        mut cluster: ClusterWorker<M>,
         save_path: Option<String>,
         global_rank: usize,
         world_size: usize,
     ) -> Self {
+        // Arm the full metrics stream before the user runs their first
+        // `next_plan`: dispatch (which fills the stream) only happens on this
+        // thread, so no aggregated frame can be missed between here and the
+        // first drain point.
+        let metrics_rx = cluster.inner_mut().enable_metrics_stream();
         Worker {
             inner: WorkerInner::Cluster(cluster),
             epoch_state: None,
@@ -159,6 +172,7 @@ impl<M: Module + 'static> Worker<M> {
                 global_rank,
                 world_size,
             }),
+            metrics_rx: Some(metrics_rx),
         }
     }
 
@@ -192,6 +206,34 @@ impl<M: Module + 'static> Worker<M> {
             .lock()
             .ok()
             .and_then(|g| (*g).clone())
+    }
+
+    /// Drain every aggregated [`EpochMetrics`] the controller has broadcast
+    /// since the last call, oldest first (non-blocking; empty `Vec` when
+    /// nothing new). This is the full per-epoch series — the cooperative
+    /// counterpart of the managed [`DdpHandle::poll_metrics`], fed the same
+    /// coordinator-aggregated values — so a `Monitor` sees every epoch, not
+    /// just the latest (which [`Self::epoch_metrics`] gives).
+    ///
+    /// **Non-blocking by construction.** The worker thread is the only thing
+    /// that advances control (frames are dispatched inside `step` / `next_plan`
+    /// on *this* thread), so there is no separate pump to wait on — a blocking
+    /// "next" would deadlock. Call it after each `step` / at epoch boundaries
+    /// and feed what it returns to your monitor. Always empty on the
+    /// single-device path (no controller aggregates).
+    ///
+    /// [`DdpHandle::poll_metrics`]: super::DdpHandle::poll_metrics
+    pub fn poll_metrics(&self) -> Vec<EpochMetrics> {
+        match &self.metrics_rx {
+            Some(rx) => {
+                let mut out = Vec::new();
+                while let Ok(m) = rx.try_recv() {
+                    out.push(m);
+                }
+                out
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Ask the controller to run the eval callback at its next coherent

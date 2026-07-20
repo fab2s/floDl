@@ -1,5 +1,6 @@
 //! Reporting and observability hooks: aggregated_metrics, report_*, compute_param_norm, send_final_snapshot, abort_nccl.
 
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crate::nn::Module;
@@ -19,6 +20,24 @@ impl<M: Module> GpuWorker<M> {
     /// mutex until the coord has aggregated at least one epoch.
     pub fn aggregated_metrics(&self) -> Arc<Mutex<Option<EpochMetrics>>> {
         Arc::clone(&self.aggregated_metrics)
+    }
+
+    /// Arm the cooperative-tier full metrics stream and return its receiver.
+    ///
+    /// Called once, on the cooperative `Worker` cluster path, before the user
+    /// runs their first `next_plan` (so no `EpochAggregated` frame can be
+    /// dispatched before the sender is installed — dispatch only happens on
+    /// this worker thread). From here on `dispatch_control` forwards every
+    /// aggregated epoch to the returned receiver *as well as* the latest-only
+    /// `aggregated_metrics` slot, so the user drains the same per-epoch series
+    /// the managed `DdpHandle` gets from the coordinator's launcher sink.
+    ///
+    /// Managed / setup-mode workers never call this, so `metrics_stream_tx`
+    /// stays `None` and nothing accumulates.
+    pub(crate) fn enable_metrics_stream(&mut self) -> mpsc::Receiver<EpochMetrics> {
+        let (tx, rx) = mpsc::channel();
+        self.metrics_stream_tx = Some(tx);
+        rx
     }
 
     /// Drain any queued `Shutdown` / `ShutdownWithSave` messages from

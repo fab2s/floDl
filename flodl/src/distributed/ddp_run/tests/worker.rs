@@ -362,3 +362,70 @@ fn test_worker_channels_create() {
     ch.control_tx.send(ControlMsg::Shutdown).unwrap();
 }
 
+/// Minimal `EpochMetrics` fixture stamped with an epoch + loss so the
+/// stream-order assertion can tell frames apart.
+fn epoch_metrics_fixture(epoch: usize, avg_loss: f64) -> EpochMetrics {
+    EpochMetrics {
+        epoch,
+        scalars: HashMap::new(),
+        per_rank: vec![],
+        avg_loss,
+        epoch_ms: 0.0,
+        per_rank_throughput: vec![],
+        per_rank_batch_share: vec![],
+        per_rank_share_complete_ms: vec![],
+        per_rank_compute_only_ms: vec![],
+        per_rank_data_starve_ms: vec![],
+        device_indices: vec![],
+    }
+}
+
+/// The cooperative-tier metrics stream: once armed, every coord-broadcast
+/// `EpochAggregated` is forwarded to the drain receiver in order (the full
+/// per-epoch series), *and* the latest still lands in the `aggregated_metrics`
+/// slot (which backs `Worker::epoch_metrics`). This is the receiving half of
+/// the closure exercised end-to-end (with a live coordinator) by the NCCL
+/// suite; here it is pinned on CPU without NCCL.
+#[test]
+fn test_worker_metrics_stream_forwards_every_epoch() {
+    let (mut worker, ch) = make_test_worker();
+    let rx = worker.enable_metrics_stream();
+
+    // Two aggregated epochs arrive on the control channel (as the coordinator
+    // broadcasts them); a single handle_control drain processes both.
+    ch.control_tx
+        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(0, 0.9)))
+        .unwrap();
+    ch.control_tx
+        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(1, 0.5)))
+        .unwrap();
+    let shutdown = worker.handle_control().unwrap();
+    assert!(!shutdown);
+
+    // Stream carries BOTH epochs, oldest first (no epoch is dropped).
+    let drained: Vec<EpochMetrics> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(drained.len(), 2, "both aggregated epochs must be streamed");
+    assert_eq!(drained[0].epoch, 0);
+    assert_eq!(drained[1].epoch, 1);
+    assert!((drained[1].avg_loss - 0.5).abs() < 1e-9);
+
+    // Latest-only slot still tracks the most recent epoch (backs epoch_metrics).
+    let latest = worker.aggregated_metrics().lock().unwrap().clone();
+    assert_eq!(latest.unwrap().epoch, 1);
+}
+
+/// Without arming the stream (the managed / setup default), `EpochAggregated`
+/// still updates the latest-only slot but nothing accumulates — no unbounded
+/// queue in the tiers that never drain it.
+#[test]
+fn test_worker_metrics_slot_without_stream() {
+    let (mut worker, ch) = make_test_worker();
+    // No enable_metrics_stream(): metrics_stream_tx stays None.
+    ch.control_tx
+        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(3, 0.1)))
+        .unwrap();
+    worker.handle_control().unwrap();
+    let latest = worker.aggregated_metrics().lock().unwrap().clone();
+    assert_eq!(latest.unwrap().epoch, 3);
+}
+

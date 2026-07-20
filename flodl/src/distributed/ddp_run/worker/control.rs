@@ -341,6 +341,14 @@ impl<M: Module> GpuWorker<M> {
                 // Cluster-builder runs that drive the training loop
                 // inside the framework's closure can also reach this
                 // via `GpuWorker::aggregated_metrics()`.
+                // Cooperative tier: forward the full per-epoch series to the
+                // user's drain (armed only there; None everywhere else, so no
+                // accumulation in managed / setup mode). Clone before the slot
+                // write consumes `metrics`. A dropped receiver is benign (the
+                // user stopped polling); this never blocks the control drain.
+                if let Some(tx) = &self.metrics_stream_tx {
+                    let _ = tx.send(metrics.clone());
+                }
                 if let Ok(mut slot) = self.aggregated_metrics.lock() {
                     *slot = Some(metrics);
                 }
