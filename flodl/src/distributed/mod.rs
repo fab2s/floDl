@@ -86,4 +86,4 @@ pub use ddp::{Ddp, HasGraph, Trainer};
 pub use ddp::DdpConfig;
 pub use el_che::{AnchorVerdict, ElChe, Phase, WindowReport};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
-pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker};
+pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker, Worker, StepOutcome};

@@ -122,7 +122,7 @@ fn single_host_worker_trains_and_finishes() {
     let mut coop = Worker::single(w, epochs, total);
 
     let mut steps = 0usize;
-    while let Some(_plan) = coop.next_epoch().unwrap() {
+    while let Some(_plan) = coop.next_plan().unwrap() {
         while let Some(batch) = coop.next_batch().unwrap() {
             let loss = mse_train(coop.model(), &batch).unwrap();
             loss.backward().unwrap();
@@ -139,14 +139,14 @@ fn single_host_worker_trains_and_finishes() {
 }
 
 #[test]
-fn worker_next_epoch_stops_after_num_epochs() {
+fn worker_next_plan_stops_after_num_epochs() {
     let (w, _ch) = make_det_worker(16);
     let mut coop = Worker::single(w, 3, 16);
-    assert!(coop.next_epoch().unwrap().is_some());
-    assert!(coop.next_epoch().unwrap().is_some());
-    assert!(coop.next_epoch().unwrap().is_some());
-    assert!(coop.next_epoch().unwrap().is_none(), "None after num_epochs");
-    assert!(coop.next_epoch().unwrap().is_none(), "stays None");
+    assert!(coop.next_plan().unwrap().is_some());
+    assert!(coop.next_plan().unwrap().is_some());
+    assert!(coop.next_plan().unwrap().is_some());
+    assert!(coop.next_plan().unwrap().is_none(), "None after num_epochs");
+    assert!(coop.next_plan().unwrap().is_none(), "stays None");
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn worker_sync_now_drains_reduce_in_step() {
     let mut coop = Worker::single(w, 1, total);
 
     // Advance into the epoch and run one batch's forward/backward.
-    assert!(coop.next_epoch().unwrap().is_some());
+    assert!(coop.next_plan().unwrap().is_some());
     let batch = coop.next_batch().unwrap().expect("first batch");
     let loss = mse_train(coop.model(), &batch).unwrap();
     loss.backward().unwrap();
@@ -225,7 +225,7 @@ fn builder_into_worker_single_device_trains() {
     .unwrap();
 
     let mut steps = 0usize;
-    while let Some(_plan) = w.next_epoch().unwrap() {
+    while let Some(_plan) = w.next_plan().unwrap() {
         while let Some(batch) = w.next_batch().unwrap() {
             let loss = mse_train(w.model(), &batch).unwrap();
             loss.backward().unwrap();
@@ -240,7 +240,7 @@ fn builder_into_worker_single_device_trains() {
 
 #[test]
 fn cooperative_worker_matches_managed_run_epoch_plan() {
-    // The load-bearing test: driving the cooperative loop (next_epoch /
+    // The load-bearing test: driving the cooperative loop (next_plan /
     // next_batch / user fwd+bwd / step) produces the same trained params as the
     // managed run_epoch_plan, given identical init + identical (deterministic)
     // data. Locks the "one code path" claim at the Worker level.
@@ -266,7 +266,7 @@ fn cooperative_worker_matches_managed_run_epoch_plan() {
 
     // Cooperative: user owns the loop.
     let mut coop = Worker::single(coop_w, epochs, total);
-    while let Some(_plan) = coop.next_epoch().unwrap() {
+    while let Some(_plan) = coop.next_plan().unwrap() {
         while let Some(batch) = coop.next_batch().unwrap() {
             let loss = mse_train(coop.model(), &batch).unwrap();
             loss.backward().unwrap();

@@ -231,7 +231,8 @@ future layer on top.
 
 ## Scope
 
-This is a design direction, not a description of shipped behavior. The managed
-tier (`Trainer::builder().run()`) and the bypass primitive (`Ddp::wrap`) exist
-today; the cooperative tier, the intent channel, and model-splitting are
-proposed. None of them reframe the controller that ships now.
+The managed tier (`Trainer::builder().run()`), the bypass primitive
+(`Ddp::wrap`), the cooperative tier (`Trainer::builder(...).into_worker()`), and
+its intent channel (`Worker::request_eval` / `request_checkpoint`) all ship
+today. Model-splitting (the meta-GPU layer) and the controller-serviced bypass
+remain design directions. None of them reframe the controller that ships now.

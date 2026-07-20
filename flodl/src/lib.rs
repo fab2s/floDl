@@ -94,7 +94,7 @@ pub use nn::{
 };
 pub use distributed::{
     NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, HasGraph, Trainer, ElChe,
-    ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker,
+    ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker, Worker, StepOutcome,
     ElCheConfig, ElCheMode, TrainerConfig, MaxFailureThreshold,
     ClusterBuilder, HostBuilder,
     NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum,

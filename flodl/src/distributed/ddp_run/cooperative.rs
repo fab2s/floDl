@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! let mut w = Trainer::builder(mf, of, tf).into_worker()?;
-//! while let Some(_epoch) = w.next_epoch()? {
+//! while let Some(_plan) = w.next_plan()? {
 //!     while let Some(batch) = w.next_batch()? {   // owned batch, borrows nothing
 //!         let loss = train_step(w.model(), &batch)?; // user forward + loss
 //!         loss.backward()?;
@@ -19,14 +19,17 @@
 //! let state = w.finish()?;
 //! ```
 //!
+//! `next_plan` yields the next unit of work the controller dispatches — under
+//! progressive cadence (the default for Cadence/Async) that is one *chunk* of
+//! an epoch, not the whole epoch, so the returned [`EpochPlan`]'s `.epoch` can
+//! repeat across calls (see [`Worker::next_plan`]). The inner loop drains that
+//! unit's batches.
+//!
 //! The reduce is never decided here: it happens as a side effect of the
 //! control drain inside `step` (`after_step` -> `handle_control`) when the
 //! coordinator's `SyncNow` frame lands, at the ElChe cadence. `step` never
 //! names a cadence and never calls the collective directly, which is what keeps
 //! the single-step-clock and determinism invariants intact.
-//!
-//! Construction (`into_worker`) is wired in the following PR; this module is
-//! the API surface over the already-built worker.
 
 use crate::autograd::Variable;
 use crate::distributed::cluster_worker::ClusterWorker;
@@ -42,7 +45,7 @@ use super::{EpochMetrics, EpochPlan, TrainedState};
 pub struct StepOutcome {
     /// The controller asked the cohort to shut down (a `Shutdown` frame was
     /// drained during this step's control processing). The user's loop should
-    /// stop; the next `next_epoch` returns `None`.
+    /// stop; the next `next_plan` returns `None`.
     pub shutdown: bool,
 }
 
@@ -59,7 +62,7 @@ pub struct Worker<M: Module> {
     /// Current epoch cursor; `None` between epochs (before the first
     /// `next_batch` of an epoch and after the shard is drained).
     epoch_state: Option<EpochState>,
-    /// Plan handed out by the last `next_epoch`, consumed lazily by the first
+    /// Plan handed out by the last `next_plan`, consumed lazily by the first
     /// `next_batch` of the epoch (which runs `begin_epoch`).
     pending_plan: Option<EpochPlan>,
     /// Stamped at the end of `next_batch` (after `sync_before_forward`) and read
@@ -73,7 +76,7 @@ pub struct Worker<M: Module> {
     /// Owned (does not borrow the worker), so it can live in the handle.
     active_guard: Option<StreamGuard>,
     /// The controller signalled shutdown (seen in `next_batch`'s wait or in
-    /// `step`'s control drain); `next_epoch` returns `None` from here on.
+    /// `step`'s control drain); `next_plan` returns `None` from here on.
     shutdown: bool,
     /// Set by `finish` so the Drop guard knows the run ended cleanly. Without
     /// it, dropping a cluster rank's `Worker` mid-run (user loop errored /
@@ -214,14 +217,23 @@ impl<M: Module + 'static> Worker<M> {
             .report_intent(crate::distributed::wire::IntentKind::CheckpointNow);
     }
 
-    /// Advance to the next epoch. `Some(plan)` opens an epoch (the plan is the
-    /// coordinator's — or, single-device, the whole dataset); `None` ends the
-    /// training loop (all epochs done, or the controller signalled shutdown).
+    /// Advance to the next unit of work the controller dispatches, or `None`
+    /// when training is over (all epochs done, or the controller signalled
+    /// shutdown). The returned [`EpochPlan`] carries `.epoch` (which epoch this
+    /// unit belongs to) and its partition span.
+    ///
+    /// **Granularity is not one-per-epoch under progressive dispatch** (the
+    /// default for Cadence / Async): the controller splits an epoch into
+    /// several chunks and dispatches them as separate plans, so this yields
+    /// once per *chunk* and the same `.epoch` repeats across consecutive calls.
+    /// Under `Sync` it is one plan per epoch. To run per-epoch logic in your
+    /// loop, gate on `.epoch` changing rather than on each `next_plan` call
+    /// (the framework already fires the registered role-elected `epoch_fn` once
+    /// per epoch transition for you).
     ///
     /// On the cluster path this blocks in `wait_for_epoch_plan` (draining
-    /// control so a `SyncNow` cannot deadlock a peer) and fires the
-    /// role-elected `epoch_fn` on the epoch transition.
-    pub fn next_epoch(&mut self) -> Result<Option<EpochPlan>> {
+    /// control so a `SyncNow` cannot deadlock a peer).
+    pub fn next_plan(&mut self) -> Result<Option<EpochPlan>> {
         if self.shutdown {
             return Ok(None);
         }
@@ -297,7 +309,7 @@ impl<M: Module + 'static> Worker<M> {
         if self.epoch_state.is_none() {
             let plan = match self.pending_plan.take() {
                 Some(plan) => plan,
-                // No live epoch (next_batch called before next_epoch, or after
+                // No live plan (next_batch called before next_plan, or after
                 // the shard drained). Nothing to yield.
                 None => return Ok(None),
             };
@@ -327,7 +339,7 @@ impl<M: Module + 'static> Worker<M> {
                 } else {
                     self.worker_mut().end_epoch(&mut st)?;
                 }
-                // Cursor cleared (st dropped); next_epoch starts the next one.
+                // Cursor cleared (st dropped); next_plan starts the next one.
                 Ok(None)
             }
             Err(e) => {
@@ -382,8 +394,6 @@ impl<M: Module + 'static> Worker<M> {
     /// inference. Closes any epoch left in flight, then runs the rank teardown
     /// (cluster) or captures the final snapshot (single-device).
     pub fn finish(mut self) -> Result<TrainedState> {
-        // Disarm the Drop guard: a clean finish, not a dropped-mid-run rank.
-        self.finished = true;
         // Release any lingering per-batch guard before the final accounting.
         self.active_guard = None;
         if let Some(mut st) = self.epoch_state.take() {
@@ -394,10 +404,10 @@ impl<M: Module + 'static> Worker<M> {
 
         // Borrow (never move) self.inner — `Worker` has a Drop impl, so moving
         // a field out is illegal; teardown / snapshot both take `&mut`.
-        match &mut self.inner {
+        let state = match &mut self.inner {
             WorkerInner::Single { worker, .. } => {
                 let snap = worker.snapshot_params();
-                Ok(TrainedState {
+                TrainedState {
                     params: snap
                         .params
                         .iter()
@@ -408,14 +418,14 @@ impl<M: Module + 'static> Worker<M> {
                         .iter()
                         .map(|t| t.to_device(Device::CPU))
                         .collect::<Result<Vec<_>>>()?,
-                })
+                }
             }
             WorkerInner::Cluster(cluster) => {
                 // Snapshot tensors already land on CPU (snapshot_params'
                 // contract). `None` (worker errored before send_final_snapshot)
                 // falls back to an empty state, matching the via_coord path.
                 let final_snapshot = cluster.teardown();
-                Ok(final_snapshot
+                final_snapshot
                     .map(|snap| TrainedState {
                         params: snap.params,
                         buffers: snap.buffers,
@@ -423,9 +433,19 @@ impl<M: Module + 'static> Worker<M> {
                     .unwrap_or(TrainedState {
                         params: Vec::new(),
                         buffers: Vec::new(),
-                    }))
+                    })
             }
-        }
+        };
+
+        // Disarm the Drop guard ONLY now — every `?` above has cleared, so this
+        // is a fully clean finish. If `finish()` had errored above (e.g.
+        // `end_epoch`'s report send failed, or the snapshot D2H failed), `self`
+        // drops with `finished == false`: a cluster rank then writes its death
+        // record + `exit(1)` to unblock peers (matching the managed path's
+        // teardown-error handling), while a single-device `Worker` (no
+        // forensics) just returns the `Err`.
+        self.finished = true;
+        Ok(state)
     }
 }
 
