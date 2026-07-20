@@ -99,6 +99,30 @@ pub struct DdpHandle {
     pub(super) training_meta: Option<serde_json::Value>,
 }
 
+/// Terminate this process immediately with `code`, skipping C++ static
+/// destructors (via `_exit`), after flushing stdio.
+///
+/// For a cluster role that has finished its work and must terminate — the
+/// launcher once its driver joins, a relay/agent once its loop returns — this
+/// replaces `std::process::exit`. Those roles hold libtorch state deep in the
+/// call stack (built model / coordinator buffers) that `process::exit` leaves
+/// un-dropped because it never unwinds the Rust frames; `libtorch_cpu.so`'s
+/// static destructors then hit a general-protection fault at exit (observed
+/// on the rig as a launcher exit 139 after an otherwise-clean cooperative
+/// run). The managed launcher avoids this only by *returning* and letting
+/// `main` unwind first; a force-exiting role cannot, so it skips the faulting
+/// static teardown entirely. Safe here: the driver/loop has already joined and
+/// all results are streamed, so there is nothing left to flush beyond stdio
+/// (which `_exit` does not do — hence the explicit flush), and the OS reclaims
+/// everything else.
+pub(super) fn clean_process_exit(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` merely terminates the process; it runs no user code.
+    unsafe { libc::_exit(code) }
+}
+
 impl DdpHandle {
     /// Auto-promote a single-host multi-GPU run with no cluster envelope:
     /// synthesize a localhost cluster and set `FLODL_INTERNAL_FULL_CLUSTER_JSON`
@@ -400,10 +424,10 @@ impl DdpHandle {
                 // the launcher). Run the byte-router until its local ranks
                 // finish, then exit — it never trains.
                 match crate::distributed::launcher::run_relay() {
-                    Ok(()) => std::process::exit(0),
+                    Ok(()) => clean_process_exit(0),
                     Err(e) => {
                         eprintln!("cluster relay: {e}");
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                 }
             }
@@ -413,10 +437,10 @@ impl DdpHandle {
                 // supervise this host's relay and rank children, exit.
                 // It never trains.
                 match crate::distributed::launcher::run_agent() {
-                    Ok(()) => std::process::exit(0),
+                    Ok(()) => clean_process_exit(0),
                     Err(e) => {
                         eprintln!("cluster agent: {e}");
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                 }
             }
@@ -616,18 +640,18 @@ impl DdpHandle {
             // process has no cooperative loop to hand back to the user.
             if let Some(driver) = handle.launcher_driver.take() {
                 match driver.join() {
-                    Ok(Ok(())) => std::process::exit(0),
+                    Ok(Ok(())) => clean_process_exit(0),
                     Ok(Err(e)) => {
                         eprintln!("flodl cluster launcher: {e}");
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                     Err(_) => {
                         eprintln!("flodl cluster launcher: driver thread panicked");
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                 }
             }
-            std::process::exit(0);
+            clean_process_exit(0);
         }
 
         // Rank context: a spawned rank re-entering the user binary. Mirror
