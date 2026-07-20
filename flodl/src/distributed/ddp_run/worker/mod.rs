@@ -245,6 +245,13 @@ pub struct GpuWorker<M: Module> {
     /// gets from the coordinator's launcher-side sink. Fed from
     /// `dispatch_control`, so it populates from both `step` and `next_plan`.
     metrics_stream_tx: Option<mpsc::Sender<EpochMetrics>>,
+    /// Cooperative-tier eval stream, sibling of [`Self::metrics_stream_tx`].
+    /// `None` in managed / setup mode. When armed by
+    /// [`Self::enable_eval_stream`] (cooperative `Worker` cluster path),
+    /// every `EvalBroadcast` frame (`(epoch, metric)`) is forwarded here, so
+    /// [`crate::distributed::Worker::poll_eval`] surfaces the controller-
+    /// elected eval without a launcher. Fed from `dispatch_control`.
+    eval_stream_tx: Option<mpsc::Sender<(usize, f64)>>,
 
     // -- Checkpoint --
     /// Called on rank 0 after averaging events. Log-and-continue on error.

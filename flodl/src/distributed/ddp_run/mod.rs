@@ -1308,6 +1308,12 @@ pub(crate) enum ControlMsg {
     /// local-multi-GPU / cluster). See
     /// `EpochAggregated`.
     EpochAggregated(EpochMetrics),
+    /// Coord-broadcast eval result for a completed callback (final canonical
+    /// eval or an intent-/cadence-driven one). The cooperative [`Worker`]
+    /// forwards this to its eval stream so `poll_eval()` surfaces the
+    /// controller-elected metric; other tiers ignore it. See
+    /// [`crate::distributed::wire::ControlMsgWire::EvalBroadcast`].
+    EvalBroadcast { epoch: usize, metric: f64 },
     /// NCCL consensus checkpoint: write the elected rank's CURRENT model
     /// (post-collective consensus) to `<save_path>.fdl`. See
     /// [`crate::distributed::wire::ControlMsgWire::SaveConsensusModel`]. No

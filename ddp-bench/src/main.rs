@@ -252,6 +252,19 @@ struct Cli {
     #[option]
     per_epoch_eval: bool,
 
+    /// Execution tier: "managed" (default) runs the framework-driven
+    /// `Trainer::builder().run()`; "cooperative" runs `.into_worker()` and
+    /// hand-drives the loop in this harness — the *decomposed* form, written
+    /// once and scaling unchanged from one device to N to a cluster while the
+    /// controller keeps owning cadence / partition / averaging / eval-rank
+    /// election. Same builder config feeds both, so a cooperative run is the
+    /// managed run's parity twin (that is what the toggle is for).
+    ///
+    /// Honored on the DDP `Builder` modes (nccl-*/cpu-*); solo modes ignore
+    /// it. `--per-epoch-eval` is managed-only for now.
+    #[option(default = "managed")]
+    tier: String,
+
     /// Convergence guard selector. Default: `trend` (production behavior,
     /// 3-rises-above-threshold rule).
     ///
@@ -601,6 +614,22 @@ fn run() -> flodl::tensor::Result<()> {
         }
     };
 
+    // Execution tier. Loud-reject the combos that don't fit the cooperative
+    // path yet, rather than silently ignoring them (loud-errors-over-silent).
+    let tier = crate::config::Tier::parse(&cli.tier).ok_or_else(|| {
+        flodl::tensor::TensorError::new(&format!(
+            "--tier must be \"managed\" or \"cooperative\", got \"{}\"",
+            cli.tier
+        ))
+    })?;
+    if tier == crate::config::Tier::Cooperative && cli.per_epoch_eval {
+        return Err(flodl::tensor::TensorError::new(
+            "--per-epoch-eval is managed-only for now; the cooperative tier \
+             surfaces the controller-elected final eval via Worker::poll_eval. \
+             Drop --per-epoch-eval or use --tier managed.",
+        ));
+    }
+
     // Convergence guard selection + flag-compatibility validation.
     // Loud errors when guard-specific flags don't match the chosen guard
     // (the `--guard <name>` selector is the source of truth).
@@ -871,6 +900,7 @@ fn run() -> flodl::tensor::Result<()> {
                 ram_max_usage: cli.ram_max_usage,
                 sample_cache: cli.sample_cache,
                 disk_stage_gb: cli.disk_stage,
+                tier,
             };
 
             match harness::run_combo(model_def, mode, &run_config) {

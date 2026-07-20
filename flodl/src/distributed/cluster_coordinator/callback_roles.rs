@@ -281,11 +281,30 @@ impl ClusterCoordinator {
             eprintln!(
                 "cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}"
             );
-        } else if let Some(ref f) = self.eval_result_fn {
-            if let Err(e) = f(epoch, metric) {
-                eprintln!(
-                    "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
+        } else {
+            // Broadcast the elected rank's eval to every rank so the
+            // cooperative tier's `Worker::poll_eval` surfaces it without a
+            // launcher. Sent here — on `EvalResult` receipt — so it precedes
+            // the `Shutdown` the event loop sends on a later tick; each rank
+            // drains it in the same control pass (before returning `None` from
+            // `wait_for_epoch_plan`). Broadcast failures are non-fatal (a
+            // rank's stream may already be closing at shutdown).
+            if let Err(e) = self.broadcast_control(
+                &crate::distributed::wire::ControlMsgWire::EvalBroadcast {
+                    epoch: epoch as u64,
+                    metric,
+                },
+            ) {
+                crate::verbose!(
+                    "  ddp: EvalBroadcast (epoch {epoch}) failed: {e}"
                 );
+            }
+            if let Some(ref f) = self.eval_result_fn {
+                if let Err(e) = f(epoch, metric) {
+                    eprintln!(
+                        "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
+                    );
+                }
             }
         }
     }

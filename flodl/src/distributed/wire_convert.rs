@@ -230,6 +230,9 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
         ControlMsgWire::EpochAggregated(metrics_wire) => {
             Ok(Some(ControlMsg::EpochAggregated(metrics_wire.into())))
         }
+        ControlMsgWire::EvalBroadcast { epoch, metric } => Ok(Some(
+            ControlMsg::EvalBroadcast { epoch: epoch as usize, metric },
+        )),
         ControlMsgWire::SaveConsensusModel { target_rank } => {
             if target_rank == u64::MAX {
                 return Err(TensorError::new(

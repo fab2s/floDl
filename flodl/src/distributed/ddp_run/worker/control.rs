@@ -353,6 +353,15 @@ impl<M: Module> GpuWorker<M> {
                     *slot = Some(metrics);
                 }
             }
+            ControlMsg::EvalBroadcast { epoch, metric } => {
+                // Cooperative tier: forward the controller-elected eval to the
+                // user's drain (armed only there; None elsewhere). Sibling of
+                // the EpochAggregated forward above; a dropped receiver is
+                // benign and never blocks the control drain.
+                if let Some(tx) = &self.eval_stream_tx {
+                    let _ = tx.send((epoch, metric));
+                }
+            }
             ControlMsg::SaveConsensusModel { target_rank } => {
                 // NCCL consensus checkpoint: the elected rank writes its
                 // CURRENT model — which holds the just-completed in-place

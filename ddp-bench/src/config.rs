@@ -91,6 +91,44 @@ impl fmt::Display for DdpMode {
     }
 }
 
+/// Execution tier: who owns the training loop.
+///
+/// `Managed` is the framework-driven path (`Trainer::builder().run()`): the
+/// launcher narrates, the ranks self-drive. `Cooperative` is the decomposed
+/// path (`.into_worker()`): the loop is hand-written in the bench and scales
+/// unchanged from one device to N to a cluster, while the controller still
+/// owns cadence / partition / averaging / eval-rank election. Same builder
+/// config feeds both — only the terminal differs — so a cooperative run is
+/// the managed run's parity twin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tier {
+    /// Framework owns the loop (default).
+    #[default]
+    Managed,
+    /// User (this harness) owns the loop via a `Worker`.
+    Cooperative,
+}
+
+impl Tier {
+    /// Parse `--tier managed|cooperative`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "managed" => Some(Tier::Managed),
+            "cooperative" => Some(Tier::Cooperative),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Tier::Managed => write!(f, "managed"),
+            Tier::Cooperative => write!(f, "cooperative"),
+        }
+    }
+}
+
 /// Default training parameters for a model.
 #[derive(Debug, Clone)]
 pub struct ModelDefaults {
@@ -270,4 +308,10 @@ pub struct RunConfig {
     /// Local-disk overflow tier under each rank's sample cache in GB
     /// (`--disk-stage`). `None` = library default (off).
     pub disk_stage_gb: Option<u64>,
+    /// Execution tier (`--tier managed|cooperative`). `Managed` (default)
+    /// runs `builder.run()`; `Cooperative` runs `builder.into_worker()` and
+    /// hand-drives the loop. Both share the identical builder config, so a
+    /// cooperative run is the managed run's parity twin. `DdpMode::Solo`
+    /// ignores this (there is no builder path).
+    pub tier: Tier,
 }

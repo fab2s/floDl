@@ -429,3 +429,39 @@ fn test_worker_metrics_slot_without_stream() {
     assert_eq!(latest.unwrap().epoch, 3);
 }
 
+/// The cooperative-tier eval stream: once armed, every `EvalBroadcast` frame
+/// is forwarded to the drain receiver in order (the receiving half of the
+/// controller-elected eval surfaced by `Worker::poll_eval`, pinned on CPU
+/// without NCCL). Unarmed, nothing accumulates.
+#[test]
+fn test_worker_eval_stream_forwards_each_broadcast() {
+    let (mut worker, ch) = make_test_worker();
+    let rx = worker.enable_eval_stream();
+
+    ch.control_tx
+        .send(ControlMsg::EvalBroadcast { epoch: 1, metric: 0.80 })
+        .unwrap();
+    ch.control_tx
+        .send(ControlMsg::EvalBroadcast { epoch: 3, metric: 0.91 })
+        .unwrap();
+    assert!(!worker.handle_control().unwrap());
+
+    let drained: Vec<(usize, f64)> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(drained.len(), 2, "both eval broadcasts must be streamed");
+    assert_eq!(drained[0].0, 1);
+    assert_eq!(drained[1].0, 3);
+    assert!((drained[1].1 - 0.91).abs() < 1e-9);
+}
+
+/// Without arming the eval stream, `EvalBroadcast` is a no-op drain (no
+/// accumulation in managed / setup mode).
+#[test]
+fn test_worker_eval_broadcast_without_stream_is_noop() {
+    let (mut worker, ch) = make_test_worker();
+    ch.control_tx
+        .send(ControlMsg::EvalBroadcast { epoch: 2, metric: 0.5 })
+        .unwrap();
+    // Just must not panic / must drain cleanly (eval_stream_tx is None).
+    assert!(!worker.handle_control().unwrap());
+}
+

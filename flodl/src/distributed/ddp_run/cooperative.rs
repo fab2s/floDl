@@ -92,6 +92,12 @@ pub struct Worker<M: Module> {
     /// Drained non-blocking via [`Self::poll_metrics`]. `None` on the
     /// single-device path (no coordinator aggregates).
     metrics_rx: Option<std::sync::mpsc::Receiver<EpochMetrics>>,
+    /// Controller-elected eval stream, armed only on the cluster path. Fed by
+    /// the worker's `dispatch_control` with every `EvalBroadcast` frame — the
+    /// eval the controller ran on the rank IT elected (Fastest), not a
+    /// hardcoded one. Drained non-blocking via [`Self::poll_eval`]. `None` on
+    /// the single-device path (no controller).
+    eval_rx: Option<std::sync::mpsc::Receiver<(usize, f64)>>,
 }
 
 /// Death-record context carried by a cluster-rank `Worker` for its Drop guard.
@@ -141,6 +147,7 @@ impl<M: Module + 'static> Worker<M> {
             finished: false,
             forensics: None, // single device: no peers to unblock
             metrics_rx: None, // no coordinator aggregates on a single device
+            eval_rx: None,    // no controller eval on a single device
         }
     }
 
@@ -159,6 +166,7 @@ impl<M: Module + 'static> Worker<M> {
         // thread, so no aggregated frame can be missed between here and the
         // first drain point.
         let metrics_rx = cluster.inner_mut().enable_metrics_stream();
+        let eval_rx = cluster.inner_mut().enable_eval_stream();
         Worker {
             inner: WorkerInner::Cluster(cluster),
             epoch_state: None,
@@ -173,6 +181,7 @@ impl<M: Module + 'static> Worker<M> {
                 world_size,
             }),
             metrics_rx: Some(metrics_rx),
+            eval_rx: Some(eval_rx),
         }
     }
 
@@ -229,6 +238,32 @@ impl<M: Module + 'static> Worker<M> {
                 let mut out = Vec::new();
                 while let Ok(m) = rx.try_recv() {
                     out.push(m);
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Drain the controller-elected eval results broadcast since the last
+    /// call, oldest first as `(epoch, metric)` (non-blocking; empty when
+    /// nothing new). The eval ran on the rank the controller picked (Fastest
+    /// by default) on the coherent consensus model — the whole point of the
+    /// cooperative tier: you write one loop and the collective's single-rank
+    /// side tasks are placed for you, not pinned to a hardcoded rank.
+    ///
+    /// The final canonical eval lands here during the loop's terminal
+    /// `next_plan` (the controller sends it just before `Shutdown`), so poll
+    /// once more after the loop to catch it. Requesting evals mid-run
+    /// ([`Self::request_eval`]) surfaces them here per epoch. Same
+    /// non-blocking contract as [`Self::poll_metrics`]; always empty on the
+    /// single-device path (no controller).
+    pub fn poll_eval(&self) -> Vec<(usize, f64)> {
+        match &self.eval_rx {
+            Some(rx) => {
+                let mut out = Vec::new();
+                while let Ok(e) = rx.try_recv() {
+                    out.push(e);
                 }
                 out
             }

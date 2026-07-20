@@ -1169,6 +1169,17 @@ pub enum ControlMsgWire {
     /// `monitor.log(epoch, dur, &model)` sees the aggregated view
     /// regardless of single-GPU / local-multi-GPU / cluster.
     EpochAggregated(EpochMetricsWire),
+    /// Coord-broadcast eval result for a completed callback (the final
+    /// canonical eval, or any intent-/cadence-driven eval). Emitted right
+    /// after the elected rank's [`TimingMsgWire::EvalResult`] reaches the
+    /// coordinator, so it precedes `Shutdown` on the wire and every rank
+    /// drains it in the same control pass. Lets the **cooperative tier**
+    /// surface the controller-elected eval through
+    /// [`crate::distributed::Worker::poll_eval`] without a launcher — the
+    /// eval runs on the rank the controller picks (Fastest), not a hardcoded
+    /// one. `epoch` is the eval's tagged epoch (`num_epochs` for the final
+    /// canonical eval).
+    EvalBroadcast { epoch: u64, metric: f64 },
     /// NCCL consensus checkpoint: tell the elected rank to write its CURRENT
     /// model (params + buffers) to `<save_path>.fdl` as the resumable consensus
     /// — distinct from [`Self::Checkpoint`] (which fires the user `checkpoint_fn`)

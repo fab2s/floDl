@@ -40,6 +40,18 @@ impl<M: Module> GpuWorker<M> {
         rx
     }
 
+    /// Arm the cooperative-tier eval stream and return its receiver. Sibling
+    /// of [`Self::enable_metrics_stream`]: from here on `dispatch_control`
+    /// forwards every `EvalBroadcast` frame (`(epoch, metric)`) to the
+    /// returned receiver, so the user's
+    /// [`crate::distributed::Worker::poll_eval`] surfaces the controller-
+    /// elected eval. Managed / setup-mode workers never call this.
+    pub(crate) fn enable_eval_stream(&mut self) -> mpsc::Receiver<(usize, f64)> {
+        let (tx, rx) = mpsc::channel();
+        self.eval_stream_tx = Some(tx);
+        rx
+    }
+
     /// Drain any queued `Shutdown` / `ShutdownWithSave` messages from
     /// `control_rx` and process them. Called from `ClusterWorker`'s
     /// teardown path so that — when the worker exits the main loop

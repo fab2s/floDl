@@ -137,6 +137,16 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             .map_err(|e| TensorError::new(&format!("failed to create {run_dir}: {e}")))?;
     }
 
+    // Cooperative-tier artifact gating. The launcher exits inside
+    // `into_worker`, so it never reaches the artifact writes below — every
+    // process that does is a rank. To keep one clean `training.log` /
+    // `done:` line (managed relied on the launcher writing last), only the
+    // narrator (global rank 0) writes; the rest stay silent. Managed is
+    // unaffected (`is_coop` false → `suppress_artifacts` false).
+    let is_coop = matches!(config.tier, crate::config::Tier::Cooperative);
+    let coop_narrator = is_coop && cooperative_narrator();
+    let suppress_artifacts = is_coop && !coop_narrator;
+
     let lr_note = if (config.lr - model_def.defaults.lr).abs() > 1e-10 {
         format!(", lr={:.1e} ({:.2}x)", config.lr, config.lr / model_def.defaults.lr)
     } else {
@@ -278,22 +288,25 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     timeline.stop();
 
-    // Rotate existing artifacts before overwriting.
-    rotate_artifact(&run_dir, "training.log");
-    rotate_artifact(&run_dir, "timeline.json");
-    rotate_artifact(&run_dir, "timeline.csv");
-    rotate_artifact(&run_dir, "timeline.html");
-
-    // Save artifacts
-    let _ = timeline.save_json(&format!("{run_dir}/timeline.json"));
-    let _ = timeline.save_csv(&format!("{run_dir}/timeline.csv"));
-    let _ = timeline.save_html(&format!("{run_dir}/timeline.html"));
+    // Rotate + save artifacts. Suppressed on cooperative non-narrator ranks
+    // (they'd race the narrator's writes to the shared run_dir — the launcher
+    // that wrote last in managed mode is gone).
+    if !suppress_artifacts {
+        rotate_artifact(&run_dir, "training.log");
+        rotate_artifact(&run_dir, "timeline.json");
+        rotate_artifact(&run_dir, "timeline.csv");
+        rotate_artifact(&run_dir, "timeline.html");
+        let _ = timeline.save_json(&format!("{run_dir}/timeline.json"));
+        let _ = timeline.save_csv(&format!("{run_dir}/timeline.csv"));
+        let _ = timeline.save_html(&format!("{run_dir}/timeline.html"));
+    }
     monitor.finish();
 
     let (final_loss, _epoch_times, log_lines) = result?;
 
-    // Save training log with GPU header and total time
-    {
+    // Save training log with GPU header and total time (narrator only under
+    // the cooperative tier; always in managed).
+    if !suppress_artifacts {
         let log_path = format!("{run_dir}/training.log");
         #[cfg(feature = "cuda")]
         let header = {
@@ -336,7 +349,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // stays at its init value and the line would always read 0.0. The
     // controller-active principle says the controller is the canonical
     // narrator; let it own the end-of-run summary.
-    if !is_worker_rank {
+    if !is_worker_rank || coop_narrator {
         eprintln!(
             "  done: loss={:.6}, total={:.1}s, syncs={}, idle=[{}]",
             final_loss,
@@ -1008,6 +1021,19 @@ fn run_unified(
             });
     }
 
+    // Cooperative tier: hand-drive the loop over a `Worker` instead of
+    // `.run()`. `into_worker` fans out + `process::exit`s on the launcher role
+    // (it never returns there — the launcher's coordinator narration is not
+    // used), so only rank / single-device processes reach `run_cooperative`.
+    // The same `builder` config above feeds both tiers, so this is the managed
+    // run's parity twin.
+    if matches!(config.tier, crate::config::Tier::Cooperative) {
+        let worker = builder.into_worker()?;
+        return run_cooperative(
+            worker, model_def, config, monitor, test_dataset, dataset, train_fn_ptr, augment_fn,
+        );
+    }
+
     let handle = builder.run()?;
 
     let mut epoch_times = Vec::new();
@@ -1049,68 +1075,8 @@ fn run_unified(
                 log_lines.push(line);
             }
         }
-        // Build log line: loss + (eval if available) + model-defined scalars + time.
-        let scalars: std::collections::BTreeMap<String, f64> =
-            metrics.scalars.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let mut line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
-        if let Some(eval_val) = pending_eval.remove(&metrics.epoch) {
-            line.push_str(&format!(", eval={eval_val:.4}"));
-        }
-        line.push_str(&format_scalars(&scalars));
-        line.push_str(&format!(", time={:.1}s", metrics.epoch_ms / 1000.0));
-        eprintln!("    {line}");
-        log_lines.push(line);
-
-        // Per-rank breakdown for multi-rank runs. Layout is
-        //   [highest-share]  [random middle]  [lowest-share]
-        // where highest-share is the fastest rank in the cadence (gets
-        // the most batches) and lowest-share is the slow-anchor rank.
-        // Random middle is sampled uniformly from the in-between ranks
-        // each epoch — O(1) per epoch and ergodic over the run, which
-        // scales to large worlds without flooding the log line. For
-        // world_size == 2 the middle is omitted; for == 3 the middle is
-        // the unique non-extreme rank (no randomness needed).
-        if metrics.device_indices.len() >= 2 {
-            let n = metrics.device_indices.len();
-            let mut sorted: Vec<usize> = (0..n).collect();
-            sorted.sort_by(|&a, &b| {
-                let sa = metrics.per_rank_batch_share.get(a).copied().unwrap_or(0.0);
-                let sb = metrics.per_rank_batch_share.get(b).copied().unwrap_or(0.0);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let highest = sorted[0];
-            let lowest = sorted[n - 1];
-            let middle: Option<usize> = match n {
-                2 => None,
-                3 => Some(sorted[1]),
-                _ => {
-                    let pick = flodl::Rng::from_entropy().usize(n - 2);
-                    Some(sorted[1 + pick])
-                }
-            };
-
-            let render = |r: usize| -> String {
-                let dev = metrics.device_indices[r];
-                let share = metrics.per_rank_batch_share.get(r).copied().unwrap_or(0.0);
-                let tput = metrics.per_rank_throughput.get(r).copied().unwrap_or(0.0);
-                format!(" rank{r}[cuda{dev},share={share:.4},tput={tput:.2}]")
-            };
-
-            let mut rank_line = String::from("per-rank:");
-            rank_line.push_str(&render(highest));
-            if let Some(mid) = middle {
-                rank_line.push_str(&render(mid));
-            }
-            rank_line.push_str(&render(lowest));
-            eprintln!("    {rank_line}");
-            log_lines.push(rank_line);
-        }
-
-        monitor.log(
-            metrics.epoch,
-            Duration::from_millis(metrics.epoch_ms as u64),
-            &metrics,
-        );
+        let eval_val = pending_eval.remove(&metrics.epoch);
+        emit_epoch_metrics_line(&metrics, eval_val, monitor, &mut log_lines);
     }
 
     // Final drain: catches the last epoch's eval (which has no subsequent
@@ -1202,6 +1168,229 @@ fn format_scalars(scalars: &std::collections::BTreeMap<String, f64>) -> String {
         s.push_str(&format!(", {k}={v:.4}"));
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Epoch narration (shared by the managed + cooperative tiers)
+// ---------------------------------------------------------------------------
+
+/// Format + emit one aggregated-epoch log line (loss + optional eval +
+/// model-defined scalars + time), the multi-rank per-rank breakdown, and the
+/// monitor push. Shared by both tiers so their per-epoch narration cannot
+/// drift — the only difference is where the `EpochMetrics` / `eval_val` come
+/// from (managed: `next_metrics` + `eval_rx`; cooperative: `poll_metrics` +
+/// `poll_eval`).
+fn emit_epoch_metrics_line(
+    metrics: &flodl::distributed::EpochMetrics,
+    eval_val: Option<f64>,
+    monitor: &mut Monitor,
+    log_lines: &mut Vec<String>,
+) {
+    let scalars: std::collections::BTreeMap<String, f64> =
+        metrics.scalars.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut line = format!("epoch {}: loss={:.6}", metrics.epoch, metrics.avg_loss);
+    if let Some(eval_val) = eval_val {
+        line.push_str(&format!(", eval={eval_val:.4}"));
+    }
+    line.push_str(&format_scalars(&scalars));
+    line.push_str(&format!(", time={:.1}s", metrics.epoch_ms / 1000.0));
+    eprintln!("    {line}");
+    log_lines.push(line);
+
+    // Per-rank breakdown for multi-rank runs. Layout is
+    //   [highest-share]  [random middle]  [lowest-share]
+    // where highest-share is the fastest rank in the cadence (gets the most
+    // batches) and lowest-share is the slow-anchor rank. Random middle is
+    // sampled uniformly from the in-between ranks each epoch — O(1) and
+    // ergodic over the run, scaling to large worlds without flooding the
+    // line. world_size == 2 omits the middle; == 3 uses the unique
+    // non-extreme rank (no randomness needed).
+    if metrics.device_indices.len() >= 2 {
+        let n = metrics.device_indices.len();
+        let mut sorted: Vec<usize> = (0..n).collect();
+        sorted.sort_by(|&a, &b| {
+            let sa = metrics.per_rank_batch_share.get(a).copied().unwrap_or(0.0);
+            let sb = metrics.per_rank_batch_share.get(b).copied().unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let highest = sorted[0];
+        let lowest = sorted[n - 1];
+        let middle: Option<usize> = match n {
+            2 => None,
+            3 => Some(sorted[1]),
+            _ => {
+                let pick = flodl::Rng::from_entropy().usize(n - 2);
+                Some(sorted[1 + pick])
+            }
+        };
+
+        let render = |r: usize| -> String {
+            let dev = metrics.device_indices[r];
+            let share = metrics.per_rank_batch_share.get(r).copied().unwrap_or(0.0);
+            let tput = metrics.per_rank_throughput.get(r).copied().unwrap_or(0.0);
+            format!(" rank{r}[cuda{dev},share={share:.4},tput={tput:.2}]")
+        };
+
+        let mut rank_line = String::from("per-rank:");
+        rank_line.push_str(&render(highest));
+        if let Some(mid) = middle {
+            rank_line.push_str(&render(mid));
+        }
+        rank_line.push_str(&render(lowest));
+        eprintln!("    {rank_line}");
+        log_lines.push(rank_line);
+    }
+
+    monitor.log(
+        metrics.epoch,
+        Duration::from_millis(metrics.epoch_ms as u64),
+        metrics,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative tier (--tier cooperative)
+// ---------------------------------------------------------------------------
+
+/// Whether THIS process is the single cooperative-tier narrator (global rank
+/// 0). In cooperative mode the launcher exits inside `into_worker`, so no
+/// launcher is left to own the log; every rank receives the same aggregated
+/// broadcast, so exactly one — global rank 0 — writes `training.log` and the
+/// `done:` line while the rest train silently. Single-device runs (no cluster
+/// env) are the sole process, hence always the narrator.
+fn cooperative_narrator() -> bool {
+    match flodl::distributed::LocalCluster::from_env() {
+        Ok(Some(cluster)) => cluster.my_rank().map(|(gr, _)| gr == 0).unwrap_or(true),
+        _ => true,
+    }
+}
+
+/// Drain the controller's aggregated per-epoch metrics that have arrived since
+/// the last call, narrating them on the narrator only. Called at each plan
+/// boundary and once more after the loop, mirroring the managed `next_metrics`
+/// drain but non-blocking (the loop thread is the only control pump, so a
+/// blocking wait would deadlock — see `Worker::poll_metrics`).
+///
+/// Every rank drains (even non-narrators) so the stream channel stays bounded
+/// over a long run; only the narrator accumulates + emits.
+fn drain_cooperative_metrics(
+    worker: &flodl::distributed::Worker<Box<dyn Module>>,
+    narrator: bool,
+    monitor: &mut Monitor,
+    log_lines: &mut Vec<String>,
+    epoch_times: &mut Vec<f64>,
+    final_loss: &mut f64,
+) {
+    for m in worker.poll_metrics() {
+        if narrator {
+            *final_loss = m.avg_loss;
+            epoch_times.push(m.epoch_ms);
+            emit_epoch_metrics_line(&m, None, monitor, log_lines);
+        }
+    }
+}
+
+/// Hand-drive the cooperative training loop over a `Worker`, producing the
+/// same `(final_loss, epoch_times, log_lines)` shape as the managed path.
+///
+/// The reduce / cadence / partition / eval-rank election are still the
+/// controller's — the loop only owns forward + backward + `step`. Per-epoch
+/// metrics come from `poll_metrics` (the aggregated broadcast every rank
+/// receives), the final eval from `poll_eval` (run on the controller-elected
+/// rank, not a hardcoded one). Narration is gated to global rank 0; other
+/// ranks train silently.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn run_cooperative(
+    mut worker: flodl::distributed::Worker<Box<dyn Module>>,
+    model_def: &ModelDef,
+    config: &RunConfig,
+    monitor: &mut Monitor,
+    test_dataset: Option<Arc<dyn flodl::data::BatchDataSet>>,
+    dataset: Arc<dyn flodl::data::BatchDataSet>,
+    train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
+    augment_fn: Option<fn(&[Tensor]) -> Result<Vec<Tensor>>>,
+) -> Result<(f64, Vec<f64>, Vec<String>)> {
+    let narrator = cooperative_narrator();
+    let mut final_loss = 0.0;
+    let mut epoch_times: Vec<f64> = Vec::new();
+    let mut log_lines: Vec<String> = Vec::new();
+
+    // `next_plan` yields per-chunk under progressive dispatch (the same
+    // `.epoch` can repeat); the inner loop drains its batches. The reduce
+    // rides `step`'s control drain at the ElChe cadence — the loop never
+    // names it.
+    while let Some(_plan) = worker.next_plan()? {
+        while let Some(batch) = worker.next_batch()? {
+            let batch = match augment_fn {
+                Some(aug) => aug(&batch)?,
+                None => batch,
+            };
+            let loss = train_fn(worker.model().as_ref(), &batch)?;
+            loss.backward()?;
+            let outcome = worker.step(&loss)?;
+            if outcome.shutdown {
+                break;
+            }
+        }
+        // Every rank drains (bounds the channel); narrator emits.
+        drain_cooperative_metrics(
+            &worker, narrator, monitor, &mut log_lines, &mut epoch_times, &mut final_loss,
+        );
+    }
+
+    // Final drain: the last epoch's metrics and the controller-elected final
+    // eval both land during the terminal `next_plan` (the controller sends the
+    // eval just before `Shutdown`), so catch them here.
+    drain_cooperative_metrics(
+        &worker, narrator, monitor, &mut log_lines, &mut epoch_times, &mut final_loss,
+    );
+    let mut saw_final_eval = false;
+    for (ep, metric) in worker.poll_eval() {
+        if narrator {
+            // The final canonical eval is tagged with `num_epochs` (sentinel);
+            // anything earlier is an intent-/cadence-driven eval.
+            let line = if ep >= config.epochs {
+                saw_final_eval = true;
+                format!("final eval={metric:.4}")
+            } else {
+                format!("epoch {ep}: eval={metric:.4}")
+            };
+            eprintln!("    {line}");
+            log_lines.push(line);
+        }
+    }
+
+    let state = worker.finish()?;
+
+    // Single-device fallback: no controller means no eval broadcast, so the
+    // narrator evaluates its own final consensus state directly (mirrors the
+    // managed single-process eval). Skipped when the controller already
+    // supplied the elected-rank eval above.
+    if narrator
+        && !saw_final_eval
+        && let Some(eval_fn) = model_def.eval_fn
+    {
+        let device = Device::CUDA(0);
+        let model = (model_def.build)(device)?;
+        {
+            let _no_grad = flodl::autograd::NoGradGuard::new();
+            for (param, src) in model.parameters().iter().zip(&state.params) {
+                param.variable.data().copy_(&src.to_device(device)?, false)?;
+            }
+        }
+        for (buf, src) in model.buffers().iter().zip(&state.buffers) {
+            buf.get().copy_(&src.to_device(device)?, false)?;
+        }
+        model.eval();
+        let eval_dataset = test_dataset.as_ref().unwrap_or(&dataset);
+        let eval_data = preload_full_dataset(eval_dataset.as_ref(), device)?;
+        let avg = eval_weighted(model.as_ref(), &eval_data, config.batch_size, device, eval_fn)?;
+        let line = format!("final eval={avg:.4}");
+        eprintln!("    {line}");
+        log_lines.push(line);
+    }
+
+    Ok((final_loss, epoch_times, log_lines))
 }
 
 /// Rotate an existing artifact file by appending a timestamp before the extension.

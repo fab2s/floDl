@@ -374,6 +374,7 @@ impl<M: Module> GpuWorker<M> {
             lr_scale: 1.0,
             aggregated_metrics: aggregated_slot,
             metrics_stream_tx: None,
+            eval_stream_tx: None,
             checkpoint_fn,
             eval_fn,
             eval_dataset,

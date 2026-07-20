@@ -133,6 +133,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
                             ControlMsg::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
                             ControlMsg::EpochAggregated(_) => "EpochAggregated",
+                            ControlMsg::EvalBroadcast { .. } => "EvalBroadcast",
                             ControlMsg::SaveConsensusModel { .. } => "SaveConsensusModel",
                             ControlMsg::StageAdvisory { .. } => "StageAdvisory",
                         }
