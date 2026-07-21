@@ -346,9 +346,22 @@ fn run_reduce_thread(
                             "cluster_controller: set_write_timeout: {e}"
                         ))
                     })?;
+                // 10s handshake timeout (mirrors the coordinator's
+                // formation guard): the mux peek only guarantees the 4
+                // magic bytes arrived, so a relay that wedges between
+                // magic and Hello must error this loop — a blocking
+                // read here outlives the shutdown flag and hangs the
+                // Drop join. The post-handshake read half re-arms its
+                // own timeout below.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .map_err(|e| {
+                        TensorError::new(&format!(
+                            "cluster_controller: set_read_timeout: {e}"
+                        ))
+                    })?;
                 // Channel-select magic, then the relay handshake
-                // (blocking reads — relays send both immediately on
-                // connect).
+                // (relays send both immediately on connect).
                 crate::distributed::wire::expect_channel_magic(
                     &mut stream,
                     crate::distributed::wire::CHANNEL_MAGIC_DATA,
