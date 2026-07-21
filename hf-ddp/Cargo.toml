@@ -1,0 +1,26 @@
+[package]
+name = "hf-ddp"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+# flodl-hf head DDP vehicle: runs a HuggingFace head through the cooperative
+# (and managed) DDP tiers, cross-host or single-host auto-promote. Starts as a
+# thin fine-tuning smoke (the distilbert cooperative-DDP example as a `--bin`,
+# since a flodl-hf *example* can't ride the `fdl @cluster` pre-flight — it
+# builds `--bin`, not `--example`); intended to grow into a real HF
+# fine-tuning benchmark (larger datasets, eval, throughput), hence the plain
+# `hf-ddp` name. Follows the ddp-bench cluster convention (command == dir ==
+# bin); standalone (workspace-excluded, like ddp-bench) with path deps.
+
+[features]
+default = []
+cuda = ["flodl/cuda", "flodl-hf/cuda"]
+
+[dependencies]
+flodl = { path = "../flodl" }
+# default features = hub + tokenizer (needed by from_pretrained + the tokenizer)
+flodl-hf = { path = "../flodl-hf" }
+# FdlArgs derive + parse_or_schema: the binary answers `--fdl-schema`, so
+# `fdl hf-ddp -h` derives from the code (no inline schema to drift).
+flodl-cli = { path = "../flodl-cli" }

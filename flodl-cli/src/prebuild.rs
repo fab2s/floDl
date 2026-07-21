@@ -200,9 +200,44 @@ pub fn prebuild_remotes(
     let envelope: Arc<Mutex<BTreeMap<String, PerHostEnvelope>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
 
-    let mut handles = Vec::with_capacity(remotes.len());
-    for worker in remotes {
-        let worker = worker.clone();
+    // Cold shared cargo registry hazard: the per-(host,arch) target dirs are
+    // distinct, but every build shares one `~/.cargo/registry`. Running them
+    // all in parallel from cold races two `cargo build`s to unpack the same
+    // not-yet-cached crate into that registry — observed on the first build of
+    // a new cluster binary as `error: failed to unpack package serde_derive`.
+    // So build the FIRST remote serially: it fully populates the shared
+    // registry (download + unpack of every dep), after which the rest run in
+    // parallel finding all deps already unpacked (they still compile into
+    // their own target dirs). Steady-state (registry warm) this is ~free — the
+    // serial build is a cache hit; only a genuinely cold build pays for it.
+    {
+        let first: &ClusterWorker = remotes[0];
+        if remotes.len() > 1 {
+            eprintln!(
+                "fdl: pre-flight warming shared cargo registry via {} (serial) before parallel builds",
+                first.host,
+            );
+        }
+        match prebuild_one_worker(
+            &project_root, &cmd_cwd, &controller_path,
+            first, &cmd_name,
+            controller_docker_svc.as_deref(),
+        ) {
+            Ok(env_entry) => {
+                eprintln!("fdl: pre-flight OK ({})", first.host);
+                envelope.lock().unwrap().insert(first.host.clone(), env_entry);
+            }
+            Err(e) => {
+                eprintln!("fdl: pre-flight FAILED ({}): {}", first.host, e);
+                errors.lock().unwrap().push(format!("{}: {}", first.host, e));
+            }
+        }
+    }
+
+    // Remaining workers: parallel, registry now warm.
+    let mut handles = Vec::with_capacity(remotes.len().saturating_sub(1));
+    for worker in &remotes[1..] {
+        let worker = (*worker).clone();
         let project_root = Arc::clone(&project_root);
         let cmd_cwd = Arc::clone(&cmd_cwd);
         let cmd_name = Arc::clone(&cmd_name);

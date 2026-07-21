@@ -219,3 +219,5 @@ commands:
   # entry here is only needed for binaries launched from this overlay.
   # ddp-bench:
   #   cluster: true
+  # hf-ddp:            # flodl-hf head DDP validation vehicle (--bin hf-ddp)
+  #   cluster: true

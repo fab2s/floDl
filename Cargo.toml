@@ -1,6 +1,6 @@
 [workspace]
 members = ["flodl-sys", "flodl", "flodl-cli", "flodl-cli-macros", "flodl-hf"]
-exclude = ["benchmarks", "ddp-bench"]
+exclude = ["benchmarks", "ddp-bench", "hf-ddp"]
 resolver = "2"
 
 [workspace.package]

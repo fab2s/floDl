@@ -4,6 +4,7 @@ commands:
   # --- Sub-command (child fdl.yml) ---
   ddp-bench:                    # convention: ./ddp-bench/fdl.yml
   flodl-hf:                     # convention: ./flodl-hf/fdl.yml
+  hf-ddp:                 # convention: ./hf-ddp/fdl.yml (flodl-hf DDP validation vehicle)
 
   # --- CPU targets ---
   build:
