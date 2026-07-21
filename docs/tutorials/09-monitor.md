@@ -14,7 +14,7 @@ Record metrics on the graph during training, then pass the graph to `log`:
 
 ```rust
 use flodl::*;
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 
 let model = FlowBuilder::from(Linear::new(2, 16)?)
     .through(GELU)

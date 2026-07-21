@@ -1496,7 +1496,7 @@ for epoch in range(num_epochs):
 
 ```rust
 // flodl - built-in monitor with live dashboard
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 
 let mut monitor = Monitor::new(num_epochs);
 monitor.serve(3000)?;                        // live dashboard at http://localhost:3000

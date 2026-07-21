@@ -7,7 +7,7 @@
 //! Run: `cargo run --example observation`
 
 use flodl::*;
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 
 fn main() -> Result<()> {
     manual_seed(42);

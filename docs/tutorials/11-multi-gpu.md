@@ -328,7 +328,7 @@ dashboard URL that aggregates every rank's metrics. Open it once;
 follow the whole cluster.
 
 ```rust
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 
 let mut monitor = Monitor::new(num_epochs);
 monitor.serve(3000)?;             // http://launcher-host:3000

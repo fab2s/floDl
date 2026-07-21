@@ -49,7 +49,7 @@ use flodl::{
     CosineScheduler,
     no_grad,
 };
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 
 // ---------------------------------------------------------------------------
 // Reusable sub-graph builders
