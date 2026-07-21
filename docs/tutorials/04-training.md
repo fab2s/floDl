@@ -250,22 +250,25 @@ Reference: `TrainerConfig<M>`](../ddp.md#trainerconfigm--the-umbrella).
 
 Want explicit control of the training loop (multi-stage losses, per-step
 observation hooks, conditional backward, custom gradient-clipping
-placement)? The self-driven `Trainer::setup` tier that used to fill this
-slot - framework does device replication + optimizer setup, you keep the
-loop, auto-scaling 1-or-N GPU - is **deprecated**; its user-owned-loop
-ergonomics return later as a cooperative tier on the controller engine
-(see [trainer-execution-tiers](../design/trainer-execution-tiers.md)).
-Until then, pick one:
+placement)? Pick one:
 
-- **Framework owns the loop** (recommended): `Trainer::builder(...).run()`
-  above; the `train_step` closure is your forward + loss.
-- **Explicit per-rank control** (multi-GPU): `Ddp::wrap(&model, device,
-  rank, &rendezvous)?`, calling `sync_params()` / `all_reduce_gradients()`
-  yourself (see [Multi-GPU](11-multi-gpu.md)).
+- **Framework owns the loop** (managed tier, recommended):
+  `Trainer::builder(...).run()` above; the `train_step` closure is your
+  forward + loss.
+- **You own the loop body, controller owns scheduling** (cooperative
+  tier): `Trainer::builder(...).into_worker()?` returns a `Worker` -
+  `next_plan()` / `next_batch()` / `step()` / `finish()` - while the
+  controller keeps cadence, partition, eval-election, and checkpointing
+  (see [trainer-execution-tiers](../design/trainer-execution-tiers.md)).
+- **Explicit per-rank control** (bypass tier, multi-GPU):
+  `Ddp::wrap(&model, device, rank, &rendezvous)?`, calling
+  `sync_params()` / `all_reduce_gradients()` yourself (see
+  [Multi-GPU](11-multi-gpu.md)).
 - **Single-device manual loop**: the pattern below.
 
 `flodl-hf` task-head wrappers (e.g. `BertForSequenceClassification`)
-currently train through `Trainer::setup_head` - see
+`impl Module` directly, so they ride the same `Trainer::builder(...)` /
+`Trainer::run(...)` entry - see
 [HuggingFace Integration](14-flodl-hf.md) for a fine-tune walkthrough.
 
 ## The Training Loop

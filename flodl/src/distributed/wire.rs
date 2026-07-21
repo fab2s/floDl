@@ -1164,7 +1164,7 @@ pub enum ControlMsgWire {
     /// `latest_metrics()` / `graph_gpu_metrics()`. The framework-
     /// managed `Trainer::builder` path already had this view via
     /// `DdpHandle::next_metrics()`; this broadcast gives the same
-    /// view to the user-owned `Trainer::setup` training loop in
+    /// view to the cooperative (`into_worker`) user loop in
     /// process-per-rank cluster mode. User code stays identical:
     /// `monitor.log(epoch, dur, &model)` sees the aggregated view
     /// regardless of single-GPU / local-multi-GPU / cluster.

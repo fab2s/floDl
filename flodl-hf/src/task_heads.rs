@@ -493,7 +493,7 @@ impl<C: Clone> HasGraph for ClassificationHead<C> {
 /// cooperative loop never calls (the user runs the head's own loss fn in their
 /// `train_fn`). `as_any` presents the inner graph so DDP's multi-input replica
 /// paths downcast to it (via `GraphExt::as_graph`) instead of the single-input
-/// fallback — mirroring flodl's internal `HeadReplica`.
+/// fallback.
 impl<C: Clone> Module for ClassificationHead<C> {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.graph.forward(input)

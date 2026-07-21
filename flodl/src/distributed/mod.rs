@@ -7,15 +7,17 @@
 //!   single-host multi-GPU (process-per-rank auto-promote), and
 //!   multi-host cluster from one code path
 //!
+//! User-owned training loop, controller-authoritative:
+//!
+//! - [`Trainer::builder()`]`.into_worker()` -- the cooperative tier. You
+//!   own the loop body; the controller stays authoritative over cadence,
+//!   partition, eval election, and checkpointing (see
+//!   `docs/design/trainer-execution-tiers.md`).
+//!
 //! Explicit multi-GPU control:
 //!
 //! - [`Ddp::wrap()`] -- manual per-rank gradient sync for advanced
 //!   patterns (GAN, RL, custom collectives)
-//!
-//! Deprecated: the self-driven setup tier ([`Trainer::setup()`] and
-//! friends) schedules without the controller; its user-owned-loop
-//! ergonomics return as a cooperative tier on the controller engine
-//! (see `docs/design/trainer-execution-tiers.md`).
 //!
 //! Supporting infrastructure: NCCL bindings, CUDA events/streams, El Che
 //! heterogeneous cadence strategy, the launcher/controller/coordinator
@@ -82,8 +84,6 @@ pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};
 pub use cluster_builder::{ClusterBuilder, HostBuilder};
 pub use config::{ElCheConfig, ElCheMode, TrainerConfig};
 pub use ddp::{Ddp, HasGraph, Trainer};
-#[allow(deprecated)] // re-exported until the setup tier is removed
-pub use ddp::DdpConfig;
 pub use el_che::{AnchorVerdict, ElChe, Phase, WindowReport};
 pub use lr_event_meta::{LrEventMeta, LrEventMetaConfig, MetaAction};
 pub use ddp_run::{ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker, Worker, StepOutcome};

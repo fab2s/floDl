@@ -109,8 +109,9 @@ Before writing code, decide:
      auto-promotes to process-per-rank. Tune DDP cadence with
      `.elche(ElCheConfig::nccl_cadence())` (five modes).
    - For explicit per-rank gradient-sync / broadcast control, use
-     `Ddp::wrap(&model, device, rank, &rendezvous)?`. (The self-driven
-     `Trainer::setup()` tier is deprecated.)
+     `Ddp::wrap(&model, device, rank, &rendezvous)?` (bypass tier). To
+     own the loop body while the controller schedules, use
+     `Trainer::builder(...).into_worker()?` (cooperative tier).
    - See `ai/skills/port/guide.md` Phase 3 "Distributed Training" for the
      full mapping and `docs/ddp.md` for the reference.
 

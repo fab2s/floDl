@@ -370,7 +370,7 @@ pub trait NamedInputModule: Module {
 /// Body code calls [`TraceEmit::publish`] to publish named auxiliary outputs
 /// (one per published name per iteration). The runner harvests the map after
 /// each step and appends each entry into the loop's per-name vector, surfaced
-/// downstream via [`crate::graph::Graph::traces`] and `LossContext::traces`.
+/// downstream via [`crate::graph::Graph::traces`].
 ///
 /// Use [`TraceEmit::discard`] when calling `step` outside a loop runner
 /// (typically from a `Module::forward` shim that delegates to `step` for

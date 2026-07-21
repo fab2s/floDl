@@ -394,11 +394,15 @@ speed and lets faster cards run ahead while the slow one anchors
 synchronization. Tune it with `.elche(ElCheConfig::...)` (five modes:
 `nccl_sync` / `nccl_cadence` / `cpu_sync` / `cpu_cadence` / `cpu_async`).
 
-**Manual per-rank control:** for explicit gradient-sync / parameter-broadcast
-control (GAN, RL, progressive), drop to `Ddp::wrap(&model, device, rank,
-&rendezvous)?` and call `sync_params()` / `all_reduce_gradients()` yourself.
-(The self-driven `Trainer::setup()` tier is deprecated; its user-owned-loop
-ergonomics return later as a cooperative tier on the controller engine.)
+**Manual per-rank control (bypass tier):** for explicit gradient-sync /
+parameter-broadcast control (GAN, RL, progressive), drop to
+`Ddp::wrap(&model, device, rank, &rendezvous)?` and call `sync_params()`
+/ `all_reduce_gradients()` yourself.
+
+**Own the loop body (cooperative tier):** `Trainer::builder(...).into_worker()?`
+returns a `Worker` (`next_plan()` / `next_batch()` / `step()` / `finish()`)
+while the controller keeps cadence, partition, eval-election, and
+checkpointing.
 
 For the full DDP surface (policies, backends, convergence guard, metrics,
 live monitor integration, troubleshooting), see `docs/ddp.md`.

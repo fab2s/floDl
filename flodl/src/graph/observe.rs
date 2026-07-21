@@ -137,8 +137,8 @@ impl Graph {
     /// only want this graph's own metrics.
     pub fn latest_metrics(&self) -> Vec<(String, f64)> {
         // Cluster-mode short-circuit: when the framework has populated
-        // the aggregated-metrics slot (`Trainer::builder` or
-        // `Trainer::setup` via_coord paths), surface the coord's
+        // the aggregated-metrics slot (`Trainer::builder` / `Trainer::run`
+        // or the cooperative `into_worker` path), surface the coord's
         // cross-rank view instead of this rank's local epoch history.
         // User code stays identical (`monitor.log(epoch, dur, &model)`);
         // single-GPU / standalone runs fall through to the local

@@ -99,10 +99,8 @@ pub use distributed::{
     ClusterBuilder, HostBuilder,
     NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum,
 };
-#[allow(deprecated)] // re-exported until the setup tier is removed
-pub use distributed::DdpConfig;
 pub use graph::{
-    FlowBuilder, MergeOp, Graph, GraphExt, LossContext, MapBuilder, Trend, TrendGroup,
+    FlowBuilder, MergeOp, Graph, GraphExt, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,

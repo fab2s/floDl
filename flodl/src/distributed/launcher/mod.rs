@@ -1,8 +1,9 @@
 //! Cluster launcher: role detection, dial-in membership, fan-out sugar,
 //! controller orchestration.
 //!
-//! Slots transparently into [`Trainer::setup`] and friends on cluster-mode
-//! startup. Each user-binary invocation routes to one of five roles:
+//! Slots transparently into [`Trainer::run`] / [`Trainer::builder`] on
+//! cluster-mode startup. Each user-binary invocation routes to one of five
+//! roles:
 //!
 //! - **Launcher**: the parent process that fdl-cli execs after parsing
 //!   `fdl.yml`. Opens the membership join window (see the crate-internal
@@ -23,8 +24,8 @@
 //!   directly by the launcher for its local host). See [`run_relay`].
 //!
 //! - **Rank**: a spawned child running the user's training code. Inherits
-//!   the slim per-host envelope and the rank-slot env var; existing
-//!   [`Trainer::setup`] cluster-path logic handles the rest (rendezvous,
+//!   the slim per-host envelope and the rank-slot env var; the
+//!   [`Trainer::run`] cluster-path logic handles the rest (rendezvous,
 //!   `Ddp::wrap`, training loop). Envelopes are byte-identical whether the
 //!   host was fan-out-managed or self-deployed — ranks never know the join
 //!   protocol exists.
@@ -62,7 +63,8 @@
 //! agent/relay/full set → that role; slim+slot → rank; all unset →
 //! single-device; anything else → loud error.
 //!
-//! [`Trainer::setup`]: crate::distributed::Trainer::setup
+//! [`Trainer::run`]: crate::distributed::Trainer::run
+//! [`Trainer::builder`]: crate::distributed::Trainer::builder
 //! [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
 
 use std::env;
@@ -160,7 +162,7 @@ pub enum Role {
     /// training path.
     SingleDevice,
     /// This process is a rank. Continue with cluster-mode training
-    /// (`Trainer::setup` will read the slim envelope and rendezvous).
+    /// (`Trainer::run` will read the slim envelope and rendezvous).
     Rank,
     /// This process is the launcher. Caller must run the fan-out via
     /// [`run_launcher_with_config`] and exit the program when it returns.
@@ -184,7 +186,6 @@ pub enum Role {
 /// vars set — silently winning one over the other costs hours of
 /// debugging on a misconfigured rig).
 ///
-/// [`Trainer::setup`]: crate::distributed::Trainer::setup
 pub fn dispatch() -> Result<Role> {
     let agent_set = env::var_os(ENV_AGENT_JSON).is_some();
     let relay_set = env::var_os(ENV_RELAY_JSON).is_some();

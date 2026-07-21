@@ -1058,7 +1058,7 @@ VRAM.
    ResidentLoader but composes well with it. Worth a separate design?
 
 5. **Multi-GPU data splitting.** Multi-GPU training is now implemented via
-   `Trainer::setup()` and `Trainer::builder()`. The `DataLoader` supports distributed
+   `Trainer::builder()` / `Trainer::run()`. The `DataLoader` supports distributed
    mode with proportional epoch sharding across devices. See
    [DDP Reference](../ddp.md) for details.
 

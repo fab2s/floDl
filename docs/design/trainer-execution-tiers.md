@@ -1,24 +1,27 @@
 # Trainer Execution Tiers: one authoritative controller, three ergonomics
 
-flodl's distributed layer currently exposes two cluster entry points that
-diverge in both feature set and control model:
+flodl's distributed layer once exposed two cluster entry points that
+diverged in both feature set and control model:
 
 - `Trainer::builder(...).run()` runs through the **`ClusterCoordinator`**
   (authoritative): the controller computes cadence, data partition, anchor,
   callback-role election, and drives elastic membership + checkpoint
   orchestration + the dashboard. Ranks execute the controller's plan.
-- `Trainer::setup(&graph, ...)` runs a **self-driven, replicated** ElChe:
-  ranks AllReduce their per-rank wall times and each computes an identical
-  schedule locally, with no controller spawned. It keeps the user's own
-  training loop, but only carries *base* ElChe (overhead/anchor/speed-ratio),
-  not the convergence guard, LR-aware meta-controller, outer optimizer,
-  EASGD, relax-up, or the CPU averaging backend, and gets none of the ops
-  layer (elastic membership, checkpoint-on-failure, dashboard).
+- `Trainer::setup(&graph, ...)` (**now removed**) ran a **self-driven,
+  replicated** ElChe: ranks AllReduce'd their per-rank wall times and each
+  computed an identical schedule locally, with no controller spawned. It
+  kept the user's own training loop, but only carried *base* ElChe
+  (overhead/anchor/speed-ratio), not the convergence guard, LR-aware
+  meta-controller, outer optimizer, EASGD, relax-up, or the CPU averaging
+  backend, and got none of the ops layer (elastic membership,
+  checkpoint-on-failure, dashboard).
 
-So there are effectively two scheduling brains, and they can drift: a
-`setup` run and a `builder` run of the same configuration do **not**
-necessarily produce the same model once the controller-only features engage.
-This note proposes collapsing that to one engine with three ergonomic tiers.
+That was two scheduling brains that could drift: a `setup` run and a
+`builder` run of the same configuration did **not** necessarily produce the
+same model once the controller-only features engaged. This note is the
+design behind collapsing that to one engine with three ergonomic tiers - now
+shipped, with the setup tier retired (see "Consequence for `Trainer::setup`"
+below).
 
 ## Principle: the controller stays authoritative
 
@@ -221,11 +224,14 @@ rather than replicated: it sidesteps the hazard entirely.
 
 ## Consequence for `Trainer::setup`
 
-With the cooperative tier in place, `setup`'s self-driven replicated ElChe is
-the odd one out, the only path that schedules without the controller. It can
-be re-expressed as the cooperative tier (a cooperative loop plus the `Graph`
-convenience) or retired. Either way the replicated scheduling brain goes away,
-leaving **one authoritative controller, one rank engine, one cooperation
+Done: with the cooperative tier shipped and rig-proven, `setup`'s self-driven
+replicated ElChe - the only path that scheduled without the controller - was
+**removed**. Its user-owned-loop ergonomics live on as the cooperative tier
+(`Trainer::builder(...).into_worker()`), and `flodl-hf` task heads reach it
+directly now that they `impl Module`. The graph-embedded replicated brain
+(`cluster_ddp` / `cluster_el_che` + the cluster branches of `Graph::step`)
+left with it, so `graph` no longer imports `distributed` DDP types. What
+remains is **one authoritative controller, one rank engine, one cooperation
 contract**, exposed at three ergonomic levels, with model-splitting as a
 future layer on top.
 

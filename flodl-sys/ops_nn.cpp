@@ -545,29 +545,46 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
     }
 }
 
-// Force real symbol references to BOTH c10_cuda.so and libtorch_cuda.so
-// so that --as-needed doesn't drop them from the link. Without this,
-// no Rust code directly references symbols in these libraries, so the
-// linker silently drops them and torch::cuda::is_available() returns
-// false even with a GPU present.
+// Keeping the CUDA libraries loaded so their aten-kernel registrations run.
+// Without this, `at::empty`/`randn` on a CUDA device fail with
+// "not available for the CUDA backend" even with a GPU present.
 //
-// c10_cuda.so      -> c10::cuda::device_count()
-// libtorch_cuda.so -> torch::CudaIPCCollect() (static initializers in
-//                     this library register the CUDA backend)
+// c10_cuda.so is pinned by a real symbol reference (c10::cuda::device_count
+// in flodl_force_cuda_link below), resolved at link time so the lib is a
+// DT_NEEDED loaded at process start.
+//
+// libtorch_cuda.so is the one that actually registers the CUDA kernels, and
+// it is the fragile one: NO Rust/shim code references a symbol *defined*
+// there, so its DT_NEEDED entry survived only incidentally (whatever CUDA
+// path a given binary happened to link). `--as-needed` drops it the instant
+// that incidental reference vanishes - observed when an unrelated code
+// removal dropped the last one and every CUDA op in an integration binary
+// began failing. Rather than depend on a link-time symbol we don't control,
+// load it explicitly at process start via a static initializer: `dlopen`
+// runs the library's static initializers and registers the CUDA backend
+// regardless of `--as-needed`. The initializer lives in this always-linked
+// shim TU, so it covers every binary that uses flodl (bins, tests, benches).
 #ifdef FLODL_BUILD_CUDA
 #include <cuda_runtime.h>
 #include <dlfcn.h>
-namespace torch { void CudaIPCCollect(); }
+
+namespace {
+struct ForceCudaLibLoad {
+    ForceCudaLibLoad() {
+        // Non-fatal on failure: a CPU-only deployment that cannot find the
+        // lib simply falls back to reporting CUDA unavailable, honestly.
+        (void)dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+};
+static ForceCudaLibLoad force_cuda_lib_load;
+}  // namespace
 #endif
 
 extern "C" int flodl_force_cuda_link(void) {
     try {
 #ifdef FLODL_BUILD_CUDA
-    // c10_cuda.so dependency
+    // c10_cuda.so dependency (real symbol reference).
     volatile int n = (int)c10::cuda::device_count();
-    // libtorch_cuda.so dependency -- take address, don't call
-    volatile auto p = &torch::CudaIPCCollect;
-    (void)p;
     return n;
 #else
     return 0;

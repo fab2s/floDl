@@ -88,10 +88,12 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
 //           .dataset(dataset).batch_size(64).num_epochs(5).run()?;
 ```
 
-`flodl-hf` task-head wrappers train the same way (return the wrapper from
-`model_factory`). The self-driven `Trainer::setup` / `Trainer::setup_head`
-tier that used to appear here is deprecated (see the entry note at the top
-of this doc); for an explicit per-rank loop use `Ddp::wrap`.
+`flodl-hf` task-head wrappers train the same way (task heads `impl Module`
+directly, so return the wrapper from `model_factory`). To keep the loop
+yourself, use the cooperative tier - `Trainer::builder(...).into_worker()?`
+returns a `Worker` whose loop body you own while the controller keeps
+cadence, partition, eval-election, and checkpointing. For an explicit
+per-rank loop use `Ddp::wrap` (the bypass tier).
 
 ### Config-bag form - `Trainer::run`
 

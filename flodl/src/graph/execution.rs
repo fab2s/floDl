@@ -222,19 +222,10 @@ impl Module for Graph {
     }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        // Cluster mode: route through the local replica. `self`'s own nodes
-        // act as a structural template only; the replica owns this rank's
-        // training parameters.
-        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
-            return replica.forward(input);
-        }
         self.forward_impl(std::slice::from_ref(input))
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
-            return replica.parameters();
-        }
         let mut params = Vec::new();
         let mut seen = HashSet::new();
 
@@ -253,9 +244,6 @@ impl Module for Graph {
     }
 
     fn buffers(&self) -> Vec<crate::nn::Buffer> {
-        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
-            return replica.buffers();
-        }
         let mut bufs = Vec::new();
         let mut seen = HashSet::new();
 
@@ -280,10 +268,6 @@ impl Module for Graph {
     }
 
     fn set_training(&self, training: bool) {
-        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
-            replica.set_training(training);
-            return;
-        }
         let mut visited = HashSet::new();
         for &ni in &self.order {
             if let Some(ref module) = self.nodes[ni].module {

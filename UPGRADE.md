@@ -44,17 +44,36 @@ gone:
 | `AsyncDdp` / `AsyncDdpBuilder` / `AsyncDdpConfig` | `DdpHandle` / `DdpBuilder` / `DdpRunConfig` (create via `Trainer::builder()`) |
 | `DdpHandle::auto()` / `auto_with()` / `builder()` | `Trainer::builder(model_factory, optim_factory, train_fn)` |
 
-### Deprecated: the self-driven `Trainer::setup` tier
+### Removed: the self-driven `Trainer::setup` tier
 
 `Trainer::setup` / `setup_with` / `setup_head` / `setup_head_with` and
-their `DdpConfig` config bag are deprecated (they still compile). They
-are the only path that schedules without the controller, so they miss
-the convergence guard, LR-aware meta-controller, outer optimizer,
-elastic membership, and checkpoint orchestration. Move to
-`Trainer::builder(...)` (own the loop-body via the step closure) or
-`Trainer::run(...)` (framework owns the loop). The user-owned-loop
-ergonomics return later as a cooperative tier on the controller engine
-(see `docs/design/trainer-execution-tiers.md`).
+their `DdpConfig` config bag are gone. They were the only path that
+scheduled without the controller, so they missed the convergence guard,
+LR-aware meta-controller, outer optimizer, elastic membership, and
+checkpoint orchestration. The user-owned-loop ergonomics they offered
+now return as the **cooperative tier** on the controller engine.
+
+| Removed | Replacement |
+|---|---|
+| `Trainer::setup(...)` / `setup_with(...)` (you own the loop) | `Trainer::builder(model_factory, optim_factory, train_fn).into_worker()?` - returns a `Worker`; you own the loop body while the controller owns cadence, partition, eval-election, and checkpointing |
+| `Trainer::setup_head(&head, factory, opt)` / `setup_head_with(...)` | task heads `impl Module` directly now - drive the head through `Trainer::builder(head_factory, optim_factory, \|head, batch\| head.compute_loss(...)).into_worker()?` (cooperative) or `.run()` (managed) |
+| `DdpConfig` config bag | `TrainerConfig<M>` (with `Trainer::run(...)`) or the `Trainer::builder(...)` chained setters |
+
+The cooperative loop body reads:
+
+```rust
+let mut worker = Trainer::builder(model_factory, optim_factory, train_fn).into_worker()?;
+while let Some(plan) = worker.next_plan()? {
+    while let Some(batch) = worker.next_batch()? {
+        let loss = /* forward + loss */;
+        worker.step(&loss)?;
+    }
+}
+let state = worker.finish()?;
+```
+
+If you don't need to own the loop, `Trainer::run(...)` / `Trainer::builder(...).run()`
+(the managed tier) drives it for you. See `docs/design/trainer-execution-tiers.md`.
 
 ### Removed: `DataLoader::distributed`
 

@@ -192,10 +192,11 @@ Trainer::builder(
 ```
 
 For an explicit loop, `Ddp::wrap` gives per-rank gradient-sync control
-and a fully-manual single-device loop is the lowest tier. See
+(the bypass tier). The cooperative tier - `Trainer::builder(...).into_worker()` -
+hands you the loop body while the controller stays authoritative over
+cadence, partition, eval-election, and checkpointing. See
 [Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
-for all three tiers. (The self-driven `Trainer::setup` tier is deprecated
-pending its cooperative-tier replacement.)
+for all three tiers (bypass / cooperative / managed).
 
 ## The Graph Builder
 
@@ -581,10 +582,11 @@ fdl add flodl-hf --install      # wire it: pin to your root Cargo.toml
 fdl flodl-hf classify           # runs AutoModel on a real fine-tune
 ```
 
-Fine-tuning uses the same loop code on CPU, single GPU, or N GPUs:
-`Trainer::setup_head` distributes the head transparently when more
-devices are available, and `compute_loss(enc, labels)` mirrors HF
-Python's `model(..., labels=...).loss` one-call shape. Round-trip the
+Fine-tuning uses the same loop code on CPU, single GPU, or N GPUs: task
+heads `impl Module` directly, so `Trainer::run` / `Trainer::builder(...)`
+distribute the head transparently when more devices are available, and
+`compute_loss(enc, labels)` mirrors HF Python's `model(..., labels=...).loss`
+one-call shape. Round-trip the
 trained head back out with `fdl flodl-hf export` then verify it loads
 into HF Python's `AutoModelFor*` with `fdl flodl-hf verify-export`.
 
@@ -804,7 +806,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** - Trainer::run / Trainer::builder, process-per-rank auto-promote, ElChe, DataLoader integration
 12. **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** - ElChe cadence, process-per-rank cluster, A/B testable backends
 13. **[Data Loading](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)** - DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
-14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** - load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::setup_head`, round-trip export to the HF ecosystem, PyTorch parity
+14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** - load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::run` / `Trainer::builder(...)`, round-trip export to the HF ecosystem, PyTorch parity
 
 ### Examples
 

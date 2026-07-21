@@ -38,7 +38,7 @@ last_modified_at: 2026-04-28T21:22:12+02:00
   <div style="max-width: 720px; margin: 1.5rem auto;">
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
       This is the FlowBuilder Graph version &mdash; the same ResNet-20 architecture
-      expressed as a computation graph. One <code>Trainer::setup()</code> call turns it into
+      expressed as a computation graph. One <code>Trainer::run()</code> call turns it into
       multi-GPU training. The non-graph ResNet-20 (manual <code>Module</code> impl)
       produces identical results through <code>Trainer::builder()</code>, confirming that
       both DDP entry points converge correctly.

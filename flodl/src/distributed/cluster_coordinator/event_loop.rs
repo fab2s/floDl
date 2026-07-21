@@ -814,11 +814,11 @@ impl ClusterCoordinator {
                 }
             }
             // Broadcast the aggregated view back to every rank so the
-            // user-owned `Trainer::setup` training loop's
+            // cooperative (`into_worker`) user loop's
             // `monitor.log(&model)` sees the cross-rank picture
             // (global scalars + per-rank GPU tabs). The
-            // `Trainer::builder` path already had this via the sink
-            // tx; this broadcast gives the same UX to setup-mode
+            // `Trainer::builder().run()` path already had this via the
+            // sink tx; this broadcast gives the same UX to cooperative
             // users in process-per-rank cluster runs. Broadcast
             // failures are non-fatal — a rank's stream may have
             // already closed during shutdown; surface as verbose.

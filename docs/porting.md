@@ -235,12 +235,27 @@ let state = handle.join()?;  // averaged params + buffers
 
 ### Your own loop
 
-The self-driven `Trainer::setup()` tier (framework does replication +
-optimizer setup, you keep the loop) is deprecated; its user-owned-loop
-ergonomics return later as a cooperative tier on the controller engine.
-For now, reach for `Trainer::builder(...).run()` above when you want the
-framework to own the loop, or `Ddp::wrap` (see [Multi-GPU](#multi-gpu-ddp))
-for explicit per-rank gradient-sync / broadcast control.
+To keep the loop yourself, use the **cooperative tier**:
+`Trainer::builder(...).into_worker()?` returns a `Worker` and hands you
+the loop body, while the controller stays authoritative over cadence,
+partition, eval-election, and checkpointing:
+
+```rust
+let mut worker = Trainer::builder(build_model, |p| Adam::new(p, 1e-3), train_step)
+    .into_worker()?;
+while let Some(plan) = worker.next_plan()? {
+    while let Some(batch) = worker.next_batch()? {
+        let loss = /* forward + loss */;
+        worker.step(&loss)?;
+    }
+}
+let state = worker.finish()?;
+```
+
+Or reach for `Trainer::builder(...).run()` above (the managed tier) when
+you want the framework to own the loop, or `Ddp::wrap`
+(see [Multi-GPU](#multi-gpu-ddp)) for explicit per-rank gradient-sync /
+broadcast control (the bypass tier).
 
 ### Fully manual: closest port from PyTorch
 

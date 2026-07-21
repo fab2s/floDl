@@ -240,10 +240,9 @@ let _ = graph.forward(&x)?;
 let qualities = graph.traces("quality");   // Vec<Variable>, one per iteration
 let losses    = graph.traces("step_loss"); // Vec<Variable>, one per iteration
 
-// Inside a loss closure (LossContext), the same names appear under
-// `ctx.traces["quality"]` / `ctx.traces["step_loss"]`. Backward through
-// these is fully supported -- gradients flow through the per-iteration
-// outputs into the loop body's parameters.
+// `graph.traces(name)` returns the published `Variable`s directly.
+// Backward through these is fully supported -- gradients flow through
+// the per-iteration outputs into the loop body's parameters.
 ```
 
 Sparse emits are allowed: a step that does not call

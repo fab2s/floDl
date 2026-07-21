@@ -7,7 +7,6 @@ use indexmap::IndexMap;
 use super::node::*;
 use super::profile;
 use super::GraphExt;
-use super::LossContext;
 use crate::autograd::Variable;
 use crate::nn::{Buffer, Module, Parameter};
 use crate::tensor::{Result, TensorError};
@@ -107,19 +106,6 @@ pub struct Graph {
     pub(crate) node_input_count: Vec<usize>,
     // Cached execution buffers (reused across forward calls, avoids re-allocation)
     pub(crate) exec_slots: RefCell<Vec<Vec<Option<Variable>>>>,
-    // Cluster-mode DDP state (process-per-rank). Holds the local replica and
-    // a `Ddp` wrapping a single `NcclRankComm` joined to the cross-process
-    // group. Set by `Trainer::setup` when `LocalCluster::from_env()` returns
-    // `Some`. Exists alongside `distributed` during the multi-host DDP
-    // consolidation arc; a follow-up collapses both into a single field.
-    pub(crate) cluster_ddp:
-        RefCell<Option<(crate::distributed::ddp::Ddp, Box<dyn Module>)>>,
-    // Cluster-mode El Che cadence state (heterogeneous DDP across processes).
-    // When set, `step()` defers the sync + optimizer step until the local
-    // cadence target is reached; cross-process timing AllReduce keeps every
-    // rank's anchor in lockstep without a broadcast.
-    pub(crate) cluster_el_che:
-        RefCell<Option<crate::distributed::ddp::ClusterElCheState>>,
     // Optimizer for step() (works for both single-GPU and distributed)
     pub(crate) optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
     // Optional per-batch LR scheduler. When set, `step()` updates every
@@ -127,8 +113,8 @@ pub struct Graph {
     // calling `optimizer.step()`.
     pub(crate) scheduler: RefCell<Option<std::sync::Arc<dyn crate::nn::Scheduler>>>,
     // DDP linear-scaling factor applied multiplicatively to scheduler output.
-    // Defaults to 1.0 (no scaling). Set by `Trainer::setup_with` when the user
-    // enabled `DdpConfig::lr_scale_ratio`.
+    // Defaults to 1.0 (no scaling); set via `set_lr_scale` to apply the
+    // Goyal et al. linear-scaling rule on top of the attached scheduler.
     pub(crate) lr_scale: Cell<f64>,
     // Dedicated training step counter for the LR scheduler. Incremented once
     // per `step()` call, regardless of whether the caller also invokes
@@ -142,9 +128,6 @@ pub struct Graph {
     /// `forward_batch` / `data_num_batches` keep reading the metadata in
     /// `data_binding`. Set together with `data_binding` by `set_data_loader`.
     pub(crate) data_loader: RefCell<Option<crate::data::DataLoader>>,
-    // Per-batch loss closure for El Che (set by set_loss_fn(), None = legacy gather path)
-    #[allow(clippy::type_complexity)]
-    pub(crate) loss_fn: RefCell<Option<Box<dyn Fn(&LossContext) -> Result<Variable>>>>,
     // Cached flag: trace-namespace collision check has run successfully once.
     // Set the first time trace observation is performed (single-GPU lookup or
     // El Che gather). Validates that emit-published trace names from loop
@@ -463,15 +446,12 @@ impl Graph {
             output_port_idx,
             node_input_count,
             exec_slots,
-            cluster_ddp: RefCell::new(None),
-            cluster_el_che: RefCell::new(None),
             optimizer: RefCell::new(None),
             scheduler: RefCell::new(None),
             lr_scale: Cell::new(1.0),
             training_step: Cell::new(0),
             data_binding: RefCell::new(None),
             data_loader: RefCell::new(None),
-            loss_fn: RefCell::new(None),
             traces_validated: Cell::new(false),
             source_config: RefCell::new(None),
             aggregated_metrics: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -589,25 +569,7 @@ impl Graph {
 
     /// Forward with multiple inputs (for graphs with Input ports).
     /// Inputs are in declaration order: From entry first, then each Input.
-    ///
-    /// In cluster mode, routes to the local replica's graph (via
-    /// [`GraphExt::as_graph`]) so the
-    /// replica's parameters drive the forward. Loud error if the
-    /// replica does not expose a graph — `forward_multi` is
-    /// graph-specific and has no meaningful fallback.
     pub fn forward_multi(&self, inputs: &[Variable]) -> Result<Variable> {
-        if let Some((_, replica)) = self.cluster_ddp.borrow().as_ref() {
-            return match replica.as_graph() {
-                Some(g) => g.forward_multi(inputs),
-                None => Err(TensorError::new(
-                    "forward_multi: cluster-mode replica does not expose a Graph \
-                     (GraphExt::as_graph returned None) — multi-input forward has \
-                     no fallback. Wrap the model in something that presents its \
-                     graph through Module::as_any (e.g. HeadReplica for HasGraph \
-                     wrappers).",
-                )),
-            };
-        }
         self.forward_impl(inputs)
     }
 

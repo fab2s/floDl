@@ -186,7 +186,7 @@ commands) and can be overridden per preset.
 
 ### ddp
 
-Maps 1:1 to `DdpConfig` and `DdpRunConfig`.
+Maps 1:1 to flodl-cli's own `DdpConfig` and `DdpRunConfig`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

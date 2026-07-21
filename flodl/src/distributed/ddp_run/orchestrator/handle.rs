@@ -1,4 +1,4 @@
-//! `DdpHandle`: handle returned by `Trainer::builder().run()` / `Trainer::setup()`.
+//! `DdpHandle`: handle returned by `Trainer::builder().run()` / `Trainer::run()`.
 //!
 //! Holds, depending on topology, the launcher driver thread (cluster /
 //! multi-GPU auto-promote) or the inline single-GPU state. Provides `join`,

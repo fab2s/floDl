@@ -636,8 +636,8 @@
     }
 
     /// `HasGraph` should return a reference to the same underlying graph
-    /// the head owns (pointer equality). This is the contract
-    /// `Trainer::setup_head` relies on for rank-0 param matching.
+    /// the head owns (pointer equality) — the contract graph-aware
+    /// framework paths rely on to reach the head's real parameters.
     #[test]
     fn has_graph_returns_inner_graph_by_reference() {
         let config = tiny_bert_config();
@@ -650,37 +650,25 @@
         assert!(std::ptr::eq(qa.graph(),    <BertForQuestionAnswering as HasGraph>::graph(&qa)));
     }
 
-    /// End-to-end `Trainer::setup_head` on CPU: build a head, wire
-    /// optimizer via `setup_head`, run a full forward → loss → backward
-    /// → step cycle, confirm no error and the loss is finite.
-    ///
-    /// Validates the single-device branch of `setup_head`'s distribute
-    /// call (no replicas created, optimizer + training-mode wired on
-    /// rank 0). When `usable_cuda_devices()` reports 2+ GPUs the
-    /// distribute path instead creates CUDA replicas, and a full
-    /// distributed forward driving every rank is required before
-    /// `step()`; flodl's own DDP test suite covers that end-to-end, so
-    /// here we exit early rather than duplicate that coverage.
+    /// End-to-end single-device training step on CPU: build a head, wire
+    /// the optimizer + training mode on its graph, run a full forward →
+    /// loss → backward → step cycle, confirm no error and the loss is
+    /// finite. Multi-GPU DDP over heads rides the cooperative
+    /// (`into_worker`) tier, covered by flodl's own DDP suite + `hf-ddp`.
     #[test]
-    #[allow(deprecated)] // exercises the deprecated setup tier until removal
-    fn setup_head_drives_cpu_training_step() {
-        use flodl::{usable_cuda_devices, Adam, Trainer};
+    fn head_drives_cpu_training_step() {
+        use flodl::Adam;
         use crate::task_heads::sequence_classification_loss;
-
-        if usable_cuda_devices().len() >= 2 {
-            return;
-        }
 
         let config = tiny_bert_config();
         let dev = Device::CPU;
         let head = BertForSequenceClassification::on_device(&config, 3, dev).unwrap();
 
-        let cfg_for_factory = config.clone();
-        Trainer::setup_head(
-            &head,
-            move |dev| BertForSequenceClassification::on_device(&cfg_for_factory, 3, dev),
-            |p| Adam::new(p, 1e-3),
-        ).unwrap();
+        // Single-device wiring: set the optimizer over the head's graph
+        // parameters and enable training mode (what the retired
+        // `Trainer::setup_head` did on the no-cluster path).
+        head.graph().set_optimizer(|p| Adam::new(p, 1e-3));
+        head.graph().set_training(true);
 
         let batch = 2;
         let seq = 4;

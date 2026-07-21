@@ -1,74 +1,17 @@
 use crate::autograd::Variable;
 use crate::nn::Module;
-use crate::tensor::{Result, Tensor, TensorError};
+use crate::tensor::{Result, TensorError};
 
 use super::node::DEFAULT_INPUT;
 use super::execution::GraphEpochIterator;
 use super::graph::{DataLoaderBinding, Graph};
-use super::LossContext;
 
 // ---------------------------------------------------------------------------
-// Distributed Data Parallel + optimizer integration
+// Optimizer + training-step integration (single-device)
 // ---------------------------------------------------------------------------
-//
-// COUPLING NOTE (tier-scoped, audit C3): the `cluster_ddp` /
-// `cluster_el_che` state embedded in `Graph` — and the cluster branches
-// of `Graph::step` below — are the engine of the DEPRECATED
-// `Trainer::setup` self-driven tier (`ClusterElCheState::from_config`
-// takes the deprecated `DdpConfig`; every `set_cluster_ddp` caller is
-// the setup family). The `Trainer::run` / builder tier never routes
-// through them. This is graph/'s only remaining import of distributed
-// types; it leaves wholesale when the setup tier is removed
-// (docs/design/trainer-execution-tiers.md), so no abstraction seam is
-// built for it on purpose.
 
 impl Graph {
-    /// Attach cluster-mode DDP state (process-per-rank).
-    ///
-    /// Called from [`Trainer::setup`](crate::distributed::Trainer::setup) when
-    /// the launcher has shipped a per-node envelope (detected via
-    /// [`LocalCluster::from_env`](crate::distributed::LocalCluster::from_env)).
-    /// The caller has already built the local replica on this rank's device
-    /// and joined the cross-process NCCL group via
-    /// [`crate::distributed::Ddp::wrap`].
-    ///
-    /// From this point on, the [`Module`] surface (`forward`, `parameters`,
-    /// `buffers`, `set_training`) short-circuits to `replica`; `self` acts as
-    /// a structural template only. [`Graph::step`] dispatches AllReduce
-    /// through `ddp` and steps the local optimizer.
-    pub fn set_cluster_ddp(
-        &self,
-        ddp: crate::distributed::ddp::Ddp,
-        replica: Box<dyn crate::nn::Module>,
-    ) {
-        *self.cluster_ddp.borrow_mut() = Some((ddp, replica));
-    }
-
-    /// Attach cluster-mode El Che cadence state.
-    ///
-    /// Called from [`Trainer::setup`](crate::distributed::Trainer::setup) /
-    /// [`Trainer::setup_with`](crate::distributed::Trainer::setup_with) when
-    /// heterogeneous cluster DDP is in play.
-    /// From this point on, [`Graph::step`] defers the actual sync +
-    /// optimizer step until the local cadence target is reached; cross-rank
-    /// timing AllReduce keeps every rank's anchor in lockstep.
-    ///
-    /// Must be called after [`Graph::set_cluster_ddp`] — cluster El Che has
-    /// no meaning outside cluster mode.
-    pub(crate) fn set_cluster_el_che(
-        &self,
-        state: crate::distributed::ddp::ClusterElCheState,
-    ) {
-        *self.cluster_el_che.borrow_mut() = Some(state);
-    }
-
-    /// Whether cluster-mode El Che cadence is active.
-    pub fn has_cluster_el_che(&self) -> bool {
-        self.cluster_el_che.borrow().is_some()
-    }
-
-    /// Set the optimizer for training. When distributed, creates one optimizer
-    /// per replica. When single-GPU, creates a single optimizer.
+    /// Set the optimizer for training.
     ///
     /// The factory receives the parameter list and returns an optimizer.
     ///
@@ -80,9 +23,6 @@ impl Graph {
         F: Fn(&[crate::nn::Parameter]) -> O,
         O: crate::nn::Optimizer + 'static,
     {
-        // `self.parameters()` short-circuits to the cluster-mode replica
-        // when set; single-device falls through to the in-process graph's
-        // params. Either way, one optimizer over the local parameters.
         let opt = factory(&self.parameters());
         *self.optimizer.borrow_mut() = Some(Box::new(opt));
     }
@@ -93,8 +33,6 @@ impl Graph {
     /// `scheduler.lr(training_step) * lr_scale` before the optimizer step.
     /// The internal `training_step` counter increments once per `step()`
     /// call and is independent of the recurrent-state `step_count`.
-    ///
-    /// Works for both single-GPU and distributed graphs.
     ///
     /// ```ignore
     /// use std::sync::Arc;
@@ -129,35 +67,13 @@ impl Graph {
             .map(|s| s.lr(self.training_step.get()) * self.lr_scale.get())
     }
 
-    /// Perform one training step.
-    ///
-    /// - **Cluster mode (process-per-rank)**: AllReduce gradients across the
-    ///   cluster (weighted under El Che cadence), sync buffers, step the
-    ///   local optimizer, zero grad. Under El Che, `step()` is conditional
-    ///   and only fires the sync + optimizer at cadence boundaries.
-    /// - **Single-GPU / CPU**: step optimizer, zero grad.
+    /// Perform one training step: step the optimizer, then zero grad.
     ///
     /// When a scheduler is attached via [`Self::set_scheduler`], the
     /// optimizer's LR is updated from `scheduler.lr(training_step) *
     /// lr_scale` before the step, and `training_step` increments by one
     /// after.
     pub fn step(&self) -> Result<()> {
-        // Cluster mode (process-per-rank): single local replica + Ddp,
-        // single local optimizer. Two paths:
-        //   * El Che enabled  → step() is conditional. Accumulates
-        //     gradients locally until the cadence target is reached, then
-        //     runs the cross-rank timing AllReduce, weighted gradient
-        //     AllReduce, and optimizer step.
-        //   * El Che disabled → AllReduce gradients every batch
-        //     (traditional DDP), then optimizer step.
-        if self.cluster_ddp.borrow().is_some() {
-            if self.cluster_el_che.borrow().is_some() {
-                return self.cluster_step_el_che();
-            }
-            return self.cluster_step_plain();
-        }
-
-        // Single-GPU / CPU: just step the local optimizer.
         let scheduled = self.scheduled_lr();
         let mut opt = self.optimizer.borrow_mut();
         if let Some(ref mut optimizer) = *opt {
@@ -169,187 +85,6 @@ impl Graph {
         }
         self.training_step.set(self.training_step.get() + 1);
         Ok(())
-    }
-
-    /// Plain cluster-mode step (no El Che): per-batch AllReduce + optimizer.
-    fn cluster_step_plain(&self) -> Result<()> {
-        let cluster = self.cluster_ddp.borrow();
-        let (ddp, _replica) = cluster.as_ref().unwrap();
-        ddp.all_reduce_gradients()?;
-        ddp.sync_buffers()?;
-        drop(cluster);
-
-        let scheduled = self.scheduled_lr();
-        let mut opt = self.optimizer.borrow_mut();
-        if let Some(ref mut optimizer) = *opt {
-            if let Some(lr) = scheduled {
-                optimizer.set_lr(lr);
-            }
-            optimizer.step()?;
-            optimizer.zero_grad();
-        }
-        self.training_step.set(self.training_step.get() + 1);
-        Ok(())
-    }
-
-    /// Cluster-mode step with El Che cadence (heterogeneous DDP).
-    ///
-    /// Accumulates gradients locally until `local_batch_idx` reaches the
-    /// El Che target for this rank, then:
-    /// 1. Cross-rank timing AllReduce (everyone sees per-rank wall_ms).
-    /// 2. Per-rank gradient clipping (if `max_grad_norm` set).
-    /// 3. Normalize accumulated gradients by local count.
-    /// 4. Weighted AllReduce on gradients (scale-by-count then Sum).
-    /// 5. Buffer broadcast.
-    /// 6. [`crate::distributed::ElChe::report_timing`] — anchor + ratios
-    ///    adapt deterministically
-    ///    on every rank from the same input vector, so all ranks agree on
-    ///    next-cycle counts without a separate broadcast.
-    /// 7. Optimizer step + zero-grad.
-    /// 8. Reset cycle counter; training_step += 1.
-    fn cluster_step_el_che(&self) -> Result<()> {
-        // Reserve the cluster borrow scope for the whole sync — we need the
-        // Ddp handle for both timing AllReduce and weighted gradient
-        // AllReduce, and the replica reference for parameter scaling/clip.
-        let (my_rank, world_size, target) = {
-            let cluster = self.cluster_ddp.borrow();
-            let (ddp, _replica) = cluster.as_ref().unwrap();
-            let my_rank = ddp.rank();
-            let world_size = ddp.world_size();
-            let mut state_ref = self.cluster_el_che.borrow_mut();
-            let state = state_ref.as_mut().unwrap();
-            if state.cycle_start.is_none() {
-                state.cycle_start = Some(std::time::Instant::now());
-            }
-            state.local_batch_idx += 1;
-            let target = state.el_che.batch_counts()[my_rank];
-            if state.local_batch_idx < target {
-                // Accumulate more; no sync this call.
-                return Ok(());
-            }
-            (my_rank, world_size, target)
-        };
-
-        // Cadence boundary: compute wall time for this cycle, AllReduce
-        // timings across all ranks.
-        let cycle_wall_ms = {
-            let state_ref = self.cluster_el_che.borrow();
-            let state = state_ref.as_ref().unwrap();
-            state.cycle_start.unwrap().elapsed().as_secs_f64() * 1000.0
-        };
-
-        let mut wall_ms_vec = vec![0.0_f64; world_size];
-        wall_ms_vec[my_rank] = cycle_wall_ms;
-        {
-            let cluster = self.cluster_ddp.borrow();
-            let (ddp, _replica) = cluster.as_ref().unwrap();
-            ddp.all_reduce_per_rank_f64(&mut wall_ms_vec)?;
-        }
-
-        // Snapshot current counts (used by both gradient ops and reporting).
-        let counts: Vec<usize> = {
-            let state_ref = self.cluster_el_che.borrow();
-            let state = state_ref.as_ref().unwrap();
-            state.el_che.batch_counts().to_vec()
-        };
-
-        // Per-rank gradient clipping (before normalize-by-count). Operates on
-        // the replica's parameters since that's what backward() populated.
-        {
-            let cluster = self.cluster_ddp.borrow();
-            let (_, replica) = cluster.as_ref().unwrap();
-            let max_grad_norm = self.cluster_el_che.borrow()
-                .as_ref().unwrap().max_grad_norm;
-            if let Some(max_norm) = max_grad_norm {
-                let param_tensors: Vec<Tensor> = replica
-                    .parameters()
-                    .into_iter()
-                    .filter(|p| p.variable.grad().is_some())
-                    .map(|p| p.variable.data())
-                    .collect();
-                if !param_tensors.is_empty() {
-                    Tensor::clip_grad_norm_fused(&param_tensors, max_norm)?;
-                }
-            }
-
-            // Normalize accumulated gradients by local count. Each rank
-            // ran `target` backward passes, so without this the optimizer
-            // would see grads `target`× too large.
-            if target > 1 {
-                for p in replica.parameters() {
-                    if let Some(g) = p.variable.grad() {
-                        let _ = g.mul_scalar_(1.0 / target as f64);
-                    }
-                }
-            }
-        }
-
-        // Weighted gradient AllReduce + buffer sync.
-        let sync_start = std::time::Instant::now();
-        {
-            let cluster = self.cluster_ddp.borrow();
-            let (ddp, _replica) = cluster.as_ref().unwrap();
-            ddp.weighted_all_reduce_gradients(&counts)?;
-            ddp.sync_buffers()?;
-        }
-        let sync_ms = sync_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Report timing → ElChe anchor + ratios adapt. All ranks call this
-        // with identical inputs (post-AllReduce wall_ms_vec, same counts,
-        // same sync_ms scaled to local clock); deterministic state stays
-        // coherent across processes without a broadcast.
-        //
-        // Graph DDP doesn't wire a convergence guard at this site, so
-        // any overhead-tune proposal is committed unconditionally here
-        // (preserves pre-refactor behavior — the propose-then-commit
-        // split exists for the convergence-guarded worker paths). Both
-        // `commit` and `report` are deterministic across processes, so
-        // the cross-rank invariant holds.
-        {
-            let mut state_ref = self.cluster_el_che.borrow_mut();
-            let state = state_ref.as_mut().unwrap();
-            state.el_che.report_timing(&wall_ms_vec, &counts, sync_ms);
-            state.el_che.commit_proposed_anchor();
-            state.local_batch_idx = 0;
-            state.cycle_start = None;
-        }
-
-        // Optimizer step.
-        let scheduled = self.scheduled_lr();
-        let mut opt = self.optimizer.borrow_mut();
-        if let Some(ref mut optimizer) = *opt {
-            if let Some(lr) = scheduled {
-                optimizer.set_lr(lr);
-            }
-            optimizer.step()?;
-            optimizer.zero_grad();
-        }
-        self.training_step.set(self.training_step.get() + 1);
-        Ok(())
-    }
-
-    /// Number of devices in use (1 if not distributed).
-    ///
-    /// In cluster mode, returns the cross-process world size from the
-    /// rendezvous; this process owns one of those slots.
-    pub fn world_size(&self) -> usize {
-        if let Some((ddp, _)) = self.cluster_ddp.borrow().as_ref() {
-            return ddp.world_size();
-        }
-        1
-    }
-
-    /// Whether this graph is running in distributed mode.
-    pub fn is_distributed(&self) -> bool {
-        self.cluster_ddp.borrow().is_some()
-    }
-
-    /// Whether El Che cadence is active (heterogeneous DDP).
-    ///
-    /// Alias for [`Self::has_cluster_el_che`] — the in-process El Che path
-    /// has been removed; the only El Che that exists now is cluster-mode.
-    pub fn has_el_che(&self) -> bool {
-        self.has_cluster_el_che()
     }
 
     /// Set learning rate on the local optimizer.
@@ -364,13 +99,9 @@ impl Graph {
 
     /// Attach a DataLoader for integrated training.
     ///
-    /// When distributed: upgrades the loader to per-device backends (resident
-    /// or streaming per device based on VRAM). Enables `model.epoch()` for
-    /// zero-transfer iteration and `model.forward(&batch)` for auto-wired
-    /// forward passes.
-    ///
-    /// When single-GPU: stores the loader as-is. `model.epoch()` delegates
-    /// to `loader.epoch()` directly.
+    /// Stores the loader and enables `model.epoch()` (which delegates to the
+    /// loader's epoch iterator) plus `model.forward_batch(&batch)` for
+    /// auto-wired forward passes.
     ///
     /// The `forward_input` parameter names the batch field used as the primary
     /// model input (e.g., "image"). Other batch fields that match graph
@@ -474,49 +205,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Register a per-batch loss function for El Che distributed training.
-    ///
-    /// When set, `forward_distributed_el_che` runs forward + loss + backward
-    /// per batch internally, keeping only ONE forward graph in VRAM at a time.
-    /// Without this, all forward graphs are held simultaneously (VRAM scales
-    /// with anchor * devices), which caps the practical anchor at 1.
-    ///
-    /// The closure receives a [`LossContext`] with live autograd on all fields.
-    /// It must return a scalar loss `Variable`.
-    ///
-    /// `forward_batch()` returns detached gathered outputs when a loss function
-    /// is registered. Tags and traces on the graph are gathered (detached) for
-    /// metrics. Calling `.backward()` on the returned Variable is a no-op.
-    ///
-    /// ```ignore
-    /// model.set_loss_fn(|ctx: &LossContext| {
-    ///     let cls  = cross_entropy_loss(&ctx.tags["head"], &ctx.batch["label"])?;
-    ///     let rec  = mse_loss(&ctx.tags["recon"], &ctx.batch["image"])?;
-    ///     Ok(cls + rec)
-    /// });
-    ///
-    /// for batch in model.epoch(epoch).activate() {
-    ///     let _metrics = model.forward_batch(&batch?)?;
-    ///     model.step()?;
-    /// }
-    /// ```
-    pub fn set_loss_fn<F>(&self, f: F)
-    where
-        F: Fn(&LossContext) -> Result<Variable> + 'static,
-    {
-        *self.loss_fn.borrow_mut() = Some(Box::new(f));
-    }
-
-    /// Whether a per-batch loss function is registered.
-    pub fn has_loss_fn(&self) -> bool {
-        self.loss_fn.borrow().is_some()
-    }
-
     /// Get an epoch iterator for integrated training.
     ///
-    /// When distributed: returns a `DistributedEpochIterator` that produces
-    /// per-rank shards and a user-facing Batch with targets on the gather device.
-    /// When single-GPU: delegates to the DataLoader's epoch iterator.
+    /// Delegates to the attached DataLoader's epoch iterator.
     ///
     /// ```ignore
     /// for batch in model.epoch(epoch) {
@@ -559,7 +250,7 @@ impl Graph {
     /// Batch-aware forward pass.
     ///
     /// Extracts the primary input and auxiliary graph inputs from the named
-    /// Batch, handles DDP presharding and El Che transparently.
+    /// Batch and runs the graph forward.
     ///
     /// ```ignore
     /// let out = model.forward_batch(&b)?;
@@ -588,9 +279,6 @@ impl Graph {
             )));
         }
 
-        // In cluster mode `forward` short-circuits to the local replica; in
-        // single-device mode it runs the graph in-process. Either way, route
-        // through the Module trait surface to honor the cluster_ddp wiring.
         if graph_inputs.len() == 1 {
             use crate::nn::Module;
             return Module::forward(self, &graph_inputs[0]);

@@ -124,12 +124,13 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
 //           .dataset(dataset).batch_size(64).num_epochs(5).run()?;
 ```
 
-`flodl-hf` task-head wrappers (any type implementing `HasGraph`)
-currently train through `Trainer::setup_head` - see
-[HuggingFace Integration](14-flodl-hf.md). The self-driven
-`Trainer::setup` tier that used to appear here is deprecated (its
-user-owned-loop ergonomics return later as a cooperative tier); for an
-explicit per-rank loop use `Ddp::wrap`.
+`flodl-hf` task-head wrappers `impl Module` directly, so they ride the
+same `Trainer::builder(...)` / `Trainer::run(...)` entry - see
+[HuggingFace Integration](14-flodl-hf.md). To keep the loop body
+yourself, the cooperative tier - `Trainer::builder(...).into_worker()?` -
+returns a `Worker` while the controller owns cadence, partition,
+eval-election, and checkpointing; for an explicit per-rank loop use
+`Ddp::wrap` (the bypass tier).
 
 ## PyTorch comparison
 
@@ -470,7 +471,7 @@ elastic membership, controller-driven checkpoint retry.
 |---|---|
 | `Trainer::builder(model_fn, opt_fn, step).run()` | Universal - any Module, any tier (CPU / 1 GPU / N GPUs / cluster). |
 | `Trainer::run(model_fn, opt_fn, step, cfg)` | Same as above but takes a `TrainerConfig` data-bag - useful for config-driven launchers. |
-| `Trainer::setup_head(&head, factory, opt_fn)` | Current `flodl-hf` task-head entry (deprecated pending the cooperative tier). |
+| `Trainer::builder(model_fn, opt_fn, step).into_worker()?` | Cooperative tier - you own the loop body (`next_plan` / `next_batch` / `step` / `finish`) while the controller owns cadence, partition, eval-election, checkpointing. `flodl-hf` heads `impl Module`, so they ride this too. |
 | `Ddp::wrap(&model, device, global_rank, &rdv)` | Low-level per-rank gradient-sync primitive for manual control (GAN/RL); production multi-GPU auto-promotes to processes. |
 
 | Knob | Lives on | Common values |
