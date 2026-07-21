@@ -202,18 +202,36 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
         }
     }
 
-    // Positional choice validation.
+    // Positional binding + choice validation. A positional with no decl
+    // to bind to (beyond the declared list, no variadic) is an error, not
+    // silence: `bench -- --model lenet` lands here with `--model` as a
+    // positional and the run would otherwise proceed on defaults.
+    // Lenient mode keeps tolerating extras — orphan values of dropped
+    // unknown flags land as positionals, and the binary re-parses the
+    // tail authoritatively.
     for (idx, value) in out.positionals.iter().enumerate() {
-        let decl = positional_decl_for(spec, idx);
-        if let Some(d) = decl {
-            if let Some(choices) = &d.choices {
-                if !choices.iter().any(|c| c == value) {
-                    return Err(format!(
-                        "invalid value `{value}` for <{}> -- allowed: {}",
-                        d.name,
-                        choices.join(", ")
-                    ));
+        match positional_decl_for(spec, idx) {
+            Some(d) => {
+                if let Some(choices) = &d.choices {
+                    if !choices.iter().any(|c| c == value) {
+                        return Err(format!(
+                            "invalid value `{value}` for <{}> -- allowed: {}",
+                            d.name,
+                            choices.join(", ")
+                        ));
+                    }
                 }
+            }
+            None if spec.lenient_unknowns => {}
+            None => {
+                let hint = if value.starts_with('-') {
+                    "; tokens after a standalone `--` are treated as \
+                     positional arguments, not options — pass options \
+                     directly, without a `--` separator"
+                } else {
+                    ""
+                };
+                return Err(format!("unexpected argument `{value}`{hint}"));
             }
         }
     }
@@ -673,6 +691,47 @@ mod tests {
         let out = parse(&spec, &argv(&["--", "--verbose", "-x"])).unwrap();
         assert!(!out.options.contains_key("verbose"));
         assert_eq!(out.positionals, vec!["--verbose".to_string(), "-x".into()]);
+    }
+
+    #[test]
+    fn excess_positional_errors_loudly() {
+        // No positionals declared: a stray token must error, not vanish.
+        let spec = ArgsSpec {
+            options: vec![value("model", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["stray"])).unwrap_err();
+        assert!(err.contains("unexpected argument `stray`"), "got: {err}");
+    }
+
+    #[test]
+    fn dashdash_forwarded_options_error_with_hint() {
+        // The `fdl bench -- --model lenet` footgun: after `--` the
+        // options land as positionals; with none declared this must be
+        // loud (it used to run silently on defaults).
+        let spec = ArgsSpec {
+            options: vec![value("model", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["--", "--model", "lenet"])).unwrap_err();
+        assert!(err.contains("unexpected argument `--model`"), "got: {err}");
+        assert!(err.contains("without a `--` separator"), "got: {err}");
+    }
+
+    #[test]
+    fn lenient_mode_tolerates_excess_positionals() {
+        // Orphan values of dropped unknown flags land as positionals in
+        // lenient mode; the binary re-parses authoritatively, so fdl-side
+        // validation must not reject them.
+        let spec = ArgsSpec {
+            options: vec![],
+            positionals: vec![],
+            lenient_unknowns: true,
+        };
+        let out = parse(&spec, &argv(&["--unknown", "orphan-value"])).unwrap();
+        assert_eq!(out.positionals, vec!["orphan-value".to_string()]);
     }
 
     #[test]

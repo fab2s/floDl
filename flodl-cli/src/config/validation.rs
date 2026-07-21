@@ -68,7 +68,7 @@ pub fn schema_to_args_spec(schema: &Schema) -> crate::args::parser::ArgsSpec {
 
     // Positionals: drop the `required` bit. Strict mode is scoped to
     // option names/values only; arity is the binary's concern.
-    let positionals: Vec<PositionalDecl> = schema
+    let mut positionals: Vec<PositionalDecl> = schema
         .args
         .iter()
         .map(|a| PositionalDecl {
@@ -81,6 +81,16 @@ pub fn schema_to_args_spec(schema: &Schema) -> crate::args::parser::ArgsSpec {
                 .map(|cs| strict_choices_to_strings(cs)),
         })
         .collect();
+    // Catch-all so fdl-side validation never rejects positionals: like
+    // arity, positional binding is the binary's concern — its own parse
+    // errors loudly on excess. Keeps `-- <anything>` passthrough intact
+    // under strict schemas.
+    positionals.push(PositionalDecl {
+        name: "rest".to_string(),
+        required: false,
+        variadic: true,
+        choices: None,
+    });
 
     ArgsSpec {
         options,
