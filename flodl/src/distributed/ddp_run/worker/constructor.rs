@@ -303,25 +303,38 @@ impl<M: Module> GpuWorker<M> {
         // Sync mode but the recovery path needs the buffer regardless,
         // so paying the alloc once is simpler than threading a
         // `cluster_mode` flag through the constructor.
+        // Alloc failure must fail construction loudly: a swallowed None
+        // here is indistinguishable from "no comm attached" and only
+        // surfaces later as a misleading abort-retry error (params) or a
+        // silent restore skip (buffers).
         let pre_sync_scratch = if nccl_comm.is_some() {
-            let scratch: Result<Vec<Tensor>> = param_vars.iter()
+            let scratch: Vec<Tensor> = param_vars.iter()
                 .map(|v| Tensor::zeros_like(&v.data()))
-                .collect();
-            scratch.ok()
+                .collect::<Result<_>>()
+                .map_err(|e| TensorError::new(&format!(
+                    "GpuWorker r{}: pre-sync param scratch alloc failed: {e}",
+                    config.rank,
+                )))?;
+            Some(scratch)
         } else {
             None
         };
         // Companion scratch for the f32 buffers riding the NCCL sync
         // (mover-averaged running stats) — same abort-recovery rationale,
         // same gating. Tiny next to the param scratch (per-channel stat
-        // vectors vs full weight matrices).
+        // vectors vs full weight matrices). Empty (no f32 buffers) is the
+        // one legitimate None once a comm is attached.
         let pre_sync_buffer_scratch = if nccl_comm.is_some() {
-            let scratch: Result<Vec<Tensor>> = buffer_list.iter()
+            let scratch: Vec<Tensor> = buffer_list.iter()
                 .map(|b| b.get())
                 .filter(|t| t.dtype() == crate::tensor::DType::Float32)
                 .map(|t| Tensor::zeros_like(&t))
-                .collect();
-            scratch.ok().filter(|v| !v.is_empty())
+                .collect::<Result<_>>()
+                .map_err(|e| TensorError::new(&format!(
+                    "GpuWorker r{}: pre-sync buffer scratch alloc failed: {e}",
+                    config.rank,
+                )))?;
+            (!scratch.is_empty()).then_some(scratch)
         } else {
             None
         };

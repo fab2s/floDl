@@ -49,11 +49,15 @@ loop that bypasses the controller.
 | Cooperative | `Trainer::builder(...)` + a rank handle | user owns the loop body | authoritative |
 | Managed | `Trainer::builder(...).run()` | framework | authoritative |
 
-The managed tier and the bypass primitive exist today. The **cooperative
-tier is the missing middle** and is what closes the `setup` / `builder` gap.
+All three tiers are shipped. The cooperative tier — designed here as the
+missing middle that closes the `setup` / `builder` gap — landed as
+`Trainer::builder(...).into_worker()`, yielding a `Worker` the user drives
+with `next_plan` / `next_batch` / `step` / `finish` (plus the intent channel
+below); `fdl api-ref` is authoritative for the exact surface.
 
 A cooperative loop reads like single-device code; the cluster is presented as
-one logical trainer ("the collective as a whole"):
+one logical trainer ("the collective as a whole"). The sketch below is the
+design shape the shipped `Worker` grew from:
 
 ```rust
 let mut w = Trainer::builder(model_factory, optim_factory).into_worker()?;
