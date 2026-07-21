@@ -532,7 +532,7 @@ impl<M: Module> Drop for Worker<M> {
     /// `Err` and propagated, or panicked) is a self-inflicted rank death: write
     /// the forensic record and exit non-zero so the launcher's supervisor
     /// SIGTERMs the peers — mirroring the managed rank entry's `catch_unwind` +
-    /// `process::exit(1)`. A clean `finish()` disarms this; the single-device
+    /// `clean_process_exit(1)`. A clean `finish()` disarms this; the single-device
     /// path has no `forensics` (no peers), so it is a plain no-op.
     fn drop(&mut self) {
         if self.finished {
@@ -568,12 +568,18 @@ impl<M: Module> Drop for Worker<M> {
         }
         if panicking {
             // Let the unwind continue to terminate the process (exit 101); the
-            // panic hook already printed the payload. Calling process::exit
-            // here would mask that with exit(1).
+            // panic hook already printed the payload. An unwind drops the
+            // libtorch objects properly, so it must NOT be short-circuited
+            // with an exit call here.
             eprintln!("flodl cluster rank: {reason}");
         } else {
             eprintln!("flodl cluster rank: {reason}; exiting to unblock peers");
-            std::process::exit(1);
+            // clean_process_exit, NOT process::exit: this stack holds a live
+            // model/optimizer that never unwinds, and libtorch's static
+            // destructors GP-fault over it — turning this deliberate exit(1)
+            // into a SIGSEGV/139 that masks the real cause (observed live on
+            // the rig). The death record above is already durable (fs::write).
+            crate::distributed::ddp_run::clean_process_exit(1);
         }
     }
 }

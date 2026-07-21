@@ -408,7 +408,7 @@ impl CheckpointMeta {
 }
 
 /// Last-gasp forensic record written by a cluster rank that died on an
-/// unrecoverable error (the `process::exit(1)` path in
+/// unrecoverable error (the `clean_process_exit(1)` path in
 /// `run_cluster_rank_via_coord`).
 ///
 /// Lets a postmortem / the launcher tell "a rank crashed on its own"

@@ -310,7 +310,13 @@ impl DdpHandle {
             Ok(Err(e)) => {
                 eprintln!("flodl cluster rank: rank failed: {e}");
                 write_death_record(e.to_string());
-                std::process::exit(1);
+                // clean_process_exit, NOT process::exit: the worker's model /
+                // comm state is still live on this never-unwound stack, and
+                // libtorch's static destructors GP-fault over it — the
+                // supervisor then reports "signal 11" instead of this
+                // deliberate exit 1 (observed live on the rig when peers died
+                // during a formation broadcast).
+                super::clean_process_exit(1);
             }
             Err(panic) => {
                 // The default panic hook has already printed the message +

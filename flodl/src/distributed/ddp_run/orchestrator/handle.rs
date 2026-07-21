@@ -102,20 +102,33 @@ pub struct DdpHandle {
 /// Terminate this process immediately with `code`, skipping C++ static
 /// destructors (via `_exit`), after flushing stdio.
 ///
-/// For a cluster role that has finished its work and must terminate — the
-/// launcher once its driver joins, a relay/agent once its loop returns — this
-/// replaces `std::process::exit`. Those roles hold libtorch state deep in the
-/// call stack (built model / coordinator buffers) that `process::exit` leaves
-/// un-dropped because it never unwinds the Rust frames; `libtorch_cpu.so`'s
-/// static destructors then hit a general-protection fault at exit (observed
-/// on the rig as a launcher exit 139 after an otherwise-clean cooperative
-/// run). The managed launcher avoids this only by *returning* and letting
-/// `main` unwind first; a force-exiting role cannot, so it skips the faulting
-/// static teardown entirely. Safe here: the driver/loop has already joined and
-/// all results are streamed, so there is nothing left to flush beyond stdio
-/// (which `_exit` does not do — hence the explicit flush), and the OS reclaims
-/// everything else.
-pub(super) fn clean_process_exit(code: i32) -> ! {
+/// EVERY force-exiting cluster role goes through this instead of
+/// `std::process::exit` — success exits (the launcher once its driver
+/// joins, a relay/agent once its loop returns) and error exits (a rank
+/// whose entry returned `Err`, a cooperative `Worker` dropped without
+/// `finish()`) alike. A process that has touched libtorch holds C++
+/// state deep in the call stack (built model / coordinator buffers)
+/// that `process::exit` leaves un-dropped because it never unwinds the
+/// Rust frames; `libtorch_cpu.so`'s static destructors then hit a
+/// general-protection fault at exit, replacing the intended exit code
+/// with SIGSEGV/139 (observed on the rig both as a launcher exit 139
+/// after a clean cooperative run, and as rank `Err` exits reported as
+/// "signal 11" by the supervisor). The managed launcher avoids this
+/// only by *returning* and letting `main` unwind first; a force-exiting
+/// role cannot, so it skips the faulting static teardown entirely.
+///
+/// Uniform policy on purpose: routing only the sites where libtorch is
+/// provably live would leave a per-site liveness analysis to rot as
+/// code moves — and at a pre-libtorch site this costs nothing (the
+/// flush is the only observable difference from `process::exit`, and
+/// it is the desirable one). Safe at error sites too: everything a
+/// peer depends on is already durable before the call — death records
+/// go through `fs::write` (closed on return), peer unblocking keys on
+/// the connection drop / non-success status, never on atexit work —
+/// and the OS reclaims everything else. Panic paths are NOT routed
+/// here: an unwind drops libtorch objects properly and must be left to
+/// terminate on its own (exit 101).
+pub(crate) fn clean_process_exit(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -483,7 +496,7 @@ impl DdpHandle {
                     crate::distributed::launcher::claim_cluster_entry("rank")
                 {
                     eprintln!("flodl cluster rank: {e}");
-                    std::process::exit(1);
+                    clean_process_exit(1);
                 }
                 let dispatch_result: Result<Self> = Self::run_cluster_rank_via_coord(
                     cluster,
@@ -505,7 +518,7 @@ impl DdpHandle {
                         eprintln!(
                             "flodl cluster rank: pre-rendezvous setup failed: {e}"
                         );
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                 };
             }
@@ -517,7 +530,7 @@ impl DdpHandle {
                 eprintln!(
                     "flodl cluster rank: envelope parse failed: {e}"
                 );
-                std::process::exit(1);
+                clean_process_exit(1);
             }
         }
 
@@ -610,7 +623,7 @@ impl DdpHandle {
         // Non-training roles (Launcher / Relay / Agent) are handled exactly as
         // the managed `launch` handles them — reuse it. Launcher returns a
         // `DdpHandle` holding the driver (join it, then exit — the launcher
-        // never runs the user's loop); Relay/Agent `process::exit` inside
+        // never runs the user's loop); Relay/Agent `clean_process_exit` inside
         // `launch` and never return. This branch diverges, so it does not move
         // the training params away from the Rank/SingleDevice paths below.
         if matches!(
@@ -663,7 +676,7 @@ impl DdpHandle {
                     crate::distributed::launcher::claim_cluster_entry("rank")
                 {
                     eprintln!("flodl cluster rank: {e}");
-                    std::process::exit(1);
+                    clean_process_exit(1);
                 }
                 return match Self::run_cluster_rank_worker(
                     cluster,
@@ -683,7 +696,7 @@ impl DdpHandle {
                         // level (see the managed rank entry's rationale). Exit
                         // non-zero so the launcher's supervisor SIGTERMs peers.
                         eprintln!("flodl cluster rank: pre-rendezvous setup failed: {e}");
-                        std::process::exit(1);
+                        clean_process_exit(1);
                     }
                 };
             }
@@ -692,7 +705,7 @@ impl DdpHandle {
             }
             Err(e) => {
                 eprintln!("flodl cluster rank: envelope parse failed: {e}");
-                std::process::exit(1);
+                clean_process_exit(1);
             }
         }
 

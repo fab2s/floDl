@@ -148,7 +148,7 @@ pub const ENV_PREBUILD_PER_HOST: &str = "FLODL_INTERNAL_PREBUILD_PER_HOST";
 /// - On [`Role::Launcher`], the caller assembles the controller-scope
 ///   config (typically from the user's `DdpRunConfig` via
 ///   `super::ddp_run::build_coord_config_from_builder`), then calls
-///   [`run_launcher_with_config`] and `std::process::exit(0)` when it
+///   [`run_launcher_with_config`] and `clean_process_exit(0)` when it
 ///   returns. This is the "launcher trampoline": the user's `main()`
 ///   ran up to the `Trainer::builder(...).run()` boundary, which gives
 ///   the dispatch site native access to `Box<dyn ConvergenceGuard>` and
@@ -261,21 +261,26 @@ pub(crate) fn role_env_pristine() -> bool {
 ///
 /// [`Trainer::run`]: crate::distributed::Trainer::run
 pub fn exit_if_worker_role() {
+    // clean_process_exit throughout: same force-exit policy as the trampoline
+    // arms in `DdpHandle::launch` (see its doc for the libtorch
+    // static-teardown GP-fault this avoids). Relay/agent touch no CUDA today,
+    // but the uniform policy costs nothing and can't rot.
+    use crate::distributed::ddp_run::clean_process_exit;
     if env::var_os(ENV_RELAY_JSON).is_some() {
         match run_relay() {
-            Ok(()) => std::process::exit(0),
+            Ok(()) => clean_process_exit(0),
             Err(e) => {
                 eprintln!("flodl relay: {e}");
-                std::process::exit(1);
+                clean_process_exit(1);
             }
         }
     }
     if env::var_os(ENV_AGENT_JSON).is_some() {
         match run_agent() {
-            Ok(()) => std::process::exit(0),
+            Ok(()) => clean_process_exit(0),
             Err(e) => {
                 eprintln!("flodl agent: {e}");
-                std::process::exit(1);
+                clean_process_exit(1);
             }
         }
     }
