@@ -71,7 +71,7 @@ The "no CUDA before `Trainer::run`" invariant is now hardened: `Trainer::builder
 
 #### Elastic membership + controller-driven checkpoint orchestration
 
-Ranks can die and rejoin without aborting the run. The controller owns the lifecycle decisions; workers just report and follow.
+Ranks can die without aborting the run: the controller evicts the dead rank for the remainder of the run and redistributes its work across survivors. The controller owns the lifecycle decisions; workers just report and follow. Membership only ever shrinks — a dead or new rank cannot join a formed world (elastic scale-up is designed but not yet implemented).
 
 - **Heartbeat**: `HeartbeatWire` flows worker → controller; missed heartbeats past a configurable threshold transition the rank to `Dead` in the coordinator's per-rank state and elastically renormalize partition ratios across survivors.
 - **`max_failure` threshold + `ShutdownWithSave`**: cluster aborts cleanly when the surviving rank count drops below `max_failure`. On abort the coordinator drives a final checkpoint save through whichever rank still has the freshest state (callback-role-aware), then signals every survivor to exit. Lone NCCL survivors short-circuit the wait and exit immediately.
@@ -316,7 +316,7 @@ The progressive chunk pool now partitions each epoch's permutation into contiguo
 
 - **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.
 - **`FLODL_NET_TIMEOUT_SCALE`**: one env knob scales the whole cluster deadline set (handshakes, rendezvous, heartbeat windows, join window) — for slow rigs, congested CI, or debugger-attached runs.
-- **`flodl::distributed::chunk_pool`**: extracted from coordinator; reusable chunk-pool dispatch primitive for replaying training data across cluster ranks deterministically after a rank rejoin.
+- **`flodl::distributed::chunk_pool`**: extracted from coordinator; reusable chunk-pool dispatch primitive that reclaims a dead rank's in-flight data chunks and redistributes them deterministically across the surviving ranks.
 - **Network-aware logging (`flodl::log`)**: rank-scope prefixes that survive the cluster fan-in (`[rank=N]`-style markers preserved when controller forwards logs to launcher stdout).
 - **Optimizer `state_dict_keys()`**: Adam / RMSprop / SGD expose state-dict key listings for checkpoint introspection.
 - **Optimizer state persistence now covers every optimizer**: `Adagrad`, `RAdam`, and `NAdam` gained `Stateful` (save/load of moments, per-parameter step counts, and hyperparameters), so `Optimizer::save_state_to` no longer returns "unsupported" for them — the cluster save-on-unrecoverable-failure flow can now persist any optimizer's `.optim` sidecar and resume faithfully instead of silently restarting their moment estimates. Their state files are born under the new self-identifying `FDLO` header (see Fixed), so no migration ever applies to them.

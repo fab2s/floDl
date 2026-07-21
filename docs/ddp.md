@@ -548,8 +548,17 @@ files. Compatible with `.meta.json` from any prior flodl run.
 
 ## Elastic membership
 
-Ranks can die and rejoin without aborting the run. The controller owns
-the lifecycle; workers just report and follow.
+Ranks can die without aborting the run. The controller owns the
+lifecycle; workers just report and follow: a dead rank is evicted for
+the remainder of the run and its unprocessed work is redistributed
+across survivors.
+
+Membership only ever **shrinks**. The world is formed once, at the join
+window (see [Dial-in membership](#dial-in-membership-the-join-window));
+after that, neither a new rank nor a previously dead one can join the
+cohort. Elastic scale-up (mid-training join) is designed but not yet
+implemented — see `.design/hierarchical-elastic-ddp.md` for the
+direction and its consistency invariant.
 
 ### What happens when a rank dies
 

@@ -285,7 +285,9 @@ synthesizes the same topology auto-promote uses on a multi-GPU host.
 
 ## Elastic membership
 
-Ranks can die and rejoin without aborting the run:
+Ranks can die without aborting the run — the survivors carry on with
+the dead rank's work redistributed (membership only shrinks; a dead or
+new rank cannot join a formed world, scale-up is not yet implemented):
 
 - **Heartbeat miss** → coordinator transitions the rank to `Dead` and
   renormalizes `partition_ratios` across survivors.

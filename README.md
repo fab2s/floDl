@@ -481,8 +481,9 @@ fdl @cluster train     # SSHes each worker, pre-builds, fans out
 Heterogeneous-rig support extends to per-host libtorch variants
 (`precompiled/cu128` on one host, `builds/sm61-sm120` on another),
 NCCL version-skew handling via `fdl nccl build` (builds a matching
-libnccl for `LD_PRELOAD`), and elastic membership (ranks can die and
-rejoin without aborting the run).
+libnccl for `LD_PRELOAD`), and elastic membership (ranks can die
+without aborting the run — survivors absorb the lost rank's work;
+membership only shrinks, rejoin/scale-up is not yet implemented).
 
 > **Invariant - no CUDA before `Trainer::run`.** User binaries must
 > not touch libtorch's CUDA context in `main()` (no

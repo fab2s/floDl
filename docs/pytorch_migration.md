@@ -1618,7 +1618,7 @@ every worker, pre-builds, and fans out.
 | Equal batch per GPU only | `ElChe` cadence | Heterogeneous GPU support; weighted gradient averaging |
 | `NCCL` / `Gloo` backend choice | `ElCheMode::{NcclSync, NcclCadence, CpuSync, CpuCadence, CpuAsync}` | Five modes via one enum; default `NcclCadence` |
 | No built-in A/B testing | Swap `.elche(ElCheConfig::*)` | One line per mode |
-| No elastic membership | Ranks survive death + rejoin; `max_failure` + `ShutdownWithSave` | Controller-driven checkpoint retry / role failover |
+| No elastic membership | The run survives rank death (survivors absorb the work); `max_failure` + `ShutdownWithSave` | Controller-driven checkpoint retry / role failover |
 
 ### Key differences
 
