@@ -533,8 +533,10 @@ impl ClusterCoordinator {
         // NCCL consensus MODEL write: the consensus is on-device across ranks
         // (no controller-side frame to tap), so dispatch the elected rank to
         // write its post-collective `self.model`. We are at the tail of
-        // `finish_averaging_nccl`, AFTER the in-place AllReduce-Avg, so the
-        // rank holds the pure consensus; mpsc/wire FIFO orders this frame after
+        // `finish_averaging_nccl`, AFTER the in-place weighted AllReduce, so
+        // the rank holds the pure consensus — params work-weighted, f32
+        // buffers mover-averaged (matching the CPU forge's frame semantics);
+        // mpsc/wire FIFO orders this frame after
         // the `SyncNow` it already processed. CPU is a no-op here — its model
         // was already written by the controller forge tap.
         if matches!(self.backend, AverageBackend::Nccl) {

@@ -311,6 +311,20 @@ impl<M: Module> GpuWorker<M> {
         } else {
             None
         };
+        // Companion scratch for the f32 buffers riding the NCCL sync
+        // (mover-averaged running stats) — same abort-recovery rationale,
+        // same gating. Tiny next to the param scratch (per-channel stat
+        // vectors vs full weight matrices).
+        let pre_sync_buffer_scratch = if nccl_comm.is_some() {
+            let scratch: Result<Vec<Tensor>> = buffer_list.iter()
+                .map(|b| b.get())
+                .filter(|t| t.dtype() == crate::tensor::DType::Float32)
+                .map(|t| Tensor::zeros_like(&t))
+                .collect();
+            scratch.ok().filter(|v| !v.is_empty())
+        } else {
+            None
+        };
 
         // Adopt the model's shared aggregated-metrics slot (Graph
         // exposes one; other Modules default to None and get a
@@ -404,6 +418,7 @@ impl<M: Module> GpuWorker<M> {
             },
             timeline: config.timeline.clone(),
             pre_sync_scratch,
+            pre_sync_buffer_scratch,
             outer_optimizer,
             outer_prev_global: None,
             _grad_accumulators: grad_accumulators,

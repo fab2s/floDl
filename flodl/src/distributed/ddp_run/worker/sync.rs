@@ -38,6 +38,19 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
 /// collective (which sums `nᵢ^γ`), giving the NCCL path the same
 /// γ-aware weighting as the CPU backend.
 ///
+/// `buffer_refs` (the model's f32 buffers — BatchNorm running stats and
+/// the like) ride the same sync as a SECOND premul collective, weighted
+/// by the 0/1 mover indicator (`moverᵢ / Σmover`) — equal weight among
+/// the ranks that moved, idle ranks contributing nothing but adopting
+/// the consensus in place. This mirrors the CPU backend's buffer
+/// semantics exactly (see `param_bridge`): only the params consensus is
+/// γ-weighted; running stats must not inherit a fast rank's dominance.
+/// Non-f32 buffers never reach here (the caller filters; NCCL premul is
+/// f32-only, and integer counters are deterministic values updated
+/// identically on every rank — passing them through locally is correct,
+/// not a dropped sync). An empty `buffer_refs` skips the collective on
+/// every rank alike (model-structural, so collectively consistent).
+///
 /// A rank that did 0 steps since the last sync still holds the previous
 /// consensus; its factor is 0 and it contributes nothing — but it STILL
 /// joins both collectives, so the cohort never stalls. If the WHOLE
@@ -45,35 +58,38 @@ fn pinned_like(t: &Tensor) -> Result<Tensor> {
 /// and the param reduce is skipped (every rank sees the same gathered
 /// `Σn`, so the skip is collective-consistent).
 ///
-/// A cheap scalar `ReduceOp::Sum` of the per-rank counts supplies `Σn^γ`
-/// (a few bytes vs the multi-MB params) BEFORE the param collective —
-/// that is what lets each rank compute its pre-normalized factor.
-/// Running it on the SAME comm as the param reduce keeps `Σn` consistent
-/// with the live cohort across an abort-driven rebuild (it reflects the
-/// survivors). On an abort the caller restores params from the pre-sync
-/// scratch before retrying; the retry re-runs BOTH collectives on the
-/// rebuilt comm, deriving a fresh factor from the survivor cohort (the
-/// premul op is comm-bound and created per call).
+/// A cheap `ReduceOp::Sum` of the per-rank `[nᵢ^γ, moverᵢ]` pair
+/// supplies `Σn^γ` and `Σmover` (a few bytes vs the multi-MB params)
+/// BEFORE the param collective — that is what lets each rank compute
+/// both pre-normalized factors. Running it on the SAME comm as the
+/// param reduce keeps the totals consistent with the live cohort across
+/// an abort-driven rebuild (they reflect the survivors). On an abort
+/// the caller restores params AND buffers from the pre-sync scratches
+/// before retrying; the retry re-runs the collectives on the rebuilt
+/// comm, deriving fresh factors from the survivor cohort (the premul op
+/// is comm-bound and created per call).
 ///
 /// Requires NCCL >= 2.11 (build + runtime; the shim errors loudly
 /// naming the found version).
-// 8 args: the `rank`/`seq` pair is collective-step diagnostic context
+// 9 args: the `rank`/`seq` pair is collective-step diagnostic context
 // (-vvv ENTER/EXIT logging); a struct wrapper would obscure the hot path for
-// a private single-caller helper.
+// a private single-caller helper (pub(crate) only for the NCCL test suite).
 #[allow(clippy::too_many_arguments)]
-fn weighted_allreduce_nccl(
+pub(crate) fn weighted_allreduce_nccl(
     comm: &crate::distributed::nccl::NcclRankComm,
     stream: Option<&crate::tensor::cuda_stream::CudaStream>,
     param_refs: &[&Tensor],
+    buffer_refs: &[&Tensor],
     n_i: f64,
     gamma: f64,
     device: Device,
     rank: usize,
     seq: usize,
 ) -> Result<()> {
-    // Collective-step instrumentation (-vvv): this fn issues TWO collectives
-    // per sync (count-reduce, then a CONDITIONAL param-reduce). A cohort
-    // desync shows up as ranks issuing a DIFFERENT number of collectives for
+    // Collective-step instrumentation (-vvv): this fn issues up to THREE
+    // collectives per sync (count-reduce, then a CONDITIONAL param-reduce,
+    // then a CONDITIONAL buffer-reduce when the model has f32 buffers). A
+    // cohort desync shows up as ranks issuing a DIFFERENT number of collectives for
     // the same `seq` — e.g. one rank takes the `total_n <= 0` skip and does 1
     // all_reduce while peers do 2, leaving them waiting on a phantom. Logging
     // ENTER/EXIT of each collective per rank pins which one a stuck rank
@@ -97,27 +113,33 @@ fn weighted_allreduce_nccl(
     // used to protect are gone (premultiplied inside the collective);
     // the guard remains for the count tensor and the readout ordering.
     let _stream_guard = stream.map(StreamGuard::new);
-    // Σn^γ over the live cohort.
-    let count = Tensor::full(&[1], n_eff, TensorOptions { device, ..Default::default() })?;
-    let total_n = match stream {
+    // 0/1 mover indicator: the buffer consensus is equal-weight among the
+    // ranks that moved (never γ-weighted — see the doc above).
+    let mover = crate::distributed::realized_work::mover_mass(n_i);
+    // [Σn^γ, Σmover] over the live cohort in one small collective.
+    let count = Tensor::from_f32(&[n_eff as f32, mover as f32], &[2], device)?;
+    let totals = match stream {
         Some(s) => {
             comm.all_reduce_on_stream(&[&count], ReduceOp::Sum, s)?;
             s.synchronize()?;
-            count.item()?
+            count.to_f64_vec()?
         }
         None => {
             comm.all_reduce(&[&count], ReduceOp::Sum)?;
-            count.item()?
+            count.to_f64_vec()?
         }
     };
+    let (total_n, total_movers) = (totals[0], totals[1]);
     crate::debug!(
-        "  ddp-areduce: rank {rank} seq={seq} COUNT exit (total_n={total_n})"
+        "  ddp-areduce: rank {rank} seq={seq} COUNT exit (total_n={total_n}, total_movers={total_movers})"
     );
     if !crate::distributed::realized_work::is_realized(total_n) {
-        // Whole cohort idle since the last sync: consensus already holds.
+        // Whole cohort idle since the last sync: consensus already holds
+        // (params AND buffers — no step means no forward, so no running-
+        // stat drift either; both reduces are skipped together).
         crate::debug!(
             "  ddp-areduce: rank {rank} seq={seq} SKIP param-reduce (total_n={total_n}) \
-             -- 1 collective this seq (peers doing 2 would deadlock)"
+             -- 1 collective this seq (peers doing more would deadlock)"
         );
         return Ok(());
     }
@@ -131,25 +153,40 @@ fn weighted_allreduce_nccl(
     match stream {
         Some(s) => {
             comm.all_reduce_premul_sum(param_refs, factor, Some(s))?;
-            // EXIT FENCE: retire the collective before returning. The
-            // collective's own write is the LAST write to the params
-            // (no divide kernel follows anymore), so this synchronize
-            // is purely the entry-fence contract ("the weighted reduce
-            // retires everything before returning") that lets the
-            // caller's divergence readout, the outer-optimizer
-            // writeback, and the next forward run unfenced on THEIR
-            // streams. A wedged collective still parks the host here,
-            // where the NCCL watchdog's abort can free it.
-            s.synchronize()?;
         }
         None => {
-            // No dedicated comm stream: the collective shares the
-            // caller's current stream, so plain enqueue order fences it
+            // No dedicated comm stream: the collectives share the
+            // caller's current stream, so plain enqueue order fences them
             // against every downstream consumer on that stream.
             comm.all_reduce_premul_sum(param_refs, factor, None)?;
         }
     }
     crate::debug!("  ddp-areduce: rank {rank} seq={seq} PARAM exit");
+    // Buffer consensus (BatchNorm running stats etc.): equal weight among
+    // movers. `total_movers >= 1` is implied by the realized `total_n`
+    // above (γ-mass is nonzero only for n_i > 0, which makes mover 1),
+    // and it is identical on every rank (it came out of the collective),
+    // so the divide is safe and the branch collectively consistent.
+    if !buffer_refs.is_empty() {
+        let buf_factor = (mover / total_movers) as f32;
+        crate::debug!(
+            "  ddp-areduce: rank {rank} seq={seq} BUFFER enter (nbuffers={}, factor={buf_factor})",
+            buffer_refs.len()
+        );
+        comm.all_reduce_premul_sum(buffer_refs, buf_factor, stream)?;
+        crate::debug!("  ddp-areduce: rank {rank} seq={seq} BUFFER exit");
+    }
+    if let Some(s) = stream {
+        // EXIT FENCE: retire the collectives before returning. Their own
+        // writes are the LAST writes to params/buffers (no divide kernel
+        // follows anymore), so this synchronize is purely the entry-fence
+        // contract ("the weighted reduce retires everything before
+        // returning") that lets the caller's divergence readout, the
+        // outer-optimizer writeback, and the next forward run unfenced on
+        // THEIR streams. A wedged collective still parks the host here,
+        // where the NCCL watchdog's abort can free it.
+        s.synchronize()?;
+    }
     Ok(())
 }
 
@@ -419,7 +456,12 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
-    /// Perform in-place NCCL AllReduce(Avg) on this rank's parameters.
+    /// Perform the in-place NCCL weighted AllReduce on this rank's
+    /// parameters (work-weighted) and f32 buffers (mover-averaged —
+    /// BatchNorm running stats and the like; see
+    /// [`weighted_allreduce_nccl`] for the weighting asymmetry). Non-f32
+    /// buffers keep their local value — deterministic counters updated
+    /// identically on every rank, mirroring the CPU bridge's filter.
     ///
     /// All ranks must process SyncNow concurrently for the collective
     /// to complete. Runs on `comm_stream` and records `copy_done` so
@@ -474,6 +516,16 @@ impl<M: Module> GpuWorker<M> {
         }
 
         let param_tensors: Vec<_> = self.param_vars.iter().map(|v| v.data()).collect();
+        // f32 buffers ride the sync (mover-averaged in place through the
+        // storage-sharing handles); the subset is model-structural, so it
+        // is identical in count/order on every rank and the collective
+        // stays balanced. Non-f32 buffers keep their local value.
+        let buffer_tensors: Vec<Tensor> = self
+            .buffer_list
+            .iter()
+            .map(|b| b.get())
+            .filter(|t| t.dtype() == crate::tensor::DType::Float32)
+            .collect();
         let mut nccl_ms_total = 0.0_f64;
 
         // Monotonic per-rank sync sequence for the collective-step diagnostic.
@@ -509,6 +561,21 @@ impl<M: Module> GpuWorker<M> {
                         dst.copy_(src, true)?; // params <- scratch
                     }
                 }
+                // Buffers mirror the params' snapshot/restore: an aborted
+                // buffer collective can leave them partially premultiplied
+                // (a torn running-var is eval garbage until BN momentum
+                // heals it), so the retry must restart from clean state.
+                if let Some(ref buf_scratch) = self.pre_sync_buffer_scratch {
+                    if attempt == 0 {
+                        for (dst, src) in buf_scratch.iter().zip(&buffer_tensors) {
+                            dst.copy_(src, true)?; // scratch <- buffers
+                        }
+                    } else {
+                        for (dst, src) in buffer_tensors.iter().zip(buf_scratch.iter()) {
+                            dst.copy_(src, true)?; // buffers <- scratch
+                        }
+                    }
+                }
             } else if attempt > 0 {
                 // No scratch and we need to retry — can't recover param
                 // state cleanly. Cluster NCCL mode must allocate scratch
@@ -521,6 +588,7 @@ impl<M: Module> GpuWorker<M> {
             }
 
             let param_refs: Vec<&Tensor> = param_tensors.iter().collect();
+            let buffer_refs: Vec<&Tensor> = buffer_tensors.iter().collect();
             let n_i = self.steps_since_avg as f64;
             let device = self.device;
             let comm = self.nccl_comm.as_ref().expect("nccl_comm present");
@@ -536,6 +604,7 @@ impl<M: Module> GpuWorker<M> {
                 comm,
                 self.comm_stream.as_ref(),
                 &param_refs,
+                &buffer_refs,
                 n_i,
                 self.gamma,
                 device,

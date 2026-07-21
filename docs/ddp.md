@@ -884,6 +884,14 @@ grad_avg      = sum(weight[rank] * grad[rank])
 Mathematically correct mean gradient regardless of per-device batch
 counts.
 
+Weight consensus follows the same principle at every sync (shaped by
+`gamma`), on both backends. Non-learnable f32 buffers — BatchNorm
+running stats and the like — ride the same sync but are averaged with
+*equal* weight among the ranks that stepped in the window, never
+`gamma`-weighted: running statistics must not inherit a fast rank's
+dominance. Non-f32 buffers (deterministic integer counters, updated
+identically on every rank) keep their local value.
+
 ### LR-aware meta-controller
 
 `ElCheConfig::meta_controller(true)` enables an observer above ElChe

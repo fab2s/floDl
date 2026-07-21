@@ -29,6 +29,12 @@ mod sync;
 /// Per-epoch training cursor, driven step-wise by the cooperative
 /// [`Worker`](crate::distributed::ddp_run::Worker) tier.
 pub(crate) use epoch_plan::EpochState;
+/// Crate-internal export for the NCCL test suite (`nccl_tests.rs`
+/// exercises the fused weighted collective directly on a 2-GPU comm;
+/// the suite compiles CPU-side too and self-skips at runtime, so this
+/// is gated on `test` alone, not the cuda feature).
+#[cfg(test)]
+pub(crate) use sync::weighted_allreduce_nccl;
 
 // ---------------------------------------------------------------------------
 // GpuWorker
@@ -328,6 +334,14 @@ pub struct GpuWorker<M: Module> {
     /// Allocated once at worker creation. `None` when policy == Sync (divergence
     /// is near-zero by construction, no point measuring) or no NCCL comm.
     pre_sync_scratch: Option<Vec<Tensor>>,
+    /// Companion scratch for the f32 buffers riding the NCCL sync
+    /// (mover-averaged running stats). Only used by the abort-recovery
+    /// retry in `sync_now_nccl` — an aborted buffer collective can leave
+    /// running stats partially premultiplied, and unlike params there is
+    /// no divergence readout to co-fund the allocation, so this exists
+    /// purely so retries restart from clean buffer state. `None` when no
+    /// NCCL comm or the model has no f32 buffers.
+    pre_sync_buffer_scratch: Option<Vec<Tensor>>,
 
     /// Outer optimizer applied to the consensus on the NCCL path, replicated
     /// per rank. After the in-place AllReduce leaves the work-weighted

@@ -365,7 +365,8 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::SaveConsensusModel { target_rank } => {
                 // NCCL consensus checkpoint: the elected rank writes its
                 // CURRENT model — which holds the just-completed in-place
-                // AllReduce-Avg consensus (no EASGD blend on the NCCL path) —
+                // weighted-AllReduce consensus, params work-weighted and f32
+                // buffers mover-averaged (no EASGD blend on the NCCL path) —
                 // to `<save_path>.fdl`. Targeted: only the named rank runs.
                 // No `.optim`, no shutdown; best-effort (mirrors the CPU
                 // forge's detached write), so no result frame. The coord's

@@ -248,6 +248,98 @@
 
     #[test]
     #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    fn test_nccl_weighted_allreduce_syncs_buffers_mover_averaged() {
+        // The fused weighted sync must produce TWO different consensuses in
+        // one call: params work-weighted (nᵢ/Σn), buffers equal-weighted
+        // among movers (BatchNorm running stats must not inherit a fast
+        // rank's dominance — the CPU backend's `param_bridge` asymmetry,
+        // mirrored on the ring). With n = 3/1 over params 10/20 the params
+        // land at 0.75·10 + 0.25·20 = 12.5 while buffers 100/200 land at
+        // 0.5·100 + 0.5·200 = 150 on BOTH ranks. A second round with an
+        // idle rank (n = 2/0) checks the mover indicator: params and
+        // buffers both become rank0's values verbatim, and the idle rank
+        // ADOPTS them in place (factor 0 contributes nothing but the
+        // collective still overwrites — that is the consensus adoption).
+        if !require_multi_gpu() { return; }
+        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::distributed::ddp_run::weighted_allreduce_nccl;
+
+        let uid = NcclUniqueId::new().unwrap();
+        let uid0 = uid.clone();
+        let uid1 = uid;
+        let h0 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(0);
+            NcclRankComm::init_rank(0, 2, &uid0).unwrap()
+        });
+        let h1 = std::thread::spawn(move || {
+            crate::tensor::set_current_cuda_device(1);
+            NcclRankComm::init_rank(1, 2, &uid1).unwrap()
+        });
+        let comm0 = h0.join().unwrap();
+        let comm1 = h1.join().unwrap();
+
+        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
+        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
+        let p0 = Tensor::full(&[32], 10.0, opts0).unwrap();
+        let p1 = Tensor::full(&[32], 20.0, opts1).unwrap();
+        let b0 = Tensor::full(&[8], 100.0, opts0).unwrap();
+        let b1 = Tensor::full(&[8], 200.0, opts1).unwrap();
+
+        let run = |comm: crate::distributed::nccl::NcclRankComm,
+                   dev: u8,
+                   p: Tensor,
+                   b: Tensor,
+                   n_i: f64| {
+            std::thread::spawn(move || {
+                crate::tensor::set_current_cuda_device(dev);
+                weighted_allreduce_nccl(
+                    &comm, None, &[&p], &[&b], n_i, 1.0,
+                    Device::CUDA(dev), dev as usize, 0,
+                )
+                .unwrap();
+                comm
+            })
+        };
+
+        // Round 1: both move, unequal work (3 vs 1 steps).
+        let h0 = run(comm0, 0, p0.clone(), b0.clone(), 3.0);
+        let h1 = run(comm1, 1, p1.clone(), b1.clone(), 1.0);
+        let comm0 = h0.join().unwrap();
+        let comm1 = h1.join().unwrap();
+        cuda_synchronize(0);
+        cuda_synchronize(1);
+        for (t, want, what) in [
+            (&p0, 12.5, "rank0 params"), (&p1, 12.5, "rank1 params"),
+            (&b0, 150.0, "rank0 buffers"), (&b1, 150.0, "rank1 buffers"),
+        ] {
+            let v: f64 = t.mean().unwrap().item().unwrap();
+            assert!((v - want).abs() < 1e-4, "{what}: want {want}, got {v}");
+        }
+
+        // Round 2: rank1 idle. Diverge the local copies first so adoption
+        // is observable, then sync with n = 2/0. (Plain tensors — no grad
+        // tracking, so the in-place fills need no no_grad guard.)
+        p0.fill_(1.0).unwrap();
+        p1.fill_(9.0).unwrap();
+        b0.fill_(5.0).unwrap();
+        b1.fill_(7.0).unwrap();
+        let h0 = run(comm0, 0, p0.clone(), b0.clone(), 2.0);
+        let h1 = run(comm1, 1, p1.clone(), b1.clone(), 0.0);
+        h0.join().unwrap();
+        h1.join().unwrap();
+        cuda_synchronize(0);
+        cuda_synchronize(1);
+        for (t, want, what) in [
+            (&p0, 1.0, "rank0 params"), (&p1, 1.0, "rank1 params (adopted)"),
+            (&b0, 5.0, "rank0 buffers"), (&b1, 5.0, "rank1 buffers (adopted)"),
+        ] {
+            let v: f64 = t.mean().unwrap().item().unwrap();
+            assert!((v - want).abs() < 1e-4, "{what}: want {want}, got {v}");
+        }
+    }
+
+    #[test]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
     fn test_nccl_rank_comm_init_and_reduce() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
