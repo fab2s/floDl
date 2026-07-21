@@ -532,10 +532,8 @@ impl ClusterCoordinator {
         if samples == 0 {
             return None;
         }
-        let (offset, actual_size) = match self.chunk_pools.get_mut(&epoch) {
-            Some(pool) => pool.take_chunk(samples, rank)?,
-            None => return None,
-        };
+        let (offset, actual_size) =
+            self.chunk_pools.get_mut(&epoch)?.take_chunk(samples, rank)?;
         self.rank_epoch[rank] = epoch;
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,

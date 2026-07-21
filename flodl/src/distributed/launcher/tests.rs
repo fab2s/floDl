@@ -675,7 +675,7 @@
                 .expect("spawn `true`");
             children.push(("host".to_string(), lr, vec![lr], child, Vec::new()));
         }
-        assert!(supervise_children(children, None).is_none());
+        assert!(supervise_children(children, None, None).is_none());
     }
 
     #[test]
@@ -705,7 +705,7 @@
         ];
 
         let start = std::time::Instant::now();
-        let err = supervise_children(children, None).expect("expected failure attribution");
+        let err = supervise_children(children, None, None).expect("expected failure attribution");
         let elapsed = start.elapsed();
 
         assert!(
@@ -902,7 +902,7 @@
                 std::sync::atomic::AtomicBool::new(true),
             ),
         };
-        let verdict = supervise_children(children, Some(elastic));
+        let verdict = supervise_children(children, Some(elastic), None);
         assert!(
             verdict.is_none(),
             "within-tolerance death must not fail the run: {verdict:?}"
@@ -947,7 +947,7 @@
             ),
         };
         let start = std::time::Instant::now();
-        let err = supervise_children(children, Some(elastic))
+        let err = supervise_children(children, Some(elastic), None)
             .expect("pre-formation failure must fail the run");
         assert!(err.to_string().contains("host-a"), "got: {err}");
         assert!(
@@ -985,7 +985,7 @@
                 std::sync::atomic::AtomicBool::new(true),
             ),
         };
-        let err = supervise_children(children, Some(elastic))
+        let err = supervise_children(children, Some(elastic), None)
             .expect("threshold breach must fail the run");
         assert!(err.to_string().contains("max_failure exceeded"), "got: {err}");
     }

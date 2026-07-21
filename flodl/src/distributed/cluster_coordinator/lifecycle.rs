@@ -114,7 +114,13 @@ impl ClusterCoordinator {
         // relays never dial in, and the launcher must be able to stop this
         // loop (via `ClusterCoordinatorConfig::abort`), join the coord
         // thread, and surface the original error through
-        // `DdpHandle::join`.
+        // `DdpHandle::join`. The formation deadline is the self-contained
+        // backstop for the same scenario when no abort arrives: the join
+        // window bounded admission, this bounds the dial-in that follows —
+        // a registered-but-never-dialing relay must fail the run loudly
+        // here, not leave the cohort to die of its own rank-side deadlines.
+        let formation_deadline = std::time::Instant::now()
+            + Duration::from_secs(config.formation_timeout_secs);
         while covered < world_size {
             let mut stream = match source.try_accept("cluster_coordinator")? {
                 Some(s) => s,
@@ -127,6 +133,16 @@ impl ClusterCoordinator {
                         return Err(TensorError::new(&format!(
                             "cluster_coordinator: aborted by launcher before \
                              cohort formed ({covered}/{world_size} ranks covered)"
+                        )));
+                    }
+                    if std::time::Instant::now() >= formation_deadline {
+                        return Err(TensorError::new(&format!(
+                            "cluster_coordinator: relay dial-in did not cover the \
+                             world within {}s ({covered}/{world_size} ranks \
+                             covered) — a relay failed to start or dial; aborting \
+                             formation (FLODL_NET_TIMEOUT_SCALE scales this \
+                             deadline)",
+                            config.formation_timeout_secs,
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(10));

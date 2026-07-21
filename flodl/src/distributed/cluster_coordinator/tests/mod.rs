@@ -22,6 +22,7 @@ mod callbacks;
 mod delivered_feed;
 mod epoch_dispatch;
 mod fastest;
+mod formation;
 mod gate;
 mod heartbeat;
 mod lost_broadcast;

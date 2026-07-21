@@ -1110,6 +1110,12 @@ pub fn run_launcher_with_config(
     // (with `abort` raised on failure) instead of leaving them detached.
     let mut coord_driver: Option<thread::JoinHandle<()>> = None;
     let mut rdv_driver: Option<thread::JoinHandle<()>> = None;
+    // Root cause slot for a coordinator that failed to START (formation
+    // deadline, bind/handshake error): the coord thread records it here and
+    // raises `abort`; the supervision verdict below prefers it over the
+    // child exit statuses (the children died BECAUSE the brain did).
+    let coord_fatal: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
@@ -1158,6 +1164,7 @@ pub fn run_launcher_with_config(
         // failure path instead of forcing process::exit(1).
         config = config.abort_flag(Arc::clone(&abort));
         let coord_abort = Arc::clone(&abort);
+        let coord_fatal_slot = Arc::clone(&coord_fatal);
         let coord_source =
             crate::distributed::port_mux::StreamSource::Mux(mux_control);
         coord_driver = Some(thread::Builder::new()
@@ -1232,6 +1239,19 @@ pub fn run_launcher_with_config(
                         eprintln!(
                             "cluster launcher: ClusterCoordinator start failed: {e}"
                         );
+                        // The run just lost its brain before it formed: no
+                        // coordinator means nothing will ever consume death
+                        // reports or broadcast Shutdown to the relays, so
+                        // supervision would wait on agents that wait on
+                        // relays that wait on ranks — forever (the
+                        // formation-window wedge, observed live). Record
+                        // the root cause and raise the run-wide abort so
+                        // the child watchers terminate the cohort and the
+                        // launcher surfaces THIS error.
+                        if let Ok(mut slot) = coord_fatal_slot.lock() {
+                            *slot = Some(e.to_string());
+                        }
+                        coord_abort.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             })
@@ -1501,7 +1521,21 @@ pub fn run_launcher_with_config(
             world_size,
             cohort_formed: Arc::clone(&cohort_formed),
         }),
+        // Run-wide abort: raised by the coord thread on a start failure
+        // (formation deadline) and by the local-spawn failure path — the
+        // watchers observe it and terminate their children, so supervision
+        // is released instead of waiting on a brainless cohort.
+        Some(Arc::clone(&abort)),
     );
+    // A coordinator start failure is the root cause of everything the
+    // watchers just reaped — surface it as THE run error rather than the
+    // downstream child kill statuses.
+    let any_failure = match coord_fatal.lock().ok().and_then(|mut s| s.take()) {
+        Some(root) => Some(TensorError::new(&format!(
+            "cluster launcher: coordinator failed at formation — {root}"
+        ))),
+        None => any_failure,
+    };
 
     // Terminal phase, published while the status endpoint is still up:
     // the cleanup passes below can take seconds, and a `fdl status`

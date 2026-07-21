@@ -108,6 +108,19 @@ pub struct ClusterCoordinatorConfig {
     /// of waiting the production default.
     pub rendezvous_timeout_secs: u64,
 
+    /// Wall-budget (seconds) for the post-join formation phase: every
+    /// admitted host's relay must dial the coordinator's control plane
+    /// (covering all `world_size` ranks) within this window of the
+    /// accept loop starting. The join window bounds worker *admission*;
+    /// this bounds the dial-in that follows it — without it, a relay
+    /// that registered but never dials (crashed between spawn and
+    /// connect, one dead leg of a split relay) left the accept loop
+    /// spinning until the whole cohort died of its own deadlines. On
+    /// expiry the coordinator errors loudly, naming the coverage
+    /// reached. Default `scaled_deadline_secs(60)` (see
+    /// `FLODL_NET_TIMEOUT_SCALE`).
+    pub formation_timeout_secs: u64,
+
     /// Global ranks running on the same host as the coordinator
     /// process (the launcher's host in production, the test
     /// process in tests). NCCL re-rendezvous prefers picking the
@@ -318,6 +331,7 @@ impl ClusterCoordinatorConfig {
             abort: None,
             heartbeat_timeout_secs: crate::distributed::wire::scaled_deadline_secs(30),
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
+            formation_timeout_secs: crate::distributed::wire::scaled_deadline_secs(60),
             local_ranks: Vec::new(),
             max_failure: None,
             save_path: None,
@@ -570,6 +584,13 @@ impl ClusterCoordinatorConfig {
     /// [`Self::rendezvous_timeout_secs`].
     pub fn rendezvous_timeout_secs(mut self, secs: u64) -> Self {
         self.rendezvous_timeout_secs = secs;
+        self
+    }
+
+    /// Override the formation dial-in wall-budget (see the field doc on
+    /// [`Self::formation_timeout_secs`]).
+    pub fn formation_timeout_secs(mut self, secs: u64) -> Self {
+        self.formation_timeout_secs = secs;
         self
     }
 

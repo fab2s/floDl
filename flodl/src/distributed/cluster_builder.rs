@@ -178,7 +178,7 @@ impl ClusterBuilder {
         // the HMAC envelope. Mirrors the YAML validator so the builder
         // stays 1:1 with the file schema. See
         // [`crate::distributed::is_reserved_cluster_env_key`].
-        for (k, _) in self.env.iter() {
+        for k in self.env.keys() {
             if crate::distributed::is_reserved_cluster_env_key(k) {
                 return Err(TensorError::new(&format!(
                     "ClusterBuilder: cluster-scope env key {k:?} is reserved \
@@ -188,7 +188,7 @@ impl ClusterBuilder {
             }
         }
         for w in &self.workers {
-            for (k, _) in w.env.iter() {
+            for k in w.env.keys() {
                 if crate::distributed::is_reserved_cluster_env_key(k) {
                     return Err(TensorError::new(&format!(
                         "ClusterBuilder: host {:?}: env key {k:?} is reserved \

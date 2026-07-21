@@ -197,6 +197,7 @@ fn exit_status_desc(st: &ExitStatus) -> String {
 pub(super) fn supervise_children(
     children: Vec<SupervisedChild>,
     elastic: Option<ElasticSupervision>,
+    run_abort: Option<Arc<AtomicBool>>,
 ) -> Option<TensorError> {
     if children.is_empty() {
         return None;
@@ -218,17 +219,31 @@ pub(super) fn supervise_children(
         all_forwarders.extend(fwd);
         let txc = tx.clone();
         let kill_flag = Arc::clone(&kill_all);
+        let abort_flag = run_abort.clone();
         watchers.push(thread::spawn(move || {
             // Poll instead of a blocking `wait()` so the kill-all flag can be
             // observed while the child still runs. `kill()` goes through the
             // owned `Child` (never a raw PID), so it is immune to PID reuse and
             // is only ever issued before this watcher reaps the child.
+            //
+            // `abort_flag` (the launcher's run-wide abort) is polled the same
+            // way: a run whose coordinator died at formation has no brain
+            // left to drive relays/agents to a shutdown — the only actor
+            // that can unblock the cohort is this watcher killing its own
+            // child (the ssh session's remote trap then cleans the far
+            // side). Without this poll the launcher wedged forever on
+            // all-ranks-dead-at-formation: relay blocked accepting its dead
+            // local ranks, agent waiting on the relay, launcher waiting on
+            // the agent (observed live on the rig, 2026-07-21).
             let mut killed = false;
             let st = loop {
                 match child.try_wait() {
                     Ok(Some(status)) => break Ok(status),
                     Ok(None) => {
-                        if !killed && kill_flag.load(Ordering::SeqCst) {
+                        let abort_hit = abort_flag
+                            .as_ref()
+                            .is_some_and(|f| f.load(Ordering::SeqCst));
+                        if !killed && (kill_flag.load(Ordering::SeqCst) || abort_hit) {
                             // SIGKILL (std has no graceful terminate without
                             // libc). Kill-all is only the fatal pre-formation /
                             // no-coordinator teardown; remote children still
