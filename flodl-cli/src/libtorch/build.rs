@@ -534,12 +534,19 @@ fn bundle_system_cudnn(dst_lib: &Path) {
                 Err(_) => continue,
             };
             if meta.file_type().is_symlink() {
-                let target = match fs::read_link(&path) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
                 let _ = fs::remove_file(&dst);
-                if std::os::unix::fs::symlink(&target, &dst).is_ok() {
+                // Re-create the link on unix (see the SONAME note above).
+                // Non-unix has no unprivileged symlink — and this scan is
+                // Linux-shaped anyway — so degrade to a resolving copy;
+                // the gate is about compiling on Windows, not behavior.
+                #[cfg(unix)]
+                if let Ok(target) = fs::read_link(&path) {
+                    if std::os::unix::fs::symlink(&target, &dst).is_ok() {
+                        copied += 1;
+                    }
+                }
+                #[cfg(not(unix))]
+                if fs::copy(&path, &dst).is_ok() {
                     copied += 1;
                 }
             } else if fs::copy(&path, &dst).is_ok() {
