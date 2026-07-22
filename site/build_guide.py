@@ -63,6 +63,10 @@ LINK_REWRITES = [
     (r"\(\.\./\.\./flodl/examples/([^)]+)\)", r"(https://github.com/flodl-labs/flodl/tree/main/flodl/examples/\1)"),
     # From docs/ root level (troubleshooting.md, pytorch_migration.md)
     (r"\(ddp\.md\)", "(/guide/ddp-reference)"),
+    (r"\(ddp\.md(#[^)]+)\)", r"(/guide/ddp-reference\1)"),
+    # ddp-benchmark.md is not a guide page; the site carries a hand-built
+    # summary at /ddp-benchmark (full report stays on GitHub).
+    (r"\(ddp-benchmark\.md\)", "(/ddp-benchmark)"),
     (r"\(pytorch_migration\.md\)", "(/guide/migration)"),
     (r"\(troubleshooting\.md\)", "(/guide/troubleshooting)"),
     (r"\(tutorials/00-rust-primer\.md\)", "(/guide/rust-primer)"),

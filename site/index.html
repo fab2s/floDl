@@ -325,21 +325,21 @@ commands:
           <th></th>
           <th>He et al. 2015</th>
           <th>Single RTX 5060 Ti</th>
-          <th>Mixed 5060 Ti + 1060 6GB</th>
+          <th>RTX 5060 Ti + 2&times; GTX 1060 (two hosts)</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td><strong>CIFAR-10 eval</strong></td>
           <td>91.25%</td>
-          <td>91.66%</td>
-          <td><strong>92.42%</strong></td>
+          <td>92.10%</td>
+          <td><strong>92.36%</strong></td>
         </tr>
         <tr>
           <td><strong>Wall time</strong></td>
           <td>-</td>
-          <td>3,127 s</td>
-          <td><strong>2,650 s</strong></td>
+          <td>699 s</td>
+          <td><strong>524 s</strong></td>
         </tr>
       </tbody>
     </table>
@@ -380,12 +380,12 @@ commands:
 
   <div class="showcase" style="max-width: 720px; margin: 1.5rem auto; text-align: left;">
     <div class="showcase-header">
-      <span>Six modes via <code>ElCheMode</code>, one line per mode</span>
+      <span>Five modes via <code>ElCheMode</code> + outer optimizers, one line each</span>
     </div>
-    <pre>.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">cpu_async</span>().<span class="fn">easgd_alpha</span>(<span class="num">0.6</span>))   <span class="cm">// best-in-class on reference rig</span>
-.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">nccl_async</span>())                   <span class="cm">// default; cross-epoch lookahead</span>
-.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">nccl_cadence</span>())                 <span class="cm">// strict cross-epoch lockstep</span>
-.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">nccl_sync</span>())                    <span class="cm">// per-batch AllReduce baseline</span></pre>
+    <pre>.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">nccl_cadence</span>())   <span class="cm">// default; slow card anchors, fast card ranges ahead</span>
+.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">cpu_cadence</span>())    <span class="cm">// fastest wall time on the reference rig</span>
+.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">cpu_async</span>())      <span class="cm">// barrier-free async, EASGD blending built in</span>
+.<span class="fn">outer_optimizer</span>(|| <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">NesterovMomentum</span>::<span class="fn">new</span>(<span class="num">0.7</span>, <span class="num">0.9</span>)))  <span class="cm">// DiLoCo: best eval on the rig</span></pre>
   </div>
 
   <p style="margin-top: 1.2rem;">
@@ -456,7 +456,7 @@ commands:
     <div class="feature">
       <div class="feature-icon ddp">&#9672;</div>
       <h3>Heterogeneous DDP</h3>
-      <p>Mix any CUDA GPUs, identical training loop for 1 or N. ElChe cadence lets the fast card range ahead while the slow one anchors sync. A 5060 Ti + 1060 cluster reaches 92.42% on CIFAR-10 ResNet-20 in less wall time than the 5060 Ti alone.</p>
+      <p>Mix any CUDA GPUs, identical training loop for 1 or N, across hosts. ElChe cadence lets the fast card range ahead while the slow ones anchor sync. A 5060 Ti + two 1060s spanning two hosts reach 92.36% on CIFAR-10 ResNet-20, beating the 5060 Ti alone on both accuracy and wall time.</p>
     </div>
   </div>
 </section>

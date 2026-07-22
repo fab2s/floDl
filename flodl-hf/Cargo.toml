@@ -31,7 +31,7 @@ hub = ["hf-hub", "dep:flodl-cli"]
 tokenizer = ["tokenizers"]
 
 [dependencies]
-flodl = { version = "=0.5.3", path = "../flodl" }
+flodl = { version = "=0.6.0", path = "../flodl" }
 safetensors = "0.4"
 serde_json = "1"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
@@ -39,7 +39,7 @@ tokenizers = { version = "0.20", optional = true }
 # Optional, gated behind `hub`: lets the export_hf CLI binary use the
 # FdlArgs derive so its --help output matches what `fdl flodl-hf export
 # -h` renders. Pure-Rust dep; pulls no libtorch.
-flodl-cli = { version = "=0.5.3", path = "../flodl-cli", optional = true }
+flodl-cli = { version = "=0.6.0", path = "../flodl-cli", optional = true }
 
 [[example]]
 name = "bert_embed"

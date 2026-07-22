@@ -319,7 +319,10 @@ services:
       - jekyll-bundle:/usr/local/bundle
     ports:
       - "4000:4000"
-    command: bash -c "bundle install && jekyll serve --watch --force_polling --livereload"
+    # --host 0.0.0.0: jekyll defaults to binding 127.0.0.1 INSIDE the
+    # container, which resets every connection docker-proxy forwards from
+    # the host (port mapped, page never loads).
+    command: bash -c "bundle install && jekyll serve --host 0.0.0.0 --watch --force_polling --livereload"
     environment:
       - JEKYLL_ENV=development
 

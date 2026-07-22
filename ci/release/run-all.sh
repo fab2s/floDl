@@ -47,7 +47,9 @@ fi
 
 PASS_LIST=""
 FAIL_LIST=""
+FOUND=0
 for script in $(ls -1 [0-9][0-9]-*.sh 2>/dev/null | sort); do
+    FOUND=$((FOUND + 1))
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  $script"
@@ -63,6 +65,16 @@ for script in $(ls -1 [0-9][0-9]-*.sh 2>/dev/null | sort); do
         FAIL_LIST="$FAIL_LIST $script"
     fi
 done
+
+# Zero checks found = the directory resolution failed (the classic cause:
+# sourcing the script with `.`, which makes $0 the shell and lands the cd
+# in the caller's cwd). An empty check-set must NEVER read as green.
+if [ "$FOUND" = 0 ]; then
+    echo "FAIL: no NN-*.sh check scripts found in $(pwd) — nothing was checked."
+    echo "Run it as a command: sh ci/release/run-all.sh   (sourcing with '.' breaks \$0-based dir resolution)"
+    # `return` when sourced (don't kill the caller's shell); exit otherwise.
+    return 1 2>/dev/null || exit 1
+fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

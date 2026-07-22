@@ -15,7 +15,7 @@ categories = ["command-line-utilities", "development-tools"]
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 serde_json = "1"
-flodl-cli-macros = { path = "../flodl-cli-macros", version = "=0.5.3" }
+flodl-cli-macros = { path = "../flodl-cli-macros", version = "=0.6.0" }
 
 [lib]
 name = "flodl_cli"
