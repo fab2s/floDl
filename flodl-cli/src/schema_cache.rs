@@ -12,9 +12,6 @@
 //! Cache invalidation is mtime-based: the cache file's mtime is compared
 //! against `fdl.yml` in the command dir. A cache older than its fdl.yml is
 //! considered stale. Users can also force-refresh.
-//!
-//! See `docs/design/run-config.md` — "2. Option schemas and the `--fdl-schema`
-//! contract" — for the JSON shape.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -175,32 +172,7 @@ fn find_docker_compose_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// POSIX-quote a single token so it survives `bash -c` as one argument.
-/// Local copy to avoid pulling `run.rs` into `schema_cache.rs` for one
-/// helper.
-fn posix_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | '@' | ',')
-    });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+use crate::util::shell::posix_quote;
 
 #[cfg(test)]
 mod tests {
@@ -258,6 +230,7 @@ mod tests {
             args: Vec::new(),
             options,
             strict: false,
+            ..Schema::default()
         }
     }
 
@@ -281,6 +254,25 @@ mod tests {
         let tmp = TestDir::new("sc");
         let path = tmp.path().join("bad.json");
         fs::write(&path, "not json at all").unwrap();
+        assert!(read_cache(&path).is_none());
+    }
+
+    #[test]
+    fn read_cache_unknown_field_falls_back_to_none() {
+        // Version-skew guard: a schema emitted by a NEWER
+        // flodl-cli-macros than this fdl knows (extra field) must not
+        // parse partially (deny_unknown_fields) — and the probe layer
+        // degrades to "no cache" so help still renders from the inline
+        // yml schema or none.
+        let tmp = TestDir::new("sc");
+        let path = tmp.path().join("newer.json");
+        let body = r#"{
+            "options": {
+                "model": { "type": "string" }
+            },
+            "field_from_the_future": true
+        }"#;
+        fs::write(&path, body).unwrap();
         assert!(read_cache(&path).is_none());
     }
 

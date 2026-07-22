@@ -1,0 +1,557 @@
+//! Averaging-cycle policy hooks for [`super::ClusterCoordinator`]:
+//! the `trigger_averaging` dispatcher (shared preamble, then the
+//! per-backend arm in `cycle_nccl.rs` / `cycle_cpu.rs`), the window
+//! feed (`build_window_report` and its coherence attestation), and
+//! the `finish_averaging_head` feedback half (ElChe verdict + guard +
+//! meta-controller + telemetry). Transport mechanics live in the
+//! `cycle_*` siblings; this file decides and retunes, it does not
+//! move bytes.
+
+use std::time::Instant;
+
+use crate::distributed::ddp_run::convergence::ConvergenceAction;
+use crate::distributed::el_che::{AnchorVerdict, WindowReport};
+use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+use crate::distributed::wire::ControlMsgWire;
+use crate::tensor::Result;
+
+use super::{ClusterCoordinator, EpochDSummary};
+
+impl ClusterCoordinator {
+    /// Per-AllReduce d-aggregator update. Called once per
+    /// `finish_averaging_{nccl,cpu}` after the convergence guard's
+    /// `d_raw` + `k_max` are known.
+    pub(super) fn update_epoch_d_aggregator(&mut self, d_raw: f64, k_max: usize) {
+        self.epoch_d_count += 1;
+        self.epoch_d_sum += d_raw;
+        if d_raw < self.epoch_d_min {
+            self.epoch_d_min = d_raw;
+        }
+        if d_raw > self.epoch_d_max {
+            self.epoch_d_max = d_raw;
+        }
+        self.epoch_last_d = d_raw;
+        self.epoch_last_k_max = k_max;
+    }
+
+    /// Drain the epoch d-aggregator + reset to identity. Called from
+    /// the post-aggregate hook to build the `DivergenceEpoch` event
+    /// payload.
+    pub(super) fn take_epoch_d_summary(&mut self) -> EpochDSummary {
+        let snap = EpochDSummary {
+            count: self.epoch_d_count,
+            d_min: self.epoch_d_min,
+            d_max: self.epoch_d_max,
+            d_sum: self.epoch_d_sum,
+            d_at_epoch_end: self.epoch_last_d,
+            k_at_epoch_end: self.epoch_last_k_max,
+        };
+        self.epoch_d_min = f64::INFINITY;
+        self.epoch_d_max = f64::NEG_INFINITY;
+        self.epoch_d_sum = 0.0;
+        self.epoch_d_count = 0;
+        snap
+    }
+
+    /// The per-rank `(ms, batches)` pair fed to
+    /// [`crate::distributed::ElChe::report_timing`] at each averaging cycle.
+    /// ElChe derives `ms_per_batch[r] = ms[r] / batches[r]`.
+    ///
+    /// **Cadence and Async** (both progressive) feed the rank-reported
+    /// DELIVERED cost — the window ledger's marginal delivered ms (Σ
+    /// per-batch `batch_ms + data_ms` = compute + data) over its MATCHED
+    /// batch count. Accumulated CONTINUOUSLY from each `Batch`
+    /// report (see `event_loop`), so it is present at the reduce by
+    /// construction — no completion-frame race. ElChe then schedules
+    /// per-rank windows on realized wall instead of the compute-only
+    /// wall (Σ per-batch `train_step` ms). This closes the
+    /// cpu-cadence idle (a data-starved rank's delivered cost rises, so the
+    /// balancer stops over-allocating the fast rank) AND makes the nccl
+    /// path data-/transport-aware — required when identical GPUs sit at
+    /// different network distances or behind asymmetric storage.
+    ///
+    /// The matched divisor is what makes this safe on BOTH backends. ms and
+    /// batch count accumulate TOGETHER per `Batch`, so even when NCCL's
+    /// `finish_averaging_nccl` runs INLINE in `trigger_averaging` (before
+    /// the window's last completion drains), dividing the delivered sum by
+    /// ITS OWN batch count yields a correct per-batch estimate — and a late
+    /// batch leaking into the next window is benign (ms and count leak
+    /// together). The accumulator is MARGINAL: the window's FIRST batch is
+    /// routed to the fill slot by `WindowLedger::record_batch` so the
+    /// per-chunk fixed fill cost never enters the quoted per-batch rate.
+    ///
+    /// Per-rank fallback to the compute-only `(wall, steps)` pair when a
+    /// rank has no delivered sample this window (cold-start, or a
+    /// single-batch window whose only batch the marginal skip dropped) so
+    /// no spurious zero / zero-ms report poisons ElChe's trust window.
+    ///
+    /// **Sync** (non-progressive) keeps the compute-only `(wall, steps)`
+    /// feed unchanged. Every alive mover (steps > 0) has a delivered
+    /// sample this window (nonzero ms AND batches). This is both the
+    /// all-or-none coherence predicate for the delivered feed in
+    /// [`Self::build_window_report`] and the settle condition for
+    /// `trigger_averaging`'s pre-finish drain.
+    pub(super) fn movers_delivered_complete(&self) -> bool {
+        (0..self.world_size)
+            .filter(|&r| !self.is_dead(r) && self.window.steps(r) > 0)
+            // REPORT-AT-SYNC: the delivered sample is present at the reduce
+            // by construction from the continuous `Batch` reports — true for
+            // every stepping rank with >= 2 batches this window. A
+            // single-batch window (marginal skipped its only batch) has no
+            // sample -> coherent compute-scale fallback for that (rare)
+            // window.
+            .all(|r| self.window.has_delivered_sample(r))
+    }
+
+    /// Whether this run's mode may ride the delivered timing scale at
+    /// all: CPU Cadence/Async + NCCL Cadence. NCCL Cadence is
+    /// transport-aware because the ledger's delivered pair accumulates
+    /// continuously per `Batch`, so it is present at the inline finish
+    /// by construction — the completion-frame race that originally
+    /// forced NCCL onto the compute-only feed is gone. Without the
+    /// delivered feed, NCCL allocation is blind to data + transport
+    /// (x1-link rig: shares [0.53, 0.235, 0.235] vs the true ~4.9×
+    /// delivered ratio → fast rank ~45% idle at every barrier). NCCL
+    /// Async stays excluded: overshoot streaming under the inline
+    /// finish is unvalidated there. Sync (non-progressive) always
+    /// feeds the compute-only scale.
+    fn delivered_capable(&self) -> bool {
+        match self.backend {
+            AverageBackend::Cpu => {
+                matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
+            }
+            AverageBackend::Nccl => matches!(self.policy, ApplyPolicy::Cadence),
+        }
+    }
+
+    /// Assemble this window's [`WindowReport`] from the ledger — the
+    /// event the coordinator feeds `ElChe::report_window` once per
+    /// averaging cycle.
+    ///
+    /// The `delivered_coherent` attestation is the coordinator's half
+    /// of the mixed-scale inversion guard (the scale-SELECTION half
+    /// lives in `WindowReport::select_feed`, next to ElChe's relative
+    /// allocation model): the delivered scale is only offered when the
+    /// mode supports it AND every alive mover has a delivered sample
+    /// this window ([`Self::movers_delivered_complete`] — the
+    /// coordinator owns that predicate because it owns membership and
+    /// the ledger). A single mover on the compute scale against peers
+    /// on delivered would invert the allocation (rig: equal-speed
+    /// Pascals drifting to 0.33 vs 0.10 shares on cpu-async; the
+    /// x1-link Pascal drawing ~73% of all steps and diverging to NaN).
+    pub(super) fn build_window_report(&self, sync_ms: f64) -> WindowReport {
+        WindowReport {
+            wall_ms: self.window.wall_ms_all().to_vec(),
+            steps: self.window.steps_all().to_vec(),
+            delivered_ms: self.window.delivered_ms_all().to_vec(),
+            delivered_batches: self.window.delivered_batches_all().to_vec(),
+            fill_ms: (0..self.world_size)
+                .map(|r| self.window.fill_excess_ms(r))
+                .collect(),
+            delivered_coherent: self.delivered_capable()
+                && self.movers_delivered_complete(),
+            sync_ms,
+        }
+    }
+
+    /// `-vvv` delivered-vs-compute per-cycle dump (Cadence + Async — the
+    /// progressive policies that ride the delivered feed). Surfaces the gap
+    /// the fix closes: `pb_delivered_ms/batch` (what ElChe schedules on,
+    /// over the matched divisor) vs `compute_ms/batch` (what it used to,
+    /// over `steps_since_avg`), per rank, against the resulting
+    /// `batch_counts`. Call BEFORE the per-cycle counter resets. No-op
+    /// unless `-vvv`.
+    fn dump_delivered_timing(&self, reduce_ms: f64) {
+        if !self.prof_enabled
+            || !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
+        {
+            return;
+        }
+        let r1 = |v: &[f64]| -> Vec<f64> {
+            v.iter().map(|m| (m * 10.0).round() / 10.0).collect()
+        };
+        let compute_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.window.steps(r).max(1);
+                self.window.wall_ms(r) / n as f64
+            })
+            .collect();
+        // The feed: rank-reported DELIVERED (compute+data), accumulated
+        // continuously per `Batch` (marginal), present at sync by
+        // construction.
+        let pb_delivered_per_batch: Vec<f64> = (0..self.world_size)
+            .map(|r| {
+                let n = self.window.delivered_batches(r).max(1);
+                self.window.delivered_ms(r) / n as f64
+            })
+            .collect();
+        // Which feed did ElChe actually schedule on this cycle? `delivered`
+        // means every stepping rank had a delivered sample;
+        // `COMPUTE-FALLBACK` means the all-or-none coherence gate
+        // ([`Self::movers_delivered_complete`]) dropped the WHOLE cohort to
+        // compute-only because at least one mover lacked one. `missing`
+        // names those movers — the culprits that trip the fallback. A run
+        // that alternates delivered / COMPUTE-FALLBACK is mixing scales
+        // across windows.
+        let feed = if self.movers_delivered_complete() {
+            "delivered"
+        } else {
+            "COMPUTE-FALLBACK"
+        };
+        let missing: Vec<usize> = (0..self.world_size)
+            .filter(|&r| {
+                !self.is_dead(r)
+                    && self.window.steps(r) > 0
+                    && !self.window.has_delivered_sample(r)
+            })
+            .collect();
+        eprintln!(
+            "[coord-prof] {:?} {:?} | feed={feed} missing={missing:?} \
+             pb_delivered_ms/batch={:?} compute_ms/batch={:?} steps={:?} \
+             pb_batches={:?} batch_counts={:?} reduce_ms={:.1}",
+            self.backend,
+            self.policy,
+            r1(&pb_delivered_per_batch),
+            r1(&compute_per_batch),
+            self.window.steps_all(),
+            self.window.delivered_batches_all(),
+            self.el_che.batch_counts(),
+            reduce_ms,
+        );
+    }
+
+    /// Trigger an averaging cycle. Dispatches to the backend-specific
+    /// trigger message + finish hook. Mirrors OLD
+    /// `Coordinator::trigger_averaging`.
+    ///
+    /// - NCCL: broadcast `SyncNow`; finish_averaging_nccl runs
+    ///   convergence inline using last-round divergence data + emits
+    ///   `SetGlobalStep`.
+    /// - CPU: broadcast `RequestParams`; finish_averaging_cpu mirrors
+    ///   the NCCL flow but emits `Update{version}` as the lifecycle
+    ///   barrier. Workers receive averaged tensors via the data
+    ///   channel (`CpuReduceClient`)
+    ///   between RequestParams and the next round.
+    pub fn trigger_averaging(&mut self) -> Result<()> {
+        // Open a SyncStart window on the shared timeline so the user-
+        // side `summary.sync_count` reflects this averaging cycle.
+        // `sync_start` records wall-clock for the matching SyncEnd's
+        // `duration_ms` in `finish_averaging_*`.
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::SyncStart);
+        }
+        self.sync_start = Some(Instant::now());
+        // CHECKPOINT ARM (before any RequestParams/SyncNow broadcast = before the
+        // param freeze): if a checkpoint is due this reduce, capture coverage now
+        // (so `covered ⊆ consensus`; a post-reduce capture would over-count under
+        // async overshoot → lost data) and arm the consensus model write. The
+        // `.meta.json` is written at the matching `finish_averaging_*` from the
+        // stashed coverage + final counters.
+        self.maybe_arm_checkpoint();
+        match self.backend {
+            AverageBackend::Nccl => self.arm_nccl_cycle(),
+            AverageBackend::Cpu => self.arm_cpu_cycle(),
+        }
+    }
+
+    /// Shared first half of `finish_averaging_nccl` / `finish_averaging_cpu`:
+    /// feed ElChe the window timing, run the convergence-guard verdict +
+    /// LR-aware meta-controller, apply the anchor action, bump
+    /// `version` / `avg_count` / `global_step`, and emit the per-cycle
+    /// telemetry (Divergence / GuardTelemetry / AnchorChanged). Everything
+    /// here is backend-independent; the per-backend middle (NCCL
+    /// `SetGlobalStep` vs CPU fold + `Update` fan-out) follows it.
+    pub(super) fn finish_averaging_head(&mut self) {
+        let prev_sync_ms = self.cycle.take_last_sync_ms();
+        // Snapshot anchor BEFORE the guard verdict + meta-nudge so the
+        // post-cycle `AnchorChanged` event captures the cycle's net
+        // change.
+        let old_anchor = self.el_che.anchor();
+        // Stage per-rank callback slack BEFORE report_timing so the
+        // recompute inside ElChe applies it to the next cycle's
+        // batch_counts (when the next cycle is the LAST cycle of the
+        // current epoch).
+        self.maybe_apply_callback_slack_for_next_cycle();
+        // ONE timing event per cycle: the window's observations (both
+        // scales + fill + the delivered-coherence attestation) go to
+        // ElChe as a WindowReport; scale selection and the fill staging
+        // happen inside `report_window` (a fully-idle window reports
+        // nothing, so no zero-ms sample poisons the trust windows).
+        let report_window = self.build_window_report(prev_sync_ms);
+        self.el_che.report_window(&report_window);
+        if !self.calibrated && self.el_che.is_calibrated() {
+            self.calibrated = true;
+        }
+        self.dump_delivered_timing(prev_sync_ms);
+
+        let report = self.cycle.divergence_report();
+        let cycle_batches: usize = self.window.total_steps();
+        let k_max = self.window.max_steps();
+        let action = self.convergence_guard.report(&report, cycle_batches, k_max);
+
+        // LR-aware meta-controller (OLD `observe_meta` parity): consult
+        // the meta after the guard verdict; a `NudgeDown` MetaAction
+        // dispatches to `el_che.nudge_anchor_down` and composes
+        // multiplicatively with the guard's own anchor adjustment
+        // below.
+        self.observe_meta(action);
+
+        self.version += 1;
+        self.avg_count += 1;
+
+        // Map the guard's action onto the source-agnostic verdict seam
+        // (`ElChe::apply_verdict`); the coordinator's own overshoot knob
+        // is mutated alongside — it is scheduling state ElChe does not
+        // own. On Stable, ElChe may grow the window to amortize sync
+        // cost; convergence is maintained separately by SuppressGrowth /
+        // NudgeDown pulling the anchor back when weight-space divergence
+        // rises — growth and convergence balance rather than being
+        // hard-disabled.
+        match action {
+            ConvergenceAction::Stable => {
+                self.el_che.apply_verdict(AnchorVerdict::Stable {
+                    relax_up: self.policy == ApplyPolicy::Async
+                        && self.elche_relax_up,
+                });
+                if self.policy == ApplyPolicy::Async && self.overshoot_auto {
+                    self.max_overshoot =
+                        (self.max_overshoot + 1).min(self.overshoot_ceiling);
+                }
+            }
+            ConvergenceAction::SuppressGrowth => {
+                self.el_che.apply_verdict(AnchorVerdict::SuppressGrowth);
+            }
+            ConvergenceAction::NudgeDown { factor } => {
+                self.el_che.apply_verdict(AnchorVerdict::NudgeDown { factor });
+                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
+                    self.max_overshoot = self.overshoot_initial;
+                }
+            }
+        }
+        if self.policy == ApplyPolicy::Async {
+            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
+        }
+
+        self.global_step += cycle_batches;
+
+        // Per-AllReduce divergence event + epoch aggregator update.
+        // `d_raw` is the max relative delta across ranks for this
+        // cycle; the epoch-level aggregator drains in
+        // `try_advance_or_shutdown_after_aggregate`. Lambda fields are
+        // intentionally None — analyze.rs recomputes guard-specific
+        // λ̂ from observables now that the guard pipeline is plural.
+        let d_raw = report.max_relative_delta();
+        self.update_epoch_d_aggregator(d_raw, k_max);
+        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::Divergence {
+                d_raw,
+                lambda_raw: None,
+                lambda_ema: None,
+                k_used: cycle_batches,
+                k_max,
+                step: self.global_step,
+                deltas: report.deltas.clone(),
+                post_norm: report.post_norm,
+                pre_norms: report.pre_norms.clone(),
+                epoch: Some(in_flight_epoch),
+            });
+            let telemetry = self.convergence_guard.telemetry();
+            if !telemetry.is_empty() {
+                tl.event(crate::monitor::EventKind::GuardTelemetry {
+                    epoch: in_flight_epoch,
+                    step: self.global_step,
+                    values: telemetry
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                });
+            }
+            let new_anchor = self.el_che.anchor();
+            if new_anchor != old_anchor {
+                tl.event(crate::monitor::EventKind::AnchorChanged {
+                    from: old_anchor,
+                    to: new_anchor,
+                });
+            }
+        }
+    }
+
+    /// Shared second half of `finish_averaging_nccl` / `finish_averaging_cpu`:
+    /// reset the window accumulators, clear the throttle / HOLD / divergence
+    /// slots, and kick idle progressive ranks back into motion. Callers
+    /// finish with their own end-of-cycle events (`CpuAvgEnd`,
+    /// `emit_sync_end`). `steps_since_avg` is NOT reset here — its
+    /// placement is backend-specific (the CPU path must reset BEFORE the
+    /// atomic-dispatch fold so `cap_to_reduce_budget` sees the fresh
+    /// window).
+    pub(super) fn finish_averaging_tail(&mut self) {
+        // Window timing (compute wall + delivered + fill) resets with the
+        // window; step counts reset backend-specifically (see callers).
+        self.window.reset_timing();
+        self.cycle.clear_throttled();
+        for h in &mut self.dispatch_hold_logged {
+            *h = false;
+        }
+        self.cycle.reset_divergence_signals();
+        // Overshoot gate is open again — kick any rank still sitting in
+        // `wait_for_epoch_plan` (gated, or just finished its last chunk
+        // before the cycle) so progressive dispatch doesn't stall until
+        // the next epoch-aggregate hook.
+        self.wake_idle_ranks_in_progressive();
+    }
+
+    /// Close the SyncStart window opened in `trigger_averaging`. Emits
+    /// `SyncEnd { duration_ms }` on the shared timeline if one is
+    /// attached and a `sync_start` was recorded. No-op otherwise.
+    /// Called from the end of both `finish_averaging_nccl` and
+    /// `finish_averaging_cpu`.
+    pub(super) fn emit_sync_end(&mut self) {
+        if let Some(start) = self.sync_start.take() {
+            if let Some(ref tl) = self.timeline {
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
+            }
+        }
+    }
+
+    /// ARM a one-shot coverage-granular checkpoint at the START of a reduce
+    /// cycle (called from `trigger_averaging`, before any
+    /// `RequestParams`/`SyncNow` broadcast — i.e. before the workers freeze
+    /// their params for this reduce).
+    ///
+    /// When `checkpoint_at_epoch` is armed and the cohort has reached that
+    /// epoch, this:
+    /// 1. captures coverage NOW (`snapshot_coverage`) and stashes it in
+    ///    `pending_checkpoint_coverage` for the matching `finish_*` to write —
+    ///    capturing before the param freeze guarantees `covered ⊆ consensus`
+    ///    (a chunk completed-and-drained before the freeze is provably in each
+    ///    rank's frozen params; anything later is recorded uncovered → bounded
+    ///    redo on resume, never lost data);
+    /// 2. arms the consensus MODEL write at the forge — CPU: the controller
+    ///    reduce thread taps this round's averaged frame
+    ///    ([`crate::distributed::CheckpointForge::arm`]); NCCL: elected-rank
+    ///    write (wired in a follow-on step);
+    /// 3. disarms `checkpoint_at_epoch` so it fires exactly once.
+    pub(super) fn maybe_arm_checkpoint(&mut self) {
+        let Some(target_epoch) = self.checkpoint_at_epoch else {
+            return;
+        };
+        // Fire at the first reduce where any live rank has reached the target
+        // epoch (typically mid-epoch, so the coverage block is non-trivial).
+        let reached = (0..self.world_size)
+            .any(|r| !self.is_dead(r) && self.rank_epoch[r] >= target_epoch);
+        if !reached {
+            return;
+        }
+        self.checkpoint_at_epoch = None; // exactly once
+        // Capture coverage at the freeze boundary; consumed at finish.
+        self.pending_checkpoint_coverage = Some(self.snapshot_coverage());
+        // Arm the model write at the forge.
+        match self.backend {
+            AverageBackend::Cpu => {
+                if let (Some(stem), Some(forge)) =
+                    (self.save_path.as_ref(), self.checkpoint_forge.as_ref())
+                {
+                    let model_path =
+                        crate::distributed::CheckpointBundle::model_path(stem);
+                    if forge.can_write_model() {
+                        forge.arm(model_path);
+                    } else {
+                        crate::verbose!(
+                            "  ddp: checkpoint armed but no model schema captured; \
+                             writing meta-only (epoch {target_epoch})"
+                        );
+                    }
+                }
+            }
+            AverageBackend::Nccl => {
+                // NCCL consensus is on-device across ranks (nothing to arm
+                // controller-side). The elected-rank model write is dispatched
+                // from `finish_pending_checkpoint_meta` at the tail of
+                // `finish_averaging_nccl`, AFTER the collective, so the rank
+                // holds the post-collective consensus. Nothing to do here
+                // beyond the coverage capture already done above.
+                let _ = target_epoch;
+            }
+        }
+    }
+
+    /// Write the stashed checkpoint `.meta.json` at the end of a reduce cycle
+    /// (called from both `finish_averaging_*`). No-op unless
+    /// `maybe_arm_checkpoint` captured coverage for this cycle. The meta pairs
+    /// the trigger-time coverage with the now-final post-round counters
+    /// (epoch / global_step / sync_round) + ElChe/guard state, stamped
+    /// [`crate::distributed::SaveReason::Checkpoint`]. Mirrors the
+    /// controller-side meta write in `dispatch_shutdown_with_save`.
+    pub(super) fn finish_pending_checkpoint_meta(&mut self) {
+        let Some(coverage) = self.pending_checkpoint_coverage.take() else {
+            return;
+        };
+        let Some(stem) = self.save_path.as_ref() else {
+            eprintln!(
+                "flodl ddp: checkpoint coverage captured but save_path is unset; \
+                 meta not written"
+            );
+            return;
+        };
+        let meta_path = crate::distributed::CheckpointBundle::meta_path(stem);
+        // Cluster-wide epoch = max across live ranks (the highest any reached).
+        let epoch = self.rank_epoch.iter().copied().max().unwrap_or(0);
+        let mut elche_state = self.el_che.to_state();
+        elche_state.trend_history = self.convergence_guard.trend_history();
+        let meta = crate::distributed::CheckpointMeta::new(
+            epoch,
+            self.global_step,
+            self.avg_count,
+            self.world_size,
+            crate::distributed::SaveReason::Checkpoint,
+        )
+        .with_elche_state(elche_state)
+        .with_coverage(coverage);
+        // Detach the meta file write so the checkpoint never touches the
+        // training clock (matches the forge's detached `.fdl` write). The
+        // meta is built synchronously from coordinator state above (cheap);
+        // only the serialize + atomic disk write runs off-thread. Ownership
+        // of `meta` + `meta_path` moves into the writer.
+        let version = self.version;
+        let spawn = std::thread::Builder::new()
+            .name("flodl-ckpt-meta".to_string())
+            .spawn(move || match meta.write_to_file(&meta_path) {
+                Ok(()) => crate::verbose!(
+                    "  ddp: checkpoint meta written {} (epoch {epoch}, version {version})",
+                    meta_path.display(),
+                ),
+                Err(e) => eprintln!(
+                    "flodl ddp: checkpoint meta write to {} failed: {e}",
+                    meta_path.display(),
+                ),
+            });
+        if let Err(e) = spawn {
+            eprintln!("flodl ddp: failed to spawn checkpoint meta writer thread: {e}");
+        }
+        // NCCL consensus MODEL write: the consensus is on-device across ranks
+        // (no controller-side frame to tap), so dispatch the elected rank to
+        // write its post-collective `self.model`. We are at the tail of
+        // `finish_averaging_nccl`, AFTER the in-place weighted AllReduce, so
+        // the rank holds the pure consensus — params work-weighted, f32
+        // buffers mover-averaged (matching the CPU forge's frame semantics);
+        // mpsc/wire FIFO orders this frame after
+        // the `SyncNow` it already processed. CPU is a no-op here — its model
+        // was already written by the controller forge tap.
+        if matches!(self.backend, AverageBackend::Nccl) {
+            let target = self.checkpoint_role;
+            if target < self.world_size && !self.is_dead(target) {
+                let msg = ControlMsgWire::SaveConsensusModel {
+                    target_rank: target as u64,
+                };
+                if let Err(e) = self.send_control(target, &msg) {
+                    eprintln!(
+                        "flodl ddp: SaveConsensusModel dispatch to rank {target} \
+                         failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+}

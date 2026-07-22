@@ -42,20 +42,20 @@ sh ci/release/03-lint-docs.sh
 
 ## Common failures
 
-- **`02-version-sync` fails** -- you bumped `Cargo.toml` but the
+- **`02-version-sync` fails** - you bumped `Cargo.toml` but the
   `[Unreleased]` header in `CHANGELOG.md` still says `[Unreleased]`.
   Rename it to `[X.Y.Z] - YYYY-MM-DD`.
-- **`03-lint-docs` A (make refs)** -- a command was removed from the
+- **`03-lint-docs` A (make refs)** - a command was removed from the
   root Makefile but docs still reference it. Update the doc or add a
   new Makefile target.
-- **`03-lint-docs` B (hardcoded paths)** -- someone pasted their local
+- **`03-lint-docs` B (hardcoded paths)** - someone pasted their local
   checkout path into a script. Swap for `"$(dirname "$0")/.."` in
   shell, `(Resolve-Path "$PSScriptRoot\..").Path` in PowerShell, or
   `env::current_dir()` in Rust.
-- **`03-lint-docs` C (fdl cmd)** -- a `fdl bench-cpu`-style leftover
+- **`03-lint-docs` C (fdl cmd)** - a `fdl bench-cpu`-style leftover
   in docs after the command was removed. Update or drop the mention.
-- **`08-publish-dry` missing `version =`** -- a `path = "../foo"` dep
-  without a `version = "X.Y.Z"` companion -- crates.io requires both.
+- **`08-publish-dry` missing `version =`** - a `path = "../foo"` dep
+  without a `version = "X.Y.Z"` companion - crates.io requires both.
 
 ## Tagging and publishing
 
@@ -82,7 +82,7 @@ cargo publish -p flodl-cli
 ```
 
 Wait for each to index on crates.io (typically a few seconds) before
-running the next -- `flodl` depends on `flodl-sys`, so the latter must
+running the next - `flodl` depends on `flodl-sys`, so the latter must
 be indexed first.
 
 ## After the release

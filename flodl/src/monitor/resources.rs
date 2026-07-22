@@ -1,18 +1,46 @@
 //! System resource sampling: CPU, RAM, GPU memory, GPU utilization.
 //!
 //! CPU and RAM are read from `/proc/stat` and `/proc/meminfo` (Linux only).
-//! GPU metrics use the FFI layer (CUDA + NVML).
+//! GPU identity (count, names, VRAM totals) comes from
+//! [`crate::sys::detect_gpus`] (nvidia-smi) and live metrics from NVML;
+//! neither initializes the CUDA runtime. The only CUDA-context-dependent
+//! read, caching-allocator reserved bytes, is gated on
+//! [`crate::tensor::cuda_has_primary_context`] so that constructing or
+//! polling a sampler never creates a CUDA context as a side effect.
+//! `Monitor::new` runs in every process, including the pre-fan-out
+//! launcher, where touching CUDA would break the
+//! no-CUDA-before-`Trainer::run` invariant and pin VRAM on every GPU
+//! for the life of the process.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Background NVML poll interval. Higher rate means denser samples per
+/// epoch, so a single barrier-period sample (which can read 0%) gets
+/// diluted by surrounding compute samples in the rolling-window mean
+/// returned from [`ResourceSampler::sample`]. 250 ms keeps NVML
+/// overhead negligible while giving ~13 samples per 3 s epoch.
+const GPU_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Rolling-window size for per-device GPU utilization samples. At
+/// [`GPU_POLL_INTERVAL`] = 250 ms, 32 entries covers ~8 s of history
+/// — long enough to smooth out brief sync-barrier dips, short enough
+/// that the displayed average still tracks real workload shifts
+/// (mode changes, batch-size sweeps, schedule transitions) within a
+/// few seconds rather than blurring the entire run.
+const GPU_UTIL_WINDOW: usize = 32;
+
 /// Per-device GPU snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct GpuSnapshot {
-    /// CUDA device index.
+    /// Physical device index (nvidia-smi / NVML enumeration). Matches
+    /// the CUDA runtime index when `CUDA_VISIBLE_DEVICES` is unset; in
+    /// scoped-down processes it identifies the actual card rather than
+    /// the remapped runtime slot.
     pub device_index: u8,
     /// Device name (e.g., "NVIDIA GeForce RTX 5060 Ti").
     pub name: String,
@@ -33,13 +61,19 @@ pub struct ResourceSample {
     pub ram_used_bytes: Option<u64>,
     /// Total system RAM in bytes.
     pub ram_total_bytes: Option<u64>,
-    /// GPU utilization percentage (0-100), None if NVML unavailable.
-    /// Aggregate: mean across all GPUs (background-averaged over the epoch).
+    /// GPU utilization percentage (0-100) for the rank in `aggregate_rank`,
+    /// None if NVML unavailable.
     pub gpu_util_percent: Option<f32>,
-    /// Total physical VRAM in bytes (device 0).
+    /// Total physical VRAM in bytes for the rank in `aggregate_rank`.
     pub vram_total_bytes: Option<u64>,
-    /// Bytes reserved by the CUDA caching allocator (device 0).
+    /// Bytes reserved by the CUDA caching allocator on the rank in
+    /// `aggregate_rank`.
     pub vram_allocated_bytes: Option<u64>,
+    /// CUDA device index whose data populates the aggregate fields above.
+    /// Picked uniformly at random per `sample()` call so that, over the
+    /// run, each rank is observed roughly equally without paying O(N)
+    /// per-tick aggregation cost. Per-GPU detail is preserved in `gpus`.
+    pub aggregate_rank: Option<u8>,
     /// Per-GPU snapshots (empty on CPU builds).
     pub gpus: Vec<GpuSnapshot>,
 }
@@ -109,10 +143,16 @@ pub(super) struct CpuTimes {
     pub(super) idle: u64,
 }
 
-/// Per-device GPU utilization accumulator for background polling.
+/// Per-device GPU utilization rolling-window accumulator. Background
+/// poller pushes a sample per device every [`GPU_POLL_INTERVAL`];
+/// [`ResourceSampler::sample`] reads the per-device mean over the last
+/// [`GPU_UTIL_WINDOW`] entries without draining the buffer. This
+/// dilutes single-sample dips when one poll lands during a sync
+/// barrier; with ~32 samples in the window, the per-device mean tracks
+/// the between-syncs compute load rather than any individual barrier-
+/// period zero.
 struct GpuUtilAccum {
-    sum: Vec<f64>,
-    count: Vec<u32>,
+    samples: Vec<VecDeque<f32>>,
 }
 
 /// Handle for the background GPU utilization poller thread.
@@ -131,6 +171,36 @@ impl Drop for GpuPollerHandle {
     }
 }
 
+/// Static per-device identity, captured once at sampler construction
+/// from [`crate::sys::detect_gpus`] (nvidia-smi). No CUDA runtime
+/// involvement, and no per-sample process spawn.
+struct GpuStatic {
+    /// Physical index (nvidia-smi / NVML enumeration). NVML queries
+    /// must use this: NVML ignores `CUDA_VISIBLE_DEVICES`.
+    physical_index: u8,
+    name: String,
+    total_bytes: Option<u64>,
+}
+
+/// Enumerate GPUs without touching the CUDA runtime. Position in the
+/// returned Vec is used as the CUDA runtime index for context-gated
+/// allocator reads (exact when `CUDA_VISIBLE_DEVICES` is unset or an
+/// ascending index list; a reordering list like `1,0` would mislabel
+/// allocator stats, which nothing in flodl's launch paths produces).
+fn detect_gpu_statics() -> Vec<GpuStatic> {
+    if !cfg!(feature = "cuda") {
+        return Vec::new();
+    }
+    crate::sys::detect_gpus()
+        .into_iter()
+        .map(|g| GpuStatic {
+            physical_index: g.index,
+            name: g.name,
+            total_bytes: Some(g.total_memory_mb * 1024 * 1024),
+        })
+        .collect()
+}
+
 /// Stateful resource sampler. Maintains previous CPU reading for delta
 /// computation and a background thread for GPU utilization averaging.
 ///
@@ -139,8 +209,13 @@ impl Drop for GpuPollerHandle {
 /// interval since the last call. This prevents point-in-time sampling
 /// artifacts in heterogeneous DDP (where the fast GPU may be idle at
 /// epoch boundaries, giving misleadingly low single-sample readings).
+///
+/// Construction and sampling never initialize the CUDA runtime (see
+/// the module docs); a sampler is safe in any process, launcher
+/// included.
 pub struct ResourceSampler {
     prev_cpu: Option<CpuTimes>,
+    gpus: Vec<GpuStatic>,
     gpu_poller: Option<GpuPollerHandle>,
 }
 
@@ -155,21 +230,22 @@ impl ResourceSampler {
     /// first delta and starting a background GPU utilization poller.
     pub fn new() -> Self {
         let prev_cpu = read_cpu_times();
-        let gpu_poller = Self::start_gpu_poller();
-        Self { prev_cpu, gpu_poller }
+        let gpus = detect_gpu_statics();
+        let gpu_poller = Self::start_gpu_poller(&gpus);
+        Self { prev_cpu, gpus, gpu_poller }
     }
 
-    /// Start a background thread that polls NVML utilization every ~1 second.
-    /// Returns `None` if no CUDA devices are available.
-    fn start_gpu_poller() -> Option<GpuPollerHandle> {
-        let n = crate::tensor::cuda_device_count();
-        if n <= 0 {
+    /// Start a background thread that polls NVML utilization at
+    /// [`GPU_POLL_INTERVAL`] and feeds a per-device rolling window
+    /// (window position i tracks `gpus[i]`, polled by physical index).
+    /// Returns `None` if no GPUs are visible.
+    fn start_gpu_poller(gpus: &[GpuStatic]) -> Option<GpuPollerHandle> {
+        if gpus.is_empty() {
             return None;
         }
-        let n = n as usize;
+        let physical: Vec<u8> = gpus.iter().map(|g| g.physical_index).collect();
         let accum = Arc::new(Mutex::new(GpuUtilAccum {
-            sum: vec![0.0; n],
-            count: vec![0; n],
+            samples: physical.iter().map(|_| VecDeque::with_capacity(GPU_UTIL_WINDOW)).collect(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let accum2 = accum.clone();
@@ -178,15 +254,18 @@ impl ResourceSampler {
             .name("gpu-util-poller".into())
             .spawn(move || {
                 while !stop2.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(GPU_POLL_INTERVAL);
                     if stop2.load(Ordering::Relaxed) {
                         break;
                     }
                     if let Ok(mut acc) = accum2.lock() {
-                        for i in 0..n {
-                            if let Some(util) = crate::tensor::cuda_utilization_idx(i as i32) {
-                                acc.sum[i] += util as f64;
-                                acc.count[i] += 1;
+                        for (i, &phys) in physical.iter().enumerate() {
+                            if let Some(util) = crate::tensor::cuda_utilization_idx(phys as i32) {
+                                let buf = &mut acc.samples[i];
+                                if buf.len() == GPU_UTIL_WINDOW {
+                                    buf.pop_front();
+                                }
+                                buf.push_back(util as f32);
                             }
                         }
                     }
@@ -229,61 +308,73 @@ impl ResourceSampler {
             s.ram_total_bytes = Some(total);
         }
 
-        // Drain background GPU utilization averages
-        let n = crate::tensor::cuda_device_count();
+        // Read the per-device rolling-window mean WITHOUT draining
+        // the buffer: samples persist across `sample()` calls so a
+        // short epoch with one sync-period dip averages out against
+        // the rest of the window's compute samples. See [`GPU_UTIL_WINDOW`]
+        // / [`GPU_POLL_INTERVAL`] for window-sizing rationale.
+        let n = self.gpus.len();
         let util_averages: Vec<Option<f32>> = if let Some(ref poller) = self.gpu_poller {
-            if let Ok(mut acc) = poller.accum.lock() {
-                let avgs: Vec<Option<f32>> = acc.sum.iter().zip(acc.count.iter())
-                    .map(|(&s, &c)| if c > 0 { Some((s / c as f64) as f32) } else { None })
-                    .collect();
-                // Reset for next interval
-                for s in acc.sum.iter_mut() { *s = 0.0; }
-                for c in acc.count.iter_mut() { *c = 0; }
-                avgs
+            if let Ok(acc) = poller.accum.lock() {
+                acc.samples
+                    .iter()
+                    .map(|buf| {
+                        if buf.is_empty() {
+                            None
+                        } else {
+                            let sum: f32 = buf.iter().sum();
+                            Some(sum / buf.len() as f32)
+                        }
+                    })
+                    .collect()
             } else {
-                vec![None; n as usize]
+                vec![None; n]
             }
         } else {
-            vec![None; n as usize]
+            vec![None; n]
         };
 
-        // Per-GPU snapshots
-        for i in 0..n {
+        // Per-GPU snapshots. Identity from the construction-time
+        // nvidia-smi statics, utilization via NVML, allocator stats
+        // only where this process already holds a CUDA context.
+        for (i, g) in self.gpus.iter().enumerate() {
             let mut gpu = GpuSnapshot {
-                device_index: i as u8,
+                device_index: g.physical_index,
+                name: g.name.clone(),
+                vram_total_bytes: g.total_bytes,
                 ..Default::default()
             };
-            if let Some(name) = crate::tensor::cuda_device_name_idx(i) {
-                gpu.name = name;
-            }
-            if let Ok((_, total)) = crate::tensor::cuda_memory_info_idx(i) {
-                gpu.vram_total_bytes = Some(total);
-            }
-            if let Ok(alloc) = crate::tensor::cuda_allocated_bytes_idx(i) {
-                gpu.vram_allocated_bytes = Some(alloc);
+            // Caching-allocator reserved bytes are per-process and take
+            // the CUDA runtime index (= position in the visible list).
+            // Querying them from a process without a context would
+            // CREATE one (pinning VRAM); gate on context presence.
+            if crate::tensor::cuda_has_primary_context(i as i32) {
+                if let Ok(alloc) = crate::tensor::cuda_allocated_bytes_idx(i as i32) {
+                    gpu.vram_allocated_bytes = Some(alloc);
+                }
             }
             // Background average if available, else instant NVML sample
-            gpu.util_percent = util_averages.get(i as usize).copied().flatten()
-                .or_else(|| crate::tensor::cuda_utilization_idx(i).map(|u| u as f32));
+            gpu.util_percent = util_averages.get(i).copied().flatten()
+                .or_else(|| {
+                    crate::tensor::cuda_utilization_idx(g.physical_index as i32)
+                        .map(|u| u as f32)
+                });
             s.gpus.push(gpu);
         }
 
-        // Aggregate VRAM from device 0
-        if let Some(gpu0) = s.gpus.first() {
-            s.vram_total_bytes = gpu0.vram_total_bytes;
-            s.vram_allocated_bytes = gpu0.vram_allocated_bytes;
-        }
-        // Aggregate GPU utilization: mean across all GPUs
-        let mut util_sum = 0.0f64;
-        let mut util_count = 0u32;
-        for gpu in &s.gpus {
-            if let Some(util) = gpu.util_percent {
-                util_sum += util as f64;
-                util_count += 1;
-            }
-        }
-        if util_count > 0 {
-            s.gpu_util_percent = Some((util_sum / util_count as f64) as f32);
+        // Aggregate fields: pick one GPU uniformly at random and copy its
+        // VRAM + util into the top-level fields. Over many ticks the
+        // displayed values cover every rank ergodically; each tick pays
+        // O(1) instead of O(world_size). Per-GPU detail stays in `s.gpus`
+        // for the timeline CSV / dashboard so this only affects the
+        // compact summary surface (epoch log line, summary string).
+        if !s.gpus.is_empty() {
+            let pick = crate::rng::Rng::from_entropy().usize(s.gpus.len());
+            let g = &s.gpus[pick];
+            s.aggregate_rank = Some(g.device_index);
+            s.vram_total_bytes = g.vram_total_bytes;
+            s.vram_allocated_bytes = g.vram_allocated_bytes;
+            s.gpu_util_percent = g.util_percent;
         }
 
         s
@@ -338,4 +429,41 @@ pub(super) fn read_meminfo() -> Option<(u64, u64)> {
 pub(super) fn parse_kb_value(s: &str) -> Option<u64> {
     let val: u64 = s.split_whitespace().next()?.parse().ok()?;
     Some(val * 1024) // kB to bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Constructing and polling a sampler must never initialize the
+    /// CUDA runtime: `Monitor::new` runs in the fan-out launcher, where
+    /// a CUDA touch breaks the no-CUDA-before-`Trainer::run` invariant
+    /// and a primary context pins VRAM on every device for the life of
+    /// the process.
+    ///
+    /// Only verifiable in a process that has done no CUDA work yet; in
+    /// the parallel CUDA test harness another test may already hold a
+    /// context, in which case this degrades to a no-op. Run it alone
+    /// (`--exact`) for the meaningful negative check.
+    #[test]
+    fn test_resource_sampler_never_initializes_cuda() {
+        if crate::tensor::cuda_has_primary_context(0) {
+            eprintln!("skipped: CUDA context already present in this process");
+            return;
+        }
+        let mut sampler = ResourceSampler::new();
+        let s = sampler.sample();
+        // Give the NVML poller a couple of ticks too.
+        std::thread::sleep(Duration::from_millis(550));
+        let _ = sampler.sample();
+        assert!(
+            !crate::tensor::cuda_has_primary_context(0),
+            "ResourceSampler must not create a CUDA context"
+        );
+        // Identity still works without a context: totals come from
+        // nvidia-smi, allocator stats stay None.
+        for gpu in &s.gpus {
+            assert!(gpu.vram_allocated_bytes.is_none());
+        }
+    }
 }

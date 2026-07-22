@@ -41,6 +41,7 @@ char* flodl_expand(FlodlTensor t, int64_t* new_shape, int ndim,
 
 void flodl_free_tensor(FlodlTensor t);
 char* flodl_shallow_clone(FlodlTensor t, FlodlTensor* result);
+char* flodl_deep_clone(FlodlTensor t, FlodlTensor* result);
 
 // --- Tensor metadata ---
 
@@ -50,6 +51,7 @@ int flodl_dtype(FlodlTensor t);
 int flodl_device_type(FlodlTensor t);
 int flodl_device_index(FlodlTensor t);
 int64_t flodl_numel(FlodlTensor t);
+int64_t flodl_storage_nbytes(FlodlTensor t);
 
 // --- Data access ---
 
@@ -148,6 +150,8 @@ char* flodl_count_nonzero_dim(FlodlTensor t, int dim, FlodlTensor* result);
 char* flodl_nonzero(FlodlTensor t, FlodlTensor* result);
 char* flodl_unique(FlodlTensor t, int sorted, int return_inverse,
                   FlodlTensor* output, FlodlTensor* inverse_indices);
+char* flodl_unique_consecutive(FlodlTensor t, int return_inverse,
+                              FlodlTensor* output, FlodlTensor* inverse_indices);
 char* flodl_searchsorted(FlodlTensor sorted_seq, FlodlTensor values,
                         FlodlTensor* result);
 
@@ -511,6 +515,11 @@ void flodl_cuda_synchronize(int device_index);
 // Returns error string on failure (caller must free), NULL on success.
 char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
+// NVML-backed variant of the above (queries the driver directly rather than
+// libtorch's allocator view). Returns 0 on success, -1 if NVML is
+// unavailable or the query fails.
+int flodl_cuda_nvml_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
+
 // Query bytes currently handed out by libtorch's CUDA caching allocator.
 // This can exceed physical VRAM when unified memory spills to host RAM.
 // spill = max(0, allocated - vram_total).
@@ -536,6 +545,10 @@ void flodl_cuda_empty_cache(void);
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.
 int flodl_cuda_utilization(int device_index);
+
+// Whether the given device has an active CUDA primary context (i.e. CUDA
+// has been initialized on it). Returns 1 if present, 0 if not, -1 on error.
+int flodl_cuda_has_primary_context(int device_index);
 
 // Query GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
 // Writes into caller-provided buffer. Returns error string on failure.
@@ -635,6 +648,9 @@ char* flodl_adam_step_batched(FlodlTensor* params, FlodlTensor* grads,
 // --- Fused Adam/AdamW (multi-tensor, single kernel on CUDA) ---
 // Uses libtorch's at::_fused_adam_ / at::_fused_adamw_ to perform the
 // complete Adam update across ALL params in one kernel launch on CUDA.
+// steps[i] is param i's own step count (libtorch's per-param state_steps;
+// bias correction is per-param, so late-unfrozen params correct from
+// their first step, not the global one).
 // grad_scale / found_inf: pass NULL to skip (no mixed precision).
 
 // _fused_adam_: L2 weight decay (adds wd*param to gradient).
@@ -642,7 +658,7 @@ char* flodl_fused_adam_(FlodlTensor* params, FlodlTensor* grads,
                          FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
                          int count, double lr,
                          double beta1, double beta2, double eps,
-                         double weight_decay, int64_t step,
+                         double weight_decay, const int64_t* steps,
                          FlodlTensor grad_scale, FlodlTensor found_inf);
 
 // _fused_adamw_: decoupled weight decay (param *= 1 - lr*wd).
@@ -650,7 +666,7 @@ char* flodl_fused_adamw_(FlodlTensor* params, FlodlTensor* grads,
                           FlodlTensor* exp_avgs, FlodlTensor* exp_avg_sqs,
                           int count, double lr,
                           double beta1, double beta2, double eps,
-                          double weight_decay, int64_t step,
+                          double weight_decay, const int64_t* steps,
                           FlodlTensor grad_scale, FlodlTensor found_inf);
 
 // --- Pinned memory ---
@@ -825,6 +841,7 @@ void  flodl_cuda_event_delete(void* event);
 char* flodl_cuda_stream_new(int device_index, int high_priority, void** stream_out);
 char* flodl_cuda_stream_synchronize(void* stream);
 char* flodl_cuda_stream_wait_event(void* stream, void* event);
+char* flodl_tensor_record_stream(void* tensor, void* stream);
 int   flodl_cuda_stream_query(void* stream);
 void  flodl_cuda_stream_set_current(void* stream);
 void* flodl_cuda_stream_get_current(int device_index);
@@ -896,9 +913,38 @@ void flodl_nccl_destroy_rank(void* handle);
 // tensors: array of ntensors FlodlTensors (all on this rank's device).
 // ntensors: number of tensors to reduce (batched with ncclGroupStart/End).
 // stream: CUDA stream handle, or NULL for default stream.
-// op: 0=Sum, 1=Prod, 2=Max, 3=Min, 4=Avg
+// op: 0=Sum, 1=Prod, 2=Max, 3=Min, 4=Avg — or a dynamic op value from
+//     flodl_nccl_redop_premulsum_create_rank (passed through raw).
 char* flodl_nccl_all_reduce_rank(void* handle, FlodlTensor* tensors,
                                   int ntensors, void* stream, int op);
+
+// Create a PreMulSum reduction op bound to this rank's communicator:
+// each rank's contribution is premultiplied by ITS OWN `scalar` inside
+// the collective (result = sum of f_i * x_i). Scalar residence is
+// ncclScalarHostImmediate (the float is captured at create time), dtype
+// f32 — callers must reduce f32 tensors with it. The returned op value
+// is comm-bound and window-scoped: create per reduce window, pass as
+// `op` to flodl_nccl_all_reduce_rank, then destroy. Create/destroy are
+// communication-free and cheap (NCCL docs).
+// Requires NCCL >= 2.11 at BOTH build and run time (the loaded library
+// can differ from the build headers via LD_PRELOAD); errors loudly
+// naming the found version otherwise.
+char* flodl_nccl_redop_premulsum_create_rank(void* handle, float scalar,
+                                              int* op_out);
+
+// Destroy a dynamic reduction op created by
+// flodl_nccl_redop_premulsum_create_rank on the same communicator.
+char* flodl_nccl_redop_destroy_rank(void* handle, int op);
+
+// Broadcast on a single-rank communicator (cross-process / cross-host).
+// root rank's tensors are sent in-place to all other ranks.
+// All ranks must call this concurrently for the collective to complete.
+// tensors: array of ntensors FlodlTensors (all on this rank's device).
+// ntensors: number of tensors to broadcast (batched with ncclGroupStart/End).
+// stream: CUDA stream handle, or NULL for default stream.
+// root: source rank (in 0..world_size).
+char* flodl_nccl_broadcast_rank(void* handle, FlodlTensor* tensors,
+                                 int ntensors, void* stream, int root);
 
 // Abort a single-rank communicator, unblocking any in-progress collective.
 // Thread-safe: can be called from any thread to unblock a stuck AllReduce.

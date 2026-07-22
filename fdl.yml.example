@@ -4,6 +4,7 @@ commands:
   # --- Sub-command (child fdl.yml) ---
   ddp-bench:                    # convention: ./ddp-bench/fdl.yml
   flodl-hf:                     # convention: ./flodl-hf/fdl.yml
+  hf-ddp:                 # convention: ./hf-ddp/fdl.yml (flodl-hf DDP validation vehicle)
 
   # --- CPU targets ---
   build:
@@ -13,25 +14,30 @@ commands:
   test:
     description: Run all CPU tests
     run: cargo test
-    append: -- --nocapture
+    append: -- --nocapture --skip leakcheck
     docker: dev
   test-release:
     description: Run tests in release mode
     run: cargo test --release
-    append: -- --nocapture
+    append: -- --nocapture --skip leakcheck
     docker: dev
   test-live:
     description: Run live tests (network / external resources; `#[ignore]` + name ending in `_live`)
     run: cargo test live
     append: -- --nocapture --ignored
     docker: dev
+  leak-test:
+    description: Run the process-global leak tests single-threaded (name contains `leakcheck`)
+    run: cargo test leakcheck
+    append: -- --nocapture --test-threads=1
+    docker: dev
   check:
     description: Type check without building
     run: cargo check
     docker: dev
   clippy:
-    description: Lint (including test code, workspace + ddp-bench)
-    run: cargo clippy --tests -- -W clippy::all && cd ddp-bench && cargo clippy --tests -- -W clippy::all
+    description: Lint (all targets incl. tests + examples, workspace + ddp-bench)
+    run: cargo clippy --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests -- -W clippy::all
     docker: dev
   doc:
     description: Generate API docs (strict, fails on warnings)
@@ -39,7 +45,7 @@ commands:
     docker: dev
   ci:
     description: Run the full CI CPU job locally (build + test + clippy + doc)
-    run: cargo build && cargo test -- --nocapture && cargo clippy -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
+    run: cargo build && cargo test -- --nocapture --skip leakcheck && cargo test leakcheck -- --test-threads=1 --nocapture && cargo clippy --all-targets -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
     docker: dev
   shell:
     description: Interactive shell in dev container
@@ -51,30 +57,36 @@ commands:
     description: Build with CUDA feature
     run: cargo build --features cuda
     docker: cuda
+  # Scoping: -p flodl -p flodl-hf — only crates that carry the `cuda`
+  # feature have CUDA tests. flodl-cli / flodl-cli-macros are config +
+  # dispatch (no GPU code, no CUDA tests); flodl-sys has no tests at
+  # all. Without `-p` cargo would still compile + invoke their test
+  # binaries on every pass, filter everything out, and dump hundreds
+  # of `running 0 tests` lines into the output.
   cuda-test:
     description: Run CUDA tests (parallel, excludes NCCL/Graph)
-    run: cargo test --features cuda
+    run: cargo test -p flodl -p flodl-hf --features cuda
     append: -- --nocapture
     docker: cuda
   cuda-test-all:
     description: Full CUDA suite (parallel + NCCL isolated + serial)
-    run: cargo test --features cuda -- --nocapture && cargo test --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: cuda
   cuda-test-nccl:
     description: NCCL/DDP tests only (isolated processes)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
     docker: cuda
   cuda-test-serial:
     description: Serial CUDA tests (Graphs, manual_seed, probes)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: cuda
   cuda-test-graph:
     description: CUDA Graph tests only (exclusive GPU, single-threaded)
-    run: cargo test --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
+    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
     docker: cuda
   cuda-clippy:
-    description: Lint with CUDA feature (including tests, workspace + ddp-bench)
-    run: cargo clippy --features cuda --tests -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features cuda -- -W clippy::all
+    description: Lint with CUDA feature (all targets incl. tests + examples, workspace + ddp-bench)
+    run: cargo clippy --features cuda --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features cuda -- -W clippy::all
     docker: cuda
   cuda-shell:
     description: Interactive shell in CUDA container

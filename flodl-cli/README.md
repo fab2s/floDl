@@ -70,8 +70,8 @@ equally to the flodl source checkout and to anything you scaffolded with
   a nested sub-project with its own `fdl.yml`, or a preset that merges
   structured config over an enclosing `entry:`. Replaces the old
   `make`/`docker compose` workflow.
-- **Environment overlays.** `fdl --env ci test` loads `fdl.ci.yml` on top
-  of the base config; `FDL_ENV=ci` and first-arg conventions work too.
+- **Environment overlays.** `fdl @ci test` loads `fdl.ci.yml` on top
+  of the base config; `fdl --env ci test` and `FDL_ENV=ci` are equivalent.
   `fdl config show [env]` prints the resolved merged config with per-layer
   annotations.
 - **Shell completions.** `fdl completions bash|zsh|fish` emits a
@@ -88,6 +88,35 @@ equally to the flodl source checkout and to anything you scaffolded with
   [README](https://github.com/flodl-labs/flodl/blob/main/flodl-cli-macros/README.md)
   or the [CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md#declaring-flags-in-rust)
   for the full attribute surface and a worked example.
+
+### For multi-GPU and cluster training
+
+`fdl` carries first-class commands for multi-host clusters:
+
+- **`fdl probe`** — readiness audit (single-host) / **`fdl @cluster
+  probe`** — SSH-aggregated cluster audit. Surfaces GPU/libtorch arch
+  mismatches, NCCL version skew across hosts, missing
+  `nccl_socket_ifname:`, legacy schema keys in `fdl.cluster.yml`,
+  shared-data mount divergence, and dashboard port collisions. Returns
+  non-zero on errors — use as a CI gate before launching multi-hour
+  jobs.
+- **`fdl nccl build`** — compile `libnccl` from source for the local
+  GPU archs + auto-detected target NCCL version, for the LD_PRELOAD
+  bridge pattern that resolves NCCL major.minor skew on heterogeneous
+  rigs.
+- **`fdl --gpus <spec>`** — global GPU scope override. On
+  cluster-aware commands, synthesizes a single-host cluster envelope;
+  on non-cluster commands, sets `CUDA_VISIBLE_DEVICES`.
+- **`fdl @cluster <cmd>`** — `@` selector for the `cluster` env
+  overlay. Auto-builds the target binary per-host (resolving per-host
+  libtorch variants from `fdl.cluster.yml`'s `arch:` declarations),
+  SSHes each worker, fans out, supervises rank children, tears them
+  down on parent exit.
+
+See the [DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)
+for the topology side and the
+[CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md)
+for the full command surface.
 
 ### In the flodl source checkout specifically
 

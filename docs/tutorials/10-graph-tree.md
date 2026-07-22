@@ -21,7 +21,7 @@ let encoder = FlowBuilder::from(Linear::new(4, 8)?)
 
 When a labeled graph is used inside another `FlowBuilder`, the parent
 automatically registers it as a **child subgraph**. Unlabeled graphs work
-exactly as before -- they just don't get tree features.
+exactly as before - they just don't get tree features.
 
 ```rust
 let model = FlowBuilder::from(encoder)  // child "encoder" registered
@@ -32,7 +32,7 @@ assert_eq!(model.tree_children().len(), 1);
 assert!(model.child_graph("encoder").is_some());
 ```
 
-Labels must be valid identifiers (no dots -- dots are path separators).
+Labels must be valid identifiers (no dots - dots are path separators).
 Duplicate labels at the same level produce a build error.
 
 ## The composed flag
@@ -51,9 +51,9 @@ computation when a parent will handle the loss.
 
 Dots in paths mean subgraph boundaries. The rule is simple:
 
-- `"encoder"` -- child subgraph "encoder" (or local tag if no child with that name)
-- `"encoder.hidden"` -- tag "hidden" inside child "encoder"
-- `"letter.read.confidence"` -- tag "confidence" inside "read" inside "letter"
+- `"encoder"` - child subgraph "encoder" (or local tag if no child with that name)
+- `"encoder.hidden"` - tag "hidden" inside child "encoder"
+- `"letter.read.confidence"` - tag "confidence" inside "read" inside "letter"
 
 No fuzzy resolution, no walking up to parents. If a segment doesn't match
 a child or tag, you get a clear error.
@@ -106,7 +106,7 @@ let mut optimizer = Adam::with_groups()
 ```
 
 For checkpoint operations, `named_parameters_at()` returns names in the
-**target's own namespace** -- not the parent's:
+**target's own namespace** - not the parent's:
 
 ```rust
 let named = model.named_parameters_at("encoder")?;
@@ -186,7 +186,7 @@ println!("encoder loss trend: {:?}", trend.last());
 ### Tree-aware flush and metrics
 
 `flush()` **automatically recurses** into all labeled child subgraphs. A single
-`model.flush(&[])` on the root graph flushes the entire tree -- no need to walk
+`model.flush(&[])` on the root graph flushes the entire tree - no need to walk
 children manually. If a child's buffer is already empty (flushed separately),
 it's safely skipped (no double epoch entries).
 
@@ -207,7 +207,7 @@ model.flush(&[]);  // flushes parent + subscan + letter
 monitor.log(epoch, t.elapsed(), &model);
 ```
 
-The dashboard displays each metric as a separate curve -- the dotted names
+The dashboard displays each metric as a separate curve - the dotted names
 provide natural grouping in the legend.
 
 ### Independent flush cadences
@@ -232,12 +232,12 @@ monitor.log(epoch, t.elapsed(), &model);  // uses latest_metrics() by default
 ```
 
 When using independent cadences, the parent's `latest_metrics()` still collects
-from children -- it reads whatever the child last flushed. So the dashboard
+from children - it reads whatever the child last flushed. So the dashboard
 shows the child's most recent epoch value, updated at the child's own pace.
 
 ## Internal tags
 
-Tags starting with `_` are automatically internal -- hidden from parent
+Tags starting with `_` are automatically internal - hidden from parent
 graph resolution:
 
 ```rust
@@ -280,7 +280,7 @@ model.set_training_at("encoder", false)?;
 // Rest of model stays in training mode
 ```
 
-This matters for BatchNorm -- frozen subgraphs should use running stats
+This matters for BatchNorm - frozen subgraphs should use running stats
 (eval mode), not batch stats.
 
 ## Verbose build output
@@ -321,7 +321,7 @@ never accessed during `forward_impl()`. The pre-computed Vec routing, reused
 execution buffers, and topological level execution remain exactly as they are.
 
 Tree operations (`parameters_at`, `freeze`, `tagged_at`, etc.) are explicit
-calls -- they only run when you call them, never during forward/backward.
+calls - they only run when you call them, never during forward/backward.
 
 ## Quick reference
 
@@ -385,12 +385,12 @@ model.load_subgraph_checkpoint("encoder", "encoder_v2.fdl")?;
 ```
 
 The migrated checkpoint is written as v2 with a zeroed structural hash, so it
-loads without architecture validation. Same architecture required -- if you
+loads without architecture validation. Same architecture required - if you
 changed layer sizes, retrain instead.
 
 ## What's next
 
-The graph tree is the foundation for progressive model composition --
+The graph tree is the foundation for progressive model composition -
 training layers independently, checkpointing them, and composing them
 into larger models with fine-grained training control. See the
 [design document](../design/graph-tree.md) for the full architecture.

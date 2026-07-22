@@ -2,7 +2,6 @@
     use crate::tensor::{
         cuda_device_count, cuda_synchronize, test_device, DType, TensorOptions,
     };
-    use super::NCCL_LOCK;
 
     fn require_multi_gpu() -> bool {
         if !test_device().is_cuda() || cuda_device_count() < 2 {
@@ -21,216 +20,6 @@
             }
         }
         true
-    }
-
-    // -- CPU validation tests -----------------------------------------------
-
-    #[test]
-    fn test_ddp_requires_two_models() {
-        // Can't construct Ddp with 1 model (NCCL needs 2+ CUDA devices).
-        // Just verify the validation logic.
-        let result = Ddp::wrap(&[], &[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_ddp_model_device_mismatch() {
-        // Model count must match device count
-        let result = Ddp::wrap(
-            &[],
-            &[Device::CUDA(0), Device::CUDA(1)],
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_shard_sizes_equal() {
-        let ratios = vec![0.5, 0.5];
-        let state = mock_state(&ratios);
-        assert_eq!(state.compute_shard_sizes(10), vec![5, 5]);
-        assert_eq!(state.compute_shard_sizes(11), vec![6, 5]);
-        assert_eq!(state.compute_shard_sizes(3), vec![2, 1]);
-    }
-
-    #[test]
-    fn test_shard_sizes_unequal() {
-        let ratios = vec![0.7, 0.3];
-        let state = mock_state(&ratios);
-        assert_eq!(state.compute_shard_sizes(10), vec![7, 3]);
-        assert_eq!(state.compute_shard_sizes(100), vec![70, 30]);
-    }
-
-    #[test]
-    fn test_shard_sizes_three_devices() {
-        let ratios = vec![0.5, 0.3, 0.2];
-        let state = mock_state(&ratios);
-        let sizes = state.compute_shard_sizes(10);
-        assert_eq!(sizes.iter().sum::<i64>(), 10);
-        assert_eq!(sizes, vec![5, 3, 2]);
-    }
-
-    /// Helper: create a minimal DistributedState for unit tests.
-    fn mock_state(ratios: &[f64]) -> DistributedState {
-        let n = ratios.len();
-        DistributedState {
-            replicas: Vec::new(),
-            // Safety: we never use comms in shard/balance tests. Build a dummy.
-            comms: unsafe { mock_nccl_comms(n) },
-            devices: (0..n as u8)
-                .map(Device::CUDA)
-                .collect(),
-            optimizers: Vec::new(),
-            chunk_ratios: ratios.to_vec(),
-            param_groups: Vec::new(),
-            buffer_groups: Vec::new(),
-            last_timing: None,
-            last_shard_sizes: vec![0; n],
-            ema_throughput: vec![0.0; n],
-            step_count: 0,
-            calibration_steps: DEFAULT_CALIBRATION_STEPS,
-            rebalance_interval: DEFAULT_REBALANCE_INTERVAL,
-            el_che: None,
-            last_el_che_counts: Vec::new(),
-            last_el_che_sync: None,
-            max_grad_norm: None,
-            timeline: None,
-        }
-    }
-
-    /// Create a NcclComms with a null handle for shard-size unit tests only.
-    /// Never call any actual NCCL operations on this.
-    unsafe fn mock_nccl_comms(n: usize) -> NcclComms {
-        let devices: Vec<Device> = (0..n as u8).map(Device::CUDA).collect();
-        // Drop on a null handle is a no-op.
-        unsafe { NcclComms::from_raw(std::ptr::null_mut(), devices) }
-    }
-
-    // -- Auto-balancer unit tests (CPU, no NCCL needed) ---------------------
-
-    #[test]
-    fn test_is_balanced_equal() {
-        let state = mock_state(&[0.5, 0.5]);
-        assert!(state.is_balanced());
-    }
-
-    #[test]
-    fn test_is_balanced_unequal() {
-        let state = mock_state(&[0.7, 0.3]);
-        assert!(!state.is_balanced());
-    }
-
-    #[test]
-    fn test_rebalance_proportional() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // GPU 0 is 3x faster than GPU 1
-        state.ema_throughput = vec![30.0, 10.0];
-        state.rebalance();
-        // Expect ~75/25 split
-        assert!((state.chunk_ratios[0] - 0.75).abs() < 0.01,
-            "fast GPU should get ~75%, got {}", state.chunk_ratios[0]);
-        assert!((state.chunk_ratios[1] - 0.25).abs() < 0.01,
-            "slow GPU should get ~25%, got {}", state.chunk_ratios[1]);
-        // Must sum to 1.0
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9, "ratios must sum to 1.0, got {sum}");
-    }
-
-    #[test]
-    fn test_rebalance_three_devices() {
-        let mut state = mock_state(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
-        // Throughput: 50, 30, 20 (total 100)
-        state.ema_throughput = vec![50.0, 30.0, 20.0];
-        state.rebalance();
-        assert!((state.chunk_ratios[0] - 0.50).abs() < 0.01);
-        assert!((state.chunk_ratios[1] - 0.30).abs() < 0.01);
-        assert!((state.chunk_ratios[2] - 0.20).abs() < 0.01);
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_rebalance_respects_min_ratio() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // GPU 1 is extremely slow (would get <5% without clamping)
-        state.ema_throughput = vec![100.0, 1.0];
-        state.rebalance();
-        assert!(state.chunk_ratios[1] >= MIN_CHUNK_RATIO,
-            "slow GPU should get at least MIN_CHUNK_RATIO, got {}", state.chunk_ratios[1]);
-        let sum: f64 = state.chunk_ratios.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_rebalance_no_data() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        state.ema_throughput = vec![0.0, 0.0];
-        state.rebalance();
-        // Should not change ratios when no data
-        assert_eq!(state.chunk_ratios, vec![0.5, 0.5]);
-    }
-
-    #[test]
-    fn test_update_balance_calibration_timing() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Simulate steps without timing (no CudaEvents on CPU)
-        for _ in 0..DEFAULT_CALIBRATION_STEPS - 1 {
-            let rebalanced = state.update_balance().unwrap();
-            assert!(!rebalanced, "should not rebalance during calibration");
-        }
-        // Step at calibration boundary triggers rebalance (but no-op without data)
-        let rebalanced = state.update_balance().unwrap();
-        assert!(rebalanced, "should rebalance at calibration boundary");
-    }
-
-    #[test]
-    fn test_update_balance_interval() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Skip past calibration
-        state.step_count = DEFAULT_CALIBRATION_STEPS;
-        // Steps up to next interval should not rebalance
-        for _ in 0..DEFAULT_REBALANCE_INTERVAL - 1 {
-            let rebalanced = state.update_balance().unwrap();
-            assert!(!rebalanced);
-        }
-        // At interval boundary: rebalance
-        let rebalanced = state.update_balance().unwrap();
-        assert!(rebalanced);
-    }
-
-    #[test]
-    fn test_ema_throughput_init() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // First measurement initializes directly (not blended)
-        state.ema_throughput = vec![0.0, 0.0];
-        // Manually set what update_throughput would compute from timing
-        let throughput_0 = 10.0;
-        state.ema_throughput[0] = throughput_0; // simulates first measurement
-        assert_eq!(state.ema_throughput[0], 10.0);
-    }
-
-    #[test]
-    fn test_ema_throughput_smoothing() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        state.ema_throughput = vec![10.0, 5.0];
-        // Simulate what update_balance does with a new measurement
-        let new_measurement = 20.0;
-        state.ema_throughput[0] =
-            EMA_ALPHA * new_measurement + (1.0 - EMA_ALPHA) * state.ema_throughput[0];
-        // EMA: 0.3 * 20 + 0.7 * 10 = 6 + 7 = 13
-        assert!((state.ema_throughput[0] - 13.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_shard_sizes_after_rebalance() {
-        let mut state = mock_state(&[0.5, 0.5]);
-        // Rebalance to 70/30
-        state.ema_throughput = vec![70.0, 30.0];
-        state.rebalance();
-        // Verify shard computation uses new ratios
-        let sizes = state.compute_shard_sizes(100);
-        assert_eq!(sizes.iter().sum::<i64>(), 100);
-        assert_eq!(sizes[0], 70);
-        assert_eq!(sizes[1], 30);
     }
 
     // -- Cross-device autograd verification ---------------------------------
@@ -449,138 +238,6 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_graph_distribute_adapts_to_hardware() {
-        use crate::graph::FlowBuilder;
-        use crate::nn::Linear;
-        use crate::tensor::usable_cuda_devices;
-
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = FlowBuilder::from(Linear::new(4, 2).unwrap())
-            .build()
-            .unwrap();
-
-        let result = model.distribute(|dev| {
-            FlowBuilder::from(Linear::on_device(4, 2, dev)?).build()
-        });
-        assert!(result.is_ok());
-
-        let usable = usable_cuda_devices();
-        if usable.len() >= 2 {
-            // Multi-GPU: should be distributed
-            assert!(model.is_distributed());
-            assert_eq!(model.world_size(), usable.len());
-        } else {
-            // Single GPU or CPU: no-op
-            assert!(!model.is_distributed());
-            assert_eq!(model.world_size(), 1);
-        }
-    }
-
-    #[test]
-    fn test_ddp_auto_single_gpu() {
-        // On multi-GPU hardware Trainer::setup would initialize NCCL,
-        // which poisons CUBLAS for concurrent tests. Skip here;
-        // multi-GPU path is validated in test_ddp_auto_multi_gpu.
-        if cuda_device_count() >= 2 {
-            return;
-        }
-
-        use crate::graph::FlowBuilder;
-        use crate::nn::{Adam, Linear, ReLU, mse_loss};
-
-        let model = FlowBuilder::from(Linear::new(4, 8).unwrap())
-            .through(ReLU::new())
-            .through(Linear::new(8, 2).unwrap())
-            .build()
-            .unwrap();
-
-        Trainer::setup(
-            &model,
-            |dev| {
-                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
-                    .through(ReLU::new())
-                    .through(Linear::on_device(8, 2, dev)?)
-                    .build()
-            },
-            |p| Adam::new(p, 0.001),
-        )
-        .unwrap();
-
-        // Optimizer should be set: step() works
-        let x = Variable::new(
-            Tensor::randn(&[4, 4], Default::default()).unwrap(),
-            false,
-        );
-        let target = Variable::new(
-            Tensor::randn(&[4, 2], Default::default()).unwrap(),
-            false,
-        );
-        let out = model.forward(&x).unwrap();
-        let loss = mse_loss(&out, &target).unwrap();
-        loss.backward().unwrap();
-        model.step().unwrap();
-
-        assert!(!model.is_distributed());
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-nccl"]
-    fn test_ddp_auto_multi_gpu() {
-        if !require_multi_gpu() {
-            return;
-        }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        use crate::graph::FlowBuilder;
-        use crate::nn::{Adam, Linear, ReLU, mse_loss};
-
-        let model = FlowBuilder::from(
-            Linear::on_device(4, 8, Device::CUDA(0)).unwrap(),
-        )
-        .through(ReLU::new())
-        .through(Linear::on_device(8, 2, Device::CUDA(0)).unwrap())
-        .build()
-        .unwrap();
-
-        Trainer::setup(
-            &model,
-            |dev| {
-                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
-                    .through(ReLU::new())
-                    .through(Linear::on_device(8, 2, dev)?)
-                    .build()
-            },
-            |p| Adam::new(p, 0.001),
-        )
-        .unwrap();
-
-        assert!(model.is_distributed());
-        assert_eq!(model.world_size(), 2);
-
-        // Full training step
-        let opts = TensorOptions {
-            dtype: DType::Float32,
-            device: Device::CUDA(0),
-        };
-        let x = Variable::new(
-            Tensor::randn(&[8, 4], opts).unwrap(),
-            false,
-        );
-        let target = Variable::new(
-            Tensor::randn(&[8, 2], opts).unwrap(),
-            false,
-        );
-        let out = model.forward(&x).unwrap();
-        let loss = mse_loss(&out, &target).unwrap();
-        loss.backward().unwrap();
-        model.step().unwrap();
-
-        cuda_synchronize(0);
-        cuda_synchronize(1);
-    }
-
-    #[test]
     fn test_graph_step_without_optimizer() {
         use crate::graph::FlowBuilder;
         use crate::nn::Linear;
@@ -665,19 +322,31 @@
 
     #[test]
     fn test_cadence_anchor_auto_tune() {
-        // High AllReduce overhead should trigger anchor increase.
-        // 10% target: compute 1000ms, sync 500ms => overhead 50% >> 10%.
+        // High per-window fixed overhead should trigger anchor growth.
+        // No fill is staged (no coordinator), so the signal is reduce-only:
+        // overhead = sync / (anchor·marginal + sync). With marginal 100ms,
+        // anchor 10 => window_compute 1000, sync 500 => 500/1500 = 0.33 > 0.10.
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.10);
 
-        // Both devices equal speed, anchor=10.
-        let bc = c.batch_counts().to_vec(); c.report_timing(&[1000.0, 1000.0], &bc, 500.0);
+        // Auto-tune is gated to Phase::Stable+ to prevent warmup over-reaction.
+        // Prime with five low-overhead reports of equal-speed timings to reach
+        // Stable, then issue the high-overhead trigger.
+        for _ in 0..5 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[1000.0, 1000.0], &bc, 5.0);
+        }
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[1000.0, 1000.0], &bc, 500.0);
 
-        // overhead = 500/1000 = 0.50, target = 0.10
-        // scale = 0.50/0.10 = 5.0 => new anchor = ceil(10 * 5) = 50
-        assert_eq!(c.anchor(), 50);
-        assert_eq!(c.batches(0), 50);
-        assert_eq!(c.batches(1), 50);
+        // window-pressure proposes; commit to apply (Stable verdict).
+        c.commit_proposed_anchor();
+
+        // scale = min(0.33/0.10, GROWTH_STEP_CAP=2.0) = 2.0
+        // new anchor = ceil(10 * 2) = 20 (capped per cycle; multi-cycle climb)
+        assert_eq!(c.anchor(), 20);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 20);
     }
 
     #[test]
@@ -686,29 +355,157 @@
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.10);
 
-        // Fast=500ms, slow=1000ms (equal initial counts), sync=400ms.
-        let bc = c.batch_counts().to_vec(); c.report_timing(&[500.0, 1000.0], &bc, 400.0);
+        // Prime to Stable phase. Pass fixed bc=[10,10] each call so the
+        // synthetic wall_ms keeps a stable per-batch ratio across reports
+        // (in production wall_ms would scale with n; in the test it does
+        // not, so we keep n fixed instead).
+        for _ in 0..5 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
+        }
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
 
-        // overhead = 400/1000 = 0.40, target = 0.10, scale = 4.0
-        // new anchor = ceil(10 * 4) = 40
-        assert_eq!(c.anchor(), 40);
-        assert_eq!(c.batches(1), 40); // slow device
-        // fast device: 100ms/batch vs 50ms/batch => 2x ratio => 80
-        assert_eq!(c.batches(0), 80);
+        // anchor rank = slow rank 1 (100ms/batch). window_compute = 10·100 = 1000,
+        // sync 400 => overhead 400/1400 = 0.286. scale = min(2.86, 2.0) = 2.0.
+        // new anchor = ceil(10 * 2) = 20.
+        assert_eq!(c.anchor(), 20);
+        assert_eq!(c.batches(1), 20); // slow device
+        // fast device: 100ms/batch vs 50ms/batch => 2x ratio => 40
+        assert_eq!(c.batches(0), 40);
+    }
+
+    #[test]
+    fn test_cap_binding_suppresses_anchor_growth() {
+        // Anchor wind-up guard: when the window cap is binding (counts
+        // scaled down to fit the epoch), measured overhead stays above
+        // target forever — growth proposals must be suppressed, or the
+        // anchor ratchets toward max_anchor while delivered counts stay
+        // pinned and every anchor-derived quantity lies.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        c.set_max_total_batches(30); // binding almost immediately
+
+        for _ in 0..5 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
+        }
+        // Force the cap to bind once.
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
+        let anchor_after_first = c.anchor();
+
+        // Keep reporting pathological overhead: with the cap binding, no
+        // further growth proposals may land.
+        for _ in 0..10 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+            c.commit_proposed_anchor();
+        }
+        assert!(
+            c.anchor() <= anchor_after_first,
+            "anchor ratcheted under a binding window cap: {} -> {}",
+            anchor_after_first,
+            c.anchor(),
+        );
+        let total = c.batches(0) + c.batches(1);
+        assert!(total <= 30, "cap still enforced: total={total}");
+    }
+
+    #[test]
+    fn test_speed_ratio_clamped_against_degenerate_sample() {
+        // One legitimate-but-tiny reading (sub-ms wall over many batches)
+        // must not blow the schedule up by a 1e4x ratio on paths without
+        // max_batch_diff / max_total_batches.
+        let mut c = ElChe::new(2, 10);
+        for _ in 0..6 {
+            // rank 0: absurdly fast reading; rank 1: 100 ms/batch.
+            c.report_timing(&[0.1, 1000.0], &[10, 10], 1.0);
+        }
+        // ratio would be 10_000x unclamped; with the 64x clamp the fast
+        // rank gets at most anchor * 64 batches.
+        assert!(
+            c.batches(0) <= 10 * 64,
+            "ratio clamp failed: fast rank got {} batches",
+            c.batches(0),
+        );
+    }
+
+    #[test]
+    fn test_warmup_unsticks_when_pinned_anchor_never_reports() {
+        // A pinned anchor rank that never produces a valid reading must
+        // not freeze the controller in Warmup forever: after a full trust
+        // window of misses, election falls back to ranks with data.
+        let mut c = ElChe::new(2, 10).with_initial_anchor(1);
+        for _ in 0..10 {
+            // rank 1 (the pinned anchor) reports nothing valid; rank 0
+            // reports steadily.
+            c.report_timing(&[100.0, 0.0], &[10, 0], 1.0);
+        }
+        assert!(
+            c.is_calibrated(),
+            "controller stayed un-calibrated: pinned dead anchor froze Warmup",
+        );
+    }
+
+    #[test]
+    fn test_nudge_anchor_down_ignores_nan_factor() {
+        let mut c = ElChe::new(2, 10);
+        for _ in 0..6 {
+            c.report_timing(&[100.0, 100.0], &[10, 10], 1.0);
+        }
+        let before = c.anchor();
+        c.nudge_anchor_down(f64::NAN);
+        assert_eq!(c.anchor(), before, "NaN factor must be a no-op");
+        c.nudge_anchor_down(0.5);
+        assert!(c.anchor() < before, "finite factor still nudges");
+    }
+
+    #[test]
+    fn test_cadence_window_capped_to_max_total() {
+        // Window cap (set by the cluster coordinator to the epoch's batch
+        // count): the overhead auto-tune may grow the schedule to amortize
+        // an expensive sync, but `recompute_batch_counts` must scale the
+        // per-rank counts down proportionally so their sum never exceeds
+        // the cap — a reduce window must fit within one epoch. Mirrors
+        // `test_cadence_anchor_auto_tune_with_speed_ratio` (which grows to
+        // [80, 40], sum 120) but with the total capped at 60.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        c.set_max_total_batches(40);
+
+        for _ in 0..5 {
+            c.report_timing(&[500.0, 1000.0], &[10, 10], 5.0);
+        }
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 400.0);
+        c.commit_proposed_anchor();
+
+        // Uncapped (×2 grow) this is [40, 20] (sum 60). Capped to 40 and
+        // scaled proportionally: ~[26, 13] (sum <= 40, ~2x ratio preserved).
+        let total = c.batches(0) + c.batches(1);
+        assert!(total <= 40, "window capped to max_total: total={total} (<= 40)");
+        assert!(
+            c.batches(0) > c.batches(1),
+            "speed ratio preserved after cap: fast={} slow={}",
+            c.batches(0),
+            c.batches(1),
+        );
     }
 
     #[test]
     fn test_cadence_anchor_capped_at_max() {
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.01)
-            .with_max_anchor(30);
+            .with_max_anchor(15);
 
+        // Prime to Stable phase before triggering auto-tune.
+        for _ in 0..5 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[100.0, 100.0], &bc, 0.5);
+        }
         // Extreme overhead: sync dominates.
-        let bc = c.batch_counts().to_vec(); c.report_timing(&[100.0, 100.0], &bc, 500.0);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 100.0], &bc, 500.0);
+        c.commit_proposed_anchor();
 
-        // Would want anchor=500 but capped at 30.
-        assert_eq!(c.anchor(), 30);
-        assert_eq!(c.batches(0), 30);
+        // ×2 grow wants ceil(10*2)=20, but max_anchor clamps it to 15.
+        assert_eq!(c.anchor(), 15);
+        assert_eq!(c.batches(0), 15);
     }
 
     #[test]
@@ -720,6 +517,80 @@
         let bc = c.batch_counts().to_vec(); c.report_timing(&[1000.0, 1000.0], &bc, 5.0);
 
         assert_eq!(c.anchor(), 10); // no change
+    }
+
+    #[test]
+    fn test_overhead_proposal_committed_on_stable_verdict() {
+        // High-overhead trigger should propose a grow; commit applies it.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
+        }
+        // overhead = 500/1500 = 0.33 > 0.10; scale = min(3.3, 2.0) = 2.0
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        // Before commit, anchor unchanged.
+        assert_eq!(c.anchor(), 10, "report_timing must not mutate anchor");
+        c.commit_proposed_anchor();
+        assert_eq!(c.anchor(), 20, "commit applies the ×2-capped grow");
+    }
+
+    #[test]
+    fn test_overhead_grow_vetoed_on_suppress_growth() {
+        // Grow proposal + SuppressGrowth verdict → anchor stays put.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
+        }
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        c.veto_proposed_growth();
+        assert_eq!(c.anchor(), 10, "SuppressGrowth vetoes the grow proposal");
+    }
+
+    #[test]
+    fn test_growth_latched_off_after_suppress_growth() {
+        // SuppressGrowth latches growth OFF; it re-arms only after
+        // GROWTH_REARM_STABLE (5) consecutive Stable verdicts — the margin
+        // to the convergence cliff. The controller must not re-attempt
+        // growth every cycle while latched.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 5.0);
+        }
+        // Grow proposed, then SuppressGrowth: drop it AND latch growth off.
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        c.veto_proposed_growth();
+        assert_eq!(c.anchor(), 10, "SuppressGrowth vetoes the grow");
+        assert!(!c.growth_enabled(), "growth latched off");
+
+        // While latched, a high-overhead report proposes nothing → no grow
+        // even on a Stable commit. Five Stable commits re-arm the latch.
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+            c.commit_proposed_anchor();
+            assert_eq!(c.anchor(), 10, "no growth while latched off / re-arming");
+        }
+        assert!(c.growth_enabled(), "5 consecutive Stable verdicts re-arm growth");
+
+        // A fresh high-overhead report now grows again.
+        c.report_timing(&[1000.0, 1000.0], &[10, 10], 500.0);
+        c.commit_proposed_anchor();
+        assert!(c.anchor() > 10, "growth resumes after re-arm");
+    }
+
+    #[test]
+    fn test_overhead_proposal_discarded_on_nudge_down() {
+        // Grow proposal + NudgeDown verdict → proposal dropped, nudge
+        // operates on the current (pre-proposal) anchor.
+        let mut c = ElChe::new(2, 20).with_overhead_target(0.10);
+        for _ in 0..5 {
+            c.report_timing(&[1000.0, 1000.0], &[20, 20], 5.0);
+        }
+        c.report_timing(&[1000.0, 1000.0], &[20, 20], 500.0);
+        // Proposal: ×2-capped grow to ceil(20 * 2.0) = 40. NudgeDown discards
+        // that and applies factor 0.5 to the current anchor (20).
+        c.discard_proposed_anchor();
+        c.nudge_anchor_down(0.5);
+        assert_eq!(c.anchor(), 10, "nudge halves the pre-proposal anchor");
     }
 
     #[test]
@@ -753,6 +624,111 @@
         let bc = c.batch_counts().to_vec(); c.report_timing(&[1000.0, 1000.0], &bc, 10.0);
         assert_eq!(c.batches(0), 20);
         assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_callback_slack_reduces_firing_rank_count() {
+        // Calibrate: rank 0 fast (50 ms/batch), rank 1 slow (100 ms/batch).
+        // Ratio 2:1 → rank 0 gets 20 batches, rank 1 gets 10 (anchor).
+        // wall_ms must scale with `bc` to keep ms-per-batch stable in
+        // the trust window (50 vs 25 with different bc → different
+        // smoothed ratio, which is fine in production but obscures
+        // slack arithmetic in a unit test).
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+
+        // Stage 200 ms of callback slack on rank 0. At 50 ms/batch
+        // that is 4 batches' worth.
+        c.apply_callback_slack(&[200.0, 0.0]);
+
+        // Recompute with timings that keep ms/batch at 50/100:
+        // rank 0 doing 20 batches in 1000ms; rank 1 doing 10 in 1000ms.
+        c.report_timing(&[1000.0, 1000.0], &[20, 10], 10.0);
+        assert_eq!(c.batches(0), 16);
+        assert_eq!(c.batches(1), 10);
+
+        // Slack auto-clears: next recompute returns rank 0 to 20 (the
+        // un-slacked target). Dead-zone hysteresis allows the jump from
+        // 16 to 20 since the delta is > 5% of 16.
+        c.report_timing(&[800.0, 1000.0], &[16, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_callback_slack_clamps_at_one() {
+        // Pathologically large slack must not starve the rank entirely.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        assert_eq!(c.batches(0), 20);
+
+        // 10s of slack on a 50ms/batch rank = 200 batches, far above
+        // the rank's 20-batch quota. Target should clamp at 1.
+        c.apply_callback_slack(&[10_000.0, 0.0]);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        assert_eq!(c.batches(0), 1, "slack must clamp at 1, not starve to 0");
+        assert_eq!(c.batches(1), 10);
+    }
+
+    #[test]
+    fn test_callback_slack_size_mismatch_is_noop() {
+        // Wrong-length slack vectors are silently ignored — a misconfig
+        // should never crash a running cluster, just leave behavior at
+        // the unslacked baseline.
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        c.report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+
+        // Length 3 on a 2-rank cluster: rejected.
+        c.apply_callback_slack(&[200.0, 0.0, 0.0]);
+        assert_eq!(c.pending_callback_slack_ms(), &[0.0, 0.0]);
+
+        // Length 0: also rejected.
+        c.apply_callback_slack(&[]);
+        assert_eq!(c.pending_callback_slack_ms(), &[0.0, 0.0]);
+
+        // Behavior unchanged after the no-op set. Use stable timings.
+        c.report_timing(&[1000.0, 1000.0], &[20, 10], 10.0);
+        assert_eq!(c.batches(0), 20);
+    }
+
+    #[test]
+    fn test_callback_slack_multi_rank() {
+        // Slack on multiple ranks simultaneously: each rank's reduction
+        // is independent. ms/batch: rank 0 = 33.3ms, rank 1 = 50ms,
+        // rank 2 = 100ms (anchor). Targets: rank 0 = 10 * (100/33.3) ≈ 30,
+        // rank 1 = 10 * (100/50) = 20, rank 2 = 10.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        c.report_timing(&[333.0, 500.0, 1000.0], &[10, 10, 10], 10.0);
+        let baseline_0 = c.batches(0);
+        let baseline_1 = c.batches(1);
+        let baseline_2 = c.batches(2);
+
+        // 100ms slack on rank 0 (= 4 batches @ ceil(100/33) = 4)
+        // 100ms slack on rank 1 (= 2 batches @ 50ms)
+        c.apply_callback_slack(&[100.0, 100.0, 0.0]);
+        // Keep ms/batch stable: wall_ms = bc * ms_per_batch.
+        // rank 0: 30 * 33.3 ≈ 999; rank 1: 20 * 50 = 1000; rank 2: 10 * 100 = 1000.
+        c.report_timing(
+            &[baseline_0 as f64 * 33.3, baseline_1 as f64 * 50.0, 1000.0],
+            &[baseline_0, baseline_1, baseline_2],
+            10.0,
+        );
+
+        // Rank 0 drops by 3-4 (33ms/batch → ceil(100/33) = 4).
+        assert!(
+            c.batches(0) == baseline_0 - 4 || c.batches(0) == baseline_0 - 3,
+            "rank 0 expected baseline-3 or baseline-4, got {} (baseline {baseline_0})",
+            c.batches(0),
+        );
+        // Rank 1 drops by 2.
+        assert_eq!(c.batches(1), baseline_1 - 2);
+        // Rank 2 (no slack) unchanged.
+        assert_eq!(c.batches(2), baseline_2);
     }
 
     #[test]
@@ -965,384 +941,146 @@
         assert_eq!(c.batches(0), 10);
         assert_eq!(c.batches(1), 20);
 
-        // After timing: rank 0 is actually 2x faster (500ms for 10 vs 2000ms for 20)
-        let bc = c.batch_counts().to_vec(); c.report_timing(&[500.0, 2000.0], &bc, 10.0);
+        // Election can change the anchor only once the balancer enters
+        // `Phase::Stable` (≥5 calibrations) — by design, no single noisy
+        // reading can flip the initial pick. Feed corrective timings (rank
+        // 0 is actually 2x faster) for six reports so the 6th sees Stable
+        // on entry and re-elects on the trust window. bc passed verbatim
+        // each call so the synthetic per-batch arithmetic stays stable.
+        for _ in 0..6 {
+            c.report_timing(&[500.0, 2000.0], &[10, 20], 10.0);
+        }
 
         // Self-corrected: rank 1 is slow (anchor), rank 0 gets more
         assert_eq!(c.batches(1), c.anchor());
         assert!(c.batches(0) > c.batches(1), "fast device should get more batches");
     }
 
-    // -- DdpConfig tests ------------------------------------------------------
+    // -- PR 1: Phase machine + tie-band anchor election -----------------------
+
+    use crate::distributed::Phase;
 
     #[test]
-    fn test_ddp_config_defaults() {
-        let c = DdpConfig::new();
-        assert!(c.speed_hint.is_none());
-        assert!(c.overhead_target.is_none());
-        assert!(c.max_anchor.is_none());
-    }
-
-    #[test]
-    fn test_ddp_config_builder() {
-        let c = DdpConfig::new()
-            .speed_hint(1, 2.5)
-            .overhead_target(0.05)
-            .max_anchor(Some(20));
-        assert_eq!(c.speed_hint, Some((1, 2.5)));
-        assert_eq!(c.overhead_target, Some(0.05));
-        assert_eq!(c.max_anchor, Some(20));
+    fn test_phase_starts_at_probe() {
+        let c = ElChe::new(3, 10);
+        assert_eq!(c.phase(), Phase::Probe);
+        assert_eq!(c.anchor_rank(), None);
     }
 
     #[test]
-    fn test_ddp_config_disable_el_che() {
-        let c = DdpConfig::new().max_anchor(Some(0));
-        assert_eq!(c.max_anchor, Some(0));
+    fn test_phase_advances_on_first_calibration() {
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 380.0, 395.0], &bc, 10.0);
+        assert_eq!(c.phase(), Phase::Warmup);
+        assert!(c.anchor_rank().is_some());
     }
 
     #[test]
-    fn test_configure_el_che_creates_from_config() {
-        let mut state = mock_state(&[0.5, 0.5]);
-
-        let config = DdpConfig::new().speed_hint(1, 2.0).overhead_target(0.15);
-        state.configure_el_che(&config);
-
-        assert!(state.el_che.is_some());
-        let el = state.el_che.as_ref().unwrap();
-        // Slow rank gets anchor, fast gets more
-        assert_eq!(el.batches(1), el.anchor());
-        assert!(el.batches(0) > el.batches(1));
+    fn test_phase_warmup_to_stable_at_5() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        for _ in 0..5 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        }
+        assert_eq!(c.phase(), Phase::Stable);
     }
 
     #[test]
-    fn test_configure_el_che_disabled() {
-        let mut state = mock_state(&[0.5, 0.5]);
-
-        let config = DdpConfig::new().max_anchor(Some(0));
-        state.configure_el_che(&config);
-
-        assert!(state.el_che.is_none());
+    fn test_phase_stable_to_mature_at_20() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        for _ in 0..20 {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[500.0, 1000.0], &bc, 10.0);
+        }
+        assert_eq!(c.phase(), Phase::Mature);
     }
 
     #[test]
-    fn test_configure_el_che_single_device_noop() {
-        let mut state = mock_state(&[1.0]);
+    fn test_anchor_stable_under_tied_slow_ranks() {
+        // The 3-GPU bug case: rank 0 fast (100ms), ranks 1 and 2 within 5%
+        // of each other (380 vs 395). Old argmax flapped between 1 and 2 each
+        // cycle; tie-band + sticky should pin one and keep it.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
 
-        let config = DdpConfig::new();
-        state.configure_el_che(&config);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 380.0, 395.0], &bc, 10.0);
+        let first = c.anchor_rank().expect("anchor elected");
 
-        // Single device -- El Che not created
-        assert!(state.el_che.is_none());
-    }
-
-    // -- El Che CUDA integration tests (multi-GPU, NCCL) ----------------------
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-nccl"]
-    fn test_el_che_full_training_loop() {
-        if !require_multi_gpu() {
-            return;
+        // Subsequent cycles with the slowest swapping inside the tie band.
+        for (a, b) in &[(390.0, 380.0), (385.0, 388.0), (392.0, 386.0)] {
+            let bc = c.batch_counts().to_vec();
+            c.report_timing(&[100.0, *a, *b], &bc, 10.0);
+            assert_eq!(
+                c.anchor_rank(), Some(first),
+                "anchor must stay sticky across tied slow-rank fluctuations",
+            );
         }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        use crate::graph::FlowBuilder;
-        use crate::nn::{Adam, Linear, ReLU, mse_loss};
-        use crate::data::{DataLoader, DataSet};
-
-        // Simple dataset: 200 samples, 4 features, 2 targets
-        struct TinyData;
-        impl DataSet for TinyData {
-            fn len(&self) -> usize { 200 }
-            fn get(&self, index: usize) -> crate::tensor::Result<Vec<Tensor>> {
-                let x = Tensor::from_f32(
-                    &[index as f32; 4], &[4], Device::CPU,
-                )?;
-                let y = Tensor::from_f32(
-                    &[(index as f32) * 0.1; 2], &[2], Device::CPU,
-                )?;
-                Ok(vec![x, y])
-            }
-        }
-
-        let model = FlowBuilder::from(
-            Linear::on_device(4, 8, Device::CUDA(0)).unwrap(),
-        )
-        .through(ReLU::new())
-        .through(Linear::on_device(8, 2, Device::CUDA(0)).unwrap())
-        .build()
-        .unwrap();
-
-        Trainer::setup_with(
-            &model,
-            |dev| {
-                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
-                    .through(ReLU::new())
-                    .through(Linear::on_device(8, 2, dev)?)
-                    .build()
-            },
-            |p| Adam::new(p, 0.001),
-            DdpConfig::new().speed_hint(1, 2.0).max_anchor(Some(3)),
-        )
-        .unwrap();
-
-        assert!(model.is_distributed());
-        assert!(model.has_el_che());
-        assert_eq!(model.world_size(), 2);
-
-        // Set up DataLoader
-        let loader = DataLoader::from_dataset(TinyData)
-            .batch_size(10)
-            .names(&["input", "target"])
-            .build()
-            .unwrap();
-
-        model.set_data_loader(loader, "input").unwrap();
-
-        // Run 1 epoch
-        let mut step_count = 0;
-        for batch in model.epoch(0).activate() {
-            let b = batch.unwrap();
-            let out = model.forward_batch(&b).unwrap();
-            let target = Variable::new(b["target"].clone(), false);
-            let loss = mse_loss(&out, &target).unwrap();
-            loss.backward().unwrap();
-            model.step().unwrap();
-            step_count += 1;
-        }
-
-        // With anchor=3 and ratio=2.0: ~5 batches per El Che step (3 + 2*3=6, total ~5-6)
-        // 200 samples / 10 batch_size = 20 batches total
-        // ~20 / 5 = ~4 El Che iterations
-        assert!(step_count > 0, "should have trained at least one step");
-        assert!(step_count <= 20, "should not have more steps than batches");
-
-        cuda_synchronize(0);
-        cuda_synchronize(1);
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-nccl"]
-    fn test_el_che_tagged_outputs_gathered() {
-        if !require_multi_gpu() {
-            return;
+    fn test_anchor_switches_when_clear_winner_emerges() {
+        // Outside the cohort band (>15% margin), anchor must follow the real slow.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+
+        c.report_timing(&[100.0, 400.0, 200.0], &[10, 10, 10], 10.0);
+        assert_eq!(c.anchor_rank(), Some(1));
+
+        // Rank 2 becomes clearly slower. Anchor swaps are gated to Stable
+        // (≥5 calibrations) so only the 6th call onward sees the new
+        // election. Push five corrective reports for the trust window to
+        // dominate, then assert. bc fixed to keep ms_per_batch stable.
+        for _ in 0..5 {
+            c.report_timing(&[100.0, 200.0, 600.0], &[10, 10, 10], 10.0);
         }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        use crate::graph::FlowBuilder;
-        use crate::nn::{Adam, Linear, ReLU, mse_loss};
-        use crate::data::{DataLoader, DataSet};
-
-        struct TinyData;
-        impl DataSet for TinyData {
-            fn len(&self) -> usize { 100 }
-            fn get(&self, index: usize) -> crate::tensor::Result<Vec<Tensor>> {
-                let x = Tensor::from_f32(
-                    &[index as f32; 4], &[4], Device::CPU,
-                )?;
-                let y = Tensor::from_f32(
-                    &[(index as f32) * 0.1; 2], &[2], Device::CPU,
-                )?;
-                Ok(vec![x, y])
-            }
-        }
-
-        // Build model with a tagged intermediate
-        let model = FlowBuilder::from(
-            Linear::on_device(4, 8, Device::CUDA(0)).unwrap(),
-        )
-        .through(ReLU::new())
-        .tag("hidden")
-        .through(Linear::on_device(8, 2, Device::CUDA(0)).unwrap())
-        .build()
-        .unwrap();
-
-        Trainer::setup_with(
-            &model,
-            |dev| {
-                FlowBuilder::from(Linear::on_device(4, 8, dev)?)
-                    .through(ReLU::new())
-                    .tag("hidden")
-                    .through(Linear::on_device(8, 2, dev)?)
-                    .build()
-            },
-            |p| Adam::new(p, 0.001),
-            DdpConfig::new().max_anchor(Some(2)),
-        )
-        .unwrap();
-
-        let loader = DataLoader::from_dataset(TinyData)
-            .batch_size(10)
-            .names(&["input", "target"])
-            .build()
-            .unwrap();
-
-        model.set_data_loader(loader, "input").unwrap();
-
-        // Run one iteration and check tagged output
-        let mut iter = model.epoch(0).activate();
-        if let Some(batch) = iter.next() {
-            let b = batch.unwrap();
-            let out = model.forward_batch(&b).unwrap();
-
-            // Tagged output should exist and have gathered batch dimension
-            let hidden = model.tagged("hidden");
-            assert!(hidden.is_some(), "tagged output should be gathered");
-            let h = hidden.unwrap();
-            // hidden shape: [total_samples_across_devices, 8]
-            assert_eq!(h.shape()[1], 8);
-            // Total samples should be > batch_size (multiple batches gathered)
-            assert!(h.shape()[0] >= 10, "gathered hidden should span multiple batches");
-
-            let target = Variable::new(b["target"].clone(), false);
-            let loss = mse_loss(&out, &target).unwrap();
-            loss.backward().unwrap();
-            model.step().unwrap();
-        }
-
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        assert_eq!(c.anchor_rank(), Some(2), "real slowdown must be tracked");
     }
 
-    /// LoopBody emitting two named per-iteration traces, gather-friendly.
-    /// Returns 2*x; emits "double" = 2*x and "quad" = 4*x.
-    struct EmittingDoublerLB;
-    impl crate::nn::Module for EmittingDoublerLB {
-        fn forward(&self, input: &Variable) -> crate::tensor::Result<Variable> {
-            crate::nn::forward_via_step(self, input)
-        }
-        fn as_loop_body(&self) -> Option<&dyn crate::nn::LoopBody> { Some(self) }
-    }
-    impl crate::nn::LoopBody for EmittingDoublerLB {
-        fn step(
-            &self,
-            input: &Variable,
-            _refs: &std::collections::HashMap<String, Variable>,
-            emit: &mut crate::nn::TraceEmit<'_>,
-        ) -> crate::tensor::Result<Variable> {
-            let two_x = input.add(input)?;
-            let four_x = two_x.add(&two_x)?;
-            emit.publish("double", two_x.clone());
-            emit.publish("quad", four_x);
-            Ok(two_x)
-        }
-    }
-
-    // DO NOT REMOVE the #[ignore] attribute below.
-    //
-    // This test exercises Trainer::setup_with -> Graph::distribute (NCCL
-    // multi-GPU) and MUST run isolated. Without #[ignore] it falls into
-    // cuda-test-all's first leg (`cargo test --features cuda`, parallel,
-    // non-ignored), where NCCL communicator init does CUDA context
-    // manipulation that corrupts concurrent CUBLAS operations on shared
-    // GPU threads. Symptom is hard CUBLAS_STATUS_EXECUTION_FAILED errors
-    // across hundreds of otherwise-unrelated tests, not just a warning.
-    // Empirically validated on 2026-04-01 across the existing NCCL test
-    // surface. The device save/restore inside NcclComms methods is
-    // production-correct (prevents device leaking in training loops) but
-    // not enough for parallel test execution.
-    //
-    // Separately: this test goes through the unpinned Graph::distribute
-    // path. That is fine today (everything on default stream, AccumulateGrad
-    // and gradients match), but will need its own `_grad_accumulators`-style
-    // stream pin (mirroring `flodl/src/distributed/ddp_run/worker.rs`) once
-    // CUDA Graph capture is wired into El Che, or once model-parallel /
-    // sharded paths force non-default streams on this entry point. Until
-    // then the #[ignore] keeps this test compatible with the NCCL exclusivity
-    // rule, matching its siblings (test_el_che_full_training_loop,
-    // test_el_che_tagged_outputs_gathered).
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-nccl"]
-    fn test_el_che_loop_body_emits_gathered_across_replicas() {
-        // Verify multi-trace API works under DDP: each replica's emits land in
-        // its own loop's named_store, gather across ranks/batches concatenates
-        // per (emit_name, step_idx), final ctx.traces[name] is reachable from
-        // the loss closure with the right shape.
-        if !require_multi_gpu() {
-            return;
-        }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn test_relax_anchor_up_grows_anchor() {
+        let mut c = ElChe::new(2, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 5.0);
+        let before = c.anchor();
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), before + 1, "anchor should grow by 1 on relax");
+    }
 
-        use crate::graph::{FlowBuilder, LossContext};
-        use crate::nn::{Adam, Linear, mse_loss};
-        use crate::data::{DataLoader, DataSet};
-        use std::cell::Cell;
-        use std::rc::Rc;
+    #[test]
+    fn test_relax_anchor_up_capped_by_max_batch_diff() {
+        // Ratio 1:3 means at anchor=N, batch_counts=[N, 3N], diff=2N.
+        // With max_batch_diff=20, anchor caps at 10 (yielding [10, 30]).
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50)
+            .with_max_batch_diff(20);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[300.0, 900.0], &bc, 5.0); // 1:3 speed ratio
+        // Already at anchor=10, [10,30], diff=20. Next relax would project
+        // anchor=11 → [11, 33], diff=22 > 20 → refuse.
+        let before = c.anchor();
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), before, "relax must refuse when projected diff exceeds cap");
+    }
 
-        struct TinyData;
-        impl DataSet for TinyData {
-            fn len(&self) -> usize { 32 }
-            fn get(&self, index: usize) -> crate::tensor::Result<Vec<Tensor>> {
-                let x = Tensor::from_f32(
-                    &[(index as f32) + 1.0; 2], &[2], Device::CPU,
-                )?;
-                let y = Tensor::from_f32(
-                    &[(index as f32) + 1.0; 2], &[2], Device::CPU,
-                )?;
-                Ok(vec![x, y])
-            }
-        }
+    #[test]
+    fn test_relax_anchor_up_capped_by_max_anchor() {
+        let mut c = ElChe::new(2, 10)
+            .with_overhead_target(0.50)
+            .with_max_anchor(11);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[500.0, 1000.0], &bc, 5.0);
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), 11);
+        c.relax_anchor_up();
+        assert_eq!(c.anchor(), 11, "relax must respect max_anchor");
+    }
 
-        // Linear before the loop gives the graph learnable parameters so the
-        // loss closure's backward can flow gradients (the test exercises gather,
-        // not optimization, but backward requires grad-bearing params).
-        let model = FlowBuilder::from(
-            Linear::on_device(2, 2, Device::CUDA(0)).unwrap(),
-        )
-        .loop_body(EmittingDoublerLB)
-        .for_n(3)
-        .build()
-        .unwrap();
-
-        Trainer::setup_with(
-            &model,
-            |dev| {
-                FlowBuilder::from(Linear::on_device(2, 2, dev)?)
-                    .loop_body(EmittingDoublerLB)
-                    .for_n(3)
-                    .build()
-            },
-            |p| Adam::new(p, 0.001),
-            DdpConfig::new().max_anchor(Some(2)),
-        )
-        .unwrap();
-
-        let loader = DataLoader::from_dataset(TinyData)
-            .batch_size(4)
-            .names(&["input", "target"])
-            .build()
-            .unwrap();
-
-        model.set_data_loader(loader, "input").unwrap();
-
-        // Loss closure inspects ctx.traces — both emit names must be present
-        // with non-empty Vec<Variable> on each invocation.
-        let saw_emits = Rc::new(Cell::new(false));
-        let saw_emits_w = saw_emits.clone();
-        model.set_loss_fn(move |ctx: &LossContext| {
-            let doubles = ctx.traces.get("double")
-                .expect("ctx.traces missing 'double'");
-            let quads = ctx.traces.get("quad")
-                .expect("ctx.traces missing 'quad'");
-            assert_eq!(doubles.len(), 3, "3 iterations expected");
-            assert_eq!(quads.len(), 3, "3 iterations expected");
-            saw_emits_w.set(true);
-            let target = &ctx.batch["target"];
-            let target_var = Variable::new(target.clone(), false);
-            mse_loss(ctx.output, &target_var)
-        });
-
-        let iter = model.epoch(0).activate();
-        let mut iterations = 0;
-        for batch in iter {
-            let b = batch.unwrap();
-            let _out = model.forward_batch(&b).unwrap();
-            model.step().unwrap();
-            iterations += 1;
-            if iterations >= 2 { break; }
-        }
-
-        assert!(saw_emits.get(), "loss closure must have run with traces visible");
-
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+    #[test]
+    fn test_anchor_election_lowest_rank_tiebreak() {
+        // No prior anchor (Probe phase first call): with all ranks tied, the
+        // deterministic tiebreak picks the lowest-indexed candidate.
+        let mut c = ElChe::new(3, 10).with_overhead_target(0.50);
+        let bc = c.batch_counts().to_vec();
+        c.report_timing(&[100.0, 100.0, 100.0], &bc, 10.0);
+        assert_eq!(c.anchor_rank(), Some(0));
     }

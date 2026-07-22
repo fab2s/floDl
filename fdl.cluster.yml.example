@@ -1,0 +1,223 @@
+# Multi-host cluster overlay -- deep-merges onto fdl.yml.
+#
+# Usage:
+#   cp fdl.cluster.yml.example fdl.cluster.yml
+#   # edit `controller:` + `workers:` sections to match your rig
+#   fdl @cluster <command>     # activates this overlay (`@` env selector)
+#   fdl --env cluster <cmd>    # equivalent (flag form)
+#   FDL_ENV=cluster fdl <cmd>  # equivalent (env-var form)
+#
+# Schema (Refactor 2): strict separation of `controller:` (the
+# orchestrator host fdl-cli runs on, NEVER a NCCL rank) and `workers:`
+# (every rank-carrying host).
+#
+# Conventions:
+#   - This file lives alongside fdl.yml. fdl-cli's overlay mechanism
+#     picks it up when invoked as `fdl @cluster <cmd>` (the `@` env
+#     selector) or with `FDL_ENV=cluster` set in the environment.
+#   - One process per rank. Each worker owns one rank per visible CUDA
+#     device. Global rank IDs are NOT user input — fdl probes each host
+#     for its device count before fan-out and assigns ranks sequentially
+#     by worker order: worker 0 owns [0..N0), worker 1 owns [N0..N0+N1),
+#     etc. The probe queries `nvidia-smi --query-gpu=index --format=csv,noheader`
+#     via SSH for workers using `local_devices: all`.
+#   - `local_devices:` accepts either an explicit list (`[0, 1]`) or
+#     the `all` shorthand. With `all`, fdl probes the host's GPU count
+#     before dispatch; explicit lists carry their own count. A 0-GPU
+#     result on a worker using `all` aborts dispatch with a clear error
+#     (likely misconfig — switch to an explicit `[0, 1, ...]` list).
+#   - `nccl_socket_ifname:` is required on every worker when the
+#     cluster spans multiple machines. NCCL needs it to bind its TCP
+#     transport; auto-detection is brittle so fdl errors loudly if
+#     missing.
+#   - `host:` is the worker identifier (was `name:` pre-Refactor 2).
+#     Used for /etc/hosts resolution, `--add-host` injection, and as
+#     the default SSH target.
+#   - `ssh:` is a launcher-only sub-block that groups all SSH knobs for
+#     this worker. fdl-cli uses it to connect; flodl itself only reads
+#     `ssh.target` to know the network endpoint. Omit the whole block
+#     to skip overrides (default target = `host:`, defaults for
+#     port/user/identity/options come from system ssh +
+#     `~/.ssh/config`). Sub-fields:
+#       target:        ssh hostname/IP/alias (default: `host:`)
+#       port:          maps to `ssh -p <port>`
+#       user:          maps to `ssh -l <user>`
+#       identity_file: maps to `ssh -i <path>`
+#       options:       list of `-o Key=Value` directives, e.g.
+#                      `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`
+#   - `tunnel:` (optional, default false) routes this worker's training
+#     traffic through its fan-out SSH session instead of a direct TCP
+#     connection: the launcher adds a remote forward
+#     (`-R 127.0.0.1:<port>:127.0.0.1:<port>`) to the host's relay SSH
+#     session and points the host at `127.0.0.1:<controller.port>` --
+#     its loopback end of the tunnel. Cross-host traffic then rides the
+#     encrypted SSH session (flodl channels are HMAC-authenticated but
+#     cleartext otherwise -- flodl warns loudly when a cleartext channel
+#     touches a peer outside private address space). Requires a CPU
+#     ElChe mode (NCCL's peer-to-peer data plane cannot ride a
+#     controller tunnel) and a remote host; both validated loudly at
+#     launch. When EVERY remote worker is tunneled, the controller
+#     binds loopback only -- the training port is then unreachable
+#     except through sshd on the controller host.
+#   - `path:` is the project checkout dir on this host. fdl-cli cd's
+#     here before invoking the remote command. Heterogeneous mounts
+#     are fine (e.g. `/opt/flodl` on the controller, `/srv/flodl` in a
+#     VM); training data is the user's responsibility to mount
+#     identically across hosts (NAS / SMB / virtiofs / S3-FUSE).
+#   - `arch:` is the libtorch variant subpath under `<path>/libtorch/`
+#     on this host. E.g. `precompiled/cu128` (PT cu128 wheels) or
+#     `builds/sm61-sm120` (a from-source build). The convention path
+#     `<path>/libtorch/<arch>` is what the rank reads at runtime; the
+#     controller-side build (pre-flight) mirrors it via
+#     `<controller.path>/libtorch/<controller.arch>`. Both point at
+#     the same physical libtorch via the shared project-root mount.
+#
+#     For heterogeneous rigs, each worker's `arch:` selects a
+#     different variant (e.g. Blackwell host on `precompiled/cu128`,
+#     Pascal host on `builds/sm61-sm120`) -- the convention keeps the
+#     path stable while the variant differs per host.
+#
+#     `fdl probe`'s GPU compat check derives supported sm
+#     architectures by basename parsing (e.g. `builds/sm61-sm120` ->
+#     `6.1 12.0`) plus reading the variant's `.arch` metadata file at
+#     `<path>/libtorch/<arch>/.arch`.
+#   - `docker:` (optional) names the docker-compose service that
+#     provides this host's runtime environment (e.g. `cuda`, `dev`).
+#     It does NOT wrap training: fan-out runs each rank's binary
+#     directly on the host over SSH (only the controller's pre-flight
+#     build runs in a container). It is a probe-time signal: `fdl
+#     probe` uses it to skip host-level NCCL scanning (NCCL ships in
+#     the container image) and reports "via Docker image <svc>"
+#     instead of erroring on a missing libnccl.so on the host. Omit
+#     when the host runs flodl natively. Per-host, NOT global: mixed
+#     deployments (controller in Docker, worker bare-metal) are common.
+#   - `data_path:` (optional) shared-storage path visible to this host.
+#     flodl assumes a filesystem reachable at the same logical path on
+#     every node (NAS / SMB / virtiofs / S3-FUSE / SSHFS) holding
+#     training data, model checkpoints, and per-rank logs. Defaults to
+#     `/flodl/data` when omitted. `fdl probe` verifies it exists + is
+#     readable on each host before fan-out. Multi-host checkpoint /
+#     resume paths must live here (see `save_path` / `resume_from`).
+#
+# `controller.port:` defaults to 1337 when omitted (replaces
+# PyTorch's MASTER_PORT default of 29500). This single port carries
+# every cross-host channel (membership join, NCCL rendezvous,
+# CPU-reduce data, coordinator control) — connections route themselves
+# with a channel-select magic. Worker hosts derive `+4` / `+5` for their
+# host-local rank↔relay loopback channels; those never leave the host.
+#
+# The same port also answers plain HTTP GETs with the run's membership
+# state as `state.json`: `fdl status` (or curl) shows the lifecycle
+# phase and who has joined, live from before the join window opens
+# through training. Read-only; reachability follows the port's bind
+# scope (an all-tunneled run exposes it through sshd only).
+#
+# `controller.join:` (optional) tunes the membership window. Workers —
+# fan-out-managed AND self-deployed — dial in and JOIN the run; the
+# window decides when the world forms. Defaults are all-or-nothing over
+# the configured capacity: the run starts the instant every configured
+# rank is in, and cannot start below that. Override to allow degraded
+# starts or leave the door open for extra dial-in workers:
+#   min_rank_start:    quorum in ranks; the run cannot start below it
+#                      (default: the configured capacity)
+#   join_timeout:      window in seconds; quorum reached early does NOT
+#                      close it — late workers within it still join
+#                      (default 300)
+#   target_ranks:      the window closes the moment this many ranks are
+#                      in (default: the configured capacity; raise it to
+#                      wait for self-deployed workers)
+#   max_join_timeout:  hard cap in seconds; quorum still unmet when it
+#                      expires fails the run loudly (default 600, or the
+#                      window length when that is set higher)
+#   open_admission:    accept joins without the pre-shared session salt
+#                      on a non-loopback bind (loudly warned — any peer
+#                      that can reach the port can then join the run).
+#                      A loopback bind (all workers tunneled) is open by
+#                      construction: reachability through sshd IS the
+#                      authentication.
+
+cluster:
+  controller:
+    host: 192.168.122.1               # controller bind address (was `master_addr`)
+    port: 1337                        # controller port (was `master_port`); default 1337
+    path: /opt/flodl                  # controller's view of the shared project root
+    # docker: cuda                    # optional pre-flight build context
+    # arch: precompiled/cu128         # optional libtorch variant for pre-flight
+    # data_path: /flodl/data          # shared-storage root (default /flodl/data)
+    # join:                           # membership-window overrides (see above)
+    #   min_rank_start: 2
+    #   join_timeout: 300
+    #   target_ranks: 4
+    #   max_join_timeout: 600
+
+  workers:
+    - host: node-a                    # worker identifier; default SSH target
+      local_devices: [0]              # 1 device -> 1 rank, assigned [0]
+      nccl_socket_ifname: virbr0
+      path: /opt/flodl                # checkout path on this worker
+      arch: precompiled/cu128         # libtorch variant under <path>/libtorch/
+      docker: cuda                    # runtime env is the `cuda` image (probe skips
+                                      # host NCCL scan); does NOT wrap training -- the
+                                      # rank binary runs directly over SSH. Omit when
+                                      # this worker runs flodl natively.
+      # data_path: /flodl/data        # shared-storage root (default /flodl/data)
+
+    - host: node-b
+      ssh:                            # optional sub-block; omit entirely to use defaults
+        target: node-b                # ssh target; defaults to host: if omitted
+        # port: 2222
+        # user: ubuntu
+        # identity_file: /home/ubuntu/.ssh/cluster_key
+        # options:
+        #   - ProxyJump=bastion
+        #   - StrictHostKeyChecking=no
+      local_devices: all              # probed pre-dispatch; equivalent to [0, 1]
+                                      # if this worker has 2 visible CUDA devices.
+                                      # Resulting ranks: [1, 2] (sequential after node-a's [0]).
+      nccl_socket_ifname: enp1s0
+      path: /srv/flodl                # heterogeneous mounts are fine
+      arch: builds/sm61-sm120         # different variant per worker is OK
+                                      # no `docker:` here -> bare-metal flodl install.
+      # Optional per-worker env vars exported into every rank child
+      # spawned on this worker. Overrides cluster-scope `env:` for
+      # matching keys. Example: pin a host-built libnccl version so
+      # libtorch's dlopen resolves to the same NCCL bytes as the
+      # other ranks on the cluster.
+      # env:
+      #   LD_PRELOAD: /opt/flodl/libtorch/nccl/builds/v2.27.5-sm61/lib/libnccl.so.2
+      #
+      # NCCL_P2P_DISABLE / NCCL_SHM_DISABLE used to be required on
+      # consumer GPUs under VFIO passthrough (older libnccl
+      # versions hung the VM at ncclCommInitRank). Verified obsolete
+      # 2026-05 with libnccl 2.27.5 + driver 580.142 — NCCL detects
+      # P2P unavailability and falls back to socket transport on its
+      # own. Restore only if a future driver/libnccl regression
+      # reintroduces the failure mode.
+
+  # Cluster-scope env: applied to every rank child on every worker.
+  # Per-worker `env:` blocks override matching keys.
+  # env:
+  #   NCCL_DEBUG: INFO
+
+# ---------------------------------------------------------------------------
+# commands: which commands fan out to the cluster.
+#
+# A command is single-host UNLESS it carries `cluster: true` — that flag
+# is what makes `fdl @cluster <name>` SSH to every worker above and run
+# the pre-flight build + fan-out. Without a `commands:` block, copying
+# this file gives you a topology but nothing that dispatches to it (the
+# launcher stays single-host and prints "N GPUs visible, cluster off").
+# ---------------------------------------------------------------------------
+commands:
+  # Connectivity smoke: one line per rank proves SSH + env reach every host.
+  smoke:
+    cluster: true
+    run: echo "rank says hello from $(hostname)"
+
+  # Real training binary. `cluster: true` is inherited by every command
+  # under the binary's own fdl.yml (e.g. ddp-bench/), so a per-command
+  # entry here is only needed for binaries launched from this overlay.
+  # ddp-bench:
+  #   cluster: true
+  # hf-ddp:            # flodl-hf head DDP validation vehicle (--bin hf-ddp)
+  #   cluster: true

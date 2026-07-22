@@ -22,6 +22,21 @@ use flodl::tensor::{Device, Result, Tensor};
 
 use crate::config::ModelDefaults;
 
+/// Where the training data lives during the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    /// Parse the whole dataset into RAM tensors up front (default).
+    Ram,
+    /// Read per sample from the raw files through flodl's `DataSet`
+    /// layer, exercising the storage-read path the staging tiers
+    /// absorb. Honored by the CIFAR-10 models (`resnet`,
+    /// `resnet-graph`); other models error loudly.
+    Disk,
+}
+
+/// Model names whose dataset factory honors [`DataSource::Disk`].
+pub const DISK_SOURCE_MODELS: [&str; 2] = ["resnet", "resnet-graph"];
+
 /// Dataset configuration passed to each model's dataset factory.
 #[allow(dead_code)]
 pub struct DatasetConfig {
@@ -29,6 +44,7 @@ pub struct DatasetConfig {
     pub data_dir: PathBuf,
     pub virtual_len: usize,
     pub pool_size: usize,
+    pub data_source: DataSource,
 }
 
 /// A benchmark model definition.
@@ -42,6 +58,16 @@ pub struct ModelDef {
     pub build: fn(Device) -> Result<Box<dyn Module>>,
     /// Create the dataset for this model.
     pub dataset: fn(&DatasetConfig) -> Result<Arc<dyn BatchDataSet>>,
+    /// Report `dataset.len()` without actually constructing the dataset.
+    ///
+    /// Launcher processes in cluster mode call this in place of `dataset`
+    /// to skip the heavy load (the launcher fans out to rank children
+    /// and never reads training data itself, but the framework needs
+    /// `total_samples` to compute per-rank partition sizes). For real-
+    /// data datasets that's typically a known constant (MNIST = 60000
+    /// train, CIFAR-10 = 50000 train); for synthetic datasets the hint
+    /// can return `cfg.virtual_len`.
+    pub dataset_size_hint: fn(&DatasetConfig) -> Result<usize>,
     /// Training step: forward + loss. Returns the loss Variable.
     pub train_fn: fn(&dyn Module, &[Tensor]) -> Result<Variable>,
     /// Optional evaluation metric (e.g. accuracy). Called after each epoch.
@@ -65,6 +91,12 @@ pub struct ModelDef {
     pub published_eval: Option<f64>,
     /// True if higher eval is better (accuracy). False for loss-like metrics.
     pub eval_higher_is_better: bool,
+    /// True when the published baseline is reported as a per-epoch curve
+    /// (loss + accuracy at every epoch). Solo runs of such models go through
+    /// the dedicated `run_baseline_solo` path so we can reproduce the curve
+    /// shape; every other run (multi-GPU, non-baseline solo) flows through
+    /// the unified `Trainer::builder` path with final-only eval.
+    pub needs_baseline_eval: bool,
 }
 
 /// All registered benchmark models.

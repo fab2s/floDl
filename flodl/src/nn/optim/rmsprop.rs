@@ -7,7 +7,7 @@ use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
     write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    write_u32_le, read_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -171,7 +171,7 @@ impl Optimizer for RMSprop {
                                 b.add_(&update)?;
                                 b
                             }
-                            None => update.mul_scalar(1.0)?,
+                            None => update.copy()?,
                         };
                         let scaled = b.mul_scalar(lr)?;
                         data.sub_(&scaled)?;
@@ -186,6 +186,17 @@ impl Optimizer for RMSprop {
             }
             Ok(())
         })
+    }
+
+    fn reset_state(&mut self) {
+        // Squared-grad running average + momentum buffer back to fresh.
+        // Lengths preserved for per-param indexing.
+        for slot in &mut self.v {
+            *slot = None;
+        }
+        for slot in &mut self.buf {
+            *slot = None;
+        }
     }
 
     fn zero_grad(&self) {
@@ -206,9 +217,15 @@ impl Optimizer for RMSprop {
             g.lr = lr;
         }
     }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
 }
 
 impl Stateful for RMSprop {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::RMSprop }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;
@@ -221,12 +238,7 @@ impl Stateful for RMSprop {
             write_tensor_state(w, self.buf[i].as_ref())?;
         }
         // Groups
-        write_u32_le(w, self.groups.len() as u32)?;
-        for g in &self.groups {
-            write_f64_le(w, g.lr)?;
-            write_i64_le(w, g.range.start as i64)?;
-            write_i64_le(w, g.range.end as i64)?;
-        }
+        super::write_groups(w, &self.groups)?;
         Ok(())
     }
 
@@ -248,14 +260,7 @@ impl Stateful for RMSprop {
             self.buf[i] = read_tensor_state(r, dev)?;
         }
         // Groups
-        let ng = read_u32_le(r)? as usize;
-        self.groups.clear();
-        for _ in 0..ng {
-            let lr = read_f64_le(r)?;
-            let start = read_i64_le(r)? as usize;
-            let end = read_i64_le(r)? as usize;
-            self.groups.push(GroupMeta { lr, range: start..end });
-        }
+        self.groups = super::read_groups(r, self.params.len(), "RMSprop")?;
         Ok(())
     }
 }

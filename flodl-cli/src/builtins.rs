@@ -37,6 +37,65 @@ pub struct DiagnoseArgs {
     pub json: bool,
 }
 
+/// Cluster readiness probe.
+///
+/// Default (single-host): probes the local box for GPU + libtorch arch
+/// match + shared-data path + NCCL availability. Cluster context
+/// (`fdl @cluster probe` / `FDL_ENV=cluster`): probes every host in
+/// `fdl.cluster.yml` via SSH and aggregates the report.
+///
+/// Exit code: 0 when every checked component is green; 1 when any
+/// issue was surfaced. `fdl deploy` and CI consume the `--json` shape.
+#[derive(crate::FdlArgs, Debug)]
+pub struct ProbeArgs {
+    /// Emit machine-readable JSON.
+    #[option]
+    pub json: bool,
+    /// Skip the shared-data-mount visibility check. Useful for
+    /// single-host setups without a shared filesystem configured.
+    #[option]
+    pub skip_mount: bool,
+    /// Override the shared-data path (default: cluster.yml's
+    /// per-host `data_path:`, or the convention default
+    /// `/flodl/data` when unset).
+    #[option]
+    pub data_path: Option<std::path::PathBuf>,
+    /// Override the libtorch directory. Default walks up from cwd
+    /// for `libtorch/.active`. Use this when the libtorch install
+    /// lives outside the project tree (e.g. a separate virtiofs
+    /// share mounted at a known path on a worker node).
+    #[option]
+    pub libtorch_path: Option<std::path::PathBuf>,
+    /// Treat NCCL as provided by a Docker image (compose service name
+    /// from `fdl.yml`, e.g. `cuda`). Suppresses host-level NCCL
+    /// discovery and reports "via Docker image `<svc>`" instead. In
+    /// cluster mode, this is auto-derived from each host's `docker:`
+    /// field in `fdl.cluster.yml`.
+    #[option]
+    pub docker: Option<String>,
+}
+
+/// Live cluster run status.
+///
+/// Fetches the controller's `state.json` (membership + lifecycle
+/// phase, served on the training port itself) and pretty-prints it.
+/// Live for the whole run, join window included: shows who has joined
+/// while the world is still forming.
+///
+/// Exit code: 0 when the state was fetched; 1 when no endpoint
+/// answered (usually: no run is up).
+#[derive(crate::FdlArgs, Debug)]
+pub struct StatusArgs {
+    /// Emit the raw state.json body instead of the human summary.
+    #[option]
+    pub json: bool,
+    /// Controller address to query, `host[:port]` (default port 1337).
+    /// Overrides the active env's `cluster.controller`. This is all a
+    /// self-deployed worker's operator needs to watch a run.
+    #[option]
+    pub addr: Option<String>,
+}
+
 /// Generate flodl API reference.
 #[derive(crate::FdlArgs, Debug)]
 pub struct ApiRefArgs {
@@ -172,6 +231,26 @@ pub struct LibtorchBuildArgs {
     pub dry_run: bool,
 }
 
+/// Build NCCL from NVIDIA source for a heterogeneous-arch rig.
+#[derive(crate::FdlArgs, Debug)]
+pub struct NcclBuildArgs {
+    /// NCCL git tag to build (e.g. "v2.27.5-1"). Default: infer from the
+    /// active libtorch's bundled NCCL version string (the version we must
+    /// match for cross-rank handshake).
+    #[option]
+    pub tag: Option<String>,
+    /// Override CUDA architectures (semicolon-separated, e.g. "6.1;12.0").
+    /// Default: auto-detect from local GPUs.
+    #[option]
+    pub archs: Option<String>,
+    /// Parallel compilation jobs.
+    #[option(default = "6")]
+    pub jobs: usize,
+    /// Show what would happen without building.
+    #[option]
+    pub dry_run: bool,
+}
+
 /// Install AI coding assistant skills.
 #[derive(crate::FdlArgs, Debug)]
 pub struct SkillInstallArgs {
@@ -272,6 +351,16 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: None,
         },
         BuiltinSpec {
+            path: &["nccl"],
+            description: Some("Build NCCL from source (heterogeneous-arch bridge)"),
+            schema_fn: None,
+        },
+        BuiltinSpec {
+            path: &["nccl", "build"],
+            description: Some("Compile libnccl for the local GPU arch"),
+            schema_fn: Some(NcclBuildArgs::schema),
+        },
+        BuiltinSpec {
             path: &["init"],
             description: Some("Scaffold a new floDl project"),
             schema_fn: Some(InitArgs::schema),
@@ -285,6 +374,20 @@ pub fn registry() -> &'static [BuiltinSpec] {
             path: &["diagnose"],
             description: Some("System and GPU diagnostics"),
             schema_fn: Some(DiagnoseArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["probe"],
+            description: Some(
+                "Cluster readiness probe (GPU + libtorch + data mount)",
+            ),
+            schema_fn: Some(ProbeArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["status"],
+            description: Some(
+                "Live cluster run status (membership, lifecycle phase)",
+            ),
+            schema_fn: Some(StatusArgs::schema),
         },
         BuiltinSpec {
             path: &["install"],
@@ -352,7 +455,7 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: None,
         },
         // Hidden: `version` is covered by `-V` / `--version` but still
-        // reserved so first-arg env detection doesn't hijack it.
+        // reserved as a top-level built-in name.
         BuiltinSpec {
             path: &["version"],
             description: None,
@@ -363,7 +466,6 @@ pub fn registry() -> &'static [BuiltinSpec] {
 }
 
 /// True when `name` is a reserved top-level built-in (visible or hidden).
-/// Drives env-collision detection in first-arg resolution.
 pub fn is_builtin_name(name: &str) -> bool {
     registry()
         .iter()
@@ -438,9 +540,9 @@ mod tests {
         // here. Keeping the list local (rather than introspecting main.rs)
         // documents the coupling explicitly.
         let dispatched = [
-            "setup", "libtorch", "diagnose", "api-ref", "init", "add",
-            "install", "skill", "schema", "completions", "autocomplete",
-            "config", "version",
+            "setup", "libtorch", "nccl", "diagnose", "probe", "status",
+            "api-ref", "init", "add", "install", "skill", "schema",
+            "completions", "autocomplete", "config", "version",
         ];
         for name in &dispatched {
             assert!(
@@ -458,9 +560,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "setup", "libtorch", "init", "add", "diagnose", "install",
-                "skill", "api-ref", "config", "schema", "completions",
-                "autocomplete",
+                "setup", "libtorch", "nccl", "init", "add", "diagnose",
+                "probe", "status", "install", "skill", "api-ref", "config",
+                "schema", "completions", "autocomplete",
             ]
         );
     }

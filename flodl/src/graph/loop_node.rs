@@ -27,11 +27,11 @@ impl LoopBuilder {
             return fb;
         }
         if fb.current.len() != 1 {
-            fb.err = Some("loop requires single stream".into());
+            fb.fail("loop requires single stream");
             return fb;
         }
         if n < 1 {
-            fb.err = Some("loop requires at least 1 iteration".into());
+            fb.fail("loop requires at least 1 iteration");
             return fb;
         }
 
@@ -61,11 +61,11 @@ impl LoopBuilder {
             return fb;
         }
         if fb.current.len() != 1 {
-            fb.err = Some("loop requires single stream".into());
+            fb.fail("loop requires single stream");
             return fb;
         }
         if max_iter < 1 {
-            fb.err = Some("loop requires max_iter >= 1".into());
+            fb.fail("loop requires max_iter >= 1");
             return fb;
         }
 
@@ -97,11 +97,11 @@ impl LoopBuilder {
             return fb;
         }
         if fb.current.len() != 1 {
-            fb.err = Some("loop requires single stream".into());
+            fb.fail("loop requires single stream");
             return fb;
         }
         if max_iter < 1 {
-            fb.err = Some("loop requires max_iter >= 1".into());
+            fb.fail("loop requires max_iter >= 1");
             return fb;
         }
 

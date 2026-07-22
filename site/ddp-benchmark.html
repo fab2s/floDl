@@ -1,21 +1,24 @@
 ---
 layout: default
 title: DDP Benchmark
-description: "8 models, 8 DDP modes, 70 runs. Every mode converges. Heterogeneous GPUs (2.5x speed gap) train faster than the fast GPU alone."
-last_modified_at: 2026-04-28T21:22:12+02:00
+description: "8 models, 6 DDP modes, 63 runs across a 3-GPU two-host cluster. DiLoCo takes the accuracy crown at 92.36% on ResNet-20, beating the fast GPU alone on both accuracy and wall time."
+last_modified_at: 2026-07-22T23:45:00+02:00
 ---
 
 <section class="section">
   <h2 class="section-title">DDP Benchmark</h2>
   <p class="section-sub">
-    Eight models, eight distributed modes, 70 training runs.<br>
-    Two mismatched GPUs training faster than the fast one alone.
+    Eight models, six distributed modes, three solo baselines, 63 runs.<br>
+    Three mismatched GPUs across two hosts, faster than the fast one alone.
   </p>
 
   <div style="max-width: 720px; margin: 1.5rem auto;">
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
-      <strong>Hardware:</strong> RTX 5060 Ti (sm_120, 15 GB) + GTX 1060 (sm_61, 6 GB).
-      A 2.5x compute gap. No pre-built libtorch covers both architectures &mdash;
+      <strong>Hardware:</strong> RTX 5060 Ti (sm_120, 16 GB) on the controller host,
+      plus two GTX 1060 (sm_61, 6 GB) inside a VM on the same box &mdash; a real
+      multi-host cluster coordinated over TCP, with the slowest card behind a
+      PCIe x1 riser. Up to ~12x delivered-throughput gap between fastest and
+      slowest rank. No pre-built libtorch covers both architectures &mdash;
       compiled from source with <code>fdl libtorch build</code>.
     </p>
   </div>
@@ -30,18 +33,17 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 <section class="section">
   <h2 class="section-title">ResNet-20 on CIFAR-10</h2>
   <p class="section-sub">
-    200 epochs, every DDP mode surpasses solo.<br>
-    Published reference: 91.25% accuracy
+    200 epochs, every DDP mode beats the published reference.<br>
+    Published: 91.25% accuracy
     (<a href="https://arxiv.org/abs/1512.03385">He et al. 2015</a>, Table 6).
   </p>
 
   <div style="max-width: 720px; margin: 1.5rem auto;">
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
       This is the FlowBuilder Graph version &mdash; the same ResNet-20 architecture
-      expressed as a computation graph. One <code>Trainer::setup()</code> call turns it into
-      multi-GPU training. The non-graph ResNet-20 (manual <code>Module</code> impl)
-      produces identical results through <code>Trainer::builder()</code>, confirming that
-      both DDP entry points converge correctly.
+      expressed as a computation graph. One <code>Trainer::run()</code> call turns it
+      into a 3-rank multi-host training run. The manual-<code>Module</code> ResNet-20
+      confirms parity below.
     </p>
   </div>
 
@@ -54,26 +56,27 @@ last_modified_at: 2026-04-28T21:22:12+02:00
           <th>vs Paper</th>
           <th>Wall time</th>
           <th>Speedup</th>
-          <th>GPU0</th>
-          <th>GPU1</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td>solo-0 (5060 Ti)</td><td>91.66%</td><td>+0.41pp</td><td>3127s</td><td>1.0x</td><td>100%</td><td>&mdash;</td></tr>
-        <tr><td>solo-1 (1060)</td><td>91.69%</td><td>+0.44pp</td><td>3702s</td><td>0.8x</td><td>&mdash;</td><td>100%</td></tr>
-        <tr class="bench-highlight"><td><strong>nccl-sync</strong></td><td><strong>92.38%</strong></td><td><strong>+1.13pp</strong></td><td><strong>2605s</strong></td><td><strong>1.2x</strong></td><td>99%</td><td>100%</td></tr>
-        <tr class="bench-highlight"><td><strong>nccl-cadence</strong></td><td><strong>92.42%</strong></td><td><strong>+1.17pp</strong></td><td><strong>2650s</strong></td><td><strong>1.2x</strong></td><td>100%</td><td>100%</td></tr>
-        <tr class="bench-highlight"><td><strong>nccl-async</strong></td><td><strong>92.44%</strong></td><td><strong>+1.19pp</strong></td><td><strong>2697s</strong></td><td><strong>1.2x</strong></td><td>100%</td><td>100%</td></tr>
-        <tr><td>cpu-sync</td><td>92.53%</td><td>+1.28pp</td><td>4418s</td><td>0.7x</td><td>99%</td><td>100%</td></tr>
-        <tr><td>cpu-cadence</td><td>92.04%</td><td>+0.79pp</td><td>2670s</td><td>1.2x</td><td>100%</td><td>100%</td></tr>
-        <tr><td>cpu-async</td><td>92.43%</td><td>+1.18pp</td><td>2614s</td><td>1.2x</td><td>100%</td><td>100%</td></tr>
-        <tr><td>sync (Graph DDP)</td><td>91.43%</td><td>+0.18pp</td><td>6376s</td><td>0.5x</td><td>100%</td><td>100%</td></tr>
+        <tr><td>solo-0 (5060 Ti)</td><td>92.10%</td><td>+0.85pp</td><td>699s</td><td>1.0x</td></tr>
+        <tr><td>solo-1 (1060)</td><td>91.70%</td><td>+0.45pp</td><td>3186s</td><td>0.22x</td></tr>
+        <tr><td>solo-2 (1060, x1 riser)</td><td>91.94%</td><td>+0.69pp</td><td>3318s</td><td>0.21x</td></tr>
+        <tr class="bench-highlight"><td><strong>cpu-async-diloco</strong></td><td><strong>92.36%</strong></td><td><strong>+1.11pp</strong></td><td><strong>524s</strong></td><td><strong>1.33x</strong></td></tr>
+        <tr class="bench-highlight"><td><strong>cpu-cadence</strong></td><td>91.67%</td><td>+0.42pp</td><td><strong>512s</strong></td><td><strong>1.37x</strong></td></tr>
+        <tr><td>cpu-async</td><td>92.08%</td><td>+0.83pp</td><td>529s</td><td>1.32x</td></tr>
+        <tr><td>nccl-cadence</td><td>92.06%</td><td>+0.81pp</td><td>548s</td><td>1.28x</td></tr>
+        <tr><td>nccl-sync</td><td>91.98%</td><td>+0.73pp</td><td>1173s</td><td>0.60x</td></tr>
+        <tr><td>cpu-sync</td><td>91.62%</td><td>+0.37pp</td><td>1650s</td><td>0.42x</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
-      Eval = test set accuracy (held-out 10K samples). GPU% = compute utilization.
-      Speedup relative to solo-0. All 9 modes beat the published 91.25%.
-      Sync (Graph DDP) pays full barrier cost with a 2.5x speed gap, hence the lower speedup.
+      Eval = held-out test accuracy (10K samples). Speedup relative to solo-0
+      (which pays per-epoch eval; its training-only time is 670s). Every mode
+      beats the paper; the cluster beats the fast GPU alone on wall time while
+      the slowest card would need 55 minutes for the same run. The <code>*-sync</code>
+      modes reduce once per slow-rank step, so they pay the rendezvous
+      thousands of times &mdash; correctness baselines, not speed contenders.
     </p>
   </div>
 </section>
@@ -81,7 +84,35 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 <hr class="divider">
 
 <!-- ============================================================ -->
-<!-- ResNet non-graph confirmation -->
+<!-- Solo overfits, the consensus can't -->
+<!-- ============================================================ -->
+
+<section class="section">
+  <h2 class="section-title">Solo overfits. The consensus can't.</h2>
+  <p class="section-sub">
+    The most interesting row above is not the wall time.
+  </p>
+
+  <div style="max-width: 720px; margin: 1.5rem auto;">
+    <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
+      Solo-0 reached exactly 92.36% at epoch 159 &mdash; then spent the last 40
+      epochs trading it away: training loss kept halving (0.025 &rarr; 0.012)
+      while eval slid back to 92.10%. Textbook overfitting-in-time.
+      <code>cpu-async-diloco</code> ends at that same 92.36% &mdash; and holds it.
+      Each replica only sees its own data partition, so whatever one replica
+      memorizes, the others did not: the consensus average attenuates
+      replica-private memorization every round while shared structure survives.
+      DiLoCo's outer Nesterov momentum smooths the consensus trajectory on top.
+      The distributed run is, in effect, a solo run with perfect early stopping
+      &mdash; without needing to know when to stop, and faster.
+    </p>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<!-- ResNet non-graph parity -->
 <!-- ============================================================ -->
 
 <section class="section">
@@ -91,7 +122,7 @@ last_modified_at: 2026-04-28T21:22:12+02:00
     same convergence &mdash; confirming both DDP entry points work.
   </p>
 
-  <div class="bench-table" style="max-width: 920px;">
+  <div class="bench-table" style="max-width: 720px;">
     <table>
       <thead>
         <tr>
@@ -99,51 +130,19 @@ last_modified_at: 2026-04-28T21:22:12+02:00
           <th>Eval</th>
           <th>vs Paper</th>
           <th>Wall time</th>
-          <th>Speedup</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td>solo-0 (5060 Ti)</td><td>91.62%</td><td>+0.37pp</td><td>2994s</td><td>1.0x</td></tr>
-        <tr><td>nccl-sync</td><td>92.19%</td><td>+0.94pp</td><td>2491s</td><td>1.2x</td></tr>
-        <tr><td>nccl-cadence</td><td>92.00%</td><td>+0.75pp</td><td>2574s</td><td>1.2x</td></tr>
-        <tr><td>nccl-async</td><td>92.10%</td><td>+0.85pp</td><td>2522s</td><td>1.2x</td></tr>
-        <tr><td>cpu-sync</td><td>92.44%</td><td>+1.19pp</td><td>4356s</td><td>0.7x</td></tr>
-        <tr><td>cpu-cadence</td><td>91.75%</td><td>+0.50pp</td><td>2467s</td><td>1.2x</td></tr>
-        <tr><td>cpu-async</td><td>91.92%</td><td>+0.67pp</td><td>2534s</td><td>1.2x</td></tr>
+        <tr><td>solo-0 (5060 Ti)</td><td>91.73%</td><td>+0.48pp</td><td>689s</td></tr>
+        <tr><td>nccl-cadence</td><td>91.60%</td><td>+0.35pp</td><td>536s</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
-      <code>Trainer::builder()</code> path. No Graph required &mdash; any <code>Module</code> works.
-    </p>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- ============================================================ -->
-<!-- CPU averaging redemption -->
-<!-- ============================================================ -->
-
-<section class="section">
-  <h2 class="section-title">CPU averaging: fixed</h2>
-  <p class="section-sub">
-    v0.3.0 shipped with CPU averaging broken. v0.4.0 fixes it.<br>
-    One stream synchronization bug, three policies restored.
-  </p>
-
-  <div class="bench-table" style="max-width: 600px;">
-    <table>
-      <thead>
-        <tr><th>Policy</th><th>v0.3.0</th><th>v0.4.0</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>CPU Sync</td><td style="color: #e55">broken</td><td style="color: #5b5"><strong>92.53%</strong></td></tr>
-        <tr><td>CPU Cadence</td><td style="color: #e55">broken</td><td style="color: #5b5"><strong>92.04%</strong></td></tr>
-        <tr><td>CPU Async</td><td style="color: #e55">broken</td><td style="color: #5b5"><strong>92.43%</strong></td></tr>
-      </tbody>
-    </table>
-    <p class="bench-note">
-      ResNet-20 Graph on CIFAR-10, 200 epochs. Both backends are now production-ready.
+      <code>Trainer::builder()</code> path, no Graph required. The eager and graph
+      engines land within 0.1% of each other on both wall time and eval
+      (compare the graph flavor's cpu-sync 1650.2s vs the eager 1648.4s from
+      the same sweep), so the full mode suite runs on the graph flavor and the
+      eager model keeps these two parity cells.
     </p>
   </div>
 </section>
@@ -155,27 +154,27 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 <!-- ============================================================ -->
 
 <section class="section">
-  <h2 class="section-title">El Che: three policies</h2>
+  <h2 class="section-title">El Che: three cadences, one engine</h2>
   <p class="section-sub">
-    Different tradeoffs for different hardware.<br>
-    All three converge. The choice is throughput vs gradient freshness.
+    Every mode runs the same ElChe-scheduled engine with work-weighted averaging.<br>
+    The choice is where each mode sits on the throughput / freshness curve.
   </p>
 
   <div class="what-you-get" style="max-width: 920px;">
     <div class="wyg-card">
       <h3>Sync</h3>
-      <p>AllReduce every batch. Maximum gradient freshness. The fast GPU waits at every barrier. Best convergence, worst throughput on mixed hardware.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.38%, 2605s (NCCL) / 92.53%, 4418s (CPU)</p>
+      <p>Equal data split; the reduce fires as soon as every alive rank has made at least one step. Degenerates to classic DDP on homogeneous rigs; on mixed hardware the fast GPU runs several steps per reduce inside its equal share, then idles. Correctness baseline.</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 91.98%, 1173s (NCCL) / 91.62%, 1650s (CPU)</p>
     </div>
     <div class="wyg-card">
       <h3>Cadence</h3>
-      <p>Slow GPU anchors the sync interval. Fast GPU processes more batches between syncs, contributing proportionally to its speed. Auto-tunes to keep AllReduce overhead below 10%.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.42%, 2650s (NCCL) / 92.04%, 2670s (CPU)</p>
+      <p>Data dispatched proportionally to measured throughput; the reduce fires once every rank completes its planned window. The slow card anchors the interval, the fast card contributes proportionally more. Fastest wall time on this rig.</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.06%, 548s (NCCL) / 91.67%, 512s (CPU)</p>
     </div>
     <div class="wyg-card">
-      <h3>Async</h3>
-      <p>Workers run independently, averaging when ready. The fast GPU ranges ahead, creating useful parameter diversity. Fastest wall time, convergence smooths out over epochs.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.44%, 2697s (NCCL) / 92.43%, 2614s (CPU)</p>
+      <h3>Async (+ DiLoCo)</h3>
+      <p>Cadence plus bounded overshoot and barrier-free application, with EASGD elastic blending on by default. A few percent of wall behind cadence (the divergence guard grows its window more cautiously); add the DiLoCo outer optimizer for the best eval of every mode tested.</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.08%, 529s / 92.36%, 524s with DiLoCo</p>
     </div>
   </div>
 </section>
@@ -189,7 +188,7 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 <section class="section">
   <h2 class="section-title">Confirmation: 6 more models</h2>
   <p class="section-sub">
-    Small models with 5 epochs. DDP converges correctly across the board,<br>
+    Small models with 5&ndash;50 epochs. DDP converges correctly across the board,<br>
     though short runs penalize El Che calibration time.
   </p>
 
@@ -207,19 +206,20 @@ last_modified_at: 2026-04-28T21:22:12+02:00
         </tr>
       </thead>
       <tbody>
-        <tr><td>LeNet-5 (MNIST)</td><td>~99%</td><td>98.57%</td><td>98.96%</td><td>cpu-async</td><td>7.0s</td><td>cpu-async</td></tr>
-        <tr><td>MLP (MNIST)</td><td>~97%</td><td>97.00%</td><td>97.89%</td><td>cpu-sync</td><td>3.3s</td><td>cpu-async</td></tr>
-        <tr><td>Logistic (MNIST)</td><td>~92%</td><td>92.37%</td><td>92.51%</td><td>nccl-cadence</td><td>3.1s</td><td>cpu-async</td></tr>
-        <tr><td>Conv AE (MNIST)</td><td>&mdash;</td><td>0.0007</td><td>0.0006</td><td>sync</td><td>5.3s</td><td>cpu-cadence</td></tr>
-        <tr><td>GPT-nano (Shakespeare)</td><td>~1.5&ndash;2.0</td><td>2.4743</td><td>2.4316</td><td>cpu-cadence</td><td>7.0s</td><td>cpu-async</td></tr>
-        <tr><td>Char-RNN (Shakespeare)</td><td>~1.5</td><td>1.5707</td><td>1.5672</td><td>solo-1</td><td>21.5s</td><td>cpu-cadence</td></tr>
+        <tr><td>LeNet-5 (MNIST)</td><td>~99%</td><td>98.74%</td><td>98.94%</td><td>cpu-sync</td><td>8.0s</td><td>cpu-async-diloco</td></tr>
+        <tr><td>MLP (MNIST)</td><td>~97%</td><td>97.14%</td><td>97.41%</td><td>cpu-async-diloco</td><td>7.0s</td><td>cpu-async</td></tr>
+        <tr><td>Logistic (MNIST)</td><td>~92%</td><td>92.36%</td><td>92.30%</td><td>cpu-async-diloco</td><td>7.0s</td><td>cpu-async-diloco</td></tr>
+        <tr><td>Conv AE (MNIST)</td><td>&mdash;</td><td>0.0006</td><td>0.0008</td><td>cpu-sync</td><td>&mdash;</td><td>&mdash;</td></tr>
+        <tr><td>GPT-nano (Shakespeare)</td><td>~1.5&ndash;2.0</td><td>1.7599</td><td>1.8144</td><td>cpu-async-diloco</td><td>&mdash;</td><td>&mdash;</td></tr>
+        <tr><td>Char-RNN (Shakespeare)</td><td>~1.5</td><td>1.7245</td><td>1.5670</td><td>cpu-sync</td><td>31.5s</td><td>nccl-cadence</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
-      Eval is test-set accuracy (classification models) or validation loss (language models, lower is better).
-      5 epochs is too short for DDP to fully demonstrate its advantage &mdash;
-      gradient averaging slows early convergence and El Che needs time to calibrate.
-      These results confirm correctness, not peak performance.
+      Eval is test-set accuracy (classification) or validation loss (language
+      models, lower is better). Short runs are correctness confirmation, not
+      peak performance &mdash; gradient averaging slows early convergence and
+      El Che needs calibration time. The 200-epoch flagship above is where DDP
+      demonstrates its advantage.
     </p>
   </div>
 </section>
@@ -233,25 +233,29 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 <section class="section">
   <h2 class="section-title">Methodology</h2>
   <p class="section-sub">
-    Reproducible. Ship it with <code>fdl ddp-bench</code>.
+    Reproducible. Ships with <code>fdl ddp-bench</code>.
   </p>
 
   <div style="max-width: 720px; margin: 1.5rem auto;">
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
-      <strong>Nine modes</strong>: solo-0, solo-1, sync (Graph DDP), and six builder
-      modes (nccl/cpu &times; sync/cadence/async). Every combination of backend
-      and El Che policy.
+      <strong>Nine modes</strong>: three solo baselines (one per GPU) and six
+      cluster modes &mdash; nccl/cpu &times; sync/cadence, cpu-async, and
+      cpu-async + DiLoCo outer optimizer. Every cluster cell runs as a real
+      3-rank multi-host cluster (process-per-rank, TCP control plane, one
+      rank host being a VM).
     </p>
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8; margin-top: 1rem;">
-      <strong>Eval protocol</strong>: Solo modes evaluate against the held-out test set
-      every epoch. DDP builder modes run a final evaluation after training completes,
-      loading the averaged parameters into a fresh model. Both paths use the same
-      eval function on the same test data.
+      <strong>Eval protocol</strong>: Solo modes evaluate against the held-out test
+      set every epoch. Cluster modes run a final evaluation after training,
+      loading the consensus parameters into a fresh model. Both paths use the
+      same eval function on the same test data.
     </p>
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8; margin-top: 1rem;">
-      <strong>GPU utilization</strong>: Sampled at 100ms intervals via NVML.
-      GPU0/GPU1 percentages are compute utilization (not memory, not load).
-      Idle time is cumulative seconds with &lt;5% utilization.
+      <strong>GPU utilization</strong>: Sampled at 100ms intervals. The sampler runs
+      on the controller host, so cluster rows carry the controller GPU's
+      utilization; remote-rank activity is rank-reported (allocation shares,
+      throughput) and fully covered in the report's per-rank schedule and
+      trajectory charts.
     </p>
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8; margin-top: 1rem;">
       <strong>Reproducibility</strong>: Seed 42, deterministic data loading, identical
@@ -261,15 +265,14 @@ last_modified_at: 2026-04-28T21:22:12+02:00
 
     <div style="margin-top: 2rem;">
 <pre style="background: var(--bg-alt); padding: 1rem; border-radius: 6px; font-size: 14px; overflow-x: auto;">
-fdl ddp-bench full-sweep          # all models, all modes
-fdl ddp-bench --model resnet-graph --mode nccl-async --epochs 200
-fdl ddp-bench report              # generate markdown report
+fdl @cluster ddp-bench --model resnet-graph --mode cpu-cadence --epochs 200
+fdl ddp-bench --report --charts resnet-graph     # report + SVG charts
 </pre>
     </div>
 
     <p style="color: var(--dim); font-size: 14px; margin-top: 1.5rem; text-align: center;">
-      The full detailed report with per-epoch trajectories, idle analysis,
-      and El Che calibration data is available in
+      The full report &mdash; per-epoch trajectories, per-rank schedules, sync
+      cadence charts, idle analysis &mdash; lives in
       <a href="https://github.com/flodl-labs/flodl/blob/main/docs/ddp-benchmark.md">docs/ddp-benchmark.md</a>.
     </p>
   </div>

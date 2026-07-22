@@ -19,7 +19,7 @@ Two pressures from the user side drive this:
 2. **Downstream use.** A model trained in flodl must be usable in the
    stacks teams already deploy: HuggingFace `transformers`, `vLLM`, `TGI`,
    `ollama`, `llama.cpp`. flodl does not need to be an inference server to
-   answer this -- it needs to emit formats those stacks already read.
+   answer this - it needs to emit formats those stacks already read.
 
 The distinction matters because it keeps flodl's scope bounded. flodl
 differentiates on training (DDP, ElChe, real libtorch autograd, parity-
@@ -183,7 +183,7 @@ cleanly to whichever inference stack they already deploy. The near-term
 plan is the minimum work that makes that handoff trustworthy.
 
 The longer-term opportunity is the reverse direction: using the same
-DDP / worker / NCCL machinery for inference-as-a-training-primitive --
+DDP / worker / NCCL machinery for inference-as-a-training-primitive -
 RL rollouts, synthetic data, large-scale eval. That is where flodl can
 add something candle and vLLM do not, because it lives inside the
 training process rather than outside it. Not now, but the primitives

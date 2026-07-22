@@ -21,6 +21,7 @@ pub fn def() -> ModelDef {
         description: "Conv autoencoder on MNIST (PyTorch tutorial)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(60_000),
         train_fn: train_step,
         eval_fn: Some(eval_mse),
         test_dataset: Some(make_test_dataset),
@@ -30,6 +31,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST reconstruction, eval=MSE ([PyTorch AE tutorial](https://pytorch.org/tutorials/beginner/introyt/autoencoders_intro.html))",
         eval_higher_is_better: false,
         published_eval: None,
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

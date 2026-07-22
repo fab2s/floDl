@@ -228,11 +228,11 @@ commands:
   </div>
 
   <p class="section-sub" style="margin-top: 1.5rem; font-size: 0.95rem;">
-    Three equivalent ways to apply an overlay: <code>fdl --env ci test</code>,
-    <code>FDL_ENV=ci fdl test</code>, or just <code>fdl ci test</code> when the name
-    doesn't collide with a command. Explicit selectors fail loudly on missing
-    files; the first-arg convention falls through so existing commands are never
-    shadowed.
+    Three equivalent ways to apply an overlay: <code>fdl @ci test</code>,
+    <code>fdl --env ci test</code>, or <code>FDL_ENV=ci fdl test</code>. The
+    <code>@</code> selector works anywhere before <code>--</code>, just like
+    <code>--env</code>. Every form fails loudly on a missing overlay file, and an
+    env may freely share a name with a command.
   </p>
 </section>
 
@@ -325,21 +325,21 @@ commands:
           <th></th>
           <th>He et al. 2015</th>
           <th>Single RTX 5060 Ti</th>
-          <th>Mixed 5060 Ti + 1060 6GB</th>
+          <th>RTX 5060 Ti + 2&times; GTX 1060 (two hosts)</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td><strong>CIFAR-10 eval</strong></td>
           <td>91.25%</td>
-          <td>91.66%</td>
-          <td><strong>92.42%</strong></td>
+          <td>92.10%</td>
+          <td><strong>92.36%</strong></td>
         </tr>
         <tr>
           <td><strong>Wall time</strong></td>
           <td>-</td>
-          <td>3,127 s</td>
-          <td><strong>2,650 s</strong></td>
+          <td>699 s</td>
+          <td><strong>524 s</strong></td>
         </tr>
       </tbody>
     </table>
@@ -353,36 +353,39 @@ commands:
   <p class="section-sub" style="margin-top: 2rem;">
     ElChe cadence auto-detects per-GPU speed. The slow device anchors
     synchronization; the fast one ranges ahead and fills what would be idle
-    time. Three policies &times; two backends, A/B-testable in one line.
+    time. Six modes (NCCL &times; CPU averaging, Sync / Cadence / Async),
+    A/B-testable in one line.
   </p>
 
   <div class="showcase" style="max-width: 720px; margin: 1.5rem auto; text-align: left;">
     <div class="showcase-header">
-      <span>Graph DDP: one line, identical loop for 1 or N GPUs</span>
+      <span>One call, every tier: CPU, single GPU, N GPUs, multi-host cluster</span>
     </div>
-    <pre><span class="ty">Ddp</span>::<span class="fn">setup</span>(&amp;model, &amp;builder, |p| <span class="ty">Adam</span>::<span class="fn">new</span>(p, <span class="num">0.001</span>))?;
+    <pre><span class="kw">let</span> handle = <span class="ty">Trainer</span>::<span class="fn">builder</span>(model_factory, optim_factory, train_step)
+    .<span class="fn">dataset</span>(dataset)
+    .<span class="fn">batch_size</span>(<span class="num">64</span>)
+    .<span class="fn">num_epochs</span>(<span class="num">50</span>)
+    .<span class="fn">run</span>()?;
 
-<span class="kw">for</span> batch <span class="kw">in</span> model.<span class="fn">epoch</span>(<span class="num">0</span>) {
-    <span class="kw">let</span> batch = batch?;
-    <span class="kw">let</span> loss = model.<span class="fn">forward_batch</span>(&amp;batch)?.<span class="fn">mse</span>(&amp;target)?;
-    loss.<span class="fn">backward</span>()?;
-    model.<span class="fn">step</span>()?;      <span class="cm">// AllReduce + sync + optimizer + zero_grad</span>
-}</pre>
+<span class="kw">let</span> state = handle.<span class="fn">join</span>()?;        <span class="cm">// averaged params + buffers on CPU</span></pre>
   </div>
+
+  <p style="margin-top: 1rem;">
+    On a host with 2+ visible CUDA devices, floDl auto-promotes to
+    process-per-rank fan-out automatically. Multi-host clusters add an
+    <code>fdl.cluster.yml</code> (or a programmatic
+    <code>ClusterBuilder</code>); <code>fdl @cluster train</code> SSHes
+    every worker, pre-builds per-host, fans out.
+  </p>
 
   <div class="showcase" style="max-width: 720px; margin: 1.5rem auto; text-align: left;">
     <div class="showcase-header">
-      <span>DDP Builder: any Module, A/B-testable policies and backends</span>
+      <span>Five modes via <code>ElCheMode</code> + outer optimizers, one line each</span>
     </div>
-    <pre><span class="kw">let</span> ddp = <span class="ty">Ddp</span>::<span class="fn">builder</span>(model_factory, optim_factory, train_fn)
-    .<span class="fn">dataset</span>(dataset)
-    .<span class="fn">batch_size</span>(<span class="num">32</span>)
-    .<span class="fn">num_epochs</span>(<span class="num">10</span>)
-    .<span class="fn">policy</span>(<span class="ty">ApplyPolicy</span>::<span class="ty">Cadence</span>)      <span class="cm">// Sync | Cadence | Async</span>
-    .<span class="fn">backend</span>(<span class="ty">AverageBackend</span>::<span class="ty">Nccl</span>)     <span class="cm">// Nccl | Cpu</span>
-    .<span class="fn">run</span>()?;
-
-<span class="kw">let</span> state = ddp.<span class="fn">join</span>()?;            <span class="cm">// averaged params + buffers on CPU</span></pre>
+    <pre>.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">nccl_cadence</span>())   <span class="cm">// default; slow card anchors, fast card ranges ahead</span>
+.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">cpu_cadence</span>())    <span class="cm">// fastest wall time on the reference rig</span>
+.<span class="fn">elche</span>(<span class="ty">ElCheConfig</span>::<span class="fn">cpu_async</span>())      <span class="cm">// barrier-free async, EASGD blending built in</span>
+.<span class="fn">outer_optimizer</span>(|| <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">NesterovMomentum</span>::<span class="fn">new</span>(<span class="num">0.7</span>, <span class="num">0.9</span>)))  <span class="cm">// DiLoCo: best eval on the rig</span></pre>
   </div>
 
   <p style="margin-top: 1.2rem;">
@@ -453,7 +456,7 @@ commands:
     <div class="feature">
       <div class="feature-icon ddp">&#9672;</div>
       <h3>Heterogeneous DDP</h3>
-      <p>Mix any CUDA GPUs, identical training loop for 1 or N. ElChe cadence lets the fast card range ahead while the slow one anchors sync. A 5060 Ti + 1060 cluster reaches 92.42% on CIFAR-10 ResNet-20 in less wall time than the 5060 Ti alone.</p>
+      <p>Mix any CUDA GPUs, identical training loop for 1 or N, across hosts. ElChe cadence lets the fast card range ahead while the slow ones anchor sync. A 5060 Ti + two 1060s spanning two hosts reach 92.36% on CIFAR-10 ResNet-20, beating the 5060 Ti alone on both accuracy and wall time.</p>
     </div>
   </div>
 </section>

@@ -233,39 +233,63 @@ The default is `true` to avoid a BatchNorm footgun: a final batch of
 size 1 produces NaN variance. Set to `false` for evaluation/inference
 where every sample matters.
 
-## DDP integration
+## Augmentation: repeated picks + a keyed transform
 
-When used with `Graph::set_data_loader()`, the loader automatically
-upgrades to distributed mode:
+flodl treats augmentation as two orthogonal, deterministic pieces
+instead of per-call randomness hidden in the dataset:
 
 ```rust
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
-
-let loader = DataLoader::from_batch_dataset(dataset)
-    .batch_size(32)
-    .names(&["image", "label"])
+let loader = DataLoader::from_dataset(my_data)
+    .batch_size(64)
+    .augment(4)                       // each sample: 4 views per epoch
+    .transform(|mut rows, keys| {     // derive each view from its key
+        for (i, key) in keys.iter().enumerate() {
+            let mut rng = key.rng();  // same key = same bytes, every run
+            // e.g. flip row i when rng.bernoulli(0.5), crop offset from
+            // rng.usize(pad), noise from rng.f32() ...
+        }
+        Ok(rows)
+    })
     .build()?;
-
-model.set_data_loader(loader, "image");
-
-for batch in model.epoch(0) {
-    let batch = batch?;
-    let loss = model.forward_batch(&batch)?;
-    model.step()?;
-}
 ```
 
-In distributed mode:
+- **`.augment(k)`** is pure scheduling: the epoch becomes a shuffle of
+  `len() * k` *picks*, so each sample appears `k` times, spread across
+  the epoch, and batch counts scale by `k`. Every pick fetches the same
+  raw bytes - staged once across the caching tiers - and counts as one
+  unit of work for DDP scheduling. Without a transform, `k > 1` is
+  plain oversampling.
+- **`.transform(f)`** runs at delivery, after device transfer, on every
+  batch. It receives the rows plus one `PickKey { sample, repeat,
+  epoch, seed }` per row; `key.rng()` gives a stateless RNG unique to
+  that view, so augmentation is exactly reproducible across runs, ranks,
+  and checkpoint resumes - statistically equivalent to stochastic
+  augmentation, strictly better for debugging. Both knobs exist on
+  `TrainerConfig` / `Trainer::builder` for DDP with identical semantics.
 
-- Each GPU gets its own data backend (resident or streaming, selected
-  per-device based on available VRAM)
-- No lowest-common-denominator: a 16 GB GPU can go resident while a
-  6 GB GPU streams
-- Presharded forward: each replica processes its local shard with zero
-  cross-device input transfer
-- Shard sizes adapt to the auto-balancer's chunk ratios
+### Why not augment inside `get()`?
 
-For the DDP Builder, pass the dataset directly:
+The PyTorch `__getitem__` habit - random crop/flip inside the dataset -
+breaks under flodl's staging tiers: the RAM sample cache, disk stage,
+and VRAM pool (all on by default) retain samples **by index** and
+re-serve those bytes on later epochs, so per-call randomness would be
+silently frozen at its first realization. `DataSet::get()` /
+`BatchDataSet::get_batch` therefore carry a purity contract: same
+index, same bytes, every call. Debug builds probe it (one double-fetch
+compare per run) and panic with an explanation if it is violated;
+release builds skip the probe.
+
+The payoff for keeping raw bytes in the tiers: a VRAM-pooled sample
+uploads once and derives all `k` views on device, and the transform can
+never corrupt the retained data - delivered batches are always freshly
+assembled storage. Keep transforms as tensor ops (they run on the
+target device); a transform that round-trips to host defeats residency.
+
+## DDP integration
+
+Pass the dataset directly to `Trainer::builder` or `TrainerConfig` -
+the framework constructs a per-rank `DataLoader` against each rank's
+dataset shard automatically:
 
 ```rust
 let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
@@ -275,20 +299,72 @@ let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
     .run()?;
 ```
 
+Under DDP, each rank's loader operates independently:
+
+- **Per-rank backend selection**: a 16 GB rank can go resident while a
+  6 GB rank on the same training run streams. No
+  lowest-common-denominator constraint.
+- **Proportional sharding**: the coordinator computes shard sizes from
+  `partition_ratios` (or auto-balances by throughput via ElChe) and
+  pushes the epoch plan to each worker. Fast ranks get larger shards.
+- **No cross-rank transfer in the data path**: each rank loads its own
+  shard from its own `DataSet` impl. The DataLoader is otherwise
+  unaware that a cluster exists.
+
+### Streaming from external sources
+
+`DataSet` / `BatchDataSet` are pull-based traits - the body of `get()`
+/ `get_batch()` decides where the samples come from. The framework's
+"resident" vs "streaming" modes are about CPU → VRAM transfer; the
+underlying source can be RAM, mmap, disk, network, S3, a database, or
+anything else accessible from Rust.
+
+For source-streaming patterns:
+
+```rust
+struct S3Dataset { /* ... bucket handle, prefetch pool, etc. ... */ }
+
+impl BatchDataSet for S3Dataset {
+    fn len(&self) -> usize { /* total samples in dataset */ self.total }
+
+    fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+        // Fetch on-demand. Cache locally as you go, parallelize
+        // requests if useful - all up to your impl.
+        let bytes = self.fetch_indices(indices)?;
+        self.decode_to_tensors(&bytes, indices.len())
+    }
+}
+```
+
+The DataLoader's prefetch worker keeps `K` future batches in flight on
+a dedicated CUDA stream, so the network round-trip for batch N+1 can
+overlap with batch N's compute. No special hooks needed; just
+implement the trait and pass it.
+
 ## Builder reference
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `.batch_size(usize)` | Required | Batch size per GPU |
-| `.device(Device)` | CPU | Target device (leave as CPU for DDP) |
+| `.batch_size(usize)` | Required | Batch size per rank |
+| `.device(Device)` | CPU | Target device (the per-rank loader auto-targets its own CUDA device under DDP) |
 | `.seed(u64)` | 42 | RNG seed for shuffling |
 | `.shuffle(bool)` | true | Enable shuffling |
-| `.sampler(Box<dyn Sampler>)` | -- | Custom sampler (overrides shuffle) |
+| `.sampler(Box<dyn Sampler>)` | - | Custom sampler (overrides shuffle) |
 | `.prefetch(usize)` | Auto | Override auto-detected prefetch depth |
 | `.vram_max_usage(f64)` | 0.90 | Max VRAM fraction for prefetch |
+| `.ram_max_usage(f64)` | 0.50 | Available-RAM fraction for the reader ring + sample cache |
+| `.sample_cache(bool)` | true | Read-through RAM sample cache (later epochs read from RAM) |
+| `.disk_stage(gb)` | 0 = off | Local-disk overflow tier under the sample cache |
+| `.disk_stage_dir(path)` | temp dir | Where the disk stage's pack file lives |
+| `.vram_pool(bool)` | true | Device-resident sample pool in leftover VRAM |
+| `.activation_reserve(bytes)` | Auto | Declared first-step VRAM reserve for prefetch sizing |
+| `.augment(usize)` | 1 | Views per sample per epoch (pick-space schedule) |
+| `.transform(fn)` | - | Deterministic delivery transform, keyed per `PickKey` |
 | `.streaming()` | Auto | Force streaming mode |
 | `.names(&[&str])` | Positional | Name batch tensor positions |
 | `.drop_last(bool)` | true | Drop incomplete final batch |
+
+Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vram_max_usage` / `with_ram_max_usage` / `with_sample_cache` / `with_disk_stage` / `with_disk_stage_dir` (or the chained `DdpBuilder` twins) — and govern each rank's prefetch channel, device sample pool, and staging tiers with the same defaults and clamps. One sizing policy serves both paths; co-hosted ranks split the host-RAM share in proportion to their schedule, each rank's disk stage writes its own pid-unique pack file, and `FLODL_VRAM_POOL=off` now disables the device sample pool on the solo loader path too (previously DDP-only).
 
 ## DataLoader methods
 
@@ -300,7 +376,6 @@ let ddp = Trainer::builder(model_factory, optim_factory, train_fn)
 | `.batch_size()` | Batch size |
 | `.device()` | Target or gather device |
 | `.is_resident()` | Whether in resident mode |
-| `.is_distributed()` | Whether in distributed mode |
 | `.prefetch_depth()` | Current prefetch depth |
 | `.set_prefetch_depth(n)` | Override prefetch depth |
 | `.auto_resize()` | Re-probe VRAM and adapt prefetch |

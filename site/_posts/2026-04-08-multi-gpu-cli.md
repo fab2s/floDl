@@ -19,8 +19,8 @@ runs. Two solo baselines, three DDP policies on NCCL.
 
 | Mode | Epoch 5 accuracy | Avg epoch (s) | GPU util |
 |---|---:|---:|---:|
-| Solo 5060 Ti | 89.1% | 135.7 | -- |
-| Solo 1060 | 88.4% | 380.4 | -- |
+| Solo 5060 Ti | 89.1% | 135.7 | - |
+| Solo 1060 | 88.4% | 380.4 | - |
 | DDP Sync (NCCL) | 94.8% | 225.4 | 64% |
 | DDP Cadence (NCCL) | 79.1% | 140.9 | 90% |
 | DDP Async (NCCL) | 87.7% | 118.6 | 87% |

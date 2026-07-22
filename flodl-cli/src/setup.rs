@@ -125,11 +125,24 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     }
 
     if !skip_download {
-        // Always download CPU variant (useful as fallback)
+        // Always download CPU variant (useful as fallback).
+        //
+        // Special case: on macOS in a Docker-Mounted project the libtorch
+        // ends up bind-mounted into a Linux container, so the host's
+        // macOS arm64 (Mach-O) build is useless. Force Linux x86_64 in
+        // that combination so the mount works as expected.
+        let mounted_docker_project =
+            ctx.is_project && ctx.root.join("Dockerfile").exists();
+        let force_linux = cfg!(target_os = "macos") && mounted_docker_project;
+        if force_linux {
+            println!("  macOS + Docker-Mounted project: fetching Linux libtorch");
+            println!("  for the container (host arch would not load inside Linux).");
+        }
         println!("  Downloading CPU libtorch...");
         let cpu_opts = download::DownloadOpts {
             variant: download::Variant::Cpu,
             activate: false, // don't activate CPU if we'll also get CUDA
+            force_linux,
             ..Default::default()
         };
         download::run_with_context(cpu_opts, &ctx)?;

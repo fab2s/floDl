@@ -122,7 +122,7 @@ fn deberta_v2_parity_vs_pytorch_live() {
     // dtype on load. The reference fixture is f32, so cast to f32 to match
     // the reference's precision budget. (For f16 forward parity one would
     // also regenerate the fixture in f16 — out of scope here.)
-    cast_parameters(&graph.parameters(), DType::Float32);
+    cast_parameters(&graph.parameters(), DType::Float32).unwrap();
     graph.eval();
 
     let out = graph

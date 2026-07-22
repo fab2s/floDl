@@ -19,11 +19,11 @@ pub(super) fn wire_gate(
         return fb;
     }
     if fb.current.len() != 1 {
-        fb.err = Some("gate requires single stream".into());
+        fb.fail("gate requires single stream");
         return fb;
     }
     if experts.len() < 2 {
-        fb.err = Some("gate requires at least 2 experts".into());
+        fb.fail("gate requires at least 2 experts");
         return fb;
     }
 
@@ -106,7 +106,9 @@ fn gate_route(
         .collect::<Result<Vec<_>>>()?;
 
     if expert_outs.is_empty() {
-        panic!("gate: no experts (n={})", n_experts);
+        return Err(crate::tensor::TensorError::new(&format!(
+            "gate: no experts to route to (n={n_experts})"
+        )));
     }
 
     // Vectorized combination: stack → broadcast multiply → sum

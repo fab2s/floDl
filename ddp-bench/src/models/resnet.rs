@@ -27,6 +27,7 @@ pub fn def() -> ModelDef {
         description: "ResNet-20 on CIFAR-10 (~91% acc, He et al. 2015)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(50_000),
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
         test_dataset: Some(make_test_dataset),
@@ -38,6 +39,7 @@ pub fn def() -> ModelDef {
         reference: "CIFAR-10 91.25% acc ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6)",
         eval_higher_is_better: true,
         published_eval: Some(0.9125),
+        needs_baseline_eval: true,
         defaults: ModelDefaults {
             epochs: 200,
             batches_per_epoch: 0, // full dataset
@@ -52,8 +54,21 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
 }
 
 pub fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
-    let cifar = crate::download::ensure_cifar10(&cfg.data_dir)?;
-    Ok(Arc::new(cifar))
+    match cfg.data_source {
+        super::DataSource::Ram => {
+            let cifar = crate::download::ensure_cifar10(&cfg.data_dir)?;
+            Ok(Arc::new(cifar))
+        }
+        super::DataSource::Disk => {
+            // Same raw batch files, read per sample instead of parsed
+            // into RAM: every batch pays the storage read unless a
+            // tier above (sample cache, staging) absorbs it.
+            let dir = crate::download::ensure_cifar10_extracted(&cfg.data_dir)?;
+            let disk = flodl::data::datasets::Cifar10Disk::open_train(&dir)?;
+            eprintln!("  data source: disk ({})", dir.display());
+            Ok(flodl::data::batch_dataset_from(disk))
+        }
+    }
 }
 
 pub fn make_test_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {

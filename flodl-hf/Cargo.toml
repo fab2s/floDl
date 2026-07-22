@@ -31,7 +31,7 @@ hub = ["hf-hub", "dep:flodl-cli"]
 tokenizer = ["tokenizers"]
 
 [dependencies]
-flodl = { version = "=0.5.3", path = "../flodl" }
+flodl = { version = "=0.6.0", path = "../flodl" }
 safetensors = "0.4"
 serde_json = "1"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
@@ -39,7 +39,7 @@ tokenizers = { version = "0.20", optional = true }
 # Optional, gated behind `hub`: lets the export_hf CLI binary use the
 # FdlArgs derive so its --help output matches what `fdl flodl-hf export
 # -h` renders. Pure-Rust dep; pulls no libtorch.
-flodl-cli = { version = "=0.5.3", path = "../flodl-cli", optional = true }
+flodl-cli = { version = "=0.6.0", path = "../flodl-cli", optional = true }
 
 [[example]]
 name = "bert_embed"
@@ -94,6 +94,10 @@ name = "distilbert_finetune"
 required-features = ["hub", "tokenizer"]
 
 [[example]]
+name = "distilbert_finetune_ddp"
+required-features = ["hub", "tokenizer"]
+
+[[example]]
 name = "auto_classify"
 required-features = ["hub", "tokenizer"]
 
@@ -103,5 +107,8 @@ required-features = ["hub"]
 
 [package.metadata.docs.rs]
 all-features = true
-rustc-args = ["--cfg", "docsrs"]
+# `--cfg docsrs` as rustdoc-arg ONLY. Passing it via rustc-args
+# propagates to every dep compile including serde, tripping
+# serde 1.0.228's broken `cfg(all(docsrs, if_docsrs_then_no_serde_core))`
+# path. Real docs.rs only applies the cfg at doc time.
 rustdoc-args = ["--cfg", "docsrs"]

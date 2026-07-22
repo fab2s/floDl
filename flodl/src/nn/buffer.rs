@@ -29,6 +29,15 @@ impl Buffer {
         self.inner.borrow().clone()
     }
 
+    /// Stable identity of the shared cell: clones of the same `Buffer`
+    /// return the same id, independent buffers differ. This is what
+    /// buffer collection dedups on (a module graph can reach the same
+    /// shared buffer through several paths). Valid only while some
+    /// clone is alive — ids can be recycled after the last clone drops.
+    pub fn id(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
+    }
+
     /// Replace the underlying tensor.
     pub fn set(&self, tensor: Tensor) {
         *self.inner.borrow_mut() = tensor;

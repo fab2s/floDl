@@ -124,9 +124,51 @@ pub fn cuda_utilization() -> Option<u32> {
 }
 
 /// Query GPU utilization percentage for a specific device (0-100) via NVML.
+///
+/// `device_index` is the PHYSICAL device index (nvidia-smi / NVML
+/// enumeration): NVML ignores `CUDA_VISIBLE_DEVICES`, so passing a CUDA
+/// runtime index queries the wrong card in scoped-down processes. Use
+/// [`crate::sys::GpuInfo::index`] to resolve physical indices.
+///
+/// Never initializes the CUDA runtime in the calling process; safe to
+/// call before `Trainer::run`.
 pub fn cuda_utilization_idx(device_index: i32) -> Option<u32> {
     let val = unsafe { ffi::flodl_cuda_utilization(device_index) };
     if val >= 0 { Some(val as u32) } else { None }
+}
+
+/// Query device-wide VRAM usage `(used_bytes, total_bytes)` via NVML.
+///
+/// Reports the same device-global numbers as [`cuda_memory_info_idx`]
+/// but WITHOUT creating a CUDA context in the calling process
+/// (`cudaMemGetInfo` initializes a primary context on the queried
+/// device, pinning VRAM for the life of the process; NVML does not).
+/// Use this from monitoring paths and any process that must not touch
+/// the CUDA runtime (launcher, pre-`Trainer::run`).
+///
+/// `physical_index` is the PHYSICAL device index (nvidia-smi / NVML
+/// enumeration, independent of `CUDA_VISIBLE_DEVICES`); see
+/// [`crate::sys::GpuInfo::index`].
+///
+/// Returns `None` if NVML is unavailable or the index is invalid.
+pub fn cuda_nvml_memory_info_idx(physical_index: i32) -> Option<(u64, u64)> {
+    let mut used: u64 = 0;
+    let mut total: u64 = 0;
+    let rc = unsafe { ffi::flodl_cuda_nvml_mem_info(physical_index, &mut used, &mut total) };
+    if rc == 0 { Some((used, total)) } else { None }
+}
+
+/// Whether this process already holds a CUDA primary context on the
+/// device (CUDA runtime index).
+///
+/// Queries driver context state without creating one. Context-dependent
+/// reads (caching-allocator stats such as [`cuda_allocated_bytes_idx`])
+/// are only meaningful in a process that has actually used the device;
+/// gate them on this so a monitoring call never initializes CUDA as a
+/// side effect. Always `false` on CPU-only builds and before the first
+/// CUDA operation on the device.
+pub fn cuda_has_primary_context(device_index: i32) -> bool {
+    unsafe { ffi::flodl_cuda_has_primary_context(device_index) != 0 }
 }
 
 /// Set the current CUDA device.
@@ -146,7 +188,9 @@ pub fn cuda_synchronize(device_index: u8) {
 
 /// Returns the GPU device name for the given index (e.g. "NVIDIA GeForce GTX 1060 6GB").
 pub fn cuda_device_name_idx(device: i32) -> Option<String> {
-    let mut buf = [0i8; 256];
+    // `c_char` (i8 on x86_64, u8 on Linux aarch64) so the FFI buffer
+    // type matches on every platform.
+    let mut buf = [0 as std::ffi::c_char; 256];
     let err = unsafe { ffi::flodl_cuda_device_name(device, buf.as_mut_ptr(), 256) };
     if err.is_null() {
         let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
@@ -296,23 +340,24 @@ fn recommended_cuda_variant(sm_major: u32) -> &'static str {
 ///
 /// Returns something like:
 /// `"CPU: AMD Ryzen 9 5900X (64GB) | GPU: NVIDIA GeForce GTX 1060 (6GB)"`
+///
+/// GPU identity comes from [`crate::sys::detect_gpus`] (nvidia-smi,
+/// honors `CUDA_VISIBLE_DEVICES`), so this never initializes the CUDA
+/// runtime in the calling process. `Monitor::new` calls it before
+/// `Trainer::run` resolves roles; a CUDA touch here would violate the
+/// no-CUDA-before-`Trainer::run` invariant in every user binary that
+/// constructs a monitor at the top of its training code.
 pub fn hardware_summary() -> String {
     let cpu = cpu_model_name().unwrap_or_else(|| "Unknown CPU".into());
     let threads = cpu_thread_count();
     let ram = total_ram_gb();
     let mut s = format!("{} ({} threads, {}GB)", cpu, threads, ram);
 
-    if cuda_available() {
-        let n = cuda_device_count();
-        for i in 0..n {
-            if let Some(gpu) = cuda_device_name_idx(i) {
-                let vram_str = cuda_memory_info_idx(i)
-                    .map(|(_, total)| format!(" ({}GB)", total / (1024 * 1024 * 1024)))
-                    .unwrap_or_default();
-                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
-                    " | {}{}", gpu, vram_str
-                ));
-            }
+    if cfg!(feature = "cuda") {
+        for gpu in crate::sys::detect_gpus() {
+            let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
+                " | {} ({}GB)", gpu.name, gpu.total_memory_mb / 1024
+            ));
         }
     }
     s

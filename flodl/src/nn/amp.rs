@@ -76,21 +76,38 @@ where
 }
 
 /// Returns true if CUDA autocast is currently enabled.
+///
+/// CUDA shorthand for [`is_autocast_enabled_for`]; use that to query a
+/// different device type (mirrors [`AutocastGuard::for_device`]).
 pub fn is_autocast_enabled() -> bool {
-    unsafe { ffi::flodl_is_autocast_enabled(ffi::FLODL_CUDA) != 0 }
+    is_autocast_enabled_for(ffi::FLODL_CUDA)
 }
 
-/// Cast all parameters to a different dtype.
+/// Returns true if autocast is currently enabled for the given device type
+/// (`ffi::FLODL_CUDA` / `ffi::FLODL_CPU`). Mirrors
+/// [`AutocastGuard::for_device`], which sets it per device type.
+pub fn is_autocast_enabled_for(device_type: i32) -> bool {
+    unsafe { ffi::flodl_is_autocast_enabled(device_type) != 0 }
+}
+
+/// Cast all parameters to a different dtype. No-op for parameters already
+/// at the target dtype.
 ///
-/// No-op for parameters already at the target dtype.
-pub fn cast_parameters(params: &[Parameter], dtype: DType) {
+/// All-or-nothing: every conversion is computed first, so if any fails the
+/// error is returned with NO parameter mutated. Previously a per-parameter
+/// failure was silently swallowed, leaving a half-cast, mixed-dtype model
+/// that failed cryptically much later.
+pub fn cast_parameters(params: &[Parameter], dtype: DType) -> Result<()> {
+    let mut pending: Vec<(&Parameter, Tensor)> = Vec::new();
     for p in params {
-        if p.variable.data().dtype() != dtype
-            && let Ok(t) = p.variable.data().to_dtype(dtype)
-        {
-            p.variable.set_data(t);
+        if p.variable.data().dtype() != dtype {
+            pending.push((p, p.variable.data().to_dtype(dtype)?));
         }
     }
+    for (p, t) in pending {
+        p.variable.set_data(t);
+    }
+    Ok(())
 }
 
 /// GradScaler for mixed precision training.
@@ -113,6 +130,14 @@ pub struct GradScaler {
     interval: i64,
     steps_since_growth: i64,
     found_inf: bool,
+    /// Lower bound on `scale`. Loss scaling only ever scales *up* (to lift
+    /// small fp16 gradients out of underflow), so the scale should never
+    /// need to drop below 1.0. Without a floor, sustained inf/NaN gradients
+    /// halve the scale every step until it underflows to 0.0, after which
+    /// `scale(loss)` is always 0, gradients are always "finite" zeros, and
+    /// training is silently dead. Flooring keeps the scale usable; if inf
+    /// persists at the floor, the divergence is real (not a scaling issue).
+    min_scale: f64,
 }
 
 impl Default for GradScaler {
@@ -124,6 +149,7 @@ impl Default for GradScaler {
             interval: 2000,
             steps_since_growth: 0,
             found_inf: false,
+            min_scale: 1.0,
         }
     }
 }
@@ -185,7 +211,9 @@ impl GradScaler {
     /// Call this after every `step()` call, regardless of whether it succeeded.
     pub fn update(&mut self) {
         if self.found_inf {
-            self.scale *= self.backoff;
+            // Floor at `min_scale` so sustained inf can't drive the scale to
+            // 0.0 (which would silently zero all gradients and kill training).
+            self.scale = (self.scale * self.backoff).max(self.min_scale);
             self.steps_since_growth = 0;
         } else {
             self.steps_since_growth += 1;
@@ -199,6 +227,8 @@ impl GradScaler {
 }
 
 impl Stateful for GradScaler {
+    fn state_kind(&self) -> crate::nn::StateKind { crate::nn::StateKind::GradScaler }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_f64_le(w, self.scale)?;
         write_i64_le(w, self.steps_since_growth)?;
@@ -246,7 +276,7 @@ mod tests {
             name: "w".into(),
         };
         assert_eq!(p.variable.data().dtype(), DType::Float32);
-        cast_parameters(std::slice::from_ref(&p), DType::Float64);
+        cast_parameters(std::slice::from_ref(&p), DType::Float64).unwrap();
         assert_eq!(p.variable.data().dtype(), DType::Float64);
     }
 
@@ -257,7 +287,7 @@ mod tests {
             variable: Variable::new(t, true),
             name: "w".into(),
         };
-        cast_parameters(std::slice::from_ref(&p), DType::Float32);
+        cast_parameters(std::slice::from_ref(&p), DType::Float32).unwrap();
         assert_eq!(p.variable.data().dtype(), DType::Float32);
     }
 
@@ -296,6 +326,28 @@ mod tests {
     }
 
     #[test]
+    fn test_grad_scaler_scale_floors_and_never_dies() {
+        // Regression: sustained inf must NOT drive the scale to 0.0 (which
+        // would silently zero every gradient and kill training). It floors
+        // at min_scale (1.0) instead.
+        let mut scaler = GradScaler::new();
+        for _ in 0..40 {
+            scaler.found_inf = true; // simulate an inf-detected step
+            scaler.update();
+            assert!(
+                scaler.scale_factor() > 0.0,
+                "scale must never reach 0.0, got {}",
+                scaler.scale_factor()
+            );
+        }
+        assert!(
+            (scaler.scale_factor() - 1.0).abs() < 1e-9,
+            "sustained inf should settle at the 1.0 floor, got {}",
+            scaler.scale_factor()
+        );
+    }
+
+    #[test]
     fn test_grad_scaler_step_inf() {
         let mut scaler = GradScaler::new();
         let t = Tensor::from_f32(&[1.0], &[1], test_device()).unwrap();
@@ -322,6 +374,7 @@ mod tests {
             interval: 3,
             steps_since_growth: 2,
             found_inf: false,
+            min_scale: 1.0,
         };
         scaler.update(); // steps_since_growth becomes 3 >= interval
         assert_eq!(scaler.scale_factor(), 200.0);

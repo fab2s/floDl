@@ -113,6 +113,116 @@ impl BatchDataSet for Cifar10 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cifar10Disk: per-sample reads from the raw batch files
+// ---------------------------------------------------------------------------
+
+/// The canonical training batch file names of the CIFAR-10 binary
+/// distribution.
+pub const TRAIN_BATCH_FILES: [&str; 5] = [
+    "data_batch_1.bin",
+    "data_batch_2.bin",
+    "data_batch_3.bin",
+    "data_batch_4.bin",
+    "data_batch_5.bin",
+];
+
+/// The canonical test batch file name of the CIFAR-10 binary
+/// distribution.
+pub const TEST_BATCH_FILE: &str = "test_batch.bin";
+
+/// CIFAR-10 read directly from the raw batch files, one sample per
+/// read.
+///
+/// Where [`Cifar10`] parses everything into RAM up front, this reads
+/// each sample's 3073 bytes from storage on demand (the raw format is
+/// already a fixed-stride record file). It implements
+/// [`DataSet`](crate::data::DataSet), so the sample-keyed tiers above
+/// (RAM sample cache, disk stage, reservation staging) apply
+/// automatically — this is the path for benchmarking storage-bound
+/// training and for datasets that outgrow RAM.
+///
+/// Samples are `[image [3, 32, 32] Float32 in [0, 1], label [] Int64]`
+/// — batch-stacked, identical to [`Cifar10::get_batch`] output.
+pub struct Cifar10Disk {
+    files: Vec<crate::data::records::FixedStrideRecords>,
+    /// Cumulative record count before each file (index routing).
+    starts: Vec<usize>,
+    total: usize,
+}
+
+impl Cifar10Disk {
+    /// Open raw CIFAR-10 batch files (any subset, in the given order).
+    pub fn open<P: AsRef<std::path::Path>>(paths: &[P]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(TensorError::new("Cifar10Disk: no batch files provided"));
+        }
+        let mut files = Vec::with_capacity(paths.len());
+        let mut starts = Vec::with_capacity(paths.len());
+        let mut total = 0usize;
+        for path in paths {
+            let recs =
+                crate::data::records::FixedStrideRecords::open(path, BYTES_PER_RECORD)?;
+            starts.push(total);
+            total += recs.count();
+            files.push(recs);
+        }
+        Ok(Cifar10Disk { files, starts, total })
+    }
+
+    /// Open the 5 canonical training batches under `dir`
+    /// (`data_batch_1.bin` … `data_batch_5.bin`).
+    pub fn open_train(dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let paths: Vec<_> = TRAIN_BATCH_FILES.iter().map(|f| dir.join(f)).collect();
+        Self::open(&paths)
+    }
+
+    /// Open the canonical test batch under `dir` (`test_batch.bin`).
+    pub fn open_test(dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open(&[dir.as_ref().join(TEST_BATCH_FILE)])
+    }
+}
+
+impl crate::data::DataSet for Cifar10Disk {
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<Tensor>> {
+        if index >= self.total {
+            return Err(TensorError::new(&format!(
+                "Cifar10Disk: sample {index} out of bounds ({} samples)",
+                self.total
+            )));
+        }
+        // Locate the owning file (a handful of files: linear scan).
+        let file_idx = self
+            .starts
+            .iter()
+            .rposition(|&start| start <= index)
+            .expect("starts[0] == 0 covers every index");
+        let record = self.files[file_idx].record(index - self.starts[file_idx])?;
+
+        let label = record[0] as i64;
+        if label > 9 {
+            return Err(TensorError::new(&format!(
+                "Cifar10Disk: sample {index} in {} has invalid label {label}",
+                self.files[file_idx].path().display()
+            )));
+        }
+
+        // Pixels are already CHW: [1024 R][1024 G][1024 B].
+        let mut pixels = Vec::with_capacity(PIXELS_PER_IMAGE);
+        for &b in &record[1..] {
+            pixels.push(b as f32 / 255.0);
+        }
+        let image = Tensor::from_f32(&pixels, &[3, 32, 32], Device::CPU)?;
+        let label = Tensor::from_i64(&[label], &[], Device::CPU)?;
+        Ok(vec![image, label])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +294,69 @@ mod tests {
             .select(0, 0).unwrap()
             .item().unwrap();
         assert!((b_pixel - 1.0).abs() < 1e-6);
+    }
+
+    /// Write batches to a scratch dir and return their paths.
+    fn write_batches(name: &str, batches: &[Vec<u8>]) -> Vec<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join("flodl-cifar10-disk-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        batches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let path = dir.join(format!("{name}-{}-{i}.bin", std::process::id()));
+                std::fs::write(&path, b).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disk_matches_parsed() {
+        use crate::data::DataSet;
+
+        let b1 = make_batch(IMAGES_PER_BATCH);
+        let b2 = make_batch(IMAGES_PER_BATCH);
+        let parsed = Cifar10::parse(&[&b1, &b2]).unwrap();
+        let paths = write_batches("match", &[b1, b2]);
+        let disk = Cifar10Disk::open(&paths).unwrap();
+
+        assert_eq!(DataSet::len(&disk), 2 * IMAGES_PER_BATCH);
+
+        // Cross-file index routing + byte-identical content vs the
+        // bulk parser (indices past 10_000 live in the second file).
+        for &i in &[0usize, 9_999, 10_000, 10_005, 19_999] {
+            let sample = disk.get(i).unwrap();
+            assert_eq!(sample[0].shape(), &[3, 32, 32]);
+            let bulk_img = parsed.images.select(0, i as i64).unwrap();
+            let diff: f64 = sample[0].sub(&bulk_img).unwrap().abs().unwrap().sum().unwrap().item().unwrap();
+            assert_eq!(diff, 0.0);
+            let bulk_label: f64 = parsed.labels.select(0, i as i64).unwrap().item().unwrap();
+            let disk_label: f64 = sample[1].item().unwrap();
+            assert_eq!(disk_label, bulk_label);
+            assert_eq!(sample[1].shape(), &[] as &[i64]);
+        }
+
+        for p in paths {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn disk_bounds_and_bad_label_error() {
+        use crate::data::DataSet;
+
+        let mut bad = make_batch(2);
+        bad[0] = 11; // invalid label on sample 0
+        let paths = write_batches("bad", &[bad]);
+        let disk = Cifar10Disk::open(&paths).unwrap();
+
+        assert!(disk.get(2).is_err());
+        let err = disk.get(0).unwrap_err();
+        assert!(err.to_string().contains("invalid label"));
+
+        for p in paths {
+            std::fs::remove_file(p).unwrap();
+        }
     }
 }

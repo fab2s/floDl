@@ -27,7 +27,7 @@ For the historical record of shipped phases and individual changes, see
 - **fdl maturity pass**: zero-dep `FdlArgs` derive (flodl-cli +
   flodl-cli-macros), `--fdl-schema` contract, ddp-bench and flodl-cli
   migrated, multi-env overlay (`fdl.local.yml`, `fdl.ci.yml`, …) with
-  first-arg routing, deep-merge, conflict detection, and
+  `@env` selector routing, deep-merge, conflict detection, and
   `fdl config show`. See
   [docs/design/run-config.md](docs/design/run-config.md).
 - **HuggingFace integration** sibling crate `flodl-hf`: six BERT-family
@@ -39,10 +39,11 @@ For the historical record of shipped phases and individual changes, see
   key-set validation and native-dtype preservation, `from_pretrained`
   Hub integration, PyTorch parity tests at `max_abs_diff <= 1e-5` on
   29 of 30 head cells (DeBERTa-v2 MLM gap documented in
-  `flodl-hf/tests/deberta_v2_parity.rs`). `Trainer::setup_head` +
+  `flodl-hf/tests/deberta_v2_parity.rs`). Task heads `impl Module` +
   `HasGraph` make fine-tuning transparent across CPU / single GPU /
-  multi-GPU, and `compute_loss(enc, labels)` mirrors HF Python's one-
-  call loss shape. Round-trip back to the HF ecosystem with
+  multi-GPU through the cooperative (`Trainer::builder(...).into_worker()`)
+  and managed (`.run()`) tiers, and `compute_loss(enc, labels)` mirrors
+  HF Python's one-call loss shape. Round-trip back to the HF ecosystem with
   `fdl flodl-hf export` (Hub or local `.fdl` checkpoint) and
   `fdl flodl-hf verify-export` (auto-detect family/head, loadability
   + bit-exact forward parity). `fdl add flodl-hf` `--playground` /
@@ -70,6 +71,19 @@ not a commitment; only moving one to In Progress is.
   hierarchical ElChe (intra-host NCCL + inter-host DiLoCo). Real
   feature PR with design doc and cloud test budget. See
   [docs/design/cloud-ddp.md](docs/design/cloud-ddp.md).
+- **Async stale-update correction (HeLoCo-style)**: direction-aware
+  pseudo-gradient correction for fully-async and wide-window regimes,
+  where worker drift exceeds ElChe's bounded-staleness envelope.
+  Per-tensor-block cosine alignment against the outer-optimizer
+  momentum (preserve aligned blocks, shrink conflicting components,
+  reorient weakly-aligned ones at fixed norm) plus a momentum
+  look-ahead initialization, layered on the DiLoCo `NesterovMomentum`
+  outer optimizer already shipped. The complement to ElChe's
+  cadence/window control: ElChe keeps drift small so utilization can
+  reclaim barrier idle; this repairs drift when a deployment chooses
+  to let it grow (geo-distributed, non-IID per-node shards). After
+  HeLoCo (Asif et al., arXiv 2606.00271). See
+  [docs/design/cloud-ddp.md](docs/design/cloud-ddp.md).
 - **ddp-bench: next published model**. Class-level pull, repeats as
   models land. Top candidates: small transformer (GPT-2 tiny / BERT-
   small) for the attention family, ViT, UNet for multi-scale skip
@@ -93,8 +107,8 @@ not a commitment; only moving one to In Progress is.
   attention), LLaMA (RoPE, GQA, SwiGLU, then the architecture), LoRA
   adapters, ViT. Then a flagship ElChe-driven fine-tuning benchmark on
   heterogeneous consumer GPUs to validate the transparent fine-tune
-  plumbing end-to-end (`Trainer::setup_head` + `compute_loss` shipped
-  in 0.5.3 with the BERT family; see Shipped). See
+  plumbing end-to-end (task heads `impl Module` + `compute_loss`, driven
+  through the cooperative / managed Trainer tiers; see Shipped). See
   [docs/design/cloud-ddp.md](docs/design/cloud-ddp.md) for the
   downstream ElChe tie-in.
 - **flodl-manager CLI evolution**: keep maturing `fdl` toward a true

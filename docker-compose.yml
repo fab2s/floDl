@@ -14,8 +14,28 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FDL_CMD
+      - FDL_ENV
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh.user:` is unset, bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_INTERNAL_HOST_USER
       # Share the hf-hub cache with the hf-parity service so `fdl test-live`
       # reuses fixtures downloaded by `fdl flodl-hf parity bert*`. Repo-local,
       # gitignored, survives container rebuild.
@@ -35,11 +55,176 @@ services:
       - ./.cargo-git-cuda:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
       - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
+      # SSH-agent socket forwarded so the launcher can ssh into remote
+      # cluster hosts. Falls back to /dev/null when the user has no
+      # agent running — ssh then errors loudly inside the container,
+      # which is the right signal for non-cluster runs.
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # NCCL falls back to SHM transport when GPUs lack peer-to-peer (no NVLink,
+    # separate PCIe slots — the consumer-rig case). 3-GPU heterogeneous DDP on
+    # any non-trivial model exhausts Docker's default 64 MB /dev/shm. 2 GB is
+    # generous headroom for ResNet-class workspaces.
+    shm_size: 2gb
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
+    # Share the host's network namespace so the cluster controller +
+    # coord (bound on exa-side ports) are reachable from remote rank
+    # VMs. Docker's default bridge isolates the container from the
+    # host's other networks (virbr0, enp1s0, etc.); with
+    # `network_mode: host` the container sees every interface the
+    # host has, and `master_addr` resolves identically inside and
+    # outside the container.
+    network_mode: host
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FDL_CMD
+      - FDL_ENV
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh.user:` is unset, bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_INTERNAL_HOST_USER
+      # SSH-agent forwarding: launcher SSHes into remote cluster hosts
+      # from inside this container. The host's agent socket is bind-
+      # mounted at /ssh-agent (see volumes:) and re-exposed via
+      # SSH_AUTH_SOCK so ssh-add'ed keys work without copying private
+      # material into the image. Run `eval $(ssh-agent) && ssh-add` on
+      # the host before `fdl @cluster ...`.
+      - SSH_AUTH_SOCK=/ssh-agent
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # cuda-rank: long-lived sshd container for cluster-mode dispatch.
+  #
+  # Treats this container as a VM-equivalent "remote host" so the
+  # cluster launcher reaches it over SSH (fresh process tree, no
+  # fork+exec inheritance from the launcher process). Mirrors the
+  # `flodl-pascal` VM transport shape but over loopback.
+  #
+  # Usage:
+  #   # 1. Generate a dedicated keypair on the host (one-time):
+  #   mkdir -p .ssh-cuda-rank && \
+  #     ssh-keygen -t ed25519 -N '' \
+  #       -f .ssh-cuda-rank/cuda_rank_key \
+  #       -C 'flodl cuda-rank container'
+  #   cp .ssh-cuda-rank/cuda_rank_key.pub .ssh-cuda-rank/authorized_keys
+  #
+  #   # 2. Bring the container up (auto-builds Dockerfile.cuda on first run):
+  #   docker compose up -d cuda-rank
+  #
+  #   # 3. Verify SSH from host:
+  #   ssh -p 2222 -i .ssh-cuda-rank/cuda_rank_key \
+  #       -o StrictHostKeyChecking=accept-new ubuntu@127.0.0.1 whoami
+  #
+  #   # 4. In fdl.cluster.yml, replace the exa host entry with:
+  #   #   - host: exa-cuda
+  #   #     ranks: [0]
+  #   #     local_devices: [0]
+  #   #     nccl_socket_ifname: virbr0
+  #   #     path: /workspace                # in-container project path
+  #   #     ssh:
+  #   #       target: 127.0.0.1
+  #   #       port: 2222
+  #   #       user: ubuntu
+  #   #       identity_file: /home/me/project/.ssh-cuda-rank/cuda_rank_key
+  #   #     arch: precompiled/cu128
+  #   # (drop `docker: cuda` -- launcher dispatches via SSH, not via docker)
+  cuda-rank:
+    image: flodl-cuda:${CUDA_TAG:-12.8}
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.0}
+    # sshd needs root to bind a privileged port (none here — 2222) and
+    # to privilege-drop on login (PAM). NOT setting `user:` lets the
+    # default root identity hold for the sshd process; the SSH'd login
+    # lands as `ubuntu` per the Dockerfile.cuda config.
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-cuda:/usr/local/cargo/registry
+      - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
+      - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
+      # Public key file → authorized_keys (read-only). Generate on host
+      # via the `ssh-keygen` step in the usage comment above.
+      - ${CUDA_RANK_AUTHORIZED_KEYS:-./.ssh-cuda-rank/authorized_keys}:/home/ubuntu/.ssh/authorized_keys:ro
+      # Persistent host keys so SSH client's known_hosts doesn't churn
+      # on every container restart.
+      - ./.ssh-cuda-rank/host_keys:/etc/ssh/host_keys
+    working_dir: /workspace
+    # Generate host keys on first start, fix authorized_keys perms, run
+    # sshd in the foreground so the container lives. `-e` sends sshd
+    # logs to stderr (visible via `docker compose logs cuda-rank`).
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        for k in rsa ecdsa ed25519; do
+          f=/etc/ssh/host_keys/ssh_host_$${k}_key
+          [ -f "$$f" ] || ssh-keygen -q -N '' -t $$k -f "$$f"
+          ln -sf "$$f" /etc/ssh/ssh_host_$${k}_key
+        done
+        chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys 2>/dev/null || true
+        chmod 600 /home/ubuntu/.ssh/authorized_keys 2>/dev/null || true
+        # Symlink fdl into PATH for SSH'd sessions. The launcher's
+        # SSH remote command does `exec fdl <subcmd>` (per
+        # launcher.rs:905); sshd's non-interactive session PATH
+        # doesn't include /workspace/target/release. Symlink survives
+        # rebuilds of fdl because it's recreated every container start.
+        ln -sf /workspace/target/release/fdl /usr/local/bin/fdl
+        # Ensure the SSH'd session inherits libtorch on LD_LIBRARY_PATH
+        # (sshd's PAM env doesn't auto-propagate it). The remote command
+        # in launcher.rs already sets LD_LIBRARY_PATH explicitly via the
+        # prebuild envelope, but bake a default for non-prebuild paths
+        # and interactive debugging.
+        # /etc/environment is read by PAM on SSH login. Bake the
+        # Dockerfile's ENV bits so SSH'd non-interactive commands
+        # inherit them (Dockerfile ENV is NOT inherited by SSH sessions).
+        cat > /etc/environment <<EOF
+        LD_LIBRARY_PATH=$${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64
+        LIBRARY_PATH=$${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64
+        LIBTORCH_PATH=$${LIBTORCH_PATH}
+        CUDA_HOME=/usr/local/cuda
+        RUSTUP_HOME=$${RUSTUP_HOME}
+        CARGO_HOME=$${CARGO_HOME}
+        PATH=$${PATH}
+        EOF
+        exec /usr/sbin/sshd -D -e
+    # `cuda-rank` is a remote host from the launcher's POV, so its
+    # hostname is distinct from the host's. The cluster.yml `name:`
+    # field must match this (rather than $HOSTNAME) for the launcher
+    # to take the SSH path.
+    hostname: exa-cuda
+    # Share host network: sshd binds on the host's 127.0.0.1:2222.
+    # NCCL transport interfaces (virbr0 etc.) are also reachable
+    # because they're host-side interfaces.
+    network_mode: host
+    shm_size: 2gb
+    # No env passthrough needed — the launcher SSHes in fresh and sets
+    # the slim envelope (FLODL_INTERNAL_CLUSTER_JSON, FLODL_INTERNAL_LOCAL_RANK) on the
+    # SSH command line, exactly like the Pascal VM path.
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
@@ -62,8 +247,39 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    # See `cuda` service: NCCL SHM transport on multi-GPU heterogeneous setups
+    # exhausts the 64 MB Docker default /dev/shm.
+    shm_size: 2gb
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    hostname: ${HOSTNAME}
+    # Share the host's network namespace so the cluster controller +
+    # coord (bound on exa-side ports) are reachable from remote rank
+    # VMs. Docker's default bridge isolates the container from the
+    # host's other networks (virbr0, enp1s0, etc.); with
+    # `network_mode: host` the container sees every interface the
+    # host has, and `master_addr` resolves identically inside and
+    # outside the container.
+    network_mode: host
     environment:
       - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # Cluster envelope: when fdl-cli activates a `cluster: true`
+      # command, these are set on the controller process so the
+      # spawned user binary's `flodl::launcher::dispatch` detects
+      # launcher role and fans out. Bare names = pass-through from
+      # the docker compose caller's env (the fdl-cli process).
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FDL_CMD
+      - FDL_ENV
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
+      # Controller's user name (host-side). Read by the launcher inside
+      # the container as the default `ssh -l <user>` target when the
+      # per-host `ssh.user:` is unset, bridges container's stock
+      # `ubuntu` (UID 1000) identity vs. the user's actual remote
+      # account.
+      - FLODL_INTERNAL_HOST_USER
     deploy:
       resources:
         reservations:
@@ -103,7 +319,10 @@ services:
       - jekyll-bundle:/usr/local/bundle
     ports:
       - "4000:4000"
-    command: bash -c "bundle install && jekyll serve --watch --force_polling --livereload"
+    # --host 0.0.0.0: jekyll defaults to binding 127.0.0.1 INSIDE the
+    # container, which resets every connection docker-proxy forwards from
+    # the host (port mapped, page never loads).
+    command: bash -c "bundle install && jekyll serve --host 0.0.0.0 --watch --force_polling --livereload"
     environment:
       - JEKYLL_ENV=development
 

@@ -1,6 +1,6 @@
 # Tutorial 1: Tensors
 
-Tensors are the fundamental data type in floDl — n-dimensional arrays of numbers backed by libtorch. This tutorial covers creation, operations, error handling, and memory management.
+Tensors are the fundamental data type in floDl - n-dimensional arrays of numbers backed by libtorch. This tutorial covers creation, operations, error handling, and memory management.
 
 ## Creating Tensors
 
@@ -9,7 +9,7 @@ All creation functions return `Result<Tensor>`.
 ```rust
 use flodl::{Tensor, TensorOptions, Device, DType};
 
-// From Rust data — data is copied into libtorch
+// From Rust data - data is copied into libtorch
 let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::CPU)?;
 
 // Filled tensors
@@ -51,7 +51,7 @@ t.device();  // Device::CPU
 
 ## Operations
 
-Operations return new tensors — originals are never modified. Every operation
+Operations return new tensors - originals are never modified. Every operation
 returns `Result<Tensor>`, and the `?` operator propagates errors:
 
 ```rust
@@ -87,7 +87,7 @@ t.hardswish()?      // efficient Swish approximation
 t.hardsigmoid()?    // piecewise-linear sigmoid
 t.prelu(&weight)?   // parametric ReLU
 t.softmax(-1)?      // softmax along dimension
-t.log_softmax(-1)?  // log(softmax(x)) — numerically stable
+t.log_softmax(-1)?  // log(softmax(x)) - numerically stable
 ```
 
 ### Math
@@ -125,8 +125,8 @@ t.atan()?           // arc tangent
 #### Numerically Stable
 
 ```rust
-t.log1p()?          // ln(1 + x) — stable for small x
-t.expm1()?          // exp(x) - 1 — stable for small x
+t.log1p()?          // ln(1 + x) - stable for small x
+t.expm1()?          // exp(x) - 1 - stable for small x
 t.log2()?           // log base 2
 t.log10()?          // log base 10
 t.erf()?            // Gauss error function
@@ -145,13 +145,13 @@ t.remainder_tensor(&other)? // Python-style modulo (tensor)
 #### Fused Operations
 
 ```rust
-// self + mat1 @ mat2 * alpha + self * beta — single kernel
+// self + mat1 @ mat2 * alpha + self * beta - single kernel
 t.addmm(&mat1, &mat2, 1.0, 1.0)?;
 
-// self + tensor1 * tensor2 * value — fused multiply-accumulate
+// self + tensor1 * tensor2 * value - fused multiply-accumulate
 t.addcmul(&t1, &t2, 1.0)?;
 
-// self + tensor1 / tensor2 * value — fused divide-accumulate
+// self + tensor1 / tensor2 * value - fused divide-accumulate
 t.addcdiv(&t1, &t2, 1.0)?;
 
 // linear interpolation: self + (end - self) * weight
@@ -181,7 +181,7 @@ t.std_dim(1, true)?           // std along dim
 t.prod()?                     // product of all elements
 t.prod_dim(1, true)?          // product along dim
 t.cumsum(0)?                  // cumulative sum along dim
-t.logsumexp(1, true)?         // log(sum(exp(x))) — numerically stable
+t.logsumexp(1, true)?         // log(sum(exp(x))) - numerically stable
 t.norm()?                     // L2 norm of all elements
 ```
 
@@ -248,7 +248,7 @@ let sim = a.cosine_similarity(&b, 1, 1e-8)?;
 // Lp normalization along a dimension
 let normed = t.normalize(2.0, 1)?;   // L2-normalize along dim 1
 
-// Masked fill — set elements where mask is true
+// Masked fill - set elements where mask is true
 let y = t.masked_fill(&mask, 0.0)?;
 ```
 
@@ -268,14 +268,14 @@ let item: f64 = t.select(0, 0)?.item()?; // scalar value as f64
 ## Memory Management
 
 Tensors are backed by C++ memory managed through libtorch. Rust's ownership
-system handles cleanup automatically via `Drop` — you never need to free
+system handles cleanup automatically via `Drop` - you never need to free
 tensors manually.
 
 ```rust
 {
     let t = Tensor::zeros(&[1000, 1000], TensorOptions::default())?;
     // ... use t ...
-} // t is dropped here — C++ memory freed immediately
+} // t is dropped here - C++ memory freed immediately
 ```
 
 This is a fundamental advantage over garbage-collected languages. In Go,
@@ -300,7 +300,7 @@ println!("live handles: {}", live_tensor_count());
 // Current process RSS in kilobytes (Linux only).
 println!("RSS: {}MB", rss_kb() / 1024);
 
-// Count autograd nodes reachable from a tensor — measures graph
+// Count autograd nodes reachable from a tensor - measures graph
 // complexity. Compare against Python to detect decomposed-op bloat.
 let loss = mse_loss(&pred, &target)?;
 println!("autograd nodes: {}", loss.data().autograd_node_count());
@@ -318,7 +318,7 @@ any other section of code. These match the standard PyTorch memory diagnostics:
 | `cuda_reset_peak_stats()` | `torch.cuda.reset_peak_memory_stats()` |
 
 "Active" bytes are memory currently holding tensor data. "Reserved" bytes
-include the CUDA caching allocator's free pool — memory that libtorch has
+include the CUDA caching allocator's free pool - memory that libtorch has
 obtained from the driver but is not currently in use by any tensor. The gap
 between the two tells you how much allocator headroom exists.
 
@@ -359,6 +359,16 @@ if flodl::cuda_available() {
 }
 ```
 
+> **Note**: `cuda_device_count()` and `cuda_available()` initialize
+> libtorch's CUDA context as a side effect. That's safe in
+> single-process code or after `Trainer::run` has fanned out. If you
+> need a GPU count *before* `Trainer::run` (e.g. to log the topology
+> from `main()`), use `flodl::sys::detect_gpus()` instead - it shells
+> out to `nvidia-smi` without touching libtorch, so it won't poison
+> spawned children's CUDA contexts on multi-GPU rigs. See
+> [Multi-GPU Training](11-multi-gpu.md) for the "no CUDA before
+> `Trainer::run`" invariant.
+
 ### Non-blocking Device Transfer
 
 The default `to_device()` blocks until the transfer completes. For CPU-to-GPU
@@ -373,7 +383,7 @@ let cpu_tensor = Tensor::randn(&[256, 512], TensorOptions::default())?;
 // Pin the CPU tensor into page-locked memory (requires CUDA)
 let pinned = cpu_tensor.pin_memory()?;
 
-// Launch the transfer — returns immediately
+// Launch the transfer - returns immediately
 let gpu = pinned.to_device_async(Device::CUDA(0))?;
 
 // ... do CPU work while the DMA transfer runs ...
@@ -422,7 +432,7 @@ flodl::set_cudnn_benchmark(true);  // opt-in, 5-10% speedup for fixed shapes
 ```
 
 Leave this off for dynamic-shape workloads (variable-length sequences,
-multi-resolution images) — the warmup cost can hurt throughput.
+multi-resolution images) - the warmup cost can hurt throughput.
 
 ## Memory Format (Channels Last)
 
@@ -440,7 +450,7 @@ assert!(images_cl.is_channels_last());
 assert_eq!(images_cl.shape(), &[8, 3, 224, 224]); // logical shape unchanged
 ```
 
-The logical shape stays the same — only the physical memory stride order changes.
+The logical shape stays the same - only the physical memory stride order changes.
 This avoids format-conversion overhead inside cuDNN convolution kernels. On Tensor
 Core GPUs, expect an 8--35% speedup for Conv2d-heavy workloads, depending on layer
 sizes and batch dimensions.
@@ -484,7 +494,7 @@ Tensor::foreach_lerp_scalar_(&params, &targets, 0.1)?;
 // In-place sqrt of every tensor
 Tensor::foreach_sqrt_(&params)?;
 
-// Compute the L2 norm of each tensor — returns a Vec<Tensor> of scalars
+// Compute the L2 norm of each tensor - returns a Vec<Tensor> of scalars
 let norms: Vec<Tensor> = Tensor::foreach_norm(&params, 2.0)?;
 ```
 

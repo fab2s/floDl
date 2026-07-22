@@ -98,18 +98,6 @@ fn detect_arch_list() -> Result<String, String> {
     Ok(caps.join(";"))
 }
 
-/// Convert "6.1;12.0" -> "sm61-sm120" for directory naming.
-fn arch_dir_name(archs: &str) -> String {
-    archs
-        .split(';')
-        .map(|cap| {
-            let clean = cap.replace('.', "");
-            format!("sm{}", clean)
-        })
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 // ---------------------------------------------------------------------------
 // Native toolchain detection
 // ---------------------------------------------------------------------------
@@ -237,7 +225,7 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
         None => detect_arch_list()?,
     };
 
-    let arch_dir = arch_dir_name(&archs);
+    let arch_dir = system::arch_dir_name(&archs);
     let install_path = ctx.root.join(format!("libtorch/builds/{}", arch_dir));
     let variant_id = format!("builds/{}", arch_dir);
 
@@ -491,7 +479,88 @@ fn build_native(archs: &str, install_path: &str, ctx: &Context, max_jobs: usize)
         }
     }
 
+    // Bundle cuDNN: copy system cuDNN libs into the install path so
+    // deploys to hosts without a system cuDNN install (e.g. a bare
+    // VM guest) can still find libcudnn_graph.so.9 and the
+    // other sub-libs via libtorch's lib dir on LD_LIBRARY_PATH.
+    // Best-effort on the native path: walks common cuDNN install
+    // prefixes and copies the first match it finds. Silently skipped
+    // when system cuDNN isn't present (Docker path bundles them via
+    // Dockerfile.cuda.source).
+    let dst_lib = Path::new(install_path).join("lib");
+    bundle_system_cudnn(&dst_lib);
+
     Ok(())
+}
+
+/// Locate system cuDNN libs (libcudnn.so.9 + sub-libs) and copy them
+/// into `dst_lib`. Walks common install prefixes; copies every file
+/// matching `libcudnn*.so*` from the first prefix that contains any.
+/// Returns silently (best-effort) — the Docker build bundles via
+/// Dockerfile, so failure here only affects the rarer native path.
+fn bundle_system_cudnn(dst_lib: &Path) {
+    let candidates = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/cuda/lib64",
+        "/usr/local/lib",
+    ];
+    for prefix in candidates {
+        let dir = Path::new(prefix);
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut copied = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Match libcudnn.so* and libcudnn_*.so* but skip static
+            // archives (.a) and headers.
+            if !name.starts_with("libcudnn") {
+                continue;
+            }
+            if !name.contains(".so") {
+                continue;
+            }
+            let dst = dst_lib.join(name);
+            // `fs::copy` resolves symlinks → loses the SONAME chain
+            // PyTorch's loader walks. Re-create symlinks; fall back to
+            // copy for real files.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                let target = match fs::read_link(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let _ = fs::remove_file(&dst);
+                if std::os::unix::fs::symlink(&target, &dst).is_ok() {
+                    copied += 1;
+                }
+            } else if fs::copy(&path, &dst).is_ok() {
+                copied += 1;
+            }
+        }
+        if copied > 0 {
+            println!(
+                "  Bundled {copied} cuDNN file(s) from {prefix} into the libtorch install",
+            );
+            return;
+        }
+    }
+    // No cuDNN found on the build host. Not fatal — most users build
+    // with cuDNN present, and the Docker path bundles regardless. Note
+    // the gap so it's visible if a deploy later fails to find cuDNN.
+    println!(
+        "  Note: no system cuDNN detected in /usr/lib/x86_64-linux-gnu, \
+         /usr/local/cuda/lib64, or /usr/local/lib; install path will \
+         rely on the target host providing cuDNN at runtime.",
+    );
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {

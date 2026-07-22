@@ -26,6 +26,8 @@
 //! ```
 
 pub mod log;
+pub mod sys;
+pub mod metrics;
 pub mod tensor;
 pub mod autograd;
 pub mod nn;
@@ -53,19 +55,20 @@ macro_rules! modules {
 }
 
 pub use log::{Verbosity, set_verbosity, verbosity};
-pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_active_bytes, cuda_active_bytes_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_empty_cache, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, cuda_compute_capability, probe_device, usable_cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, cuda_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions};
+pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_active_bytes, cuda_active_bytes_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_empty_cache, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, cuda_compute_capability, probe_device, usable_cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, cuda_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions, CudaEvent, CudaEventFlags, CudaStream, StreamGuard};
 #[cfg(feature = "rng")]
 pub use rng::Rng;
 pub use autograd::{Variable, no_grad, is_grad_enabled, NoGradGuard, max_pool2d, adaptive_avg_pool2d, grid_sample, scaled_dot_product_attention, embedding, embedding_bag};
 pub use nn::{
     Module, NamedInputModule, LoopBody, TraceEmit, forward_via_step,
-    Parameter, Buffer, Linear, Optimizer, Stateful,
+    Parameter, Buffer, Linear, Optimizer, Stateful, StateKind,
     SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder,
     RMSprop, RMSpropBuilder, Adagrad, AdagradBuilder, RAdam, NAdam,
     save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
-    migrate_checkpoint, migrate_checkpoint_file, checkpoint_version, checkpoint_keys,
+    migrate_checkpoint, migrate_checkpoint_file, migrate_optim_state_file,
+    checkpoint_version, checkpoint_keys,
     LoadReport, MigrateReport,
-    GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled,
+    GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled, is_autocast_enabled_for,
     Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU,
     LeakyReLU, ELU, Softplus, Mish,
     SELU, Hardswish, Hardsigmoid, PReLU,
@@ -90,12 +93,14 @@ pub use nn::{
     GaussianBlur, gaussian_blur_2d,
 };
 pub use distributed::{
-    CudaEvent, CudaEventFlags, CudaStream, StreamGuard,
-    NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, DdpConfig, HasGraph, Trainer, ElChe,
-    ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker,
+    NcclComms, NcclRankComm, NcclUniqueId, ReduceOp, Ddp, HasGraph, Trainer, ElChe,
+    ApplyPolicy, DdpHandle, DdpBuilder, DdpRunConfig, AverageBackend, TrainedState, EpochMetrics, MetricsFn, record_scalar, drain_scalars, GpuWorker, Worker, StepOutcome,
+    ElCheConfig, ElCheMode, TrainerConfig, MaxFailureThreshold,
+    ClusterBuilder, HostBuilder,
+    NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum,
 };
 pub use graph::{
-    FlowBuilder, MergeOp, Graph, LossContext, MapBuilder, Trend, TrendGroup,
+    FlowBuilder, MergeOp, Graph, GraphExt, MapBuilder, Trend, TrendGroup,
     Profile, NodeTiming, LevelTiming, format_duration,
     SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector,
     ThresholdHalt, LearnedHalt,
@@ -104,5 +109,6 @@ pub use graph::{
     GraphEpochIterator, ActiveGraphEpochIterator,
 };
 pub use worker::CpuWorker;
+pub use monitor::Monitor;
 #[cfg(feature = "rng")]
-pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, DistributedEpochIterator, Batch};
+pub use data::{DataSet, BatchDataSet, Sampler, RandomSampler, SequentialSampler, DataLoader, DataLoaderBuilder, EpochIterator, Batch, PickKey, TransformFn};

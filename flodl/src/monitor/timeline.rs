@@ -13,7 +13,7 @@
 //! // ... training with event injection ...
 //! tl.event(EventKind::EpochStart { epoch: 0 });
 //! // ... training ...
-//! tl.event(EventKind::EpochEnd { epoch: 0, loss: 0.42 });
+//! tl.event(EventKind::EpochEnd { epoch: 0, loss: 0.42, lr: 0.001 });
 //!
 //! tl.stop();
 //! tl.save_html("timeline.html")?;
@@ -77,8 +77,11 @@ pub struct TimelineEvent {
 pub enum EventKind {
     /// Worker started processing an epoch.
     EpochStart { epoch: usize },
-    /// Worker finished an epoch.
-    EpochEnd { epoch: usize, loss: f64 },
+    /// Worker finished an epoch. `lr` is the optimizer's current learning
+    /// rate at end-of-epoch; under step-decay schedules this is the LR that
+    /// was active throughout the epoch, under continuous schedules it is the
+    /// last value the scheduler wrote.
+    EpochEnd { epoch: usize, loss: f64, lr: f64 },
     /// AllReduce or parameter sync started.
     SyncStart,
     /// AllReduce or parameter sync completed.
@@ -91,10 +94,87 @@ pub enum EventKind {
     AnchorChanged { from: usize, to: usize },
     /// Worker was throttled (max_batch_diff exceeded).
     Throttle { rank: usize },
+    /// A best-effort coordinator→worker control broadcast failed to reach
+    /// one or more live ranks. `control` names the dropped message (e.g.
+    /// `SyncNow`, `RequestParams`, `DeclareDead`, `Update`); `failures` is
+    /// the count of live ranks that did not receive it. Recorded loudly:
+    /// a silently dropped `SyncNow`/`DeclareDead` can leave the survivor
+    /// cohort waiting on a signal that never arrives. The per-rank error
+    /// detail is on stderr at emission time.
+    LostBroadcast { control: String, failures: usize },
     /// Auto-detected GPU idle gap (post-processing).
     Idle { device: u8, duration_ms: f64 },
-    /// User-defined event.
-    Custom { label: String },
+    /// LR-aware meta-controller nudged the El Che anchor down.
+    ///
+    /// Emitted from the coordinator's `observe_meta` whenever the
+    /// meta returns `MetaAction::NudgeDown` and `ElChe::nudge_anchor_down(factor)`
+    /// fires. The cycle's net anchor delta (meta nudge composed with
+    /// any guard-driven adjustment) is reported separately via
+    /// `AnchorChanged`; this event isolates the meta's contribution
+    /// with the raw `factor` used.
+    MetaNudge { factor: f64, from: usize, to: usize },
+    /// MSF passive observation: per-AllReduce divergence + lambda sample.
+    ///
+    /// Emitted at every `ConvergenceGuard::observe_lambda` call. `d_raw` is
+    /// the max normalized delta across ranks; `lambda_raw`/`lambda_ema` are
+    /// the across-event Lyapunov proxy `(1/k) * log(D_t / D_{t-1})` and its
+    /// EMA. `None` on the first event in a fresh estimator or when below the
+    /// noise floor.
+    Divergence {
+        d_raw: f64,
+        lambda_raw: Option<f64>,
+        lambda_ema: Option<f64>,
+        k_used: usize,
+        k_max: usize,
+        step: usize,
+        /// Per-rank `||pre - post|| / ||post||`. Length = world_size.
+        deltas: Vec<f64>,
+        /// L2 norm of the post-AllReduce consensus weights `||W̄_t||`.
+        /// `None` when not computed (NCCL v1 path skips this). Carries the
+        /// longitudinal meta-oscillator state: tracking `||W̄_t||` across
+        /// events gives consensus magnitude trajectory between syncs.
+        post_norm: Option<f64>,
+        /// Per-rank pre-AllReduce L2 norm `||W_i||`. `None` when not
+        /// computed. With `post_norm` and `deltas` this enables the
+        /// cosine-similarity / magnitude-shift decomposition (MSF/SWA
+        /// directional vs magnitude split).
+        pre_norms: Option<Vec<f64>>,
+        /// In-flight epoch at the time of this event (= `last_aggregated_epoch
+        /// + 1`, or 0 before the first epoch aggregates). `None` for
+        /// timelines emitted before this field was added; consumers fall
+        /// back to `EpochEnd` timestamp lookup.
+        epoch: Option<usize>,
+    },
+    /// Guard-specific diagnostic values for the current AllReduce event.
+    /// Emitted by the coordinator after each `report()` call to a
+    /// pluggable [`crate::distributed::ddp_run::ConvergenceGuard`]. The key
+    /// set depends on the active guard (e.g. MsfGuard emits
+    /// `lambda_raw` / `lambda_ema`; TrendGuard emits `d_history_last`;
+    /// NoGuard emits nothing). Old timelines lack this event entirely;
+    /// consumers should treat absence as "no diagnostics available".
+    GuardTelemetry {
+        epoch: usize,
+        step: usize,
+        values: Vec<(String, f64)>,
+    },
+    /// MSF passive observation: per-epoch divergence + lambda aggregates.
+    ///
+    /// Emitted at `on_epoch_aggregated`. Aggregates over all `Divergence`
+    /// events in this epoch plus a snapshot of the last sample. The lambda
+    /// estimator state is NOT reset across epochs — `prev_d` carries forward.
+    DivergenceEpoch {
+        epoch: usize,
+        sync_count: usize,
+        d_min: f64,
+        d_max: f64,
+        d_mean: f64,
+        lambda_min: Option<f64>,
+        lambda_max: Option<f64>,
+        lambda_mean: Option<f64>,
+        lambda_ema_at_epoch_end: Option<f64>,
+        d_at_epoch_end: f64,
+        k_at_epoch_end: usize,
+    },
 }
 
 /// Aggregate statistics from a timeline.
@@ -131,11 +211,33 @@ pub struct TimelineBroadcast {
     pub events: Vec<TimelineEvent>,
 }
 
+/// Full-resolution sample archive cap (~14 h at the default 100 ms poll).
+/// The archive grows at poll rate for the life of the run; without a cap a
+/// multi-day run accumulates tens of millions of samples. Trimmed
+/// oldest-first in 10% blocks; the first trim prints a one-time notice.
+const MAX_TIMELINE_SAMPLES: usize = 500_000;
+/// Event archive cap (events are training-driven and far sparser).
+const MAX_TIMELINE_EVENTS: usize = 100_000;
+static TRIM_NOTICE: AtomicBool = AtomicBool::new(false);
+
+fn trim_archive<T>(buf: &mut Vec<T>, cap: usize, what: &str) {
+    if buf.len() > cap {
+        buf.drain(..cap / 10);
+        if !TRIM_NOTICE.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "flodl monitor: timeline {what} archive reached its cap ({cap});                  oldest entries are being dropped — lower the poll rate or export                  periodically for full multi-day resolution"
+            );
+        }
+    }
+}
+
 /// High-frequency system profiler for training diagnostics.
 ///
 /// Captures CPU, RAM, and per-GPU metrics at configurable intervals plus
 /// training events. Thread-safe: wrap in `Arc` and share across coordinator
-/// and worker threads.
+/// and worker threads. The in-memory archives are capped (500k samples,
+/// ~14 h at the default 100 ms poll); oldest entries are trimmed past the
+/// cap with a one-time notice.
 ///
 /// Polling and broadcasting are decoupled: samples are collected at
 /// `poll_interval_ms` (default 100ms) for full-resolution post-hoc analysis,
@@ -225,8 +327,11 @@ impl Timeline {
         }
 
         self.stop_flag.store(false, Ordering::SeqCst);
-        let tl = Arc::clone(self);
-        *handle = Some(thread::spawn(move || tl.poll_loop()));
+        // The poller holds only a Weak: a strong Arc here would keep an
+        // abandoned timeline (dropped without stop()) alive forever —
+        // Drop could never run and the thread never exited.
+        let weak = Arc::downgrade(self);
+        *handle = Some(thread::spawn(move || Self::poll_loop(weak)));
     }
 
     /// Stop background polling and join the thread.
@@ -242,7 +347,11 @@ impl Timeline {
     pub fn event(&self, kind: EventKind) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let evt = TimelineEvent { elapsed_ms, kind };
-        self.events.lock().unwrap().push(evt.clone());
+        {
+            let mut events = self.events.lock().unwrap();
+            events.push(evt.clone());
+            trim_archive(&mut events, MAX_TIMELINE_EVENTS, "event");
+        }
         self.pending_events.lock().unwrap().push(evt);
     }
 
@@ -467,25 +576,42 @@ impl Timeline {
     // Internal
     // -----------------------------------------------------------------------
 
-    fn poll_loop(&self) {
-        let interval = Duration::from_millis(self.poll_interval_ms);
-        let broadcast_interval = Duration::from_millis(self.broadcast_interval_ms);
+    fn poll_loop(weak: std::sync::Weak<Self>) {
+        let (interval, broadcast_interval) = match weak.upgrade() {
+            Some(tl) => (
+                Duration::from_millis(tl.poll_interval_ms),
+                Duration::from_millis(tl.broadcast_interval_ms),
+            ),
+            None => return,
+        };
         let mut prev_cpu: Option<CpuTimes> = None;
         let mut last_broadcast = Instant::now();
 
-        let n_gpus = {
-            #[cfg(feature = "cuda")]
-            {
-                crate::tensor::cuda_device_count().max(0) as usize
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                0usize
-            }
+        // GPU identity via nvidia-smi, live metrics via NVML, allocator
+        // stats gated on an existing CUDA context: the timeline poller
+        // must never initialize the CUDA runtime (it can run in the
+        // launcher, and a context would pin VRAM on every device).
+        // `(physical nvidia-smi index, total VRAM bytes)` per device;
+        // Vec position doubles as the CUDA runtime index.
+        let gpu_statics: Vec<(u8, u64)> = if cfg!(feature = "cuda") {
+            crate::sys::detect_gpus()
+                .into_iter()
+                .map(|g| (g.index, g.total_memory_mb * 1024 * 1024))
+                .collect()
+        } else {
+            Vec::new()
         };
 
-        while !self.stop_flag.load(Ordering::SeqCst) {
-            let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        loop {
+            // Re-acquire per tick: a failed upgrade means every user Arc
+            // is gone — the timeline was abandoned without stop(), so the
+            // poller exits (letting Drop run) instead of pinning it.
+            let Some(tl) = weak.upgrade() else { return };
+            let this = tl.as_ref();
+            if this.stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let elapsed_ms = this.start.elapsed().as_millis() as u64;
 
             // CPU utilization (delta)
             let cur_cpu = read_cpu_times();
@@ -507,23 +633,26 @@ impl Timeline {
             let (ram_used, ram_total) = read_meminfo().unwrap_or((0, 0));
 
             // Per-GPU
-            let mut gpus = Vec::with_capacity(n_gpus);
-            for i in 0..n_gpus {
-                #[cfg(feature = "cuda")]
-                let (compute_util, vram_used, vram_alloc, vram_total) = {
-                    let idx = i as i32;
-                    let util = crate::tensor::cuda_utilization_idx(idx)
-                        .map(|u| u as u8)
-                        .unwrap_or(0);
-                    let (used, total) = crate::tensor::cuda_memory_info_idx(idx).unwrap_or((0, 0));
-                    let alloc = crate::tensor::cuda_allocated_bytes_idx(idx).unwrap_or(0);
-                    (util, used, alloc, total)
+            let mut gpus = Vec::with_capacity(gpu_statics.len());
+            for (i, &(phys, total_static)) in gpu_statics.iter().enumerate() {
+                let compute_util = crate::tensor::cuda_utilization_idx(phys as i32)
+                    .map(|u| u as u8)
+                    .unwrap_or(0);
+                // Device-wide used/total via NVML (physical index);
+                // fall back to the nvidia-smi total when NVML is out.
+                let (vram_used, vram_total) =
+                    crate::tensor::cuda_nvml_memory_info_idx(phys as i32)
+                        .unwrap_or((0, total_static));
+                // Allocator reserved bytes: per-process, runtime index,
+                // and only readable where a CUDA context already exists.
+                let vram_alloc = if crate::tensor::cuda_has_primary_context(i as i32) {
+                    crate::tensor::cuda_allocated_bytes_idx(i as i32).unwrap_or(0)
+                } else {
+                    0
                 };
-                #[cfg(not(feature = "cuda"))]
-                let (compute_util, vram_used, vram_alloc, vram_total) = (0u8, 0u64, 0u64, 0u64);
 
                 gpus.push(GpuTimelineSample {
-                    device: i as u8,
+                    device: phys,
                     compute_util,
                     vram_used_bytes: vram_used,
                     vram_allocated_bytes: vram_alloc,
@@ -539,23 +668,27 @@ impl Timeline {
                 gpus,
             };
 
-            // Store in full-resolution archive
-            self.samples.lock().unwrap().push(sample.clone());
+            // Store in full-resolution archive (capped)
+            {
+                let mut samples = this.samples.lock().unwrap();
+                samples.push(sample.clone());
+                trim_archive(&mut samples, MAX_TIMELINE_SAMPLES, "sample");
+            }
             // Buffer for next broadcast
-            self.pending_samples.lock().unwrap().push(sample);
+            this.pending_samples.lock().unwrap().push(sample);
 
             // Broadcast to subscribers at the slower interval
             if last_broadcast.elapsed() >= broadcast_interval {
-                self.flush_broadcast();
+                this.flush_broadcast();
                 last_broadcast = Instant::now();
             }
 
             // Sleep in small increments to check stop flag
             let wake = Instant::now() + interval;
             while Instant::now() < wake {
-                if self.stop_flag.load(Ordering::SeqCst) {
+                if this.stop_flag.load(Ordering::SeqCst) {
                     // Final broadcast before exit
-                    self.flush_broadcast();
+                    this.flush_broadcast();
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -641,10 +774,10 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
             EventKind::EpochStart { epoch } => {
                 let _ = write!(out, "\"k\":\"epoch_start\",\"epoch\":{epoch}");
             }
-            EventKind::EpochEnd { epoch, loss } => {
+            EventKind::EpochEnd { epoch, loss, lr } => {
                 let _ = write!(
                     out,
-                    "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6}"
+                    "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6},\"lr\":{lr:.6e}"
                 );
             }
             EventKind::SyncStart => {
@@ -665,6 +798,13 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
             EventKind::Throttle { rank } => {
                 let _ = write!(out, "\"k\":\"throttle\",\"rank\":{rank}");
             }
+            EventKind::LostBroadcast { control, failures } => {
+                let escaped = control.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(
+                    out,
+                    "\"k\":\"lost_broadcast\",\"control\":\"{escaped}\",\"failures\":{failures}"
+                );
+            }
             EventKind::Idle {
                 device,
                 duration_ms,
@@ -674,10 +814,104 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                     "\"k\":\"idle\",\"dev\":{device},\"ms\":{duration_ms:.1}"
                 );
             }
-            EventKind::Custom { label } => {
-                // Escape quotes in label
-                let escaped = label.replace('\\', "\\\\").replace('"', "\\\"");
-                let _ = write!(out, "\"k\":\"custom\",\"label\":\"{escaped}\"");
+            EventKind::MetaNudge { factor, from, to } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"meta_nudge\",\"factor\":{factor:.6},\"from\":{from},\"to\":{to}"
+                );
+            }
+            EventKind::Divergence {
+                d_raw,
+                lambda_raw,
+                lambda_ema,
+                k_used,
+                k_max,
+                step,
+                deltas,
+                post_norm,
+                pre_norms,
+                epoch,
+            } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"div\",\"d\":{d_raw:.6e},\"k_used\":{k_used},\"k_max\":{k_max},\"step\":{step}"
+                );
+                if let Some(ep) = epoch {
+                    let _ = write!(out, ",\"epoch\":{ep}");
+                }
+                if let Some(l) = lambda_raw {
+                    let _ = write!(out, ",\"lambda\":{l:.6e}");
+                }
+                if let Some(l) = lambda_ema {
+                    let _ = write!(out, ",\"lambda_ema\":{l:.6e}");
+                }
+                if let Some(p) = post_norm {
+                    let _ = write!(out, ",\"post_norm\":{p:.6e}");
+                }
+                if let Some(prs) = pre_norms {
+                    out.push_str(",\"pre_norms\":[");
+                    for (i, p) in prs.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let _ = write!(out, "{p:.6e}");
+                    }
+                    out.push(']');
+                }
+                out.push_str(",\"deltas\":[");
+                for (i, d) in deltas.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, "{d:.6e}");
+                }
+                out.push(']');
+            }
+            EventKind::GuardTelemetry { epoch, step, values } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"guard_telemetry\",\"epoch\":{epoch},\"step\":{step},\"values\":{{",
+                );
+                for (i, (k, v)) in values.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let escaped = k.replace('\\', "\\\\").replace('"', "\\\"");
+                    let _ = write!(out, "\"{escaped}\":{v:.6e}");
+                }
+                out.push('}');
+            }
+            EventKind::DivergenceEpoch {
+                epoch,
+                sync_count,
+                d_min,
+                d_max,
+                d_mean,
+                lambda_min,
+                lambda_max,
+                lambda_mean,
+                lambda_ema_at_epoch_end,
+                d_at_epoch_end,
+                k_at_epoch_end,
+            } => {
+                let _ = write!(
+                    out,
+                    "\"k\":\"div_epoch\",\"epoch\":{epoch},\"syncs\":{sync_count},\
+                     \"d_min\":{d_min:.6e},\"d_max\":{d_max:.6e},\"d_mean\":{d_mean:.6e},\
+                     \"d_end\":{d_at_epoch_end:.6e},\"k_end\":{k_at_epoch_end}"
+                );
+                if let Some(l) = lambda_min {
+                    let _ = write!(out, ",\"lambda_min\":{l:.6e}");
+                }
+                if let Some(l) = lambda_max {
+                    let _ = write!(out, ",\"lambda_max\":{l:.6e}");
+                }
+                if let Some(l) = lambda_mean {
+                    let _ = write!(out, ",\"lambda_mean\":{l:.6e}");
+                }
+                if let Some(l) = lambda_ema_at_epoch_end {
+                    let _ = write!(out, ",\"lambda_ema_end\":{l:.6e}");
+                }
             }
         }
         out.push('}');
@@ -697,6 +931,7 @@ mod tests {
         tl.event(EventKind::EpochEnd {
             epoch: 0,
             loss: 0.42,
+            lr: 0.001,
         });
 
         let events = tl.events.lock().unwrap();
@@ -782,6 +1017,30 @@ mod tests {
         let mut buf2 = String::new();
         write_events_json(&mut buf2, &events);
         assert!(buf2.contains("\"sync_start\""));
+    }
+
+    /// `MetaNudge` (LR-aware meta-controller anchor nudge) carries
+    /// `factor` / `from` / `to` as a strongly-typed JSON shape that
+    /// ddp-bench's analyze pipeline parses as `k=meta_nudge`.
+    #[test]
+    fn test_meta_nudge_json_shape() {
+        let tl = Timeline::new(100);
+        tl.event(EventKind::MetaNudge {
+            factor: 0.85,
+            from: 40,
+            to: 34,
+        });
+
+        let mut buf = String::new();
+        let events = tl.events.lock().unwrap();
+        write_events_json(&mut buf, &events);
+        assert!(
+            buf.contains("\"k\":\"meta_nudge\""),
+            "meta_nudge kind tag missing: {buf}",
+        );
+        assert!(buf.contains("\"factor\":0.850000"), "factor missing: {buf}");
+        assert!(buf.contains("\"from\":40"), "from missing: {buf}");
+        assert!(buf.contains("\"to\":34"), "to missing: {buf}");
     }
 
     #[test]

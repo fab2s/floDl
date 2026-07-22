@@ -192,7 +192,7 @@ ALBERT, XLM-RoBERTa, and DeBERTa-v2 are exercised through
 - [x] XLM-RoBERTa family (base + four task heads, PyTorch parity)
 - [x] DeBERTa-v2 / v3 family (base + seqcls/tokcls/qa parity; MLM gap documented)
 - [x] `AutoModel` / `AutoConfig` dispatch across all six families (`#[non_exhaustive]`)
-- [x] `Trainer::setup_head` + `HasGraph` (transparent 1-or-N-GPU fine-tuning)
+- [x] Task heads `impl Module` - ride `Trainer::run` / `Trainer::builder(...)` (transparent 1-or-N-GPU fine-tuning)
 - [x] `compute_loss(enc, labels)` task-head loss wiring (mirrors HF Python's `model(..., labels=...).loss`)
 - [x] Round-trip export: `fdl flodl-hf export` (Hub or `.fdl` checkpoint) + `verify-export` (auto-detect family/head) + `verify-matrix` (30-cell quarterly gate)
 - [x] `fdl add flodl-hf` `--playground` / `--install` modes for on-site discovery and direct wiring

@@ -69,12 +69,12 @@ y.backward()?;
 
 `backward()` requires a scalar (single-element) output. After the backward
 pass, the calling variable's grad_fn chain is severed in-place (via
-`detach_()`) — this immediately frees the C++ autograd Node objects rather
+`detach_()`) - this immediately frees the C++ autograd Node objects rather
 than waiting for the variable to be dropped. Leaf variables hold their
 accumulated gradients:
 
 ```rust
-println!("{:?}", w.grad());  // dy/dw — the gradient tensor
+println!("{:?}", w.grad());  // dy/dw - the gradient tensor
 println!("{:?}", x.grad());  // dy/dx
 ```
 
@@ -94,8 +94,8 @@ let w = Variable::new(w_t, true);
 let y = x.mul(&w)?.sum()?;
 y.backward()?;
 
-let w_grad = w.grad().unwrap().to_f32_vec()?;  // [2.0] — dy/dw = x
-let x_grad = x.grad().unwrap().to_f32_vec()?;  // [3.0] — dy/dx = w
+let w_grad = w.grad().unwrap().to_f32_vec()?;  // [2.0] - dy/dw = x
+let x_grad = x.grad().unwrap().to_f32_vec()?;  // [3.0] - dy/dx = w
 ```
 
 ## ZeroGrad
@@ -145,12 +145,12 @@ no_grad(|| {
 
 floDl uses Rust's `Result<T>` type for error handling. Every operation that
 can fail returns a `Result`, and the `?` operator propagates errors immediately
-— no silent failures, no error chains:
+- no silent failures, no error chains:
 
 ```rust
 let result = x.matmul(&w)?.add(&b)?;
 // If matmul fails (shape mismatch), the error returns immediately.
-// No silent propagation — you handle errors explicitly.
+// No silent propagation - you handle errors explicitly.
 ```
 
 This is more explicit than error chains but catches bugs earlier and

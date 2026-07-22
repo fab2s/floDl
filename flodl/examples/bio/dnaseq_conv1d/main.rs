@@ -14,7 +14,7 @@
 //!
 //! Run: `cargo run --release --example dnaseq_conv1d`
 
-use flodl::monitor::Monitor;
+use flodl::Monitor;
 use flodl::*;
 
 const SEQ_LEN: usize = 200;

@@ -1,13 +1,13 @@
 # Benchmark: flodl vs PyTorch
 
 Ten models, ten interleaved rounds, idle machine. Same architectures, same
-hyperparameters, same CUDA kernels -- the only variable is the framework
+hyperparameters, same CUDA kernels - the only variable is the framework
 overhead.
 
 > This is a living document. The benchmark suite ships with flodl and runs in
-> Docker -- anyone can reproduce these numbers on their own hardware.
+> Docker - anyone can reproduce these numbers on their own hardware.
 
-## Results (v0.3.0 -- April 2026)
+## Results (v0.3.0 - April 2026)
 
 | Model | PyTorch | flodl | Delta | Py σ | Rs σ | Py alloc | Rs alloc | Py rsrvd | Rs rsrvd |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -23,19 +23,19 @@ overhead.
 | convnet | 1298.0 ms | 1298.2 ms | 0% | ±0.3 | ±0.1 | 1102 MB | 1103 MB | 1420 MB | 1484 MB |
 
 **flodl wins 8 of 10 benchmarks, ties 2, and loses none. The two ties
-(convnet, lstm_seq) are compute-bound -- both frameworks saturate the GPU,
+(convnet, lstm_seq) are compute-bound - both frameworks saturate the GPU,
 confirming identical CUDA kernel dispatch.**
 
 ### Reading the table
 
-- **Median epoch time** -- median of the best run's 20 measured epochs, taken
+- **Median epoch time** - median of the best run's 20 measured epochs, taken
   across 10 rounds. Lower is faster.
-- **σ** -- scaled MAD (Median Absolute Deviation x 1.4826) across rounds,
+- **σ** - scaled MAD (Median Absolute Deviation x 1.4826) across rounds,
   σ-equivalent for normal data but robust to OS/GC outliers. Lower means
   more predictable. See [Why MAD, not standard deviation?](#why-mad-not-standard-deviation) below.
-- **alloc** -- peak active tensor bytes (`torch.cuda.max_memory_allocated` /
+- **alloc** - peak active tensor bytes (`torch.cuda.max_memory_allocated` /
   `cuda_peak_active_bytes`). This is the memory your tensors actually use.
-- **rsrvd** -- peak allocator reservation (`torch.cuda.max_memory_reserved` /
+- **rsrvd** - peak allocator reservation (`torch.cuda.max_memory_reserved` /
   `cuda_peak_reserved_bytes`). This is the memory the caching allocator holds.
 
 ### Where flodl wins and why
@@ -52,7 +52,7 @@ that overhead compounds.
 **Graph-builder architectures** (residual_tower -24%, feedback_fixed -16%,
 gated_routing -12%, iterative_refine -11%): flodl's `Graph::build()`
 pre-computes a flat Vec-indexed routing table. Forward dispatch is array
-indexing -- no HashMap lookups, no dynamic allocation. Gate combination uses
+indexing - no HashMap lookups, no dynamic allocation. Gate combination uses
 vectorized stack+broadcast+sum (3 kernels regardless of expert count).
 
 **Fused RNN** (gru_seq -4%): Both frameworks call the same cuDNN fused kernel
@@ -62,7 +62,7 @@ and FFI marshalling.
 
 **Compute-bound ties** (convnet 0%, lstm_seq 0%): These models spend
 >99% of time inside cuDNN kernels. Framework overhead is invisible. The tie
-proves both frameworks dispatch identical CUDA kernels -- the speed advantage
+proves both frameworks dispatch identical CUDA kernels - the speed advantage
 appears precisely where framework overhead dominates.
 
 ### Variance: what the σ column tells you
@@ -85,7 +85,7 @@ architectures, every node finishing within ±3ms instead of ±10ms improves
 effective throughput scaling.
 
 The deployment story compounds this: the flodl benchmark Docker image is
-26.86 GB vs PyTorch's 38.45 GB -- 30% smaller. No Python, no pip, no PyTorch
+26.86 GB vs PyTorch's 38.45 GB - 30% smaller. No Python, no pip, no PyTorch
 distribution, just the Rust binary and libtorch. On clusters with cold starts
 or shared storage, 12 GB less per node adds up.
 
@@ -113,7 +113,7 @@ for themselves.
 
 ## What was measured
 
-### Tier 1 -- Standard architectures
+### Tier 1 - Standard architectures
 
 These models use standard nn modules (Linear, Conv2d, LSTM, GRU, MultiheadAttention,
 ConvTranspose2d, activations, normalization). Both sides use identical PyTorch-equivalent code.
@@ -127,7 +127,7 @@ ConvTranspose2d, activations, normalization). Both sides use identical PyTorch-e
 | **lstm_seq** | 2-layer LSTM -> linear projection | ~2.5M | 128 | Fused LSTM throughput |
 | **conv_autoenc** | Conv2d encoder + ConvTranspose2d decoder | ~3.5M | 64 | Transposed convolution, image reconstruction |
 
-### Tier 2 -- Graph builder architectures
+### Tier 2 - Graph builder architectures
 
 These models use flodl's `FlowBuilder` (residual connections, gated routing,
 loops). The PyTorch equivalents use manual `forward()` implementations with
@@ -149,31 +149,31 @@ transformer), and random synthetic data. Each epoch runs 50 batches.
 
 The benchmark suite is designed for reproducibility and statistical rigor:
 
-1. **Interleaved rounds** -- 10 rounds alternate Rust-first/Python-first to
+1. **Interleaved rounds** - 10 rounds alternate Rust-first/Python-first to
    distribute thermal drift and background noise equally.
 
-2. **GPU clocks** -- locked at 3090 MHz (RTX 5060 Ti default applications
+2. **GPU clocks** - locked at 3090 MHz (RTX 5060 Ti default applications
    clock). On non-WSL systems, the suite auto-detects and locks the GPU
    clock; on WSL2, clock locking requires the host-side PowerShell script.
 
-3. **Multi-run best-of** -- each round runs 4 complete passes (1 warmup + 3
+3. **Multi-run best-of** - each round runs 4 complete passes (1 warmup + 3
    measured). The best run's median is reported, filtering process-level noise.
 
-4. **Per-epoch measurement** -- each measured run collects 20 epoch times with
+4. **Per-epoch measurement** - each measured run collects 20 epoch times with
    3 warmup epochs. The median is used (not mean) to resist outliers.
 
-5. **GPU warmup** -- 15 seconds of synthetic GPU load before any measurement
+5. **GPU warmup** - 15 seconds of synthetic GPU load before any measurement
    to stabilize thermal state and clocks.
 
-6. **Idle machine** -- system rebooted, non-essential services stopped, display
+6. **Idle machine** - system rebooted, non-essential services stopped, display
    off. No user processes competing for resources.
 
-7. **Docker isolation** -- both frameworks run in the same container image with
+7. **Docker isolation** - both frameworks run in the same container image with
    identical CUDA toolkit, libtorch, and system libraries.
 
-8. **Peak VRAM tracking** -- VRAM measured via `cuda_reset_peak_stats()` /
+8. **Peak VRAM tracking** - VRAM measured via `cuda_reset_peak_stats()` /
    `cuda_peak_active_bytes()`, matching `torch.cuda.max_memory_allocated()`
-   semantics. Not a snapshot -- the true high-water mark.
+   semantics. Not a snapshot - the true high-water mark.
 
 ### Statistical model
 
@@ -212,10 +212,10 @@ The difference is what happens between kernel launches:
 PyTorch's forward pass goes through Python -> TorchScript dispatch -> C++.
 flodl calls libtorch directly from Rust via FFI. For models with many small
 operations (MLP, transformer, residual tower, routing), the per-op dispatch
-overhead dominates -- hence the 24-31% improvement.
+overhead dominates - hence the 24-31% improvement.
 
 For compute-bound models (convnet, lstm_seq), both frameworks spend >99% of
-time in cuDNN kernels and the dispatch overhead is invisible -- hence the
+time in cuDNN kernels and the dispatch overhead is invisible - hence the
 0% delta.
 
 ### Fused operations
@@ -231,7 +231,7 @@ With N = hundreds of parameters, this adds up every batch.
 
 ### Fused RNN kernels
 
-Both frameworks call cuDNN's fused `at::lstm()` / `at::gru()` -- a single
+Both frameworks call cuDNN's fused `at::lstm()` / `at::gru()` - a single
 kernel for the entire sequence across all layers. flodl additionally caches
 the packed parameter tensors on the C++ side (`RnnParams` handle), eliminating
 per-forward parameter collection, FFI array marshalling, and `std::vector`
@@ -241,7 +241,7 @@ reconstruction. This is the same strategy as PyTorch's
 ### Pre-computed graph routing
 
 flodl's `Graph::build()` pre-computes a flat Vec-indexed routing table.
-Forward pass dispatch is array indexing -- no HashMap lookups, no dynamic
+Forward pass dispatch is array indexing - no HashMap lookups, no dynamic
 allocation. Gate combination uses vectorized stack+broadcast+sum (3 kernels
 regardless of expert count).
 
@@ -263,7 +263,7 @@ optimization work has been done:
 | **Fused Adam/AdamW** | Single multi-tensor CUDA kernel for the full optimizer step | Eliminates N*4 per-parameter kernel launches |
 | **Foreach ops** | 7 batched tensor operations (`foreach_zero_`, `foreach_norm`, `foreach_mul_scalar_`, etc.) | Single kernel for N parameters |
 | **Fused gradient clipping** | `clip_grad_norm` via `_foreach_norm` + `_foreach_mul_` | 2 kernels instead of 2N |
-| **Fused RNN** | `at::lstm()` / `at::gru()` -- single cuDNN kernel for full sequence | Eliminates N*L per-timestep cell dispatch |
+| **Fused RNN** | `at::lstm()` / `at::gru()` - single cuDNN kernel for full sequence | Eliminates N*L per-timestep cell dispatch |
 | **RNN param caching** | C++ `RnnParams` handle caches packed parameter tensors | Zero per-forward FFI overhead for LSTM/GRU |
 | **CUDA Graphs** | Capture/replay kernel sequences, eliminating CPU dispatch overhead | Available for static-shape workloads |
 | **Automatic mixed precision** | `AutocastGuard` / `autocast()` + `GradScaler` for fp16/bf16 | Up to 3x on Tensor Core GPUs |
@@ -273,7 +273,7 @@ optimization work has been done:
 | **Loop fast-path** | Direct `forward()` call when loop body has no refs | Eliminates HashMap overhead per iteration |
 | **Vectorized gate combination** | Stack+broadcast+sum for MoE routing | 3 kernels regardless of expert count |
 
-These optimizations are automatic -- users get them without changing their
+These optimizations are automatic - users get them without changing their
 training code. The benchmark suite does not enable CUDA Graphs, mixed
 precision, or channels-last format to ensure a fair apples-to-apples
 comparison with standard PyTorch.
@@ -281,7 +281,7 @@ comparison with standard PyTorch.
 ## Earlier benchmark: FBRL letter model (v0.1.1)
 
 > **Note:** This benchmark was run with flodl v0.1.1 before the optimizations
-> listed above. It measures a different thing -- real end-to-end training of a
+> listed above. It measures a different thing - real end-to-end training of a
 > non-trivial model, including data loading, checkpointing, and a live
 > dashboard.
 
@@ -295,12 +295,12 @@ comparison with standard PyTorch.
 \* VRAM overhead is a fixed cost from CUDA toolkit version difference (cu126
 vs cu124) and libtorch's caching allocator. Does not grow with model size.
 
-**Model:** FBRL letter recognition -- recurrent attention with GRU controller,
+**Model:** FBRL letter recognition - recurrent attention with GRU controller,
 CNN encoder, deconv decoder, 9-component loss stack. 11,440 grayscale 128x128
 images, 100 epochs on a GTX 1060 6GB.
 
 **Key finding:** flodl ran a live training dashboard and async gzip
-checkpointing -- more work per epoch than PyTorch -- and was still 19% faster.
+checkpointing - more work per epoch than PyTorch - and was still 19% faster.
 The epoch time standard deviation was 0.10s (flodl) vs 0.85s (PyTorch).
 
 Full details, raw data, and reproduction steps at
@@ -330,7 +330,7 @@ fdl bench cpu
 fdl bench publish --rounds 20 --lock-clocks 2407 --output benchmarks/report.txt
 ```
 
-`fdl bench --help` lists every available flag — the schema is published by
+`fdl bench --help` lists every available flag - the schema is published by
 `benchmarks/run.sh --fdl-schema` and auto-cached on first use.
 
 Each round runs the full Rust suite then the full Python suite (alternating
@@ -342,7 +342,7 @@ VRAM tracking.
 
 - Docker with NVIDIA Container Toolkit (for GPU benchmarks)
 - `make`
-- An NVIDIA GPU (any generation -- the suite adapts)
+- An NVIDIA GPU (any generation - the suite adapts)
 
 The Docker image includes Rust, Python, PyTorch, libtorch, and all
 dependencies. First build takes ~15 minutes; subsequent runs reuse the cached

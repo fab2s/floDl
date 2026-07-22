@@ -183,25 +183,28 @@ let handle = Trainer::builder(
 let state = handle.join()?;  // averaged params + buffers, ready for inference
 ```
 
-For task-head wrappers like `flodl-hf`'s
-`BertForSequenceClassification`, `Trainer::setup_head` is the
-matching one-liner that distributes the wrapper instead of the bare
-graph:
+Task-head wrappers like `flodl-hf`'s `BertForSequenceClassification`
+`impl Module` directly, so they ride the exact same `Trainer` entry -
+hand the head factory to `Trainer::builder(...)` and it distributes
+the wrapper instead of the bare graph:
 
 ```rust
 let head = DistilBertForSequenceClassification::from_pretrained(repo)?;
 let config = head.config().clone();
 let num_labels = head.labels().len() as i64;
 
-Trainer::setup_head(
-    &head,
+Trainer::builder(
     move |dev| DistilBertForSequenceClassification::on_device(&config, num_labels, dev),
     |p| Adam::new(p, 5e-5),
-)?;
+    |head, batch| head.compute_loss(/* enc, labels from batch */),
+)
+.dataset(dataset)
+.batch_size(16)
+.num_epochs(3)
+.run()?;
 ```
 
-Same call shape on 1 or N GPUs. On a single GPU the replica factory
-is never invoked. On heterogeneous multi-GPU, El Che cadence
+Same call shape on 1 or N GPUs. On heterogeneous multi-GPU, El Che cadence
 auto-tunes how often the slow card synchronises with the fast one
 (the original arc this whole project pulls from). The `flodl-hf`
 crate ships a complete fine-tune walkthrough as
@@ -255,8 +258,9 @@ Next on the
 - **LoRA adapters** for parameter-efficient fine-tuning
 - **ViT** for the vision branch
 - A flagship **El Che fine-tune benchmark** on heterogeneous consumer
-  GPUs, validating `Trainer::setup_head` end-to-end (the plumbing
-  landed in 0.5.3; the demo is the next thing on this axis)
+  GPUs, validating the task-head `Trainer` path end-to-end (heads
+  `impl Module`; the plumbing landed in 0.5.3, the demo is the next
+  thing on this axis)
 
 ## Where to go next
 
@@ -266,9 +270,9 @@ Next on the
   walkthrough.
 - **Read the training tutorial**:
   [Training](/guide/training) covers the three Trainer tiers
-  (`Trainer::builder` framework-managed, `Trainer::setup` decomposed,
-  fully manual) with the same code on CPU, single GPU, and
-  multi-GPU.
+  (`Trainer::run` / `Trainer::builder().run()` framework-managed,
+  `Trainer::builder().into_worker()` cooperative, `Ddp::wrap` bypass)
+  with the same code on CPU, single GPU, and multi-GPU.
 - **Skim the crate README**:
   [flodl-hf on GitHub](https://github.com/flodl-labs/flodl/tree/main/flodl-hf)
   has the install matrix and a code block per task shape.

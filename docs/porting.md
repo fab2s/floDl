@@ -68,7 +68,7 @@ Graph builder for model composition.
 | `nn.LayerNorm(n)` | `LayerNorm::new(n)?` |
 | `nn.Dropout(p)` | `Dropout::new(p)` |
 | `nn.ReLU()` | `ReLU::new()` |
-| `nn.GELU()` | `GELU` (erf form, default) — use `GELU::tanh()` for the tanh approximation |
+| `nn.GELU()` | `GELU` (erf form, default) - use `GELU::tanh()` for the tanh approximation |
 | `nn.Embedding(n, d)` | `Embedding::new(n, d)?` |
 | `nn.LSTM(in, h, layers)` | `LSTM::new(in, h, layers)?` |
 | `nn.GRU(in, h, layers)` | `GRU::new(in, h, layers)?` |
@@ -215,7 +215,7 @@ loop, backward, optimizer step, and gradient sync.
 
 ```rust
 // Step closure: forward + loss, returns the loss Variable.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
     cross_entropy_loss(&model.forward(&input)?, &target)
@@ -233,25 +233,29 @@ let handle = Trainer::builder(
 let state = handle.join()?;  // averaged params + buffers
 ```
 
-### Trainer::setup: setup only, your loop
+### Your own loop
 
-`Trainer::setup` runs device replication + optimizer setup +
-training-mode toggle in one call; the loop stays yours.
+To keep the loop yourself, use the **cooperative tier**:
+`Trainer::builder(...).into_worker()?` returns a `Worker` and hands you
+the loop body, while the controller stays authoritative over cadence,
+partition, eval-election, and checkpointing:
 
 ```rust
-let model = build_model()?;
-Trainer::setup(&model, |dev| build_model_on(dev), |p| Adam::new(p, 0.001))?;
-
-for epoch in 0..num_epochs {
-    for batch in loader.epoch(epoch) {
-        let batch = batch?;
-        let pred = model.forward(&batch[0].into())?;
-        let loss = cross_entropy_loss(&pred, &batch["label"].into())?;
-        loss.backward()?;
-        model.step()?;  // AllReduce + buffer sync + optimizer + zero_grad
+let mut worker = Trainer::builder(build_model, |p| Adam::new(p, 1e-3), train_step)
+    .into_worker()?;
+while let Some(plan) = worker.next_plan()? {
+    while let Some(batch) = worker.next_batch()? {
+        let loss = /* forward + loss */;
+        worker.step(&loss)?;
     }
 }
+let state = worker.finish()?;
 ```
+
+Or reach for `Trainer::builder(...).run()` above (the managed tier) when
+you want the framework to own the loop, or `Ddp::wrap`
+(see [Multi-GPU](#multi-gpu-ddp)) for explicit per-rank gradient-sync /
+broadcast control (the bypass tier).
 
 ### Fully manual: closest port from PyTorch
 
@@ -273,30 +277,33 @@ for epoch in 0..num_epochs {
 ## Multi-GPU (DDP)
 
 The `Trainer` tiers in [Training loop](#training-loop) above already cover
-the multi-GPU story: both `Trainer::builder` and `Trainer::setup`
-auto-detect available CUDA devices and fall back to single-GPU/CPU when
-fewer than 2 GPUs are present. The same code runs on CPU, single GPU,
-and multi-GPU with no process-group setup, no `torchrun`, no `mp.spawn`,
-and no `DistributedSampler`.
+the multi-GPU story: `Trainer::builder(...).run()` / `Trainer::run(...)`
+auto-detect visible CUDA devices, training inline on 0-1 GPU and
+auto-promoting to the process-per-rank path on 2+. The same code runs on
+CPU, single GPU, and multi-GPU with no process-group setup, no `torchrun`,
+no `mp.spawn`, and no `DistributedSampler`.
 
-For DDP-specific knobs (sync policy, averaging backend),
-`Trainer::builder` exposes them on the builder chain:
+For DDP-specific knobs (cadence × backend, ElChe tuning), pass an
+`ElCheConfig` to `.elche(...)`:
 
 ```rust
 let ddp = Trainer::builder(model_factory, optim_factory, train_step)
     .dataset(dataset)
     .batch_size(32)
     .num_epochs(10)
-    .policy(ApplyPolicy::Cadence)      // Sync | Cadence | Async
-    .backend(AverageBackend::Nccl)     // Nccl | Cpu
+    .elche(ElCheConfig::nccl_cadence())  // default; five modes total
     .run()?;
 
-let state = ddp.join()?;               // averaged params + buffers on CPU
+let state = ddp.join()?;                // averaged params + buffers on CPU
 ```
 
-ElChe cadence auto-detects heterogeneous GPU speeds and lets the faster
-card run ahead while the slow one anchors synchronization. See the
-[DDP Reference](ddp.md) for policies, backends, convergence guard,
+ElChe cadence auto-detects heterogeneous GPU speeds and lets the
+faster card run ahead while the slow one anchors synchronization.
+The default mode is `NcclCadence` - anchor-based scheduling with
+NCCL AllReduce at every cadence boundary. Other modes: `NcclSync`,
+`CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on the reference
+rig - genuine async via decoupled CPU averaging). See the
+[DDP Reference](ddp.md) for the full mode surface, convergence guard,
 metrics, and live-monitor wiring, and [DDP Benchmark](ddp-benchmark.md)
 for results on mixed consumer hardware.
 
@@ -306,6 +313,7 @@ for results on mixed consumer hardware.
 |---------|---------|-------|
 | Error handling | Exceptions | `Result<T>` with `?` operator |
 | Memory | Garbage collected | Reference counted (cheap clone) |
+| Tensor copy | `.clone()` is a deep copy | `.clone()` is *shallow* (shares storage); use `.copy()` for a deep, independent copy |
 | Model composition | `nn.Sequential` / manual `forward()` | `FlowBuilder` (declarative data flow) |
 | Training mode | `model.train()` | `model.train()` |
 | Eval mode | `model.eval()` | `model.eval()` |

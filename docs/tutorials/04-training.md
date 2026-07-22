@@ -28,38 +28,38 @@ let loss = poisson_nll_loss(&pred, &target, true)?; // Poisson NLL (log_input=tr
 // target: [batch] class indices (Int64) or [batch, classes] one-hot/soft labels.
 let loss = cross_entropy_loss(&logits, &target)?;
 
-// Negative Log Likelihood — use after log_softmax
+// Negative Log Likelihood - use after log_softmax
 let loss = nll_loss(&log_probs, &target)?;
 
 // Binary Cross-Entropy (from probabilities, after sigmoid)
 let loss = bce_loss(&probs, &target)?;
 
-// Binary Cross-Entropy with logits (numerically stable — preferred)
+// Binary Cross-Entropy with logits (numerically stable - preferred)
 let loss = bce_with_logits_loss(&logits, &target)?;
 
-// Focal Loss — down-weights easy examples for class imbalance
+// Focal Loss - down-weights easy examples for class imbalance
 let loss = focal_loss(&logits, &target, 0.25, 2.0)?;  // alpha, gamma
 
 // KL Divergence
 let loss = kl_div_loss(&log_pred, &target)?;
 
-// CTC Loss — for sequence-to-sequence without alignment (speech, OCR)
+// CTC Loss - for sequence-to-sequence without alignment (speech, OCR)
 let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0)?;
 ```
 
 ### Metric Learning Losses
 
 ```rust
-// Triplet margin loss — push negatives away from anchor-positive pairs
+// Triplet margin loss - push negatives away from anchor-positive pairs
 let loss = triplet_margin_loss(&anchor, &positive, &negative, 1.0)?;
 
-// Cosine embedding loss — similar pairs close, dissimilar far
+// Cosine embedding loss - similar pairs close, dissimilar far
 let loss = cosine_embedding_loss(&x1, &x2, &labels, 0.5)?;
 
-// Hinge embedding loss — for binary tasks with {-1, +1} labels
+// Hinge embedding loss - for binary tasks with {-1, +1} labels
 let loss = hinge_embedding_loss(&input, &labels, 1.0)?;
 
-// Margin ranking loss — x1 should be ranked higher than x2
+// Margin ranking loss - x1 should be ranked higher than x2
 let loss = margin_ranking_loss(&x1, &x2, &labels, 0.0)?;
 ```
 
@@ -99,7 +99,7 @@ let optimizer = RMSprop::new(&params, 0.01);  // default alpha=0.99, eps=1e-8
 
 ### Adagrad
 
-Accumulates all past squared gradients — works well for sparse features:
+Accumulates all past squared gradients - works well for sparse features:
 
 ```rust
 let optimizer = Adagrad::new(&params, 0.01);
@@ -116,7 +116,7 @@ let optimizer = NAdam::new(&params, 0.001);  // Nesterov momentum with Adam
 
 ### Fused CUDA Optimizers
 
-On CUDA, both `Adam` and `AdamW` automatically use `_fused_adamw_` -- a
+On CUDA, both `Adam` and `AdamW` automatically use `_fused_adamw_` - a
 single multi-tensor kernel that updates all parameters, gradients, and
 moment buffers in one launch. A naive implementation would require 4N
 separate kernels (one each for momentum update, variance update, bias
@@ -145,7 +145,7 @@ clip_grad_value(&params, 0.5)?;
 ```
 
 Under the hood, `clip_grad_norm` uses `_foreach_norm` + `_foreach_mul_`
-internally -- two kernels total regardless of the number of parameters,
+internally - two kernels total regardless of the number of parameters,
 instead of 2N kernels with a naive per-parameter approach. This is
 particularly beneficial on CUDA where kernel launch overhead dominates
 for small per-parameter operations.
@@ -180,7 +180,7 @@ optimizer step, the gradient sync, and the device replication.
 ```rust
 // Step closure: takes the replica's model and one batch, returns the
 // loss Variable. The framework calls backward + optimizer step + sync.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].to_dtype(DType::Int64)?, false);
     let pred = model.forward(&input)?;
@@ -203,49 +203,72 @@ let state = handle.join()?;  // averaged params + buffers, ready for inference
 ```
 
 This is the highest-level entry: framework owns the loop, the data
-dispatch, the gradient sync (NCCL), and the optimizer. The
+dispatch, the gradient sync (NCCL or CPU averaging), and the
+optimizer. The
 [ddp-bench](https://github.com/flodl-labs/flodl/tree/main/ddp-bench) suite
 is the canonical reference for this pattern across MLP, LeNet, ResNet,
 GPT-nano, char-RNN, and conv-AE models, each wired through the same
 `train_step` closure.
 
-For policy choice (Sync / Cadence / Async), backend choice
-(NCCL / CPU averaging), and El Che heterogeneous-GPU cadence, see
-[Multi-GPU Training](11-multi-gpu.md) and the [DDP Reference](../ddp.md).
+The same call scales transparently from CPU → single GPU → multi-GPU
+single-host → multi-host cluster. On a host with 2+ visible CUDA
+devices it auto-promotes to process-per-rank. For mode selection
+(`NcclCadence` (default), `CpuAsync`, etc.), heterogeneous-rig
+cadence (ElChe), and cluster topology (`fdl.cluster.yml` /
+`ClusterBuilder`), see [Multi-GPU Training](11-multi-gpu.md), the
+[Heterogeneous & Multi-Host DDP tutorial](12-async-ddp.md), and the
+[DDP Reference](../ddp.md).
 
-## Decomposing Trainer: keep your loop, share the setup
+### `TrainerConfig` - the config-bag form
 
-When you want explicit control of the training loop (multi-stage losses,
-per-step observation hooks, conditional backward, custom gradient
-clipping placement), `Trainer::setup` exposes the setup tier of the
-framework-managed mode without taking over the loop. It runs the same
-hardware detection, GPU replication, optimizer creation, and
-training-mode toggle as `Trainer::builder`; the loop is yours.
+When the call site wants every knob in one data struct (e.g.
+config-driven launchers), `Trainer::run(model_fn, opt_fn, step_fn,
+cfg)` takes a `TrainerConfig`:
 
 ```rust
-let model = build_model()?;
+let cfg = TrainerConfig::new(dataset)
+    .batch_size(64)
+    .num_epochs(50)
+    .elche(ElCheConfig::nccl_cadence())         // default; just shown explicitly
+    .max_grad_norm(5.0)
+    .checkpoint_every(5)
+    .save_path("ckpts/run43")
+    .resume_from("ckpts/run42")
+    .metrics_fn(Arc::new(|m| {
+        eprintln!("epoch={} loss={:.4} {:.0}ms", m.epoch, m.avg_loss, m.epoch_ms);
+        Ok(())
+    }));
 
-// One call: pick best device, replicate across GPUs if available, set
-// per-replica optimizer, enable training mode. Auto-tuned El Che
-// cadence on heterogeneous multi-GPU.
-Trainer::setup(
-    &model,
-    |dev| build_model_on(dev),
-    |p| Adam::new(p, 0.001),
-)?;
-
-// Loop is yours. Same code on CPU, single GPU, multi-GPU.
-for (input_t, target_t) in &batches {
-    let input = Variable::new(input_t.clone(), false);
-    let target = Variable::new(target_t.clone(), false);
-    let loss = mse_loss(&model.forward(&input)?, &target)?;
-    loss.backward()?;
-    model.step()?;  // AllReduce + buffer sync + optimizer + zero_grad
-}
+Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 ```
 
-Task-head wrappers (e.g. `flodl-hf`'s `BertForSequenceClassification`)
-use the matching `Trainer::setup_head` entry. See
+Same launcher trampoline as `Trainer::builder(...).run()`. Pick
+whichever shape matches your call site. Full setter surface in [DDP
+Reference: `TrainerConfig<M>`](../ddp.md#trainerconfigm--the-umbrella).
+
+## Keep your own loop
+
+Want explicit control of the training loop (multi-stage losses, per-step
+observation hooks, conditional backward, custom gradient-clipping
+placement)? Pick one:
+
+- **Framework owns the loop** (managed tier, recommended):
+  `Trainer::builder(...).run()` above; the `train_step` closure is your
+  forward + loss.
+- **You own the loop body, controller owns scheduling** (cooperative
+  tier): `Trainer::builder(...).into_worker()?` returns a `Worker` -
+  `next_plan()` / `next_batch()` / `step()` / `finish()` - while the
+  controller keeps cadence, partition, eval-election, and checkpointing
+  (see [trainer-execution-tiers](../design/trainer-execution-tiers.md)).
+- **Explicit per-rank control** (bypass tier, multi-GPU):
+  `Ddp::wrap(&model, device, rank, &rendezvous)?`, calling
+  `sync_params()` / `all_reduce_gradients()` yourself (see
+  [Multi-GPU](11-multi-gpu.md)).
+- **Single-device manual loop**: the pattern below.
+
+`flodl-hf` task-head wrappers (e.g. `BertForSequenceClassification`)
+`impl Module` directly, so they ride the same `Trainer::builder(...)` /
+`Trainer::run(...)` entry - see
 [HuggingFace Integration](14-flodl-hf.md) for a fine-tune walkthrough.
 
 ## The Training Loop
@@ -253,8 +276,9 @@ use the matching `Trainer::setup_head` entry. See
 When you can't or don't want to use `Trainer` (non-Graph custom code,
 single-device prototype, or you're learning the mechanics), the manual
 pattern is: **forward -> loss -> zero_grad -> backward -> clip -> step**.
-The same six steps run inside `Trainer::setup`'s `model.step()`; the
-`train_step` closure of `Trainer::builder` is the forward + loss portion.
+The framework runs these same six steps for you inside
+`Trainer::builder(...).run()`; the `train_step` closure is the forward +
+loss portion.
 
 ```rust
 model.train();
@@ -321,7 +345,7 @@ for epoch in 0..num_epochs {
 `record` pushes raw `f64` values into the same buffer. `flush` computes
 the mean, stores it in epoch history, and clears the buffer.
 
-## Stateful Graphs — end_step
+## Stateful Graphs - end_step
 
 Call `end_step()` after each training step. It severs autograd references
 held by the graph and increments the step counter (used by schedulers and
@@ -331,7 +355,7 @@ observation). It detaches:
 - **Tagged outputs** (Variables captured by `tag()` for observation)
 - **Module internal state** (e.g., recurrent hidden state in custom modules)
 
-> **Warning:** Forgetting `end_step()` causes linear memory growth — the
+> **Warning:** Forgetting `end_step()` causes linear memory growth - the
 > autograd graph accumulates across batches without bound. If you see
 > steadily rising RAM during training, a missing `end_step()` is the most
 > likely cause.
@@ -359,7 +383,7 @@ for (input_t, target_t) in &batches {
 before `tag("x")`) it is mandatory. For graphs that use `tag()` for
 observation, it prevents tagged output Variables from holding stale
 autograd graph references between batches. Even for simple graphs, it is
-good practice — it keeps the step counter accurate and costs nothing.
+good practice - it keeps the step counter accurate and costs nothing.
 
 The lower-level `detach_state()` is available if you need to break gradient
 chains without incrementing the step counter.
@@ -387,7 +411,7 @@ opt.set_lr(1e-3);
 
 ## Parameter Freezing
 
-Freeze parameters to disable gradient tracking — useful for transfer
+Freeze parameters to disable gradient tracking - useful for transfer
 learning:
 
 ```rust
@@ -405,7 +429,7 @@ if param.is_frozen() { /* ... */ }
 ```
 
 Frozen parameters are automatically skipped by optimizers (they produce
-no gradient). Freezing works through `Rc<RefCell>` — a freeze is visible
+no gradient). Freezing works through `Rc<RefCell>` - a freeze is visible
 everywhere the parameter is referenced.
 
 ## Checkpoints
@@ -413,10 +437,10 @@ everywhere the parameter is referenced.
 Save and restore model parameters using named checkpoints:
 
 ```rust
-// Save — includes all parameters, buffers, and structural hash
+// Save - includes all parameters, buffers, and structural hash
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load — validates architecture, returns a report
+// Load - validates architecture, returns a report
 let report = model.load_checkpoint("/tmp/model.fdl")?;
 ```
 
@@ -438,7 +462,7 @@ Named checkpoints match by qualified name, so you can load a subset of parameter
 // Save with qualified names
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load into a different model — matches by name
+// Load into a different model - matches by name
 // Use the lower-level API with None hash to skip architecture validation
 let new_named = new_model.named_parameters();
 let new_buffers = new_model.named_buffers();
@@ -462,7 +486,7 @@ are errors.
 
 ## LR Scheduling
 
-Schedulers compute learning rates without owning the optimizer — they are
+Schedulers compute learning rates without owning the optimizer - they are
 pure calculators:
 
 ```rust
@@ -521,7 +545,7 @@ if is_autocast_enabled() {
 Half-precision gradients can underflow to zero. `GradScaler` solves this
 by scaling the loss before backward (inflating gradient magnitudes), then
 unscaling gradients before the optimizer step. It dynamically adjusts the
-scale factor -- growing it when gradients stay finite, backing off when
+scale factor - growing it when gradients stay finite, backing off when
 inf/nan is detected.
 
 ```rust
@@ -598,7 +622,7 @@ no_grad(|| {
 
 The graph tracks step and epoch counts for schedulers and observation.
 `end_step()` should be called after every training step (it detaches state
-and increments the counter — see above). `end_epoch()` closes out the epoch:
+and increments the counter - see above). `end_epoch()` closes out the epoch:
 
 ```rust
 model.end_step();   // detach state + increment step counter (call every batch)
@@ -619,7 +643,7 @@ fn main() -> Result<()> {
     // CPU-side RNG: controls data shuffling, augmentation
     let mut rng = Rng::seed(42);
 
-    // Build model AFTER seeding — weight initialization uses the seed
+    // Build model AFTER seeding - weight initialization uses the seed
     let model = FlowBuilder::from(Linear::new(2, 16)?)
         .through(GELU)
         .through(Linear::new(16, 2)?)
@@ -659,7 +683,7 @@ fn main() -> Result<()> {
     let mut optimizer = Adam::new(&params, 0.01);
     model.train();
 
-    // Training loop (simplified — no data loader yet).
+    // Training loop (simplified - no data loader yet).
     let input_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
     let target_t = Tensor::randn(&[20, 2], TensorOptions::default())?;
 

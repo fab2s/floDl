@@ -18,11 +18,11 @@ pub(super) fn wire_switch(
         return fb;
     }
     if fb.current.len() != 1 {
-        fb.err = Some("switch requires single stream".into());
+        fb.fail("switch requires single stream");
         return fb;
     }
     if branches.len() < 2 {
-        fb.err = Some("switch requires at least 2 branches".into());
+        fb.fail("switch requires at least 2 branches");
         return fb;
     }
 

@@ -104,6 +104,7 @@ impl Conv3d {
         stride: [i64; 3], padding: [i64; 3], dilation: [i64; 3],
         groups: i64, device: Device,
     ) -> Result<Self> {
+        super::init::validate_conv_groups("Conv3d", in_channels, out_channels, groups)?;
         let shape = [out_channels, in_channels / groups,
                      kernel_size[0], kernel_size[1], kernel_size[2]];
         let fan_in = (in_channels / groups) * kernel_size[0] * kernel_size[1] * kernel_size[2];

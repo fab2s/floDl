@@ -29,7 +29,7 @@ use crate::tensor::{
     check_err, current_cuda_device, set_current_cuda_device,
     Device, Result, Tensor, TensorError,
 };
-use super::cuda_stream::CudaStream;
+use crate::tensor::cuda_stream::CudaStream;
 
 /// NCCL reduction operation.
 #[derive(Clone, Copy, Debug)]
@@ -63,16 +63,6 @@ pub struct NcclComms {
 unsafe impl Send for NcclComms {}
 
 impl NcclComms {
-    /// Create from a raw handle and device list. Used internally for testing.
-    ///
-    /// # Safety
-    /// Caller must ensure `handle` is a valid NCCL communicator handle
-    /// (or null for mock/test use). Drop on null handle is a no-op.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_raw(handle: *mut c_void, devices: Vec<Device>) -> Self {
-        NcclComms { handle, devices }
-    }
-
     /// Initialize NCCL communicators for the given CUDA devices.
     ///
     /// All devices must be distinct CUDA devices. Returns error on CPU
@@ -308,6 +298,7 @@ impl NcclComms {
             let abort_handle = Arc::new(NcclAbortHandle {
                 ptr: rank_handle,
                 aborted: AtomicBool::new(false),
+                guard: std::sync::Mutex::new(()),
             });
             comms.push(NcclRankComm {
                 handle: rank_handle,
@@ -364,6 +355,15 @@ impl NcclUniqueId {
     pub fn as_bytes(&self) -> &[u8; NCCL_UNIQUE_ID_BYTES] {
         &self.bytes
     }
+
+    /// Reconstruct a unique ID from raw bytes.
+    ///
+    /// Used by the multi-host rendezvous to materialize the master-generated
+    /// ID on worker hosts after receiving it over TCP. Single-process callers
+    /// should use [`new`](Self::new) instead.
+    pub fn from_bytes(bytes: [u8; NCCL_UNIQUE_ID_BYTES]) -> Self {
+        NcclUniqueId { bytes }
+    }
 }
 
 impl std::fmt::Debug for NcclUniqueId {
@@ -384,6 +384,24 @@ impl std::fmt::Debug for NcclUniqueId {
 pub struct NcclAbortHandle {
     ptr: *mut c_void,
     aborted: AtomicBool,
+    /// ISSUE GUARD: mutual exclusion between enqueuing a collective and
+    /// aborting the communicator. `ncclCommAbort` FREES the comm, so an
+    /// abort landing in the gap BETWEEN two collectives turns the next
+    /// enqueue into a use-after-free (SIGSEGV — observed live: the
+    /// watchdog fired between the count-reduce and the param-reduce of
+    /// a weighted sync). Every enqueue takes this lock and re-checks
+    /// `aborted` under it; `abort()` takes it too, so the freed-comm
+    /// state is only ever observable as a loud pre-issue error, never
+    /// as a dangling pointer.
+    ///
+    /// No-deadlock argument: NCCL calls here are enqueue-fast — the
+    /// peer-wait happens in the CUDA stream synchronize, OUTSIDE this
+    /// lock (that is also why aborting a comm whose kernels are being
+    /// waited on works: the kernels die and the stream sync returns).
+    /// Residual: an enqueue wedging INSIDE NCCL (internal connect
+    /// stall) would hold the lock and block the watchdog — strictly
+    /// rarer than the deterministic use-after-free this lock removes.
+    guard: std::sync::Mutex<()>,
 }
 
 // SAFETY: ncclCommAbort is explicitly documented as thread-safe.
@@ -397,11 +415,32 @@ impl NcclAbortHandle {
     /// Thread-safe and idempotent. After abort, the communicator is destroyed;
     /// the owning [`NcclRankComm`]'s Drop becomes a no-op.
     pub fn abort(&self) -> Result<()> {
-        if self.aborted.swap(true, Ordering::AcqRel) {
-            return Ok(()); // already aborted
+        // Take the issue guard so no collective can be mid-enqueue (or
+        // start enqueuing) while the comm is being freed. A collective
+        // already blocked in its stream-wait is unaffected — that wait
+        // is outside the guard, and killing the comm's kernels is
+        // exactly how it gets released.
+        let _guard = self.guard.lock().expect("nccl issue guard poisoned");
+        if !self.claim() {
+            return Ok(()); // already aborted or destroyed
         }
         let err = unsafe { ffi::flodl_nccl_abort_rank(self.ptr) };
         check_err(err)
+    }
+
+    /// Take the issue guard for enqueuing one collective, failing loudly
+    /// if the communicator has been aborted. Callers hold the returned
+    /// guard across the FFI enqueue only — stream synchronization happens
+    /// after release.
+    pub(crate) fn lock_for_issue(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.guard.lock().expect("nccl issue guard poisoned");
+        if self.is_aborted() {
+            return Err(TensorError::new(
+                "NCCL communicator aborted (peer death); collective refused — \
+                 the caller must rebuild the comm on the surviving cohort",
+            ));
+        }
+        Ok(guard)
     }
 
     /// Whether this communicator has been aborted or destroyed.
@@ -409,10 +448,17 @@ impl NcclAbortHandle {
         self.aborted.load(Ordering::Acquire)
     }
 
-    /// Mark as handled (comm already destroyed by normal Drop).
-    /// Future `abort()` calls become no-ops, preventing use-after-free.
-    fn mark_destroyed(&self) {
-        self.aborted.store(true, Ordering::Release);
+    /// Atomically claim the right to tear the comm down (abort OR destroy).
+    /// Returns `true` for exactly one caller; everyone else gets `false`.
+    ///
+    /// Abort (watchdog thread) and destroy (`NcclRankComm::drop`) can race —
+    /// the cluster worker's NCCL watchdog runs until a shutdown flag that is
+    /// set only AFTER the comm is dropped. A check-then-act here would let
+    /// `abort()` pass the check while Drop is mid-`flodl_nccl_destroy_rank`
+    /// and call into a freed comm. The single swap makes the two teardown
+    /// paths mutually exclusive.
+    fn claim(&self) -> bool {
+        !self.aborted.swap(true, Ordering::AcqRel)
     }
 }
 
@@ -480,6 +526,7 @@ impl NcclRankComm {
         let abort_handle = Arc::new(NcclAbortHandle {
             ptr: handle,
             aborted: AtomicBool::new(false),
+            guard: std::sync::Mutex::new(()),
         });
         Ok(NcclRankComm { handle, rank, world_size, abort_handle })
     }
@@ -514,6 +561,7 @@ impl NcclRankComm {
     ///   inside a single NCCL group call for efficiency).
     /// - `op`: reduction operation applied element-wise (e.g. `ReduceOp::Avg`).
     pub fn all_reduce(&self, tensors: &[&Tensor], op: ReduceOp) -> Result<()> {
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce_rank(
@@ -525,6 +573,71 @@ impl NcclRankComm {
             )
         };
         check_err(err)
+    }
+
+    /// In-place work-weighted AllReduce: each rank's contribution is
+    /// premultiplied by ITS OWN `factor` inside the collective
+    /// (`ncclRedOpCreatePreMulSum`), so the output is `Σ fᵢ·xᵢ` with a
+    /// single collective and ZERO bookend kernels. With
+    /// `fᵢ = nᵢ^γ / Σn^γ` the output IS the work-weighted consensus —
+    /// no pre-scale, no post-divide, and therefore no divide kernel for
+    /// downstream consumers to race (the fence contract collapses to
+    /// "order after the collective").
+    ///
+    /// The dynamic reduction op is comm-bound and window-scoped: created
+    /// here, used for this batched collective, destroyed before
+    /// returning (communication-free, cheap). This composes with the
+    /// abort→rebuild path naturally — a rebuilt comm gets a fresh op on
+    /// its next window. Requires NCCL >= 2.11 at build and run time
+    /// (checked in the shim; errors loudly naming the found version).
+    ///
+    /// `tensors` must all be f32 (the premul scalar is created with
+    /// `ncclFloat32`; NCCL requires the scalar dtype to match).
+    ///
+    /// `stream`: `Some` enqueues on that CUDA stream (comm-stream
+    /// overlap), `None` uses the current stream.
+    pub fn all_reduce_premul_sum(
+        &self,
+        tensors: &[&Tensor],
+        factor: f32,
+        stream: Option<&CudaStream>,
+    ) -> Result<()> {
+        for (i, t) in tensors.iter().enumerate() {
+            if t.dtype() != crate::tensor::DType::Float32 {
+                return Err(crate::TensorError::new(&format!(
+                    "all_reduce_premul_sum: tensor {i} is {:?}, but the \
+                     PreMulSum scalar is f32 — NCCL requires matching dtypes",
+                    t.dtype(),
+                )));
+            }
+        }
+        // One issue-guard across create → collective → destroy: the op is
+        // comm-bound, and the abort path frees the comm — none of the
+        // three calls may race it (same contract as the other
+        // collectives; see NcclAbortHandle::lock_for_issue).
+        let _guard = self.abort_handle.lock_for_issue()?;
+        let mut op: i32 = 0;
+        let err = unsafe {
+            ffi::flodl_nccl_redop_premulsum_create_rank(self.handle, factor, &mut op)
+        };
+        check_err(err)?;
+        let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let stream_ptr = stream.map_or(ptr::null_mut(), |s| s.as_ptr());
+        let reduce_err = unsafe {
+            ffi::flodl_nccl_all_reduce_rank(
+                self.handle,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                stream_ptr,
+                op,
+            )
+        };
+        // Destroy the op regardless of the collective's outcome (it only
+        // frees comm-local state; enqueue has already happened). Surface
+        // the collective error first — it is the load-bearing one.
+        let destroy_err = unsafe { ffi::flodl_nccl_redop_destroy_rank(self.handle, op) };
+        check_err(reduce_err)?;
+        check_err(destroy_err)
     }
 
     /// In-place AllReduce on an explicit CUDA stream.
@@ -543,6 +656,7 @@ impl NcclRankComm {
         op: ReduceOp,
         stream: &CudaStream,
     ) -> Result<()> {
+        let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce_rank(
@@ -555,18 +669,88 @@ impl NcclRankComm {
         };
         check_err(err)
     }
+
+    /// In-place Broadcast from `root` rank to all other ranks, using the
+    /// default stream.
+    ///
+    /// All ranks must call this concurrently with the same number of tensors
+    /// and the same `root` for the collective to complete. The `root` rank's
+    /// tensor contents are sent in-place to all other ranks.
+    ///
+    /// # Parameters
+    ///
+    /// - `tensors`: one or more tensors on this rank's device. On non-root
+    ///   ranks, contents are overwritten with the root rank's values.
+    /// - `root`: source rank, in `0..world_size()`.
+    pub fn broadcast(&self, tensors: &[&Tensor], root: usize) -> Result<()> {
+        if root >= self.world_size {
+            return Err(crate::TensorError::new(&format!(
+                "NcclRankComm::broadcast: root {root} out of range \
+                 (world_size = {})",
+                self.world_size
+            )));
+        }
+        let _guard = self.abort_handle.lock_for_issue()?;
+        let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let err = unsafe {
+            ffi::flodl_nccl_broadcast_rank(
+                self.handle,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                ptr::null_mut(),
+                root as i32,
+            )
+        };
+        check_err(err)
+    }
+
+    /// In-place Broadcast on an explicit CUDA stream.
+    ///
+    /// Same semantics as [`broadcast`](Self::broadcast), but NCCL work is
+    /// enqueued on the provided stream for overlap with compute kernels.
+    pub fn broadcast_on_stream(
+        &self,
+        tensors: &[&Tensor],
+        root: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if root >= self.world_size {
+            return Err(crate::TensorError::new(&format!(
+                "NcclRankComm::broadcast_on_stream: root {root} out of range \
+                 (world_size = {})",
+                self.world_size
+            )));
+        }
+        let _guard = self.abort_handle.lock_for_issue()?;
+        let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
+        let err = unsafe {
+            ffi::flodl_nccl_broadcast_rank(
+                self.handle,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                stream.as_ptr(),
+                root as i32,
+            )
+        };
+        check_err(err)
+    }
 }
 
 impl Drop for NcclRankComm {
     fn drop(&mut self) {
-        // ncclCommAbort already frees the comm; skip destroy if aborted.
-        if !self.handle.is_null() && !self.abort_handle.is_aborted() {
+        // ncclCommAbort already frees the comm; destroy only if we win the
+        // teardown claim. The swap-based claim (not check-then-act) makes
+        // this mutually exclusive with a concurrent watchdog `abort()` —
+        // see `NcclAbortHandle::claim`. Claiming also invalidates stale
+        // Arc<NcclAbortHandle> clones (held by DdpHandle / the cluster
+        // watchdog) so they never call ncclCommAbort on a freed pointer.
+        // Claim FIRST (even with a null handle) so stale clones are always
+        // invalidated; destroy only when we won the claim AND the handle is
+        // live.
+        if self.abort_handle.claim() && !self.handle.is_null() {
             unsafe { ffi::flodl_nccl_destroy_rank(self.handle) };
             self.handle = ptr::null_mut();
         }
-        // Invalidate the abort handle so stale Arc<NcclAbortHandle> clones
-        // (held by DdpHandle) don't call ncclCommAbort on a freed pointer.
-        self.abort_handle.mark_destroyed();
     }
 }
 
@@ -580,355 +764,5 @@ impl std::fmt::Debug for NcclRankComm {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tensor::{test_device, cuda_device_count, cuda_synchronize, TensorOptions, DType};
-    use crate::distributed::ddp::NCCL_LOCK;
-
-    fn require_multi_gpu() -> bool {
-        if !test_device().is_cuda() || cuda_device_count() < 2 {
-            return false;
-        }
-        // Verify all devices can run compute kernels (e.g., GTX 1060
-        // sm_61 is unsupported by libtorch cu128 builds).
-        for i in 0..2 {
-            let opts = TensorOptions { dtype: DType::Float32, device: Device::CUDA(i) };
-            if Tensor::zeros(&[1], opts).is_err() {
-                eprintln!("Device CUDA({i}) cannot run compute kernels, skipping multi-GPU test");
-                return false;
-            }
-        }
-        true
-    }
-
-    #[test]
-    fn test_nccl_requires_two_devices() {
-        let result = NcclComms::new(&[Device::CUDA(0)]);
-        assert!(result.is_err(), "NcclComms should require 2+ devices");
-    }
-
-    #[test]
-    fn test_nccl_rejects_cpu() {
-        let result = NcclComms::new(&[Device::CPU, Device::CPU]);
-        assert!(result.is_err(), "NcclComms should reject CPU devices");
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_init_destroy() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
-        assert_eq!(comms.size(), 2);
-        assert_eq!(comms.devices(), &[Device::CUDA(0), Device::CUDA(1)]);
-        // Drop cleans up
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_broadcast() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-
-        // Set values on device 0, zeros on device 1
-        let t0 = Tensor::full(&[64], 42.0, opts0).unwrap();
-        let t1 = Tensor::zeros(&[64], opts1).unwrap();
-
-        // Broadcast from device 0
-        comms.broadcast(&[&t0, &t1], 0).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
-
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 42.0).abs() < 1e-5),
-            "device 0 should still have 42.0");
-        assert!(vals1.iter().all(|&v| (v - 42.0).abs() < 1e-5),
-            "device 1 should have 42.0 after broadcast");
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_all_reduce_sum() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-
-        // 1.0 on device 0, 2.0 on device 1
-        let t0 = Tensor::full(&[128], 1.0, opts0).unwrap();
-        let t1 = Tensor::full(&[128], 2.0, opts1).unwrap();
-
-        comms.all_reduce(&[&t0, &t1], ReduceOp::Sum).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
-
-        // Sum: 1.0 + 2.0 = 3.0 on both devices
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 3.0).abs() < 1e-5),
-            "device 0 should have 3.0 after AllReduce Sum");
-        assert!(vals1.iter().all(|&v| (v - 3.0).abs() < 1e-5),
-            "device 1 should have 3.0 after AllReduce Sum");
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_all_reduce_avg() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-
-        // 10.0 on device 0, 20.0 on device 1
-        let t0 = Tensor::full(&[64], 10.0, opts0).unwrap();
-        let t1 = Tensor::full(&[64], 20.0, opts1).unwrap();
-
-        comms.all_reduce(&[&t0, &t1], ReduceOp::Avg).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
-
-        // Avg: (10.0 + 20.0) / 2 = 15.0
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 15.0).abs() < 1e-5),
-            "device 0 should have 15.0 after AllReduce Avg");
-        assert!(vals1.iter().all(|&v| (v - 15.0).abs() < 1e-5),
-            "device 1 should have 15.0 after AllReduce Avg");
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_all_reduce_on_streams() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let comms = NcclComms::new(&[Device::CUDA(0), Device::CUDA(1)]).unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-
-        let stream0 = CudaStream::new(Device::CUDA(0), false).unwrap();
-        let stream1 = CudaStream::new(Device::CUDA(1), false).unwrap();
-
-        let t0 = Tensor::full(&[32], 5.0, opts0).unwrap();
-        let t1 = Tensor::full(&[32], 7.0, opts1).unwrap();
-
-        comms.all_reduce_on_streams(
-            &[&t0, &t1], ReduceOp::Sum, &[&stream0, &stream1],
-        ).unwrap();
-
-        stream0.synchronize().unwrap();
-        stream1.synchronize().unwrap();
-
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 12.0).abs() < 1e-5),
-            "device 0 should have 12.0 after AllReduce Sum on streams");
-        assert!(vals1.iter().all(|&v| (v - 12.0).abs() < 1e-5),
-            "device 1 should have 12.0 after AllReduce Sum on streams");
-    }
-
-    // --- NcclRankComm tests ---
-
-    #[test]
-    fn test_nccl_rank_comm_rejects_invalid_rank() {
-        let result = NcclRankComm::init_rank(2, 2, &NcclUniqueId { bytes: [0; NCCL_UNIQUE_ID_BYTES] });
-        assert!(result.is_err(), "rank >= world_size should fail");
-    }
-
-    #[test]
-    fn test_nccl_rank_comm_rejects_world_size_one() {
-        let result = NcclRankComm::init_rank(0, 1, &NcclUniqueId { bytes: [0; NCCL_UNIQUE_ID_BYTES] });
-        assert!(result.is_err(), "world_size < 2 should fail");
-    }
-
-    #[test]
-    fn test_nccl_unique_id_clone() {
-        // NcclUniqueId must be cloneable for distribution to worker threads
-        fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
-        assert_send_sync_clone::<NcclUniqueId>();
-    }
-
-    #[test]
-    fn test_nccl_rank_comm_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<NcclRankComm>();
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_rank_comm_init_and_reduce() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let uid = NcclUniqueId::new().unwrap();
-        let uid0 = uid.clone();
-        let uid1 = uid;
-
-        // Each rank must call init_rank concurrently. Use two threads.
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            NcclRankComm::init_rank(0, 2, &uid0).unwrap()
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            NcclRankComm::init_rank(1, 2, &uid1).unwrap()
-        });
-        let comm0 = h0.join().unwrap();
-        let comm1 = h1.join().unwrap();
-
-        assert_eq!(comm0.rank(), 0);
-        assert_eq!(comm0.world_size(), 2);
-        assert_eq!(comm1.rank(), 1);
-
-        // AllReduce Avg: 10.0 on dev0, 20.0 on dev1 -> 15.0 on both
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-        let t0 = Tensor::full(&[64], 10.0, opts0).unwrap();
-        let t1 = Tensor::full(&[64], 20.0, opts1).unwrap();
-
-        // AllReduce must be called concurrently from different threads
-        let t0_clone = t0.clone();
-        let t1_clone = t1.clone();
-
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            comm0.all_reduce(&[&t0_clone], ReduceOp::Avg).unwrap();
-            cuda_synchronize(0);
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            comm1.all_reduce(&[&t1_clone], ReduceOp::Avg).unwrap();
-            cuda_synchronize(1);
-        });
-        h0.join().unwrap();
-        h1.join().unwrap();
-
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 15.0).abs() < 1e-5),
-            "rank 0 should have 15.0 after AllReduce Avg, got {}", vals0[0]);
-        assert!(vals1.iter().all(|&v| (v - 15.0).abs() < 1e-5),
-            "rank 1 should have 15.0 after AllReduce Avg, got {}", vals1[0]);
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_rank_comm_on_stream() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let uid = NcclUniqueId::new().unwrap();
-        let uid0 = uid.clone();
-        let uid1 = uid;
-
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            NcclRankComm::init_rank(0, 2, &uid0).unwrap()
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            NcclRankComm::init_rank(1, 2, &uid1).unwrap()
-        });
-        let comm0 = h0.join().unwrap();
-        let comm1 = h1.join().unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-        let stream0 = CudaStream::new(Device::CUDA(0), false).unwrap();
-        let stream1 = CudaStream::new(Device::CUDA(1), false).unwrap();
-
-        let t0 = Tensor::full(&[32], 3.0, opts0).unwrap();
-        let t1 = Tensor::full(&[32], 7.0, opts1).unwrap();
-        let t0c = t0.clone();
-        let t1c = t1.clone();
-
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            comm0.all_reduce_on_stream(&[&t0c], ReduceOp::Sum, &stream0).unwrap();
-            stream0.synchronize().unwrap();
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            comm1.all_reduce_on_stream(&[&t1c], ReduceOp::Sum, &stream1).unwrap();
-            stream1.synchronize().unwrap();
-        });
-        h0.join().unwrap();
-        h1.join().unwrap();
-
-        let vals0 = t0.to_f32_vec().unwrap();
-        let vals1 = t1.to_f32_vec().unwrap();
-        assert!(vals0.iter().all(|&v| (v - 10.0).abs() < 1e-5),
-            "rank 0 should have 10.0 after Sum, got {}", vals0[0]);
-        assert!(vals1.iter().all(|&v| (v - 10.0).abs() < 1e-5),
-            "rank 1 should have 10.0 after Sum, got {}", vals1[0]);
-    }
-
-    #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
-    fn test_nccl_rank_comm_multi_tensor_batch() {
-        if !require_multi_gpu() { return; }
-        let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let uid = NcclUniqueId::new().unwrap();
-        let uid0 = uid.clone();
-        let uid1 = uid;
-
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            NcclRankComm::init_rank(0, 2, &uid0).unwrap()
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            NcclRankComm::init_rank(1, 2, &uid1).unwrap()
-        });
-        let comm0 = h0.join().unwrap();
-        let comm1 = h1.join().unwrap();
-
-        let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
-        let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-
-        // Two tensors per rank (simulates multiple params)
-        let a0 = Tensor::full(&[16], 1.0, opts0).unwrap();
-        let b0 = Tensor::full(&[8], 100.0, opts0).unwrap();
-        let a1 = Tensor::full(&[16], 3.0, opts1).unwrap();
-        let b1 = Tensor::full(&[8], 200.0, opts1).unwrap();
-
-        let a0c = a0.clone();
-        let b0c = b0.clone();
-        let a1c = a1.clone();
-        let b1c = b1.clone();
-
-        let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
-            comm0.all_reduce(&[&a0c, &b0c], ReduceOp::Avg).unwrap();
-            cuda_synchronize(0);
-        });
-        let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
-            comm1.all_reduce(&[&a1c, &b1c], ReduceOp::Avg).unwrap();
-            cuda_synchronize(1);
-        });
-        h0.join().unwrap();
-        h1.join().unwrap();
-
-        // a: avg(1.0, 3.0) = 2.0, b: avg(100.0, 200.0) = 150.0
-        let va0 = a0.to_f32_vec().unwrap();
-        let vb0 = b0.to_f32_vec().unwrap();
-        assert!(va0.iter().all(|&v| (v - 2.0).abs() < 1e-5), "a0 should be 2.0");
-        assert!(vb0.iter().all(|&v| (v - 150.0).abs() < 1e-5), "b0 should be 150.0");
-
-        let va1 = a1.to_f32_vec().unwrap();
-        let vb1 = b1.to_f32_vec().unwrap();
-        assert!(va1.iter().all(|&v| (v - 2.0).abs() < 1e-5), "a1 should be 2.0");
-        assert!(vb1.iter().all(|&v| (v - 150.0).abs() < 1e-5), "b1 should be 150.0");
-    }
-}
+#[path = "nccl_tests.rs"]
+mod tests;

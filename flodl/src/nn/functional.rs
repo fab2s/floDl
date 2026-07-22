@@ -45,7 +45,11 @@ impl Module for GaussianBlur {
 /// ```
 pub fn gaussian_blur_2d(input: &Variable, sigma: f64) -> Result<Variable> {
     let shape = input.shape();
-    assert!(shape.len() == 4, "gaussian_blur_2d expects [B, C, H, W], got {:?}", shape);
+    if shape.len() != 4 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "gaussian_blur_2d expects a 4-D [B, C, H, W] input, got shape {shape:?}"
+        )));
+    }
     let channels = shape[1];
     let device = input.device();
 
@@ -94,6 +98,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_gaussian_blur_non_4d_is_err_not_panic() {
+        // Wrong-rank runtime input at a Result-returning boundary surfaces as
+        // Err (was an assert! panic).
+        let opts = crate::tensor::test_opts();
+        let input = Variable::new(Tensor::randn(&[3, 16, 16], opts).unwrap(), false);
+        let err = gaussian_blur_2d(&input, 1.0).unwrap_err();
+        assert!(err.to_string().contains("4-D"), "unexpected: {err}");
+    }
+
+    #[test]
     fn test_gaussian_blur_preserves_shape() {
         let opts = crate::tensor::test_opts();
         let input = Variable::new(Tensor::randn(&[1, 3, 16, 16], opts).unwrap(), false);
@@ -129,7 +143,7 @@ mod tests {
     /// Mimics the fbrl training pattern: forward → gaussian_blur_2d → loss → backward,
     /// repeated many times. RSS should stay roughly flat.
     #[test]
-    fn test_gaussian_blur_no_ram_leak() {
+    fn test_gaussian_blur_no_ram_leak_leakcheck() {
         if crate::tensor::test_device() != crate::tensor::Device::CPU { return; }
         use crate::nn::{Linear, Module, Adam, Optimizer};
 

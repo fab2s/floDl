@@ -413,7 +413,7 @@ fn main() -> Result<()> {
 
     println!("\nSample reconstructions (loaded model):");
     for (orig, recon) in sample.iter().zip(reconstructed.iter()) {
-        let acc = per_base_accuracy(&[orig.clone()], &[recon.clone()]);
+        let acc = per_base_accuracy(std::slice::from_ref(orig), std::slice::from_ref(recon));
         println!("  orig: {orig}");
         println!("  rec : {recon}   (acc={acc:.2})\n");
     }

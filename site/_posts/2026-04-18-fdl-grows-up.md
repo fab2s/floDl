@@ -57,7 +57,7 @@ fn main() {
 With this in place:
 
 - `--help` renders an ANSI-coloured help page assembled from the
-  doc-comments. Descriptions, choices, defaults, types -- all there,
+  doc-comments. Descriptions, choices, defaults, types - all there,
   no hand-written banner.
 - `--fdl-schema` emits JSON describing every flag. `fdl` probes the
   binary on first use and caches the result at
@@ -70,7 +70,7 @@ With this in place:
   your binary runs.
 
 Reserved flag names (`--help`, `--version`, `--quiet`, `--env`) can
-no longer be shadowed by accident -- collisions error at derive time
+no longer be shadowed by accident - collisions error at derive time
 with a message pointing at the offending field. This is one of the
 two breaking changes in 0.5.0.
 
@@ -87,15 +87,15 @@ commands, `commands:` for docker-wrapped entries with structured
 config). In 0.5.0 they merge into one `commands:` map, and each
 entry comes in exactly one of three kinds:
 
-- **`run:`** -- inline shell (optionally wrapped in `docker compose`).
-- **`path:`** -- pointer to a nested sub-project with its own
+- **`run:`** - inline shell (optionally wrapped in `docker compose`).
+- **`path:`** - pointer to a nested sub-project with its own
   `fdl.yml`.
-- **preset** -- deep-merge structured `ddp:` / `training:` /
+- **preset** - deep-merge structured `ddp:` / `training:` /
   `options:` config over an enclosing `entry:`.
 
 The three-kind model is the long-term stable surface. No further
 breaking changes to its shape are scheduled. If you had a 0.4.0
-`fdl.yml`, the upgrade is boring -- wrap your `scripts:` values in
+`fdl.yml`, the upgrade is boring - wrap your `scripts:` values in
 `run:` and move on. Step-by-step in
 [UPGRADE.md](https://github.com/flodl-labs/flodl/blob/main/UPGRADE.md).
 
@@ -160,13 +160,13 @@ was no public contract for participating.
 surface through `--fdl-schema`; `fdl` caches it; help, validation,
 and completion are driven from the same struct the parser reads
 from. Writing a custom training harness doesn't mean rebuilding the
-CLI ergonomics from scratch -- it means adding `#[derive(FdlArgs)]`
+CLI ergonomics from scratch - it means adding `#[derive(FdlArgs)]`
 above a struct.
 
 The derive is ~1100 lines of proc-macro code, zero runtime
 dependencies on any argv-parsing crate. `flodl-cli` itself doesn't
 pull in `clap` or `structopt` and neither do binaries that use the
-derive -- the generated parser is self-contained.
+derive - the generated parser is self-contained.
 
 ## What's still the same
 
@@ -190,7 +190,7 @@ version bump.
   overlays) to see what actually merges.
 - **Read the full CLI reference**:
   [docs/cli.md](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md)
-  covers all three contexts -- standalone, in-project, flodl source
+  covers all three contexts - standalone, in-project, flodl source
   checkout.
 
 And if the whole framing of a CLI you can extend rather than wrap

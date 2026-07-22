@@ -1,6 +1,6 @@
 # Graph Tree: Composable Subgraph Training
 
-> **ARCHIVED — Historical design doc.** This feature shipped in v0.2.0
+> **ARCHIVED - Historical design doc.** This feature shipped in v0.2.0
 > and is documented for users in
 > [Tutorial 10: Graph Tree](../../tutorials/10-graph-tree.md). Internal
 > links below were written from the original `docs/design/` location;
@@ -10,7 +10,7 @@ A design for hierarchical graph composition with label-path addressing and
 per-subgraph training control.
 
 This feature enables the "hierarchical composition" and "multi-strategy training"
-described in the trajectory thesis -- trained graphs nested as modules inside
+described in the trajectory thesis - trained graphs nested as modules inside
 parent graphs, with fine-grained control over which parts train, freeze, or
 share gradients.
 
@@ -25,20 +25,20 @@ flodl supports Graph-as-Module composition: a built `Graph` implements
 `Module` and can be placed inside another `FlowBuilder`. Training a composed
 system requires these capabilities (all now implemented):
 
-1. **Selective freezing** -- freeze the read phase of a letter model while its
+1. **Selective freezing** - freeze the read phase of a letter model while its
    scan phase adapts to word-level context.
-2. **Cross-boundary observation** -- a parent graph needs to read a child's
+2. **Cross-boundary observation** - a parent graph needs to read a child's
    tagged outputs (e.g., confidence scores) to make routing decisions.
-3. **Subgraph checkpointing** -- load a pre-trained letter model into a subtree
+3. **Subgraph checkpointing** - load a pre-trained letter model into a subtree
    of a larger word model, without disturbing surrounding weights.
-4. **Per-subgraph optimizer groups** -- different learning rates for different
+4. **Per-subgraph optimizer groups** - different learning rates for different
    subgraphs, collected by label path rather than manual parameter wrangling.
-5. **Training phase control** -- declarative freeze/thaw schedules expressed as
+5. **Training phase control** - declarative freeze/thaw schedules expressed as
    label paths, not imperative `requires_grad` surgery.
 
 ### Core principle: layered models trained independently
 
-The graph tree is designed for **models of models** -- layered compositions
+The graph tree is designed for **models of models** - layered compositions
 where each layer can be trained, checkpointed, and loaded into a parent as
 a building block. Training is progressive: lower layers are proven first,
 then frozen (fully or partially) and composed into higher layers.
@@ -73,7 +73,7 @@ WordGraph "word"
         Already trained on isolated letters -- classification
 ```
 
-**N is data-dependent** -- meta scan estimates the letter count, and `each`
+**N is data-dependent** - meta scan estimates the letter count, and `each`
 fans out dynamically. All N instances share weights (one model called N times).
 
 **Progressive training pipeline:**
@@ -94,9 +94,9 @@ Step 3: Compose full word model
         -> checkpoint: word_v1.fdl.gz
 ```
 
-Each step builds on proven layers. Step 2 doesn't touch letter.read weights --
+Each step builds on proven layers. Step 2 doesn't touch letter.read weights -
 they're proven on isolated letters. Step 3 doesn't touch subscan's letter
-spotting -- it's proven on letter-in-word data. The word model only needs to
+spotting - it's proven on letter-in-word data. The word model only needs to
 learn boundary detection and letter count estimation.
 
 **What the graph tree supports:**
@@ -130,12 +130,12 @@ not something it's built for.
 
 However, when a graph is composed into a parent, the parent sets a
 `composed: Cell<bool>` flag on it. The child can query `is_composed()` to
-adapt its behavior -- e.g., skip its own loss computation when a parent
+adapt its behavior - e.g., skip its own loss computation when a parent
 handles the loss, or suppress standalone-only observation. The flag is a
 one-bit signal: "you are part of something larger." Nothing more.
 
 The parent discovers its children at build time and registers them in its own
-metadata. All tree operations are top-down -- you call them on an ancestor,
+metadata. All tree operations are top-down - you call them on an ancestor,
 never on a child reaching up.
 
 ### 3. Strict dot semantics
@@ -143,9 +143,9 @@ never on a child reaching up.
 Dots in paths always mean subgraph boundaries. No fuzzy resolution, no
 "walk up to parent", no ambiguity heuristics.
 
-- `"scan"` -- local tag in the current graph (existing behavior, unchanged)
-- `"letter.scan"` -- child subgraph `"letter"`, then `"scan"` within it
-- `"letter.scan.location"` -- child `"letter"`, then `"scan"` within it, then `"location"` within that
+- `"scan"` - local tag in the current graph (existing behavior, unchanged)
+- `"letter.scan"` - child subgraph `"letter"`, then `"scan"` within it
+- `"letter.scan.location"` - child `"letter"`, then `"scan"` within it, then `"location"` within that
 
 If a dot-path segment doesn't resolve to a registered child subgraph, you get
 a clear error: *`"letter" is not a subgraph of this graph`*. Period.
@@ -217,7 +217,7 @@ All tree operations use dot-separated label paths with optional loop indexing:
 1. Split path on `.` into segments.
 2. First segment: look up in `self.children`. If found, descend into that
    child graph. If not found, treat the entire path as a local tag name
-   (only valid for single-segment paths -- a dotted path that doesn't start
+   (only valid for single-segment paths - a dotted path that doesn't start
    with a child label is an error).
 3. Subsequent segments: within the resolved child graph, look up the next
    segment in *its* `children` first, then in its `tag_names`. Recurse.
@@ -229,9 +229,9 @@ All tree operations use dot-separated label paths with optional loop indexing:
 - Negative indexing: `"scan[-1]"` for last iteration.
 
 **Error messages are explicit:**
-- `"letter" is not a subgraph of this graph` -- first segment doesn't match any child
-- `"scan" is not a subgraph or tag within "letter"` -- intermediate segment fails
-- `path "letter.scan" resolves to a tag, not a subgraph -- cannot descend further` -- dotting into a non-graph
+- `"letter" is not a subgraph of this graph` - first segment doesn't match any child
+- `"scan" is not a subgraph or tag within "letter"` - intermediate segment fails
+- `path "letter.scan" resolves to a tag, not a subgraph -- cannot descend further` - dotting into a non-graph
 
 ### 3. Tag visibility: shared by default, opt-in internal
 
@@ -292,7 +292,7 @@ This resolves the path, then delegates to the target graph/module's existing
 (existing behavior) prevents double-counting shared parameters.
 
 The existing `parameters()` method remains unchanged (returns all parameters
-in the graph, including those in child subgraphs -- this already works because
+in the graph, including those in child subgraphs - this already works because
 child graphs are modules in nodes).
 
 ### 5. Tree-aware freeze/thaw
@@ -315,7 +315,7 @@ impl Graph {
 ```
 
 These delegate to `Parameter::freeze()` / `Parameter::unfreeze()` which already
-exist. Invalid paths return `Err` -- a typo in `"lettre.scan"` is caught
+exist. Invalid paths return `Err` - a typo in `"lettre.scan"` is caught
 immediately rather than silently freezing nothing.
 
 **Training phase definitions become declarative:**
@@ -379,14 +379,14 @@ regardless of what the parent graph looks like.
 
 All tree-aware access methods distinguish between two kinds of absence:
 
-- **Null** (`Err`) -- the path doesn't exist in the topology. Typo, wrong
+- **Null** (`Err`) - the path doesn't exist in the topology. Typo, wrong
   structure, or the subgraph was never registered. This is a wiring bug.
-- **Nil** (`Ok(None)`) -- the path resolves to a real tag/subgraph, but no
+- **Nil** (`Ok(None)`) - the path resolves to a real tag/subgraph, but no
   value has been computed yet in the current forward pass. This is a timing
-  issue -- you're reading before the producer executed.
-- **Value** (`Ok(Some(v))`) -- the path resolves and the value is available.
+  issue - you're reading before the producer executed.
+- **Value** (`Ok(Some(v))`) - the path resolves and the value is available.
 
-This maps to `Result<Option<T>>` -- idiomatic Rust for two-level fallibility.
+This maps to `Result<Option<T>>` - idiomatic Rust for two-level fallibility.
 
 **Why this matters:**
 
@@ -407,8 +407,8 @@ This maps to `Result<Option<T>>` -- idiomatic Rust for two-level fallibility.
 |---|---|---|---|
 | `tagged_at` | path invalid | tag not yet computed | `Variable` |
 | `trend_at` | path invalid | no data collected yet | `Trend` |
-| `parameters_at` | path invalid | -- (always `Ok`) | `Vec<Parameter>` |
-| `collect_at` | path invalid | -- (always `Ok`) | `()` |
+| `parameters_at` | path invalid | - (always `Ok`) | `Vec<Parameter>` |
+| `collect_at` | path invalid | - (always `Ok`) | `()` |
 
 **Build-time path validation:**
 
@@ -455,7 +455,7 @@ The existing `tagged()`, `collect()`, `record_scalar()`, `trend()` methods
 remain unchanged for local access. The `_at` variants resolve the label path,
 then delegate to the target graph's existing observation methods.
 
-**Use case -- conditional retry in word model:**
+**Use case - conditional retry in word model:**
 
 ```rust
 // After letter model forward pass:
@@ -551,7 +551,7 @@ impl Graph {
 }
 ```
 
-This matters for BatchNorm -- frozen subgraphs should use running stats (eval
+This matters for BatchNorm - frozen subgraphs should use running stats (eval
 mode), not batch stats (training mode).
 
 ---
@@ -582,13 +582,13 @@ proportional to the number of subgraphs. This is a one-time cost at
 
 Child graphs already contribute to the parent's structural hash implicitly
 through their parameter shapes and topology (they're modules in nodes). The
-`children` HashMap is **not** added to hash computation -- that would change
+`children` HashMap is **not** added to hash computation - that would change
 existing hashes and invalidate checkpoints for no functional gain.
 
 ### Parameter collection: same complexity
 
 `parameters()` already walks all nodes including child subgraphs (they're
-modules). `parameters_at()` is additive -- it walks a subtree instead of
+modules). `parameters_at()` is additive - it walks a subtree instead of
 the full graph. Same deduplication by `Rc` pointer.
 
 ---
@@ -619,7 +619,7 @@ pub(crate) enum ResolvedPath<'a> {
 }
 ```
 
-No Rc, no ownership -- just borrowed references into the existing node array.
+No Rc, no ownership - just borrowed references into the existing node array.
 
 ### Phase B: Training control
 
@@ -726,7 +726,7 @@ Composition" sections of the trajectory thesis:
 
 > Each sub-graph carries its training context (optimizer, loss, schedule).
 > Gradient flow between sub-graphs is declared in the graph topology.
-> The meta-controller's branching and looping are native Rust -- zero overhead.
+> The meta-controller's branching and looping are native Rust - zero overhead.
 > Training the meta-controller is just another backward pass through a graph
 > that happens to contain other trained graphs as nodes.
 
@@ -740,15 +740,15 @@ end-to-end training, each layer is a proven, checkpointed model before it
 becomes a component. The training pipeline is a sequence of composition steps,
 not a single optimization run. This means:
 
-- **Reproducibility** -- each layer's training is isolated. A regression in
+- **Reproducibility** - each layer's training is isolated. A regression in
   the letter model is debugged at the letter level, not by staring at word-
   level loss curves.
-- **Remixability** -- swap in a better letter model, retrain only the layers
+- **Remixability** - swap in a better letter model, retrain only the layers
   above it. The checkpoint boundary is the composition boundary.
-- **Incremental cost** -- adding a new level (e.g., sentence -> word) doesn't
+- **Incremental cost** - adding a new level (e.g., sentence -> word) doesn't
   retrain the proven lower layers. You pay training cost only for the new
   routing and the adapting scan phases.
-- **Testability** -- each layer has its own test suite and success criteria
+- **Testability** - each layer has its own test suite and success criteria
   before it enters a composition. The letter model is proven on letter data;
   it doesn't need to be re-proven at the word level.
 
@@ -790,4 +790,4 @@ not a single optimization run. This means:
    subgraph's weights. Loading it into `"subscan"` should recursively
    restore the letter weights within it. The checkpoint format already
    stores named parameters with qualified paths, so this should work
-   naturally -- needs explicit testing.
+   naturally - needs explicit testing.

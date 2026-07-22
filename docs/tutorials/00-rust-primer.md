@@ -2,7 +2,7 @@
 
 You don't need to learn all of Rust to use floDl. This tutorial covers the 10
 patterns you'll actually encounter in training scripts. If you've written
-PyTorch, you already have the mental model — Rust just makes a few things
+PyTorch, you already have the mental model - Rust just makes a few things
 explicit that Python leaves implicit.
 
 > **Time:** ~15 minutes. After this you can follow every floDl tutorial.
@@ -19,15 +19,15 @@ explicit that Python leaves implicit.
 ## 1. Variables: `let` and `let mut`
 
 ```rust
-let x = 5;         // immutable — like Python, most things don't change
-let mut y = 10;    // mutable — opt-in, like declaring "I will modify this"
+let x = 5;         // immutable - like Python, most things don't change
+let mut y = 10;    // mutable - opt-in, like declaring "I will modify this"
 y += 1;            // ok
-// x += 1;         // compile error — x is immutable
+// x += 1;         // compile error - x is immutable
 ```
 
 **PyTorch equivalent:** Python variables are always mutable. Rust defaults to
 immutable and makes you say `mut` when you need mutation. This prevents
-accidental overwrites — the compiler catches them for you.
+accidental overwrites - the compiler catches them for you.
 
 Optimizers need `mut` because `step()` updates internal state:
 
@@ -46,13 +46,13 @@ let c = a.add(&b)?;  // &b = "borrow b without taking ownership"
 
 **PyTorch equivalent:** In Python, everything is passed by reference
 automatically. Rust makes you write `&` to say "I'm borrowing this, not
-consuming it." Most floDl methods take `&self` or `&Tensor` — you'll see `&`
+consuming it." Most floDl methods take `&self` or `&Tensor` - you'll see `&`
 everywhere, and it always means the same thing: "use it, don't move it."
 
 ## 3. The `?` Operator and `Result<T>`
 
 GPU operations can fail (shape mismatch, out of memory, etc.). Python raises
-exceptions. Rust returns `Result<T>` — either `Ok(value)` or `Err(error)`:
+exceptions. Rust returns `Result<T>` - either `Ok(value)` or `Err(error)`:
 
 ```rust
 // The ? operator: "if this failed, return the error immediately"
@@ -62,12 +62,12 @@ let y = x.matmul(&w)?.add(&b)?.relu()?;
 This is equivalent to:
 
 ```python
-# Python — exceptions propagate implicitly
+# Python - exceptions propagate implicitly
 y = (x @ w + b).relu()
 ```
 
 The only difference: Rust makes you acknowledge each fallible call with `?`.
-Chain them freely — a single `?` per call is all you need.
+Chain them freely - a single `?` per call is all you need.
 
 Your `main` function returns `Result<()>` to enable `?`:
 
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
 ## 4. Closures: `|| {}`
 
 ```rust
-// Rust closure — like Python's lambda, but multi-line
+// Rust closure - like Python's lambda, but multi-line
 let make_batch = || {
     let x = Tensor::randn(&[16, 2], opts).unwrap();
     let y = Tensor::randn(&[16, 2], opts).unwrap();
@@ -104,14 +104,14 @@ let batches: Vec<_> = (0..32).map(|_| make_batch()).collect();
 ## 5. Vectors, Slices, and Iteration
 
 ```rust
-// Vec<T> — like Python's list, but typed
+// Vec<T> - like Python's list, but typed
 let losses: Vec<f64> = Vec::new();
 
-// Slices &[T] — a view into contiguous data
+// Slices &[T] - a view into contiguous data
 let shape: &[i64] = &[2, 3];
 let t = Tensor::zeros(shape, opts)?;
 
-// Iteration — like Python's for loop
+// Iteration - like Python's for loop
 for (input, target) in &batches {
     let pred = model.forward(&input)?;
     // ...
@@ -144,7 +144,7 @@ Every layer (`Linear`, `GELU`, `LayerNorm`) and every `Graph` implements
 let pred = model.forward(&input)?;   // works for Linear, Graph, anything
 ```
 
-**PyTorch equivalent:** `nn.Module` — same concept, Rust just enforces the
+**PyTorch equivalent:** `nn.Module` - same concept, Rust just enforces the
 interface at compile time instead of duck-typing it.
 
 ## 7. Types You'll See But Don't Need to Understand
@@ -153,8 +153,8 @@ These appear in signatures and error messages. You don't need to construct them:
 
 | Type | What it means | When you see it |
 |------|---------------|-----------------|
-| `Result<T>` | "Might fail" — use `?` | Every tensor/module operation |
-| `Option<T>` | "Might be absent" — `Some(v)` or `None` | `x.grad()` returns `Option<Tensor>` |
+| `Result<T>` | "Might fail" - use `?` | Every tensor/module operation |
+| `Option<T>` | "Might be absent" - `Some(v)` or `None` | `x.grad()` returns `Option<Tensor>` |
 | `Vec<T>` | Growable array | `parameters()`, shape data |
 | `&[T]` | Slice (borrowed view) | Shape arguments: `&[2, 3]` |
 | `Box<dyn Module>` | Any module, heap-allocated | Inside `modules![...]` macro |
@@ -169,12 +169,14 @@ These appear in signatures and error messages. You don't need to construct them:
 
 ```rust
 let a = Tensor::zeros(&[2, 3], opts)?;
-let b = a;       // a is "moved" into b — a is no longer valid
+let b = a;       // a is "moved" into b - a is no longer valid
 // println!("{:?}", a);  // compile error: a was moved
 
 // Fix: clone if you need both
 let a = Tensor::zeros(&[2, 3], opts)?;
-let b = a.clone();  // b is a shallow copy (shared storage, like PyTorch)
+let b = a.clone();  // shallow: b shares a's storage (an in-place op on one
+                    // is seen by the other). UNLIKE PyTorch's deep .clone();
+                    // use a.copy() for an independent, owned copy.
 // both a and b are valid
 ```
 
@@ -187,7 +189,7 @@ rare in training code. The compiler tells you when it happens.
 let mut v = vec![1, 2, 3];
 // Can't borrow mutably and immutably at the same time:
 // let r = &v[0];
-// v.push(4);    // compile error — v is borrowed by r
+// v.push(4);    // compile error - v is borrowed by r
 // println!("{}", r);
 
 // Fix: finish using the immutable borrow first
@@ -211,7 +213,7 @@ fn add_one_v2(x: i64) -> i64 {
 ```
 
 The last expression without a semicolon is the return value. Add a semicolon
-and it becomes a statement that returns `()` — the compiler will tell you if
+and it becomes a statement that returns `()` - the compiler will tell you if
 you get this wrong.
 
 ### Turbofish `::<Type>`
@@ -310,7 +312,7 @@ fn main() -> Result<()> {
 
 **What's the same:**
 - Build model, create optimizer, training loop, zero_grad/forward/backward/step
-- The structure is identical — Rust just makes error handling and ownership explicit
+- The structure is identical - Rust just makes error handling and ownership explicit
 
 ---
 

@@ -7,22 +7,17 @@
 //! is managed under `~/.flodl/` (override with `$FLODL_HOME`).
 
 use flodl_cli::{
-    add, api_ref, builtins, cli_error, completions, config, context, diagnose, dispatch, init,
-    libtorch, overlay, parse_or_schema_from, run, schema, schema_cache, setup, skill, style,
-    update_check, util,
+    add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
+    overlay, parse_or_schema_from, probe, run, setup, skill, status, style, update_check,
 };
 
 use builtins::{
-    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, LibtorchActivateArgs,
-    LibtorchBuildArgs, LibtorchDownloadArgs, LibtorchListArgs, LibtorchRemoveArgs, SchemaClearArgs,
-    SchemaListArgs, SchemaRefreshArgs, SetupArgs, SkillInstallArgs,
+    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, ProbeArgs, SetupArgs,
+    SkillInstallArgs, StatusArgs,
 };
-use dispatch::{walk_commands, WalkOutcome};
 
 use std::env;
 use std::process::ExitCode;
-
-use context::Context;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -84,25 +79,78 @@ fn main() -> ExitCode {
         }
     }
 
+    // Export HOSTNAME so docker-compose's `hostname: ${HOSTNAME}` resolves to
+    // the host's name (the cluster launcher matches
+    // `cluster.hosts[i].name == hostname()`). Bash keeps HOSTNAME as a shell
+    // variable but does NOT export it, so a non-interactive `fdl` invocation
+    // otherwise leaves it unset -- compose warns ("The \"HOSTNAME\" variable
+    // is not set. Defaulting to a blank string.") and the container hostname
+    // comes up blank. Only fill when unset, so an explicit exported HOSTNAME
+    // still wins.
+    if env::var_os("HOSTNAME").is_none() {
+        let host = crate::cluster::resolve_local_hostname();
+        if !host.is_empty() {
+            // SAFETY: called before any threads are spawned.
+            unsafe {
+                env::set_var("HOSTNAME", host);
+            }
+        }
+    }
+
     // Extract `--no-append`, the escape hatch that suppresses any
     // `append:` suffix declared by a run-kind command. Scoped to this
     // invocation only — nested `fdl` calls re-evaluate their own flags.
     let (args, no_append) = extract_no_append(&args);
 
-    // Environment selection: `--env X` > `FDL_ENV=X` > first-arg convention.
-    // Explicit selectors must resolve to an existing overlay; first-arg
-    // detection falls through when the arg matches no overlay. Ambiguous
-    // cases (a command name also matches a sibling env file) are a loud
-    // error rather than silent precedence.
-    let cwd = env::current_dir().unwrap_or_default();
-    let fdl_env_var = env::var("FDL_ENV").ok();
-    let (active_env, args) = match resolve_env(&args, &cwd, fdl_env_var.as_deref()) {
+    // Extract `--no-prebuild`, which opts a single invocation out of
+    // the cluster-mode pre-flight build (see [`prebuild`]). Lets users
+    // skip the per-remote build phase when they know the binaries are
+    // fresh (or when working around a build-only issue).
+    let (args, no_prebuild) = extract_no_prebuild(&args);
+
+    // Extract `--gpus` (global; accepted at any position). Cluster-aware
+    // commands with N>=2 GPUs trigger single-host envelope synthesis and
+    // multi-process spawn. Non-cluster commands map `--gpus` to
+    // `CUDA_VISIBLE_DEVICES` on the single child process. Recursive
+    // invocations (FLODL_INTERNAL_CLUSTER_JSON set) shouldn't normally see this
+    // flag in their args -- the launcher strips it before re-exec'ing.
+    let (args, gpus_spec) = match extract_gpus_flag(&args) {
         Ok(pair) => pair,
         Err(msg) => {
             cli_error!("{msg}");
             return ExitCode::FAILURE;
         }
     };
+
+    // Environment selection: `@env` / `--env X` (command-line, equivalent)
+    // override `FDL_ENV=X`. Every form must resolve to an existing overlay
+    // or it is a loud error — there is no positional-env convention, so the
+    // first bare token is always a command.
+    let fdl_env_var = env::var("FDL_ENV").ok();
+    let (active_env, args) = match resolve_env(&args, fdl_env_var.as_deref()) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            cli_error!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Propagate the active env name to child processes so they can
+    // discover the overlay-merged config at runtime. Previously only
+    // exported inside `prepare_cluster_env` (cluster-launcher path);
+    // unconditional propagation makes the env name available to any
+    // spawned binary — load-bearing for test discovery (each test
+    // resolves its cluster topology from
+    // `fdl.<FDL_ENV>.yml`) and harmless for non-test commands.
+    // No-op when no env is active (FDL_ENV stays unset).
+    if let Some(env_name) = active_env.as_deref() {
+        // SAFETY: main() has not spawned threads at this point;
+        // matches the invariant documented for
+        // `prepare_cluster_env` and `apply_cuda_visible_devices`.
+        unsafe {
+            env::set_var(cluster::ENV_FDL_ENV, env_name);
+        }
+    }
 
     // Bare `fdl` with no args behaves like `fdl --help`.
     let cmd = args.get(1).map(String::as_str).unwrap_or("--help");
@@ -123,10 +171,27 @@ fn main() -> ExitCode {
             }
         }
         "libtorch" => dispatch_libtorch(&args),
+        "nccl" => dispatch_nccl(&args),
         "diagnose" => {
             let cli: DiagnoseArgs = parse_sub("fdl diagnose", &args[1..]);
             diagnose::run(cli.json);
             ExitCode::SUCCESS
+        }
+        "probe" => {
+            let cli: ProbeArgs = parse_sub("fdl probe", &args[1..]);
+            let code = probe::run(
+                cli.json,
+                cli.skip_mount,
+                cli.data_path,
+                cli.libtorch_path,
+                cli.docker,
+            );
+            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        "status" => {
+            let cli: StatusArgs = parse_sub("fdl status", &args[1..]);
+            let code = status::run(cli.json, cli.addr.as_deref());
+            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "api-ref" => {
             let cli: ApiRefArgs = parse_sub("fdl api-ref", &args[1..]);
@@ -168,7 +233,11 @@ fn main() -> ExitCode {
             let shell = args.get(2).map(String::as_str).unwrap_or("bash");
             let cwd = env::current_dir().unwrap_or_default();
             let project = load_project_config(&cwd, active_env.as_deref());
-            completions::generate(shell, project.as_ref().map(|(p, r)| (p, r.as_path())));
+            completions::generate(
+                shell,
+                project.as_ref().map(|(p, r)| (p, r.as_path())),
+                active_env.as_deref(),
+            );
             ExitCode::SUCCESS
         }
         "autocomplete" => {
@@ -180,8 +249,11 @@ fn main() -> ExitCode {
         "config" => cmd_config_show(&args[1..], active_env.as_deref()),
         "--help" | "-h" => {
             let cwd = env::current_dir().unwrap_or_default();
-            if let Some((project, root)) = load_project_config(&cwd, active_env.as_deref()) {
-                run::print_project_help(&project, &root, active_env.as_deref());
+            // Never let a bogus env selector block --help: degrade to base
+            // help when the overlay is missing (feedback_help_never_blocked).
+            let help_env = help_env_or_note(&cwd, active_env.as_deref());
+            if let Some((project, root)) = load_project_config(&cwd, help_env) {
+                run::print_project_help(&project, &root, help_env);
             } else {
                 print_usage();
             }
@@ -191,46 +263,130 @@ fn main() -> ExitCode {
             println!("flodl-cli {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        other => dispatch_config(other, &args, active_env.as_deref(), no_append),
+        other => dispatch_config(
+            other,
+            &args,
+            active_env.as_deref(),
+            no_append,
+            no_prebuild,
+            gpus_spec.as_ref(),
+        ),
     }
 }
 
 /// Resolve the active environment selector.
 ///
-/// Precedence (highest wins):
-///   1. Explicit `--env X` / `--env=X` flag (scan-anywhere, like `-v`).
-///   2. `FDL_ENV=X` environment variable (`fdl_env`).
-///   3. First-arg convention: `fdl ci test` where `fdl.ci.yml` exists.
+/// Three forms, no positional convention:
+///   * `@env` sigil token (`fdl @cluster probe`), accepted anywhere before
+///     a standalone `--`, exactly like `--env`.
+///   * `--env X` / `--env=X` flag (scan-anywhere).
+///   * `FDL_ENV=X` environment variable (`fdl_env`).
 ///
-/// Explicit selectors (#1, #2) must resolve to an existing overlay — missing
-/// files error loudly rather than silently falling through. First-arg
-/// detection still falls through when the arg matches no overlay (it may
-/// just be a command).
+/// `@env` and `--env` are command-line selectors and rank equal; supplying
+/// both with *different* values is a loud conflict error, and either one
+/// overrides `FDL_ENV`. Because there is no positional-env convention, the
+/// first bare token is unconditionally a command (no command/env name
+/// collision is possible).
 ///
-/// `cwd` and `fdl_env` are injected for testability; `main` reads them from
-/// the process environment once at startup.
+/// Overlay EXISTENCE is deliberately NOT validated here — that happens at the
+/// config-load path ([`config::load_project_with_env`] →
+/// `resolve_config_layers`), which errors loudly for any command that actually
+/// consumes the config. Validating upfront would block `--help` and
+/// env-agnostic builtins (e.g. `fdl setup` with a stale `FDL_ENV`), so
+/// resolution and validation are kept separate (`feedback_help_never_blocked`).
+///
+/// `fdl_env` is injected for testability; `main` reads it from the process
+/// environment once at startup.
 fn resolve_env(
     args: &[String],
-    cwd: &std::path::Path,
     fdl_env: Option<&str>,
 ) -> Result<(Option<String>, Vec<String>), String> {
-    // 1. Explicit flag wins — strip it from args before anything else.
+    // Strip both command-line selectors up front.
     let (args, flag_env) = extract_env_flag(args)?;
-    if let Some(ref env_name) = flag_env {
-        validate_env_exists(env_name, "--env", cwd)?;
-        return Ok((flag_env, args));
-    }
+    let (args, at_env) = extract_at_env(&args)?;
 
-    // 2. Environment variable, if set and non-empty.
+    // Reconcile `@env` and `--env` — equal rank, conflict if they disagree.
+    let cli_env = match (flag_env, at_env) {
+        (Some(f), Some(a)) if f != a => {
+            return Err(format!(
+                "conflicting env selectors: `--env {f}` and `@{a}` — pick one"
+            ));
+        }
+        (Some(v), _) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    };
+
+    // A command-line selector wins over the ambient `FDL_ENV`. Existence of
+    // the overlay is validated later, at the config-load path (see the fn doc).
+    if let Some(env_name) = cli_env {
+        return Ok((Some(env_name), args));
+    }
     if let Some(env_name) = fdl_env {
         if !env_name.is_empty() {
-            validate_env_exists(env_name, "FDL_ENV", cwd)?;
             return Ok((Some(env_name.to_string()), args));
         }
     }
 
-    // 3. First-arg convention — returns None if no overlay matches.
-    resolve_env_first_arg(&args, cwd)
+    Ok((None, args))
+}
+
+/// Extract the global `--gpus` flag. Accepted at any position; both forms:
+/// `--gpus 0,1` and `--gpus=0,1`. Errors on duplicate, missing value, or
+/// value that looks like another flag.
+///
+/// Scan-anywhere, but stops at the first standalone `--`: a `--gpus` token
+/// past the separator is bound for the inner command and forwarded untouched
+/// (consistent with [`extract_env_flag`] and the other global-flag extractors).
+///
+/// Returns the args with `--gpus` (and its value) removed, plus the parsed
+/// [`gpus::GpusSpec`] when set.
+fn extract_gpus_flag(
+    args: &[String],
+) -> Result<(Vec<String>, Option<gpus::GpusSpec>), String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut spec: Option<gpus::GpusSpec> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            // Everything from here on is bound for the inner command;
+            // forward it verbatim (consistent with the other global-flag
+            // extractors). A `--gpus` past the separator is the script's.
+            out.extend(args[i..].iter().cloned());
+            break;
+        }
+        if a == "--gpus" {
+            let value = args.get(i + 1).ok_or_else(|| {
+                "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)"
+                    .to_string()
+            })?;
+            if value.is_empty() || value.starts_with('-') {
+                return Err(format!("--gpus requires a value, got `{value}`"));
+            }
+            if spec.is_some() {
+                return Err("--gpus specified more than once".to_string());
+            }
+            spec = Some(gpus::GpusSpec::parse(value)?);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = a.strip_prefix("--gpus=") {
+            if spec.is_some() {
+                return Err("--gpus specified more than once".to_string());
+            }
+            if value.is_empty() {
+                return Err(
+                    "--gpus= requires a value (e.g. `--gpus=0,1`)".to_string(),
+                );
+            }
+            spec = Some(gpus::GpusSpec::parse(value)?);
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    Ok((out, spec))
 }
 
 /// Strip `--env <value>` / `--env=<value>` tokens from `args`.
@@ -239,12 +395,22 @@ fn resolve_env(
 /// (`--env=ci`) form. Errors on missing value, empty value, or duplicate
 /// occurrence. Returns `(filtered_args, Some(value))` on success, or
 /// `(filtered_args, None)` when the flag is absent.
+///
+/// Scan-anywhere, but stops at the first standalone `--`: a `--env` token
+/// past the separator is bound for the inner command and forwarded
+/// untouched (consistent with [`extract_at_env`] and the other global
+/// flag extractors).
 fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     let mut out = Vec::with_capacity(args.len());
     let mut env: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if a == "--" {
+            // Everything from here on is forwarded verbatim.
+            out.extend(args[i..].iter().cloned());
+            break;
+        }
         if a == "--env" {
             let value = args.get(i + 1).ok_or_else(|| {
                 "--env requires a value (e.g. `--env ci`)".to_string()
@@ -276,84 +442,86 @@ fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), St
     Ok((out, env))
 }
 
-/// Confirm that `fdl.<env>.yml` exists next to the nearest base config,
-/// erroring with the source (`--env` or `FDL_ENV`) when it doesn't.
-fn validate_env_exists(
-    env_name: &str,
-    source: &str,
-    cwd: &std::path::Path,
-) -> Result<(), String> {
-    let base_config = config::find_config(cwd).ok_or_else(|| {
-        format!(
-            "{source} `{env_name}` set but no fdl.yml found in {} or parents",
-            cwd.display()
-        )
-    })?;
-    if overlay::find_env_file(&base_config, env_name).is_none() {
-        return Err(format!(
-            "{source} `{env_name}`: overlay not found \
-             (expected fdl.{env_name}.yml next to {})",
-            base_config.display()
-        ));
+/// Strip a single `@<env>` selector token from `args`, returning the env
+/// name without the leading `@`.
+///
+/// The `@<env>` sigil is a PRE-COMMAND selector: it is recognized only among
+/// the tokens *before* the command (`fdl @cluster probe`), never after it.
+/// The first bare token (not a flag, not `@`-prefixed) is the command — from
+/// there on nothing is treated as an env selector, so an `@`-prefixed option
+/// value (`fdl train --tag @best`) or a positional the command owns is
+/// forwarded verbatim rather than mistaken for an env selector. A standalone
+/// `--` before the command also ends recognition. Index 0 (the program name)
+/// is never inspected. By the time this runs every other global flag has been
+/// stripped upstream (and `--env` inside `resolve_env`), so the first bare
+/// token really is the command. Errors on a bare `@` (no name) or on more
+/// than one `@`-token.
+fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut env: Option<String> = None;
+    // Set once the command token (or a `--`) is reached: everything from there
+    // on is the command and its arguments, forwarded verbatim.
+    let mut command_seen = false;
+    for (i, arg) in args.iter().enumerate() {
+        if i == 0 || command_seen {
+            out.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            command_seen = true;
+            out.push(arg.clone());
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix('@') {
+            if name.is_empty() {
+                return Err(
+                    "`@` requires an env name (e.g. `@cluster`)".to_string(),
+                );
+            }
+            if env.is_some() {
+                return Err(
+                    "env selector (`@<env>`) specified more than once".to_string(),
+                );
+            }
+            env = Some(name.to_string());
+            continue;
+        }
+        // First non-flag, non-`@` token = the command; end recognition. A
+        // leading global flag that survived upstream extraction starts with
+        // `-` and is tolerated (skipped) until the command is reached.
+        if !arg.starts_with('-') {
+            command_seen = true;
+        }
+        out.push(arg.clone());
     }
-    Ok(())
+    Ok((out, env))
 }
 
-/// First-arg environment resolution. Returns `(Some(env), args_without_env)`
-/// when the first positional matches a sibling `fdl.<arg>.yml` overlay and
-/// no built-in, script, or sub-command by that name exists. Returns
-/// `(None, args)` when no env applies. Errors on ambiguity.
-fn resolve_env_first_arg(
-    args: &[String],
-    cwd: &std::path::Path,
-) -> Result<(Option<String>, Vec<String>), String> {
-    let candidate = match args.get(1) {
-        Some(a) if !a.starts_with('-') => a,
-        _ => return Ok((None, args.to_vec())),
-    };
-
-    let base_config = match config::find_config(cwd) {
-        Some(p) => p,
-        None => return Ok((None, args.to_vec())),
-    };
-    let env_file = overlay::find_env_file(&base_config, candidate);
-    if env_file.is_none() {
-        return Ok((None, args.to_vec()));
+/// For `--help` only: degrade to base help when the selected env's overlay is
+/// missing, rather than hard-erroring at config load. `--help` must always
+/// render (`feedback_help_never_blocked`); a typo'd `@env` / `FDL_ENV` should
+/// still show help, with a note. Returns the env to load with: the original
+/// `env` when its overlay exists (or there is no project), else `None` plus a
+/// stderr note. Overlay *content* errors still surface normally at load.
+fn help_env_or_note<'a>(cwd: &std::path::Path, env: Option<&'a str>) -> Option<&'a str> {
+    let name = env?;
+    match config::find_config(cwd) {
+        // Overlay present → merge it as usual.
+        Some(base) if overlay::find_env_file(&base, name).is_some() => Some(name),
+        // In a project but the overlay is missing → base help + note.
+        Some(_) => {
+            eprintln!("fdl: env `{name}` not found; showing base help");
+            None
+        }
+        // No project at all → load_project_config returns None → print_usage.
+        None => None,
     }
-
-    // An overlay exists — check for collision with a command of the same name.
-    let is_command = is_builtin_name(candidate) || is_project_command(&base_config, candidate);
-    if is_command {
-        return Err(format!(
-            "ambiguous `{candidate}`: matches both a command and an env overlay \
-             (fdl.{candidate}.yml).\nResolve by renaming one."
-        ));
-    }
-
-    // Unambiguously an env; consume it and return the rest.
-    let mut rest = Vec::with_capacity(args.len() - 1);
-    rest.push(args[0].clone());
-    rest.extend(args.iter().skip(2).cloned());
-    Ok((Some(candidate.clone()), rest))
-}
-
-fn is_builtin_name(name: &str) -> bool {
-    builtins::is_builtin_name(name)
-}
-
-fn is_project_command(base_config: &std::path::Path, name: &str) -> bool {
-    // Must NOT merge env overlays here — that would be circular when the
-    // env name also matches a command key. Inspect the raw base only.
-    let Ok(project) = config::load_project_with_env(base_config, None) else {
-        return false;
-    };
-    project.commands.contains_key(name)
 }
 
 /// Thin wrapper over `parse_or_schema_from` that sets the program name
 /// shown in `--help` output so `fdl setup --help` looks like
 /// "fdl setup" rather than the crate name.
-fn parse_sub<T: flodl_cli::FdlArgsTrait>(program: &str, tail: &[String]) -> T {
+pub(crate) fn parse_sub<T: flodl_cli::FdlArgsTrait>(program: &str, tail: &[String]) -> T {
     let mut argv = Vec::with_capacity(tail.len() + 1);
     argv.push(program.to_string());
     // tail[0] is the sub-command name (e.g. "setup"); skip it so the derive
@@ -362,46 +530,6 @@ fn parse_sub<T: flodl_cli::FdlArgsTrait>(program: &str, tail: &[String]) -> T {
     parse_or_schema_from::<T>(&argv)
 }
 
-// ---------------------------------------------------------------------------
-// libtorch dispatch
-// ---------------------------------------------------------------------------
-
-fn dispatch_libtorch(args: &[String]) -> ExitCode {
-    let sub = args.get(2).map(String::as_str).unwrap_or("--help");
-    match sub {
-        "list" => {
-            let cli: LibtorchListArgs = parse_sub("fdl libtorch list", &args[2..]);
-            cmd_libtorch_list(cli.json)
-        }
-        "info" => cmd_libtorch_info(),
-        "activate" => {
-            let cli: LibtorchActivateArgs = parse_sub("fdl libtorch activate", &args[2..]);
-            cmd_libtorch_activate(cli.variant.as_deref())
-        }
-        "download" => {
-            let cli: LibtorchDownloadArgs = parse_sub("fdl libtorch download", &args[2..]);
-            cmd_libtorch_download(cli)
-        }
-        "build" => {
-            let cli: LibtorchBuildArgs = parse_sub("fdl libtorch build", &args[2..]);
-            cmd_libtorch_build(cli)
-        }
-        "remove" => {
-            let cli: LibtorchRemoveArgs = parse_sub("fdl libtorch remove", &args[2..]);
-            cmd_libtorch_remove(cli.variant.as_deref())
-        }
-        "--help" | "-h" => {
-            print_libtorch_usage();
-            ExitCode::SUCCESS
-        }
-        other => {
-            eprintln!("unknown libtorch command: {other}");
-            eprintln!();
-            print_libtorch_usage();
-            ExitCode::FAILURE
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // skill dispatch
@@ -436,1000 +564,19 @@ fn dispatch_skill(args: &[String]) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// schema dispatch
-// ---------------------------------------------------------------------------
 
-fn dispatch_schema(args: &[String]) -> ExitCode {
-    let sub = args.get(2).map(String::as_str).unwrap_or("--help");
-    match sub {
-        "list" => {
-            let cli: SchemaListArgs = parse_sub("fdl schema list", &args[2..]);
-            cmd_schema_list(cli.json)
-        }
-        "clear" => {
-            let cli: SchemaClearArgs = parse_sub("fdl schema clear", &args[2..]);
-            cmd_schema_clear(cli.cmd.as_deref())
-        }
-        "refresh" => {
-            let cli: SchemaRefreshArgs = parse_sub("fdl schema refresh", &args[2..]);
-            cmd_schema_refresh(cli.cmd.as_deref())
-        }
-        "--help" | "-h" => {
-            print_schema_usage();
-            ExitCode::SUCCESS
-        }
-        other => {
-            cli_error!("unknown schema command: {other}");
-            eprintln!();
-            print_schema_usage();
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_schema_list(json: bool) -> ExitCode {
-    let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
-        return ExitCode::FAILURE;
-    };
-    let caches = schema::discover_caches(&root);
-
-    if json {
-        // Keep JSON minimal and stable: array of {name, path, status}.
-        print!("[");
-        for (i, c) in caches.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            let rel = c
-                .cache_path
-                .strip_prefix(&root)
-                .unwrap_or(&c.cache_path);
-            print!(
-                "{{\"name\":\"{}\",\"path\":\"{}\",\"status\":\"{}\"}}",
-                util::system::escape_json(&c.cmd_name),
-                util::system::escape_json(&rel.to_string_lossy()),
-                match c.status() {
-                    schema::CacheStatus::Fresh => "fresh",
-                    schema::CacheStatus::Stale => "stale",
-                    schema::CacheStatus::Orphan => "orphan",
-                }
-            );
-        }
-        println!("]");
-        return ExitCode::SUCCESS;
-    }
-
-    if caches.is_empty() {
-        println!("No cached schemas under {}.", root.display());
-        println!("Run `fdl <cmd> --refresh-schema` after building to populate.");
-        return ExitCode::SUCCESS;
-    }
-
-    println!("{}:", style::yellow("Cached schemas"));
-    for c in &caches {
-        let rel = c.cache_path.strip_prefix(&root).unwrap_or(&c.cache_path);
-        let status_label = match c.status() {
-            schema::CacheStatus::Fresh => style::green("fresh"),
-            schema::CacheStatus::Stale => style::yellow("stale"),
-            schema::CacheStatus::Orphan => style::red("orphan"),
-        };
-        println!(
-            "    {}  {}  [{status_label}]",
-            style::green(&format!("{:<18}", c.cmd_name)),
-            style::dim(&rel.display().to_string()),
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-fn cmd_schema_clear(filter: Option<&str>) -> ExitCode {
-    let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
-        return ExitCode::FAILURE;
-    };
-    match schema::clear_caches(&root, filter) {
-        Ok(removed) if removed.is_empty() => {
-            match filter {
-                Some(name) => println!("No cached schema for `{name}`."),
-                None => println!("No cached schemas to clear."),
-            }
-            ExitCode::SUCCESS
-        }
-        Ok(removed) => {
-            for p in &removed {
-                let rel = p.strip_prefix(&root).unwrap_or(p);
-                println!("Removed {}", rel.display());
-            }
-            println!();
-            println!("Cleared {} cache file(s).", removed.len());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            cli_error!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_schema_refresh(filter: Option<&str>) -> ExitCode {
-    let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
-        return ExitCode::FAILURE;
-    };
-    let results = match schema::refresh_caches(&root, filter) {
-        Ok(r) => r,
-        Err(e) => {
-            cli_error!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if results.is_empty() {
-        match filter {
-            Some(name) => println!("No cached schema for `{name}`."),
-            None => println!("No cached schemas to refresh."),
-        }
-        return ExitCode::SUCCESS;
-    }
-
-    let mut ok = 0usize;
-    let mut failed = 0usize;
-    for r in &results {
-        let rel = r.cache_path.strip_prefix(&root).unwrap_or(&r.cache_path);
-        match &r.outcome {
-            Ok(()) => {
-                ok += 1;
-                println!(
-                    "{}  {}  [{}]",
-                    style::green(&format!("{:<18}", r.cmd_name)),
-                    style::dim(&rel.display().to_string()),
-                    style::green("refreshed"),
-                );
-            }
-            Err(e) => {
-                failed += 1;
-                println!(
-                    "{}  {}  [{}]",
-                    style::green(&format!("{:<18}", r.cmd_name)),
-                    style::dim(&rel.display().to_string()),
-                    style::red("failed"),
-                );
-                println!("    {e}");
-            }
-        }
-    }
-    println!();
-    println!("Refreshed {ok}, failed {failed}.");
-    if failed > 0 {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-/// Resolve the project root (dir of nearest `fdl.yml`) for schema ops.
-/// All three sub-commands need it; factored here so each helper can
-/// cli_error! + return on missing config with one call.
-fn project_root_for_schema() -> Option<std::path::PathBuf> {
-    let cwd = env::current_dir().unwrap_or_default();
-    let base = config::find_config(&cwd)?;
-    base.parent().map(|p| p.to_path_buf())
-}
-
-fn print_schema_usage() {
-    println!("fdl schema -- inspect, clear, or refresh cached --fdl-schema outputs");
-    println!();
-    println!("{}:", style::yellow("Usage"));
-    println!("    fdl schema list [--json]");
-    println!("    fdl schema clear [<cmd>]");
-    println!("    fdl schema refresh [<cmd>]");
-    println!();
-    println!("{}:", style::yellow("Commands"));
-    println!(
-        "    {}  Show every cached schema with fresh/stale/orphan status",
-        style::green(&format!("{:<10}", "list"))
-    );
-    println!(
-        "    {}  Delete cached schema(s). No arg clears all; `<cmd>` clears one",
-        style::green(&format!("{:<10}", "clear"))
-    );
-    println!(
-        "    {}  Re-probe each entry's --fdl-schema and overwrite the cache",
-        style::green(&format!("{:<10}", "refresh"))
-    );
-    println!();
-    println!("Cached schemas live at `<cmd-dir>/.fdl/schema-cache/<cmd>.json`.");
-    println!("Cargo entries must be built before `refresh` (`cargo build ...`).");
-}
-
-// ---------------------------------------------------------------------------
-// libtorch subcommands
-// ---------------------------------------------------------------------------
-
-fn cmd_libtorch_list(json: bool) -> ExitCode {
-    let ctx = Context::resolve();
-    let root = &ctx.root;
-    let variants = libtorch::detect::list_variants(root);
-    let active = libtorch::detect::read_active(root);
-    let active_path = active.as_ref().map(|i| i.path.as_str());
-
-    if json {
-        print!("[");
-        for (i, v) in variants.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            let is_active = active_path == Some(v.as_str());
-            print!(
-                "{{\"variant\":\"{}\",\"active\":{}}}",
-                util::system::escape_json(v),
-                is_active
-            );
-        }
-        println!("]");
-    } else if variants.is_empty() {
-        println!("No libtorch variants installed.");
-        println!("Run: fdl libtorch download");
-    } else {
-        for v in &variants {
-            let marker = if active_path == Some(v.as_str()) {
-                " (active)"
-            } else {
-                ""
-            };
-            println!("  {v}{marker}");
-        }
-    }
-
-    ExitCode::SUCCESS
-}
-
-fn cmd_libtorch_info() -> ExitCode {
-    let ctx = Context::resolve();
-    let root = &ctx.root;
-    match libtorch::detect::read_active(root) {
-        Some(info) => {
-            println!("Active:   {}", info.path);
-            if let Some(v) = &info.torch_version {
-                println!("Version:  {v}");
-            }
-            if let Some(c) = &info.cuda_version {
-                println!("CUDA:     {c}");
-            }
-            if let Some(a) = &info.archs {
-                println!("Archs:    {a}");
-            }
-            if let Some(s) = &info.source {
-                println!("Source:   {s}");
-            }
-            ExitCode::SUCCESS
-        }
-        None => {
-            eprintln!("No active libtorch variant.");
-            eprintln!("Run: fdl libtorch download");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_libtorch_activate(variant: Option<&str>) -> ExitCode {
-    let ctx = Context::resolve();
-    let root = &ctx.root;
-    let variant = match variant {
-        Some(v) => v,
-        None => {
-            eprintln!("usage: fdl libtorch activate <variant>");
-            eprintln!();
-            eprintln!("Available variants:");
-            for v in libtorch::detect::list_variants(root) {
-                eprintln!("  {v}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if !libtorch::detect::is_valid_variant(root, variant) {
-        cli_error!("'{variant}' is not a valid libtorch variant");
-        eprintln!("  Expected: libtorch/{variant}/lib/ to exist");
-        eprintln!();
-        eprintln!("Available variants:");
-        for v in libtorch::detect::list_variants(root) {
-            eprintln!("  {v}");
-        }
-        return ExitCode::FAILURE;
-    }
-
-    match libtorch::detect::set_active(root, variant) {
-        Ok(()) => {
-            println!("Active variant set to: {variant}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            cli_error!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
-    use libtorch::download::{DownloadOpts, Variant};
-    use std::path::PathBuf;
-
-    // --cpu and --cuda are mutually exclusive.
-    if cli.cpu && cli.cuda.is_some() {
-        cli_error!("--cpu and --cuda are mutually exclusive");
-        return ExitCode::FAILURE;
-    }
-
-    let variant = if cli.cpu {
-        Variant::Cpu
-    } else {
-        match cli.cuda.as_deref() {
-            Some("12.6") => Variant::Cuda126,
-            Some("12.8") => Variant::Cuda128,
-            Some(_) => unreachable!("validated by #[option(choices = ...)]"),
-            None => Variant::Auto,
-        }
-    };
-
-    let opts = DownloadOpts {
-        variant,
-        custom_path: cli.path.map(PathBuf::from),
-        activate: !cli.no_activate,
-        dry_run: cli.dry_run,
-    };
-
-    match libtorch::download::run(opts) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            cli_error!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_libtorch_build(cli: LibtorchBuildArgs) -> ExitCode {
-    use libtorch::build::{BuildBackend, BuildOpts};
-
-    if cli.jobs == 0 {
-        cli_error!("--jobs must be a positive number");
-        return ExitCode::FAILURE;
-    }
-
-    // --docker and --native are mutually exclusive; absent -> Auto.
-    if cli.docker && cli.native {
-        cli_error!("--docker and --native are mutually exclusive");
-        return ExitCode::FAILURE;
-    }
-
-    let backend = if cli.docker {
-        BuildBackend::Docker
-    } else if cli.native {
-        BuildBackend::Native
-    } else {
-        BuildBackend::Auto
-    };
-
-    let opts = BuildOpts {
-        archs: cli.archs,
-        max_jobs: cli.jobs,
-        dry_run: cli.dry_run,
-        backend,
-    };
-
-    match libtorch::build::run(opts) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            cli_error!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_libtorch_remove(variant: Option<&str>) -> ExitCode {
-    let ctx = Context::resolve();
-    let root = &ctx.root;
-    let variant = match variant {
-        Some(v) => v,
-        None => {
-            eprintln!("usage: fdl libtorch remove <variant>");
-            eprintln!();
-            eprintln!("Installed variants:");
-            for v in libtorch::detect::list_variants(root) {
-                eprintln!("  {v}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match libtorch::manage::remove_variant(root, variant) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            cli_error!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Install
-// ---------------------------------------------------------------------------
-
-fn cmd_install(check_only: bool, dev: bool) -> ExitCode {
-    use std::path::PathBuf;
-    use std::process::{Command, Stdio};
-
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    let self_path = match env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            cli_error!("cannot determine own binary path: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let home = match env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-        Some(h) => PathBuf::from(h),
-        None => {
-            cli_error!("cannot determine home directory");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let bin_dir = home.join(".local/bin");
-    let dest = bin_dir.join("fdl");
-
-    // --check: compare versions
-    if check_only {
-        let latest = fetch_latest_github_tag();
-        println!("Installed: {current_version}");
-        // Check if current install is a symlink (dev mode)
-        if dest.is_symlink() {
-            if let Ok(target) = std::fs::read_link(&dest) {
-                println!("Mode:      dev (symlink -> {})", target.display());
-            }
-        }
-        match &latest {
-            Some(tag) => {
-                println!("Latest:    {tag}");
-                if tag == current_version {
-                    println!("Up to date.");
-                } else {
-                    println!("Update available. Run: fdl install");
-                }
-            }
-            None => println!("Latest:    (could not check GitHub)"),
-        }
-        return ExitCode::SUCCESS;
-    }
-
-    // Create ~/.local/bin/ if needed
-    if let Err(e) = std::fs::create_dir_all(&bin_dir) {
-        cli_error!("cannot create {}: {}", bin_dir.display(), e);
-        return ExitCode::FAILURE;
-    }
-
-    // --dev: symlink to the stable local-build location (~/.cargo/bin/fdl),
-    // which is where `cargo install --path flodl-cli` (== `fdl self-build`)
-    // drops the freshly-compiled binary. Every subsequent rebuild updates
-    // that same path, so the symlink is kept pointing at today's build for
-    // free. Falling back to `env::current_exe()` would footgun when the
-    // user happens to be running the binary *from* `~/.local/bin/fdl`
-    // itself — `canonicalize()` returns that same path and we'd create a
-    // symlink to itself (Too many levels of symbolic links).
-    if dev {
-        #[cfg(unix)]
-        {
-            let cargo_bin = home.join(".cargo/bin/fdl");
-            let self_canonical = self_path.canonicalize().unwrap_or(self_path.clone());
-
-            // Prefer the cargo-install target; fall back to the running
-            // binary only when cargo-install isn't present.
-            let target = if cargo_bin.is_file() {
-                cargo_bin.canonicalize().unwrap_or(cargo_bin)
-            } else {
-                self_canonical.clone()
-            };
-
-            // Self-loop guard: refuse to symlink dest to itself.
-            //
-            // Compare the fully-resolved `target` against the resolved
-            // `dest` when it exists, and fall back to the raw `dest`
-            // path otherwise. Raw-only would miss the case where
-            // `~/.cargo/bin/fdl` already symlinks (transitively) back
-            // to `~/.local/bin/fdl`; canonical-only would fail when
-            // `dest` does not yet exist.
-            let dest_resolved = dest.canonicalize().unwrap_or_else(|_| dest.clone());
-            if target == dest_resolved || target == dest {
-                eprintln!(
-                    "error: --dev cannot symlink `{}` to itself.",
-                    dest.display()
-                );
-                eprintln!();
-                eprintln!(
-                    "The currently-running `fdl` is installed at the dest path \
-                     and no stable cargo build exists at `{}`.",
-                    home.join(".cargo/bin/fdl").display()
-                );
-                eprintln!();
-                eprintln!("Build one first:");
-                eprintln!("    cargo install --path flodl-cli");
-                eprintln!("    # or (from inside a flodl checkout):");
-                eprintln!("    fdl self-build");
-                eprintln!();
-                eprintln!("Then rerun `fdl install --dev`.");
-                return ExitCode::FAILURE;
-            }
-
-            // Remove existing (file or symlink) before linking.
-            if dest.exists() || dest.is_symlink() {
-                let _ = std::fs::remove_file(&dest);
-            }
-
-            match std::os::unix::fs::symlink(&target, &dest) {
-                Ok(()) => {
-                    println!("Linked fdl -> {}", target.display());
-                    println!("Global fdl now tracks your local build.");
-                    println!("Rebuild with: cargo install --path flodl-cli (or `fdl self-build`).");
-                }
-                Err(e) => {
-                    cli_error!("symlink failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-
-            return print_path_hint(&bin_dir);
-        }
-
-        #[cfg(not(unix))]
-        {
-            eprintln!("--dev mode requires Unix (symlinks). Use fdl install without --dev.");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Normal install: download from GitHub if newer, else copy self
-    let latest = fetch_latest_github_tag();
-
-    // Check installed version
-    let installed_version = if dest.exists() && !dest.is_symlink() {
-        let self_canonical = self_path.canonicalize().unwrap_or(self_path.clone());
-        let dest_canonical = dest.canonicalize().unwrap_or(dest.clone());
-        if self_canonical == dest_canonical {
-            Some(current_version.to_string())
-        } else {
-            Command::new(&dest)
-                .arg("version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .and_then(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .trim()
-                        .strip_prefix("flodl-cli ")
-                        .map(|v| v.to_string())
-                })
-        }
-    } else {
-        None
-    };
-
-    // Was it a dev symlink? Switching to copy mode.
-    let was_dev = dest.is_symlink();
-    if was_dev {
-        let _ = std::fs::remove_file(&dest);
-    }
-
-    // Decide source: download if newer, else copy self
-    let source_path;
-    let source_version;
-    let mut downloaded_path: Option<PathBuf> = None;
-
-    if let Some(ref tag) = latest {
-        if tag != current_version && is_newer(tag, current_version) {
-            match download_release_binary(tag, &home) {
-                Ok(path) => {
-                    source_version = tag.clone();
-                    source_path = path.clone();
-                    downloaded_path = Some(path);
-                }
-                Err(e) => {
-                    eprintln!("warning: could not download {tag}: {e}");
-                    eprintln!("Installing current binary ({current_version}) instead.");
-                    source_path = self_path.clone();
-                    source_version = current_version.to_string();
-                }
-            }
-        } else {
-            source_path = self_path.clone();
-            source_version = current_version.to_string();
-        }
-    } else {
-        source_path = self_path.clone();
-        source_version = current_version.to_string();
-    }
-
-    // Check if update is needed
-    if !was_dev {
-        if let Some(ref iv) = installed_version {
-            if iv == &source_version {
-                println!("fdl {} is already installed at {}", iv, dest.display());
-                if let Some(ref dl) = downloaded_path {
-                    let _ = std::fs::remove_file(dl);
-                }
-                return ExitCode::SUCCESS;
-            }
-            println!("Updating fdl {iv} -> {source_version}");
-        } else {
-            println!("Installing fdl {source_version}");
-        }
-    } else {
-        println!("Switching from dev symlink to installed copy ({source_version})");
-    }
-
-    // Copy
-    if let Err(e) = std::fs::copy(&source_path, &dest) {
-        cli_error!("{e}");
-        return ExitCode::FAILURE;
-    }
-
-    if let Some(ref dl) = downloaded_path {
-        let _ = std::fs::remove_file(dl);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-    }
-
-    println!("Installed fdl {} to {}", source_version, dest.display());
-    print_path_hint(&bin_dir)
-}
-
-fn print_path_hint(bin_dir: &std::path::Path) -> ExitCode {
-    let path_var = env::var("PATH").unwrap_or_default();
-    let bin_dir_str = bin_dir.to_string_lossy();
-    let in_path = path_var.split(':').any(|p| p == bin_dir_str.as_ref());
-
-    if !in_path {
-        println!();
-        println!("~/.local/bin is not in your PATH. Add it:");
-        println!();
-        let shell = env::var("SHELL").unwrap_or_default();
-        if shell.contains("zsh") {
-            println!("  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc");
-        } else {
-            println!(
-                "  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && source ~/.bashrc"
-            );
-        }
-    }
-
-    ExitCode::SUCCESS
-}
-
-/// Fetch the latest release tag from GitHub.
-fn fetch_latest_github_tag() -> Option<String> {
-    use std::process::{Command, Stdio};
-    let output = Command::new("curl")
-        .args(["-sI", "https://github.com/flodl-labs/flodl/releases/latest"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.to_lowercase().starts_with("location:") {
-            let tag = line.rsplit('/').next()?.trim();
-            if !tag.is_empty() {
-                return Some(tag.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Simple version comparison: "0.3.1" > "0.3.0".
-fn is_newer(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
-    let va = parse(a);
-    let vb = parse(b);
-    va > vb
-}
-
-/// Download the fdl binary for this platform from a GitHub release.
-fn download_release_binary(tag: &str, home: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let os = if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "macos") {
-        "darwin"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        return Err("unsupported OS".into());
-    };
-
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        if cfg!(target_os = "macos") {
-            "arm64"
-        } else {
-            "aarch64"
-        }
-    } else {
-        return Err("unsupported architecture".into());
-    };
-
-    let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
-    let artifact = format!("flodl-cli-{os}-{arch}{ext}");
-    let url = format!("https://github.com/flodl-labs/flodl/releases/download/{tag}/{artifact}");
-
-    let tmp = home.join(".flodl").join("tmp");
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("cannot create temp dir: {e}"))?;
-    let dest = tmp.join(format!("fdl-{tag}{ext}"));
-
-    println!("Downloading fdl {tag} from GitHub...");
-    util::http::download_file(&url, &dest)?;
-
-    Ok(dest)
-}
-
-// ---------------------------------------------------------------------------
-// fdl.yaml dispatch
-// ---------------------------------------------------------------------------
-
-fn load_project_config(
-    cwd: &std::path::Path,
-    env: Option<&str>,
-) -> Option<(config::ProjectConfig, std::path::PathBuf)> {
-    let config_path = config::find_config(cwd)?;
-    let root = config_path.parent()?.to_path_buf();
-    let project = config::load_project_with_env(&config_path, env).ok()?;
-    Some((project, root))
-}
-
-
-/// Dispatch an unknown top-level token through the unified `commands:`
-/// graph declared in fdl.yml. Handles arbitrary nesting: each step either
-/// recurses into a child fdl.yml (Path), executes a self-contained shell
-/// command (Run), or invokes the enclosing entry with merged preset
-/// fields (Preset).
-///
-/// The graph walk itself lives in [`dispatch::walk_commands`] and is
-/// pure — this wrapper performs the actual IO (process spawning, stdout
-/// writes, exit code mapping) based on the returned [`WalkOutcome`].
-fn dispatch_config(
-    cmd: &str,
-    args: &[String],
-    env: Option<&str>,
-    no_append: bool,
-) -> ExitCode {
-    let cwd = env::current_dir().unwrap_or_default();
-    let (project, project_root) = match load_project_config(&cwd, env) {
-        Some(pair) => pair,
-        None => {
-            eprintln!("unknown command: {cmd}");
-            eprintln!();
-            print_usage();
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let tail: &[String] = args.get(2..).unwrap_or(&[]);
-    let outcome = walk_commands(cmd, tail, &project.commands, &project_root, env);
-
-    match outcome {
-        WalkOutcome::RunScript {
-            command,
-            append,
-            user_args,
-            docker,
-            cwd,
-        } => {
-            let effective_append = if no_append { None } else { append.as_deref() };
-            run::exec_script(
-                &command,
-                effective_append,
-                &user_args,
-                docker.as_deref(),
-                &cwd,
-            )
-        }
-        WalkOutcome::ExecCommand {
-            config,
-            preset,
-            tail,
-            cmd_dir,
-        } => run::exec_command(&config, preset.as_deref(), &tail, &cmd_dir, &project_root),
-        WalkOutcome::RefreshSchema {
-            config,
-            cmd_dir,
-            cmd_name,
-        } => cmd_refresh_schema(&config, &cmd_dir, &cmd_name),
-        WalkOutcome::PrintCommandHelp { config, name } => {
-            run::print_command_help(&config, &name);
-            ExitCode::SUCCESS
-        }
-        WalkOutcome::PrintPresetHelp {
-            config,
-            parent_label,
-            preset_name,
-        } => {
-            run::print_preset_help(&config, &parent_label, &preset_name);
-            ExitCode::SUCCESS
-        }
-        WalkOutcome::PrintRunHelp {
-            name,
-            description,
-            run,
-            append,
-            docker,
-        } => {
-            run::print_run_help(
-                &name,
-                description.as_deref(),
-                &run,
-                append.as_deref(),
-                docker.as_deref(),
-            );
-            ExitCode::SUCCESS
-        }
-        WalkOutcome::UnknownCommand { name } => {
-            eprintln!("unknown command: {name}");
-            eprintln!();
-            run::print_project_help(&project, &project_root, env);
-            ExitCode::FAILURE
-        }
-        WalkOutcome::PresetAtTopLevel { name } => {
-            eprintln!(
-                "error: preset command `{name}` has no enclosing \
-                 fdl.yml (top-level commands must be `run:` or `path:`)"
-            );
-            ExitCode::FAILURE
-        }
-        WalkOutcome::Error(msg) => {
-            cli_error!("{msg}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// `fdl config show [<env>]` — print the resolved merged config.
-///
-/// `tail` is `args[1..]`: `tail[0]` is always "config", `tail[1]` is the
-/// sub-command ("show"), `tail[2..]` carry options (an optional explicit
-/// `<env>` that overrides the first-arg env detection).
-fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> ExitCode {
-    let sub = tail.get(1).map(String::as_str).unwrap_or("--help");
-    match sub {
-        "show" => {}
-        "--help" | "-h" => {
-            print_config_usage();
-            return ExitCode::SUCCESS;
-        }
-        other => {
-            eprintln!("unknown config sub-command: {other}");
-            eprintln!();
-            print_config_usage();
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Optional explicit env override: `fdl config show prod`.
-    let explicit_env = tail.get(2).map(String::as_str);
-    let target_env = explicit_env.or(active_env);
-
-    let cwd = env::current_dir().unwrap_or_default();
-    let base = match config::find_config(&cwd) {
-        Some(p) => p,
-        None => {
-            cli_error!("no fdl.yml found in {} or parent directories", cwd.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Resolve every contributing layer (including `inherit-from:`
-    // ancestors) so we can tag each leaf with its source file, not just
-    // "base/overlay". Layer order matches `load_merged_value`: deepest
-    // ancestor first, env overlay chain last.
-    let layers = match config::resolve_config_layers(&base, target_env) {
-        Ok(ls) => ls,
-        Err(e) => {
-            cli_error!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let labels: Vec<String> = layers
-        .iter()
-        .map(|(p, _)| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string()
-        })
-        .collect();
-    let values: Vec<serde_yaml::Value> =
-        layers.iter().map(|(_, v)| v.clone()).collect();
-
-    let annotated = overlay::merge_layers_annotated(&values);
-    print!("{}", overlay::render_annotated_yaml(&annotated, &labels));
-    ExitCode::SUCCESS
-}
-
-fn print_config_usage() {
-    println!("fdl config -- inspect resolved project configuration");
-    println!();
-    println!("USAGE:");
-    println!("    fdl config show [<env>]");
-    println!();
-    println!("Without an env argument, prints the base fdl.yml. With an env argument");
-    println!("(e.g. `fdl config show ci`), prints the base deep-merged with");
-    println!("fdl.<env>.yml. When invoked through the first-arg form");
-    println!("(`fdl ci config show`), the env is already active and no extra");
-    println!("argument is needed.");
-}
-
-/// `fdl <cmd> --refresh-schema`: run `<entry> --fdl-schema`, validate, cache.
-///
-/// Required for cargo-based entries, which are never auto-probed (compile
-/// latency would ruin `--help`). Users build once, then run this explicitly.
-fn cmd_refresh_schema(
-    cmd_config: &config::CommandConfig,
-    cmd_dir: &std::path::Path,
-    cmd_name: &str,
-) -> ExitCode {
-    let entry = match &cmd_config.entry {
-        Some(e) => e.as_str(),
-        None => {
-            eprintln!(
-                "error: no entry point defined in {}/fdl.yml",
-                cmd_dir.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    eprintln!("Probing `{entry} --fdl-schema`...");
-    let schema = match schema_cache::probe(entry, cmd_dir, cmd_config.docker.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            cli_error!("{e}");
-            if schema_cache::is_cargo_entry(entry) {
-                eprintln!();
-                eprintln!("Hint: cargo-based entries must be built first.");
-                eprintln!("Build with the right features, then rerun this command.");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let cache = schema_cache::cache_path(cmd_dir, cmd_name);
-    if let Err(e) = schema_cache::write_cache(&cache, &schema) {
-        cli_error!("{e}");
-        return ExitCode::FAILURE;
-    }
-    eprintln!("Cached schema for `{cmd_name}` at {}", cache.display());
-    eprintln!(
-        "  {} options, {} positional args",
-        schema.options.len(),
-        schema.args.len()
-    );
-    ExitCode::SUCCESS
-}
+mod cli;
+use cli::libtorch::dispatch_libtorch;
+use cli::nccl::dispatch_nccl;
+use cli::schema::dispatch_schema;
+use cli::install::cmd_install;
+use cli::config::{cmd_config_show, dispatch_config, load_project_config};
 
 // ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 
-fn print_usage() {
+pub(crate) fn print_usage() {
     println!("flodl-cli {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("The floDl companion tool: setup, libtorch, diagnostics, API reference.");
@@ -1447,6 +594,7 @@ fn print_usage() {
     println!("    -vvv               Trace output (maximum detail)");
     println!("    -q, --quiet        Suppress all non-error output");
     println!("    --no-append        Drop a run command's `append:` suffix (cargo / runner defaults)");
+    println!("    --no-prebuild      Skip the cluster pre-flight build (assumes binaries are fresh)");
     println!();
     println!("COMMANDS:");
     println!("    setup              Interactive guided setup");
@@ -1496,8 +644,21 @@ fn print_usage() {
 fn extract_verbosity(args: &[String]) -> (Vec<String>, Option<u8>) {
     let mut level: Option<u8> = None;
     let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
 
     for arg in args {
+        // A verbosity flag after the first standalone `--` is bound for the
+        // inner command; forward it (and everything after) verbatim, matching
+        // the other global-flag extractors.
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "-vvv" => level = Some(4), // Trace
             "-vv" => level = Some(3),  // Debug
@@ -1545,18 +706,59 @@ fn extract_no_append(args: &[String]) -> (Vec<String>, bool) {
     (filtered, found)
 }
 
+/// Strip `--no-prebuild` from `args`, returning a bool that's true
+/// when the flag was present. Symmetric with [`extract_no_append`];
+/// stops scanning at the first standalone `--` so a literal
+/// `--no-prebuild` after the user's `--` reaches the inner script.
+fn extract_no_prebuild(args: &[String]) -> (Vec<String>, bool) {
+    let mut found = false;
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
+
+    for arg in args {
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--no-prebuild" {
+            found = true;
+            continue;
+        }
+        filtered.push(arg.clone());
+    }
+
+    (filtered, found)
+}
+
 /// Strip `--ansi` / `--no-ansi` from `args`, returning a
 /// [`style::ColorChoice`] override when either was present. Errors if
 /// both are given (ambiguous). Scan-anywhere, consistent with `-v`
-/// and `--env` — global flags aren't position-locked.
+/// and `--env` — global flags aren't position-locked. Stops at the first
+/// standalone `--`, so an `--ansi` / `--no-ansi` past the separator is
+/// forwarded to the inner command untouched.
 fn extract_ansi_flags(
     args: &[String],
 ) -> Result<(Vec<String>, Option<style::ColorChoice>), String> {
     let mut ansi = false;
     let mut no_ansi = false;
     let mut filtered = Vec::with_capacity(args.len());
+    let mut past_dashdash = false;
 
     for arg in args {
+        if past_dashdash {
+            filtered.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            past_dashdash = true;
+            filtered.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "--ansi" => ansi = true,
             "--no-ansi" => no_ansi = true,
@@ -1575,299 +777,6 @@ fn extract_ansi_flags(
     Ok((filtered, choice))
 }
 
-fn print_libtorch_usage() {
-    println!("fdl libtorch -- manage libtorch installations");
-    println!();
-    println!("USAGE:");
-    println!("    fdl libtorch <command> [options]");
-    println!();
-    println!("COMMANDS:");
-    println!("    download           Download pre-built libtorch");
-    println!("        --cpu          Force CPU variant");
-    println!("        --cuda <ver>   Specific CUDA version (12.6, 12.8)");
-    println!("    build              Build libtorch from source");
-    println!("        --docker       Force Docker build (isolated, reproducible)");
-    println!("        --native       Force native build (faster, requires host toolchain)");
-    println!("        --archs <list> Override CUDA architectures");
-    println!("        --jobs <n>     Parallel compilation jobs (default: 6)");
-    println!("    list               Show installed variants");
-    println!("        --json         JSON output");
-    println!("    activate <name>    Set active variant");
-    println!("    remove <name>      Remove a variant");
-    println!("    info               Show active variant details");
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::{Path, PathBuf};
-
-    fn args(xs: &[&str]) -> Vec<String> {
-        xs.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Zero-dep tempdir helper — matches the pattern used in overlay.rs /
-    /// dispatch.rs (no `tempfile` crate dependency in flodl-cli).
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("fdl-env-test-{pid}-{n}"));
-            std::fs::create_dir_all(&dir).expect("tempdir creation");
-            TempDir(dir)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn touch(path: &Path, contents: &str) {
-        std::fs::write(path, contents).expect("write fixture");
-    }
-
-    #[test]
-    fn extract_env_flag_absent_returns_none() {
-        let (out, env) = extract_env_flag(&args(&["fdl", "test"])).unwrap();
-        assert_eq!(out, args(&["fdl", "test"]));
-        assert!(env.is_none());
-    }
-
-    #[test]
-    fn extract_env_flag_long_separated_form() {
-        let (out, env) = extract_env_flag(&args(&["fdl", "--env", "ci", "test"])).unwrap();
-        assert_eq!(out, args(&["fdl", "test"]));
-        assert_eq!(env.as_deref(), Some("ci"));
-    }
-
-    #[test]
-    fn extract_env_flag_equals_form() {
-        let (out, env) = extract_env_flag(&args(&["fdl", "--env=ci", "test"])).unwrap();
-        assert_eq!(out, args(&["fdl", "test"]));
-        assert_eq!(env.as_deref(), Some("ci"));
-    }
-
-    #[test]
-    fn extract_env_flag_scans_anywhere() {
-        // Matches `-v`/`-q` global-flag convention: strippable from any position.
-        let (out, env) = extract_env_flag(&args(&["fdl", "test", "--env", "prod"])).unwrap();
-        assert_eq!(out, args(&["fdl", "test"]));
-        assert_eq!(env.as_deref(), Some("prod"));
-    }
-
-    #[test]
-    fn extract_env_flag_missing_value_errors() {
-        let err = extract_env_flag(&args(&["fdl", "--env"])).unwrap_err();
-        assert!(err.contains("--env requires a value"), "got: {err}");
-    }
-
-    #[test]
-    fn extract_env_flag_empty_equals_errors() {
-        let err = extract_env_flag(&args(&["fdl", "--env="])).unwrap_err();
-        assert!(err.contains("requires a value"), "got: {err}");
-    }
-
-    #[test]
-    fn extract_env_flag_value_looks_like_flag_errors() {
-        // `fdl --env --help` almost certainly means the user forgot the value;
-        // loud error beats silently treating `--help` as the env name.
-        let err = extract_env_flag(&args(&["fdl", "--env", "--help"])).unwrap_err();
-        assert!(err.contains("--env requires a value"), "got: {err}");
-    }
-
-    #[test]
-    fn extract_env_flag_duplicate_errors() {
-        let err = extract_env_flag(&args(&["fdl", "--env", "ci", "--env", "prod"])).unwrap_err();
-        assert!(err.contains("more than once"), "got: {err}");
-    }
-
-    #[test]
-    fn extract_env_flag_duplicate_mixed_forms_errors() {
-        let err = extract_env_flag(&args(&["fdl", "--env=ci", "--env", "prod"])).unwrap_err();
-        assert!(err.contains("more than once"), "got: {err}");
-    }
-
-    // --- resolve_env: precedence + error paths ----------------------------
-    //
-    // These exercise the full flag / env-var / first-arg composition with
-    // real fixture files on disk. Injecting `cwd` + `fdl_env` keeps them
-    // hermetic (no mutation of the process cwd or environment).
-
-    #[test]
-    fn resolve_env_flag_wins_over_env_var_and_first_arg() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-        touch(&tmp.path().join("fdl.prod.yml"), "");
-        touch(&tmp.path().join("fdl.stage.yml"), "");
-
-        // --env prod is explicit → beats FDL_ENV=stage and the `ci` first-arg.
-        let (env, rest) = resolve_env(
-            &args(&["fdl", "ci", "--env", "prod", "test"]),
-            tmp.path(),
-            Some("stage"),
-        )
-        .unwrap();
-        assert_eq!(env.as_deref(), Some("prod"));
-        // --env/--env=value tokens stripped; `ci` stays as the first-arg candidate,
-        // which resolve_env_first_arg is skipped for entirely.
-        assert_eq!(rest, args(&["fdl", "ci", "test"]));
-    }
-
-    #[test]
-    fn resolve_env_env_var_wins_over_first_arg() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-        touch(&tmp.path().join("fdl.stage.yml"), "");
-
-        let (env, rest) =
-            resolve_env(&args(&["fdl", "ci", "test"]), tmp.path(), Some("stage")).unwrap();
-        assert_eq!(env.as_deref(), Some("stage"));
-        // First-arg `ci` left untouched when FDL_ENV takes over.
-        assert_eq!(rest, args(&["fdl", "ci", "test"]));
-    }
-
-    #[test]
-    fn resolve_env_empty_env_var_falls_through_to_first_arg() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
-        let (env, rest) = resolve_env(&args(&["fdl", "ci", "test"]), tmp.path(), Some("")).unwrap();
-        assert_eq!(env.as_deref(), Some("ci"));
-        assert_eq!(rest, args(&["fdl", "test"]));
-    }
-
-    #[test]
-    fn resolve_env_first_arg_still_works_when_no_explicit_selector() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
-        let (env, rest) = resolve_env(&args(&["fdl", "ci", "test"]), tmp.path(), None).unwrap();
-        assert_eq!(env.as_deref(), Some("ci"));
-        assert_eq!(rest, args(&["fdl", "test"]));
-    }
-
-    #[test]
-    fn resolve_env_flag_errors_on_missing_overlay() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
-        let err = resolve_env(&args(&["fdl", "--env", "nope", "test"]), tmp.path(), None)
-            .unwrap_err();
-        assert!(err.contains("--env"), "got: {err}");
-        assert!(err.contains("nope"), "got: {err}");
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_env_env_var_errors_on_missing_overlay() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
-        let err = resolve_env(&args(&["fdl", "test"]), tmp.path(), Some("nope")).unwrap_err();
-        assert!(err.contains("FDL_ENV"), "got: {err}");
-        assert!(err.contains("nope"), "got: {err}");
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_env_equals_form_consumes_single_token() {
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-        touch(&tmp.path().join("fdl.ci.yml"), "");
-
-        let (env, rest) =
-            resolve_env(&args(&["fdl", "test", "--env=ci"]), tmp.path(), None).unwrap();
-        assert_eq!(env.as_deref(), Some("ci"));
-        assert_eq!(rest, args(&["fdl", "test"]));
-    }
-
-    #[test]
-    fn resolve_env_first_arg_unknown_falls_through() {
-        // `deploy` isn't an env overlay — leave it as the first positional.
-        let tmp = TempDir::new();
-        touch(&tmp.path().join("fdl.yml"), "");
-
-        let (env, rest) =
-            resolve_env(&args(&["fdl", "deploy", "--now"]), tmp.path(), None).unwrap();
-        assert!(env.is_none());
-        assert_eq!(rest, args(&["fdl", "deploy", "--now"]));
-    }
-
-    // ── --ansi / --no-ansi extraction ────────────────────────────────────
-
-    #[test]
-    fn extract_ansi_flags_absent_returns_none() {
-        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "setup"])).unwrap();
-        assert_eq!(rest, args(&["fdl", "setup"]));
-        assert!(choice.is_none());
-    }
-
-    #[test]
-    fn extract_ansi_flags_ansi_forces_always() {
-        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "--ansi", "setup"])).unwrap();
-        assert_eq!(rest, args(&["fdl", "setup"]));
-        assert_eq!(choice, Some(style::ColorChoice::Always));
-    }
-
-    #[test]
-    fn extract_ansi_flags_no_ansi_forces_never() {
-        let (rest, choice) = extract_ansi_flags(&args(&["fdl", "--no-ansi", "setup"])).unwrap();
-        assert_eq!(rest, args(&["fdl", "setup"]));
-        assert_eq!(choice, Some(style::ColorChoice::Never));
-    }
-
-    #[test]
-    fn extract_ansi_flags_scans_anywhere() {
-        // Position-independent, consistent with -v / --env.
-        let (rest, choice) =
-            extract_ansi_flags(&args(&["fdl", "setup", "--no-ansi"])).unwrap();
-        assert_eq!(rest, args(&["fdl", "setup"]));
-        assert_eq!(choice, Some(style::ColorChoice::Never));
-    }
-
-    #[test]
-    fn extract_ansi_flags_both_set_errors() {
-        let err = extract_ansi_flags(&args(&["fdl", "--ansi", "--no-ansi"])).unwrap_err();
-        assert!(err.contains("mutually exclusive"), "got: {err}");
-    }
-
-    #[test]
-    fn extract_no_append_absent_returns_false() {
-        let (out, found) = extract_no_append(&args(&["fdl", "test"]));
-        assert_eq!(out, args(&["fdl", "test"]));
-        assert!(!found);
-    }
-
-    #[test]
-    fn extract_no_append_strips_flag_from_anywhere_before_dashdash() {
-        let (out, found) =
-            extract_no_append(&args(&["fdl", "test", "--no-append", "--", "-p", "x"]));
-        assert_eq!(out, args(&["fdl", "test", "--", "-p", "x"]));
-        assert!(found);
-    }
-
-    #[test]
-    fn extract_no_append_preserves_flag_after_dashdash() {
-        // Past the first `--` the token is bound for the inner script,
-        // so don't swallow it — escape hatch for run-scripts whose own
-        // proxy flags collide.
-        let (out, found) =
-            extract_no_append(&args(&["fdl", "test", "--", "--no-append"]));
-        assert_eq!(out, args(&["fdl", "test", "--", "--no-append"]));
-        assert!(!found);
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

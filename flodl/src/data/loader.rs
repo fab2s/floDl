@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use super::prefetch::PrefetchWorker;
+use super::sample_cache::SampleCache;
 use super::sampler::{RandomSampler, Sampler, SequentialSampler};
 use super::{Batch, BatchDataSet, DataSet, DataSetAdapter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -36,8 +37,8 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     let idx = device.index() as i32;
 
     match crate::tensor::cuda_memory_info_idx(idx) {
-        Ok((free, total)) => {
-            let used = total.saturating_sub(free);
+        // The probe returns (used, total) — used first, not free.
+        Ok((used, total)) => {
             let cap = (total as f64 * VRAM_MAX_USAGE) as u64;
             let budget = cap.saturating_sub(used);
             total_bytes < budget
@@ -51,45 +52,59 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
 /// at `epoch()` time when free VRAM reflects actual model allocation.
 const BOOTSTRAP_PREFETCH: usize = 4;
 
-/// Compute prefetch depth from VRAM usage cap.
-///
-/// `max_usage` is the fraction of **total** VRAM to use (default 0.90).
-/// The prefetch budget is the gap between current usage and the cap,
-/// minus `activation_reserve` bytes reserved for forward/backward
-/// activation memory and gradients.
-///
-/// Called at each `epoch()` boundary. By that point the model, optimizer,
-/// and any other allocations are done, so current usage is the real baseline.
-pub(crate) fn prefetch_depth_from_vram(
-    per_sample_bytes: usize,
-    batch_size: usize,
-    device: Device,
-    max_usage: f64,
-    activation_reserve: usize,
-) -> usize {
-    if !device.is_cuda() {
-        return 2; // CPU: just double-buffer
-    }
-
-    let batch_bytes = per_sample_bytes * batch_size;
-    if batch_bytes == 0 {
-        return 2;
-    }
-
-    let idx = device.index() as i32;
-    let (free, total) = crate::tensor::cuda_memory_info_idx(idx)
-        .unwrap_or((0, 0));
-
-    let used = (total as usize).saturating_sub(free as usize);
-    let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
-    let budget = cap.saturating_sub(used + activation_reserve);
-
-    budget / batch_bytes
+/// Where the streaming loader's activation reserve came from. Decides
+/// how much of the computed budget the FIRST fill may take: before the
+/// first training step, the VRAM probe cannot see activations,
+/// gradients, or lazily created optimizer state, so the fill is
+/// discounted by how much of that gap the reserve already covers.
+/// After the first step the probe is honest (the allocator retains
+/// those blocks) and the full budget applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReserveSource {
+    /// No information: reserve is 0, first fill takes 1/3 of budget.
+    Bare,
+    /// Framework-derived (3x parameter bytes via `Graph::set_data_loader`):
+    /// gradients (~1x) and lazy optimizer state (~2x, Adam-family) are
+    /// covered; activations are not. First fill takes 1/2.
+    Auto,
+    /// User-declared via `activation_reserve()`: full trust, no haircut.
+    User,
 }
+
+/// First-fill target from the computed full-budget depth: the graduated
+/// haircut for the sizing done before any training step has run.
+pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> usize {
+    let divisor = match source {
+        ReserveSource::Bare => 3,
+        ReserveSource::Auto => 2,
+        ReserveSource::User => 1,
+    };
+    (full_depth / divisor).max(1)
+}
+
+// Budget policy (ring sizing, cache budget, prefetch depth) lives in
+// `data::budget` — one law shared with the DDP worker/stager paths.
+// Re-exported here for this module's call sites and its test file.
+pub(crate) use super::budget::{
+    prefetch_depth_from_vram, ring_slots_from_ram, sample_cache_budget, RING_SLOTS_WITH_CACHE,
+};
+#[cfg(test)]
+pub(crate) use super::budget::RING_SLOTS_FALLBACK;
 
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder
 // ---------------------------------------------------------------------------
+
+/// Pick-space context shared by both loader modes: augmentation
+/// multiplicity, the shuffle seed (which keys the transform), and the
+/// delivery transform itself. At `augment = 1` with no transform this
+/// is inert — picks and sample ids coincide.
+#[derive(Clone)]
+pub(crate) struct PickCtx {
+    pub(crate) augment: usize,
+    pub(crate) seed: u64,
+    pub(crate) transform: Option<crate::data::TransformFn>,
+}
 
 /// Builder for [`DataLoader`]. Constructed via
 /// [`DataLoader::from_dataset`] or [`DataLoader::from_batch_dataset`].
@@ -104,6 +119,19 @@ pub struct DataLoaderBuilder {
     force_streaming: bool,
     names: Option<Vec<String>>,
     vram_max_usage: f64,
+    ram_max_usage: f64,
+    activation_reserve: Option<usize>,
+    /// Read-through sample cache created by `from_dataset` (None for
+    /// opaque `BatchDataSet` loaders). The adapter inside `dataset`
+    /// holds the other Arc.
+    pub(crate) sample_cache: Option<Arc<SampleCache>>,
+    sample_cache_enabled: bool,
+    disk_stage_bytes: u64,
+    disk_stage_dir: Option<std::path::PathBuf>,
+    vram_pool_enabled: bool,
+    no_shuffle: bool,
+    augment: usize,
+    transform: Option<crate::data::TransformFn>,
 }
 
 impl DataLoaderBuilder {
@@ -119,6 +147,16 @@ impl DataLoaderBuilder {
             force_streaming: false,
             names: None,
             vram_max_usage: 0.90,
+            ram_max_usage: 0.50,
+            activation_reserve: None,
+            sample_cache: None,
+            sample_cache_enabled: true,
+            disk_stage_bytes: 0,
+            disk_stage_dir: None,
+            vram_pool_enabled: super::vram_pool::VRAM_POOL_DEFAULT,
+            no_shuffle: false,
+            augment: 1,
+            transform: None,
         }
     }
 
@@ -155,10 +193,7 @@ impl DataLoaderBuilder {
     /// When `false`, uses [`SequentialSampler`] (indices in order every epoch).
     /// This is overridden if [`sampler`](DataLoaderBuilder::sampler) is called.
     pub fn shuffle(mut self, shuffle: bool) -> Self {
-        if !shuffle {
-            let n = self.dataset.len();
-            self.sampler = Some(Box::new(SequentialSampler::new(n)));
-        }
+        self.no_shuffle = !shuffle;
         self
     }
 
@@ -168,13 +203,59 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Augmentation multiplicity: each sample appears `k` times per
+    /// epoch, spread by the shuffle. Default: 1.
+    ///
+    /// Pure scheduling — every one of the `k` picks fetches the same
+    /// raw bytes (staged once across the tiers); data variation comes
+    /// exclusively from the [`transform`](DataLoaderBuilder::transform),
+    /// keyed per pick. Without a transform, `k > 1` is plain
+    /// oversampling (`k` identical views per epoch). An epoch is one
+    /// pass over the `len() * k` picks, so batch counts scale by `k`.
+    ///
+    /// Composes with the built-in samplers only; combining with
+    /// [`sampler`](DataLoaderBuilder::sampler) is a build error.
+    pub fn augment(mut self, k: usize) -> Self {
+        self.augment = k.max(1);
+        self
+    }
+
+    /// Deterministic per-batch transform applied at delivery — the
+    /// sanctioned home for augmentation (see [`PickKey`]).
+    ///
+    /// Receives the delivered rows (raw bytes, already on the target
+    /// device, freshly assembled — never aliasing the staging tiers)
+    /// and one [`PickKey`] per row. Must be a pure function of
+    /// `(rows, keys)` and preserve the row count; derive per-view
+    /// randomness from [`PickKey::rng`]. Runs live on every delivery:
+    /// the tiers retain raw samples only, and each pick re-derives its
+    /// view — for a VRAM-pooled sample that is one upload and `k`
+    /// on-device realizations.
+    ///
+    /// [`PickKey`]: crate::data::PickKey
+    /// [`PickKey::rng`]: crate::data::PickKey::rng
+    pub fn transform(
+        mut self,
+        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> Result<Vec<Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.transform = Some(crate::data::TransformFn::new(f));
+        self
+    }
+
     /// Override auto-detected prefetch depth (streaming mode only).
     ///
     /// Auto-detection fills `(1 - margin)` of free VRAM at build time.
     /// Use this to set a specific depth instead. Disables automatic
     /// per-epoch adaptation.
     ///
-    /// Set to 0 for synchronous loading (no background thread).
+    /// The streaming loader always runs a background prefetch thread; a
+    /// depth of `0` is clamped to `1`, not switched to synchronous loading.
+    /// Synchronous, single-threaded loading is the *resident* path, chosen
+    /// automatically when the dataset fits in VRAM (it is not selectable
+    /// here).
     pub fn prefetch(mut self, depth: usize) -> Self {
         self.prefetch_depth = Some(depth);
         self
@@ -191,6 +272,129 @@ impl DataLoaderBuilder {
     /// can be loaded in any order. Clamped to `[0.50, 0.99]`.
     pub fn vram_max_usage(mut self, max_usage: f64) -> Self {
         self.vram_max_usage = max_usage.clamp(0.50, 0.99);
+        self
+    }
+
+    /// Maximum fraction of **available** host RAM the reader stage may
+    /// claim while buffering batches ahead (streaming mode, CUDA
+    /// targets).
+    ///
+    /// Default: 0.50. The streaming pipeline runs two stages on CUDA
+    /// targets: a reader thread fetches batches from the dataset into
+    /// a pageable-RAM ring while the transfer thread pins and copies
+    /// to the device, so storage-read latency (network shares, slow
+    /// disks) overlaps transfer work instead of adding to it. The ring
+    /// is sized at each `epoch()` as this fraction of `MemAvailable`,
+    /// which already excludes every other process on the box, permanent
+    /// fixtures included (pinned VM memory, hugepages), so the budget
+    /// tracks what is actually free and self-adjusts as the box fills
+    /// or drains.
+    ///
+    /// The ceiling is **per loader**: each loader sizes its ring
+    /// independently, so when several rank processes with CUDA-target
+    /// loaders share one host, give each a divided fraction (e.g.
+    /// `0.50 / local_ranks`) — they cannot see each other's rings at
+    /// sizing time.
+    ///
+    /// `0.0` disables the reader stage (single-stage pipeline).
+    /// Clamped to `[0.0, 0.90]`.
+    pub fn ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Enable / disable the read-through sample cache (streaming mode,
+    /// [`DataSet`]-backed loaders). Default: enabled.
+    ///
+    /// The cache retains samples in RAM as epoch 1 reads them, so later
+    /// epochs read at RAM speed instead of storage speed. It is keyed
+    /// by sample identity, which makes staged content reshuffle-proof:
+    /// a reshuffle changes only the order, never the content set. It
+    /// shares the [`ram_max_usage`](Self::ram_max_usage) budget with
+    /// the reader ring (the ring keeps a small flow-buffer slice, the
+    /// cache gets the rest) and never evicts — with every epoch
+    /// touching each sample exactly once in fresh random order, no
+    /// eviction policy beats filling until the budget is reached and
+    /// keeping what is there.
+    ///
+    /// Disable for single-pass training over a dataset far larger than
+    /// RAM, where retained samples are never revisited and the whole
+    /// budget is better spent on the reader ring. Opaque
+    /// [`BatchDataSet`] loaders have no sample layer and are never
+    /// cached; `ram_max_usage(0.0)` also stops all admissions.
+    pub fn sample_cache(mut self, enabled: bool) -> Self {
+        self.sample_cache_enabled = enabled;
+        self
+    }
+
+    /// Enable / disable the device-resident sample pool (streaming
+    /// mode, CUDA targets). Default: enabled.
+    ///
+    /// The pool retains as many samples as fit in leftover VRAM
+    /// (measured after the first training step, under the same cap as
+    /// prefetch) and assembles batches by gathering retained rows on
+    /// device instead of uploading them — H2D traffic shrinks by the
+    /// hit rate, the middle ground between resident and streaming
+    /// modes. Samples enter by device-side capture from batches that
+    /// were uploaded anyway, so filling costs no extra transfers.
+    /// Sizing is automatic; there is no fraction knob.
+    ///
+    /// Disable for single-pass training (retained rows are never
+    /// revisited) or to keep every spare byte of VRAM for something
+    /// else.
+    pub fn vram_pool(mut self, enabled: bool) -> Self {
+        self.vram_pool_enabled = enabled;
+        self
+    }
+
+    /// Local-disk overflow tier below the sample cache, sized in GB
+    /// (`0` = off, the default).
+    ///
+    /// Samples the RAM cache declines are staged once in an
+    /// append-only pack file on a local drive; later epochs read them
+    /// at disk speed instead of source speed. Pays exactly when the
+    /// source is slower than local disk (network mounts) and data is
+    /// revisited — for a dataset already on local SSD it buys nothing,
+    /// the source IS the disk. The pack file is ephemeral (removed
+    /// when the loader drops) and lives in the system temp directory
+    /// unless [`disk_stage_dir`](Self::disk_stage_dir) says otherwise;
+    /// a RAM-backed temp dir (tmpfs) triggers a loud warning, since a
+    /// stage that spends RAM defeats its purpose.
+    ///
+    /// Requires the sample layer: `build()` errors loudly on an opaque
+    /// [`BatchDataSet`] loader or with `sample_cache(false)`. Ignored
+    /// in resident mode (the dataset already lives on-device).
+    pub fn disk_stage(mut self, gb: u64) -> Self {
+        self.disk_stage_bytes = gb.saturating_mul(1 << 30);
+        self
+    }
+
+    /// Directory for the disk-stage pack file (default: the system
+    /// temp directory). Point this at a real local drive — not a
+    /// network mount (that would re-buy the latency the stage exists
+    /// to avoid) and not tmpfs (that spends RAM).
+    pub fn disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.disk_stage_dir = Some(dir.into());
+        self
+    }
+
+    /// Bytes to reserve for forward/backward memory in streaming-mode
+    /// VRAM sizing (activations, gradients, lazily created optimizer
+    /// state).
+    ///
+    /// The adaptive prefetch sizes its buffer from a VRAM probe, and
+    /// before the first training step that probe cannot see step
+    /// memory: it does not exist yet. Setting an explicit reserve
+    /// deducts it from the prefetch budget and disables the
+    /// conservative first-fill discount entirely (full trust). When
+    /// unset, the loader falls back to a graduated first fill: 1/2 of
+    /// the budget when the framework derived a reserve from model size
+    /// ([`crate::graph::Graph::set_data_loader`] wires 3x parameter
+    /// bytes to cover gradients + optimizer state), 1/3 with no
+    /// information at all. From the second consumed batch on, the
+    /// probe is honest and the full budget applies either way.
+    pub fn activation_reserve(mut self, bytes: usize) -> Self {
+        self.activation_reserve = Some(bytes);
         self
     }
 
@@ -264,7 +468,54 @@ impl DataLoaderBuilder {
             force_streaming,
             names,
             vram_max_usage,
+            ram_max_usage,
+            activation_reserve,
+            sample_cache,
+            sample_cache_enabled,
+            disk_stage_bytes,
+            disk_stage_dir,
+            vram_pool_enabled,
+            no_shuffle,
+            augment,
+            transform,
         } = self;
+
+        // `FLODL_VRAM_POOL=off` runtime kill-switch — same parse as
+        // the DDP rank workers (audit D7: it used to be honored only
+        // there, so a scripted A/B silently no-op'ed on the solo path).
+        let vram_pool_enabled =
+            vram_pool_enabled && !super::vram_pool::vram_pool_env_off();
+
+        // Augmentation is pick-space scheduling over the built-in
+        // samplers; a custom sampler owns its own index stream, so the
+        // combination has no defined meaning — error loudly.
+        if augment > 1 && sampler.is_some() {
+            return Err(TensorError::new(
+                "DataLoader: augment(k) composes with the built-in samplers only \
+                 (the schedule becomes a shuffle of len()*k picks). A custom \
+                 sampler owns its index stream; emit repeated indices from it \
+                 directly if you need multiplicity, or drop the custom sampler.",
+            ));
+        }
+
+        // The off switch drops the loader-side handle; the adapter's
+        // clone stays dormant (budget 0 = pure pass-through).
+        let sample_cache = if sample_cache_enabled {
+            sample_cache
+        } else {
+            None
+        };
+
+        // disk_stage is an explicit knob: with no sample layer to
+        // stage, error loudly instead of silently doing nothing.
+        if disk_stage_bytes > 0 && sample_cache.is_none() {
+            return Err(TensorError::new(
+                "DataLoader: disk_stage requires the sample layer — a DataSet-backed \
+                 loader with the sample cache enabled. Opaque BatchDataSet loaders \
+                 have no per-sample access to stage; sample_cache(false) disables \
+                 the tier the stage overflows from.",
+            ));
+        }
 
         let n = dataset.len();
 
@@ -297,10 +548,23 @@ impl DataLoaderBuilder {
         // Wrap in Arc early so both paths can share it, and OOM fallback
         // from resident to streaming keeps the dataset alive.
         let dataset: Arc<dyn BatchDataSet> = Arc::from(dataset);
-        let shuffle = sampler.is_none();
+        let shuffle = sampler.is_none() && !no_shuffle;
+        // The schedule runs over PICKS: n samples × augment views,
+        // shuffled as one space so a sample's k views spread across
+        // the epoch instead of clustering.
+        let picks = n * augment;
+        let pick_ctx = PickCtx {
+            augment,
+            seed,
+            transform,
+        };
 
-        let sampler = sampler.unwrap_or_else(|| {
-            Box::new(RandomSampler::new(n, seed))
+        let sampler = sampler.unwrap_or_else(|| -> Box<dyn Sampler> {
+            if no_shuffle {
+                Box::new(SequentialSampler::new(picks))
+            } else {
+                Box::new(RandomSampler::new(picks, seed))
+            }
         });
 
         let user_set_depth = prefetch_depth.is_some();
@@ -309,23 +573,23 @@ impl DataLoaderBuilder {
         // model allocation. User override skips adaptive sizing.
         let streaming_depth = prefetch_depth.unwrap_or(BOOTSTRAP_PREFETCH);
         if use_resident {
-            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone()) {
+            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone(), pick_ctx.clone()) {
                 Ok(loader) => Ok(loader),
                 Err(e) if device.is_cuda() && e.is_cuda_oom() => {
                     // VRAM estimate was wrong, fall back to streaming.
                     // Recreate sampler since build_resident consumed it.
                     let sampler: Box<dyn Sampler> = if shuffle {
-                        Box::new(RandomSampler::new(n, seed))
+                        Box::new(RandomSampler::new(picks, seed))
                     } else {
-                        Box::new(SequentialSampler::new(n))
+                        Box::new(SequentialSampler::new(picks))
                     };
                     crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, user_set_depth, names)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
         }
     }
 }
@@ -337,6 +601,7 @@ fn build_resident(
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 ) -> Result<DataLoader> {
     let n = dataset.len();
     let all_indices: Vec<usize> = (0..n).collect();
@@ -368,6 +633,7 @@ fn build_resident(
             sampler,
             drop_last,
             names,
+            pick_ctx,
         }),
     })
 }
@@ -382,10 +648,43 @@ fn build_streaming(
     prefetch_depth: usize,
     per_sample_bytes: usize,
     vram_max_usage: f64,
+    ram_max_usage: f64,
     user_set_depth: bool,
+    activation_reserve: Option<usize>,
+    sample_cache: Option<Arc<SampleCache>>,
+    disk_stage_bytes: u64,
+    disk_stage_dir: &Option<std::path::PathBuf>,
+    vram_pool_enabled: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 ) -> Result<DataLoader> {
-    let worker = PrefetchWorker::new(Arc::clone(&dataset), device, prefetch_depth);
+    // Local-disk overflow tier under the sample cache. Attached here,
+    // not in build(): the resident path never reads through the cache,
+    // so it must not create a pack file it would never use.
+    if disk_stage_bytes > 0 {
+        if let Some(cache) = &sample_cache {
+            let dir = disk_stage_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir);
+            cache.attach_disk(super::sample_cache::DiskStage::create(
+                &dir,
+                disk_stage_bytes,
+                dataset.len(),
+            )?);
+        }
+    }
+
+    let worker = PrefetchWorker::new(
+        Arc::clone(&dataset),
+        device,
+        prefetch_depth,
+        vram_pool_enabled,
+        pick_ctx.augment,
+    );
+    let (reserve, reserve_source) = match activation_reserve {
+        Some(bytes) => (bytes, ReserveSource::User),
+        None => (0, ReserveSource::Bare),
+    };
 
     Ok(DataLoader {
         inner: LoaderInner::Streaming(StreamingLoader {
@@ -398,10 +697,17 @@ fn build_streaming(
             names,
             per_sample_bytes,
             vram_max_usage,
+            ram_max_usage,
+            sample_cache,
             user_set_depth,
+            activation_reserve: reserve,
+            reserve_source,
+            governor: Arc::new(super::prefetch::GovernorCtl::new(prefetch_depth)),
+            pick_ctx,
         }),
     })
 }
+
 
 // ---------------------------------------------------------------------------
 // DataLoader
@@ -442,7 +748,6 @@ pub struct DataLoader {
 pub(crate) enum LoaderInner {
     Resident(ResidentLoader),
     Streaming(StreamingLoader),
-    Distributed(DistributedLoader),
 }
 
 impl DataLoader {
@@ -456,14 +761,24 @@ impl DataLoader {
 impl DataLoader {
     /// Create a DataLoader from a per-item [`DataSet`].
     ///
-    /// Items are automatically stacked into batches.
+    /// Items are automatically stacked into batches. Sample fetches go
+    /// through a read-through RAM cache in streaming mode (see
+    /// [`DataLoaderBuilder::sample_cache`]).
     pub fn from_dataset<D: DataSet + 'static>(dataset: D) -> DataLoaderBuilder {
-        DataLoaderBuilder::new(Box::new(DataSetAdapter { inner: dataset }))
+        let cache = Arc::new(SampleCache::new(dataset.len()));
+        let mut builder = DataLoaderBuilder::new(Box::new(DataSetAdapter::with_cache(
+            dataset,
+            Arc::clone(&cache),
+        )));
+        builder.sample_cache = Some(cache);
+        builder
     }
 
     /// Create a DataLoader from a per-batch [`BatchDataSet`].
     ///
-    /// The dataset is responsible for returning properly batched tensors.
+    /// The dataset is responsible for returning properly batched
+    /// tensors. Batches are opaque to the loader, so the sample cache
+    /// does not apply (batching is the dataset's own affair).
     pub fn from_batch_dataset<D: BatchDataSet + 'static>(dataset: D) -> DataLoaderBuilder {
         DataLoaderBuilder::new(Box::new(dataset))
     }
@@ -483,9 +798,6 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(loader) => loader.epoch(epoch),
             LoaderInner::Streaming(loader) => loader.epoch(epoch),
-            LoaderInner::Distributed(_) => {
-                panic!("DataLoader: distributed mode requires Graph::epoch(), not direct epoch()")
-            }
         }
     }
 
@@ -494,7 +806,6 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(l) => l.sampler.len(),
             LoaderInner::Streaming(l) => l.sampler.len(),
-            LoaderInner::Distributed(l) => l.sampler.borrow().len(),
         }
     }
 
@@ -508,7 +819,6 @@ impl DataLoader {
         let (n, bs, dl) = match &self.inner {
             LoaderInner::Resident(l) => (l.sampler.len(), l.batch_size, l.drop_last),
             LoaderInner::Streaming(l) => (l.sampler.len(), l.batch_size, l.drop_last),
-            LoaderInner::Distributed(l) => (l.sampler.borrow().len(), l.batch_size, l.drop_last),
         };
         if dl { n / bs } else { n.div_ceil(bs) }
     }
@@ -518,16 +828,14 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(l) => l.batch_size,
             LoaderInner::Streaming(l) => l.batch_size,
-            LoaderInner::Distributed(l) => l.batch_size,
         }
     }
 
-    /// Target device (for single-device loaders) or gather device (for distributed).
+    /// Target device for the loader.
     pub fn device(&self) -> Device {
         match &self.inner {
             LoaderInner::Resident(l) => l.device,
             LoaderInner::Streaming(l) => l.device,
-            LoaderInner::Distributed(l) => l.gather_device,
         }
     }
 
@@ -541,13 +849,7 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(l) => &l.names,
             LoaderInner::Streaming(l) => &l.names,
-            LoaderInner::Distributed(l) => &l.names,
         }
-    }
-
-    /// Whether the loader is in distributed mode (multi-device backends).
-    pub fn is_distributed(&self) -> bool {
-        matches!(&self.inner, LoaderInner::Distributed(_))
     }
 
     /// Current prefetch depth (streaming mode). Returns 0 for resident loaders.
@@ -555,12 +857,6 @@ impl DataLoader {
         match &self.inner {
             LoaderInner::Resident(_) => 0,
             LoaderInner::Streaming(l) => l.worker.prefetch_depth(),
-            LoaderInner::Distributed(l) => {
-                l.backends.iter().filter_map(|b| match b {
-                    DeviceBackend::Streaming { worker, .. } => Some(worker.prefetch_depth()),
-                    _ => None,
-                }).max().unwrap_or(0)
-            }
         }
     }
 
@@ -572,25 +868,53 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => {}
             LoaderInner::Streaming(l) => {
-                l.worker.set_prefetch_depth(depth);
+                l.worker.set_prefetch_depth(depth.max(1));
+                // Apply immediately: the governor target is the live
+                // in-flight bound (the channel capacity, set above, only
+                // takes effect at the next epoch and acts as a ceiling).
+                l.governor
+                    .target
+                    .store(depth.max(1), std::sync::atomic::Ordering::Relaxed);
                 l.user_set_depth = true;
-            }
-            LoaderInner::Distributed(l) => {
-                for backend in &mut l.backends {
-                    if let DeviceBackend::Streaming { worker, .. } = backend {
-                        worker.set_prefetch_depth(depth);
-                    }
-                }
             }
         }
     }
 
-    /// Measure free VRAM and resize prefetch buffers to fill available space.
+    /// Bytes reserved for forward/backward memory in streaming-mode
+    /// VRAM sizing. Same contract as
+    /// [`DataLoaderBuilder::activation_reserve`]: an explicit value is
+    /// fully trusted (no first-fill discount). No-op for resident
+    /// loaders.
+    pub fn set_activation_reserve(&mut self, bytes: usize) {
+        if let LoaderInner::Streaming(l) = &mut self.inner {
+            l.activation_reserve = bytes;
+            l.reserve_source = ReserveSource::User;
+        }
+    }
+
+    /// Framework-derived reserve (`Graph::set_data_loader` wires 3x
+    /// parameter bytes: gradients ~1x + lazy optimizer state ~2x).
+    /// Never overrides a user-declared reserve; keeps the halved
+    /// first-fill discount since activations remain unaccounted for.
+    pub(crate) fn set_activation_reserve_auto(&mut self, bytes: usize) {
+        if let LoaderInner::Streaming(l) = &mut self.inner {
+            if l.reserve_source == ReserveSource::Bare {
+                l.activation_reserve = bytes;
+                l.reserve_source = ReserveSource::Auto;
+            }
+        }
+    }
+
+    /// Measure free VRAM and resize the prefetch in-flight target to
+    /// fill available space.
     ///
-    /// **This happens automatically** at every epoch boundary (epoch 1+).
-    /// The loader re-probes free VRAM each epoch and fills 90% of it.
-    /// You only need to call this manually if you want to resize at a
-    /// different point (e.g., mid-epoch during an AllReduce window).
+    /// **This happens automatically**: at every `epoch()` call, and
+    /// once mid-run after the first training step (when the probe
+    /// first sees activations/gradients/optimizer state). You only
+    /// need this manually to resize at a different point (e.g.,
+    /// mid-epoch during an AllReduce window) -- the target applies
+    /// immediately, capped for the current epoch by the channel
+    /// capacity chosen at its start.
     ///
     /// Calling this (or [`set_prefetch_depth`](DataLoader::set_prefetch_depth))
     /// disables automatic adaptation -- the loader assumes you're managing
@@ -605,129 +929,23 @@ impl DataLoader {
         match &mut self.inner {
             LoaderInner::Resident(_) => 0,
             LoaderInner::Streaming(l) => {
-                let depth = prefetch_depth_from_vram(l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, 0);
+                use std::sync::atomic::Ordering;
+                // Deduct the reserve only while the probe is still
+                // blind to step memory; afterwards it would double-count.
+                let reserve = if l.governor.honest_resize_done.load(Ordering::Relaxed) {
+                    0
+                } else {
+                    l.activation_reserve
+                };
+                let depth = prefetch_depth_from_vram(
+                    l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, reserve,
+                );
+                let depth = depth.max(1);
                 l.worker.set_prefetch_depth(depth);
+                l.governor.target.store(depth, Ordering::Relaxed);
                 l.user_set_depth = true;
                 depth
             }
-            LoaderInner::Distributed(l) => {
-                let bs = l.batch_size;
-                let mut max_depth = 0;
-                for backend in &mut l.backends {
-                    if let DeviceBackend::Streaming { worker, device, per_sample_bytes } = backend {
-                        let depth = prefetch_depth_from_vram(*per_sample_bytes, bs, *device, VRAM_MAX_USAGE, 0);
-                        worker.set_prefetch_depth(depth);
-                        max_depth = max_depth.max(depth);
-                    }
-                }
-                max_depth
-            }
-        }
-    }
-
-    /// Get the shared dataset Arc (for upgrade_distributed to load onto devices).
-    pub(crate) fn dataset_arc(&self) -> Result<Arc<dyn BatchDataSet>> {
-        match &self.inner {
-            LoaderInner::Resident(l) => Ok(Arc::clone(&l._dataset)),
-            LoaderInner::Streaming(l) => Ok(Arc::clone(&l._dataset)),
-            LoaderInner::Distributed(l) => Ok(Arc::clone(&l.dataset)),
-        }
-    }
-
-    /// Upgrade this loader to distributed mode with per-device backends.
-    ///
-    /// Called by `Graph::set_data_loader()`. Replaces the inner loader with
-    /// a `DistributedLoader` that has one backend per device (resident or
-    /// streaming, chosen per device based on VRAM).
-    pub(crate) fn upgrade_distributed(
-        &mut self,
-        devices: &[Device],
-        dataset: Arc<dyn BatchDataSet>,
-    ) -> Result<()> {
-        // Extract config from current inner
-        let (batch_size, sampler_len, drop_last, names, seed) = match &self.inner {
-            LoaderInner::Resident(l) => (l.batch_size, l.sampler.len(), l.drop_last, l.names.clone(), 42u64),
-            LoaderInner::Streaming(l) => (l.batch_size, l.sampler.len(), l.drop_last, l.names.clone(), 42u64),
-            LoaderInner::Distributed(_) => {
-                return Err(TensorError::new("DataLoader: already in distributed mode"));
-            }
-        };
-
-        let prefetch_depth = BOOTSTRAP_PREFETCH;
-        let (backends, gather_device, gather_resident_idx) =
-            build_distributed_backends(&dataset, devices, prefetch_depth)?;
-
-        let sampler: Box<dyn Sampler> = Box::new(
-            super::sampler::RandomSampler::new(sampler_len, seed),
-        );
-
-        self.inner = LoaderInner::Distributed(DistributedLoader {
-            backends,
-            dataset,
-            sampler: std::cell::RefCell::new(sampler),
-            batch_size,
-            drop_last,
-            names,
-            pending_shards: std::cell::Cell::new(None),
-            el_che_counts: std::cell::Cell::new(None),
-            pending_el_che_batches: std::cell::Cell::new(None),
-            gather_device,
-            gather_resident_idx,
-            seed,
-        });
-
-        Ok(())
-    }
-
-    /// Consume and return pre-placed per-rank shards (for `forward_distributed_presharded`).
-    pub(crate) fn take_shards(&self) -> Option<Vec<Vec<Tensor>>> {
-        match &self.inner {
-            LoaderInner::Distributed(l) => l.take_shards(),
-            _ => None,
-        }
-    }
-
-    /// Whether per-rank shards are pending.
-    pub(crate) fn has_shards(&self) -> bool {
-        match &self.inner {
-            LoaderInner::Distributed(l) => l.has_shards(),
-            _ => false,
-        }
-    }
-
-    /// Set El Che per-device batch counts (called by Graph::step).
-    pub(crate) fn set_el_che_counts(&self, counts: Vec<usize>) {
-        if let LoaderInner::Distributed(l) = &self.inner {
-            l.set_el_che_counts(counts);
-        }
-    }
-
-    /// Consume per-device El Che batches (for forward_distributed_el_che).
-    pub(crate) fn take_el_che_batches(&self) -> Option<Vec<Vec<Vec<Tensor>>>> {
-        match &self.inner {
-            LoaderInner::Distributed(l) => l.take_el_che_batches(),
-            _ => None,
-        }
-    }
-
-    /// Whether El Che batches are pending.
-    pub(crate) fn has_el_che_batches(&self) -> bool {
-        match &self.inner {
-            LoaderInner::Distributed(l) => l.has_el_che_batches(),
-            _ => false,
-        }
-    }
-
-    /// Start a distributed epoch. Returns a `DistributedEpochIterator`.
-    #[allow(dead_code)]
-    pub(crate) fn epoch_distributed<'a>(
-        &'a mut self,
-        epoch: usize,
-        chunk_ratios: &'a [f64],
-    ) -> Result<DistributedEpochIterator<'a>> {
-        match &self.inner {
-            LoaderInner::Distributed(l) => Ok(DistributedEpochIterator::new(l, epoch, chunk_ratios)),
-            _ => Err(TensorError::new("DataLoader: not in distributed mode")),
         }
     }
 }
@@ -746,12 +964,17 @@ pub(crate) struct ResidentLoader {
     sampler: Box<dyn Sampler>,
     drop_last: bool,
     names: Vec<String>,
+    pick_ctx: PickCtx,
 }
 
 impl ResidentLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
-        let indices = self.sampler.indices(epoch);
-        let n = indices.len();
+        // The sampler yields PICKS; the resident data is stored by
+        // sample id, so the gather runs on the decoded ids (the same
+        // sample id may appear several times in one batch — that is
+        // augmentation, and index_select handles repeats natively).
+        let picks = self.sampler.indices(epoch);
+        let n = picks.len();
         let bs = self.batch_size;
 
         // Compute batch boundaries
@@ -767,13 +990,22 @@ impl ResidentLoader {
         }
 
         // Build index tensor on the target device (i64 for index_select)
-        let i64_indices: Vec<i64> = indices.iter().map(|&i| i as i64).collect();
-        let perm = Tensor::from_i64(
+        let k = self.pick_ctx.augment.max(1) as i64;
+        let i64_indices: Vec<i64> = picks.iter().map(|&i| i as i64 / k).collect();
+        let perm = match Tensor::from_i64(
             &i64_indices,
             &[i64_indices.len() as i64],
             self.device,
-        )
-        .expect("failed to create permutation tensor");
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                return EpochIterator {
+                    inner: EpochIteratorInner::Failed(Some(TensorError::new(&format!(
+                        "resident loader: failed to upload the epoch permutation: {e}"
+                    )))),
+                }
+            }
+        };
 
         EpochIterator {
             inner: EpochIteratorInner::Resident(ResidentEpochIter {
@@ -782,6 +1014,9 @@ impl ResidentLoader {
                 batch_ranges,
                 pos: 0,
                 names: &self.names,
+                picks,
+                pick_ctx: &self.pick_ctx,
+                epoch,
             }),
         }
     }
@@ -804,21 +1039,68 @@ pub(crate) struct StreamingLoader {
     per_sample_bytes: usize,
     /// Maximum fraction of total VRAM to use for prefetch.
     vram_max_usage: f64,
+    /// Host RAM ceiling for the reader-stage ring (see
+    /// [`DataLoaderBuilder::ram_max_usage`]). `0.0` = single-stage.
+    ram_max_usage: f64,
+    /// Read-through sample cache shared with the adapter inside the
+    /// worker's dataset. `None` = opaque `BatchDataSet` loader or
+    /// `.sample_cache(false)`. Budgeted at each `epoch()`.
+    sample_cache: Option<Arc<SampleCache>>,
     /// True when the user explicitly set depth (`.prefetch()` or `set_prefetch_depth()`).
     /// Skips automatic adaptation so we don't override the user's choice.
     user_set_depth: bool,
+    /// Bytes deducted from the prefetch budget before the first
+    /// training step has run (see [`ReserveSource`]).
+    activation_reserve: usize,
+    /// Where the reserve came from; picks the first-fill discount.
+    reserve_source: ReserveSource,
+    /// Depth governor shared with the worker and the live epoch
+    /// iterator. The worker keeps at most `target` batches in flight;
+    /// the target is adjustable at any moment (epoch sizing, one-shot
+    /// honest resize, `auto_resize`, worker OOM halving).
+    governor: Arc<super::prefetch::GovernorCtl>,
+    pick_ctx: PickCtx,
 }
 
 impl StreamingLoader {
     fn epoch(&mut self, epoch: usize) -> EpochIterator<'_> {
-        // Probe VRAM usage and size the prefetch buffer to fill up to cap.
-        // At epoch 0 this is the real signal: model is loaded, VRAM is known.
-        // At epoch N>0: re-probe in case conditions changed.
+        use std::sync::atomic::Ordering;
+
+        // Size the epoch. Two regimes, keyed to information rather than
+        // epoch count:
+        // - Before the first training step of the RUN, the VRAM probe
+        //   cannot see activations/gradients/lazy optimizer state, so
+        //   the initial target deducts the activation reserve and takes
+        //   the graduated first-fill discount. Once the consumer drains
+        //   its second batch (first step demonstrably done), the epoch
+        //   iterator re-probes and raises the target to the honest
+        //   budget mid-epoch.
+        // - After that, probes are honest (the allocator retains step
+        //   memory as "used"), so epoch starts take the full budget
+        //   with no reserve.
         if !self.user_set_depth {
-            let depth = prefetch_depth_from_vram(
+            // Reserve-free depth: the capacity ceiling for this epoch.
+            // Any later raise (honest resize, auto_resize) stays <= it,
+            // because "used" only grows once training runs.
+            let full = prefetch_depth_from_vram(
                 self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage, 0,
             );
-            self.worker.set_prefetch_depth(depth);
+            let target = if self.governor.honest_resize_done.load(Ordering::Relaxed) {
+                full.max(1)
+            } else {
+                let reserved = prefetch_depth_from_vram(
+                    self.per_sample_bytes,
+                    self.batch_size,
+                    self.device,
+                    self.vram_max_usage,
+                    self.activation_reserve,
+                );
+                initial_fill_target(reserved, self.reserve_source)
+            };
+            self.worker.set_prefetch_depth(full.max(2));
+            self.governor.begin_epoch(target);
+        } else {
+            self.governor.begin_epoch(self.worker.prefetch_depth());
         }
 
         let indices = self.sampler.indices(epoch);
@@ -832,16 +1114,78 @@ impl StreamingLoader {
             n.div_ceil(bs)
         };
 
+        // One RAM probe per epoch serves both RAM consumers below.
+        let mem = crate::sys::mem_info().map(|m| m.available_bytes);
+
+        // Reader-ring sizing: CUDA targets only. On CPU targets the
+        // batch channel itself is the read-ahead buffer (no transfer
+        // stage to overlap), so the pipeline stays single-stage. The
+        // mechanism in the worker is device-agnostic; this is policy.
+        // While the sample cache is active the ring is capped to a
+        // flow-buffer depth: jitter absorption saturates fast, retained
+        // samples pay again every later epoch.
+        let ring_slots = if self.device.is_cuda() {
+            let sized = ring_slots_from_ram(
+                self.per_sample_bytes,
+                bs,
+                self.ram_max_usage,
+                mem,
+                num_batches,
+            );
+            if self.sample_cache.is_some() {
+                sized.min(RING_SLOTS_WITH_CACHE)
+            } else {
+                sized
+            }
+        } else {
+            0
+        };
+
+        // Sample-cache budget refresh: same available-RAM share as the
+        // ring, recomputed from the live probe once per epoch (see
+        // `sample_cache_budget` for why held bytes are added back to
+        // the probe before taking the share). A shrinking budget stops
+        // new admissions, never drops staged content. Without RAM
+        // visibility the budget stays as it was (initially 0: no
+        // admissions on hosts we cannot measure).
+        if let Some(cache) = &self.sample_cache {
+            if let Some(available) = mem {
+                let ring_bytes = (ring_slots as u64)
+                    .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
+                let budget = sample_cache_budget(
+                    available,
+                    cache.bytes() as u64,
+                    ring_bytes,
+                    self.ram_max_usage,
+                );
+                cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
+            }
+        }
+
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already
         // closed (old batch_tx dropped by the worker when send fails or epoch ends).
-        let batch_rx = self.worker.start_epoch(indices, bs, self.drop_last);
+        let batch_rx = self.worker.start_epoch(
+            indices,
+            bs,
+            self.drop_last,
+            Arc::clone(&self.governor),
+            ring_slots,
+        );
 
         EpochIterator {
             inner: EpochIteratorInner::Streaming(StreamingEpochIter {
                 batch_rx,
                 remaining: num_batches,
                 names: &self.names,
+                governor: Arc::clone(&self.governor),
+                adaptive: !self.user_set_depth,
+                per_sample_bytes: self.per_sample_bytes,
+                batch_size: self.batch_size,
+                device: self.device,
+                vram_max_usage: self.vram_max_usage,
+                pick_ctx: &self.pick_ctx,
+                epoch,
             }),
         }
     }
@@ -865,6 +1209,11 @@ pub struct EpochIterator<'a> {
 enum EpochIteratorInner<'a> {
     Resident(ResidentEpochIter<'a>),
     Streaming(StreamingEpochIter<'a>),
+    /// Epoch setup failed before the first batch (e.g. the resident path's
+    /// permutation-tensor upload). `epoch()` cannot return `Result` without
+    /// breaking every training loop, but `Item = Result<Batch>` already is
+    /// the error channel — the failure is delivered as the first item.
+    Failed(Option<TensorError>),
 }
 
 struct ResidentEpochIter<'a> {
@@ -874,12 +1223,42 @@ struct ResidentEpochIter<'a> {
     batch_ranges: Vec<(usize, usize)>,
     pos: usize,
     names: &'a [String],
+    /// The epoch's pick stream (perm holds the decoded sample ids;
+    /// picks key the transform).
+    picks: Vec<usize>,
+    pick_ctx: &'a PickCtx,
+    epoch: usize,
 }
 
 struct StreamingEpochIter<'a> {
     batch_rx: std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>,
     remaining: usize,
     names: &'a [String],
+    /// Shared with the loader and worker: this side bumps `consumed`
+    /// per drained batch and performs the one-shot honest resize.
+    governor: Arc<super::prefetch::GovernorCtl>,
+    /// False when the user pinned the depth (no honest resize).
+    adaptive: bool,
+    // Sizing snapshot for the honest resize probe.
+    per_sample_bytes: usize,
+    batch_size: usize,
+    device: Device,
+    vram_max_usage: f64,
+    pick_ctx: &'a PickCtx,
+    epoch: usize,
+}
+
+impl Drop for StreamingEpochIter<'_> {
+    fn drop(&mut self) {
+        // Unblock the worker's governor gate: `consumed` stops
+        // advancing once this iterator is gone, so an abandoned
+        // mid-epoch iterator would otherwise leave the worker waiting
+        // at the gate forever instead of reaching the failed send that
+        // ends the epoch.
+        self.governor
+            .abandoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl<'a> Iterator for EpochIterator<'a> {
@@ -889,6 +1268,7 @@ impl<'a> Iterator for EpochIterator<'a> {
         match &mut self.inner {
             EpochIteratorInner::Resident(iter) => iter.next(),
             EpochIteratorInner::Streaming(iter) => iter.next(),
+            EpochIteratorInner::Failed(err) => err.take().map(Err),
         }
     }
 
@@ -900,6 +1280,10 @@ impl<'a> Iterator for EpochIterator<'a> {
             }
             EpochIteratorInner::Streaming(iter) => {
                 (iter.remaining, Some(iter.remaining))
+            }
+            EpochIteratorInner::Failed(err) => {
+                let n = usize::from(err.is_some());
+                (n, Some(n))
             }
         }
     }
@@ -930,12 +1314,32 @@ impl<'a> ResidentEpochIter<'a> {
             }
         }
 
+        // Delivery transform: keyed per pick, on the freshly gathered
+        // rows (index_select allocates — resident data is never
+        // aliased into the batch).
+        if let Some(ref f) = self.pick_ctx.transform {
+            let batch_picks = &self.picks[start..start + len];
+            tensors = match crate::data::apply_transform(
+                f,
+                tensors,
+                batch_picks,
+                self.pick_ctx.augment,
+                self.epoch,
+                self.pick_ctx.seed,
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+
         Some(Ok(Batch::new(tensors, self.names.to_vec())))
     }
 }
 
 impl StreamingEpochIter<'_> {
     fn next(&mut self) -> Option<Result<Batch>> {
+        use std::sync::atomic::Ordering;
+
         if self.remaining == 0 {
             return None;
         }
@@ -951,602 +1355,94 @@ impl StreamingEpochIter<'_> {
                     if let Err(e) = event.synchronize() {
                         return Some(Err(e));
                     }
+                    // Cross-stream lifetime pin (same hazard as the DDP
+                    // worker's delivery, see epoch_plan): the blocks were
+                    // allocated on the prefetch copy stream, and the
+                    // consumer drops the batch while its own stream's
+                    // kernels (backward reads the labels) may still be in
+                    // flight — freed, the blocks guard only against the
+                    // copy stream and the next upload can overwrite them
+                    // mid-read.
+                    match crate::tensor::cuda_stream::CudaStream::current(self.device) {
+                        Ok(cur) => {
+                            for t in &batch.tensors {
+                                if let Err(e) = t.record_stream(&cur) {
+                                    return Some(Err(e));
+                                }
+                            }
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
                 }
-                Some(Ok(Batch::new(batch.tensors, self.names.to_vec())))
+                self.governor.consumed.fetch_add(1, Ordering::Relaxed);
+                let run_consumed =
+                    self.governor.run_consumed.fetch_add(1, Ordering::Relaxed) + 1;
+                // Honest-probe latch, once per RUN: draining the second
+                // batch means the first batch's forward/backward/step
+                // have executed, so a probe now sees activations,
+                // gradients, and lazily created optimizer state as
+                // "used". Keyed to consumption, not epoch boundaries, so
+                // single-pass training benefits too. The latch must be
+                // set regardless of who owns the depth — it marks probe
+                // honesty, and the VRAM sample pool's one-shot budget
+                // decision (`maybe_install`) gates on it; an explicit
+                // `.prefetch(N)` must pin the in-flight depth, not
+                // silently disable the pool tier.
+                if run_consumed >= 2
+                    && !self.governor.honest_resize_done.load(Ordering::Relaxed)
+                {
+                    self.governor.honest_resize_done.store(true, Ordering::Relaxed);
+                    // Honest resize of the in-flight target: adaptive
+                    // mode only — a user-set depth stays exactly where
+                    // the user put it. Full budget, no reserve (the
+                    // probe accounts for step memory itself).
+                    if self.adaptive {
+                        let depth = prefetch_depth_from_vram(
+                            self.per_sample_bytes,
+                            self.batch_size,
+                            self.device,
+                            self.vram_max_usage,
+                            0,
+                        );
+                        self.governor.target.store(depth.max(1), Ordering::Relaxed);
+                    }
+                }
+                // Delivery transform: after the copy event, so the ops
+                // are ordered against the async H2D; keyed by the
+                // batch's picks, on freshly assembled rows.
+                let tensors = if let Some(ref f) = self.pick_ctx.transform {
+                    match crate::data::apply_transform(
+                        f,
+                        batch.tensors,
+                        &batch.picks,
+                        self.pick_ctx.augment,
+                        self.epoch,
+                        self.pick_ctx.seed,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e)),
+                    }
+                } else {
+                    batch.tensors
+                };
+                Some(Ok(Batch::new(tensors, self.names.to_vec())))
             }
             Ok(Err(e)) => Some(Err(e)),
             Err(_) => {
-                // Channel closed (worker stopped or panicked)
+                // Channel closed. Dataset errors AND dataset panics are
+                // reported per-batch (see `guarded_get_batch`), so the
+                // worker dying is flodl's own fault — say so.
                 self.remaining = 0;
                 Some(Err(TensorError::new(
-                    "DataLoader: prefetch worker stopped unexpectedly",
+                    "DataLoader: prefetch worker stopped unexpectedly \
+                     (dataset errors are reported per-batch, so this is \
+                     likely a flodl bug — please report it)",
                 )))
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// DistributedLoader (DDP-aware, per-device backends)
-// ---------------------------------------------------------------------------
-
-/// Per-device data backend: resident (full dataset in VRAM) or streaming
-/// (prefetch worker with async H2D transfers).
-///
-/// Each device independently chooses its mode based on available VRAM.
-pub(crate) enum DeviceBackend {
-    Resident {
-        gpu_data: Vec<Tensor>,
-        device: Device,
-    },
-    Streaming {
-        worker: PrefetchWorker,
-        device: Device,
-        /// Per-sample bytes (for adaptive resize depth calculation).
-        per_sample_bytes: usize,
-    },
-}
-
-impl DeviceBackend {
-    fn device(&self) -> Device {
-        match self {
-            DeviceBackend::Resident { device, .. } | DeviceBackend::Streaming { device, .. } => *device,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn is_resident(&self) -> bool {
-        matches!(self, DeviceBackend::Resident { .. })
-    }
-}
-
-/// Distributed data loader with per-device backends.
-///
-/// Created by [`DataLoader::upgrade_distributed`] when `Graph::set_data_loader()`
-/// detects a multi-GPU topology. Each device gets its own backend (resident
-/// if the dataset fits in its VRAM, streaming otherwise).
-pub(crate) struct DistributedLoader {
-    /// One backend per device, indexed by rank.
-    pub backends: Vec<DeviceBackend>,
-    /// Shared dataset (used by streaming backends and for gather fallback).
-    pub dataset: Arc<dyn BatchDataSet>,
-    /// Epoch shuffling (RefCell for interior mutability via shared references).
-    pub sampler: std::cell::RefCell<Box<dyn Sampler>>,
-    pub batch_size: usize,
-    pub drop_last: bool,
-    pub names: Vec<String>,
-    /// Pre-computed per-rank shards from last epoch iterator advance.
-    /// `pending_shards[rank]` = `Vec<Tensor>` (all tensor positions) on `devices[rank]`.
-    /// Set by `DistributedEpochIterator::next()`, consumed by `Graph::forward_distributed_presharded()`.
-    pub pending_shards: std::cell::Cell<Option<Vec<Vec<Tensor>>>>,
-    /// El Che: per-device batch counts for the current cadence step.
-    /// Set by `Graph::step()` after `ElChe::report_timing()`, read by `DistributedEpochIterator::next()`.
-    /// `None` means El Che is inactive (standard sharding path).
-    pub el_che_counts: std::cell::Cell<Option<Vec<usize>>>,
-    /// El Che: per-device complete batches from the last epoch iterator advance.
-    /// `[rank][batch_idx][tensor_position]` -- each batch is a complete, unsharded batch on that device.
-    /// Set by `DistributedEpochIterator::next()`, consumed by `Graph::forward_distributed_el_che()`.
-    pub pending_el_che_batches: std::cell::Cell<Option<Vec<Vec<Vec<Tensor>>>>>,
-    /// Device for the user-facing batch (loss computation).
-    pub gather_device: Device,
-    /// If gather_device is a resident backend, its index. None if gather is CPU.
-    pub gather_resident_idx: Option<usize>,
-    #[allow(dead_code)]
-    pub seed: u64,
-}
-
-impl DistributedLoader {
-    /// Consume and return the pre-placed per-rank shards.
-    /// Returns None if no shards are pending (forward called without epoch advance).
-    pub fn take_shards(&self) -> Option<Vec<Vec<Tensor>>> {
-        self.pending_shards.take()
-    }
-
-    /// Whether shards are pending from the last epoch iterator advance.
-    pub fn has_shards(&self) -> bool {
-        // Cell<Option<T>> doesn't have a peek, but we can check via take+put
-        let val = self.pending_shards.take();
-        let has = val.is_some();
-        self.pending_shards.set(val);
-        has
-    }
-
-    /// Set El Che per-device batch counts (called by Graph::step after report_timing).
-    pub fn set_el_che_counts(&self, counts: Vec<usize>) {
-        self.el_che_counts.set(Some(counts));
-    }
-
-    /// Take El Che batch counts (consumed by the epoch iterator each iteration).
-    pub fn take_el_che_counts(&self) -> Option<Vec<usize>> {
-        self.el_che_counts.take()
-    }
-
-    /// Peek whether El Che counts are set.
-    pub fn has_el_che_counts(&self) -> bool {
-        let val = self.el_che_counts.take();
-        let has = val.is_some();
-        self.el_che_counts.set(val);
-        has
-    }
-
-    /// Consume per-device El Che batches (for forward_distributed_el_che).
-    pub fn take_el_che_batches(&self) -> Option<Vec<Vec<Vec<Tensor>>>> {
-        self.pending_el_che_batches.take()
-    }
-
-    /// Whether El Che batches are pending.
-    pub fn has_el_che_batches(&self) -> bool {
-        let val = self.pending_el_che_batches.take();
-        let has = val.is_some();
-        self.pending_el_che_batches.set(val);
-        has
-    }
-}
-
-/// Build per-device backends for a distributed loader.
-///
-/// For each device: probe VRAM, attempt resident loading, fallback to streaming
-/// on OOM. Returns the backends and gather device info.
-fn build_distributed_backends(
-    dataset: &Arc<dyn BatchDataSet>,
-    devices: &[Device],
-    prefetch_depth: usize,
-) -> Result<(Vec<DeviceBackend>, Device, Option<usize>)> {
-    let n = dataset.len();
-    let all_indices: Vec<usize> = (0..n).collect();
-
-    // Load full dataset to CPU once (shared across all device loads)
-    let cpu_tensors = dataset.get_batch(&all_indices)?;
-    if cpu_tensors.is_empty() {
-        return Err(TensorError::new(
-            "DataLoader: dataset returned empty tensor list",
-        ));
-    }
-
-    let per_sample_bytes: usize = cpu_tensors.iter().map(|t| t.nbytes()).sum();
-    let mut backends = Vec::with_capacity(devices.len());
-
-    for &dev in devices {
-        if can_fit_resident(n, per_sample_bytes, dev) {
-            // Try resident: pin + transfer
-            match load_resident_tensors(&cpu_tensors, dev) {
-                Ok(gpu_data) => {
-                    backends.push(DeviceBackend::Resident { gpu_data, device: dev });
-                    continue;
-                }
-                Err(e) if dev.is_cuda() && e.is_cuda_oom() => {
-                    // VRAM estimate wrong, fall back to streaming
-                    crate::tensor::cuda_empty_cache();
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Streaming fallback
-        let worker = PrefetchWorker::new(Arc::clone(dataset), dev, prefetch_depth);
-        backends.push(DeviceBackend::Streaming {
-            worker,
-            device: dev,
-            per_sample_bytes,
-        });
-    }
-
-    // Select gather device: prefer resident backend with most free VRAM
-    let (gather_device, gather_idx) = select_gather_device(&backends);
-
-    Ok((backends, gather_device, gather_idx))
-}
-
-/// Transfer CPU tensors to a device via pin_memory.
-fn load_resident_tensors(cpu_tensors: &[Tensor], device: Device) -> Result<Vec<Tensor>> {
-    let mut gpu_data = Vec::with_capacity(cpu_tensors.len());
-    for t in cpu_tensors {
-        let pinned = t.pin_memory()?;
-        gpu_data.push(pinned.to_device(device)?);
-    }
-    Ok(gpu_data)
-}
-
-/// Pick the gather device: resident backend with most free VRAM,
-/// or the primary device when all backends are streaming.
-fn select_gather_device(backends: &[DeviceBackend]) -> (Device, Option<usize>) {
-    let mut best_idx: Option<usize> = None;
-    let mut best_free: u64 = 0;
-
-    for (i, backend) in backends.iter().enumerate() {
-        if let DeviceBackend::Resident { device: Device::CUDA(idx), .. } = backend {
-            let free = crate::tensor::cuda_memory_info_idx(*idx as i32)
-                .map(|(f, _)| f)
-                .unwrap_or(0);
-            if free > best_free {
-                best_free = free;
-                best_idx = Some(i);
-            }
-        }
-    }
-
-    match best_idx {
-        Some(idx) => (backends[idx].device(), Some(idx)),
-        // All streaming: gather on the primary device so targets stay
-        // on the same CUDA device as model weights.
-        None => (backends[0].device(), None),
-    }
-}
-
-/// Epoch iterator for distributed training.
-///
-/// Yields `Result<Batch>` containing target tensors on the gather device.
-/// Simultaneously stores per-rank input shards in the `DistributedLoader`
-/// for `forward_distributed_presharded()` to consume.
-pub struct DistributedEpochIterator<'a> {
-    loader: &'a DistributedLoader,
-    /// Global permutation for this epoch.
-    permutation: Vec<usize>,
-    /// Current position in the permutation (sample index, not batch index).
-    cursor: usize,
-    /// Number of batches remaining.
-    remaining: usize,
-    /// Per-rank chunk ratios (read from Graph's DistributedState each batch).
-    chunk_ratios: &'a [f64],
-    /// Streaming batch receivers, one per streaming backend (indexed by rank).
-    /// None for resident backends.
-    streaming_rx: Vec<Option<std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>>>,
-}
-
-impl<'a> DistributedEpochIterator<'a> {
-    pub(crate) fn new(
-        loader: &'a DistributedLoader,
-        epoch: usize,
-        chunk_ratios: &'a [f64],
-    ) -> Self {
-        let permutation = loader.sampler.borrow_mut().indices(epoch);
-        let n = permutation.len();
-        let bs = loader.batch_size;
-        let num_batches = if loader.drop_last { n / bs } else { n.div_ceil(bs) };
-
-        // Open one persistent channel per streaming backend for the entire epoch.
-        let streaming_rx: Vec<Option<std::sync::mpsc::Receiver<Result<super::prefetch::PrefetchedBatch>>>> =
-            loader.backends.iter().map(|backend| {
-                match backend {
-                    DeviceBackend::Streaming { worker, .. } => {
-                        Some(worker.start_distributed_epoch())
-                    }
-                    DeviceBackend::Resident { .. } => None,
-                }
-            }).collect();
-
-        DistributedEpochIterator {
-            loader,
-            permutation,
-            cursor: 0,
-            remaining: num_batches,
-            chunk_ratios,
-            streaming_rx,
-        }
-    }
-}
-
-impl Iterator for DistributedEpochIterator<'_> {
-    type Item = Result<Batch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // El Che path: pull complete batches per device
-        if self.loader.has_el_che_counts() {
-            return self.next_el_che();
-        }
-
-        // Standard sharding path
-        self.remaining -= 1;
-
-        let bs = self.loader.batch_size;
-        let n = self.permutation.len();
-        let end = (self.cursor + bs).min(n);
-        if self.loader.drop_last && (end - self.cursor) < bs {
-            self.remaining = 0;
-            return None;
-        }
-
-        // Global batch indices from the permutation
-        let batch_indices: Vec<usize> = self.permutation[self.cursor..end].to_vec();
-        let batch_len = batch_indices.len() as i64;
-        self.cursor = end;
-
-        // Compute per-rank shard sizes
-        let shard_sizes = compute_shard_sizes_from_ratios(batch_len, self.chunk_ratios);
-
-        // Split batch indices into per-rank slices
-        let mut per_rank_shards: Vec<Vec<Tensor>> = Vec::with_capacity(self.loader.backends.len());
-        let mut offset = 0usize;
-
-        for (rank, backend) in self.loader.backends.iter().enumerate() {
-            let shard_len = shard_sizes[rank] as usize;
-            let shard_indices = &batch_indices[offset..offset + shard_len];
-            offset += shard_len;
-
-            match backend {
-                DeviceBackend::Resident { gpu_data, device } => {
-                    // Build index tensor on device, index_select each position
-                    let idx_i64: Vec<i64> = shard_indices.iter().map(|&i| i as i64).collect();
-                    let idx_tensor = match Tensor::from_i64(
-                        &idx_i64,
-                        &[idx_i64.len() as i64],
-                        *device,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => return Some(Err(e)),
-                    };
-
-                    let mut shard_tensors = Vec::with_capacity(gpu_data.len());
-                    for t in gpu_data {
-                        match t.index_select(0, &idx_tensor) {
-                            Ok(selected) => shard_tensors.push(selected),
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    per_rank_shards.push(shard_tensors);
-                }
-                DeviceBackend::Streaming { worker, .. } => {
-                    // Send shard indices; result arrives on persistent epoch channel.
-                    worker.load_batch(shard_indices.to_vec());
-
-                    let rx = self.streaming_rx[rank].as_ref().unwrap();
-                    match rx.recv() {
-                        Ok(Ok(batch)) => {
-                            #[cfg(feature = "cuda")]
-                            if let Some(ref event) = batch.ready_event {
-                                if let Err(e) = event.synchronize() {
-                                    return Some(Err(e));
-                                }
-                            }
-                            per_rank_shards.push(batch.tensors);
-                        }
-                        Ok(Err(e)) => return Some(Err(e)),
-                        Err(_) => {
-                            return Some(Err(TensorError::new(
-                                "DataLoader: streaming worker stopped unexpectedly",
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build user-facing Batch with targets on the gather device.
-        // Targets are all tensor positions (for now). In Step 5/6,
-        // forward(&Batch) will filter to target-only fields.
-        let user_batch = match self.build_gather_batch(&batch_indices, &per_rank_shards) {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Store per-rank shards for forward_distributed_presharded()
-        self.loader.pending_shards.set(Some(per_rank_shards));
-
-        Some(Ok(user_batch))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ExactSizeIterator for DistributedEpochIterator<'_> {}
-
-impl DistributedEpochIterator<'_> {
-    /// El Che iteration: pull complete batches per device, not shards.
-    ///
-    /// Each device gets `counts[rank]` complete batches of `batch_size` samples.
-    /// Data is loaded to each device independently. The user-facing Batch
-    /// contains all targets concatenated (for loss computation on gathered output).
-    fn next_el_che(&mut self) -> Option<Result<Batch>> {
-        let counts = self.loader.take_el_che_counts().unwrap_or_default();
-        let n_devices = counts.len();
-        let total_batches: usize = counts.iter().sum();
-        if total_batches == 0 {
-            self.remaining = 0;
-            return None;
-        }
-
-        // Every rank must process at least 1 batch per sync point.
-        // If fewer batches remain than devices, end the epoch.
-        if self.remaining < n_devices {
-            self.remaining = 0;
-            return None;
-        }
-
-        // Clamp if near epoch end, ensuring minimum 1 per rank
-        let actual_counts = if total_batches > self.remaining {
-            // Scale proportionally to fit remaining batches
-            let scale = self.remaining as f64 / total_batches as f64;
-            let mut clamped: Vec<usize> = counts.iter()
-                .map(|&c| ((c as f64 * scale).floor() as usize).max(1))
-                .collect();
-            // Trim if we overshot remaining (from the .max(1) floors)
-            let mut clamped_total: usize = clamped.iter().sum();
-            while clamped_total > self.remaining {
-                // Reduce the largest count
-                if let Some(max_idx) = clamped.iter().enumerate()
-                    .filter(|&(_, &c)| c > 1)
-                    .max_by_key(|&(_, &c)| c)
-                    .map(|(i, _)| i)
-                {
-                    clamped[max_idx] -= 1;
-                    clamped_total -= 1;
-                } else {
-                    break; // all at 1, can't reduce further
-                }
-            }
-            // Distribute any remaining deficit
-            let mut deficit = self.remaining.saturating_sub(clamped_total);
-            for c in &mut clamped {
-                if deficit == 0 { break; }
-                *c += 1;
-                deficit -= 1;
-            }
-            clamped
-        } else {
-            counts
-        };
-
-        let actual_total: usize = actual_counts.iter().sum();
-        if actual_total == 0 {
-            self.remaining = 0;
-            return None;
-        }
-
-        let bs = self.loader.batch_size;
-        let n = self.permutation.len();
-
-        // Pull total_batches * batch_size samples from the permutation
-        let total_samples = actual_total * bs;
-        let avail = n - self.cursor;
-        let take_samples = total_samples.min(avail);
-        let all_indices: Vec<usize> = self.permutation[self.cursor..self.cursor + take_samples].to_vec();
-        self.cursor += take_samples;
-
-        // Route complete batches to each device
-        let mut per_device_batches: Vec<Vec<Vec<Tensor>>> = Vec::with_capacity(actual_counts.len());
-        let mut sample_offset = 0usize;
-
-        for (rank, &count) in actual_counts.iter().enumerate() {
-            let backend = &self.loader.backends[rank];
-            let mut device_batches: Vec<Vec<Tensor>> = Vec::with_capacity(count);
-
-            for _ in 0..count {
-                let batch_end = (sample_offset + bs).min(all_indices.len());
-                if batch_end <= sample_offset {
-                    break;
-                }
-                let batch_indices = &all_indices[sample_offset..batch_end];
-                sample_offset = batch_end;
-
-                match self.load_batch_on_device(backend, batch_indices, rank) {
-                    Ok(tensors) => device_batches.push(tensors),
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-
-            per_device_batches.push(device_batches);
-        }
-
-        self.remaining = self.remaining.saturating_sub(actual_total);
-
-        // Build gathered user batch with all targets concatenated
-        let user_batch = match self.build_gather_batch(&all_indices[..take_samples.min(all_indices.len())], &[]) {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Store per-device batches for forward_distributed_el_che()
-        self.loader.pending_el_che_batches.set(Some(per_device_batches));
-
-        // Re-seed counts for next iteration (step() will overwrite with updated counts)
-        self.loader.el_che_counts.set(Some(actual_counts));
-
-        Some(Ok(user_batch))
-    }
-
-    /// Load a single batch on a specific device backend.
-    fn load_batch_on_device(
-        &self,
-        backend: &DeviceBackend,
-        batch_indices: &[usize],
-        rank: usize,
-    ) -> Result<Vec<Tensor>> {
-        match backend {
-            DeviceBackend::Resident { gpu_data, device } => {
-                let idx_i64: Vec<i64> = batch_indices.iter().map(|&i| i as i64).collect();
-                let idx_tensor = Tensor::from_i64(
-                    &idx_i64,
-                    &[idx_i64.len() as i64],
-                    *device,
-                )?;
-                let mut tensors = Vec::with_capacity(gpu_data.len());
-                for t in gpu_data {
-                    tensors.push(t.index_select(0, &idx_tensor)?);
-                }
-                Ok(tensors)
-            }
-            DeviceBackend::Streaming { worker, .. } => {
-                worker.load_batch(batch_indices.to_vec());
-                let rx = self.streaming_rx[rank].as_ref().unwrap();
-                match rx.recv() {
-                    Ok(Ok(batch)) => {
-                        #[cfg(feature = "cuda")]
-                        if let Some(ref event) = batch.ready_event {
-                            event.synchronize()?;
-                        }
-                        Ok(batch.tensors)
-                    }
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(TensorError::new(
-                        "DataLoader: streaming worker stopped unexpectedly",
-                    )),
-                }
-            }
-        }
-    }
-
-    /// Build the user-facing Batch on the gather device.
-    fn build_gather_batch(
-        &self,
-        batch_indices: &[usize],
-        _per_rank_shards: &[Vec<Tensor>],
-    ) -> Result<Batch> {
-        let names = self.loader.names.clone();
-
-        match self.loader.gather_resident_idx {
-            Some(gather_rank) => {
-                // Gather from a resident backend: index_select all positions
-                if let DeviceBackend::Resident { gpu_data, device } = &self.loader.backends[gather_rank] {
-                    let idx_i64: Vec<i64> = batch_indices.iter().map(|&i| i as i64).collect();
-                    let idx_tensor = Tensor::from_i64(
-                        &idx_i64,
-                        &[idx_i64.len() as i64],
-                        *device,
-                    )?;
-
-                    let mut tensors = Vec::with_capacity(gpu_data.len());
-                    for t in gpu_data {
-                        tensors.push(t.index_select(0, &idx_tensor)?);
-                    }
-                    Ok(Batch::new(tensors, names))
-                } else {
-                    unreachable!("gather_resident_idx points to non-resident backend")
-                }
-            }
-            None => {
-                // All streaming: fetch targets from CPU dataset
-                let tensors = self.loader.dataset.get_batch(batch_indices)?;
-                Ok(Batch::new(tensors, names))
-            }
-        }
-    }
-}
-
-/// Compute per-rank shard sizes from chunk ratios.
-/// Same logic as DistributedState::compute_shard_sizes but standalone.
-fn compute_shard_sizes_from_ratios(batch_size: i64, ratios: &[f64]) -> Vec<i64> {
-    let n = ratios.len();
-    let mut sizes = Vec::with_capacity(n);
-    let mut remaining = batch_size;
-
-    for (i, &ratio) in ratios.iter().enumerate().take(n) {
-        if i == n - 1 {
-            sizes.push(remaining);
-        } else {
-            let s = (batch_size as f64 * ratio).round() as i64;
-            let s = s.max(1).min(remaining - (n - i - 1) as i64);
-            sizes.push(s);
-            remaining -= s;
-        }
-    }
-
-    sizes
-}
 
 // ---------------------------------------------------------------------------
 // Tests

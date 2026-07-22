@@ -1,10 +1,10 @@
 [workspace]
 members = ["flodl-sys", "flodl", "flodl-cli", "flodl-cli-macros", "flodl-hf"]
-exclude = ["benchmarks", "ddp-bench"]
+exclude = ["benchmarks", "ddp-bench", "hf-ddp"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

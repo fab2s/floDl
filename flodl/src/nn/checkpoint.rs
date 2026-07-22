@@ -39,34 +39,102 @@ pub fn save_checkpoint<W: Write>(
     buffers: &[(String, Buffer)],
     structural_hash: Option<&str>,
 ) -> Result<()> {
+    let total = (params.len() + buffers.len()) as u32;
+    write_checkpoint_header(w, total, structural_hash)?;
+
+    for (name, p) in params {
+        write_entry_name(w, name)?;
+        write_tensor_data(w, &p.variable.data())?;
+    }
+
+    for (name, b) in buffers {
+        write_entry_name(w, name)?;
+        write_tensor_data(w, &b.get())?;
+    }
+
+    Ok(())
+}
+
+/// Write the checkpoint header: `MAGIC(4) | VERSION(u32) | hash(32) | count(u32)`.
+///
+/// Shared by [`save_checkpoint`] (the `Tensor` path) and
+/// [`save_checkpoint_from_raw`] (the raw-payload path) so the on-disk
+/// layout has a single definition.
+pub(crate) fn write_checkpoint_header<W: Write>(
+    w: &mut W,
+    total: u32,
+    structural_hash: Option<&str>,
+) -> Result<()> {
     w.write_all(&MAGIC).map_err(io_err)?;
     w.write_all(&VERSION.to_le_bytes()).map_err(io_err)?;
-
-    // Write 32-byte hash (or zeros)
     let hash_bytes = match structural_hash {
         Some(hex) => hex_to_bytes(hex)?,
         None => [0u8; HASH_LEN],
     };
     w.write_all(&hash_bytes).map_err(io_err)?;
-
-    let total = (params.len() + buffers.len()) as u32;
     w.write_all(&total.to_le_bytes()).map_err(io_err)?;
-
-    for (name, p) in params {
-        let name_bytes = name.as_bytes();
-        w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
-        w.write_all(name_bytes).map_err(io_err)?;
-        write_tensor_data(w, &p.variable.data())?;
-    }
-
-    for (name, b) in buffers {
-        let name_bytes = name.as_bytes();
-        w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
-        w.write_all(name_bytes).map_err(io_err)?;
-        write_tensor_data(w, &b.get())?;
-    }
-
     Ok(())
+}
+
+/// Write an entry's `name_len(u32) | name` prefix (the bytes that precede
+/// the tensor body in every checkpoint entry).
+fn write_entry_name<W: Write>(w: &mut W, name: &str) -> Result<()> {
+    let name_bytes = name.as_bytes();
+    w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(name_bytes).map_err(io_err)?;
+    Ok(())
+}
+
+/// One entry for [`save_checkpoint_from_raw`]: a name plus an already-
+/// serialized tensor body (shape, dtype, native bytes). Lets a caller that
+/// already holds raw native-byte tensor data (e.g. the cluster consensus
+/// reduce) write a loadable `.fdl` without reconstructing `Tensor`s — no
+/// bytes→Tensor→bytes round-trip, no duplicate model in RAM.
+pub(crate) struct RawCheckpointEntry<'a> {
+    /// Qualified parameter / buffer name (matches load-side keys).
+    pub name: &'a str,
+    /// Tensor shape (i64 dims, as the on-disk format stores them).
+    pub shape: &'a [i64],
+    /// Checkpoint dtype tag (see `dtype_tag` — `3` = Float32).
+    pub dtype_tag: u8,
+    /// Raw native-byte-order tensor data.
+    pub raw: &'a [u8],
+}
+
+/// Save a checkpoint directly from raw, already-serialized tensor bodies,
+/// bypassing `Tensor` construction. The on-disk format is byte-identical to
+/// [`save_checkpoint`] (so [`load_checkpoint`] reads it unchanged); only the
+/// source differs. Entry order is the load-side name-match order; pass
+/// params first then buffers to mirror [`save_checkpoint`].
+pub(crate) fn save_checkpoint_from_raw<W: Write>(
+    w: &mut W,
+    entries: &[RawCheckpointEntry<'_>],
+    structural_hash: Option<&str>,
+) -> Result<()> {
+    write_checkpoint_header(w, entries.len() as u32, structural_hash)?;
+    for e in entries {
+        write_entry_name(w, e.name)?;
+        // Tensor body: ndim(u32) + shape(i64*ndim) + dtype_tag(1) +
+        // byte_count(u64) + raw. Mirrors `write_tensor_data` exactly.
+        w.write_all(&(e.shape.len() as u32).to_le_bytes()).map_err(io_err)?;
+        for &s in e.shape {
+            w.write_all(&s.to_le_bytes()).map_err(io_err)?;
+        }
+        w.write_all(&[e.dtype_tag]).map_err(io_err)?;
+        w.write_all(&(e.raw.len() as u64).to_le_bytes()).map_err(io_err)?;
+        w.write_all(e.raw).map_err(io_err)?;
+    }
+    Ok(())
+}
+
+/// File wrapper for [`save_checkpoint_from_raw`]: gzips when `path` ends in
+/// `.gz` and writes atomically (tmp + rename), matching [`save_checkpoint_file`].
+pub(crate) fn save_checkpoint_from_raw_file(
+    path: &str,
+    entries: &[RawCheckpointEntry<'_>],
+    structural_hash: Option<&str>,
+) -> Result<()> {
+    write_file_atomic(path, |mut w| save_checkpoint_from_raw(&mut w, entries, structural_hash))
 }
 
 /// Load a checkpoint, matching entries by qualified name against both
@@ -124,20 +192,13 @@ pub fn load_checkpoint<R: Read>(
         std::collections::HashMap::with_capacity(count);
 
     for _ in 0..count {
-        let name_len = read_u32(r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-        let ndim = read_u32(r)? as usize;
-        let mut shape = vec![0i64; ndim];
-        for s in &mut shape { *s = read_i64(r)?; }
+        let name = read_name(r)?;
+        let shape = read_shape(r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let dtype = dtype_from_tag(tag[0])?;
         let byte_count = read_u64(r)? as usize;
-        let mut raw = vec![0u8; byte_count];
-        r.read_exact(&mut raw).map_err(io_err)?;
+        let raw = read_payload(r, byte_count)?;
         ckpt.insert(name, (shape, dtype, raw));
     }
 
@@ -199,6 +260,50 @@ pub fn load_checkpoint<R: Read>(
     Ok(LoadReport { loaded, skipped, missing })
 }
 
+/// Atomic file write shared by every checkpoint writer: stream into
+/// `<path>.tmp`, then rename over the final path.
+///
+/// A crash mid-write (SIGKILL, disk-full, power loss) then never leaves a
+/// torn `<path>` that resume could mistake for valid — it leaves a stale
+/// `.tmp` instead, which resume ignores. gzip is chosen from the FINAL
+/// extension, not the tmp name, so the `.tmp` suffix cannot defeat `.gz`
+/// detection. Rename within a single directory is atomic on POSIX.
+pub(crate) fn write_file_atomic<T>(
+    path: &str,
+    write: impl FnOnce(&mut dyn Write) -> Result<T>,
+) -> Result<T> {
+    let is_gz = path.ends_with(".gz");
+    let tmp = format!("{path}.tmp");
+    let write_result = (|| -> Result<T> {
+        let f = std::fs::File::create(&tmp).map_err(io_err)?;
+        if is_gz {
+            let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            let v = write(&mut w)?;
+            w.finish().map_err(io_err)?;
+            Ok(v)
+        } else {
+            let mut w = std::io::BufWriter::new(f);
+            let v = write(&mut w)?;
+            // Explicit flush so a write error surfaces here rather than being
+            // swallowed by BufWriter's drop-flush after we've already renamed.
+            w.flush().map_err(io_err)?;
+            Ok(v)
+        }
+    })();
+    match write_result {
+        Ok(v) => {
+            std::fs::rename(&tmp, path).map_err(io_err)?;
+            Ok(v)
+        }
+        Err(e) => {
+            // Best-effort cleanup so a failed write doesn't litter a stale
+            // `.tmp`; the write error is what the caller needs to see.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Save checkpoint to a file path. Uses gzip compression if path ends with `.gz`.
 pub fn save_checkpoint_file(
     path: &str,
@@ -206,16 +311,7 @@ pub fn save_checkpoint_file(
     buffers: &[(String, Buffer)],
     structural_hash: Option<&str>,
 ) -> Result<()> {
-    let f = std::fs::File::create(path).map_err(io_err)?;
-    if path.ends_with(".gz") {
-        let mut w = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        save_checkpoint(&mut w, params, buffers, structural_hash)?;
-        w.finish().map_err(io_err)?;
-        Ok(())
-    } else {
-        let mut w = std::io::BufWriter::new(f);
-        save_checkpoint(&mut w, params, buffers, structural_hash)
-    }
+    write_file_atomic(path, |mut w| save_checkpoint(&mut w, params, buffers, structural_hash))
 }
 
 /// Load checkpoint from a file path. Detects gzip from `.gz` extension.
@@ -278,15 +374,9 @@ pub fn checkpoint_keys(path: &str) -> Result<Vec<String>> {
     let count = read_u32(&mut r)? as usize;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
-        let name_len = read_u32(&mut r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        keys.push(String::from_utf8_lossy(&name_bytes).into_owned());
-        // Skip ndim, shape, dtype tag, byte_count + raw payload.
-        let ndim = read_u32(&mut r)? as usize;
-        for _ in 0..ndim {
-            let _ = read_i64(&mut r)?;
-        }
+        keys.push(read_name(&mut r)?);
+        // Skip shape, dtype tag, byte_count + raw payload.
+        let _ = read_shape(&mut r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let byte_count = read_u64(&mut r)? as usize;
@@ -351,8 +441,10 @@ pub(crate) fn read_tensor_state<R: Read>(r: &mut R, device: Device) -> Result<Op
 
 // --- Internal: dtype-aware tensor serialization ---
 
-/// DType tag byte for checkpoint format.
-fn dtype_tag(dtype: DType) -> u8 {
+/// DType tag byte for checkpoint format. `pub(crate)` so the cluster
+/// consensus writer can tag raw f32 payloads for
+/// [`save_checkpoint_from_raw`] without duplicating the mapping.
+pub(crate) fn dtype_tag(dtype: DType) -> u8 {
     match dtype {
         DType::Float16  => 1,
         DType::BFloat16 => 2,
@@ -399,20 +491,15 @@ pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
 }
 
 /// Read tensor data written by write_tensor_data.
-fn read_tensor_data<R: Read>(r: &mut R) -> Result<Tensor> {
-    let ndim = read_u32(r)? as usize;
-    let mut shape = vec![0i64; ndim];
-    for s in &mut shape {
-        *s = read_i64(r)?;
-    }
+pub(crate) fn read_tensor_data<R: Read>(r: &mut R) -> Result<Tensor> {
+    let shape = read_shape(r)?;
 
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag).map_err(io_err)?;
     let dtype = dtype_from_tag(tag[0])?;
 
     let byte_count = read_u64(r)? as usize;
-    let mut raw = vec![0u8; byte_count];
-    r.read_exact(&mut raw).map_err(io_err)?;
+    let raw = read_payload(r, byte_count)?;
 
     tensor_from_raw_bytes(&raw, &shape, dtype)
 }
@@ -454,24 +541,13 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
             Tensor::from_i64(&data, shape, Device::CPU)
         }
         DType::Float16 | DType::BFloat16 | DType::Int32 => {
-            // For f16/bf16/i32: load raw bytes via from_blob directly.
-            let mut shape_v = shape.to_vec();
-            let mut handle: flodl_sys::FlodlTensor = std::ptr::null_mut();
-            let (dev_type, dev_idx) = crate::tensor::Device::CPU.to_ffi();
-            let err = unsafe {
-                flodl_sys::flodl_from_blob(
-                    raw.as_ptr() as *mut std::ffi::c_void,
-                    shape_v.as_mut_ptr(),
-                    shape_v.len() as i32,
-                    dtype as i32,
-                    dev_type, dev_idx,
-                    &mut handle,
-                )
-            };
-            check_err_raw(err)?;
-            debug_assert!(!handle.is_null());
-            // Safety: from_blob clones the data in the shim, so handle is independent
-            Ok(unsafe { Tensor::from_raw_handle(handle) })
+            // No typed Vec waypoint for these (Rust has no native f16/bf16, and
+            // i32 would need its own reinterpret): hand the raw little-endian
+            // bytes straight to Tensor::from_blob, which the shim copies. Routing
+            // through from_blob (not raw flodl_from_blob) is load-bearing: it
+            // homes the `raw.len() == numel × element_size` check, so a truncated
+            // or corrupt checkpoint errors instead of driving an OOB read.
+            Tensor::from_blob(raw, shape, dtype, Device::CPU)
         }
     }
 }
@@ -552,20 +628,13 @@ fn read_raw_checkpoint<R: Read>(r: &mut R) -> Result<Vec<RawEntry>> {
     let mut entries = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let name_len = read_u32(r)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes).map_err(io_err)?;
-        let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-        let ndim = read_u32(r)? as usize;
-        let mut shape = vec![0i64; ndim];
-        for s in &mut shape { *s = read_i64(r)?; }
+        let name = read_name(r)?;
+        let shape = read_shape(r)?;
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         let dtype = dtype_from_tag(tag[0])?;
         let byte_count = read_u64(r)? as usize;
-        let mut raw = vec![0u8; byte_count];
-        r.read_exact(&mut raw).map_err(io_err)?;
+        let raw = read_payload(r, byte_count)?;
 
         entries.push(RawEntry { name, shape, dtype, raw });
     }
@@ -701,7 +770,9 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
 
 /// Migrate a checkpoint file. Detects gzip from `.gz` extension on both paths.
 ///
-/// Source and destination must be different paths.
+/// In-place migration (`src == dst`) is safe: the destination is written to
+/// a temporary file and renamed over `dst` only after the source has been
+/// fully read (the same atomic tmp + rename every checkpoint writer uses).
 pub fn migrate_checkpoint_file(
     src: &str,
     dst: &str,
@@ -709,34 +780,15 @@ pub fn migrate_checkpoint_file(
     buffers: &[(String, Buffer)],
 ) -> Result<MigrateReport> {
     let sf = std::fs::File::open(src).map_err(io_err)?;
-    let df = std::fs::File::create(dst).map_err(io_err)?;
-
-    match (src.ends_with(".gz"), dst.ends_with(".gz")) {
-        (true, true) => {
+    write_file_atomic(dst, |mut w| {
+        if src.ends_with(".gz") {
             let mut r = flate2::read::GzDecoder::new(sf);
-            let mut w = flate2::write::GzEncoder::new(df, flate2::Compression::default());
-            let report = migrate_checkpoint(&mut r, &mut w, params, buffers)?;
-            w.finish().map_err(io_err)?;
-            Ok(report)
-        }
-        (true, false) => {
-            let mut r = flate2::read::GzDecoder::new(sf);
-            let mut w = std::io::BufWriter::new(df);
+            migrate_checkpoint(&mut r, &mut w, params, buffers)
+        } else {
+            let mut r = std::io::BufReader::new(sf);
             migrate_checkpoint(&mut r, &mut w, params, buffers)
         }
-        (false, true) => {
-            let mut r = std::io::BufReader::new(sf);
-            let mut w = flate2::write::GzEncoder::new(df, flate2::Compression::default());
-            let report = migrate_checkpoint(&mut r, &mut w, params, buffers)?;
-            w.finish().map_err(io_err)?;
-            Ok(report)
-        }
-        (false, false) => {
-            let mut r = std::io::BufReader::new(sf);
-            let mut w = std::io::BufWriter::new(df);
-            migrate_checkpoint(&mut r, &mut w, params, buffers)
-        }
-    }
+    })
 }
 
 // --- Shared helpers ---
@@ -745,7 +797,63 @@ pub(crate) fn io_err(e: impl std::fmt::Display) -> TensorError {
     TensorError::new(&format!("io: {}", e))
 }
 
-fn check_err_raw(err: *mut i8) -> Result<()> {
+/// Bound on serialized entry names — checkpoint keys are code identifiers;
+/// anything bigger is corruption, not data.
+const MAX_NAME_LEN: usize = 64 * 1024;
+/// Bound on tensor rank in a checkpoint header.
+const MAX_NDIM: usize = 64;
+
+/// Read a length-prefixed entry name. The length is untrusted header data:
+/// without the cap a corrupt file allocates up to 4 GiB before reading a byte.
+fn read_name<R: Read>(r: &mut R) -> Result<String> {
+    let name_len = read_u32(r)? as usize;
+    if name_len > MAX_NAME_LEN {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: entry name length {name_len} exceeds {MAX_NAME_LEN}"
+        )));
+    }
+    let mut name_bytes = vec![0u8; name_len];
+    r.read_exact(&mut name_bytes).map_err(io_err)?;
+    Ok(String::from_utf8_lossy(&name_bytes).into_owned())
+}
+
+/// Read a rank-prefixed shape, rank capped for the same reason as names.
+fn read_shape<R: Read>(r: &mut R) -> Result<Vec<i64>> {
+    let ndim = read_u32(r)? as usize;
+    if ndim > MAX_NDIM {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: tensor rank {ndim} exceeds {MAX_NDIM}"
+        )));
+    }
+    let mut shape = vec![0i64; ndim];
+    for s in &mut shape {
+        *s = read_i64(r)?;
+    }
+    Ok(shape)
+}
+
+/// Read a payload whose length comes from the untrusted header. The
+/// allocation grows with the bytes actually present (`take` + `read_to_end`),
+/// so a header claiming 2^60 bytes on a truncated file errors at EOF instead
+/// of aborting the process on the allocation.
+fn read_payload<R: Read>(r: &mut R, byte_count: usize) -> Result<Vec<u8>> {
+    const PREALLOC_CAP: usize = 16 << 20;
+    let mut raw = Vec::with_capacity(byte_count.min(PREALLOC_CAP));
+    let n = r
+        .by_ref()
+        .take(byte_count as u64)
+        .read_to_end(&mut raw)
+        .map_err(io_err)?;
+    if n != byte_count {
+        return Err(TensorError::new(&format!(
+            "corrupt checkpoint: payload truncated: header claims {byte_count} bytes, \
+             {n} present"
+        )));
+    }
+    Ok(raw)
+}
+
+fn check_err_raw(err: *mut std::ffi::c_char) -> Result<()> {
     if err.is_null() {
         Ok(())
     } else {
@@ -838,1020 +946,5 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tensor::TensorOptions;
-
-    fn make_named_params(sizes: &[(i64, i64)]) -> Vec<(String, Parameter)> {
-        sizes.iter().enumerate().map(|(i, &(rows, cols))| {
-            let t = Tensor::randn(&[rows, cols], TensorOptions {
-                dtype: DType::Float32,
-                device: crate::tensor::test_device(),
-            }).unwrap();
-            let name = format!("layer_{}/weight", i);
-            (name.clone(), Parameter::new(t, "weight"))
-        }).collect()
-    }
-
-    fn make_named_buffers(sizes: &[i64]) -> Vec<(String, Buffer)> {
-        sizes.iter().enumerate().map(|(i, &features)| {
-            let t = Tensor::randn(&[features], TensorOptions {
-                dtype: DType::Float32,
-                device: crate::tensor::test_device(),
-            }).unwrap();
-            let name = format!("bn_{}/running_mean", i);
-            (name.clone(), Buffer::new(t, "running_mean"))
-        }).collect()
-    }
-
-    #[test]
-    fn test_named_roundtrip() {
-        let params = make_named_params(&[(4, 8), (8, 2)]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], None).unwrap();
-
-        let load_params = make_named_params(&[(4, 8), (8, 2)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &[], None).unwrap();
-
-        assert_eq!(report.loaded.len(), 2);
-        assert!(report.skipped.is_empty());
-        assert!(report.missing.is_empty());
-
-        for ((_, src), (_, dst)) in params.iter().zip(load_params.iter()) {
-            let src_data = src.variable.data().to_f32_vec().unwrap();
-            let dst_data = dst.variable.data().to_f32_vec().unwrap();
-            assert_eq!(src_data, dst_data);
-        }
-    }
-
-    #[test]
-    fn test_buffer_roundtrip() {
-        let params = make_named_params(&[(4, 8)]);
-        let buffers = make_named_buffers(&[8]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &buffers, None).unwrap();
-
-        // Fresh model with same structure
-        let load_params = make_named_params(&[(4, 8)]);
-        let load_buffers = make_named_buffers(&[8]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &load_buffers, None).unwrap();
-
-        assert_eq!(report.loaded.len(), 2); // 1 param + 1 buffer
-        assert!(report.skipped.is_empty());
-        assert!(report.missing.is_empty());
-
-        // Verify buffer data matches
-        let src_data = buffers[0].1.get().to_f32_vec().unwrap();
-        let dst_data = load_buffers[0].1.get().to_f32_vec().unwrap();
-        assert_eq!(src_data, dst_data);
-    }
-
-    #[test]
-    fn test_named_partial_load() {
-        let params_3 = make_named_params(&[(4, 8), (8, 4), (4, 2)]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params_3, &[], None).unwrap();
-
-        let mut params_4 = make_named_params(&[(4, 8), (8, 4), (4, 2), (2, 1)]);
-        params_4[3].0 = "extra/weight".to_string();
-
-        let before_extra = params_4[3].1.variable.data().to_f32_vec().unwrap();
-
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &params_4, &[], None).unwrap();
-
-        assert_eq!(report.loaded.len(), 3);
-        assert_eq!(report.missing.len(), 1);
-        assert_eq!(report.missing[0], "extra/weight");
-        assert!(report.skipped.is_empty());
-
-        let after_extra = params_4[3].1.variable.data().to_f32_vec().unwrap();
-        assert_eq!(before_extra, after_extra);
-    }
-
-    #[test]
-    fn test_named_skipped_checkpoint_params() {
-        let params = make_named_params(&[(4, 8), (8, 2)]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], None).unwrap();
-
-        let model = vec![params[0].clone()];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &model, &[], None).unwrap();
-
-        assert_eq!(report.loaded.len(), 1);
-        assert_eq!(report.skipped.len(), 1);
-        assert!(report.missing.is_empty());
-    }
-
-    #[test]
-    fn test_named_shape_mismatch_error() {
-        let params = make_named_params(&[(4, 8)]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], None).unwrap();
-
-        let wrong_shape = vec![(
-            "layer_0/weight".to_string(),
-            Parameter::new(
-                Tensor::randn(&[4, 4], TensorOptions {
-                    dtype: DType::Float32,
-                    device: crate::tensor::test_device(),
-                }).unwrap(),
-                "weight",
-            ),
-        )];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &wrong_shape, &[], None);
-        assert!(result.is_err(), "shape mismatch should be an error");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("shape mismatch"), "error should mention shape: {}", err_msg);
-    }
-
-    #[test]
-    fn test_buffer_shape_mismatch_error() {
-        let buffers = make_named_buffers(&[8]);
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &[], &buffers, None).unwrap();
-
-        let wrong_buffers = vec![(
-            "bn_0/running_mean".to_string(),
-            Buffer::new(
-                Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap(),
-                "running_mean",
-            ),
-        )];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &[], &wrong_buffers, None);
-        assert!(result.is_err());
-        assert!(format!("{}", result.unwrap_err()).contains("shape mismatch"));
-    }
-
-    #[test]
-    fn test_compressed_roundtrip() {
-        let params = make_named_params(&[(16, 32), (32, 8)]);
-        let buffers = make_named_buffers(&[32]);
-
-        let dir = std::env::temp_dir();
-        let gz_path = dir.join("test_ckpt_v2.fdl.gz");
-        let plain_path = dir.join("test_ckpt_v2.fdl");
-        let gz = gz_path.to_str().unwrap();
-        let plain = plain_path.to_str().unwrap();
-
-        save_checkpoint_file(gz, &params, &buffers, None).unwrap();
-        save_checkpoint_file(plain, &params, &buffers, None).unwrap();
-
-        // Compressed should be smaller
-        let gz_size = std::fs::metadata(gz).unwrap().len();
-        let plain_size = std::fs::metadata(plain).unwrap().len();
-        assert!(gz_size < plain_size, "gz={} should be < plain={}", gz_size, plain_size);
-
-        // Load from compressed and verify
-        let load_params = make_named_params(&[(16, 32), (32, 8)]);
-        let load_buffers = make_named_buffers(&[32]);
-        let report = load_checkpoint_file(gz, &load_params, &load_buffers, None).unwrap();
-        assert_eq!(report.loaded.len(), 3); // 2 params + 1 buffer
-
-        for ((_, src), (_, dst)) in params.iter().zip(load_params.iter()) {
-            assert_eq!(src.variable.data().to_f32_vec().unwrap(),
-                       dst.variable.data().to_f32_vec().unwrap());
-        }
-
-        let src_buf = buffers[0].1.get().to_f32_vec().unwrap();
-        let dst_buf = load_buffers[0].1.get().to_f32_vec().unwrap();
-        assert_eq!(src_buf, dst_buf);
-
-        std::fs::remove_file(gz).ok();
-        std::fs::remove_file(plain).ok();
-    }
-
-    #[test]
-    fn test_hash_roundtrip() {
-        let params = make_named_params(&[(4, 8)]);
-        // Use a known 64-char hex hash
-        let hash = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], Some(hash)).unwrap();
-
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        // Same hash: should succeed
-        let report = load_checkpoint(&mut cursor, &load_params, &[], Some(hash)).unwrap();
-        assert_eq!(report.loaded.len(), 1);
-    }
-
-    #[test]
-    fn test_hash_mismatch_error() {
-        let params = make_named_params(&[(4, 8)]);
-        let hash_a = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
-        let hash_b = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], Some(hash_a)).unwrap();
-
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &load_params, &[], Some(hash_b));
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("architecture mismatch"), "error: {}", msg);
-    }
-
-    #[test]
-    fn test_zero_hash_skips_validation() {
-        let params = make_named_params(&[(4, 8)]);
-
-        // Save with no hash (zero bytes)
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], None).unwrap();
-
-        // Load with a hash expectation — should still succeed (file has zeros)
-        let hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &[], Some(hash)).unwrap();
-        assert_eq!(report.loaded.len(), 1);
-
-        // Save with hash, load with None — should succeed (no expected hash)
-        let mut buf2 = Vec::new();
-        save_checkpoint(&mut buf2, &params, &[], Some(hash)).unwrap();
-        let load_params2 = make_named_params(&[(4, 8)]);
-        let mut cursor2 = std::io::Cursor::new(&buf2);
-        let report2 = load_checkpoint(&mut cursor2, &load_params2, &[], None).unwrap();
-        assert_eq!(report2.loaded.len(), 1);
-    }
-
-    /// Write a checkpoint with an explicit version byte (for testing v1 migration).
-    fn save_checkpoint_versioned<W: std::io::Write>(
-        w: &mut W,
-        version: u32,
-        params: &[(String, Parameter)],
-        buffers: &[(String, Buffer)],
-    ) {
-        w.write_all(&MAGIC).unwrap();
-        w.write_all(&version.to_le_bytes()).unwrap();
-        w.write_all(&[0u8; HASH_LEN]).unwrap();
-        let total = (params.len() + buffers.len()) as u32;
-        w.write_all(&total.to_le_bytes()).unwrap();
-        for (name, p) in params {
-            let name_bytes = name.as_bytes();
-            w.write_all(&(name_bytes.len() as u32).to_le_bytes()).unwrap();
-            w.write_all(name_bytes).unwrap();
-            write_tensor_data(w, &p.variable.data()).unwrap();
-        }
-        for (name, b) in buffers {
-            let name_bytes = name.as_bytes();
-            w.write_all(&(name_bytes.len() as u32).to_le_bytes()).unwrap();
-            w.write_all(name_bytes).unwrap();
-            write_tensor_data(w, &b.get()).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_migrate_all_renamed() {
-        // Simulate v1 checkpoint with old-style names
-        let old_params = vec![
-            ("linear_0/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("linear_1/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 2], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &[]);
-
-        // New model with renamed tags
-        let new_params = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("decoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 2], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let mut out = Vec::new();
-        let report = migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &[],
-        ).unwrap();
-
-        assert!(report.unchanged.is_empty());
-        assert_eq!(report.remapped.len(), 2);
-        assert!(report.dropped.is_empty());
-        assert!(report.missing.is_empty());
-        assert!(report.is_complete());
-
-        // Verify the migrated checkpoint loads correctly
-        let verify_params = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("decoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 2], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&out);
-        let load_report = load_checkpoint(&mut cursor, &verify_params, &[], None).unwrap();
-        assert_eq!(load_report.loaded.len(), 2);
-        assert!(load_report.missing.is_empty());
-
-        // Verify data preserved: old param data matches loaded data
-        for (i, (_, vp)) in verify_params.iter().enumerate() {
-            let expected = old_params[i].1.variable.data().to_f32_vec().unwrap();
-            let got = vp.variable.data().to_f32_vec().unwrap();
-            assert_eq!(expected, got, "data mismatch for param {}", i);
-        }
-    }
-
-    #[test]
-    fn test_migrate_partial_rename() {
-        // Some names match, some don't
-        let old_params = vec![
-            ("shared/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("linear_0/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 2], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &[]);
-
-        let new_params = vec![
-            ("shared/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 2], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let mut out = Vec::new();
-        let report = migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &[],
-        ).unwrap();
-
-        assert_eq!(report.unchanged, vec!["shared/weight"]);
-        assert_eq!(report.remapped.len(), 1);
-        assert_eq!(report.remapped[0], ("linear_0/weight".to_string(), "encoder/weight".to_string()));
-        assert!(report.is_complete());
-    }
-
-    #[test]
-    fn test_migrate_with_buffers() {
-        let old_params = vec![
-            ("linear_0/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let old_buffers = vec![
-            ("bn_0/running_mean".to_string(), Buffer::new(
-                Tensor::zeros(&[8], crate::tensor::test_opts()).unwrap(), "running_mean")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &old_buffers);
-
-        let new_params = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let new_buffers = vec![
-            ("norm/running_mean".to_string(), Buffer::new(
-                Tensor::zeros(&[8], crate::tensor::test_opts()).unwrap(), "running_mean")),
-        ];
-
-        let mut out = Vec::new();
-        let report = migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &new_buffers,
-        ).unwrap();
-
-        assert_eq!(report.remapped.len(), 2);
-        assert!(report.is_complete());
-
-        // Verify migrated checkpoint loads with new names
-        let vp = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let vb = vec![
-            ("norm/running_mean".to_string(), Buffer::new(
-                Tensor::zeros(&[8], crate::tensor::test_opts()).unwrap(), "running_mean")),
-        ];
-        let mut cursor = std::io::Cursor::new(&out);
-        let load_report = load_checkpoint(&mut cursor, &vp, &vb, None).unwrap();
-        assert_eq!(load_report.loaded.len(), 2);
-    }
-
-    #[test]
-    fn test_migrate_dropped_and_missing() {
-        let old_params = vec![
-            ("old/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("removed/weight".to_string(), Parameter::new(
-                Tensor::randn(&[16, 16], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &[]);
-
-        // New model: one matching shape, one entirely new
-        let new_params = vec![
-            ("new/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("added/weight".to_string(), Parameter::new(
-                Tensor::randn(&[32, 32], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let mut out = Vec::new();
-        let report = migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &[],
-        ).unwrap();
-
-        assert_eq!(report.remapped.len(), 1);
-        assert_eq!(report.dropped, vec!["removed/weight"]);
-        assert_eq!(report.missing, vec!["added/weight"]);
-        assert!(!report.is_complete());
-    }
-
-    #[test]
-    fn test_migrate_positional_disambiguation() {
-        // Two params with identical shape — must match by position
-        let old_params = vec![
-            ("linear_0/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("linear_1/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &[]);
-
-        let new_params = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("decoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let mut out = Vec::new();
-        let report = migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &[],
-        ).unwrap();
-
-        assert_eq!(report.remapped.len(), 2);
-        // Positional: first old → first new, second old → second new
-        assert_eq!(report.remapped[0].0, "linear_0/weight");
-        assert_eq!(report.remapped[0].1, "encoder/weight");
-        assert_eq!(report.remapped[1].0, "linear_1/weight");
-        assert_eq!(report.remapped[1].1, "decoder/weight");
-
-        // Verify correct data assignment
-        let vp = vec![
-            ("encoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-            ("decoder/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&out);
-        load_checkpoint(&mut cursor, &vp, &[], None).unwrap();
-
-        // encoder/weight should have linear_0's data, decoder/weight should have linear_1's data
-        let enc_data = vp[0].1.variable.data().to_f32_vec().unwrap();
-        let dec_data = vp[1].1.variable.data().to_f32_vec().unwrap();
-        let old_0 = old_params[0].1.variable.data().to_f32_vec().unwrap();
-        let old_1 = old_params[1].1.variable.data().to_f32_vec().unwrap();
-        assert_eq!(enc_data, old_0);
-        assert_eq!(dec_data, old_1);
-    }
-
-    #[test]
-    fn test_migrate_v1_writes_v2() {
-        let old_params = vec![
-            ("x/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &old_params, &[]);
-
-        // Confirm source is v1
-        let mut peek = std::io::Cursor::new(&ckpt);
-        let mut magic = [0u8; 4];
-        std::io::Read::read_exact(&mut peek, &mut magic).unwrap();
-        let mut vbuf = [0u8; 4];
-        std::io::Read::read_exact(&mut peek, &mut vbuf).unwrap();
-        assert_eq!(u32::from_le_bytes(vbuf), 1);
-
-        let new_params = vec![
-            ("y/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let mut out = Vec::new();
-        migrate_checkpoint(
-            &mut std::io::Cursor::new(&ckpt), &mut out,
-            &new_params, &[],
-        ).unwrap();
-
-        // Confirm output is v2
-        let mut peek2 = std::io::Cursor::new(&out);
-        std::io::Read::read_exact(&mut peek2, &mut magic).unwrap();
-        assert_eq!(&magic, b"FDLC");
-        std::io::Read::read_exact(&mut peek2, &mut vbuf).unwrap();
-        assert_eq!(u32::from_le_bytes(vbuf), VERSION); // should be 2
-    }
-
-    #[test]
-    fn test_migrate_file_roundtrip() {
-        let old_params = vec![
-            ("old/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let dir = std::env::temp_dir();
-        let src = dir.join("test_migrate_src.fdl");
-        let dst = dir.join("test_migrate_dst.fdl");
-
-        // Write v1 checkpoint to file
-        {
-            let f = std::fs::File::create(&src).unwrap();
-            let mut w = std::io::BufWriter::new(f);
-            save_checkpoint_versioned(&mut w, 1, &old_params, &[]);
-        }
-
-        let new_params = vec![
-            ("new/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-
-        let report = migrate_checkpoint_file(
-            src.to_str().unwrap(),
-            dst.to_str().unwrap(),
-            &new_params, &[],
-        ).unwrap();
-        assert_eq!(report.remapped.len(), 1);
-        assert!(report.is_complete());
-
-        // Load migrated file
-        let vp = vec![
-            ("new/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let load_report = load_checkpoint_file(
-            dst.to_str().unwrap(), &vp, &[], None,
-        ).unwrap();
-        assert_eq!(load_report.loaded.len(), 1);
-
-        // Verify data preserved
-        let expected = old_params[0].1.variable.data().to_f32_vec().unwrap();
-        let got = vp[0].1.variable.data().to_f32_vec().unwrap();
-        assert_eq!(expected, got);
-
-        std::fs::remove_file(src).ok();
-        std::fs::remove_file(dst).ok();
-    }
-
-    #[test]
-    fn test_migrate_display() {
-        let report = MigrateReport {
-            unchanged: vec!["shared/weight".to_string()],
-            remapped: vec![("old/bias".to_string(), "new/bias".to_string())],
-            dropped: vec!["removed/weight".to_string()],
-            missing: vec!["added/weight".to_string()],
-        };
-        let text = format!("{}", report);
-        assert!(text.contains("unchanged (1)"));
-        assert!(text.contains("remapped (1)"));
-        assert!(text.contains("old/bias -> new/bias"));
-        assert!(text.contains("dropped (1)"));
-        assert!(text.contains("missing (1)"));
-    }
-
-    #[test]
-    fn test_checkpoint_version_peek() {
-        let params = make_named_params(&[(4, 8)]);
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_version_peek.fdl");
-        save_checkpoint_file(path.to_str().unwrap(), &params, &[], None).unwrap();
-
-        let v = checkpoint_version(path.to_str().unwrap()).unwrap();
-        assert_eq!(v, VERSION);
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_load_accepts_v1() {
-        // v1 checkpoints must still load in v2 builds
-        let params = vec![
-            ("x/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut ckpt = Vec::new();
-        save_checkpoint_versioned(&mut ckpt, 1, &params, &[]);
-
-        let load_params = vec![
-            ("x/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&ckpt);
-        let report = load_checkpoint(&mut cursor, &load_params, &[], None).unwrap();
-        assert_eq!(report.loaded.len(), 1);
-
-        let expected = params[0].1.variable.data().to_f32_vec().unwrap();
-        let got = load_params[0].1.variable.data().to_f32_vec().unwrap();
-        assert_eq!(expected, got);
-    }
-
-    // --- Edge case / corruption tests ---
-
-    #[test]
-    fn test_truncated_checkpoint_header_only() {
-        // Write valid header but truncate before any entry data
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&[0u8; HASH_LEN]);
-        // Claim 5 entries, but provide none
-        buf.extend_from_slice(&5u32.to_le_bytes());
-
-        let params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err(), "truncated checkpoint should return Err, not panic");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("io:"), "should be an IO error: {}", msg);
-    }
-
-    #[test]
-    fn test_truncated_checkpoint_mid_entry() {
-        // Save a valid checkpoint, then truncate in the middle of the first entry
-        let params = make_named_params(&[(4, 8)]);
-        let mut full = Vec::new();
-        save_checkpoint(&mut full, &params, &[], None).unwrap();
-
-        // Header = 4 (magic) + 4 (version) + 32 (hash) + 4 (count) = 44
-        // Truncate partway through the first entry (e.g., keep only 50 bytes)
-        let truncated = full[..50.min(full.len())].to_vec();
-
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&truncated);
-        let result = load_checkpoint(&mut cursor, &load_params, &[], None);
-        assert!(result.is_err(), "truncated mid-entry should return Err");
-    }
-
-    #[test]
-    fn test_empty_file() {
-        // Zero bytes: read_exact for magic should fail
-        let buf: Vec<u8> = Vec::new();
-        let params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err(), "empty file should return Err");
-    }
-
-    #[test]
-    fn test_invalid_magic_bytes() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JUNK"); // wrong magic
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&[0u8; HASH_LEN]);
-        buf.extend_from_slice(&0u32.to_le_bytes());
-
-        let params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("bad magic"), "error should mention bad magic: {}", msg);
-    }
-
-    #[test]
-    fn test_invalid_magic_checkpoint_version() {
-        // checkpoint_version() should also reject bad magic
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_bad_magic_version.fdl");
-        std::fs::write(&path, b"NOT_FDLC_data").unwrap();
-
-        let result = checkpoint_version(path.to_str().unwrap());
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("bad magic"), "error: {}", msg);
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_unsupported_version_high() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&99u32.to_le_bytes()); // version 99
-        buf.extend_from_slice(&[0u8; HASH_LEN]);
-        buf.extend_from_slice(&0u32.to_le_bytes());
-
-        let params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("unsupported checkpoint version"), "error: {}", msg);
-        assert!(msg.contains("99"), "should mention version 99: {}", msg);
-    }
-
-    #[test]
-    fn test_unsupported_version_zero() {
-        // Version 0 is also rejected (valid range is 1..=MAX_VERSION)
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&0u32.to_le_bytes()); // version 0
-        buf.extend_from_slice(&[0u8; HASH_LEN]);
-        buf.extend_from_slice(&0u32.to_le_bytes());
-
-        let params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("unsupported checkpoint version"), "error: {}", msg);
-    }
-
-    #[test]
-    fn test_hash_mismatch_both_nonzero() {
-        // Both file and expected have nonzero hashes that differ
-        let params = make_named_params(&[(4, 8)]);
-        let hash_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let hash_b = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], Some(hash_a)).unwrap();
-
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &load_params, &[], Some(hash_b));
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("architecture mismatch"), "error: {}", msg);
-        // Error message should include both hashes for diagnostics
-        assert!(msg.contains(hash_b), "should show expected hash: {}", msg);
-    }
-
-    #[test]
-    fn test_zero_entries_empty_model() {
-        // Save a checkpoint with no parameters and no buffers
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &[], &[], None).unwrap();
-
-        // Load into an empty model
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &[], &[], None).unwrap();
-        assert!(report.loaded.is_empty());
-        assert!(report.skipped.is_empty());
-        assert!(report.missing.is_empty());
-    }
-
-    #[test]
-    fn test_zero_entries_nonempty_model() {
-        // Save empty checkpoint, load into model that expects params
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &[], &[], None).unwrap();
-
-        let load_params = make_named_params(&[(4, 8)]);
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &load_params, &[], None).unwrap();
-        assert!(report.loaded.is_empty());
-        assert!(report.skipped.is_empty());
-        assert_eq!(report.missing.len(), 1, "model param should be reported as missing");
-    }
-
-    #[test]
-    fn test_shape_mismatch_transposed() {
-        // Save [4, 8], try to load into [8, 4] (transposed, same numel)
-        let params = vec![
-            ("layer/weight".to_string(), Parameter::new(
-                Tensor::randn(&[4, 8], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &params, &[], None).unwrap();
-
-        let wrong_params = vec![
-            ("layer/weight".to_string(), Parameter::new(
-                Tensor::randn(&[8, 4], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &wrong_params, &[], None);
-        assert!(result.is_err(), "transposed shape should be a mismatch error");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("shape mismatch"), "error: {}", msg);
-        assert!(msg.contains("[4, 8]"), "should show checkpoint shape: {}", msg);
-        assert!(msg.contains("[8, 4]"), "should show model shape: {}", msg);
-    }
-
-    #[test]
-    fn test_dtype_mismatch_auto_cast() {
-        // Save as f32, load into f64 parameter. The code does to_dtype() automatically.
-        let f32_param = vec![
-            ("layer/weight".to_string(), Parameter::new(
-                Tensor::ones(&[2, 3], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &f32_param, &[], None).unwrap();
-
-        // Create f64 parameter with same shape
-        let f64_param = vec![
-            ("layer/weight".to_string(), Parameter::new(
-                Tensor::zeros(&[2, 3], TensorOptions {
-                    dtype: DType::Float64,
-                    device: crate::tensor::test_device(),
-                }).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &f64_param, &[], None).unwrap();
-        assert_eq!(report.loaded.len(), 1, "dtype auto-cast should succeed");
-
-        // Verify the loaded data is correct and in f64
-        let loaded = f64_param[0].1.variable.data();
-        assert_eq!(loaded.dtype(), DType::Float64);
-        let vals = loaded.to_f64_vec().unwrap();
-        for v in vals {
-            assert!((v - 1.0).abs() < 1e-6, "expected ~1.0, got {}", v);
-        }
-    }
-
-    #[test]
-    fn test_dtype_mismatch_buffer_auto_cast() {
-        // Same auto-cast test for buffers
-        let f32_buffers = vec![
-            ("norm/running_mean".to_string(), Buffer::new(
-                Tensor::ones(&[8], crate::tensor::test_opts()).unwrap(), "running_mean")),
-        ];
-        let mut buf = Vec::new();
-        save_checkpoint(&mut buf, &[], &f32_buffers, None).unwrap();
-
-        let f64_buffers = vec![
-            ("norm/running_mean".to_string(), Buffer::new(
-                Tensor::zeros(&[8], TensorOptions {
-                    dtype: DType::Float64,
-                    device: crate::tensor::test_device(),
-                }).unwrap(), "running_mean")),
-        ];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let report = load_checkpoint(&mut cursor, &[], &f64_buffers, None).unwrap();
-        assert_eq!(report.loaded.len(), 1);
-        assert_eq!(f64_buffers[0].1.get().dtype(), DType::Float64);
-        let vals = f64_buffers[0].1.get().to_f64_vec().unwrap();
-        for v in vals {
-            assert!((v - 1.0).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_compressed_roundtrip_with_hash() {
-        // Test gz compression with structural hash validation
-        let params = make_named_params(&[(8, 16)]);
-        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-
-        let dir = std::env::temp_dir();
-        let gz_path = dir.join("test_ckpt_hash_gz.fdl.gz");
-        let path_str = gz_path.to_str().unwrap();
-
-        save_checkpoint_file(path_str, &params, &[], Some(hash)).unwrap();
-
-        // Load with matching hash
-        let load_params = make_named_params(&[(8, 16)]);
-        let report = load_checkpoint_file(path_str, &load_params, &[], Some(hash)).unwrap();
-        assert_eq!(report.loaded.len(), 1);
-
-        // Load with wrong hash should fail
-        let bad_hash = "1111111111111111111111111111111111111111111111111111111111111111";
-        let load_params2 = make_named_params(&[(8, 16)]);
-        let result = load_checkpoint_file(path_str, &load_params2, &[], Some(bad_hash));
-        assert!(result.is_err());
-
-        std::fs::remove_file(gz_path).ok();
-    }
-
-    #[test]
-    fn test_corrupted_gz_file() {
-        // Write valid gz header then garbage: should produce an error
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_corrupt.fdl.gz");
-        // Write some garbage that is not valid gzip
-        std::fs::write(&path, b"\x1f\x8b\x08\x00GARBAGE_NOT_VALID_GZ").unwrap();
-
-        let params = make_named_params(&[(4, 8)]);
-        let result = load_checkpoint_file(path.to_str().unwrap(), &params, &[], None);
-        assert!(result.is_err(), "corrupted gz should return Err");
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_unknown_dtype_tag() {
-        // Manually craft a checkpoint with an invalid dtype tag byte
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&[0u8; HASH_LEN]);
-        buf.extend_from_slice(&1u32.to_le_bytes()); // 1 entry
-
-        // Entry name
-        let name = b"layer/weight";
-        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        buf.extend_from_slice(name);
-
-        // ndim = 1, shape = [4]
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&4i64.to_le_bytes());
-
-        // Invalid dtype tag (255)
-        buf.push(255);
-
-        // byte_count = 16 (4 * f32), then dummy data
-        buf.extend_from_slice(&16u64.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 16]);
-
-        let params = vec![
-            ("layer/weight".to_string(), Parameter::new(
-                Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap(), "weight")),
-        ];
-        let mut cursor = std::io::Cursor::new(&buf);
-        let result = load_checkpoint(&mut cursor, &params, &[], None);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("unknown dtype tag"), "error: {}", msg);
-    }
-
-    #[test]
-    fn test_checkpoint_keys_peeks_names_without_loading_data() {
-        let params = vec![
-            (
-                "encoder/layer/weight".to_string(),
-                Parameter::new(
-                    Tensor::ones(&[4, 8], crate::tensor::test_opts()).unwrap(),
-                    "weight",
-                ),
-            ),
-            (
-                "pooler/dense/weight".to_string(),
-                Parameter::new(
-                    Tensor::ones(&[8, 8], crate::tensor::test_opts()).unwrap(),
-                    "weight",
-                ),
-            ),
-        ];
-        let buffers = vec![(
-            "encoder/layer/running_mean".to_string(),
-            Buffer::new(
-                Tensor::zeros(&[8], crate::tensor::test_opts()).unwrap(),
-                "running_mean",
-            ),
-        )];
-
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_checkpoint_keys_peek.fdl");
-        let path_str = path.to_str().unwrap();
-
-        save_checkpoint_file(path_str, &params, &buffers, None).unwrap();
-        let keys = checkpoint_keys(path_str).unwrap();
-        assert_eq!(
-            keys,
-            vec![
-                "encoder/layer/weight".to_string(),
-                "pooler/dense/weight".to_string(),
-                "encoder/layer/running_mean".to_string(),
-            ],
-            "params first then buffers, in declaration order",
-        );
-
-        std::fs::remove_file(path_str).ok();
-    }
-
-    #[test]
-    fn test_checkpoint_keys_handles_gzip() {
-        let params = vec![(
-            "x/w".to_string(),
-            Parameter::new(
-                Tensor::ones(&[2, 2], crate::tensor::test_opts()).unwrap(),
-                "w",
-            ),
-        )];
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_checkpoint_keys_gz.fdl.gz");
-        let path_str = path.to_str().unwrap();
-
-        save_checkpoint_file(path_str, &params, &[], None).unwrap();
-        let keys = checkpoint_keys(path_str).unwrap();
-        assert_eq!(keys, vec!["x/w".to_string()]);
-
-        std::fs::remove_file(path_str).ok();
-    }
-
-    #[test]
-    fn test_checkpoint_keys_rejects_bad_magic() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_checkpoint_keys_bad.fdl");
-        std::fs::write(&path, b"NOPEnotacheckpoint").unwrap();
-        let err = checkpoint_keys(path.to_str().unwrap()).unwrap_err();
-        assert!(format!("{err}").contains("bad magic"), "got: {err}");
-        std::fs::remove_file(path).ok();
-    }
-}
+#[path = "checkpoint_tests.rs"]
+mod tests;

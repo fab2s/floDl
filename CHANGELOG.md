@@ -5,22 +5,454 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-22
+
+The headline of this release is a full re-architecture of the distributed layer from a thread-per-GPU in-process model to a process-per-rank cluster model with an authenticated control plane, dial-in membership, elastic failure handling, controller-driven checkpoint orchestration, and a transparent launcher trampoline. The same single training entry (`Trainer::builder()` / `Trainer::run`) now drives single-device, single-host multi-GPU, and multi-host clusters from one code path. Every cross-host channel shares ONE controller port (workers join through it, training rides it, `fdl status` reads it, and `tunnel: true` routes it through SSH). ElChe (the heterogeneous cadence balancer that landed in 0.5.x) gained a phase machine, a divergence guardrail, an LR-aware meta-controller, delivered-cost scheduling, EASGD elastic averaging on the CPU async path, a pluggable outer optimizer (SlowMo / DiLoCo), and a `Fastest` epoch-callback dispatcher for free-compute eval. `fdl` gained a cluster readiness gate (`fdl probe`), a live run-status command (`fdl status`), a libnccl bridge builder (`fdl nccl build`), a global `--gpus` flag, and a strict cluster.yml schema with controller/worker separation.
 
 ### Added
+
+#### Multi-process cluster architecture: launcher / controller / coordinator / worker
+
+The distributed layer is now process-based end-to-end. A single `Trainer::run` invocation transparently auto-promotes to process-per-rank fan-out when 2+ GPUs are visible (homogeneous local rig) or when a cluster overlay is active (`fdl @cluster <cmd>` / `FDL_ENV=cluster`). Thread-based multi-GPU is retained only as the lower-level `Ddp::wrap` primitive (manual / test use); the in-process multi-GPU orchestration engine is gone (see Changed).
+
+- **`flodl::distributed::launcher`**: role detector (`Role::SingleDevice | Rank | Launcher | Relay | Agent`) plus the launcher trampoline that opens the membership window, supervises children concurrently, and tears them down on parent exit. The trampoline runs from inside the user's `main()` at the `Trainer::builder(...).run()` boundary so guard closures and other non-`Serialize` `DdpRunConfig` knobs reach the controller without crossing a process boundary as JSON. Binaries that gate before `Trainer::run` (GPU checks, mode parsing) call `launcher::exit_if_worker_role()` first so the internal per-host roles never fall into user gating.
+- **`flodl::distributed::controller`**: `ClusterController` runs on the launcher host as a TCP byte router for CPU averaging round-frames and rank-side log fan-in. The controller, not rank 0, binds rendezvous (`distributed: controller binds rendezvous; drop rank-0 master pattern`) so the orchestrator host is no longer a NCCL rank itself.
+- **`flodl::distributed::cluster_coordinator::ClusterCoordinator`**: state-machine port of the old in-process `Coordinator` adapted for cross-process scheduling. Drives epoch dispatch, callback role assignment, dead-rank handling, CPU finalize, NCCL via-coord routing, heartbeat, checkpoint orchestration, cost-aware dispatch, and chunk-pool replay. Split across 9 files under `cluster_coordinator/` (averaging, callback_roles, config, dead_ranks, epoch_dispatch, event_loop, lifecycle, mod, test_helpers).
+- **`flodl::distributed::cluster_worker::ClusterWorker<M>`**: TCP-driven wrapper around `GpuWorker` running on each rank child. Mirrors the in-process worker loop but with control / timing / metrics / param flows traveling over the wire.
+- **`flodl::distributed::cpu_reduce`**: rank-side TCP client for CPU averaging + a `CpuAverager` on the launcher side. Replaces the in-process `cpu_avg` averaging path on cluster runs; `Tensor` ↔ `RoundFrame` conversion is the boundary.
+- **HMAC-authenticated wire protocol (`flodl::distributed::wire`)**: every control frame is HMAC-SHA256-keyed by a per-session 128-bit salt, truncated to 64 bits. Stale / mis-routed / forged frames fail authentication with 2^-64 probability and surface loudly. Payloads are not confidential (no TLS); the guarantee is authentication and tamper detection. Magic + version constants are independent of the data-channel protocol so the two evolve separately.
+- **Dashboard relocated from rank to launcher**: ranks emit `TimingMsgWire::Dashboard*` registration frames (graph SVG, metadata, hardware summary) and piggy-back resource samples on `MetricsMsgWire::resources`; the coordinator forwards everything to a `DashboardSink` trait whose concrete implementation in `launcher` wraps the HTTP `DashboardServer`. One dashboard URL for the whole cluster, hosted off the operator-facing host, with per-rank tabs derived from the cluster topology.
+
+#### Dial-in membership: join window, quorum knobs, worker agents
+
+Workers **join** a run; the controller admits them. The launcher opens a join window on the controller port; every worker — fan-out-managed and self-deployed alike — dials in with a hello (host, GPU inventory, libtorch variant, dataset signature) and receives its global ranks in **admission order** (contiguous by construction). `world_size` freezes at window close, and all coordination infrastructure is sized to the world that actually formed.
+
+- **One worker agent per host** (`Role::Agent`): fan-out starts one SSH session per remote host; the agent dials back in, joins, and — once the world forms — spawns its host's relay and rank children locally. The join connection stays open as the host control link (per-rank exit reports up, abort down, EOF = host death). A **self-deployed worker** needs nothing but the controller address: a three-field `AgentSpec` (`host`, `controller_host`, `controller_port`) in `FLODL_INTERNAL_AGENT_JSON` resolves its own GPUs and joins like any fan-out agent.
+- **`controller.join:` quorum knobs** (cluster.yml, `ClusterBuilder`, or defaults): `min_rank_start` (quorum), `join_timeout` (window; quorum-early does NOT close it), `target_ranks` (early close), `max_join_timeout` (hard cap, loud fail), `open_admission`. Fan-out defaults make the window close the instant every configured rank is in — zero added latency, all-or-nothing preserved. The dial-in that follows the window is bounded too: every admitted host's relay must reach the coordinator within a formation deadline (60s, `FLODL_NET_TIMEOUT_SCALE`-scaled), and a coordinator that fails formation aborts the whole run with the coverage reached as the root cause — a host that crashed between admission and dial-in can't leave the cohort waiting on each other in a cycle.
+- **Trust follows bind scope**: pre-shared session salt keys the join hello on managed rigs (wrong key = dropped without reply); a loopback bind (all workers tunneled) is open by construction — reachability through sshd IS the authentication — and hands the salt out in the accept reply. `open_admission: true` extends that to a network bind, loudly warned.
+- **Run status on the training port**: the same controller port answers plain HTTP GETs with the run's membership state as `state.json` — lifecycle phase (`waiting` / `forming` / `training` / `done` / `failed`), per-host membership, join-window countdowns. **`fdl status`** pretty-prints it (`--json` for scripts, `--addr host[:port]` for self-deploy operators); curl works without fdl.
+- **Cohort inventory for post-run consumers** (`launcher::cohort_inventory()`): the launcher snapshots every admitted worker (`JoinedMember`: host, ranks, physical devices, GPU labels) at world formation, so code running in the launcher process after `Trainer::run` can describe hardware it can never probe locally — e.g. a bench harness writing a hardware header that covers remote hosts. Join-hello GPU labels now carry VRAM + compute capability (`"NVIDIA GeForce GTX 1060 6GB (6GB, sm_61)"`), which also enriches `state.json` / `fdl status`.
+
+#### One controller port: mux, SSH tunnels, cleartext guard
+
+Every cross-host channel (membership join, NCCL bootstrap rendezvous, CPU-reduce data, coordinator control, HTTP status) accepts on the single `controller.port` (default 1337); connections route themselves with a 4-byte channel-select magic. Config is one `host:port`; one SSH forward covers all traffic.
+
+- **`tunnel: true` per worker**: routes the host's training traffic through its fan-out SSH session (a remote forward on the agent session) instead of a direct TCP connection. CPU ElChe modes only (NCCL's data plane is peer-to-peer and cannot ride a controller tunnel); when every remote worker is tunneled the controller binds loopback-only, making the training port unreachable except through sshd.
+- **Cleartext guard**: flodl channels are HMAC-authenticated but not encrypted; flodl now warns loudly whenever a cleartext channel touches a peer outside private address space (loopback / RFC1918 / link-local / CGNAT-shared), on both the accept and dial sides.
+- **Model-derived frame ceiling**: the maximum accepted wire-frame size is derived from the actual model (bytes × 2, floored at 64 MiB) instead of a fixed 1 GiB constant, installed in every process from the launcher's CPU-side model probe.
+
+#### Per-host relay: fold tier + single uplink
+
+One transport relay per remote host (`Role::Relay`, no CUDA) multiplexes its local ranks onto a single controller connection — and is the first fold tier of the CPU reduce: it sums its local ranks' contributions element-wise (masses included) into one host frame per round and fans the controller's single consensus broadcast back out. K local ranks cost 1x the model bytes on the host uplink per direction instead of Kx. A rank death mid-window simply produces a lighter host frame; the controller accounts per-connection and forwards dead-rank declarations down to the owning relay.
+
+#### `TrainerConfig` + `ElCheMode`: single-config training entry
+
+Collapses the policy × backend matrix into one user-facing enum and gathers everything `Trainer::run` needs into one struct. The chained `Trainer::builder(...)` form still exists and remains the right tool for callback-heavy setups; `TrainerConfig` is the data-bag form for config-driven launchers.
+
+- **`ElCheMode`** enum (in `flodl::distributed::config`): `NcclSync | NcclCadence | CpuSync | CpuCadence | CpuAsync`. Names match the ddp-bench / commit / design-doc vocabulary; internally splits into the legacy `(ApplyPolicy, AverageBackend)` pair. `NcclSync` is the degenerate ElChe case (anchor=1) so all five modes route through the same code path.
+- **`ElCheConfig`**: controller-scope tuning (mode, anchor, max_anchor, min_anchor, overhead_target, max_batch_diff, max_overshoot, gamma, relax_up, partition_ratios, meta_controller, convergence_guard, divergence_threshold, no_divergence_guard, easgd_alpha). Five preset constructors (`nccl_sync()`, `nccl_cadence()`, `cpu_sync()`, `cpu_cadence()`, `cpu_async()`) plus a builder chain.
+- **`TrainerConfig<M>`**: umbrella struct gathering dataset / batch_size / num_epochs / elche / max_grad_norm / checkpoint_every / save_path / resume_from / callbacks (`checkpoint_fn`, `epoch_fn`, `metrics_fn`, `scheduler_fn`, `eval_fn`, `eval_result_fn`) / epoch_callback_policy / timeline / optional programmatic `cluster`. Both `Trainer::run` and `Trainer::builder().run()` accept it.
+- **`Trainer::run(model_factory, optim_factory, train_fn, cfg)`**: config-bag entry. Internally builds a `DdpBuilder`, sets the launcher env from `cfg.cluster` if present, and dispatches through the same launcher trampoline as fdl-cli-launched runs (one launcher contract; two construction paths).
+
+#### `ClusterBuilder` + `HostBuilder`: programmatic cluster construction
+
+Fluent builder mirroring `fdl.cluster.yml` 1:1 (same fields, same validation), for tests and for binaries that want to launch a cluster from inside `main()` without depending on a yml on disk.
+
+- **`flodl::ClusterBuilder::new()`** → `.controller("controller.example.com").port(1337).path("/srv/project").done().host("worker-a").devices([0, 1]).nccl_socket_ifname("enp1s0").ssh("worker-a.example.com").ssh_port(22).ssh_user("ubuntu").ssh_identity_file("/path/to/key").done().build()` → `FullCluster`. `.controller()` returns a `ControllerBuilder` (`.port()` / `.path()` / `.done()`); each `.host()` returns a `HostBuilder`; `.done()` returns the parent `ClusterBuilder` for chaining.
+- **`ClusterBuilder::all_local_gpus()`** ergonomic single-host helper: synthesizes a `FullCluster` from `sys::detect_gpus()` with a loopback controller and one worker pinning every visible CUDA device. The "I just want every local GPU as a rank, no yml" path.
+- **`TrainerConfig::cluster(full)`** wires a `FullCluster` directly into `Trainer::run`. The launcher env-var contract (`FLODL_INTERNAL_FULL_CLUSTER_JSON`) is filled by `Trainer::run` if not already set by fdl-cli, so a programmatic cluster and an overlay-driven cluster reach the launcher the same way.
+
+#### `flodl::sys::detect_gpus`: CUDA-free GPU detection
+
+`sys::detect_gpus() -> Vec<GpuInfo>` shells out to `nvidia-smi` and returns `(index, name, sm_version, vram_bytes)` per visible device without loading libtorch. Honors `CUDA_VISIBLE_DEVICES` so the result matches the post-scope view that the auto-promote path and child processes will see.
+
+This is the canonical pre-`Trainer::run` GPU query. The previous habit of calling `flodl::tensor::cuda_device_count()` from `main()` initializes libtorch's CUDA context in the launcher process; that context then poisons the spawned children's contexts on heterogeneous-GPU rigs ("no CUDA before `Trainer::run`" invariant). `detect_gpus` is the safe replacement.
+
+The "no CUDA before `Trainer::run`" invariant is now hardened: `Trainer::builder` / `Trainer::run` / `Module::on_device(CUDA(_))` all defer device touches until inside the run path. User binaries that respected the invariant pre-0.6.0 are unaffected; binaries that didn't will now error at a clearer site instead of corrupting a spawned child's CUDA state silently.
+
+#### Elastic membership + controller-driven checkpoint orchestration
+
+Ranks can die without aborting the run: the controller evicts the dead rank for the remainder of the run and redistributes its work across survivors. The controller owns the lifecycle decisions; workers just report and follow. Membership only ever shrinks — a dead or new rank cannot join a formed world (elastic scale-up is designed but not yet implemented).
+
+- **Heartbeat**: `HeartbeatWire` flows worker → controller; missed heartbeats past a configurable threshold transition the rank to `Dead` in the coordinator's per-rank state and elastically renormalize partition ratios across survivors.
+- **`max_failure` threshold + `ShutdownWithSave`**: cluster aborts cleanly when the surviving rank count drops below `max_failure`. On abort the coordinator drives a final checkpoint save through whichever rank still has the freshest state (callback-role-aware), then signals every survivor to exit. Lone NCCL survivors short-circuit the wait and exit immediately.
+- **`flodl::distributed::checkpoint_meta`**: `CheckpointMeta` writes a `<stem>.meta.json` sidecar carrying ElCheState (phase, calibration_count, anchor, partition_ratios, ring buffer) plus the `SaveReason` (GracefulShutdown / MaxFailureExceeded / SingleSurvivor / AllRanksLost / ReduceStall / Checkpoint) and the `CheckpointBundle` path helpers (`model_path` / `optim_path` / `meta_path` / `config_sidecar_path`). The controller writes meta atomically alongside the model + optimizer files.
+- **Controller-driven checkpoint retry + role failover**: a save failure on the elected callback rank does not poison the run. The coordinator picks a new callback rank from survivors (cost-aware: lowest smoothed_ms_per_batch first, sticky within a run), re-issues the save, and resumes. Failed callbacks are time-excluded from rank-cost accounting so retry latency doesn't bias the next dispatch decision.
+- **NCCL rendezvous-timeout retry with `survivors_ordered`**: if `ncclCommInitRank` doesn't quorum within the timeout, the coordinator picks the largest contiguous survivor subset, rebuilds the comm, and retries. Used at run start and after a mid-run rank death.
+- **Every wait is bounded, every death is diagnosed**: bootstrap rendezvous has an idle deadline + a pre-auth reject cap; reduce cycles have stall ceilings on both backends (a wedge escalates to a diagnosed `ShutdownWithSave` instead of a silent overnight hang); a rank exiting non-zero writes a `RankDeathRecord` sidecar (`<save_path>.rank<N>.death.json`) so post-mortems don't start from a bare exit code.
+- **`Trainer::builder(...).resume_from(stem)` / `TrainerConfig::resume_from`**: launcher kickoff loads the model / optim / meta bundle, restores `ElCheState` (preserving phase + calibration trajectory), and continues training from the resume epoch. Compatible with controller-written `.meta.json` from any prior run.
+- **Coverage-granular checkpoint/resume** (`TrainerConfig::checkpoint_at_epoch` / `DdpBuilder::checkpoint_at_epoch`): a one-shot checkpoint fires on a progressive data-*coverage* boundary (the epoch where any rank reaches the target) rather than on a wall clock. `load_consensus_checkpoint` forges a coherent consensus model from the cluster's `RoundFrame`s; `ddp-bench` exposes `--save-path` / `--resume-from` / `--checkpoint-at-epoch` to exercise the round-trip.
+
+#### ElChe: phase machine, divergence guard, LR-aware meta-controller, EASGD
+
+The cadence balancer that shipped in 0.5.x grew load-bearing additions for production-grade heterogeneous training.
+
+- **`Phase` lifecycle**: `Probe → Warmup → Stable → Mature`, monotonic and `>=`-comparable. Probe = no calibrations yet; Warmup = first few calibrations with sticky anchor; Stable = normal operation with overhead auto-tune + hysteresis; Mature = long-running steady state. Gates the more aggressive controllers (anchor swaps, relax-up) to `>= Stable`.
+- **`relax_up`**: in `Phase::Stable` with passing convergence guard, ElChe is allowed to grow the anchor upward, amortizing AllReduce barrier cost over more local SGD when divergence stays bounded. Off by default; opt in via `ElCheConfig::relax_up(true)`.
+- **Progressive warmup + 5% dead zone**: anchor decisions inside the dead zone (anchor differences smaller than 5% of current) are no-ops, reducing thrash on near-stable cadences.
+- **Window-pressure anchor auto-tune**: the anchor is tuned from per-window *fixed overhead* (reduce + window-fill measured against the bottleneck rank's window wall) toward `ElCheConfig::overhead_target` (default `0.05`), with a growth latch that only grows the anchor while pressure stays below target. Replaces the compute-only overhead signal on the cadence path.
+- **Delivered-cost scheduling**: ElChe calibrates on each rank's *delivered* cost — compute + data starvation + transport — not compute-only timing, so a rank on a slow link or a starving loader is no longer over-allocated and left idling at the barrier.
+- **Work-weighted consensus averaging** (both backends): each rank's contribution is weighted by its realized work in the window (`w_k` proportional to steps delivered, shaped by `ElCheConfig::gamma`); ranks that delivered zero steps are excluded rather than diluting the consensus. On NCCL the weighting is applied inside the AllReduce via `PreMulSum` (NCCL >= 2.11 required), removing the bookend scale/divide kernels — and unlocking `gamma` on the NCCL backend. Non-learnable f32 buffers (BatchNorm running stats and the like) ride the same sync on both backends, averaged with equal weight among the ranks that stepped in the window — never `gamma`-weighted, so running statistics don't inherit a fast rank's dominance; non-f32 buffers (deterministic integer counters, updated identically on every rank) keep their local value.
+- **Convergence guard (`flodl::distributed::ddp_run::convergence`)**: `ConvergenceGuard` trait with three implementations:
+  - **`NoGuard`** (passive baseline; always reports `Stable`).
+  - **`TrendGuard`** (production default; three-rises-above-threshold rule on weight-space divergence, default threshold 0.05).
+  - **`LambdaEstimator`** (MSF λ-hat passive observation for instrumentation; doesn't influence cadence).
+  - `ConvergenceAction::{Stable, Divergent, Tighten}` drives the coordinator's response (nudge anchor down on `Divergent`, no-op on `Stable`).
+  - Guard state is part of `ElCheState` and round-trips through checkpoint resume.
+- **LR-aware meta-controller (`flodl::distributed::lr_event_meta`)**: a layer above ElChe that watches the LR trajectory, anchor trend, and convergence-guard verdicts in a rolling window. Reactively nudges the anchor down on sharp LR drops or sustained divergence, and reports `is_settled()` once the metric stops moving. **On by default**; `ElCheConfig::meta_controller(false)` collects an unconditioned baseline.
+- **EASGD elastic averaging**: `ElCheConfig::easgd_alpha(α)` enables EASGD-style elastic blending (0 < α ≤ 1.0) on the `CpuAsync` path. The CPU averaging backend receives a blend of local + center weights instead of a hard overwrite, smoothing divergence in long async runs. Ignored outside `CpuAsync`.
+
+#### Pluggable outer optimizer: SlowMo / DiLoCo
+
+A second optimization loop applied to the work-weighted **consensus** model between the reduce and the broadcast, on top of the inner per-rank optimizers. Opens the door to communication-efficient distributed methods (DiLoCo, SlowMo) without touching the inner training loop.
+
+- **`flodl::distributed::OuterOptimizer`** trait + `OuterOptimizerFactory`: an `outer_step` plus `checkpoint_state` / `load_checkpoint_state` / `resets_inner`. Three impls, all re-exported at the crate root:
+  - **`OuterAvg`** (default): stateless identity passthrough — reproduces plain work-weighted averaging exactly, no momentum, no artifact.
+  - **`SlowMomentum::new(lr, mu)`**: SlowMo heavy-ball momentum on the pseudo-gradient, continuous inner loop.
+  - **`NesterovMomentum::new(lr, mu)`**: DiLoCo-style Nesterov outer step with disposable inner state (`resets_inner()` makes each worker reset its inner optimizer per outer round).
+- **`TrainerConfig::outer_optimizer(factory)`** / **`DdpBuilder::outer_optimizer(factory)`** select the variant; built once per site (controller-side on the CPU backend, per-rank replicated lock-step on NCCL).
+- **`ElCheConfig::gamma(γ)`**: consensus allocation-weighting exponent (default `1.0` = pre-gamma behavior).
+- **Outer-optimizer momentum checkpointing**: momentum-bearing variants persist their slow momentum to a `<stem>.outer.fdl` sidecar (one tensor per model parameter, positional). On CPU the controller writes it; on NCCL an elected rank writes it and every rank reloads its replicated copy on resume, so the resumed outer trajectory is faithful. Stateless `OuterAvg` writes no sidecar.
+- **`ddp-bench`**: `--outer-optimizer none|slowmo|diloco` plus `--outer-lr` / `--outer-mu` / `--gamma`, with a loud-error guard on momentum flags passed to `none`.
+
+#### `EpochCallbackPolicy::Fastest`: cost-aware free-compute callbacks
+
+`Trainer::builder().epoch_callback_policy(EpochCallbackPolicy::Fastest)` dispatches per-epoch callbacks (`checkpoint_fn`, `eval_fn`, `metrics_fn`, `epoch_fn`) on the rank with the lowest smoothed_ms_per_batch instead of always pinning to rank 0. On heterogeneous rigs the fastest rank has the most idle time at the sync barrier, so the eval / save runs as free compute rather than stalling the slow rank's next batch.
+
+- Sticky within a run: the dispatcher re-picks only on rank death.
+- Supported on the via_coord cluster path; loud-errors on the single-host fallback.
+- **`Fastest` is the default**; `Rank(n)` (the previous rank-0 convention) remains available for workflows that need a pinned callback rank.
+
+#### `Trainer::builder().eval_fn(...)` + eval cadence: cluster-aware held-out evaluation
+
+`eval_fn` registers an evaluation closure that the coordinator dispatches per the configured `EvalCadence`, and `eval_result_fn` receives the controller-side scalar result. Heterogeneous-rig-friendly via `EpochCallbackPolicy::Fastest`: eval runs on whichever rank is idle longest at the barrier.
+
+- `EvalFn<M> = Arc<dyn Fn(&M, &Tensor, &Tensor) -> Result<f64> + Send + Sync>`.
+- `EvalResultFn = Arc<dyn Fn(usize, f64) + Send + Sync>` (controller-side; receives the rank's reported scalar plus the epoch index).
+- Wires through `TrainerConfig::eval_fn` / `eval_result_fn` / `eval_dataset` for the config-bag entry.
 
 #### `Trainer::builder().metrics_fn(...)`: host-side per-epoch callback
 
 The chained `Trainer::builder(...).run()?.join()?` shape was sold as the canonical "just train" form, but anything beyond final-weights-only (per-epoch logging, monitor updates, per-rank metric capture) forced users into a manual `let handle = run()?; while let Some(m) = handle.next_metrics() {...}; handle.join()?` polling loop. `metrics_fn` closes that gap.
 
-- **`flodl::MetricsFn`** type alias: `Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>`. Mirrors the shape of `CheckpointFn` for consistency.
-- **`DdpBuilder::metrics_fn(f)`** registers a host-side callback fired once per epoch with the aggregated `EpochMetrics`, after all ranks have reported. Errors are logged to stderr; training continues.
-- **Composes with `next_metrics()`**: the same `EpochMetrics` reaches the callback (if registered) *and* the polling queue, so users can register `metrics_fn` and keep polling. No deprecation, no fork in docs.
-- **Transparent 1-or-N GPU**: fires identically on the multi-GPU path (coordinator thread, per-epoch as ranks aggregate) and the single-GPU fallback path (main thread, per-epoch as training progresses). `run_single` previously dropped its `MetricsMsg` traffic; it now drains it, builds a single-rank `EpochMetrics`, fires `metrics_fn`, and pushes to the same queue `next_metrics()` reads. Single-GPU `next_metrics()` previously returned `None` immediately — that pre-existing transparency gap is closed.
-- **Single-GPU is synchronous by design**: `run_single` runs to completion before returning the `DdpHandle`, so explicit pollers see all queued metrics back-to-back rather than blocking per-epoch. A single GPU has nothing to be async with; that's the natural shape, not a limitation.
-- **Future enhancement**: surfacing callback errors to `DdpHandle::join()` for early-stop semantics is not in this release; the contract is observation-only.
+- `flodl::MetricsFn` type alias: `Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>`. Mirrors the shape of `CheckpointFn`.
+- `DdpBuilder::metrics_fn(f)` registers a host-side callback fired once per epoch with the aggregated `EpochMetrics`, after all ranks have reported. Errors are logged to stderr; training continues.
+- Composes with `next_metrics()`: the same `EpochMetrics` reaches the callback (if registered) and the polling queue, so users can register `metrics_fn` and keep polling. No deprecation, no fork in docs.
+- Transparent 1-or-N GPU: fires identically on the multi-GPU path (coordinator thread, per-epoch as ranks aggregate) and the single-GPU fallback (main thread, per-epoch as training progresses). Single-GPU `next_metrics()` previously returned `None` immediately; that pre-existing transparency gap is closed.
+- Single-GPU `run_single` is synchronous by design: runs to completion before returning the `DdpHandle`, so explicit pollers see all queued metrics back-to-back rather than blocking per-epoch.
+- The contract is observation-only: callback errors are logged, not surfaced to `DdpHandle::join()`. Early-stop semantics via callback errors is a future enhancement.
 
-Motivation: the bench harness, dashboards, and any non-trivial training loop want host-side per-epoch hooks. The chained "managed pattern" should look like the one-liner from the docs *and* be observable; without `metrics_fn` those two were mutually exclusive.
+#### `fdl probe`: cluster readiness gate
+
+New `fdl probe` subcommand (`flodl-cli/src/probe.rs`) audits a host or a whole cluster for distributed-training readiness before fan-out. Errors loudly on misconfig; the green path is silent enough to use as a CI smoke test.
+
+- **Single-host (`fdl probe`)**: GPU inventory (count, name, sm version, VRAM), libtorch variant + linkage, NCCL availability (host libnccl or Docker-image-bundled), shared-data path resolution, dashboard port availability. Splits results into warnings (informational) vs errors (block dispatch).
+- **Cluster (`fdl @cluster probe`)**: SSHes each worker, runs the per-host probe, aggregates. Validates per-worker `arch:` against actual GPU sm versions, checks libtorch variant arch coverage, surfaces NCCL major.minor skew across hosts (the common failure mode on heterogeneous rigs).
+- **Docker-aware NCCL detection**: when a worker has `docker: <svc>` set in cluster.yml, the probe reports "via Docker image `<svc>`" instead of erroring on a missing host-level libnccl.so.
+- **Output modes**: `--json` for tooling, default human-readable. `--skip-mount` / `--data-path` / `--libtorch-path` for targeted overrides.
+- Returns non-zero on errors; zero on green or warnings-only.
+
+#### `fdl nccl build`: libnccl source builder for the LD_PRELOAD bridge
+
+`fdl nccl build` compiles NVIDIA's libnccl from source for the local GPU architectures + auto-detected target version, producing a `libnccl.so.2` that can be `LD_PRELOAD`-ed into libtorch to override the bundled version. Required on heterogeneous-rig clusters when one host's libtorch ships NCCL 2.27.x and another's ships 2.26.x: NCCL refuses handshake across major.minor skew, so the easier side rebuilds.
+
+- Auto-detects the target NCCL tag from the active libtorch variant's `third_party/nccl` submodule version.
+- Auto-detects architectures from local GPUs (multi-arch builds supported, e.g. `sm_61 + sm_120` for a Pascal + Blackwell rig).
+- Containerized build via `Dockerfile.nccl.source`. 5-15 minutes depending on CPU cores and arch count.
+- Output drops under `libtorch/nccl/builds/<tag>-<archs>/lib/libnccl.so.2`. Wire it into a worker via `env.LD_PRELOAD` in cluster.yml.
+
+#### `fdl --gpus`: global GPU scope override
+
+`fdl --gpus <spec> <cmd>` sets `CUDA_VISIBLE_DEVICES` for the dispatched command. Accepted at any argv position; spec is a comma-separated index list (`0,1`) or the `all` shorthand.
+
+- Cluster-aware: on `fdl @cluster <cmd>`, `--gpus` overrides per-worker `local_devices` for the local controller host; remote workers continue to use their cluster.yml-declared devices.
+- Non-cluster: maps `--gpus` directly to `CUDA_VISIBLE_DEVICES` for the dispatched subprocess.
+- Loud errors on duplicate, missing value, or invalid spec.
+
+#### cluster.yml schema: first-class `controller:` / `workers:` separation
+
+`fdl.cluster.yml.example` and the matching `fdl.cluster-test.yml.example` (testing overlay) now codify the controller / worker separation. The orchestrator host fdl-cli runs on is never a NCCL rank; every rank-carrying host lives under `workers:`.
+
+- `controller:` block: `host` (controller bind, was `master_addr`) / `port` (default 1337, replaces PyTorch's 29500 — the ONE port every cross-host channel shares; worker hosts derive `+4`/`+5` for their host-local rank↔relay loopbacks only) / `path` (controller's view of the shared project root) / optional `docker:` / `arch:` for pre-flight build context / optional `join:` quorum block (see dial-in membership).
+- `workers[]`: per-host entries with `host` (worker identifier and default ssh target, was `name`) / `local_devices` (explicit list or `all` shorthand probed at dispatch) / `nccl_socket_ifname` (required for multi-host) / `path` (project checkout dir) / `arch` (libtorch variant subpath under `<path>/libtorch/`) / optional `docker:` / `env:` / `ssh:` sub-block.
+- `ssh:` sub-block: groups `target` / `port` / `user` / `identity_file` / `options` (list of `-o Key=Value`) into one launcher-only block. Omit entirely to use system ssh + `~/.ssh/config` defaults.
+- `env:` blocks: cluster-scope `env:` applies to every rank child on every worker; per-worker `env:` overrides matching keys. Per-host CUDA_VISIBLE_DEVICES scoping for heterogeneous rigs.
+- Orchestrator-only host entries are permitted (worker entry with empty `ranks:`) for clusters where the controller is itself one of the SSH targets but owns no GPUs.
+- `cluster-test` env (in-process topology source, no fan-out) replaces the previous test-discovery convention. Exports `FLODL_TESTING_CLUSTER_JSON` to `cargo test` so `flodl::distributed::testing::discover_test_cluster()` reads the same yml the production overlay does.
+
+#### `fdl @<env>` environment selector
+
+The `@<env>` sigil (scan-anywhere before `--`) selects an `fdl.<env>.yml` overlay: `fdl @cluster probe`, `fdl @cluster-test cuda-test-nccl`. It ranks equally with `--env <name>` and `FDL_ENV=<name>`; supplying two that disagree is a loud error, and all three forms must resolve to an existing overlay. Replaces the previous "first positional token matches an overlay" convention, so the first bare token is now always a command (an env may share a name with a command).
+
+#### Variant-shaped `#[derive(FdlArgs)]`: enum subcommands
+
+`#[derive(FdlArgs)]` now accepts an **enum of newtype variants**, turning each variant into a subcommand. Previously the derive only accepted a struct with named fields, so multi-mode binaries hand-rolled their own `while let` argv dispatch (and a separate hand-maintained `usage()` printer that drifted from it). A multi-mode CLI is now one enum whose `main` is an exhaustive `match` — adding a mode is a compile-time exhaustiveness obligation, not a dispatch-table edit.
+
+```rust
+#[derive(FdlArgs)]
+enum Cli {
+    /// Train a model on a dataset
+    Train(TrainArgs),
+    /// Evaluate a trained model on a test split
+    Eval(EvalArgs),
+    /// Generate samples (subcommand renamed from the variant ident)
+    #[command(name = "gen")]
+    Generate(GenArgs),
+}
+
+fn main() {
+    match parse_or_schema::<Cli>() {
+        Cli::Train(a) => { /* ... */ }
+        Cli::Eval(a) => { /* ... */ }
+        Cli::Generate(a) => { /* ... */ }
+    }
+}
+```
+
+- **Thin dispatcher, full reuse**: the enum derive peels the leading subcommand token and delegates parsing / schema / help to the wrapped type, which carries its own `#[derive(FdlArgs)]`. No new field-parsing — a subcommand *is* a struct. Only single-tuple (newtype) variants are accepted; unit, named-field, and multi-field variants fail at derive time with a pointed error.
+- **Self-documenting**: subcommand name = the variant ident kebab-cased (`TrainSubscan` → `train-subscan`), overridable with `#[command(name = "...")]`. Variant doc-comments become the per-subcommand descriptions in the parent `--help` command list.
+- **Contextual help**: `<bin> --help` lists the commands; `<bin> train --help` renders only train's flags. `<bin> --fdl-schema` emits the whole tree. Backed by a new defaulted `FdlArgsTrait::render_help_path` method (single-struct CLIs are unaffected — the default forwards to `render_help`).
+- **`Schema` grew two additive fields** (`description`, `commands: BTreeMap<String, Schema>`), both `#[serde(skip_serializing_if)]`. A leaf schema serializes byte-identically to before, so existing single-struct consumers (`ddp-bench`, `flodl-hf`, `fdl`'s own commands) and inline `fdl.yml` schemas are untouched. A node is a leaf (`args`/`options`) **or** a branch (`commands`), never both — enforced by `validate_schema`. The shape mirrors the recursive `commands:` map `fdl.yml` already uses, closing the depth-1 asymmetry between the macro and yaml layers.
+- **`fdl`-side consumers are tree-aware**: `fdl <bin> --help` lists the binary's subcommands; tail validation descends to the invoked subcommand's leaf (with "did you mean" on a mistyped subcommand); bash / zsh / fish completions complete subcommand names and per-subcommand flags.
+- **Arbitrary depth for free**: a variant may wrap another `FdlArgs` enum; dispatch, schema, and help all recurse through tail-recursive delegation with no special-casing.
+
+#### Heterogeneous-rig cluster support
+
+These features came out of a forced heterogeneous topology: a rig crash and OS migration pushed two of three GPUs into a VM, producing a single-machine cluster whose VM rank ran a different libtorch variant from the bare-metal ranks. Every heterogeneous-rig pain point a multi-host deployment would hit (NCCL version skew, per-host libtorch arch, shared-mount conventions, per-host CUDA scoping) showed up inside one box, and shaped the design accordingly.
+
+- **Per-case `libtorch/.active.<case>` pointers**: one libtorch checkout, multiple per-host pointers. The `FDL_LIBTORCH_CASE=<case>` env var selects which pointer file to read; cluster.yml's per-host `arch:` points at the per-host case. Single-host setups keep using bare `.active`.
+- **Per-host pre-flight build (`flodl-cli/src/prebuild.rs`)**: `fdl @cluster <cmd>` and any `cluster: true` command auto-build the target binary locally for every remote host before fan-out. Per-host `CARGO_TARGET_DIR=target/cluster/<host>/`, libtorch resolved from each host's variant, CUDA feature derived from the host's `.arch` metadata. Builds run in parallel per host; first failure aborts fan-out. Remote dispatch invokes the prebuilt binary directly (no cargo, no rustc on remote).
+- **`Dockerfile.cuda` cuda-rank service**: long-lived sshd container as a VM-equivalent cluster remote. Lets a developer simulate a remote NCCL rank without standing up a real second host. Drops authorized_keys, mounts the project root + libtorch as the production layout, listens on port 2222.
+- **libtorch source builds bundle cuDNN sub-libs**: source-built libtorch variants now bundle the matching cuDNN sub-libraries (cudnn_cnn, cudnn_ops, cudnn_adv, cudnn_engines_*, cudnn_graph, cudnn_heuristic) so dlopen-based loading doesn't fall back to the system cuDNN at runtime. Closes a class of mysterious mismatches on heterogeneous-rig deployments where the host cuDNN version differs from what libtorch was built against.
+- **`Dockerfile.nccl.source`**: dedicated NCCL build context (see `fdl nccl build` above).
+
+#### `flowbuilder_residual` example
+
+`flodl/examples/flowbuilder_residual/`: minimal residual-block example showing the canonical `fork().also(...).merge()` pattern. Generated SVG (`site/assets/images/flowbuilder-residual.svg`) ships with the site assets for inline embedding in docs.
+
+#### Two-stage streaming prefetch: reader ring + `ram_max_usage`
+
+The streaming `DataLoader` pipeline now runs two stages on CUDA targets: a reader thread fetches batches from the dataset into a bounded pageable-RAM ring while the transfer thread pins and copies to the device. Storage-read latency (network shares, slow disks) overlaps transfer work instead of adding to it, raising the prefetch throughput ceiling from `1/(t_read + t_transfer)` to `1/max(t_read, t_transfer)`; the ring absorbs read jitter. This is a ceiling raise for read-bound pipelines — a pipeline that already keeps up gains nothing, by design.
+
+- **`DataLoaderBuilder::ram_max_usage(f)`** (default `0.50`, clamped `[0.0, 0.90]`, `0.0` = single-stage): fraction of the host's **available** RAM the reader may claim while staging ahead. The ring is sized at each `epoch()` from the kernel's `MemAvailable`, so every other process on the box — permanent fixtures like pinned VM memory and hugepages included — is accounted for automatically and the budget self-adjusts as the box fills or drains; when it cannot fit one batch, the pipeline falls back to single-stage. Per-loader ceiling: multiple CUDA-target loaders on one host should each get a divided fraction.
+- **`flodl::sys::mem_info()`**: host RAM probe (`MemTotal` / `MemAvailable` from `/proc/meminfo`), CUDA-free like the rest of `flodl::sys`.
+- The VRAM depth governor and the RAM ring bound different resources and stay orthogonal: the governor caps device in-flight (transfer stage), the ring caps host-RAM in-flight (reader stage). CPU-target loaders keep the single-stage pipeline (their batch channel already is the read-ahead buffer), as does the coordinator-paced distributed batch path.
+
+#### Augmentation as deterministic repeated picks
+
+Augmentation is now a first-class, reproducible schedule concept instead of per-call randomness hidden in the dataset. Two orthogonal knobs, on `DataLoaderBuilder` (solo) and `TrainerConfig` / `DdpBuilder` (DDP) alike:
+
+- **`.augment(k)`** — each sample appears `k` times per epoch, spread by the shuffle. Pure scheduling: the epoch permutation runs over the pick space `len() * k`, and a pick decodes intrinsically as `(pick / k, pick % k)` = (sample, repeat) — so the decode survives re-partition, rank death, and resume with no side tables. Every pick fetches the same raw bytes (staged once across the tiers) and counts as one unit of realized work; ElChe, the coordinator ledger, the wire format, and coverage-granular resume all run in pick space unchanged. Composes with the built-in samplers; combining with a custom sampler errors loudly.
+- **`.transform(f)`** — the deterministic delivery transform, the sanctioned home for augmentation. Receives each delivered batch (raw rows, already on the target device, freshly assembled) plus one `PickKey { sample, repeat, epoch, seed }` per row; derive per-view randomness from `PickKey::rng()` (stateless, frozen mixing constants — checkpointed runs reproduce their augmentation exactly). Runs live on every delivery and never writes back: the staging tiers (RAM cache, disk stage, VRAM pool) retain raw samples only, so a VRAM-pooled sample uploads once and derives its `k` views on device. Batch assembly always materializes fresh storage, so even an in-place transform cannot corrupt the retained raw bytes.
+
+With `k = 1` and no transform, everything is byte-identical to before — the epoch permutation scheme is unchanged (and now lives in one place, `epoch_permutation`, shared by the solo sampler and the DDP partition expansion). The flow window's drop-behind became multiplicity-aware: a sample stays resident until its last advised pick instead of popping on first hit.
+
+`ddp-bench` exposes the pair as `--augment <k>` (schedule multiplicity) and `--augment-noise <amp>` (a `PickKey`-keyed additive input-noise transform, so the k views carry distinct bytes — the A/B arm for the keyed delivery path under real multi-rank runs).
+
+#### Sample cache: later epochs read from RAM, not storage
+
+`DataSet`-backed streaming loaders now retain samples in a read-through RAM cache as epoch 1 reads them; later epochs hit RAM instead of re-reading storage. The cache is keyed by sample identity, which makes staged content reshuffle-proof: a reshuffle changes only the access order, never the content set. When the budget covers the whole dataset, storage is read exactly once for the entire run.
+
+- **`DataLoaderBuilder::sample_cache(bool)`** (default enabled): the off switch for single-pass training over data far larger than RAM, where retained samples are never revisited. Opaque `BatchDataSet` loaders have no sample layer and are never cached (their batching is the dataset's own affair).
+- **Admission: fill until full; evict only under re-partition.** On the solo path every epoch touches each sample exactly once in a fresh random order, so a cache holding K of N samples hits K/N of reads for any eviction policy; admit-until-full delivers that with zero eviction churn and the solo loader never evicts. On the DDP staging path the coordinator re-partitions the permutation every epoch, the K-set tie breaks, and the stager evicts in next-use order against its advisory — prior-epoch leftovers (absent from the visible future) go first, sooner-needed samples take their room, and the tier declines when everything held is needed sooner (the flow window's exact rule, now spanning both tiers). A shrinking RAM budget stops new admissions; retained content drops only through that next-use order, never as a blanket flush.
+- Shares the `ram_max_usage` budget with the reader ring: the ring is capped to a small flow-buffer depth while the cache is active (jitter absorption saturates fast; retained samples pay again on every later epoch), the cache gets the remaining headroom, refreshed each `epoch()` against `MemAvailable`. Reads take an uncontended per-slot read lock; admission is set-if-empty under the slot's write lock, eviction empties the slot for reuse.
+
+#### Disk stage: a local-drive tier under the sample cache
+
+`DataLoaderBuilder::disk_stage(gb)` (default 0 = off) adds a local-disk overflow tier: samples the RAM cache declines are staged once in an append-only pack file, and later epochs read them at local-disk speed instead of source speed. With RAM + disk covering the dataset, a network-mounted source is read exactly once per run. Lookup cascades RAM → disk → source.
+
+- **One pack file, not one file per sample**: sequential append is every drive's fast path, and the offset index reuses the same lock-free set-once-slot pattern as the RAM tier (positioned reads, no shared seek state). The per-tensor layout reuses the checkpoint codec — one serialization format in the codebase, not two.
+- **`DataLoaderBuilder::disk_stage_dir(path)`** overrides the location (default: system temp dir). A RAM-backed directory (tmpfs — `/tmp` frequently is) triggers a loud warning, since a stage that spends RAM defeats its purpose. The pack file is ephemeral: removed when the loader drops.
+- **Failure split**: a read error on the pack file surfaces (it is a real disk problem); a write error never fails training — the sample is already in hand — it latches the stage off loudly and the run continues source-backed. Budget-full is a plain decline, not a failure.
+- Requires the sample layer: `build()` errors loudly on an opaque `BatchDataSet` loader or with `sample_cache(false)`. Pays exactly when the source is slower than local disk (network mounts) and data is revisited; for a dataset already on local SSD the source is the disk and the stage buys nothing.
+
+#### Reservation staging: cluster ranks read their data ahead of training
+
+Cluster workers now stage their upcoming training data ahead of the training frontier. At each progressive epoch start the coordinator sends every rank a `StageAdvisory` — its reservation view as certainty-ordered permutation spans: the rank's own reserved span first (deterministic for the whole epoch), then the other spans' window-sized tails (the truing margins, whose final owner can move under throughput drift). A background stager thread on each rank walks the advisory through the shared permutation and reads the samples into a sample-keyed staging tier that the live prefetch path shares: batch fetches become read-through (staged rows served from the tier, misses fetched in one bulk call and admitted on the way out, row order preserved).
+
+- **Advisory, never authoritative**: chunk allocation remains the only execution authority. Staging may overlap across ranks near reservation boundaries — margins are staged by several ranks on purpose — but only allocated work executes, so staged-and-allocated-elsewhere data needs no invalidation protocol; it just ages out. Latest advisory wins.
+- **Cross-epoch**: advisories carry run-stream segments — this epoch's spans plus the predicted next epoch's (same ratio table over the next permutation, computable before its pool exists) — so the stager walks into the next epoch while this one trains. An epoch is just where the order function switches, never a data-movement event; staged content is reshuffle-invariant (sample-keyed).
+- **Refreshed on the window clock**: advisories re-emit at each reduce boundary (the same clock reservation truing rides), so boundary drift and ratio changes reach the stagers without a timer of their own.
+- **Consumption-proportional host shares**: each advisory carries the current schedule; a worker takes the `ram_max_usage` share (default 0.50) of its host's live `MemAvailable` — anchored by what its tiers already retain, so the budget holds steady as they fill — and splits it among co-hosted ranks (from the cluster envelope) by their schedule counts — `budget ∝ consumption rate` gives every rank the same seconds of lookahead, which matters acutely on hosts whose combined VRAM exceeds RAM. Available-based on purpose: a total-anchored cap reads permanent fixtures (pinned VM memory, hugepages) as pressure and zeroes the budget on exactly the heterogeneous hosts staging targets. Budgets refresh with each advisory; a shrink stops new admissions, never drops staged content.
+- **Dormant until advised**: the tier has budget 0 (pure pass-through, one atomic load per row) until the first advisory arrives, so single-device runs, tests, and non-progressive modes never pay for it.
+- **A flow window with next-use-priority eviction rides beyond the pinned tier**: what the pinned tier declines lands in a bounded stream pool instead of wasting the read. Training consumption pops entries (the frontier passing IS the drop-behind), admission under pressure evicts the entry whose next use in the advised stream is farthest — keep what recurs soonest — and the stager pauses before fetching rather than reading past a full window, so no source read is ever spent on a sample nothing can retain. Next-use positions re-key from each advisory on the window clock.
+- **`FLODL_STAGER=off` kill-switch + verbose observability**: setting `FLODL_STAGER=off` (or `0`) in a worker's `env:` block leaves the dataset unwrapped and spawns no stager — the clean A/B lever for measuring staging against the same binary. Under `-vv`, each advisory logs its segment count, sample count, pinned/stream budget split, and cumulative staged count, so a silent stager (zero budget, empty advisories) is visible instead of indistinguishable from a working one. User `FLODL_*` variables pass through worker `env:` blocks; only the framework's internal channel (`FLODL_INTERNAL_*`, `CUDA_VISIBLE_DEVICES`, and the other launcher-owned keys) is reserved.
+
+#### Device-resident sample pool: the VRAM tier of the sample cascade
+
+Streaming `DataLoader`s on CUDA targets now retain as many samples as fit in leftover VRAM and assemble batches by gathering retained rows on device instead of uploading them — H2D traffic shrinks by the hit rate. The middle ground between resident mode (whole dataset on device) and streaming (every byte crosses PCIe every epoch): one byte over the resident budget no longer costs the whole dataset's residency.
+
+- **Admission is capture-at-delivery**: samples enter the pool by device-to-device copy out of batches that were uploaded anyway (transfer stream, raw pre-augmentation rows), so filling costs zero extra transfers — the first epoch populates the pool as a side effect. Sample-keyed and admit-until-full: under per-epoch reshuffle any K retained samples of N hit K/N of reads, the same argument as the RAM sample cache one tier up.
+- **Sizing is automatic and conservative**: dormant until the honest post-first-step probe (the prefetch governor's latch, or the rank worker's explicit signal on coordinator-paced paths), then one budget decision from measured free VRAM minus a flow-buffer in-flight reserve minus a safety margin — with a capacity tier active, prefetch depth is a rate-matcher, not a capacity claim, the same arbitration as the reader ring's flow-buffer cap one tier down. No fraction knob; **`DataLoaderBuilder::vram_pool(false)`** is the off switch.
+- **Never the reason a step OOMs**: storage is slab-chunked (partially freeable); on transient data-plane OOM the governor's target halving runs first and slab eviction is the last resort, after which the budget latches down. The training-step path is untouched.
+- Batch assembly restores exact caller row order (pooled rows gathered, misses uploaded, stitched on the transfer stream so the delivery event covers everything); per-epoch `-v` telemetry reports rows served on-device, H2D bytes saved, and pool occupancy.
+- **DDP rank workers pool too** — the path that never had a resident mode at all (cluster ranks re-uploaded every byte every epoch, whatever the dataset size). The worker signals the pool's budget moment itself at the first post-calibration plan boundary (measured activation peak = its honest probe). Knobs: `TrainerConfig::vram_pool` / `DdpBuilder::vram_pool` / `DdpRunConfig::with_vram_pool` (default on), plus a per-worker `FLODL_VRAM_POOL=off` env kill-switch for A/B runs. On a heterogeneous cluster the fast rank serves 100% of its rows on-device once the pool fills (~400MB of H2D saved per epoch on CIFAR-sized data); reservation-drift misses on slower ranks stay small and keep being captured.
+
+#### One memory-budget policy: the data-plane knobs reach the trainer
+
+All memory sizing across the data cascade — reader ring, sample cache, DDP stager tiers, prefetch depth, VRAM-pool flow reserve — now runs through one policy module (`flodl::data::budget`), so the solo loader and the DDP rank workers can never drift apart on how a machine's memory is priced. Previously the DDP side hardcoded its own copies (a fixed `0.90` VRAM fraction, a fixed `available/2` host-RAM share) with no user knob.
+
+- **`TrainerConfig::with_vram_max_usage(f)` / `with_ram_max_usage(f)`** (and the chained `DdpBuilder` twins `.vram_max_usage()` / `.ram_max_usage()`): the same two memory knobs the solo `DataLoaderBuilder` has always had now govern each DDP rank's data plane — prefetch channel + device sample pool for VRAM, staging tiers for host RAM — with identical defaults (`0.90` / `0.50`) and clamps. Co-hosted ranks split the host-RAM share in proportion to their schedule.
+- **`with_sample_cache(b)` / `with_disk_stage(gb)` / `with_disk_stage_dir(path)`** complete the knob parity: the solo loader's remaining staging knobs now reach the trainer too. `sample_cache(false)` pins each rank's retained cache at zero (the flow window keeps the whole staging share); `disk_stage(gb)` attaches the same RAM → disk → source overflow cascade under each rank's staging cache, spilling to an ephemeral pid-unique pack file per rank, so co-hosted ranks sharing a temp directory never collide. `ddp-bench` exposes both as `--sample-cache` / `--disk-stage`.
+- **`FLODL_VRAM_POOL=off` now reaches the solo loader too**: the runtime kill-switch (and the pool's default) had one definition on the DDP path and none on the solo path, so a scripted A/B silently no-op'ed on single-GPU runs. One shared parse + one shared default now serve both.
+- **One anchored budget law**: every host-RAM budget is `r × (MemAvailable + held)` — held bytes added back *before* taking the share, so the cap is a fixed point of the run's starting headroom. Both single-sided variants are real bugs this rules out: full add-back after the share ratchets toward 100% of RAM, no add-back self-starves the tier as it fills.
+- **Honest retention pricing** (`Tensor::storage_nbytes`, new public API): a retained view is charged the whole backing buffer its clone pins, not its logical size — and a view whose backing storage exceeds twice its logical size is materialized into owned storage at admission instead (a 4KB row `select`ed from a 500MB row-group no longer pins the 500MB, in any tier). The stager also re-prices its room-check estimate after every fetch (running max) instead of trusting the first sample's size, so variable-size datasets (NLP sequences, mixed resolutions) can no longer slip past the room checks and waste source reads on samples nothing can retain.
+- **Install-chunk truce**: on the plan boundary where a DDP rank's VRAM pool takes its one-shot budget, the prefetch channel collapses to the pool's flow-buffer reserve — previously both sized themselves against the same free VRAM on that one chunk (transient-OOM window); from the next boundary the probe sees pool bytes as used and the depth re-sizes honestly. The flow-reserve formula itself now has a single definition both budget-signal paths share.
+
+#### Per-sample datasets end to end: `DataSet` trainer entries + disk-backed readers
+
+The one-method `DataSet::get(index)` contract now reaches every training entry — implement how to read one sample (or use a shipped reader) and the framework owns batching, RAM caching, disk staging, reservation staging, and distribution. Storage-backed data (local files, network mounts, beds larger than RAM) trains through the same entry as RAM-resident tensors.
+
+- **`TrainerConfig::from_dataset(ds)`** and **`DdpBuilder::sample_dataset(ds)`**: per-sample twins of the `BatchDataSet` entries. Rank workers read samples through the shared staging tier and stage them ahead of the training frontier per their reservations.
+- **`flodl::data::batch_dataset_from(ds)`**: public promotion of any `DataSet` into an opaque `BatchDataSet` (position-wise stacking) for APIs without a native per-sample entry.
+- **`flodl::data::FixedStrideRecords`**: a file as `count` fixed-size records with lock-free positioned reads (`read_exact_at`), optional leading header. Many raw dataset distributions are exactly this shape; a custom format needs a parse closure, not a loader. Misaligned file sizes error loudly.
+- **`flodl::data::datasets::Cifar10Disk`**: CIFAR-10 read per sample from the raw batch files (the binary distribution is already a 3073-byte-stride record file — no repacking). `open(paths)` / `open_train(dir)` / `open_test(dir)`; sample output batch-stacks identically to the RAM parser.
+- **ddp-bench `--data-source ram|disk`**: the CIFAR models (`resnet`, `resnet-graph`) can train from per-sample storage reads, exercising the staging tiers against real read paths; models without a per-sample reader reject the flag loudly.
+
+#### Per-rank data reservations in progressive dispatch
+
+The progressive chunk pool now partitions each epoch's permutation into contiguous per-rank spans sized by ElChe throughput ratios (equal until calibrated), and serves each rank's chunks from the front of its own span instead of a shared arrival-order cursor. Each rank's upcoming data is thereby deterministic for the whole epoch — the foundation for staging it ahead of the training frontier. Throughput drift is absorbed by reservation truing: a rank that out-runs its span steals from the tail of the largest-residue span (the boundary moves, the coverage books stay exact). Training semantics are unchanged — a reservation table is a deterministic partition of the globally reshuffled order where the old cursor produced a nondeterministic one — and the dispatch discipline (one chunk in flight, schedule-exact window sizing, reduce/epoch barriers, coverage-granular checkpoint/resume, dead-rank reclaim) is untouched.
+
+#### Misc additions
+
+- **`flodl/examples/auto_promote`**: plain-binary multi-GPU — a minimal `Trainer::builder().run()` binary demonstrating that the same code auto-promotes to process-per-rank on a multi-GPU host with zero cluster config.
+- **`FLODL_NET_TIMEOUT_SCALE`**: one env knob scales the whole cluster deadline set (handshakes, rendezvous, heartbeat windows, join window, formation dial-in) — for slow rigs, congested CI, or debugger-attached runs.
+- **`flodl::distributed::chunk_pool`**: extracted from coordinator; reusable chunk-pool dispatch primitive that reclaims a dead rank's in-flight data chunks and redistributes them deterministically across the surviving ranks.
+- **Network-aware logging (`flodl::log`)**: rank-scope prefixes that survive the cluster fan-in (`[rank=N]`-style markers preserved when controller forwards logs to launcher stdout).
+- **`Monitor` re-exported at the crate root**: `use flodl::*;` now reaches it like every other type in a typical training binary (`Graph`, `Adam`, losses, `Trainer`); previously it alone required the `use flodl::monitor::Monitor;` module path (which still works).
+- **Optimizer `state_dict_keys()`**: Adam / RMSprop / SGD expose state-dict key listings for checkpoint introspection.
+- **Optimizer state persistence now covers every optimizer**: `Adagrad`, `RAdam`, and `NAdam` gained `Stateful` (save/load of moments, per-parameter step counts, and hyperparameters), so `Optimizer::save_state_to` no longer returns "unsupported" for them — the cluster save-on-unrecoverable-failure flow can now persist any optimizer's `.optim` sidecar and resume faithfully instead of silently restarting their moment estimates. Their state files are born under the new self-identifying `FDLO` header (see Fixed), so no migration ever applies to them.
+- **Scaled CUDA NCCL communicator wiring**: `NcclComms` better handles N-rank topologies; `NcclRankComm::split` is the per-thread comm seam used by the `Ddp::wrap` / cluster-worker thread-test path (production ranks use per-process `NcclRankComm::init_rank`).
+- **`Tensor::copy()`**: a deep-copy primitive that allocates fresh storage (the flodl spelling of PyTorch's deep `.clone()`). flodl's `Clone` is a *shallow* alias sharing storage (libtorch's copy constructor), so an in-place op through one handle is visible through every alias; `Tensor::copy()` returns an independent, owned duplicate for the cases that need it (optimizer state seeded from a gradient, snapshots held across later mutation). The `Clone` and `Variable::data` docs now flag the shallow-vs-PyTorch divergence and point to it.
+
+### Changed
+
+#### CUDA stream/event primitives moved to `tensor` (BC-transparent)
+
+`CudaStream` / `StreamGuard` / `CudaEvent` / `CudaEventFlags` are device-runtime tools, not DDP machinery, and now live in `flodl::tensor::{cuda_stream, cuda_event}` — below every consumer, so the data layer no longer reaches into `distributed` for them. Every existing path keeps working: the crate-root re-exports are unchanged and `flodl::distributed::cuda_stream::…` / `flodl::distributed::{CudaStream, …}` remain valid re-exports of the same types. `Variable::id()` and `Buffer::id()` are also new: the stable shared-cell identity that parameter/buffer collection dedups on, previously hand-rolled as `Rc::as_ptr` casts at every site.
+
+#### `Module` trait de-cycled from `graph` and `distributed`
+
+The `nn::Module` trait no longer names types from higher layers — a `Linear` no longer transitively knows what a DDP metrics struct or a `Graph` is. Two changes, one of them BC-relevant:
+
+- **`Module::as_graph` → `Module::as_any` + `graph::GraphExt`** (BC-relevant): the trait's `as_graph(&self) -> Option<&Graph>` hook is replaced by a graph-agnostic opt-in identity hook `as_any(&self) -> Option<&dyn Any>` (default `None`; composite types return `Some(self)`, transparent wrappers may present their inner composite). The ergonomic `.as_graph()` call survives unchanged as `flodl::graph::GraphExt` — a blanket extension over every `Module`, re-exported at the crate root, so `use flodl::*` code keeps compiling verbatim. Migration is only needed for external `Module` impls that *overrode* `as_graph`: override `as_any` instead (return the graph you used to return, as `&dyn Any`).
+- **`EpochMetrics` moved to the leaf `flodl::metrics` module** (BC-transparent): the type `Module::aggregated_metrics_slot` is typed against is plain metrics data, not distributed vocabulary, and now lives below every consumer. `flodl::EpochMetrics` and `flodl::distributed::EpochMetrics` remain valid re-exports of the same type — no path breaks, no behavior change.
+
+The last `graph` → `distributed` edge (`Graph`'s embedded `cluster_ddp` / `cluster_el_che` state and the cluster branches of `Graph::step`) was the engine of the self-driven `Trainer::setup` tier; it left wholesale when that tier was removed (see Removed). `Graph::step` is now single-device only, and `graph` no longer imports `distributed` DDP types.
+
+- **`DataSet::get` / `BatchDataSet::get_batch` purity contract, stated and probed**: both traits now document that sample content must be a pure function of the index — the staging cascade (RAM sample cache, disk stage, VRAM sample pool, all on by default) retains samples by index and re-serves them on later epochs, so per-call randomness (augmentation inside the dataset, the PyTorch `__getitem__` convention) is silently frozen at its first realization and served for the rest of the run. Debug builds now probe the contract — the first staged fetch is fetched twice and compared (NaN-tolerant), panicking with the full explanation on divergence; release builds skip the probe entirely. Augmentation belongs downstream of the loader as a deterministic on-device transform (e.g. a graph `.map` stage); first-class support for augmentation as deterministic repeated picks is designed in `docs/design/data-cascade.md`.
+
+#### Distributed layer: in-process thread-per-GPU DDP engine removed
+
+The in-process multi-replica DDP machinery on `Ddp`, `Graph::distribute`, and the `DataLoader::distributed` mode is no longer the production multi-GPU path. The new launcher trampoline + cluster coordinator path is the canonical one and auto-promotes on 2+ visible GPUs. `Trainer::run` / `Trainer::builder` always go through the cluster path on `cfg(not(test))` when multiple GPUs are visible.
+
+The in-process multi-GPU **orchestration engine** that briefly survived as the `cfg(test)` multi-GPU harness — the thread-based `Coordinator` plus the multi-worker branch of `DdpHandle::launch` — is now removed outright. `DdpHandle::launch` keeps only the launcher-trampoline path (auto-promote / cluster) and the single-device fallback; reaching it with 2+ GPUs and no cluster envelope (only possible under `cfg(test)`) is a loud error. flodl's own multi-GPU validation moved to the `ddp-bench` binary (real process-per-rank, exercised by `fdl cuda-test-nccl`); thread-based multi-GPU survives only as the lower-level `Ddp::wrap` primitive (GAN / RL / manual control) and the coordinator's own thread-driven control-protocol tests.
+
+- **`Coordinator` / `CoordinatorBuilder` removed**: the in-process coordinator and its builder are gone (they were never part of the `flodl::distributed` public re-export — `Trainer` / `DdpHandle` / `DdpBuilder` / `GpuWorker` are the surface). The cross-process `ClusterCoordinator` is the only coordinator now.
+- **Single training entry**: `Trainer::run` / `Trainer::builder().run()` work identically on 1 GPU, N GPUs on one host, or N GPUs across hosts. No code change to scale up.
+- **`Graph::distribute` simplified**: the cross-replica gather pipeline, the per-replica `named_trace_buf` plumbing, the host-side `Rc<RefCell>` choreography are gone from the production path. Re-introduced only in `cfg(test)` for the `Ddp::wrap`-driven test suite.
+- **`DataLoader::distributed` mode removed**: each rank child instantiates its own loader against its own dataset shard; proportional sharding is computed from `ElCheConfig::partition_ratios` (or auto-balanced) by the coordinator and pushed to workers as part of the epoch plan.
+
+This is the largest pre-1.0 API break in flodl's history. The motivation is dead-simple: the threaded model could not survive a rank dying, could not span a host, could not give the user a per-rank log stream, and forced the entire process to share libtorch's per-process CUDA context. Multi-process solves all four at once.
+
+**Migration note**: most call sites that drove `Ddp::*` or `Graph::distribute` directly migrate to `Trainer::run` / `Trainer::builder().run()` as a one-line swap. The same swap unlocks multi-host scaling at no extra cost (auto-promote on 2+ visible GPUs, opt-in to multi-host via `fdl.cluster.yml` or `TrainerConfig::cluster(FullCluster)`). `Ddp::wrap` remains available for callers that explicitly want the thread-per-GPU path (single-process testing, GAN / RL patterns that need direct replica control) — **with a new per-rank signature**: `Ddp::wrap(&model, device, global_rank, &rdv)` wraps ONE replica against a shared `TcpRendezvous` (the same primitive each cluster rank uses internally), replacing the old whole-process form that owned every replica at once.
+
+#### cluster.yml: `master_addr` / `master_port` → `controller.host` / `controller.port`
+
+The previous flat top-level `master_addr` / `master_port` keys are replaced by the structured `controller:` block (`host` / `port` / `path` / `arch` / `docker`). `name:` on each worker is renamed to `host:` to match the controller key. SSH knobs are grouped into an `ssh:` sub-block instead of living as flat `ssh_*` fields on the worker.
+
+Migration: see `fdl.cluster.yml.example` and `fdl.cluster-test.yml.example` for the canonical layout. `fdl probe` warns on legacy keys.
+
+#### `ddp-bench`: unified harness, eval-cost separation, cluster-aware loader
+
+The benchmark crate was overhauled to drive the new cluster path and to surface ElChe / cadence behavior cleanly.
+
+- `run_sync` collapsed into `run_unified`: one harness for every cadence mode, parametrized by the same `ElCheMode` enum as production.
+- `run_baseline_solo`: single-GPU baseline with eval-cost separation so reported speedups don't smuggle eval overhead into the train-time denominator.
+- `--partition-ratios`: explicit per-rank ratio passthrough (`flodl::DdpBuilder::partition_ratios`).
+- `--epoch-callback-policy`: pick `Rank(n)` or `Fastest` from the CLI.
+- Per-rank schedule reporting + train-only-aware speedup in the analyze + report passes.
+- Cluster-aware: `ddp-bench` skips the dataset load on the launcher process (the launcher exits without training), so cluster fan-out doesn't pay the dataset cost twice.
+- Analysis layer split into `analyze/{fit, log, msf, timeline}` + `report/{mod, elche, msf, tables}` submodules.
+
+#### Internal: large modules split into per-file submodules
+
+`cluster_coordinator.rs` (4227 LOC), `ddp_run/orchestrator.rs` (3000+ LOC), `ddp_run/worker.rs` (2796 LOC), `ddp_run/tests.rs` (4368 LOC), `cluster_coordinator/tests.rs` (2964 LOC), `graph/graph_tests.rs` (2670 LOC), `flodl-cli/src/config.rs` (2995 LOC), `flodl-cli/src/main.rs` (1958 LOC) are now multi-file submodules. Tests for `flodl::autograd`, `flodl::nn`, `flodl::tensor`, `flodl::nn::checkpoint`, `flodl::graph::tree`, `flodl::distributed::cluster`, `controller`, `cpu_reduce`, `nccl`, `wire`, `flodl-hf::models::{bert, distilbert, deberta_v2}`, `flodl-hf::safetensors_io` were extracted to sibling `*_tests.rs` files. No behavior change; per-file diffs become reviewable again.
+
+#### Dashboard binds loopback by default
+
+The live training dashboard (an unauthenticated HTTP server) previously bound `0.0.0.0`: anyone who could reach the host could read training metrics. It now binds `127.0.0.1` by default; view it remotely through an SSH tunnel (`ssh -L <port>:localhost:<port> <host>`), or set `FLODL_DASHBOARD_BIND=<addr>` to widen the bind explicitly — a non-loopback value prints a loud no-auth warning.
+
+#### docs.rs gate: strict local pre-commit canonical check
+
+`make docs-rs` now runs a CI-parity pass with `RUSTDOCFLAGS="-D warnings"` against every published crate (`flodl`, `flodl-cli`, `flodl-hf`, `flodl-cli-macros`) on stable + nightly. It is the canonical strict pre-commit gate; `fdl doc` is the in-Docker CI-strict gate; `fdl ci` is the full CPU job orchestrator. Mismatches between the three were a recurring source of "docs build locally, fail on docs.rs" surprises.
+
+#### Mixed-precision (`amp`) API: `cast_parameters` now fallible; autocast query gains a device variant
+
+`nn::cast_parameters` returns `Result<()>` (was `()`). It previously swallowed a per-parameter `to_dtype` failure silently (leaving a half-cast, mixed-dtype model that failed cryptically much later) and is now all-or-nothing: every conversion is computed first, so a failure returns `Err` with no parameter mutated. Callers add `?` / `.unwrap()`. `nn::is_autocast_enabled_for(device_type)` is new, the general form of `is_autocast_enabled()` (which stays as the CUDA shorthand), mirroring `AutocastGuard::for_device`.
+
+### Deprecated
+
+- The flat `cluster.yml` schema (`master_addr`, `master_port`, top-level `ssh_*` on workers) is deprecated in favor of the structured `controller:` / `workers[].ssh:` layout. `fdl probe` flags legacy keys with migration hints. Removal targeted for a future release.
+
+### Removed
+
+- **The self-driven setup tier** - `Trainer::setup()`, `Trainer::setup_with()`, `Trainer::setup_head()`, `Trainer::setup_head_with()`, and the `DdpConfig` config bag. It was the only path that scheduled without the controller (no convergence guard, meta-controller, outer optimizer, elastic membership, or checkpoint orchestration), so its self-driven replicated ElChe brain could drift from the controller's. Its user-owned-loop ergonomics return, controller-authoritative, as the **cooperative tier**: `Trainer::builder(model_factory, optim_factory, train_fn).into_worker()` yields a `Worker` you drive yourself (`next_plan` / `next_batch` / `step` / `finish`) while the controller owns cadence, partition, eval election, and checkpointing. For `flodl-hf` task heads (which now `impl Module` directly), `setup_head` is replaced by driving the head through `Trainer::builder(head_factory, optim, |head, batch| head.compute_loss(...)).into_worker()` or `.run()`. Also removed with the tier: the graph-embedded `cluster_ddp` / `cluster_el_che` state and cluster branches of `Graph::step` (now single-device only), and `Graph::set_loss_fn` / `has_loss_fn` + the `LossContext` type (the vestigial distributed-gather loss hook, which had no remaining driver). `HasGraph` stays. See `docs/design/trainer-execution-tiers.md`.
+- The `0.3.0`-deprecated compatibility surface is gone: the `AsyncDdp` / `AsyncDdpBuilder` / `AsyncDdpConfig` type aliases and the `DdpHandle::auto()` / `DdpHandle::auto_with()` / `DdpHandle::builder()` constructors. All of them had pointed at `Trainer::builder()` for two minor releases; migrate any remaining call to `Trainer::builder(...)` (chained setters) or `Trainer::run(...)` (config bag).
+- **The NCCL async mode** (`ddp-bench`'s `nccl-async`, the `Async` policy on the NCCL backend). Cross-epoch lookahead on NCCL delivered near-zero real-world speedup over `nccl-cadence` while complicating the dispatch path; `cpu_async` is the genuine async mode (decoupled averaging on a separate channel). `ElCheMode` never carries an `NcclAsync` variant.
+
+### Fixed
+
+Fixes below correct behavior that shipped in 0.5.x. Bugs born and fixed inside this release cycle carry no entry — the feature sections above describe the delivered state.
+
+- **A rank dying on an error announced a CLEAN exit, masking its death and wedging cadence cohorts**: the worker teardown reported `Exiting` — the clean-completion latch — on every exit path. The coordinator's latch rightly suppresses both death detectors for a cleanly-finished rank (it stops heartbeating by design, and a late child-exit report must not double-count it), so an error exit that sent it was never processed as a death: no ledger declare, no ElChe recompute, no partition redistribution — and a cpu-cadence cohort wedged forever on the dead rank's unfinished window (`BELOW-WINDOW (blocks gate)`, staged samples never reclaimed). Teardown now reports `Exiting` only on clean completion; error exits stay silent and the death flows through the designed detectors (the launcher's child-exit report within milliseconds, heartbeat staleness as the 30s backstop), which run the full death chain. The latch's exactly-once semantics for genuinely clean exits are pinned by a new coordinator test.
+- **Async-prefetched batches could be overwritten mid-read (missing cross-stream lifetime pin)**: batch device blocks are allocated on the prefetch worker's copy stream but consumed on the trainer's stream. The delivery `wait_event` orders the kernels; it does **not** extend the blocks' caching-allocator lifetime — so a batch dropped while its backward was still in flight (the norm in the free-running, window-deferred CPU-averaging modes) returned its blocks to the copy stream's pool, and the next upload could reuse and overwrite them mid-read. Observed as a device-side `nll_loss` assert (a whole slab of out-of-range labels) killing the fast rank of tiny-model cluster runs; the same-mechanism corruption of *input* tensors was silent. Every async batch delivery now pins the tensors to the consumer's stream via the new `Tensor::record_stream(&CudaStream)` (full FFI chain: shim → binding → method), covering both the DDP worker path and the plain streaming `DataLoader`; `CudaStream::current(device)` was added for consumers on the thread-current stream.
+- **`#[derive(FdlArgs)]` binaries silently ignored options forwarded after a standalone `--`**: the parser follows the POSIX convention that `--` ends flag parsing, so `fdl ddp-bench -- --model lenet` landed `--model lenet` as *positional* arguments — and any positional beyond the binary's declared list was dropped without a word, running the binary on its defaults (observed as a cluster run executing the full default sweep instead of the requested model). Excess positionals are now a loud parse error, with a hint when the stray token looks like an option ("pass options directly, without a `--` separator"). `fdl`-side tail validation is unchanged — positional binding stays the binary's concern (a catch-all keeps `-- <anything>` passthrough intact under strict schemas), so the error fires exactly once, at the authoritative parser, in every mode: direct, Docker, and cluster fan-out.
+
+- **The divergence guard's default threshold suppressed healthy EASGD runs**: the `TrendGuard` floor was calibrated for full-overwrite param adoption, where measured weight-space divergence is pure per-window drift and any standing value signals trouble. EASGD blending (`cpu-async`) deliberately keeps replicas on an elastic spread (~0.1 at α=0.5) — the operating point, not drift — so the overwrite floor sat permanently below the signal and the guard held the reduce window small on exactly the mode built to tolerate divergence (measured: ~35% extra reduces bought no convergence; 3-seed probe, unsuppressed runs converged equal-or-better). The default threshold is now keyed on adoption semantics: 0.05 for overwrite modes, 0.3 when `easgd_alpha` is set. An explicit `divergence_threshold` still wins, and a genuine divergence spiral crosses the raised floor with sustained rises and is caught as before.
+- **The epoch progress line's trailing `(14%)` read as run progress**: the unlabeled figure is the GPU-utilization sample from a randomly-chosen rank, taken at the epoch boundary — it legitimately bounces while `epoch 172/200` sits next to it saying 86%. Now labeled with the sampled device (`gpu[cuda0] 14%`), matching the adjacent VRAM bracket style.
+- **The NCCL backend never re-synced non-learnable buffers after startup**: the periodic NCCL sync AllReduced parameters only, while buffers (BatchNorm running mean/var and the like) got a single broadcast at formation and then drifted apart as each rank's forward accumulated statistics over its own data partition. Weights stayed in consensus — the visible signal — so the drift was silent: eval and the consensus checkpoint used the elected rank's own diverged running stats, and the CPU backend (which does average buffers) produced checkpoints with different buffer semantics than NCCL ones. f32 buffers now ride every NCCL sync as a second `PreMulSum` collective, averaged with equal weight among the ranks that stepped in the window (matching the CPU backend exactly); the abort-recovery retry restores buffers alongside params so a peer-death mid-collective can't leave torn running stats behind.
+- **Streaming loader could deadlock at an epoch boundary (in-flight accounting race)**: the prefetch worker publishes a batch into the epoch channel *before* counting it against the depth governor, so a consumer that received the batch, finished the epoch, and started the next one inside that window had the straggling `sent` increment land after the new epoch's counter reset — phantom in-flight work that, at the pre-warm-up depth target of 1, parked the worker at the governor gate forever while the consumer blocked on an empty channel. Needed an unlucky preemption between two adjacent instructions, so it surfaced as a rare, load-dependent hang (constrained-core CI, oversubscribed test hosts) rather than anything reproducible. The per-epoch counter reset now rides the `StartEpoch` command into the worker itself, where the command channel orders it after any straggler by construction — the consumer arms the epoch (target + abandon latch), the worker owns the flight counters.
+- **`flodl-sys` FFI strings typed `*mut c_char`, unbreaking Linux aarch64**: every extern fn returning a C `char*` (292 signatures — error strings, `flodl_free_string`, the device-name buffer) was hardcoded `*mut i8`. `c_char` is `i8` on x86_64 but `u8` on Linux aarch64, so every `CStr::from_ptr(err)` failed to compile on ARM (Apple-Silicon Docker, Graviton, Jetson-class hosts). The signatures now say `*mut c_char` at the source — correct by construction: on x86_64 this is a type-alias no-op (zero ABI or behavior change), on aarch64 the crate now simply compiles (`cargo check --target aarch64-unknown-linux-gnu` verified), and any future `CStr::from_ptr` call site is portable without remembering a cast. Supersedes the four per-site `as *const c_char` casts from the Apple-Silicon support PR (thanks @newQuery — the casts were exactly right; this moves the fix to the root so no fifth site can ever miss it).
+- **The VRAM budget layer read the memory probe inverted, disabling adaptive prefetch and resident mode on mostly-free devices**: `cuda_memory_info_idx` returns `(used, total)` — as its documentation says — but `prefetch_depth_from_vram` and `can_fit_resident` destructured it as `(free, total)`. Every derived quantity flipped: the emptier the card, the smaller the computed budget. In practice a mostly-free device produced a ~zero prefetch budget (streaming loaders fell back to minimal depth; DDP rank workers never created their prefetch pipeline at all and ran the synchronous fetch-and-upload path), and `can_fit_resident` concluded that almost nothing fit, so resident mode silently never engaged on CUDA targets. Both call sites now read the contract; adaptive prefetch depth, resident-mode auto-detection, and the rank workers' async data pipeline all size from the device's real headroom.
+- **`Monitor::new` initialized CUDA in every process, including the launcher**: constructing a monitor probed hardware and started resource sampling through the CUDA runtime (`cudaMemGetInfo` on every device creates a primary context, pinning VRAM for the life of the process). The documented "one `Monitor` at the top of the training code" pattern therefore violated the no-CUDA-before-`Trainer::run` rule in every user binary, and the launcher's dashboard sink did the same internally, squatting VRAM on all GPUs for the whole run. GPU identity now comes from nvidia-smi (`sys::detect_gpus`), live metrics from NVML, and the only context-dependent read (caching-allocator reserved bytes) is gated on `tensor::cuda_has_primary_context`, a new context-state query that never creates one. Constructing and polling a `Monitor` is now CUDA-free anywhere. Along the way: the NVML utilization poller was indexing cards by CUDA runtime index, but NVML ignores `CUDA_VISIBLE_DEVICES`, so a rank scoped to `CUDA_VISIBLE_DEVICES=1` was polling the wrong card's utilization; the monitor now resolves physical indices for NVML queries.
+- **Autograd silently swallowed FFI failures**: `Variable::set_grad` and `zero_grad` discarded errors (a failed write let the optimizer step with the unclipped / still-scaled / stale gradient), `detach()` fell back to a still-attached clone, `Tensor::grad()` mapped errors to `None` (indistinguishable from "no gradient"), and `Variable::new(tensor, true)` on an integer dtype silently returned a non-tracking variable that trained nothing. All five now panic with a named message; the integer-dtype case matches PyTorch, which raises the same error. None of these paths can fail for a correct program with valid tensors.
+- **C++ exceptions could unwind through the FFI boundary (undefined behavior)**: ~55 shim entry points had no try/catch at all — including the fused Adam/AdamW kernels, the CUDA graph/event/stream families, and the tensor accessors — so a `c10::Error` thrown there (bad device index, shape mismatch in a fused step, CUDA failure during a free) unwound into Rust as UB, and no function anywhere caught non-`std::exception` throws. Every `extern "C"` function is now exception-tight: functions with an error return report through it; functions without one contain the exception and abort with a named message (a defined, loud failure replacing UB — not a path working code could reach).
+- **GRU/LSTM ran with stale weights after checkpoint load**: the cuDNN parameter cache pinned the tensors it was built from on first forward and was never invalidated, but `load_checkpoint`, `cast_parameters`, and `Graph::to_device` replace parameter tensors wholesale (`Variable::set_data`) — so any forward → load → forward sequence silently kept computing with the pre-load weights (in-place optimizer/DDP updates were unaffected). `Variable` now carries a data generation bumped on every `set_data`, and GRU/LSTM rebuild their cache when any parameter's generation changes; cache hits remain an integer compare with no FFI.
+- **Graph epoch iteration use-after-free window**: `Graph::epoch(..).activate()` released its borrow on the data-loader binding while the returned iterator kept a raw pointer into it, so calling `set_data_loader` mid-iteration (or activating a second iterator) was undefined behavior from safe code. The loader now lives in its own cell whose exclusive borrow is held for the iterator's lifetime: a mid-iteration `set_data_loader` returns a loud error, a second activation panics with a named message, and `forward_batch` / `data_num_batches` / `data_batch_size` keep working during iteration (the scalars are cached at bind time).
+- **`migrate_checkpoint_file` with equal source and destination destroyed the checkpoint**: the destination was opened with `File::create` before the source was read, so an in-place migration truncated the file it was about to migrate ("source and destination must be different" was documented but nothing enforced it). Every checkpoint file writer now shares the same atomic tmp + rename path (previously only `save_checkpoint_file` had it), which makes in-place migration safe by construction — the source is fully consumed before the rename replaces it — and gives the cluster-consensus writer crash-atomicity as well.
+- **Optimizer state load trusted the group table**: `load_state` restored per-group LR ranges without validating them, so a corrupt or truncated `.optim` file could restore a range past the parameter count — an index-out-of-bounds panic at the next `step()` instead of an error at load — or a non-contiguous table that silently skipped parameters (`step()` only updates group-covered params). The group codec is now one shared reader/writer for SGD / Adam / AdamW / RMSprop that rejects any table that is not a contiguous partition of the optimizer's parameters, naming the offending group.
+- **Checkpoint reads allocated whatever the header claimed**: entry name lengths, tensor ranks, and payload byte counts were trusted before any data arrived, so a corrupt or truncated `.fdl` file could abort the process on a 2^60-byte allocation instead of reporting an error. Payload reads are now bounded by the bytes actually present (a lying header errors as "payload truncated"), and name/rank fields carry sanity caps — corruption is a loud `Err` on every checkpoint read path (load, keys listing, migration, optimizer state).
+- **`fdl` overlay libtorch resolution silently fell back to `.active`**: the per-host libtorch resolver hardcoded `fdl.yml` (config discovery accepts `fdl.yaml` / `fdl.json` too) and swallowed overlay load errors — so under `FDL_ENV` an `fdl.yaml` project, or any broken overlay, silently built against the `.active` variant instead of the host's declared arch (the wrong libtorch on a heterogeneous rig). A set `FDL_ENV` whose overlay cannot be resolved is now a loud failure; legitimately-not-applicable cases (host not listed, no `cluster:` block) still fall back.
+- **`fdl probe --json` emitted invalid JSON for strings with control characters**: two divergent hand-rolled escapers (one missing `\t`/`\r`, the other silently deleting `\r`) meant a tab in a GPU name or mount path broke cluster probe fan-in. One RFC-8259-complete escaper now serves every JSON emitter in fdl. The probe fan-in parser also flags a remote report missing its schema's required keys as probable fdl version skew instead of parsing it as a healthy zero-GPU host.
+- **`fdl` could silently adopt an example config in non-interactive contexts**: the "copy `fdl.yml.example` to `fdl.yml`? [Y/n]" prompt ran even without a terminal, where reading stdin hits EOF and the Y-default treated that as consent — CI, shell completions, and piped invocations could create a live config file as a side effect. Without a TTY the example is now used read-only, no prompt, no copy.
+- **A project path containing a space shattered `fdl`'s docker dispatch**: the compose overlay `-f <path>`, the `-e FDL_PROJECT_ROOT=<root>` injection, the container-side `cd <root>/<workdir>`, and the remote probe's `cd`/argv quoting were spliced into `sh -c` strings unquoted (or through hand-rolled quote escapes). All now go through the one shared POSIX-quoting helper — which also replaces the three divergent private copies of that helper that had drifted apart.
+- **Dashboard server shutdown leaked its port and its client threads**: `Monitor` shutdown stopped only the message thread — the acceptor kept the port bound until process exit and every connected SSE client's handler thread stayed blocked forever. Shutdown now closes the accept loop (freeing the port for the next run in the same process), disconnects every SSE client, and a connection racing shutdown can no longer register itself into the already-cleared client list. Dropping the server without an explicit shutdown does the same.
+- **A dashboard client that stopped reading grew server memory without bound**: each SSE client's event queue was unbounded and pruned only on hard disconnect, so a stalled-but-connected browser tab accumulated every epoch event for the life of the run. Client queues are now bounded; a client that stops draining is disconnected instead of buffered forever.
+- **Timeline profiler archives grew unbounded and an abandoned timeline could never be freed**: samples accumulate at poll rate (~864k/day at the default 100 ms) with no cap, and the poller thread held a strong `Arc` to its own timeline — dropping the last user handle without calling `stop()` leaked the thread and the whole archive permanently. The poller now holds a `Weak` reference (an abandoned timeline winds down on its next tick), and both archives are capped with oldest-first trimming and a one-time notice.
+- **Dropping a data loader could hang forever behind a stalled consumer**: the prefetch worker's batch sends block, so a consumer that kept its receiver alive but stopped draining wedged the worker mid-send — and the loader's `Drop` then waited on the join indefinitely. Batch sends now block in bounded slices against a teardown latch, so dropping the loader always reclaims the worker.
+- **A panic in user dataset code silently killed the data loader**: a `get_batch` panic took the prefetch worker thread down with it — the panic message was discarded, and every subsequent epoch failed with a generic "prefetch worker stopped unexpectedly" that pointed at flodl instead of the dataset. Dataset panics are now caught at the fetch boundary and delivered as an `Err` batch carrying the panic message, exactly like a dataset `Err`; the worker survives and later epochs keep working.
+- **Resident-loader epoch setup panicked instead of erroring**: a failure while uploading the epoch permutation tensor (CUDA error or out-of-memory at epoch start) was an `.expect` panic. The epoch iterator's items are already `Result<Batch>`, so the failure is now delivered as the first item of the epoch — the same channel streaming-loader errors always used.
+- **Conv constructors accepted invalid `groups`**: `groups = 0` was an i64 division-by-zero panic inside a `Result`-returning constructor, and a non-dividing `groups` silently truncated the weight shape (integer division) into a wrong-shaped kernel. All six conv / conv-transpose variants now validate through one shared check — positive and dividing both channel counts, matching PyTorch's errors.
+- **`Tensor::unique(sorted: false)` deduplicated adjacent runs only**: the unsorted path ran `unique_consecutive`, so `unique([1, 2, 1])` returned `[1, 2, 1]` — a silent wrong answer for anyone porting PyTorch code, where `torch.unique` always deduplicates globally and `sorted` only controls output ordering. Both paths now run the global dedup kernel (the sorted path also stops paying a discarded `unique_consecutive` pass it always ran first), and the adjacent-run behavior is available deliberately as the new `Tensor::unique_consecutive`, matching PyTorch's op of the same name.
+- **Shape ops copied or aliased depending on input layout**: `reshape` / `transpose` / `permute` / `select` / `narrow` / `squeeze` / `unsqueeze` / `flatten` appended a `.contiguous()` intending an owned copy, but `.contiguous()` is a no-op *view* when the result is already contiguous — so `narrow(0, ..)` aliased the source while `narrow(1, ..)` copied, and whether an in-place write on the result reached the source depended on dim and layout. The ops now return views wherever libtorch does (PyTorch parity, deterministic): slice-write idioms like `t.narrow(0, i, 1)?.copy_(&src)` now always write through, `transpose` / `permute` stop paying a copy, and every readout path makes its own contiguous copy at the point of use as before.
+- **`Tensor::item()` / `to_i64_vec()` / `to_f64_vec()` dtype-blind reads**: `item()` returned garbage bit patterns as `Ok` for Float16/BFloat16/Int32 scalars (an f16 loss under autocast was the live case) and errored on Int64; `to_i64_vec()` on a non-Int64 tensor reinterpreted raw bytes as indices and returned `Ok`; `to_f64_vec()` routed integers through f32, silently truncating above 2^24. All three now cast on device to the target dtype before the host copy (floats truncate toward zero in `to_i64_vec`, matching PyTorch's `.long()`), the same pattern `to_f32_vec` always used.
+- **`Tensor::from_f32` / `from_f64` / `from_i64` out-of-bounds read**: the typed constructors handed the slice pointer to libtorch without checking `data.len()` against the shape product, so a shape larger than the data was an out-of-bounds read from safe code (`from_blob` already validated; the typed paths did not). All four constructors now share one validation home; length mismatches, negative dimensions, and overflowing shape products error loudly, naming the constructor that was called.
+- **Checkpoint load of `f16` / `bf16` / `i32` tensors out-of-bounds read**: while the `f32` / `f64` / `i64` restore paths built owned buffers routed through the validated typed constructors, the half-precision and `i32` path handed the raw byte pointer straight to libtorch, reading `numel x element_size` bytes on trust — so a truncated or corrupt checkpoint drove an out-of-bounds read. That path now goes through `Tensor::from_blob`, which enforces the same length check, so a short payload errors instead of reading past the buffer.
+- **DDP activation-reserve calibration double-subtracted the resident batch**: the first-batch measurement (`peak - current`) already nets the batch out — both readings include it — but the worker subtracted one batch again, so whenever activations + gradients fit inside a single batch (small models) the reserve saturated to 0. And 0 doubles as the not-yet-measured sentinel, so every subsequent chunk re-calibrated with the same arithmetic and the rank ran the synchronous data path — no prefetch — for the entire run. The second subtraction is gone, and a completed measurement is floored to 1 byte so a degenerate reading can never collide with the sentinel and re-arm calibration.
+- **NCCL communicator init from threads**: `ncclCommInitRank` must run on the main thread; the released thread-per-GPU engine (`Trainer::setup` multi-GPU) was occasionally calling it from a worker thread on heterogeneous-GPU rigs, corrupting the shared CUDA context. Production ranks are now separate processes (per-process `init_rank`); the surviving `Ddp::wrap` thread path uses init-on-main + `split()`.
+- **`fdl` argv handling**: the parser scanned the whole argv for `--fdl-schema` / `--help`, hijacking tokens meant for the command after `--`; negative numbers were rejected as space-separated option values (`--offset -5`); and `fdl run` passed user args to `docker` unquoted, so shell metacharacters in an argument could be interpreted. All three scoped/quoted correctly now.
+- **Streaming prefetch could OOM the first training step and killed the epoch on transient OOM**: the adaptive VRAM sizing filled to the 90% cap using a probe taken before any forward/backward had run, when activations, gradients, and lazily created optimizer state do not exist yet, so the first step competed with a full prefetch buffer (the `activation_reserve` deduction existed but every caller passed 0). And a prefetch-side CUDA OOM surfaced as one `Err` batch that aborted the epoch, even though the consumer drains continuously and the same allocation succeeds moments later. Prefetch depth is now a governed in-flight target instead of a fixed per-epoch channel capacity: the first fill takes a graduated share of the budget (full with a user-declared `activation_reserve`, 1/2 when `Graph::set_data_loader` derives 3x parameter bytes for gradients + optimizer state, 1/3 bare), then a one-shot honest resize raises it to the full budget as soon as the second batch is consumed, keyed to consumption rather than epoch boundaries so single-pass training benefits too. The worker retries transient OOM (empty cache, up to 10 x 100 ms) and halves the in-flight target so overcommit self-heals. `auto_resize` mid-epoch now actually takes effect immediately (its docs previously claimed it did).
+- **`fdl` config files silently ignored unknown keys**: a mistyped key anywhere in `fdl.yml`, a sub-command `fdl.yml`, or a cluster overlay configured nothing (`dokcer: cuda` ran on the host, `epoch: 50` under `training:` trained with default epochs) while CLI flag typos got strict did-you-mean rejection. Every config struct now rejects unknown keys, naming the field and listing the valid ones with the merged-view location. Scoping is preserved: a bad key inside one `commands:` entry errors only when that command is invoked, so `--help` and sibling commands keep working. A user-supplied `ranks:` in a worker block, which never did anything (rank assignment is probe-computed), is now a loud load error saying so. A `--fdl-schema` probe emitted by a newer flodl-cli-macros than the installed `fdl` understands now falls back to the inline schema instead of silently dropping the unknown field.
+- **`fdl` entry-command docker wrapper defeated its own argument quoting**: the `entry:`-kind docker path (e.g. `fdl ddp-bench`) wrapped the composed command as `bash -c "…"` inside the outer `sh -c`, where the host shell still expands `$` and backticks (an argument containing `$(cmd)` executed on the host despite being single-quoted for the container) and any `"` in an argument spliced the command line. The wrapper now POSIX-quotes the whole inner command, the same form the `run:`-kind path always used. The testing-cluster envelope also moved from an inline `-e NAME=VALUE` to a bare `-e NAME` pass-through, so its value never rides the command line at all.
+- **Empty `fdl.yml`**: an empty or comments-only config file failed to parse with a cryptic serde error instead of loading as the default project config.
+- **Adam / AdamW / RAdam / NAdam / Adagrad bias-corrected against a global step counter**: every adaptive optimizer advanced one step count shared by all parameters, but bias correction (and RAdam's variance rectification, NAdam's Nesterov schedule, Adagrad's lr-decay) is per-parameter by construction. A parameter unfrozen partway through a run — the fine-tuning workflow parameter freezing exists to serve — therefore bias-corrected its fresh `m=0`/`v=0` moments against the *global* step instead of its own first step, and its first few updates landed roughly 3x too large (the first-moment estimate is under-boosted ~10x while the second-moment denominator is under-boosted ~31x), a silent overshoot that decayed over ~1/(1-β₂) steps. Each optimizer now tracks a per-parameter step count incremented only when that parameter receives a gradient, matching PyTorch's `state_steps`; the fused Adam/AdamW CUDA kernel already accepted libtorch's native per-param `state_steps` vector and had merely been fed one broadcast scalar. The `.optim` state format changed to carry per-parameter steps and now leads with a self-identifying `FDLO` header (magic + version + optimizer kind), so a file can no longer be positionally misparsed by the wrong optimizer; a pre-header file written by flodl ≤ 0.5.x is rejected with a pointer to the new `flodl::nn::migrate_optim_state_file(src, dst, kind)` converter, which rewrites the file under the header and expands the old single global step into per-parameter steps.
+- **`Module::move_to_device` default did nothing despite documenting that it moved parameters and buffers**: the trait default was an empty body, so `Graph::set_device` moved parameters itself and only *composite* modules worked — calling `move_to_device` on a bare leaf module (a lone `Linear`, a `BatchNorm` outside a graph) silently left it on its original device, and `BatchNorm`'s own override moved only its running-stat buffers while swallowing the errors. The default now moves everything reachable through `parameters()` and `buffers()` (detach → move → `set_data`, the recipe `Graph::set_device` already used, which also bumps parameter data-generation so cuDNN weight caches rebuild), skips already-on-device tensors so repeated moves stay cheap, and panics with a named message on a failed move rather than leaving a half-moved model to surface later as a confusing cross-device op error. `BatchNorm`'s redundant override is gone.
+- **Dashboard `<script>` injection could break out of its tag on a `</script>` in run data**: both dashboard emitters inline run constants (graph label, structural hash, hardware string, metadata, GPU init) into a `<script>` block, but the escaping diverged — the static-report path neutralized `</script>` in some constants (data/svg/metadata) and the live server escaped only `\`/`"`, so a label or metadata value containing `</script>` closed the tag early and injected arbitrary markup into the page. The HTML parser scans for `</script` literally, ignorant of JS string quoting, so per-value quote-escaping never protected the tag. Both paths now route every injected constant through one shared `</script>` neutralization applied to the whole assembled script body (`<\/script`, transparent across JSON/JS-string/template-literal contexts) so the escape set cannot drift between them again.
+- **A custom module that forgot to override `parameters()` trained nothing, silently**: `Module::parameters()` defaults to an empty list for a leaf with no sub-modules, so a user layer that held parameters but never overrode the accessor reached training with nothing to optimize and every step was a no-op — burning GPU hours to produce an unchanged model with no error. Every training entry (`Trainer::run`, `Trainer::builder().run()`, `DdpBuilder`, `Ddp::wrap` / `Ddp::from_comm`) now rejects a zero-parameter model loudly, naming the likely cause. Optimizer-level empty parameter lists stay supported (deliberate — a metrics-only probe optimizer is valid).
+- **`GradScaler` could drive its loss scale to zero and silently kill training**: on a detected inf/NaN gradient the scale is multiplied by the backoff factor with no lower bound, so a run with sustained non-finite gradients (a genuinely diverging model) halved the scale every step until it underflowed to `0.0`, after which `scale(loss)` is always zero, the unscaled gradients are always finite zeros, no inf is ever detected again, and training continues forever having quietly stopped learning. The scale now floors at `min_scale` (default `1.0`, since loss scaling only ever scales *up*, so there is no legitimate reason to go below 1.0); if inf persists at the floor the divergence is real and surfaces as such instead of masquerading as a dead-but-"healthy" run.
+- **`cuda_graph_capture` synchronized a hardcoded device 0 before capture, wrong on multi-GPU**: the pre-capture sync always targeted device 0 regardless of which device the captured closure actually runs on, so on a rig where capture happens on any other device the warmup work on the real capture device was not guaranteed to have drained before capture began. It now synchronizes the current device (`tensor::current_cuda_device()`).
+- **List-returning shims could segfault on allocation failure and leaked on a mid-loop throw**: the four shims that return a tensor array (`meshgrid`, `chunk`, `split`, `unbind`) malloc the result array then wrap each tensor in a loop. `flodl_meshgrid` alone never null-checked the malloc (a failed allocation wrote through a null pointer), and all four leaked the array plus every already-wrapped tensor if a wrap threw partway through (an out-of-memory the caller could recover from, since it surfaces as a normal `Err`). All four now go through one leak-safe `wrap_list` helper: it null-checks the allocation, and on any mid-loop failure frees every element allocated so far and the array before the exception propagates.
 
 ## [0.5.3] - 2026-04-28
 
@@ -37,24 +469,24 @@ Loop bodies can now publish multiple named auxiliary outputs per iteration witho
 - **Sparse emits supported**: a step that doesn't publish a given name simply doesn't grow that name's vector. `traces["name"].len() <= n_iter`, equal to the count of iterations where the name was published.
 - **Collision detection**: trace namespace is validated once per graph (cached via `Cell<bool>`) on first observation, either via `Graph::traces`, `Graph::traces_named`, or `el_che_snapshot_traces` / `gather_tags_and_traces` on the El Che path. Panics on cross-loop emit-name reuse or emit-name vs post-loop-trace-tag collisions; tag and trace key spaces are otherwise separate (`LossContext::tags` vs `LossContext::traces`).
 - **DDP integration via `Graph::distribute`**: full multi-trace support across replicas, not a single-GPU-only feature.
-  - Each replica's body, built by the factory closure, owns its own `named_trace_buf` (per-replica emit storage). No host-side `Rc<RefCell>` for replicas to share — that was the failure mode the API was designed to avoid.
+  - Each replica's body, built by the factory closure, owns its own `named_trace_buf` (per-replica emit storage). No host-side `Rc<RefCell>` for replicas to share - that was the failure mode the API was designed to avoid.
   - The gather pipeline (`el_che_snapshot_traces`, `gather_detached_traces`, `el_che_set_gathered_traces`) walks `named_trace_buf` alongside the legacy single-stream `trace_buf`, moving each step's `Variable` to the gather device and concatenating per `(emit_name, step_idx)` across ranks and batches. The loss closure observing `ctx.traces["name"]` sees one combined `Vec<Variable>` per step regardless of how many replicas published it.
-  - `validate_trace_namespace` runs from the gather path too, so cross-loop emit-name collisions and emit-vs-tag collisions are caught under DDP — they don't silently merge into the same key on the host side.
+  - `validate_trace_namespace` runs from the gather path too, so cross-loop emit-name collisions and emit-vs-tag collisions are caught under DDP - they don't silently merge into the same key on the host side.
   - Backward through gathered traces is supported: the loss closure can read `ctx.traces["name"]` and let its `Variable`s feed into the loss; the autograd graph spans the per-replica forward + the host-side loss.
-  - Test coverage: `test_el_che_loop_body_emits_gathered_across_replicas` exercises the full path — two named emits per iteration, gather across replicas, loss-closure consumption with backward through grad-bearing parameters.
+  - Test coverage: `test_el_che_loop_body_emits_gathered_across_replicas` exercises the full path - two named emits per iteration, gather across replicas, loss-closure consumption with backward through grad-bearing parameters.
 
 Motivation: `Module::trace() -> Option<Variable>` is one stream per loop, requires four pieces of side-channel state on the body (RefCell field + side-effect write in `forward` + getter + `reset()` cleanup), and the natural `Rc<RefCell>` workaround for multiple streams breaks under DDP because `Graph::distribute` builds fresh bodies per replica while loss closures registered on the host capture only the host's buffer. `LoopBody::step` removes the side-channel pattern entirely and makes multi-stream a free side effect.
 
 #### `Trainer`: primary training entry point
 
-`Trainer` is the new default API for training in flodl. It forwards to the same DDP machinery as `Ddp::*` but reads as "just train" rather than "set up DDP" — the one-liner works transparently on 1 or N GPUs.
+`Trainer` is the new default API for training in flodl. It forwards to the same DDP machinery as `Ddp::*` but reads as "just train" rather than "set up DDP" - the one-liner works transparently on 1 or N GPUs.
 
-- **`Trainer::setup(&model, builder, optimizer)`** — one-call setup for Graph-based models, replacing `Ddp::setup()`. Auto-detects hardware, distributes if multi-GPU, sets optimizer, enables training mode. Zero DDP overhead on single GPU / CPU.
-- **`Trainer::setup_with(&model, builder, optimizer, config)`** — same but takes a `DdpConfig` for explicit El Che cadence / speed hints / overhead target. Replaces `Ddp::setup_with()`.
-- **`Trainer::builder(model_factory, optim_factory, train_fn)`** — builder entry for framework-managed training. Replaces `Ddp::builder()`. Works identically on single or multi-GPU.
+- **`Trainer::setup(&model, builder, optimizer)`** - one-call setup for Graph-based models, replacing `Ddp::setup()`. Auto-detects hardware, distributes if multi-GPU, sets optimizer, enables training mode. Zero DDP overhead on single GPU / CPU.
+- **`Trainer::setup_with(&model, builder, optimizer, config)`** - same but takes a `DdpConfig` for explicit El Che cadence / speed hints / overhead target. Replaces `Ddp::setup_with()`.
+- **`Trainer::builder(model_factory, optim_factory, train_fn)`** - builder entry for framework-managed training. Replaces `Ddp::builder()`. Works identically on single or multi-GPU.
 - `flodl::Trainer` re-exported from the crate root alongside `Ddp`.
 
-Motivation: `Ddp::builder()` read as an opt-in for "when you have multiple GPUs," obscuring that the same entry is the sensible default for single-GPU training too. `Trainer::builder()` makes the intent explicit — reach for it by default; drop to `Ddp::wrap()` when you need explicit multi-GPU control (GAN, RL, progressive patterns).
+Motivation: `Ddp::builder()` read as an opt-in for "when you have multiple GPUs," obscuring that the same entry is the sensible default for single-GPU training too. `Trainer::builder()` makes the intent explicit - reach for it by default; drop to `Ddp::wrap()` when you need explicit multi-GPU control (GAN, RL, progressive patterns).
 
 #### flodl-hf: loss wiring on BERT-family task heads
 
@@ -82,10 +514,10 @@ All nine `*For{SequenceClassification,TokenClassification,QuestionAnswering}` he
 
 `GELU` gains an `approximate: GeluApprox` field so flodl can dispatch both the erf form (PyTorch `nn.GELU()`, HF `hidden_act="gelu"`) and the tanh approximation (HF `hidden_act` in {`"gelu_new"`, `"gelu_pytorch_tanh"`}) required by ALBERT, GPT-2, and derivative checkpoints. The bare-name usage `.through(GELU)` keeps compiling: `pub const GELU: GELU = GELU::exact();` re-exports the default-constructed value under the type name, so existing code is untouched.
 
-- **`GELU::exact()`** — erf form, the default; same as bare `GELU`.
-- **`GELU::tanh()`** — tanh approximation; pick this for ALBERT, GPT-2, and HF `gelu_new` / `gelu_pytorch_tanh` checkpoints.
-- **`GELU::with_approximate(approx)`** — runtime-chosen form, used by `flodl-hf` config loaders that map `hidden_act` strings to a [`GeluApprox`] value at load time.
-- **`GeluApprox` enum** — `Exact` (default) | `Tanh`. Adding a new variant later (e.g. a polynomial fit) makes every downstream `match` site fail to compile until handled, which is what we want for a numerically-distinct activation.
+- **`GELU::exact()`** - erf form, the default; same as bare `GELU`.
+- **`GELU::tanh()`** - tanh approximation; pick this for ALBERT, GPT-2, and HF `gelu_new` / `gelu_pytorch_tanh` checkpoints.
+- **`GELU::with_approximate(approx)`** - runtime-chosen form, used by `flodl-hf` config loaders that map `hidden_act` strings to a [`GeluApprox`] value at load time.
+- **`GeluApprox` enum** - `Exact` (default) | `Tanh`. Adding a new variant later (e.g. a polynomial fit) makes every downstream `match` site fail to compile until handled, which is what we want for a numerically-distinct activation.
 
 This is the canonical pattern in flodl for parametrising what was previously a unit-struct module without breaking BC: `pub struct GELU { … }` carries the field, a `pub const GELU: GELU = GELU::exact();` named identically (Rust puts types and consts in separate namespaces) keeps bare-name value usage working, and opt-in constructors cover the variants.
 
@@ -93,73 +525,73 @@ This is the canonical pattern in flodl for parametrising what was previously a u
 
 ALBERT (`albert-base-v1` / `albert-base-v2` reference checkpoints) joins the family roster, with both architecture deltas that distinguish ALBERT from BERT plumbed through end-to-end.
 
-- **`AlbertConfig` / `AlbertModel`** — backbone with **factorised embeddings** (token / position / type embeddings live in a smaller `embedding_size` space, lifted into `hidden_size` via a single `embedding_hidden_mapping_in` projection; embedding LayerNorm runs in embedding space) and **cross-layer parameter sharing** (one transformer block re-applied `num_hidden_layers` times). The encoder block itself is mathematically identical to BERT (post-LN, GELU activation), so the shared `TransformerLayer` carries the implementation; only the weight-key suffixes differ.
-- **`AlbertLayerStack`**: wraps the single shared block and forwards `num_hidden_layers` times inside one `Module`, surfacing parameters under the HF state_dict tag `albert.encoder.albert_layer_groups.0.albert_layers.0`. Configs with `num_hidden_groups > 1` or `inner_group_num > 1` are rejected at `from_json_str` time — every public `albert-*` checkpoint as of 0.5.3 sits at `1`/`1`; the axis can grow when a non-trivial checkpoint appears.
+- **`AlbertConfig` / `AlbertModel`** - backbone with **factorised embeddings** (token / position / type embeddings live in a smaller `embedding_size` space, lifted into `hidden_size` via a single `embedding_hidden_mapping_in` projection; embedding LayerNorm runs in embedding space) and **cross-layer parameter sharing** (one transformer block re-applied `num_hidden_layers` times). The encoder block itself is mathematically identical to BERT (post-LN, GELU activation), so the shared `TransformerLayer` carries the implementation; only the weight-key suffixes differ.
+- **`AlbertLayerStack`**: wraps the single shared block and forwards `num_hidden_layers` times inside one `Module`, surfacing parameters under the HF state_dict tag `albert.encoder.albert_layer_groups.0.albert_layers.0`. Configs with `num_hidden_groups > 1` or `inner_group_num > 1` are rejected at `from_json_str` time - every public `albert-*` checkpoint as of 0.5.3 sits at `1`/`1`; the axis can grow when a non-trivial checkpoint appears.
 - **`AlbertPooler`**: tanh-activated `[CLS]` pooler, bit-exact against HF reference.
 - **`AlbertMLMHeadTransform` + `AlbertForMaskedLM`**: dedicated `hidden -> dense -> activation -> LayerNorm -> embedding_size` transform feeding a tied decoder back to vocabulary, mirroring HF's `AlbertMLMHead`.
-- **Full task-head set**: `AlbertForSequenceClassification`, `AlbertForTokenClassification`, `AlbertForQuestionAnswering`, `AlbertForMaskedLM` — type aliases over the family-agnostic task-head generics, all exposing `forward_encoded` / `compute_loss` like the BERT-family heads.
-- **`hidden_act` dispatch**: ALBERT ships `gelu_new` (tanh approximation); `AlbertConfig::from_json_str` parses `hidden_act` into `GeluApprox::Tanh` and the encoder layer plus MLM head transform call the matching libtorch op. ALBERT was the integration that motivated the GELU approximation-form work above — picking the wrong form silently produces ~1e-2 max-abs diff.
+- **Full task-head set**: `AlbertForSequenceClassification`, `AlbertForTokenClassification`, `AlbertForQuestionAnswering`, `AlbertForMaskedLM` - type aliases over the family-agnostic task-head generics, all exposing `forward_encoded` / `compute_loss` like the BERT-family heads.
+- **`hidden_act` dispatch**: ALBERT ships `gelu_new` (tanh approximation); `AlbertConfig::from_json_str` parses `hidden_act` into `GeluApprox::Tanh` and the encoder layer plus MLM head transform call the matching libtorch op. ALBERT was the integration that motivated the GELU approximation-form work above - picking the wrong form silently produces ~1e-2 max-abs diff.
 - **Auto dispatch**: `AutoConfig::Albert` and `AutoModelFor*::Albert` variants extend the family dispatch.
 
 #### flodl-hf: XLM-RoBERTa family + task heads
 
 XLM-RoBERTa (`xlm-roberta-base` reference checkpoint and the multilingual fine-tunes built on top) joins as a structural sibling to RoBERTa.
 
-- **`XlmRobertaConfig` / `XlmRobertaModel`** — architecturally identical to RoBERTa: same encoder layers, same `roberta.*` state_dict prefix, same tied-decoder MLM head, same position-id convention. HF's `XLMRobertaModel` subclasses `RobertaModel` without structural changes; this port follows suit, delegating to the RoBERTa graph builders after a trivial `From<&XlmRobertaConfig> for RobertaConfig` conversion. Loaded safetensors line up directly without any key renaming.
+- **`XlmRobertaConfig` / `XlmRobertaModel`** - architecturally identical to RoBERTa: same encoder layers, same `roberta.*` state_dict prefix, same tied-decoder MLM head, same position-id convention. HF's `XLMRobertaModel` subclasses `RobertaModel` without structural changes; this port follows suit, delegating to the RoBERTa graph builders after a trivial `From<&XlmRobertaConfig> for RobertaConfig` conversion. Loaded safetensors line up directly without any key renaming.
 - **Distinct config struct, not a type alias**: keeps the HF `model_type: "xlm-roberta"` signal typed through `AutoConfig`, and leaves room for XLM-R-only fields to grow without churning `RobertaConfig`. Field layout mirrors `RobertaConfig` exactly.
 - **Full task-head set**: `XlmRobertaForSequenceClassification`, `XlmRobertaForTokenClassification`, `XlmRobertaForQuestionAnswering`, `XlmRobertaForMaskedLM`, all over the family-agnostic generics with `forward_encoded` / `compute_loss`.
-- **Tokenizer**: SentencePiece over the ~250k multilingual vocabulary (vs RoBERTa's 50k BPE) is handled by `HfTokenizer::from_pretrained` transparently — from the model's perspective, `input_ids` are `input_ids`.
+- **Tokenizer**: SentencePiece over the ~250k multilingual vocabulary (vs RoBERTa's 50k BPE) is handled by `HfTokenizer::from_pretrained` transparently - from the model's perspective, `input_ids` are `input_ids`.
 - **Auto dispatch**: `AutoConfig::XlmRoberta` and `AutoModelFor*::XlmRoberta` variants extend the family dispatch.
 
 #### flodl-hf: DeBERTa-v2 / DeBERTa-v3 family + task heads
 
 DeBERTa-v2 / DeBERTa-v3 (`microsoft/deberta-v3-{xsmall,small,base,large}` and SQuAD / NLI fine-tunes on top) joins with disentangled self-attention. DeBERTa-v3 ships under HF's `deberta-v2` architecture name (the v3 distinction is a config knob, not a separate class), so this port covers both.
 
-- **`DebertaV2Config` / `DebertaV2Model`** — backbone with three load-bearing departures from the BERT family:
-  1. **Disentangled attention** — each layer computes content-to-content + content-to-position + position-to-content scores, scaled by `sqrt(head_dim * 3)`. Implemented in a dedicated `crate::models::deberta_transformer_layer`, separate from the shared `TransformerLayer` because the math is fundamentally different.
-  2. **No absolute positional embedding** — position information is carried by the encoder's `rel_embeddings` table and threaded into every layer as a disentangled bias.
-  3. **Mask-gated embeddings** — post-LayerNorm, the embedding output is multiplied element-wise by the padding mask, zeroing pad positions before they enter the encoder.
-- **`DebertaV2Encoder`** + **`ContextPooler`** — DeBERTa-v2's `pooler_output` is `tanh(dropout(linear(last_hidden[:, 0])))`, distinct from BERT's tanh-only pooler. The sequence-classification head dispatches via the family-generic `ClassificationHead<DebertaV2Config>` over the `ContextPooler`.
-- **`build_deberta_attention_mask`** — public helper exposed for callers wiring `forward_multi` directly outside the head wrappers.
-- **Task-head coverage**: `DebertaV2ForSequenceClassification`, `DebertaV2ForTokenClassification`, `DebertaV2ForQuestionAnswering` are bit-exact against HF Python on pinned checkpoints. `DebertaV2ForMaskedLM` is wired in but does not have a working pinned reference: V3 checkpoints ship no MLM weights (V3 trains via Replaced-Token-Detection — the MLM head is random-init by design), and V2 xlarge ships real MLM weights but uses `conv_kernel_size=3`, which this port does not implement. The investigation is documented in `flodl-hf/tests/deberta_v2_parity.rs` module-doc; ConvLayer support would unblock V2 xlarge MLM parity.
+- **`DebertaV2Config` / `DebertaV2Model`** - backbone with three load-bearing departures from the BERT family:
+  1. **Disentangled attention** - each layer computes content-to-content + content-to-position + position-to-content scores, scaled by `sqrt(head_dim * 3)`. Implemented in a dedicated `crate::models::deberta_transformer_layer`, separate from the shared `TransformerLayer` because the math is fundamentally different.
+  2. **No absolute positional embedding** - position information is carried by the encoder's `rel_embeddings` table and threaded into every layer as a disentangled bias.
+  3. **Mask-gated embeddings** - post-LayerNorm, the embedding output is multiplied element-wise by the padding mask, zeroing pad positions before they enter the encoder.
+- **`DebertaV2Encoder`** + **`ContextPooler`** - DeBERTa-v2's `pooler_output` is `tanh(dropout(linear(last_hidden[:, 0])))`, distinct from BERT's tanh-only pooler. The sequence-classification head dispatches via the family-generic `ClassificationHead<DebertaV2Config>` over the `ContextPooler`.
+- **`build_deberta_attention_mask`** - public helper exposed for callers wiring `forward_multi` directly outside the head wrappers.
+- **Task-head coverage**: `DebertaV2ForSequenceClassification`, `DebertaV2ForTokenClassification`, `DebertaV2ForQuestionAnswering` are bit-exact against HF Python on pinned checkpoints. `DebertaV2ForMaskedLM` is wired in but does not have a working pinned reference: V3 checkpoints ship no MLM weights (V3 trains via Replaced-Token-Detection - the MLM head is random-init by design), and V2 xlarge ships real MLM weights but uses `conv_kernel_size=3`, which this port does not implement. The investigation is documented in `flodl-hf/tests/deberta_v2_parity.rs` module-doc; ConvLayer support would unblock V2 xlarge MLM parity.
 - **Config strictness**: `from_json_str` rejects `share_att_key=false`, missing `c2p` / `p2c` in `pos_att_type`, `relative_attention=false`, `position_biased_input=true`, `norm_rel_ebd != "layer_norm"`, non-zero `conv_kernel_size`, `embedding_size != hidden_size`, and `legacy=true`. Each rejection names the failing knob. This matches every public `microsoft/deberta-v3-*` checkpoint; DeBERTa-v1 and other variants surface a specific parse-time error.
 - **Auto dispatch**: `AutoConfig::DebertaV2` and `AutoModelFor*::DebertaV2` variants extend the family dispatch.
 
 #### flodl-hf: Masked-language-modeling heads across all six families
 
-A fourth task shape — masked-language modeling — joins sequence classification, token classification, and question answering. All six families ship a `*ForMaskedLM` wrapper that consumes raw text and returns the top-k fill-mask candidates with probabilities, mirroring HF Python's `pipeline("fill-mask")`.
+A fourth task shape - masked-language modeling - joins sequence classification, token classification, and question answering. All six families ship a `*ForMaskedLM` wrapper that consumes raw text and returns the top-k fill-mask candidates with probabilities, mirroring HF Python's `pipeline("fill-mask")`.
 
-- **Type aliases over `MaskedLmHead<Cfg>`**: `BertForMaskedLM`, `RobertaForMaskedLM`, `DistilBertForMaskedLM`, `XlmRobertaForMaskedLM`, `AlbertForMaskedLM`, `DebertaV2ForMaskedLM` — same `from_pretrained` / `forward_encoded` / `compute_loss` / `predict` shape as the other task heads.
+- **Type aliases over `MaskedLmHead<Cfg>`**: `BertForMaskedLM`, `RobertaForMaskedLM`, `DistilBertForMaskedLM`, `XlmRobertaForMaskedLM`, `AlbertForMaskedLM`, `DebertaV2ForMaskedLM` - same `from_pretrained` / `forward_encoded` / `compute_loss` / `predict` shape as the other task heads.
 - **`AutoModelForMaskedLM` enum**: family-agnostic dispatch, mirrors the existing `AutoModelFor*` entry points. `from_pretrained` reads `config.json`, builds the matching family head, and returns the dispatched enum; callers stay family-agnostic.
 - **`fill_mask(text, top_k)` ergonomics**: pick the `[MASK]` (BERT-family) or `<mask>` (RoBERTa-family) token, run a single forward, and return the top-k vocabulary candidates with probabilities for the masked position. Tokenizer mask-token resolution is unified through `HfTokenizer`.
-- **Per-family head shapes**: each family ships its native MLM head structure unchanged from HF reference — BERT's `transform + tied decoder`, RoBERTa's flat tied decoder with bias, DistilBERT's `vocab_layer_norm + vocab_projector`, ALBERT's `embedding_size`-factored decoder, DeBERTa-v2's V3 non-legacy layout. No structural unification; the family-agnostic surface lives at the `MaskedLmHead<Cfg>` generic level above the per-family graph.
+- **Per-family head shapes**: each family ships its native MLM head structure unchanged from HF reference - BERT's `transform + tied decoder`, RoBERTa's flat tied decoder with bias, DistilBERT's `vocab_layer_norm + vocab_projector`, ALBERT's `embedding_size`-factored decoder, DeBERTa-v2's V3 non-legacy layout. No structural unification; the family-agnostic surface lives at the `MaskedLmHead<Cfg>` generic level above the per-family graph.
 - **Parity coverage**: five of six family MLM cells (BERT, RoBERTa, DistilBERT, XLM-RoBERTa, ALBERT) are bit-exact against HF Python on pinned checkpoints. The DeBERTa-v2 MLM gap is documented above; the wrapper compiles and runs against the available reference but the comparison surfaces the upstream RTD-vs-MLM mismatch rather than a flodl-hf bug.
 
-#### `fdl flodl-hf verify-export <dir>` — generic export verifier (auto-detect)
+#### `fdl flodl-hf verify-export <dir>` - generic export verifier (auto-detect)
 
 A single Python verifier replaces the six per-family `verify-export-<family>` scripts. Reads `<dir>/config.json`, dispatches on `(model_type, architectures[0])` to the matching HF `AutoModelFor*`, then asserts (1) zero `missing_keys` / `unexpected_keys` on load and (2) bit-exact agreement on the head's primary forward output(s) for a fixed prompt.
 
-- **`fdl flodl-hf verify-export <dir>`** — positional `<dir>` is the staged export. No `--family` / `--head` flag — both auto-detected from the suffix on `architectures[0]` (`Model`, `ForSequenceClassification`, `ForTokenClassification`, `ForQuestionAnswering`, `ForMaskedLM`).
+- **`fdl flodl-hf verify-export <dir>`** - positional `<dir>` is the staged export. No `--family` / `--head` flag - both auto-detected from the suffix on `architectures[0]` (`Model`, `ForSequenceClassification`, `ForTokenClassification`, `ForQuestionAnswering`, `ForMaskedLM`).
 - **Hub source recovery**: `fdl flodl-hf export --hub <repo>` now stamps `flodl_source_repo: <repo>` into the exported `config.json`, so `verify-export` recovers the source automatically. Override via `--hub-source <repo>` for hand-staged dirs or fall-through to `_name_or_path` if a Hub config still carries one.
-- The six per-family `verify-export-{bert,roberta,distilbert,xlm-roberta,albert,deberta-v2}` commands are now thin wrappers that call the generic script with `--hub-source` baked in — same zero-arg ergonomics, one Python script behind them. Removed: `flodl-hf/scripts/verify_export_<family>.py` (×6) and `flodl-hf/scripts/_export_verify.py`.
+- The six per-family `verify-export-{bert,roberta,distilbert,xlm-roberta,albert,deberta-v2}` commands are now thin wrappers that call the generic script with `--hub-source` baked in - same zero-arg ergonomics, one Python script behind them. Removed: `flodl-hf/scripts/verify_export_<family>.py` (×6) and `flodl-hf/scripts/_export_verify.py`.
 
-The generic command extends coverage from base backbones to the full 30-cell head matrix (6 families × {base, seqcls, tokcls, qa, mlm}) — exactly the cases the Rust `_live` head-roundtrip tests already cover bit-exact at the safetensors layer. Run order: `fdl flodl-hf export --hub <repo> --out <dir>` (dev container), then `fdl flodl-hf verify-export <dir>` (hf-parity container).
+The generic command extends coverage from base backbones to the full 30-cell head matrix (6 families × {base, seqcls, tokcls, qa, mlm}) - exactly the cases the Rust `_live` head-roundtrip tests already cover bit-exact at the safetensors layer. Run order: `fdl flodl-hf export --hub <repo> --out <dir>` (dev container), then `fdl flodl-hf verify-export <dir>` (hf-parity container).
 
-#### `fdl flodl-hf export` — staged HuggingFace-compatible export
+#### `fdl flodl-hf export` - staged HuggingFace-compatible export
 
 Re-emit any flodl-hf-supported model as an HF-compatible directory (`model.safetensors` + `config.json`) that loads back into HF Python's `AutoModelFor*.from_pretrained`. The companion to the verify-export entry above; together they form the round-trip gate that proves flodl-hf weight loaders, graph builders, and config writers all agree with the HF Python reference.
 
 - **Two source modes, mutually exclusive**:
-  - `--hub <repo>` — fetch from the HuggingFace Hub and re-emit. Auto-detects family from `model_type` (`bert`, `roberta`, `distilbert`, `xlm-roberta`, `albert`, `deberta-v2`).
-  - `--checkpoint <path>` — re-emit a local `.fdl` checkpoint. Reads architecture from the sidecar `<stem>.config.json` (or `--config <path>` to override).
-- **`--head <auto|base|seqcls|tokcls|qa|mlm>`** (Hub mode): force a specific head class instead of dispatching on the upstream `architectures[0]`. `auto` (default) reads the upstream architecture; `base` re-exports the bare backbone even when the upstream advertises a head — useful for treating a pretraining checkpoint as a feature-extraction encoder. The other four force the matching head wrapper.
+  - `--hub <repo>` - fetch from the HuggingFace Hub and re-emit. Auto-detects family from `model_type` (`bert`, `roberta`, `distilbert`, `xlm-roberta`, `albert`, `deberta-v2`).
+  - `--checkpoint <path>` - re-emit a local `.fdl` checkpoint. Reads architecture from the sidecar `<stem>.config.json` (or `--config <path>` to override).
+- **`--head <auto|base|seqcls|tokcls|qa|mlm>`** (Hub mode): force a specific head class instead of dispatching on the upstream `architectures[0]`. `auto` (default) reads the upstream architecture; `base` re-exports the bare backbone even when the upstream advertises a head - useful for treating a pretraining checkpoint as a feature-extraction encoder. The other four force the matching head wrapper.
 - **`--out <dir>`** (required): output directory. Writes `<out>/model.safetensors` + `<out>/config.json` in HF-canonical layout.
 - **`--force`**: overwrite existing files in `<out>` without prompting.
-- **`--preserve-source-config`** (checkpoint mode): also write the loaded source config verbatim to `<out>/config.source.json` alongside the canonical `config.json` — for research / replication provenance, since the canonical `to_json_str` normalises some fields away.
+- **`--preserve-source-config`** (checkpoint mode): also write the loaded source config verbatim to `<out>/config.source.json` alongside the canonical `config.json` - for research / replication provenance, since the canonical `to_json_str` normalises some fields away.
 - **Bit-exact round-trip on every supported family / head**: exported dir loads back into HF Python's `AutoModelFor*` with zero `missing_keys` / `unexpected_keys` and bit-identical forward outputs, validated by `fdl flodl-hf verify-matrix` across the 30-cell head matrix.
 - **Tokenizer round-trip**: when a `--hub` source ships a fast tokenizer, `tokenizer.json` is also persisted to `<out>` via [`HfTokenizer::save`](#hftokenizersave--persist-a-loaded-tokenizer-back-to-disk) so the staged dir is fully self-contained for HF Python's `AutoTokenizer.from_pretrained`.
 
-#### `fdl flodl-hf verify-matrix` — full head-matrix runner
+#### `fdl flodl-hf verify-matrix` - full head-matrix runner
 
 Quarterly-manual gate that runs `fdl flodl-hf export` then `verify-export` across the full 30-cell head matrix (6 families × `{base, seqcls, tokcls, qa, mlm}`), then prints a PASS/FAIL grid.
 
@@ -179,7 +611,7 @@ Quarterly-manual gate that runs `fdl flodl-hf export` then `verify-export` acros
 
 Surfaced by the round-trip gate: a save side that always wrote f32 made the export step lossy on f16 / bf16 checkpoints, and `verify-matrix` would have eventually flagged it as a numerics drift on those families.
 
-#### `HfTokenizer::save` — persist a loaded tokenizer back to disk
+#### `HfTokenizer::save` - persist a loaded tokenizer back to disk
 
 `HfTokenizer` gained a `save(path)` method that writes the wrapped `tokenizers::Tokenizer` to a JSON file in the form HF Python's `AutoTokenizer.from_pretrained` reads back. Required for the export round-trip (`fdl flodl-hf export --hub` writes `tokenizer.json` alongside `model.safetensors` so the staged dir is self-contained). Standalone callers can use it to checkpoint tokenizer state at fine-tune save points.
 
@@ -192,10 +624,10 @@ tok.save("./checkpoint/tokenizer.json")?;
 
 `fdl add flodl-hf` from 0.5.2 dropped a sandbox playground under `./flodl-hf/`. It now exposes two modes (combinable) reflecting how a user actually wires an ecosystem crate into a project: try-it-out (sandbox) versus wire-it-in (root dependency).
 
-- **`--playground`** — original behaviour: scaffolds `./flodl-hf/` as a standalone cargo crate with a one-file `AutoModel` example, an `fdl.yml` with runnable commands, and a `flodl-hf:` entry in the root `fdl.yml` so `fdl flodl-hf <cmd>` routes into the playground from the project root. The user's own `Cargo.toml` is untouched.
-- **`--install`** — new: appends `flodl-hf = "=X.Y.Z"` to the root `Cargo.toml` `[dependencies]` (default features = `hub` + `tokenizer`). Wires the crate into the user's own code; nothing else mutated. Idempotent (already-present is a no-op). Version locked to the project's flodl version.
+- **`--playground`** - original behaviour: scaffolds `./flodl-hf/` as a standalone cargo crate with a one-file `AutoModel` example, an `fdl.yml` with runnable commands, and a `flodl-hf:` entry in the root `fdl.yml` so `fdl flodl-hf <cmd>` routes into the playground from the project root. The user's own `Cargo.toml` is untouched.
+- **`--install`** - new: appends `flodl-hf = "=X.Y.Z"` to the root `Cargo.toml` `[dependencies]` (default features = `hub` + `tokenizer`). Wires the crate into the user's own code; nothing else mutated. Idempotent (already-present is a no-op). Version locked to the project's flodl version.
 - **Combinable**: `fdl add flodl-hf --playground --install` does both.
-- **No flag**: interactive `[Y/n]`-style prompt asking which mode(s). When stdin is non-tty (CI, piped input) the prompt errors loudly with the explicit-flag guidance instead of silently picking a default — per `feedback_loud_errors_over_silent.md`.
+- **No flag**: interactive `[Y/n]`-style prompt asking which mode(s). When stdin is non-tty (CI, piped input) the prompt errors loudly with the explicit-flag guidance instead of silently picking a default - per `feedback_loud_errors_over_silent.md`.
 - **Internals**: two new flodl-cli utility modules, `util::cargo_toml` and `util::fdl_yml`, do the file mutations. They preserve formatting and comments where possible, surface conflicts loudly (path-only or git-only flodl deps in the host project's `Cargo.toml` error with actionable guidance instead of guessing a version), and are reusable for future `fdl add <crate>` targets.
 
 #### `fdl run` argv forwarding: `--` separator + `append:` field
@@ -213,20 +645,20 @@ tok.save("./checkpoint/tokenizer.json")?;
   `fdl test` runs `cargo test -- --nocapture`; `fdl test -- -p flodl-hf` runs `cargo test -p flodl-hf -- --nocapture`.
 - **Same forwarding rule for path-kind commands' `run:` entry-point** (e.g. cargo run --example): args after `--` go between the entry and any `append:` tokens. Visible in every `fdl flodl-hf example <name>` invocation that takes args.
 
-The change makes `fdl` a transparent forwarder for the underlying tool's flags rather than a wrapper that absorbs them — running `cargo test`-equivalent flows through `fdl` is now byte-identical to running `cargo test` directly, modulo Docker dispatch.
+The change makes `fdl` a transparent forwarder for the underlying tool's flags rather than a wrapper that absorbs them - running `cargo test`-equivalent flows through `fdl` is now byte-identical to running `cargo test` directly, modulo Docker dispatch.
 
 #### flodl-cli polish: schema probing, bare-project help, parity subcommand layout
 
 Smaller user-facing fixes that smooth out the host-side `fdl` experience.
 
-- **Docker-aware schema probing**: `fdl <command> --help` invokes the command's schema-probe (`<entry> --fdl-schema`) inside the appropriate Docker service when the command declares `docker:` and the host shell isn't already inside a container. Previously, schema probes ran on the host and silently failed when the binary lived in the container — leaving `--help` either incomplete or erroring on a missing executable. Now `fdl` walks up to the nearest `docker-compose.yml` and runs `docker compose run --rm <svc> bash -c '<entry> --fdl-schema'` from there, matching the dispatch path for the actual run.
+- **Docker-aware schema probing**: `fdl <command> --help` invokes the command's schema-probe (`<entry> --fdl-schema`) inside the appropriate Docker service when the command declares `docker:` and the host shell isn't already inside a container. Previously, schema probes ran on the host and silently failed when the binary lived in the container - leaving `--help` either incomplete or erroring on a missing executable. Now `fdl` walks up to the nearest `docker-compose.yml` and runs `docker compose run --rm <svc> bash -c '<entry> --fdl-schema'` from there, matching the dispatch path for the actual run.
 - **Bare-project help fallthrough**: a path-kind sub-project (no top-level `entry:` but with `commands:` listed) used to error on `fdl <project>` with "no entry point defined". Now it prints help, mirroring the top-level `fdl` UX. Per `feedback_help_never_blocked.md`: `--help` must always render, validation lives on the exec path, scoped to the single thing invoked.
 - **`fdl flodl-hf parity` subcommand layout**: the per-checkpoint parity regenerator commands now live under `flodl-hf/parity/fdl.yml.example` (a sub-project) instead of being flat under `flodl-hf/fdl.yml.example`. `fdl flodl-hf parity bert`, `fdl flodl-hf parity albert`, etc., remain the call shape; the underlying organisation is just cleaner. New `parity_all.py` runs every checkpoint in sequence (handy for contributors regenerating after sha bumps).
 - **Doc-link sweep** (`b683ed0`): mass fix of stale doc links across `README.md`, `docs/ddp.md`, `docs/tutorials/13-data-loading.md`, plus a new `site/guide/index.html` landing page on flodl.dev.
 
 #### `fdl` daily update check (opt-in by default, multi-axis opt-out)
 
-`fdl` now probes crates.io once per day for newer versions of itself (`flodl-cli`) and, when run inside a Cargo project, the user-facing flodl crates the project depends on (`flodl`, `flodl-hf`). Outdated crates surface as one-line nudges at the end of the user's command — no extra latency on the work itself, no surprise network traffic, no blocking on a slow registry.
+`fdl` now probes crates.io once per day for newer versions of itself (`flodl-cli`) and, when run inside a Cargo project, the user-facing flodl crates the project depends on (`flodl`, `flodl-hf`). Outdated crates surface as one-line nudges at the end of the user's command - no extra latency on the work itself, no surprise network traffic, no blocking on a slow registry.
 
 - **Cache + throttle**: results are cached in `<config-dir>/flodl/config.json` (XDG on Linux/BSD, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows); the throttle window is 24 hours per machine.
 - **Non-blocking probe**: HTTP via `curl --max-time 2`, fired from a `Drop` guard at process exit so the user-visible command output runs first. Every failure mode (offline, slow network, registry hiccup) is silent.
@@ -236,7 +668,7 @@ Smaller user-facing fixes that smooth out the host-side `fdl` experience.
   - Auto-disabled when `CI=true` (any standard CI runner), or when `/.dockerenv` is present (container filesystems are ephemeral, cache would never warm).
 - **Probe scope**: when run inside a Cargo project, reads `Cargo.lock` to identify which user-facing flodl crates are actually depended on. No probe for crates the user doesn't use.
 
-This is the same UX pattern `cargo` and `rustup` use — minimal, opt-out-able, ergonomic. Surfaced from `feedback_ux_polish_is_adoption_lever.md` as a small UX win that compounds as flodl ships more often.
+This is the same UX pattern `cargo` and `rustup` use - minimal, opt-out-able, ergonomic. Surfaced from `feedback_ux_polish_is_adoption_lever.md` as a small UX win that compounds as flodl ships more often.
 
 #### flodl-hf: internal consolidation pass
 
@@ -256,21 +688,21 @@ A round of structural refactors landed alongside the family expansion, with no u
 
 #### flodl-hf: `AutoConfig` and `AutoModelFor*` dispatch enums grew variants and are now `#[non_exhaustive]`
 
-The four pre-existing dispatch enums — `AutoConfig`, `AutoModelForSequenceClassification`, `AutoModelForTokenClassification`, `AutoModelForQuestionAnswering` — gained variants for the three new families (`XlmRoberta`, `Albert`, `DebertaV2`) added this release. The brand-new `AutoModelForMaskedLM` enum ships with the same shape. All five are now marked `#[non_exhaustive]` so future family additions (ModernBERT, LLaMA, ViT, …) do not require another bump on this axis.
+The four pre-existing dispatch enums - `AutoConfig`, `AutoModelForSequenceClassification`, `AutoModelForTokenClassification`, `AutoModelForQuestionAnswering` - gained variants for the three new families (`XlmRoberta`, `Albert`, `DebertaV2`) added this release. The brand-new `AutoModelForMaskedLM` enum ships with the same shape. All five are now marked `#[non_exhaustive]` so future family additions (ModernBERT, LLaMA, ViT, …) do not require another bump on this axis.
 
 - **Documented usage is unaffected.** `AutoModelFor*::from_pretrained(...)?.predict(...)` and `AutoConfig::from_json_str(...)?.model_type()` do not pattern-match on the variant list, so the call-site shape stays identical.
-- **Exhaustive `match` arms in caller code break.** A match on `AutoConfig { Bert, Roberta, DistilBert }` written against 0.5.2 will fail to compile against 0.5.3 — both because the variant set grew and because `#[non_exhaustive]` requires a `_ => …` arm even when all known variants are covered. Adding a wildcard arm (or coverage for the new variants) fixes it.
+- **Exhaustive `match` arms in caller code break.** A match on `AutoConfig { Bert, Roberta, DistilBert }` written against 0.5.2 will fail to compile against 0.5.3 - both because the variant set grew and because `#[non_exhaustive]` requires a `_ => …` arm even when all known variants are covered. Adding a wildcard arm (or coverage for the new variants) fixes it.
 - **Pre-1.0 break, called out so adopters aren't surprised.** Strict cargo-semver would require a 0.6.0 bump. flodl-hf is on its second publish (first was 0.5.2 five days ago), the practical break radius is essentially "users who wrote exhaustive matches on a brand-new dispatch enum within a five-day window," and a 0.6.0 cycle for one shape of break would force the same bump on every future family addition. Shipping as 0.5.3 with `#[non_exhaustive]` installed once means subsequent family adds (ModernBERT, LLaMA, ViT, LoRA) are BC-clean by attribute, regardless of version policy.
 
 ### Deprecated
 
-- `Ddp::setup()`, `Ddp::setup_with()`, `Ddp::builder()` — use the matching `Trainer::*` methods instead. Same behavior, clearer intent. Compile-time deprecation warnings guide migration. `Ddp::wrap()` remains on `Ddp` as the explicit multi-GPU control tier. Removal targeted for a future release.
+- `Ddp::setup()`, `Ddp::setup_with()`, `Ddp::builder()` - use the matching `Trainer::*` methods instead. Same behavior, clearer intent. Compile-time deprecation warnings guide migration. `Ddp::wrap()` remains on `Ddp` as the explicit multi-GPU control tier. Removal targeted for a future release.
 
 ### Fixed
 
 - **flodl-hf `--checkpoint` re-export round-trip on base backbones.** `AutoModel::from_pretrained_for_export` was preserving the Hub config's `architectures` field verbatim (e.g. `["BertForMaskedLM"]` for `bert-base-uncased`) while the actual built graph mirrored HF's `AutoModel.from_pretrained` and dropped the head. The sidecar then drove `build_for_export` to rebuild the head class, producing a structural-hash mismatch on `Graph::load_checkpoint`. Now normalised to the base class name (`BertModel`, `RobertaModel`, `DistilBertModel`, `XLMRobertaModel`, `AlbertModel`, `DebertaV2Model`) so `--hub` and `--checkpoint` modes round-trip bit-identically.
 - **`flodl_hf::export::keys_have_pooler`** misclassified saved checkpoints whose pooler keys carry a tag-qualified prefix (e.g. `bert.pooler/dense.weight`). The `starts_with("pooler/")` check only matched bare layouts and silently returned `false` for every BERT-family base checkpoint. Fixed to normalise the `/` tag separator and `ends_with` against the family pooler suffixes, mirroring the safetensors-side `weights_have_pooler`.
-- **`DebertaV2Config::from_json_str`** now accepts `pos_att_type` as either the pipe-separated string (`"p2c|c2p"`, the v3 base convention) or a JSON array (`["p2c", "c2p"]`, what `transformers` re-emits when re-saving fine-tuned heads — `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, `deepset/deberta-v3-base-squad2`, etc.). Previously array configs failed parsing with an empty-string error.
+- **`DebertaV2Config::from_json_str`** now accepts `pos_att_type` as either the pipe-separated string (`"p2c|c2p"`, the v3 base convention) or a JSON array (`["p2c", "c2p"]`, what `transformers` re-emits when re-saving fine-tuned heads - `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, `deepset/deberta-v3-base-squad2`, etc.). Previously array configs failed parsing with an empty-string error.
 - **`fdl flodl-hf export --hub <repo>`** was re-emitting the upstream Hub config's `architectures` field verbatim (e.g. `["BertForMaskedLM"]` for `bert-base-uncased`) while the loader, mirroring HF's `AutoModel.from_pretrained`, built the base backbone and silently dropped head keys. The stale architecture fooled HF Python's `AutoModelFor*` dispatch on the exported dir into building a head whose weights weren't there. The companion fix on the `--checkpoint` re-export path landed in `cf967f8`; this completes the matching fix on `--hub`. Now `examples/export_hf.rs::run_hub` reads the normalised config from `graph.source_config()` (which `from_pretrained_for_export` already stamps with the base class name on every supported family), so the staged dir's `architectures` reflects what was actually built. Surfaced by `fdl flodl-hf verify-export` on first run.
 
 ## [0.5.2] - 2026-04-22
@@ -283,50 +715,50 @@ Scaffolded under `flodl-hf/` with feature-gated modules so downstream users can 
 - **Three install profiles**:
   - *Full* (default): `safetensors` + `hf-hub` + `tokenizers`. `flodl-hf = "0.5.2"` loads `"bert-base-uncased"` out of the box.
   - *Vision-only*: `hub` feature only. For ViT, CLIP vision towers, or any image model that doesn't need tokenisation. Drops regex + unicode surface.
-  - *Offline / minimal*: no default features. `safetensors`-only. For air-gapped environments, embedded training, or local-disk pipelines — no network, no async runtime, no TLS stack.
+  - *Offline / minimal*: no default features. `safetensors`-only. For air-gapped environments, embedded training, or local-disk pipelines - no network, no async runtime, no TLS stack.
 - **`cuda` feature** on `flodl-hf` re-exports `flodl/cuda`.
 - **HTTP backend**: `ureq` + `rustls-tls` on `hf-hub = "0.4"`. Sync, no tokio, no openssl (dev Docker image has no `libssl-dev`, so rustls is now the convention for any HTTP dep).
 - **ROADMAP**: HF fine-tuning moved to `In progress` with `[started]` marker; `flodl-manager CLI evolution` line added to Possibilities (gaps flagged while scaffolding: `fdl build` argv forwarding, `fdl add <crate>` command).
 
 #### flodl-hf: HuggingFace-naming foundations
 
-- **`flodl-hf::path::HfPath`** — immutable dotted-path builder that assembles HuggingFace-style keys segment by segment. Authors write short identifiers (`root.sub("encoder").sub("layer").sub(i).sub("attention").sub("self").leaf("query")`) instead of `format!` boilerplate. `sub` accepts anything `ToString`, so integer layer indices compose directly. `new`/`sub`/`leaf` panic on invalid segments (programmer error); `try_new`/`try_sub`/`try_leaf` return `Result` for user-supplied input (LoRA adapter names, custom head names from config, HF `get_submodule` paths). Validation rejects empty segments and embedded `.` / `/`.
-- **`flodl-hf::path::hf_key_from_flodl_key`** — converts flodl's `"{tag}/{leaf}"` qualified names (from `Graph::named_parameters()`) to HuggingFace-dotted keys by swapping only the final `/` for `.`. Centralises the flodl ↔ HF boundary in one place.
-- **`flodl-hf::safetensors_io::LoadValidation`** — three-bucket key-set diff (`missing`, `unused`, `shape_mismatches`) with stable sorted output. `into_result()` emits a loud `TensorError` listing up to 20 entries per bucket with a `"... and N more"` truncation tail, surfacing every disagreement in a single error instead of failing on the first mismatch. Catches the entire `"queri"` vs `"query"` typo class: the bad tag appears as `missing`, the real checkpoint key as `unused`, pointing straight at the fix.
-- **`flodl-hf::safetensors_io::expected_from_graph`** — walks a `Graph`'s named parameters + buffers and returns the HF-key + shape list needed by `validate_keys`.
+- **`flodl-hf::path::HfPath`** - immutable dotted-path builder that assembles HuggingFace-style keys segment by segment. Authors write short identifiers (`root.sub("encoder").sub("layer").sub(i).sub("attention").sub("self").leaf("query")`) instead of `format!` boilerplate. `sub` accepts anything `ToString`, so integer layer indices compose directly. `new`/`sub`/`leaf` panic on invalid segments (programmer error); `try_new`/`try_sub`/`try_leaf` return `Result` for user-supplied input (LoRA adapter names, custom head names from config, HF `get_submodule` paths). Validation rejects empty segments and embedded `.` / `/`.
+- **`flodl-hf::path::hf_key_from_flodl_key`** - converts flodl's `"{tag}/{leaf}"` qualified names (from `Graph::named_parameters()`) to HuggingFace-dotted keys by swapping only the final `/` for `.`. Centralises the flodl ↔ HF boundary in one place.
+- **`flodl-hf::safetensors_io::LoadValidation`** - three-bucket key-set diff (`missing`, `unused`, `shape_mismatches`) with stable sorted output. `into_result()` emits a loud `TensorError` listing up to 20 entries per bucket with a `"... and N more"` truncation tail, surfacing every disagreement in a single error instead of failing on the first mismatch. Catches the entire `"queri"` vs `"query"` typo class: the bad tag appears as `missing`, the real checkpoint key as `unused`, pointing straight at the fix.
+- **`flodl-hf::safetensors_io::expected_from_graph`** - walks a `Graph`'s named parameters + buffers and returns the HF-key + shape list needed by `validate_keys`.
 
 #### flodl-hf: BERT architecture
 
 Full HuggingFace BERT stack under `flodl-hf/src/models/bert.rs`: `BertConfig` (with a `bert_base_uncased()` preset), `BertEmbeddings`, `BertSelfAttention` (fused `scaled_dot_product_attention` with in-kernel dropout), `BertSelfOutput`, `BertAttention`, `BertIntermediate`, `BertOutput`, `BertLayer`, `BertPooler`, `BertModel`.
 
-- **`BertModel::build` / `BertModel::on_device`** — returns a flodl `Graph` with `embeddings → N encoder layers → pooler`. The graph takes **4 inputs**: `input_ids`, `position_ids`, `token_type_ids`, and a pre-computed additive `attention_mask` shared across all encoder layers via `.using()`.
+- **`BertModel::build` / `BertModel::on_device`** - returns a flodl `Graph` with `embeddings → N encoder layers → pooler`. The graph takes **4 inputs**: `input_ids`, `position_ids`, `token_type_ids`, and a pre-computed additive `attention_mask` shared across all encoder layers via `.using()`.
 - **Only `BertLayer` implements `Module`**; inner composites carry ad-hoc `forward` signatures matching their real semantics (residual inputs). Not pretending residuals are single-input. Parameter aggregation is explicit via `HfPath::prefix_params`.
 - **`build_extended_attention_mask(mask)`** helper: raw `[B, S]` 0/1 → additive `[B, 1, 1, S]` f32 (`0.0` attend, `-1e4` mask, fp16-safe). Callers run this once before `forward_multi`, mirroring HF Python's explicit `get_extended_attention_mask` idiom.
-- **HF-compatible parameter naming**: tags encode HF dotted paths directly; `Graph::named_parameters() + hf_key_from_flodl_key` yields `"bert.encoder.layer.0.attention.self.query.weight"` on the first run. BERT-base has **199 parameters** total — pinned by a test.
+- **HF-compatible parameter naming**: tags encode HF dotted paths directly; `Graph::named_parameters() + hf_key_from_flodl_key` yields `"bert.encoder.layer.0.attention.self.query.weight"` on the first run. BERT-base has **199 parameters** total - pinned by a test.
 
 #### flodl-hf: safetensors weight loader
 
-`flodl-hf/src/safetensors_io.rs` — `load_safetensors_into_graph(graph, bytes)` plus rename-aware and allow-unused variants (`*_with_rename`, `*_with_rename_allow_unused`, `*_file_*` path-based).
+`flodl-hf/src/safetensors_io.rs` - `load_safetensors_into_graph(graph, bytes)` plus rename-aware and allow-unused variants (`*_with_rename`, `*_with_rename_allow_unused`, `*_file_*` path-based).
 
 - **Strict-load semantics**: `validate_keys` runs first; any disagreement bails before mutating any parameter. Either the graph is fully loaded or fully untouched. Makes safe retry / fall-back possible.
-- **`Variable::set_data` over `copy_`**: libtorch rejects in-place ops on leaf Variables that require grad. `set_data` swaps storage while preserving `requires_grad` — the documented "optimizer replacement" path. `Buffer::set` is the buffer equivalent.
+- **`Variable::set_data` over `copy_`**: libtorch rejects in-place ops on leaf Variables that require grad. `set_data` swaps storage while preserving `requires_grad` - the documented "optimizer replacement" path. `Buffer::set` is the buffer equivalent.
 - **Host-side dtype conversion** supports F32 / F64 / BF16 / F16 → f32, including a custom `f16_bits_to_f32` (normals, subnormals, Inf, NaN) so the loader doesn't drag in the `half` crate.
 - **Integer dtypes rejected loudly** (`I8`/`I16`/`I32`/`I64`/`U*`/`BOOL`/`F8*`). Silent casts hide upstream bugs.
 - **`bert_legacy_key_rename`** handles pre-2020 BERT checkpoints' legacy `LayerNorm.gamma` / `LayerNorm.beta` → `weight` / `bias`. The rename-aware loader checks injectivity and raises a loud error on collision.
 
 #### flodl-hf: HuggingFace Hub integration
 
-- **`BertModel::from_pretrained(repo_id)` / `::from_pretrained_on_device(repo_id, dev)`** — one-liner weight + config pull via `hf_hub::api::sync::Api`. Parses `config.json`, builds the matching `Graph`, loads safetensors weights via the allow-unused rename-aware loader. The 7 `cls.*` task-head keys in `bert-base-uncased` (it's a `BertForPreTraining` checkpoint) are logged and discarded (up to 20 with a truncation tail).
-- **`HfTokenizer::from_pretrained(repo_id)`** — downloads `tokenizer.json` via the same `hf_hub` cache. Feature-gated on both `hub` and `tokenizer`.
-- **`fdl test-live`** — root-level command that runs `cargo test live -- --nocapture --ignored`. Canonical runner for `_live`-suffixed `#[ignore]`'d tests that need network / external resources. See `feedback_live_test_naming.md`.
+- **`BertModel::from_pretrained(repo_id)` / `::from_pretrained_on_device(repo_id, dev)`** - one-liner weight + config pull via `hf_hub::api::sync::Api`. Parses `config.json`, builds the matching `Graph`, loads safetensors weights via the allow-unused rename-aware loader. The 7 `cls.*` task-head keys in `bert-base-uncased` (it's a `BertForPreTraining` checkpoint) are logged and discarded (up to 20 with a truncation tail).
+- **`HfTokenizer::from_pretrained(repo_id)`** - downloads `tokenizer.json` via the same `hf_hub` cache. Feature-gated on both `hub` and `tokenizer`.
+- **`fdl test-live`** - root-level command that runs `cargo test live -- --nocapture --ignored`. Canonical runner for `_live`-suffixed `#[ignore]`'d tests that need network / external resources. See `feedback_live_test_naming.md`.
 
 #### flodl-hf: `HfTokenizer` (model-agnostic wrapper)
 
-`flodl-hf/src/tokenizer.rs` — thin façade over `tokenizers::Tokenizer`.
+`flodl-hf/src/tokenizer.rs` - thin façade over `tokenizers::Tokenizer`.
 
 - **`from_file(path)` + `from_pretrained(repo_id)`** (the latter gated on the `hub` feature).
 - **`encode(&[&str])` / `encode_on_device(&[&str], Device)`** return an `EncodedBatch` carrying `input_ids` / `attention_mask` / `token_type_ids` / `position_ids` as `i64 [B, S]` Variables.
-- **Sensible padding defaults** installed on load when `tokenizer.json` hasn't configured padding itself: `BatchLongest`, direction `Right`, `pad_id = token_to_id("[PAD]").unwrap_or(0)`. **No default truncation** — oversized texts error loudly at the model rather than silently truncate.
+- **Sensible padding defaults** installed on load when `tokenizer.json` hasn't configured padding itself: `BatchLongest`, direction `Right`, `pad_id = token_to_id("[PAD]").unwrap_or(0)`. **No default truncation** - oversized texts error loudly at the model rather than silently truncate.
 - **Model-agnostic**: one wrapper serves BERT, GPT2, LLaMA, etc. The loaded `tokenizer.json` carries the model-specific pre-tokenizer and post-processor. For BERT, the raw 0/1 `attention_mask` still needs `build_extended_attention_mask` before `forward_multi`.
 
 #### flodl-hf: PyTorch forward-parity infrastructure
@@ -335,28 +767,28 @@ Full HuggingFace BERT stack under `flodl-hf/src/models/bert.rs`: `BertConfig` (w
 
 - **`fdl flodl-hf parity-bert`** regenerates the committed parity fixture:
   - `flodl-hf/scripts/Dockerfile.parity` (`python:3.12-slim` + torch 2.8.0 CPU wheel + `transformers ~4.46` + `safetensors ~0.4` + `huggingface-hub ~0.26`).
-  - `flodl-hf/scripts/parity_bert.py` — loads `bert-base-uncased`, forces `torch.nn.attention.SDPBackend.MATH` for determinism, writes inputs + outputs + provenance metadata (`source_model` / `source_sha` / `torch_version` / `sdpa_backend`) to `flodl-hf/tests/fixtures/bert_base_uncased_parity.safetensors` (~16 KB).
+  - `flodl-hf/scripts/parity_bert.py` - loads `bert-base-uncased`, forces `torch.nn.attention.SDPBackend.MATH` for determinism, writes inputs + outputs + provenance metadata (`source_model` / `source_sha` / `torch_version` / `sdpa_backend`) to `flodl-hf/tests/fixtures/bert_base_uncased_parity.safetensors` (~16 KB).
 - **`flodl-hf/tests/bert_parity.rs`** → `bert_parity_vs_pytorch_live`. Asserts `max_abs_diff ≤ 1e-5` on `pooler_output` vs the HF Python reference. Observed on the reference host: **9.835e-7** (well under the 1e-5 tolerance, 10x headroom).
-- **`flodl-hf/tests/tokenizer_parity.rs`** → `bert_tokenizer_matches_parity_fixture_live`. Asserts `HfTokenizer` reproduces the exact pinned `input_ids` + `attention_mask` + `token_type_ids` from the parity fixture — `"hello world"` → `[101, 7592, 2088, 102]`. Closes the `text → tokens → BertModel → HF reference` loop end-to-end.
+- **`flodl-hf/tests/tokenizer_parity.rs`** → `bert_tokenizer_matches_parity_fixture_live`. Asserts `HfTokenizer` reproduces the exact pinned `input_ids` + `attention_mask` + `token_type_ids` from the parity fixture - `"hello world"` → `[101, 7592, 2088, 102]`. Closes the `text → tokens → BertModel → HF reference` loop end-to-end.
 - **`docker-compose.yml` gains the `hf-parity` service** (mounts workspace, `HF_HOME=/workspace/.hf-cache` for persistent weight / tokenizer cache; gitignored).
 - Both parity gates run via `fdl test-live`.
 
 #### flodl-hf: runnable examples
 
 - **`flodl-hf/examples/`** with a child `fdl.yml`, surfaced as `fdl flodl-hf example <name>`. Cleanly separates user-facing demos from dev tooling (`parity-bert`).
-- **`flodl-hf/examples/bert_embed.rs`** — closed-loop example: `HfTokenizer::from_pretrained` → `BertModel::from_pretrained` → `forward_multi` → per-sentence pooled embeddings. Prints `dim=768 L2=… head=[…]` for each input text in a batch.
+- **`flodl-hf/examples/bert_embed.rs`** - closed-loop example: `HfTokenizer::from_pretrained` → `BertModel::from_pretrained` → `forward_multi` → per-sentence pooled embeddings. Prints `dim=768 L2=… head=[…]` for each input text in a batch.
 - **Cargo `[[example]]` stanzas** carry `required-features = ["hub", "tokenizer"]` so `--no-default-features` builds skip the example cleanly. Adding an example is three yml lines + one Cargo stanza.
 
 #### flodl-hf: BERT task heads
 
 Three fine-tuned heads on top of `BertModel`, each with a Laravel-flavoured `predict()` / `answer()` API and live parity tests against real Hub checkpoints. All three load with one line (`from_pretrained(repo_id)`), pulling weights, config, and tokenizer in one go. No per-head tokenizer setup, no separate `AutoTokenizer` call.
 
-- **`BertForSequenceClassification`** — `pooler_output → Dropout → Linear(hidden, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str])` returns `Vec<Vec<(String, f32)>>` sorted descending by probability, with label names from the checkpoint's `id2label` (or `LABEL_k` fallback). Works out of the box with emotion / sentiment / toxicity / NLI fine-tunes such as `nateraw/bert-base-uncased-emotion`, `nlptown/bert-base-multilingual-uncased-sentiment`, `unitary/toxic-bert`.
-- **`BertForTokenClassification`** — `last_hidden_state → Dropout → Linear(hidden, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str])` returns `Vec<Vec<TokenPrediction>>` with `{ token, label, score, attends }` per sub-token; the `attends` flag mirrors the attention mask so padding drops cleanly. Works with `dslim/bert-base-NER`, `dbmdz/bert-large-cased-finetuned-conll03-english`, etc.
-- **`BertForQuestionAnswering`** — `last_hidden_state → Linear(hidden, 2)` splitting into start/end logits. Parameter keys `qa_outputs.{weight,bias}`. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }` with the extracted span decoded through the attached tokenizer. Span search is restricted to context tokens (`token_type_id == 1`) so the question region can't be answered-with-itself. Works with `csarron/bert-base-uncased-squad-v1` and other SQuAD fine-tunes.
-- **`BertConfig` extended** with `num_labels: Option<i64>` and `id2label: Option<Vec<String>>`, parsed from `config.json`. Non-contiguous label ids (gap, duplicate) error loudly — silently reindexing would misalign names with logits rows.
-- **`BertModel::on_device_without_pooler`** — mirrors HF Python's `add_pooling_layer=False`. Emits `last_hidden_state` (`[B, S, H]`) instead of pooled output; the shape token-classification and QA heads consume. Backed by a shared private `bert_backbone_flow` helper so `BertModel` and every task head build on one source of truth.
-- **`HfTokenizer::encode_pairs(&[(&str, &str)])`** — paired encoding with `token_type_ids == 1` on the second segment. Required for QA; also useful for NLI and sentence-pair classification.
+- **`BertForSequenceClassification`** - `pooler_output → Dropout → Linear(hidden, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str])` returns `Vec<Vec<(String, f32)>>` sorted descending by probability, with label names from the checkpoint's `id2label` (or `LABEL_k` fallback). Works out of the box with emotion / sentiment / toxicity / NLI fine-tunes such as `nateraw/bert-base-uncased-emotion`, `nlptown/bert-base-multilingual-uncased-sentiment`, `unitary/toxic-bert`.
+- **`BertForTokenClassification`** - `last_hidden_state → Dropout → Linear(hidden, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str])` returns `Vec<Vec<TokenPrediction>>` with `{ token, label, score, attends }` per sub-token; the `attends` flag mirrors the attention mask so padding drops cleanly. Works with `dslim/bert-base-NER`, `dbmdz/bert-large-cased-finetuned-conll03-english`, etc.
+- **`BertForQuestionAnswering`** - `last_hidden_state → Linear(hidden, 2)` splitting into start/end logits. Parameter keys `qa_outputs.{weight,bias}`. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }` with the extracted span decoded through the attached tokenizer. Span search is restricted to context tokens (`token_type_id == 1`) so the question region can't be answered-with-itself. Works with `csarron/bert-base-uncased-squad-v1` and other SQuAD fine-tunes.
+- **`BertConfig` extended** with `num_labels: Option<i64>` and `id2label: Option<Vec<String>>`, parsed from `config.json`. Non-contiguous label ids (gap, duplicate) error loudly - silently reindexing would misalign names with logits rows.
+- **`BertModel::on_device_without_pooler`** - mirrors HF Python's `add_pooling_layer=False`. Emits `last_hidden_state` (`[B, S, H]`) instead of pooled output; the shape token-classification and QA heads consume. Backed by a shared private `bert_backbone_flow` helper so `BertModel` and every task head build on one source of truth.
+- **`HfTokenizer::encode_pairs(&[(&str, &str)])`** - paired encoding with `token_type_ids == 1` on the second segment. Required for QA; also useful for NLI and sentence-pair classification.
 - **Parity infrastructure per head**:
   - `fdl flodl-hf parity-bert-seqcls` / `parity-bert-tokencls` / `parity-bert-qa` regenerate fixtures under `flodl-hf/tests/fixtures/bert_{seqcls,tokencls,qa}_parity.safetensors` against `nateraw/bert-base-uncased-emotion` / `dslim/bert-base-NER` / `csarron/bert-base-uncased-squad-v1` respectively. Each script pins a text input, forces the MATH SDPA backend, records source SHA + torch version in metadata. The SeqCls script chains through `convert_bin_to_safetensors.py` first because the emotion checkpoint is `.bin`-only.
   - Matching `_live` integration tests (`bert_seqcls_parity_vs_pytorch_live`, `bert_tokencls_parity_vs_pytorch_live`, `bert_qa_parity_vs_pytorch_live`) assert `max_abs_diff ≤ 1e-5` on logits against the HF reference. Run via `fdl test-live`.
@@ -364,13 +796,13 @@ Three fine-tuned heads on top of `BertModel`, each with a Laravel-flavoured `pre
 
 #### flodl-hf: RoBERTa architecture + task heads
 
-`flodl-hf/src/models/roberta.rs` — full RoBERTa stack (`RobertaConfig`, `RobertaEmbeddings`, encoder layer, pooler, three task heads). Same attention + FFN shape as BERT, four load-bearing deltas that make RoBERTa-family checkpoints load cleanly without per-model tokenizer or input plumbing.
+`flodl-hf/src/models/roberta.rs` - full RoBERTa stack (`RobertaConfig`, `RobertaEmbeddings`, encoder layer, pooler, three task heads). Same attention + FFN shape as BERT, four load-bearing deltas that make RoBERTa-family checkpoints load cleanly without per-model tokenizer or input plumbing.
 
-- **`RobertaModel::from_pretrained(repo_id)`** — one-liner weight + config pull mirroring the BERT path. **Returns a pooler-free backbone by default** (`last_hidden_state` of shape `[B, S, hidden]`) since `roberta-base` and most fine-tunes don't ship pooler weights — RoBERTa pretraining drops BERT's NSP objective. HF Python silently random-initialises the pooler on load, which makes `pooler_output` non-reproducible; flodl-hf takes the opposite default and keeps the weight load strict. `RobertaModel::on_device` is still available for checkpoints that do carry their own pooler.
-- **Position ids computed internally** from `input_ids` using HF's padding-offset convention (`padding_idx + cumsum(mask) * mask`; real tokens start at `padding_idx + 1`). The graph takes **3 named inputs** (`input_ids`, `token_type_ids`, `attention_mask`) — no `position_ids` in the signature, matching HF Python's `RobertaModel.forward`. Callers don't need to know the quirk exists.
-- **`RobertaForSequenceClassification`** — uses the HF-native two-layer head on the `<s>` hidden state: `Dropout → dense → tanh → Dropout → out_proj`. Parameter keys `classifier.dense.{weight,bias}` + `classifier.out_proj.{weight,bias}` — not a single `classifier.{weight,bias}` like BERT. Works with `cardiffnlp/twitter-roberta-base-sentiment-latest`, `roberta-large-mnli`, `SamLowe/roberta-base-go_emotions`.
-- **`RobertaForTokenClassification`** — same `Dropout → Linear` shape as BERT's token-classification head; loads `Jean-Baptiste/roberta-large-ner-english`, `obi/deid_roberta_i2b2`, etc. `predict(&[&str]) → Vec<Vec<TokenPrediction>>`.
-- **`RobertaForQuestionAnswering`** — `qa_outputs.{weight,bias}` head. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }`. Span search is restricted to `sequence_id == 1` (see below), since RoBERTa's `token_type_ids` are uniformly zero and can't distinguish question from context. Works with `deepset/roberta-base-squad2`.
+- **`RobertaModel::from_pretrained(repo_id)`** - one-liner weight + config pull mirroring the BERT path. **Returns a pooler-free backbone by default** (`last_hidden_state` of shape `[B, S, hidden]`) since `roberta-base` and most fine-tunes don't ship pooler weights - RoBERTa pretraining drops BERT's NSP objective. HF Python silently random-initialises the pooler on load, which makes `pooler_output` non-reproducible; flodl-hf takes the opposite default and keeps the weight load strict. `RobertaModel::on_device` is still available for checkpoints that do carry their own pooler.
+- **Position ids computed internally** from `input_ids` using HF's padding-offset convention (`padding_idx + cumsum(mask) * mask`; real tokens start at `padding_idx + 1`). The graph takes **3 named inputs** (`input_ids`, `token_type_ids`, `attention_mask`) - no `position_ids` in the signature, matching HF Python's `RobertaModel.forward`. Callers don't need to know the quirk exists.
+- **`RobertaForSequenceClassification`** - uses the HF-native two-layer head on the `<s>` hidden state: `Dropout → dense → tanh → Dropout → out_proj`. Parameter keys `classifier.dense.{weight,bias}` + `classifier.out_proj.{weight,bias}` - not a single `classifier.{weight,bias}` like BERT. Works with `cardiffnlp/twitter-roberta-base-sentiment-latest`, `roberta-large-mnli`, `SamLowe/roberta-base-go_emotions`.
+- **`RobertaForTokenClassification`** - same `Dropout → Linear` shape as BERT's token-classification head; loads `Jean-Baptiste/roberta-large-ner-english`, `obi/deid_roberta_i2b2`, etc. `predict(&[&str]) → Vec<Vec<TokenPrediction>>`.
+- **`RobertaForQuestionAnswering`** - `qa_outputs.{weight,bias}` head. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }`. Span search is restricted to `sequence_id == 1` (see below), since RoBERTa's `token_type_ids` are uniformly zero and can't distinguish question from context. Works with `deepset/roberta-base-squad2`.
 - **`RobertaConfig::from_json_str`** parses all shape + task-head fields. Defaults track HF's `RobertaConfig`: `layer_norm_eps = 1e-5` (not BERT's `1e-12`), `type_vocab_size = 1`, `pad_token_id = 1`, `max_position_embeddings = 514` (holds `padding_idx` row + 512 real positions).
 - **Parity infrastructure per head**: `fdl flodl-hf parity-roberta` / `parity-roberta-seqcls` / `parity-roberta-tokencls` / `parity-roberta-qa` regenerate fixtures under `flodl-hf/tests/fixtures/roberta_*.safetensors` against `roberta-base`, `cardiffnlp/twitter-roberta-base-sentiment-latest`, `Jean-Baptiste/roberta-large-ner-english`, and `deepset/roberta-base-squad2`. Matching `_live` integration tests assert `max_abs_diff ≤ 1e-5` on pooled output / logits against the HF reference. Run via `fdl test-live`.
 - **Runnable examples**: `fdl flodl-hf example roberta-embed` / `roberta-classify` / `roberta-ner` / `roberta-qa`.
@@ -390,8 +822,8 @@ Three fine-tuned heads on top of `BertModel`, each with a Laravel-flavoured `pre
 - **`DistilBertModel::from_pretrained(repo_id)`** returns a pooler-free `Graph` taking **2 named inputs**: `input_ids` (implicit) + `attention_mask`. No `token_type_ids` (DistilBERT is single-segment; the embedding table doesn't exist) and no `position_ids` (sequential `0..S` computed internally via `Tensor::arange + reshape + expand`). Callers ignore both quirks.
 - **`DistilBertConfig::from_json_str`** reads HF's native field names exactly: `n_layers` / `n_heads` / `dim` / `hidden_dim` rather than BERT's `num_hidden_layers` / `num_attention_heads` / `hidden_size` / `intermediate_size`. HF docs cross-reference friction-free; the encoder instantiation pays a tiny adapter cost. Plus the two DistilBERT-specific dropouts `qa_dropout` (typical `0.1`) and `seq_classif_dropout` (typical `0.2`), and `sinusoidal_pos_embds` (parsed but unused: HF Python overwrites the sinusoidal init with the checkpoint's learned positions, so every public checkpoint ships a trained table).
 - **`DistilBertForSequenceClassification`** uses HF's two-layer head on the first token's hidden state: `select(CLS) -> pre_classifier (dim -> dim) -> ReLU -> Dropout(seq_classif_dropout) -> classifier (dim -> num_labels)`. Parameter keys `pre_classifier.{weight,bias}` + `classifier.{weight,bias}` are siblings at the root level, not nested. Works with `lxyuan/distilbert-base-multilingual-cased-sentiments-student` (3-class sentiment, multilingual).
-- **`DistilBertForTokenClassification`** — `last_hidden_state -> Dropout -> Linear(dim, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str]) -> Vec<Vec<TokenPrediction>>`. Works with `dslim/distilbert-NER` (PER / ORG / LOC / MISC BIO, 9 labels).
-- **`DistilBertForQuestionAnswering`** — `last_hidden_state -> Dropout(qa_dropout) -> Linear(dim, 2)`. Parameter keys `qa_outputs.{weight,bias}`. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }`; span search restricted to `sequence_ids == 1` (reuses the model-agnostic filter added with `EncodedBatch.sequence_ids`). Works with `distilbert/distilbert-base-cased-distilled-squad`.
+- **`DistilBertForTokenClassification`** - `last_hidden_state -> Dropout -> Linear(dim, num_labels)`. Parameter keys `classifier.{weight,bias}`. `predict(&[&str]) -> Vec<Vec<TokenPrediction>>`. Works with `dslim/distilbert-NER` (PER / ORG / LOC / MISC BIO, 9 labels).
+- **`DistilBertForQuestionAnswering`** - `last_hidden_state -> Dropout(qa_dropout) -> Linear(dim, 2)`. Parameter keys `qa_outputs.{weight,bias}`. `answer(question, context)` / `answer_batch(&[(q, c)])` return `Answer { text, start, end, score }`; span search restricted to `sequence_ids == 1` (reuses the model-agnostic filter added with `EncodedBatch.sequence_ids`). Works with `distilbert/distilbert-base-cased-distilled-squad`.
 - **Parity infrastructure per head**: `fdl flodl-hf parity-distilbert` / `parity-distilbert-seqcls` / `parity-distilbert-tokencls` / `parity-distilbert-qa` regenerate fixtures under `flodl-hf/tests/fixtures/distilbert_*.safetensors` against the four pinned checkpoints. Matching `_live` integration tests assert `max_abs_diff <= 1e-5` on logits / hidden state. Observed on the reference host: `distilbert-base-uncased` backbone **1.431e-6**, `lxyuan/*-sentiments-student` SeqCls **2.384e-7** (42x headroom), `dslim/distilbert-NER` TokenCls **3.815e-6**, `distilbert/distilbert-base-cased-distilled-squad` QA **2.623e-6**.
 - **Runnable examples**: `fdl flodl-hf example distilbert-embed` / `distilbert-classify` / `distilbert-ner` / `distilbert-qa`.
 
@@ -399,9 +831,9 @@ Three fine-tuned heads on top of `BertModel`, each with a Laravel-flavoured `pre
 
 One-liner Hub loading over the BERT / RoBERTa / DistilBERT families without the caller having to know which family the checkpoint belongs to. Dispatches on `config.json`'s `model_type` field, mirroring HF Python's `AutoModel` / `AutoModelForSequenceClassification` / … entry points.
 
-- **`flodl-hf::models::auto::AutoConfig`** — enum over `BertConfig` / `RobertaConfig` / `DistilBertConfig`, parsed by `AutoConfig::from_json_str`. Dispatches on `model_type` (`bert` / `roberta` / `distilbert`). Unsupported values (`modernbert`, `xlm-roberta`, `electra`, …) surface a loud error naming the offending type and listing the supported set. A new `config_json::required_string` helper backs the dispatch read.
-- **`AutoModel::from_pretrained(repo_id)` / `::from_pretrained_on_device`** — returns a `Graph`. Routes BERT through `BertModel::on_device_without_pooler` so the output is always `last_hidden_state` of shape `[batch, seq_len, hidden]`, consistent across the three families. Diverges intentionally from HF Python's `BertModel.from_pretrained` (which includes the pooler); when BERT's pooler output is specifically needed, use `BertModel::from_pretrained` directly. The returned graph's `forward_multi` input count still varies by family (BERT: 4, RoBERTa: 3, DistilBERT: 2); callers that run the graph directly need to match that, the task-head wrappers below hide it.
-- **`AutoModelForSequenceClassification` / `AutoModelForTokenClassification` / `AutoModelForQuestionAnswering`** — enums over the per-family concrete heads. `from_pretrained(repo_id)` dispatches loading; `predict(&[&str])` / `answer(question, context)` / `answer_batch(&[(q, c)])` run inference with a unified signature. `with_tokenizer` and `graph()` / `labels()` accessors delegate to the inner head. The same code path serves `bert-base-uncased`, `roberta-base`, and `distilbert-base-uncased`.
+- **`flodl-hf::models::auto::AutoConfig`** - enum over `BertConfig` / `RobertaConfig` / `DistilBertConfig`, parsed by `AutoConfig::from_json_str`. Dispatches on `model_type` (`bert` / `roberta` / `distilbert`). Unsupported values (`modernbert`, `xlm-roberta`, `electra`, …) surface a loud error naming the offending type and listing the supported set. A new `config_json::required_string` helper backs the dispatch read.
+- **`AutoModel::from_pretrained(repo_id)` / `::from_pretrained_on_device`** - returns a `Graph`. Routes BERT through `BertModel::on_device_without_pooler` so the output is always `last_hidden_state` of shape `[batch, seq_len, hidden]`, consistent across the three families. Diverges intentionally from HF Python's `BertModel.from_pretrained` (which includes the pooler); when BERT's pooler output is specifically needed, use `BertModel::from_pretrained` directly. The returned graph's `forward_multi` input count still varies by family (BERT: 4, RoBERTa: 3, DistilBERT: 2); callers that run the graph directly need to match that, the task-head wrappers below hide it.
+- **`AutoModelForSequenceClassification` / `AutoModelForTokenClassification` / `AutoModelForQuestionAnswering`** - enums over the per-family concrete heads. `from_pretrained(repo_id)` dispatches loading; `predict(&[&str])` / `answer(question, context)` / `answer_batch(&[(q, c)])` run inference with a unified signature. `with_tokenizer` and `graph()` / `labels()` accessors delegate to the inner head. The same code path serves `bert-base-uncased`, `roberta-base`, and `distilbert-base-uncased`.
 - **Runnable example**: `fdl flodl-hf example auto-classify -- <repo_id>`. Default: `cardiffnlp/twitter-roberta-base-sentiment-latest`; pass any BERT / RoBERTa / DistilBERT classification checkpoint as `argv[1]`. Same three-line caller regardless of family.
 - **No new parity fixtures**: AutoModel is a pure dispatch layer over already-tested per-family paths. Unit tests cover `AutoConfig::from_json_str` dispatch for all three families plus unknown-model-type and malformed-input error cases.
 
@@ -409,30 +841,30 @@ One-liner Hub loading over the BERT / RoBERTa / DistilBERT families without the 
 
 Closes the "very rustic" discovery gap. Before today, a user with a fresh flodl project couldn't find flodl-hf without reading docs, editing their `Cargo.toml` manually, and guessing the right feature flavors. Now one command drops a working playground.
 
-- **`fdl add flodl-hf` (alias: `fdl add hf`)** — scaffolds a `./flodl-hf/` sub-crate inside the current flodl project. Standalone cargo crate with its own `Cargo.toml` + `src/main.rs` (a one-file `AutoModel` classifier that takes a repo id from argv) + `fdl.yml` with runnable commands (`classify`, `bert`, `distilbert-sentiment`, plus `build` / `check` / `shell`) + `README.md` documenting the three feature flavors (full / vision-only / offline), the `fdl flodl-hf convert` workflow for `.bin`-only repos, and how to wire flodl-hf into a main crate when the user is ready.
+- **`fdl add flodl-hf` (alias: `fdl add hf`)** - scaffolds a `./flodl-hf/` sub-crate inside the current flodl project. Standalone cargo crate with its own `Cargo.toml` + `src/main.rs` (a one-file `AutoModel` classifier that takes a repo id from argv) + `fdl.yml` with runnable commands (`classify`, `bert`, `distilbert-sentiment`, plus `build` / `check` / `shell`) + `README.md` documenting the three feature flavors (full / vision-only / offline), the `fdl flodl-hf convert` workflow for `.bin`-only repos, and how to wire flodl-hf into a main crate when the user is ready.
 - **Version lockstep**: the scaffold parses the host project's `flodl = "X.Y.Z"` dependency (plain, table, or workspace-inherited form) and pins `flodl-hf` to the matching `=X.Y.Z`. Git-only and path-only flodl deps error with actionable guidance rather than silently picking a version.
 - **Scope contract**: no mutation of the user's root `Cargo.toml` or `fdl.yml`. The playground is a side crate for hands-on discovery; wiring flodl-hf into the user's main code stays their call. The generated README walks through it.
 - **Idempotent**: refuses to overwrite an existing `./flodl-hf/` directory. Users delete explicitly if they want a regenerate.
 - **`fdl init --with-hf`** and **interactive prompt**: `fdl init` now asks "Include flodl-hf (HuggingFace: BERT/RoBERTa/DistilBERT, Hub loader, tokenizer)?" after the Docker/native choice. `--with-hf` bypasses the prompt for scripted invocations; any explicit `--docker` / `--native` / `--with-hf` flag puts init in non-interactive mode, respecting `--with-hf` verbatim.
-- **Templates live in `flodl-cli/src/scaffold/`** — baked into the `fdl` binary via `include_str!` at compile time and travel inside the `flodl-cli` crate tarball, so `cargo install flodl-cli` from crates.io drops a fully functional `fdl add`. The scaffold `Cargo.toml` is stored as `Cargo.toml.in` to prevent cargo treating the sub-directory as a nested package during `cargo package`; it is written out as `Cargo.toml` when the scaffold runs.
+- **Templates live in `flodl-cli/src/scaffold/`** - baked into the `fdl` binary via `include_str!` at compile time and travel inside the `flodl-cli` crate tarball, so `cargo install flodl-cli` from crates.io drops a fully functional `fdl add`. The scaffold `Cargo.toml` is stored as `Cargo.toml.in` to prevent cargo treating the sub-directory as a nested package during `cargo package`; it is written out as `Cargo.toml` when the scaffold runs.
 - **Host-project mode detection**: `fdl add flodl-hf` inspects the parent dir to decide how to wire the scaffolded commands. `docker-compose.yml` present → Docker mode, scaffolded `fdl.yml` keeps `docker: dev` on each cargo command so `fdl classify` dispatches into the `dev` service. `docker-compose.yml` absent → Native mode, `docker:` lines stripped so `fdl classify` runs `cargo run --release` directly on the host. The invariant `fdl.yml` (or `fdl.yml.example`) must be present is enforced loudly: a missing fdl config aborts the scaffold with "expects an initialised flodl project". `.bin`-to-safetensors conversion is documented as a direct Python invocation in the scaffold README (`pip install torch transformers safetensors` + inline script) rather than assuming the rdl-repo-internal `fdl flodl-hf convert` Docker service is available in user projects.
 - **First slice of the broader flodl-manager roadmap line**: deliberately narrow. `fdl add` supports only `flodl-hf` today; per-model feature flavors (`fdl add hf --for bert|vit|offline`), `fdl build` / `clippy` argv forwarding, and `fdl doctor` / `model-info` stay on the roadmap for follow-up arcs.
 
 #### flodl-hf: `EncodedBatch.sequence_ids` + model-agnostic QA span filter
 
-- **`EncodedBatch` gains `sequence_ids: Variable`** — per-token segment tag from the HF tokenizer (`0` = first sequence, `1` = second sequence, `-1` = special / padding). This is the canonical HF signal for "which part of a pair encoding does this token belong to"; it's model-agnostic, where `token_type_ids` is a model input whose semantics vary (BERT sets segment B to 1; RoBERTa keeps everything at zero).
+- **`EncodedBatch` gains `sequence_ids: Variable`** - per-token segment tag from the HF tokenizer (`0` = first sequence, `1` = second sequence, `-1` = special / padding). This is the canonical HF signal for "which part of a pair encoding does this token belong to"; it's model-agnostic, where `token_type_ids` is a model input whose semantics vary (BERT sets segment B to 1; RoBERTa keeps everything at zero).
 - **`BertForQuestionAnswering::extract` switched** from `token_type_ids == 1` to `sequence_ids == 1` for context-region filtering. Behaviour is bit-identical on BERT (the tokenizer sets both equal), but the same code now works across the full BERT family.
 
 #### flodl: `LayerNorm` with custom epsilon
-- **`LayerNorm::with_eps`** and **`LayerNorm::on_device_with_eps`** — constructors accepting a custom epsilon, required for HuggingFace BERT (`eps = 1e-12`) and any architecture deviating from the PyTorch `1e-5` default.
+- **`LayerNorm::with_eps`** and **`LayerNorm::on_device_with_eps`** - constructors accepting a custom epsilon, required for HuggingFace BERT (`eps = 1e-12`) and any architecture deviating from the PyTorch `1e-5` default.
 - **`LayerNorm::DEFAULT_EPS`** associated constant.
 - Hand-computed golden-value test anchors the eps-reaches-the-kernel claim (not just "doesn't panic").
 
 #### flodl: Native `torch.embedding` FFI with `padding_idx`
 - **FFI chain**: `flodl_embedding` shim in `flodl-sys/{shim.h, ops_training.cpp, src/lib.rs}` → `Tensor::embedding(weight, indices, padding_idx)` → `autograd::embedding(weight, indices, padding_idx)`. Delegates to libtorch's `at::embedding` directly, replacing the previous `index_select + reshape` manual path in `Embedding::forward`.
-- **`Embedding::with_padding_idx`** and **`Embedding::on_device_with_padding_idx`** — constructors accepting `Option<i64>`. The gradient of the `padding_idx` row is masked to zero during backward by the native kernel, so the PAD embedding doesn't drift during fine-tuning. Range-checked at construction.
+- **`Embedding::with_padding_idx`** and **`Embedding::on_device_with_padding_idx`** - constructors accepting `Option<i64>`. The gradient of the `padding_idx` row is masked to zero during backward by the native kernel, so the PAD embedding doesn't drift during fine-tuning. Range-checked at construction.
 - **`Embedding::NO_PADDING = -1`** associated constant (sentinel matching `at::embedding`'s convention).
-- For LLaMA-style checkpoints where `pad_token_id == eos_token_id`, pass `padding_idx = None` — otherwise the EOS row freezes, silently breaking fine-tuning.
+- For LLaMA-style checkpoints where `pad_token_id == eos_token_id`, pass `padding_idx = None` - otherwise the EOS row freezes, silently breaking fine-tuning.
 - `Embedding::forward` now handles indices of any shape, returning `[*indices.shape, embedding_dim]` without manual reshape.
 
 #### flodl: `scaled_dot_product_attention` FFI
@@ -441,7 +873,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 
 - **`flodl_scaled_dot_product_attention`** shim in `flodl-sys/{shim.h, ops_nn.cpp, src/lib.rs}`.
 - **`Tensor::scaled_dot_product_attention(q, k, v, attn_mask: Option<&Tensor>, dropout_p, is_causal, scale: Option<f64>)`** in `flodl/src/tensor/nn_ops.rs`.
-- **`autograd::scaled_dot_product_attention(...)`** (re-exported as `flodl::scaled_dot_product_attention`) — backward via native libtorch autograd, same `Variable::wrap` pattern as `embedding`.
+- **`autograd::scaled_dot_product_attention(...)`** (re-exported as `flodl::scaled_dot_product_attention`) - backward via native libtorch autograd, same `Variable::wrap` pattern as `embedding`.
 - Sentinel conventions: `attn_mask = None` for no mask; `scale = None` (or any `Some(x)` with `x <= 0.0`) selects the default `1/sqrt(E)`.
 - Parity test `test_sdpa_parity_vs_naive` anchors the fused kernel against a hand-rolled `softmax(QKᵀ/√d)V` implementation; `test_sdpa_backward` covers the autograd path.
 - libtorch 2.10.0; SDPA shipped in 2.0, so safe under any supported variant.
@@ -457,7 +889,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 
 ### Removed
 
-- **`Embedding` struct fields `num_embeddings` and `embedding_dim`** — both were stored but never read after the move to `at::embedding`. Fields were private; no user-visible impact.
+- **`Embedding` struct fields `num_embeddings` and `embedding_dim`** - both were stored but never read after the move to `at::embedding`. Fields were private; no user-visible impact.
 
 ## [0.5.1] - 2026-04-19
 
@@ -471,7 +903,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 #### Release-readiness suite (`make release-check`)
 - **`ci/release/`** (new): eight self-contained shell scripts each verifying one release-gate invariant, plus a `run-all.sh` orchestrator. Scripts: `01-git` (clean tree, tag available), `02-version-sync` (Cargo.toml matches a dated CHANGELOG header), `03-lint-docs` (stale `make` refs, hardcoded user paths, dangling `fdl <cmd>` references in docs), `04-shell` (`sh -n` / `bash -n` picks interpreter from shebang, optional `shellcheck`), `05-ci` (delegates to `fdl ci`), `06-scaffold` (delegates to `make test-init`), `07-docs-rs` (delegates to `make docs-rs`), `08-publish-dry` (`cargo publish --dry-run` per workspace crate in dep order).
 - **`make release-check`**: orchestrator target that prints a pass/fail summary and exits non-zero on any failure. Designed to catch the exact bug class this release fixed (removed `make bench*` / `bench-cpu` leftovers across docs and source code).
-- **`docs/release.md`** (new): release process doc — pre-flight checklist, script table, common failures, post-tag steps (`git push --tags`, `cargo publish` dep order).
+- **`docs/release.md`** (new): release process doc - pre-flight checklist, script table, common failures, post-tag steps (`git push --tags`, `cargo publish` dep order).
 - **Side-fixes uncovered by the linter and folded in**: `flodl-cli/src/libtorch/{build,download}.rs` printing `Run 'make cuda-test' to verify.` → `fdl cuda-test`; 23 `#[ignore = "... run with: make cuda-test-*"]` test attribute messages across `flodl/src/distributed/*.rs` and `flodl/src/nn/cuda_graph.rs` → `fdl cuda-test-*`; `Dockerfile.cuda.source` + embedded copy comments referencing `make build-libtorch` → `fdl libtorch build`.
 
 #### Post-init / post-setup "install globally?" prompt
@@ -603,11 +1035,11 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 
 ### Added
 
-#### `ddp-bench` — DDP Validation Suite
+#### `ddp-bench` - DDP Validation Suite
 - **New workspace member `ddp-bench/`**: End-to-end harness that reproduces published training setups to build scientifically valid solo baselines, then measures DDP/ElChe convergence quality against them.
 - **8 reference models** (`ddp-bench/src/models/`):
   - `logistic` / `mlp` / `lenet` / `conv_ae` (MNIST)
-  - `resnet` (ResNet-20 on CIFAR-10, He et al. 2015 — paper baseline 91.25%)
+  - `resnet` (ResNet-20 on CIFAR-10, He et al. 2015 - paper baseline 91.25%)
   - `resnet_graph` (FlowBuilder rewrite of ResNet-20: same parameter count, same accuracy, with graph-level observation, named parameters and tagged residual blocks)
   - `char_rnn` (Karpathy 2015 char-RNN on Shakespeare, LSTM-256x2)
   - `gpt_nano` (4-layer pre-norm Transformer on Shakespeare, warmup + cosine decay)
@@ -618,56 +1050,56 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Dataset downloader** (`download.rs`): on-demand download + cache for MNIST, CIFAR-10, Shakespeare. Cache lives under `data/` (gitignored).
 - CLI flags: `--list`, `--model <name|all>`, `--mode <mode|all>`, `--epochs N`, `--batch-size`, `--lr-scale F`, `--validate`, `--baseline <path>`, `--save-baseline`, `--report <path>`, `--seed`.
 
-#### Built-in Standard Datasets — `flodl::data::datasets`
+#### Built-in Standard Datasets - `flodl::data::datasets`
 - **`Mnist`** (`data/datasets/mnist.rs`): parses IDX gzip into `[N,1,28,28]` Float32 + `[N]` Int64. `Mnist::parse(images_gz, labels_gz) -> Result<Self>`. Implements `BatchDataSet`.
 - **`Cifar10`** (`data/datasets/cifar10.rs`): parses the binary batch format into `[N,3,32,32]` Float32 + `[N]` Int64 (10 classes). Implements `BatchDataSet`.
 - **`Shakespeare`** (`data/datasets/shakespeare.rs`): char-level tokenizer for next-char prediction. `[N, seq_len]` Int64 over a 65-symbol vocabulary, plus a `decode(&[i64]) -> String` helper. Implements `BatchDataSet`.
 - All three plug directly into `DataLoader::builder(dataset)` in single-GPU and DDP modes.
 
-#### Convergence Guard — Unified Divergence Reaction
+#### Convergence Guard - Unified Divergence Reaction
 - **`convergence` module** (`flodl/src/distributed/ddp_run/convergence.rs`): unified weight-space divergence guard for both NCCL and CPU averaging paths.
 - **`DivergenceReport`**: per-rank L2 deltas plus optional pre/post norms. Free decomposition into cosine similarities and magnitude shifts via the algebraic identity (no extra reductions).
 - **`ConvergenceAction`**: `Stable` / `SuppressGrowth` / `NudgeDown { factor }` recommendations.
-- **`ConvergenceGuard::new(policy, enabled, threshold)`**: 5-interval ring buffer. Detects 3-consecutive-rising trends above threshold and returns `SuppressGrowth` to freeze ElChe anchor/overshoot growth (rather than aggressively shrinking, which can kill convergence — overhead auto-tune handles loosening on its own).
+- **`ConvergenceGuard::new(policy, enabled, threshold)`**: 5-interval ring buffer. Detects 3-consecutive-rising trends above threshold and returns `SuppressGrowth` to freeze ElChe anchor/overshoot growth (rather than aggressively shrinking, which can kill convergence - overhead auto-tune handles loosening on its own).
 - **Wired into `Coordinator`** for both NCCL and CPU paths (`Sync` is no-op, `Cadence`/`Async` use trend detection). Configurable via `DdpRunConfig::with_divergence_threshold(f64)`.
 - Cross-rank divergence is now reset after every averaging event, fixing a stale-state bug that pinned the ElChe anchor at 1.
 
-#### Timeline Profiler — `monitor::timeline`
+#### Timeline Profiler - `monitor::timeline`
 - **`Timeline`** (`flodl/src/monitor/timeline.rs`): high-frequency (default 100ms poll, 1s broadcast) system + GPU profiler. Captures CPU, RAM, per-GPU compute utilization and VRAM as `TimelineSample`s, interleaved with training events.
 - **`EventKind`**: `EpochStart` / `EpochEnd { loss }` / `SyncStart` / `SyncEnd { duration_ms }` / `CpuAvgStart` / `CpuAvgEnd { duration_ms }` / `AnchorChanged { from, to }` / `Throttle { rank }` / `Idle { device, duration_ms }` / `Custom { label }`.
 - **API**: `Timeline::new(poll_ms)` / `with_intervals(poll_ms, broadcast_ms)` (returns `Arc<Timeline>`), `start()` / `stop()`, `event(EventKind)`, `subscribe()` for live `mpsc` updates, `summary()`, `idle_gaps(device, threshold_pct, min_ms)`, `drain()`, `sample_count()`.
-- **Output**: `save_json(path)`, `save_csv(path)`, `save_html(path)` — the HTML view (`timeline.html`) renders a swimlane visualization of CPU/GPU utilization, sync/averaging events, anchor changes and detected idle gaps. Used by `ddp-bench` for every run (`runs/<model>/<mode>/timeline.html`).
+- **Output**: `save_json(path)`, `save_csv(path)`, `save_html(path)` - the HTML view (`timeline.html`) renders a swimlane visualization of CPU/GPU utilization, sync/averaging events, anchor changes and detected idle gaps. Used by `ddp-bench` for every run (`runs/<model>/<mode>/timeline.html`).
 - Enable per-job in `fdl.yaml` with `ddp.timeline: true` or `output.timeline: true`.
 
-#### Verbosity-Gated Logging — `flodl::log`
+#### Verbosity-Gated Logging - `flodl::log`
 - **`Verbosity` enum**: `Quiet (0)` / `Normal (1)` / `Verbose (2)` / `Debug (3)` / `Trace (4)`. Higher levels include lower.
 - **Macros**: `flodl::msg!("...", args)` (Normal default, `@Verbose`/`@Debug`/`@Trace` for explicit level), plus `flodl::verbose!()`, `flodl::debug!()`, `flodl::trace!()`.
 - **Routing**: Normal/Verbose go to **stdout**; Debug/Trace go to **stderr** so they remain unbuffered in Docker non-TTY environments. Errors keep using bare `eprintln!`.
-- **Zero-code config**: `FLODL_VERBOSITY=verbose cargo run` (accepts integers 0–4 or names). Programmatic override via `flodl::log::set_verbosity(Verbosity)`.
+- **Zero-code config**: `FLODL_VERBOSITY=verbose cargo run` (accepts integers 0-4 or names). Programmatic override via `flodl::log::set_verbosity(Verbosity)`.
 - **CLI integration**: `fdl -v` / `-vv` / `-vvv` / `--quiet` set `FLODL_VERBOSITY` in the parent process so it flows into Docker child commands automatically.
 
-#### FlowBuilder — `also_with`
-- **`FlowBuilder::also_with(skip, main)`** (`flodl/src/graph/flow.rs`): residual connection with a custom skip path. Generalizes [`also`](../flodl/src/graph/flow.rs) for cases where the skip needs its own transform — e.g. ResNet downsample blocks where a 1×1 conv + BN matches channel/stride changes. Output is `skip(x) + main(x)`. Exercised by `ddp-bench/src/models/resnet_graph.rs` (ResNet-20 on CIFAR-10, full paper-accuracy baseline).
+#### FlowBuilder - `also_with`
+- **`FlowBuilder::also_with(skip, main)`** (`flodl/src/graph/flow.rs`): residual connection with a custom skip path. Generalizes [`also`](../flodl/src/graph/flow.rs) for cases where the skip needs its own transform - e.g. ResNet downsample blocks where a 1×1 conv + BN matches channel/stride changes. Output is `skip(x) + main(x)`. Exercised by `ddp-bench/src/models/resnet_graph.rs` (ResNet-20 on CIFAR-10, full paper-accuracy baseline).
 
 #### `AdaptiveAvgPool2d`
 - **`AdaptiveAvgPool2d::new([h, w])`** (`flodl/src/nn/pooling.rs`): global / fixed-output-size average pooling. Counterpart to the existing `AdaptiveMaxPool2d`. `[1, 1]` gives global average pooling (common ResNet head before FC); arbitrary output sizes enable variable-size input support. Re-exported at crate root.
 
-#### Metrics — `drain_scalars`
+#### Metrics - `drain_scalars`
 - **`flodl::drain_scalars() -> HashMap<String, (f64, usize)>`** (`flodl/src/distributed/ddp_run/mod.rs`): companion to the existing `record_scalar`. Flushes the thread-local accumulator and returns `(sum, count)` per tag so callers (monitors, custom loops) can average or log per-batch scalars outside the DDP coordinator path. Re-exported at crate root.
 
-#### LR Scheduling — Cross-Mode Parity
+#### LR Scheduling - Cross-Mode Parity
 - **`Graph::set_scheduler(Arc<dyn Scheduler>)`** and **`Graph::set_lr_scale(f64)`** (`flodl/src/graph/distributed.rs`): scheduler attached on the Graph DDP path drives the optimizer LR via `scheduler.lr(training_step) * lr_scale` on every `step()`. `training_step` advances per `step()` call. **`Graph::training_step()`** accessor exposed for monitoring.
 - **`GpuWorker::set_scheduler` / `set_lr_scale` / `current_lr`** (`flodl/src/distributed/ddp_run/worker.rs`): same mechanism on the DDP-builder path. LR computed as `scheduler.lr(global_step + steps_since_avg) * lr_scale` per batch.
 - **`DdpBuilder::scheduler(factory)`** (`flodl/src/distributed/ddp_run/orchestrator.rs:1219`): per-worker scheduler factory closure. Each rank instantiates its own scheduler (cheap to clone, no shared state). Pairs with `lr_scale_ratio` to keep all ranks in lockstep.
 - **`DdpBuilder::lr_scale_ratio(f64)`** / **`DdpRunConfig::with_lr_scale_ratio(f64)`**: when set, the framework auto-computes the per-rank `lr_scale` from `world_size` (linear scaling rule, Goyal et al. 2017). Default `0.0` (= disabled, `lr_scale = 1.0`); set to `1.0` for full linear scaling, fractional values for sub-linear. Manual override stays available via `--lr-scale` in `ddp-bench`.
-- **Cross-mode parity test** (`graph_tests.rs`): asserts that the same `MultiStepLR` produces identical LR trajectories across all three training paths — manual reference loop, `GpuWorker` (DDP builder), and `Graph::step()` — for both unscaled and `lr_scale != 1.0`.
+- **Cross-mode parity test** (`graph_tests.rs`): asserts that the same `MultiStepLR` produces identical LR trajectories across all three training paths - manual reference loop, `GpuWorker` (DDP builder), and `Graph::step()` - for both unscaled and `lr_scale != 1.0`.
 - **Coordinator regression**: `SyncAck` no longer inflates `steps_since_avg` and now properly satisfies `nccl_ack`, fixing a scheduler drift across NCCL averaging events.
 
-#### DDP — New Configuration Knobs
+#### DDP - New Configuration Knobs
 - **`DdpBuilder::no_divergence_guard()`** / **`DdpRunConfig::with_no_divergence_guard()`**: disable the convergence guard entirely. Use during calibration runs or when the divergence trend logging is more noise than signal. Default: enabled with `divergence_threshold = 0.05`.
-- **`DdpBuilder::max_overshoot(usize)`** / **`DdpRunConfig::with_max_overshoot(usize)`**: cap how many extra batches the fastest rank can run past the slowest before the next averaging event in `Async` policy. Pairs with auto-tuning; set to bound the worst case explicitly. Async-only — the `Cadence` policy uses wall-time anchoring instead. The internal `overshoot_ceiling` (default ~3× anchor) gates the auto-tuner.
+- **`DdpBuilder::max_overshoot(usize)`** / **`DdpRunConfig::with_max_overshoot(usize)`**: cap how many extra batches the fastest rank can run past the slowest before the next averaging event in `Async` policy. Pairs with auto-tuning; set to bound the worst case explicitly. Async-only - the `Cadence` policy uses wall-time anchoring instead. The internal `overshoot_ceiling` (default ~3× anchor) gates the auto-tuner.
 - **`DdpBuilder::timeline(Arc<Timeline>)`** / **`DdpRunConfig::with_timeline(Arc<Timeline>)`** / **`DdpConfig::timeline(Arc<Timeline>)`** / **`Graph::timeline(Arc<Timeline>)`**: attach a shared `monitor::Timeline` so the DDP runtime injects `EpochStart/End`, `SyncStart/End`, `CpuAvgStart/End`, `AnchorChanged`, `Throttle` events into the profiler stream. All four entry points (single-GPU Graph, manual `Ddp::wrap`, `Ddp::setup`, `DdpBuilder`) accept the same `Arc<Timeline>`. Used by `ddp-bench` to produce per-run swimlane HTML.
-- **`Coordinator::builder()`** (`flodl/src/distributed/ddp_run/coordinator/mod.rs`): the coordinator now exposes a fluent builder (`progressive`, `batch_size`, `timeline`, `divergence_threshold`, `no_divergence_guard`, `overhead_target`, `max_anchor`, `checkpoint_every`, `snapshot_timeout_secs`, `epoch_metrics_tx`, `device_indices`, `num_epochs`, `partition_ratios`, `max_overshoot`, `overshoot_ceiling`, `build`). Internal — the user-facing surface is still `DdpBuilder`/`Ddp::setup` — but useful for writing custom orchestrators.
+- **`Coordinator::builder()`** (`flodl/src/distributed/ddp_run/coordinator/mod.rs`): the coordinator now exposes a fluent builder (`progressive`, `batch_size`, `timeline`, `divergence_threshold`, `no_divergence_guard`, `overhead_target`, `max_anchor`, `checkpoint_every`, `snapshot_timeout_secs`, `epoch_metrics_tx`, `device_indices`, `num_epochs`, `partition_ratios`, `max_overshoot`, `overshoot_ceiling`, `build`). Internal - the user-facing surface is still `DdpBuilder`/`Ddp::setup` - but useful for writing custom orchestrators.
 - **Note on `max_batch_diff`**: the field shipped in 0.3.0 (per-rank lockstep limit). What's new is `DdpBuilder::max_batch_diff(usize)` as a top-level fluent setter (was only reachable via `DdpRunConfig::with_max_batch_diff`).
 
 #### CLI: `fdl run` and Project / Sub-command Manifests
@@ -689,7 +1121,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 #### Docs: PyTorch Porting Guide
 - **`docs/porting.md`** (257 lines, full rewrite from the previous 7-line stub): user-facing porting guide that mirrors the AI skill (`ai/skills/port/guide.md`) and references `fdl api-ref` for the canonical type/method index.
 - **`docs/cli.md`** (130 lines): full CLI reference (setup, libtorch, init, diagnose, api-ref, install, skill, run, completions, config, verbosity flags, fdl.yaml manifest).
-- **`docs/design/run-config.md`** (296 lines): formal spec for `fdl.yaml` — schema, merge order, sub-command resolution, Docker integration, and how DDP/training/output map onto `DdpConfig` / `DdpRunConfig`.
+- **`docs/design/run-config.md`** (296 lines): formal spec for `fdl.yaml` - schema, merge order, sub-command resolution, Docker integration, and how DDP/training/output map onto `DdpConfig` / `DdpRunConfig`.
 - Updates to `docs/pytorch_migration.md` and the CLI section of the README.
 
 #### CLI: API Reference Generator
@@ -722,7 +1154,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 
 ### Changed
 
-#### DDP — Streaming Epochs and NCCL Cadence Boundaries
+#### DDP - Streaming Epochs and NCCL Cadence Boundaries
 - **Streaming epoch dispatch**: `Coordinator::dispatch_next_chunk` now streams sub-epoch chunks instead of full-epoch partitions in `Cadence` and `Async` modes, adapting to live throughput. Added a guard so the coordinator never recreates chunk pools for already-aggregated epochs (was causing a deadlock under heterogeneous cadences).
 - **NCCL cadence boundary fixes**: per-rank epoch ack handling rewritten so that the slowest rank no longer stalls the next epoch's `SyncNow` broadcast. ElChe anchor + overshoot remain anchored to the slow rank's wall time.
 - **`max_overshoot` is Async-only**: documented as such; the auto-tune is no longer evaluated for `Cadence`.
@@ -762,7 +1194,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Validated**: 54 training runs across 6 architectures (`logistic`, `mlp`, `lenet`, `char-rnn`, `gpt-nano`, `conv-ae`) times 9 DDP modes with zero warnings in any `training.log`. Also validated across the earlier 6-mode 200-epoch `resnet_graph` run on CIFAR-10.
 - **Side effect**: unblocks CUDA Graph capture for DDP workers. Graph capture fails loudly on stream mismatches between the training stream and the accumulator stream, so prior workarounds are no longer needed.
 
-## [0.3.0] - 2026-04-08 — Multi-GPU & Infrastructure
+## [0.3.0] - 2026-04-08 - Multi-GPU & Infrastructure
 
 ### Added
 
@@ -828,7 +1260,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Auto-balancing integration**: Epoch iterator reads chunk_ratios fresh per batch. Shard sizes adapt as ratios change every 50 steps. Mixed resident/streaming backends handle dynamic ratios correctly.
 - Training loop identical for 1 or N GPUs. `distribute()` + `set_data_loader()` are the only differences.
 
-#### `Ddp::setup()` — One-Liner DDP Setup
+#### `Ddp::setup()` - One-Liner DDP Setup
 - **`Ddp::setup(&model, builder, optimizer)`**: Single call to auto-detect GPUs, distribute the model, set per-replica optimizers, and enable training mode. No-op distribute for single GPU/CPU (still sets optimizer + training). Training loop identical for 1 or N GPUs.
 - **`Ddp::setup_with(&model, builder, optimizer, config)`**: Same as `setup()` but accepts a `DdpConfig` for explicit El Che configuration (speed hints, overhead target, max anchor).
 - **`Ddp::is_heterogeneous()`**: Detects mixed GPU models. `setup()` auto-enables El Che when heterogeneous GPUs are detected.
@@ -862,7 +1294,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Device save/restore**: All `NcclComms` methods (`new`, `all_reduce`, `broadcast`, and stream variants) now save and restore the current CUDA device around FFI calls. Prevents NCCL operations from leaking device context changes to callers.
 - **Shared `NCCL_LOCK`**: Single `pub(crate)` mutex in `ddp` module, used by both `nccl::tests` and `ddp::tests` to serialize NCCL communicator operations.
 
-#### El Che — Heterogeneous DDP
+#### El Che - Heterogeneous DDP
 - **`ElChe`**: Cadence strategy for mixed-GPU training. Slow device anchors the sync cadence, fast devices range ahead processing more batches per sync. Named after Che Guevara's marching principle: "the column marches at the slowest one's pace."
   - `ElChe::new(world_size, anchor)` with builder pattern.
   - `with_speed_ratio(slow_rank, ratio)`: Seed initial batch distribution from known speed differential. Self-corrects after first `report_timing()`.
@@ -889,7 +1321,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **`Graph::epoch()`** seeds initial batch counts from `ElChe::batch_counts()`. **`Graph::step()`** feeds updated counts back to the loader after `report_timing()`.
 - Training loop is identical for homogeneous and heterogeneous GPU setups. `Ddp::setup()` detects heterogeneous hardware and enables El Che automatically.
 
-#### DDP Builder — Thread-Per-GPU Training
+#### DDP Builder - Thread-Per-GPU Training
 - **`DdpHandle`**: Thread-per-GPU training with Local SGD and adaptive parameter averaging. Each GPU runs its own training loop with a local optimizer. A lightweight coordinator thread triggers periodic parameter averaging. Two orthogonal knobs: [`ApplyPolicy`] (when to average) and [`AverageBackend`] (how to average).
 - **`DdpBuilder`** (recommended entry point): Fluent API for configuring and launching training. Required: `.dataset()`, `.batch_size()`, `.num_epochs()`. Optional: `.policy()`, `.backend()`, `.overhead_target()`, `.max_anchor()`, `.anchor()`, `.divergence_threshold()`, `.max_batch_diff()`, `.checkpoint_every()`, `.checkpoint_fn()`, `.epoch_fn()`, `.progressive_dispatch()`.
   ```rust
@@ -919,7 +1351,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Global epoch management**: Coordinator owns epochs globally. Workers are mode-agnostic (wait for `EpochPlan`, run partition, report metrics). `EpochPlan { epoch, partition_offset, partition_size }` ensures deterministic, non-overlapping sample coverage. Throughput-proportional partition sizing when ElChe is calibrated; `partition_ratios` for fixed splits. Auto lookahead in `Async` mode (fast ranks may run 1 epoch ahead).
 - **Single-GPU fallback**: With fewer than 2 CUDA devices, training runs on the main thread with no coordinator or averaging. API is identical; `join()` returns `TrainedState` in both cases.
 
-#### DDP Builder — Robustness
+#### DDP Builder - Robustness
 - **`max_batch_diff`**: Hard limit on how far any GPU can run ahead of the slowest. Workers that exceed the limit are throttled (block on control channel) until the next averaging event. `Some(0)` = strict lockstep.
 - **`drain_until_shutdown`**: After training, workers keep handling control messages (especially `SyncNow`) until the coordinator sends `Shutdown`. Prevents NCCL deadlock when workers finish at different times.
 - **NCCL init-on-main + split()**: All NCCL communicators initialized from the main thread via `NcclComms::new()` then `split()` into per-rank `NcclRankComm`. Per-thread `ncclCommInitRank` corrupts CUDA context on heterogeneous GPUs.
@@ -929,14 +1361,14 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **CPU Update delivery logging**: Failed Update deliveries to dead workers are logged with the affected rank.
 - **Shutdown cleanup**: `drain_avg_state()` logs and joins any in-progress CPU averaging (Collecting or Computing) before the coordinator exits, preventing detached threads from holding GPU resources.
 
-#### DDP Builder — Observability
+#### DDP Builder - Observability
 - **Averaging success logging**: Both paths log on successful averaging. NCCL: `"NCCL averaging #N complete (vV)"`. CPU: `"CPU averaging #N complete (vV, X.Xms)"` with timing.
 - **Per-rank epoch metrics**: Worker epoch-end metrics (rank, epoch, loss, batches, wall time) forwarded to stderr from the coordinator loop.
 - **Coordinator accessors**: `avg_count()`, `abort_count()`, `last_batch_ms()`, `last_avg_ms()`, `is_cpu_averaging()`, `version()`, `avg_interval()`, `is_calibrated()`, `steps_since_avg()` for external monitoring.
 - **Divergence monitoring** (Async policy): Per-rank parameter L2 norms tracked. Relative norm difference triggers interval halving (diverging) or doubling (converging). Threshold configurable via `divergence_threshold` (default 0.05).
 - **Hardware summary**: Prints GPU count, heterogeneous/homogeneous detection, per-GPU name + VRAM, policy, and backend at launch.
 
-#### DDP Builder — Metrics Pipeline
+#### DDP Builder - Metrics Pipeline
 - **`record_scalar(name, value)`**: Thread-local function callable from inside the train function. Records named scalar metrics (accuracy, custom losses, etc.) per batch. Metrics are aggregated per rank per epoch and forwarded to the coordinator.
 - **`EpochMetrics`**: Aggregated metrics for one completed epoch. Fields: `epoch`, `avg_loss`, `batches_processed`, `epoch_ms`, `samples_processed`, `per_rank_loss`, `per_rank_time_ms`, `per_rank_scalars`, `scalars`.
 - **`DdpHandle::poll_metrics()`**: Non-blocking poll for completed epoch metrics. Returns a `Vec<EpochMetrics>` of all epochs aggregated since the last poll. Enables external monitoring loops.
@@ -944,13 +1376,13 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **`DdpHandle::setup_monitor(&self, &mut Monitor)`**: Wire the DDP handle's graph identity, architecture SVG, and training config into a training monitor. Enables the live dashboard and HTML archive for DDP Builder training runs.
 - **`LossContext`**: Per-batch context passed to loss closures in distributed training. Provides batch metadata (shard sizes, device indices) for loss functions that need to weight contributions correctly.
 
-#### DDP Builder — Epoch Callback
+#### DDP Builder - Epoch Callback
 - **`EpochFn<M>`**: `Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>`. Called at the start of each epoch inside each worker thread, before `run_epoch_plan()`.
 - **`.epoch_fn()`** on `DdpBuilder`: Set the callback. Typical uses: LR schedules, noise curricula, dynamic loss weights.
 - **`GpuWorker::set_lr(f64)`**: Delegate to the worker's optimizer.
 - **`GpuWorker::current_epoch()`**: Public accessor for the current epoch number.
 
-#### DDP Builder — Checkpointing
+#### DDP Builder - Checkpointing
 - **`CheckpointFn<M>`**: `Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>`. Called on rank 0 after averaging events (multi-GPU) or epoch boundaries (single-GPU). Errors are logged but do not stop training.
 - **`checkpoint_every(n)`**: Save every N averaging events. Coordinated through `ControlMsg::Checkpoint` to rank 0's worker thread (which owns the model).
 - **`TrainedState`** on partial failure: If some workers died, `collect_final_state()` averages surviving workers' snapshots. If averaging fails, falls back to the first snapshot's tensors. Returns `None` only if zero snapshots arrived.
@@ -1012,7 +1444,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **15 tests un-ignored**: `cuda_event` (3), `cuda_stream` (4), DDP cross-device autograd (2) tests now run in the normal `make cuda-test` flow. They have proper mutex serialization and early-return guards.
 - **NCCL/DDP/Graph tests remain `#[ignore]`**: NCCL communicator init corrupts concurrent CUBLAS operations. Must run single-threaded.
 - **Process-isolated test targets**: NCCL tests run in their own cargo process to prevent CUBLAS context poisoning. Fixes SIGABRT in `test_manual_seed_reproducible` when run after NCCL init.
-  - **`make cuda-test-all`**: Three-pass target -- parallel + NCCL (isolated) + remaining serial.
+  - **`make cuda-test-all`**: Three-pass target - parallel + NCCL (isolated) + remaining serial.
   - **`make cuda-test-nccl`**: NCCL/DDP tests only (isolated processes).
   - **`make cuda-test-serial`** (new): Remaining serial tests (CUDA Graphs, manual_seed, probes).
 
@@ -1029,24 +1461,24 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 ## [0.2.2] - 2026-03-31
 
 ### Added
-- `Tensor::nbytes()` — total size in bytes (`numel() * element_size()`), matches `torch.Tensor.nbytes`
+- `Tensor::nbytes()` - total size in bytes (`numel() * element_size()`), matches `torch.Tensor.nbytes`
 
 #### Fused sequence RNN kernels
-- **`LSTM::forward_seq`** now calls `at::lstm()` — single cuDNN kernel for the entire sequence across all layers, replacing per-timestep cell unrolling. Eliminates N×L kernel launches (N=timesteps, L=layers) per forward pass.
-- **`GRU::forward_seq`** now calls `at::gru()` — same fused optimization. Also eliminates the cuDNN benchmark variance that caused ±270ms σ in per-cell dispatch.
-- **`flatten_rnn_params`** (shim) — packs per-cell RNN weight tensors into cuDNN's expected contiguous layout using `at::_cudnn_rnn_flatten_weight`, the same function PyTorch's `nn.LSTM.flatten_parameters()` uses internally. Eliminates the "RNN module weights are not part of single contiguous chunk" warning on CUDA. Uses `set_()` under `NoGradGuard` to redirect parameter storage in-place — persists across training steps, self-corrects after checkpoint load or dtype cast.
-- **Flatten cache** — LSTM and GRU cache the flattened param tensors after the first forward call, skipping both the per-forward param collection (8 tensors via `flat_map` + `collect`) and the cuDNN flatten FFI call on subsequent forwards. Same strategy as PyTorch's `flatten_parameters()` but without the pointer-validation overhead.
-- **`RnnParams` C++ cache** — persistent `std::vector<at::Tensor>` on the C++ side behind an opaque handle (`flodl_rnn_params_create` / `flodl_lstm_cached` / `flodl_gru_cached`). After the first forward, subsequent calls pass a single pointer to the pre-built param vector, eliminating per-forward handle collection, FFI array marshalling, and `std::vector` reconstruction. Matches PyTorch's single-call `at::lstm()`/`at::gru()` pattern exactly.
+- **`LSTM::forward_seq`** now calls `at::lstm()` - single cuDNN kernel for the entire sequence across all layers, replacing per-timestep cell unrolling. Eliminates N×L kernel launches (N=timesteps, L=layers) per forward pass.
+- **`GRU::forward_seq`** now calls `at::gru()` - same fused optimization. Also eliminates the cuDNN benchmark variance that caused ±270ms σ in per-cell dispatch.
+- **`flatten_rnn_params`** (shim) - packs per-cell RNN weight tensors into cuDNN's expected contiguous layout using `at::_cudnn_rnn_flatten_weight`, the same function PyTorch's `nn.LSTM.flatten_parameters()` uses internally. Eliminates the "RNN module weights are not part of single contiguous chunk" warning on CUDA. Uses `set_()` under `NoGradGuard` to redirect parameter storage in-place - persists across training steps, self-corrects after checkpoint load or dtype cast.
+- **Flatten cache** - LSTM and GRU cache the flattened param tensors after the first forward call, skipping both the per-forward param collection (8 tensors via `flat_map` + `collect`) and the cuDNN flatten FFI call on subsequent forwards. Same strategy as PyTorch's `flatten_parameters()` but without the pointer-validation overhead.
+- **`RnnParams` C++ cache** - persistent `std::vector<at::Tensor>` on the C++ side behind an opaque handle (`flodl_rnn_params_create` / `flodl_lstm_cached` / `flodl_gru_cached`). After the first forward, subsequent calls pass a single pointer to the pre-built param vector, eliminating per-forward handle collection, FFI array marshalling, and `std::vector` reconstruction. Matches PyTorch's single-call `at::lstm()`/`at::gru()` pattern exactly.
 - FFI chain: `flodl_lstm` / `flodl_gru` in shim → `Tensor::lstm_seq` / `Tensor::gru_seq` in nn_ops (new `flatten` flag skips redundant flatten calls). Cached path: `flodl_lstm_cached` / `flodl_gru_cached` → `Tensor::lstm_seq_cached` / `Tensor::gru_seq_cached`.
-- `LSTMCell::forward_step` and `GRUCell::forward_step` unchanged — still available for single-step / streaming use cases
+- `LSTMCell::forward_step` and `GRUCell::forward_step` unchanged - still available for single-step / streaming use cases
 
 #### Benchmark suite extensions
-- **`transformer`** benchmark — 4-layer encoder (MultiheadAttention + FFN + LayerNorm + residual), Embedding, cross-entropy loss. B=32, seq=128, d_model=512, 8 heads.
-- **`lstm_seq`** benchmark — 2-layer LSTM + linear projection, directly comparable to gru_seq. B=128, seq=50.
-- **`conv_autoenc`** benchmark — Conv2d encoder + ConvTranspose2d decoder (DCGAN-style), reconstruction with MSE loss. B=64, 64×64 images.
+- **`transformer`** benchmark - 4-layer encoder (MultiheadAttention + FFN + LayerNorm + residual), Embedding, cross-entropy loss. B=32, seq=128, d_model=512, 8 heads.
+- **`lstm_seq`** benchmark - 2-layer LSTM + linear projection, directly comparable to gru_seq. B=128, seq=50.
+- **`conv_autoenc`** benchmark - Conv2d encoder + ConvTranspose2d decoder (DCGAN-style), reconstruction with MSE loss. B=64, 64×64 images.
 
 ### Changed
-- **Benchmark σ uses scaled MAD** — variance column now reports Median Absolute Deviation × 1.4826 (σ-equivalent for normal distributions) instead of standard deviation. Robust to OS scheduling outliers, GC pauses, and WSL2 thermal transients that inflated stdev on long runs (e.g. gru_seq Py σ: ±143 stdev → ±27 MAD).
+- **Benchmark σ uses scaled MAD** - variance column now reports Median Absolute Deviation × 1.4826 (σ-equivalent for normal distributions) instead of standard deviation. Robust to OS scheduling outliers, GC pauses, and WSL2 thermal transients that inflated stdev on long runs (e.g. gru_seq Py σ: ±143 stdev → ±27 MAD).
 
 ### Fixed
 - **Benchmark report generation**: Fix silent `set -e` exit caused by `[ "$ROUNDS" -gt 1 ] && echo 's'` returning exit code 1 inside command substitution when ROUNDS=1. Reports were never written for single-round runs.
@@ -1056,50 +1488,50 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 
 ### Added
 
-#### PyTorch Parity — Tensor Operations
+#### PyTorch Parity - Tensor Operations
 - **Math ops**: `log1p`, `expm1`, `log2`, `log10`, `tan`, `asin`, `acos`, `atan`, `erf`, `erfc`, `trunc`, `frac`, `fmod`, `fmod_tensor`, `remainder`, `remainder_tensor`, `lerp`, `lerp_tensor`, `isclose`, `addmm`, `addcmul`, `addcdiv`, `clamp_min`, `clamp_max`, `selu`, `hardswish`, `hardsigmoid`, `prelu`
 - **Reductions**: `prod`, `prod_dim`, `cumsum`, `logsumexp`
 - **Shape ops**: `flip`, `roll`, `diagonal`, `movedim`, `tile`, `split`, `unbind`, `contiguous`, `cat_many`, `unsqueeze_many`, `narrow_scatter`, `pad_mode` (constant/reflect/replicate/circular), `meshgrid`
 - **NN tensor ops**: `conv1d`, `conv_transpose1d`, `conv3d`, `conv_transpose3d`, `avg_pool2d`, `avg_pool1d`, `max_pool1d`, `adaptive_max_pool2d`, `instance_norm`, `group_norm`, `linear` (fused), `pixel_shuffle`, `pixel_unshuffle`, `bilinear`, `embedding_bag`, `interpolate` (nearest/bilinear/bicubic/trilinear), `im2col`, `col2im`, `bce_loss`, `nll_loss`, `ctc_loss`
 - **Comparison/similarity**: `maximum`, `minimum`, `atan2`, `masked_fill`, `normalize`, `cosine_similarity`
 
-#### PyTorch Parity — Autograd
+#### PyTorch Parity - Autograd
 - **New differentiable ops**: `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `clamp_min`, `clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `atan2`, `maximum`, `minimum`, `masked_fill`, `normalize`, `cosine_similarity`, `prod`, `prod_dim`, `cumsum`, `logsumexp`, `unsqueeze_many`, `cat_many`, `stack`, `triu`, `tril`
 - **NN autograd ops**: `conv1d`, `conv_transpose1d`, `conv3d`, `conv_transpose3d`, `avg_pool2d`, `avg_pool1d`, `max_pool1d`, `adaptive_max_pool2d`, `instance_norm`, `group_norm`, `pixel_shuffle`, `pixel_unshuffle`, `bilinear`, `embedding_bag`, `im2col`, `col2im`
 
-#### PyTorch Parity — Modules
+#### PyTorch Parity - Modules
 - **Convolutions**: `Conv1d` (with `Conv1dBuilder`), `Conv3d` (with `Conv3dBuilder`), `ConvTranspose1d`, `ConvTranspose3d`
-- **Recurrent**: `GRU` (multi-layer sequence module), `LSTM` (multi-layer sequence module) — match `nn.GRU`/`nn.LSTM` interface with `forward_seq`, batch-first support
+- **Recurrent**: `GRU` (multi-layer sequence module), `LSTM` (multi-layer sequence module) - match `nn.GRU`/`nn.LSTM` interface with `forward_seq`, batch-first support
 - **Normalization**: `GroupNorm`, `InstanceNorm`, `RMSNorm`
 - **Pooling**: `AvgPool2d`, `MaxPool1d`, `AvgPool1d`, `AdaptiveMaxPool2d`, `PixelShuffle`, `PixelUnshuffle`, `Upsample`, `Unfold`, `Fold`
-- **Attention**: `MultiheadAttention` — self-attention and cross-attention with optional masking
-- **Bilinear**: `Bilinear` — bilinear transformation `y = x1^T A x2 + b`
+- **Attention**: `MultiheadAttention` - self-attention and cross-attention with optional masking
+- **Bilinear**: `Bilinear` - bilinear transformation `y = x1^T A x2 + b`
 - **Activations**: `LeakyReLU`, `ELU`, `Softplus`, `Mish`, `SELU`, `Hardswish`, `Hardsigmoid`, `PReLU` (learnable), `Softmax`, `LogSoftmax`, `Flatten`
-- **Dropout**: `AlphaDropout` — maintains self-normalizing property for SELU networks
-- **Embedding**: `EmbeddingBag` — bag-of-embeddings with sum/mean/max aggregation
-- **Padding**: `ZeroPad2d`, `ReflectionPad2d` — symmetric and asymmetric padding modules
+- **Dropout**: `AlphaDropout` - maintains self-normalizing property for SELU networks
+- **Embedding**: `EmbeddingBag` - bag-of-embeddings with sum/mean/max aggregation
+- **Padding**: `ZeroPad2d`, `ReflectionPad2d` - symmetric and asymmetric padding modules
 
-#### PyTorch Parity — Losses
+#### PyTorch Parity - Losses
 - `bce_loss` (from probabilities), `nll_loss`, `ctc_loss`, `focal_loss` (class imbalance), `triplet_margin_loss`, `cosine_embedding_loss`, `hinge_embedding_loss`, `margin_ranking_loss`, `poisson_nll_loss`
 
-#### PyTorch Parity — Optimizers
+#### PyTorch Parity - Optimizers
 - `RMSprop` (with `RMSpropBuilder` for parameter groups)
 - `Adagrad` (with `AdagradBuilder` for parameter groups)
-- `RAdam` — Rectified Adam with variance-aware warmup
-- `NAdam` — Nesterov-accelerated Adam
+- `RAdam` - Rectified Adam with variance-aware warmup
+- `NAdam` - Nesterov-accelerated Adam
 
-#### PyTorch Parity — LR Schedulers
-- `ExponentialLR` — exponential decay (`lr = base_lr * gamma^step`)
-- `MultiStepLR` — decay at specific milestones
-- `OneCycleLR` — super-convergence schedule (warmup + cosine decay)
-- `CyclicLR` — triangular wave between base and max LR (symmetric and asymmetric)
+#### PyTorch Parity - LR Schedulers
+- `ExponentialLR` - exponential decay (`lr = base_lr * gamma^step`)
+- `MultiStepLR` - decay at specific milestones
+- `OneCycleLR` - super-convergence schedule (warmup + cosine decay)
+- `CyclicLR` - triangular wave between base and max LR (symmetric and asymmetric)
 
-#### PyTorch Parity — Initialization
+#### PyTorch Parity - Initialization
 - `kaiming_uniform`, `kaiming_normal` now re-exported at crate root
 - New: `uniform`, `normal`, `orthogonal`, `trunc_normal`, `uniform_bias`
 
 #### Test Coverage (+165 tests, 769 total)
-- **Autograd gradient verification** (55 tests): finite-difference checks for every new differentiable op — `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `clamp_min`/`clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `maximum`, `minimum`, `masked_fill`, `cosine_similarity`, `normalize`, `prod`, `cumsum`, `logsumexp`, `tril`, `flatten`; fused NN op gradients for all conv variants (1d/2d/3d + transpose), all pooling variants, `layer_norm`, `group_norm`, `instance_norm`, `bilinear`, `embedding_bag`, `pixel_shuffle`/`unshuffle`, `im2col`/`col2im`, `grid_sample`, `gru_cell`, `lstm_cell`; Variable API coverage (`set_grad`, `set_requires_grad`, `is_leaf`, `numel`, `zero_grad_set_to_none`, `set_data`, `to_device`)
+- **Autograd gradient verification** (55 tests): finite-difference checks for every new differentiable op - `leaky_relu`, `elu`, `softplus`, `mish`, `selu`, `hardswish`, `hardsigmoid`, `prelu`, `clamp_min`/`clamp_max`, `log1p`, `expm1`, `log2`, `log10`, `maximum`, `minimum`, `masked_fill`, `cosine_similarity`, `normalize`, `prod`, `cumsum`, `logsumexp`, `tril`, `flatten`; fused NN op gradients for all conv variants (1d/2d/3d + transpose), all pooling variants, `layer_norm`, `group_norm`, `instance_norm`, `bilinear`, `embedding_bag`, `pixel_shuffle`/`unshuffle`, `im2col`/`col2im`, `grid_sample`, `gru_cell`, `lstm_cell`; Variable API coverage (`set_grad`, `set_requires_grad`, `is_leaf`, `numel`, `zero_grad_set_to_none`, `set_data`, `to_device`)
 - **Module forward/backward** (60+ tests): Conv1d (builder, groups, stride/padding, no-bias, gradient), Conv2d (builder, grouped, stride, no-bias, gradient), Conv3d, ConvTranspose1d/2d/3d (forward, gradient, stride, parameters), GroupNorm (batch-size-one, single-group, groups=channels, gradient), InstanceNorm (3D input, affine parameters, gradient), LayerNorm (3D, normalization, gradient), BatchNorm/BatchNorm2d (training, eval, running stats, rejects invalid dims, gradient), Bilinear (gradient, no-bias, rejects single input), Dropout (training, eval identity, p=0), ZeroPad2d/ReflectionPad2d (asymmetric, values, no-parameters)
 - **Loss functions** (20+ tests): MSE (basic, zero loss), cross-entropy (class indices, wrong predictions, gradient), BCE/BCEWithLogits (gradient), L1, SmoothL1 (negative beta rejection), KLDiv, CTC, focal (reduces to CE at gamma=0), triplet margin (zero when far), cosine embedding (similar/dissimilar), hinge embedding (positive/negative), margin ranking (with margin), Poisson NLL (log/no-log)
 - **Mixed precision** (7 tests): AutocastGuard lifecycle, autocast closure, GradScaler (defaults, scale, step finite/inf, update growth/backoff, state roundtrip), cast_parameters (basic, noop same dtype)
@@ -1111,12 +1543,12 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 ### Added
 
 #### Graph Tree (hierarchical composition)
-- **Label-path addressing**: Dot-separated paths (`"encoder.scan.hidden"`) for addressing subgraphs and tags across graph boundaries. Strict dot semantics -- dots always mean subgraph boundaries, no fuzzy resolution.
+- **Label-path addressing**: Dot-separated paths (`"encoder.scan.hidden"`) for addressing subgraphs and tags across graph boundaries. Strict dot semantics - dots always mean subgraph boundaries, no fuzzy resolution.
 - **Tree registration**: Labeled graphs nested via `FlowBuilder` are automatically detected as child subgraphs. `tree_children()`, `child_graph()`, `subgraph()` for navigation. `is_composed()` flag on child graphs.
-- **Selective freeze/thaw**: `freeze("encoder.read")`, `thaw("encoder.scan")`, `is_frozen("encoder")` -- declarative training phase control by label path.
+- **Selective freeze/thaw**: `freeze("encoder.read")`, `thaw("encoder.scan")`, `is_frozen("encoder")` - declarative training phase control by label path.
 - **Path-based parameter collection**: `parameters_at()`, `named_parameters_at()`, `named_buffers_at()` for per-subgraph optimizer groups. Target namespace used for checkpoint compatibility.
-- **Subgraph checkpoint loading**: `load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")` -- loads a checkpoint into a specific subgraph using the child's own namespace and structural hash validation.
-- **Cross-boundary observation**: `tagged_at()` (null/nil semantics), `collect_at()`, `record_at()`, `trend_at()` -- read tagged outputs and metrics across graph boundaries.
+- **Subgraph checkpoint loading**: `load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")` - loads a checkpoint into a specific subgraph using the child's own namespace and structural hash validation.
+- **Cross-boundary observation**: `tagged_at()` (null/nil semantics), `collect_at()`, `record_at()`, `trend_at()` - read tagged outputs and metrics across graph boundaries.
 - **Tree-aware flush and metrics**: `flush()` automatically recurses into labeled child subgraphs. `latest_metrics()` collects from the entire tree with dotted prefixes (`"encoder.loss"`). `Monitor::log()` sees the whole tree with zero extra code. `flush_local()` and `latest_metrics_local()` for independent per-subgraph observation cadences.
 - **Internal tags**: Tags prefixed with `_` are auto-internal (hidden from parent resolution). Explicit `.internal("tag")` on FlowBuilder. Cross-boundary resolution rejects internal tags.
 - **Training mode propagation**: `set_training_at("encoder", false)` for selective eval mode on subgraphs (BatchNorm running stats).
@@ -1131,34 +1563,34 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 #### Checkpoint Migration
 - **`migrate_checkpoint()`** / **`migrate_checkpoint_file()`**: Automatically remap parameter names from an older checkpoint to match a model's current naming. Matches by exact name first, then by shape+dtype in positional order. Handles params and buffers, supports `.gz` compression. Returns a `MigrateReport` with `unchanged`, `remapped`, `dropped`, `missing` fields and a `Display` impl for human-readable output.
 - **`checkpoint_version()`**: Peek at a checkpoint file's version without loading it. Returns `1` for flodl 0.1.x, `2` for 0.2.0+.
-- **`MigrateReport`**: Full accounting of a migration — `is_complete()` returns true when nothing was dropped or missing.
+- **`MigrateReport`**: Full accounting of a migration - `is_complete()` returns true when nothing was dropped or missing.
 
 ### Changed
 - **Breaking**: Checkpoint format version bumped to v2. Checkpoints saved with 0.2.0+ write version 2; `load_checkpoint` accepts both v1 and v2 (binary layout is identical, only naming conventions differ). v1 checkpoints can be migrated with `migrate_checkpoint_file()`.
-- **Breaking**: Restructuring a graph with `.label()` or renaming tags changes the parameter names that feed into `structural_hash()` — the hash algorithm is unchanged, but its inputs differ. Checkpoints saved before restructuring will fail architecture validation on load. Use `migrate_checkpoint_file()` to remap parameter names, or retrain.
+- **Breaking**: Restructuring a graph with `.label()` or renaming tags changes the parameter names that feed into `structural_hash()` - the hash algorithm is unchanged, but its inputs differ. Checkpoints saved before restructuring will fail architecture validation on load. Use `migrate_checkpoint_file()` to remap parameter names, or retrain.
 
 ## [0.1.5] - 2026-03-25
 
 ### Added
-- `make docs-rs` — local docs.rs build validation via disposable Docker container (nightly Rust, `--cfg docsrs`, no libtorch). Catches docs.rs failures before publishing.
+- `make docs-rs` - local docs.rs build validation via disposable Docker container (nightly Rust, `--cfg docsrs`, no libtorch). Catches docs.rs failures before publishing.
 
 ### Fixed
 - Fix docs.rs build: `rand` 0.9.2 uses `feature(doc_auto_cfg)` removed in nightly 1.92+. Made `rand` an optional dependency (`rng` feature, on by default) so docs.rs can build without it.
-- Fix flaky `test_clip_grad_norm` — seed RNG for deterministic weights.
+- Fix flaky `test_clip_grad_norm` - seed RNG for deterministic weights.
 - Fix rustdoc broken intra-doc links in `Tensor` (escaped shape brackets, qualified method paths).
 
 ## [0.1.4] - 2026-03-25
 
 ### Fixed
-- Disable example scraping on docs.rs — examples require libtorch which the docs.rs sandbox doesn't have. The scraping failure corrupted dependency artifacts, breaking the doc build.
+- Disable example scraping on docs.rs - examples require libtorch which the docs.rs sandbox doesn't have. The scraping failure corrupted dependency artifacts, breaking the doc build.
 
 ## [0.1.3] - 2026-03-25
 
 ### Added
 
 #### GPU Performance
-- **Fused Adam/AdamW**: `_fused_adamw_` single multi-tensor CUDA kernel for the complete optimizer step across all parameters. Reduces ~4N kernel launches to 1 per parameter group. Automatic on CUDA — no API change needed. `grad_scale`/`found_inf` params exposed for GradScaler integration.
-- **Foreach operations**: 7 batched tensor ops that reduce CUDA kernel launches — `foreach_add_scalar_`, `foreach_mul_scalar_`, `foreach_zero_`, `foreach_add_list_`, `foreach_norm`, `foreach_lerp_scalar_`, `foreach_sqrt_`. Used internally by fused optimizers and gradient clipping.
+- **Fused Adam/AdamW**: `_fused_adamw_` single multi-tensor CUDA kernel for the complete optimizer step across all parameters. Reduces ~4N kernel launches to 1 per parameter group. Automatic on CUDA - no API change needed. `grad_scale`/`found_inf` params exposed for GradScaler integration.
+- **Foreach operations**: 7 batched tensor ops that reduce CUDA kernel launches - `foreach_add_scalar_`, `foreach_mul_scalar_`, `foreach_zero_`, `foreach_add_list_`, `foreach_norm`, `foreach_lerp_scalar_`, `foreach_sqrt_`. Used internally by fused optimizers and gradient clipping.
 - **Fused gradient clipping**: `clip_grad_norm` now uses `_foreach_norm` + `_foreach_mul_` internally (2 kernels instead of 2N).
 - **CUDA Graphs**: `CudaGraph` struct with capture/replay/reset for zero CPU dispatch overhead. `cuda_graph_capture()` convenience helper with warmup. `MemPoolId`, `CaptureMode` (Global/ThreadLocal/Relaxed), `cuda_graph_pool_handle()` for memory pool sharing. 2-5x speedup for models with many small kernels.
 - **Autocast (AMP)**: `AutocastGuard` RAII wrapper and `autocast()` closure helper for automatic mixed-precision dispatch. Eligible ops (matmul, conv, linear) run in Float16/BFloat16 on Tensor Core GPUs. Up to 3x speedup on RTX 30xx+.
@@ -1169,7 +1601,7 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - **Non-blocking device transfer**: `Tensor::to_device_async()` for overlapped CPU-to-GPU transfer. Pair with `pin_memory()` for maximum overlap.
 - **`Tensor::copy_()`**: In-place copy with `non_blocking` parameter for async CUDA transfers. Used by CUDA Graph capture for data loading.
 - **`Tensor::pin_memory()`** and `is_pinned()`: Page-locked CPU memory for fast async GPU transfers.
-- **Peak VRAM tracking**: `cuda_peak_active_bytes()`, `cuda_peak_reserved_bytes()`, `cuda_reset_peak_stats()` — matches `torch.cuda.max_memory_allocated()` / `max_memory_reserved()` / `reset_peak_memory_stats()` semantics. With `_idx` variants for multi-GPU.
+- **Peak VRAM tracking**: `cuda_peak_active_bytes()`, `cuda_peak_reserved_bytes()`, `cuda_reset_peak_stats()` - matches `torch.cuda.max_memory_allocated()` / `max_memory_reserved()` / `reset_peak_memory_stats()` semantics. With `_idx` variants for multi-GPU.
 
 #### Graph Engine
 - **Pre-computed routing**: `Graph::build()` pre-computes a Vec-indexed routing table. Forward dispatch uses flat array indexing instead of HashMap lookups. Cached execution buffers reused across forward calls. Zero allocation during inference.
@@ -1199,23 +1631,23 @@ Full FFI chain adding fused attention to flodl. Used internally by `BertSelfAtte
 - `vram_spill` column in CSV export.
 
 ### Fixed
-- README links now use absolute GitHub URLs — fixes broken links on crates.io where relative paths don't resolve.
+- README links now use absolute GitHub URLs - fixes broken links on crates.io where relative paths don't resolve.
 
 ## [0.1.1] - 2026-03-18
 
 ### Fixed
-- Replace `sha2` with `hmac-sha256` — fixes docs.rs build (sha2's asm feature doesn't compile on docs.rs).
+- Replace `sha2` with `hmac-sha256` - fixes docs.rs build (sha2's asm feature doesn't compile on docs.rs).
 - Widen leak test tolerance for CI parallel test jitter.
 
 ## [0.1.0] - 2026-03-18
 
 ### Added
-- **Graph identity**: `Graph::structural_hash()` — deterministic SHA-256 hash of graph topology, module names, and parameter/buffer shapes. Any architecture change produces a different hash. `Graph::short_hash()` returns the first 8 chars. `FlowBuilder::label()` sets a human-readable name (does not affect hash).
+- **Graph identity**: `Graph::structural_hash()` - deterministic SHA-256 hash of graph topology, module names, and parameter/buffer shapes. Any architecture change produces a different hash. `Graph::short_hash()` returns the first 8 chars. `FlowBuilder::label()` sets a human-readable name (does not affect hash).
 - **Checkpoint architecture validation**: Checkpoint format v1 embeds a 32-byte structural hash. `load_checkpoint` / `load_checkpoint_file` accept an optional hash and error on architecture mismatch.
-- **Dashboard metadata**: `Monitor::set_metadata(serde_json::Value)` attaches hyperparameters/config to the HTML archive. `watch()` / `watch_profiled()` capture graph label and hash. Dashboard header shows `"floDl — {label} [{hash8}]"`.
-- **Parameter freezing**: `Parameter::freeze()`, `unfreeze()`, `is_frozen()` — disable/enable gradient tracking per parameter. Optimizers automatically skip frozen params (no grad). `Parameter::to_device()` now preserves frozen state.
+- **Dashboard metadata**: `Monitor::set_metadata(serde_json::Value)` attaches hyperparameters/config to the HTML archive. `watch()` / `watch_profiled()` capture graph label and hash. Dashboard header shows `"floDl - {label} [{hash8}]"`.
+- **Parameter freezing**: `Parameter::freeze()`, `unfreeze()`, `is_frozen()` - disable/enable gradient tracking per parameter. Optimizers automatically skip frozen params (no grad). `Parameter::to_device()` now preserves frozen state.
 - **Named checkpoints**: `Graph::named_parameters()` and `named_buffers()` return qualified names (`"tag/weight"` or `"node_id/running_mean"`). `save_checkpoint` / `load_checkpoint` persist both parameters and buffers (e.g., BatchNorm running stats), matching by name for partial loading. `LoadReport` reports what was loaded, skipped, and missing.
-- **Optimizer parameter groups**: `Adam::with_groups()`, `SGD::with_groups()`, `AdamW::with_groups()` — builder API for per-group learning rates. `Optimizer::set_group_lr()` adjusts a single group; `set_lr()` updates all groups. Groups are persisted through `Stateful` save/load.
+- **Optimizer parameter groups**: `Adam::with_groups()`, `SGD::with_groups()`, `AdamW::with_groups()` - builder API for per-group learning rates. `Optimizer::set_group_lr()` adjusts a single group; `set_lr()` updates all groups. Groups are persisted through `Stateful` save/load.
 
 ### Core Stack
 - **Tensor**: Owned RAII tensors with Drop, ~72 operations. CPU and CUDA (feature-gated).

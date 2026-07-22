@@ -1,71 +1,13 @@
 description: DDP validation and benchmark suite
 docker: cuda
+# Cargo entry: `compile: true` lets fdl auto-probe the binary's own
+# `--fdl-schema` output, so `fdl ddp-bench --help` (and tab-completion) reflect
+# the actual CLI — the binary is the single source of truth, no hand-written
+# schema to drift out of sync with the code. The first `-h` after an fdl.yml
+# change compiles once in the cuda container; the result is then cached
+# (.fdl/schema-cache/, gitignored) and subsequent `-h` are fast.
+compile: true
 entry: cargo run --release --features cuda --
-
-# Interim hand-written schema. Drives `fdl ddp-bench --help` rendering and
-# (once completions land) tab-completion. Will be replaced by the binary's
-# own `--fdl-schema` output in the next rollout step.
-schema:
-  options:
-    model:
-      type: string
-      short: m
-      description: Run a specific model (or "all" for every registered model)
-      default: all
-      choices: [logistic, mlp, lenet, resnet, resnet-graph, char-rnn, gpt-nano, conv-ae, all]
-    mode:
-      type: string
-      description: Run a specific DDP mode (or "all" for every mode)
-      default: solo-0
-      choices: [solo-0, solo-1, nccl-sync, nccl-cadence, nccl-async, cpu-sync, cpu-cadence, cpu-async, all]
-    epochs:
-      type: int
-      description: Override epoch count (default comes from training.epochs)
-    batches:
-      type: int
-      description: Batches per epoch (default = full epoch)
-    batch-size:
-      type: int
-      description: Batch size per GPU
-    lr-scale:
-      type: float
-      description: Multiply default LR (auto-scales when epochs > 5)
-    output:
-      type: path
-      description: Output directory for runs and timelines
-      default: runs
-    data-dir:
-      type: path
-      description: Dataset cache directory
-      default: data
-    monitor:
-      type: int
-      description: Live dashboard port (omit to disable)
-    validate:
-      type: bool
-      description: Check results against baselines
-    save-baseline:
-      type: bool
-      description: Save results as the new baseline
-    baseline:
-      type: path
-      description: Baseline JSON file
-      default: baselines/baseline.json
-    tolerance:
-      type: float
-      description: Validation tolerance (0.0-1.0 relative)
-      default: 0.15
-    seed:
-      type: int
-      description: RNG seed
-      default: 42
-    list:
-      type: bool
-      description: Show available models and modes, then exit
-    report:
-      type: path
-      description: Analyze saved runs and write a markdown report (skips training). Use "-" for stdout.
-      default: runs/report.md
 
 # Default LRs per model (for reference):
 #   linear=0.001  mlp=0.001  convnet=0.001  lstm=0.001
@@ -82,9 +24,9 @@ output:
 
 commands:
   quick:
-    description: Fast smoke test (linear, 1 epoch)
+    description: Fast smoke test (logistic, 1 epoch)
     training: { epochs: 1 }
-    options: { model: linear, mode: solo-0, batches: 100 }
+    options: { model: logistic, mode: solo-0, batches: 100 }
 
   full-sweep:
     description: All models, all DDP modes
@@ -98,9 +40,9 @@ commands:
     description: Solo baseline on slow GPU (all models)
     options: { model: all, mode: solo-1 }
 
-  nccl-async:
-    description: NCCL async for all models
-    options: { model: all, mode: nccl-async }
+  solo-2:
+    description: Solo baseline on second slow GPU (all models, 3-GPU rigs)
+    options: { model: all, mode: solo-2 }
 
   nccl-cadence:
     description: NCCL cadence for all models

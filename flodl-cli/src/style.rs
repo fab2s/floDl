@@ -132,15 +132,18 @@ pub fn print_cli_error(msg: impl std::fmt::Display) {
     eprintln!("{}: {msg}", red("error"));
 }
 
+/// Process-wide test mutex. Any test that mutates `CHOICE` or the
+/// `NO_COLOR` / `FORCE_COLOR` env vars must take this lock, and so must
+/// any test whose output is shaped by `color_enabled()` (e.g. the
+/// overlay `render_*` tests, which would otherwise see stray ANSI keys
+/// when stderr-in-docker is a TTY).
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Process-wide state (CHOICE + env vars) makes these tests inherently
-    // serial. Guard with a mutex so `cargo test`'s parallel runner doesn't
-    // interleave them.
-    static LOCK: Mutex<()> = Mutex::new(());
+    use super::TEST_ENV_LOCK as LOCK;
 
     fn reset() {
         set_color_choice(ColorChoice::Auto);

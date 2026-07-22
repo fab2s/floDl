@@ -7,7 +7,7 @@ use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
     write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    write_u32_le, read_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -147,9 +147,10 @@ impl Optimizer for SGD {
                                 v.add_(&grad)?;
                                 v
                             }
-                            // mul_scalar creates a new tensor with independent storage,
-                            // unlike clone() which shares storage with grad
-                            None => grad.mul_scalar(1.0)?,
+                            // Deep copy: independent storage, unlike the
+                            // shallow clone() which shares storage with grad
+                            // (a later in-place update would corrupt grad).
+                            None => grad.copy()?,
                         };
                         // data -= lr * v
                         let scaled = v.mul_scalar(lr)?;
@@ -164,6 +165,15 @@ impl Optimizer for SGD {
             }
             Ok(())
         })
+    }
+
+    fn reset_state(&mut self) {
+        // Momentum velocity buffers back to fresh (lazily re-allocated on the
+        // next step, as at construction). Length preserved so the per-param
+        // indexing stays valid.
+        for slot in &mut self.velocity {
+            *slot = None;
+        }
     }
 
     fn zero_grad(&self) {
@@ -184,9 +194,15 @@ impl Optimizer for SGD {
             g.lr = lr;
         }
     }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
 }
 
 impl Stateful for SGD {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::Sgd }
+
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
         write_f64_le(w, self.lr)?;
@@ -195,12 +211,7 @@ impl Stateful for SGD {
             write_tensor_state(w, v.as_ref())?;
         }
         // Groups
-        write_u32_le(w, self.groups.len() as u32)?;
-        for g in &self.groups {
-            write_f64_le(w, g.lr)?;
-            write_i64_le(w, g.range.start as i64)?;
-            write_i64_le(w, g.range.end as i64)?;
-        }
+        super::write_groups(w, &self.groups)?;
         Ok(())
     }
 
@@ -218,14 +229,7 @@ impl Stateful for SGD {
             self.velocity[i] = read_tensor_state(r, dev)?;
         }
         // Groups
-        let ng = read_u32_le(r)? as usize;
-        self.groups.clear();
-        for _ in 0..ng {
-            let lr = read_f64_le(r)?;
-            let start = read_i64_le(r)? as usize;
-            let end = read_i64_le(r)? as usize;
-            self.groups.push(GroupMeta { lr, range: start..end });
-        }
+        self.groups = super::read_groups(r, self.params.len(), "SGD")?;
         Ok(())
     }
 }

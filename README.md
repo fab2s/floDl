@@ -35,17 +35,19 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 ---
 
-> **What's new in 0.5.0** -- the `fdl` CLI maturity pass. New proc-macro
-> crate [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros)
-> adds `#[derive(FdlArgs)]` -- any Rust binary gets typed argv parsing,
-> JSON schema, shell completions, and env-var fallback for free.
-> `fdl.yml` consolidates to a single `commands:` map with three clean
-> kinds (`run:` / `path:` / preset). New
-> [`--env` overlays](docs/cli.md#environment-overlays) and
-> [`fdl config show`](docs/cli.md#fdl-config) surface per-environment
-> config with per-field origin annotations, so you can see the
-> resolved YAML before running a two-hour job. Migration from 0.4.0:
-> see [UPGRADE.md](UPGRADE.md).
+> **What's new** - full re-architecture of the distributed layer to
+> process-per-rank with elastic membership, plus the same single
+> entry (`Trainer::builder(...).run()`) now scales from CPU to
+> single-host multi-GPU (auto-promoted on 2+ visible GPUs) to
+> multi-host clusters via `fdl.cluster.yml` or `ClusterBuilder`.
+> ElChe collapsed to `ElCheMode` (five modes,
+> default `NcclCadence`); convergence guard is now authoritative over
+> `overhead_target`; per-epoch callbacks default to the fastest rank
+> (free compute on heterogeneous rigs). New CLI: `fdl probe` (cluster
+> readiness audit), `fdl nccl build` (libnccl source builder for
+> heterogeneous-NCCL clusters), `fdl --gpus` (global GPU scope
+> override), `fdl @cluster <cmd>` (multi-host fan-out). See the
+> CHANGELOG and [DDP Reference](docs/ddp.md) for the full surface.
 
 ---
 
@@ -92,7 +94,7 @@ replaces silent failures with compile-time error handling. `Drop` replaces the
 garbage collector. The [full migration guide](https://github.com/flodl-labs/flodl/blob/main/docs/pytorch_migration.md) covers
 every op, module, and pattern.
 
-> **New to Rust?** Read [Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes.
+> **New to Rust?** Read [Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md) - 10 patterns in 15 minutes.
 
 ## Getting Started
 
@@ -118,7 +120,7 @@ cd my-project
 ./fdl run     # train the model
 ```
 
-**Native** -- [Rust](https://rustup.rs/) 1.85+ and libtorch:
+**Native** - [Rust](https://rustup.rs/) 1.85+ and libtorch:
 
 ```bash
 ./fdl libtorch download    # auto-detects CPU or CUDA
@@ -171,7 +173,7 @@ the universal `Trainer` takes a step closure and owns the loop:
 
 ```rust
 // One step: forward + loss, returns the loss Variable.
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+fn train_step(model: &impl Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].clone(), false);
     let target = Variable::new(batch[1].clone(), false);
     mse_loss(&model.forward(&input)?, &target)
@@ -189,14 +191,17 @@ Trainer::builder(
     .join()?;
 ```
 
-`Trainer::setup` (own the loop, framework owns the setup) is the
-in-between tier. See [Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
-for all three tiers.
+For an explicit loop, `Ddp::wrap` gives per-rank gradient-sync control
+(the bypass tier). The cooperative tier - `Trainer::builder(...).into_worker()` -
+hands you the loop body while the controller stays authoritative over
+cadence, partition, eval-election, and checkpointing. See
+[Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
+for all three tiers (bypass / cooperative / managed).
 
 ## The Graph Builder
 
 floDl's fluent graph builder lets you describe complex architectures as
-readable data flow — no boilerplate, no `nn.Module` subclassing.
+readable data flow - no boilerplate, no `nn.Module` subclassing.
 
 ```rust
 let model = FlowBuilder::from(Linear::new(2, 16)?)
@@ -207,7 +212,7 @@ let model = FlowBuilder::from(Linear::new(2, 16)?)
     .build()?;
 ```
 
-`build()` returns a `Graph` that implements `Module` — you can nest it
+`build()` returns a `Graph` that implements `Module` - you can nest it
 inside other graphs. Things get interesting when architectures get complex:
 
 ```rust
@@ -222,8 +227,8 @@ let g = FlowBuilder::from(encoder).tag("encoded")
     .build()?;
 ```
 
-Every construct — `split/merge`, `also`, `loop_body`, `gate`, `switch`, `map`,
-`tag/using` — composes cleanly. Forward references (`using` before `tag`) carry
+Every construct - `split/merge`, `also`, `loop_body`, `gate`, `switch`, `map`,
+`tag/using` - composes cleanly. Forward references (`using` before `tag`) carry
 state across calls, enabling recurrent architectures without special-casing.
 
 | Method | What it does |
@@ -232,11 +237,11 @@ state across calls, enabling recurrent architectures without special-casing.
 | `also(m)` | Residual: `input + m(input)` |
 | `fork(m)` | Side branch: capture output as tag, stream continues |
 | `split(modules![...]).merge(op)` | Parallel branches, merged by `Add` or `Mean` |
-| `tag(name)` / `using(refs)` | Named references — backward or forward (across calls) |
+| `tag(name)` / `using(refs)` | Named references - backward or forward (across calls) |
 | `loop_body(body).for_n(n)` | Fixed iteration with BPTT |
 | `loop_body(body).while_cond` / `until_cond` | Conditional loops |
-| `gate(router, modules![...])` | Soft routing — weighted combination |
-| `switch(selector, modules![...])` | Hard routing — only selected branch |
+| `gate(router, modules![...])` | Soft routing - weighted combination |
+| `switch(selector, modules![...])` | Hard routing - only selected branch |
 | `map(body).each()` / `.over(tag)` / `.slices(n)` | Element-wise, tagged, or sliced iteration |
 | `input(names)` | Auxiliary graph inputs for multi-input architectures |
 
@@ -246,7 +251,7 @@ the [full showcase](https://github.com/flodl-labs/flodl/tree/main/flodl/examples
 ## Graph Tree: Hierarchical Composition
 
 This is where floDl goes beyond PyTorch. Graphs nest inside graphs with
-**label-path addressing** — dot-separated paths that let you reach into any
+**label-path addressing** - dot-separated paths that let you reach into any
 subgraph from the root. Train components independently, compose them into
 larger architectures, and control training phases declaratively.
 
@@ -280,7 +285,7 @@ model.validate_path("encoder.read.confidence")?;  // -> Tag
 
 ### Declarative training phases
 
-Freeze and thaw entire subtrees by path — no manual parameter iteration:
+Freeze and thaw entire subtrees by path - no manual parameter iteration:
 
 ```rust
 // Phase 1: train only the classifier, encoder is frozen
@@ -305,7 +310,7 @@ Train a component standalone, save it, load it into a larger model:
 // Pre-trained encoder saved earlier
 encoder.save_checkpoint("encoder_v1.fdl.gz")?;
 
-// Load into the composed model — namespace + hash validated
+// Load into the composed model - namespace + hash validated
 model.load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")?;
 model.freeze("encoder.read")?;  // lock what's proven
 ```
@@ -321,7 +326,7 @@ model.record_scalar("total_loss", total)?;
 
 model.flush(&[]);  // single call flushes the entire tree
 
-// Trends across boundaries — drive training decisions
+// Trends across boundaries - drive training decisions
 if model.trend_at("encoder.scan.loss")?.stalled(10, 1e-4) {
     model.thaw("encoder.read")?;  // scan stalled, unfreeze read
 }
@@ -343,7 +348,7 @@ See the full **[Graph Tree Tutorial](https://github.com/flodl-labs/flodl/blob/ma
 ### Training Monitor
 
 Drop-in monitor with adaptive ETA, resource tracking, and a live web
-dashboard — no external dependencies, no separate process.
+dashboard - no external dependencies, no separate process.
 
 ```rust
 use flodl::monitor::Monitor;
@@ -369,13 +374,13 @@ monitor.finish();
 
 <p align="center">
   <a href="https://flodl.dev/benchmark">
-    <img src="https://raw.githubusercontent.com/flodl-labs/flodl/main/docs/dashboard.gif" alt="floDl live training dashboard — click for interactive version" width="800">
+    <img src="https://raw.githubusercontent.com/flodl-labs/flodl/main/docs/dashboard.gif" alt="floDl live training dashboard - click for interactive version" width="800">
   </a>
 </p>
-<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> — real data from a 100-epoch training run</em></p>
+<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> - real data from a 100-epoch training run</em></p>
 
 The live dashboard updates via Server-Sent Events (no WebSocket, no npm),
-tracks CPU/GPU/RAM/VRAM, and supports late join — open it mid-training and
+tracks CPU/GPU/RAM/VRAM, and supports late join - open it mid-training and
 all past epochs backfill instantly.
 
 ```rust
@@ -430,55 +435,69 @@ the **[Observation example](https://github.com/flodl-labs/flodl/tree/main/flodl/
 
 ## Multi-GPU Training
 
-`Trainer::setup()` gives you transparent heterogeneous multi-GPU training with
-zero changes to your training loop. floDl detects your GPUs, picks the best
-strategy, and balances work automatically: the slowest GPU anchors the pace
-while faster ones run ahead intelligently.
-
-**Graph DDP** -- one line to go from single-GPU to multi-GPU:
+The **same `Trainer::builder` call** scales from CPU to N GPUs on one
+host to N GPUs across many hosts. On a host with 2+ visible CUDA
+devices, floDl auto-promotes to process-per-rank fan-out
+automatically - zero training-loop changes.
 
 ```rust
-// Detect GPUs, replicate model, set optimizer, enable training
-Trainer::setup(&model, &builder, |p| Adam::new(p, 0.001))?;
-
-// Training loop is IDENTICAL for 1 or N GPUs
-for batch in model.epoch(0) {
-    let loss = model.forward_batch(&batch?)?;
-    model.step()?;  // AllReduce + sync + optimizer + zero_grad
-}
-```
-
-**DDP Builder** -- thread-per-GPU, works with any `Module`:
-
-```rust
-let state = Trainer::builder(model_factory, optim_factory, train_fn)
+// Universal entry: works on CPU, 1 GPU, N GPUs single-host, N GPUs multi-host.
+let handle = Trainer::builder(model_factory, optim_factory, train_step)
     .dataset(dataset)
-    .batch_size(32)
-    .num_epochs(10)
-    .policy(ApplyPolicy::Cadence)       // ElChe for mixed GPUs
-    .backend(AverageBackend::Nccl)      // or Cpu for A/B testing
-    .run()?
-    .join()?;
+    .batch_size(64)
+    .num_epochs(50)
+    .run()?;
+
+let state: TrainedState = handle.join()?;
 ```
 
-| | Graph DDP | DDP Builder |
-|---|---|---|
-| **Works with** | `Graph` builder | Any `Module` |
-| **GPU model** | Scatter per batch | Thread per GPU (Local SGD) |
-| **Mixed GPUs** | El Che auto-enabled | `ApplyPolicy` x `AverageBackend` |
-| **Setup** | One line (`Trainer::setup`) | Builder pattern |
-| **Dashboard** | Integrated | Stderr logging |
+**ElChe - heterogeneous-rig cadence.** Mixed GPU generations? ElChe
+auto-balances: the slowest GPU anchors the pace; faster ones process
+proportionally more batches per averaging window, AllReduce overhead
+stays bounded, the convergence guard vetoes anchor growth when
+weight-space divergence rises. No configuration needed for the common
+case.
 
-**A/B testing**: swap `AverageBackend::Nccl` for `AverageBackend::Cpu`
-with one line. If loss curves match, you have validated the cheaper
-backend for your workload.
+**Five DDP modes, one line each.** `ElCheConfig::default()` is
+`nccl_cadence()` (recommended NCCL default). Swap to any of the five
+modes for A/B testing:
+
+```rust
+.elche(ElCheConfig::cpu_async().easgd_alpha(0.6))   // best-in-class on reference rig
+.elche(ElCheConfig::nccl_cadence())                 // default; slow rank anchors, fast ranks fill the window
+.elche(ElCheConfig::nccl_sync())                    // per-batch AllReduce baseline
+.elche(ElCheConfig::cpu_cadence())                  // CPU-mediated cadence (no NVLink/P2P needed)
+```
+
+**Multi-host clusters.** Add an `fdl.cluster.yml` next to your
+`fdl.yml`, or build the topology programmatically with
+`ClusterBuilder`. Then:
+
+```bash
+fdl probe              # readiness gate: GPU + libtorch + NCCL + shared-data audit
+fdl @cluster train     # SSHes each worker, pre-builds, fans out
+```
+
+Heterogeneous-rig support extends to per-host libtorch variants
+(`precompiled/cu128` on one host, `builds/sm61-sm120` on another),
+NCCL version-skew handling via `fdl nccl build` (builds a matching
+libnccl for `LD_PRELOAD`), and elastic membership (ranks can die
+without aborting the run — survivors absorb the lost rank's work;
+membership only shrinks, rejoin/scale-up is not yet implemented).
+
+> **Invariant - no CUDA before `Trainer::run`.** User binaries must
+> not touch libtorch's CUDA context in `main()` (no
+> `cuda_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
+> tensors). The launcher exits without training; touching CUDA there
+> poisons spawned children's contexts on heterogeneous rigs. Use
+> `flodl::sys::detect_gpus()` (CUDA-free) for pre-run GPU queries.
 
 See the **[Multi-GPU Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)**,
-**[DDP Builder Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
+**[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
 **[Data Loading Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)**, and
 **[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)**.
 
-### Validation suite — `ddp-bench`
+### Validation suite - `ddp-bench`
 
 The repo ships with [`ddp-bench/`](https://github.com/flodl-labs/flodl/tree/main/ddp-bench),
 a workspace member that reproduces published training setups (Logistic /
@@ -564,10 +583,11 @@ fdl add flodl-hf --install      # wire it: pin to your root Cargo.toml
 fdl flodl-hf classify           # runs AutoModel on a real fine-tune
 ```
 
-Fine-tuning uses the same loop code on CPU, single GPU, or N GPUs:
-`Trainer::setup_head` distributes the head transparently when more
-devices are available, and `compute_loss(enc, labels)` mirrors HF
-Python's `model(..., labels=...).loss` one-call shape. Round-trip the
+Fine-tuning uses the same loop code on CPU, single GPU, or N GPUs: task
+heads `impl Module` directly, so `Trainer::run` / `Trainer::builder(...)`
+distribute the head transparently when more devices are available, and
+`compute_loss(enc, labels)` mirrors HF Python's `model(..., labels=...).loss`
+one-call shape. Round-trip the
 trained head back out with `fdl flodl-hf export` then verify it loads
 into HF Python's `AutoModelFor*` with `fdl flodl-hf verify-export`.
 
@@ -585,7 +605,7 @@ floDl covers the modules, losses, and optimizers you actually use:
 | **NN Modules** | 30+ | `Linear`, `Conv1d`/`2d`/`3d` + transpose, `GRU`/`LSTM`, `MultiheadAttention`, `Bilinear`, all norms (`Layer`/`RMS`/`Group`/`Batch`/`Instance`), all pooling, `Embedding`/`EmbeddingBag`, `PixelShuffle`, `Upsample`, `Unfold`/`Fold` |
 | **Activations** | 17 | `ReLU`, `LeakyReLU`, `ELU`, `GELU`, `SiLU`, `Mish`, `SELU`, `Softplus`, `Hardswish`, `PReLU`, `Softmax`, ... |
 | **Losses** | 15 | MSE, CrossEntropy, BCE, NLL, CTC, Focal, Triplet, KLDiv, SmoothL1, Cosine, Hinge, Margin, Poisson, ... |
-| **Optimizers** | 7 | `SGD`, `Adam`, `AdamW`, `RMSprop`, `Adagrad`, `RAdam`, `NAdam` — all with parameter groups |
+| **Optimizers** | 7 | `SGD`, `Adam`, `AdamW`, `RMSprop`, `Adagrad`, `RAdam`, `NAdam` - all with parameter groups |
 | **Schedulers** | 8 | Step, Cosine, Exponential, MultiStep, OneCycle, Cyclic, Warmup (composable), Plateau |
 | **Init** | 9 | Xavier, Kaiming, orthogonal, truncated normal, uniform, normal |
 | **Tensor Ops** | 100+ | Full arithmetic, trig, reductions, shape, indexing, comparisons, fused ops |
@@ -600,7 +620,7 @@ code for every op, module, and pattern.
 
 ## Performance
 
-Same CUDA kernels as PyTorch — the difference comes from what happens
+Same CUDA kernels as PyTorch - the difference comes from what happens
 *between* kernel launches. Ten models, ten interleaved rounds, locked GPU
 clocks (RTX 5060 Ti, v0.3.0 vs PyTorch 2.10.0):
 
@@ -618,7 +638,7 @@ clocks (RTX 5060 Ti, v0.3.0 vs PyTorch 2.10.0):
 | convnet | 1298.0 ms | 1298.2 ms | 0% |
 
 Wins 8 of 10, ties 2, zero regressions. The ties (convnet, lstm_seq) are
-compute-bound -- both frameworks saturate the GPU, confirming identical
+compute-bound - both frameworks saturate the GPU, confirming identical
 CUDA kernels. The gap appears where framework overhead matters:
 dispatch-bound architectures (transformer -31%, mlp -29%), graph routing
 (residual_tower -24%), and recurrent loops (feedback_fixed -16%).
@@ -628,39 +648,38 @@ dispatch-bound architectures (transformer -31%, mlp -29%), graph routing
 
 ### Multi-GPU (DDP)
 
-ResNet-20 on CIFAR-10, 200 epochs -- heterogeneous GPUs (RTX 5060 Ti +
+ResNet-20 on CIFAR-10, 200 epochs - heterogeneous GPUs (RTX 5060 Ti +
 GTX 1060, 2.5x speed ratio). Published reference: 91.25%
 ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6):
 
 | Mode | Eval | vs Published | Time | vs Solo-0 |
 |---|---:|---:|---:|---:|
-| solo-0 (fast GPU only) | 91.66% | +0.41% | 3127s | -- |
-| nccl-async | **92.44%** | **+1.19%** | 2697s | 1.2x |
+| solo-0 (fast GPU only) | 91.66% | +0.41% | 3127s | - |
 | nccl-cadence | **92.42%** | **+1.17%** | 2650s | 1.2x |
 | cpu-async | **92.43%** | **+1.18%** | 2614s | 1.2x |
 | cpu-cadence | **92.04%** | **+0.79%** | 2670s | 1.2x |
 
 Every ElChe mode surpasses published accuracy while finishing faster
 than the fast GPU alone. 200 epochs is where ElChe's proportional
-scheduling has room to calibrate and shine -- shorter models (logistic
+scheduling has room to calibrate and shine - shorter models (logistic
 through gpt-nano) confirm DDP convergence across architectures.
 
-**[DDP Benchmark Report](https://github.com/flodl-labs/flodl/blob/main/docs/ddp-benchmark.md)** --
+**[DDP Benchmark Report](https://github.com/flodl-labs/flodl/blob/main/docs/ddp-benchmark.md)** -
 full results for 8 models across 9 DDP modes
 
 ## Why Rust for Deep Learning?
 
 **Deterministic memory.** Python adds ~3-5 us of framework overhead per GPU
-op. Go's GC can't manage VRAM — an [earlier Go implementation](https://github.com/fab2s/goDl)
+op. Go's GC can't manage VRAM - an [earlier Go implementation](https://github.com/fab2s/goDl)
 required 5 phases of lifecycle management (refcounting, GC callbacks, VRAM
 budgets, pending-free queues). Rust replaces all of that with
 `impl Drop for Tensor`. Memory is freed the instant a tensor leaves scope.
 
-**Zero-cost safety.** Every op returns `Result<T>` — no silent failures.
+**Zero-cost safety.** Every op returns `Result<T>` - no silent failures.
 Ownership ensures tensors are freed exactly once. The borrow checker
 prevents data races at compile time.
 
-**Same GPU kernels.** floDl binds libtorch — the C++ library under
+**Same GPU kernels.** floDl binds libtorch - the C++ library under
 PyTorch. CUDA, cuBLAS, cuDNN are identical. floDl replaces the dispatch
 path, autograd tracking, and graph execution.
 
@@ -673,7 +692,9 @@ path, autograd tracking, and graph execution.
 |------|-------------|
 | `clip_grad_norm` / `clip_grad_value` | Fused gradient clipping (2 kernels total via foreach ops) |
 | `save_checkpoint` / `load_checkpoint` | Named `.fdl` checkpoints, structural hash, partial loading, `LoadReport` |
+| `save_state_file` / `load_state_file` | Optimizer state save/load (`.optim`, self-identifying header, gzip-aware, atomic) |
 | `migrate_checkpoint` | Remap parameter names across versions |
+| `migrate_optim_state_file` | Convert an old optimizer `.optim` file to the current format |
 | `Parameter::freeze` / `unfreeze` | Per-parameter gradient control |
 | `GradScaler` | Dynamic loss scaling for fp16 training |
 | `cast_parameters` | Cast model parameters to any dtype |
@@ -691,7 +712,7 @@ recognizes automatically:
 | Method | What happens |
 |--------|-------------|
 | `as_named_input()` | `using()` refs arrive as a named map |
-| `reset()` | Loops auto-call before iterating — clears per-forward state |
+| `reset()` | Loops auto-call before iterating - clears per-forward state |
 | `detach_state()` | Break gradient chains on retained state |
 | `sub_modules()` | Recursive device placement, training mode, parameter collection |
 
@@ -701,7 +722,7 @@ recognizes automatically:
 <summary><strong>Build Profiles</strong></summary>
 
 ```toml
-# Optimize floDl in dev builds — your code stays fast to compile.
+# Optimize floDl in dev builds - your code stays fast to compile.
 [profile.dev.package.flodl]
 opt-level = 3
 
@@ -726,14 +747,19 @@ codegen-units = 1
 
 | Component | What it does |
 |-----------|-------------|
-| `Trainer::setup` | One-liner: detect GPUs, distribute, set optimizer, train |
-| `Trainer::builder` | Thread-per-GPU with Local SGD, any Module |
-| `ApplyPolicy` | Sync / Cadence / Async (when to average) |
-| `AverageBackend` | Nccl / Cpu (how to average, A/B testable) |
-| `ElChe` | Heterogeneous GPU cadence strategy |
-| `NcclComms` / `NcclRankComm` | NCCL AllReduce, Broadcast, abort handles |
-| `CudaEvent` / `CudaStream` | Async GPU-CPU pipeline, timing |
-| `DataLoader` | Resident/streaming/distributed, VRAM-aware prefetch, auto OOM fallback |
+| `Trainer::builder(...).run()` | Universal entry. Same call scales from CPU to multi-host cluster. |
+| `Trainer::run(..., TrainerConfig)` | Config-bag form - same launcher, data-driven setup. |
+| `Ddp::wrap(&model, device, rank, &rdv)` | Low-level per-rank gradient-sync for manual control (GAN/RL). |
+| `ElCheMode` | `NcclSync/Cadence`, `CpuSync/Cadence/Async`. Default `NcclCadence`. |
+| `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
+| `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
+| `ClusterBuilder` | Programmatic cluster construction (mirrors `fdl.cluster.yml`). |
+| `flodl::sys::detect_gpus` | CUDA-free GPU detection; canonical pre-`Trainer::run` query. |
+| `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards - TrendGuard is default. Guard is authoritative over `overhead_target`. |
+| `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
+| `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
+| `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
+| `Ddp::wrap` | Manual thread-based DDP primitive (per-rank gradient sync) for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
 
 </details>
 
@@ -743,12 +769,12 @@ Every differentiable path is verified against finite-difference gradients:
 - 117 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam)
-- 1027 library tests, zero clippy warnings — all tests run on both CPU and CUDA
+- 1027 library tests, zero clippy warnings - all tests run on both CPU and CUDA
 
 ### Hardware Compatibility
 
 Developed and tested from NVIDIA Pascal (GTX 1060 6GB) to Blackwell
-(RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 — floDl
+(RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 - floDl
 links libtorch's stable C API, which supports every architecture the driver
 supports. If `nvidia-smi` works, floDl trains on it.
 
@@ -758,30 +784,30 @@ supports. If `nvidia-smi` works, floDl trains on it.
 
 | Background | Start here |
 |-----------|-----------|
-| **New to Rust** | [Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md) — 10 patterns in 15 minutes |
+| **New to Rust** | [Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md) - 10 patterns in 15 minutes |
 | **Know Rust, new to DL** | [Tensors](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/01-tensors.md) then [Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md) |
 | **Know PyTorch** | [Porting Guide](https://github.com/flodl-labs/flodl/blob/main/docs/porting.md) (or `/port` with AI) then [Graph Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/05-graph-builder.md) |
-| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md) then [DDP Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md) |
+| **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md) then [Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md) |
 | **Bringing a HuggingFace model** | [HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md): load BERT, RoBERTa, DistilBERT, ALBERT, XLM-R, or DeBERTa-v2; classify, NER, QA, or fill-mask; fine-tune and round-trip back to the HF ecosystem |
 | **Just show me code** | [`quickstart`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/) |
 
 ### Tutorials
 
-0. **[Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md)** — 10 Rust patterns in 15 minutes
-1. **[Tensors](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/01-tensors.md)** — creation, ops, memory, CUDA
-2. **[Autograd](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/02-autograd.md)** — variables, gradients, backward
-3. **[Modules](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/03-modules.md)** — all layers, convolutions, RNNs, attention, normalization
-4. **[Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)** — losses, optimizers, mixed precision, full loop
-5. **[Graph Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/05-graph-builder.md)** — fluent API from simple to complex
-6. **[Advanced Graphs](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/06-advanced-graphs.md)** — forward refs, loops, gates, switches
-7. **[Visualization](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/07-visualization.md)** — DOT/SVG, profiling heatmaps
-8. **[Utilities](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/08-utilities.md)** — checkpoints, clipping, freezing, initialization, scheduling, verbosity-gated logging
-9. **[Training Monitor](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/09-monitor.md)** — ETA, resource tracking, live dashboard
-10. **[Graph Tree](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/10-graph-tree.md)** — hierarchical composition, freeze/thaw, subgraph checkpoints
-11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** — Trainer::setup, El Che, auto-balancing, DataLoader integration
-12. **[DDP Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** — thread-per-GPU, Local SGD, A/B testable backends
-13. **[Data Loading](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)** — DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
-14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** — load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::setup_head`, round-trip export to the HF ecosystem, PyTorch parity
+0. **[Rust for PyTorch Users](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/00-rust-primer.md)** - 10 Rust patterns in 15 minutes
+1. **[Tensors](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/01-tensors.md)** - creation, ops, memory, CUDA
+2. **[Autograd](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/02-autograd.md)** - variables, gradients, backward
+3. **[Modules](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/03-modules.md)** - all layers, convolutions, RNNs, attention, normalization
+4. **[Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)** - losses, optimizers, mixed precision, full loop
+5. **[Graph Builder](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/05-graph-builder.md)** - fluent API from simple to complex
+6. **[Advanced Graphs](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/06-advanced-graphs.md)** - forward refs, loops, gates, switches
+7. **[Visualization](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/07-visualization.md)** - DOT/SVG, profiling heatmaps
+8. **[Utilities](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/08-utilities.md)** - checkpoints, clipping, freezing, initialization, scheduling, verbosity-gated logging
+9. **[Training Monitor](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/09-monitor.md)** - ETA, resource tracking, live dashboard
+10. **[Graph Tree](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/10-graph-tree.md)** - hierarchical composition, freeze/thaw, subgraph checkpoints
+11. **[Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)** - Trainer::run / Trainer::builder, process-per-rank auto-promote, ElChe, DataLoader integration
+12. **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)** - ElChe cadence, process-per-rank cluster, A/B testable backends
+13. **[Data Loading](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)** - DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration
+14. **[HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md)** - load BERT, RoBERTa, DistilBERT, ALBERT, XLM-RoBERTa, DeBERTa-v2 checkpoints, AutoModel dispatch across four task heads (seqcls, NER, QA, MLM), fine-tune with `Trainer::run` / `Trainer::builder(...)`, round-trip export to the HF ecosystem, PyTorch parity
 
 ### Examples
 
@@ -794,14 +820,15 @@ supports. If `nvidia-smi` works, floDl trains on it.
 - [`observation`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/observation/): collect, flush, trend queries, early stopping
 - [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/): every graph builder method in one graph
 - [`flowbuilder_residual`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/flowbuilder_residual/): MLP classifier with a tagged residual block via FlowBuilder
+- [`auto_promote`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/auto_promote/): the same plain training code auto-scaling CPU → 1 GPU → N-GPU DDP, zero distributed code
 - [`bio/dnaseq_conv1d`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dnaseq_conv1d/): DNA Conv1D motif classifier (synthetic ChIP-seq peak annotation)
 - [`bio/dna_autoencoder`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/bio/dna_autoencoder/): DNA convolutional autoencoder with checkpoint round-trip
 
 ### Porting from PyTorch
 
-- **[Porting Guide](https://github.com/flodl-labs/flodl/blob/main/docs/porting.md)** — module mapping, FlowBuilder patterns, training loop translation
-- **[AI-assisted porting](https://github.com/flodl-labs/flodl/tree/main/ai/skills/port/)** — point any AI coding assistant at the skill guide for automated translation. With Claude Code: `/port my_model.py`
-- **`fdl api-ref`** — generate a structured API reference for your flodl version. Used by AI tools and useful on its own.
+- **[Porting Guide](https://github.com/flodl-labs/flodl/blob/main/docs/porting.md)** - module mapping, FlowBuilder patterns, training loop translation
+- **[AI-assisted porting](https://github.com/flodl-labs/flodl/tree/main/ai/skills/port/)** - point any AI coding assistant at the skill guide for automated translation. With Claude Code: `/port my_model.py`
+- **`fdl api-ref`** - generate a structured API reference for your flodl version. Used by AI tools and useful on its own.
 
 ### Architecture
 
@@ -834,7 +861,7 @@ if you designed it around Rust's ownership model instead of fighting a garbage
 collector?
 
 An [earlier attempt in Go](https://github.com/fab2s/goDl) proved the
-architecture — the graph builder, the module system, the observation engine —
+architecture - the graph builder, the module system, the observation engine -
 but hit a wall: Go's GC cannot manage GPU memory deterministically. That
 required building five layers of memory management infrastructure on top of
 the language, not with it.

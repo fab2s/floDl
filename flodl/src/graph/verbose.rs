@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 use crate::nn::Module;
-use super::Graph;
+use super::{Graph, GraphExt};
 
 impl Graph {
     /// Generate a tree summary showing subgraph structure, tags, and parameter counts.

@@ -3,16 +3,19 @@
 A design for device-resident data loading that eliminates transfer overhead
 by keeping the entire dataset on the compute device alongside the model.
 
-Combined with CUDA Graphs, this enables **zero-dispatch training** -- the CPU
+Combined with CUDA Graphs, this enables **zero-dispatch training** - the CPU
 does nothing during an epoch except launch pre-recorded GPU operations.
 
-**Status:** Resident and streaming DataLoader modes shipped in v0.2.0 (Phase 10).
-DDP-aware resident/streaming with per-device backend selection shipped in v0.3.0
-(Phase 11). What remains is the zero-dispatch layer: full train-step CUDA Graph
-capture (forward + backward + optimizer as one replay) and double-buffered static
-I/O tensors for the Graph path. See
-[Tutorial 12: DDP Builder](../tutorials/12-async-ddp.md) for the current data
-pipeline.
+**Status:** Device-resident, streaming, and distributed `DataLoader` modes
+ship today, including DDP-aware per-device backend selection. Note: the
+`ResidentLoader<const N>` const-generic surface described below is the
+*originating design*, not the shipped type — the live helper is an internal
+`pub(crate) struct ResidentLoader` (non-generic) behind the `DataLoader`
+modes, not a public API. What remains is the zero-dispatch layer: full
+train-step CUDA Graph capture (forward + backward + optimizer as one replay)
+and double-buffered static I/O tensors for the Graph path. See
+[Tutorial 13: Data Loading](../tutorials/13-data-loading.md) for the current
+data pipeline.
 
 ---
 
@@ -27,8 +30,8 @@ CPU memory → pin_memory → async DMA → GPU kernel → backward → optimize
 ```
 
 For large models (LLMs, diffusion), the GPU compute dominates and transfer
-overhead is noise. But for **small, focused models** -- exactly the kind FBRL
-produces -- the transfer overhead is a significant fraction of total batch time.
+overhead is noise. But for **small, focused models** - exactly the kind FBRL
+produces - the transfer overhead is a significant fraction of total batch time.
 
 ### Why this matters now
 
@@ -44,7 +47,7 @@ Three things converge:
    decomposition that makes the problem learnable also makes it fit in VRAM.
 
 3. **flodl already has the primitives.** `to_device()`, `narrow()`,
-   `index_select()`, `copy_()`, CUDA Graphs, foreach ops -- everything needed
+   `index_select()`, `copy_()`, CUDA Graphs, foreach ops - everything needed
    for GPU-resident iteration exists. What's missing is the thin orchestration
    layer that makes it a one-liner.
 
@@ -89,7 +92,7 @@ margins for activation memory and CUDA context overhead (~400 MB), these fit
 in 16 GB with room for a desktop environment and a browser.
 
 As VRAM scales to 24-48 GB, larger datasets and deeper compositions qualify
-automatically -- no code changes needed.
+automatically - no code changes needed.
 
 ---
 
@@ -106,8 +109,8 @@ The pattern should feel like a natural extension of what users already do with
 
 ### 2. Zero-copy when possible
 
-Unshuffled iteration uses `narrow()` -- a view into the existing GPU tensor,
-no allocation. Shuffled iteration uses per-batch `index_select()` -- allocates
+Unshuffled iteration uses `narrow()` - a view into the existing GPU tensor,
+no allocation. Shuffled iteration uses per-batch `index_select()` - allocates
 only batch-sized tensors, not full dataset copies.
 
 ### 3. CUDA Graph compatibility as a first-class concern
@@ -124,7 +127,7 @@ available" than to OOM mid-epoch.
 
 ### 5. Device-agnostic
 
-`ResidentLoader` works on any device -- CPU, CUDA, and future backends (ROCm,
+`ResidentLoader` works on any device - CPU, CUDA, and future backends (ROCm,
 MPS, XPU). On CPU it's a fast batch iterator with zero transfer overhead. On
 GPU it eliminates host-device transfers entirely. The budget check reports
 available memory for the target device; the iteration pattern is universal.
@@ -170,11 +173,11 @@ enum Order {
 }
 ```
 
-**Why const generic?** Dataset arity is always a compile-time fact -- you
+**Why const generic?** Dataset arity is always a compile-time fact - you
 never load an unknown number of tensors. `ResidentLoader<2>` for (input, target),
 `ResidentLoader<3>` for (image, label, case). The type system catches arity
 mismatches at build time, not at epoch 47. Batch containers are `[Tensor; N]`
-on the stack -- zero heap allocation for the common case of 2-4 tensors.
+on the stack - zero heap allocation for the common case of 2-4 tensors.
 
 **Constructor variants:**
 
@@ -286,7 +289,7 @@ impl<const N: usize> ResidentLoader<N> {
 }
 ```
 
-`std::array::from_fn` constructs `[Tensor; N]` inline -- no Vec, no heap.
+`std::array::from_fn` constructs `[Tensor; N]` inline - no Vec, no heap.
 The compiler knows N at monomorphization time.
 
 ### 2. VRAM budget estimation
@@ -372,7 +375,7 @@ data. The budget is dominated by dataset size.
 
 ### 3. CUDA Graph captured training pattern
 
-Not a new API -- this is a usage pattern combining existing `CudaGraph` with
+Not a new API - this is a usage pattern combining existing `CudaGraph` with
 `ResidentLoader`. Documented as the recommended high-performance path.
 
 ```rust
@@ -550,7 +553,7 @@ monitor.log(epoch, t.elapsed(), &model);
 ```
 
 **What the CPU does per attempt:** one `replay()` + one `sync` + one `item()`.
-The sync is the cost -- it forces the CPU to wait for the GPU. But compare:
+The sync is the cost - it forces the CPU to wait for the GPU. But compare:
 
 | Pattern | GPU ops per attempt | CPU-GPU syncs |
 |---------|-------------------|---------------|
@@ -574,7 +577,7 @@ toward the zero-dispatch performance of full capture.
 | Phase-level graphs | Light (sync between phases) | Between phases | Conditional loops (subscan) |
 | No CUDA Graphs | Heavy (every kernel) | Full | Prototyping, debugging |
 
-All three approaches benefit equally from VRAM-resident data -- the transfer
+All three approaches benefit equally from VRAM-resident data - the transfer
 elimination is independent of how the compute is dispatched. Phase-level
 capture is the natural fit for FBRL's progressive training, where inner loops
 and retry mechanisms are structural.
@@ -595,10 +598,10 @@ training, including captured CUDA Graphs:
 
 **Resource metrics** (VRAM, CPU, GPU utilization): sampled by `monitor.log()`
 via NVML system calls. Pure CPU-side. Works unchanged with any training
-pattern -- no GPU sync needed.
+pattern - no GPU sync needed.
 
 **Training metrics** (loss, attempts, lr, confidence): pushed via
-`record_scalar()`, which is pure Rust -- appends an f64 to a Vec in the
+`record_scalar()`, which is pure Rust - appends an f64 to a Vec in the
 Graph's batch buffer. The only GPU involvement is obtaining the value itself
 (e.g., `loss_buf.item()` requires a sync).
 
@@ -614,7 +617,7 @@ to the SSE dashboard. All CPU-side.
 #### Async metric push: zero-sync dashboard
 
 The key insight: **metrics are observability, not control flow.** The dashboard
-doesn't need the loss value from the current batch right now -- it needs it
+doesn't need the loss value from the current batch right now - it needs it
 eventually. A one-batch delay is completely invisible on a training curve.
 
 By combining `pin_memory()` + `copy_(non_blocking=true)`, the GPU writes
@@ -675,15 +678,15 @@ monitor.log(epoch, t.elapsed(), &model);
 
 **Why `to_f32_vec()` instead of `.item()`?** `.item()` may trigger a sync
 internally. Reading from the pinned CPU tensor via `to_f32_vec()` is a pure
-CPU memory read -- the data is already there because the non-blocking copy
+CPU memory read - the data is already there because the non-blocking copy
 completed while the GPU was working on the next batch.
 
 **The principle:** separate **control flow values** from **observability values**.
 
 | Value type | Needs real-time? | Pattern |
 |-----------|-----------------|---------|
-| Conditional (confidence for retry loop) | Yes -- CPU must decide now | `sync` + `.item()` |
-| Observability (loss for dashboard) | No -- one-batch delay is fine | `copy_(non_blocking)` to pinned CPU |
+| Conditional (confidence for retry loop) | Yes - CPU must decide now | `sync` + `.item()` |
+| Observability (loss for dashboard) | No - one-batch delay is fine | `copy_(non_blocking)` to pinned CPU |
 
 This means even the **phase-level pattern** can avoid the loss sync:
 
@@ -709,7 +712,7 @@ if sample_idx > 0 {
 
 **Phase-level capture is dashboard-friendly by design.** The confidence sync
 that drives the conditional loop also provides the confidence metric for free.
-The loss uses async push -- zero additional sync.
+The loss uses async push - zero additional sync.
 
 ### 6. Shuffle strategy
 
@@ -723,7 +726,7 @@ Two modes, chosen automatically based on `Order`:
 **Why not shuffle the full dataset?**
 
 `index_select(0, full_permutation)` would create a complete copy of the dataset
-in VRAM -- temporarily doubling memory usage. For a 2 GB dataset on a 4 GB
+in VRAM - temporarily doubling memory usage. For a 2 GB dataset on a 4 GB
 budget, that's fatal.
 
 Per-batch `index_select()` allocates only `batch_size` rows at a time. The
@@ -733,10 +736,10 @@ temporary is tiny and immediately freed after the training step.
 
 The permutation is generated on CPU via `Rng::shuffle()` on a `Vec<usize>`.
 This is O(N) where N is the sample count. For 100K samples, this takes
-microseconds -- negligible compared to one GPU batch.
+microseconds - negligible compared to one GPU batch.
 
 The per-batch index tensor creation (`Tensor::from_i64`) is a small CPU→GPU
-transfer (batch_size × 8 bytes). For batch_size=64, that's 512 bytes --
+transfer (batch_size × 8 bytes). For batch_size=64, that's 512 bytes -
 invisible.
 
 ### 7. Integration with training monitor
@@ -758,7 +761,7 @@ dashboard. The budget struct provides all the numbers.
 ### 8. Double-buffered async loading
 
 Double-buffering serves two purposes: handling datasets larger than VRAM,
-and -- more importantly -- providing a **natural hook for progressive training
+and - more importantly - providing a **natural hook for progressive training
 strategies** like curriculum learning.
 
 When the full dataset exceeds available VRAM but a single epoch's data fits
@@ -802,10 +805,10 @@ impl ResidentLoader {
 ```
 
 **VRAM cost:** 2x one epoch's data. For FBRL's small datasets, this is
-typically well under 1 GB total -- trivial on 16+ GB hardware.
+typically well under 1 GB total - trivial on 16+ GB hardware.
 
 **The `epoch_data_fn` callback is the key.** It doesn't just return "the next
-chunk of a too-large dataset" -- it returns **whatever data this epoch should
+chunk of a too-large dataset" - it returns **whatever data this epoch should
 train on.** This makes it the natural integration point for progressive
 training strategies:
 
@@ -826,7 +829,7 @@ let loader = ResidentLoader::double_buffered(
 
 The callback produces different tensors each epoch, and the double-buffer
 ensures the next epoch's data is already in VRAM when training needs it.
-This is not a "data doesn't fit" escape hatch -- it's a **training strategy
+This is not a "data doesn't fit" escape hatch - it's a **training strategy
 primitive**.
 
 **When double-buffering is the right choice:**
@@ -836,11 +839,11 @@ primitive**.
 - Dataset is too large to fit entirely, but one epoch's worth fits
 
 **When to skip it:**
-- Full dataset fits in VRAM and doesn't change -- use `ResidentLoader::load()`
-- Even one epoch's data doesn't fit -- fall back to per-batch CPU→GPU transfer
+- Full dataset fits in VRAM and doesn't change - use `ResidentLoader::load()`
+- Even one epoch's data doesn't fit - fall back to per-batch CPU→GPU transfer
   using `to_device()` or `to_device_async()` with `pin_memory()`
 
-This is not a partial-VRAM compromise -- it's full VRAM-resident training with
+This is not a partial-VRAM compromise - it's full VRAM-resident training with
 a streaming data source. The GPU never waits for data after epoch 1.
 
 ---
@@ -852,7 +855,7 @@ a streaming data source. The GPU never waits for data after epoch 1.
 | Operation | Standard | VRAM-resident |
 |-----------|----------|---------------|
 | Per-batch CPU→GPU | 0.1-2 ms (depends on batch size) | 0 |
-| Per-batch GPU→GPU copy_ | -- | ~0.01 ms |
+| Per-batch GPU→GPU copy_ | - | ~0.01 ms |
 | Epochs × batches saved | 100 × 781 = 78,100 transfers | 0 transfers |
 
 For the letter model (781 batches/epoch, 100 epochs): eliminating 78,100
@@ -877,14 +880,14 @@ ResidentLoader itself is negligible:
 - For 100K samples: 800 KB for the index array
 
 The dataset tensors are the real cost, and they're the same tensors that would
-exist on CPU anyway -- just on a different device.
+exist on CPU anyway - just on a different device.
 
 ### Shuffle overhead
 
 Per-epoch shuffle cost:
-- CPU: `Rng::shuffle()` on Vec<usize> -- O(N), ~10 μs for 100K samples
-- Per-batch: `Tensor::from_i64(batch_indices)` -- 512 bytes for batch_size=64
-- Per-batch: `index_select()` -- one GPU kernel, ~0.01 ms
+- CPU: `Rng::shuffle()` on Vec<usize> - O(N), ~10 μs for 100K samples
+- Per-batch: `Tensor::from_i64(batch_indices)` - 512 bytes for batch_size=64
+- Per-batch: `index_select()` - one GPU kernel, ~0.01 ms
 
 Total shuffle overhead per epoch: ~0.01 ms × num_batches ≈ 8 ms for 781 batches.
 Compared to the ~39 seconds saved from eliminated transfers, this is noise.
@@ -898,8 +901,8 @@ Compared to the ~39 seconds saved from eliminated transfers, this is noise.
 **Files:** `flodl/src/data/mod.rs` (new module), `flodl/src/lib.rs`
 
 1. Create `data` module with `ResidentLoader` struct.
-2. `new()` -- validate tensors (same dim 0, same device).
-3. `load()` -- move to device, then `new()`.
+2. `new()` - validate tensors (same dim 0, same device).
+3. `load()` - move to device, then `new()`.
 4. `drop_last()` builder method.
 5. Sequential iteration via `narrow()`.
 6. `shuffle()` via `Rng`, shuffled iteration via `index_select()`.
@@ -912,7 +915,7 @@ Compared to the ~39 seconds saved from eliminated transfers, this is noise.
 **Files:** `flodl/src/data/budget.rs`
 
 1. `ResidentBudget` struct with all fields.
-2. `estimate()` -- compute bytes from tensor shapes and dtypes.
+2. `estimate()` - compute bytes from tensor shapes and dtypes.
 3. `OptimizerKind` enum for state multiplier.
 4. `Display` impl for human-readable output.
 5. Activation estimate heuristic (conservative, clearly labeled).
@@ -923,7 +926,7 @@ Compared to the ~39 seconds saved from eliminated transfers, this is noise.
 
 1. `double_buffered()` constructor with epoch data callback.
 2. Two internal ResidentLoader buffers (active + prefetch).
-3. `advance_epoch()` -- swap buffers, start async prefetch for next epoch.
+3. `advance_epoch()` - swap buffers, start async prefetch for next epoch.
 4. Async loading via `to_device_async()` + `pin_memory()` on a background thread.
 5. `prefetch_ready()` check for monitoring.
 
@@ -931,9 +934,9 @@ Compared to the ~39 seconds saved from eliminated transfers, this is noise.
 
 **Files:** `docs/tutorials/`, `examples/vram_training/`
 
-1. Tutorial: "VRAM-Resident Training" -- when to use, budget check, basic loop.
-2. Tutorial: "Zero-Dispatch Training" -- ResidentLoader + CUDA Graphs pattern.
-3. Example: `vram_training/main.rs` -- complete working example.
+1. Tutorial: "VRAM-Resident Training" - when to use, budget check, basic loop.
+2. Tutorial: "Zero-Dispatch Training" - ResidentLoader + CUDA Graphs pattern.
+3. Example: `vram_training/main.rs` - complete working example.
 4. Update `docs/pytorch_migration.md` with comparison to PyTorch DataLoader.
 
 ### Phase E: Monitor integration
@@ -1012,7 +1015,7 @@ pieces:
 5. Faster training = faster iteration = more experiments = better models
 
 The compound effect: FBRL doesn't just make problems tractable, it makes them
-**fast**. And this advantage scales with hardware -- as VRAM grows, larger
+**fast**. And this advantage scales with hardware - as VRAM grows, larger
 compositions qualify for full-VRAM training without code changes.
 
 **Progressive VRAM residency:**
@@ -1026,7 +1029,7 @@ Paragraph:     fits (< 16 GB)               -- next gen, 48+ GB GPU
 ```
 
 Each level of the FBRL hierarchy will naturally cross the VRAM-residency
-threshold as hardware improves. No architectural changes needed -- just more
+threshold as hardware improves. No architectural changes needed - just more
 VRAM.
 
 ---
@@ -1036,7 +1039,7 @@ VRAM.
 1. **Activation memory estimation.** The budget's activation estimate is
    conservative but imprecise. A more accurate approach would be to run one
    forward pass and measure peak VRAM delta. Adding a `budget.measure()`
-   method that does this is worth it -- cheap and removes the main source of
+   method that does this is worth it - cheap and removes the main source of
    budget uncertainty. The conservative estimate is good for pre-flight, but
    measured is better for tight fits.
 
@@ -1055,7 +1058,7 @@ VRAM.
    ResidentLoader but composes well with it. Worth a separate design?
 
 5. **Multi-GPU data splitting.** Multi-GPU training is now implemented via
-   `Trainer::setup()` and `Trainer::builder()`. The `DataLoader` supports distributed
+   `Trainer::builder()` / `Trainer::run()`. The `DataLoader` supports distributed
    mode with proportional epoch sharding across devices. See
    [DDP Reference](../ddp.md) for details.
 

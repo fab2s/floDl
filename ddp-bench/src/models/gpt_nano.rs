@@ -30,6 +30,15 @@ pub fn def() -> ModelDef {
         description: "GPT-nano on Shakespeare (nanoGPT, loss ~1.5-2.0)",
         build: build_model,
         dataset: make_dataset,
+        // Shakespeare corpus is ~1MB; parsing is cheap, so the hint
+        // calls the same factory + reports `.len()`. Avoids hardcoding
+        // a sequence count that depends on `SEQ_LEN` + train_fraction.
+        dataset_size_hint: |cfg| {
+            let shakespeare = crate::download::ensure_shakespeare_train(
+                &cfg.data_dir, SEQ_LEN,
+            )?;
+            Ok(shakespeare.len())
+        },
         train_fn: train_step,
         eval_fn: Some(eval_loss),
         test_dataset: Some(make_test_dataset),
@@ -47,6 +56,7 @@ pub fn def() -> ModelDef {
         reference: "Shakespeare CE loss ~1.5-2.0, eval=val loss ([nanoGPT](https://github.com/karpathy/nanoGPT), [Vaswani 2017](https://arxiv.org/abs/1706.03762))",
         eval_higher_is_better: false,
         published_eval: None,
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 50,
             batches_per_epoch: 0, // full dataset

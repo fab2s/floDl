@@ -1,7 +1,7 @@
 # Research Questions
 
 Open questions and hypotheses that emerge from flodl development and benchmarking.
-Not claims -- observations worth investigating.
+Not claims - observations worth investigating.
 
 ## Parameter averaging vs gradient averaging at scale
 
@@ -21,7 +21,7 @@ generalization ([Izmailov et al. 2018](https://arxiv.org/abs/1803.05407)).
 than gradient AllReduce, a fire-and-forget parameter shipping architecture (no AllReduce
 barrier, no GPU stall) could outperform synchronized gradient exchange at thousand-GPU
 scale. The bottleneck shifts from network-wide AllReduce coordination to staleness
-management -- which El Che's anchor/cadence mechanism already handles for heterogeneous
+management - which El Che's anchor/cadence mechanism already handles for heterogeneous
 local GPUs.
 
 **What would confirm/refute this:**
@@ -64,8 +64,8 @@ differently from the builder's per-worker copies.
 
 ## DDP as a dynamical system: chaos theory analogies
 
-**Observation:** El Che's divergence metric -- `||pre - post|| / ||post||` measured
-between sync points -- behaves like a discrete-time Lyapunov exponent. It measures
+**Observation:** El Che's divergence metric - `||pre - post|| / ||post||` measured
+between sync points - behaves like a discrete-time Lyapunov exponent. It measures
 how fast replica trajectories diverge from the last synchronization point.
 
 Empirical data from ResNet-20 CIFAR-10 (200 epochs, nccl-cadence):
@@ -76,18 +76,18 @@ Empirical data from ResNet-20 CIFAR-10 (200 epochs, nccl-cadence):
 
 **The strange attractor interpretation:** Each GPU replica follows a different
 trajectory through the loss landscape, perturbed by different data batches. Between
-syncs they explore independently -- chaotic trajectories diverging from slightly
+syncs they explore independently - chaotic trajectories diverging from slightly
 different initial conditions (the last sync point). Averaging collapses them back
 to a centroid.
 
 That centroid is unreachable by any single trajectory. It's the average of multiple
-chaotic explorations -- a point in weight space no individual SGD path would visit.
+chaotic explorations - a point in weight space no individual SGD path would visit.
 This is the "strange attractor" of the averaging dynamics: a basin the system orbits
 around but never lands on through any single path.
 
 **The convergence guard as regime detector:** El Che's guard watches for 3 consecutive
 rising divergence values above threshold. In dynamical systems terms, this detects a
-positive Lyapunov exponent -- the system transitioning from stable to chaotic. The
+positive Lyapunov exponent - the system transitioning from stable to chaotic. The
 response (tighten cadence = sync more often) bounds the divergence, keeping replicas
 within the basin of the attractor.
 
@@ -101,7 +101,7 @@ The LR schedule creates phase transitions visible in the divergence curve:
 lives in a wider minimum than any individual trajectory would find, this explains
 why cpu-sync (parameter averaging) generalizes better than nccl-sync (gradient
 averaging). Gradient averaging keeps replicas on the same trajectory. Parameter
-averaging lets them diverge and finds the centroid -- which by construction sits
+averaging lets them diverge and finds the centroid - which by construction sits
 in a wider basin.
 
 This connects to the Stochastic Weight Averaging literature
@@ -125,12 +125,12 @@ architecture where sync DDP reached only 4.2%. The diverged-then-averaged Local 
 trajectories produced implicit regularization that accelerated convergence.
 
 **Hypothesis:** The mechanism is analogous to ensemble methods. Each replica is a
-"weak learner" -- individually wrong, but wrong in different ways because they see
+"weak learner" - individually wrong, but wrong in different ways because they see
 different data. Averaging their parameters cancels uncorrelated errors and preserves
 the shared signal. More diverse trajectories (longer cadence intervals, async timing)
 produce stronger regularization, up to the point where staleness degrades the signal.
 
 **The cadence sweet spot:** Too frequent syncing (sync mode) keeps replicas identical,
 eliminating diversity. Too infrequent syncing lets replicas diverge beyond the basin
-of useful averaging. El Che's auto-tuned cadence searches for the boundary -- maximum
+of useful averaging. El Che's auto-tuned cadence searches for the boundary - maximum
 diversity that still averages constructively.

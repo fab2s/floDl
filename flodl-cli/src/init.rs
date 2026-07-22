@@ -105,12 +105,29 @@ fn pick_mode_interactively() -> Mode {
     if !prompt::ask_yn("Use Docker for builds?", true) {
         return Mode::Native;
     }
+
+    // On macOS, Docker runs Linux containers under Rosetta/QEMU emulation.
+    // Builds and training are substantially slower than native cargo on the
+    // host. Warn once and offer a chance to drop to Native before the user
+    // commits to a Docker scaffold.
+    if cfg!(target_os = "macos") {
+        println!();
+        println!("  Heads up: on macOS, Docker runs Linux containers under emulation");
+        println!("  (Rosetta / QEMU). Builds and training will be substantially slower");
+        println!("  than running cargo natively on the host. Native mode keeps");
+        println!("  everything on the Mac and uses macOS libtorch directly.");
+        println!();
+        if !prompt::ask_yn("Continue with Docker?", true) {
+            return Mode::Native;
+        }
+    }
+
     // 1-based: 1 = mounted (default), 2 = baked-in.
     let choice = prompt::ask_choice(
-        "libtorch location",
+        "How should libtorch be provided to the container?",
         &[
-            "Mounted from host (recommended: lighter image, swap CUDA variants)",
-            "Baked into the Docker image (zero host dependencies)",
+            "Mount it from the host (recommended: lighter image, swap CUDA variants)",
+            "Bake it into the image at build time (zero host setup)",
         ],
         1,
     );
@@ -720,4 +737,32 @@ commands:
 
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|e| format!("cannot write {}: {}", path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_name;
+
+    #[test]
+    fn validate_name_accepts_alnum_hyphen_underscore() {
+        for ok in ["my_project", "my-project", "Proj123", "a", "x_1-2"] {
+            assert!(validate_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        let err = validate_name("").unwrap_err();
+        assert!(err.contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn validate_name_rejects_disallowed_chars() {
+        // Spaces, dots, and path separators are the realistic footguns
+        // (a project name becomes a directory + a crate name).
+        for bad in ["my project", "my.project", "a/b", "../evil", "name!"] {
+            let err = validate_name(bad).unwrap_err();
+            assert!(err.contains("only letters"), "{bad:?} -> unexpected: {err}");
+        }
+    }
 }

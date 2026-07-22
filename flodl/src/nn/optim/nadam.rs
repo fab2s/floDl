@@ -1,11 +1,17 @@
 //! NAdam (Nesterov-accelerated Adam) optimizer.
 
+use std::io::{Read, Write};
+
 use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
+use crate::nn::checkpoint::{
+    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
+    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+};
 use crate::nn::parameter::Parameter;
 
-use super::Optimizer;
+use super::{Optimizer, Stateful};
 
 /// NAdam optimizer (Dozat, 2016).
 ///
@@ -26,7 +32,9 @@ pub struct NAdam {
     weight_decay: f64,
     m: Vec<Option<crate::tensor::Tensor>>,
     v: Vec<Option<crate::tensor::Tensor>>,
-    step_count: u64,
+    /// Per-param step counts, incremented only when the param has a grad
+    /// (the Nesterov bias-correction schedule is per-param).
+    steps: Vec<i64>,
 }
 
 impl NAdam {
@@ -37,7 +45,7 @@ impl NAdam {
         NAdam {
             params: params.iter().map(|p| p.variable.clone()).collect(),
             lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.0,
-            m: vec![None; n], v: vec![None; n], step_count: 0,
+            m: vec![None; n], v: vec![None; n], steps: vec![0; n],
         }
     }
 
@@ -48,17 +56,19 @@ impl NAdam {
 impl Optimizer for NAdam {
     fn lr(&self) -> f64 { self.lr }
     fn step(&mut self) -> Result<()> {
-        self.step_count += 1;
-        let t = self.step_count as f64;
         let b1 = self.beta1;
         let b2 = self.beta2;
-        let b1t = b1.powf(t);
-        let b2t = b2.powf(t);
-        let b1t1 = b1.powf(t + 1.0);
 
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
                 if let Some(mut grad) = param.grad() {
+                    // Per-param step: the Nesterov bias-correction schedule
+                    // restarts for a late-unfrozen param.
+                    self.steps[i] += 1;
+                    let t = self.steps[i] as f64;
+                    let b1t = b1.powf(t);
+                    let b2t = b2.powf(t);
+                    let b1t1 = b1.powf(t + 1.0);
                     let data = param.data().detach()?;
                     if self.weight_decay > 0.0 {
                         grad = grad.add(&data.mul_scalar(self.weight_decay)?)?;
@@ -90,18 +100,122 @@ impl Optimizer for NAdam {
         })
     }
 
+    fn reset_state(&mut self) {
+        // Moment estimates back to fresh, step counts to 0 (Nesterov
+        // momentum schedule restarts). Lengths preserved for per-param indexing.
+        for slot in &mut self.m {
+            *slot = None;
+        }
+        for slot in &mut self.v {
+            *slot = None;
+        }
+        for s in &mut self.steps {
+            *s = 0;
+        }
+    }
+
     fn zero_grad(&self) {
         for p in &self.params { p.zero_grad_set_to_none(); }
     }
 
     fn set_lr(&mut self, lr: f64) { self.lr = lr; }
+
+    fn save_state_to(&self, path: &str) -> Result<()> {
+        <Self as Stateful>::save_state_file(self, path)
+    }
+}
+
+impl Stateful for NAdam {
+    fn state_kind(&self) -> super::StateKind { super::StateKind::NAdam }
+
+    fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
+        write_u32_le(w, self.params.len() as u32)?;
+        write_f64_le(w, self.lr)?;
+        write_f64_le(w, self.beta1)?;
+        write_f64_le(w, self.beta2)?;
+        write_f64_le(w, self.eps)?;
+        write_f64_le(w, self.weight_decay)?;
+        for i in 0..self.params.len() {
+            write_tensor_state(w, self.m[i].as_ref())?;
+            write_tensor_state(w, self.v[i].as_ref())?;
+            write_i64_le(w, self.steps[i])?;
+        }
+        // Empty group table: NAdam has no group support yet, but the
+        // slot keeps the payload shape uniform with grouped optimizers.
+        super::write_groups(w, &[])?;
+        Ok(())
+    }
+
+    fn load_state<R: Read>(&mut self, r: &mut R) -> Result<()> {
+        let count = read_u32_le(r)? as usize;
+        if count != self.params.len() {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "NAdam: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+            )));
+        }
+        self.lr = read_f64_le(r)?;
+        self.beta1 = read_f64_le(r)?;
+        self.beta2 = read_f64_le(r)?;
+        self.eps = read_f64_le(r)?;
+        self.weight_decay = read_f64_le(r)?;
+        for i in 0..self.params.len() {
+            let dev = self.params[i].data().device();
+            self.m[i] = read_tensor_state(r, dev)?;
+            self.v[i] = read_tensor_state(r, dev)?;
+            self.steps[i] = read_i64_le(r)?;
+        }
+        let groups = super::read_groups(r, self.params.len(), "NAdam")?;
+        if !groups.is_empty() {
+            return Err(crate::tensor::TensorError::new(
+                "NAdam: state file carries a group table, but this flodl's \
+                 NAdam has no parameter-group support",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_helpers::make_param;
+    use super::super::test_helpers::{make_param, state_tmp};
     use crate::tensor::Tensor;
+
+    #[test]
+    fn test_nadam_state_file_roundtrip() {
+        // Locks the Stateful impl added for NAdam: per-param steps + lr
+        // round-trip through the .optim header.
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = NAdam::new(std::slice::from_ref(&p), 0.02);
+        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        opt.step().unwrap();
+
+        let path = state_tmp("nadam_roundtrip.optim");
+        opt.save_state_to(&path).unwrap();
+
+        let mut opt2 = NAdam::new(std::slice::from_ref(&p), 0.5);
+        opt2.load_state_file(&path).unwrap();
+        assert_eq!(opt2.steps, opt.steps);
+        assert!((opt2.lr - 0.02).abs() < 1e-12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_nadam_reset_state_clears_moments_and_steps() {
+        let dev = crate::tensor::test_device();
+        let p = make_param("w", &[2]);
+        let mut opt = NAdam::new(std::slice::from_ref(&p), 0.01);
+        for _ in 0..3 {
+            p.variable.set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
+            opt.step().unwrap();
+        }
+        assert!(opt.steps.iter().any(|&s| s > 0), "warm-up should advance steps");
+        opt.reset_state();
+        assert!(opt.steps.iter().all(|&s| s == 0), "steps must reset to 0");
+        assert!(opt.m.iter().all(|s| s.is_none()), "m must be cleared");
+        assert!(opt.v.iter().all(|s| s.is_none()), "v must be cleared");
+    }
 
     #[test]
     fn test_nadam_steps() {

@@ -13,7 +13,7 @@
 //! `num_labels` guard, softmax-and-sort for sequence classification,
 //! and the QA span-search algorithm.
 
-use flodl::{cross_entropy_loss, Graph, HasGraph, Module, Result, TensorError, Variable};
+use flodl::{cross_entropy_loss, Buffer, Graph, HasGraph, Module, Parameter, Result, TensorError, Variable};
 
 /// One extracted answer span from a
 /// `*ForQuestionAnswering::answer` / `::answer_batch` call.
@@ -478,6 +478,31 @@ impl<C: Clone + EncoderInputs> ClassificationHead<C> {
 
 impl<C: Clone> HasGraph for ClassificationHead<C> {
     fn graph(&self) -> &Graph { &self.graph }
+}
+
+/// Present the head as a [`Module`] so it can train through the unified
+/// [`Trainer::builder`](flodl::Trainer::builder) / cooperative
+/// [`Worker`](flodl::Worker) path (`M = ThisHead` directly). Every method
+/// delegates to the inner [`Graph`] — that is where the parameters and
+/// buffers live, so the defaults (which introspect the struct's own fields)
+/// would find nothing and train a zero-parameter model.
+///
+/// The head's real forward is multi-input (`input_ids` + `attention_mask` via
+/// [`Graph::forward_multi`], reached through [`Self::forward_encoded`] /
+/// [`Self::compute_loss`]); `Module::forward` is a single-input fallback the
+/// cooperative loop never calls (the user runs the head's own loss fn in their
+/// `train_fn`). `as_any` presents the inner graph so DDP's multi-input replica
+/// paths downcast to it (via `GraphExt::as_graph`) instead of the single-input
+/// fallback.
+impl<C: Clone> Module for ClassificationHead<C> {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        self.graph.forward(input)
+    }
+    fn parameters(&self) -> Vec<Parameter> { self.graph.parameters() }
+    fn buffers(&self) -> Vec<Buffer> { self.graph.buffers() }
+    fn name(&self) -> &str { "classification_head" }
+    fn set_training(&self, training: bool) { self.graph.set_training(training); }
+    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(&self.graph) }
 }
 
 // ── TaggingHead ──────────────────────────────────────────────────────────

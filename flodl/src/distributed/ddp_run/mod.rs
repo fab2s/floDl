@@ -1,9 +1,17 @@
-//! DDP run mode: thread-per-GPU training with Local SGD and adaptive parameter averaging.
+//! DDP run mode: the `Trainer::builder()` / [`DdpBuilder`] entry, the
+//! [`DdpHandle`] it returns, the per-rank [`GpuWorker`], and the shared
+//! cadence config ([`ApplyPolicy`] / [`AverageBackend`] / `DdpRunConfig`).
 //!
-//! Each GPU runs its own optimizer independently (zero wait). A lightweight coordinator
-//! triggers periodic parameter averaging at ElChe-determined intervals. Two orthogonal
-//! knobs control the behavior: [`ApplyPolicy`] (when to average) and [`AverageBackend`]
-//! (how to average).
+//! `DdpHandle::launch` dispatches by topology: a single visible device runs
+//! the inline single-host fallback; 2+ devices or an active cluster overlay
+//! auto-promote to the process-per-rank cluster path (launcher / controller /
+//! `cluster_coordinator` / `cluster_worker`), where each rank process drives a
+//! [`GpuWorker`] over the wire. The in-process thread-per-GPU engine that once
+//! lived here was removed; thread-based multi-GPU is available only as the
+//! lower-level `Ddp::wrap` primitive.
+//!
+//! Two orthogonal knobs control averaging cadence: [`ApplyPolicy`] (when to
+//! average) and [`AverageBackend`] (how to average).
 //!
 //! # Quick start
 //!
@@ -14,8 +22,7 @@
 //!     .dataset(dataset)
 //!     .batch_size(32)
 //!     .num_epochs(10)
-//!     .policy(ApplyPolicy::Cadence)
-//!     .backend(AverageBackend::Nccl)
+//!     .elche(ElCheConfig::nccl_cadence())
 //!     .checkpoint_every(5)
 //!     .checkpoint_fn(|ver, g| g.save_checkpoint(&format!("ckpt_v{ver}.fdl")))
 //!     .run()?;
@@ -25,19 +32,19 @@
 //! // state.buffers[i] corresponds to model.buffers()[i]
 //! ```
 //!
-//! # Architecture
+//! # Architecture (process-per-rank)
 //!
 //! ```text
-//! GPU Thread 0:  create model+Adam+dataset -> [fwd -> bwd -> adam step -> repeat]
-//! GPU Thread 1:  create model+Adam+dataset -> [fwd -> bwd -> adam step -> repeat]
-//! Coordinator:   collect timing/metrics -> trigger param averaging -> monitor divergence
+//! Rank process 0:  create model+optim+dataset -> [fwd -> bwd -> step -> repeat]
+//! Rank process 1:  create model+optim+dataset -> [fwd -> bwd -> step -> repeat]
+//! Controller:      collect timing/metrics -> trigger param averaging -> monitor divergence
 //! ```
 //!
 //! # Choosing a policy
 //!
 //! | Policy | When to use | Tradeoff |
 //! |--------|-------------|----------|
-//! | [`ApplyPolicy::Sync`] | Correctness-first, small models, homogeneous GPUs | Identical to standard DDP. Fast GPU waits at every batch. |
+//! | [`ApplyPolicy::Sync`] | Correctness-first, small models, homogeneous GPUs | Standard-DDP-like equal data split, but the reduce is NOT per-batch lockstep: it fires once every alive rank has made ≥1 step since the last reduce (work-weighted), so a fast GPU front-runs within its share and idles once it's exhausted. Degenerates to classic DDP on homogeneous rigs. |
 //! | [`ApplyPolicy::Cadence`] | Heterogeneous GPUs (e.g. Pascal + Blackwell) | Fast GPU runs ahead by ElChe-determined batches. Good throughput/convergence balance. |
 //! | [`ApplyPolicy::Async`] | Maximum throughput, large models, fault tolerance | Averaging interval auto-tunes from divergence monitoring. Best for experienced users. |
 //!
@@ -62,20 +69,27 @@
 //!   unblocked via `ncclCommAbort` instead of hanging forever.
 
 mod worker;
-mod coordinator;
+pub(crate) use worker::NcclAbortSlot;
+mod cooperative;
 mod orchestrator;
+mod shared;
 pub mod convergence;
 
+pub use cooperative::{StepOutcome, Worker};
 pub use worker::*;
-pub use coordinator::*;
+pub(crate) use shared::{
+    aggregate_epoch_metrics, equal_sizes, ratio_to_sizes, throughput_sizes,
+};
 pub use orchestrator::*;
-pub use convergence::{ConvergenceAction, ConvergenceGuard, DivergenceReport};
+pub use convergence::{
+    ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample,
+    MsfGuard, NoGuard, TrendGuard,
+};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::rng::Rng;
 use crate::tensor::{Device, Result, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -117,10 +131,29 @@ pub fn drain_scalars() -> HashMap<String, (f64, usize)> {
     SCALAR_ACCUM.with(|acc| std::mem::take(&mut *acc.borrow_mut()))
 }
 
+/// Loud guard for the "custom leaf module forgot to override
+/// `Module::parameters()`" footgun: the trait default returns an empty list
+/// for modules without sub-modules, so a forgotten override reaches the
+/// trainer as a model with nothing to train and every step becomes a silent
+/// no-op. Every training entry (single-device path, process ranks, thread
+/// workers, manual `Ddp::wrap`) calls this right after its first model build.
+pub(crate) fn ensure_trainable_params(n_params: usize, entry: &str) -> Result<()> {
+    if n_params == 0 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "{entry}: model has zero trainable parameters — nothing to train. \
+             If this is a custom leaf module, note that Module::parameters() \
+             defaults to an empty list; override it to return the module's \
+             parameters."
+        )));
+    }
+    Ok(())
+}
+
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
 ///
-/// Called on rank 0 after averaging events (multi-GPU) or at epoch boundaries
+/// Called on the rank selected by [`EpochCallbackPolicy`] (default
+/// `Fastest`) at checkpoint events (multi-GPU) or at epoch boundaries
 /// (single-GPU). Errors are logged but do not stop training.
 pub type CheckpointFn<M> = Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>;
 
@@ -165,21 +198,125 @@ pub type EpochFn<M> = Arc<dyn Fn(usize, &mut GpuWorker<M>) + Send + Sync>;
 /// async with, so this is the natural shape, not a limitation.
 pub type MetricsFn = Arc<dyn Fn(&EpochMetrics) -> Result<()> + Send + Sync>;
 
-// ---------------------------------------------------------------------------
-// Deprecated aliases (backward compatibility)
-// ---------------------------------------------------------------------------
+/// Cadence for invoking the user-supplied [`EvalFn`].
+///
+/// Controls how often the framework dispatches an eval pass to the
+/// rank chosen by [`EpochCallbackPolicy`]. Triggered from the
+/// controller's `dispatch_epoch` on the configured epoch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EvalCadence {
+    /// Fire eval every `n` epochs. `n == 0` is treated as "never".
+    Epochs(usize),
+}
 
-/// Deprecated: renamed to [`DdpHandle`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpHandle. Use Trainer::builder() to create.")]
-pub type AsyncDdp = DdpHandle;
+/// Eval callback: receives `&model` and the held-out `&dyn BatchDataSet`,
+/// returns the aggregated scalar metric for the eval pass. The user
+/// implements the batch iteration loop — framework just hands over
+/// the model + dataset and consumes the result.
+///
+/// Framework guarantees:
+/// - Fires on the rank selected by [`EpochCallbackPolicy`].
+/// - Sync-aligned: the chosen rank's model is at its post-AllReduce /
+///   post-EASGD-blend state when invoked.
+/// - `model.eval()` is called before and `model.train()` after the
+///   user's closure; no explicit mode flip needed inside.
+pub type EvalFn<M> = std::sync::Arc<
+    dyn Fn(&M, &dyn crate::data::BatchDataSet) -> Result<f64> + Send + Sync,
+>;
 
-/// Deprecated: renamed to [`DdpBuilder`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpBuilder. Use Trainer::builder() to create.")]
-pub type AsyncDdpBuilder<F, M, G, O, T> = DdpBuilder<F, M, G, O, T>;
+/// Receiver for the [`EvalFn`] scalar result on the controller side.
+/// Mirrors [`MetricsFn`]'s shape — fires after the chosen rank's eval
+/// metric flows back over `EvalResult`.
+pub type EvalResultFn = std::sync::Arc<
+    dyn Fn(usize, f64) -> Result<()> + Send + Sync,
+>;
 
-/// Deprecated: renamed to [`DdpRunConfig`].
-#[deprecated(since = "0.3.0", note = "Renamed to DdpRunConfig")]
-pub type AsyncDdpConfig = DdpRunConfig;
+/// Scheduler factory type: `(world_size) -> Arc<dyn Scheduler>`.
+///
+/// Called once per rank-process to construct the per-batch LR
+/// scheduler. The `world_size` argument
+/// is provided so user-supplied factories can scale base LR by replica
+/// count (Goyal et al. linear-scaling) without re-implementing the math.
+///
+/// In cluster mode, every rank builds an identical scheduler from this
+/// factory; the controller drives synchronization by broadcasting
+/// `SetGlobalStep` after each averaging cycle. Schedulers are pure
+/// functions of step (`fn lr(&self, step: usize) -> f64`), so every rank
+/// computes the same LR for the same input — equivalent to broadcasting
+/// LR directly but with one `u64` per averaging cycle instead of one
+/// `Vec<f64>` per param group.
+pub type SchedulerFn = Box<dyn Fn(usize) -> Arc<dyn crate::nn::Scheduler> + Send + Sync>;
+
+/// The rank-executed callbacks, bundled.
+///
+/// These five thread verbatim down the rank chain (`launch` →
+/// `run_cluster_rank_via_coord` → `ClusterWorker::connect_and_build`)
+/// before the worker consumes them; the coordinator-side callbacks
+/// (`metrics_fn`, `scheduler_fn`, `convergence_guard`, `eval_result_fn`)
+/// branch off to the coordinator and stay separate. Bundling only this
+/// verbatim subset keeps each signature honest — no layer carries a
+/// callback it doesn't run. Moved (not cloned) through the chain.
+pub(crate) struct RankCallbacks<M: crate::nn::Module> {
+    pub checkpoint_fn: Option<CheckpointFn<M>>,
+    pub epoch_fn: Option<EpochFn<M>>,
+    pub eval_fn: Option<EvalFn<M>>,
+    pub eval_dataset: Option<Arc<dyn crate::data::BatchDataSet>>,
+    pub outer_optimizer_factory:
+        Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
+}
+
+// Hand-written (not derived) so it doesn't require `M: Default` — every
+// field is `None` regardless of `M`. The all-`None` bundle is the
+// "no callbacks" case (tests, callback-free runs).
+impl<M: crate::nn::Module> Default for RankCallbacks<M> {
+    fn default() -> Self {
+        RankCallbacks {
+            checkpoint_fn: None,
+            epoch_fn: None,
+            eval_fn: None,
+            eval_dataset: None,
+            outer_optimizer_factory: None,
+        }
+    }
+}
+
+/// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
+/// `checkpoint_fn`, and future `eval_fn`).
+///
+/// One logical epoch transition produces one callback invocation, on
+/// the rank selected by this policy. The cluster looks like a single
+/// meta-GPU from the user's perspective; firing the same callback on
+/// every rank would multiply side effects (N file writes, N eval
+/// passes, etc.) for no benefit.
+///
+/// Default is [`Self::Fastest`] — on heterogeneous rigs the fastest
+/// rank has the most idle time at sync barriers, so eval / save / log
+/// runs as free compute. On a single-GPU run the only rank is
+/// trivially the fastest, so `Fastest` collapses to running on that
+/// rank — no special-case needed. Pin to a specific rank with
+/// [`Self::Rank`] when the research convention demands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EpochCallbackPolicy {
+    /// Fire on the explicitly-named **global rank** — the
+    /// cluster-wide rank index in `[0, world_size)`, where ranks are
+    /// assigned sequentially by worker order in the cluster topology
+    /// (worker 0 owns ranks `[0..N0)`, worker 1 owns `[N0..N0+N1)`,
+    /// etc.). On a 4-rank cluster across two 2-GPU hosts, `Rank(0)`
+    /// fires on the first rank of the first worker host, `Rank(3)`
+    /// fires on the last rank of the last host. Loud-errors at
+    /// builder validation if `n >= world_size`.
+    Rank(usize),
+    /// Fire on the rank with the lowest `smoothed_ms_per_batch`
+    /// (controller-resolved via ElChe). Sticky within a run: the
+    /// chosen rank is re-selected only on rank death. Honors
+    /// heterogeneous-DDP intuition — fastest rank has the most idle
+    /// time at sync barriers, so callbacks are "free compute". On
+    /// single-GPU runs the only rank trivially satisfies "fastest".
+    #[default]
+    Fastest,
+}
 
 // ---------------------------------------------------------------------------
 // Return type
@@ -205,58 +342,12 @@ pub struct TrainedState {
     pub buffers: Vec<Tensor>,
 }
 
-/// Aggregated epoch metrics from all DDP workers.
-///
-/// Available via [`DdpHandle::poll_metrics()`], [`DdpHandle::next_metrics()`],
-/// and the host-side [`crate::distributed::DdpBuilder::metrics_fn`] callback.
-/// The coordinator aggregates per-rank [`MetricsMsg`] into this structure once
-/// all ranks have reported for the same epoch; the same `EpochMetrics` reaches
-/// the callback (if registered) and the polling queue, so both surfaces compose.
-///
-/// # Example: explicit polling
-///
-/// ```ignore
-/// let handle = Trainer::builder(...).run()?;
-/// while let Some(m) = handle.next_metrics() {
-///     for (name, value) in &m.scalars {
-///         monitor.record_scalar(name, *value);
-///     }
-/// }
-/// let state = handle.join()?;
-/// ```
-///
-/// # Example: chained `.run()?.join()?` with `metrics_fn`
-///
-/// ```ignore
-/// Trainer::builder(model_factory, optim_factory, train_step)
-///     .dataset(dataset).batch_size(32).num_epochs(N)
-///     .metrics_fn(move |m| {
-///         println!("epoch {}: loss={:.4}", m.epoch, m.avg_loss);
-///         Ok(())
-///     })
-///     .run()?
-///     .join()?;
-/// ```
-#[derive(Clone, Debug)]
-pub struct EpochMetrics {
-    /// Epoch number (0-based).
-    pub epoch: usize,
-    /// Weighted-average scalar metrics across all ranks.
-    /// Each value is the batch-weighted mean.
-    pub scalars: HashMap<String, f64>,
-    /// Per-rank scalar metrics (index = rank).
-    pub per_rank: Vec<HashMap<String, f64>>,
-    /// Average loss across all ranks (batch-weighted).
-    pub avg_loss: f64,
-    /// Wall-clock epoch time (ms), max across ranks.
-    pub epoch_ms: f64,
-    /// Per-rank throughput in samples/ms (index = rank).
-    pub per_rank_throughput: Vec<f64>,
-    /// Per-rank batch share as fraction 0.0..1.0 (index = rank).
-    pub per_rank_batch_share: Vec<f64>,
-    /// CUDA device index per rank (for dashboard GPU tabs).
-    pub device_indices: Vec<u8>,
-}
+// `EpochMetrics` lives in the leaf `crate::metrics` module (plain data
+// consumed across nn / graph / distributed / monitor); re-exported here
+// so `distributed::EpochMetrics` and the crate-root path stay valid.
+pub use crate::metrics::EpochMetrics;
+// EpochMetrics ↔ EpochMetricsWire conversions live in
+// crate::distributed::wire_convert (one home for every msg↔wire mapping).
 
 // ---------------------------------------------------------------------------
 // Configuration enums
@@ -278,9 +369,18 @@ pub struct EpochMetrics {
 ///   is nudged down (tighter sync). Differs from Cadence only in epoch
 ///   dispatch (per-rank vs broadcast) in non-progressive mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ApplyPolicy {
-    /// Average after every batch (K=1). Equivalent to standard synchronous DDP.
-    /// Lowest risk of model divergence. Fast GPUs wait at the collective barrier.
+    /// Tightest reduce cadence with a standard-DDP-like EQUAL data split.
+    ///
+    /// Not per-batch lockstep: the reduce fires as soon as every alive
+    /// rank has made at least one step since the last reduce, and each
+    /// rank's contribution is work-weighted (sum-and-count) — on a
+    /// heterogeneous rig the fast GPU runs several steps per reduce
+    /// within its equal share instead of waiting at a per-batch
+    /// barrier, then idles once that share is exhausted. On a
+    /// homogeneous rig this degenerates to classic synchronous DDP
+    /// (one step per rank per reduce). Lowest risk of model divergence.
     Sync,
     /// Average every N batches where N is determined by ElChe's cadence strategy.
     /// The slow device sets the pace; fast devices process proportionally more
@@ -291,6 +391,28 @@ pub enum ApplyPolicy {
     /// (tighter sync). Differs from Cadence only in epoch dispatch
     /// (per-rank in non-progressive, identical in progressive mode).
     Async,
+}
+
+impl ApplyPolicy {
+    /// Whether this policy runs on a single step-clock with a HARD reduce /
+    /// epoch barrier: the coordinator never hands a rank a step that crosses
+    /// a barrier, so the fast rank is HELD at its window until the reduce
+    /// resets `steps_since_avg`, and no rank crosses an epoch boundary ahead
+    /// of the cohort. True for `Sync` and `Cadence`.
+    ///
+    /// `Async` is the one regime allowed bounded lookahead (overrunning its
+    /// window by `max_overshoot`), so it opts out.
+    ///
+    /// This is a property of the PACING policy alone — it is independent of
+    /// [`AverageBackend`] (whether the reduce moves over NCCL or CPU sockets
+    /// is transport, orthogonal to pacing). Gating these barriers on the
+    /// backend instead conflates the two axes: it silently means "NCCL => no
+    /// pacing", which is correct only because `Async` happens to be CPU-only
+    /// and is flatly wrong for NCCL `Cadence` (the fast rank then streams
+    /// across every epoch and the cohort wedges).
+    pub fn is_barrier_paced(&self) -> bool {
+        matches!(self, ApplyPolicy::Sync | ApplyPolicy::Cadence)
+    }
 }
 
 /// Controls HOW parameter averaging is performed.
@@ -309,6 +431,7 @@ pub enum ApplyPolicy {
 /// | **Fault tolerance** | Abort handles unblock stuck collectives | Coordinator timeout (5s) detects dead workers |
 /// | **Buffer averaging** | Natural (AllReduce averages everything) | Explicit (buffers averaged with equal weight) |
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AverageBackend {
     /// NCCL AllReduce in-place on GPU params. Default and recommended.
     ///
@@ -335,32 +458,22 @@ pub enum AverageBackend {
 /// All fields have sensible defaults. Use the builder methods to customize.
 #[derive(Clone, Debug)]
 pub struct DdpRunConfig {
-    /// ElChe overhead target (fraction of compute time). Default: 0.10.
-    pub overhead_target: Option<f64>,
-    /// Maximum anchor count (gradient staleness limit). Default: 200.
-    pub max_anchor: Option<usize>,
-    /// Initial ElChe anchor (batches before first sync). Default: 10.
-    pub anchor: Option<usize>,
-    /// Divergence threshold for the trend guardrail. Default: 0.05.
-    pub divergence_threshold: Option<f64>,
-    /// Disable the divergence guardrail entirely. Default: false (enabled).
-    /// When true, ElChe's overhead auto-tune handles cadence alone.
-    pub no_divergence_guard: bool,
-    /// Maximum batch lead of fastest over slowest worker.
-    /// `Some(0)` = strict lockstep. `None` = unlimited. Default: `None`.
-    pub max_batch_diff: Option<usize>,
+    /// The DDP coordination/convergence STRATEGY — the single source of
+    /// truth for mode (canonical), cadence tuning (anchor / max_anchor /
+    /// min_anchor / overhead_target / max_batch_diff), the convergence
+    /// guard (`convergence_guard` override + `divergence_threshold` /
+    /// `no_divergence_guard` primitives), `partition_ratios`,
+    /// `easgd_alpha`, `meta_controller`, and `max_overshoot`. The
+    /// builder's `policy`/`backend` are reconciled into `elche.mode` at
+    /// build via `ElCheMode::from_parts` (the inverse of `mode.split()`).
+    /// Everything else on `DdpRunConfig` is run-scope / topology.
+    pub elche: crate::distributed::ElCheConfig,
     /// Save a checkpoint every N global epochs.
     /// `None` = no checkpointing. Default: `None`.
     pub checkpoint_every: Option<usize>,
     /// Timeout for CPU averaging snapshot collection (seconds). Default: 5.
     /// Only applies to [`AverageBackend::Cpu`].
     pub snapshot_timeout_secs: u64,
-    /// Explicit per-rank partition ratios (e.g. `[0.7, 0.3]`).
-    ///
-    /// When set, disables automatic throughput-based rebalancing.
-    /// Ratios must sum to approximately 1.0. Length must match `world_size`.
-    /// Use this when you know your hardware and want fixed data splits.
-    pub partition_ratios: Option<Vec<f64>>,
     /// Enable progressive chunk dispatch for cold-start calibration.
     ///
     /// Instead of sending the full epoch partition upfront, the coordinator
@@ -376,23 +489,49 @@ pub struct DdpRunConfig {
     /// spikes on any GPU are bounded before they propagate through
     /// AllReduce averaging.
     pub max_grad_norm: Option<f64>,
+    /// Enable the device-resident sample pool on rank workers: leftover
+    /// VRAM (measured after the first training step) retains samples so
+    /// later epochs gather them on device instead of re-uploading them.
+    /// Sizing is automatic; `FLODL_VRAM_POOL=off` (or `0`) in a
+    /// worker's `env:` block is the runtime kill-switch. Default:
+    /// `true`.
+    pub vram_pool: bool,
+    /// Augmentation multiplicity: each sample appears `k` times per
+    /// epoch in the shared shuffle (pick space `len()*k`). Pure
+    /// scheduling — data variation comes from `transform`, keyed per
+    /// pick. Default: `1`.
+    pub augment: usize,
+    /// Deterministic delivery transform applied on each rank, keyed by
+    /// [`crate::data::PickKey`] — the sanctioned augmentation seam.
+    /// Runs at the worker's delivery point on freshly assembled rows;
+    /// the staging tiers retain raw samples only. Default: `None`.
+    pub transform: Option<crate::data::TransformFn>,
+    /// Fraction of **total** VRAM each rank worker may use for its data
+    /// plane (prefetch channel + device sample pool), clamped to
+    /// `[0.50, 0.99]` at the sizing sites. Default: `0.90` (the solo
+    /// loader's `vram_max_usage` default).
+    pub vram_max_usage: f64,
+    /// Fraction of currently **available** host RAM each rank's staging
+    /// tiers may retain (co-hosted ranks split it consumption-
+    /// proportionally); `0.0` disables staging retention. Default:
+    /// `0.50` (the solo loader's `ram_max_usage` default).
+    pub ram_max_usage: f64,
+    /// Pinned RAM sample retention in each rank's staging tier (see
+    /// [`crate::distributed::TrainerConfig::sample_cache`]). `false`
+    /// pins the read-through cache's budget to zero; the flow window
+    /// keeps the whole staging share. Default: `true`.
+    pub sample_cache: bool,
+    /// Local-disk overflow tier under each rank's sample cache, in GB
+    /// (see [`crate::distributed::TrainerConfig::disk_stage_gb`]).
+    /// Default: `0` (off).
+    pub disk_stage_gb: u64,
+    /// Directory for the disk-stage pack file (default: system temp dir).
+    pub disk_stage_dir: Option<std::path::PathBuf>,
     /// Optional high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events (sync,
     /// epoch boundaries, anchor changes, throttle) into the timeline.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
-    /// Maximum batches past the planned sync point any GPU may execute.
-    ///
-    /// Controls how aggressively fast GPUs stream into the next epoch's
-    /// data when the current epoch's pool is exhausted. This is NOT the
-    /// same as `max_batch_diff` (which limits divergence between GPUs).
-    ///
-    /// `None` = auto-tuned from convergence feedback: starts conservative
-    /// (`max(2, total_batches / 100)` capped at 5), grows by +1 after
-    /// each successful sync with good convergence, resets on divergence.
-    ///
-    /// Default: `None` (auto).
-    pub max_overshoot: Option<usize>,
     /// LR scaling ratio for multi-GPU training. Default: `1.0`.
     ///
     /// Controls how much the learning rate is scaled with `world_size`.
@@ -406,6 +545,81 @@ pub struct DdpRunConfig {
     ///
     /// Tune this if convergence degrades at higher GPU counts.
     pub lr_scale_ratio: f64,
+    /// Checkpoint bundle stem for the cluster-mode
+    /// save-on-unrecoverable-failure path. When set on a cluster
+    /// run, workers persist a `<save_path>.fdl` / `.optim` /
+    /// `.meta.json` bundle on
+    /// `ShutdownWithSave`
+    /// receipt; see [`crate::distributed::CheckpointBundle`].
+    /// Required for the via-coord cluster orchestrator entry;
+    /// optional for non-cluster builds.
+    ///
+    /// **Multi-host: this stem must resolve to shared storage.** The
+    /// bundle is split across hosts and each piece is written on its
+    /// writer's host: each surviving worker writes its `.fdl` / `.optim`
+    /// on its own host, while the controller writes the `.meta.json`
+    /// sidecar (and reads it back on [`Self::resume_from`]) on ITS host.
+    /// A host-local path scatters the bundle and breaks resume. On a
+    /// genuine multi-host launch the framework prints a one-time reminder;
+    /// single-box multi-GPU is unaffected (one host owns every piece).
+    pub save_path: Option<String>,
+
+    /// Threshold for declaring a cluster run unrecoverable. When the
+    /// dead-rank count reaches this limit, the coord broadcasts
+    /// `ShutdownWithSave` to all survivors. `None` = no user-configured
+    /// threshold; backend hard limits still apply (NCCL needs 2+
+    /// survivors; CPU needs at least 1). Only honored on cluster-mode
+    /// runs; non-cluster builds ignore this field.
+    pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
+
+    /// Cluster-mode heartbeat staleness threshold (seconds). If a
+    /// rank's last `TimingMsg` frame is older than this, the
+    /// controller declares the rank dead and triggers the
+    /// elastic-membership / max_failure flow. `None` = use the
+    /// controller's built-in default (currently 30s). Only honored on
+    /// cluster-mode via_coord runs.
+    pub heartbeat_timeout_secs: Option<u64>,
+
+    /// Which rank fires user-supplied per-epoch callbacks (`epoch_fn`,
+    /// `checkpoint_fn`, `eval_fn`). See [`EpochCallbackPolicy`] for the
+    /// variants. Default [`EpochCallbackPolicy::Fastest`].
+    pub epoch_callback_policy: EpochCallbackPolicy,
+
+    /// Cadence (in epochs) for the user-supplied `eval_fn`. `Some(n)`
+    /// triggers an eval dispatch every `n` epochs from the controller's
+    /// `dispatch_epoch`. `None` or `0` disables. Builder sugar:
+    /// [`DdpBuilder::eval_every`] (accepts [`EvalCadence`]).
+    pub eval_every_epochs: Option<usize>,
+
+    /// Checkpoint bundle stem for resume. When set, the cluster
+    /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
+    /// the controller with the saved trajectory state (epoch,
+    /// global_step, sync_round, ElChe state including TrendGuard
+    /// history), and kicks the launcher off at `meta.epoch` instead of
+    /// `0`.
+    ///
+    /// Model parameters and optimizer state are NOT auto-loaded from
+    /// the bundle by this field — the user's `model_factory` /
+    /// `optim_factory` closures are the right place for that (call
+    /// [`crate::nn::load_checkpoint_file`] /
+    /// [`crate::nn::optim::Stateful::load_state_file`] inside them).
+    /// This field carries the controller-side trajectory only.
+    ///
+    /// Multi-host: like [`Self::save_path`], this stem must resolve to
+    /// shared storage visible to every host (the controller reads the
+    /// meta on its host; ranks re-seed from the same stem on theirs).
+    ///
+    /// `None` = fresh run. Builder sugar: [`DdpBuilder::resume_from`].
+    pub resume_from: Option<String>,
+
+    /// Arm a one-shot coverage-granular checkpoint at the first reduce
+    /// where the cohort reaches this epoch. Progressive modes only
+    /// (Cadence / Async — a Sync run has no chunk pools to snapshot).
+    /// Pairs with [`Self::save_path`] for the bundle stem: the forged
+    /// consensus model lands in `<stem>.fdl` and the trajectory +
+    /// data-coverage in `<stem>.meta.json`. `None` = no mid-run
+    /// checkpoint. Builder sugar: [`DdpBuilder::checkpoint_at_epoch`].
+    pub checkpoint_at_epoch: Option<usize>,
 }
 
 impl Default for DdpRunConfig {
@@ -418,51 +632,122 @@ impl DdpRunConfig {
     /// Create a default config (all defaults).
     pub fn new() -> Self {
         DdpRunConfig {
-            overhead_target: None,
-            max_anchor: None,
-            anchor: None,
-            divergence_threshold: None,
-            no_divergence_guard: false,
-            max_batch_diff: None,
+            elche: crate::distributed::ElCheConfig::default(),
             checkpoint_every: None,
             snapshot_timeout_secs: 5,
-            partition_ratios: None,
             progressive_dispatch: None,
             max_grad_norm: None,
+            vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
+            augment: 1,
+            transform: None,
+            vram_max_usage: 0.90,
+            ram_max_usage: 0.50,
+            sample_cache: true,
+            disk_stage_gb: 0,
+            disk_stage_dir: None,
             timeline: None,
-            max_overshoot: None,
             lr_scale_ratio: 1.0,
+            save_path: None,
+            max_failure: None,
+            heartbeat_timeout_secs: None,
+            epoch_callback_policy: EpochCallbackPolicy::default(),
+            eval_every_epochs: None,
+            resume_from: None,
+            checkpoint_at_epoch: None,
         }
+    }
+
+    /// Resume a cluster run from a previously-saved checkpoint bundle.
+    ///
+    /// `stem` is the path stem used at save time (the value passed to
+    /// [`Self::with_save_path`] / [`DdpBuilder::save_path`]). The
+    /// orchestrator reads `<stem>.meta.json` at `.run()` time and seeds
+    /// the controller with the saved trajectory state. See
+    /// [`Self::resume_from`] for details on what is and isn't restored.
+    pub fn with_resume_from(mut self, stem: impl Into<String>) -> Self {
+        self.resume_from = Some(stem.into());
+        self
+    }
+
+    /// Arm a one-shot coverage-granular checkpoint at the given epoch.
+    /// Pairs with [`Self::with_save_path`]. See [`Self::checkpoint_at_epoch`].
+    pub fn with_checkpoint_at_epoch(mut self, epoch: usize) -> Self {
+        self.checkpoint_at_epoch = Some(epoch);
+        self
+    }
+
+    /// Override which rank fires user-supplied per-epoch callbacks.
+    /// See [`EpochCallbackPolicy`]. Default is `Fastest`.
+    pub fn with_epoch_callback_policy(mut self, policy: EpochCallbackPolicy) -> Self {
+        self.epoch_callback_policy = policy;
+        self
+    }
+
+    /// Set the cluster-mode heartbeat staleness threshold (seconds).
+    /// See [`Self::heartbeat_timeout_secs`].
+    pub fn with_heartbeat_timeout_secs(mut self, secs: u64) -> Self {
+        self.heartbeat_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the checkpoint bundle stem for cluster-mode unrecoverable-
+    /// failure persistence. See
+    /// [`crate::distributed::CheckpointBundle`] for the layout.
+    pub fn with_save_path(mut self, path: impl Into<String>) -> Self {
+        self.save_path = Some(path.into());
+        self
+    }
+
+    /// Set the unrecoverable-failure threshold for cluster mode.
+    pub fn with_max_failure(
+        mut self,
+        threshold: crate::distributed::max_failure::MaxFailureThreshold,
+    ) -> Self {
+        self.max_failure = Some(threshold);
+        self
     }
 
     /// Set the AllReduce overhead target (fraction of compute time).
     pub fn with_overhead_target(mut self, target: f64) -> Self {
-        self.overhead_target = Some(target);
+        self.elche.overhead_target = Some(target);
         self
     }
 
     /// Set the maximum anchor count.
     pub fn with_max_anchor(mut self, max: usize) -> Self {
-        self.max_anchor = Some(max);
+        self.elche.max_anchor = Some(max);
+        self
+    }
+
+    /// Set the minimum anchor count (auto-tune floor).
+    ///
+    /// Forces the overhead auto-tune above its natural equilibrium. Combined
+    /// with `with_max_anchor(min)` (same value), pins the anchor at a fixed
+    /// cadence — useful for fixed-k experiments. The convergence guard and
+    /// divergence nudge-down paths BYPASS this floor; pair with
+    /// `with_convergence_guard(NoGuard)` + `with_no_divergence_guard()` for
+    /// truly hard pinning.
+    pub fn with_min_anchor(mut self, min: usize) -> Self {
+        self.elche.min_anchor = Some(min);
         self
     }
 
     /// Set the initial anchor count.
     pub fn with_anchor(mut self, anchor: usize) -> Self {
-        self.anchor = Some(anchor);
+        self.elche.anchor = anchor;
         self
     }
 
     /// Set the divergence threshold for the trend guardrail.
     pub fn with_divergence_threshold(mut self, threshold: f64) -> Self {
-        self.divergence_threshold = Some(threshold);
+        self.elche.divergence_threshold = Some(threshold);
         self
     }
 
     /// Disable the divergence guardrail. ElChe's overhead auto-tune
     /// handles cadence alone. Use when you know your workload is stable.
     pub fn with_no_divergence_guard(mut self) -> Self {
-        self.no_divergence_guard = true;
+        self.elche.no_divergence_guard = true;
         self
     }
 
@@ -471,7 +756,7 @@ impl DdpRunConfig {
     /// `0` = strict lockstep (sync DDP behavior). Workers that exceed
     /// this lead are paused until the slowest catches up.
     pub fn with_max_batch_diff(mut self, max: usize) -> Self {
-        self.max_batch_diff = Some(max);
+        self.elche.max_batch_diff = Some(max);
         self
     }
 
@@ -483,7 +768,7 @@ impl DdpRunConfig {
     ///
     /// `0` disables cross-epoch streaming. Default: auto-tuned.
     pub fn with_max_overshoot(mut self, max: usize) -> Self {
-        self.max_overshoot = Some(max);
+        self.elche.max_overshoot = Some(max);
         self
     }
 
@@ -493,6 +778,15 @@ impl DdpRunConfig {
     /// Errors from the checkpoint function are logged but do not stop training.
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
         self.checkpoint_every = Some(n);
+        self
+    }
+
+    /// Fire the user-supplied `eval_fn` every `n` epochs from the
+    /// controller's `dispatch_epoch`. `n == 0` disables. Builder
+    /// sugar [`DdpBuilder::eval_every`] takes the [`EvalCadence`]
+    /// enum and forwards the integer here.
+    pub fn with_eval_every_epochs(mut self, n: usize) -> Self {
+        self.eval_every_epochs = if n == 0 { None } else { Some(n) };
         self
     }
 
@@ -511,7 +805,7 @@ impl DdpRunConfig {
     /// Disables automatic throughput-based rebalancing. Ratios are normalized
     /// so they sum to 1.0. Length must match `world_size` at launch time.
     pub fn with_partition_ratios(mut self, ratios: &[f64]) -> Self {
-        self.partition_ratios = Some(ratios.to_vec());
+        self.elche.partition_ratios = Some(ratios.to_vec());
         self
     }
 
@@ -537,6 +831,63 @@ impl DdpRunConfig {
         self
     }
 
+    /// Enable / disable the device-resident sample pool on rank
+    /// workers (see [`Self::vram_pool`]). Default: enabled.
+    pub fn with_vram_pool(mut self, enabled: bool) -> Self {
+        self.vram_pool = enabled;
+        self
+    }
+
+    /// Augmentation multiplicity (see [`Self::augment`]).
+    pub fn with_augment(mut self, k: usize) -> Self {
+        self.augment = k.max(1);
+        self
+    }
+
+    /// Delivery transform (see [`Self::transform`]).
+    pub fn with_transform(
+        mut self,
+        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> crate::tensor::Result<Vec<Tensor>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.transform = Some(crate::data::TransformFn::new(f));
+        self
+    }
+
+    /// VRAM share for each rank's data plane (see
+    /// [`Self::vram_max_usage`]).
+    pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {
+        self.vram_max_usage = max_usage.clamp(0.50, 0.99);
+        self
+    }
+
+    /// Host-RAM share for each rank's staging tiers (see
+    /// [`Self::ram_max_usage`]).
+    pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
+        self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Pinned RAM sample retention (see [`Self::sample_cache`]).
+    pub fn with_sample_cache(mut self, enabled: bool) -> Self {
+        self.sample_cache = enabled;
+        self
+    }
+
+    /// Local-disk overflow tier in GB (see [`Self::disk_stage_gb`]).
+    pub fn with_disk_stage(mut self, gb: u64) -> Self {
+        self.disk_stage_gb = gb;
+        self
+    }
+
+    /// Disk-stage directory (see [`Self::disk_stage_dir`]).
+    pub fn with_disk_stage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.disk_stage_dir = Some(dir.into());
+        self
+    }
+
     /// Attach a high-frequency system timeline for profiling DDP behavior.
     ///
     /// When set, the coordinator and workers inject training events
@@ -554,6 +905,42 @@ impl DdpRunConfig {
         self.lr_scale_ratio = ratio;
         self
     }
+
+    /// Allow or suppress ElChe's anchor relax-up on stable convergence.
+    ///
+    /// Default: `false` (off). Set to `true` to enable: each `Stable`
+    /// convergence-guard verdict will grow the anchor via
+    /// `el_che.relax_anchor_up()`. Opt in when measuring the relax-up
+    /// regime; the default keeps the anchor under overhead-based control
+    /// alone, matching pre-relax-up behavior.
+    pub fn with_elche_relax_up(mut self, enabled: bool) -> Self {
+        self.elche.relax_up = enabled;
+        self
+    }
+
+    /// Set the EASGD elastic averaging weight α. Must be in `(0, 1]`.
+    /// `None` (default) is full overwrite (equivalent to α=1.0 with the
+    /// fast copy_ path). Values in `(0, 1)` enable elastic blending on
+    /// the cpu-async path; α=1.0 also enables blending but is functionally
+    /// identical to the overwrite default. See `easgd_alpha` field docs
+    /// for the formula and reference.
+    pub fn with_easgd_alpha(mut self, alpha: f64) -> Self {
+        assert!(
+            alpha > 0.0 && alpha <= 1.0,
+            "easgd_alpha must be in (0, 1], got {alpha}"
+        );
+        self.elche.easgd_alpha = Some(alpha);
+        self
+    }
+
+    /// Enable the LR-aware meta-controller above ElChe.
+    ///
+    /// On by default. See the `meta_controller` field for behavior
+    /// and `crate::distributed::lr_event_meta` for the design.
+    pub fn with_meta_controller(mut self, enabled: bool) -> Self {
+        self.elche.meta_controller = enabled;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,13 +953,18 @@ impl DdpRunConfig {
 /// Exiting is sent exactly once, before the worker thread terminates, so the
 /// coordinator never sends NCCL collectives to a dead worker.
 #[derive(Clone, Debug)]
-pub enum TimingMsg {
+pub(crate) enum TimingMsg {
     /// Per-batch timing report.
     Batch {
         /// Which GPU sent this.
         rank: usize,
-        /// Wall-clock time for this batch (ms).
+        /// Compute-only wall-clock time for this batch (ms): the `train_step`.
         batch_ms: f64,
+        /// Per-batch DATA wall (ms): prefetch/H2D stall (prefetch path) or
+        /// dataset fetch+to-device (sync path). `batch_ms + data_ms` is the
+        /// rank's realized DELIVERED per-batch wall; the coordinator
+        /// accumulates it continuously (race-free, like `batch_ms`).
+        data_ms: f64,
         /// Worker's local step counter (monotonically increasing).
         step_count: usize,
         /// L2 norm of all parameters (computed periodically, not every batch).
@@ -589,7 +981,7 @@ pub enum TimingMsg {
     ///
     /// Satisfies the coordinator's `nccl_ack` check (`step_count >
     /// nccl_sync_step`) without inflating `steps_since_avg`. Using
-    /// [`TimingMsg::Batch`] here would add a phantom batch per sync per
+    /// `TimingMsg::Batch` here would add a phantom batch per sync per
     /// rank, inflating `global_step` and firing the LR scheduler early.
     SyncAck {
         /// Which GPU sent this.
@@ -599,19 +991,116 @@ pub enum TimingMsg {
         /// Weight-space divergence from the AllReduce:
         /// `||params_before - params_after|| / ||params_after||`.
         divergence: Option<f64>,
+        /// Post-AllReduce consensus L2 norm `||params_after||`. Identical
+        /// across ranks (all params identical post-AllReduce); the coordinator
+        /// can take any rank's value. Used for longitudinal meta-velocity
+        /// tracking. `None` when divergence is also `None`.
+        post_norm: Option<f64>,
+        /// Pre-AllReduce per-rank L2 norm `||params_before||_i`. With
+        /// `divergence` and `post_norm` this gives the cosine-similarity /
+        /// magnitude-shift decomposition (MSF/SWA directional vs magnitude
+        /// split). `None` when divergence is also `None`.
+        pre_norm: Option<f64>,
     },
-    /// Worker is about to exit. Coordinator must stop including this rank
-    /// in collectives before processing any further messages.
+    /// Worker completed CLEANLY and is about to exit. Coordinator must
+    /// stop including this rank in collectives before processing any
+    /// further messages. Clean completion ONLY: this latches the rank
+    /// as `exited`, which suppresses both death detectors for it
+    /// (heartbeat staleness + reported child exits) — an error exit
+    /// must never send it, or the death goes unprocessed and a cadence
+    /// cohort wedges on the dead rank's unfinished window.
     Exiting {
         /// Which GPU is exiting.
         rank: usize,
+    },
+    /// Per-batch learning rate snapshot from a worker, used by the LR-aware
+    /// meta-controller to detect sharp drops between averaging cycles.
+    ///
+    /// Cheap fire-and-forget message: just a `(rank, lr)` pair. The
+    /// coordinator caches the most recent value per rank and feeds it into
+    /// [`crate::distributed::lr_event_meta::LrEventMeta::observe`] each
+    /// averaging cycle. Workers can choose to emit only on LR change or on
+    /// every batch — receiver is idempotent.
+    LrUpdate {
+        /// Which GPU sent this.
+        rank: usize,
+        /// Current optimizer learning rate.
+        lr: f64,
+    },
+    /// Cooperative-tier user intent (request, not command) from
+    /// [`Worker::request_eval`](Worker::request_eval) /
+    /// [`request_checkpoint`](Worker::request_checkpoint). Fire-and-forget on
+    /// `timing_tx`; the controller folds it into its next coherent
+    /// role-elected dispatch. No-op on the single-device path (no controller).
+    Intent {
+        /// Which rank made the request (diagnostic; the controller's policy,
+        /// not this rank, decides where the folded task runs).
+        rank: usize,
+        /// What the user asked for.
+        kind: crate::distributed::wire::IntentKind,
+    },
+    /// Periodic liveness signal from a cluster worker's heartbeat
+    /// thread. Cluster-only. See `Heartbeat` for
+    /// the failure-detection rationale.
+    Heartbeat {
+        /// Which rank sent this.
+        rank: usize,
+        /// Worker's local step counter at emission time. Diagnostic.
+        step_count: usize,
+    },
+    /// Cluster-mode "snapshot ready, entering AllReduce barrier"
+    /// marker emitted by the worker's CPU-averaging param bridge.
+    /// See `SnapshotReady`.
+    SnapshotReady {
+        /// Which rank sent this.
+        rank: usize,
+    },
+    /// Response from the chosen surviving rank to coord's
+    /// `ControlMsg::RequestNewNcclId`: 128 raw bytes of a freshly
+    /// generated `NcclUniqueId`.
+    NewNcclIdGenerated {
+        /// Sender rank (so coord validates against its request).
+        rank: usize,
+        /// 128 bytes of NCCL unique-id.
+        uid_bytes: Vec<u8>,
+    },
+    /// Eval result from the chosen rank back to the coord. See
+    /// `EvalResult`.
+    EvalResult {
+        rank: usize,
+        schedule_id: u64,
+        epoch: u64,
+        metric: f64,
+        elapsed_ms: f64,
+        error: Option<String>,
+    },
+    /// Checkpoint result from the role rank back to the coord. See
+    /// `CheckpointResult`.
+    /// Reported on success and failure; the coord decides the next
+    /// action (retry on different live rank, give up + exhaust, time
+    /// exclusion from the coord's window ledger).
+    CheckpointResult {
+        rank: usize,
+        version: u64,
+        elapsed_ms: f64,
+        error: Option<String>,
+    },
+    /// Post-fire notice from the rank that ran `epoch_fn`. See
+    /// `EpochFnElapsed`.
+    /// Reported once per `epoch_fn` invocation; the coord time-excludes
+    /// it from the coord's window ledger and updates
+    /// `last_epoch_fn_elapsed_ms_ewma` for callback-aware scheduling.
+    EpochFnElapsed {
+        rank: usize,
+        epoch: usize,
+        elapsed_ms: f64,
     },
 }
 
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
 ///
 /// Fire-and-forget: worker sends this and immediately starts the next epoch.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MetricsMsg {
     /// Which GPU sent this.
     pub rank: usize,
@@ -621,10 +1110,30 @@ pub struct MetricsMsg {
     pub avg_loss: f64,
     /// Number of batches processed in this epoch.
     pub batches_processed: usize,
-    /// Wall-clock time for this epoch (ms).
+    /// Wall-clock time for this epoch (ms). Includes any post-completion
+    /// idle time waiting for collective sync. Kept for backwards-compatibility
+    /// and as a coarse outer-bound timing; do not use as a balancer denominator
+    /// for heterogeneous DDP — see `share_complete_ms`.
     pub epoch_ms: f64,
     /// Total samples processed this epoch (batches * batch_size).
     pub samples_processed: usize,
+    /// Time the rank spent on its assigned work, from epoch start to its last
+    /// batch finishing (ms). Includes data-pipeline waits (the rank's own
+    /// pipeline limitation), excludes post-completion sync-barrier idle.
+    /// This is the honest balancer denominator: tput = samples_processed
+    /// / share_complete_ms reflects the rank's actual capacity.
+    pub share_complete_ms: f64,
+    /// Pure compute time within the epoch (sum of forward+backward+optimizer
+    /// step durations, ms). Diagnostic only — not used by the balancer.
+    /// Useful for capacity / saturation analysis.
+    pub compute_only_ms: f64,
+    /// Cumulative time the rank was blocked waiting for data (ms).
+    /// On the prefetch path this is time spent in `recv()` on the prefetch
+    /// channel; on the sync path this is time spent in `dataset.get_batch()`
+    /// plus host-to-device transfer. Diagnostic only: surfacing this drives
+    /// prefetch-tuning decisions, not balancer share allocation. Feeding
+    /// it back to the balancer would create a contaminated control loop.
+    pub data_starve_ms: f64,
     /// Named scalar metrics recorded via [`record_scalar()`] during this epoch.
     /// Each value is `(sum, count)` for computing the mean.
     pub scalars: HashMap<String, (f64, usize)>,
@@ -679,7 +1188,7 @@ pub struct AveragedParams {
 
 /// Control signals from the coordinator to a GPU worker.
 #[derive(Debug)]
-pub enum ControlMsg {
+pub(crate) enum ControlMsg {
     /// \[CPU path\] Request parameter snapshot for averaging.
     RequestParams,
     /// \[CPU path\] Deliver averaged parameters.
@@ -694,6 +1203,55 @@ pub enum ControlMsg {
     /// reconstruct their sample indices from the global permutation using the
     /// plan's offset and size.
     StartEpoch(EpochPlan),
+    /// Mid-epoch partition extension. Coord-emitted when redistributing
+    /// a freshly-dead rank's un-processed samples onto survivors so the
+    /// epoch still processes its intended sample count. Worker appends
+    /// the resolved indices to its in-flight `partition` Vec; the
+    /// epoch loop re-checks `partition.len()` each iteration so the
+    /// new batches are processed before declaring the epoch complete.
+    ExtendPartition {
+        /// Offset into the global epoch permutation where the new
+        /// slice starts (resolved via the same `make_partition` call
+        /// the worker would use for `StartEpoch`).
+        partition_offset: usize,
+        /// Number of additional sample indices to append.
+        partition_size: usize,
+    },
+    /// Coord-emitted notification that a peer rank has been declared
+    /// dead. The cluster-worker's inbound bridge converts this into
+    /// a local-ledger update so the NCCL watchdog thread can react;
+    /// it is NOT dispatched to the inner GpuWorker because the inner
+    /// is typically blocked in an in-flight NCCL collective and
+    /// cannot service control messages until the watchdog aborts the
+    /// comm. See `DeclareDead`. Fieldless: the inbound bridge reads the
+    /// `ControlMsgWire::DeclareDead { rank }` payload directly into the
+    /// local ledger; this worker-facing token carries no payload because
+    /// the inner GpuWorker never consumes it.
+    DeclareDead,
+    /// Coord-emitted directive to rebuild the local NCCL comm with
+    /// the shrunken cohort. Sent after one or more `DeclareDead`s.
+    /// See `NewNcclSession`. Fieldless for the same reason as
+    /// [`DeclareDead`](Self::DeclareDead): the bridge stages the
+    /// `ControlMsgWire::NewNcclSession` payload into the session mailbox;
+    /// the inner GpuWorker never reads it off this token.
+    NewNcclSession,
+    /// Coord-emitted request to generate a fresh NCCL unique-id and
+    /// ship its bytes back via the timing channel
+    /// (`TimingMsg::NewNcclIdGenerated`). Only one rank receives
+    /// this per re-rendezvous cycle (the lowest-numbered survivor).
+    /// See `RequestNewNcclId`.
+    RequestNewNcclId,
+    /// The rank's data-reservation view: run-stream `segments` of
+    /// `(epoch, spans)` in walk order (own span first, truing margins
+    /// last per segment; cross-epoch segments walk into the next epoch
+    /// while this one trains) plus the current `counts` schedule for
+    /// host-share budgeting. Forwarded to the background stager;
+    /// purely advisory (allocation stays `StartEpoch`-driven), latest
+    /// wins.
+    StageAdvisory {
+        counts: Vec<usize>,
+        segments: Vec<(usize, Vec<(usize, usize)>)>,
+    },
     /// Worker is too far ahead: block until the next real command arrives.
     /// Sent when the worker's batch lead exceeds `ElChe::max_batch_diff`.
     Throttle,
@@ -703,18 +1261,123 @@ pub enum ControlMsg {
     /// sync point. Workers use this to compute per-batch LR:
     /// `scheduler.lr(global_step + steps_since_avg)`.
     SetGlobalStep(usize),
-    /// Save a checkpoint from rank 0 after averaging.
+    /// Coord-emitted directive to persist a checkpoint bundle for the
+    /// given `version`. Targeted: only the rank whose `rank ==
+    /// target_rank` runs its `checkpoint_fn`; other ranks receiving
+    /// this frame silently no-op. The coord owns role assignment
+    /// (sticky `checkpoint_role` with failover on rank death or
+    /// `CheckpointResult.error`); the worker never decides whether
+    /// it is the checkpointer.
+    ///
+    /// Mirrors `Checkpoint`.
+    /// In threaded DDP, the coord still broadcasts to every worker's
+    /// mpsc channel (same as before) — the `target_rank` field tells
+    /// each worker to no-op unless it matches its own rank, preserving
+    /// the single-checkpointer semantic without per-worker dispatch.
     Checkpoint {
-        /// Version number (averaging event count in multi-GPU, epoch in single-GPU).
+        /// Version (averaging event count in multi-GPU, epoch in single-GPU).
         version: u64,
+        /// Rank that should execute `checkpoint_fn`. `usize::MAX` is
+        /// reserved for v2 controller-as-checkpointer (CPU-async
+        /// mode); the worker treats it as "not me" and no-ops.
+        target_rank: usize,
+    },
+    /// Run the user's [`EvalFn`] on the rank's current model + eval
+    /// dataset. Targeted: only the rank whose `rank == target_rank`
+    /// runs; others silently no-op. Mirrors
+    /// `ExecuteEvalCallback`.
+    ExecuteEvalCallback {
+        schedule_id: u64,
+        epoch: u64,
+        target_rank: usize,
+    },
+    /// Coord-pushed notification that the rank designated to fire the
+    /// user-supplied `epoch_fn` has been resolved. Worker stores this
+    /// in its local `epoch_callback_role` and consults it at every
+    /// epoch transition. Mirrors
+    /// `SetEpochCallbackRole`.
+    SetEpochCallbackRole {
+        rank: usize,
     },
     /// Shut down this worker.
     Shutdown,
+    /// Persist a checkpoint bundle to the configured `save_path` then
+    /// shut down. Emitted by the cluster coord when the run is
+    /// unrecoverable (max_failure threshold breached, or NCCL cohort
+    /// below 2 ranks). Workers write
+    /// [`crate::distributed::CheckpointBundle`] members; rank 0 is the
+    /// canonical writer for the model + meta files. See
+    /// `ShutdownWithSave`.
+    ShutdownWithSave {
+        /// Why the cluster is saving + exiting; recorded in the
+        /// `.meta.json` for post-mortem inspection.
+        reason: crate::distributed::checkpoint_meta::SaveReason,
+    },
+    /// Coord-broadcast aggregated [`EpochMetrics`] for the just-completed
+    /// epoch. Each rank's worker absorbs this into its local `Graph` so
+    /// `latest_metrics()` / `graph_gpu_metrics()` surface the global
+    /// cross-rank view (user-facing UX parity: `monitor.log(&model)`
+    /// shows the same aggregated view regardless of single-GPU /
+    /// local-multi-GPU / cluster). See
+    /// `EpochAggregated`.
+    EpochAggregated(EpochMetrics),
+    /// Coord-broadcast eval result for a completed callback (final canonical
+    /// eval or an intent-/cadence-driven one). The cooperative [`Worker`]
+    /// forwards this to its eval stream so `poll_eval()` surfaces the
+    /// controller-elected metric; other tiers ignore it. See
+    /// [`crate::distributed::wire::ControlMsgWire::EvalBroadcast`].
+    EvalBroadcast { epoch: usize, metric: f64 },
+    /// NCCL consensus checkpoint: write the elected rank's CURRENT model
+    /// (post-collective consensus) to `<save_path>.fdl`. See
+    /// [`crate::distributed::wire::ControlMsgWire::SaveConsensusModel`]. No
+    /// `.optim`, no shutdown; the worker no-ops unless `target_rank` matches.
+    SaveConsensusModel {
+        /// Elected rank that should write the consensus model.
+        target_rank: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Initial setup
 // ---------------------------------------------------------------------------
+
+/// Default base seed for deterministic per-epoch shuffling across the DDP
+/// paths (single-host fallback, cluster rank entry, coordinator dispatch).
+///
+/// The epoch `e` permutation is `Rng::seed(SHUFFLE_BASE_SEED + e)` (see
+/// `make_partition` and [`crate::data::RandomSampler`]). Coverage-granular
+/// resume records this value in
+/// [`crate::distributed::CoverageBlock::seed`] so a resumed run can verify it
+/// re-shuffles over the SAME index space; changing it between save and resume
+/// invalidates recorded coverage. Single source of truth — every
+/// `WorkerConfig.seed` default and the coverage snapshot read it from here.
+pub const SHUFFLE_BASE_SEED: u64 = 42;
+
+/// Resolve the data-shuffle base seed for a run.
+///
+/// On **resume** the seed is read from the checkpoint meta's
+/// [`CoverageBlock::seed`](crate::distributed::CoverageBlock) so the resumed
+/// permutation reproduces the saved one by *reading* the recorded value, not
+/// by assuming the build's [`SHUFFLE_BASE_SEED`] still matches it. Every role
+/// (coordinator + each rank) resolves it from the same meta file, so the value
+/// is consistent across the cohort without a broadcast. A fresh run, or a meta
+/// with no coverage block (e.g. a clean-boundary save), falls back to
+/// [`SHUFFLE_BASE_SEED`]. Errors loudly if `resume_from` is set but the meta
+/// can't be read — a silent fallback could desync a worker's permutation from
+/// the recorded coverage.
+pub(crate) fn resolve_shuffle_seed(resume_from: Option<&str>) -> crate::tensor::Result<u64> {
+    let Some(stem) = resume_from else {
+        return Ok(SHUFFLE_BASE_SEED);
+    };
+    let meta = crate::distributed::CheckpointMeta::read_from_file(
+        &crate::distributed::CheckpointBundle::meta_path(stem),
+    )?;
+    Ok(meta
+        .coverage
+        .as_ref()
+        .map(|c| c.seed)
+        .unwrap_or(SHUFFLE_BASE_SEED))
+}
 
 /// Configuration passed to a GPU worker at spawn time.
 ///
@@ -733,20 +1396,80 @@ pub struct WorkerConfig {
     pub initial_params: Vec<Tensor>,
     /// Initial buffer tensors in pinned CPU memory.
     pub initial_buffers: Vec<Tensor>,
-    /// Total number of samples in the dataset.
+    /// Total number of PICKS in an epoch (`dataset.len() * augment`) —
+    /// the schedule space every partition offset/size lives in.
     pub total_samples: usize,
-    /// Batch size.
+    /// Batch size (in picks).
     pub batch_size: usize,
-    /// RNG seed for deterministic shuffling.
+    /// Augmentation multiplicity (see [`DdpRunConfig::augment`]); a
+    /// pick decodes as `(pick / augment, pick % augment)`.
+    pub augment: usize,
+    /// Delivery transform (see [`DdpRunConfig::transform`]).
+    pub transform: Option<crate::data::TransformFn>,
+    /// RNG base seed for deterministic shuffling; the epoch `e` permutation is
+    /// `Rng::seed(seed + e)`. Defaults to [`SHUFFLE_BASE_SEED`] at every
+    /// construction site.
     pub seed: u64,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,
+    /// Device-resident sample pool on this worker (see
+    /// [`DdpRunConfig::vram_pool`]). `FLODL_VRAM_POOL=off` overrides at
+    /// runtime.
+    pub vram_pool: bool,
+    /// VRAM share for this worker's data plane (see
+    /// [`DdpRunConfig::vram_max_usage`]).
+    pub vram_max_usage: f64,
+    /// Host-RAM share for this worker's staging tiers (see
+    /// [`DdpRunConfig::ram_max_usage`]).
+    pub ram_max_usage: f64,
+    /// Pinned RAM sample retention in this worker's staging tier (see
+    /// [`DdpRunConfig::sample_cache`]).
+    pub sample_cache: bool,
+    /// Local-disk overflow tier under this worker's sample cache, in
+    /// GB (see [`DdpRunConfig::disk_stage_gb`]).
+    pub disk_stage_gb: u64,
+    /// Directory for the disk-stage pack file (default: system temp dir).
+    pub disk_stage_dir: Option<std::path::PathBuf>,
+    /// EASGD elastic averaging weight (0, 1]. `None` = full overwrite of
+    /// local params with averaged consensus on the cpu-async path (current
+    /// behavior). When set, [`crate::distributed::GpuWorker::load_averaged`]
+    /// blends `W_local := (1-α)·W_local + α·W_avg` instead. See
+    /// [`crate::distributed::ElCheConfig::easgd_alpha`] for details.
+    pub easgd_alpha: Option<f64>,
+    /// Consensus allocation-weighting exponent `γ`: rank weighted `nₖ^γ` in
+    /// the work-weighted average (both backends). `1.0` (default) = plain
+    /// work-weighting, byte-identical to pre-gamma behavior. See
+    /// [`crate::distributed::ElCheConfig::gamma`].
+    pub gamma: f64,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
     /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:
     /// Sync mode skips weight-space divergence (near-zero by construction).
     pub policy: ApplyPolicy,
+    /// Checkpoint bundle stem for unrecoverable-failure persistence.
+    ///
+    /// When set, workers write a bundle (`.fdl` model, `.optim` optimizer
+    /// state, `.meta.json` trajectory) on receipt of
+    /// `ShutdownWithSave`; see
+    /// [`crate::distributed::CheckpointBundle`] for path derivation.
+    /// `None` in standalone single-GPU runs and CPU-only tests that
+    /// don't exercise the save path.
+    pub save_path: Option<String>,
+    /// Coordinator-liveness deadline (seconds) for the cluster worker's
+    /// inbound bridge: if no frame (coord heartbeat or real traffic) arrives
+    /// within this window, the coord is presumed wedged-open and the rank
+    /// bails. Mirrors the coordinator's own `heartbeat_timeout_secs` so both
+    /// liveness directions share one timescale. Inert on the thread-based
+    /// [`crate::distributed::GpuWorker`] path (single-host / tests) — only
+    /// [`crate::distributed::cluster_worker`]'s TCP inbound loop reads it.
+    /// Defaults to [`DEFAULT_COORD_LIVENESS_TIMEOUT_SECS`].
+    pub coord_liveness_timeout_secs: u64,
 }
+
+/// Default coordinator-liveness deadline (seconds), matching the
+/// coordinator's default `heartbeat_timeout_secs`. Used when a run does not
+/// set `heartbeat_timeout_secs` explicitly.
+pub const DEFAULT_COORD_LIVENESS_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Partition generation
@@ -767,10 +1490,10 @@ fn make_partition(
     epoch: usize,
     seed: u64,
 ) -> Vec<usize> {
-    // Deterministic global shuffle (same seed = same permutation for all ranks)
-    let mut rng = Rng::seed(seed.wrapping_add(epoch as u64));
-    let mut all: Vec<usize> = (0..total).collect();
-    rng.shuffle(&mut all);
+    // Deterministic global shuffle (same seed = same permutation for
+    // all ranks) — the one scheme shared with the solo RandomSampler.
+    // `total` counts PICKS (samples × augment); see epoch_permutation.
+    let all = crate::rng::epoch_permutation(seed, epoch, total);
 
     // This rank's consecutive slice
     let end = (offset + size).min(total);
@@ -778,6 +1501,4 @@ fn make_partition(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
-#[path = "tests.rs"]
 mod tests;

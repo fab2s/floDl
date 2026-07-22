@@ -10,7 +10,7 @@ training control.
 
 ## Gradient clipping
 
-Deep models — especially those with loops or long chains — can suffer
+Deep models - especially those with loops or long chains - can suffer
 from exploding gradients. floDl provides two clipping strategies. Both
 are called between `backward()` and `optimizer.step()`.
 
@@ -35,7 +35,7 @@ clip_grad_value(&params, 0.5)?;
 optimizer.step()?;
 ```
 
-Use `clip_grad_norm` as the default — it preserves gradient direction.
+Use `clip_grad_norm` as the default - it preserves gradient direction.
 
 ## Checkpoints
 
@@ -44,10 +44,10 @@ Save and restore model parameters with a compact binary format.
 ### Saving and loading
 
 ```rust
-// Save — parameters + buffers + structural hash, one call
+// Save - parameters + buffers + structural hash, one call
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load — validates architecture, returns LoadReport
+// Load - validates architecture, returns LoadReport
 let report = model.load_checkpoint("/tmp/model.fdl")?;
 ```
 
@@ -69,7 +69,7 @@ let report = load_checkpoint(&mut reader, &named, &buffers, hash)?;
 
 ### Details
 
-- Parameters and buffers store their native dtype — float16 params stay f16 on disk.
+- Parameters and buffers store their native dtype - float16 params stay f16 on disk.
 - Named checkpoints match entries by qualified name and validate shapes.
 - The `io::Write` / `io::Read` variants (`save_checkpoint`, `load_checkpoint`)
   work with any destination: files, buffers, network connections.
@@ -85,7 +85,7 @@ use flodl::*;
 // Save with qualified names from a Graph
 model.save_checkpoint("/tmp/model.fdl")?;
 
-// Load into a different model — only matching names transfer
+// Load into a different model - only matching names transfer
 // Use lower-level API with None hash since architectures differ
 let new_named = new_model.named_parameters();
 let new_buffers = new_model.named_buffers();
@@ -112,7 +112,7 @@ for (name, param) in &new_named {
     }
 }
 
-// Only unfrozen params get gradients — optimizer skips the rest
+// Only unfrozen params get gradients - optimizer skips the rest
 let fresh: Vec<Parameter> = new_named.iter()
     .filter(|(_, p)| !p.is_frozen())
     .map(|(_, p)| p.clone())
@@ -158,18 +158,18 @@ for epoch in 0..num_epochs {
         }
     }
 }
-// worker.finish() is called on Drop — waits for queued saves
+// worker.finish() is called on Drop - waits for queued saves
 ```
 
 `snapshot_cpu()` copies all parameters (detached from autograd) and buffers to
 CPU. The resulting `ModelSnapshot` is `Send`, so it can safely cross thread
 boundaries. The checkpoint format is the same `.fdl` format used by
-`save_checkpoint` — files saved with `save_file` can be loaded by
+`save_checkpoint` - files saved with `save_file` can be loaded by
 `load_checkpoint_file`.
 
 ## Weight initialization
 
-floDl modules use sensible defaults — `Linear` initializes weights with
+floDl modules use sensible defaults - `Linear` initializes weights with
 Kaiming uniform (suitable for ReLU) and bias with uniform. But you can
 override this when needed.
 
@@ -223,7 +223,7 @@ flodl::cuda_manual_seed_all(42);
 
 ### CPU-side RNG
 
-For data loading, shuffling, and augmentation, use `Rng` — a lightweight
+For data loading, shuffling, and augmentation, use `Rng` - a lightweight
 wrapper around SmallRng (Xoshiro256++):
 
 ```rust
@@ -241,7 +241,7 @@ rng.range(-5, 5)        // integer [low, high)
 rng.normal(0.0, 1.0)    // Gaussian sample
 ```
 
-`Rng` is `Clone` — clone it to fork independent streams from the same state.
+`Rng` is `Clone` - clone it to fork independent streams from the same state.
 
 ### Full reproducibility setup
 
@@ -258,7 +258,7 @@ fn main() -> Result<()> {
 ## LR Scheduling
 
 Schedulers are pure LR calculators, decoupled from the optimizer. You call
-`.lr(step)` and set the optimizer's LR yourself — no hidden optimizer coupling.
+`.lr(step)` and set the optimizer's LR yourself - no hidden optimizer coupling.
 
 ```rust
 use flodl::*;
@@ -305,7 +305,7 @@ pub trait Scheduler {
 ## Trend-based training control
 
 After collecting metrics and flushing epoch summaries (see
-[Training — Observing Training](04-training.md#observing-training)),
+[Training - Observing Training](04-training.md#observing-training)),
 query trends to make training decisions.
 
 ### Trend queries
@@ -404,7 +404,7 @@ g.write_log("training.log", total_epochs, &["loss"])?;
 ## Verbosity-gated logging
 
 floDl ships a tiny logging system in `flodl::log`. Five levels, four
-macros, one global atomic — no log targets, no module filtering, no
+macros, one global atomic - no log targets, no module filtering, no
 external dependencies. Designed so library code can chatter freely at
 higher verbosities without forcing every user to wire up a logger.
 
@@ -412,11 +412,11 @@ higher verbosities without forcing every user to wire up a logger.
 
 | Level | When | Where it goes |
 |------|------|----------------|
-| `Quiet` (0) | `--quiet` — errors only via `eprintln!` | (everything else suppressed) |
-| `Normal` (1) | Default — epoch summaries, progress, milestones | stdout |
-| `Verbose` (2) | `-v` — DDP sync, cadence changes, data loading detail | stdout |
-| `Debug` (3) | `-vv` — per-batch timing, internal loops | **stderr** (unbuffered) |
-| `Trace` (4) | `-vvv` — extreme granularity | **stderr** (unbuffered) |
+| `Quiet` (0) | `--quiet` - errors only via `eprintln!` | (everything else suppressed) |
+| `Normal` (1) | Default - epoch summaries, progress, milestones | stdout |
+| `Verbose` (2) | `-v` - DDP sync, cadence changes, data loading detail | stdout |
+| `Debug` (3) | `-vv` - per-batch timing, internal loops | **stderr** (unbuffered) |
+| `Trace` (4) | `-vvv` - extreme granularity | **stderr** (unbuffered) |
 
 Debug and Trace use stderr deliberately so they stay visible in Docker
 non-TTY environments where stdout is block-buffered.
@@ -424,7 +424,7 @@ non-TTY environments where stdout is block-buffered.
 ### Macros
 
 ```rust
-// Default level is Normal — suppressed by --quiet, shown otherwise
+// Default level is Normal - suppressed by --quiet, shown otherwise
 flodl::msg!("epoch {}: loss={:.4}", epoch, loss);
 
 // Explicit level via @ prefix
@@ -438,7 +438,7 @@ flodl::debug!  ("per-batch: {}ms", batch_ms);
 flodl::trace!  ("{:?}", tensor);
 ```
 
-All four macros are zero-cost when the level is not enabled — the format
+All four macros are zero-cost when the level is not enabled - the format
 arguments are not evaluated.
 
 ### Configuration
@@ -456,17 +456,17 @@ fdl --quiet test              # Errors only
 ```bash
 # 2. Environment variable (no code, no CLI)
 FLODL_VERBOSITY=verbose cargo run
-FLODL_VERBOSITY=2       cargo run    # same — accepts integers 0..4
+FLODL_VERBOSITY=2       cargo run    # same - accepts integers 0..4
 ```
 
 ```rust
-// 3. Programmatic — overrides the env var
+// 3. Programmatic - overrides the env var
 use flodl::{Verbosity, set_verbosity};
 set_verbosity(Verbosity::Debug);
 ```
 
 The level is read once on first access, then cached in a single global
-atomic — checking enablement on a hot loop is one relaxed atomic load.
+atomic - checking enablement on a hot loop is one relaxed atomic load.
 
 ### Recipe: gating expensive diagnostics
 
@@ -546,7 +546,7 @@ for (x, y) in &batches {
 ```
 
 Expect 2-5x speedup for models with many small kernels (RNNs, GRUs).
-All tensors involved in the captured region must have fixed shapes --
+All tensors involved in the captured region must have fixed shapes -
 dynamic shapes require a new capture. Tests that use CUDA graphs must
 run single-threaded (`fdl cuda-test-serial`).
 

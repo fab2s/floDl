@@ -113,7 +113,7 @@ let model = FlowBuilder::from(encoder).tag("encoded")
 available to the cross-attention module as a named input. The data doesn't
 need to flow linearly anymore. You can reach back to any tagged point.
 
-This is how you build skip connections, cross-attention, U-Net architectures —
+This is how you build skip connections, cross-attention, U-Net architectures -
 any pattern where a downstream module needs to see an earlier activation.
 
 ## Loops
@@ -127,7 +127,7 @@ let model = FlowBuilder::from(initial_state)
 
 `loop_body` takes a module and repeats it, feeding each iteration's output
 as the next iteration's input. `for_n(3)` runs it three times. The gradient
-flows through all iterations — full backpropagation through time.
+flows through all iterations - full backpropagation through time.
 
 There's also `while_cond(halt_fn, max)` for adaptive computation: keep
 iterating until a learned halt condition is met, up to a maximum.
@@ -180,7 +180,7 @@ mutations. You're writing a description, not modifying state.
 
 ## Forward references: the trick that enables recurrence
 
-Everything so far has been about referring to the past — modules that need
+Everything so far has been about referring to the past - modules that need
 earlier activations. But some architectures need to refer to their own
 output from the *previous* forward pass. Recurrent networks. Attention
 with memory. Anything where state persists across calls.
@@ -192,7 +192,7 @@ before it exists, it becomes a forward reference.
 .through(StateAdd).using(&["memory"]).tag("memory")
 ```
 
-On the first forward pass, `"memory"` doesn't exist yet — the reference
+On the first forward pass, `"memory"` doesn't exist yet - the reference
 returns a zero tensor. On subsequent passes, it returns the value from
 the previous call. The graph owns the state buffer. The module doesn't
 need to know it's recurrent.
@@ -203,7 +203,7 @@ manages it.
 
 ## Graphs are modules
 
-A `Graph` built by the builder implements `Module` — the same trait as
+A `Graph` built by the builder implements `Module` - the same trait as
 `Linear` or `GELU`. This means a graph is just another building block:
 
 ```rust
@@ -218,7 +218,7 @@ let model = FlowBuilder::from(encoder)
     .build()?;
 ```
 
-Parameters, buffers, named references — everything composes. Build
+Parameters, buffers, named references - everything composes. Build
 sub-graphs as functions, nest them arbitrarily. The same API works at
 every scale.
 
@@ -248,7 +248,7 @@ at build time.
 ## A real architecture
 
 This isn't a framework that only handles toy examples. [FBRL](https://github.com/fab2s/fbrl)
-uses the builder for a foveal attention model — a recurrent architecture
+uses the builder for a foveal attention model - a recurrent architecture
 that learns where to look in an image. Here's a simplified view of the
 actual builder chain:
 
@@ -271,14 +271,14 @@ Nine loss components drive attention guidance, reconstruction,
 classification, and fixation diversity.
 
 This architecture trains at ~40 seconds per epoch on a GTX 1060.
-Restructuring it — from separated phases to a unified graph for transfer
-to word-level recognition — meant changing the builder chain. Not
+Restructuring it - from separated phases to a unified graph for transfer
+to word-level recognition - meant changing the builder chain. Not
 rewriting `forward()`. Not a new class. The restructured version trained
 faster.
 
 That's the point. The builder makes architecture changes cheap. You
-describe the new flow, and the training infrastructure — checkpoints,
-visualization, observation, profiling — follows automatically.
+describe the new flow, and the training infrastructure - checkpoints,
+visualization, observation, profiling - follows automatically.
 
 ## The gap
 

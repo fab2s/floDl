@@ -46,8 +46,8 @@ extern crate self as flodl_cli;
 /// AI porting tools and as a machine-readable surface index.
 pub mod api_ref;
 
-/// Argv parsing primitives and the [`FdlArgsTrait`](args::FdlArgsTrait)
-/// contract that `#[derive(FdlArgs)]` implements.
+/// Argv parsing primitives and the [`FdlArgsTrait`] contract that
+/// `#[derive(FdlArgs)]` implements.
 pub mod args;
 
 /// Built-in `fdl` sub-commands (setup, install, completions, schema,
@@ -61,6 +61,20 @@ pub mod completions;
 /// `fdl.yml` manifest loading, validation, and resolved-command types.
 pub mod config;
 
+/// Cluster-mode env preparation. fdl-cli sets `FLODL_INTERNAL_FULL_CLUSTER_JSON`
+/// + `FLODL_INTERNAL_FDL_CMD` + `FDL_ENV` on its process env so the user binary
+/// inherits them and detects launcher role via
+/// `flodl::distributed::launcher::dispatch`. Fan-out, log fan-in, and
+/// ClusterController all live on the flodl side.
+/// Entry point [`cluster::prepare_cluster_env`]; recursion guard via
+/// [`cluster::should_dispatch`].
+pub mod cluster;
+
+/// `--gpus` flag parsing + single-host cluster envelope synthesis (loopback,
+/// one host, N ranks). Used when `--gpus` is set on a cluster-aware command
+/// and no `cluster:` block is configured in YAML.
+pub mod gpus;
+
 /// Cross-cutting context passed to sub-command handlers (resolved config,
 /// verbosity, overlay selection, working directory, ...).
 pub mod context;
@@ -71,6 +85,15 @@ pub mod dispatch;
 
 /// Hardware and compatibility diagnostics (`fdl diagnose`).
 pub mod diagnose;
+
+/// Cluster readiness probe (`fdl probe`): GPU + libtorch arch +
+/// shared-data path + NCCL discovery. Pre-training gate; the
+/// foundation for `fdl deploy` and the transparent launcher dispatch.
+pub mod probe;
+
+/// Live run status (`fdl status`): fetches the controller's
+/// `state.json` (membership + lifecycle phase) and pretty-prints it.
+pub mod status;
 
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
@@ -85,13 +108,25 @@ pub mod add;
 /// info) used by both `fdl libtorch` and the standalone-manager flow.
 pub mod libtorch;
 
-/// Environment overlay loader (`--env`, `FDL_ENV`, first-arg convention)
-/// with per-field origin annotations for `fdl config show`.
+/// NCCL source builds (`fdl nccl build`). Drops a standalone libnccl.so
+/// into `libtorch/nccl/builds/<ver>-<archs>/` for the LD_PRELOAD bridge
+/// pattern used by cross-host heterogeneous-arch clusters.
+pub mod nccl;
+
+/// Environment overlay loader (`@env`, `--env`, `FDL_ENV`) with
+/// per-field origin annotations for `fdl config show`.
 pub mod overlay;
 
 /// Runtime: invoking resolved commands, streaming their output, and
 /// mapping exit codes through `fdl`.
 pub mod run;
+
+/// Pre-flight build for cluster commands. Builds the target binary
+/// locally (in Docker on the controller) for each remote host's
+/// libtorch ABI before fan-out, delivering it via the shared
+/// project-root mount so the remote can exec it directly without a
+/// cargo / rustc toolchain.
+pub mod prebuild;
 
 /// `fdl schema` sub-command: discover every cache under the project,
 /// report fresh / stale / orphan states, and clear or refresh on

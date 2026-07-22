@@ -6,6 +6,10 @@ use crate::tensor::{DType, Device, Result, Tensor};
 
 pub(crate) struct VariableInner {
     pub data: Tensor,
+    /// Monotonic counter bumped every time `set_data` replaces the tensor.
+    /// Module-side caches built from parameter tensors (e.g. the GRU/LSTM
+    /// cuDNN param cache) key their validity on this.
+    pub data_generation: u64,
 }
 
 /// A differentiable variable wrapping a Tensor.
@@ -33,15 +37,23 @@ pub struct Variable {
 impl Variable {
     /// Create a leaf variable (parameter or input data).
     /// If `requires_grad` is true, libtorch will track operations for autodiff.
+    ///
+    /// # Panics
+    ///
+    /// Panics if gradient tracking cannot be enabled — e.g. on integer
+    /// dtypes (libtorch: only floating-point tensors can require
+    /// gradients). PyTorch raises the same error; silently returning a
+    /// non-tracking variable would train nothing for this parameter.
     pub fn new(data: Tensor, requires_grad: bool) -> Self {
         let data = if requires_grad {
             // Set requires_grad on the C++ tensor so libtorch tracks ops
-            data.set_requires_grad(true).unwrap_or(data)
+            data.set_requires_grad(true)
+                .unwrap_or_else(|e| panic!("Variable::new: cannot enable gradient tracking: {e}"))
         } else {
             data
         };
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data })),
+            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
         }
     }
 
@@ -50,17 +62,31 @@ impl Variable {
     /// metadata from their inputs automatically).
     pub(crate) fn wrap(data: Tensor) -> Self {
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data })),
+            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
         }
     }
 
     /// Get the underlying tensor data (shallow clone sharing storage).
     ///
-    /// The returned `Tensor` shares the same memory as the variable's data.
-    /// In-place mutations on either side will be visible to both. If you need
-    /// an independent copy, call `.data().copy()` instead.
+    /// The returned `Tensor` shares the same memory as the variable's data —
+    /// the same aliasing semantics as PyTorch's `.data`. In-place mutations
+    /// on either side will be visible to both. If you need an independent
+    /// copy, call `.data().copy()` instead. Because the share counts as the
+    /// same tensor for concurrency purposes, the thread-safety rules on
+    /// [`Tensor`](crate::tensor::Tensor#thread-safety) apply across it: never
+    /// mutate in place while any other thread accesses the variable.
     pub fn data(&self) -> Tensor {
         self.inner.borrow().data.clone()
+    }
+
+    /// Stable identity of the shared autograd cell: clones of the same
+    /// `Variable` return the same id, independent copies differ. This
+    /// is what parameter collection dedups on (a module graph can reach
+    /// the same shared parameter through several paths). Valid only
+    /// while some clone is alive — ids can be recycled after the last
+    /// clone drops.
+    pub fn id(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
     }
 
     /// Get the accumulated gradient, if any.
@@ -71,8 +97,15 @@ impl Variable {
 
     /// Replace the gradient tensor directly (e.g. for gradient clipping or unscaling).
     /// Equivalent to `param.grad = grad` in PyTorch.
+    ///
+    /// Panics if the FFI write fails (broken tensor handle): dropping the
+    /// write silently would let the optimizer step with the old gradient.
     pub fn set_grad(&self, grad: Tensor) {
-        let _ = self.inner.borrow().data.set_grad(&grad);
+        self.inner
+            .borrow()
+            .data
+            .set_grad(&grad)
+            .unwrap_or_else(|e| panic!("Variable::set_grad: gradient write failed: {e}"));
     }
 
     /// Whether this variable tracks gradients.
@@ -102,7 +135,7 @@ impl Variable {
     /// handle that keeps the node alive; store it for the lifetime of
     /// the worker.
     ///
-    /// Call this under a [`StreamGuard`](crate::distributed::cuda_stream::StreamGuard)
+    /// Call this under a [`StreamGuard`](crate::tensor::cuda_stream::StreamGuard)
     /// on the training compute stream during DDP worker setup so that
     /// gradient accumulation runs on the same stream as subsequent
     /// forward/backward passes. Without this, the node is created
@@ -145,8 +178,15 @@ impl Variable {
 
     /// Zero out the accumulated gradient (fills `.grad()` with zeros).
     /// See also [`zero_grad_set_to_none`](Self::zero_grad_set_to_none) for the faster alternative.
+    ///
+    /// Panics if the FFI call fails (broken tensor handle): a silently
+    /// skipped zero would leak the previous step's gradient into the next.
     pub fn zero_grad(&self) {
-        let _ = self.inner.borrow().data.zero_grad();
+        self.inner
+            .borrow()
+            .data
+            .zero_grad()
+            .unwrap_or_else(|e| panic!("Variable::zero_grad failed: {e}"));
     }
 
     /// Null out the gradient instead of zeroing it. No CUDA kernel.
@@ -156,9 +196,17 @@ impl Variable {
 
     /// Detach from the computation graph. Returns a new leaf variable
     /// sharing the same data tensor (detached) with no gradient tracking.
+    ///
+    /// Panics if the FFI call fails (broken tensor handle): falling back
+    /// to the attached tensor would silently keep gradients flowing where
+    /// the caller asked to cut them.
     pub fn detach(&self) -> Variable {
-        let detached = self.inner.borrow().data.detach()
-            .unwrap_or_else(|_| self.inner.borrow().data.clone());
+        let detached = self
+            .inner
+            .borrow()
+            .data
+            .detach()
+            .unwrap_or_else(|e| panic!("Variable::detach failed: {e}"));
         Variable::wrap(detached)
     }
 
@@ -173,14 +221,30 @@ impl Variable {
 
     /// Replace the underlying tensor data (used by optimizers).
     /// Preserves the `requires_grad` flag from the current tensor.
+    /// Bumps [`data_generation`](Self::data_generation) so caches built
+    /// from the old tensor can detect the replacement.
     pub fn set_data(&self, data: Tensor) {
         let rg = self.requires_grad();
         let data = if rg {
-            data.set_requires_grad(true).unwrap_or(data)
+            // Silently dropping tracking here would freeze this parameter.
+            data.set_requires_grad(true).unwrap_or_else(|e| {
+                panic!("Variable::set_data: cannot keep gradient tracking on the replacement tensor: {e}")
+            })
         } else {
             data
         };
-        self.inner.borrow_mut().data = data;
+        let mut inner = self.inner.borrow_mut();
+        inner.data = data;
+        inner.data_generation += 1;
+    }
+
+    /// Monotonic generation of the underlying tensor: incremented every
+    /// time [`set_data`](Self::set_data) replaces it (checkpoint load,
+    /// dtype cast, device move). In-place mutation (`copy_`, optimizer
+    /// steps) does not change it. Module caches built from parameter
+    /// tensors key their validity on this.
+    pub fn data_generation(&self) -> u64 {
+        self.inner.borrow().data_generation
     }
 
     /// Total number of elements in the tensor (product of all dimensions).

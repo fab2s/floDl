@@ -11,9 +11,23 @@
 
 #include "shim.h"
 #include <torch/torch.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// Exception firewall for extern "C" functions with no error-return
+// channel: a C++ exception unwinding through the C boundary into Rust is
+// undefined behavior, so contain it and fail loudly instead. Only
+// reachable when an invariant is already broken (bad handle, corrupted
+// CUDA context, allocation failure) — a defined, named abort beats UB.
+[[noreturn]] static inline void flodl_fatal(const char* fn, const char* what) {
+    fprintf(stderr, "flodl: fatal C++ exception in %s: %s\n",
+            fn, what ? what : "non-standard C++ exception");
+    fflush(stderr);
+    abort();
+}
 
 // Helper: convert a C++ exception to a malloc'd C string.
 static inline char* make_error(const std::string& msg) {
@@ -91,6 +105,33 @@ static inline std::vector<at::Tensor> unwrap_list(FlodlTensor* tensors, int coun
         result.push_back(unwrap(tensors[i]));
     }
     return result;
+}
+
+// Helper: wrap a tensor vector into a malloc'd FlodlTensor[] the caller
+// (Rust) owns (free each element with flodl_free_tensor, then free() the
+// array). Returns nullptr on malloc failure. Leak-safe: if wrapping throws
+// mid-loop (bad_alloc), every element allocated so far AND the array are
+// freed before the exception propagates, so the error path leaks nothing.
+// Allocates at least one slot so malloc(0) can't be mistaken for OOM.
+static inline FlodlTensor* wrap_list(const std::vector<torch::Tensor>& tensors) {
+    int n = (int)tensors.size();
+    FlodlTensor* arr =
+        (FlodlTensor*)malloc(sizeof(FlodlTensor) * (n > 0 ? n : 1));
+    if (!arr) {
+        return nullptr;
+    }
+    for (int i = 0; i < n; i++) {
+        try {
+            arr[i] = wrap(tensors[i]);
+        } catch (...) {
+            for (int j = 0; j < i; j++) {
+                delete reinterpret_cast<torch::Tensor*>(arr[j]);
+            }
+            free(arr);
+            throw;
+        }
+    }
+    return arr;
 }
 
 // Helper: build IntArrayRef from C array.

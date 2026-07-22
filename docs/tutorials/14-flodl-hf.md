@@ -365,29 +365,48 @@ let head = DistilBertForSequenceClassification::from_pretrained(model_repo)?;
 let tok  = HfTokenizer::from_pretrained(tok_repo)?;
 ```
 
-### 2. Wire the optimizer through `Trainer::setup_head`
+### 2. Wire the optimizer
+
+Task heads `impl Module` directly, so on a single device you wire the
+optimizer straight onto the head's graph and flip on training mode:
+
+```rust
+use flodl::Adam;
+
+head.graph().set_optimizer(|p| Adam::new(p, 5e-5));
+head.graph().set_training(true);
+```
+
+The training loop body below is byte-identical whether you run on CPU or
+a single GPU. To fan the same head across N GPUs, hand it to the
+`Trainer` tiers instead - because the head is a `Module`, you drive it
+directly:
 
 ```rust
 use flodl::{Adam, Trainer};
 
 let replica_config = head.config().clone();
 let num_labels     = head.labels().len() as i64;
-Trainer::setup_head(
-    &head,
+// managed tier - framework owns the loop:
+Trainer::builder(
     move |dev| DistilBertForSequenceClassification::on_device(
         &replica_config, num_labels, dev,
     ),
     |p| Adam::new(p, 5e-5),
-)?;
+    |head, batch| head.compute_loss(/* enc, labels from batch */),
+)
+.dataset(dataset)
+.batch_size(16)
+.num_epochs(3)
+.run()?;
 ```
 
-`Trainer::setup_head` is the task-head equivalent of `Trainer::setup`
-for graph-based models. On CPU or single GPU it is a thin wrapper that
-prints the device summary, sets the optimizer, and enables training
-mode; on multi-GPU hosts it auto-distributes via the factory closure
-(only invoked for additional replica devices). The training loop body
-below is byte-identical for 1 or N GPUs. See
-[Multi-GPU DDP](11-multi-gpu.md) for the multi-device story.
+Swap `.run()` for `.into_worker()?` to keep the loop body yourself (the
+cooperative tier) while the controller owns cadence, partition,
+eval-election, and checkpointing. See
+[Multi-GPU DDP](11-multi-gpu.md) for the multi-device story and
+[`docs/design/trainer-execution-tiers.md`](../design/trainer-execution-tiers.md)
+for the three tiers.
 
 ### 3. Train
 
@@ -637,9 +656,9 @@ Landed in 0.5.3:
 - **Loss wiring on every task head**: `compute_loss(enc, labels)`
   mirrors HF Python's `model(..., labels=...).loss`; free functions in
   `flodl_hf::task_heads` for hand-rolled compositions.
-- **`Trainer::setup_head` + `HasGraph` trait**: transparent 1-or-N-GPU
-  training for task-head wrappers; same loop code on CPU, single GPU,
-  and multi-GPU.
+- **Task heads `impl Module`**: drive a head straight through
+  `Trainer::run` / `Trainer::builder(...)` for transparent 1-or-N-GPU
+  training; same loop code on CPU, single GPU, and multi-GPU.
 - **Round-trip export to the HF ecosystem**: `fdl flodl-hf export`
   (Hub or local checkpoint), `verify-export` (auto-detect family +
   head from `architectures[0]`), `verify-matrix` (30-cell pre-release
@@ -684,8 +703,9 @@ those three are on the next ergonomics pass.
 - [`flodl-hf` crate README](https://github.com/flodl-labs/flodl/blob/main/flodl-hf/README.md)
 - [flodl-hf examples](https://github.com/flodl-labs/flodl/tree/main/flodl-hf/examples)
 - [The floDl CLI](../cli.md) (see `fdl add`, `fdl flodl-hf`, `fdl test-live`)
-- [Multi-GPU DDP](11-multi-gpu.md) (the same `Trainer::setup_head`
-  call distributes the fine-tune walkthrough across N devices)
+- [Multi-GPU DDP](11-multi-gpu.md) (the same `Trainer` entry point
+  distributes the fine-tune walkthrough across N devices - heads
+  `impl Module`)
 
 ---
 

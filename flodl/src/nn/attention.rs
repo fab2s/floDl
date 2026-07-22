@@ -79,10 +79,12 @@ impl MultiheadAttention {
 
     /// Create a multi-head attention module on a specific device.
     pub fn on_device(embed_dim: i64, num_heads: i64, device: Device) -> Result<Self> {
-        assert!(
-            embed_dim % num_heads == 0,
-            "embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
-        );
+        if num_heads <= 0 || embed_dim % num_heads != 0 {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "MultiheadAttention: embed_dim ({embed_dim}) must be divisible by \
+                 a positive num_heads ({num_heads})"
+            )));
+        }
         let head_dim = embed_dim / num_heads;
 
         Ok(MultiheadAttention {
@@ -112,9 +114,17 @@ impl MultiheadAttention {
         value: &Variable,
         mask: Option<&Tensor>,
     ) -> Result<Variable> {
-        let batch = query.shape()[0];
-        let seq_q = query.shape()[1];
-        let seq_k = key.shape()[1];
+        let q_shape = query.shape();
+        let k_shape = key.shape();
+        if q_shape.len() < 3 || k_shape.len() < 3 {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "MultiheadAttention::forward_ext expects 3-D [batch, seq, embed] \
+                 query/key, got query {q_shape:?}, key {k_shape:?}"
+            )));
+        }
+        let batch = q_shape[0];
+        let seq_q = q_shape[1];
+        let seq_k = k_shape[1];
 
         // Project Q, K, V
         let q = self.q_proj.forward(query)?;
@@ -175,6 +185,18 @@ impl Module for MultiheadAttention {
 mod tests {
     use super::*;
     use crate::tensor::test_device;
+
+    #[test]
+    fn test_mha_indivisible_heads_is_err_not_panic() {
+        // embed_dim not divisible by num_heads at a Result ctor → Err (was
+        // an assert! panic).
+        let device = test_device();
+        // `.map(|_| ())` because MultiheadAttention isn't Debug (unwrap_err needs it).
+        let err = MultiheadAttention::on_device(10, 3, device).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("divisible"), "unexpected: {err}");
+        // Zero / negative heads also rejected rather than dividing by zero.
+        assert!(MultiheadAttention::on_device(8, 0, device).is_err());
+    }
 
     #[test]
     fn test_mha_self_attention() {

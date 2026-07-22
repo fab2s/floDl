@@ -20,7 +20,13 @@ pub struct StepDecay {
 
 impl StepDecay {
     /// Create a step decay scheduler: lr *= gamma every `step_size` steps.
+    ///
+    /// # Panics
+    /// If `step_size == 0` (would divide by zero in [`lr`](Self::lr)).
+    /// Panics at construction — a fail-fast config check before the run,
+    /// not a cryptic mid-training divide-by-zero.
     pub fn new(base_lr: f64, step_size: usize, gamma: f64) -> Self {
+        assert!(step_size >= 1, "StepDecay: step_size must be >= 1, got {step_size}");
         StepDecay {
             base_lr,
             step_size,
@@ -50,7 +56,12 @@ pub struct CosineScheduler {
 
 impl CosineScheduler {
     /// Create a cosine annealing scheduler from `base_lr` to `min_lr` over `total_steps`.
+    ///
+    /// # Panics
+    /// If `total_steps == 0` (would yield a NaN LR via 0/0 in [`lr`](Self::lr)).
+    /// Fail-fast at construction rather than a NaN partway through training.
     pub fn new(base_lr: f64, min_lr: f64, total_steps: usize) -> Self {
+        assert!(total_steps >= 1, "CosineScheduler: total_steps must be >= 1, got {total_steps}");
         CosineScheduler {
             base_lr,
             min_lr,
@@ -329,12 +340,25 @@ pub struct CyclicLR {
 impl CyclicLR {
     /// Create a CyclicLR with symmetric up/down phases.
     /// `step_size`: number of steps in each half-cycle.
+    ///
+    /// # Panics
+    /// If `step_size == 0` (each phase is a divisor, and the cycle length
+    /// `up + down` is a modulus, in [`lr`](Self::lr)).
     pub fn new(base_lr: f64, max_lr: f64, step_size: usize) -> Self {
+        assert!(step_size >= 1, "CyclicLR: step_size must be >= 1, got {step_size}");
         CyclicLR { base_lr, max_lr, step_size_up: step_size, step_size_down: step_size }
     }
 
     /// Create with asymmetric up/down phase lengths.
+    ///
+    /// # Panics
+    /// If either `step_size_up` or `step_size_down` is 0 (each is a divisor,
+    /// and their sum is the cycle-length modulus, in [`lr`](Self::lr)).
     pub fn asymmetric(base_lr: f64, max_lr: f64, step_size_up: usize, step_size_down: usize) -> Self {
+        assert!(
+            step_size_up >= 1 && step_size_down >= 1,
+            "CyclicLR: step_size_up and step_size_down must be >= 1, got up={step_size_up} down={step_size_down}"
+        );
         CyclicLR { base_lr, max_lr, step_size_up, step_size_down }
     }
 
@@ -360,6 +384,32 @@ impl Scheduler for CyclicLR {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "step_size must be >= 1")]
+    fn test_step_decay_zero_step_size_panics_at_construction() {
+        // Fail-fast: catches the config error at new(), not as a runtime
+        // divide-by-zero deep in training.
+        let _ = StepDecay::new(0.1, 0, 0.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "total_steps must be >= 1")]
+    fn test_cosine_zero_total_steps_panics_at_construction() {
+        let _ = CosineScheduler::new(0.1, 0.0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "step_size must be >= 1")]
+    fn test_cyclic_zero_step_size_panics_at_construction() {
+        let _ = CyclicLR::new(0.001, 0.01, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be >= 1")]
+    fn test_cyclic_asymmetric_zero_phase_panics_at_construction() {
+        let _ = CyclicLR::asymmetric(0.001, 0.01, 10, 0);
+    }
 
     #[test]
     fn test_step_decay() {

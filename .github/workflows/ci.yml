@@ -35,6 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cheap, toolchain-free gate: the embedded skill assets baked into
+      # the fdl binary (flodl-cli/assets/skills/) must match the ai/
+      # sources, else a released fdl ships a stale /port skill. Fails the
+      # PR before any build work. Fix locally with `make sync-skills`.
+      - name: Skill assets in sync with ai/
+        run: sh ci/release/09-skill-assets.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -82,14 +89,25 @@ jobs:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-        run: cargo test -- --nocapture
+        run: cargo test -- --nocapture --skip leakcheck
+
+      # Process-global leak tests (they read the process-wide live-tensor
+      # count / RSS) are meaningless under the parallel harness — a
+      # concurrent test's tensors inflate the delta. Run them isolated,
+      # single-threaded. Name filter: `leakcheck`.
+      - name: Leak tests (serial)
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: cargo test leakcheck -- --test-threads=1 --nocapture
 
       - name: Clippy
         env:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-        run: cargo clippy -- -W clippy::all
+        run: cargo clippy --all-targets -- -W clippy::all
 
       - name: Doc (strict, fails on warnings)
         # Clippy doesn't lint doc comments -- rustdoc is the only validator
@@ -177,4 +195,4 @@ jobs:
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
-            cargo clippy --features cuda -- -W clippy::all
+            cargo clippy --features cuda --all-targets -- -W clippy::all

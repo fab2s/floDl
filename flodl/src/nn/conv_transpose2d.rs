@@ -140,6 +140,7 @@ impl ConvTranspose2d {
         stride: [i64; 2], padding: [i64; 2], output_padding: [i64; 2],
         dilation: [i64; 2], groups: i64, device: Device,
     ) -> Result<Self> {
+        super::init::validate_conv_groups("ConvTranspose2d", in_channels, out_channels, groups)?;
         // Note: weight shape is [in_channels, out_channels/groups, kH, kW]
         let shape = [in_channels, out_channels / groups, kernel_size, kernel_size];
         let fan_in = in_channels * kernel_size * kernel_size;

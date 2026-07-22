@@ -163,7 +163,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("through requires single stream".into());
+            self.fail("through requires single stream");
             return self;
         }
 
@@ -199,7 +199,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("fork requires single stream".into());
+            self.fail("fork requires single stream");
             return self;
         }
 
@@ -227,7 +227,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("also requires single stream".into());
+            self.fail("also requires single stream");
             return self;
         }
 
@@ -283,7 +283,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("also_with requires single stream".into());
+            self.fail("also_with requires single stream");
             return self;
         }
 
@@ -338,11 +338,11 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("tag requires single stream".into());
+            self.fail("tag requires single stream");
             return self;
         }
         if self.taps.contains_key(name) {
-            self.err = Some(format!("duplicate tag: {}", name));
+            self.fail(format!("duplicate tag: {}", name));
             return self;
         }
 
@@ -373,7 +373,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() < 2 {
-            self.err = Some(format!(
+            self.fail(format!(
                 "tag_group({:?}) requires multiple streams (got {}); use tag for single-stream",
                 name,
                 self.current.len()
@@ -381,11 +381,11 @@ impl FlowBuilder {
             return self;
         }
         if self.tag_groups.contains_key(name) {
-            self.err = Some(format!("duplicate tag group: {:?}", name));
+            self.fail(format!("duplicate tag group: {:?}", name));
             return self;
         }
         if self.taps.contains_key(name) {
-            self.err = Some(format!(
+            self.fail(format!(
                 "tag group {:?} conflicts with existing tag",
                 name
             ));
@@ -396,7 +396,7 @@ impl FlowBuilder {
         for (i, cur) in self.current.iter().enumerate() {
             let tag = format!("{}_{}", name, i);
             if self.taps.contains_key(&tag) {
-                self.err = Some(format!(
+                self.fail(format!(
                     "tag_group({:?}): suffixed name {:?} conflicts with existing tag",
                     name, tag
                 ));
@@ -431,7 +431,7 @@ impl FlowBuilder {
         }
         for &name in names {
             if self.taps.contains_key(name) {
-                self.err = Some(format!(
+                self.fail(format!(
                     "input tag {:?} conflicts with existing tag",
                     name
                 ));
@@ -483,15 +483,15 @@ impl FlowBuilder {
         } else if self.current.len() > 1 {
             self.current.clone()
         } else {
-            self.err = Some(
-                "using requires a preceding through, split, or merge".into(),
+            self.fail(
+                "using requires a preceding through, split, or merge",
             );
             return self;
         };
 
         for target in &targets {
             if let Err(e) = self.wire_using(target, refs) {
-                self.err = Some(e);
+                self.fail(e);
                 return self;
             }
         }
@@ -510,11 +510,11 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() != 1 {
-            self.err = Some("split requires single stream".into());
+            self.fail("split requires single stream");
             return self;
         }
         if modules.len() < 2 {
-            self.err = Some("split requires at least 2 branches".into());
+            self.fail("split requires at least 2 branches");
             return self;
         }
 
@@ -543,7 +543,7 @@ impl FlowBuilder {
             return self;
         }
         if self.current.len() < 2 {
-            self.err = Some("merge requires multiple streams (after split)".into());
+            self.fail("merge requires multiple streams (after split)");
             return self;
         }
 
@@ -645,6 +645,29 @@ impl FlowBuilder {
     pub(super) fn next_id(&mut self, prefix: &str) -> String {
         self.counter += 1;
         format!("{}_{}", prefix, self.counter)
+    }
+
+    /// Record the first deferred builder error, stamped with the chain
+    /// position it occurred at.
+    ///
+    /// FlowBuilder defers the first error to [`build()`](Self::build); a
+    /// bare message ("through requires single stream") gives no clue which
+    /// of many chained calls failed. This appends the most recently built
+    /// node, whose id encodes both the module type and its global sequence
+    /// number (e.g. `Conv2d_2`), so the message points at where the chain
+    /// had reached. First-error-wins: a later `fail` never overwrites an
+    /// earlier one (matches the entry guards on every builder method).
+    pub(super) fn fail(&mut self, msg: impl std::fmt::Display) {
+        if self.err.is_some() {
+            return;
+        }
+        let at = self
+            .on_target
+            .as_ref()
+            .or_else(|| self.current.first())
+            .map(|n| format!(" (after node '{}')", n.node_id))
+            .unwrap_or_else(|| " (at chain start)".to_string());
+        self.err = Some(format!("{msg}{at}"));
     }
 
     fn add_module(&mut self, module: impl Module + 'static) -> NodeRef {

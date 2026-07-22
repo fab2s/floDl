@@ -20,6 +20,7 @@ pub fn def() -> ModelDef {
         description: "Logistic regression on MNIST (~92% acc)",
         build: build_model,
         dataset: make_dataset,
+        dataset_size_hint: |_| Ok(60_000),
         train_fn: train_step,
         eval_fn: Some(eval_accuracy),
         test_dataset: Some(make_test_dataset),
@@ -29,6 +30,7 @@ pub fn def() -> ModelDef {
         reference: "MNIST ~92% acc (linear baseline)",
         eval_higher_is_better: true,
         published_eval: Some(0.92),
+        needs_baseline_eval: false,
         defaults: ModelDefaults {
             epochs: 5,
             batches_per_epoch: 0, // full dataset

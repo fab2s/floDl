@@ -18,7 +18,7 @@
 //!
 //! HTTP via `curl --max-time 2`, silent on every failure mode. The
 //! probe never blocks the user's command output: it runs from a
-//! [`Guard`](crate::update_check::Guard) that fires at process exit
+//! `Guard` that fires at process exit
 //! (Drop), after the user-visible work is done.
 
 use std::collections::BTreeMap;

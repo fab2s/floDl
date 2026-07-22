@@ -186,7 +186,7 @@ fn parse_compose_project_mounts(
         Ok(t) => t,
         Err(_) => return std::collections::HashMap::new(),
     };
-    let doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
+    let doc: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&text) {
         Ok(d) => d,
         Err(_) => return std::collections::HashMap::new(),
     };
@@ -222,7 +222,7 @@ fn parse_compose_project_mounts(
 /// Inside a service's `volumes:` sequence, find the entry that
 /// bind-mounts the project root (host path `.` or `./`) and return the
 /// container-side target path.
-fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
+fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
     for entry in volumes {
         if let Some(s) = entry.as_str() {
             // Short form: "host:container[:options]". Docker-compose's
@@ -238,10 +238,10 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
         } else if let Some(m) = entry.as_mapping() {
             // Long form: { type: bind, source: ., target: /workspace }.
             let source = m
-                .get(serde_yaml::Value::String("source".into()))
+                .get(serde_yaml_ng::Value::String("source".into()))
                 .and_then(|v| v.as_str());
             let target = m
-                .get(serde_yaml::Value::String("target".into()))
+                .get(serde_yaml_ng::Value::String("target".into()))
                 .and_then(|v| v.as_str());
             if matches!(source, Some(".") | Some("./")) {
                 if let Some(t) = target {
@@ -254,10 +254,11 @@ fn find_project_mount(volumes: &[serde_yaml::Value]) -> Option<String> {
 }
 
 /// Resolve libtorch env vars from the project root, matching the Makefile logic:
-///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>
+///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>          (standalone)
+///                      = <host.path>/libtorch/<host.arch>     (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
-fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
+fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
     // CPU path is always the same.
@@ -266,9 +267,7 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
         "./libtorch/precompiled/cpu".into(),
     ));
 
-    // Active variant for CUDA.
-    if let Some(info) = libtorch::detect::read_active(project_root) {
-        let host_path = format!("./libtorch/{}", info.path);
+    if let Some((info, host_path)) = resolve_libtorch(project_root)? {
         env.push(("LIBTORCH_HOST_PATH".into(), host_path));
 
         // CUDA version from .arch metadata.
@@ -290,7 +289,126 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
         }
     }
 
-    env
+    Ok(env)
+}
+
+/// Resolve `(LibtorchInfo, host_path)` for `libtorch_env`.
+///
+/// Priority:
+///   1. Cluster overlay's per-host `arch:` (when `FDL_ENV` is
+///      set, the merged config has a `cluster:` block, AND the current
+///      hostname matches an entry). Resolved via the convention
+///      `<host.path>/libtorch/<arch>`, so each host in a shared-checkout
+///      heterogeneous rig picks its own libtorch without flipping the
+///      global `.active`.
+///   2. `project_root/libtorch/.active` (or `.active.<case>` via the
+///      `FDL_LIBTORCH_CASE` env var). Standalone single-host default.
+///
+/// Returns `Ok(None)` only when neither path resolves — the caller (env
+/// builder) then omits `LIBTORCH_HOST_PATH`, which surfaces as a
+/// libtorch-missing error from the downstream cargo/Docker invocation.
+/// `Err` when an active `FDL_ENV` overlay fails to load (see
+/// [`resolve_libtorch_from_overlay`]).
+fn resolve_libtorch(
+    project_root: &Path,
+) -> Result<Option<(libtorch::detect::LibtorchInfo, String)>, String> {
+    if let Some(resolved) = resolve_libtorch_from_overlay(project_root)? {
+        return Ok(Some(resolved));
+    }
+    let Some(info) = libtorch::detect::read_active(project_root) else {
+        return Ok(None);
+    };
+    let host_path = format!("./libtorch/{}", info.path);
+    Ok(Some((info, host_path)))
+}
+
+/// Try to resolve libtorch from the active cluster overlay's current-
+/// host entry. `Ok(None)` when the overlay legitimately doesn't apply
+/// (no `FDL_ENV`, no `cluster:` block, the current host isn't listed,
+/// or the entry's `arch:` is unset). `Err` when `FDL_ENV` is set but the
+/// config cannot be loaded — the user asked for that env, so silently
+/// falling back to `.active` could select the wrong libtorch.
+///
+/// Convention: libtorch lives at `<host.path>/libtorch/<host.arch>`
+/// on every host. The controller's view uses `<host.path>` directly
+/// here because this function is the controller-side (local) path
+/// resolver — when fdl runs locally as the current host, that host's
+/// own `path:` IS the controller's view.
+fn resolve_libtorch_from_overlay(
+    project_root: &Path,
+) -> Result<Option<(libtorch::detect::LibtorchInfo, String)>, String> {
+    let Ok(env_name) = std::env::var("FDL_ENV") else {
+        return Ok(None);
+    };
+    let env_name = env_name.trim();
+    if env_name.is_empty() {
+        return Ok(None);
+    }
+    // Same discovery set as `find_config` (fdl.yaml / fdl.yml / fdl.json) —
+    // a hardcoded fdl.yml here silently skipped fdl.yaml projects.
+    let base_path = config::find_config_in(project_root).ok_or_else(|| {
+        format!(
+            "FDL_ENV={env_name} is set but no fdl config file exists in {}",
+            project_root.display()
+        )
+    })?;
+    let cfg = config::load_project_with_env(&base_path, Some(env_name))
+        .map_err(|e| format!("FDL_ENV={env_name}: cannot resolve the overlay: {e}"))?;
+    let Some(cluster) = cfg.cluster else {
+        return Ok(None);
+    };
+    let host_name = crate::cluster::resolve_local_hostname();
+    let Some(entry) = cluster.workers.iter().find(|w| w.host == host_name) else {
+        return Ok(None);
+    };
+    let Some(arch) = entry.arch.as_ref() else {
+        return Ok(None);
+    };
+    let variant_dir = std::path::PathBuf::from(&entry.path)
+        .join("libtorch")
+        .join(arch);
+    Ok(resolve_libtorch_at(&variant_dir))
+}
+
+/// Resolve a libtorch variant dir (the per-host `arch:` applied as
+/// `<path>/libtorch/<arch>`) into
+/// `(LibtorchInfo, absolute host path for Docker bind mount)`. Accepts
+/// the same three shapes as `probe::check_libtorch_at`:
+///   1. Pointer file `.active*` — read pointer, resolve variant against
+///      the file's parent dir.
+///   2. Directory containing `.active` — read its `.active`.
+///   3. Direct variant dir (has `lib/`) — use as-is, parse `.arch` if
+///      present.
+pub(crate) fn resolve_libtorch_at(
+    path: &Path,
+) -> Option<(libtorch::detect::LibtorchInfo, String)> {
+    if path.is_file()
+        && path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".active"))
+    {
+        let libtorch_root = path.parent()?;
+        let info = libtorch::detect::read_active_from(path, libtorch_root)?;
+        let host_path = libtorch_root.join(&info.path).display().to_string();
+        return Some((info, host_path));
+    }
+    if path.join(".active").exists() {
+        let info = libtorch::detect::read_active_from(
+            &path.join(".active"),
+            path,
+        )?;
+        let host_path = path.join(&info.path).display().to_string();
+        return Some((info, host_path));
+    }
+    if path.join("lib").is_dir() {
+        let info = libtorch::detect::libtorch_info_from_dir(
+            path.display().to_string(),
+            path,
+        );
+        let host_path = path.display().to_string();
+        return Some((info, host_path));
+    }
+    None
 }
 
 /// Spawn a shell command with libtorch env vars set.
@@ -299,11 +417,25 @@ fn libtorch_env(project_root: &Path) -> Vec<(String, String)> {
 /// `environment:` section in docker-compose.yml (bare variable name
 /// passes the host value through when set, ignored otherwise).
 fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
-    let env_vars = libtorch_env(project_root);
+    let env_vars = match libtorch_env(project_root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("fdl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", command])
         .current_dir(project_root)
+        // Export HOSTNAME so docker-compose's `hostname: ${HOSTNAME}`
+        // interpolation resolves to the host's hostname. bash sets
+        // HOSTNAME as a shell built-in but doesn't export it; docker
+        // compose only reads exported env vars.
+        .env(
+            "HOSTNAME",
+            crate::cluster::resolve_local_hostname(),
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .stdin(Stdio::inherit());
@@ -324,33 +456,7 @@ fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
 
 // ── Run-kind execution ──────────────────────────────────────────────────
 
-/// POSIX-quote a single token so it round-trips through `sh -c` / `bash
-/// -c` as one argument. Empty strings become `''`; tokens containing
-/// only safe characters pass through unchanged; everything else is
-/// wrapped in single quotes with embedded `'` escaped as `'\''`.
-pub(crate) fn posix_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | '@' | ',')
-    });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub(crate) use crate::util::shell::posix_quote;
 
 /// Split `s` on the first whitespace-bounded `--` token, returning the
 /// halves with that token removed. Trim each half. When no such token is
@@ -465,6 +571,31 @@ pub(crate) fn compose_run_command(
 /// between `command` and `append`, so a script like `cargo test live`
 /// with `append: -- --nocapture --ignored` still receives its libtest
 /// flags after a user-supplied `-p flodl-hf`.
+/// Forward the testing-cluster envelope into a docker-compose run
+/// invocation. When `fdl @cluster-test-{nccl,cpu} <cmd>` activates an
+/// overlay with a `cluster:` block, the dispatcher sets
+/// `FLODL_TESTING_CLUSTER_JSON` in fdl-cli's own env (see
+/// `dispatch_config` in main.rs). This helper checks that variable and
+/// returns a bare ` -e NAME` fragment (docker passes the value through
+/// from the environment the `sh -c` child inherits from this process)
+/// so the inner cargo process can see it; without it, the env var dies
+/// at the docker boundary and `discover_test_cluster()` inside the
+/// container silently falls back to local autodetect.
+///
+/// The value never appears on the command line, so this stays correct
+/// even if the envelope encoding changes (today it is hex, which would
+/// be shell-safe inline; the bare form does not depend on that).
+/// Source of truth for the env-var name lives in
+/// `flodl::distributed::testing::ENV_TESTING_CLUSTER_JSON`; mirrored
+/// here as a literal because flodl-cli is decoupled from the flodl
+/// library crate by policy (it must build without libtorch).
+fn testing_cluster_env_arg() -> String {
+    match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
+        Ok(_) => " -e FLODL_TESTING_CLUSTER_JSON".to_string(),
+        Err(_) => String::new(),
+    }
+}
+
 pub fn exec_script(
     command: &str,
     append: Option<&str>,
@@ -479,8 +610,10 @@ pub fn exec_script(
             // Quote the whole composed command for the outer
             // `bash -c` so user args containing shell metacharacters
             // don't escape the inner shell.
+            let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
+            let testing_env_arg = testing_cluster_env_arg();
             let docker_cmd = format!(
-                "docker compose run --rm {service} bash -c {}",
+                "docker compose{overlay} run --rm{testing_env_arg} {service} bash -c {}",
                 posix_quote(&inner_cmd)
             );
             spawn_docker_shell(&docker_cmd, cwd)
@@ -604,7 +737,10 @@ pub fn exec_command(
         let inner = if workdir.is_empty() || workdir == "." {
             format!("{entry} {args_str}")
         } else {
-            format!("cd {container_root}/{workdir} && {entry} {args_str}")
+            format!(
+                "cd {} && {entry} {args_str}",
+                posix_quote(&format!("{container_root}/{workdir}"))
+            )
         };
 
         if preset_name.is_some() {
@@ -618,8 +754,20 @@ pub fn exec_command(
         // the env, the binary just reads it. Without this, a user
         // typing `flodl-hf/tests/.exports/bert` from the host repo
         // root resolves against the wrong cwd inside the container.
+        let overlay = crate::cluster::cluster_compose_overlay_arg(project_root);
+        let testing_env_arg = testing_cluster_env_arg();
+        // Quote the whole composed command for the outer `sh -c`,
+        // exactly like `exec_script`. A double-quoted wrapper would
+        // let the outer shell expand `$`/backticks inside it (host-side,
+        // defeating shell_join's quoting) and break on any `"` in an
+        // argument.
+        // FDL_PROJECT_ROOT is quoted too: this whole string goes through
+        // `sh -c`, and a container root with a space would otherwise
+        // splice the env value across arguments.
         let docker_cmd = format!(
-            "docker compose run --rm -e FDL_PROJECT_ROOT={container_root} {service} bash -c \"{inner}\"",
+            "docker compose{overlay} run --rm -e {}{testing_env_arg} {service} bash -c {}",
+            posix_quote(&format!("FDL_PROJECT_ROOT={container_root}")),
+            posix_quote(&inner),
         );
         spawn_docker_shell(&docker_cmd, project_root)
     } else {
@@ -656,16 +804,16 @@ pub fn exec_command(
     }
 }
 
-/// Join args into a shell-safe string.
+/// Join args into a single shell-safe string for the docker `bash -c "…"`
+/// path. Each token is POSIX-quoted via [`posix_quote`], so shell
+/// metacharacters in a value (`$`, backticks, globs, `;`, `|`, redirections,
+/// …) are passed literally rather than expanded or interpreted by the inner
+/// shell. The previous predicate only quoted tokens containing a space, `"`,
+/// or empty — leaving `$HOME`, `` `cmd` ``, `*.py`, `a;b` to be interpreted.
+/// Mirrors `exec_script`, which quotes through the same helper.
 fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|a| {
-            if a.contains(' ') || a.contains('"') || a.is_empty() {
-                format!("'{}'", a.replace('\'', "'\\''"))
-            } else {
-                a.clone()
-            }
-        })
+        .map(|a| posix_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -737,11 +885,15 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     let (presets, sub_cmds) = split_commands_by_kind(&cmd_config.commands);
     let preset_slot = cmd_config.arg_name.as_deref().unwrap_or("preset");
 
+    // Wrap descriptions to the terminal width (or COLUMNS / a sane default).
+    let width = help_width();
+
     print_title(cmd_config, name);
     print_usage_line(cmd_config, name, &presets, &sub_cmds, preset_slot);
-    print_arguments_section(cmd_config, &presets, preset_slot);
+    print_arguments_section(cmd_config, &presets, preset_slot, width);
     print_sub_commands_section(&sub_cmds);
-    print_options_section(cmd_config);
+    print_schema_commands_section(cmd_config, name);
+    print_options_section(cmd_config, width);
     print_entry_section(cmd_config);
     print_defaults_section(cmd_config);
 }
@@ -778,6 +930,7 @@ fn print_arguments_section(
     cmd_config: &CommandConfig,
     presets: &CommandGroup,
     preset_slot: &str,
+    width: usize,
 ) {
     // Schema-declared positionals (typed slots on the entry binary) and
     // the preset slot (dispatched by fdl before the binary sees argv)
@@ -793,9 +946,12 @@ fn print_arguments_section(
     }
     eprintln!();
     eprintln!("{}:", style::yellow("Arguments"));
+    let avail = width.saturating_sub(4);
     if let Some(schema) = &cmd_config.schema {
         for a in &schema.args {
-            eprintln!("    {}", format_arg(a));
+            for line in format_arg(a, avail) {
+                eprintln!("    {line}");
+            }
         }
     }
     if !presets.is_empty() {
@@ -833,7 +989,36 @@ fn print_sub_commands_section(sub_cmds: &CommandGroup) {
     }
 }
 
-fn print_options_section(cmd_config: &CommandConfig) {
+/// List the entry binary's own subcommands when its schema is a tree
+/// (a variant-shaped `#[derive(FdlArgs)]` CLI). Distinct from
+/// [`print_sub_commands_section`], which lists fdl.yml-level Run/Path
+/// commands — these come from the binary's `--fdl-schema` output, and each
+/// has its own flag set (drill in with `fdl <name> <subcommand> --help`).
+fn print_schema_commands_section(cmd_config: &CommandConfig, name: &str) {
+    let Some(schema) = &cmd_config.schema else {
+        return;
+    };
+    if schema.commands.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("{}:", style::yellow("Commands"));
+    for (sub_name, sub_schema) in &schema.commands {
+        let desc = sub_schema.description.as_deref().unwrap_or("-");
+        eprintln!(
+            "    {}  {}",
+            style::green(&format!("{:<20}", sub_name)),
+            desc
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "    Run {} for a subcommand's options.",
+        style::dim(&format!("fdl {name} <command> --help"))
+    );
+}
+
+fn print_options_section(cmd_config: &CommandConfig, width: usize) {
     // Schema-driven options. Renders only when a schema block is present
     // in fdl.yaml; the "Defaults" section covers ddp/training/output.
     let Some(schema) = &cmd_config.schema else {
@@ -844,8 +1029,9 @@ fn print_options_section(cmd_config: &CommandConfig) {
     }
     eprintln!();
     eprintln!("{}:", style::yellow("Options"));
+    let avail = width.saturating_sub(4);
     for (long, spec) in &schema.options {
-        for line in format_option(long, spec) {
+        for line in format_option(long, spec, avail) {
             eprintln!("    {line}");
         }
     }
@@ -1049,8 +1235,8 @@ pub fn print_project_help(
         style::green(&format!("{:<18}", "-V, --version"))
     );
     eprintln!(
-        "    {}  Use fdl.<name>.yml overlay (also: FDL_ENV=<name>)",
-        style::green(&format!("{:<18}", "--env <name>"))
+        "    {}  Use fdl.<name>.yml overlay (also: --env <name>, FDL_ENV=<name>)",
+        style::green(&format!("{:<18}", "@<name>"))
     );
     eprintln!(
         "    {}  Verbose output",
@@ -1079,6 +1265,10 @@ pub fn print_project_help(
     eprintln!(
         "    {}  Drop a run command's `append:` suffix",
         style::green(&format!("{:<18}", "--no-append"))
+    );
+    eprintln!(
+        "    {}  Skip the cluster pre-flight build",
+        style::green(&format!("{:<18}", "--no-prebuild"))
     );
 
     // Built-in commands.
@@ -1137,14 +1327,14 @@ pub fn print_project_help(
                 };
                 eprintln!(
                     "    {}  Overlay from fdl.{}.yml{active_marker}",
-                    style::green(&format!("{:<18}", e)),
+                    style::green(&format!("{:<18}", format!("@{e}"))),
                     e
                 );
             }
             eprintln!();
             eprintln!(
                 "Use {} to run a command with an environment overlay.",
-                style::dim("fdl <env> <command>")
+                style::dim("fdl @<env> <command>")
             );
         }
     }
@@ -1223,47 +1413,172 @@ fn format_arg_usage(a: &ArgSpec) -> String {
     }
 }
 
-fn format_arg(a: &ArgSpec) -> String {
-    let mut left = format_arg_usage(a);
-    // Target ~22-char visual width for the label column.
+/// Label-column width for the `Arguments` section (chars, after the
+/// section's own left indent). Descriptions wrap into the column to the
+/// right of this.
+const ARG_COL: usize = 22;
+/// Label-column width for the `Options` section (option flags run wider
+/// than positional args, so they get a roomier column).
+const OPT_COL: usize = 30;
+
+fn format_arg(a: &ArgSpec, avail_width: usize) -> Vec<String> {
+    let left = format_arg_usage(a);
     let visible = visible_width(&left);
-    if visible < 22 {
-        for _ in 0..(22 - visible) {
-            left.push(' ');
-        }
-    } else {
-        left.push(' ');
-    }
-    let mut line = left;
-    line.push_str(a.description.as_deref().unwrap_or("-"));
-    append_default_and_choices(&mut line, &a.default, &a.choices, &a.ty);
-    line
+    let segs = desc_segments(a.description.as_deref(), &a.default, &a.choices, &a.ty);
+    format_row(&left, visible, ARG_COL, &segs, avail_width)
 }
 
-/// Format an option row. Returns one or more lines; `choices` list wraps
-/// onto a second indented line when present, to keep the main row readable.
-fn format_option(long: &str, spec: &OptionSpec) -> Vec<String> {
+/// Format an option row into one or more display lines: the flag (with its
+/// value placeholder) in the label column, the description word-wrapped
+/// into an aligned column to its right. A flag wider than the column drops
+/// its description to the next line rather than crowding it.
+fn format_option(long: &str, spec: &OptionSpec, avail_width: usize) -> Vec<String> {
     let flag = match &spec.short {
         Some(s) => format!("-{s}, --{long}"),
         None => format!("    --{long}"),
     };
     let placeholder = option_placeholder(&spec.ty);
-    let left = if placeholder.is_empty() {
-        style::green(&flag)
+    let (left, visible) = if placeholder.is_empty() {
+        (style::green(&flag), flag.chars().count())
     } else {
-        style::green(&format!("{flag} {placeholder}"))
+        (
+            style::green(&format!("{flag} {placeholder}")),
+            flag.chars().count() + 1 + placeholder.chars().count(),
+        )
     };
-    let visible = visible_width_for(&flag, placeholder);
-
-    // Pad to 30 columns for alignment.
-    let pad = if visible < 30 { 30 - visible } else { 1 };
-    let mut line = format!("{left}{}", " ".repeat(pad));
-    line.push_str(spec.description.as_deref().unwrap_or("-"));
-    append_default_and_choices(&mut line, &spec.default, &spec.choices, &spec.ty);
-
-    let mut out = vec![line];
+    let segs = desc_segments(spec.description.as_deref(), &spec.default, &spec.choices, &spec.ty);
+    let mut out = format_row(&left, visible, OPT_COL, &segs, avail_width);
     if let Some(env) = &spec.env {
-        out.push(format!("{}  {}", " ".repeat(32), style::dim(&format!("[env: {env}]"))));
+        out.push(format!(
+            "{}{}",
+            " ".repeat(OPT_COL),
+            style::dim(&format!("[env: {env}]"))
+        ));
+    }
+    out
+}
+
+/// A word/segment for description wrapping: `text` is the visible content
+/// (what counts toward the wrap width), `styled` is what actually gets
+/// printed (may carry ANSI escapes, which have zero visible width).
+struct Seg {
+    text: String,
+    styled: String,
+}
+
+impl Seg {
+    fn plain(s: &str) -> Seg {
+        Seg { text: s.to_string(), styled: s.to_string() }
+    }
+    fn dim(s: &str) -> Seg {
+        Seg { text: s.to_string(), styled: style::dim(s) }
+    }
+}
+
+/// Break a description (plus its `[default:]` / `[possible:]` / list-type
+/// annotations) into wrap units. Free-text words split on whitespace so
+/// they reflow; each annotation stays whole (a `[possible: a, b, c]` list
+/// reads better unbroken than reflowed mid-item).
+fn desc_segments(
+    description: Option<&str>,
+    default: &Option<serde_json::Value>,
+    choices: &Option<Vec<serde_json::Value>>,
+    ty: &str,
+) -> Vec<Seg> {
+    let mut segs: Vec<Seg> = description
+        .unwrap_or("-")
+        .split_whitespace()
+        .map(Seg::plain)
+        .collect();
+    if let Some(d) = default {
+        // Skip noisy defaults: bool false, empty list, null.
+        let is_empty_list = matches!(d, serde_json::Value::Array(a) if a.is_empty());
+        let is_false = matches!(d, serde_json::Value::Bool(false));
+        if !d.is_null() && !is_false && !is_empty_list {
+            segs.push(Seg::dim(&format!("[default: {}]", format_value(d))));
+        }
+    }
+    if let Some(choices) = choices {
+        if !choices.is_empty() {
+            let list = choices.iter().map(format_value).collect::<Vec<_>>().join(", ");
+            segs.push(Seg::dim(&format!("[possible: {list}]")));
+        }
+    }
+    // Annotate list types so users know about repeat/comma semantics.
+    if ty.starts_with("list[") {
+        segs.push(Seg::dim("(repeat or comma-separate)"));
+    }
+    segs
+}
+
+/// Greedily pack segments into lines no wider than `width` visible chars,
+/// one space between words. A single segment wider than `width` (e.g. a
+/// long unbreakable annotation) gets its own overflowing line rather than
+/// being split.
+fn wrap_segments(segs: &[Seg], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for seg in segs {
+        let w = seg.text.chars().count();
+        if cur_w == 0 {
+            cur.push_str(&seg.styled);
+            cur_w = w;
+        } else if cur_w + 1 + w <= width {
+            cur.push(' ');
+            cur.push_str(&seg.styled);
+            cur_w += 1 + w;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(&seg.styled);
+            cur_w = w;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Lay out a two-column help row: a `label` of visible width
+/// `label_visible` in a column `desc_col` chars wide, then `segs` wrapped
+/// into the description column to its right. `avail_width` is the printable
+/// width the section has after its own left indent. Continuation lines
+/// align under the description column; a label too wide for its column
+/// drops the description to the next line.
+fn format_row(
+    label: &str,
+    label_visible: usize,
+    desc_col: usize,
+    segs: &[Seg],
+    avail_width: usize,
+) -> Vec<String> {
+    // Floor so a narrow terminal still leaves a usable description column.
+    const MIN_DESC: usize = 20;
+    let desc_width = avail_width.saturating_sub(desc_col).max(MIN_DESC);
+    let desc_lines = wrap_segments(segs, desc_width);
+    let pad = " ".repeat(desc_col);
+    let mut out: Vec<String> = Vec::with_capacity(desc_lines.len() + 1);
+    if label_visible < desc_col {
+        let gap = " ".repeat(desc_col - label_visible);
+        out.push(format!("{label}{gap}{}", desc_lines[0]));
+    } else {
+        // Label overflows its column: give it its own line, description below.
+        out.push(label.to_string());
+        out.push(format!("{pad}{}", desc_lines[0]));
+    }
+    for line in &desc_lines[1..] {
+        out.push(format!("{pad}{line}"));
+    }
+    // Drop trailing padding (e.g. a "-" placeholder leaves a padded blank).
+    for line in &mut out {
+        while line.ends_with(' ') {
+            line.pop();
+        }
     }
     out
 }
@@ -1277,36 +1592,6 @@ fn option_placeholder(ty: &str) -> &'static str {
         "list[path]" => "<PATH>...",
         t if t.starts_with("list[") => "<VALUE>...",
         _ => "<VALUE>",
-    }
-}
-
-fn append_default_and_choices(
-    line: &mut String,
-    default: &Option<serde_json::Value>,
-    choices: &Option<Vec<serde_json::Value>>,
-    ty: &str,
-) {
-    if let Some(d) = default {
-        // Skip noisy defaults: bool false, empty list, null.
-        let is_empty_list = matches!(d, serde_json::Value::Array(a) if a.is_empty());
-        let is_false = matches!(d, serde_json::Value::Bool(false));
-        if !d.is_null() && !is_false && !is_empty_list {
-            line.push_str(&format!(" {}", style::dim(&format!("[default: {}]", format_value(d)))));
-        }
-    }
-    if let Some(choices) = choices {
-        if !choices.is_empty() {
-            let list = choices
-                .iter()
-                .map(format_value)
-                .collect::<Vec<_>>()
-                .join(", ");
-            line.push_str(&format!(" {}", style::dim(&format!("[possible: {list}]"))));
-        }
-    }
-    // Annotate list types so users know about repeat/comma semantics.
-    if ty.starts_with("list[") {
-        line.push_str(&format!(" {}", style::dim("(repeat or comma-separate)")));
     }
 }
 
@@ -1325,12 +1610,64 @@ fn visible_width(s: &str) -> usize {
     strip_ansi(s).chars().count()
 }
 
-fn visible_width_for(flag: &str, placeholder: &str) -> usize {
-    if placeholder.is_empty() {
-        flag.chars().count()
-    } else {
-        flag.chars().count() + 1 + placeholder.chars().count()
+/// Printable width to wrap help output to. Precedence: an explicit
+/// `COLUMNS` env var (lets CI and pipelines pin it), else the controlling
+/// terminal's width when stderr is a TTY, else a readable default. Clamped
+/// so ultra-wide terminals don't stretch descriptions past comfortable
+/// reading length and narrow ones stay usable.
+fn help_width() -> usize {
+    const DEFAULT: usize = 100;
+    const MIN: usize = 60;
+    const MAX: usize = 120;
+    let raw = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .or_else(term_cols)
+        .unwrap_or(DEFAULT);
+    raw.clamp(MIN, MAX)
+}
+
+/// The controlling terminal's column count via `TIOCGWINSZ`, or `None`
+/// when stderr is not a TTY (help is piped/redirected) or the query fails.
+/// Dep-free: the minimal-deps policy precludes a terminal-size crate, so we
+/// declare the one `ioctl` we need. Non-unix targets have no equivalent
+/// here and fall back to the default width.
+#[cfg(unix)]
+fn term_cols() -> Option<usize> {
+    use std::io::IsTerminal;
+    use std::os::unix::io::AsRawFd;
+
+    let stderr = std::io::stderr();
+    if !stderr.is_terminal() {
+        return None;
     }
+    #[repr(C)]
+    struct Winsize {
+        row: u16,
+        col: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+    // TIOCGWINSZ request code: 0x5413 on Linux/Android (incl. WSL), the
+    // packed 0x4008_7468 on the BSDs/macOS.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
+    unsafe extern "C" {
+        fn ioctl(fd: std::os::raw::c_int, request: std::os::raw::c_ulong, ...) -> std::os::raw::c_int;
+    }
+    let mut ws = Winsize { row: 0, col: 0, xpixel: 0, ypixel: 0 };
+    // SAFETY: `ioctl(TIOCGWINSZ, &Winsize)` writes the window size into the
+    // struct; the fd is stderr, verified above to be a terminal.
+    let rc = unsafe { ioctl(stderr.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
+    (rc == 0 && ws.col > 0).then_some(ws.col as usize)
+}
+
+#[cfg(not(unix))]
+fn term_cols() -> Option<usize> {
+    None
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -1354,6 +1691,125 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test_env::env_lock;
+
+    // Help-column wrapping. Plain segments keep these independent of the
+    // color state (no `style::*` calls), so they need no style lock.
+    fn plain_segs(words: &[&str]) -> Vec<Seg> {
+        words.iter().map(|w| Seg::plain(w)).collect()
+    }
+
+    #[test]
+    fn wrap_segments_packs_words_within_width() {
+        let segs = plain_segs(&["alpha", "beta", "gamma", "delta"]);
+        // width 12: "alpha beta" (10) fits, +" gamma" (16) does not.
+        let lines = wrap_segments(&segs, 12);
+        assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
+        for line in &lines {
+            assert!(line.chars().count() <= 12);
+        }
+    }
+
+    #[test]
+    fn wrap_segments_oversized_segment_gets_its_own_line() {
+        let segs = plain_segs(&["short", "supercalifragilistic", "tail"]);
+        let lines = wrap_segments(&segs, 10);
+        // The oversized word overflows alone rather than being split.
+        assert_eq!(lines, vec!["short", "supercalifragilistic", "tail"]);
+    }
+
+    #[test]
+    fn format_row_aligns_continuation_under_description_column() {
+        // desc_col 8, avail 28 → desc width 20 (the MIN_DESC floor).
+        let segs = plain_segs(&["aaaa", "bbbb", "cccc", "dddd", "eeee"]);
+        let rows = format_row("--x", 3, 8, &segs, 28);
+        // "aaaa bbbb cccc dddd" = 19 ≤ 20 fits; " eeee" would be 24, wraps.
+        assert_eq!(rows[0], "--x     aaaa bbbb cccc dddd"); // 3 + 5 spaces = column 8
+        assert_eq!(rows[1], format!("{}eeee", " ".repeat(8)));
+        // Continuation lines are indented exactly to the column.
+        for row in &rows[1..] {
+            assert!(row.starts_with(&" ".repeat(8)));
+            assert!(!row.starts_with(&" ".repeat(9)));
+        }
+    }
+
+    #[test]
+    fn format_row_overflowing_label_drops_description_below() {
+        let segs = plain_segs(&["desc"]);
+        // Label wider than the 8-char column → own line, desc aligned below.
+        let rows = format_row("--a-very-long-flag", 18, 8, &segs, 40);
+        assert_eq!(rows[0], "--a-very-long-flag");
+        assert_eq!(rows[1], format!("{}desc", " ".repeat(8)));
+    }
+
+    #[test]
+    fn help_width_honors_columns_env_within_clamp() {
+        let _lock = env_lock();
+        let prev = std::env::var("COLUMNS").ok();
+        // SAFETY: guarded by the process-wide env lock.
+        unsafe { std::env::set_var("COLUMNS", "90") };
+        assert_eq!(help_width(), 90);
+        unsafe { std::env::set_var("COLUMNS", "9999") };
+        assert_eq!(help_width(), 120); // clamped to MAX
+        unsafe { std::env::set_var("COLUMNS", "10") };
+        assert_eq!(help_width(), 60); // clamped to MIN
+        match prev {
+            Some(v) => unsafe { std::env::set_var("COLUMNS", v) },
+            None => unsafe { std::env::remove_var("COLUMNS") },
+        }
+    }
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "fdl-run-test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn overlay_libtorch_finds_fdl_yaml_spelling() {
+        // The resolver previously hardcoded `fdl.yml` while config
+        // discovery accepts fdl.yaml / fdl.yml / fdl.json — an fdl.yaml
+        // project under FDL_ENV silently fell back to `.active`.
+        let _guard = env_lock();
+        let dir = unique_tmp_dir("yaml-spelling");
+        std::fs::write(dir.join("fdl.yaml"), "description: base\n").unwrap();
+        std::fs::write(
+            dir.join("fdl.testenv.yaml"),
+            "cluster:\n  controller:\n    host: 127.0.0.1\n    port: 29500\n    path: /opt/flodl\n  workers:\n    - host: not-this-host\n      local_devices: [0]\n      nccl_socket_ifname: lo\n      path: /opt/flodl\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("FDL_ENV", "testenv") };
+        // Loads through fdl.yaml + overlay; current host isn't listed →
+        // legitimate Ok(None), NOT an Err and NOT a hardcoded-name miss.
+        let resolved = resolve_libtorch_from_overlay(&dir);
+        unsafe { std::env::remove_var("FDL_ENV") };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(resolved, Ok(None)), "{resolved:?}");
+    }
+
+    #[test]
+    fn overlay_libtorch_load_failure_is_loud() {
+        // A broken overlay under FDL_ENV must error, not silently fall
+        // back to `.active` (wrong libtorch on heterogeneous rigs).
+        let _guard = env_lock();
+        let dir = unique_tmp_dir("broken-overlay");
+        std::fs::write(dir.join("fdl.yml"), "description: base\n").unwrap();
+        // FDL_ENV names an overlay that doesn't exist -> load error.
+        unsafe { std::env::set_var("FDL_ENV", "missing-env") };
+        let resolved = resolve_libtorch_from_overlay(&dir);
+        unsafe { std::env::remove_var("FDL_ENV") };
+        std::fs::remove_dir_all(&dir).ok();
+        let err = match resolved {
+            Ok(v) => panic!("expected Err, got Ok({v:?})"),
+            Err(e) => e,
+        };
+        assert!(err.contains("missing-env"), "{err}");
+    }
 
     #[test]
     fn posix_quote_passes_safe_strings_through() {
@@ -1376,6 +1832,38 @@ mod tests {
     fn posix_quote_escapes_embedded_single_quotes() {
         assert_eq!(posix_quote("it's"), "'it'\\''s'");
         assert_eq!(posix_quote("'"), "''\\'''");
+    }
+
+    #[test]
+    fn posix_quote_round_trips_shell_join_output() {
+        // The docker exec paths nest quoting: shell_join single-quotes
+        // each arg, then the whole `cd … && entry args` command is
+        // posix_quote'd again for the outer `sh -c`. The embedded
+        // single quotes must re-escape as '\'' so the inner bash sees
+        // the args byte-for-byte. A double-quoted wrapper ("{inner}")
+        // instead lets the OUTER shell expand $/backticks and breaks
+        // on any `"` in an arg.
+        let args: Vec<String> = ["--tag", "$HOME", "a\"b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let inner = format!("cd /workspace/bench && train {}", shell_join(&args));
+        assert_eq!(
+            posix_quote(&inner),
+            "'cd /workspace/bench && train --tag '\\''$HOME'\\'' '\\''a\"b'\\'''"
+        );
+    }
+
+    #[test]
+    fn shell_join_quotes_shell_metacharacters() {
+        // M23: safe tokens pass through bare and join with spaces; values with
+        // shell metacharacters ($, glob, ;) are single-quoted so the inner
+        // `bash -c "…"` treats them literally instead of expanding them.
+        let args: Vec<String> = ["--model", "mlp", "--tag", "$HOME", "*.py", "a;b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(shell_join(&args), "--model mlp --tag '$HOME' '*.py' 'a;b'");
     }
 
     #[test]
@@ -1496,5 +1984,106 @@ mod tests {
             split_append_dashdash(""),
             (String::new(), String::new())
         );
+    }
+
+    // ── resolve_libtorch_at: 3-shape libtorch variant resolution ────────
+    //
+    // Each test builds a synthetic libtorch dir under a per-test scratch
+    // path (the minimal-deps policy precludes pulling in `tempfile`) and feeds the path
+    // through `resolve_libtorch_at`. Variant names (`precompiled/v1`,
+    // `builds/v2`) are deliberately abstract — the resolver is structural,
+    // not rig-aware.
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0);
+            let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("fdl-resolve-libtorch-{}-{}", nanos, seq));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn populate_lt_root(root: &std::path::Path) {
+        for (sub, torch, archs) in [
+            ("precompiled/v1", "1.0", "0.0"),
+            ("builds/v2", "2.0", "1.0"),
+        ] {
+            let d = root.join(sub);
+            std::fs::create_dir_all(d.join("lib")).unwrap();
+            std::fs::write(
+                d.join(".arch"),
+                format!("torch={torch}\ncuda=1.0\narchs={archs}\nsource=test\n"),
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_libtorch_at_pointer_file() {
+        let s = Scratch::new();
+        let lt = s.path().join("libtorch");
+        populate_lt_root(&lt);
+        let pointer = lt.join(".active.alt");
+        std::fs::write(&pointer, "precompiled/v1\n").unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&pointer)
+            .expect("pointer file resolves");
+        assert_eq!(info.path, "precompiled/v1");
+        assert_eq!(info.torch_version.as_deref(), Some("1.0"));
+        assert_eq!(host_path, lt.join("precompiled/v1").display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_libtorch_root_dir() {
+        let s = Scratch::new();
+        let lt = s.path().join("libtorch");
+        populate_lt_root(&lt);
+        std::fs::write(lt.join(".active"), "builds/v2\n").unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&lt)
+            .expect("libtorch-root dir resolves");
+        assert_eq!(info.path, "builds/v2");
+        assert_eq!(info.torch_version.as_deref(), Some("2.0"));
+        assert_eq!(host_path, lt.join("builds/v2").display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_direct_variant_dir() {
+        let s = Scratch::new();
+        let variant = s.path().join("standalone-libtorch");
+        std::fs::create_dir_all(variant.join("lib")).unwrap();
+        std::fs::write(
+            variant.join(".arch"),
+            "torch=3.0\ncuda=2.0\narchs=1.0\nsource=test\n",
+        ).unwrap();
+
+        let (info, host_path) = resolve_libtorch_at(&variant)
+            .expect("direct variant dir resolves");
+        assert_eq!(info.path, variant.display().to_string());
+        assert_eq!(info.torch_version.as_deref(), Some("3.0"));
+        assert_eq!(host_path, variant.display().to_string());
+    }
+
+    #[test]
+    fn resolve_libtorch_at_bogus_path_returns_none() {
+        let s = Scratch::new();
+        let bogus = s.path().join("no-lib-no-active-no-pointer");
+        std::fs::create_dir_all(&bogus).unwrap();
+        assert!(resolve_libtorch_at(&bogus).is_none(),
+            "dir without lib/, .active, or pointer-shape filename → None");
     }
 }

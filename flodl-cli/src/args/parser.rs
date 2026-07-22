@@ -202,18 +202,36 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
         }
     }
 
-    // Positional choice validation.
+    // Positional binding + choice validation. A positional with no decl
+    // to bind to (beyond the declared list, no variadic) is an error, not
+    // silence: `bench -- --model lenet` lands here with `--model` as a
+    // positional and the run would otherwise proceed on defaults.
+    // Lenient mode keeps tolerating extras — orphan values of dropped
+    // unknown flags land as positionals, and the binary re-parses the
+    // tail authoritatively.
     for (idx, value) in out.positionals.iter().enumerate() {
-        let decl = positional_decl_for(spec, idx);
-        if let Some(d) = decl {
-            if let Some(choices) = &d.choices {
-                if !choices.iter().any(|c| c == value) {
-                    return Err(format!(
-                        "invalid value `{value}` for <{}> -- allowed: {}",
-                        d.name,
-                        choices.join(", ")
-                    ));
+        match positional_decl_for(spec, idx) {
+            Some(d) => {
+                if let Some(choices) = &d.choices {
+                    if !choices.iter().any(|c| c == value) {
+                        return Err(format!(
+                            "invalid value `{value}` for <{}> -- allowed: {}",
+                            d.name,
+                            choices.join(", ")
+                        ));
+                    }
                 }
+            }
+            None if spec.lenient_unknowns => {}
+            None => {
+                let hint = if value.starts_with('-') {
+                    "; tokens after a standalone `--` are treated as \
+                     positional arguments, not options — pass options \
+                     directly, without a `--` separator"
+                } else {
+                    ""
+                };
+                return Err(format!("unexpected argument `{value}`{hint}"));
             }
         }
     }
@@ -223,6 +241,18 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
 
 /// Consume one flag — given the decl and optional inline value — and
 /// advance the argv cursor accordingly. Returns the new index.
+/// Whether `s` should be treated as a flag when deciding if the token after a
+/// value-taking option is that option's value.
+///
+/// A leading `-` marks a flag EXCEPT for a bare `-`/`--` and for negative
+/// numbers: `--lr -0.5` must consume `-0.5` as the value, not read it as a
+/// flag. This is unambiguous here because every flodl short flag is alphabetic
+/// (`-v`/`-q`/`-h`/`-V`/`-y`) — a `-<number>` token can only be a value.
+/// `f64::from_str` also accepts `-inf` / `-nan`, which are fine as values.
+fn is_flag_like(s: &str) -> bool {
+    s.starts_with('-') && s != "-" && s != "--" && s.parse::<f64>().is_err()
+}
+
 fn consume_flag(
     decl: &OptionDecl,
     inline_value: Option<String>,
@@ -249,7 +279,7 @@ fn consume_flag(
     let next_idx = i + 1;
     let next_is_flag = args
         .get(next_idx)
-        .map(|s| s.starts_with('-') && s != "-" && s != "--")
+        .map(|s| is_flag_like(s))
         .unwrap_or(true); // absent counts as "no value available"
 
     if !next_is_flag {
@@ -346,6 +376,18 @@ fn unknown_long_error(spec: &ArgsSpec, name: &str) -> String {
         Some(s) => format!("unknown flag `--{name}`, did you mean `{s}`?"),
         None => format!("unknown flag `--{name}`"),
     }
+}
+
+/// "Did you mean" suggestion over a fixed candidate list: returns the
+/// first candidate within edit distance 2 of `input`, if any. The
+/// flag-level equivalent is folded into `unknown_long_error`; this
+/// public entry is for the enum-dispatch codegen, which suggests a
+/// subcommand name when the user mistypes one (`bin trian` → `train`).
+pub fn suggest(candidates: &[&str], input: &str) -> Option<String> {
+    candidates
+        .iter()
+        .find(|c| similar(c, input))
+        .map(|c| (*c).to_string())
 }
 
 /// "did you mean" similarity: edit distance ≤ 2 qualifies.
@@ -451,6 +493,47 @@ mod tests {
             Some(OptionState::WithValues(v)) => assert_eq!(v, &vec!["mlp".to_string()]),
             other => panic!("expected WithValues, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn is_flag_like_treats_negative_numbers_as_values() {
+        // M22: negative numbers (and bare -/--) are NOT flags for the purpose
+        // of value consumption; alphabetic short/long flags are.
+        assert!(is_flag_like("--verbose"));
+        assert!(is_flag_like("-v"));
+        assert!(!is_flag_like("-0.5"));
+        assert!(!is_flag_like("-5"));
+        assert!(!is_flag_like("-1e-3"));
+        assert!(!is_flag_like("-")); // bare dash: value/stdin sentinel
+        assert!(!is_flag_like("--")); // separator
+        assert!(!is_flag_like("mlp")); // plain positional value
+    }
+
+    #[test]
+    fn value_flag_consumes_space_separated_negative_number() {
+        // M22: `--lr -0.5` reads `-0.5` as the value, not a flag.
+        let spec = ArgsSpec {
+            options: vec![value("lr", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let out = parse(&spec, &argv(&["--lr", "-0.5"])).unwrap();
+        match out.options.get("lr") {
+            Some(OptionState::WithValues(v)) => assert_eq!(v, &vec!["-0.5".to_string()]),
+            other => panic!("expected WithValues([-0.5]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn value_flag_still_errors_when_next_is_a_real_flag() {
+        // A genuine flag after a value-requiring option is NOT consumed.
+        let spec = ArgsSpec {
+            options: vec![value("lr", None, false), flag("verbose", None)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["--lr", "--verbose"])).unwrap_err();
+        assert!(err.contains("requires a value"), "got: {err}");
     }
 
     #[test]
@@ -608,6 +691,47 @@ mod tests {
         let out = parse(&spec, &argv(&["--", "--verbose", "-x"])).unwrap();
         assert!(!out.options.contains_key("verbose"));
         assert_eq!(out.positionals, vec!["--verbose".to_string(), "-x".into()]);
+    }
+
+    #[test]
+    fn excess_positional_errors_loudly() {
+        // No positionals declared: a stray token must error, not vanish.
+        let spec = ArgsSpec {
+            options: vec![value("model", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["stray"])).unwrap_err();
+        assert!(err.contains("unexpected argument `stray`"), "got: {err}");
+    }
+
+    #[test]
+    fn dashdash_forwarded_options_error_with_hint() {
+        // The `fdl bench -- --model lenet` footgun: after `--` the
+        // options land as positionals; with none declared this must be
+        // loud (it used to run silently on defaults).
+        let spec = ArgsSpec {
+            options: vec![value("model", None, false)],
+            positionals: vec![],
+            ..ArgsSpec::default()
+        };
+        let err = parse(&spec, &argv(&["--", "--model", "lenet"])).unwrap_err();
+        assert!(err.contains("unexpected argument `--model`"), "got: {err}");
+        assert!(err.contains("without a `--` separator"), "got: {err}");
+    }
+
+    #[test]
+    fn lenient_mode_tolerates_excess_positionals() {
+        // Orphan values of dropped unknown flags land as positionals in
+        // lenient mode; the binary re-parses authoritatively, so fdl-side
+        // validation must not reject them.
+        let spec = ArgsSpec {
+            options: vec![],
+            positionals: vec![],
+            lenient_unknowns: true,
+        };
+        let out = parse(&spec, &argv(&["--unknown", "orphan-value"])).unwrap();
+        assert_eq!(out.positionals, vec!["orphan-value".to_string()]);
     }
 
     #[test]

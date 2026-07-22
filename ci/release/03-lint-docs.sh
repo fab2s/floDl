@@ -50,10 +50,13 @@ if [ -n "$STALE_MAKE" ]; then
 fi
 
 # --- B. Hardcoded user paths ---
+# `/home/me/` is the documented placeholder convention (docs, examples)
+# and `/home/ubuntu/` is the container-internal user (Dockerfile.cuda,
+# docker-compose ssh rank setup) — both are deliberate, not leaks.
 HARDCODED=$(git grep -nE '/home/[a-z][a-zA-Z0-9_-]+/|/Users/[a-zA-Z][a-zA-Z0-9_-]+/|C:\\\\Users\\\\[a-zA-Z][a-zA-Z0-9_-]+' \
     -- ':!ci/release' ':!CHANGELOG.md' ':!Cargo.lock' \
        ':!site/_site' ':!site/.jekyll-cache' \
-    2>/dev/null || true)
+    2>/dev/null | grep -vE '/home/(me|ubuntu)/' || true)
 
 if [ -n "$HARDCODED" ]; then
     echo "FAIL: hardcoded user-specific paths:"

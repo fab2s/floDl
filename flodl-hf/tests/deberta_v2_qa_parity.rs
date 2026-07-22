@@ -49,7 +49,7 @@ fn deberta_v2_qa_parity_vs_pytorch_live() {
     let ref_shape = shape_i64(&ref_logits);
 
     let head = DebertaV2ForQuestionAnswering::from_pretrained(MODEL_ID).unwrap();
-    cast_parameters(&head.graph().parameters(), DType::Float32);
+    cast_parameters(&head.graph().parameters(), DType::Float32).unwrap();
     head.graph().eval();
 
     let out = head.graph()

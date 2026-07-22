@@ -2,7 +2,7 @@ use crate::autograd::Variable;
 use crate::tensor::{Result, TensorError};
 
 use super::trend::{Trend, TrendGroup};
-use super::Graph;
+use super::{Graph, GraphExt};
 
 /// Reduction strategy for non-scalar tagged outputs in collect_with().
 pub enum Reduce {
@@ -136,6 +136,25 @@ impl Graph {
     /// Use [`latest_metrics_local()`](Self::latest_metrics_local) if you
     /// only want this graph's own metrics.
     pub fn latest_metrics(&self) -> Vec<(String, f64)> {
+        // Cluster-mode short-circuit: when the framework has populated
+        // the aggregated-metrics slot (`Trainer::builder` / `Trainer::run`
+        // or the cooperative `into_worker` path), surface the coord's
+        // cross-rank view instead of this rank's local epoch history.
+        // User code stays identical (`monitor.log(epoch, dur, &model)`);
+        // single-GPU / standalone runs fall through to the local
+        // history below.
+        if let Ok(slot) = self.aggregated_metrics.lock() {
+            if let Some(ref m) = *slot {
+                let mut out = Vec::with_capacity(m.scalars.len() + 1);
+                out.push(("loss".to_string(), m.avg_loss));
+                let mut keys: Vec<&String> = m.scalars.keys().collect();
+                keys.sort();
+                for k in keys {
+                    out.push((k.clone(), m.scalars[k]));
+                }
+                return out;
+            }
+        }
         let mut metrics = self.latest_metrics_local();
         // Collect from labeled children with dotted prefixes
         for (label, &ni) in &self.children {
@@ -148,6 +167,33 @@ impl Graph {
             }
         }
         metrics
+    }
+
+    /// Per-rank GPU tabs from the coord-broadcast aggregated view.
+    /// Each tuple is `(device_index, throughput_samples_per_ms,
+    /// batch_share_fraction)` — matches the fields the dashboard's
+    /// per-GPU tabs already consume via
+    /// [`crate::monitor::GpuMetrics`]. Empty when the framework
+    /// hasn't populated the slot yet (single-GPU runs, pre-first-
+    /// aggregation cluster mode).
+    pub fn aggregated_gpu_tabs(&self) -> Vec<(u8, f64, f64)> {
+        let Ok(slot) = self.aggregated_metrics.lock() else {
+            return Vec::new();
+        };
+        let Some(ref m) = *slot else {
+            return Vec::new();
+        };
+        m.device_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &dev)| {
+                (
+                    dev,
+                    m.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                    m.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
     }
 
     /// Return latest epoch values for this graph only, without child metrics.
@@ -395,30 +441,6 @@ impl Graph {
         }
 
         self.traces_validated.set(true);
-    }
-
-    /// Replace trace buffer contents for the given tag.
-    ///
-    /// Used by El Che gathering to set catted traces from all devices/batches.
-    /// Routes to the legacy `trace_buf` when `name` matches a post-loop tag,
-    /// otherwise writes into the first loop's `named_trace_buf` whose store
-    /// already carries `name` (i.e. the loop that produced it on this rank).
-    pub(crate) fn set_traces(&self, name: &str, traces: Vec<Variable>) {
-        if let Some(&(ni, _)) = self.tag_names.get(name)
-            && let Some(ref buf) = self.nodes[ni].trace_buf
-        {
-            *buf.borrow_mut() = traces;
-            return;
-        }
-        for node in &self.nodes {
-            if let Some(ref store) = node.named_trace_buf {
-                let mut store_mut = store.borrow_mut();
-                if store_mut.contains_key(name) {
-                    store_mut.insert(name.to_string(), traces);
-                    return;
-                }
-            }
-        }
     }
 
     /// Get the last trace output from the most recent loop iteration.

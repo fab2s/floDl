@@ -1,32 +1,30 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
 
 use indexmap::IndexMap;
-use hmac_sha256::Hash as Sha256;
 
 use super::node::*;
 use super::profile;
-use super::LossContext;
+use super::GraphExt;
 use crate::autograd::Variable;
 use crate::nn::{Buffer, Module, Parameter};
-use crate::tensor::{Result, Tensor, TensorError};
+use crate::tensor::{Result, TensorError};
 
 /// Pre-computed route from one node's output port to another node's input port.
 /// Replaces HashMap-based edge routing in forward_impl for O(1) access.
 #[derive(Clone)]
 pub(crate) struct Route {
-    from_port_idx: usize,
-    to_node_idx: usize,
-    to_port_idx: usize,
+    // pub(crate): built in `graph.rs`, read by `forward_impl` in `execution.rs`.
+    pub(crate) from_port_idx: usize,
+    pub(crate) to_node_idx: usize,
+    pub(crate) to_port_idx: usize,
 }
 
 /// Pre-computed graph input → node input slot mapping.
 pub(crate) struct InputRoute {
-    node_idx: usize,
-    port_idx: usize,
+    pub(crate) node_idx: usize,
+    pub(crate) port_idx: usize,
 }
 
 /// Forward-reference state buffer. Persists across `forward()` calls.
@@ -108,8 +106,6 @@ pub struct Graph {
     pub(crate) node_input_count: Vec<usize>,
     // Cached execution buffers (reused across forward calls, avoids re-allocation)
     pub(crate) exec_slots: RefCell<Vec<Vec<Option<Variable>>>>,
-    // Distributed Data Parallel state (set by distribute(), None for single-GPU)
-    pub(crate) distributed: RefCell<Option<crate::distributed::ddp::DistributedState>>,
     // Optimizer for step() (works for both single-GPU and distributed)
     pub(crate) optimizer: RefCell<Option<Box<dyn crate::nn::Optimizer>>>,
     // Optional per-batch LR scheduler. When set, `step()` updates every
@@ -117,8 +113,8 @@ pub struct Graph {
     // calling `optimizer.step()`.
     pub(crate) scheduler: RefCell<Option<std::sync::Arc<dyn crate::nn::Scheduler>>>,
     // DDP linear-scaling factor applied multiplicatively to scheduler output.
-    // Defaults to 1.0 (no scaling). Set by `Trainer::setup_with` when the user
-    // enabled `DdpConfig::lr_scale_ratio`.
+    // Defaults to 1.0 (no scaling); set via `set_lr_scale` to apply the
+    // Goyal et al. linear-scaling rule on top of the attached scheduler.
     pub(crate) lr_scale: Cell<f64>,
     // Dedicated training step counter for the LR scheduler. Incremented once
     // per `step()` call, regardless of whether the caller also invokes
@@ -126,9 +122,12 @@ pub struct Graph {
     pub(crate) training_step: Cell<usize>,
     // DataLoader binding for resident DDP (set by set_data_loader(), None by default)
     pub(crate) data_binding: RefCell<Option<DataLoaderBinding>>,
-    // Per-batch loss closure for El Che (set by set_loss_fn(), None = legacy gather path)
-    #[allow(clippy::type_complexity)]
-    pub(crate) loss_fn: RefCell<Option<Box<dyn Fn(&LossContext) -> Result<Variable>>>>,
+    /// The bound DataLoader, in its OWN cell so an active epoch iterator can
+    /// hold it exclusively (see
+    /// [`GraphEpochIterator::activate`](crate::graph::GraphEpochIterator::activate)) while
+    /// `forward_batch` / `data_num_batches` keep reading the metadata in
+    /// `data_binding`. Set together with `data_binding` by `set_data_loader`.
+    pub(crate) data_loader: RefCell<Option<crate::data::DataLoader>>,
     // Cached flag: trace-namespace collision check has run successfully once.
     // Set the first time trace observation is performed (single-GPU lookup or
     // El Che gather). Validates that emit-published trace names from loop
@@ -145,15 +144,28 @@ pub struct Graph {
     // the caller (e.g. `flodl-hf`'s `AutoModel::from_pretrained` sets
     // this to the HF `config.json` it loaded).
     pub(crate) source_config: RefCell<Option<String>>,
+    // Shared slot for the most recent coord-broadcast
+    // [`crate::distributed::EpochMetrics`]. Writers live on the
+    // cluster-worker bridge thread (`dispatch_control` for
+    // `ControlMsg::EpochAggregated`); readers live on the user's
+    // main training-loop thread (`latest_metrics`,
+    // `aggregated_gpu_tabs`). `Arc<Mutex<...>>` so writes from one
+    // thread are visible to reads on another. Empty until the coord
+    // pushes the first aggregated view (single-GPU runs that never
+    // hit the coord-side aggregation keep this `None` forever and
+    // fall back to local epoch_history).
+    pub(crate) aggregated_metrics: std::sync::Arc<
+        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
+    >,
 }
 
 /// Binding between a `DataLoader` and a [`Graph`] for integrated training.
 ///
 /// Created by [`Graph::set_data_loader`]. Maps batch tensor names to
-/// graph inputs and stores the loader reference.
+/// graph inputs. The loader itself lives in `Graph::data_loader` (a
+/// separate cell) so an active epoch iterator can borrow it exclusively
+/// while this metadata stays readable.
 pub(crate) struct DataLoaderBinding {
-    /// The DataLoader (possibly upgraded to distributed mode).
-    pub loader: crate::data::DataLoader,
     /// Name of the batch field used as the primary forward input (e.g., "image").
     pub forward_input: String,
     /// Mappings from batch field names to graph Input port names.
@@ -163,16 +175,16 @@ pub(crate) struct DataLoaderBinding {
     /// Names of batch fields that are targets (for loss), not consumed by forward.
     #[allow(dead_code)]
     pub target_names: Vec<String>,
-    /// Maps graph input index → shard/batch tensor position.
-    /// `shard_input_map[i]` is the index into `per_rank_shards[rank]` or
-    /// `Batch` that provides `self.inputs[i]`.
+    /// Maps graph input index → batch tensor position.
+    /// `shard_input_map[i]` is the index into `Batch` that provides
+    /// `self.inputs[i]`.
     pub shard_input_map: Vec<usize>,
-    /// Chunk ratios for distributed training (updated by auto-balancer).
-    /// Stored here so the epoch iterator can read them without borrowing DistributedState.
-    pub chunk_ratios: Vec<f64>,
-    /// Batch field names (from loader) for reconstructing Batch objects in
-    /// forward_distributed_el_che's per-batch backward path.
-    pub batch_names: Vec<String>,
+    /// Cached from the loader at bind time (fixed per loader config), so
+    /// `data_num_batches` / `data_batch_size` stay readable while an epoch
+    /// iterator holds the loader cell exclusively.
+    pub num_batches: usize,
+    /// See `num_batches`.
+    pub batch_size: usize,
 }
 
 impl Graph {
@@ -209,6 +221,17 @@ impl Graph {
                 writer_ni: 0, // resolved after node indexing
                 value,
             });
+        }
+
+        // Port-name resolution: a name that isn't among the node's declared
+        // ports is a wiring bug (silently routing to port 0 would train on
+        // wrong data), so it errors like an unknown node does.
+        fn port_index(ports: &[String], port: &str, node: &str, what: &str) -> Result<usize> {
+            ports.iter().position(|p| p == port).ok_or_else(|| {
+                TensorError::new(&format!(
+                    "unknown {what} port {port:?} on node {node:?} (declared ports: {ports:?})"
+                ))
+            })
         }
 
         // Convert to indexed storage
@@ -253,11 +276,12 @@ impl Graph {
         let mut tag_capture: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
         for (name, node_ref) in &tags {
             if let Some(&ni) = node_index.get(&node_ref.node_id) {
-                let port_idx = nodes[ni]
-                    .output_ports
-                    .iter()
-                    .position(|p| p == &node_ref.port)
-                    .unwrap_or(0);
+                let port_idx = port_index(
+                    &nodes[ni].output_ports,
+                    &node_ref.port,
+                    &node_ref.node_id,
+                    &format!("tag {name:?} output"),
+                )?;
                 tag_names_map.insert(name.clone(), (ni, port_idx));
                 tag_capture
                     .entry(ni)
@@ -316,11 +340,12 @@ impl Graph {
         for (si, fr) in forward_refs.iter().enumerate() {
             if let Some(&ni) = node_index.get(&fr.writer_id) {
                 state[si].writer_ni = ni;
-                let port_idx = nodes[ni]
-                    .output_ports
-                    .iter()
-                    .position(|p| p == &fr.writer_port)
-                    .unwrap_or(0);
+                let port_idx = port_index(
+                    &nodes[ni].output_ports,
+                    &fr.writer_port,
+                    &fr.writer_id,
+                    "state-writer output",
+                )?;
                 state_writers.entry(ni).or_default().push((si, port_idx));
             }
         }
@@ -331,16 +356,18 @@ impl Graph {
         for edge in &edges {
             let from_ni = node_index[&edge.from_node];
             let to_ni = node_index[&edge.to_node];
-            let from_port_idx = nodes[from_ni]
-                .output_ports
-                .iter()
-                .position(|p| p == &edge.from_port)
-                .unwrap_or(0);
-            let to_port_idx = nodes[to_ni]
-                .input_ports
-                .iter()
-                .position(|p| p == &edge.to_port)
-                .unwrap_or(0);
+            let from_port_idx = port_index(
+                &nodes[from_ni].output_ports,
+                &edge.from_port,
+                &edge.from_node,
+                "edge source",
+            )?;
+            let to_port_idx = port_index(
+                &nodes[to_ni].input_ports,
+                &edge.to_port,
+                &edge.to_node,
+                "edge target",
+            )?;
             routes_from[from_ni].push(Route {
                 from_port_idx,
                 to_node_idx: to_ni,
@@ -353,25 +380,27 @@ impl Graph {
             .iter()
             .map(|ep| {
                 let ni = node_index[&ep.node_id];
-                let port_idx = nodes[ni]
-                    .input_ports
-                    .iter()
-                    .position(|p| p == &ep.port)
-                    .unwrap_or(0);
-                InputRoute {
+                let port_idx = port_index(
+                    &nodes[ni].input_ports,
+                    &ep.port,
+                    &ep.node_id,
+                    "graph input",
+                )?;
+                Ok(InputRoute {
                     node_idx: ni,
                     port_idx,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Pre-compute output location
         let output_node_idx = node_index[&outputs[0].node_id];
-        let output_port_idx = nodes[output_node_idx]
-            .output_ports
-            .iter()
-            .position(|p| p == &outputs[0].port)
-            .unwrap_or(0);
+        let output_port_idx = port_index(
+            &nodes[output_node_idx].output_ports,
+            &outputs[0].port,
+            &outputs[0].node_id,
+            "graph output",
+        )?;
 
         // Pre-compute input port counts and allocate execution buffers
         let node_input_count: Vec<usize> = nodes.iter().map(|nd| nd.input_ports.len()).collect();
@@ -417,15 +446,15 @@ impl Graph {
             output_port_idx,
             node_input_count,
             exec_slots,
-            distributed: RefCell::new(None),
             optimizer: RefCell::new(None),
             scheduler: RefCell::new(None),
             lr_scale: Cell::new(1.0),
             training_step: Cell::new(0),
             data_binding: RefCell::new(None),
-            loss_fn: RefCell::new(None),
+            data_loader: RefCell::new(None),
             traces_validated: Cell::new(false),
             source_config: RefCell::new(None),
+            aggregated_metrics: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
 
         if verbose {
@@ -435,187 +464,6 @@ impl Graph {
         }
 
         graph
-    }
-
-    pub(crate) fn forward_impl(&self, graph_inputs: &[Variable]) -> Result<Variable> {
-        if graph_inputs.len() != self.inputs.len() {
-            return Err(TensorError::new(&format!(
-                "expected {} inputs, got {}",
-                self.inputs.len(),
-                graph_inputs.len()
-            )));
-        }
-
-        // Record training start on first forward (for ETA).
-        if self.training_start.get() == 0.0 {
-            self.training_start.set(instant_secs());
-        }
-
-        let is_profiling = self.profiling.get();
-        let forward_start = if is_profiling { Some(Instant::now()) } else { None };
-        let mut prof_nodes: Vec<profile::NodeTiming> = Vec::new();
-        let mut prof_levels: Vec<profile::LevelTiming> = Vec::new();
-
-        // Build reverse tag lookup for profiling: node_idx → first tag name
-        let tags_by_node: HashMap<usize, String> = if is_profiling {
-            let mut m = HashMap::new();
-            for (name, &(ni, _)) in &self.tag_names {
-                m.entry(ni).or_insert_with(|| name.clone());
-            }
-            m
-        } else {
-            HashMap::new()
-        };
-
-        let has_tags = !self.tag_capture.is_empty();
-
-        // Reuse cached execution buffers (Vec-indexed, no HashMap overhead)
-        let mut slots = self.exec_slots.borrow_mut();
-
-        // Clear previous values (drops old Variables, reuses allocations)
-        for node_slots in slots.iter_mut() {
-            for slot in node_slots.iter_mut() {
-                *slot = None;
-            }
-        }
-
-        // Clear tagged outputs
-        if has_tags {
-            self.tagged_outputs.borrow_mut().clear();
-        }
-
-        // Route graph inputs via pre-computed index mapping
-        for (i, route) in self.input_routes.iter().enumerate() {
-            slots[route.node_idx][route.port_idx] = Some(graph_inputs[i].clone());
-        }
-
-        // Will hold the output node's results until we can extract the final value
-        let mut final_output: Option<Vec<Variable>> = None;
-
-        // Execute levels sequentially
-        for (level_idx, level) in self.levels.iter().enumerate() {
-            let level_start = if is_profiling { Some(Instant::now()) } else { None };
-            let mut level_sum_ns: u64 = 0;
-
-            for &ni in level {
-                let node = &self.nodes[ni];
-                let input_count = self.node_input_count[ni];
-
-                // Collect inputs from pre-indexed slots (no HashMap lookups)
-                let inputs: Vec<Variable> = (0..input_count)
-                    .map(|i| {
-                        match slots[ni][i].as_ref() {
-                            Some(v) => Ok(v.clone()),
-                            None if i > 0 => {
-                                // Zero fill for unconnected ref ports (forward refs)
-                                let first = slots[ni][0].as_ref().ok_or_else(|| {
-                                    TensorError::new(&format!(
-                                        "node '{}': ref port {} has no data and primary input \
-                                         is also missing — check that all inputs are connected",
-                                        node.id, i
-                                    ))
-                                })?;
-                                Ok(Variable::new(
-                                    Tensor::zeros_like(&first.data())?,
-                                    false,
-                                ))
-                            }
-                            _ => Err(TensorError::new(&format!(
-                                "node '{}': missing primary input (port {}) — check that all \
-                                 inputs to this node are connected in the graph builder",
-                                node.id, i
-                            ))),
-                        }
-                    })
-                    .collect::<Result<Vec<Variable>>>()?;
-
-                // Release input slots early (frees Rc references)
-                for slot in slots[ni].iter_mut() {
-                    *slot = None;
-                }
-
-                // Execute node (with optional per-node timing)
-                let node_start = if is_profiling { Some(Instant::now()) } else { None };
-                let node_outputs = (node.run)(&inputs)?;
-                if is_profiling {
-                    let elapsed = node_start.unwrap().elapsed();
-                    level_sum_ns += elapsed.as_nanos() as u64;
-                    prof_nodes.push(profile::NodeTiming {
-                        id: node.id.clone(),
-                        tag: tags_by_node.get(&ni).cloned().unwrap_or_default(),
-                        duration: elapsed,
-                        level: level_idx,
-                    });
-                }
-
-                // Route outputs via pre-computed routing table (no HashMap, no String ops)
-                for route in &self.routes_from[ni] {
-                    let value = if route.from_port_idx < node_outputs.len() {
-                        Some(node_outputs[route.from_port_idx].clone())
-                    } else {
-                        None
-                    };
-                    slots[route.to_node_idx][route.to_port_idx] = value;
-                }
-
-                // Capture state: if this node is a state writer, store its output
-                if let Some(writers) = self.state_writers.get(&ni) {
-                    for &(si, port_idx) in writers {
-                        if port_idx < node_outputs.len() {
-                            *self.state[si].value.borrow_mut() =
-                                Some(node_outputs[port_idx].clone());
-                        }
-                    }
-                }
-
-                // Capture tagged outputs for observation
-                if has_tags {
-                    if let Some(captures) = self.tag_capture.get(&ni) {
-                        let mut tagged = self.tagged_outputs.borrow_mut();
-                        for (tag_name, port_idx) in captures {
-                            if *port_idx < node_outputs.len() {
-                                tagged.insert(
-                                    tag_name.clone(),
-                                    node_outputs[*port_idx].clone(),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Keep output node's results; all others drop here (early release)
-                if ni == self.output_node_idx {
-                    final_output = Some(node_outputs);
-                }
-            }
-
-            // Record level timing
-            if is_profiling {
-                prof_levels.push(profile::LevelTiming {
-                    index: level_idx,
-                    wall_clock: level_start.unwrap().elapsed(),
-                    sum_nodes: std::time::Duration::from_nanos(level_sum_ns),
-                    num_nodes: level.len(),
-                });
-            }
-        }
-
-        // Drop the borrow before storing profile (which also borrows RefCells)
-        drop(slots);
-
-        // Store profile
-        if is_profiling {
-            *self.last_profile.borrow_mut() = Some(profile::Profile {
-                total: forward_start.unwrap().elapsed(),
-                levels: prof_levels,
-                nodes: prof_nodes,
-            });
-        }
-
-        // Extract graph output
-        final_output
-            .and_then(|o| o.into_iter().nth(self.output_port_idx))
-            .ok_or_else(|| TensorError::new("graph produced no output"))
     }
 }
 
@@ -766,56 +614,38 @@ impl Graph {
     /// (e.g. `"linear_1"`). When a node has multiple parameters with the same
     /// name, suffixes `_0`, `_1`, ... are appended to disambiguate.
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        // Build reverse map: node_idx → tag name
-        let mut idx_to_tag: HashMap<usize, String> = HashMap::new();
-        for (tag, &(ni, _)) in &self.tag_names {
-            // First tag wins (deterministic because we only need one prefix)
-            idx_to_tag.entry(ni).or_insert_with(|| tag.clone());
-        }
-
-        let mut result = Vec::new();
-        let mut seen = HashSet::new();
-
-        for &ni in &self.order {
-            if let Some(ref module) = self.nodes[ni].module {
-                let prefix = idx_to_tag.get(&ni)
-                    .cloned()
-                    .unwrap_or_else(|| self.nodes[ni].id.clone());
-
-                let params = module.parameters();
-                // Check for duplicate param names within this node
-                let mut name_counts: HashMap<String, usize> = HashMap::new();
-                for p in &params {
-                    *name_counts.entry(p.name.clone()).or_insert(0) += 1;
-                }
-
-                let mut name_idx: HashMap<String, usize> = HashMap::new();
-                for p in params {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
-                    if !seen.insert(ptr) {
-                        continue;
-                    }
-
-                    let qualified = if name_counts[&p.name] > 1 {
-                        let idx = name_idx.entry(p.name.clone()).or_insert(0);
-                        let q = format!("{}/{}_{}", prefix, p.name, idx);
-                        *idx += 1;
-                        q
-                    } else {
-                        format!("{}/{}", prefix, p.name)
-                    };
-
-                    result.push((qualified, p));
-                }
-            }
-        }
-
-        result
+        self.named_items(
+            |m| m.parameters(),
+            |p| p.variable.id(),
+            |p| p.name.clone(),
+        )
     }
 
     /// Return buffers with qualified names, using the same prefix logic
     /// as `named_parameters()`.
     pub fn named_buffers(&self) -> Vec<(String, Buffer)> {
+        self.named_items(
+            |m| m.buffers(),
+            |b| b.id(),
+            |b| b.name.clone(),
+        )
+    }
+
+    /// Shared body of [`named_parameters`](Self::named_parameters) and
+    /// [`named_buffers`](Self::named_buffers): walk nodes in execution
+    /// order, prefix each item by its node's tag (first tag wins) or node
+    /// ID, dedup by identity (`id_of`), and disambiguate same-named items
+    /// within a node with `_0`/`_1`/... suffixes. `collect` pulls the
+    /// items from a module; `id_of`/`name_of` read an item's identity and
+    /// name (the only points where `Parameter` and `Buffer` differ).
+    fn named_items<T>(
+        &self,
+        collect: impl Fn(&dyn crate::nn::Module) -> Vec<T>,
+        id_of: impl Fn(&T) -> usize,
+        name_of: impl Fn(&T) -> String,
+    ) -> Vec<(String, T)> {
+        // Reverse map: node_idx → tag name (first tag wins; deterministic
+        // because we only need one prefix).
         let mut idx_to_tag: HashMap<usize, String> = HashMap::new();
         for (tag, &(ni, _)) in &self.tag_names {
             idx_to_tag.entry(ni).or_insert_with(|| tag.clone());
@@ -830,29 +660,29 @@ impl Graph {
                     .cloned()
                     .unwrap_or_else(|| self.nodes[ni].id.clone());
 
-                let bufs = module.buffers();
+                let items = collect(module.as_ref());
+                // Count duplicate names within this node.
                 let mut name_counts: HashMap<String, usize> = HashMap::new();
-                for b in &bufs {
-                    *name_counts.entry(b.name.clone()).or_insert(0) += 1;
+                for it in &items {
+                    *name_counts.entry(name_of(it)).or_insert(0) += 1;
                 }
 
                 let mut name_idx: HashMap<String, usize> = HashMap::new();
-                for b in bufs {
-                    let ptr = Rc::as_ptr(&b.inner) as usize;
-                    if !seen.insert(ptr) {
+                for it in items {
+                    if !seen.insert(id_of(&it)) {
                         continue;
                     }
-
-                    let qualified = if name_counts[&b.name] > 1 {
-                        let idx = name_idx.entry(b.name.clone()).or_insert(0);
-                        let q = format!("{}/{}_{}", prefix, b.name, idx);
+                    let name = name_of(&it);
+                    let qualified = if name_counts[&name] > 1 {
+                        let idx = name_idx.entry(name.clone()).or_insert(0);
+                        let q = format!("{}/{}_{}", prefix, name, idx);
                         *idx += 1;
                         q
                     } else {
-                        format!("{}/{}", prefix, b.name)
+                        format!("{}/{}", prefix, name)
                     };
 
-                    result.push((qualified, b));
+                    result.push((qualified, it));
                 }
             }
         }
@@ -873,393 +703,6 @@ impl Graph {
     /// First 8 characters of the structural hash.
     pub fn short_hash(&self) -> &str {
         &self.structural_hash()[..8]
-    }
-
-    /// Save all parameters and buffers to a checkpoint file.
-    ///
-    /// Embeds the structural hash for architecture validation on load.
-    /// Supports `.gz` extension for gzip compression.
-    ///
-    /// When [`source_config`](Self::source_config) is set on the graph
-    /// (e.g. populated by `flodl_hf::models::auto::AutoModel::from_pretrained`),
-    /// a sidecar `<stem>.config.json` file is written next to the
-    /// checkpoint with the source config verbatim. The stem strips both
-    /// `.fdl` and an optional `.gz` so `model.fdl.gz` produces
-    /// `model.config.json`. Downstream tools (e.g. `fdl flodl-hf export
-    /// --checkpoint`) use this to rebuild the right family without an
-    /// explicit `--config` argument.
-    pub fn save_checkpoint(&self, path: &str) -> Result<()> {
-        let params = self.named_parameters();
-        let buffers = self.named_buffers();
-        let hash = self.structural_hash();
-        crate::nn::save_checkpoint_file(path, &params, &buffers, Some(hash))?;
-
-        if let Some(content) = self.source_config.borrow().as_ref() {
-            let sidecar = sidecar_config_path(path);
-            std::fs::write(&sidecar, content).map_err(|e| {
-                TensorError::new(&format!(
-                    "save_checkpoint: cannot write sidecar {}: {e}",
-                    sidecar.display()
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Attach an opaque source-config string to the graph.
-    ///
-    /// Typically called by loaders that build a graph from an external
-    /// definition (HF `config.json`, ONNX manifest, …) so subsequent
-    /// `save_checkpoint` calls drop a `<stem>.config.json` sidecar.
-    /// Pass an empty string to attach a non-meaningful sentinel; pass
-    /// `clear_source_config` to drop attachment entirely.
-    pub fn set_source_config(&self, content: String) {
-        *self.source_config.borrow_mut() = Some(content);
-    }
-
-    /// Read the currently-attached source config, if any.
-    pub fn source_config(&self) -> Option<String> {
-        self.source_config.borrow().clone()
-    }
-
-    /// Drop any attached source config so subsequent saves emit no
-    /// sidecar.
-    pub fn clear_source_config(&self) {
-        *self.source_config.borrow_mut() = None;
-    }
-
-    /// Load parameters and buffers from a checkpoint file.
-    ///
-    /// Validates the structural hash against this graph's architecture.
-    /// Returns a [`LoadReport`](crate::nn::LoadReport) describing what was
-    /// loaded, skipped, or missing.
-    pub fn load_checkpoint(&self, path: &str) -> Result<crate::nn::LoadReport> {
-        let params = self.named_parameters();
-        let buffers = self.named_buffers();
-        let hash = self.structural_hash();
-        crate::nn::load_checkpoint_file(path, &params, &buffers, Some(hash))
-    }
-
-    fn compute_structural_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-
-        // 1. Nodes in topological order
-        for &ni in &self.order {
-            let node = &self.nodes[ni];
-            hasher.update(node.id.as_bytes());
-            hasher.update(b"\0");
-
-            if let Some(ref module) = node.module {
-                hasher.update(module.name().as_bytes());
-                hasher.update(b"\0");
-
-                // Sorted parameters
-                let mut params: Vec<_> = module.parameters().into_iter()
-                    .map(|p| (p.name.clone(), p.variable.shape()))
-                    .collect();
-                params.sort_by(|a, b| a.0.cmp(&b.0));
-                for (name, shape) in &params {
-                    hasher.update(b"P");
-                    hasher.update(name.as_bytes());
-                    hasher.update(b"\0");
-                    for &dim in shape {
-                        hasher.update(dim.to_le_bytes());
-                    }
-                }
-
-                // Sorted buffers
-                let mut bufs: Vec<_> = module.buffers().into_iter()
-                    .map(|b| (b.name.clone(), b.shape()))
-                    .collect();
-                bufs.sort_by(|a, b| a.0.cmp(&b.0));
-                for (name, shape) in &bufs {
-                    hasher.update(b"B");
-                    hasher.update(name.as_bytes());
-                    hasher.update(b"\0");
-                    for &dim in shape {
-                        hasher.update(dim.to_le_bytes());
-                    }
-                }
-
-                // Nested graph hash
-                if let Some(nested_hash) = module.structural_hash() {
-                    hasher.update(b"G");
-                    hasher.update(nested_hash.as_bytes());
-                }
-            }
-        }
-
-        // 2. Edges
-        hasher.update(b"EDGES");
-        for edge in &self.edges {
-            hasher.update(edge.from_node.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(edge.from_port.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(edge.to_node.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(edge.to_port.as_bytes());
-            hasher.update(b"\0");
-        }
-
-        // 3. Tags (sorted)
-        hasher.update(b"TAGS");
-        let mut tags: Vec<_> = self.tag_names.iter().collect();
-        tags.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, (node_idx, port_idx)) in &tags {
-            hasher.update(name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update((*node_idx as u64).to_le_bytes());
-            hasher.update((*port_idx as u64).to_le_bytes());
-        }
-
-        // 4. Input/output ports
-        hasher.update(b"INPUTS");
-        for port in &self.inputs {
-            hasher.update(port.name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(port.node_id.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(port.port.as_bytes());
-            hasher.update(b"\0");
-        }
-        hasher.update(b"OUTPUTS");
-        for port in &self.outputs {
-            hasher.update(port.name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(port.node_id.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(port.port.as_bytes());
-            hasher.update(b"\0");
-        }
-
-        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
-
-/// Derive the sidecar config-json path for a checkpoint path.
-///
-/// Strips a trailing `.gz` (compression marker) if present, then
-/// replaces the extension with `config.json`. Stem is preserved
-/// verbatim so paths like `/some/dir/v3.fdl` map to
-/// `/some/dir/v3.config.json`.
-pub(crate) fn sidecar_config_path(checkpoint: &str) -> PathBuf {
-    let mut p = PathBuf::from(checkpoint);
-    if p.extension().and_then(|e| e.to_str()) == Some("gz") {
-        // Drop the .gz to expose the inner extension (.fdl, .ckpt, ...).
-        p.set_extension("");
-    }
-    p.set_extension("config.json");
-    p
-}
-
-impl Module for Graph {
-    fn name(&self) -> &str { "graph" }
-
-    fn as_graph(&self) -> Option<&Graph> { Some(self) }
-
-    fn structural_hash(&self) -> Option<String> {
-        Some(self.structural_hash().to_string())
-    }
-
-    fn forward(&self, input: &Variable) -> Result<Variable> {
-        if self.distributed.borrow().is_some() {
-            // Check if presharded data is available from the DataLoader
-            let has_shards = self.data_binding.borrow()
-                .as_ref()
-                .is_some_and(|b| b.loader.has_shards());
-
-            if has_shards {
-                self.forward_distributed_presharded()
-            } else {
-                self.forward_distributed_scatter(input)
-            }
-        } else {
-            self.forward_impl(std::slice::from_ref(input))
-        }
-    }
-
-    fn parameters(&self) -> Vec<Parameter> {
-        let mut params = Vec::new();
-        let mut seen = HashSet::new();
-
-        for &ni in &self.order {
-            if let Some(ref module) = self.nodes[ni].module {
-                for p in module.parameters() {
-                    let ptr = Rc::as_ptr(&p.variable.inner) as usize;
-                    if seen.insert(ptr) {
-                        params.push(p);
-                    }
-                }
-            }
-        }
-
-        params
-    }
-
-    fn buffers(&self) -> Vec<crate::nn::Buffer> {
-        let mut bufs = Vec::new();
-        let mut seen = HashSet::new();
-
-        for &ni in &self.order {
-            if let Some(ref module) = self.nodes[ni].module {
-                crate::nn::walk_modules_visited(
-                    module.as_ref(),
-                    &mut HashSet::new(),
-                    &mut |m: &dyn crate::nn::Module| {
-                        for b in m.buffers() {
-                            let ptr = Rc::as_ptr(&b.inner) as usize;
-                            if seen.insert(ptr) {
-                                bufs.push(b);
-                            }
-                        }
-                    },
-                );
-            }
-        }
-
-        bufs
-    }
-
-    fn set_training(&self, training: bool) {
-        let mut visited = HashSet::new();
-        for &ni in &self.order {
-            if let Some(ref module) = self.nodes[ni].module {
-                crate::nn::walk_modules_visited(
-                    module.as_ref(),
-                    &mut visited,
-                    &mut |m: &dyn crate::nn::Module| m.set_training(training),
-                );
-            }
-        }
-    }
-
-    fn move_to_device(&self, device: crate::tensor::Device) {
-        self.set_device(device);
-    }
-}
-
-
-// ---------------------------------------------------------------------------
-// GraphEpochIterator
-// ---------------------------------------------------------------------------
-
-/// Iterator over training batches, returned by [`Graph::epoch`].
-///
-/// Wraps either a single-GPU `EpochIterator` or a distributed
-/// `DistributedEpochIterator`. Yields `Result<Batch>`.
-pub enum GraphEpochIterator<'a> {
-    /// Distributed mode: per-device backends, presharded data.
-    Distributed(&'a Graph, usize),
-    /// Single GPU: delegates to DataLoader's epoch iterator.
-    Single(&'a Graph, usize),
-}
-
-/// Internal state once iteration starts (lazily initialized on first next()).
-enum GraphEpochState<'a> {
-    DistributedActive(crate::data::DistributedEpochIterator<'a>),
-    SingleActive(crate::data::EpochIterator<'a>),
-    Pending,
-}
-
-/// Active graph epoch iterator (initialized from GraphEpochIterator on first call).
-pub struct ActiveGraphEpochIterator<'a> {
-    state: GraphEpochState<'a>,
-    #[allow(dead_code)]
-    graph: &'a Graph,
-}
-
-impl<'a> GraphEpochIterator<'a> {
-    /// Activate the iterator (must be called to start iteration).
-    /// This resolves the borrow on the DataLoader binding.
-    pub fn activate(self) -> ActiveGraphEpochIterator<'a> {
-        match self {
-            GraphEpochIterator::Distributed(graph, epoch) => {
-                // Get chunk_ratios and create the distributed iterator
-                let binding = graph.data_binding.borrow();
-                let binding = binding.as_ref().unwrap();
-                let chunk_ratios = &binding.chunk_ratios as *const Vec<f64>;
-
-                // Safety: chunk_ratios lives in the DataLoaderBinding which is
-                // behind a RefCell in the Graph. The Graph outlives the iterator.
-                // We only read chunk_ratios, and they're only mutated between epochs
-                // (in step()), not during iteration.
-                let ratios_ref: &'a [f64] = unsafe { &*chunk_ratios };
-
-                if let crate::data::loader::LoaderInner::Distributed(ref dist_loader) = binding.loader.inner {
-                    let iter = crate::data::DistributedEpochIterator::new(
-                        // Safety: same reasoning -- dist_loader lives in the DataLoaderBinding
-                        unsafe { &*(dist_loader as *const _) },
-                        epoch,
-                        ratios_ref,
-                    );
-                    ActiveGraphEpochIterator {
-                        state: GraphEpochState::DistributedActive(iter),
-                        graph,
-                    }
-                } else {
-                    ActiveGraphEpochIterator {
-                        state: GraphEpochState::Pending,
-                        graph,
-                    }
-                }
-            }
-            GraphEpochIterator::Single(graph, epoch) => {
-                // For single GPU, we need a mutable borrow to call epoch()
-                // on the inner DataLoader.
-                let mut binding = graph.data_binding.borrow_mut();
-                let binding = binding.as_mut().unwrap();
-                let loader_ptr = &mut binding.loader as *mut crate::data::DataLoader;
-
-                // Safety: the DataLoader lives in the Graph's DataLoaderBinding.
-                // We create an EpochIterator that borrows from it. The Graph outlives
-                // the iterator. No concurrent mutation occurs during iteration.
-                let iter = unsafe { (*loader_ptr).epoch(epoch) };
-                ActiveGraphEpochIterator {
-                    state: GraphEpochState::SingleActive(iter),
-                    graph,
-                }
-            }
-        }
-    }
-}
-
-impl Iterator for ActiveGraphEpochIterator<'_> {
-    type Item = Result<crate::data::Batch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.state {
-            GraphEpochState::DistributedActive(iter) => iter.next(),
-            GraphEpochState::SingleActive(iter) => iter.next(),
-            GraphEpochState::Pending => None,
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match &self.state {
-            GraphEpochState::DistributedActive(iter) => iter.size_hint(),
-            GraphEpochState::SingleActive(iter) => iter.size_hint(),
-            GraphEpochState::Pending => (0, Some(0)),
-        }
-    }
-}
-
-impl ExactSizeIterator for ActiveGraphEpochIterator<'_> {}
-
-impl Drop for ActiveGraphEpochIterator<'_> {
-    fn drop(&mut self) {
-        // El Che epoch-end flush: if forward_distributed_el_che() was called
-        // but step() hasn't been called yet, gradients are accumulated and
-        // un-synced. Force a step() to prevent silent gradient loss.
-        if self.graph.has_el_che() {
-            let needs_flush = self.graph.distributed.borrow()
-                .as_ref()
-                .is_some_and(|d| d.last_timing.is_some());
-
-            if needs_flush {
-                let _ = self.graph.step();
-            }
-        }
     }
 }
 
@@ -1325,6 +768,6 @@ fn topological_levels(
 
 
 #[cfg(test)]
-#[path = "graph_tests.rs"]
+#[path = "tests/mod.rs"]
 mod tests;
 
