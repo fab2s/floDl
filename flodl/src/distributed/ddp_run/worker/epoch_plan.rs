@@ -438,8 +438,27 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
 
+            // Cross-stream lifetime pin. The batch's device blocks were
+            // allocated on the prefetch worker's copy stream but are
+            // consumed on the compute stream and dropped on this thread
+            // while compute kernels (backward reads the labels) may
+            // still be in flight. The wait_event above orders the work;
+            // it does NOT extend the blocks' allocator lifetime — freed,
+            // they guard only against the COPY stream and the next
+            // upload can reuse and overwrite them mid-read (observed as
+            // whole-slab garbage labels → device-side nll_loss assert
+            // on fast small-model ranks in free-running CPU modes).
+            #[cfg(feature = "cuda")]
+            if let Some(ref stream) = self.compute_stream {
+                for t in &prefetched.tensors {
+                    t.record_stream(stream)?;
+                }
+            }
+
             // Delivery transform: after the copy dependency is
             // installed, keyed by the batch's picks.
+            #[cfg(feature = "cuda")]
+            let transformed = self.transform.is_some();
             let tensors = if let Some(ref f) = self.transform {
                 crate::data::apply_transform(
                     f,
@@ -452,6 +471,17 @@ impl<M: Module> GpuWorker<M> {
             } else {
                 prefetched.tensors
             };
+            // Transform outputs are fresh allocations on this thread's
+            // current stream — pin them to the compute stream for the
+            // same freed-block-reuse reason as the uploaded batch.
+            #[cfg(feature = "cuda")]
+            if transformed {
+                if let Some(ref stream) = self.compute_stream {
+                    for t in &tensors {
+                        t.record_stream(stream)?;
+                    }
+                }
+            }
             st.batch_done += 1;
             Ok(Some(tensors))
         } else {

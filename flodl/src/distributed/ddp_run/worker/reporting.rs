@@ -188,10 +188,16 @@ impl<M: Module> GpuWorker<M> {
         }
     }
 
-    /// Notify the coordinator that this worker is about to exit.
+    /// Notify the coordinator that this worker completed CLEANLY and is
+    /// about to exit.
     ///
-    /// Must be called before the thread terminates so the coordinator
-    /// stops including this rank in NCCL collectives.
+    /// Clean completion only: the coordinator's `Exiting` latch
+    /// suppresses both death detectors for this rank (heartbeat
+    /// staleness + launcher-reported child exits). Calling this on an
+    /// error exit masks the death — no ledger declare, no ElChe
+    /// recompute, no partition redistribution — and a cadence cohort
+    /// wedges on the dead rank's unfinished window. Error paths must
+    /// exit silently and let the detectors fire.
     pub fn report_exiting(&self) {
         let _ = self.timing_tx.send(TimingMsg::Exiting { rank: self.rank });
     }

@@ -6,9 +6,9 @@ use std::fmt::Write;
 use crate::analyze::RunAnalysis;
 use crate::harness::RunResult;
 
+pub mod charts;
 mod tables;
 mod elche;
-mod msf;
 
 use tables::{
     write_speed_ratio, write_model_table, write_loss_ratio_table, write_missing_runs,
@@ -17,7 +17,6 @@ use tables::{
     write_epoch_overlap,
 };
 use elche::write_elche_details;
-use msf::write_msf_section;
 
 /// Published reference data for a model.
 pub struct ModelRef {
@@ -165,11 +164,14 @@ fn parse_baselines(json: &str) -> Result<Vec<Baseline>, String> {
 /// `references` maps model name to published reference data.
 /// `gpu_info` is the hardware description from training logs.
 /// `all_modes` is every known DDP mode name (for missing-run detection).
+/// `charts` is the focus model + `(relative_path, caption)` pairs already
+/// written by [`charts::write_charts`]; `None` = no chart section.
 pub fn generate_report(
     groups: &[(String, Vec<RunAnalysis>)],
     references: &HashMap<String, ModelRef>,
     gpu_info: &[String],
     all_modes: &[String],
+    charts: Option<(&str, &[(String, String)])>,
 ) -> String {
     let mut md = String::with_capacity(16_000);
 
@@ -200,14 +202,50 @@ pub fn generate_report(
 Distributed training converges slower in early epochs due to gradient averaging across devices with \
 different data views, and ElChe (cadence/async) modes need calibration time to find the optimal sync \
 interval, which further penalizes short runs. On longer training (200 epochs), every DDP mode \
-surpasses solo convergence while completing faster -- the whole point of multi-GPU training.\n\n");
+surpasses solo convergence while completing faster -- the whole point of multi-GPU training.\n\n\
+**Mode semantics**: every mode runs the same ElChe-scheduled engine with work-weighted \
+(sum-and-count) averaging; they differ in reduce cadence and dispatch. `*-sync` = equal data \
+split, reduce fires as soon as every alive rank has made at least one step since the last \
+reduce (NOT per-batch lockstep DDP -- on heterogeneous rigs the fast GPU runs several steps \
+per reduce within its equal share, then idles once it is exhausted; degenerates to classic \
+DDP on homogeneous rigs). `*-cadence` = throughput-proportional dispatch, reduce fires once \
+every rank completes its planned ElChe window. `cpu-async` = cadence plus bounded overshoot \
+and decoupled averaging. `cpu-async` is expected to trail `cpu-cadence` on fixed-epoch wall \
+time, most visibly on short runs: async's weight-space divergence runs higher by nature \
+(EASGD blending, decoupled application), so the convergence guard grows its reduce window \
+more slowly -- more reduces early in the run -- and each reduce triggers mid-flight \
+(in-flight drain plus snapshot transport against continued streaming). The surplus \
+amortizes as the window reaches the epoch cap on longer runs. Async's edge is jitter \
+tolerance when rank speeds fluctuate, not steady-state wall time.\n\n");
+
+    // Charts (focus model) - trajectories the tables can't show without
+    // exploding; each image links its SVG next to the report.
+    if let Some((model, links)) = charts
+        && !links.is_empty()
+    {
+        md.push_str(&format!("## Charts - {model}\n\n"));
+        for (path, caption) in links {
+            md.push_str(&format!("![{caption}]({path})\n\n*{caption}*\n\n"));
+        }
+    }
 
     // Missing runs
     write_missing_runs(&mut md, groups, all_modes);
 
     // Per-model comparison
     md.push_str("## Per-Model Results\n\n");
-    md.push_str("GPU columns = compute utilization % (not load). Idle = total time with <5% utilization.\n\n");
+    md.push_str("GPU columns = compute utilization % (not load), labeled by the \
+host-physical device id the run's timeline sampled; `-` = device not sampled by \
+that run. Idle = total time with <5% utilization.\n\n\
+**Known gap - remote-GPU columns**: the resource sampler runs on the \
+controller host only, so cluster rows report util/VRAM/idle for the \
+controller's GPU and show `-` for remote-host GPUs (on a heterogeneous rig \
+that reads as \"the fast card reports, the remote cards don't\"). The \
+remote-rank activity itself is fully accounted - allocation shares and \
+throughput in the Per-Rank Schedule are rank-reported over the wire, as are \
+the trajectory charts. Per-rank resource samples already cross the wire for \
+the live dashboard; persisting them into the timeline (which fills these \
+columns) is planned for an upcoming release.\n\n");
     for (model, runs) in groups {
         write_model_table(&mut md, model, runs, references.get(model));
     }
@@ -243,9 +281,13 @@ surpasses solo convergence while completing faster -- the whole point of multi-G
     // shows the raw GPU speed gap that justifies the asymmetry).
     if groups.iter().any(|(_, runs)| runs.iter().any(|r| !r.per_rank_avg.is_empty())) {
         md.push_str("## Per-Rank Schedule\n\n");
-        md.push_str("`share` is fraction of batches consumed by each rank (sums to ~1). \
-`tput` is samples/ms. Heterogeneous topology shows up here: in cadence/async modes the \
-fast GPU consumes a proportionally larger share to keep pace with the slow ones.\n\n");
+        md.push_str("`share` is the balancer's smoothed allocation view (ElChe `batch_counts`, \
+sums to ~1); `tput` is samples/ms of the rank's own work (peer-wait excluded). Under \
+cadence/async modes dispatch follows the balancer, so `share` IS the delivered work split - \
+the fast GPU consumes a proportionally larger share to keep pace with the slow ones. Under \
+`*-sync` modes dispatch is an EQUAL split regardless: there `share` shows what ElChe would \
+allocate (a capacity shadow), not delivered work - the delivered imbalance surfaces as \
+fast-GPU idle instead.\n\n");
         write_per_rank_table(&mut md, groups);
     }
 
@@ -276,39 +318,6 @@ fast GPU consumes a proportionally larger share to keep pace with the slow ones.
     if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.epoch_overlap_ms > 0.0)) {
         md.push_str("## Streaming Epoch Overlap\n\n");
         write_epoch_overlap(&mut md, groups);
-    }
-
-    // MSF passive observation (lambda_hat trajectory + phase candidates).
-    // Only emit when at least one run has MSF data; otherwise the section
-    // is just empty noise.
-    if groups.iter().any(|(_, runs)| runs.iter().any(|r| r.msf.has_data())) {
-        md.push_str("## MSF Passive Observation\n\n");
-        md.push_str("Per the v2 framing (`docs/design/msf-cadence-control-v2.md`), \
-            DDP is a synchronization-of-coupled-chaotic-oscillators problem at \
-            **two scales** linked by AllReduce. Each subsection below is tagged \
-            by the scale it operates at:\n\n\
-            - **Top scale (meta-oscillator)**: the cross-rank-collapsed observable \
-            `D_mean(t)`, the OU process the system spirals toward. The model we \
-            ship is the centroid that sits on the synchronization manifold; \
-            convergence is exclusively a top-scale phenomenon.\n\
-            - **Bottom scale (per-GPU)**: per-rank `D_i(τ)` within a cycle, \
-            chaotic by construction with positive within-cycle Lyapunov \
-            `λ_T(LR)`. Per-replica trajectories don't converge — that's by \
-            design.\n\
-            - **Cross-scale consistency**: cross-rank Pearson `r` and per-rank \
-            vs meta slope agreement. The gate that validates the meta-oscillator \
-            framing — when `r < 0.95` for any rank pair, the framing has broken \
-            and bottom-scale per-rank treatment is required (e.g. cpu-async \
-            backend's pipelined averaging is a special case of this gate \
-            firing for backend reasons).\n\n\
-            Historical proxy `λ̂ = (1/k) * log(D_t / D_{t-1})` from v1 doc \
-            survives only as a coarse phase indicator; the v2 estimators are \
-            the by-k OLS slope (within-cycle Lyapunov, bottom-scale) and \
-            CUSUM-on-OU-residual (regime detection, top-scale).\n\n\
-            Phase candidates flag epochs where `λ_min < -1e-2` AND \
-            `D_end / prev_D_end < 1/3` (collapse signature, e.g. LR drop \
-            boundary).\n\n");
-        write_msf_section(&mut md, groups);
     }
 
     md

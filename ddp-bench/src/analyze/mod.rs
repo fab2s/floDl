@@ -50,45 +50,6 @@ pub enum EventKind {
     /// meta's contribution.
     #[allow(dead_code)]
     MetaNudge { factor: f64, from: usize, to: usize },
-    /// MSF per-AllReduce sample (passive observation, no behavior effect).
-    /// Currently we only count these for the summary; per-event detail is
-    /// kept on the JSON for downstream analysis tools.
-    #[allow(dead_code)]
-    Divergence {
-        d_raw: f64,
-        lambda_raw: Option<f64>,
-        lambda_ema: Option<f64>,
-        k_used: usize,
-        k_max: usize,
-        step: usize,
-        deltas: Vec<f64>,
-        /// L2 norm of the post-AllReduce consensus weights `||W̄||`. `None`
-        /// for timelines emitted before the post_norm wiring landed.
-        post_norm: Option<f64>,
-        /// Per-rank pre-AllReduce L2 norm `||W_i||`. `None` for timelines
-        /// emitted before the pre_norm wiring landed; combined with `deltas`
-        /// and `post_norm` enables the cosine-similarity / magnitude-shift
-        /// decomposition (MSF/SWA directional vs magnitude split).
-        pre_norms: Option<Vec<f64>>,
-        /// In-flight epoch at the time of this event. `None` for timelines
-        /// emitted before the field was added; consumers fall back to
-        /// `EpochEnd` timestamp lookup.
-        epoch: Option<usize>,
-    },
-    /// MSF per-epoch aggregate snapshot.
-    DivergenceEpoch {
-        epoch: usize,
-        sync_count: usize,
-        d_min: f64,
-        d_max: f64,
-        d_mean: f64,
-        lambda_min: Option<f64>,
-        lambda_max: Option<f64>,
-        lambda_mean: Option<f64>,
-        lambda_ema_at_epoch_end: Option<f64>,
-        d_at_epoch_end: f64,
-        k_at_epoch_end: usize,
-    },
 }
 
 /// Loaded timeline data for one run.
@@ -138,7 +99,6 @@ impl std::fmt::Display for IdleCause {
 /// Per-GPU VRAM statistics.
 #[derive(Debug, Clone, Default)]
 pub struct VramStats {
-    #[allow(dead_code)]
     pub device: u8,
     /// Peak VRAM allocated (bytes) during the run.
     pub peak_allocated: u64,
@@ -176,8 +136,11 @@ pub struct RunAnalysis {
     pub final_eval: Option<f64>,
     /// Per-epoch convergence trajectory.
     pub epoch_data: Vec<EpochData>,
-    /// Per-GPU active percentage.
+    /// Per-GPU active percentage, parallel to [`Self::gpu_devices`].
     pub gpu_active_pct: Vec<f64>,
+    /// Host-physical device ids the timeline sampled (sorted). Parallel to
+    /// `gpu_active_pct`; report columns label by these ids, never by slot.
+    pub gpu_devices: Vec<u8>,
     /// Sync event count.
     pub sync_count: usize,
     /// Average sync duration (ms).
@@ -210,22 +173,13 @@ pub struct RunAnalysis {
     /// Per-rank averages across the run (from `per-rank:` log lines).
     /// Empty for solo and single-rank runs.
     pub per_rank_avg: Vec<PerRankAvg>,
-    /// MSF passive observation data (lambda_hat, per-epoch aggregates,
-    /// phase-transition candidates). Empty for runs predating MSF logging
-    /// or for modes that produce no AllReduce events (Solo, Sync without
-    /// divergence reports).
-    pub msf: MsfAnalysis,
 }
 
 mod timeline;
-mod log;
-mod fit;
-mod msf;
+pub mod log;
 
 pub use timeline::load_timeline;
 pub use log::{parse_training_log, apply_training_log};
-
-use msf::{build_msf_analysis, MsfAnalysis};
 
 /// Per-rank stats averaged across the run.
 #[derive(Debug, Clone)]
@@ -268,15 +222,33 @@ const CORRELATION_WINDOW_MS: u64 = 500;
 /// Analyze a loaded timeline.
 pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     let total_ms = tl.samples.last().map(|s| s.t).unwrap_or(0);
-    let n_gpus = tl.samples.first().map(|s| s.gpus.len()).unwrap_or(0);
+
+    // Physical device ids present in the samples. The sampler records the
+    // host-physical index (`d` field), and the array holds only the GPUs
+    // this process monitors — indexing stats by array POSITION misattributes
+    // a run on device 1 to "GPU0" (the historical solo-1 bug). Everything
+    // below keys by device id via this sorted union.
+    let mut gpu_devices: Vec<u8> = Vec::new();
+    for s in &tl.samples {
+        for g in &s.gpus {
+            if !gpu_devices.contains(&g.device) {
+                gpu_devices.push(g.device);
+            }
+        }
+    }
+    gpu_devices.sort_unstable();
+    let n_gpus = gpu_devices.len();
+    let slot_of = |device: u8| gpu_devices.iter().position(|d| *d == device);
 
     // GPU active %
     let sample_count = tl.samples.len();
     let mut gpu_active_pct = vec![0.0; n_gpus];
     if sample_count > 0 {
         for s in &tl.samples {
-            for (i, g) in s.gpus.iter().enumerate() {
-                if g.util >= 5 {
+            for g in &s.gpus {
+                if g.util >= 5
+                    && let Some(i) = slot_of(g.device)
+                {
                     gpu_active_pct[i] += 1.0;
                 }
             }
@@ -287,13 +259,14 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
     }
 
     // VRAM statistics per GPU
-    let mut vram_stats: Vec<VramStats> = (0..n_gpus)
-        .map(|i| VramStats { device: i as u8, ..Default::default() })
+    let mut vram_stats: Vec<VramStats> = gpu_devices.iter()
+        .map(|d| VramStats { device: *d, ..Default::default() })
         .collect();
     if sample_count > 0 {
         let mut vram_sums: Vec<u64> = vec![0; n_gpus];
         for s in &tl.samples {
-            for (i, g) in s.gpus.iter().enumerate() {
+            for g in &s.gpus {
+                let Some(i) = slot_of(g.device) else { continue };
                 if g.vram_allocated > vram_stats[i].peak_allocated {
                     vram_stats[i].peak_allocated = g.vram_allocated;
                 }
@@ -400,19 +373,22 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
 
     // Idle gap detection per GPU
     let mut all_gaps: Vec<IdleGap> = Vec::new();
-    let mut idle_by_cause: Vec<IdleByCause> = (0..n_gpus as u8)
-        .map(|d| IdleByCause { device: d, ..Default::default() })
+    let mut idle_by_cause: Vec<IdleByCause> = gpu_devices.iter()
+        .map(|d| IdleByCause { device: *d, ..Default::default() })
         .collect();
 
     // First training event timestamp (skip startup idle)
     let first_training_t = tl.events.first().map(|e| e.t).unwrap_or(0);
 
-    for (gpu_idx, idle) in idle_by_cause.iter_mut().enumerate() {
-        let device = gpu_idx as u8;
+    for idle in idle_by_cause.iter_mut() {
+        let device = idle.device;
         let mut gap_start: Option<u64> = None;
 
         for s in &tl.samples {
-            let util = s.gpus.get(gpu_idx).map(|g| g.util).unwrap_or(100);
+            let util = s.gpus.iter()
+                .find(|g| g.device == device)
+                .map(|g| g.util)
+                .unwrap_or(100);
 
             if util < 5 {
                 if gap_start.is_none() {
@@ -460,8 +436,6 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
             + idle.unexplained_ms;
     }
 
-    let msf = build_msf_analysis(&tl.events);
-
     RunAnalysis {
         model: model.to_string(),
         mode: mode.to_string(),
@@ -471,6 +445,7 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
         final_eval: None,
         epoch_data,
         gpu_active_pct,
+        gpu_devices,
         sync_count,
         avg_sync_ms: if sync_count > 0 { sync_total_ms / sync_count as f64 } else { 0.0 },
         total_sync_ms: sync_total_ms,
@@ -485,7 +460,6 @@ pub fn analyze(model: &str, mode: &str, tl: &Timeline) -> RunAnalysis {
         sync_intervals,
         train_only_ms: None,
         per_rank_avg: Vec::new(),
-        msf,
     }
 }
 
@@ -501,6 +475,7 @@ pub fn empty_analysis(model: &str, mode: &str) -> RunAnalysis {
         final_eval: None,
         epoch_data: Vec::new(),
         gpu_active_pct: Vec::new(),
+        gpu_devices: Vec::new(),
         sync_count: 0,
         avg_sync_ms: 0.0,
         total_sync_ms: 0.0,
@@ -515,7 +490,6 @@ pub fn empty_analysis(model: &str, mode: &str) -> RunAnalysis {
         sync_intervals: Vec::new(),
         train_only_ms: None,
         per_rank_avg: Vec::new(),
-        msf: MsfAnalysis::default(),
     }
 }
 

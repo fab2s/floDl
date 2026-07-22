@@ -986,3 +986,120 @@ fn reported_death_declared_via_drain_and_cycle_completes() {
         "queue must be drained by the tick"
     );
 }
+
+/// The `Exiting` latch is CLEAN-completion-only, and it is sharp on
+/// both edges:
+///
+/// - A cleanly-exited rank stops heartbeating by design, so the latch
+///   must suppress the staleness detector AND a late/spurious death
+///   report for it — one `active_count` decrement, no ledger declare,
+///   no bogus DeclareDead broadcast during teardown. This test pins
+///   that suppression.
+/// - The flip side (the 2026-07-22 cadence-wedge bug): an ERROR exit
+///   that sends `Exiting` inherits the same suppression and its death
+///   is never processed — no ElChe recompute, no partition
+///   redistribution — wedging a cadence cohort on the dead rank's
+///   unfinished window. That is why `ClusterWorker::teardown(clean)`
+///   only reports `Exiting` on clean completion; error exits stay
+///   silent so the reported-death drain (tested above) runs the full
+///   death chain.
+#[test]
+fn exiting_latch_suppresses_late_death_report_exactly_once() {
+    let world_size = 3;
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_for_coord = Arc::clone(&dead_ranks);
+    let reported: crate::distributed::cluster_coordinator::ReportedDeaths =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reported_for_coord = Arc::clone(&reported);
+    let (port, coord_handle) = spawn_coord(
+        world_size,
+        move || {
+            ClusterCoordinatorConfig::new(
+                ApplyPolicy::Sync,
+                AverageBackend::Cpu,
+                world_size,
+                ElChe::new(world_size, 1),
+            )
+            .no_divergence_guard()
+            .dead_ranks(dead_for_coord)
+            .reported_deaths(reported_for_coord)
+            // Staleness must NOT fire inside the test budget.
+            .heartbeat_timeout_secs(30)
+        },
+        |coord| {
+            // Drive ticks long enough for the Exiting frame and the
+            // late death report to both be processed, then assert the
+            // single decrement.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(2) {
+                coord.tick()?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            if coord.active_count() != 2 {
+                return Err(TensorError::new(&format!(
+                    "active_count must decrement exactly once for a \
+                     cleanly-exited rank (Exiting latch), got {} of {}",
+                    coord.active_count(),
+                    3,
+                )));
+            }
+            Ok(())
+        },
+    );
+
+    // Rank 2: announce a CLEAN exit, then stay connected (the process
+    // may linger through teardown).
+    let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, move |s, salt| {
+        send_timing(s, salt, TimingMsgWire::Exiting { rank: 2 })?;
+        thread::sleep(Duration::from_millis(2500));
+        Ok(())
+    });
+
+    // A late death report for the SAME rank (e.g. supervision seeing
+    // the process go away after its clean exit): must be swallowed by
+    // the latch, not double-processed.
+    let reporter = {
+        let q = Arc::clone(&reported);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(600));
+            q.lock().unwrap().push(2);
+        })
+    };
+
+    // Ranks 0 and 1: heartbeat via a Batch frame, then linger.
+    let body = |rank: u64| {
+        move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0, data_ms: 0.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                },
+            )?;
+            thread::sleep(Duration::from_millis(2500));
+            Ok(())
+        }
+    };
+    let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, body(0));
+    let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
+    let _ = r0.join();
+    let _ = r1.join();
+    let _ = r2.join();
+    let _ = reporter.join();
+    coord_handle.join().unwrap().expect("coord drives clean");
+
+    assert!(
+        !dead_ranks.is_dead(2),
+        "a cleanly-exited rank must never be declared dead by a late \
+         report (the drain skips exited ranks)"
+    );
+    assert!(
+        reported.lock().unwrap().is_empty(),
+        "the late report must still be drained (consumed, not left queued)"
+    );
+}

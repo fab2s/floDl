@@ -707,8 +707,15 @@ impl Monitor {
                 format_bytes(spill),
             );
         }
+        // Label the util sample: a bare `(14%)` after the ETA bracket reads
+        // as run progress. Same sampled rank as the VRAM figures, so it gets
+        // the same bracket style.
         if let Some(gpu) = res.gpu_util_percent {
-            let _ = write!(line, " ({:.0}%)", gpu);
+            let label = match res.aggregate_rank {
+                Some(idx) => format!("gpu[cuda{idx}]"),
+                None => String::from("gpu"),
+            };
+            let _ = write!(line, "  {label} {:.0}%", gpu);
         }
 
         crate::msg!("{}", line);

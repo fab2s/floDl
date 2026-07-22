@@ -501,7 +501,10 @@ impl<M: Module + 'static> Worker<M> {
                 // Snapshot tensors already land on CPU (snapshot_params'
                 // contract). `None` (worker errored before send_final_snapshot)
                 // falls back to an empty state, matching the via_coord path.
-                let final_snapshot = cluster.teardown();
+                // `finish()` reaching this point IS the clean completion
+                // (error paths drop with `finished == false` and exit
+                // through the death record instead).
+                let final_snapshot = cluster.teardown(true);
                 final_snapshot
                     .map(|snap| TrainedState {
                         params: snap.params,

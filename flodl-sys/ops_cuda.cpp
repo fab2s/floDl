@@ -294,6 +294,19 @@ extern "C" char* flodl_cuda_stream_wait_event(void* stream, void* event) {
     }
 }
 
+extern "C" char* flodl_tensor_record_stream(void* tensor, void* stream) {
+    try {
+        auto* t = static_cast<at::Tensor*>(tensor);
+        auto* s = static_cast<at::cuda::CUDAStream*>(stream);
+        t->record_stream(*s);
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
 extern "C" int flodl_cuda_stream_query(void* stream) {
     try {
     return static_cast<at::cuda::CUDAStream*>(stream)->query() ? 1 : 0;
@@ -878,6 +891,10 @@ extern "C" char* flodl_cuda_stream_synchronize(void* stream) {
 }
 extern "C" char* flodl_cuda_stream_wait_event(void* stream, void* event) {
     (void)stream; (void)event;
+    return make_error("CUDA Streams require a CUDA build");
+}
+extern "C" char* flodl_tensor_record_stream(void* tensor, void* stream) {
+    (void)tensor; (void)stream;
     return make_error("CUDA Streams require a CUDA build");
 }
 extern "C" int flodl_cuda_stream_query(void* stream) {

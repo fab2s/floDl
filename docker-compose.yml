@@ -145,7 +145,7 @@ services:
   #   #       target: 127.0.0.1
   #   #       port: 2222
   #   #       user: ubuntu
-  #   #       identity_file: /home/fab2s/src/fab2s/ai/rdl/.ssh-cuda-rank/cuda_rank_key
+  #   #       identity_file: /home/me/project/.ssh-cuda-rank/cuda_rank_key
   #   #     arch: precompiled/cu128
   #   # (drop `docker: cuda` -- launcher dispatches via SSH, not via docker)
   cuda-rank:

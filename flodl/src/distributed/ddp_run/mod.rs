@@ -44,7 +44,7 @@
 //!
 //! | Policy | When to use | Tradeoff |
 //! |--------|-------------|----------|
-//! | [`ApplyPolicy::Sync`] | Correctness-first, small models, homogeneous GPUs | Identical to standard DDP. Fast GPU waits at every batch. |
+//! | [`ApplyPolicy::Sync`] | Correctness-first, small models, homogeneous GPUs | Standard-DDP-like equal data split, but the reduce is NOT per-batch lockstep: it fires once every alive rank has made ≥1 step since the last reduce (work-weighted), so a fast GPU front-runs within its share and idles once it's exhausted. Degenerates to classic DDP on homogeneous rigs. |
 //! | [`ApplyPolicy::Cadence`] | Heterogeneous GPUs (e.g. Pascal + Blackwell) | Fast GPU runs ahead by ElChe-determined batches. Good throughput/convergence balance. |
 //! | [`ApplyPolicy::Async`] | Maximum throughput, large models, fault tolerance | Averaging interval auto-tunes from divergence monitoring. Best for experienced users. |
 //!
@@ -371,8 +371,16 @@ pub use crate::metrics::EpochMetrics;
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ApplyPolicy {
-    /// Average after every batch (K=1). Equivalent to standard synchronous DDP.
-    /// Lowest risk of model divergence. Fast GPUs wait at the collective barrier.
+    /// Tightest reduce cadence with a standard-DDP-like EQUAL data split.
+    ///
+    /// Not per-batch lockstep: the reduce fires as soon as every alive
+    /// rank has made at least one step since the last reduce, and each
+    /// rank's contribution is work-weighted (sum-and-count) — on a
+    /// heterogeneous rig the fast GPU runs several steps per reduce
+    /// within its equal share instead of waiting at a per-batch
+    /// barrier, then idles once that share is exhausted. On a
+    /// homogeneous rig this degenerates to classic synchronous DDP
+    /// (one step per rank per reduce). Lowest risk of model divergence.
     Sync,
     /// Average every N batches where N is determined by ElChe's cadence strategy.
     /// The slow device sets the pace; fast devices process proportionally more
@@ -994,8 +1002,13 @@ pub(crate) enum TimingMsg {
         /// split). `None` when divergence is also `None`.
         pre_norm: Option<f64>,
     },
-    /// Worker is about to exit. Coordinator must stop including this rank
-    /// in collectives before processing any further messages.
+    /// Worker completed CLEANLY and is about to exit. Coordinator must
+    /// stop including this rank in collectives before processing any
+    /// further messages. Clean completion ONLY: this latches the rank
+    /// as `exited`, which suppresses both death detectors for it
+    /// (heartbeat staleness + reported child exits) — an error exit
+    /// must never send it, or the death goes unprocessed and a cadence
+    /// cohort wedges on the dead rank's unfinished window.
     Exiting {
         /// Which GPU is exiting.
         rank: usize,

@@ -256,7 +256,14 @@ pub(crate) fn resolve_devices(requested: Option<&Vec<u8>>) -> (Vec<u8>, Vec<Stri
             detected
                 .iter()
                 .find(|g| g.index == *d)
-                .map(|g| g.name.clone())
+                .map(|g| {
+                    format!(
+                        "{} ({}GB, {})",
+                        g.name,
+                        g.total_memory_mb / 1024,
+                        g.sm_version(),
+                    )
+                })
                 .unwrap_or_else(|| format!("cuda:{d}"))
         })
         .collect();

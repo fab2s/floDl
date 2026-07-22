@@ -245,7 +245,7 @@ The five DDP modes:
 |---|---|
 | `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU. Genuine async - averaging decoupled from the GPU pipeline. |
 | `NcclCadence` (default) | Strong NCCL default. Anchor-based scheduling; fast devices process proportionally more batches per averaging window. |
-| `NcclSync` | Strict per-batch AllReduce - homogeneous rigs, correctness-first baseline |
+| `NcclSync` | Tightest cadence (reduce per slow-rank step, equal data split — not per-batch lockstep; see [What "sync" means](../ddp.md#elchemode---cadence--backend-in-one-name)) - homogeneous rigs, correctness-first baseline |
 | `CpuSync`, `CpuCadence` | A/B against NCCL when peer-access is unavailable |
 
 See [A/B testing modes](../ddp.md#ab-testing-modes) for the suggested

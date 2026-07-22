@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use super::{EpochData, PerRankAvg, RunAnalysis};
-use super::msf::build_predictive;
 
 // ---------------------------------------------------------------------------
 // Training log parser
@@ -30,6 +29,11 @@ pub struct LogEpoch {
     pub epoch: usize,
     pub loss: f64,
     pub eval: Option<f64>,
+    /// Training-set accuracy for the epoch (`train_acc=X.XXXX`), emitted
+    /// by models with an accuracy metric. Unlike eval it exists per-epoch
+    /// on every mode (DDP modes eval once at the end), so it carries the
+    /// per-epoch convergence trajectory in the charts.
+    pub train_acc: Option<f64>,
     /// Training-only wall time for the epoch (ms). Parsed from `train=Xs`
     /// (new format) or `time=Xs` (legacy, where the value was already
     /// training-only).
@@ -44,9 +48,13 @@ pub struct LogEpoch {
 pub struct RankSnapshot {
     pub rank: usize,
     pub device: u8,
-    /// Fraction of batches this rank consumed (0..1, sums to ~1 across ranks).
+    /// The balancer's smoothed allocation share (ElChe `batch_counts`,
+    /// 0..1, sums to ~1 across ranks). Equals the delivered work split
+    /// under cadence/async (dispatch follows the balancer); under
+    /// `*-sync` modes dispatch is an equal split and this is ElChe's
+    /// capacity shadow, not delivered work.
     pub batch_share: f64,
-    /// Throughput in samples/ms.
+    /// Throughput in samples/ms (the rank's own work; peer-wait excluded).
     pub throughput: f64,
 }
 
@@ -87,6 +95,7 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
                 let epoch: usize = epoch_str.parse().unwrap_or(0);
                 let mut loss = 0.0;
                 let mut eval = None;
+                let mut train_acc = None;
                 let mut time_ms = 0.0;
 
                 for kv in kv_part.split(", ") {
@@ -96,6 +105,8 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
                         .or_else(|| kv.strip_prefix("metric="))
                     {
                         eval = Some(v.parse().unwrap_or(0.0));
+                    } else if let Some(v) = kv.strip_prefix("train_acc=") {
+                        train_acc = Some(v.parse().unwrap_or(0.0));
                     } else if let Some(v) = kv.strip_prefix("train=")
                         .or_else(|| kv.strip_prefix("time="))
                     {
@@ -125,11 +136,16 @@ pub fn parse_training_log(path: &Path) -> Result<TrainingLog, String> {
                     if eval.is_some() {
                         prev.eval = eval;
                     }
+                    if train_acc.is_some() {
+                        prev.train_acc = train_acc;
+                    }
                     if time_ms != 0.0 {
                         prev.time_ms = time_ms;
                     }
                 } else {
-                    epochs.push(LogEpoch { epoch, loss, eval, time_ms, per_rank: Vec::new() });
+                    epochs.push(LogEpoch {
+                        epoch, loss, eval, train_acc, time_ms, per_rank: Vec::new(),
+                    });
                 }
             }
         }
@@ -251,13 +267,4 @@ pub fn apply_training_log(analysis: &mut RunAnalysis, log: &TrainingLog) {
         }).collect();
     }
 
-    // Predictive-value (Phase-1 kill criterion): now that eval is joined,
-    // compute λ̂_t → log(D_{t+1}) and λ̂_aggregate → eval correlations.
-    // Pearson is scale-invariant so the numbers transfer cleanly between
-    // pre- and post-correction λ̂ formulae.
-    analysis.msf.predictive = build_predictive(
-        &analysis.msf.recomputed,
-        &analysis.msf.epochs,
-        &analysis.epoch_data,
-    );
 }

@@ -93,7 +93,7 @@ equally to the flodl source checkout and to anything you scaffolded with
 
 `fdl` carries first-class commands for multi-host clusters:
 
-- **`fdl probe`** — readiness audit (single-host) / **`fdl cluster
+- **`fdl probe`** — readiness audit (single-host) / **`fdl @cluster
   probe`** — SSH-aggregated cluster audit. Surfaces GPU/libtorch arch
   mismatches, NCCL version skew across hosts, missing
   `nccl_socket_ifname:`, legacy schema keys in `fdl.cluster.yml`,

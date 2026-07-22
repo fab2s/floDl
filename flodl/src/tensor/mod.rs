@@ -829,6 +829,20 @@ impl Tensor {
         Ok(Tensor::from_raw(handle))
     }
 
+    /// Mark this tensor's storage as in use by `stream`, extending its
+    /// caching-allocator lifetime until that stream passes the current
+    /// point. Required whenever a tensor allocated on one stream is
+    /// consumed on another and may be dropped while the consumer's
+    /// kernels are still in flight — without it the allocator only
+    /// guards the block against the ALLOCATION stream and can hand the
+    /// freed block to a new allocation that overwrites it mid-read.
+    pub fn record_stream(&self, stream: &crate::tensor::cuda_stream::CudaStream) -> Result<()> {
+        let err = unsafe {
+            ffi::flodl_tensor_record_stream(self.handle, stream.as_ptr())
+        };
+        check_err(err)
+    }
+
     // --- Autograd ---
 
     /// Set requires_grad on this tensor. Returns a new tensor that shares

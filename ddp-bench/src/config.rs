@@ -148,7 +148,10 @@ pub enum GuardChoice {
     /// overhead auto-tune drives cadence alone.
     None,
     /// 3-rises-above-threshold rule on `||pre - post|| / ||post||`.
-    Trend { threshold: f64 },
+    /// `None` defers to the library default, which is EASGD-aware
+    /// (0.05 overwrite modes / 0.3 when α-blending keeps a standing
+    /// spread) and absorbs the saved trend history on resume.
+    Trend { threshold: Option<f64> },
     /// Rate-based detector with soft (`SuppressGrowth`) + hard (`NudgeDown`)
     /// thresholds on the bias-corrected `λ_ema`.
     Msf {
@@ -163,7 +166,7 @@ pub enum GuardChoice {
 
 impl Default for GuardChoice {
     fn default() -> Self {
-        GuardChoice::Trend { threshold: 0.01 }
+        GuardChoice::Trend { threshold: None }
     }
 }
 

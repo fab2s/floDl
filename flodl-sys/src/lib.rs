@@ -1250,6 +1250,9 @@ unsafe extern "C" {
     pub fn flodl_cuda_stream_wait_event(
         stream: *mut c_void, event: *mut c_void,
     ) -> *mut c_char;
+    pub fn flodl_tensor_record_stream(
+        tensor: *mut c_void, stream: *mut c_void,
+    ) -> *mut c_char;
     pub fn flodl_cuda_stream_query(stream: *mut c_void) -> i32;
     pub fn flodl_cuda_stream_set_current(stream: *mut c_void);
     pub fn flodl_cuda_stream_get_current(device_index: i32) -> *mut c_void;

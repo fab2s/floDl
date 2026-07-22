@@ -8,23 +8,38 @@ use crate::analyze::RunAnalysis;
 use super::ModelRef;
 
 pub(super) fn write_speed_ratio(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
-    let mut entries = Vec::new();
-    for (model, runs) in groups {
-        let s0 = runs.iter().find(|r| r.mode == "solo-0");
-        let s1 = runs.iter().find(|r| r.mode == "solo-1");
-        if let (Some(a), Some(b)) = (s0, s1)
-            && a.total_ms > 0
-        {
-            entries.push((model.as_str(), a.total_ms, b.total_ms));
+    // One ratio line per solo-N present anywhere (N >= 1), each vs solo-0.
+    let mut solo_modes: Vec<String> = Vec::new();
+    for (_, runs) in groups {
+        for r in runs {
+            if r.mode.starts_with("solo-") && r.mode != "solo-0"
+                && !solo_modes.contains(&r.mode)
+            {
+                solo_modes.push(r.mode.clone());
+            }
         }
     }
-    if entries.is_empty() {
-        return;
-    }
-    let _ = writeln!(md, "- **GPU speed ratio** (solo-1 / solo-0 wall time):");
-    for (model, s0, s1) in &entries {
-        let _ = writeln!(md, "  - {model}: {:.2}x ({:.0}s vs {:.0}s)",
-            *s1 as f64 / *s0 as f64, *s0 as f64 / 1000.0, *s1 as f64 / 1000.0);
+    solo_modes.sort();
+
+    for solo in &solo_modes {
+        let mut entries = Vec::new();
+        for (model, runs) in groups {
+            let s0 = runs.iter().find(|r| r.mode == "solo-0");
+            let sn = runs.iter().find(|r| &r.mode == solo);
+            if let (Some(a), Some(b)) = (s0, sn)
+                && a.total_ms > 0
+            {
+                entries.push((model.as_str(), a.total_ms, b.total_ms));
+            }
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        let _ = writeln!(md, "- **GPU speed ratio** ({solo} / solo-0 wall time):");
+        for (model, s0, sn) in &entries {
+            let _ = writeln!(md, "  - {model}: {:.2}x ({:.0}s vs {:.0}s)",
+                *sn as f64 / *s0 as f64, *s0 as f64 / 1000.0, *sn as f64 / 1000.0);
+        }
     }
 }
 
@@ -41,25 +56,31 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
         let _ = writeln!(md, "> Published: {}\n", r.note);
     }
 
-    // Header — dynamic GPU columns sized to the widest run in this group
-    let max_gpus = runs.iter()
-        .map(|r| r.gpu_active_pct.len())
-        .max()
-        .unwrap_or(2)
-        .max(2); // keep at least 2 columns for legacy single-GPU/2-GPU rigs
+    // Header — one column per sampled device id (union across the group's
+    // runs), labeled by the host-physical id the timeline recorded. A run
+    // that never sampled a device renders `-` (not sampled), never a fake 0%.
+    let mut devices: Vec<u8> = Vec::new();
+    for r in runs {
+        for d in &r.gpu_devices {
+            if !devices.contains(d) {
+                devices.push(*d);
+            }
+        }
+    }
+    devices.sort_unstable();
 
     let _ = write!(md, "| Mode | Loss |");
     if has_eval { md.push_str(" Eval |"); }
     if has_delta { md.push_str(" vs Ref |"); }
     md.push_str(" Total (s) | Syncs | Avg Sync (ms) |");
-    for i in 0..max_gpus { let _ = write!(md, " GPU{i} |"); }
+    for d in &devices { let _ = write!(md, " GPU{d} |"); }
     md.push_str(" Idle (s) |\n");
 
     let _ = write!(md, "|------|------|");
     if has_eval { md.push_str("------|"); }
     if has_delta { md.push_str("--------|"); }
     md.push_str("-----------|-------|--------------|");
-    for _ in 0..max_gpus { md.push_str("------|"); }
+    for _ in &devices { md.push_str("------|"); }
     md.push_str("----------|\n");
 
     for r in runs {
@@ -97,9 +118,14 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
             r.sync_count,
             r.avg_sync_ms,
         );
-        for i in 0..max_gpus {
-            let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
-            let _ = write!(md, " {pct:.0}% |");
+        for d in &devices {
+            match r.gpu_devices.iter().position(|x| x == d) {
+                Some(i) => {
+                    let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
+                    let _ = write!(md, " {pct:.0}% |");
+                }
+                None => md.push_str(" - |"),
+            }
         }
         let _ = writeln!(md, " {total_idle_s:.1} |");
     }
@@ -460,18 +486,26 @@ because DDP runs only eval once at the end.\n\n");
 
 /// VRAM usage table per mode per GPU.
 pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
-    let max_gpus = groups.iter()
-        .flat_map(|(_, runs)| runs.iter())
-        .map(|r| r.vram_stats.len())
-        .max()
-        .unwrap_or(2)
-        .max(2);
+    // Columns keyed by sampled device id (union across every run), same
+    // convention as the per-model table: `-` = device not sampled by that
+    // run's timeline.
+    let mut devices: Vec<u8> = Vec::new();
+    for (_, runs) in groups {
+        for r in runs {
+            for v in &r.vram_stats {
+                if !devices.contains(&v.device) {
+                    devices.push(v.device);
+                }
+            }
+        }
+    }
+    devices.sort_unstable();
 
     md.push_str("| Model | Mode |");
-    for i in 0..max_gpus { let _ = write!(md, " GPU{i} Peak (MB) | GPU{i} Mean (MB) |"); }
+    for d in &devices { let _ = write!(md, " GPU{d} Peak (MB) | GPU{d} Mean (MB) |"); }
     md.push('\n');
     md.push_str("|-------|------|");
-    for _ in 0..max_gpus { md.push_str("---------------|---------------|"); }
+    for _ in &devices { md.push_str("---------------|---------------|"); }
     md.push('\n');
 
     for (model, runs) in groups {
@@ -480,11 +514,18 @@ pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalys
             if !any_nonzero { continue; }
 
             let _ = write!(md, "| {} | {} |", model, r.mode);
-            for i in 0..max_gpus {
-                let v = r.vram_stats.get(i);
-                let peak = v.map(|s| s.peak_allocated / (1024 * 1024)).unwrap_or(0);
-                let mean = v.map(|s| s.mean_allocated / (1024 * 1024)).unwrap_or(0);
-                let _ = write!(md, " {peak} | {mean} |");
+            for d in &devices {
+                match r.vram_stats.iter().find(|v| v.device == *d) {
+                    Some(s) => {
+                        let _ = write!(
+                            md,
+                            " {} | {} |",
+                            s.peak_allocated / (1024 * 1024),
+                            s.mean_allocated / (1024 * 1024),
+                        );
+                    }
+                    None => md.push_str(" - | - |"),
+                }
             }
             md.push('\n');
         }

@@ -81,6 +81,28 @@ impl CudaStream {
         unsafe { ffi::flodl_cuda_stream_query(self.ptr) != 0 }
     }
 
+    /// The calling thread's current stream on `device` (the default
+    /// stream unless a [`StreamGuard`] is active). The returned value
+    /// owns only the wrapper — dropping it never destroys the
+    /// underlying stream.
+    pub fn current(device: Device) -> Result<Self> {
+        let device_index = match device {
+            Device::CUDA(idx) => idx as i32,
+            Device::CPU => {
+                return Err(TensorError::new(
+                    "CudaStream requires a CUDA device",
+                ))
+            }
+        };
+        let ptr = unsafe { ffi::flodl_cuda_stream_get_current(device_index) };
+        if ptr.is_null() {
+            return Err(TensorError::new(
+                "cuda_stream_get_current returned null (CUDA build required)",
+            ));
+        }
+        Ok(CudaStream { ptr, device_index })
+    }
+
     /// The device this stream belongs to.
     pub fn device(&self) -> Device {
         Device::CUDA(self.device_index as u8)

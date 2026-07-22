@@ -674,7 +674,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             );
         }
 
-        let final_snapshot = self.teardown();
+        let final_snapshot = self.teardown(exit_clean.is_ok());
         exit_clean.map(|_| final_snapshot)
     }
 
@@ -719,7 +719,12 @@ impl<M: Module + 'static> ClusterWorker<M> {
     /// [`crate::distributed::ddp_run::ParamSnapshot`] when one was captured
     /// (best-effort). Called at the end of `run_until_shutdown` (managed) and
     /// from the cooperative tier's `Worker::finish`.
-    pub(crate) fn teardown(&mut self) -> Option<crate::distributed::ddp_run::ParamSnapshot> {
+    /// `clean` distinguishes normal completion from an error exit and
+    /// gates the `Exiting` report — see below.
+    pub(crate) fn teardown(
+        &mut self,
+        clean: bool,
+    ) -> Option<crate::distributed::ddp_run::ParamSnapshot> {
         // `?`: already torn down (inner taken) -> nothing to snapshot.
         let mut inner = self.inner.take()?;
 
@@ -741,14 +746,26 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // watchdog's abort.
         inner.abort_nccl();
 
-        // Even on error, try to gracefully report exit + drop senders
-        // so the coordinator side cleans up. send_final_snapshot uses
-        // the dedicated final_param channel; the receiver now lives on
-        // `self.final_param_rx` (no background discard bridge), so the
-        // send + receive happen sequentially on this thread.
-        // report_exiting goes through the outbound bridge.
+        // send_final_snapshot uses the dedicated final_param channel;
+        // the receiver now lives on `self.final_param_rx` (no
+        // background discard bridge), so the send + receive happen
+        // sequentially on this thread.
         inner.send_final_snapshot();
-        inner.report_exiting();
+        // `Exiting` is the CLEAN-completion latch: the coordinator
+        // marks the rank `exited`, decrements `active_count`, and — by
+        // design — suppresses BOTH death detectors for it (heartbeat
+        // staleness and the launcher's reported-death queue), because a
+        // cleanly-finished rank stops heartbeating and must not be
+        // double-counted as a death. Sending it on an ERROR exit
+        // therefore masks the death entirely: no ledger declare, no
+        // ElChe recompute, no partition redistribution — and a cadence
+        // cohort wedges forever on the dead rank's unfinished window.
+        // On error, say nothing and let the real detectors fire (the
+        // launcher's child-exit report lands in milliseconds; heartbeat
+        // staleness is the 30s backstop).
+        if clean {
+            inner.report_exiting();
+        }
 
         // Drain the final snapshot before dropping inner (otherwise the
         // mpsc Sender disconnects and the recv() races with the channel

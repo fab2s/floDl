@@ -75,46 +75,9 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
                 from: item["from"].as_u64().unwrap_or(0) as usize,
                 to: item["to"].as_u64().unwrap_or(0) as usize,
             },
-            "div" => {
-                let deltas = item["deltas"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .map(|v| v.as_f64().unwrap_or(0.0))
-                            .collect::<Vec<f64>>()
-                    })
-                    .unwrap_or_default();
-                let pre_norms = item["pre_norms"].as_array().map(|a| {
-                    a.iter()
-                        .map(|v| v.as_f64().unwrap_or(0.0))
-                        .collect::<Vec<f64>>()
-                });
-                EventKind::Divergence {
-                    d_raw: item["d"].as_f64().unwrap_or(0.0),
-                    lambda_raw: item["lambda"].as_f64(),
-                    lambda_ema: item["lambda_ema"].as_f64(),
-                    k_used: item["k_used"].as_u64().unwrap_or(0) as usize,
-                    k_max: item["k_max"].as_u64().unwrap_or(0) as usize,
-                    step: item["step"].as_u64().unwrap_or(0) as usize,
-                    deltas,
-                    post_norm: item["post_norm"].as_f64(),
-                    pre_norms,
-                    epoch: item["epoch"].as_u64().map(|v| v as usize),
-                }
-            }
-            "div_epoch" => EventKind::DivergenceEpoch {
-                epoch: item["epoch"].as_u64().unwrap_or(0) as usize,
-                sync_count: item["syncs"].as_u64().unwrap_or(0) as usize,
-                d_min: item["d_min"].as_f64().unwrap_or(0.0),
-                d_max: item["d_max"].as_f64().unwrap_or(0.0),
-                d_mean: item["d_mean"].as_f64().unwrap_or(0.0),
-                lambda_min: item["lambda_min"].as_f64(),
-                lambda_max: item["lambda_max"].as_f64(),
-                lambda_mean: item["lambda_mean"].as_f64(),
-                lambda_ema_at_epoch_end: item["lambda_ema_end"].as_f64(),
-                d_at_epoch_end: item["d_end"].as_f64().unwrap_or(0.0),
-                k_at_epoch_end: item["k_end"].as_u64().unwrap_or(0) as usize,
-            },
+            // "div" / "div_epoch" (MSF passive-observation records) fall
+            // through to the skip: the JSON detail stays available to
+            // research tooling, the report no longer consumes it.
             _ => continue, // skip unknown
         };
         out.push(Event { t, kind });

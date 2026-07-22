@@ -1355,6 +1355,24 @@ impl StreamingEpochIter<'_> {
                     if let Err(e) = event.synchronize() {
                         return Some(Err(e));
                     }
+                    // Cross-stream lifetime pin (same hazard as the DDP
+                    // worker's delivery, see epoch_plan): the blocks were
+                    // allocated on the prefetch copy stream, and the
+                    // consumer drops the batch while its own stream's
+                    // kernels (backward reads the labels) may still be in
+                    // flight — freed, the blocks guard only against the
+                    // copy stream and the next upload can overwrite them
+                    // mid-read.
+                    match crate::tensor::cuda_stream::CudaStream::current(self.device) {
+                        Ok(cur) => {
+                            for t in &batch.tensors {
+                                if let Err(e) = t.record_stream(&cur) {
+                                    return Some(Err(e));
+                                }
+                            }
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
                 }
                 self.governor.consumed.fetch_add(1, Ordering::Relaxed);
                 let run_consumed =

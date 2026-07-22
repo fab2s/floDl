@@ -114,7 +114,15 @@ pub struct RunResult {
 
 /// Run a single (model, mode) combination.
 pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Result<RunResult> {
-    let mode_str = mode.to_string();
+    // An outer optimizer changes the training algorithm, so its runs get
+    // their own artifact dir (`cpu-async-diloco`) instead of colliding
+    // with the plain mode's cell. Every process (launcher + ranks) derives
+    // the same suffix from the same CLI args.
+    let mode_str = match &config.outer_optimizer {
+        crate::config::OuterOptChoice::None => mode.to_string(),
+        crate::config::OuterOptChoice::SlowMomentum { .. } => format!("{mode}-slowmo"),
+        crate::config::OuterOptChoice::Nesterov { .. } => format!("{mode}-diloco"),
+    };
 
     // Operator-visible dispatch banner: confirms which path is engaged
     // (launcher / rank / single-device) so anyone glancing at captured
@@ -309,7 +317,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     if !suppress_artifacts {
         let log_path = format!("{run_dir}/training.log");
         #[cfg(feature = "cuda")]
-        let header = {
+        let local_header = {
             let mut h = String::new();
             for dev in flodl::tensor::cuda_devices() {
                 h.push_str(&format!(
@@ -321,7 +329,29 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             h
         };
         #[cfg(not(feature = "cuda"))]
-        let header = String::new();
+        let local_header = String::new();
+        // Cluster runs: local probing only sees this host's GPUs, so the
+        // header would misdescribe the cohort (the historical "Pascals
+        // missing from the hardware section" report bug). The launcher
+        // captured every admitted worker's GPU labels at formation —
+        // write one line per rank, tagged host:device.
+        let header = match flodl::distributed::launcher::cohort_inventory() {
+            Some(cohort) => {
+                let mut h = String::new();
+                for m in cohort {
+                    for (i, rank) in m.ranks.iter().enumerate() {
+                        let dev = m.local_devices.get(i).copied().unwrap_or(i as u8);
+                        let label = m.gpus.get(i).map(String::as_str).unwrap_or("?");
+                        h.push_str(&format!(
+                            "# gpu r{rank} [{}:cuda{dev}]: {label}\n",
+                            m.host,
+                        ));
+                    }
+                }
+                h
+            }
+            None => local_header,
+        };
         let total_secs = total_ms / 1000.0;
         let footer = format!(
             "# total: {:.1}s ({:.0}m {:.0}s)",
@@ -906,8 +936,13 @@ fn run_unified(
     builder = match &config.guard {
         GuardChoice::None => builder
             .convergence_guard(flodl::distributed::ddp_run::NoGuard),
-        GuardChoice::Trend { threshold } => builder
-            .convergence_guard(flodl::distributed::ddp_run::TrendGuard::new(*threshold)),
+        // No explicit threshold defers to the library default, which is
+        // EASGD-aware (higher floor when α-blending keeps a standing
+        // spread) and absorbs the saved trend history on resume — an
+        // always-constructed override here would bypass both.
+        GuardChoice::Trend { threshold: Some(t) } => builder
+            .convergence_guard(flodl::distributed::ddp_run::TrendGuard::new(*t)),
+        GuardChoice::Trend { threshold: None } => builder,
         GuardChoice::Msf {
             suppress_threshold,
             suppress_sustain,

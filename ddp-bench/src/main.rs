@@ -86,6 +86,14 @@ struct Cli {
     #[option(default = "runs/report.md")]
     report: Option<String>,
 
+    /// With `--report`: generate SVG charts for the given model into
+    /// `<output>/charts/` and embed them in the report (eval trajectory,
+    /// fast-rank share, cumulative reduces, wall time, controller-GPU
+    /// idle). One focus model keeps the report readable; tables stay the
+    /// numeric record for everything else.
+    #[option]
+    charts: Option<String>,
+
     /// GPU selection: comma-separated physical indices ("0,1", "1,2") or "all".
     /// Sets CUDA_VISIBLE_DEVICES before libtorch init; selected GPUs are
     /// renumbered 0..N for the rest of the run (so `solo-N` picks among the
@@ -276,8 +284,10 @@ struct Cli {
     guard: Option<String>,
 
     /// Primary divergence threshold. Trend: 3-rises-above-threshold cut-off
-    /// (default 0.01). MSF: soft (`SuppressGrowth`) threshold on `λ_ema`
-    /// (default 1e-3).
+    /// (default: library default — 0.05, raised to 0.3 when EASGD blending
+    /// is active, i.e. cpu-async, whose elastic standing spread would
+    /// otherwise keep the guard permanently armed). MSF: soft
+    /// (`SuppressGrowth`) threshold on `λ_ema` (default 1e-3).
     #[option]
     guard_threshold: Option<f64>,
 
@@ -477,7 +487,7 @@ fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::G
     match kind.as_str() {
         "none" => Ok(GuardChoice::None),
         "trend" => Ok(GuardChoice::Trend {
-            threshold: cli.guard_threshold.unwrap_or(0.01),
+            threshold: cli.guard_threshold,
         }),
         "msf" => Ok(GuardChoice::Msf {
             suppress_threshold: cli.guard_threshold.unwrap_or(1.0e-3),
@@ -699,6 +709,11 @@ fn run() -> flodl::tensor::Result<()> {
         // Load and analyze
         let mut analyses: Vec<analyze::RunAnalysis> = Vec::new();
         let mut gpu_info: Vec<String> = Vec::new();
+        // Chart inputs retained for the focus model only (`--charts`):
+        // the per-epoch log detail and raw timeline that RunAnalysis
+        // deliberately reduces away.
+        let charts_model = cli.charts.clone();
+        let mut charts_data: Vec<report::charts::ChartRun> = Vec::new();
         for (model, mode) in &filtered {
             let run_dir = std::path::Path::new(&output).join(model).join(mode);
             let log_path = run_dir.join("training.log");
@@ -713,14 +728,28 @@ fn run() -> flodl::tensor::Result<()> {
                 }
             };
 
-            // Capture GPU info from the first log that has it.
-            if gpu_info.is_empty() && !log.gpu_info.is_empty() {
-                gpu_info.clone_from(&log.gpu_info);
+            // Hardware section = union across every run's header (dedup
+            // exact lines). First-log-wins hid every GPU the first run's
+            // host couldn't see (solo/cluster logs written on different
+            // hosts describe different hardware).
+            for g in &log.gpu_info {
+                if !gpu_info.contains(g) {
+                    gpu_info.push(g.clone());
+                }
+            }
+            // Cohort-format lines (`gpu rN [host:cudaD]: ...`, from
+            // `launcher::cohort_inventory`) describe the whole rig with
+            // host context; legacy `gpuN:` header lines duplicate them
+            // with less information (and per-host device numbering that
+            // collides across hosts). Prefer the cohort set when present.
+            if gpu_info.iter().any(|g| g.starts_with("gpu r")) {
+                gpu_info.retain(|g| g.starts_with("gpu r"));
             }
 
             // Timeline is optional (provides GPU utilization, idle, sync data).
-            let mut a = if let Ok(tl) = analyze::load_timeline(&tl_path) {
-                analyze::analyze(model, mode, &tl)
+            let tl = analyze::load_timeline(&tl_path).ok();
+            let mut a = if let Some(ref tl) = tl {
+                analyze::analyze(model, mode, tl)
             } else {
                 analyze::empty_analysis(model, mode)
             };
@@ -728,6 +757,13 @@ fn run() -> flodl::tensor::Result<()> {
             // Apply training log data (overrides timeline-derived loss/epochs).
             analyze::apply_training_log(&mut a, &log);
 
+            if charts_model.as_deref() == Some(model.as_str()) {
+                charts_data.push(report::charts::ChartRun {
+                    mode: mode.clone(),
+                    log,
+                    timeline: tl,
+                });
+            }
             analyses.push(a);
         }
 
@@ -754,7 +790,37 @@ fn run() -> flodl::tensor::Result<()> {
                     higher_is_better: hib,
                 }))
                 .collect();
-        let md = report::generate_report(&groups, &refs, &gpu_info, &all_modes);
+        // Charts for the focus model: SVGs land in `<output>/charts/`,
+        // the report embeds them by relative path (so they resolve when
+        // the report lives in the output dir — its normal home).
+        let mut chart_links: Vec<(String, String)> = Vec::new();
+        if let Some(ref cm) = charts_model {
+            if charts_data.is_empty() {
+                eprintln!("--charts {cm}: no runs found for that model; skipping charts");
+            } else {
+                let model_analyses: Vec<&analyze::RunAnalysis> = groups
+                    .iter()
+                    .find(|(m, _)| m == cm)
+                    .map(|(_, runs)| runs.iter().collect())
+                    .unwrap_or_default();
+                chart_links = report::charts::write_charts(
+                    std::path::Path::new(&output),
+                    cm,
+                    &charts_data,
+                    &model_analyses,
+                )
+                .map_err(|e| {
+                    flodl::tensor::TensorError::new(&format!("chart generation failed: {e}"))
+                })?;
+                eprintln!("charts: {} SVGs in {output}/charts/", chart_links.len());
+            }
+        }
+
+        let charts_arg = charts_model
+            .as_deref()
+            .filter(|_| !chart_links.is_empty())
+            .map(|m| (m, chart_links.as_slice()));
+        let md = report::generate_report(&groups, &refs, &gpu_info, &all_modes, charts_arg);
         if let Some(ref path) = report_file {
             std::fs::write(path, &md)
                 .map_err(|e| flodl::tensor::TensorError::new(&format!("cannot write {path}: {e}")))?;

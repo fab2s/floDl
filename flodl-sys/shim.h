@@ -841,6 +841,7 @@ void  flodl_cuda_event_delete(void* event);
 char* flodl_cuda_stream_new(int device_index, int high_priority, void** stream_out);
 char* flodl_cuda_stream_synchronize(void* stream);
 char* flodl_cuda_stream_wait_event(void* stream, void* event);
+char* flodl_tensor_record_stream(void* tensor, void* stream);
 int   flodl_cuda_stream_query(void* stream);
 void  flodl_cuda_stream_set_current(void* stream);
 void* flodl_cuda_stream_get_current(int device_index);

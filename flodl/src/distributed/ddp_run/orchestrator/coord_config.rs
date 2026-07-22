@@ -22,15 +22,15 @@ use crate::tensor::Result;
 /// Mirrors the guard-construction precedence used by the legacy
 /// `run_cluster_rank_cadence_nccl` worker-side path: user-supplied
 /// [`ConvergenceGuard`] wins, otherwise [`NoGuard`] when
-/// `no_divergence_guard` is set, otherwise
-/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`].
+/// `no_divergence_guard` is set, otherwise a [`TrendGuard`] at the
+/// user threshold or the EASGD-aware default
+/// ([`default_trend_threshold`]).
 ///
 /// [`ClusterCoordinatorConfig`]:
 ///     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
 /// [`ConvergenceGuard`]: convergence::ConvergenceGuard
 /// [`NoGuard`]: convergence::NoGuard
-/// [`TrendGuard::new(divergence_threshold.unwrap_or(0.05))`]:
-///     convergence::TrendGuard::new
+/// [`TrendGuard`]: convergence::TrendGuard
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_coord_config_from_builder(
     policy: ApplyPolicy,
@@ -112,7 +112,9 @@ pub(crate) fn build_coord_config_from_builder(
                 Box::new(convergence::NoGuard)
             } else {
                 let mut tg = convergence::TrendGuard::new(
-                    config.elche.divergence_threshold.unwrap_or(0.05),
+                    config.elche.divergence_threshold.unwrap_or_else(|| {
+                        default_trend_threshold(config.elche.easgd_alpha)
+                    }),
                 );
                 if let Some(history) = resume_trend_history {
                     tg = tg.with_history(history);
@@ -206,4 +208,36 @@ pub(crate) fn build_coord_config_from_builder(
     }
 
     Ok(coord_config)
+}
+
+/// Default [`TrendGuard`](convergence::TrendGuard) threshold when the user
+/// set none, keyed on the param-adoption semantics.
+///
+/// Full-overwrite modes (Sync / Cadence / un-blended Async) snap every rank
+/// onto the consensus at each reduce, so the measured weight-space
+/// divergence is pure per-window drift and a low floor (0.05) discriminates
+/// well. EASGD blending (`easgd_alpha` set) deliberately keeps replicas on
+/// an elastic spread around the consensus — the measured divergence carries
+/// a standing baseline (~0.1 at α=0.5) that IS the operating point, not
+/// drift toward failure. An overwrite-calibrated floor sits inside that
+/// band and keeps the trend rule permanently armed on a healthy run
+/// (measured 2026-07-22, resnet-graph 3-seed probe: suppression at the low
+/// floor bought no convergence and cost ~35% extra reduces). Blended modes
+/// therefore calibrate the floor above the elastic band; a genuine
+/// divergence spiral still crosses it with sustained rises and is caught.
+pub(crate) fn default_trend_threshold(easgd_alpha: Option<f64>) -> f64 {
+    if easgd_alpha.is_some() { 0.3 } else { 0.05 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_trend_threshold;
+
+    #[test]
+    fn trend_threshold_default_is_easgd_aware() {
+        // Overwrite semantics keep the historical floor.
+        assert_eq!(default_trend_threshold(None), 0.05);
+        // Blended semantics calibrate above the elastic standing spread.
+        assert_eq!(default_trend_threshold(Some(0.5)), 0.3);
+    }
 }

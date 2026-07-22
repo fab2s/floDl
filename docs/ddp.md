@@ -17,8 +17,8 @@ form) or `Trainer::run(model_factory, optim_factory, train_fn, cfg)`
   `ClusterBuilder`).
 
 No code changes between tiers. Scaling is a configuration decision, not
-a code rewrite. (For the API-tier rationale — universal builder, manual
-`Ddp::wrap` bypass, the deprecated self-driven setup tier — see the
+a code rewrite. (For the API-tier rationale - universal builder, manual
+`Ddp::wrap` bypass, the deprecated self-driven setup tier - see the
 [trainer execution tiers design note](design/trainer-execution-tiers.md).)
 
 ---
@@ -64,7 +64,7 @@ into a fresh CPU model for inference, or continue training via
 Per-sample datasets plug in the same way: implement
 `DataSet::get(index)` (or use a shipped disk-backed reader like
 `Cifar10Disk`) and hand it to `.sample_dataset(ds)` instead of
-`.dataset(ds)` — or `TrainerConfig::from_dataset(ds)` in the
+`.dataset(ds)` - or `TrainerConfig::from_dataset(ds)` in the
 config-bag form. Batching, RAM caching, and reservation staging are
 the framework's job; rank workers read samples ahead of the training
 frontier through the shared staging tier, so storage-backed data
@@ -140,14 +140,29 @@ returns `NcclCadence` (the recommended NCCL mode).
 
 | Mode | When | How | Best for |
 |---|---|---|---|
-| `NcclSync` | Every batch | NCCL AllReduce | Homogeneous GPUs, correctness-first baseline |
+| `NcclSync` | Every slow-rank step (see note below) | NCCL AllReduce | Homogeneous GPUs, correctness-first baseline |
 | `NcclCadence` | Anchor-based (ElChe) | NCCL AllReduce | **Recommended NCCL default** - heterogeneous rigs; ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window |
-| `CpuSync` | Every batch | CPU averaging | Sync without NCCL (peer-access unavailable, A/B against NCCL) |
+| `CpuSync` | Every slow-rank step (see note below) | CPU averaging | Sync without NCCL (peer-access unavailable, A/B against NCCL) |
 | `CpuCadence` | Anchor-based | CPU averaging | Heterogeneous rigs without fast peer links |
-| `CpuAsync` | Anchor + overshoot | CPU averaging + optional EASGD | **Best-in-class on the reference rig** - genuine async (decoupled averaging via separate channel), fastest convergence, fault-tolerant. CPU averaging is the only cost; a future dedicated averaging tier will lift it. |
+| `CpuAsync` | Anchor + overshoot | CPU averaging + EASGD blending (α=0.5 default) | Genuine async - averaging decoupled from the GPU pipeline via a separate channel, barrier-free application, fault-tolerant. Trades a small early-run wall surplus for it (the divergence guard grows async's window more cautiously; the surplus amortizes on long runs). Pair with the DiLoCo outer optimizer for the best eval quality on the reference rig. |
 
-`NcclSync` is the degenerate ElChe case (anchor=1). Every mode routes
-through the same machinery, so switching between them is one line.
+> **What "sync" means in flodl.** The `*-sync` modes are the tightest
+> cadence of the same ElChe-scheduled engine, not per-batch lockstep
+> DDP. Data is dispatched as an **equal split** (standard-DDP-like
+> sharding), but the reduce fires as soon as **every alive rank has
+> made at least one step since the last reduce**, with each rank's
+> contribution work-weighted (sum-and-count). On a homogeneous rig
+> this degenerates to classic synchronous DDP - one step per rank per
+> reduce. On a heterogeneous rig the fast GPU runs several steps per
+> reduce within its equal share instead of stalling at a per-batch
+> barrier, and idles once that share is exhausted (which is why sync
+> rows show high fast-GPU idle in the benchmark tables). The
+> difference vs `*-cadence`: cadence waits for each rank to complete
+> its **planned proportional window** (ElChe's `batch_counts`) before
+> reducing, and dispatches data proportionally to measured throughput.
+
+Every mode routes through the same machinery, so switching between
+them is one line.
 
 > **Note**: `NcclAsync` used to exist as a sixth mode (NCCL + per-rank
 > cross-epoch dispatch). It was dropped - measured benefit over
@@ -171,7 +186,7 @@ let elche = ElCheConfig::nccl_cadence()  // also the value of ElCheConfig::defau
 | `ElCheConfig::nccl_cadence()` | `NcclCadence` (**default**) |
 | `ElCheConfig::cpu_sync()` | `CpuSync` |
 | `ElCheConfig::cpu_cadence()` | `CpuCadence` |
-| `ElCheConfig::cpu_async()` | `CpuAsync` (best convergence in practice; see [A/B testing modes](#ab-testing-modes)) |
+| `ElCheConfig::cpu_async()` | `CpuAsync` (see [A/B testing modes](#ab-testing-modes)) |
 
 Or build the value directly with a struct literal:
 
@@ -191,13 +206,13 @@ let elche = ElCheConfig {
 | `.mode(ElCheMode)` | `NcclCadence` | The (when × how) pair. `ElCheConfig::default()` returns `nccl_cadence()`. |
 | `.anchor(n)` | 10 (Cadence/Async); 1 (Sync) | Initial anchor count. |
 | `.min_anchor(n)` / `.max_anchor(n)` | `None` (auto) | Anchor bounds. |
-| `.overhead_target(f)` | `0.05` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** - Sync modes hardcode per-batch AllReduce and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
+| `.overhead_target(f)` | `0.05` | Upper bound on `sync_ms / max(compute_ms)` per anchor window. ElChe grows the anchor when overhead exceeds the target, shrinks it when overhead drops below half. **Cadence + Async modes only** - Sync modes fire the reduce per slow-rank step (every alive rank ≥1 step; see "What sync means" above) and ignore the anchor knob. See [the overhead auto-tune section](#overhead_target-anchor-auto-tune) below. |
 | `.max_batch_diff(n)` | `None` | Cap on how far the fastest rank may lead the slowest. `Some(0)` = strict lockstep regardless of mode. |
 | `.relax_up(bool)` | `false` | Allow ElChe to grow the anchor in `Phase::Stable` when convergence stays clean. |
 | `.partition_ratios(Vec<f64>)` | auto | Static per-rank data split (e.g. `[0.7, 0.3]`). **Honored on `Sync` policy only**; Cadence/Async use progressive dispatch driven by ElChe and ignore the static ratios. For dynamic heterogeneous scheduling under those policies, ElChe's throughput-based auto-rebalancing is the intended path. |
 | `.meta_controller(bool)` | `true` | LR-aware meta-controller - watches LR + anchor + divergence; nudges anchor down on sharp LR drops or sustained divergence. On by default (LR drops are always worth catching); opt out for unconditioned-trajectory instrumentation. |
-| `.convergence_guard(g)` | `TrendGuard::new(0.05)` | Divergence guardrail. `NoGuard`, `TrendGuard`, or `MsfGuard` (rate-based). |
-| `.easgd_alpha(α)` | `None` | EASGD elastic blend on the `CpuAsync` path (`0 < α ≤ 1.0`). Ignored elsewhere. |
+| `.convergence_guard(g)` | `TrendGuard` at the EASGD-aware threshold | Divergence guardrail. `NoGuard`, `TrendGuard`, or `MsfGuard` (rate-based). The default threshold is keyed on param-adoption semantics: `0.05` for overwrite modes, `0.3` when `easgd_alpha` is set (elastic blending keeps a deliberate standing spread that a lower floor would read as permanent divergence). |
+| `.easgd_alpha(α)` | `Some(0.5)` on `CpuAsync`; `None` elsewhere | EASGD elastic blend on the `CpuAsync` path (`0 < α ≤ 1.0`) - on by default there (full overwrite is the degenerate α=1.0 case). Ignored outside `CpuAsync`. |
 | `.gamma(γ)` | `1.0` | Consensus allocation-weighting exponent applied when the outer optimizer / averaging weights ranks by work. `1.0` = pre-gamma (plain work-weighting). |
 | `.divergence_threshold(f)` | `None` | Legacy primitive feeding the default `TrendGuard` threshold when no explicit `convergence_guard` is set. Prefer `.convergence_guard(...)`. |
 | `.no_divergence_guard()` | `false` | Disable the divergence guardrail entirely (overhead auto-tune drives cadence alone). Use only when the workload is known stable. |
@@ -301,10 +316,10 @@ let cfg = TrainerConfig::new(dataset)
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
-| `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` — same knob as the solo loader's `vram_max_usage`. |
+| `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` - same knob as the solo loader's `vram_max_usage`. |
 | `.with_ram_max_usage(f)` | `f64` | Fraction of available host RAM each rank's staging tiers may retain; co-hosted ranks split it in proportion to their schedule share. Default `0.50`, clamped to `[0.0, 0.90]`; `0.0` disables staging retention. Same knob as the solo loader's `ram_max_usage`. |
-| `.with_sample_cache(b)` | `bool` | Pinned RAM sample retention in each rank's staging tier. `false` pins the retained cache at zero — the flow window keeps the whole staging share, nothing persists across epochs. Default `true` — same knob as the solo loader's `sample_cache`. |
-| `.with_disk_stage(gb)` | `u64` | Local-disk overflow tier under each rank's sample cache, in GB: samples the RAM budget declines spill to an ephemeral per-rank pack file and re-read at local-disk speed instead of source speed. Default `0` (off) — same knob as the solo loader's `disk_stage`. Pair with `.with_disk_stage_dir(path)` to point at a fast local drive. |
+| `.with_sample_cache(b)` | `bool` | Pinned RAM sample retention in each rank's staging tier. `false` pins the retained cache at zero - the flow window keeps the whole staging share, nothing persists across epochs. Default `true` - same knob as the solo loader's `sample_cache`. |
+| `.with_disk_stage(gb)` | `u64` | Local-disk overflow tier under each rank's sample cache, in GB: samples the RAM budget declines spill to an ephemeral per-rank pack file and re-read at local-disk speed instead of source speed. Default `0` (off) - same knob as the solo loader's `disk_stage`. Pair with `.with_disk_stage_dir(path)` to point at a fast local drive. |
 | `.with_augment(k)` | `usize` | Views per sample per epoch: the schedule becomes `len()*k` picks, sharded and balanced exactly like samples. Data variation comes from the transform. |
 | `.with_transform(f)` | closure | Deterministic delivery transform, keyed by `PickKey { sample, repeat, epoch, seed }` per row; runs on each rank after device transfer. The chained `DdpBuilder` twins are `.augment(k)` / `.transform(f)`. See the [data-loading tutorial](tutorials/13-data-loading.md#augmentation-repeated-picks--a-keyed-transform). |
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |
@@ -557,14 +572,20 @@ Membership only ever **shrinks**. The world is formed once, at the join
 window (see [Dial-in membership](#dial-in-membership-the-join-window));
 after that, neither a new rank nor a previously dead one can join the
 cohort. Elastic scale-up (mid-training join) is designed but not yet
-implemented — see `.design/hierarchical-elastic-ddp.md` for the
+implemented - see `.design/hierarchical-elastic-ddp.md` for the
 direction and its consistency invariant.
 
 ### What happens when a rank dies
 
-1. **Heartbeat miss** - controller transitions the rank to `Dead` in
-   per-rank state, elastically renormalizes `partition_ratios` across
-   survivors.
+1. **Death detection** - the launcher's child-exit report reaches the
+   controller within milliseconds of the process dying; heartbeat
+   staleness (30s) is the backstop for silent hangs. Either path
+   transitions the rank to `Dead` in per-rank state and elastically
+   renormalizes `partition_ratios` across survivors. (A rank that
+   *completes* cleanly announces `Exiting` instead - the
+   clean-completion latch - so a finished rank is never mistaken for a
+   death; an error exit never sends it, so a death is never masked as
+   completion.)
 2. **Lone NCCL survivor** - short-circuits the wait and exits
    immediately rather than blocking on a dead-quorum AllReduce.
 3. **`max_failure` threshold** - when survivor count drops below this,
@@ -666,8 +687,8 @@ Conventions:
 ### Dial-in membership: the join window
 
 Workers **join** a run; the controller admits them. At launch the
-controller opens a join window on its port; every worker — fan-out-
-managed and self-deployed alike — dials in with a hello (host name,
+controller opens a join window on its port; every worker - fan-out-
+managed and self-deployed alike - dials in with a hello (host name,
 GPU inventory, libtorch variant, dataset signature) and is assigned
 its global ranks **in admission order** (contiguous by construction).
 When the window closes, the world freezes: `world_size` is whatever
@@ -677,7 +698,7 @@ heartbeats, rendezvous) is sized to that world.
 `fdl @cluster <cmd>` fan-out is sugar over this protocol: it starts
 one worker agent per host over SSH, and those agents dial back in like
 any worker would. The defaults make fan-out behave exactly like a
-fixed topology — quorum and early-close target both default to the
+fixed topology - quorum and early-close target both default to the
 configured capacity, so the window closes the instant every configured
 rank is in (zero added latency) and the run cannot start below full
 strength.
@@ -688,7 +709,7 @@ the window open for extra dial-in workers:
 | Knob | Meaning | Default |
 |---|---|---|
 | `min_rank_start` | Quorum in ranks; the run cannot start below it. | configured capacity |
-| `join_timeout` | Window in seconds. Quorum reached early does NOT close it — late workers within the window still join. | 300 |
+| `join_timeout` | Window in seconds. Quorum reached early does NOT close it - late workers within the window still join. | 300 |
 | `target_ranks` | The window closes the moment this many ranks are in. Raise it above capacity to wait for self-deployed workers. | configured capacity |
 | `max_join_timeout` | Hard cap in seconds; quorum still unmet when it expires fails the run loudly. | 600 (or the window length when set higher) |
 | `open_admission` | Accept joins without the pre-shared session salt on a non-loopback bind (loudly warned). | false |
@@ -696,19 +717,19 @@ the window open for extra dial-in workers:
 Admission is authenticated by the join frames' HMAC key: fan-out
 agents receive the per-run session salt through their SSH session, so
 a peer without it cannot join. A **loopback** bind (every remote
-worker tunneled) is open by construction — the only path to the port
+worker tunneled) is open by construction - the only path to the port
 is through sshd, so reachability itself is the authentication, and the
 salt is handed out in the accept reply. `open_admission: true` extends
 that hand-out to a network bind: any peer that can reach the port can
 then join (and therefore influence) the run, which is why flodl warns
-loudly — sound only on a fully trusted segment.
+loudly - sound only on a fully trusted segment.
 
 A **self-deployed worker** needs nothing but the controller address: a
 process started on any GPU host with `FLODL_INTERNAL_AGENT_JSON` set
 to the hex-encoded spec `{"host": "...", "controller_host": "...",
 "controller_port": 1337}` (see `AgentSpec` in the API docs) resolves
 its own GPUs, joins, receives the formed-world artifacts, and spawns
-its relay and rank children — the training code is byte-identical to
+its relay and rank children - the training code is byte-identical to
 the fan-out path. Pair it with `target_ranks` above the configured
 capacity (or a bare-bones one-host config) so the window waits for it.
 
@@ -717,7 +738,7 @@ roles (agent, relay, rank) internally, so a binary that goes straight
 to `Trainer::run` needs nothing. But a binary that **gates before**
 `Trainer::run` (checks GPU counts, parses modes, validates datasets,
 and possibly exits) must short-circuit the internal worker roles first
-— otherwise the worker agent falls into the gate on the remote host
+- otherwise the worker agent falls into the gate on the remote host
 (seeing ONE host of a multi-host world) and exits without ever
 joining, and the window idles to its hard cap:
 
@@ -819,7 +840,7 @@ field listing.
 ### Live run status - `fdl status`
 
 While a run is up, the controller port answers plain HTTP GETs with
-the run's membership state as `state.json` — lifecycle phase
+the run's membership state as `state.json` - lifecycle phase
 (`waiting` / `forming` / `training` / `done` / `failed`), who has
 joined with what hardware, and the join-window countdowns while it is
 still open:
@@ -833,7 +854,7 @@ curl http://<controller>:1337/state.json   # no fdl required
 ```
 
 ```text
-cluster run @ 192.168.122.1:1337 — training
+cluster run @ 192.168.122.1:1337 - training
   ranks: 3 joined across 2 host(s)   (quorum 3, target 3)
   hosts:
     node-a  ranks [0]     1x RTX 5060 Ti   libtorch precompiled/cu128  joined +0s
@@ -844,7 +865,7 @@ The endpoint is read-only and lives exactly as long as the launcher
 process: it is up from before the join window opens (so `waiting` and
 `forming` are observable), and connection-refused afterwards is the
 honest "no run listening" signal (`fdl status` exits 1 with a note).
-Reachability follows the port's bind scope — an all-tunneled run
+Reachability follows the port's bind scope - an all-tunneled run
 exposes it through sshd only. See
 [CLI reference](cli.md#fdl-status) for address resolution details.
 
@@ -894,8 +915,8 @@ Mathematically correct mean gradient regardless of per-device batch
 counts.
 
 Weight consensus follows the same principle at every sync (shaped by
-`gamma`), on both backends. Non-learnable f32 buffers — BatchNorm
-running stats and the like — ride the same sync but are averaged with
+`gamma`), on both backends. Non-learnable f32 buffers - BatchNorm
+running stats and the like - ride the same sync but are averaged with
 *equal* weight among the ranks that stepped in the window, never
 `gamma`-weighted: running statistics must not inherit a fast rank's
 dominance. Non-f32 buffers (deterministic integer counters, updated
@@ -907,12 +928,14 @@ identically on every rank) keep their local value.
 that watches LR trajectory + anchor trend + convergence-guard verdicts
 in a rolling window. Reactively nudges the anchor down on sharp LR
 drops or sustained divergence, and reports `is_settled()` once the
-metric stops moving. Off by default.
+metric stops moving. On by default (opt out with
+`.meta_controller(false)` for unconditioned-trajectory
+instrumentation).
 
 ### EASGD elastic averaging
 
-`ElCheConfig::easgd_alpha(α)` enables EASGD-style blending on the
-`CpuAsync` path:
+`ElCheConfig::easgd_alpha(α)` tunes the EASGD-style blending on the
+`CpuAsync` path (on by default there at α=0.5):
 
 ```
 local_t1   = (1 - α) * local_t0  +  α * center_t0
@@ -920,7 +943,9 @@ center_t1  = (1 - α) * center_t0 +  α * mean(local_t0)
 ```
 
 Smooths divergence in long async runs. Honored on `CpuAsync` only;
-ignored elsewhere.
+ignored elsewhere. Note that blending keeps replicas on a deliberate
+elastic spread around the consensus - the divergence guard's default
+threshold accounts for it (see the `convergence_guard` knob above).
 
 ---
 
@@ -981,20 +1006,17 @@ Same model, same data, same seed; change one line.
 
 | Suggested order | Rationale |
 |---|---|
-| 1. **`CpuAsync`** | **Best in class** on the reference rig - fastest wall-time *and* best convergence in the published `ddp-bench` runs. The CPU averaging path decouples from the GPU forward pass (genuine async - averaging on a separate channel) and benefits most from EASGD elastic blending. Cost: a decent CPU. A future dedicated averaging tier (extra GPU or peer) will lift the cost; the convergence quality is intrinsic to the algorithm. |
-| 2. **`NcclCadence`** (default) | Recommended NCCL default. ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window. Anchor-based cadence with AllReduce at every boundary. |
-| 3. `NcclSync` | Strict-sync baseline. Tells you whether per-batch synchronization helps for your specific model. Identical to vanilla DDP. |
+| 1. **`NcclCadence`** (default) | Recommended NCCL default. ElChe tunes the anchor so the slow device sets the pace, fast devices process proportionally more batches per averaging window. Anchor-based cadence with AllReduce at every boundary. |
+| 2. **`CpuCadence`** | Fastest wall time in the published benchmark (512s vs 548s nccl-cadence on the 200-epoch flagship). Same cadence semantics without NCCL - the natural pick when peer access is unavailable or the rig spans hosts without fast links. Cost: a decent CPU on the controller host. |
+| 3. **`CpuAsync` (+ DiLoCo)** | Genuine async: barrier-free application, averaging decoupled from the GPU pipeline, EASGD blending on by default. A few percent of wall time behind `CpuCadence` on fixed-epoch runs (the divergence guard grows its window more cautiously early on; amortizes at length) - in exchange for jitter tolerance and the strongest convergence behavior: with the DiLoCo outer optimizer it posted the best eval of all modes in the published benchmark (0.9236 vs 0.9210 solo), holding the generalization peak that solo training overfits past. |
+| 4. `NcclSync` | Tightest-cadence baseline. Tells you whether near-per-step synchronization helps for your specific model. Equal data split like vanilla DDP; the reduce fires per slow-rank step, not per batch (see the "What sync means" note above) - degenerates to vanilla DDP on homogeneous rigs. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and `loss per
 wall-second` - that last metric is usually the decider. The `ddp-bench`
 suite drives every mode through the same harness; see
+[the benchmark report](ddp-benchmark.md) for the published numbers and
 [`ddp-bench`](https://github.com/flodl-labs/flodl/tree/main/ddp-bench)
-for the canonical worked example and the published numbers.
-
-`CpuSync` and `CpuCadence` exist for completeness - A/B against the
-NCCL variants when peer-access is unavailable. They're not usually
-faster or more accurate than the NCCL variants for typical workloads;
-`CpuAsync` is where the CPU backend shines.
+for the canonical worked example.
 
 ---
 

@@ -15,9 +15,14 @@ knobs that earn their keep on real heterogeneous deployments.
 ## ElChe - the cadence balancer
 
 Every cadence mode (`*Cadence`, `*Async`) routes through ElChe.
-`NcclSync` and `CpuSync` are the degenerate case (anchor=1, AllReduce
-every batch). ElChe's job is to keep AllReduce overhead bounded while
-respecting weight-space divergence.
+`NcclSync` and `CpuSync` are the tightest-cadence case: an equal data
+split with the reduce firing as soon as every alive rank has made at
+least one step since the last one — classic per-batch DDP on a
+homogeneous rig, but NOT per-batch lockstep on a heterogeneous one
+(the fast GPU runs several work-weighted steps per reduce; see
+[What "sync" means](../ddp.md#elchemode---cadence--backend-in-one-name)).
+ElChe's job is to keep AllReduce overhead bounded while respecting
+weight-space divergence.
 
 ### Phase machine
 
@@ -141,7 +146,7 @@ let base = || Trainer::builder(model_factory.clone(), optim_factory.clone(), tra
 
 let a = base().elche(ElCheConfig::cpu_async()).run()?.join()?;     // best-in-class candidate
 let b = base().elche(ElCheConfig::nccl_cadence()).run()?.join()?;  // default; recommended NCCL pick
-let c = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;     // per-batch baseline
+let c = base().elche(ElCheConfig::nccl_sync()).run()?.join()?;     // tightest-cadence baseline
 ```
 
 Suggested order (refined from the `ddp-bench` published numbers):
@@ -150,7 +155,7 @@ Suggested order (refined from the `ddp-bench` published numbers):
 |---|---|---|
 | 1 | **`CpuAsync`** | Best convergence + wall-time on the reference rig. CPU averaging decouples from the GPU forward path (genuine async - averaging on a separate channel) and benefits most from EASGD. Cost: a decent CPU. |
 | 2 | **`NcclCadence`** (default) | Recommended NCCL default. ElChe-driven anchor; fast devices process proportionally more batches per averaging window. |
-| 3 | `NcclSync` | Strict per-batch sync. Tells you whether tighter synchronization helps your specific model. |
+| 3 | `NcclSync` | Tightest cadence (per slow-rank step, equal split). Tells you whether tighter synchronization helps your specific model. |
 
 Compare on: `loss at epoch N`, `wall time per epoch`, and **`loss per
 wall-second`** - the last is usually the decider. A slightly higher

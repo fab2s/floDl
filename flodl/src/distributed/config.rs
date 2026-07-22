@@ -43,26 +43,34 @@ use super::launcher::FullCluster;
 /// single name. Matches the user-facing naming used in `ddp-bench`,
 /// commits, and the design docs (`nccl-sync`, `cpu-async`, etc.).
 ///
-/// All flodl DDP runs go through the ElChe machinery; `Sync` is the
-/// degenerate-but-valid case where anchor=1 makes ElChe behave like
-/// vanilla synchronous DDP. The other modes engage ElChe's anchor
-/// auto-tuning and (in `Async`) overshoot scheduling.
+/// All flodl DDP runs go through the ElChe machinery; the `*Sync`
+/// modes are its tightest cadence, NOT per-batch lockstep DDP: data
+/// is dispatched as an equal split, and the reduce fires as soon as
+/// every alive rank has made at least one step since the last reduce,
+/// with contributions work-weighted (sum-and-count). On a homogeneous
+/// rig that degenerates to vanilla synchronous DDP (one step per rank
+/// per reduce); on a heterogeneous rig the fast GPU runs several
+/// steps per reduce within its equal share, then idles once it is
+/// exhausted. The other modes engage ElChe's anchor auto-tuning —
+/// proportional dispatch, reduce once every rank completes its
+/// planned window — and (in `Async`) overshoot scheduling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ElCheMode {
-    /// NCCL averaging, all-reduce every batch. Vanilla synchronous DDP.
-    /// Fast GPUs wait at each collective barrier — best when GPUs are
-    /// homogeneous and inter-rank links are fast.
+    /// NCCL averaging at the tightest cadence (reduce per slow-rank
+    /// step over an equal data split — vanilla DDP only on homogeneous
+    /// rigs; see the type-level note). Best when GPUs are homogeneous
+    /// and inter-rank links are fast.
     NcclSync,
     /// NCCL averaging, anchor-based. ElChe tunes the anchor so the
     /// slow device sets the pace; fast devices process proportionally
     /// more batches per averaging window. Recommended NCCL default for
     /// mixed GPU setups.
     NcclCadence,
-    /// CPU-mediated averaging via the coordinator, all-reduce every
-    /// batch. Useful when NVLink / PCIe peer access is unavailable,
-    /// for heterogeneous-mounted rigs, or for A/B against the NCCL
-    /// path.
+    /// CPU-mediated averaging via the coordinator at the tightest
+    /// cadence (same gate as [`Self::NcclSync`]). Useful when NVLink /
+    /// PCIe peer access is unavailable, for heterogeneous-mounted
+    /// rigs, or for A/B against the NCCL path.
     CpuSync,
     /// CPU-mediated averaging, anchor-based. CPU's natural decoupling
     /// from the GPU's collective barrier makes this the most
@@ -170,9 +178,12 @@ pub struct ElCheConfig {
     /// `.meta_controller(false)` when collecting an unconditioned
     /// trajectory.
     pub meta_controller: bool,
-    /// Divergence guardrail. `None` = `TrendGuard::new(0.05)` default;
-    /// set to a custom guard to override threshold or replace
-    /// behavior. See [`crate::distributed::ddp_run::NoGuard`] /
+    /// Divergence guardrail. `None` = `TrendGuard` at the EASGD-aware
+    /// default threshold (0.05 for overwrite modes; 0.3 when
+    /// `easgd_alpha` is set, whose elastic standing spread would keep a
+    /// lower floor permanently armed); set to a custom guard to
+    /// override threshold or replace behavior. See
+    /// [`crate::distributed::ddp_run::NoGuard`] /
     /// [`crate::distributed::ddp_run::TrendGuard`].
     pub convergence_guard: Option<Box<dyn ConvergenceGuard>>,
     /// EASGD elastic-averaging weight (0.0 < α ≤ 1.0). Honored on the
@@ -180,9 +191,12 @@ pub struct ElCheConfig {
     pub easgd_alpha: Option<f64>,
     /// Divergence threshold for the default convergence guard
     /// ([`crate::distributed::ddp_run::TrendGuard`]). `None` = framework
-    /// default (0.05). Ignored when [`Self::convergence_guard`] supplies a
-    /// custom guard (the override takes precedence) or when
-    /// [`Self::no_divergence_guard`] is set.
+    /// default, keyed on param-adoption semantics: 0.05 for overwrite
+    /// modes, 0.3 when [`Self::easgd_alpha`] is set (elastic blending
+    /// keeps a deliberate standing spread ~0.1 that a lower floor would
+    /// read as permanent divergence). Ignored when
+    /// [`Self::convergence_guard`] supplies a custom guard (the override
+    /// takes precedence) or when [`Self::no_divergence_guard`] is set.
     pub divergence_threshold: Option<f64>,
     /// Disable the convergence guard entirely
     /// ([`crate::distributed::ddp_run::NoGuard`]). Default `false`. When
@@ -211,7 +225,8 @@ pub struct ElCheConfig {
 impl ElCheConfig {
     // -- Presets ----------------------------------------------------------
 
-    /// NCCL averaging, all-reduce every batch. anchor=1, no overshoot.
+    /// NCCL averaging at the tightest cadence (reduce per slow-rank
+    /// step; see [`ElCheMode::NcclSync`]). anchor=1, no overshoot.
     pub fn nccl_sync() -> Self {
         Self {
             mode: ElCheMode::NcclSync,
@@ -226,7 +241,8 @@ impl ElCheConfig {
         Self::default_for(ElCheMode::NcclCadence)
     }
 
-    /// CPU-mediated averaging, all-reduce every batch.
+    /// CPU-mediated averaging at the tightest cadence (reduce per
+    /// slow-rank step; see [`ElCheMode::CpuSync`]).
     pub fn cpu_sync() -> Self {
         Self {
             mode: ElCheMode::CpuSync,
@@ -386,8 +402,9 @@ pub struct TrainerConfig<M: Module> {
 
     /// ElChe / DDP / heterogeneity sub-config. Defaults to
     /// `ElCheConfig::nccl_cadence()` — recommended for mixed-GPU rigs;
-    /// override with a preset (e.g. `ElCheConfig::nccl_sync()` for
-    /// vanilla DDP) when appropriate.
+    /// override with a preset (e.g. `ElCheConfig::nccl_sync()` for the
+    /// tightest cadence — vanilla DDP on homogeneous rigs) when
+    /// appropriate.
     pub elche: ElCheConfig,
 
     /// Maximum gradient norm for per-worker clipping. `None` = no clipping.

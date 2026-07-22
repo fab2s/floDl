@@ -69,11 +69,12 @@
 
 use std::env;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::distributed::membership::JoinedMember;
 use crate::distributed::relay::agent::{ChannelKind, RelayChannel};
 use crate::distributed::relay::{RELAY_CONTROL_LOOPBACK_OFFSET, RELAY_DATA_LOOPBACK_OFFSET};
 use crate::tensor::{Result, TensorError};
@@ -93,6 +94,21 @@ use spawn::{
     build_remote_agent_bash_command, build_slim_envelope_for, forward_lines,
     AGENT_RANK_SENTINEL,
 };
+
+/// Cohort inventory captured at world formation (admission order): one
+/// [`JoinedMember`] per admitted worker, carrying host, ranks, physical
+/// devices, and the GPU labels from its join hello. The launcher is
+/// once-per-process, so a process-wide slot fits.
+static COHORT_INVENTORY: OnceLock<Vec<JoinedMember>> = OnceLock::new();
+
+/// GPU inventory of the formed cohort, for post-run consumers running in
+/// the launcher process (a bench harness writing a hardware header, run
+/// summaries). Covers every admitted host — including remote GPUs this
+/// process can never probe locally. `None` unless this process ran the
+/// launcher role and a world formed.
+pub fn cohort_inventory() -> Option<&'static [JoinedMember]> {
+    COHORT_INVENTORY.get().map(|v| v.as_slice())
+}
 
 
 /// Environment variable carrying the *full* cluster topology to the
@@ -1311,6 +1327,14 @@ pub fn run_launcher_with_config(
         // dialer immediately instead of queueing it forever.
         drop(mux_rendezvous);
     }
+
+    // Cohort inventory snapshot for post-run consumers in this process
+    // (e.g. a bench harness writing a hardware header covering remote
+    // hosts it can never probe itself). Captured here because the
+    // admitted-worker list is consumed just below.
+    let _ = COHORT_INVENTORY.set(
+        formed_workers.iter().map(|aw| aw.member.clone()).collect(),
+    );
 
     // ------------------------------------------------------------------
     // Ship each admitted worker its spawn artifacts
