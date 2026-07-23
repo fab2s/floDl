@@ -97,6 +97,41 @@ Best for: pre-loaded datasets, memory-mapped files, GPU-resident data.
 Both traits require `Send + Sync` so the prefetch worker can access
 them from a background thread.
 
+## Bundled datasets
+
+`flodl::data::datasets` ships parsers for common benchmark data — pure
+parsers with no download logic (fetch the files however you like):
+
+- `Mnist` / `Cifar10` — classic vision sets, parsed into RAM.
+- `Cifar10Disk` — same files read per sample from disk (the
+  larger-than-RAM path; implements `DataSet`, so the staging tiers
+  compose above it).
+- `Shakespeare` — character-level LM sequences from raw text.
+- `TokenShards` — pre-tokenized LM corpora in NumPy `.npy` shard files
+  (OLMo / olmo-mix, nanoGPT-style dumps).
+
+`TokenShards` is the path for real LM pretraining data: each shard is
+a 1-D array of token ids (`|u1`, `<u2`, `<u4`, `<i4` or `<i8`), and
+samples are non-overlapping `seq_len` windows with the target shifted
+by one. Shards are read lazily with positioned reads — a multi-GB
+corpus costs no RAM up front — and windows never cross shard
+boundaries:
+
+```rust
+use flodl::data::datasets::TokenShards;
+
+// Every .npy in the directory, sorted by name; or TokenShards::open(&paths, seq_len)
+let data = TokenShards::open_dir("data/olmo-mix", 1024)?;
+println!("{} windows over {} tokens", data.len(), data.total_tokens());
+
+// Per-sample entry point -> staging cascade (RAM cache, disk stage, VRAM pool)
+let mut loader = DataLoader::from_dataset(data)
+    .batch_size(32)
+    .streaming()
+    .build()?;
+// batch[0]: [32, 1024] Int64 inputs, batch[1]: targets shifted by one
+```
+
 ## Named batch access
 
 The `Batch` type supports both positional and named access:
