@@ -361,6 +361,34 @@ let y = mha.forward(&x)?;                           // [B, seq, 512] -> [B, seq,
 let y = mha.forward_ext(&query, &key, &value, Some(&mask))?;
 ```
 
+### RotaryEmbedding (RoPE)
+
+Rotary position embeddings encode positions as rotations of query/key
+pairs, so attention scores depend only on relative offsets (LLaMA,
+OLMo, and most modern decoder architectures). The sin/cos tables are
+precomputed once; attach one to `MultiheadAttention` and it rotates
+query and key after the head split, replacing additive position
+embeddings:
+
+```rust
+// head_dim = embed_dim / num_heads = 512 / 8 = 64
+let rope = RotaryEmbedding::new(64, 2048)?;          // head_dim, max_seq_len
+let rope = RotaryEmbedding::on_device_theta(64, 2048, 500_000.0, device)?; // custom rope_theta
+
+let mha = MultiheadAttention::new(512, 8)?.rotary(rope)?;
+let y = mha.forward_ext(&x, &x, &x, Some(&causal_mask))?;  // decoder block, no pos_emb needed
+```
+
+For hand-rolled attention, `apply` rotates `[batch, heads, seq,
+head_dim]` tensors directly:
+
+```rust
+let (q, k) = rope.apply(&q, &k)?;   // query/key may differ in heads/seq (GQA, cross-attention)
+```
+
+Cloning a `RotaryEmbedding` shares the tables (no copy), so one
+instance serves every layer of a deep model.
+
 ## Bilinear
 
 Bilinear transformation: `y = x1^T A x2 + b`. Useful for modeling

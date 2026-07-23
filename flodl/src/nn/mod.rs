@@ -6,7 +6,7 @@
 //!
 //! # Features
 //!
-//! - **Layers**: Linear, Conv1d/Conv2d/Conv3d, ConvTranspose1d/2d/3d, MaxPool1d/2d, AvgPool1d/2d, AdaptiveMaxPool2d, AdaptiveAvgPool2d, PixelShuffle/Unshuffle, Upsample, Unfold/Fold, LayerNorm, RMSNorm, GroupNorm, BatchNorm/BatchNorm2d, InstanceNorm, Dropout/Dropout2d/AlphaDropout, Embedding/EmbeddingBag, GRUCell, GRU, LSTMCell, LSTM, MultiheadAttention, Bilinear, ZeroPad2d, ReflectionPad2d
+//! - **Layers**: Linear, Conv1d/Conv2d/Conv3d, ConvTranspose1d/2d/3d, MaxPool1d/2d, AvgPool1d/2d, AdaptiveMaxPool2d, AdaptiveAvgPool2d, PixelShuffle/Unshuffle, Upsample, Unfold/Fold, LayerNorm, RMSNorm, GroupNorm, BatchNorm/BatchNorm2d, InstanceNorm, Dropout/Dropout2d/AlphaDropout, Embedding/EmbeddingBag, GRUCell, GRU, LSTMCell, LSTM, MultiheadAttention, RotaryEmbedding, Bilinear, ZeroPad2d, ReflectionPad2d
 //! - **Activations**: Identity, ReLU, LeakyReLU, ELU, Sigmoid, Tanh, GELU, SiLU, Softplus, Mish, SELU, Hardswish, Hardsigmoid, PReLU, Softmax, LogSoftmax, Flatten, GaussianBlur
 //! - **Losses**: MSE, CrossEntropy, BCE, BCEWithLogits, L1, SmoothL1, KLDiv, NLL, CTC, Focal, TripletMargin, CosineEmbedding, HingeEmbedding, MarginRanking, PoissonNLL
 //! - **Optimizers**: SGD (momentum), Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam -- fused Adam/AdamW uses `_fused_adamw_` on CUDA for single-kernel multi-tensor updates
@@ -48,6 +48,7 @@ pub mod instancenorm;
 pub mod pooling;
 pub mod bilinear;
 pub mod attention;
+pub mod rope;
 pub mod checkpoint;
 pub mod amp;
 pub mod cuda_graph;
@@ -99,6 +100,7 @@ pub use instancenorm::InstanceNorm;
 pub use pooling::{MaxPool2d, AvgPool2d, MaxPool1d, AvgPool1d, AdaptiveMaxPool2d, AdaptiveAvgPool2d, PixelShuffle, PixelUnshuffle, Upsample, Unfold, Fold};
 pub use bilinear::Bilinear;
 pub use attention::MultiheadAttention;
+pub use rope::RotaryEmbedding;
 pub use init::{xavier_uniform, xavier_normal, kaiming_uniform, kaiming_normal, uniform_bias, uniform, normal, orthogonal, trunc_normal};
 pub use functional::{gaussian_blur_2d, GaussianBlur};
 pub use cuda_graph::{CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle};

@@ -73,6 +73,7 @@ Graph builder for model composition.
 | `nn.LSTM(in, h, layers)` | `LSTM::new(in, h, layers)?` |
 | `nn.GRU(in, h, layers)` | `GRU::new(in, h, layers)?` |
 | `nn.MultiheadAttention(d, h)` | `MultiheadAttention::new(d, h)?` |
+| RoPE (hand-rolled in PyTorch) | `RotaryEmbedding::new(head_dim, max_seq)?` + `MultiheadAttention::rotary(...)` |
 
 Every module has an `::on_device(... , device)` variant for explicit
 device placement.

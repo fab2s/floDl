@@ -614,6 +614,8 @@ let cell = LSTMCell::new(128, 256)?;
 let layer = GRU::new(128, 256, 2)?;                                          // 2-layer GRU
 let layer = LSTM::new(128, 256, 2)?;                                         // 2-layer LSTM
 let layer = MultiheadAttention::new(512, 8)?;
+let rope = RotaryEmbedding::new(64, 2048)?;                                  // RoPE tables (head_dim, max_seq); hand-rolled in PyTorch
+let layer = MultiheadAttention::new(512, 8)?.rotary(rope)?;                  // rotates q/k after the head split
 let layer = Bilinear::new(128, 64, 32, true)?;
 
 // On a specific device (all modules have on_device() variants):
@@ -631,6 +633,39 @@ let cell = LSTMCell::on_device(128, 256, Device::CUDA(0))?;
 let layer = GRU::on_device(128, 256, 2, false, Device::CUDA(0))?;
 let layer = LSTM::on_device(128, 256, 2, false, Device::CUDA(0))?;
 let layer = MultiheadAttention::on_device(512, 8, Device::CUDA(0))?;
+```
+
+## Functional Ops (torch.nn.functional)
+
+The `F.*` entry points that are not simple tensor methods live in
+`flodl::autograd` as free functions over `Variable` (all re-exported at
+the crate root):
+
+```python
+# PyTorch
+y = F.scaled_dot_product_attention(q, k, v, attn_mask=m, is_causal=True)
+y = F.max_pool2d(x, 2, stride=2)
+y = F.adaptive_avg_pool2d(x, (1, 1))
+y = F.grid_sample(x, grid, mode="bilinear", align_corners=False)
+y = F.embedding(indices, weight)
+y = F.embedding_bag(indices, weight, offsets, mode="mean")
+```
+
+```rust
+// flodl
+use flodl::{scaled_dot_product_attention, max_pool2d, adaptive_avg_pool2d,
+            grid_sample, embedding, embedding_bag};
+
+// Fused attention kernel (libtorch picks the backend); attn_mask and
+// is_causal are exclusive (libtorch rejects both), scale None = 1/sqrt(E):
+let y = scaled_dot_product_attention(&q, &k, &v, Some(&m), 0.0, false, None)?;
+let y = scaled_dot_product_attention(&q, &k, &v, None, 0.0, true, None)?;   // causal
+
+let y = max_pool2d(&x, [2, 2], [2, 2], [0, 0], [1, 1], false)?;  // kernel, stride, padding, dilation, ceil_mode
+let y = adaptive_avg_pool2d(&x, [1, 1])?;
+let y = grid_sample(&x, &grid, 0, 0, false)?;                    // mode: 0=bilinear 1=nearest; padding: 0=zeros 1=border 2=reflection
+let y = embedding(&weight, &indices, -1)?;                       // padding_idx: -1 = none
+let y = embedding_bag(&weight, &indices, &offsets, 1)?;          // mode: 0=sum 1=mean 2=max
 ```
 
 ## Activations (as Modules)

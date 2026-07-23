@@ -81,7 +81,7 @@ pub use nn::{
     GroupNorm, BatchNorm, BatchNorm2d, InstanceNorm,
     MaxPool2d, AvgPool2d, MaxPool1d, AvgPool1d, AdaptiveMaxPool2d, AdaptiveAvgPool2d,
     PixelShuffle, PixelUnshuffle, Upsample, Unfold, Fold, Bilinear,
-    MultiheadAttention,
+    MultiheadAttention, RotaryEmbedding,
     mse_loss, cross_entropy_loss, bce_loss, bce_with_logits_loss, l1_loss, smooth_l1_loss, kl_div_loss,
     nll_loss, ctc_loss, focal_loss,
     triplet_margin_loss, cosine_embedding_loss, hinge_embedding_loss, margin_ranking_loss, poisson_nll_loss,
