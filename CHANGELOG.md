@@ -5,6 +5,12 @@ All notable changes to floDl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`flodl::nn::RotaryEmbedding`** — rotary position embeddings (RoPE) with precomputed sin/cos tables (`on_device_theta` for a custom `rope_theta`), applied to `[batch, heads, seq, head_dim]` query/key pairs; `MultiheadAttention::rotary(...)` attaches one so attention rotates query/key after the head split (LLaMA / OLMo style). Cloning shares the tables, so one instance serves every layer of a deep model.
+
 ## [0.6.0] - 2026-07-22
 
 The headline of this release is a full re-architecture of the distributed layer from a thread-per-GPU in-process model to a process-per-rank cluster model with an authenticated control plane, dial-in membership, elastic failure handling, controller-driven checkpoint orchestration, and a transparent launcher trampoline. The same single training entry (`Trainer::builder()` / `Trainer::run`) now drives single-device, single-host multi-GPU, and multi-host clusters from one code path. Every cross-host channel shares ONE controller port (workers join through it, training rides it, `fdl status` reads it, and `tunnel: true` routes it through SSH). ElChe (the heterogeneous cadence balancer that landed in 0.5.x) gained a phase machine, a divergence guardrail, an LR-aware meta-controller, delivered-cost scheduling, EASGD elastic averaging on the CPU async path, a pluggable outer optimizer (SlowMo / DiLoCo), and a `Fastest` epoch-callback dispatcher for free-compute eval. `fdl` gained a cluster readiness gate (`fdl probe`), a live run-status command (`fdl status`), a libnccl bridge builder (`fdl nccl build`), a global `--gpus` flag, and a strict cluster.yml schema with controller/worker separation.

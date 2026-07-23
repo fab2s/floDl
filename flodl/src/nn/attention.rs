@@ -3,6 +3,7 @@ use crate::tensor::{Device, Result, Tensor};
 
 use super::init;
 use super::parameter::Parameter;
+use super::rope::RotaryEmbedding;
 use super::Module;
 
 /// Multi-head attention mechanism.
@@ -10,7 +11,9 @@ use super::Module;
 /// Implements `MultiHead(Q, K, V) = Concat(head_1, ..., head_h) W^O`
 /// where each `head_i = Attention(Q W_i^Q, K W_i^K, V W_i^V)`.
 ///
-/// Supports optional causal masking and key-value attention masks.
+/// Supports optional causal masking, key-value attention masks, and
+/// rotary position embeddings (applied to query/key after the head
+/// split when configured via [`MultiheadAttention::rotary`]).
 ///
 /// ```ignore
 /// let mha = MultiheadAttention::on_device(512, 8, device)?;
@@ -18,6 +21,9 @@ use super::Module;
 /// let y = mha.forward(&x)?;
 /// // Cross-attention or masked: use forward_ext
 /// let y = mha.forward_ext(&query, &key, &value, Some(&mask))?;
+/// // Rotary positions (LLaMA / OLMo style):
+/// let mha = MultiheadAttention::on_device(512, 8, device)?
+///     .rotary(RotaryEmbedding::on_device(64, 2048, device)?)?;
 /// ```
 pub struct MultiheadAttention {
     q_proj: Linear,
@@ -27,6 +33,7 @@ pub struct MultiheadAttention {
     num_heads: i64,
     head_dim: i64,
     scale: f64,
+    rotary: Option<RotaryEmbedding>,
 }
 
 struct Linear {
@@ -95,7 +102,24 @@ impl MultiheadAttention {
             num_heads,
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
+            rotary: None,
         })
+    }
+
+    /// Attach a rotary position embedding, applied to query and key
+    /// after the head split. The embedding's `head_dim` must match this
+    /// module's per-head dimension.
+    pub fn rotary(mut self, rope: RotaryEmbedding) -> Result<Self> {
+        if rope.head_dim() != self.head_dim {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "MultiheadAttention::rotary: RotaryEmbedding head_dim ({}) \
+                 does not match per-head dim ({})",
+                rope.head_dim(),
+                self.head_dim
+            )));
+        }
+        self.rotary = Some(rope);
+        Ok(self)
     }
 
     /// Full attention forward with separate query, key, value and optional mask.
@@ -138,6 +162,13 @@ impl MultiheadAttention {
                  .transpose(1, 2)?;
         let v = v.reshape(&[batch, seq_k, self.num_heads, self.head_dim])?
                  .transpose(1, 2)?;
+
+        // Rotary positions rotate query/key in place of additive
+        // position embeddings.
+        let (q, k) = match &self.rotary {
+            Some(rope) => rope.apply(&q, &k)?,
+            None => (q, k),
+        };
 
         // Attention scores: [batch, heads, seq_q, seq_k]
         let k_t = k.transpose(2, 3)?;
@@ -255,5 +286,49 @@ mod tests {
         let params = mha.parameters();
         // 4 projections * 2 (weight + bias) = 8 parameters
         assert_eq!(params.len(), 8);
+    }
+
+    #[test]
+    fn test_mha_rotary_head_dim_mismatch_is_err() {
+        let device = test_device();
+        // embed_dim 8 / 2 heads -> head_dim 4; tables built for 8.
+        let rope = RotaryEmbedding::on_device(8, 16, device).unwrap();
+        let err = MultiheadAttention::on_device(8, 2, device)
+            .unwrap()
+            .rotary(rope)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("head_dim"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_mha_rotary_forward_and_gradient() {
+        let device = test_device();
+        let rope = RotaryEmbedding::on_device(4, 16, device).unwrap();
+        let mha = MultiheadAttention::on_device(8, 2, device)
+            .unwrap()
+            .rotary(rope)
+            .unwrap();
+        let opts = crate::tensor::test_opts();
+        let x = Variable::new(Tensor::randn(&[2, 5, 8], opts).unwrap(), true);
+        let y = mha.forward(&x).unwrap();
+        assert_eq!(y.shape(), vec![2, 5, 8]);
+        y.sum().unwrap().backward().unwrap();
+        assert_eq!(x.grad().unwrap().shape(), vec![2, 5, 8]);
+    }
+
+    #[test]
+    fn test_mha_rotary_with_causal_mask() {
+        let device = test_device();
+        let rope = RotaryEmbedding::on_device(4, 8, device).unwrap();
+        let mha = MultiheadAttention::on_device(8, 2, device)
+            .unwrap()
+            .rotary(rope)
+            .unwrap();
+        let opts = crate::tensor::test_opts();
+        let x = Variable::new(Tensor::randn(&[1, 4, 8], opts).unwrap(), false);
+        let mask = Tensor::ones(&[4, 4], opts).unwrap().triu(1).unwrap();
+        let y = mha.forward_ext(&x, &x, &x, Some(&mask)).unwrap();
+        assert_eq!(y.shape(), vec![1, 4, 8]);
     }
 }
