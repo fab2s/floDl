@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`flodl::data::datasets::TokenShards`** — pre-tokenized LM corpora in NumPy `.npy` shard files (OLMo / olmo-mix, nanoGPT-style dumps): 1-D token-id arrays (`|u1`/`<u2`/`<u4`/`<i4`/`<i8`), samples are non-overlapping `seq_len` windows with the target shifted by one, windows never cross shard boundaries. Shards are read lazily with positioned reads (no RAM cost up front, index-pure so the staging cascade composes above it); implements both `DataSet` and `BatchDataSet`.
 - **`flodl::nn::RotaryEmbedding`** — rotary position embeddings (RoPE) with precomputed sin/cos tables (`on_device_theta` for a custom `rope_theta`), applied to `[batch, heads, seq, head_dim]` query/key pairs; `MultiheadAttention::rotary(...)` attaches one so attention rotates query/key after the head split (LLaMA / OLMo style). Cloning shares the tables, so one instance serves every layer of a deep model.
 
 ## [0.6.0] - 2026-07-22
