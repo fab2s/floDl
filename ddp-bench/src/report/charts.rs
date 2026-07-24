@@ -5,10 +5,15 @@
 //! tables can't show without exploding: trajectories (eval, allocation,
 //! sync cadence) and per-mode comparisons at a glance.
 //!
-//! Data honesty: idle/utilization figures come from the controller host's
-//! sampler only (cluster cells can't see remote GPUs - see the timeline
-//! resource-plumb item); trajectory charts (eval, share, syncs) are built
-//! from rank-reported data and are complete across hosts.
+//! Data honesty: two sources feed the GPU charts. The controller host's
+//! local poller drives the dense idle bars (`idle-gpu0`) - meaningful
+//! only where the controller owns the GPU (solo / single-box), and
+//! silent otherwise (a dedicated controller polls no GPU). Cross-host
+//! utilization (`gpu-utilization`) is built from the ranks' own
+//! host-qualified `rank_samples` and is complete across every host, at
+//! the coarse reduce-window cadence those samples ride (a mean, not a
+//! curve). Trajectory charts (loss, share, syncs) are rank-reported and
+//! likewise complete across hosts.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -263,8 +268,57 @@ pub fn write_charts(
                 "% of run below 5% utilization",
                 &idle_bars,
             ),
-            "Idle share of the controller host's GPU only - cluster cells \
-             cannot sample remote GPUs (see Notes).",
+            "Idle share of the controller host's own GPU, from its dense \
+             local poller - present only when the controller owns that GPU \
+             (solo / single-box). A dedicated cluster controller polls no \
+             GPU; see the cross-host utilization chart for those runs.",
+        )?;
+    }
+
+    // --- 6. Cross-host GPU utilization, one group per physical GPU ---
+    //          (host:device), one bar per mode. Sourced from the ranks'
+    //          own reported samples, so every host's GPUs are covered -
+    //          the piece the controller-only idle bars structurally
+    //          cannot show. Sparse (reduce-window cadence): a mean duty
+    //          cycle, not a trajectory.
+    let mut util_groups: Vec<(String, Vec<Bar>)> = Vec::new();
+    for a in &by_mode {
+        for s in &a.rank_res {
+            if s.host.is_empty() {
+                continue;
+            }
+            let Some(util) = s.mean_util else { continue };
+            let key = format!("{}:{}", s.host, s.device);
+            let bars = match util_groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v,
+                None => {
+                    util_groups.push((key.clone(), Vec::new()));
+                    &mut util_groups.last_mut().unwrap().1
+                }
+            };
+            bars.push(Bar {
+                name: a.mode.clone(),
+                color: mode_color(&a.mode),
+                value: util,
+            });
+        }
+    }
+    util_groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (_, bars) in util_groups.iter_mut() {
+        bars.sort_by_key(|b| mode_order(&b.name));
+    }
+    if !util_groups.is_empty() {
+        emit(
+            "gpu-utilization.svg",
+            grouped_bar_chart(
+                &format!("{model} - GPU compute utilization (all hosts)"),
+                "mean compute utilization %",
+                &util_groups,
+            ),
+            "Mean compute utilization per physical GPU (host:device), one \
+             bar per mode, from the ranks' own reported samples - complete \
+             across every host. A duty-cycle mean at reduce-window cadence, \
+             not a trajectory.",
         )?;
     }
 
@@ -442,6 +496,83 @@ fn bar_chart(title: &str, x_label: &str, bars: &[Bar]) -> String {
         l + pw / 2.0,
         h - 12.0,
     ));
+    s.push_str("</svg>\n");
+    s
+}
+
+/// Grouped horizontal bar chart: one labeled group per row-block, a
+/// colored sub-bar per entry within, and a right-hand legend keyed by
+/// the first group's bar names (the mode vocabulary). Used for
+/// per-GPU-per-mode utilization.
+fn grouped_bar_chart(title: &str, x_label: &str, groups: &[(String, Vec<Bar>)]) -> String {
+    let (sub, subgap, ggap) = (16.0, 2.0, 16.0);
+    let (l, r, t, b) = (170.0, 200.0, 48.0, 44.0);
+    let w = 960.0;
+    let pw = w - l - r;
+    let group_h = |n: usize| n as f64 * sub + (n.saturating_sub(1)) as f64 * subgap;
+    let body: f64 = groups.iter().map(|(_, v)| group_h(v.len()) + ggap).sum();
+    let h = t + b + body;
+    let vmax = groups
+        .iter()
+        .flat_map(|(_, v)| v.iter())
+        .map(|b| b.value)
+        .fold(f64::MIN, f64::max)
+        .max(1e-9);
+
+    let mut s = svg_open(w, h, title);
+    let mut y = t;
+    for (label, bars) in groups {
+        let gh = group_h(bars.len());
+        // Group label, vertically centered on the block.
+        s.push_str(&format!(
+            "<text x='{:.1}' y='{:.1}' text-anchor='end' font-size='12' {FONT} fill='#333'>{}</text>",
+            l - 8.0,
+            y + gh / 2.0 + 4.0,
+            label,
+        ));
+        for (j, bar) in bars.iter().enumerate() {
+            let by = y + j as f64 * (sub + subgap);
+            let bw = bar.value / vmax * pw;
+            s.push_str(&format!(
+                "<rect x='{l}' y='{by:.1}' width='{bw:.1}' height='{sub:.1}' fill='{}'/>\
+                 <text x='{:.1}' y='{:.1}' font-size='11' {FONT} fill='#333'>{}</text>",
+                bar.color,
+                l + bw + 6.0,
+                by + sub - 4.0,
+                fmt_tick(bar.value, vmax),
+            ));
+        }
+        y += gh + ggap;
+    }
+    // Frame + x label.
+    s.push_str(&format!(
+        "<rect x='{l}' y='{t}' width='{pw}' height='{:.1}' fill='none' stroke='#999'/>\
+         <text x='{:.1}' y='{:.1}' text-anchor='middle' font-size='13' {FONT} fill='#333'>{x_label}</text>",
+        body - ggap,
+        l + pw / 2.0,
+        h - 12.0,
+    ));
+    // Legend: the mode vocabulary (dedup across groups, palette order).
+    let mut legend: Vec<(&str, &'static str)> = Vec::new();
+    for (_, bars) in groups {
+        for bar in bars {
+            if !legend.iter().any(|(n, _)| *n == bar.name) {
+                legend.push((&bar.name, bar.color));
+            }
+        }
+    }
+    legend.sort_by_key(|(n, _)| mode_order(n));
+    for (i, (name, color)) in legend.iter().enumerate() {
+        let ly = t + 4.0 + i as f64 * 20.0;
+        s.push_str(&format!(
+            "<line x1='{:.1}' y1='{ly:.1}' x2='{:.1}' y2='{ly:.1}' stroke='{color}' stroke-width='3'/>\
+             <text x='{:.1}' y='{:.1}' font-size='12' {FONT} fill='#333'>{name}</text>",
+            l + pw + 16.0,
+            l + pw + 44.0,
+            l + pw + 50.0,
+            ly + 4.0,
+        ));
+    }
     s.push_str("</svg>\n");
     s
 }
