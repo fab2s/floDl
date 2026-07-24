@@ -17,4 +17,4 @@ pub mod token_shards;
 pub use mnist::Mnist;
 pub use cifar10::{Cifar10, Cifar10Disk};
 pub use shakespeare::Shakespeare;
-pub use token_shards::TokenShards;
+pub use token_shards::{TokenDtype, TokenShards};

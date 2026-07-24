@@ -313,3 +313,117 @@ fn download_large_to_file(url: &str, dest: &Path) -> Result<()> {
     eprintln!("    {total} bytes");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// OLMo token shards (olmo-mix, raw headerless u16 despite the .npy name)
+// ---------------------------------------------------------------------------
+
+/// olmo-mix v1.6 books shard, GPT-NeoX-OLMo-Dolma-v1.5 tokens (vocab
+/// 50,280, raw little-endian u16). Full file is ~1.46 GB; the bench
+/// stages only the leading [`OLMO_TRAIN_BYTES`] — a prefix of a raw
+/// dump is itself a valid shard.
+const OLMO_TRAIN_URL: &str = "https://olmo-data.org/preprocessed/olmo-mix/v1_6-decontaminated/books/gpt-neox-olmo-dolma-v1_5/part-0-00000.npy";
+
+/// Bytes of the train shard to stage. In real-data mode the dataset
+/// size IS the epoch length, so this is the bench's epoch knob:
+/// 4 MiB = ~2.1M u16 tokens = ~4095 windows at seq 512 (~510 batches
+/// per epoch at batch 8). Bump for longer runs (the full shard is
+/// 1.46 GB).
+pub const OLMO_TRAIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Held-out C4-English validation shard from OLMo's perplexity suite
+/// (same tokenizer). Like the train shard, a leading slice is staged —
+/// the full file is ~2 MB and eval walls scale with it.
+const OLMO_EVAL_URL: &str = "https://olmo-data.org/eval-data/perplexity/v3_small_gptneox20b/c4_en/val/part-0-00000.npy";
+
+/// Bytes of the eval shard to stage: 512 KiB = ~262k tokens.
+pub const OLMO_EVAL_BYTES: u64 = 512 * 1024;
+
+/// Download the leading `OLMO_TRAIN_BYTES` of the olmo-mix books shard
+/// (if not cached) and return its path. Cached in `{data_dir}/olmo/`.
+pub fn ensure_olmo_train(data_dir: &Path) -> Result<std::path::PathBuf> {
+    ensure_olmo_shard(
+        data_dir,
+        OLMO_TRAIN_URL,
+        "books-part-0-00000.head.npy",
+        Some(OLMO_TRAIN_BYTES),
+        OLMO_TRAIN_BYTES,
+    )
+}
+
+/// Download the leading `OLMO_EVAL_BYTES` of the C4 validation shard
+/// (if not cached) and return its path.
+pub fn ensure_olmo_eval(data_dir: &Path) -> Result<std::path::PathBuf> {
+    ensure_olmo_shard(
+        data_dir,
+        OLMO_EVAL_URL,
+        "c4-val-part-0-00000.head.npy",
+        Some(OLMO_EVAL_BYTES),
+        OLMO_EVAL_BYTES,
+    )
+}
+
+fn ensure_olmo_shard(
+    data_dir: &Path,
+    url: &str,
+    file_name: &str,
+    range_bytes: Option<u64>,
+    expected_bytes: u64,
+) -> Result<std::path::PathBuf> {
+    let dir = data_dir.join("olmo");
+    ensure_dir(&dir)?;
+    let path = dir.join(file_name);
+
+    let cached_ok = fs::metadata(&path).map(|m| m.len() == expected_bytes).unwrap_or(false);
+    if !cached_ok {
+        download_range_to_file(url, &path, range_bytes)?;
+        let got = fs::metadata(&path)
+            .map_err(|e| TensorError::new(&format!("stat {}: {e}", path.display())))?
+            .len();
+        if got != expected_bytes {
+            return Err(TensorError::new(&format!(
+                "olmo shard {}: got {got} bytes, expected {expected_bytes} — \
+                 partial download or upstream change; delete the file and retry",
+                path.display()
+            )));
+        }
+    }
+    Ok(path)
+}
+
+/// Stream a download to a file, optionally requesting only the leading
+/// `bytes` via an HTTP Range header.
+fn download_range_to_file(url: &str, dest: &Path, bytes: Option<u64>) -> Result<()> {
+    match bytes {
+        None => download_large_to_file(url, dest),
+        Some(n) => {
+            eprintln!("    downloading first {n} bytes of {url}...");
+            let resp = ureq::get(url)
+                .header("Range", &format!("bytes=0-{}", n - 1))
+                .call()
+                .map_err(|e| TensorError::new(&format!("GET {url}: {e}")))?;
+            if resp.status() != 206 {
+                return Err(TensorError::new(&format!(
+                    "GET {url}: server ignored the Range request (status {}) — \
+                     refusing to stream the full file",
+                    resp.status()
+                )));
+            }
+            let mut reader = resp.into_body().into_reader();
+            let mut file = fs::File::create(dest)
+                .map_err(|e| TensorError::new(&format!("create {}: {e}", dest.display())))?;
+            let mut buf = [0u8; 65536];
+            let mut total = 0usize;
+            loop {
+                let n_read = reader.read(&mut buf)
+                    .map_err(|e| TensorError::new(&format!("read {url}: {e}")))?;
+                if n_read == 0 { break; }
+                file.write_all(&buf[..n_read])
+                    .map_err(|e| TensorError::new(&format!("write {}: {e}", dest.display())))?;
+                total += n_read;
+            }
+            eprintln!("    {total} bytes");
+            Ok(())
+        }
+    }
+}
