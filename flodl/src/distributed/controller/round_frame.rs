@@ -107,12 +107,52 @@ impl TensorPayload {
 /// body against `salt`. Mismatched salts surface here on the very first
 /// round-trip with a clear, loud error.
 ///
+/// Delegates to [`read_round_frame_streamed`] with a frame-building
+/// sink — one wire-format reader, mirroring the writer side.
+///
 /// `pub(crate)` so the rank-side client in `cpu_reduce` can share the
 /// wire format without duplication.
 pub(crate) fn read_round_frame<R: Read>(
     stream: &mut R,
     salt: &SessionSalt,
 ) -> Result<Option<RoundFrame>> {
+    let mut tensors = Vec::new();
+    match read_round_frame_streamed(stream, salt, &mut |_, payload| {
+        tensors.push(payload);
+        Ok(())
+    })? {
+        Some((kind, weight)) => Ok(Some(RoundFrame {
+            tensors,
+            kind,
+            weight,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Streaming counterpart of [`read_round_frame`] — THE frame reader.
+/// Hands each parsed [`TensorPayload`] to `sink` as it comes off the
+/// stream instead of accumulating the whole frame, so a receiver can
+/// consume payloads one at a time (e.g. decode into a tensor and free
+/// the bytes) and never hold frame + decoded output together.
+///
+/// MAC-BEFORE-USE CONTRACT: the sink receives UNAUTHENTICATED bytes —
+/// the HMAC footer is only verified after the last payload. A sink must
+/// do nothing but buffer or inertly transform (copy into a container /
+/// build a tensor); no decision and no adoption may happen on the
+/// values until this function returns `Ok`. On `Err`, the caller MUST
+/// discard everything the sink accumulated. This is the same exposure
+/// as the materialized reader (which also buffers unauthenticated
+/// payload bytes before the footer check) — the trust boundary is the
+/// return, not the sink.
+///
+/// Returns `Ok(None)` on clean EOF before the header, `Ok(Some((kind,
+/// weight)))` after the footer authenticates.
+pub(crate) fn read_round_frame_streamed<R: Read>(
+    stream: &mut R,
+    salt: &SessionSalt,
+    sink: &mut dyn FnMut(usize, TensorPayload) -> Result<()>,
+) -> Result<Option<(RoundKind, f64)>> {
     let mut mac = HMAC::new(salt.as_slice());
 
     let mut hdr = [0u8; 8];
@@ -168,7 +208,6 @@ pub(crate) fn read_round_frame<R: Read>(
         )));
     }
 
-    let mut tensors = Vec::with_capacity(num_tensors);
     let mut total_bytes: usize = 0;
     for ti in 0..num_tensors {
         let mut meta = [0u8; 2];
@@ -217,11 +256,14 @@ pub(crate) fn read_round_frame<R: Read>(
                 ))
             })?;
         mac.update(&bytes);
-        tensors.push(TensorPayload {
-            dtype,
-            shape,
-            bytes,
-        });
+        sink(
+            ti,
+            TensorPayload {
+                dtype,
+                shape,
+                bytes,
+            },
+        )?;
     }
 
     // HMAC-SHA256-64 footer: 8 bytes, little-endian, equal to the first
@@ -244,7 +286,7 @@ pub(crate) fn read_round_frame<R: Read>(
              disagreement, tampered frame, or payload corruption"
         )));
     }
-    Ok(Some(RoundFrame { tensors, kind, weight }))
+    Ok(Some((kind, weight)))
 }
 
 /// Per-tensor wire metadata for the streaming writer: everything the
