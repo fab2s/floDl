@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::distributed::controller::{
-    read_round_frame, write_round_frame, RoundKind, TensorPayload, DTYPE_F32,
+    f32_slice_to_payload_bytes, read_round_frame, sum_frames, write_round_frame,
+    RoundFrame, RoundKind, TensorPayload, DTYPE_BF16, DTYPE_F32,
 };
 use crate::distributed::relay::mux::read_len_framed;
 use std::io::{Read, Write};
@@ -506,6 +507,97 @@ fn fold_declare_dead_unblocks_the_barrier() {
     drop(c1);
     drop(controller);
     join_within(threads);
+}
+
+/// The incremental fold must produce exactly what `sum_frames` over the
+/// same frames produces — same f32 accumulation, same schema, mass
+/// summed, never divided — in both wire dtypes. Drives `FoldCtx`
+/// directly (no sockets) so the equality is byte-level.
+#[test]
+fn incremental_fold_matches_sum_frames() {
+    for dtype in [DTYPE_F32, DTYPE_BF16] {
+        let mk = |vals: &[f32], weight: f64| RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype,
+                shape: vec![vals.len() as u32],
+                bytes: f32_slice_to_payload_bytes(vals, dtype).unwrap(),
+            }],
+            kind: RoundKind::Model,
+            weight,
+        };
+        let f0 = mk(&[1.5, -2.0, 8.0], 3.0);
+        let f1 = mk(&[0.5, 4.0, -16.0], 1.0);
+
+        let ctx = FoldCtx::new(vec![0, 1], SALT);
+        let (tx, rx) = mpsc::sync_channel(4);
+        ctx.deposit(0, &frame_blob(&f0), &tx).unwrap();
+        ctx.deposit(1, &frame_blob(&f1), &tx).unwrap();
+        let MuxRecord::HostFrame { payload } = rx.try_recv().unwrap() else {
+            panic!("expected HostFrame after the completing deposit");
+        };
+        let shipped = parse_frame(&payload);
+        let expected = sum_frames(&[&f0, &f1]).unwrap();
+        assert_eq!(shipped, expected, "dtype {dtype}");
+
+        // Single-deposit round (seed shipped verbatim, no f32 image):
+        // still exactly sum_frames of the one frame — the codec
+        // round-trips its own output, so verbatim == decode + re-encode.
+        let ctx = FoldCtx::new(vec![0, 1], SALT);
+        let (tx, rx) = mpsc::sync_channel(4);
+        ctx.deposit(0, &frame_blob(&f0), &tx).unwrap();
+        ctx.mark_dead(1, &tx).unwrap();
+        let MuxRecord::HostFrame { payload } = rx.try_recv().unwrap() else {
+            panic!("expected HostFrame after the death completes the round");
+        };
+        assert_eq!(
+            parse_frame(&payload),
+            sum_frames(&[&f0]).unwrap(),
+            "single-deposit seed ship, dtype {dtype}"
+        );
+    }
+}
+
+/// A cohort mixing wire dtypes (some ranks `bf16_wire`, some not) must
+/// die loudly at the first fold, not average garbage.
+#[test]
+fn incremental_fold_rejects_dtype_mix_loudly() {
+    let bf16_frame = RoundFrame {
+        tensors: vec![TensorPayload {
+            dtype: DTYPE_BF16,
+            shape: vec![2],
+            bytes: f32_slice_to_payload_bytes(&[1.0, 2.0], DTYPE_BF16).unwrap(),
+        }],
+        kind: RoundKind::Model,
+        weight: 1.0,
+    };
+    let ctx = FoldCtx::new(vec![0, 1], SALT);
+    let (tx, _rx) = mpsc::sync_channel(4);
+    ctx.deposit(0, &frame_blob(&frame(&[1.0, 2.0], 1.0)), &tx)
+        .unwrap();
+    let err = ctx
+        .deposit(1, &frame_blob(&bf16_frame), &tx)
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("dtype") && msg.contains("bf16_wire"),
+        "want loud dtype-mix error, got: {msg}"
+    );
+}
+
+/// The deposited-set must still catch a rank depositing twice in one
+/// round (the ping-pong violation the frames map used to detect).
+#[test]
+fn incremental_fold_rejects_double_deposit() {
+    let ctx = FoldCtx::new(vec![0, 1], SALT);
+    let (tx, _rx) = mpsc::sync_channel(4);
+    ctx.deposit(0, &frame_blob(&frame(&[1.0], 1.0)), &tx).unwrap();
+    let err = ctx
+        .deposit(0, &frame_blob(&frame(&[2.0], 1.0)), &tx)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("deposited twice"),
+        "want double-deposit error, got: {err}"
+    );
 }
 
 #[test]

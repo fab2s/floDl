@@ -123,11 +123,17 @@ mod dead_ranks;
 mod round_frame;
 pub use dead_ranks::DeadRanks;
 pub use round_frame::{RoundFrame, RoundKind, TensorPayload};
-pub(crate) use round_frame::{read_round_frame, write_round_frame, sum_frames};
+pub(crate) use round_frame::{read_round_frame, write_round_frame};
+// Production summing now runs either incrementally at the relay fold
+// ([`crate::distributed::relay`]'s HostFold, same monoid) or inside
+// `reduce_realized_work`; the direct entry remains the reference the
+// fold tests compare against.
+#[cfg(test)]
+pub(crate) use round_frame::sum_frames;
 pub(crate) use round_frame::{f32_slice_to_payload_bytes, payload_to_f32};
 pub(crate) use round_frame::{
-    payload_element_size, read_round_frame_streamed, round_frame_wire_len,
-    scale_payload_bytes, write_round_frame_streamed, PayloadPart,
+    accumulate_payload_into, payload_element_size, read_round_frame_streamed,
+    round_frame_wire_len, scale_payload_bytes, write_round_frame_streamed, PayloadPart,
 };
 use round_frame::reduce_realized_work;
 // Byte-codec helpers used only by the controller round-frame tests.
