@@ -9,6 +9,7 @@ pub mod gpt_nano;
 pub mod lenet;
 pub mod logistic;
 pub mod mlp;
+pub mod olmo;
 pub mod resnet;
 pub mod resnet_graph;
 
@@ -110,6 +111,7 @@ pub fn all_models() -> Vec<ModelDef> {
         char_rnn::def(),
         gpt_nano::def(),
         conv_ae::def(),
+        olmo::def(),
     ]
 }
 
@@ -136,5 +138,6 @@ pub fn model_names() -> Vec<&'static str> {
         "char-rnn",
         "gpt-nano",
         "conv-ae",
+        "olmo",
     ]
 }

@@ -24,6 +24,36 @@ use std::path::{Path, PathBuf};
 use crate::data::{BatchDataSet, DataSet};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
+/// Token-id dtype of a raw (headerless) shard file.
+///
+/// Raw dumps carry no self-description, so [`TokenShards::open_raw`]
+/// needs the encoding stated explicitly. Values are little-endian.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenDtype {
+    /// Unsigned 8-bit (tiny vocabularies).
+    U8,
+    /// Unsigned 16-bit — what OLMo / GPT-2-class dumps use (vocab < 65,536).
+    U16,
+    /// Unsigned 32-bit.
+    U32,
+    /// Signed 32-bit.
+    I32,
+    /// Signed 64-bit.
+    I64,
+}
+
+impl TokenDtype {
+    fn npy(self) -> NpyDtype {
+        match self {
+            TokenDtype::U8 => NpyDtype::U8,
+            TokenDtype::U16 => NpyDtype::U16,
+            TokenDtype::U32 => NpyDtype::U32,
+            TokenDtype::I32 => NpyDtype::I32,
+            TokenDtype::I64 => NpyDtype::I64,
+        }
+    }
+}
+
 /// Token-id dtypes supported in shard files.
 ///
 /// Covers the encodings pretraining dumps actually use: `uint16` for
@@ -109,12 +139,44 @@ pub struct TokenShards {
 }
 
 impl TokenShards {
-    /// Open an explicit list of shard files.
+    /// Open an explicit list of `.npy` shard files.
     ///
     /// Shard order defines sample order. Errors loudly on a malformed
     /// or unsupported `.npy` header, a truncated file, or when no shard
     /// yields at least one window.
+    ///
+    /// Note: several LM corpora ship *headerless* raw dumps under a
+    /// `.npy` name (OLMo's preprocessed shards, nanoGPT's `train.bin`);
+    /// those fail here with "bad magic" — read them with
+    /// [`TokenShards::open_raw`] instead.
     pub fn open<P: AsRef<Path>>(paths: &[P], seq_len: usize) -> Result<Self> {
+        Self::build(paths, seq_len, None)
+    }
+
+    /// Open headerless raw token dumps (little-endian, C-order), stating
+    /// the dtype explicitly. The token count is the file size divided by
+    /// the item size; a file whose length is not a multiple of the item
+    /// size errors loudly.
+    ///
+    /// This is the format OLMo's preprocessed shards and nanoGPT-style
+    /// `.bin` dumps actually use (despite the `.npy` name OLMo gives
+    /// them). A prefix slice of such a file is itself a valid shard, so
+    /// partial (range) downloads stage cleanly.
+    pub fn open_raw<P: AsRef<Path>>(
+        paths: &[P],
+        dtype: TokenDtype,
+        seq_len: usize,
+    ) -> Result<Self> {
+        Self::build(paths, seq_len, Some(dtype.npy()))
+    }
+
+    /// Shared assembly for [`open`](Self::open) (`raw = None`, parse the
+    /// npy header) and [`open_raw`](Self::open_raw) (`raw = Some(dtype)`).
+    fn build<P: AsRef<Path>>(
+        paths: &[P],
+        seq_len: usize,
+        raw: Option<NpyDtype>,
+    ) -> Result<Self> {
         if seq_len == 0 {
             return Err(TensorError::new("TokenShards: seq_len must be positive"));
         }
@@ -132,8 +194,6 @@ impl TokenShards {
             let file = File::open(&path).map_err(|e| {
                 TensorError::new(&format!("TokenShards: cannot open {}: {e}", path.display()))
             })?;
-            let (dtype, tokens, data_offset) = parse_npy_header(&file, &path)?;
-
             let file_len = file
                 .metadata()
                 .map_err(|e| {
@@ -143,14 +203,33 @@ impl TokenShards {
                     ))
                 })?
                 .len();
-            let needed = data_offset + tokens * dtype.item_size();
-            if file_len < needed {
-                return Err(TensorError::new(&format!(
-                    "TokenShards: {} is truncated ({file_len} bytes, header \
-                     declares {needed})",
-                    path.display()
-                )));
-            }
+
+            let (dtype, tokens, data_offset) = match raw {
+                Some(dtype) => {
+                    let item = dtype.item_size();
+                    if file_len % item != 0 {
+                        return Err(TensorError::new(&format!(
+                            "TokenShards: {} has {file_len} bytes, not a multiple \
+                             of the {item}-byte item size — wrong dtype or corrupt \
+                             file",
+                            path.display()
+                        )));
+                    }
+                    (dtype, file_len / item, 0)
+                }
+                None => {
+                    let (dtype, tokens, data_offset) = parse_npy_header(&file, &path)?;
+                    let needed = data_offset + tokens * dtype.item_size();
+                    if file_len < needed {
+                        return Err(TensorError::new(&format!(
+                            "TokenShards: {} is truncated ({file_len} bytes, header \
+                             declares {needed})",
+                            path.display()
+                        )));
+                    }
+                    (dtype, tokens, data_offset)
+                }
+            };
 
             // A window needs seq_len + 1 tokens (input + shifted target).
             let windows = if tokens > seq_len as u64 {
@@ -533,6 +612,42 @@ mod tests {
         assert_eq!(TokenShards::len(&ds), 2);
         let first = DataSet::get(&ds, 0).unwrap()[0].to_i64_vec().unwrap();
         assert_eq!(first, vec![10, 11]);
+    }
+
+    #[test]
+    fn raw_mode_matches_npy() {
+        let dir = test_dir("raw");
+        let tokens: Vec<i64> = (0..20).collect();
+
+        // Same content, once with an npy header, once headerless raw u16.
+        let npy = dir.join("a.npy");
+        write_npy(&npy, "<u2", &tokens);
+        let raw = dir.join("a.bin");
+        let mut f = File::create(&raw).unwrap();
+        for &t in &tokens {
+            f.write_all(&(t as u16).to_le_bytes()).unwrap();
+        }
+
+        let from_npy = TokenShards::open(&[&npy], 4).unwrap();
+        let from_raw = TokenShards::open_raw(&[&raw], TokenDtype::U16, 4).unwrap();
+        assert_eq!(TokenShards::len(&from_npy), TokenShards::len(&from_raw));
+        for i in 0..TokenShards::len(&from_raw) {
+            let a = DataSet::get(&from_npy, i).unwrap();
+            let b = DataSet::get(&from_raw, i).unwrap();
+            assert_eq!(a[0].to_i64_vec().unwrap(), b[0].to_i64_vec().unwrap());
+            assert_eq!(a[1].to_i64_vec().unwrap(), b[1].to_i64_vec().unwrap());
+        }
+    }
+
+    #[test]
+    fn raw_mode_rejects_misaligned_length() {
+        let dir = test_dir("raw-odd");
+        let odd = dir.join("odd.bin");
+        std::fs::write(&odd, [0u8; 17]).unwrap(); // not a multiple of 2
+        let err = TokenShards::open_raw(&[&odd], TokenDtype::U16, 4)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("multiple"), "unexpected: {err}");
     }
 
     #[test]

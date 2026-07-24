@@ -118,10 +118,15 @@ corpus costs no RAM up front — and windows never cross shard
 boundaries:
 
 ```rust
-use flodl::data::datasets::TokenShards;
+use flodl::data::datasets::{TokenDtype, TokenShards};
 
 // Every .npy in the directory, sorted by name; or TokenShards::open(&paths, seq_len)
-let data = TokenShards::open_dir("data/olmo-mix", 1024)?;
+let data = TokenShards::open_dir("data/shards", 1024)?;
+
+// Headerless raw dumps (what OLMo's preprocessed shards and nanoGPT
+// .bin files actually are, .npy name notwithstanding) state their
+// dtype explicitly; a prefix slice of such a file is itself valid:
+let data = TokenShards::open_raw(&["data/part-0-00000.npy"], TokenDtype::U16, 1024)?;
 println!("{} windows over {} tokens", data.len(), data.total_tokens());
 
 // Per-sample entry point -> staging cascade (RAM cache, disk stage, VRAM pool)

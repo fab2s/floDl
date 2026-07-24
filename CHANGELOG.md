@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`TokenShards::open_raw` + `TokenDtype`** — headerless raw token dumps (what OLMo's preprocessed shards and nanoGPT `.bin` files actually are, `.npy` name notwithstanding), dtype stated explicitly, file length validated against the item size. A prefix slice of a raw dump is itself a valid shard, so partial (range) downloads stage cleanly.
+- **ddp-bench `olmo` model** — OLMo-150M (allenai/OLMo `configs/tiny`) LM pretraining on a staged olmo-mix books slice: RMSNorm + SwiGLU + RoPE decoder (untied head, padded vocab 50,304), AdamW (0.9, 0.95) wd 0.1, warmup + cosine, eval = held-out C4-en CE. Self-controlled via `ddp-bench/scripts/olmo_control.py` (a PyTorch mirror of the same architecture, deviations included) since AI2 publishes no curves for the tiny configs.
 - **`flodl::data::datasets::TokenShards`** — pre-tokenized LM corpora in NumPy `.npy` shard files (OLMo / olmo-mix, nanoGPT-style dumps): 1-D token-id arrays (`|u1`/`<u2`/`<u4`/`<i4`/`<i8`), samples are non-overlapping `seq_len` windows with the target shifted by one, windows never cross shard boundaries. Shards are read lazily with positioned reads (no RAM cost up front, index-pure so the staging cascade composes above it); implements both `DataSet` and `BatchDataSet`.
 - **`flodl::nn::RotaryEmbedding`** — rotary position embeddings (RoPE) with precomputed sin/cos tables (`on_device_theta` for a custom `rope_theta`), applied to `[batch, heads, seq, head_dim]` query/key pairs; `MultiheadAttention::rotary(...)` attaches one so attention rotates query/key after the head split (LLaMA / OLMo style). Cloning shares the tables, so one instance serves every layer of a deep model.
 
