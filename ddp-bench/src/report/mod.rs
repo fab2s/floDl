@@ -234,18 +234,14 @@ tolerance when rank speeds fluctuate, not steady-state wall time.\n\n");
 
     // Per-model comparison
     md.push_str("## Per-Model Results\n\n");
-    md.push_str("GPU columns = compute utilization % (not load), labeled by the \
-host-physical device id the run's timeline sampled; `-` = device not sampled by \
-that run. Idle = total time with <5% utilization.\n\n\
-**Known gap - remote-GPU columns**: the resource sampler runs on the \
-controller host only, so cluster rows report util/VRAM/idle for the \
-controller's GPU and show `-` for remote-host GPUs (on a heterogeneous rig \
-that reads as \"the fast card reports, the remote cards don't\"). The \
-remote-rank activity itself is fully accounted - allocation shares and \
-throughput in the Per-Rank Schedule are rank-reported over the wire, as are \
-the trajectory charts. Per-rank resource samples already cross the wire for \
-the live dashboard; persisting them into the timeline (which fills these \
-columns) is planned for an upcoming release.\n\n");
+    md.push_str("GPU columns = compute utilization % (not load); `-` = device not \
+sampled by that run. Bare `GPUd` columns are the controller host's devices, \
+sampled densely by the local poller and labeled by host-physical device id. \
+`host:GPUd` columns are remote-host devices: the mean compute utilization over \
+rank-reported samples that ride the metrics wire at reduce-window cadence (~one \
+sample per window) - the `~` prefix marks that sparseness: direction, not \
+precision. Idle = total time with <5% utilization, controller-host devices only \
+(the sparse remote cadence cannot support gap detection).\n\n");
     for (model, runs) in groups {
         write_model_table(&mut md, model, runs, references.get(model));
     }
@@ -287,13 +283,25 @@ cadence/async modes dispatch follows the balancer, so `share` IS the delivered w
 the fast GPU consumes a proportionally larger share to keep pace with the slow ones. Under \
 `*-sync` modes dispatch is an EQUAL split regardless: there `share` shows what ElChe would \
 allocate (a capacity shadow), not delivered work - the delivered imbalance surfaces as \
-fast-GPU idle instead.\n\n");
+fast-GPU idle instead. `host`/`util`/`vram peak` come from the ranks' own resource \
+samples (reduce-window cadence; `~` marks the sparse mean; `device` is the rank's \
+runtime index, which CUDA_VISIBLE_DEVICES scoping remaps - it need not match the \
+host-physical id in the GPU columns).\n\n");
         write_per_rank_table(&mut md, groups);
     }
 
-    // VRAM overhead
-    if groups.iter().any(|(_, runs)| runs.iter().any(|r| !r.vram_stats.is_empty() && r.vram_stats[0].peak_allocated > 0)) {
+    // VRAM overhead. Rank-reported allocator stats count as data: in
+    // cluster runs the controller poller's own allocator is empty (the
+    // ranks are child processes), so local peaks alone would skip the
+    // section exactly when the rank-derived numbers matter most.
+    if groups.iter().any(|(_, runs)| runs.iter().any(|r| {
+        r.vram_stats.iter().any(|v| v.peak_allocated > 0)
+            || r.rank_res.iter().any(|s| s.peak_allocated.is_some())
+    })) {
         md.push_str("## VRAM Usage\n\n");
+        md.push_str("Allocator bytes are per-process: cluster rows come from the \
+ranks' own samples (the controller poller cannot see child-process \
+allocations); solo rows from the local poller.\n\n");
         write_vram_table(&mut md, groups);
     }
 

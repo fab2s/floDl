@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{Event, EventKind, GpuSample, Sample, Timeline};
+use super::{Event, EventKind, GpuSample, RankGpuSample, RankSample, Sample, Timeline};
 
 /// Load a timeline from a JSON file.
 pub fn load_timeline(path: &Path) -> Result<Timeline, String> {
@@ -13,8 +13,46 @@ pub fn load_timeline(path: &Path) -> Result<Timeline, String> {
 
     let samples = parse_samples(&val["samples"])?;
     let events = parse_events(&val["events"])?;
+    let host = val["host"].as_str().map(str::to_string);
+    let rank_samples = parse_rank_samples(&val["rank_samples"]);
 
-    Ok(Timeline { samples, events })
+    Ok(Timeline { host, samples, events, rank_samples })
+}
+
+/// Parse the `rank_samples` array (rank-reported, host-qualified sparse
+/// samples from cluster runs). Absent key → empty (pre-cluster files).
+/// Optional fields stay `Option`: the producer omits what a rank did not
+/// sample, and reading a missing key as zero would fake idle GPUs.
+fn parse_rank_samples(val: &serde_json::Value) -> Vec<RankSample> {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let gpus = if let Some(gpu_arr) = item["gpus"].as_array() {
+            gpu_arr
+                .iter()
+                .map(|g| RankGpuSample {
+                    device: g["d"].as_u64().unwrap_or(0) as u8,
+                    util: g["u"].as_f64(),
+                    vram_allocated: g["va"].as_u64(),
+                    vram_total: g["vt"].as_u64(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        out.push(RankSample {
+            t: item["t"].as_u64().unwrap_or(0),
+            rank: item["rank"].as_u64().unwrap_or(0) as usize,
+            host: item["host"].as_str().unwrap_or("").to_string(),
+            cpu: item["cpu"].as_f64(),
+            ram_used: item["ram_used"].as_u64(),
+            ram_total: item["ram_total"].as_u64(),
+            gpus,
+        });
+    }
+    out
 }
 
 fn parse_samples(val: &serde_json::Value) -> Result<Vec<Sample>, String> {

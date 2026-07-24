@@ -1167,6 +1167,32 @@ pub fn run_launcher_with_config(
             .rank_hosts(rank_hosts)
             .dead_ranks(dead_ranks)
             .reported_deaths(Arc::clone(&reported_deaths));
+        // Stamp the controller's world-map host name on the timeline so
+        // post-hoc consumers can tell which rank_samples entries
+        // duplicate the local poller's (dense) coverage. Only when the
+        // launcher identifies itself in the world map — on rigs where
+        // the box's `hostname` matches no cluster.yml worker name (e.g.
+        // a controller co-located with a worker under a different
+        // name), the honest answer is "unknown": we leave the stamp
+        // absent rather than write a name (`me`) that appears nowhere
+        // in the world, which no rank_samples host could match anyway.
+        // Absent → the report treats every rank host as remote (its
+        // documented fallback), so the co-located device surfaces as
+        // both a dense-poller column and a rank-reported column.
+        if let (Some(tl), Some(idx)) = (&config.timeline, my_host_idx) {
+            tl.set_host(&world.workers[idx].host);
+        }
+        // A dedicated controller owns no local ranks: it must not report
+        // GPU columns for devices another node trains on. Poll CPU/RAM
+        // only, so every GPU column in the persisted timeline comes from
+        // a worker's own `rank_samples`. When the controller IS
+        // co-located with ranks (single-box auto-promote), local_ranks
+        // is non-empty and its dense poll stays authoritative for them.
+        if local_ranks.is_empty()
+            && let Some(tl) = &config.timeline
+        {
+            tl.set_gpu_poll(false);
+        }
 
         // Controller-hosted live dashboard. The sink owns a Monitor
         // that binds the HTTP port lazily on the first rank-emitted
