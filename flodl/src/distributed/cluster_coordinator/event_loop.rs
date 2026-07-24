@@ -657,12 +657,28 @@ impl ClusterCoordinator {
             if rank >= self.world_size {
                 continue;
             }
-            // Forward the rank's resource sample (if present) to the
-            // dashboard sink before consuming `wire`. The sample piggy-
-            // backs on MetricsMsgWire so we get it for free here; the
-            // sink renders per-rank hardware tabs.
-            if let (Some(sink), Some(sample)) = (&self.dashboard_sink, wire.resources.clone()) {
-                sink.push_resource_sample(rank, sample);
+            // Forward the rank's resource sample (if present) before
+            // consuming `wire`. The sample piggy-backs on MetricsMsgWire
+            // so we get it for free here. Two independent consumers:
+            // the dashboard sink renders per-rank hardware tabs, and
+            // the timeline persists the sample host-qualified into
+            // `timeline.json`'s `rank_samples` (the only record of
+            // remote hosts' GPU/VRAM activity — the harness's local
+            // poller cannot see them).
+            if let Some(wire_sample) = wire.resources.clone() {
+                if let Some(tl) = &self.timeline {
+                    let host = self
+                        .rank_hosts
+                        .get(rank)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let sample: crate::monitor::ResourceSample =
+                        wire_sample.clone().into();
+                    tl.rank_sample(rank, host, &sample);
+                }
+                if let Some(sink) = &self.dashboard_sink {
+                    sink.push_resource_sample(rank, wire_sample);
+                }
             }
             let msg = crate::distributed::ddp_run::MetricsMsg {
                 rank,

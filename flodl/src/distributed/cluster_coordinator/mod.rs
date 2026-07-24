@@ -419,6 +419,11 @@ pub struct ClusterCoordinator {
     /// [`ClusterCoordinatorConfig::local_ranks`].
     local_ranks: Vec<usize>,
 
+    /// Host per global rank (index = rank) for host-qualifying the
+    /// resource samples deposited into [`Self::timeline`]. See
+    /// [`ClusterCoordinatorConfig::rank_hosts`].
+    rank_hosts: Vec<String>,
+
     /// Unrecoverable-failure threshold; copied from
     /// [`ClusterCoordinatorConfig::max_failure`].
     max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,

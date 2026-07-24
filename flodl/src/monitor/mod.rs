@@ -36,7 +36,7 @@ use crate::graph::Graph;
 
 pub use format::{format_eta, format_bytes, format_metric};
 pub use resources::{ResourceSample, ResourceSampler, GpuSnapshot};
-pub use timeline::{Timeline, TimelineBroadcast, TimelineEvent, EventKind, TimelineSample, GpuTimelineSample, TimelineSummary};
+pub use timeline::{Timeline, TimelineBroadcast, TimelineEvent, EventKind, TimelineSample, GpuTimelineSample, RankTimelineSample, RankGpuSample, TimelineSummary};
 
 /// DDP metrics for a single GPU (throughput, batch split, shard size).
 #[derive(Debug, Clone, Default)]

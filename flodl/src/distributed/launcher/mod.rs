@@ -1133,6 +1133,14 @@ pub fn run_launcher_with_config(
     let coord_fatal: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
 
+    // Ask ranks for resource samples when the harness carries a
+    // Timeline that will persist them (host-qualified `rank_samples` in
+    // timeline.json). Captured here because `coord_config` moves into
+    // the coordinator below while the envelope-build loop runs after.
+    let rank_resources = coord_config
+        .as_ref()
+        .is_some_and(|c| c.timeline.is_some());
+
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
 
@@ -1144,8 +1152,19 @@ pub fn run_launcher_with_config(
             .map(|i| world.workers[i].ranks.clone())
             .unwrap_or_default();
         let dead_ranks = Arc::clone(&dead_ranks_shared);
+        // Global-rank → host map so the coord can host-qualify the
+        // rank-reported resource samples it deposits into the timeline.
+        let mut rank_hosts: Vec<String> = vec![String::new(); world_size];
+        for w in &world.workers {
+            for &r in &w.ranks {
+                if let Some(slot) = rank_hosts.get_mut(r) {
+                    *slot = w.host.clone();
+                }
+            }
+        }
         config = config
             .local_ranks(local_ranks.clone())
+            .rank_hosts(rank_hosts)
             .dead_ranks(dead_ranks)
             .reported_deaths(Arc::clone(&reported_deaths));
 
@@ -1351,7 +1370,7 @@ pub fn run_launcher_with_config(
         let member = aw.member;
         let mut stream = aw.stream;
         let dial_host = controller_dial_host(worker);
-        let envelope = build_slim_envelope_for(&world, worker, &dial_host);
+        let envelope = build_slim_envelope_for(&world, worker, &dial_host, rank_resources);
         let envelope_hex = crate::distributed::cluster::hex_encode(
             serde_json::to_string(&envelope)
                 .map_err(|e| {

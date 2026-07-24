@@ -63,6 +63,53 @@ pub struct TimelineSample {
     pub gpus: Vec<GpuTimelineSample>,
 }
 
+/// Per-GPU slice of a rank-reported resource sample. Fields are
+/// `Option` because they mirror what the rank's NVML/allocator probes
+/// could actually read — absent means "not sampled", never zero.
+#[derive(Debug, Clone)]
+pub struct RankGpuSample {
+    /// Physical device index ON THE RANK'S HOST (nvidia-smi / NVML
+    /// enumeration there). Only meaningful together with the parent
+    /// sample's `host` — device indices collide across hosts.
+    pub device: u8,
+    /// GPU compute utilization (0-100, NVML rolling-window mean).
+    pub compute_util: Option<f32>,
+    /// Bytes reserved by the rank process's CUDA caching allocator.
+    pub vram_allocated_bytes: Option<u64>,
+    /// Total physical VRAM (bytes).
+    pub vram_total_bytes: Option<u64>,
+}
+
+/// A host-qualified resource sample reported by a training rank.
+///
+/// The local poller ([`Timeline::start`]) only ever sees the GPUs of
+/// the process's own host; in cluster runs every rank ships its
+/// resource sample to the controller piggy-backed on its metrics
+/// reports, and the coordinator deposits them here so remote hosts'
+/// GPU/VRAM activity survives into the persisted timeline. `elapsed_ms`
+/// is stamped at controller arrival (ship latency is milliseconds —
+/// negligible against the metrics-report cadence the samples ride on).
+#[derive(Debug, Clone)]
+pub struct RankTimelineSample {
+    /// Milliseconds since timeline start (stamped at arrival).
+    pub elapsed_ms: u64,
+    /// Global rank that reported this sample.
+    pub rank: usize,
+    /// Host the rank runs on (from the cluster world map). Empty when
+    /// the depositor has no topology (qualifies as "unknown", not
+    /// "controller host").
+    pub host: String,
+    /// Host CPU utilization (0-100%).
+    pub cpu_util: Option<f32>,
+    /// Host RAM used (bytes).
+    pub ram_used_bytes: Option<u64>,
+    /// Host RAM total (bytes).
+    pub ram_total_bytes: Option<u64>,
+    /// The rank's GPU slice (one entry in practice — ranks strip
+    /// foreign-device entries before shipping).
+    pub gpus: Vec<RankGpuSample>,
+}
+
 /// A timestamped training event.
 #[derive(Debug, Clone)]
 pub struct TimelineEvent {
@@ -249,6 +296,9 @@ pub struct Timeline {
     broadcast_interval_ms: u64,
     samples: Mutex<Vec<TimelineSample>>,
     events: Mutex<Vec<TimelineEvent>>,
+    /// Rank-reported host-qualified samples (cluster runs). Fed by
+    /// [`Self::rank_sample`], not the local poller.
+    rank_samples: Mutex<Vec<RankTimelineSample>>,
     stop_flag: AtomicBool,
     poller_handle: Mutex<Option<JoinHandle<()>>>,
     /// Live subscribers receive batched updates at the broadcast interval.
@@ -275,6 +325,7 @@ impl Timeline {
             broadcast_interval_ms: 1000,
             samples: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
+            rank_samples: Mutex::new(Vec::new()),
             stop_flag: AtomicBool::new(false),
             poller_handle: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -297,6 +348,7 @@ impl Timeline {
             broadcast_interval_ms,
             samples: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
+            rank_samples: Mutex::new(Vec::new()),
             stop_flag: AtomicBool::new(false),
             poller_handle: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -358,6 +410,42 @@ impl Timeline {
     /// Current elapsed milliseconds since timeline creation.
     pub fn elapsed_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Deposit a rank-reported resource sample, host-qualified.
+    ///
+    /// Cluster plumb: ranks ship a [`super::ResourceSample`] to the
+    /// controller piggy-backed on their metrics reports; the
+    /// coordinator forwards each one here so per-rank GPU/VRAM/CPU
+    /// activity on REMOTE hosts (invisible to this process's local
+    /// poller) persists into [`Self::save_json`]'s `rank_samples`
+    /// array. Timestamped at arrival. `host` may be empty when the
+    /// depositor has no topology for `rank`.
+    pub fn rank_sample(&self, rank: usize, host: &str, res: &super::ResourceSample) {
+        let sample = RankTimelineSample {
+            elapsed_ms: self.start.elapsed().as_millis() as u64,
+            rank,
+            host: host.to_string(),
+            cpu_util: res.cpu_percent,
+            ram_used_bytes: res.ram_used_bytes,
+            ram_total_bytes: res.ram_total_bytes,
+            gpus: res
+                .gpus
+                .iter()
+                .map(|g| RankGpuSample {
+                    device: g.device_index,
+                    compute_util: g.util_percent,
+                    vram_allocated_bytes: g.vram_allocated_bytes,
+                    vram_total_bytes: g.vram_total_bytes,
+                })
+                .collect(),
+        };
+        let mut rank_samples = self.rank_samples.lock().unwrap();
+        rank_samples.push(sample);
+        // Same cap as the poller archive: rank samples ride the
+        // metrics-report cadence (per chunk / per epoch), far sparser
+        // than the 100ms poll, so the cap is a runaway backstop only.
+        trim_archive(&mut rank_samples, MAX_TIMELINE_SAMPLES, "rank sample");
     }
 
     /// Detect idle gaps for a device: consecutive samples where `compute_util < threshold_pct`
@@ -490,21 +578,42 @@ impl Timeline {
         self.samples.lock().unwrap().len()
     }
 
+    /// Snapshot of the rank-reported samples deposited so far (empty
+    /// outside cluster runs). Cloned — the archive is sparse (metrics
+    /// cadence, not poll cadence).
+    pub fn rank_samples(&self) -> Vec<RankTimelineSample> {
+        self.rank_samples.lock().unwrap().clone()
+    }
+
     // -----------------------------------------------------------------------
     // Export
     // -----------------------------------------------------------------------
 
     /// Save timeline as JSON.
+    ///
+    /// Top-level keys: `samples` (local poller), `events`, and
+    /// `rank_samples` (host-qualified rank-reported samples, present
+    /// only when non-empty so pre-cluster consumers see an unchanged
+    /// document shape).
     pub fn save_json(&self, path: &str) -> io::Result<()> {
         let samples = self.samples.lock().unwrap();
         let events = self.events.lock().unwrap();
+        let rank_samples = self.rank_samples.lock().unwrap();
 
-        let mut out = String::with_capacity(samples.len() * 120 + events.len() * 80);
+        let mut out = String::with_capacity(
+            samples.len() * 120 + events.len() * 80 + rank_samples.len() * 120,
+        );
         out.push_str("{\n\"samples\":[\n");
         write_samples_json(&mut out, &samples);
         out.push_str("],\n\"events\":[\n");
         write_events_json(&mut out, &events);
-        out.push_str("]\n}\n");
+        out.push(']');
+        if !rank_samples.is_empty() {
+            out.push_str(",\n\"rank_samples\":[\n");
+            write_rank_samples_json(&mut out, &rank_samples);
+            out.push(']');
+        }
+        out.push_str("\n}\n");
 
         let mut f = std::fs::File::create(path)?;
         f.write_all(out.as_bytes())
@@ -764,6 +873,47 @@ fn write_samples_json(out: &mut String, samples: &[TimelineSample]) {
     }
 }
 
+/// Emit `rank_samples` entries: `{"t":..,"rank":..,"host":"..",` then
+/// only the fields the rank actually sampled (`cpu`, `ram_used`,
+/// `ram_total`, per-GPU `u`/`va`/`vt`). Absent = not sampled — a
+/// consumer must never read a missing key as zero.
+fn write_rank_samples_json(out: &mut String, samples: &[RankTimelineSample]) {
+    for (i, s) in samples.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        let host = s.host.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = write!(out, "{{\"t\":{},\"rank\":{},\"host\":\"{host}\"", s.elapsed_ms, s.rank);
+        if let Some(cpu) = s.cpu_util {
+            let _ = write!(out, ",\"cpu\":{cpu:.1}");
+        }
+        if let Some(used) = s.ram_used_bytes {
+            let _ = write!(out, ",\"ram_used\":{used}");
+        }
+        if let Some(total) = s.ram_total_bytes {
+            let _ = write!(out, ",\"ram_total\":{total}");
+        }
+        out.push_str(",\"gpus\":[");
+        for (gi, g) in s.gpus.iter().enumerate() {
+            if gi > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{{\"d\":{}", g.device);
+            if let Some(u) = g.compute_util {
+                let _ = write!(out, ",\"u\":{u:.1}");
+            }
+            if let Some(va) = g.vram_allocated_bytes {
+                let _ = write!(out, ",\"va\":{va}");
+            }
+            if let Some(vt) = g.vram_total_bytes {
+                let _ = write!(out, ",\"vt\":{vt}");
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+}
+
 fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
     for (i, e) in events.iter().enumerate() {
         if i > 0 {
@@ -1017,6 +1167,65 @@ mod tests {
         let mut buf2 = String::new();
         write_events_json(&mut buf2, &events);
         assert!(buf2.contains("\"sync_start\""));
+    }
+
+    /// Rank-reported samples persist host-qualified under a separate
+    /// `rank_samples` key, with unsampled fields OMITTED (a consumer
+    /// reading a missing key as zero would fake idle GPUs — the exact
+    /// bug class this feed exists to fix). The key itself only appears
+    /// once at least one rank sample was deposited.
+    #[test]
+    fn test_rank_samples_json_shape() {
+        let tl = Timeline::new(100);
+
+        // No deposits → no rank_samples key (document shape unchanged
+        // for single-host runs).
+        {
+            let rank_samples = tl.rank_samples.lock().unwrap();
+            assert!(rank_samples.is_empty());
+        }
+
+        let res = crate::monitor::ResourceSample {
+            cpu_percent: Some(37.5),
+            ram_used_bytes: Some(4_000_000_000),
+            ram_total_bytes: Some(16_000_000_000),
+            gpus: vec![crate::monitor::GpuSnapshot {
+                device_index: 1,
+                name: "GTX 1060".to_string(),
+                util_percent: Some(92.0),
+                vram_allocated_bytes: Some(2_000_000_000),
+                vram_total_bytes: Some(6_000_000_000),
+            }],
+            ..Default::default()
+        };
+        tl.rank_sample(2, "flodl-pascal", &res);
+        // Sparse sample: nothing readable on this tick.
+        tl.rank_sample(0, "exa", &crate::monitor::ResourceSample::default());
+
+        let mut buf = String::new();
+        let rank_samples = tl.rank_samples.lock().unwrap();
+        write_rank_samples_json(&mut buf, &rank_samples);
+
+        assert!(buf.contains("\"rank\":2"), "rank missing: {buf}");
+        assert!(buf.contains("\"host\":\"flodl-pascal\""), "host missing: {buf}");
+        assert!(buf.contains("\"cpu\":37.5"), "cpu missing: {buf}");
+        assert!(buf.contains("\"ram_used\":4000000000"), "ram_used missing: {buf}");
+        assert!(buf.contains("\"d\":1"), "gpu device missing: {buf}");
+        assert!(buf.contains("\"u\":92.0"), "gpu util missing: {buf}");
+        assert!(buf.contains("\"va\":2000000000"), "vram alloc missing: {buf}");
+        assert!(buf.contains("\"vt\":6000000000"), "vram total missing: {buf}");
+
+        // The sparse rank 0 entry carries identity + empty gpus and NO
+        // resource keys.
+        let rank0 = buf
+            .split(",\n")
+            .find(|e| e.contains("\"rank\":0"))
+            .expect("rank 0 entry present");
+        assert!(rank0.contains("\"host\":\"exa\""), "rank0 host: {rank0}");
+        assert!(rank0.contains("\"gpus\":[]"), "rank0 gpus: {rank0}");
+        for key in ["\"cpu\"", "\"ram_used\"", "\"ram_total\""] {
+            assert!(!rank0.contains(key), "sparse entry must omit {key}: {rank0}");
+        }
     }
 
     /// `MetaNudge` (LR-aware meta-controller anchor nudge) carries

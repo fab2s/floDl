@@ -1508,11 +1508,13 @@ impl From<ResourceSampleWire> for crate::monitor::ResourceSample {
 
 /// Wire-side mirror of [`ddp_run::MetricsMsg`]. All fields plain data.
 ///
-/// `resources` is `Option<>` because not every per-epoch report needs a
-/// resource sample (the worker only populates it when the dashboard has
-/// been requested, and progressive-chunk reports leave it empty). When
-/// `Some(_)`, the launcher's dashboard renders per-rank hardware tabs
-/// for the originating rank.
+/// `resources` is `Option<>` because not every report carries a
+/// resource sample: the worker populates it only when sampling was
+/// requested — a rank-side `monitor.serve(port)` (live dashboard) or
+/// the envelope's `rank_resources` flag (timeline persistence). When
+/// `Some(_)`, the coord deposits the sample host-qualified into the
+/// launcher's timeline and the dashboard (if any) renders per-rank
+/// hardware tabs for the originating rank.
 ///
 /// [`ddp_run::MetricsMsg`]: crate::distributed::ddp_run::MetricsMsg
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

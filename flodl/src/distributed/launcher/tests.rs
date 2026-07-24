@@ -304,7 +304,7 @@
         // (controller/world_size/num_workers/worker with no ssh field).
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let worker = full.workers.iter().find(|h| h.host == "host-b").unwrap();
-        let env = build_slim_envelope_for(&full, worker, &full.controller.host);
+        let env = build_slim_envelope_for(&full, worker, &full.controller.host, false);
 
         assert_eq!(env["controller"]["host"], "192.168.122.1");
         assert_eq!(env["controller"]["port"], 29500);
@@ -322,8 +322,27 @@
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host, false);
         assert_eq!(env["worker"]["local_devices"], serde_json::json!([0]));
+    }
+
+    /// `rank_resources` is opt-in: emitted only when the launcher asks
+    /// (timeline present), absent otherwise — and the rank-side parser
+    /// reads both shapes back with matching defaults.
+    #[test]
+    fn slim_envelope_rank_resources_round_trips() {
+        let full = FullCluster::from_value(&canonical_full_json()).unwrap();
+        let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
+
+        let off = build_slim_envelope_for(&full, host_a, &full.controller.host, false);
+        assert!(off.get("rank_resources").is_none(), "off run must not emit the key");
+        let parsed = crate::distributed::LocalCluster::from_value(&off).unwrap();
+        assert!(!parsed.rank_resources);
+
+        let on = build_slim_envelope_for(&full, host_a, &full.controller.host, true);
+        assert_eq!(on["rank_resources"], serde_json::json!(true));
+        let parsed = crate::distributed::LocalCluster::from_value(&on).unwrap();
+        assert!(parsed.rank_resources);
     }
 
     #[test]
@@ -393,7 +412,7 @@
         // controller address; the configured host never leaks in.
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let worker = full.workers.iter().find(|h| h.host == "host-b").unwrap();
-        let env = build_slim_envelope_for(&full, worker, "127.0.0.1");
+        let env = build_slim_envelope_for(&full, worker, "127.0.0.1", false);
         assert_eq!(env["controller"]["host"], "127.0.0.1");
         assert_eq!(env["controller"]["port"], 29500);
     }
@@ -625,7 +644,7 @@
         // contract, validated end-to-end.
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host, false);
         let parsed = crate::distributed::cluster::LocalCluster::from_value(&env)
             .expect("slim envelope must parse via LocalCluster::from_value");
         assert_eq!(parsed.world_size(), 3);
@@ -650,7 +669,7 @@
         ];
         full = full.with_session_salt(salt);
         let host_a = full.workers.iter().find(|h| h.host == "host-a").unwrap();
-        let env = build_slim_envelope_for(&full, host_a, &full.controller.host);
+        let env = build_slim_envelope_for(&full, host_a, &full.controller.host, false);
         // Salt field must be present as a 32-char lowercase hex string.
         let hex = env
             .get("salt")

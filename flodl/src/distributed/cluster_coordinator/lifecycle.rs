@@ -356,6 +356,7 @@ impl ClusterCoordinator {
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
+            rank_hosts: config.rank_hosts.clone(),
             max_failure: config.max_failure,
             epoch_callback_policy: config.epoch_callback_policy,
             checkpoint_role: initial_callback_role(
