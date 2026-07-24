@@ -299,6 +299,16 @@ pub struct Timeline {
     /// Rank-reported host-qualified samples (cluster runs). Fed by
     /// [`Self::rank_sample`], not the local poller.
     rank_samples: Mutex<Vec<RankTimelineSample>>,
+    /// Cluster host name of the process owning this timeline (the
+    /// controller). Empty when unset. Lets `rank_samples` consumers
+    /// tell which entries duplicate the local poller's coverage.
+    host: Mutex<String>,
+    /// Whether the poller samples GPUs. On by default; the cluster
+    /// launcher turns it OFF for a dedicated controller (a process that
+    /// owns no local ranks), so the timeline never reports GPU columns
+    /// for devices another node trains on — GPU data then comes solely
+    /// from the workers' own `rank_samples`.
+    gpu_poll: AtomicBool,
     stop_flag: AtomicBool,
     poller_handle: Mutex<Option<JoinHandle<()>>>,
     /// Live subscribers receive batched updates at the broadcast interval.
@@ -326,6 +336,8 @@ impl Timeline {
             samples: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             rank_samples: Mutex::new(Vec::new()),
+            host: Mutex::new(String::new()),
+            gpu_poll: AtomicBool::new(true),
             stop_flag: AtomicBool::new(false),
             poller_handle: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -349,6 +361,8 @@ impl Timeline {
             samples: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             rank_samples: Mutex::new(Vec::new()),
+            host: Mutex::new(String::new()),
+            gpu_poll: AtomicBool::new(true),
             stop_flag: AtomicBool::new(false),
             poller_handle: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -585,25 +599,67 @@ impl Timeline {
         self.rank_samples.lock().unwrap().clone()
     }
 
+    /// Record the cluster host name of the process owning this
+    /// timeline (the controller). The cluster launcher stamps its own
+    /// world-map name here so `rank_samples` consumers can tell which
+    /// entries describe hosts the local poller already covers.
+    pub fn set_host(&self, host: &str) {
+        *self.host.lock().unwrap() = host.to_string();
+    }
+
+    /// The recorded controller host name (empty when never set).
+    pub fn host(&self) -> String {
+        self.host.lock().unwrap().clone()
+    }
+
+    /// Enable or disable GPU sampling by the background poller.
+    ///
+    /// The cluster launcher disables it for a dedicated controller (a
+    /// process that owns no local ranks) so the persisted timeline never
+    /// reports GPU columns for devices a different node trains on — GPU
+    /// data then comes solely from the workers' `rank_samples`. Turning
+    /// it off also clears the GPU slices from samples already collected
+    /// (the launcher only learns the process owns no ranks after the
+    /// membership window, by which point the poller has recorded a few
+    /// GPU samples of an unowned device); CPU/RAM history is kept.
+    pub fn set_gpu_poll(&self, on: bool) {
+        self.gpu_poll.store(on, Ordering::SeqCst);
+        if !on {
+            for s in self.samples.lock().unwrap().iter_mut() {
+                s.gpus.clear();
+            }
+            for s in self.pending_samples.lock().unwrap().iter_mut() {
+                s.gpus.clear();
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Export
     // -----------------------------------------------------------------------
 
     /// Save timeline as JSON.
     ///
-    /// Top-level keys: `samples` (local poller), `events`, and
-    /// `rank_samples` (host-qualified rank-reported samples, present
-    /// only when non-empty so pre-cluster consumers see an unchanged
-    /// document shape).
+    /// Top-level keys: `host` (controller host name, present only when
+    /// [`Self::set_host`] was called), `samples` (local poller),
+    /// `events`, and `rank_samples` (host-qualified rank-reported
+    /// samples, present only when non-empty so pre-cluster consumers
+    /// see an unchanged document shape).
     pub fn save_json(&self, path: &str) -> io::Result<()> {
         let samples = self.samples.lock().unwrap();
         let events = self.events.lock().unwrap();
         let rank_samples = self.rank_samples.lock().unwrap();
+        let host = self.host.lock().unwrap();
 
         let mut out = String::with_capacity(
             samples.len() * 120 + events.len() * 80 + rank_samples.len() * 120,
         );
-        out.push_str("{\n\"samples\":[\n");
+        out.push_str("{\n");
+        if !host.is_empty() {
+            let escaped = host.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = writeln!(out, "\"host\":\"{escaped}\",");
+        }
+        out.push_str("\"samples\":[\n");
         write_samples_json(&mut out, &samples);
         out.push_str("],\n\"events\":[\n");
         write_events_json(&mut out, &events);
@@ -741,9 +797,17 @@ impl Timeline {
             // RAM
             let (ram_used, ram_total) = read_meminfo().unwrap_or((0, 0));
 
-            // Per-GPU
+            // Per-GPU — skipped entirely for a dedicated controller
+            // (owns no local ranks): its GPU columns would describe
+            // devices another node trains on. Also spares the NVML /
+            // allocator probes on a process that has no business
+            // touching them.
             let mut gpus = Vec::with_capacity(gpu_statics.len());
+            let poll_gpus = this.gpu_poll.load(Ordering::SeqCst);
             for (i, &(phys, total_static)) in gpu_statics.iter().enumerate() {
+                if !poll_gpus {
+                    break;
+                }
                 let compute_util = crate::tensor::cuda_utilization_idx(phys as i32)
                     .map(|u| u as u8)
                     .unwrap_or(0);
@@ -1226,6 +1290,62 @@ mod tests {
         for key in ["\"cpu\"", "\"ram_used\"", "\"ram_total\""] {
             assert!(!rank0.contains(key), "sparse entry must omit {key}: {rank0}");
         }
+    }
+
+    /// The controller host stamp appears as a top-level `host` key only
+    /// when set — absent means "unknown", and consumers must not treat
+    /// any rank_samples host as duplicating the local poller's coverage.
+    #[test]
+    fn test_save_json_host_stamp() {
+        let dir = std::env::temp_dir();
+
+        let tl = Timeline::new(100);
+        let path = dir.join(format!("flodl_tl_no_host_{}.json", std::process::id()));
+        tl.save_json(path.to_str().unwrap()).unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        assert!(!doc.contains("\"host\""), "unset host must be absent: {doc}");
+        let _ = std::fs::remove_file(&path);
+
+        tl.set_host("exa-cuda");
+        assert_eq!(tl.host(), "exa-cuda");
+        let path = dir.join(format!("flodl_tl_host_{}.json", std::process::id()));
+        tl.save_json(path.to_str().unwrap()).unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            doc.contains("\"host\":\"exa-cuda\""),
+            "host stamp missing: {doc}",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_gpu_poll(false)` clears GPU slices from already-collected
+    /// samples (a dedicated controller's formation-window GPU samples of
+    /// an unowned device) while keeping their CPU/RAM history.
+    #[test]
+    fn test_set_gpu_poll_clears_existing_gpu_slices() {
+        let tl = Timeline::new(100);
+        {
+            let mut samples = tl.samples.lock().unwrap();
+            samples.push(TimelineSample {
+                elapsed_ms: 10,
+                cpu_util: 22.0,
+                ram_used_bytes: 1_000,
+                ram_total_bytes: 8_000,
+                gpus: vec![GpuTimelineSample {
+                    device: 0,
+                    compute_util: 90,
+                    vram_used_bytes: 5,
+                    vram_allocated_bytes: 0,
+                    vram_total_bytes: 16,
+                }],
+            });
+        }
+        tl.set_gpu_poll(false);
+        let samples = tl.samples.lock().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].gpus.is_empty(), "GPU slice must be cleared");
+        assert_eq!(samples[0].cpu_util, 22.0, "CPU/RAM history must survive");
+        assert_eq!(samples[0].ram_used_bytes, 1_000);
     }
 
     /// `MetaNudge` (LR-aware meta-controller anchor nudge) carries
