@@ -320,6 +320,27 @@ fn record_is_written_atomically_single_write() {
 }
 
 #[test]
+fn data_plane_records_stream_header_then_payload() {
+    // HostFrame / Broadcast payloads are model-sized: they write as
+    // header + payload (TWO writes, no [hdr‖payload] copy). The bytes
+    // on the wire must be identical to the atomic form — readers can't
+    // tell the difference — and safety comes from every reader
+    // committing to the full record after the first header byte.
+    for rec in [
+        MuxRecord::host_frame(vec![7, 8, 9]),
+        MuxRecord::broadcast(vec![4, 5]),
+    ] {
+        let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+        rec.write_to(&mut w, &SALT_A).unwrap();
+        assert_eq!(w.writes, 2, "header write + payload write");
+        let got = MuxRecord::read_from(&mut w.buf.as_slice(), &SALT_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, rec, "split-written record round-trips verbatim");
+    }
+}
+
+#[test]
 fn opaque_payload_is_not_parsed() {
     // A Data record carries arbitrary bytes verbatim — the relay never
     // interprets them. Feed bytes that are NOT a valid RoundFrame /

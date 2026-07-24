@@ -36,11 +36,12 @@
 //! payload: each blob crosses as a rank-tagged [`MuxRecord::Data`].
 //!
 //! On the **data channel** the relay is the first fold tier of the
-//! realized-work reduce. Rank readers parse and HMAC-verify each local
-//! [`RoundFrame`]; the depositor that completes the round (every local
-//! *alive* rank present) sums them element-wise — masses too — via
-//! [`controller::sum_frames`] (the fold NEVER divides; the controller
-//! divides exactly once) and ships ONE re-signed
+//! realized-work reduce. Rank readers parse, HMAC-verify, and fold each
+//! local frame INCREMENTALLY into the round's running f32 sums (the
+//! `sum_frames` monoid computed one deposit at a time — element-wise
+//! sum, masses too; the fold NEVER divides, the controller divides
+//! exactly once); the depositor that completes the round (every local
+//! *alive* rank merged) re-encodes the sums and ships ONE re-signed
 //! [`MuxRecord::HostFrame`] upstream. The controller's consensus comes
 //! back as ONE [`MuxRecord::Broadcast`], fanned out to every local
 //! alive rank. Local liveness is absorbed here: a rank EOF folds the
@@ -55,8 +56,6 @@
 //! [`MuxRecord::Broadcast`]: super::mux::MuxRecord::Broadcast
 //! [`RelayControlMsg::RankExit`]: super::mux::RelayControlMsg::RankExit
 //! [`RelayControlMsg::DeclareDead`]: super::mux::RelayControlMsg::DeclareDead
-//! [`RoundFrame`]: crate::distributed::controller::RoundFrame
-//! [`controller::sum_frames`]: crate::distributed::controller::sum_frames
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -66,7 +65,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::distributed::controller::{self, RoundFrame};
+use crate::distributed::controller::{self, RoundKind, TensorPayload};
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{Result, TensorError};
 
@@ -300,11 +299,12 @@ impl Drop for RelayChannel {
 // Data-channel fold station
 // ---------------------------------------------------------------------------
 
-/// Host-local mirror of the controller's round collection: one slot per
-/// local rank, plus the local dead-set. The mutation that completes the
-/// round (a deposit, or a death that removes the last missing rank)
-/// takes the frames and performs the fold — no dedicated fold thread,
-/// no condvar, no deadline.
+/// Host-local mirror of the controller's round collection: a running
+/// incremental fold plus the local dead-set. Each deposit merges into
+/// the fold as it arrives; the mutation that completes the round (a
+/// deposit, or a death that removes the last missing rank) takes the
+/// fold and ships it — no dedicated fold thread, no condvar, no
+/// deadline.
 struct FoldCtx {
     inner: Mutex<FoldInner>,
     /// Global rank ids served by this host (the fold barrier's roster).
@@ -319,19 +319,213 @@ struct FoldCtx {
 }
 
 struct FoldInner {
-    /// This round's parsed frame per local rank (`None` until
-    /// deposited; taken by the completing fold).
-    frames: HashMap<u32, RoundFrame>,
+    /// This round's running fold (`None` until the first deposit;
+    /// taken by the completing fold).
+    fold: Option<HostFold>,
     /// Local ranks out of the fold barrier: loopback EOF (observed
     /// here) or controller-declared death ([`RelayControlMsg::DeclareDead`]).
     dead: HashSet<u32>,
+}
+
+/// One round's incremental host fold: the running f32 sums every local
+/// deposit merges into, plus the frame schema the first deposit pinned.
+///
+/// This IS `sum_frames` computed one contribution at a time (same f32
+/// accumulation, same schema validation, mass summed, NEVER divides) —
+/// the associative monoid makes deposit order irrelevant. Holding the
+/// f32 image instead of the deposited frames caps the fold's residency
+/// at one f32 model copy regardless of how many local ranks feed it.
+///
+/// MAC-BEFORE-USE NOTE: a deposit merges payload bytes into the shared
+/// sums BEFORE its frame's HMAC footer is reached (the parse streams).
+/// That is sound ONLY because every deposit error — HMAC, schema,
+/// truncation — tears the whole data channel down (`rank_reader` flags
+/// shutdown; the round never ships): no code path continues with a
+/// polluted accumulator. Any future error-tolerant deposit path must
+/// buffer per-deposit and merge after verification instead.
+struct HostFold {
+    kind: RoundKind,
+    /// Σ realized-work mass of the deposits (never divided here — the
+    /// divide-once law belongs to the controller).
+    weight: f64,
+    /// The fold's tensor state — seed until a second deposit arrives.
+    payloads: FoldPayloads,
+    /// Ranks whose contribution is already merged (the double-deposit
+    /// detector the frames map used to provide).
+    deposited: HashSet<u32>,
+}
+
+/// The fold's tensor state, staged to keep residency at the wire dtype
+/// for as long as possible.
+///
+/// The round's FIRST deposit is held verbatim as its wire payloads
+/// (`Seed`) — on a bf16 wire that is HALF the f32 image, and it is what
+/// the barrier hold phase (seconds long, while later ranks compute) has
+/// resident. The f32 sums only materialize when a SECOND deposit
+/// arrives (`Sums`). A single-rank host therefore never builds the f32
+/// image at all: its fold ships the seed verbatim — byte-identical to
+/// decode + re-encode, since the bf16 codec round-trips its own output
+/// exactly — which makes the relay tier nearly free on 1-GPU-per-node
+/// topologies (the cloud shape).
+enum FoldPayloads {
+    /// First deposit, verbatim wire payloads (dtype + shape double as
+    /// the schema later deposits are validated against).
+    Seed(Vec<TensorPayload>),
+    /// Two or more deposits merged: per-tensor running sums, always
+    /// f32 whatever the wire dtype.
+    Sums {
+        schema: Vec<FoldSchema>,
+        sums: Vec<Vec<f32>>,
+    },
+}
+
+/// Wire identity of one tensor slot in the fold schema.
+struct FoldSchema {
+    dtype: u8,
+    shape: Vec<u32>,
+}
+
+/// Loud schema mismatch shared by the promote and accumulate paths.
+fn fold_schema_check(
+    rank: u32,
+    ti: usize,
+    got_dtype: u8,
+    got_shape: &[u32],
+    want_dtype: u8,
+    want_shape: &[u32],
+) -> Result<()> {
+    if got_dtype != want_dtype {
+        return Err(TensorError::new(&format!(
+            "relay fold: rank {rank} tensor[{ti}] dtype {got_dtype} != the round's \
+             dtype {want_dtype} (cohort mixing bf16_wire settings, or desynced \
+             rounds)"
+        )));
+    }
+    if got_shape != want_shape {
+        return Err(TensorError::new(&format!(
+            "relay fold: rank {rank} tensor[{ti}] shape {got_shape:?} != the \
+             round's shape {want_shape:?} (desynced rounds)"
+        )));
+    }
+    Ok(())
+}
+
+impl HostFold {
+    /// Merge one rank's frame blob into the running fold, seeding it on
+    /// the round's first deposit. The blob is parsed payload-by-payload
+    /// ([`controller::read_round_frame_streamed`]); each payload's bytes
+    /// are decoded into the f32 sums and freed before the next one is
+    /// read — the deposited frame never exists as a `RoundFrame`.
+    ///
+    /// Loud error on any schema disagreement with the pinned first
+    /// deposit — tensor count, dtype, shape, byte length, or
+    /// [`RoundKind`] — same contract as `sum_frames` (a mismatch means
+    /// desynced rounds, e.g. a cohort mixing `bf16_wire` settings).
+    fn accumulate(
+        fold: &mut Option<HostFold>,
+        rank: u32,
+        blob: &[u8],
+        salt: &SessionSalt,
+    ) -> Result<()> {
+        let Some(f) = fold else {
+            // Round's first deposit: hold it verbatim as the seed (wire
+            // dtype residency; also pins the schema).
+            let mut payloads: Vec<TensorPayload> = Vec::new();
+            let hdr = controller::read_round_frame_streamed(
+                &mut &blob[..],
+                salt,
+                &mut |_, p| {
+                    payloads.push(p);
+                    Ok(())
+                },
+            )?;
+            let Some((kind, weight)) = hdr else {
+                return Err(TensorError::new(&format!(
+                    "relay fold: truncated RoundFrame from rank {rank}"
+                )));
+            };
+            *fold = Some(HostFold {
+                kind,
+                weight,
+                payloads: FoldPayloads::Seed(payloads),
+                deposited: HashSet::from([rank]),
+            });
+            return Ok(());
+        };
+
+        // Second deposit promotes the seed to f32 sums; later deposits
+        // merge straight in. Either way the incoming frame streams
+        // payload-by-payload and is never materialized.
+        if let FoldPayloads::Seed(seed) = &mut f.payloads {
+            let mut schema: Vec<FoldSchema> = Vec::with_capacity(seed.len());
+            let mut sums: Vec<Vec<f32>> = Vec::with_capacity(seed.len());
+            for p in seed.iter_mut() {
+                sums.push(controller::payload_to_f32(p)?);
+                schema.push(FoldSchema {
+                    dtype: p.dtype,
+                    shape: std::mem::take(&mut p.shape),
+                });
+                // Drain the seed as the f32 image grows instead of
+                // holding both whole.
+                p.bytes = Vec::new();
+            }
+            f.payloads = FoldPayloads::Sums { schema, sums };
+        }
+        let FoldPayloads::Sums { schema, sums } = &mut f.payloads else {
+            unreachable!("seed promoted just above");
+        };
+
+        let expected = schema.len();
+        let mut seen = 0usize;
+        let hdr = controller::read_round_frame_streamed(
+            &mut &blob[..],
+            salt,
+            &mut |ti, p| {
+                let (Some(sc), Some(sum)) = (schema.get(ti), sums.get_mut(ti)) else {
+                    return Err(TensorError::new(&format!(
+                        "relay fold: rank {rank} frame carries more than {expected} \
+                         tensors (schema pinned by the round's first deposit)"
+                    )));
+                };
+                fold_schema_check(rank, ti, p.dtype, &p.shape, sc.dtype, &sc.shape)?;
+                // Byte-length agreement is enforced inside the
+                // accumulate (payload bytes vs sums numel).
+                controller::accumulate_payload_into(&p, sum).map_err(|e| {
+                    TensorError::new(&format!("relay fold: rank {rank} tensor[{ti}]: {e}"))
+                })?;
+                seen = ti + 1;
+                Ok(())
+            },
+        )?;
+        let Some((kind, weight)) = hdr else {
+            return Err(TensorError::new(&format!(
+                "relay fold: truncated RoundFrame from rank {rank}"
+            )));
+        };
+        if kind != f.kind {
+            return Err(TensorError::new(&format!(
+                "relay fold: rank {rank} frame kind {kind:?} != the round's kind \
+                 {:?} (desynced reduce rounds)",
+                f.kind
+            )));
+        }
+        if seen != expected {
+            return Err(TensorError::new(&format!(
+                "relay fold: rank {rank} frame carries {seen} tensors; the round's \
+                 first deposit carried {expected}"
+            )));
+        }
+        f.weight += weight;
+        f.deposited.insert(rank);
+        Ok(())
+    }
 }
 
 impl FoldCtx {
     fn new(local_ranks: Vec<u32>, salt: SessionSalt) -> Self {
         FoldCtx {
             inner: Mutex::new(FoldInner {
-                frames: HashMap::with_capacity(local_ranks.len()),
+                fold: None,
                 dead: HashSet::new(),
             }),
             local_ranks,
@@ -342,16 +536,23 @@ impl FoldCtx {
         }
     }
 
-    /// Deposit `rank`'s frame for the current round; fold + ship if this
-    /// completes it. Returns `Err` on protocol violations that must tear
-    /// the channel down (double deposit — the rank↔relay leg is a strict
-    /// ping-pong, so a second frame before the round folded means a
-    /// desynced stream).
+    /// Deposit `rank`'s frame blob for the current round, folding it
+    /// INCREMENTALLY into the running f32 sums (the frame is parsed
+    /// payload-by-payload straight out of the blob and never
+    /// materialized — with N model-sized local frames per round, the
+    /// old hold-then-sum kept N of them until the barrier; the
+    /// accumulator holds ONE f32 image regardless of N). Ships the
+    /// re-encoded fold if this deposit completes the round.
+    ///
+    /// Returns `Err` on protocol violations that must tear the channel
+    /// down (double deposit — the rank↔relay leg is a strict ping-pong,
+    /// so a second frame before the round folded means a desynced
+    /// stream — plus every schema/parse/HMAC failure from the
+    /// incremental fold, see [`HostFold`]).
     fn deposit(
         &self,
         rank: u32,
-        frame: RoundFrame,
-        frame_bytes: u64,
+        blob: &[u8],
         tx: &mpsc::SyncSender<MuxRecord>,
     ) -> Result<()> {
         let taken = {
@@ -361,13 +562,18 @@ impl FoldCtx {
                 // (mirrors the controller's late-frame drop).
                 return Ok(());
             }
-            if inner.frames.insert(rank, frame).is_some() {
+            if inner
+                .fold
+                .as_ref()
+                .is_some_and(|f| f.deposited.contains(&rank))
+            {
                 return Err(TensorError::new(&format!(
                     "relay fold: rank {rank} deposited twice in one round \
                      (rank↔relay ping-pong violated; stream desynced)"
                 )));
             }
-            self.bytes_in.fetch_add(frame_bytes, Ordering::Relaxed);
+            HostFold::accumulate(&mut inner.fold, rank, blob, &self.salt)?;
+            self.bytes_in.fetch_add(blob.len() as u64, Ordering::Relaxed);
             self.take_if_complete(&mut inner)
         };
         self.fold_and_ship(taken, tx)
@@ -380,40 +586,123 @@ impl FoldCtx {
         let taken = {
             let mut inner = self.inner.lock().expect("relay fold lock poisoned");
             inner.dead.insert(rank);
-            // A frame it already deposited this round stays in — the
-            // rank realized that work; the controller-side accept
-            // ledger is what decides acceptance across hosts.
+            // A contribution it already deposited this round stays in —
+            // it is already merged into the running sums; the rank
+            // realized that work, and the controller-side accept ledger
+            // is what decides acceptance across hosts.
             self.take_if_complete(&mut inner)
         };
         self.fold_and_ship(taken, tx)
     }
 
     /// Under the lock: if every local alive rank has deposited (and at
-    /// least one frame is present), take the round's frames.
-    fn take_if_complete(&self, inner: &mut FoldInner) -> Option<Vec<RoundFrame>> {
-        let complete = self
-            .local_ranks
-            .iter()
-            .all(|r| inner.dead.contains(r) || inner.frames.contains_key(r));
-        if !complete || inner.frames.is_empty() {
+    /// least one contribution is in), take the round's fold.
+    fn take_if_complete(&self, inner: &mut FoldInner) -> Option<HostFold> {
+        let complete = self.local_ranks.iter().all(|r| {
+            inner.dead.contains(r)
+                || inner
+                    .fold
+                    .as_ref()
+                    .is_some_and(|f| f.deposited.contains(r))
+        });
+        if !complete {
             return None;
         }
-        Some(inner.frames.drain().map(|(_, f)| f).collect())
+        inner.fold.take()
     }
 
-    /// Outside the lock: sum the taken frames, re-sign, ship upstream.
+    /// Outside the lock: re-encode the fold as ONE HostFrame payload
+    /// and ship it upstream. A single-deposit round (`Seed`) ships its
+    /// wire payloads verbatim — byte-identical to decode + re-encode,
+    /// the codec round-trips its own output exactly — so a 1-rank host
+    /// never touches f32. A merged round (`Sums`) streams straight from
+    /// the f32 accumulator into the payload buffer, draining each
+    /// tensor as it is encoded — no folded `RoundFrame` object, no
+    /// separate serialize pass (the old path materialized the folded
+    /// frame AND its serialization on top of the held rank frames).
     fn fold_and_ship(
         &self,
-        taken: Option<Vec<RoundFrame>>,
+        taken: Option<HostFold>,
         tx: &mpsc::SyncSender<MuxRecord>,
     ) -> Result<()> {
-        let Some(frames) = taken else {
+        let Some(fold) = taken else {
             return Ok(());
         };
-        let refs: Vec<&RoundFrame> = frames.iter().collect();
-        let folded = controller::sum_frames(&refs)?;
-        let mut buf = Vec::new();
-        controller::write_round_frame(&mut buf, &folded, &self.salt)?;
+        let HostFold {
+            kind,
+            weight,
+            payloads,
+            deposited: _,
+        } = fold;
+        let mut buf: Vec<u8>;
+        match payloads {
+            FoldPayloads::Seed(seed) => {
+                let parts: Vec<controller::PayloadPart<'_>> = seed
+                    .iter()
+                    .map(|p| controller::PayloadPart {
+                        dtype: p.dtype,
+                        shape: &p.shape,
+                        nbytes: p.bytes.len() as u64,
+                    })
+                    .collect();
+                buf = Vec::with_capacity(
+                    controller::round_frame_wire_len(&parts) as usize,
+                );
+                controller::write_round_frame_streamed(
+                    &mut buf,
+                    kind,
+                    weight,
+                    &parts,
+                    &self.salt,
+                    &mut |ti, tee| {
+                        use std::io::Write;
+                        tee.write_all(&seed[ti].bytes)
+                            .map_err(|e| TensorError::new(&e.to_string()))
+                    },
+                )?;
+                drop(seed);
+            }
+            FoldPayloads::Sums { schema, mut sums } => {
+                let parts: Vec<controller::PayloadPart<'_>> = schema
+                    .iter()
+                    .zip(sums.iter())
+                    .map(|(s, sum)| {
+                        Ok(controller::PayloadPart {
+                            dtype: s.dtype,
+                            shape: &s.shape,
+                            nbytes: (sum.len()
+                                * controller::payload_element_size(s.dtype)?)
+                                as u64,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                buf = Vec::with_capacity(
+                    controller::round_frame_wire_len(&parts) as usize,
+                );
+                controller::write_round_frame_streamed(
+                    &mut buf,
+                    kind,
+                    weight,
+                    &parts,
+                    &self.salt,
+                    &mut |ti, tee| {
+                        use std::io::Write;
+                        // Drain: this tensor's sums are freed as soon as
+                        // its wire bytes exist, so the accumulator
+                        // shrinks while the payload buffer grows instead
+                        // of coexisting whole.
+                        let sum = std::mem::take(&mut sums[ti]);
+                        let bytes = controller::f32_slice_to_payload_bytes(
+                            &sum,
+                            schema[ti].dtype,
+                        )?;
+                        drop(sum);
+                        tee.write_all(&bytes)
+                            .map_err(|e| TensorError::new(&e.to_string()))
+                    },
+                )?;
+            }
+        }
         self.rounds.fetch_add(1, Ordering::Relaxed);
         self.bytes_up.fetch_add(buf.len() as u64, Ordering::Relaxed);
         tx.send(MuxRecord::host_frame(buf)).map_err(|_| {
@@ -575,9 +864,10 @@ fn spawn_mux(
 ///
 /// Control channel (`fold` = None): wraps each length-framed blob as
 /// `Data{rank, blob}` untouched. Data channel (`fold` = Some): parses +
-/// HMAC-verifies the blob as a [`RoundFrame`] and deposits it into the
-/// host fold — the deposit that completes the round ships the folded
-/// `HostFrame` from this thread.
+/// HMAC-verifies the blob as a
+/// [`RoundFrame`](crate::distributed::controller::RoundFrame) and folds
+/// it incrementally into the host fold — the deposit that completes the
+/// round ships the re-encoded `HostFrame` from this thread.
 ///
 /// Emits `RankExit{rank}` on EOF/error then exits (on the data channel
 /// the rank also leaves the fold barrier, which may complete the round
@@ -602,25 +892,14 @@ fn rank_reader(
                     }
                 }
                 Some(ctx) => {
-                    // Parse + verify (the blob's end-to-end HMAC is
-                    // checked by read_round_frame; the relay holds the
-                    // session salt). Any failure here is a desynced or
-                    // corrupt local stream — tear the channel down
-                    // loudly rather than fold garbage.
-                    let parsed = controller::read_round_frame(
-                        &mut blob.as_slice(),
-                        &ctx.salt,
-                    );
-                    let deposit = match parsed {
-                        Ok(Some(frame)) => {
-                            ctx.deposit(rank, frame, blob.len() as u64, &tx)
-                        }
-                        Ok(None) => Err(TensorError::new(&format!(
-                            "relay fold: truncated RoundFrame from rank {rank}"
-                        ))),
-                        Err(e) => Err(e),
-                    };
-                    if let Err(e) = deposit {
+                    // Parse + verify + fold in one pass (the blob's
+                    // end-to-end HMAC is checked by the streamed parse;
+                    // the relay holds the session salt). Any failure
+                    // here is a desynced or corrupt local stream — tear
+                    // the channel down loudly rather than fold garbage
+                    // (which is also what keeps the merge-before-verify
+                    // accumulation sound, see [`HostFold`]).
+                    if let Err(e) = ctx.deposit(rank, &blob, &tx) {
                         eprintln!("relay fold: rank {rank}: {e}");
                         shutdown.store(true, Ordering::SeqCst);
                         break;

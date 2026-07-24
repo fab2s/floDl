@@ -247,17 +247,42 @@ impl MuxRecord {
         // the payload bytes.
         let auth_tag = hmac_sha256_64_2(salt, &hdr[0..17], &payload);
         hdr[17..25].copy_from_slice(&auth_tag.to_le_bytes());
-        // Single atomic write: a reader on a timeout'd socket must never
-        // see a header without its payload. Two separate write_all calls
-        // open a window where the writer is preempted mid-frame and the
-        // reader's read_exact(payload) times out having consumed partial
-        // bytes, desyncing the stream. One buffer → one write → the frame
-        // lands (and on loopback becomes readable) atomically.
-        let mut frame = Vec::with_capacity(MUX_HEADER_LEN + payload.len());
-        frame.extend_from_slice(&hdr);
-        frame.extend_from_slice(&payload);
-        w.write_all(&frame)
-            .map_err(|e| TensorError::new(&format!("relay_mux: record write failed: {e}")))?;
+        match self {
+            // Data-plane frames (host fold up, consensus broadcast down)
+            // are model-sized: the atomic [hdr‖payload] copy below would
+            // be a whole extra model image per ship, and a payload that
+            // large never lands atomically on the wire anyway. Split
+            // writes are safe here because every mux reader commits to
+            // the full record once the first header byte arrives
+            // ([`Self::try_read_from`]'s idle gate + `fill_committed`),
+            // so a mid-record read timeout can no longer desync the
+            // stream.
+            MuxRecord::HostFrame { .. } | MuxRecord::Broadcast { .. } => {
+                w.write_all(&hdr).map_err(|e| {
+                    TensorError::new(&format!("relay_mux: record header write failed: {e}"))
+                })?;
+                w.write_all(&payload).map_err(|e| {
+                    TensorError::new(&format!("relay_mux: record write failed: {e}"))
+                })?;
+            }
+            // Small control-plane records keep the single atomic write:
+            // a reader on a timeout'd socket must never see a header
+            // without its payload. Two separate write_all calls open a
+            // window where the writer is preempted mid-frame and the
+            // reader's read_exact(payload) times out having consumed
+            // partial bytes, desyncing the stream — the reader-side
+            // commit protects against it too, but on loopback one
+            // buffer → one write → the frame lands atomically, and
+            // these frames are bytes-cheap to copy.
+            MuxRecord::Data { .. } | MuxRecord::Control(_) => {
+                let mut frame = Vec::with_capacity(MUX_HEADER_LEN + payload.len());
+                frame.extend_from_slice(&hdr);
+                frame.extend_from_slice(&payload);
+                w.write_all(&frame).map_err(|e| {
+                    TensorError::new(&format!("relay_mux: record write failed: {e}"))
+                })?;
+            }
+        }
         Ok(())
     }
 
