@@ -220,6 +220,30 @@ pub struct ElCheConfig {
     /// (`nₖ = 0`) contribute zero mass for any `γ` (the idle guard in
     /// the shared `realized_work` vocabulary).
     pub gamma: f64,
+    /// Ship the CPU-averaging plane's model traffic (params / buffers)
+    /// as bfloat16 instead of f32, halving the per-sync payload at
+    /// every hop: the rank's pinned parameter snapshot, the rank→relay
+    /// frames, the per-host fold shipped upstream, and the scattered
+    /// consensus. Default `false` (f32, byte-identical to prior
+    /// behavior).
+    ///
+    /// The averaging math itself stays in f32 — every accumulator (the
+    /// relay fold, the controller's sum, the outer optimizer state)
+    /// decodes bf16 at the boundary and re-encodes after; bf16 exists
+    /// only on the wire and in the staging buffers. Control traffic
+    /// (count gathers, the formation broadcast) always rides f32, so
+    /// bookkeeping and initial state stay byte-exact. Consensus
+    /// checkpoints are written f32 regardless.
+    ///
+    /// The cost is a bf16 quantization of the consensus each sync
+    /// (~3 significant decimal digits, the same wire precision the
+    /// bf16-compression hooks in other DDP stacks accept). Honored on
+    /// the CPU backends in cluster (process-per-rank) runs; ignored by
+    /// the NCCL modes (their reduce never leaves the GPUs) and by the
+    /// single-process thread path. Must be set identically on every
+    /// rank — a mixed cohort fails loudly at the first fold with a
+    /// frame-schema dtype mismatch.
+    pub bf16_wire: bool,
 }
 
 impl ElCheConfig {
@@ -294,6 +318,9 @@ impl ElCheConfig {
             // Plain work-weighting (nₖ¹): the production default, byte-identical
             // to pre-gamma behavior.
             gamma: 1.0,
+            // f32 wire: byte-identical to prior behavior; bf16 is opt-in
+            // until the convergence A/B says otherwise.
+            bf16_wire: false,
         }
     }
 
@@ -337,6 +364,10 @@ impl ElCheConfig {
     /// `1.0` = plain work-weighting (default), `0.0` = unweighted average,
     /// `−1.0` = per-step-equal. Honored on both backends.
     pub fn gamma(mut self, g: f64) -> Self { self.gamma = g; self }
+    /// Ship the CPU-averaging plane's model traffic as bfloat16 (see
+    /// [`Self::bf16_wire`]). Halves snapshots, fold traffic, and wire
+    /// payloads; averaging still accumulates in f32.
+    pub fn bf16_wire(mut self, on: bool) -> Self { self.bf16_wire = on; self }
 }
 
 impl Default for ElCheConfig {
@@ -371,6 +402,7 @@ impl std::fmt::Debug for ElCheConfig {
             .field("no_divergence_guard", &self.no_divergence_guard)
             .field("max_overshoot", &self.max_overshoot)
             .field("gamma", &self.gamma)
+            .field("bf16_wire", &self.bf16_wire)
             .finish()
     }
 }

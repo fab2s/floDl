@@ -18,8 +18,21 @@ use super::GpuWorker;
 /// (`cudaMemcpyAsync` from pageable host memory silently falls back to a
 /// synchronous staged bounce copy). Allocated once per param/buffer and
 /// reused every reduce window — see `GpuWorker::snapshot_pinned_params`.
-fn pinned_like(t: &Tensor) -> Result<Tensor> {
-    let opts = TensorOptions { dtype: t.dtype(), device: Device::CPU };
+///
+/// `as_bf16` stages a Float32 tensor as BFloat16 instead (the `copy_`
+/// into the buffer casts on the source device, so the D2H moves half
+/// the bytes) — the [`WorkerConfig::bf16_wire`] param staging. Non-f32
+/// tensors keep their dtype regardless (integer buffers must round-trip
+/// exactly, and the reduce bridge selects f32 buffers by dtype).
+///
+/// [`WorkerConfig::bf16_wire`]: crate::distributed::ddp_run::WorkerConfig::bf16_wire
+fn pinned_like(t: &Tensor, as_bf16: bool) -> Result<Tensor> {
+    let dtype = if as_bf16 && t.dtype() == crate::tensor::DType::Float32 {
+        crate::tensor::DType::BFloat16
+    } else {
+        t.dtype()
+    };
+    let opts = TensorOptions { dtype, device: Device::CPU };
     Tensor::empty(&t.shape(), opts)?.pin_memory()
 }
 
@@ -279,14 +292,16 @@ impl<M: Module> GpuWorker<M> {
         if self.snapshot_pinned_params.is_empty() && !self.param_vars.is_empty() {
             let mut bufs = Vec::with_capacity(self.param_vars.len());
             for v in &self.param_vars {
-                bufs.push(pinned_like(&v.data())?);
+                bufs.push(pinned_like(&v.data(), self.bf16_wire)?);
             }
             self.snapshot_pinned_params = bufs;
         }
         if self.snapshot_pinned_buffers.is_empty() && !self.buffer_list.is_empty() {
             let mut bufs = Vec::with_capacity(self.buffer_list.len());
             for b in &self.buffer_list {
-                bufs.push(pinned_like(&b.get())?);
+                // Never bf16 (see the field doc: the bridge's f32 filter
+                // + exact integer counters).
+                bufs.push(pinned_like(&b.get(), false)?);
             }
             self.snapshot_pinned_buffers = bufs;
         }
@@ -312,6 +327,31 @@ impl<M: Module> GpuWorker<M> {
             self.snapshot_pinned_params.clone(),
             self.snapshot_pinned_buffers.clone(),
         ))
+    }
+
+    /// Exact (dtype-preserving) snapshot for end-of-training reporting:
+    /// always the per-tensor passthrough, never the pinned staging. Under
+    /// `bf16_wire` the staging quantizes params to bf16 — fine for the
+    /// averaging plane it feeds, wrong for the trained weights the final
+    /// snapshot becomes (`TrainedState` / checkpoints must not inherit
+    /// wire quantization). One synchronous readout at the very end of
+    /// training costs nothing on any clock that matters.
+    pub fn snapshot_params_exact(&mut self) -> ParamSnapshot {
+        // Same entry fences as `snapshot_params`: the readout must not
+        // race in-flight optimizer kernels or a pending writeback.
+        if let Some(stream) = &self.compute_stream {
+            let _ = stream.synchronize();
+        }
+        if let Some(stream) = &self.comm_stream {
+            let _ = stream.synchronize();
+        }
+        let (params, buffers) = self.read_params_passthrough();
+        ParamSnapshot {
+            rank: self.rank,
+            params,
+            buffers,
+            batch_count: self.steps_since_avg,
+        }
     }
 
     /// Per-tensor synchronous readout fallback: copy each param / buffer to

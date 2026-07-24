@@ -48,8 +48,12 @@ impl RoundKind {
 
 /// A round's payload: a list of tensors with shape + dtype + data.
 ///
-/// Identical shape sent rank→controller and controller→rank. v1 only
-/// supports `DTYPE_F32`; controller errors loudly on other dtypes.
+/// Identical shape sent rank→controller and controller→rank. Payloads
+/// carry [`DTYPE_F32`] or [`DTYPE_BF16`] tensor bytes; every frame of a
+/// round must agree on the dtype per tensor (the fold validates the
+/// schema and errors loudly on a mismatch — a cohort where some ranks
+/// enabled `bf16_wire` and some did not is a config error, not a
+/// tolerable variation).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RoundFrame {
     pub tensors: Vec<TensorPayload>,
@@ -80,7 +84,7 @@ pub struct RoundFrame {
 /// One tensor inside a [`RoundFrame`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorPayload {
-    /// Wire dtype tag (see [`DTYPE_F32`]).
+    /// Wire dtype tag (see [`DTYPE_F32`] / [`DTYPE_BF16`]).
     pub dtype: u8,
     /// Tensor shape.
     pub shape: Vec<u32>,
@@ -346,9 +350,11 @@ pub(crate) fn write_round_frame<W: Write>(
 /// Validates that every accepted frame has identical schema (same
 /// number of tensors, same dtype per tensor, same shape per tensor).
 ///
-/// v1 supports only [`DTYPE_F32`]; loud error on other dtypes (so a
-/// future user wiring f16 here gets a clear pointer at where to add
-/// support, instead of silent garbage from byte-level summation).
+/// Supports [`DTYPE_F32`] and [`DTYPE_BF16`] payloads; loud error on
+/// other dtypes. The sum ALWAYS ACCUMULATES IN F32 whatever the payload
+/// dtype — bf16 exists only on the wire, decoded per element into the
+/// f32 accumulator — and the output payload re-encodes in the input
+/// dtype, so a fold tier never changes the frame schema it forwards.
 /// Element-wise sum of `frames`, masses summed, kind preserved — the
 /// associative fold monoid shared by the per-host relay fold
 /// ([`crate::distributed::relay`]) and the controller's final reduce.
@@ -410,36 +416,32 @@ pub(crate) fn sum_frames(frames: &[&RoundFrame]) -> Result<RoundFrame> {
         }
     }
 
-    // Sum per tensor.
+    // Sum per tensor: decode each payload straight into the f32
+    // accumulator (no intermediate Vec per frame), re-encode the sum in
+    // the input dtype.
     let mut out_tensors = Vec::with_capacity(ref_frame.tensors.len());
     for ti in 0..ref_frame.tensors.len() {
         let dtype = ref_frame.tensors[ti].dtype;
-        if dtype != DTYPE_F32 {
-            return Err(TensorError::new(&format!(
-                "cluster_controller: tensor[{ti}] dtype {dtype} not supported in v1 \
-                 (only DTYPE_F32 = 0 supported). Add other dtypes in controller.rs::sum_frames."
-            )));
-        }
+        let elem = payload_element_size(dtype).map_err(|e| {
+            TensorError::new(&format!("cluster_controller: tensor[{ti}]: {e}"))
+        })?;
         let shape = ref_frame.tensors[ti].shape.clone();
         let numel = ref_frame.tensors[ti].numel();
-        if numel * std::mem::size_of::<f32>() != ref_frame.tensors[ti].bytes.len() {
+        if numel * elem != ref_frame.tensors[ti].bytes.len() {
             return Err(TensorError::new(&format!(
-                "cluster_controller: tensor[{ti}] shape {shape:?} numel*sizeof(f32) {} != nbytes {}",
-                numel * std::mem::size_of::<f32>(),
+                "cluster_controller: tensor[{ti}] shape {shape:?} numel*element_size {} != nbytes {}",
+                numel * elem,
                 ref_frame.tensors[ti].bytes.len()
             )));
         }
         let mut accum: Vec<f32> = vec![0.0; numel];
         for f in frames.iter() {
-            let view = bytes_as_f32(&f.tensors[ti].bytes)?;
-            for (a, x) in accum.iter_mut().zip(view.iter()) {
-                *a += *x;
-            }
+            accumulate_payload_into(&f.tensors[ti], &mut accum)?;
         }
         out_tensors.push(TensorPayload {
-            dtype: DTYPE_F32,
+            dtype,
             shape,
-            bytes: f32_to_bytes(&accum),
+            bytes: f32_slice_to_payload_bytes(&accum, dtype)?,
         });
     }
     Ok(RoundFrame {
@@ -473,16 +475,149 @@ pub(super) fn reduce_realized_work(frames: &[Option<RoundFrame>]) -> Result<Roun
     {
         let inv = (1.0 / summed.weight) as f32;
         for payload in &mut summed.tensors {
-            let mut vals = bytes_as_f32(&payload.bytes)?;
-            for v in &mut vals {
-                *v *= inv;
-            }
-            payload.bytes = f32_to_bytes(&vals);
+            scale_payload(payload, inv)?;
         }
     }
     Ok(summed)
 }
 
+// ---------------------------------------------------------------------------
+// Payload byte codec (f32 / bf16)
+// ---------------------------------------------------------------------------
+//
+// bf16 is the top 16 bits of an f32, so the codec is pure byte math —
+// no tensor ops on the wire path. Encoding rounds to nearest-even
+// (matching libtorch's f32→bf16 cast), decoding is exact.
+
+/// Round-to-nearest-even f32 → bf16 conversion (bit-level, matches the
+/// IEEE default rounding libtorch uses). NaN is quietened (mantissa MSB
+/// forced) so a NaN payload can never round into an infinity.
+pub(crate) fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if x.is_nan() {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let round_bit = (bits >> 16) & 1;
+    ((bits + 0x7FFF + round_bit) >> 16) as u16
+}
+
+/// Exact bf16 → f32 conversion (bf16 is a truncated f32).
+pub(crate) fn bf16_bits_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// Element size in bytes for a wire dtype tag; loud error on unknown
+/// tags (the extension pointer for any future dtype).
+pub(crate) fn payload_element_size(dtype: u8) -> Result<usize> {
+    match dtype {
+        DTYPE_F32 => Ok(4),
+        DTYPE_BF16 => Ok(2),
+        other => Err(TensorError::new(&format!(
+            "unsupported wire dtype tag {other} (0 = f32, 1 = bf16); extend \
+             round_frame.rs::payload_element_size and the codec helpers together"
+        ))),
+    }
+}
+
+/// Decode `payload`'s bytes element-wise into the f32 accumulator
+/// (`accum[i] += decode(payload[i])`), without materializing an
+/// intermediate f32 vector. The fold's inner loop — payloads are
+/// model-sized, so the zero-alloc path matters for the per-host RAM
+/// peak.
+pub(crate) fn accumulate_payload_into(
+    payload: &TensorPayload,
+    accum: &mut [f32],
+) -> Result<()> {
+    let elem = payload_element_size(payload.dtype)?;
+    if payload.bytes.len() != accum.len() * elem {
+        return Err(TensorError::new(&format!(
+            "payload byte count {} != accumulator numel {} x element size {elem}",
+            payload.bytes.len(),
+            accum.len(),
+        )));
+    }
+    match payload.dtype {
+        DTYPE_F32 => {
+            for (a, c) in accum.iter_mut().zip(payload.bytes.chunks_exact(4)) {
+                *a += f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        DTYPE_BF16 => {
+            for (a, c) in accum.iter_mut().zip(payload.bytes.chunks_exact(2)) {
+                *a += bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+        }
+        _ => unreachable!("payload_element_size validated the tag"),
+    }
+    Ok(())
+}
+
+/// Decode a payload into an owned f32 vector (exact for both dtypes —
+/// bf16 upcasts losslessly).
+pub(crate) fn payload_to_f32(payload: &TensorPayload) -> Result<Vec<f32>> {
+    let elem = payload_element_size(payload.dtype)?;
+    if payload.bytes.len() % elem != 0 {
+        return Err(TensorError::new(&format!(
+            "payload byte count {} not divisible by element size {elem}",
+            payload.bytes.len(),
+        )));
+    }
+    let mut out = vec![0.0f32; payload.bytes.len() / elem];
+    accumulate_payload_into(payload, &mut out)?;
+    Ok(out)
+}
+
+/// Encode an f32 slice as payload bytes in `dtype` (f32 verbatim
+/// little-endian, bf16 via round-to-nearest-even).
+pub(crate) fn f32_slice_to_payload_bytes(data: &[f32], dtype: u8) -> Result<Vec<u8>> {
+    let elem = payload_element_size(dtype)?;
+    let mut out = Vec::with_capacity(data.len() * elem);
+    match dtype {
+        DTYPE_F32 => {
+            for x in data {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        DTYPE_BF16 => {
+            for x in data {
+                out.extend_from_slice(&f32_to_bf16_bits(*x).to_le_bytes());
+            }
+        }
+        _ => unreachable!("payload_element_size validated the tag"),
+    }
+    Ok(out)
+}
+
+/// Multiply every element of `payload` by `factor` in place (byte-level;
+/// per-element decode → f32 multiply → re-encode for bf16). Used by the
+/// divide-once normalization.
+pub(crate) fn scale_payload(payload: &mut TensorPayload, factor: f32) -> Result<()> {
+    match payload.dtype {
+        DTYPE_F32 => {
+            for c in payload.bytes.chunks_exact_mut(4) {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * factor;
+                c.copy_from_slice(&v.to_le_bytes());
+            }
+            Ok(())
+        }
+        DTYPE_BF16 => {
+            for c in payload.bytes.chunks_exact_mut(2) {
+                let v = bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])) * factor;
+                c.copy_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+            }
+            Ok(())
+        }
+        other => Err(TensorError::new(&format!(
+            "scale_payload: unsupported wire dtype tag {other}"
+        ))),
+    }
+}
+
+/// Test-only f32 byte helpers, superseded in production by the
+/// dtype-aware codec above ([`payload_to_f32`] /
+/// [`f32_slice_to_payload_bytes`]); kept for the controller tests'
+/// plain-f32 fixtures.
+#[cfg(test)]
 pub(super) fn bytes_as_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return Err(TensorError::new(&format!(
@@ -500,6 +635,8 @@ pub(super) fn bytes_as_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Test-only companion to [`bytes_as_f32`].
+#[cfg(test)]
 pub(super) fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 4);
     for x in data {

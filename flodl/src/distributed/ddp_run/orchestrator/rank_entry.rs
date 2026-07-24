@@ -519,12 +519,18 @@ impl DdpHandle {
             AverageBackend::Cpu => None,
         };
         let mut cpu_client = match &controller_addr_str {
-            Some(addr) => Some(crate::distributed::cpu_reduce::CpuReduceClient::connect(
-                parse_or_resolve_socket_addr(addr)?,
-                global_rank as u32,
-                world_size as u32,
-                session_salt,
-            )?),
+            Some(addr) => {
+                let mut client = crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                    parse_or_resolve_socket_addr(addr)?,
+                    global_rank as u32,
+                    world_size as u32,
+                    session_salt,
+                )?;
+                // Model frames ride bf16 when configured (Control frames
+                // — including the initial broadcast below — stay f32).
+                client.set_bf16_wire(config.elche.bf16_wire);
+                Some(client)
+            }
             None => None,
         };
 
@@ -629,6 +635,7 @@ impl DdpHandle {
             // point (`GpuWorker::new`); pass the configured value through.
             easgd_alpha: config.elche.easgd_alpha,
             gamma: config.elche.gamma,
+            bf16_wire: config.elche.bf16_wire,
             timeline: config.timeline.clone(),
             policy,
             save_path,

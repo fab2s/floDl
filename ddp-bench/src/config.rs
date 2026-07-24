@@ -290,6 +290,11 @@ pub struct RunConfig {
     /// Consensus allocation-weighting exponent `γ` (rank weighted `nₖ^γ`).
     /// `1.0` = plain work-weighting (default). CPU backend only.
     pub gamma: f64,
+    /// Ship the CPU-averaging plane's model traffic as bfloat16
+    /// (`--bf16-wire`): halves pinned snapshots, relay fold traffic, and
+    /// wire payloads; averaging still accumulates in f32. CPU averaging
+    /// modes only — the builder errors loudly on nccl-* modes.
+    pub bf16_wire: bool,
     /// Augmentation multiplicity (`--augment`): each sample appears k
     /// times per epoch as distinct schedule picks. 1 = off.
     pub augment: usize,

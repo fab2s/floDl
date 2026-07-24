@@ -207,6 +207,13 @@ struct Cli {
     #[option]
     gamma: Option<f64>,
 
+    /// Ship the CPU-averaging plane's model traffic as bfloat16: halves
+    /// pinned snapshots, relay fold traffic, and wire payloads (averaging
+    /// still accumulates in f32; checkpoints and the final weights stay
+    /// exact f32). CPU averaging modes only — errors loudly on nccl-*.
+    #[option]
+    bf16_wire: bool,
+
     /// Augmentation multiplicity: each sample appears k times per epoch
     /// as distinct schedule picks (flodl `.augment(k)`) — the epoch's
     /// work scales by k and the picks shard/balance exactly like
@@ -960,6 +967,7 @@ fn run() -> flodl::tensor::Result<()> {
                 max_failure: cli.max_failure,
                 outer_optimizer: outer_opt_choice.clone(),
                 gamma: cli.gamma.unwrap_or(1.0),
+                bf16_wire: cli.bf16_wire,
                 augment: cli.augment.unwrap_or(1).max(1),
                 augment_noise: cli.augment_noise.unwrap_or(0.0),
                 vram_max_usage: cli.vram_max_usage,

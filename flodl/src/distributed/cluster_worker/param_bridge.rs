@@ -65,9 +65,24 @@ pub(super) fn param_bridge_loop(
         );
 
         // One-time scratch allocation matched to the snapshot shapes.
+        // Explicitly f32 (NOT zeros_like): under `bf16_wire` the snapshot
+        // tensors are bf16, and the divergence math mutates the scratch
+        // in place (`foreach_add_list_`), where a bf16 output cannot
+        // absorb the f32 consensus. The `copy_` below upcasts bf16 →
+        // f32 exactly, so the triple keeps full precision either way.
         if pre_scratch.is_none() {
-            let allocated: Result<Vec<Tensor>> =
-                params.iter().map(Tensor::zeros_like).collect();
+            let allocated: Result<Vec<Tensor>> = params
+                .iter()
+                .map(|t| {
+                    Tensor::zeros(
+                        &t.shape(),
+                        crate::tensor::TensorOptions {
+                            dtype: crate::tensor::DType::Float32,
+                            device: crate::tensor::Device::CPU,
+                        },
+                    )
+                })
+                .collect();
             match allocated {
                 Ok(s) => pre_scratch = Some(s),
                 Err(e) => {
@@ -121,8 +136,11 @@ pub(super) fn param_bridge_loop(
         // per-host partial sum (the relay sum-and-count) without
         // averaging-of-averages. A rank that did 0 steps still holds
         // the previous consensus, so it contributes zero mass — but it
-        // STILL joins every collective, so no rank stalls. f32 only in
-        // v1; CpuReduceClient surfaces a loud error otherwise.
+        // STILL joins every collective, so no rank stalls. Model frames
+        // ride the client's wire dtype (f32, or bf16 under
+        // `ElCheConfig::bf16_wire` — the client casts whatever staging
+        // dtype the snapshot arrived in, so the frame schema stays
+        // uniform across the cohort).
         //
         // The count gather is the all-idle skip signal (and schedule
         // telemetry): every rank learns Σ n_i and makes the identical
@@ -154,6 +172,12 @@ pub(super) fn param_bridge_loop(
         // the mass it accepted. Only the params consensus is
         // gamma-weighted; buffers stay equal-weighted among movers.
         let my_w = crate::distributed::realized_work::gamma_mass(n_i as f64, gamma);
+        // All-idle keep-local: the snapshot clones go back down as the
+        // "consensus". Under bf16 staging that re-adopts bf16-quantized
+        // params — idempotent after the first sync (adopted consensus
+        // values are bf16-representable, so re-quantizing is a no-op);
+        // only an EASGD-blended state could pick up one ~2⁻⁹-relative
+        // rounding on an (already rare) all-idle round.
         let avg_params = if total_n == 0.0 {
             params.clone()
         } else {
@@ -294,9 +318,11 @@ pub(crate) fn sumcount_reduce(
         .iter()
         .map(|t| t.mul_scalar(my_weight))
         .collect::<Result<_>>()?;
-    let refs: Vec<&Tensor> = scaled.iter().collect();
-    let (consensus, realized) = client.all_reduce_weighted(
-        &refs,
+    // Ownership handoff: the scaled scratch (a whole model copy on the
+    // params reduce) is freed the moment the wire frame is encoded,
+    // instead of sitting live across the barrier on every rank at once.
+    let (consensus, realized) = client.all_reduce_weighted_owned(
+        scaled,
         crate::distributed::controller::RoundKind::Model,
         my_weight,
     )?;

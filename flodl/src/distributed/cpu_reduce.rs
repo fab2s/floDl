@@ -30,8 +30,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use crate::distributed::controller::{
-    self, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK, PROTOCOL_VERSION,
-    RoundFrame, RoundKind, TensorPayload,
+    self, DTYPE_BF16, DTYPE_F32, HANDSHAKE_MAGIC_CONTROLLER_ACK, HANDSHAKE_MAGIC_RANK,
+    PROTOCOL_VERSION, RoundFrame, RoundKind, TensorPayload,
 };
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -82,6 +82,15 @@ pub struct CpuReduceClient {
     /// construction. When false the per-phase timing and the teardown
     /// summary are skipped entirely.
     prof_enabled: bool,
+    /// Wire dtype for [`RoundKind::Model`] frames (params / buffers) —
+    /// [`DTYPE_F32`] (default) or [`DTYPE_BF16`] via
+    /// [`Self::set_bf16_wire`]. [`RoundKind::Control`] frames (count
+    /// gathers, formation broadcasts) ALWAYS ride f32: bookkeeping must
+    /// be exact (bf16 cannot represent integers above 256), and the
+    /// volume lives in the model frames anyway. Must agree across the
+    /// cohort — a dtype mix surfaces as a loud schema error at the first
+    /// fold.
+    model_wire_dtype: u8,
 }
 
 
@@ -155,6 +164,7 @@ impl CpuReduceClient {
             prof_bytes: 0,
             prof_count: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
+            model_wire_dtype: DTYPE_F32,
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -218,6 +228,16 @@ impl CpuReduceClient {
         self.world_size
     }
 
+    /// Ship [`RoundKind::Model`] frames (params / buffers) as bf16
+    /// instead of f32, halving the reduce payload both directions. See
+    /// [`ElCheConfig::bf16_wire`](crate::distributed::ElCheConfig::bf16_wire)
+    /// for the semantics (averaging still accumulates in f32; the cast
+    /// lives at the wire boundary). [`RoundKind::Control`] traffic stays
+    /// f32 regardless. Must be set identically on every rank.
+    pub fn set_bf16_wire(&mut self, on: bool) {
+        self.model_wire_dtype = if on { DTYPE_BF16 } else { DTYPE_F32 };
+    }
+
     /// Send this rank's frame for the current round and receive the
     /// averaged frame back.
     ///
@@ -226,10 +246,18 @@ impl CpuReduceClient {
     /// any wire-level failure (truncated read, EOF before the averaged
     /// frame, magic mismatch).
     ///
+    /// Consumes `frame` and DROPS IT right after the write, before the
+    /// blocking read: model frames are hundreds of MB, and every rank
+    /// sits at this barrier simultaneously, so holding the sent payload
+    /// through the reply read doubles the cohort's sync-window RAM peak
+    /// for no reason (measured as part of the first-sync OOM spike on
+    /// the 8GB two-rank VM).
+    ///
     /// The returned frame has the same tensor count, dtypes, and shapes
     /// as the input frame; only the tensor bytes change.
-    pub fn all_reduce(&mut self, frame: &RoundFrame) -> Result<RoundFrame> {
-        write_framed_round(&mut self.stream, frame, &self.salt)?;
+    pub fn all_reduce(&mut self, frame: RoundFrame) -> Result<RoundFrame> {
+        write_framed_round(&mut self.stream, &frame, &self.salt)?;
+        drop(frame);
         match read_framed_round(&mut self.stream, &self.salt)? {
             Some(f) => Ok(f),
             None => Err(TensorError::new(
@@ -252,43 +280,83 @@ impl CpuReduceClient {
     /// [`RoundKind::Control`]: pure element-wise sum (gathers /
     /// broadcasts build on it); the returned mass is informational.
     ///
-    /// v1 supports f32 only; loud error on other dtypes. Caller is
-    /// responsible for moving reduced tensors back to GPU if needed.
+    /// `Model` frames ride [`Self::set_bf16_wire`]'s dtype; `Control`
+    /// frames always ride f32. Caller is responsible for moving reduced
+    /// tensors back to GPU if needed.
     pub fn all_reduce_weighted(
         &mut self,
         tensors: &[&Tensor],
         kind: RoundKind,
         weight: f64,
     ) -> Result<(Vec<Tensor>, f64)> {
-        // Instrumentation (gated on `-vvv`): time the three phases
-        // independently so we can attribute the cpu-cadence reduce floor
-        // to serialize (incl. GPU→CPU via `to_blob`) / wire (cross-host
-        // TCP round-trip) / deserialize. Summed across reduces, emitted
-        // at teardown by `log_profile_summary`.
-        if !self.prof_enabled {
-            let mut frame = tensors_to_round_frame(tensors)?;
-            frame.kind = kind;
-            frame.weight = weight;
-            let reduced = self.all_reduce(&frame)?;
-            return Ok((round_frame_to_tensors(&reduced)?, reduced.weight));
-        }
         let t0 = Instant::now();
-        let mut frame = tensors_to_round_frame(tensors)?;
+        let frame = tensors_to_round_frame(tensors, self.wire_dtype_for(kind))?;
+        self.round_trip(frame, kind, weight, t0)
+    }
+
+    /// [`Self::all_reduce_weighted`] taking OWNERSHIP of the tensors and
+    /// dropping them the moment the frame is encoded — before the
+    /// blocking round-trip. For the params reduce the input is a
+    /// model-sized scaled scratch copy per rank; holding it across the
+    /// barrier (where every rank's copy is live at once) was part of the
+    /// first-sync RAM spike that OOM'd the two-rank 8GB VM. Use this
+    /// whenever the caller has no post-reduce use for the inputs.
+    pub fn all_reduce_weighted_owned(
+        &mut self,
+        tensors: Vec<Tensor>,
+        kind: RoundKind,
+        weight: f64,
+    ) -> Result<(Vec<Tensor>, f64)> {
+        let t0 = Instant::now();
+        let frame = {
+            let refs: Vec<&Tensor> = tensors.iter().collect();
+            tensors_to_round_frame(&refs, self.wire_dtype_for(kind))?
+        };
+        drop(tensors);
+        self.round_trip(frame, kind, weight, t0)
+    }
+
+    /// Wire dtype for a round kind: `Model` rides the configured dtype,
+    /// `Control` is always f32 (see [`Self::set_bf16_wire`]).
+    fn wire_dtype_for(&self, kind: RoundKind) -> u8 {
+        match kind {
+            RoundKind::Model => self.model_wire_dtype,
+            RoundKind::Control => DTYPE_F32,
+        }
+    }
+
+    /// Shared round-trip tail: tag the frame, reduce, decode.
+    ///
+    /// Instrumentation (gated on `-vvv`): times the three phases
+    /// independently so the cpu-cadence reduce floor can be attributed
+    /// to serialize (incl. GPU→CPU via `to_blob`; measured from `t0`,
+    /// taken by the caller before frame build) / wire (cross-host TCP
+    /// round-trip) / deserialize. Summed across reduces, emitted at
+    /// teardown by `log_profile_summary`.
+    fn round_trip(
+        &mut self,
+        mut frame: RoundFrame,
+        kind: RoundKind,
+        weight: f64,
+        t0: Instant,
+    ) -> Result<(Vec<Tensor>, f64)> {
         frame.kind = kind;
         frame.weight = weight;
+        if !self.prof_enabled {
+            let reduced = self.all_reduce(frame)?;
+            return Ok((round_frame_to_tensors(&reduced)?, reduced.weight));
+        }
+        // Byte count captured pre-send (`all_reduce` consumes the frame).
+        let sent_bytes: u64 = frame.tensors.iter().map(|p| p.bytes.len() as u64).sum();
         let t1 = Instant::now();
-        let reduced = self.all_reduce(&frame)?;
+        let reduced = self.all_reduce(frame)?;
         let t2 = Instant::now();
         let out = round_frame_to_tensors(&reduced)?;
         let t3 = Instant::now();
         self.prof_serialize_ns += (t1 - t0).as_nanos();
         self.prof_wire_ns += (t2 - t1).as_nanos();
         self.prof_deserialize_ns += (t3 - t2).as_nanos();
-        self.prof_bytes += frame
-            .tensors
-            .iter()
-            .map(|p| p.bytes.len() as u64)
-            .sum::<u64>();
+        self.prof_bytes += sent_bytes;
         self.prof_count += 1;
         Ok((out, reduced.weight))
     }
@@ -359,8 +427,10 @@ impl CpuReduceClient {
     /// returned tensors carry root's values and should be loaded back
     /// into the live parameters via `copy_`.
     ///
-    /// v1 supports root=0 only and f32 tensors (per
-    /// [`tensors_to_round_frame`]). All ranks must call concurrently.
+    /// v1 supports root=0 only. Rides a `Control` frame, so the
+    /// broadcast is byte-exact f32 regardless of the model wire dtype
+    /// (every rank must start from IDENTICAL state). All ranks must
+    /// call concurrently.
     pub fn broadcast_from_root(
         &mut self,
         tensors: &[&Tensor],
@@ -408,8 +478,8 @@ impl CpuReduceClient {
     /// contributions only.
     ///
     /// Counterpart to [`Ddp::all_reduce_per_rank_f64`](crate::distributed::Ddp::all_reduce_per_rank_f64)
-    /// — same semantics, CPU-routed. v1 carries f32 over the wire (the
-    /// controller's only supported dtype); precision is preserved at the
+    /// — same semantics, CPU-routed. Rides a `Control` frame, so it
+    /// carries f32 regardless of the model wire dtype; precision is preserved at the
     /// millisecond level for ElChe timing and at f32-mantissa precision
     /// for divergence aggregation, both within tolerance of the
     /// downstream consumers.
@@ -432,10 +502,12 @@ impl CpuReduceClient {
             Device::CPU,
         )?;
         // Bookkeeping reduce: tag it `Control` so the consensus-checkpoint
-        // forge never mistakes this count vector for a slice of the model.
-        let mut frame = tensors_to_round_frame(&[&tensor])?;
+        // forge never mistakes this count vector for a slice of the model
+        // (and so it rides f32 regardless of the model wire dtype — bf16
+        // cannot represent batch counts above 256 exactly).
+        let mut frame = tensors_to_round_frame(&[&tensor], DTYPE_F32)?;
         frame.kind = RoundKind::Control;
-        let averaged = self.all_reduce(&frame)?;
+        let averaged = self.all_reduce(frame)?;
         let out = round_frame_to_tensors(&averaged)?;
         let avg = out
             .first()
@@ -488,24 +560,39 @@ fn read_framed_round<R: Read>(stream: &mut R, salt: &SessionSalt) -> Result<Opti
 // Tensor ↔ RoundFrame conversion
 // ---------------------------------------------------------------------------
 
-/// Build a [`RoundFrame`] from a slice of tensors.
+/// Build a [`RoundFrame`] from a slice of tensors, encoding every
+/// payload in `wire_dtype` ([`DTYPE_F32`] or [`DTYPE_BF16`]).
 ///
 /// Each tensor is moved to CPU via [`Tensor::to_blob`] (transparently
 /// handles GPU→CPU transfer) and serialized as raw native-byte-order
-/// f32 bytes. Shape is captured as `Vec<u32>` (matches the wire
-/// protocol; loud error if any dim doesn't fit in u32).
+/// bytes. Shape is captured as `Vec<u32>` (matches the wire protocol;
+/// loud error if any dim doesn't fit in u32).
 ///
-/// v1 dtype support: f32 only. Other dtypes produce a loud error with
-/// a pointer to where to extend (mirrors controller-side reduce_average
-/// restriction; both must lift together when adding f16/bf16).
-pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
+/// Accepts `Float32` and `BFloat16` tensors; a tensor whose dtype
+/// already matches `wire_dtype` serializes verbatim, anything else is
+/// cast through `to_dtype` first. Enforcing the wire dtype HERE (rather
+/// than following each tensor's dtype) is load-bearing: the pinned
+/// snapshot readout falls back to an f32 passthrough on failure, and a
+/// single rank silently switching frame dtype mid-run would desync the
+/// round schema and tear the cohort down — the cast makes every frame
+/// uniform whatever staging path produced the tensors.
+pub fn tensors_to_round_frame(tensors: &[&Tensor], wire_dtype: u8) -> Result<RoundFrame> {
+    let wire_tensor_dtype = match wire_dtype {
+        DTYPE_F32 => DType::Float32,
+        DTYPE_BF16 => DType::BFloat16,
+        other => {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: unsupported wire dtype tag {other} (0 = f32, 1 = bf16)"
+            )));
+        }
+    };
     let mut payloads = Vec::with_capacity(tensors.len());
     for (i, t) in tensors.iter().enumerate() {
-        if t.dtype() != DType::Float32 {
+        if !matches!(t.dtype(), DType::Float32 | DType::BFloat16) {
             return Err(TensorError::new(&format!(
-                "cpu_reduce: tensor[{i}] dtype {:?} not supported in v1 \
-                 (only Float32). Extend cpu_reduce.rs::tensors_to_round_frame \
-                 and controller.rs::reduce_average together to add support.",
+                "cpu_reduce: tensor[{i}] dtype {:?} not supported (only Float32 \
+                 / BFloat16). Extend cpu_reduce.rs::tensors_to_round_frame and \
+                 the round_frame.rs codec helpers together to add support.",
                 t.dtype()
             )));
         }
@@ -522,9 +609,16 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
                 })
             })
             .collect::<Result<_>>()?;
-        let bytes = t.to_blob()?;
+        let bytes = if t.dtype() == wire_tensor_dtype {
+            t.to_blob()?
+        } else {
+            // Cast on-device before the blob so the transient is
+            // wire-sized, not always f32-sized (libtorch's cast rounds
+            // to nearest-even, same as the byte codec).
+            t.to_dtype(wire_tensor_dtype)?.to_blob()?
+        };
         payloads.push(TensorPayload {
-            dtype: DTYPE_F32,
+            dtype: wire_dtype,
             shape,
             bytes,
         });
@@ -541,46 +635,40 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor]) -> Result<RoundFrame> {
 
 /// Build a list of new CPU `Tensor`s from a [`RoundFrame`].
 ///
-/// Inverse of [`tensors_to_round_frame`]. Each payload's bytes are
-/// interpreted as little-endian f32 (matches the wire format), reshaped
-/// per the payload's shape, and packed into a fresh CPU tensor. v1
-/// supports f32 only.
+/// Inverse of [`tensors_to_round_frame`]. Each payload's bytes go
+/// straight into a tensor via [`Tensor::from_blob`] (which validates
+/// shape-vs-byte-count loudly), then bf16 payloads upcast to f32 — the
+/// returned tensors are ALWAYS f32 whatever the wire carried, since
+/// every consumer (param writeback, divergence math, outer-optimizer
+/// state) works in f32. The blob path deliberately skips the
+/// intermediate `Vec<f32>` a per-element decode would allocate: on the
+/// params frame that vector was a whole extra model copy live at the
+/// sync barrier on every rank at once (part of the measured first-sync
+/// RAM spike).
 ///
 /// The returned tensors live on `Device::CPU`. Callers wanting them on
 /// GPU should follow up with [`Tensor::to_device`].
 pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
     let mut out = Vec::with_capacity(frame.tensors.len());
     for (i, p) in frame.tensors.iter().enumerate() {
-        if p.dtype != DTYPE_F32 {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: payload[{i}] dtype {} not supported in v1 \
-                 (only DTYPE_F32 = 0)",
-                p.dtype
-            )));
-        }
-        if p.bytes.len() % 4 != 0 {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: payload[{i}] byte count {} not divisible by 4 \
-                 (f32 element size)",
-                p.bytes.len()
-            )));
-        }
-        let n = p.bytes.len() / 4;
-        let mut data = Vec::with_capacity(n);
-        for j in 0..n {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&p.bytes[j * 4..(j + 1) * 4]);
-            data.push(f32::from_le_bytes(b));
-        }
+        let dtype = match p.dtype {
+            DTYPE_F32 => DType::Float32,
+            DTYPE_BF16 => DType::BFloat16,
+            other => {
+                return Err(TensorError::new(&format!(
+                    "cpu_reduce: payload[{i}] unsupported wire dtype tag {other} \
+                     (0 = f32, 1 = bf16)"
+                )));
+            }
+        };
         let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
-        let numel_from_shape: i64 = shape.iter().product();
-        if numel_from_shape != n as i64 {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: payload[{i}] shape {shape:?} numel {numel_from_shape} \
-                 != bytes-derived numel {n}"
-            )));
-        }
-        out.push(Tensor::from_f32(&data, &shape, Device::CPU)?);
+        let t = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
+            .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
+        out.push(if dtype == DType::Float32 {
+            t
+        } else {
+            t.to_dtype(DType::Float32)?
+        });
     }
     Ok(out)
 }

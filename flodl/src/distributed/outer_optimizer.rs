@@ -368,6 +368,13 @@ impl OuterStepper {
                 }
                 self.seen_params_this_window = true;
                 let weight = frame.weight;
+                // Scatter in the dtype the round arrived in (the wire
+                // dtype is a rank-side choice; the stepper must not
+                // change the frame schema mid-stream).
+                let wire_dtype = frame
+                    .tensors
+                    .first()
+                    .map_or(crate::distributed::controller::DTYPE_F32, |t| t.dtype);
                 let consensus = round_frame_to_tensors(&frame)?;
                 // First window: no prior anchor — use the consensus, so the
                 // outer gradient is zero and the step is a no-op for any
@@ -380,7 +387,7 @@ impl OuterStepper {
                 // ranks treat `weight == 0` as "keep local state", so
                 // dropping it would turn every outer step into a
                 // cohort-wide no-op adopt.
-                let mut stepped = tensors_to_round_frame(&refs)?;
+                let mut stepped = tensors_to_round_frame(&refs, wire_dtype)?;
                 stepped.weight = weight;
                 Ok(stepped)
             }
@@ -407,6 +414,7 @@ impl OuterStepper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distributed::controller::{DTYPE_BF16, DTYPE_F32};
     use crate::tensor::{Device, test_device};
 
     fn t(vals: &[f32], shape: &[i64]) -> Tensor {
@@ -450,10 +458,10 @@ mod tests {
         let p1 = t(&[4.0, 5.0], &[2]);
         let buf = t(&[9.0, 8.0], &[2]);
 
-        let mut params_frame = tensors_to_round_frame(&[&p0, &p1]).unwrap();
+        let mut params_frame = tensors_to_round_frame(&[&p0, &p1], DTYPE_F32).unwrap();
         params_frame.weight = 1.0; // realized mass: the stepper skips zero-mass frames
-        let buffers_frame = tensors_to_round_frame(&[&buf]).unwrap();
-        let mut control_frame = tensors_to_round_frame(&[&p0]).unwrap();
+        let buffers_frame = tensors_to_round_frame(&[&buf], DTYPE_F32).unwrap();
+        let mut control_frame = tensors_to_round_frame(&[&p0], DTYPE_F32).unwrap();
         control_frame.kind = RoundKind::Control;
 
         let mut stepper = OuterStepper::new(Box::new(OuterAvg));
@@ -473,6 +481,22 @@ mod tests {
         stepper.process_frame(control_frame).unwrap();
         let p_out2 = stepper.process_frame(params_frame.clone()).unwrap();
         assert_eq!(p_out2, params_frame, "params still byte-identical second window");
+    }
+
+    /// A bf16 params frame steps in f32 and re-serializes as bf16 — the
+    /// stepper never changes the frame schema mid-stream. With OuterAvg
+    /// the identity round trip is byte-exact (bf16 → f32 → bf16 RNE is
+    /// the identity on bf16-valued inputs).
+    #[test]
+    fn stepper_preserves_bf16_frame_dtype() {
+        let p = t(&[1.25, -2.5, 3.75], &[3]);
+        let mut params_frame = tensors_to_round_frame(&[&p], DTYPE_BF16).unwrap();
+        params_frame.weight = 1.0;
+        assert_eq!(params_frame.tensors[0].dtype, DTYPE_BF16);
+
+        let mut stepper = OuterStepper::new(Box::new(OuterAvg));
+        let out = stepper.process_frame(params_frame.clone()).unwrap();
+        assert_eq!(out, params_frame, "OuterAvg identity is byte-exact in bf16 too");
     }
 
     #[test]
@@ -508,16 +532,16 @@ mod tests {
     #[test]
     fn stepper_slow_momentum_steps_params_only() {
         // Through the driver: parameters are stepped, buffers pass through.
-        let mut control = tensors_to_round_frame(&[&t(&[0.0], &[1])]).unwrap();
+        let mut control = tensors_to_round_frame(&[&t(&[0.0], &[1])], DTYPE_F32).unwrap();
         control.kind = RoundKind::Control;
-        let buffers = tensors_to_round_frame(&[&t(&[9.0, 8.0], &[2])]).unwrap();
+        let buffers = tensors_to_round_frame(&[&t(&[9.0, 8.0], &[2])], DTYPE_F32).unwrap();
 
         let mut stepper = OuterStepper::new(Box::new(SlowMomentum::new(0.5, 0.9)));
 
         // Window 1: params1=[2,4] (prev==consensus first window -> unchanged),
         // buffers untouched.
         stepper.process_frame(control.clone()).unwrap();
-        let mut p1 = tensors_to_round_frame(&[&t(&[2.0, 4.0], &[2])]).unwrap();
+        let mut p1 = tensors_to_round_frame(&[&t(&[2.0, 4.0], &[2])], DTYPE_F32).unwrap();
         p1.weight = 1.0; // realized mass: the stepper skips zero-mass frames
         let p1_out = stepper.process_frame(p1.clone()).unwrap();
         assert_eq!(p1_out, p1, "first-window params unchanged (g=0)");
@@ -527,7 +551,7 @@ mod tests {
         // Window 2: consensus=[1,2], prev=[2,4]. g=[1,2], v=[1,2],
         // step=0.5*[1,2]=[0.5,1], new=[1.5,3]. Buffers still pass through.
         stepper.process_frame(control).unwrap();
-        let mut p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])]).unwrap();
+        let mut p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])], DTYPE_F32).unwrap();
         p2.weight = 1.0;
         let p2_out = stepper.process_frame(p2).unwrap();
         let stepped = round_frame_to_tensors(&p2_out).unwrap()[0].to_f32_vec().unwrap();

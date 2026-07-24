@@ -291,8 +291,8 @@
         ];
         let err = reduce_realized_work(&frames).unwrap_err();
         assert!(
-            err.to_string().contains("dtype 7"),
-            "expected dtype-7-not-supported, got: {err}"
+            err.to_string().contains("dtype tag 7"),
+            "expected dtype-tag-7-not-supported, got: {err}"
         );
     }
 
@@ -622,6 +622,158 @@
         };
         let err = sum_frames(&[&model, &control]).unwrap_err();
         assert!(err.to_string().contains("kind"), "got: {err}");
+    }
+
+    // ---- bf16 wire codec ----------------------------------------------------
+
+    /// One-tensor Model frame with bf16-encoded payload bytes.
+    fn one_tensor_frame_bf16(data: &[f32], weight: f64) -> RoundFrame {
+        RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype: DTYPE_BF16,
+                shape: vec![data.len() as u32],
+                bytes: f32_slice_to_payload_bytes(data, DTYPE_BF16).unwrap(),
+            }],
+            kind: RoundKind::Model,
+            weight,
+        }
+    }
+
+    /// The bf16 primitives: round-to-nearest-even encoding, exact
+    /// decoding, and special-value behavior.
+    #[test]
+    fn bf16_bits_round_to_nearest_even() {
+        use super::round_frame::{bf16_bits_to_f32, f32_to_bf16_bits};
+        // Exactly representable values survive the round trip bit-exact.
+        for v in [0.0f32, 1.0, -2.0, 0.5, 256.0, -0.09375] {
+            assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(v)), v, "{v}");
+        }
+        // 1.0 + 2⁻⁹ sits exactly halfway between 1.0 and the next bf16
+        // (1.0 + 2⁻⁸); nearest-EVEN resolves down to 1.0 (even mantissa).
+        let halfway = f32::from_bits(0x3F80_8000);
+        assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(halfway)), 1.0);
+        // Just above halfway rounds up.
+        let above = f32::from_bits(0x3F80_8001);
+        assert_eq!(
+            bf16_bits_to_f32(f32_to_bf16_bits(above)),
+            f32::from_bits(0x3F81_0000)
+        );
+        // Infinities pass through; NaN stays NaN (never rounds to inf).
+        assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(f32::INFINITY)), f32::INFINITY);
+        assert_eq!(
+            bf16_bits_to_f32(f32_to_bf16_bits(f32::NEG_INFINITY)),
+            f32::NEG_INFINITY
+        );
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(f32::NAN)).is_nan());
+        // Decode is exact: bf16 → f32 → bf16 is the identity.
+        for b in [0u16, 1, 0x3F80, 0x7F80, 0x8000, 0x4049] {
+            assert_eq!(f32_to_bf16_bits(bf16_bits_to_f32(b)), b, "bits {b:#06x}");
+        }
+    }
+
+    /// Payload encode/decode round trip in both dtypes, and the loud
+    /// error on an unknown tag.
+    #[test]
+    fn payload_codec_round_trips() {
+        let data = [1.5f32, -3.0, 0.0, 42.0];
+        for dtype in [DTYPE_F32, DTYPE_BF16] {
+            let p = TensorPayload {
+                dtype,
+                shape: vec![4],
+                bytes: f32_slice_to_payload_bytes(&data, dtype).unwrap(),
+            };
+            // All values are bf16-representable, so both dtypes decode exact.
+            assert_eq!(payload_to_f32(&p).unwrap(), data.to_vec(), "dtype {dtype}");
+        }
+        assert!(f32_slice_to_payload_bytes(&data, 9).is_err());
+    }
+
+    /// The fold must accumulate in f32 whatever the wire dtype. 512
+    /// frames of 1.0: a (wrong) bf16 running sum would stall at 256
+    /// (256 + 1 rounds back to 256 in bf16); the f32 accumulator reaches
+    /// 512, which IS bf16-representable, so the output encodes it exactly.
+    #[test]
+    fn sum_frames_bf16_accumulates_in_f32() {
+        let frames: Vec<RoundFrame> =
+            (0..512).map(|_| one_tensor_frame_bf16(&[1.0], 1.0)).collect();
+        let refs: Vec<&RoundFrame> = frames.iter().collect();
+        let folded = sum_frames(&refs).unwrap();
+        assert_eq!(folded.tensors[0].dtype, DTYPE_BF16, "fold preserves the wire dtype");
+        assert_eq!(payload_to_f32(&folded.tensors[0]).unwrap(), vec![512.0]);
+        assert!((folded.weight - 512.0).abs() < 1e-9);
+    }
+
+    /// A cohort mixing bf16 and f32 frames is a config error (some ranks
+    /// enabled `bf16_wire`, some did not) — loud schema error, never a
+    /// silent byte-level mangle.
+    #[test]
+    fn sum_frames_rejects_dtype_mix() {
+        let bf16 = one_tensor_frame_bf16(&[1.0], 1.0);
+        let f32f = one_tensor_frame(&[1.0]);
+        let err = sum_frames(&[&bf16, &f32f]).unwrap_err();
+        assert!(err.to_string().contains("dtype"), "got: {err}");
+    }
+
+    /// Divide-once on a bf16 round: contributions pre-scaled by mass,
+    /// sum divided exactly once, output still bf16.
+    #[test]
+    fn reduce_realized_work_bf16_normalizes() {
+        // rank A: params [2, 4] × weight 3 → [6, 12]; rank B: [4, 8] × 1.
+        let frames = vec![
+            Some(one_tensor_frame_bf16(&[6.0, 12.0], 3.0)),
+            Some(one_tensor_frame_bf16(&[4.0, 8.0], 1.0)),
+        ];
+        let reduced = reduce_realized_work(&frames).unwrap();
+        assert_eq!(reduced.tensors[0].dtype, DTYPE_BF16);
+        // (6+4)/4 = 2.5, (12+8)/4 = 5.0 — both bf16-exact.
+        assert_eq!(
+            payload_to_f32(&reduced.tensors[0]).unwrap(),
+            vec![2.5, 5.0]
+        );
+        assert!((reduced.weight - 4.0).abs() < 1e-9);
+    }
+
+    /// bf16 and f32 pipelines agree within bf16 wire precision on
+    /// realistic (non-representable) values: same contributions, same
+    /// masses, relative error bounded by a few wire quantization steps.
+    #[test]
+    fn bf16_reduce_tracks_f32_reduce_within_wire_precision() {
+        let a = [0.123_456_7f32, -1.234_567_8, 3.317_742_9];
+        let b = [2.941_385_2f32, -0.577_215_7, 1.489_306_4];
+        let f32_frames = vec![
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![3],
+                    bytes: f32_slice_to_payload_bytes(&a, DTYPE_F32).unwrap(),
+                }],
+                kind: RoundKind::Model,
+                weight: 2.0,
+            }),
+            Some(RoundFrame {
+                tensors: vec![TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![3],
+                    bytes: f32_slice_to_payload_bytes(&b, DTYPE_F32).unwrap(),
+                }],
+                kind: RoundKind::Model,
+                weight: 1.0,
+            }),
+        ];
+        let bf16_frames = vec![
+            Some(one_tensor_frame_bf16(&a, 2.0)),
+            Some(one_tensor_frame_bf16(&b, 1.0)),
+        ];
+        let exact = payload_to_f32(&reduce_realized_work(&f32_frames).unwrap().tensors[0]).unwrap();
+        let quant = payload_to_f32(&reduce_realized_work(&bf16_frames).unwrap().tensors[0]).unwrap();
+        for (e, q) in exact.iter().zip(&quant) {
+            // Two quantization stages (contribution encode + result
+            // encode), each ≤ 2⁻⁸ relative.
+            assert!(
+                (e - q).abs() <= e.abs() * (2.0 / 256.0) + 1e-6,
+                "exact {e} vs bf16 {q}"
+            );
+        }
     }
 
     /// Associativity: folding per host first then reducing equals the

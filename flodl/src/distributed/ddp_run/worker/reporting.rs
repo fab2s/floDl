@@ -170,9 +170,12 @@ impl<M: Module> GpuWorker<M> {
     /// Send the final parameter snapshot on the dedicated channel before exiting.
     ///
     /// This uses `final_param_tx` (not `param_tx`) to avoid racing with
-    /// CPU averaging snapshot collection on the same channel.
+    /// CPU averaging snapshot collection on the same channel, and the
+    /// EXACT readout (never the pinned staging) so the trained weights
+    /// carry full f32 precision even when `bf16_wire` stages the
+    /// averaging-plane snapshots in bf16.
     pub fn send_final_snapshot(&mut self) {
-        let snap = self.snapshot_params();
+        let snap = self.snapshot_params_exact();
         let _ = self.final_param_tx.send(snap);
     }
 

@@ -393,6 +393,7 @@ impl<M: Module> GpuWorker<M> {
             steps_since_avg: 0,
             steps_at_snapshot: 0,
             gamma: config.gamma,
+            bf16_wire: config.bf16_wire,
             current_version: 0,
             current_epoch: 0,
             pending_plan: None,

@@ -1441,6 +1441,18 @@ pub struct WorkerConfig {
     /// work-weighting, byte-identical to pre-gamma behavior. See
     /// [`crate::distributed::ElCheConfig::gamma`].
     pub gamma: f64,
+    /// Stage the CPU-averaging parameter snapshot in bfloat16 (see
+    /// [`crate::distributed::ElCheConfig::bf16_wire`]): the reused
+    /// pinned D2H staging buffers for PARAMS allocate as bf16 (half the
+    /// RAM, half the PCIe bytes), matching the bf16 wire frames built
+    /// from them. Buffer staging stays at native dtype — the reduce
+    /// bridge selects f32 buffers by dtype, and BatchNorm stats are KB-
+    /// scale anyway. Set only by the cluster rank path; the thread-based
+    /// single-process path always passes `false` (its in-process
+    /// averaging consumes snapshots directly and stays f32). The final
+    /// end-of-training snapshot bypasses the bf16 staging (exact f32)
+    /// so trained weights / checkpoints never inherit wire quantization.
+    pub bf16_wire: bool,
     /// Optional system timeline for high-frequency profiling.
     pub timeline: Option<Arc<crate::monitor::Timeline>>,
     /// Training policy (Sync/Cadence/Async). Used to gate divergence measurement:
