@@ -247,44 +247,103 @@ pub(crate) fn read_round_frame<R: Read>(
     Ok(Some(RoundFrame { tensors, kind, weight }))
 }
 
-/// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
-/// footer keyed by `salt`. `pub(crate)` companion to
-/// [`read_round_frame`]; shared by the rank-side client.
-pub(crate) fn write_round_frame<W: Write>(
+/// Per-tensor wire metadata for the streaming writer: everything the
+/// frame body needs EXCEPT the payload bytes, which the emitter
+/// produces on demand. Lets a sender compute the exact frame length
+/// (and write a length prefix) without materializing a single payload.
+pub(crate) struct PayloadPart<'a> {
+    /// Wire dtype tag (see [`DTYPE_F32`] / [`DTYPE_BF16`]).
+    pub dtype: u8,
+    /// Tensor shape.
+    pub shape: &'a [u32],
+    /// Exact payload byte count the emitter will write for this tensor.
+    pub nbytes: u64,
+}
+
+/// Exact on-wire length of a round frame with these payload parts —
+/// header + kind + weight + per-tensor (meta + shape + nbytes field +
+/// payload bytes) + HMAC footer. Byte-for-byte what
+/// [`write_round_frame_streamed`] emits, which is what lets the sender
+/// commit a length prefix BEFORE producing any payload bytes.
+pub(crate) fn round_frame_wire_len(parts: &[PayloadPart<'_>]) -> u64 {
+    let mut len: u64 = 8 + 1 + 8; // hdr + kind byte + weight
+    for p in parts {
+        len += 2 + 4 * p.shape.len() as u64 + 8 + p.nbytes;
+    }
+    len + 8 // HMAC footer
+}
+
+/// MAC-and-count tee for the streaming writer's payload leg: every byte
+/// the emitter writes goes to the underlying stream AND into the frame
+/// HMAC, with a running count so [`write_round_frame_streamed`] can
+/// verify the emitter honored its declared `nbytes`.
+pub(crate) struct MacTee<'a, W: Write> {
+    inner: &'a mut W,
+    mac: &'a mut HMAC,
+    written: u64,
+}
+
+impl<W: Write> Write for MacTee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.mac.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming counterpart of [`write_round_frame`] — THE frame writer
+/// (the materialized variant delegates here, so the wire format has a
+/// single implementation to keep in lockstep with [`read_round_frame`]).
+///
+/// Payload bytes never coexist as a whole frame on the sender: for each
+/// tensor the writer emits the wire metadata itself, then hands the
+/// emitter a [`MacTee`] to write exactly `parts[i].nbytes` payload bytes
+/// (loud error otherwise — by then the stream is committed, so the
+/// caller must treat it as a torn connection, which every production
+/// caller already does). On model-sized frames this replaces a
+/// whole-frame serialize buffer with one payload transient at a time.
+pub(crate) fn write_round_frame_streamed<W: Write>(
     stream: &mut W,
-    frame: &RoundFrame,
+    kind: RoundKind,
+    weight: f64,
+    parts: &[PayloadPart<'_>],
     salt: &SessionSalt,
+    emit: &mut dyn FnMut(usize, &mut MacTee<'_, W>) -> Result<()>,
 ) -> Result<()> {
     let mut mac = HMAC::new(salt.as_slice());
 
     let mut hdr = [0u8; 8];
     hdr[0..4].copy_from_slice(&ROUND_FRAME_MAGIC.to_le_bytes());
-    hdr[4..8].copy_from_slice(&(frame.tensors.len() as u32).to_le_bytes());
+    hdr[4..8].copy_from_slice(&(parts.len() as u32).to_le_bytes());
     stream.write_all(&hdr).map_err(|e| {
         TensorError::new(&format!("cluster_controller: frame header write failed: {e}"))
     })?;
     mac.update(hdr);
     // Round-kind byte (MAC-covered), mirroring `read_round_frame`.
-    let kind_byte = [frame.kind.to_wire()];
+    let kind_byte = [kind.to_wire()];
     stream.write_all(&kind_byte).map_err(|e| {
         TensorError::new(&format!("cluster_controller: frame kind write failed: {e}"))
     })?;
     mac.update(kind_byte);
     // Realized-work weight (MAC-covered), mirroring `read_round_frame`.
-    let weight_bytes = frame.weight.to_le_bytes();
+    let weight_bytes = weight.to_le_bytes();
     stream.write_all(&weight_bytes).map_err(|e| {
         TensorError::new(&format!("cluster_controller: frame weight write failed: {e}"))
     })?;
     mac.update(weight_bytes);
-    for (ti, t) in frame.tensors.iter().enumerate() {
-        let meta = [t.dtype, t.shape.len() as u8];
+    for (ti, p) in parts.iter().enumerate() {
+        let meta = [p.dtype, p.shape.len() as u8];
         stream.write_all(&meta).map_err(|e| {
             TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] meta write failed: {e}"
             ))
         })?;
         mac.update(meta);
-        for d in &t.shape {
+        for d in p.shape {
             let d_bytes = d.to_le_bytes();
             stream.write_all(&d_bytes).map_err(|e| {
                 TensorError::new(&format!(
@@ -293,19 +352,30 @@ pub(crate) fn write_round_frame<W: Write>(
             })?;
             mac.update(d_bytes);
         }
-        let nb_bytes = (t.bytes.len() as u64).to_le_bytes();
+        let nb_bytes = p.nbytes.to_le_bytes();
         stream.write_all(&nb_bytes).map_err(|e| {
             TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] nbytes write failed: {e}"
             ))
         })?;
         mac.update(nb_bytes);
-        stream.write_all(&t.bytes).map_err(|e| {
+        let mut tee = MacTee {
+            inner: stream,
+            mac: &mut mac,
+            written: 0,
+        };
+        emit(ti, &mut tee).map_err(|e| {
             TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] data write failed: {e}"
             ))
         })?;
-        mac.update(&t.bytes);
+        if tee.written != p.nbytes {
+            return Err(TensorError::new(&format!(
+                "cluster_controller: tensor[{ti}] emitter wrote {} bytes, \
+                 declared {} — frame length already committed, stream is torn",
+                tee.written, p.nbytes
+            )));
+        }
     }
 
     // 8-byte HMAC-SHA256-64 footer, keyed by salt.
@@ -319,6 +389,38 @@ pub(crate) fn write_round_frame<W: Write>(
         .flush()
         .map_err(|e| TensorError::new(&format!("cluster_controller: frame flush failed: {e}")))?;
     Ok(())
+}
+
+/// Write a RoundFrame to a stream, appending the 8-byte HMAC-SHA256
+/// footer keyed by `salt`. `pub(crate)` companion to
+/// [`read_round_frame`]; shared by the rank-side client. Delegates to
+/// [`write_round_frame_streamed`] with a borrowing emitter — zero extra
+/// copies, one wire-format implementation.
+pub(crate) fn write_round_frame<W: Write>(
+    stream: &mut W,
+    frame: &RoundFrame,
+    salt: &SessionSalt,
+) -> Result<()> {
+    let parts: Vec<PayloadPart<'_>> = frame
+        .tensors
+        .iter()
+        .map(|t| PayloadPart {
+            dtype: t.dtype,
+            shape: &t.shape,
+            nbytes: t.bytes.len() as u64,
+        })
+        .collect();
+    write_round_frame_streamed(
+        stream,
+        frame.kind,
+        frame.weight,
+        &parts,
+        salt,
+        &mut |ti, tee| {
+            tee.write_all(&frame.tensors[ti].bytes)
+                .map_err(|e| TensorError::new(&e.to_string()))
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -592,16 +694,25 @@ pub(crate) fn f32_slice_to_payload_bytes(data: &[f32], dtype: u8) -> Result<Vec<
 /// per-element decode → f32 multiply → re-encode for bf16). Used by the
 /// divide-once normalization.
 pub(crate) fn scale_payload(payload: &mut TensorPayload, factor: f32) -> Result<()> {
-    match payload.dtype {
+    scale_payload_bytes(&mut payload.bytes, payload.dtype, factor)
+}
+
+/// [`scale_payload`] on raw wire bytes: decode each element, multiply in
+/// f32, re-encode in place (single round-to-nearest-even stage for
+/// bf16). Also the rank-side γ-scale — fused into the streaming encode,
+/// it replaces the model-sized `mul_scalar` scratch copy the reduce used
+/// to make before shipping.
+pub(crate) fn scale_payload_bytes(bytes: &mut [u8], dtype: u8, factor: f32) -> Result<()> {
+    match dtype {
         DTYPE_F32 => {
-            for c in payload.bytes.chunks_exact_mut(4) {
+            for c in bytes.chunks_exact_mut(4) {
                 let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * factor;
                 c.copy_from_slice(&v.to_le_bytes());
             }
             Ok(())
         }
         DTYPE_BF16 => {
-            for c in payload.bytes.chunks_exact_mut(2) {
+            for c in bytes.chunks_exact_mut(2) {
                 let v = bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])) * factor;
                 c.copy_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
             }

@@ -404,6 +404,42 @@ pub fn write_len_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Write ONLY the 4-byte length prefix of a len-framed blob, for senders
+/// that stream the body directly to the socket instead of materializing
+/// it ([`crate::distributed::cpu_reduce`]'s model-frame path — the body
+/// is hundreds of MB there, and this is what lets it never exist as a
+/// contiguous buffer on the sender).
+///
+/// Splitting prefix and body across write calls is safe against the
+/// reader-desync class that forced [`write_len_framed`]'s single atomic
+/// write: [`try_read_len_framed`]'s idle gate only applies to the FIRST
+/// byte — once that byte lands the reader commits and reads through
+/// timeouts ([`fill_committed`]-style) until the body completes, exactly
+/// as it must for large bodies that never arrive atomically anyway.
+/// Keep small poll-loop frames on [`write_len_framed`].
+///
+/// Validates `len` against u32 (the prefix width) and the frame ceiling
+/// — the reader enforces the ceiling anyway, but failing HERE names the
+/// sender instead of tearing an opaque stream down at the relay.
+pub fn write_len_prefix<W: Write>(w: &mut W, len: u64) -> Result<()> {
+    let ceiling = frame_ceiling();
+    if len > ceiling as u64 {
+        return Err(TensorError::new(&format!(
+            "relay_mux: len-framed blob length {len} exceeds the frame ceiling \
+             {ceiling}; model has outgrown the frame ceiling (see \
+             wire::frame_ceiling)"
+        )));
+    }
+    let len = u32::try_from(len).map_err(|_| {
+        TensorError::new(&format!(
+            "relay_mux: len-framed blob too large: {len} bytes (max {})",
+            u32::MAX
+        ))
+    })?;
+    w.write_all(&len.to_le_bytes())
+        .map_err(|e| TensorError::new(&format!("relay_mux: len prefix write failed: {e}")))
+}
+
 /// Read a length-delimited opaque blob. Returns `Ok(None)` on clean EOF
 /// (peer closed before the next length prefix).
 pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {

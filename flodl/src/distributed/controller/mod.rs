@@ -125,6 +125,10 @@ pub use dead_ranks::DeadRanks;
 pub use round_frame::{RoundFrame, RoundKind, TensorPayload};
 pub(crate) use round_frame::{read_round_frame, write_round_frame, sum_frames};
 pub(crate) use round_frame::{f32_slice_to_payload_bytes, payload_to_f32};
+pub(crate) use round_frame::{
+    payload_element_size, round_frame_wire_len, scale_payload_bytes,
+    write_round_frame_streamed, PayloadPart,
+};
 use round_frame::reduce_realized_work;
 // Byte-codec helpers used only by the controller round-frame tests.
 #[cfg(test)]
