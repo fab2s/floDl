@@ -387,6 +387,8 @@ pub struct GpuWorker<M: Module> {
     /// reduce bridge builds from the snapshot. Buffer staging is exempt
     /// (see `snapshot_pinned_buffers`), and the end-of-training snapshot
     /// bypasses this staging entirely (`snapshot_params_exact`).
+    ///
+    /// [`WorkerConfig::bf16_wire`]: crate::distributed::ddp_run::WorkerConfig::bf16_wire
     snapshot_pinned_params: Vec<Tensor>,
     /// Companion pinned staging buffers for non-learnable buffers
     /// (BatchNorm running stats etc.). Same lazy-alloc + reuse +
@@ -398,7 +400,7 @@ pub struct GpuWorker<M: Module> {
     /// their frames, and they are KB-scale regardless.
     snapshot_pinned_buffers: Vec<Tensor>,
     /// Stage the param snapshot in bfloat16 (see
-    /// [`WorkerConfig::bf16_wire`]).
+    /// [`WorkerConfig::bf16_wire`](crate::distributed::ddp_run::WorkerConfig::bf16_wire)).
     bf16_wire: bool,
     /// Whether the pinned-readout failure has been reported. The fallback
     /// is silent-correct but slow; log the regression exactly once.
