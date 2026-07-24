@@ -403,26 +403,72 @@ impl CpuReduceClient {
             },
         )?;
 
-        let reduced = match read_framed_round(&mut self.stream, &self.salt)? {
-            Some(f) => f,
-            None => {
-                return Err(TensorError::new(
-                    "cpu_reduce: controller closed connection before sending averaged \
-                     frame back (controller crashed, or another rank disconnected and \
-                     triggered cluster-wide shutdown mid-round)",
-                ));
-            }
-        };
-        let t2 = Instant::now();
-        let out = round_frame_to_tensors(&reduced)?;
+        let (out, weight, decode_ns) = self.read_reduced_tensors()?;
         if prof {
+            let t2 = Instant::now();
             self.prof_serialize_ns += produce_ns;
-            self.prof_wire_ns += (t2 - t0).as_nanos().saturating_sub(produce_ns);
-            self.prof_deserialize_ns += t2.elapsed().as_nanos();
+            self.prof_wire_ns += (t2 - t0)
+                .as_nanos()
+                .saturating_sub(produce_ns)
+                .saturating_sub(decode_ns);
+            self.prof_deserialize_ns += decode_ns;
             self.prof_bytes += sent_bytes;
             self.prof_count += 1;
         }
-        Ok((out, reduced.weight))
+        Ok((out, weight))
+    }
+
+    /// Read the reduced reply as tensors, DRAINING: each payload is
+    /// decoded into its f32 CPU tensor the moment it comes off the
+    /// stream and its wire bytes are freed before the next payload is
+    /// read — neither the len-framed blob (which no longer exists, see
+    /// [`read_framed_round`]) nor the frame's payloads ever coexist
+    /// with the decoded output. Peak reply-side transient: the decoded
+    /// tensors plus ONE payload's bytes, instead of blob + payloads +
+    /// tensors (three model-sized residents before A4b).
+    ///
+    /// Tensor construction inside the sink is inert buffering under the
+    /// MAC-before-use contract of
+    /// [`read_round_frame_streamed`](crate::distributed::controller::read_round_frame_streamed):
+    /// bytes only get copied/upcast into tensors that are dropped
+    /// unadopted if the footer fails to authenticate — nothing acts on
+    /// the values until the frame verifies and this method returns.
+    ///
+    /// Returns `(tensors, round mass, decode-time ns)` — the decode
+    /// time (accumulated inside the sink, `-vvv` gated) lets the caller
+    /// split its wire/deserialize profile even though the two phases
+    /// now interleave.
+    fn read_reduced_tensors(&mut self) -> Result<(Vec<Tensor>, f64, u128)> {
+        let Some(len) =
+            crate::distributed::relay::mux::read_len_prefix(&mut self.stream)?
+        else {
+            return Err(TensorError::new(
+                "cpu_reduce: controller closed connection before sending averaged \
+                 frame back (controller crashed, or another rank disconnected and \
+                 triggered cluster-wide shutdown mid-round)",
+            ));
+        };
+        let prof = self.prof_enabled;
+        let mut decode_ns: u128 = 0;
+        let mut out: Vec<Tensor> = Vec::new();
+        let mut body = (&mut self.stream).take(len as u64);
+        let hdr = controller::read_round_frame_streamed(
+            &mut body,
+            &self.salt,
+            &mut |i, payload| {
+                let tp = Instant::now();
+                out.push(payload_to_cpu_tensor(i, &payload)?);
+                if prof {
+                    decode_ns += tp.elapsed().as_nanos();
+                }
+                Ok(())
+                // `payload` drops here — per-payload draining.
+            },
+        )?;
+        let leftover = body.limit();
+        finish_framed_body(hdr.is_some(), leftover)?;
+        let (_kind, weight) = hdr.expect("finish_framed_body verified Some");
+        Ok((out, weight, decode_ns))
     }
 
     /// Wire dtype for a round kind: `Model` rides the configured dtype,
@@ -640,13 +686,46 @@ fn write_framed_round<W: Write>(
     controller::write_round_frame(stream, frame, salt)
 }
 
-/// Read a length-delimited [`RoundFrame`] blob and parse it. `Ok(None)` on
-/// clean EOF (relay/controller closed the connection).
+/// Read a length-delimited [`RoundFrame`] and parse it STRAIGHT OFF the
+/// stream — the len-framed body never exists as a buffer (before A4b it
+/// was read whole, then parsed: blob + payloads coexisting, a
+/// model-sized extra on every reply). `Ok(None)` on clean EOF
+/// (relay/controller closed the connection).
+///
+/// The parse is bounded by [`Read::take`]`(len)`: a frame that needs
+/// more bytes than the prefix declared hits a loud mid-frame EOF error
+/// instead of eating into the next frame, and a frame that consumed
+/// fewer is caught by the leftover check — either way a prefix/body
+/// disagreement is a named error, never a silently desynced stream.
 fn read_framed_round<R: Read>(stream: &mut R, salt: &SessionSalt) -> Result<Option<RoundFrame>> {
-    match crate::distributed::relay::mux::read_len_framed(stream)? {
-        Some(buf) => controller::read_round_frame(&mut buf.as_slice(), salt),
-        None => Ok(None),
+    let Some(len) = crate::distributed::relay::mux::read_len_prefix(stream)? else {
+        return Ok(None);
+    };
+    let mut body = stream.take(len as u64);
+    let frame = controller::read_round_frame(&mut body, salt)?;
+    finish_framed_body(frame.is_some(), body.limit())?;
+    Ok(frame)
+}
+
+/// Shared tail of the streamed framed-round readers: a `None` frame
+/// inside a declared body means the stream ended mid-frame (the prefix
+/// promised bytes that never came), and leftover take-budget means the
+/// frame was shorter than its prefix — both are loud protocol errors.
+fn finish_framed_body(got_frame: bool, leftover: u64) -> Result<()> {
+    if !got_frame {
+        return Err(TensorError::new(
+            "cpu_reduce: stream ended inside a len-framed RoundFrame body \
+             (peer died mid-frame, or a zero-length prefix)",
+        ));
     }
+    if leftover != 0 {
+        return Err(TensorError::new(&format!(
+            "cpu_reduce: RoundFrame consumed {leftover} bytes fewer than its \
+             length prefix declared; sender/reader wire drift — stream is \
+             desynced",
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -753,26 +832,34 @@ fn wire_shape(i: usize, t: &Tensor) -> Result<Vec<u32>> {
 pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
     let mut out = Vec::with_capacity(frame.tensors.len());
     for (i, p) in frame.tensors.iter().enumerate() {
-        let dtype = match p.dtype {
-            DTYPE_F32 => DType::Float32,
-            DTYPE_BF16 => DType::BFloat16,
-            other => {
-                return Err(TensorError::new(&format!(
-                    "cpu_reduce: payload[{i}] unsupported wire dtype tag {other} \
-                     (0 = f32, 1 = bf16)"
-                )));
-            }
-        };
-        let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
-        let t = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
-            .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
-        out.push(if dtype == DType::Float32 {
-            t
-        } else {
-            t.to_dtype(DType::Float32)?
-        });
+        out.push(payload_to_cpu_tensor(i, p)?);
     }
     Ok(out)
+}
+
+/// Decode ONE payload into an f32 CPU tensor: `from_blob` at the wire
+/// dtype (validates shape-vs-byte-count loudly), bf16 upcast to f32.
+/// Shared per-payload body of [`round_frame_to_tensors`] and the
+/// draining streamed decode in `CpuReduceClient`.
+fn payload_to_cpu_tensor(i: usize, p: &TensorPayload) -> Result<Tensor> {
+    let dtype = match p.dtype {
+        DTYPE_F32 => DType::Float32,
+        DTYPE_BF16 => DType::BFloat16,
+        other => {
+            return Err(TensorError::new(&format!(
+                "cpu_reduce: payload[{i}] unsupported wire dtype tag {other} \
+                 (0 = f32, 1 = bf16)"
+            )));
+        }
+    };
+    let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+    let t = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
+        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
+    if dtype == DType::Float32 {
+        Ok(t)
+    } else {
+        t.to_dtype(DType::Float32)
+    }
 }
 
 #[cfg(test)]

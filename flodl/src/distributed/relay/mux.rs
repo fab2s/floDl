@@ -440,9 +440,16 @@ pub fn write_len_prefix<W: Write>(w: &mut W, len: u64) -> Result<()> {
         .map_err(|e| TensorError::new(&format!("relay_mux: len prefix write failed: {e}")))
 }
 
-/// Read a length-delimited opaque blob. Returns `Ok(None)` on clean EOF
-/// (peer closed before the next length prefix).
-pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+/// Read ONLY the 4-byte length prefix of a len-framed blob (`Ok(None)`
+/// on clean EOF before it), for receivers that parse the body straight
+/// off the stream instead of buffering it — the read-side companion of
+/// [`write_len_prefix`], with the same rationale: the model-frame body
+/// is hundreds of MB, and this is what lets it never exist as a
+/// contiguous buffer on the receiver. Callers should bound the body
+/// parse with [`Read::take`]`(len)` and verify the parser consumed
+/// exactly `len` bytes, so a prefix/body disagreement surfaces as a
+/// loud named error instead of a desynced stream.
+pub fn read_len_prefix<R: Read>(r: &mut R) -> Result<Option<usize>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -468,6 +475,22 @@ pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
              {ceiling}; corrupt or hostile peer"
         )));
     }
+    Ok(Some(len))
+}
+
+/// Read a length-delimited opaque blob. Returns `Ok(None)` on clean EOF
+/// (peer closed before the next length prefix).
+///
+/// No production caller since the A4b streaming reads (the rank leg
+/// parses bodies straight off the stream via [`read_len_prefix`], the
+/// relay poll loops use [`try_read_len_framed`]); retained as the
+/// materialized reader the relay/mux test simulators drive rank sides
+/// with.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn read_len_framed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    let Some(len) = read_len_prefix(r)? else {
+        return Ok(None);
+    };
     let body = crate::distributed::wire::read_exact_incremental(r, len)
         .map_err(|e| TensorError::new(&format!("relay_mux: len-framed body read failed: {e}")))?;
     Ok(Some(body))

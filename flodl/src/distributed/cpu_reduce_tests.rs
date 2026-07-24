@@ -524,6 +524,55 @@
         }
     }
 
+    /// A length prefix that DISAGREES with its frame body must be a
+    /// loud named error in both directions — the streamed reader parses
+    /// straight off the socket, so drift here would otherwise be a
+    /// silently desynced stream.
+    #[test]
+    fn framed_round_rejects_prefix_body_drift() {
+        let mut frame_bytes = Vec::new();
+        crate::distributed::controller::write_round_frame(
+            &mut frame_bytes,
+            &frame_with(&[1.0, 2.0]),
+            &TEST_SALT,
+        )
+        .unwrap();
+
+        // Prefix declares MORE than the frame: parse succeeds but
+        // leaves budget → "fewer than its length prefix declared".
+        let mut wire = Vec::new();
+        crate::distributed::relay::mux::write_len_prefix(
+            &mut wire,
+            frame_bytes.len() as u64 + 10,
+        )
+        .unwrap();
+        wire.extend_from_slice(&frame_bytes);
+        wire.extend_from_slice(&[0u8; 10]); // the phantom bytes the prefix promised
+        let err = read_framed_round(&mut wire.as_slice(), &TEST_SALT).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("fewer than its length prefix"),
+            "want leftover-budget error, got: {msg}"
+        );
+
+        // Prefix declares LESS than the frame: the bounded parse hits
+        // EOF mid-frame → loud read error, never bytes from the next
+        // frame.
+        let mut wire = Vec::new();
+        crate::distributed::relay::mux::write_len_prefix(
+            &mut wire,
+            frame_bytes.len() as u64 - 10,
+        )
+        .unwrap();
+        wire.extend_from_slice(&frame_bytes);
+        let err = read_framed_round(&mut wire.as_slice(), &TEST_SALT).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("read failed") || msg.contains("ended inside"),
+            "want mid-frame EOF error, got: {msg}"
+        );
+    }
+
     /// Connect failure (no controller listening) surfaces a clear error.
     #[test]
     fn surfaces_connect_failure_clearly() {
