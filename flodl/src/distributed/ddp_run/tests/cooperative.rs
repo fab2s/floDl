@@ -68,6 +68,7 @@ fn make_det_worker(total: usize) -> (GpuWorker<Linear>, WorkerChannels) {
         vram_pool: false,
         easgd_alpha: None,
         gamma: 1.0,
+        bf16_wire: false,
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,

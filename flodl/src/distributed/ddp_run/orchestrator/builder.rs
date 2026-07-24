@@ -324,6 +324,17 @@ where
         self
     }
 
+    /// Ship the CPU-averaging plane's model traffic (params / buffers) as
+    /// bfloat16, halving pinned snapshots, relay fold traffic, and wire
+    /// payloads; the averaging math still accumulates in f32. CPU
+    /// averaging modes only — `.run()` errors loudly on an NCCL mode
+    /// rather than silently ignoring the knob. See
+    /// [`crate::distributed::ElCheConfig::bf16_wire`].
+    pub fn bf16_wire(mut self, on: bool) -> Self {
+        self.config.elche.bf16_wire = on;
+        self
+    }
+
     /// Enable the LR-aware meta-controller above ElChe. Default: `true`.
     ///
     /// When enabled, the coordinator constructs a
@@ -924,6 +935,21 @@ where
             self.config.elche.easgd_alpha =
                 crate::distributed::ElCheConfig::default_for(self.config.elche.mode)
                     .easgd_alpha;
+        }
+
+        // bf16_wire is a CPU-averaging-plane knob; the NCCL reduce never
+        // leaves the GPUs, so there is no wire to halve. Silently
+        // ignoring it would let an "nccl + bf16" run masquerade as a
+        // bf16 measurement — error loudly instead.
+        if self.config.elche.bf16_wire
+            && matches!(self.backend, crate::distributed::AverageBackend::Nccl)
+        {
+            return Err(crate::tensor::TensorError::new(
+                "DdpBuilder: bf16_wire applies to the CPU averaging plane only \
+                 (cpu-sync / cpu-cadence / cpu-async modes); the NCCL reduce \
+                 stays on-GPU in f32. Drop .bf16_wire(true) or switch to a \
+                 CPU averaging mode.",
+            ));
         }
 
         Ok((dataset, batch_size, num_epochs))

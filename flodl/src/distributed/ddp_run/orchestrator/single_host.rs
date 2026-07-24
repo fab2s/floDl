@@ -123,6 +123,8 @@ impl DdpHandle {
             // Single-GPU fallback does no averaging; gamma is irrelevant. 1.0
             // (plain work-weighting) is the neutral default.
             gamma: 1.0,
+            // No averaging plane at all — no wire, no bf16 staging.
+            bf16_wire: false,
             timeline: None,
             policy: ApplyPolicy::Sync, // single-GPU fallback: no divergence measurement
             save_path: None,
@@ -346,6 +348,8 @@ impl DdpHandle {
             disk_stage_dir,
             easgd_alpha: None,
             gamma: 1.0,
+            // No averaging plane at all — no wire, no bf16 staging.
+            bf16_wire: false,
             timeline: None,
             policy: ApplyPolicy::Sync, // single device: no divergence measurement
             save_path: None,

@@ -380,11 +380,26 @@ pub struct GpuWorker<M: Module> {
     /// in-flight snapshot.
     /// Empty on CPU device / non-CPU-averaging setups (the readout falls
     /// back to a per-tensor passthrough).
+    ///
+    /// With [`WorkerConfig::bf16_wire`] the PARAM staging allocates as
+    /// bfloat16 (the D2H `copy_` casts on the source device): half the
+    /// pinned RAM and half the PCIe bytes, matching the bf16 frames the
+    /// reduce bridge builds from the snapshot. Buffer staging is exempt
+    /// (see `snapshot_pinned_buffers`), and the end-of-training snapshot
+    /// bypasses this staging entirely (`snapshot_params_exact`).
     snapshot_pinned_params: Vec<Tensor>,
     /// Companion pinned staging buffers for non-learnable buffers
     /// (BatchNorm running stats etc.). Same lazy-alloc + reuse +
-    /// single-consumer contract as `snapshot_pinned_params`.
+    /// single-consumer contract as `snapshot_pinned_params`, but ALWAYS
+    /// at the buffer's native dtype even under `bf16_wire`: the reduce
+    /// bridge selects reduce-eligible buffers by `dtype() == Float32`,
+    /// so a bf16-staged running stat would silently fall out of the
+    /// sync (the NCCL-buffers bug class); the wire cast still halves
+    /// their frames, and they are KB-scale regardless.
     snapshot_pinned_buffers: Vec<Tensor>,
+    /// Stage the param snapshot in bfloat16 (see
+    /// [`WorkerConfig::bf16_wire`]).
+    bf16_wire: bool,
     /// Whether the pinned-readout failure has been reported. The fallback
     /// is silent-correct but slow; log the regression exactly once.
     pinned_fallback_logged: bool,

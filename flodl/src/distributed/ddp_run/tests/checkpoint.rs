@@ -240,6 +240,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         vram_pool: false,
         easgd_alpha: None,
         gamma: 1.0,
+        bf16_wire: false,
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: Some(stem_str.clone()),

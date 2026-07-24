@@ -111,13 +111,13 @@
             let (tx1, rx1) = mpsc::channel();
             let t0 = thread::spawn(move || {
                 let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
-                tx0.send(c.all_reduce(&frame_with(&[2.0, 4.0, 6.0])).unwrap())
+                tx0.send(c.all_reduce(frame_with(&[2.0, 4.0, 6.0])).unwrap())
                     .unwrap();
                 drop(c);
             });
             let t1 = thread::spawn(move || {
                 let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
-                tx1.send(c.all_reduce(&frame_with(&[4.0, 8.0, 12.0])).unwrap())
+                tx1.send(c.all_reduce(frame_with(&[4.0, 8.0, 12.0])).unwrap())
                     .unwrap();
                 drop(c);
             });
@@ -140,16 +140,16 @@
             with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
                 let t0 = thread::spawn(move || -> Vec<RoundFrame> {
                     let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
-                    let r1 = c.all_reduce(&frame_with(&[1.0])).unwrap();
-                    let r2 = c.all_reduce(&frame_with(&[5.0])).unwrap();
-                    let r3 = c.all_reduce(&frame_with(&[9.0])).unwrap();
+                    let r1 = c.all_reduce(frame_with(&[1.0])).unwrap();
+                    let r2 = c.all_reduce(frame_with(&[5.0])).unwrap();
+                    let r3 = c.all_reduce(frame_with(&[9.0])).unwrap();
                     vec![r1, r2, r3]
                 });
                 let t1 = thread::spawn(move || -> Vec<RoundFrame> {
                     let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
-                    let r1 = c.all_reduce(&frame_with(&[3.0])).unwrap();
-                    let r2 = c.all_reduce(&frame_with(&[7.0])).unwrap();
-                    let r3 = c.all_reduce(&frame_with(&[11.0])).unwrap();
+                    let r1 = c.all_reduce(frame_with(&[3.0])).unwrap();
+                    let r2 = c.all_reduce(frame_with(&[7.0])).unwrap();
+                    let r3 = c.all_reduce(frame_with(&[11.0])).unwrap();
                     vec![r1, r2, r3]
                 });
                 let r0 = t0.join().unwrap();
@@ -224,7 +224,7 @@
         let data: &[f32] = &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let t = Tensor::from_f32(data, &[2, 3], Device::CPU).unwrap();
         let refs = vec![&t];
-        let frame = tensors_to_round_frame(&refs).unwrap();
+        let frame = tensors_to_round_frame(&refs, DTYPE_F32).unwrap();
         assert_eq!(frame.tensors.len(), 1);
         assert_eq!(frame.tensors[0].dtype, DTYPE_F32);
         assert_eq!(frame.tensors[0].shape, vec![2u32, 3]);
@@ -236,11 +236,56 @@
         assert_eq!(recovered[0].to_f32_vec().unwrap(), data);
     }
 
+    /// bf16 wire encoding: an f32 tensor serializes to half the bytes
+    /// and decodes back exactly for bf16-representable values (the
+    /// decode side always returns f32 tensors).
+    #[test]
+    fn tensor_round_trip_through_round_frame_bf16() {
+        let data: &[f32] = &[1.0, -2.5, 0.0, 42.0, 0.125, -256.0];
+        let t = Tensor::from_f32(data, &[2, 3], Device::CPU).unwrap();
+        let refs = vec![&t];
+        let frame =
+            tensors_to_round_frame(&refs, crate::distributed::controller::DTYPE_BF16).unwrap();
+        assert_eq!(frame.tensors[0].dtype, crate::distributed::controller::DTYPE_BF16);
+        assert_eq!(frame.tensors[0].bytes.len(), 6 * 2, "half the f32 bytes");
+
+        let recovered = round_frame_to_tensors(&frame).unwrap();
+        assert_eq!(recovered[0].dtype(), crate::tensor::DType::Float32);
+        assert_eq!(recovered[0].shape(), vec![2i64, 3]);
+        assert_eq!(recovered[0].to_f32_vec().unwrap(), data);
+    }
+
+    /// A tensor already staged in bf16 (the pinned-snapshot path)
+    /// serializes verbatim into a bf16 frame — no second cast.
+    #[test]
+    fn bf16_tensor_serializes_verbatim_into_bf16_frame() {
+        let t = Tensor::from_f32(&[1.5, -3.0], &[2], Device::CPU)
+            .unwrap()
+            .to_dtype(crate::tensor::DType::BFloat16)
+            .unwrap();
+        let frame = tensors_to_round_frame(
+            &[&t],
+            crate::distributed::controller::DTYPE_BF16,
+        )
+        .unwrap();
+        assert_eq!(frame.tensors[0].bytes, t.to_blob().unwrap());
+        // And the safety cast the other way: a bf16-staged tensor on an
+        // f32 wire upcasts rather than desyncing the frame schema.
+        let f32_frame = tensors_to_round_frame(&[&t], DTYPE_F32).unwrap();
+        assert_eq!(f32_frame.tensors[0].dtype, DTYPE_F32);
+        assert_eq!(
+            round_frame_to_tensors(&f32_frame).unwrap()[0]
+                .to_f32_vec()
+                .unwrap(),
+            vec![1.5, -3.0]
+        );
+    }
+
     #[test]
     fn tensors_to_round_frame_rejects_non_f32() {
         let t = Tensor::from_f64(&[1.0, 2.0], &[2], Device::CPU).unwrap();
         let refs = vec![&t];
-        let err = tensors_to_round_frame(&refs).unwrap_err();
+        let err = tensors_to_round_frame(&refs, DTYPE_F32).unwrap_err();
         assert!(
             err.to_string().contains("Float64") && err.to_string().contains("Float32"),
             "got: {err}"
@@ -260,8 +305,11 @@
         };
         let err = round_frame_to_tensors(&bogus).unwrap_err();
         let msg = err.to_string();
+        // The length check now lives in `Tensor::from_blob` (the decode
+        // goes blob-direct, no intermediate Vec); its loud message names
+        // the byte count and the numel-derived expectation.
         assert!(
-            msg.contains("numel") && (msg.contains("!=") || msg.contains("mismatch")),
+            msg.contains("numel") && msg.contains("expected"),
             "got: {msg}"
         );
     }
@@ -380,6 +428,41 @@
         assert_eq!(r0.len(), 1);
         assert_eq!(r0[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
         assert_eq!(r1[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
+    }
+
+    /// Full bf16 wire path end-to-end: client encode → relay fold parse
+    /// → controller f32 sum + divide → bf16 scatter → client decode.
+    /// Values chosen bf16-exact so the average is exact too.
+    #[test]
+    fn two_rank_tensor_average_bf16_wire() {
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let (tx0, rx0) = mpsc::channel();
+            let (tx1, rx1) = mpsc::channel();
+            let t0 = thread::spawn(move || {
+                let mut c = CpuReduceClient::connect(addr, 0, 2, TEST_SALT).unwrap();
+                c.set_bf16_wire(true);
+                let t = Tensor::from_f32(&[2.0, 4.0, 6.0], &[3], Device::CPU).unwrap();
+                tx0.send(c.all_reduce_tensors(&[&t]).unwrap()).unwrap();
+                drop(c);
+            });
+            let t1 = thread::spawn(move || {
+                let mut c = CpuReduceClient::connect(addr, 1, 2, TEST_SALT).unwrap();
+                c.set_bf16_wire(true);
+                let t = Tensor::from_f32(&[4.0, 8.0, 12.0], &[3], Device::CPU).unwrap();
+                tx1.send(c.all_reduce_tensors(&[&t]).unwrap()).unwrap();
+                drop(c);
+            });
+            let r0 = rx0.recv().unwrap();
+            let r1 = rx1.recv().unwrap();
+            t0.join().unwrap();
+            t1.join().unwrap();
+            (r0, r1)
+        });
+
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
+        assert_eq!(r1[0].to_f32_vec().unwrap(), vec![3.0, 6.0, 9.0]);
+        assert_eq!(r0[0].dtype(), crate::tensor::DType::Float32, "decode returns f32");
     }
 
     /// Connect failure (no controller listening) surfaces a clear error.

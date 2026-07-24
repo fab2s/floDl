@@ -292,19 +292,32 @@ fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &
             }
         })
         .collect();
+    // Consensus checkpoints are ALWAYS f32 on disk: a bf16-wire payload
+    // (see `ElCheConfig::bf16_wire`) is upcast here — exact, since bf16
+    // is a truncated f32 — so resume never depends on the wire dtype
+    // the run happened to use. f32 payloads keep the zero-copy borrow.
+    let upcast: Vec<Option<Vec<u8>>> = payloads
+        .iter()
+        .map(|p| {
+            if p.dtype == DTYPE_F32 {
+                Ok(None)
+            } else {
+                let vals = crate::distributed::controller::payload_to_f32(p)?;
+                Ok(Some(
+                    crate::distributed::controller::f32_slice_to_payload_bytes(
+                        &vals, DTYPE_F32,
+                    )?,
+                ))
+            }
+        })
+        .collect::<Result<_>>()?;
     let mut entries = Vec::with_capacity(payloads.len());
     for (i, p) in payloads.iter().enumerate() {
-        if p.dtype != DTYPE_F32 {
-            return Err(TensorError::new(&format!(
-                "checkpoint_forge: payload[{i}] dtype {} not supported (v1 f32 only)",
-                p.dtype,
-            )));
-        }
         entries.push(RawCheckpointEntry {
             name: keys[i].as_str(),
             shape: &shapes[i],
             dtype_tag: dtype_tag(DType::Float32),
-            raw: &p.bytes,
+            raw: upcast[i].as_deref().unwrap_or(&p.bytes),
         });
     }
     let path_str = path.to_str().ok_or_else(|| {
@@ -413,8 +426,8 @@ mod tests {
         let b = cpu_tensor(&[5.0, 6.0], &[2]);
         let rm = cpu_tensor(&[7.0, 8.0], &[2]);
         // Two model reduces: params frame (w, b) then buffers frame (rm).
-        let params_frame = tensors_to_round_frame(&[&w, &b]).unwrap();
-        let buffers_frame = tensors_to_round_frame(&[&rm]).unwrap();
+        let params_frame = tensors_to_round_frame(&[&w, &b], DTYPE_F32).unwrap();
+        let buffers_frame = tensors_to_round_frame(&[&rm], DTYPE_F32).unwrap();
 
         let dir = std::env::temp_dir().join(format!("flodl_forge_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -458,6 +471,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A bf16-wire run's consensus frames write an EXACT F32 checkpoint:
+    /// the forge upcasts bf16 payloads (lossless) so resume never
+    /// depends on the wire dtype. Values chosen bf16-representable.
+    #[test]
+    fn bf16_frames_write_f32_checkpoint() {
+        use crate::distributed::controller::DTYPE_BF16;
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+        };
+        let forge = CheckpointForge::new(Some(schema));
+        let w = cpu_tensor(&[1.5, -2.0, 0.25, 42.0], &[4]);
+        let frame = tensors_to_round_frame(&[&w], DTYPE_BF16).unwrap();
+        assert_eq!(frame.tensors[0].dtype, DTYPE_BF16);
+
+        let dir =
+            std::env::temp_dir().join(format!("flodl_forge_bf16_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus.fdl");
+        forge.arm(path.clone());
+        forge.accumulate(frame); // completes 1/1 → detached write
+
+        let mut found = false;
+        for _ in 0..200 {
+            if path.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(found, "bf16 accumulation produced the .fdl");
+
+        use crate::nn::Parameter;
+        let tw = Parameter::new(cpu_tensor(&[0.0; 4], &[4]), "w");
+        crate::nn::load_checkpoint_file(
+            path.to_str().unwrap(),
+            &[("p0".to_string(), tw.clone())],
+            &[],
+            None,
+        )
+        .unwrap();
+        let loaded = tw.variable.data();
+        assert_eq!(loaded.dtype(), crate::tensor::DType::Float32);
+        assert_eq!(loaded.to_f32_vec().unwrap(), vec![1.5, -2.0, 0.25, 42.0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn outer_momentum_writes_sidecar_and_round_trips() {
         // When outer momentum is stashed, the completing cycle writes both
@@ -482,9 +542,9 @@ mod tests {
         forge.arm(path.clone());
         assert!(forge.is_armed());
         // Stash momentum, then complete the model accumulation (params, buffers).
-        forge.stash_outer_momentum(tensors_to_round_frame(&[&mw, &mb]).unwrap().tensors);
-        forge.accumulate(tensors_to_round_frame(&[&w, &b]).unwrap());
-        forge.accumulate(tensors_to_round_frame(&[&rm]).unwrap()); // completes
+        forge.stash_outer_momentum(tensors_to_round_frame(&[&mw, &mb], DTYPE_F32).unwrap().tensors);
+        forge.accumulate(tensors_to_round_frame(&[&w, &b], DTYPE_F32).unwrap());
+        forge.accumulate(tensors_to_round_frame(&[&rm], DTYPE_F32).unwrap()); // completes
 
         let outer_path = path.with_extension("outer.fdl");
         let mut found = false;
@@ -528,7 +588,7 @@ mod tests {
         let path = dir.join("c.fdl");
 
         forge.arm(path.clone());
-        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap()); // completes, no stash
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap()); // completes, no stash
 
         let outer_path = path.with_extension("outer.fdl");
         let mut model_found = false;
@@ -556,7 +616,7 @@ mod tests {
         let forge = CheckpointForge::new(Some(schema));
         let w = cpu_tensor(&[1.0, 2.0], &[2]);
         // No arm() — accumulate must not crash or write.
-        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap());
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap());
     }
 
     #[test]
@@ -577,11 +637,11 @@ mod tests {
         let path = dir.join("c.fdl");
 
         forge.arm(path.clone());
-        forge.accumulate(tensors_to_round_frame(&[&stale]).unwrap()); // partial 1/2
+        forge.accumulate(tensors_to_round_frame(&[&stale], DTYPE_F32).unwrap()); // partial 1/2
         // Re-arm: the stale partial is dropped, cycle restarts.
         forge.arm(path.clone());
-        forge.accumulate(tensors_to_round_frame(&[&w]).unwrap()); // 1/2
-        forge.accumulate(tensors_to_round_frame(&[&b]).unwrap()); // 2/2 → write
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap()); // 1/2
+        forge.accumulate(tensors_to_round_frame(&[&b], DTYPE_F32).unwrap()); // 2/2 → write
 
         let mut found = false;
         for _ in 0..200 {
@@ -617,7 +677,7 @@ mod tests {
         // Two payloads but schema expects 1.
         let a = cpu_tensor(&[1.0], &[1]);
         let b = cpu_tensor(&[2.0], &[1]);
-        let frame = tensors_to_round_frame(&[&a, &b]).unwrap();
+        let frame = tensors_to_round_frame(&[&a, &b], DTYPE_F32).unwrap();
         let path = std::env::temp_dir().join("flodl_forge_mismatch.fdl");
         let err = write_consensus_fdl(&schema, &frame.tensors, &path).unwrap_err();
         assert!(err.to_string().contains("mismatch"), "got: {err}");

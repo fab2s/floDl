@@ -861,6 +861,12 @@ fn run_unified(
     // non-default gamma is paired with an NCCL backend.
     builder = builder.gamma(config.gamma);
 
+    // bf16 wire format for the CPU averaging plane (`--bf16-wire`); the
+    // builder loud-errors at `.run()` when paired with an NCCL mode.
+    if config.bf16_wire {
+        builder = builder.bf16_wire(true);
+    }
+
     // Heterogeneous topology: explicit per-rank shares disable the uniform
     // default. Without this, the fast GPU idles waiting for the slow ones at
     // every sync barrier (the publication-arc anti-pattern).

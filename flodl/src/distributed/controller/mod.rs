@@ -46,7 +46,7 @@
 //! u8  round_kind  (0 = Model, 1 = Control)
 //! f64 weight      (realized-work mass; see RoundFrame::weight)
 //! for each tensor:
-//!   u8  dtype   (0 = f32; v1 only)
+//!   u8  dtype   (0 = f32, 1 = bf16)
 //!   u8  ndim
 //!   u32 dim_0, dim_1, ..., dim_{ndim-1}
 //!   u64 nbytes
@@ -95,8 +95,21 @@ pub(crate) const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
 /// round-trip.
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
-/// dtype tag for f32 in the wire protocol. Only dtype supported.
+/// dtype tag for f32 in the wire protocol — the default and the only
+/// dtype [`RoundKind::Control`] traffic ever rides (count gathers carry
+/// integers bf16 cannot represent exactly above 256, and the formation
+/// broadcast must hand every rank byte-exact initial state).
 pub const DTYPE_F32: u8 = 0;
+
+/// dtype tag for bfloat16 in the wire protocol. Opt-in for
+/// [`RoundKind::Model`] frames via
+/// [`ElCheConfig::bf16_wire`](crate::distributed::ElCheConfig::bf16_wire):
+/// halves every param-plane frame (pinned snapshots, relay fold traffic,
+/// WAN payloads). All arithmetic on the plane — the relay fold, the
+/// controller's sum, the divide-once normalization, the outer optimizer
+/// — still ACCUMULATES IN F32; bf16 exists only at the wire/buffer
+/// boundary (encode on write, decode on read).
+pub const DTYPE_BF16: u8 = 1;
 
 /// Ceiling on a [`RoundFrame`]'s claimed tensor count — unauthenticated
 /// until the MAC verifies, so bounded before the read loop trusts it.
@@ -111,6 +124,7 @@ mod round_frame;
 pub use dead_ranks::DeadRanks;
 pub use round_frame::{RoundFrame, RoundKind, TensorPayload};
 pub(crate) use round_frame::{read_round_frame, write_round_frame, sum_frames};
+pub(crate) use round_frame::{f32_slice_to_payload_bytes, payload_to_f32};
 use round_frame::reduce_realized_work;
 // Byte-codec helpers used only by the controller round-frame tests.
 #[cfg(test)]
@@ -804,8 +818,12 @@ fn average_and_scatter(
                 && let Some(m) = stepper.checkpoint_state()
             {
                 let refs: Vec<&crate::tensor::Tensor> = m.iter().collect();
+                // Controller-local payloads (never hit the wire): stay
+                // f32 so the `<stem>.outer.fdl` momentum is exact
+                // whatever the model wire dtype.
                 outer_momentum = Some(
-                    crate::distributed::cpu_reduce::tensors_to_round_frame(&refs)?.tensors,
+                    crate::distributed::cpu_reduce::tensors_to_round_frame(&refs, DTYPE_F32)?
+                        .tensors,
                 );
             }
             stepped
