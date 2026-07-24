@@ -268,9 +268,11 @@ impl CpuReduceClient {
         }
     }
 
-    /// Weighted frame-level reduce: build a [`RoundFrame`], tag it with
-    /// `kind` + the sender's realized-work `weight`, round-trip it, and
-    /// return the reduced tensors plus the round's summed accepted mass.
+    /// Weighted frame-level reduce: ship `tensors` tagged with `kind` +
+    /// the sender's realized-work `weight`, and return the reduced
+    /// tensors plus the round's summed accepted mass. Equivalent to
+    /// [`Self::all_reduce_scaled`] with `scale = 1.0` (tensors ship
+    /// verbatim).
     ///
     /// [`RoundKind::Model`]: the controller returns the consensus (sum
     /// divided ONCE by the mass of exactly the frames it accepted). A
@@ -289,31 +291,138 @@ impl CpuReduceClient {
         kind: RoundKind,
         weight: f64,
     ) -> Result<(Vec<Tensor>, f64)> {
-        let t0 = Instant::now();
-        let frame = tensors_to_round_frame(tensors, self.wire_dtype_for(kind))?;
-        self.round_trip(frame, kind, weight, t0)
+        self.all_reduce_scaled(tensors, 1.0, kind, weight)
     }
 
-    /// [`Self::all_reduce_weighted`] taking OWNERSHIP of the tensors and
-    /// dropping them the moment the frame is encoded — before the
-    /// blocking round-trip. For the params reduce the input is a
-    /// model-sized scaled scratch copy per rank; holding it across the
-    /// barrier (where every rank's copy is live at once) was part of the
-    /// first-sync RAM spike that OOM'd the two-rank 8GB VM. Use this
-    /// whenever the caller has no post-reduce use for the inputs.
-    pub fn all_reduce_weighted_owned(
+    /// [`Self::all_reduce_weighted`] with the sender-side pre-scale
+    /// (`scale · T` element-wise) FUSED into the wire encode, streamed
+    /// straight to the socket one tensor at a time.
+    ///
+    /// This is the realized-work send path (`scale` = the same γ-mass
+    /// the frame's `weight` carries): fusing the scale means no
+    /// model-sized scratch copy (`mul_scalar` before the A4b rework),
+    /// and streaming means neither the frame's payload bytes nor its
+    /// serialized body ever coexist on the sender — the peak transient
+    /// is ONE tensor's wire bytes. The frame length is computed exactly
+    /// from shapes + dtype and committed as the length prefix before any
+    /// payload is produced (see
+    /// [`round_frame_wire_len`](crate::distributed::controller) usage).
+    ///
+    /// Reading the input tensors at stream time is the caller's single
+    /// consumption of its snapshot staging for the window — the reduce
+    /// completes (blocking read) before any next snapshot can overwrite
+    /// the buffers, so the single-consumer pinned-staging contract
+    /// holds unchanged.
+    ///
+    /// Precision: when a tensor's dtype already matches the wire dtype,
+    /// the scale runs at byte level (decode → f32 multiply →
+    /// re-encode; ONE round-to-nearest-even stage for bf16 — one fewer
+    /// than the old scale-then-serialize path). On a dtype mismatch
+    /// (e.g. the f32 passthrough-staging fallback under bf16 wire) the
+    /// scale runs on-tensor first so the wire cast stays the single
+    /// rounding stage.
+    pub fn all_reduce_scaled(
         &mut self,
-        tensors: Vec<Tensor>,
+        tensors: &[&Tensor],
+        scale: f64,
         kind: RoundKind,
         weight: f64,
     ) -> Result<(Vec<Tensor>, f64)> {
         let t0 = Instant::now();
-        let frame = {
-            let refs: Vec<&Tensor> = tensors.iter().collect();
-            tensors_to_round_frame(&refs, self.wire_dtype_for(kind))?
+        let wire_dtype = self.wire_dtype_for(kind);
+        let wire_tensor_dtype = wire_tensor_dtype(wire_dtype)?;
+        let elem = controller::payload_element_size(wire_dtype)? as u64;
+
+        // Wire metadata first: dtype support (loud), shapes as u32 (loud
+        // on overflow) + exact payload byte counts — enough to commit
+        // the frame length before producing a single payload byte.
+        for (i, t) in tensors.iter().enumerate() {
+            if !matches!(t.dtype(), DType::Float32 | DType::BFloat16) {
+                return Err(TensorError::new(&format!(
+                    "cpu_reduce: tensor[{i}] dtype {:?} not supported (only Float32 \
+                     / BFloat16). Extend cpu_reduce.rs and the round_frame.rs codec \
+                     helpers together to add support.",
+                    t.dtype()
+                )));
+            }
+        }
+        let shapes: Vec<Vec<u32>> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| wire_shape(i, t))
+            .collect::<Result<_>>()?;
+        let parts: Vec<controller::PayloadPart<'_>> = tensors
+            .iter()
+            .zip(shapes.iter())
+            .map(|(t, shape)| controller::PayloadPart {
+                dtype: wire_dtype,
+                shape,
+                nbytes: t.numel() as u64 * elem,
+            })
+            .collect();
+        let sent_bytes: u64 = parts.iter().map(|p| p.nbytes).sum();
+
+        crate::distributed::relay::mux::write_len_prefix(
+            &mut self.stream,
+            controller::round_frame_wire_len(&parts),
+        )?;
+        let prof = self.prof_enabled;
+        let mut produce_ns: u128 = 0;
+        controller::write_round_frame_streamed(
+            &mut self.stream,
+            kind,
+            weight,
+            &parts,
+            &self.salt,
+            &mut |ti, tee| {
+                let tp = Instant::now();
+                let t = tensors[ti];
+                let bytes = if t.dtype() == wire_tensor_dtype {
+                    let mut b = t.to_blob()?;
+                    if scale != 1.0 {
+                        controller::scale_payload_bytes(&mut b, wire_dtype, scale as f32)?;
+                    }
+                    b
+                } else {
+                    // Cast on-device so the transient is wire-sized; the
+                    // client-side cast is what keeps the frame schema
+                    // uniform whatever staging path produced the tensor
+                    // (see `tensors_to_round_frame`).
+                    let src = if scale != 1.0 {
+                        t.mul_scalar(scale)?
+                    } else {
+                        t.clone()
+                    };
+                    src.to_dtype(wire_tensor_dtype)?.to_blob()?
+                };
+                if prof {
+                    produce_ns += tp.elapsed().as_nanos();
+                }
+                tee.write_all(&bytes)
+                    .map_err(|e| TensorError::new(&e.to_string()))
+            },
+        )?;
+
+        let reduced = match read_framed_round(&mut self.stream, &self.salt)? {
+            Some(f) => f,
+            None => {
+                return Err(TensorError::new(
+                    "cpu_reduce: controller closed connection before sending averaged \
+                     frame back (controller crashed, or another rank disconnected and \
+                     triggered cluster-wide shutdown mid-round)",
+                ));
+            }
         };
-        drop(tensors);
-        self.round_trip(frame, kind, weight, t0)
+        let t2 = Instant::now();
+        let out = round_frame_to_tensors(&reduced)?;
+        if prof {
+            self.prof_serialize_ns += produce_ns;
+            self.prof_wire_ns += (t2 - t0).as_nanos().saturating_sub(produce_ns);
+            self.prof_deserialize_ns += t2.elapsed().as_nanos();
+            self.prof_bytes += sent_bytes;
+            self.prof_count += 1;
+        }
+        Ok((out, reduced.weight))
     }
 
     /// Wire dtype for a round kind: `Model` rides the configured dtype,
@@ -323,42 +432,6 @@ impl CpuReduceClient {
             RoundKind::Model => self.model_wire_dtype,
             RoundKind::Control => DTYPE_F32,
         }
-    }
-
-    /// Shared round-trip tail: tag the frame, reduce, decode.
-    ///
-    /// Instrumentation (gated on `-vvv`): times the three phases
-    /// independently so the cpu-cadence reduce floor can be attributed
-    /// to serialize (incl. GPU→CPU via `to_blob`; measured from `t0`,
-    /// taken by the caller before frame build) / wire (cross-host TCP
-    /// round-trip) / deserialize. Summed across reduces, emitted at
-    /// teardown by `log_profile_summary`.
-    fn round_trip(
-        &mut self,
-        mut frame: RoundFrame,
-        kind: RoundKind,
-        weight: f64,
-        t0: Instant,
-    ) -> Result<(Vec<Tensor>, f64)> {
-        frame.kind = kind;
-        frame.weight = weight;
-        if !self.prof_enabled {
-            let reduced = self.all_reduce(frame)?;
-            return Ok((round_frame_to_tensors(&reduced)?, reduced.weight));
-        }
-        // Byte count captured pre-send (`all_reduce` consumes the frame).
-        let sent_bytes: u64 = frame.tensors.iter().map(|p| p.bytes.len() as u64).sum();
-        let t1 = Instant::now();
-        let reduced = self.all_reduce(frame)?;
-        let t2 = Instant::now();
-        let out = round_frame_to_tensors(&reduced)?;
-        let t3 = Instant::now();
-        self.prof_serialize_ns += (t1 - t0).as_nanos();
-        self.prof_wire_ns += (t2 - t1).as_nanos();
-        self.prof_deserialize_ns += (t3 - t2).as_nanos();
-        self.prof_bytes += sent_bytes;
-        self.prof_count += 1;
-        Ok((out, reduced.weight))
     }
 
     /// Convenience: equal-weight mean over the accepted cohort. Each
@@ -533,18 +606,38 @@ impl CpuReduceClient {
 // Length-framed RoundFrame helpers (rank ↔ relay loopback leg)
 // ---------------------------------------------------------------------------
 
-/// Serialize `frame` (with its HMAC footer) and write it length-delimited
-/// to `stream`. The rank talks to its host-local relay, which forwards the
-/// opaque blob upstream untouched; the length prefix lets the relay frame
-/// it without parsing. See [`crate::distributed::relay::mux`].
+/// Write `frame` (with its HMAC footer) length-delimited to `stream`,
+/// STREAMED: the exact frame length goes out as the prefix, then the
+/// body is written straight from the frame's payloads — the serialized
+/// body never exists as a buffer (before A4b this path materialized the
+/// body TWICE: a serialize `Vec` plus `write_len_framed`'s atomic
+/// `[len‖body]` copy — two model-sized transients per model frame). The
+/// rank talks to its host-local relay, which forwards the opaque blob
+/// upstream untouched; the length prefix lets the relay frame it without
+/// parsing, and its reader commits through read timeouts once the first
+/// prefix byte lands (see [`mux::write_len_prefix`]), so the split
+/// writes cannot desync it. See [`crate::distributed::relay::mux`].
+///
+/// [`mux::write_len_prefix`]: crate::distributed::relay::mux::write_len_prefix
 fn write_framed_round<W: Write>(
     stream: &mut W,
     frame: &RoundFrame,
     salt: &SessionSalt,
 ) -> Result<()> {
-    let mut buf = Vec::new();
-    controller::write_round_frame(&mut buf, frame, salt)?;
-    crate::distributed::relay::mux::write_len_framed(stream, &buf)
+    let parts: Vec<controller::PayloadPart<'_>> = frame
+        .tensors
+        .iter()
+        .map(|t| controller::PayloadPart {
+            dtype: t.dtype,
+            shape: &t.shape,
+            nbytes: t.bytes.len() as u64,
+        })
+        .collect();
+    crate::distributed::relay::mux::write_len_prefix(
+        stream,
+        controller::round_frame_wire_len(&parts),
+    )?;
+    controller::write_round_frame(stream, frame, salt)
 }
 
 /// Read a length-delimited [`RoundFrame`] blob and parse it. `Ok(None)` on
@@ -577,15 +670,7 @@ fn read_framed_round<R: Read>(stream: &mut R, salt: &SessionSalt) -> Result<Opti
 /// round schema and tear the cohort down — the cast makes every frame
 /// uniform whatever staging path produced the tensors.
 pub fn tensors_to_round_frame(tensors: &[&Tensor], wire_dtype: u8) -> Result<RoundFrame> {
-    let wire_tensor_dtype = match wire_dtype {
-        DTYPE_F32 => DType::Float32,
-        DTYPE_BF16 => DType::BFloat16,
-        other => {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: unsupported wire dtype tag {other} (0 = f32, 1 = bf16)"
-            )));
-        }
-    };
+    let wire_tensor_dtype = wire_tensor_dtype(wire_dtype)?;
     let mut payloads = Vec::with_capacity(tensors.len());
     for (i, t) in tensors.iter().enumerate() {
         if !matches!(t.dtype(), DType::Float32 | DType::BFloat16) {
@@ -596,19 +681,7 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor], wire_dtype: u8) -> Result<Rou
                 t.dtype()
             )));
         }
-        let shape_i64 = t.shape();
-        let shape: Vec<u32> = shape_i64
-            .iter()
-            .enumerate()
-            .map(|(d_idx, d)| {
-                u32::try_from(*d).map_err(|_| {
-                    TensorError::new(&format!(
-                        "cpu_reduce: tensor[{i}] dim[{d_idx}] = {d} doesn't fit in u32 \
-                         (wire protocol uses u32 shape dims)"
-                    ))
-                })
-            })
-            .collect::<Result<_>>()?;
+        let shape = wire_shape(i, t)?;
         let bytes = if t.dtype() == wire_tensor_dtype {
             t.to_blob()?
         } else {
@@ -631,6 +704,35 @@ pub fn tensors_to_round_frame(tensors: &[&Tensor], wire_dtype: u8) -> Result<Rou
         kind: RoundKind::Model,
         weight: 0.0,
     })
+}
+
+/// Map a wire dtype tag to the tensor dtype the payload bytes carry;
+/// loud error on unknown tags.
+fn wire_tensor_dtype(wire_dtype: u8) -> Result<DType> {
+    match wire_dtype {
+        DTYPE_F32 => Ok(DType::Float32),
+        DTYPE_BF16 => Ok(DType::BFloat16),
+        other => Err(TensorError::new(&format!(
+            "cpu_reduce: unsupported wire dtype tag {other} (0 = f32, 1 = bf16)"
+        ))),
+    }
+}
+
+/// Tensor shape as the wire's `Vec<u32>` (loud error if any dim doesn't
+/// fit — the protocol uses u32 shape dims).
+fn wire_shape(i: usize, t: &Tensor) -> Result<Vec<u32>> {
+    t.shape()
+        .iter()
+        .enumerate()
+        .map(|(d_idx, d)| {
+            u32::try_from(*d).map_err(|_| {
+                TensorError::new(&format!(
+                    "cpu_reduce: tensor[{i}] dim[{d_idx}] = {d} doesn't fit in u32 \
+                     (wire protocol uses u32 shape dims)"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Build a list of new CPU `Tensor`s from a [`RoundFrame`].

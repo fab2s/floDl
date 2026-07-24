@@ -688,6 +688,86 @@
         assert!(f32_slice_to_payload_bytes(&data, 9).is_err());
     }
 
+    /// The streamed writer's length contract: `round_frame_wire_len`
+    /// must equal the serialized frame byte-for-byte, in both dtypes —
+    /// it is what the sender commits as the length prefix BEFORE any
+    /// payload bytes exist, so a drift here desyncs every stream.
+    #[test]
+    fn round_frame_wire_len_matches_serialized_frame() {
+        for dtype in [DTYPE_F32, DTYPE_BF16] {
+            let frame = RoundFrame {
+                tensors: vec![
+                    TensorPayload {
+                        dtype,
+                        shape: vec![2, 3],
+                        bytes: f32_slice_to_payload_bytes(&[1.5f32; 6], dtype).unwrap(),
+                    },
+                    TensorPayload {
+                        dtype,
+                        shape: vec![4],
+                        bytes: f32_slice_to_payload_bytes(&[-2.0f32; 4], dtype).unwrap(),
+                    },
+                ],
+                kind: RoundKind::Model,
+                weight: 3.0,
+            };
+            let parts: Vec<PayloadPart<'_>> = frame
+                .tensors
+                .iter()
+                .map(|t| PayloadPart {
+                    dtype: t.dtype,
+                    shape: &t.shape,
+                    nbytes: t.bytes.len() as u64,
+                })
+                .collect();
+            let mut buf = Vec::new();
+            write_round_frame(&mut buf, &frame, &TEST_SALT).unwrap();
+            assert_eq!(
+                buf.len() as u64,
+                round_frame_wire_len(&parts),
+                "dtype {dtype}"
+            );
+            // And the (streamed-under-the-hood) writer still round-trips.
+            let parsed = read_round_frame(&mut buf.as_slice(), &TEST_SALT)
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed, frame, "dtype {dtype}");
+        }
+    }
+
+    /// An emitter that writes a different byte count than its declared
+    /// `nbytes` must error loudly — the length prefix is already on the
+    /// wire by then, so silence would mean a desynced stream instead of
+    /// a named bug.
+    #[test]
+    fn streamed_writer_rejects_emitter_byte_count_mismatch() {
+        let shape = [2u32];
+        let parts = [PayloadPart {
+            dtype: DTYPE_F32,
+            shape: &shape,
+            nbytes: 8,
+        }];
+        let mut buf = Vec::new();
+        let err = write_round_frame_streamed(
+            &mut buf,
+            RoundKind::Model,
+            1.0,
+            &parts,
+            &TEST_SALT,
+            &mut |_, tee| {
+                use std::io::Write;
+                tee.write_all(&[0u8; 4])
+                    .map_err(|e| TensorError::new(&e.to_string()))
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared") && msg.contains("4"),
+            "expected loud emitter byte-count mismatch, got: {msg}"
+        );
+    }
+
     /// The fold must accumulate in f32 whatever the wire dtype. 512
     /// frames of 1.0: a (wrong) bf16 running sum would stall at 256
     /// (256 + 1 rounds back to 256 in bf16); the f32 accumulator reaches

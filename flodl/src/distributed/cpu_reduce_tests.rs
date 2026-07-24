@@ -465,6 +465,65 @@
         assert_eq!(r0[0].dtype(), crate::tensor::DType::Float32, "decode returns f32");
     }
 
+    /// The fused byte-level γ-scale must match the tensor-level
+    /// `mul_scalar` it replaced, bit-for-bit, in both wire dtypes —
+    /// libtorch's scalar mul computes in f32 and rounds to nearest-even,
+    /// exactly like `scale_payload_bytes`' decode → f32 multiply →
+    /// re-encode. A failure here means the fused path changed reduce
+    /// numerics, not just its RAM profile.
+    #[test]
+    fn fused_byte_scale_matches_mul_scalar() {
+        use crate::distributed::controller::scale_payload_bytes;
+        let vals = [0.731_442_6f32, -1.902_337_5, 3.017_882e-3, -42.523_86];
+        let w = 0.834_921_7f64;
+        for (dtype, tag) in [
+            (DType::Float32, DTYPE_F32),
+            (DType::BFloat16, DTYPE_BF16),
+        ] {
+            let t = Tensor::from_f32(&vals, &[4], Device::CPU)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let expected = t.mul_scalar(w).unwrap().to_blob().unwrap();
+            let mut fused = t.to_blob().unwrap();
+            scale_payload_bytes(&mut fused, tag, w as f32).unwrap();
+            assert_eq!(fused, expected, "dtype {dtype:?}");
+        }
+    }
+
+    /// `all_reduce_scaled` end-to-end on the bf16 wire with UNEQUAL
+    /// masses: the fused sender-side scale must produce the same
+    /// realized-work consensus the prescaled path would. Values chosen
+    /// so every intermediate (scaled contributions, sum, consensus) is
+    /// bf16-exact: (3·[2,8] + 1·[4,16]) / 4 = [2.5, 10.0].
+    #[test]
+    fn two_rank_scaled_weighted_average_bf16_wire() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, vals: [f32; 2], w: f64| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_bf16_wire(true);
+                    let t = Tensor::from_f32(&vals, &[2], Device::CPU).unwrap();
+                    c.all_reduce_scaled(&[&t], w, RoundKind::Model, w).unwrap()
+                })
+            };
+            let t0 = spawn(0, [2.0, 8.0], 3.0);
+            let t1 = spawn(1, [4.0, 16.0], 1.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, (tensors, mass)) in [(0, &r0), (1, &r1)] {
+            assert_eq!(*mass, 4.0, "rank {rank} accepted mass");
+            assert_eq!(
+                tensors[0].to_f32_vec().unwrap(),
+                vec![2.5, 10.0],
+                "rank {rank} consensus"
+            );
+        }
+    }
+
     /// Connect failure (no controller listening) surfaces a clear error.
     #[test]
     fn surfaces_connect_failure_clearly() {

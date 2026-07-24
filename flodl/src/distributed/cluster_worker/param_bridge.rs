@@ -314,15 +314,14 @@ pub(crate) fn sumcount_reduce(
     tensors: &[Tensor],
     my_weight: f64,
 ) -> Result<Vec<Tensor>> {
-    let scaled: Vec<Tensor> = tensors
-        .iter()
-        .map(|t| t.mul_scalar(my_weight))
-        .collect::<Result<_>>()?;
-    // Ownership handoff: the scaled scratch (a whole model copy on the
-    // params reduce) is freed the moment the wire frame is encoded,
-    // instead of sitting live across the barrier on every rank at once.
-    let (consensus, realized) = client.all_reduce_weighted_owned(
-        scaled,
+    // The `my_weight` pre-scale is FUSED into the streaming wire encode
+    // (byte-level, per tensor) — no model-sized scaled scratch exists,
+    // and reading `tensors` (the pinned snapshot staging) at stream time
+    // is this window's single consumption of it.
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let (consensus, realized) = client.all_reduce_scaled(
+        &refs,
+        my_weight,
         crate::distributed::controller::RoundKind::Model,
         my_weight,
     )?;
