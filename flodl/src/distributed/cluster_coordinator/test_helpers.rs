@@ -93,6 +93,19 @@ impl ClusterCoordinator {
         &self.cycle.sync_lag_ms
     }
 
+    /// Test-only seam: replace the metrics channel with a fresh one
+    /// and hand back its sender, so a test can feed
+    /// [`crate::distributed::wire::MetricsMsgWire`] frames straight
+    /// into `drain_metrics` without the TCP reader threads.
+    #[cfg(test)]
+    pub(crate) fn test_metrics_sender(
+        &mut self,
+    ) -> mpsc::Sender<crate::distributed::wire::MetricsMsgWire> {
+        let (tx, rx) = mpsc::channel();
+        self.metrics_rx = rx;
+        tx
+    }
+
     /// Build a headless ClusterCoordinator for unit-testing internal
     /// state-machine logic without spinning up TCP listeners or
     /// reader threads. `control_streams` and `reader_handles` are
@@ -165,6 +178,7 @@ impl ClusterCoordinator {
             last_step_count_at_epoch_start: vec![0; world_size],
             nccl_rendezvous_pending: None,
             local_ranks: config.local_ranks.clone(),
+            rank_hosts: config.rank_hosts.clone(),
             max_failure: config.max_failure,
             epoch_callback_policy: config.epoch_callback_policy,
             checkpoint_role: initial_callback_role(

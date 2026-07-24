@@ -101,9 +101,28 @@ pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Resul
                     cmd_dir.display()
                 )
             })?;
+            // The container starts in its configured workdir (the
+            // compose root's mount), NOT the command dir — without a
+            // `cd`, a cargo entry builds and probes the WORKSPACE
+            // default binary instead of the command's (observed:
+            // `fdl ddp-bench --refresh-schema` probing `fdl` itself,
+            // which rejects `--fdl-schema`). The command dir's path
+            // relative to the compose root is the same on both sides
+            // of the mount, so prefix the entry with a relative cd.
+            let inner_in_container = match cmd_dir
+                .strip_prefix(&compose_root)
+                .ok()
+                .filter(|rel| !rel.as_os_str().is_empty())
+            {
+                Some(rel) => format!(
+                    "cd {} && {inner}",
+                    posix_quote(&rel.to_string_lossy())
+                ),
+                None => inner,
+            };
             let wrapped = format!(
                 "docker compose run --rm {svc} bash -c {}",
-                posix_quote(&inner)
+                posix_quote(&inner_in_container)
             );
             (wrapped, compose_root)
         }

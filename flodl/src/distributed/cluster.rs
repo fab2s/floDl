@@ -166,6 +166,14 @@ pub struct LocalCluster {
     /// channels to authenticate).
     ///
     pub salt: SessionSalt,
+
+    /// Controller wants per-rank resource samples attached to metrics
+    /// reports. Set by the launcher when its harness carries a
+    /// [`crate::monitor::Timeline`] (the samples persist host-qualified
+    /// into `timeline.json`); a rank-side `monitor.serve(port)` enables
+    /// the same sampling independently of this flag. Absent = `false` —
+    /// headless runs pay no NVML poller.
+    pub rank_resources: bool,
 }
 
 /// Controller bind coordinates, shipped per rank inside the envelope.
@@ -351,6 +359,13 @@ impl LocalCluster {
             None => [0u8; super::wire::SESSION_SALT_BYTES],
         };
 
+        // Optional resource-sampling opt-in; envelopes predating the
+        // field (or built manually) default to off.
+        let rank_resources = obj
+            .get("rank_resources")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         Ok(LocalCluster {
             controller: ControllerBlock {
                 host: controller_host,
@@ -360,6 +375,7 @@ impl LocalCluster {
             num_workers,
             worker,
             salt,
+            rank_resources,
         })
     }
 

@@ -132,6 +132,13 @@ pub struct ClusterCoordinatorConfig {
     /// breaking ties by lowest global rank).
     pub local_ranks: Vec<usize>,
 
+    /// Host name per global rank (index = rank), from the launcher's
+    /// world map. Used to host-qualify the rank-reported resource
+    /// samples deposited into the timeline — device indices collide
+    /// across hosts, so a sample without its host is ambiguous.
+    /// Defaults to empty (samples deposit with an empty host).
+    pub rank_hosts: Vec<String>,
+
     /// Threshold for declaring a cluster run unrecoverable.
     ///
     /// When the count of dead ranks reaches this limit, the coord
@@ -333,6 +340,7 @@ impl ClusterCoordinatorConfig {
             rendezvous_timeout_secs: NCCL_RENDEZVOUS_TIMEOUT_SECS,
             formation_timeout_secs: crate::distributed::wire::scaled_deadline_secs(60),
             local_ranks: Vec::new(),
+            rank_hosts: Vec::new(),
             max_failure: None,
             save_path: None,
             checkpoint_every: None,
@@ -601,6 +609,14 @@ impl ClusterCoordinatorConfig {
     /// rank(s); standalone-coord tests typically leave this empty.
     pub fn local_ranks(mut self, ranks: Vec<usize>) -> Self {
         self.local_ranks = ranks;
+        self
+    }
+
+    /// Set the global-rank → host map (index = rank) used to
+    /// host-qualify rank-reported resource samples deposited into the
+    /// timeline. The launcher fills it from its world map.
+    pub fn rank_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.rank_hosts = hosts;
         self
     }
 

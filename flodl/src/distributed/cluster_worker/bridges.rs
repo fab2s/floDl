@@ -394,9 +394,10 @@ pub(super) fn outbound_loop(
     // requested, emit the matching `TimingMsgWire::Dashboard*` frames
     // so the launcher's `ClusterDashboardSink` binds the HTTP server
     // and seeds its header / per-rank tabs. Construct a local
-    // `ResourceSampler` only when the user opted in — sampling costs
-    // a /proc/stat parse + the NVML poller thread, neither worth
-    // paying for headless runs.
+    // `ResourceSampler` only when something consumes the samples
+    // (dashboard opt-in or the envelope's `rank_resources` flag) —
+    // sampling costs a /proc/stat parse + the NVML poller thread,
+    // neither worth paying for runs with no consumer.
     let pending = crate::distributed::cluster_dashboard_emit::drain();
     // Per-rank assigned CUDA device. On hosts where
     // `CUDA_VISIBLE_DEVICES` is scoped per rank (`cuda_device_count()
@@ -412,18 +413,26 @@ pub(super) fn outbound_loop(
     // and so `emit_dashboard_setup` can trim the rank's hardware
     // string to its own GPU (the launcher's sink then groups per
     // host and lists per-rank GPU labels without dupes).
-    let assigned_device_idx: Option<u8> =
-        crate::distributed::LocalCluster::from_env()
-            .ok()
-            .flatten()
-            .and_then(|c| c.my_rank().ok())
-            .and_then(|(_, dev)| match dev {
-                crate::tensor::Device::CUDA(idx) => Some(idx),
-                _ => None,
-            });
+    let envelope = crate::distributed::LocalCluster::from_env().ok().flatten();
+    let assigned_device_idx: Option<u8> = envelope
+        .as_ref()
+        .and_then(|c| c.my_rank().ok())
+        .and_then(|(_, dev)| match dev {
+            crate::tensor::Device::CUDA(idx) => Some(idx),
+            _ => None,
+        });
+    // Sampling turns on for either consumer of the samples: the live
+    // dashboard the user requested via `monitor.serve(port)`, or the
+    // controller's timeline persistence requested through the
+    // envelope's `rank_resources` flag. The dashboard emit sequence
+    // stays port-gated — the flag wants samples, not an HTTP bind.
+    let want_resources = pending.port.is_some()
+        || envelope.as_ref().is_some_and(|c| c.rank_resources);
     let resource_sampler: Option<std::sync::Mutex<crate::monitor::ResourceSampler>> =
-        if pending.port.is_some() {
-            emit_dashboard_setup(stream, salt, rank, &pending, assigned_device_idx);
+        if want_resources {
+            if pending.port.is_some() {
+                emit_dashboard_setup(stream, salt, rank, &pending, assigned_device_idx);
+            }
             Some(std::sync::Mutex::new(
                 crate::monitor::ResourceSampler::new(),
             ))
@@ -523,9 +532,20 @@ pub(super) fn write_metrics(
         // returns one snapshot per physical device — but only the
         // rank's assigned device carries this process's allocator
         // stats. Strip foreign-device entries so the dashboard sink's
-        // `gpus.first()` lands on the correct GPU.
-        if let Some(target) = assigned_device_idx {
-            sample.gpus.retain(|g| g.device_index == target);
+        // `gpus.first()` lands on the correct GPU. Only filter when
+        // there is something to disambiguate: a scoped-down rank
+        // (`CUDA_VISIBLE_DEVICES=<phys>`, the launcher's per-child
+        // spawn recipe) already sees exactly its own device, and its
+        // snapshot carries the PHYSICAL index while
+        // `assigned_device_idx` carries the remapped runtime index
+        // (`my_rank` returns `CUDA(0)` for scoped children) — matching
+        // them would empty the list for every rank whose physical
+        // device isn't 0 (observed: pascal r2 shipped no GPU slice at
+        // all, blinding both the dashboard tab and the timeline).
+        if sample.gpus.len() > 1 {
+            if let Some(target) = assigned_device_idx {
+                sample.gpus.retain(|g| g.device_index == target);
+            }
         }
         wire.resources = Some(sample.into());
     }

@@ -27,6 +27,7 @@ mod gate;
 mod heartbeat;
 mod lost_broadcast;
 mod reduce_stall;
+mod resource_plumb;
 mod shutdown_gate;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).

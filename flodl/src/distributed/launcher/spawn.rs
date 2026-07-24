@@ -843,11 +843,18 @@ pub(super) fn shell_quote(s: &str) -> String {
 /// tunneled worker (its loopback end of the SSH forward) and for every
 /// host when the controller binds loopback-only.
 ///
+/// `rank_resources` asks each rank to attach resource samples to its
+/// metrics reports (set when the launcher's harness carries a
+/// `Timeline` that will persist them). Emitted only when `true` — the
+/// parser defaults absent to off, keeping the envelope byte-identical
+/// for runs that never asked.
+///
 /// [`LocalCluster::from_env`]: crate::distributed::cluster::LocalCluster::from_env
 pub(super) fn build_slim_envelope_for(
     full: &FullCluster,
     worker: &FullWorker,
     controller_dial_host: &str,
+    rank_resources: bool,
 ) -> serde_json::Value {
     use serde_json::Value;
     let mut host_obj = serde_json::Map::new();
@@ -888,6 +895,9 @@ pub(super) fn build_slim_envelope_for(
         "salt".into(),
         Value::String(crate::distributed::wire::salt_to_hex(&full.salt)),
     );
+    if rank_resources {
+        envelope.insert("rank_resources".into(), Value::Bool(true));
+    }
     Value::Object(envelope)
 }
 
