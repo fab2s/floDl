@@ -24,6 +24,7 @@
 //! ```
 
 pub mod format;
+pub mod record;
 pub mod resources;
 pub mod timeline;
 mod server;
