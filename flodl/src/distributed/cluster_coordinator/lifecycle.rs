@@ -439,6 +439,7 @@ impl ClusterCoordinator {
             timeline: config.timeline.clone(),
             sync_start: None,
             dashboard_sink: config.dashboard_sink.clone(),
+            event_lane: crate::monitor::event_lane::EventLane::new(),
         })
     }
 
@@ -533,12 +534,16 @@ impl ClusterCoordinator {
     }
 
     /// Record a dropped best-effort broadcast: bump the run-long
-    /// [`lost_broadcasts`](Self::lost_broadcasts) counter and emit a
+    /// [`lost_broadcasts`](Self::lost_broadcasts) counter, emit a
     /// [`crate::monitor::EventKind::LostBroadcast`] on the shared timeline
-    /// if one is attached. The caller has already logged the per-rank
-    /// detail to stderr; this is the structured, queryable twin of that
-    /// log. `failures` is the number of live ranks that did not receive
-    /// the message.
+    /// if one is attached, and raise a `control_drop` alert on the record
+    /// stream. The caller has already logged the per-rank detail to stderr;
+    /// these are the structured, queryable twins of that log. `failures` is
+    /// the number of live ranks that did not receive the message.
+    ///
+    /// Path is the root: a broadcast the coordinator could not deliver is a
+    /// cohort-level fault, and the per-rank breakdown is in the error text
+    /// the caller logged.
     pub(super) fn note_lost_broadcast(&mut self, control: &str, failures: usize) {
         self.lost_broadcasts += 1;
         if let Some(ref tl) = self.timeline {
@@ -547,6 +552,11 @@ impl ClusterCoordinator {
                 failures,
             });
         }
+        self.emit_alert(
+            crate::monitor::event_lane::EventClass::ControlDrop,
+            "root".to_string(),
+            format!("{control} did not reach {failures} live rank(s)"),
+        );
     }
 
     /// Send Shutdown to every rank. Called from [`Self::shutdown`];
@@ -562,6 +572,9 @@ impl ClusterCoordinator {
         // Best-effort send Shutdown before tearing readers down. Ignore
         // write errors here: a rank may already have exited.
         let _ = self.shutdown_workers();
+        // Close the alert lane's open collapse windows so the tail of a
+        // flood lands in the persisted history, not only the live feed.
+        self.flush_alerts();
         self.shutdown_flag.store(true, Ordering::SeqCst);
         for handle_opt in self.reader_handles.iter_mut() {
             if let Some(handle) = handle_opt.take() {

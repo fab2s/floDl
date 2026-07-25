@@ -18,6 +18,7 @@ pub(crate) use std::sync::atomic::AtomicBool;
 pub(crate) use std::thread;
 pub(crate) use std::time::Duration;
 
+mod alerts;
 mod callbacks;
 mod delivered_feed;
 mod epoch_dispatch;
@@ -340,6 +341,69 @@ pub(super) fn cfg_sync_cpu(world_size: usize) -> ClusterCoordinatorConfig {
         ElChe::new(world_size, 1),
     )
     .no_divergence_guard()
+}
+
+/// Capturing [`crate::distributed::DashboardSink`] stub: records every
+/// record-stream push, window feed and alert feed alike. Shared by the
+/// `window_report` and `alerts` suites — both assert on what the coordinator
+/// actually handed the sink.
+#[derive(Default)]
+pub(super) struct StubSink {
+    windows: std::sync::Mutex<Vec<Vec<serde_json::Value>>>,
+    events: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+impl StubSink {
+    /// Number of window reports pushed so far.
+    pub(super) fn count(&self) -> usize {
+        self.windows.lock().unwrap().len()
+    }
+    /// Root record of the most recent window report.
+    pub(super) fn last_root(&self) -> serde_json::Value {
+        self.windows.lock().unwrap().last().unwrap()[0].clone()
+    }
+    /// All records of the most recent window report.
+    pub(super) fn last(&self) -> Vec<serde_json::Value> {
+        self.windows.lock().unwrap().last().unwrap().clone()
+    }
+    /// Every alert record pushed so far, flattened in emission order.
+    pub(super) fn events(&self) -> Vec<serde_json::Value> {
+        self.events.lock().unwrap().clone()
+    }
+    /// Alert records of one class, in emission order.
+    pub(super) fn events_of(&self, class: &str) -> Vec<serde_json::Value> {
+        self.events()
+            .into_iter()
+            .filter(|e| e["class"] == class)
+            .collect()
+    }
+}
+
+impl crate::distributed::DashboardSink for StubSink {
+    fn register_port(&self, _rank: usize, _port: u16) {}
+    fn set_svg(
+        &self,
+        _rank: usize,
+        _svg: String,
+        _label: Option<String>,
+        _hash: Option<String>,
+    ) {
+    }
+    fn set_metadata(&self, _rank: usize, _json: String) {}
+    fn set_hardware(&self, _rank: usize, _summary: String) {}
+    fn push_resource_sample(
+        &self,
+        _rank: usize,
+        _sample: crate::distributed::wire::ResourceSampleWire,
+    ) {
+    }
+    fn push_epoch_metrics(&self, _metrics: &crate::distributed::ddp_run::EpochMetrics) {}
+    fn push_window_records(&self, records: Vec<serde_json::Value>) {
+        self.windows.lock().unwrap().push(records);
+    }
+    fn push_events(&self, records: Vec<serde_json::Value>) {
+        self.events.lock().unwrap().extend(records);
+    }
 }
 
 #[test]

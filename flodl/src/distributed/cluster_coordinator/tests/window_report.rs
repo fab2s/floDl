@@ -7,52 +7,10 @@
 //! what matters is that the sub-epoch feed is silent by default (no
 //! cadence configured = zero behavior change) and exact when enabled.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::super::ClusterCoordinator;
-use super::{TimingMsgWire, cfg_sync_cpu};
-use crate::distributed::DashboardSink;
-use crate::distributed::wire::ResourceSampleWire;
-
-/// Capturing [`DashboardSink`] stub: records every window push.
-#[derive(Default)]
-struct StubSink {
-    windows: Mutex<Vec<Vec<serde_json::Value>>>,
-}
-
-impl StubSink {
-    /// Number of window reports pushed so far.
-    fn count(&self) -> usize {
-        self.windows.lock().unwrap().len()
-    }
-    /// Root record of the most recent window report.
-    fn last_root(&self) -> serde_json::Value {
-        self.windows.lock().unwrap().last().unwrap()[0].clone()
-    }
-    /// All records of the most recent window report.
-    fn last(&self) -> Vec<serde_json::Value> {
-        self.windows.lock().unwrap().last().unwrap().clone()
-    }
-}
-
-impl DashboardSink for StubSink {
-    fn register_port(&self, _rank: usize, _port: u16) {}
-    fn set_svg(
-        &self,
-        _rank: usize,
-        _svg: String,
-        _label: Option<String>,
-        _hash: Option<String>,
-    ) {
-    }
-    fn set_metadata(&self, _rank: usize, _json: String) {}
-    fn set_hardware(&self, _rank: usize, _summary: String) {}
-    fn push_resource_sample(&self, _rank: usize, _sample: ResourceSampleWire) {}
-    fn push_epoch_metrics(&self, _metrics: &crate::distributed::ddp_run::EpochMetrics) {}
-    fn push_window_records(&self, records: Vec<serde_json::Value>) {
-        self.windows.lock().unwrap().push(records);
-    }
-}
+use super::{StubSink, TimingMsgWire, cfg_sync_cpu};
 
 /// Feed one completed batch for `rank` carrying `loss`.
 fn batch(coord: &mut ClusterCoordinator, rank: u64, loss: f64) {

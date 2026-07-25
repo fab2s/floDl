@@ -53,7 +53,14 @@ impl ClusterCoordinator {
                     r,
                     self.heartbeat_timeout_secs,
                 );
-                self.process_rank_death(r, &ledger);
+                self.process_rank_death(
+                    r,
+                    &ledger,
+                    &format!(
+                        "heartbeat stale (>{}s)",
+                        self.heartbeat_timeout_secs,
+                    ),
+                );
                 any_newly_dead = true;
             }
         }
@@ -96,11 +103,24 @@ impl ClusterCoordinator {
     /// `exited`. Order matters: the remainder is computed BEFORE the
     /// ledger flip (the redistribution formula reads the pre-decrement
     /// survivor count plus the to-die rank).
+    ///
+    /// `reason` is the detector's short description, carried as the
+    /// `rank_lost` alert's `detail`. It rides the shared chain rather than
+    /// the call sites so a future third detector cannot forget the alert.
     pub(super) fn process_rank_death(
         &mut self,
         r: usize,
         ledger: &std::sync::Arc<crate::distributed::controller::DeadRanks>,
+        reason: &str,
     ) {
+        // Alert first: the record stream should carry the loss even if a
+        // later step of the chain (broadcast, redistribution) errors out.
+        let path = self.alert_path_for_rank(r);
+        self.emit_alert(
+            crate::monitor::event_lane::EventClass::RankLost,
+            path,
+            format!("rank {r} declared dead — {reason}"),
+        );
         let remainder_plan = self.compute_dead_rank_remainder(r);
         ledger.declare_dead(r);
         self.active_count = self.active_count.saturating_sub(1);
@@ -230,7 +250,7 @@ impl ClusterCoordinator {
                  (process exited); declaring dead",
                 r,
             );
-            self.process_rank_death(r, ledger);
+            self.process_rank_death(r, ledger, "process exited (child supervision)");
             any = true;
         }
         any

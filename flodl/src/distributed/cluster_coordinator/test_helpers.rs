@@ -261,6 +261,7 @@ impl ClusterCoordinator {
             timeline: config.timeline.clone(),
             sync_start: None,
             dashboard_sink: config.dashboard_sink.clone(),
+            event_lane: crate::monitor::event_lane::EventLane::new(),
         }
     }
 

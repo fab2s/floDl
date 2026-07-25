@@ -55,14 +55,8 @@ pub(super) struct WindowRankStat {
 /// each node carries the same field set.
 pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
     let total_steps: usize = stats.iter().map(|s| s.steps).sum();
-    let multi_host = {
-        let mut hosts: Vec<&str> =
-            stats.iter().map(|s| s.host.as_str()).filter(|h| !h.is_empty()).collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        hosts.len() > 1
-    };
-    let root_only = stats.len() == 1 && !multi_host;
+    let hosts: Vec<&str> = stats.iter().map(|s| s.host.as_str()).collect();
+    let (multi_host, root_only) = cohort_tiering(&hosts);
 
     let leaves: Vec<Leaf> = stats
         .iter()
@@ -106,6 +100,37 @@ pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
         .collect();
 
     build_tree(&leaves, &Reductions::new())
+}
+
+/// The cohort's tree shape from its per-rank host list (index = rank; an
+/// empty string means "host unknown"): `(multi_host, root_only)`.
+///
+/// A host tier appears only when the cohort spans **more than one** host, and
+/// a lone rank on a single host collapses to root-only (the root *is* the
+/// leaf). Shared with [`rank_record_path`] so an alert's origin path is
+/// exactly the node path the portal drills into — a `rank_lost` on a path the
+/// tree never emits would be un-navigable.
+fn cohort_tiering(hosts: &[&str]) -> (bool, bool) {
+    let mut named: Vec<&str> = hosts.iter().copied().filter(|h| !h.is_empty()).collect();
+    named.sort_unstable();
+    named.dedup();
+    let multi_host = named.len() > 1;
+    (multi_host, hosts.len() == 1 && !multi_host)
+}
+
+/// Full record path (`root`, `root/rankN`, or `root/<host>/rankN`) of one
+/// rank's leaf, under the same tiering [`build_window_tree`] applies.
+pub(super) fn rank_record_path(rank: usize, hosts: &[&str]) -> String {
+    let (multi_host, root_only) = cohort_tiering(hosts);
+    if root_only {
+        return "root".to_string();
+    }
+    let host = hosts.get(rank).copied().unwrap_or("");
+    if multi_host && !host.is_empty() {
+        format!("root/{host}/rank{rank}")
+    } else {
+        format!("root/rank{rank}")
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +263,55 @@ mod tests {
             .find(|c| c.path.last().unwrap() == "rank1")
             .unwrap();
         assert_eq!(r1.device, Some(1));
+    }
+
+    /// The alert lane's origin path must be a path the node tree actually
+    /// emits, in every cohort shape — otherwise a `rank_lost` points at a node
+    /// the portal cannot drill into.
+    #[test]
+    fn rank_record_path_matches_the_tree_in_every_shape() {
+        let cases: Vec<Vec<WindowRankStat>> = vec![
+            vec![stat(0, "h1", 1, Some(0.1))],
+            vec![stat(0, "h1", 1, Some(0.1)), stat(1, "h1", 1, Some(0.2))],
+            vec![
+                stat(0, "h1", 1, Some(0.1)),
+                stat(1, "h2", 1, Some(0.2)),
+                stat(2, "h2", 1, Some(0.3)),
+            ],
+        ];
+        for stats in cases {
+            let hosts: Vec<&str> = stats.iter().map(|s| s.host.as_str()).collect();
+            let root = build_window_tree(&stats);
+            let mut tree_paths: Vec<String> = Vec::new();
+            collect_leaf_paths(&root, &mut tree_paths);
+            let alert_paths: Vec<String> = (0..stats.len())
+                .map(|r| rank_record_path(r, &hosts))
+                .collect();
+            for p in &alert_paths {
+                assert!(
+                    tree_paths.contains(p),
+                    "alert path {p} is not a tree leaf ({tree_paths:?})",
+                );
+            }
+        }
+    }
+
+    /// An unknown host degrades to the flat `root/rankN` rather than emitting
+    /// an empty segment (`root//rank1`), which would not resolve to a node.
+    #[test]
+    fn unknown_host_degrades_to_the_flat_path() {
+        assert_eq!(rank_record_path(1, &["h1", ""]), "root/rank1");
+        assert_eq!(rank_record_path(0, &["h1", "h2"]), "root/h1/rank0");
+        assert_eq!(rank_record_path(0, &["h1"]), "root");
+        assert_eq!(rank_record_path(5, &["h1", "h1"]), "root/rank5");
+    }
+
+    fn collect_leaf_paths(n: &NodeRecord, out: &mut Vec<String>) {
+        if n.is_leaf() {
+            out.push(n.path.join("/"));
+        }
+        for c in &n.children {
+            collect_leaf_paths(c, out);
+        }
     }
 }

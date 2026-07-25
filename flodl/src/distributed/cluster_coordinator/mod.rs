@@ -88,6 +88,7 @@ use crate::distributed::wire::{
 };
 
 pub mod config;
+mod alerts;
 mod averaging;
 mod callback_roles;
 mod cycle_cpu;
@@ -706,6 +707,11 @@ pub struct ClusterCoordinator {
     /// `TimingMsgWire::Dashboard*` frame and per-epoch resource sample
     /// to it. `None` ⇒ no dashboard (legacy / headless cluster runs).
     pub(super) dashboard_sink: Option<Arc<dyn crate::distributed::DashboardSink>>,
+    /// Bounded, collapsing alert buffer feeding the record stream's `event`
+    /// lane (rank loss, drift, dropped control broadcasts). Always present:
+    /// it costs nothing idle, and the cohort's alert history should not
+    /// depend on whether a dashboard happened to be attached.
+    event_lane: crate::monitor::event_lane::EventLane,
 }
 
 impl ClusterCoordinator {
