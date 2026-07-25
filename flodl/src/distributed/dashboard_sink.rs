@@ -72,6 +72,21 @@ pub trait DashboardSink: Send + Sync {
         metrics: &crate::distributed::ddp_run::EpochMetrics,
     );
 
+    /// Sub-epoch monitor records for ONE reduce window: the flat,
+    /// path-keyed JSONL records of the window's record tree (root first,
+    /// then each host / rank node). Emitted only when the
+    /// `reports_per_epoch` cadence fires, so the rate is user-bounded and
+    /// independent of the reduce rate.
+    ///
+    /// Complements [`Self::push_epoch_metrics`] rather than replacing it:
+    /// the per-epoch feed is unchanged, this one fills the gap *between*
+    /// epochs (a one-epoch LLM run has exactly one epoch point).
+    /// Default = no-op, so test stubs and sinks that only render epochs
+    /// need not implement it.
+    fn push_window_records(&self, records: Vec<serde_json::Value>) {
+        let _ = records;
+    }
+
     /// Signal end-of-training to the dashboard so the SSE `complete`
     /// event fires (browser stops the elapsed counter, switches the
     /// status dot to "done"). Called by the launcher after every rank
@@ -111,6 +126,10 @@ pub struct ClusterDashboardSink {
     per_rank_hardware: Mutex<Vec<Option<String>>>,
     /// Per-rank latest resource sample, indexed by global rank.
     per_rank_resources: Mutex<Vec<Option<ResourceSample>>>,
+    /// Flat records of the most recent sub-epoch window tree (root first).
+    /// Held so the portal can serve the current tree by path; streaming
+    /// them live is a later slice.
+    latest_window_records: Mutex<Vec<serde_json::Value>>,
     /// Wall-clock start (used to compute ETA in pushed epoch records).
     start_time: Instant,
 }
@@ -144,6 +163,7 @@ impl ClusterDashboardSink {
             svg_installed: Mutex::new(false),
             per_rank_hardware: Mutex::new(vec![None; world_size]),
             per_rank_resources: Mutex::new(vec![None; world_size]),
+            latest_window_records: Mutex::new(Vec::new()),
             start_time: Instant::now(),
         }
     }
@@ -305,6 +325,26 @@ impl DashboardSink for ClusterDashboardSink {
     fn shutdown(&self) {
         let mut mon = self.monitor.lock().unwrap();
         mon.shutdown_dashboard_server();
+    }
+
+    fn push_window_records(&self, records: Vec<serde_json::Value>) {
+        // One verbose line for the root node — the sub-epoch curve as it
+        // happens, and what rig validation greps for. Full records are
+        // retained for the portal.
+        if crate::log::enabled(crate::log::Verbosity::Verbose)
+            && let Some(root) = records.first()
+        {
+            let m = &root["metrics"];
+            crate::verbose!(
+                "  ddp: window report epoch={} tick={} loss={} tput={} work={}",
+                root["epoch"],
+                root["tick"],
+                m["loss"],
+                m["throughput"],
+                root["work"],
+            );
+        }
+        *self.latest_window_records.lock().unwrap() = records;
     }
 
     fn push_epoch_metrics(

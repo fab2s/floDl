@@ -106,6 +106,17 @@ impl ClusterCoordinator {
         tx
     }
 
+    /// Test-only seam: close the current reduce window the way the
+    /// backends do (timing accumulators AND step counts), so a test can
+    /// drive several consecutive windows. Production splits these two
+    /// resets across `finish_averaging_tail` and the backend-specific
+    /// pre-fold reset; a test that only needs "next window" wants both.
+    #[cfg(test)]
+    pub(crate) fn reset_window_for_test(&mut self) {
+        self.window.reset_timing();
+        self.window.reset_steps();
+    }
+
     /// Build a headless ClusterCoordinator for unit-testing internal
     /// state-machine logic without spinning up TCP listeners or
     /// reader threads. `control_streams` and `reader_handles` are
@@ -230,6 +241,16 @@ impl ClusterCoordinator {
             metrics_sink_tx: config.metrics_sink_tx.clone(),
             eval_result_fn: config.eval_result_fn.clone(),
             eval_every_epochs: config.eval_every_epochs,
+            report_scheduler: config.reports_per_epoch.map(|x| {
+                let steps_per_epoch = crate::monitor::cadence::report_interval(
+                    config.total_samples,
+                    config.batch_size,
+                    1,
+                );
+                crate::monitor::cadence::ReportScheduler::new(x, steps_per_epoch)
+            }),
+            report_in_epoch_steps: 0.0,
+            report_epoch_seen: 0,
             metrics_device_indices: (0..world_size as u8).collect(),
             control_streams: Vec::new(),
             rank_to_conn: Vec::new(),

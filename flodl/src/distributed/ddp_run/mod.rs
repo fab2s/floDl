@@ -591,6 +591,14 @@ pub struct DdpRunConfig {
     /// [`DdpBuilder::eval_every`] (accepts [`EvalCadence`]).
     pub eval_every_epochs: Option<usize>,
 
+    /// Sub-epoch monitor reports per epoch. `Some(x)` makes the
+    /// controller emit `x` per-window metric reports across each epoch
+    /// (at reduce boundaries), filling the gap the per-epoch feed leaves
+    /// — decisive for single-epoch LLM training, where the per-epoch
+    /// curve is one point. `None` or `0` disables. Builder sugar:
+    /// [`DdpBuilder::reports_per_epoch`].
+    pub reports_per_epoch: Option<usize>,
+
     /// Checkpoint bundle stem for resume. When set, the cluster
     /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
     /// the controller with the saved trajectory state (epoch,
@@ -652,6 +660,7 @@ impl DdpRunConfig {
             heartbeat_timeout_secs: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             eval_every_epochs: None,
+            reports_per_epoch: None,
             resume_from: None,
             checkpoint_at_epoch: None,
         }
@@ -787,6 +796,14 @@ impl DdpRunConfig {
     /// enum and forwards the integer here.
     pub fn with_eval_every_epochs(mut self, n: usize) -> Self {
         self.eval_every_epochs = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Emit `n` sub-epoch monitor reports per epoch (at reduce
+    /// boundaries). `n == 0` disables. Builder sugar:
+    /// [`DdpBuilder::reports_per_epoch`].
+    pub fn with_reports_per_epoch(mut self, n: usize) -> Self {
+        self.reports_per_epoch = if n == 0 { None } else { Some(n) };
         self
     }
 

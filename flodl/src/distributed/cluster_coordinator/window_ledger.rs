@@ -54,6 +54,14 @@ pub(crate) struct WindowLedger {
     /// marginal accumulators deliberately skip. Its excess over the
     /// marginal rate is the per-window fill.
     first_batch_ms: Vec<f64>,
+    /// Sum of the per-batch training loss reported this window, with its
+    /// own matched count — the sub-epoch loss feed for the monitor
+    /// record stream. Deliberately NOT divided by `steps`: step counts
+    /// reset backend-specifically ([`WindowLedger::reset_steps`]) while
+    /// this pair resets with the timing accumulators, so a shared
+    /// denominator could divide by an already-reset count.
+    loss_sum: Vec<f64>,
+    loss_count: Vec<usize>,
 }
 
 impl WindowLedger {
@@ -64,6 +72,8 @@ impl WindowLedger {
             delivered_ms: vec![0.0; world_size],
             delivered_batches: vec![0; world_size],
             first_batch_ms: vec![0.0; world_size],
+            loss_sum: vec![0.0; world_size],
+            loss_count: vec![0; world_size],
         }
     }
 
@@ -86,6 +96,32 @@ impl WindowLedger {
         } else {
             self.first_batch_ms[rank] = batch_ms + data_ms;
         }
+    }
+
+    /// Record `rank`'s per-batch training loss for the sub-epoch monitor
+    /// feed. Split from [`WindowLedger::record_batch`] because it is a
+    /// monitoring accumulator with its own reset clock (see the field
+    /// docs), not part of the delivered / fill scheduling machinery.
+    /// Ignores an out-of-range rank and a non-finite loss (a diverged
+    /// batch must not poison the window mean).
+    pub(crate) fn record_batch_loss(&mut self, rank: usize, loss: f64) {
+        if rank >= self.loss_sum.len() || !loss.is_finite() {
+            return;
+        }
+        self.loss_sum[rank] += loss;
+        self.loss_count[rank] += 1;
+    }
+
+    /// Mean training loss `rank` reported this window, or `None` when it
+    /// reported no batch. `None` is **absent, not zero** — the monitor
+    /// record stream omits an unmeasured metric rather than averaging in
+    /// a false zero.
+    pub(crate) fn mean_loss(&self, rank: usize) -> Option<f64> {
+        let n = *self.loss_count.get(rank)?;
+        if n == 0 {
+            return None;
+        }
+        Some(self.loss_sum[rank] / n as f64)
     }
 
     /// Exclude a callback's wall-time (checkpoint / eval / epoch_fn)
@@ -218,6 +254,12 @@ impl WindowLedger {
         for f in &mut self.first_batch_ms {
             *f = 0.0;
         }
+        for l in &mut self.loss_sum {
+            *l = 0.0;
+        }
+        for n in &mut self.loss_count {
+            *n = 0;
+        }
     }
 
     /// Reset the per-rank step counts for a new window. Split from
@@ -337,6 +379,59 @@ mod tests {
         assert_eq!(l.min_steps(), 0);
         assert_eq!(l.max_steps(), 2);
         assert_eq!(l.total_steps(), 3);
+    }
+
+    #[test]
+    fn mean_loss_is_absent_until_a_batch_reports() {
+        let mut l = WindowLedger::new(2);
+        // Absent, NOT zero, before any batch.
+        assert_eq!(l.mean_loss(0), None);
+        l.record_batch_loss(0, 0.4);
+        l.record_batch_loss(0, 0.6);
+        assert!((l.mean_loss(0).unwrap() - 0.5).abs() < 1e-12);
+        // A rank that reported nothing stays absent.
+        assert_eq!(l.mean_loss(1), None);
+        // Out-of-range rank: no panic, no record.
+        l.record_batch_loss(9, 1.0);
+        assert_eq!(l.mean_loss(9), None);
+    }
+
+    #[test]
+    fn non_finite_loss_never_poisons_the_window_mean() {
+        let mut l = WindowLedger::new(1);
+        l.record_batch_loss(0, 0.5);
+        l.record_batch_loss(0, f64::NAN);
+        l.record_batch_loss(0, f64::INFINITY);
+        // Only the finite sample counts.
+        assert_eq!(l.mean_loss(0), Some(0.5));
+    }
+
+    #[test]
+    fn loss_resets_with_the_window_timing() {
+        let mut l = WindowLedger::new(1);
+        l.record_batch_loss(0, 2.0);
+        assert_eq!(l.mean_loss(0), Some(2.0));
+        l.reset_timing();
+        // Absent again — a new window starts unmeasured, not at zero.
+        assert_eq!(l.mean_loss(0), None);
+        // And the count reset with it, so the next window's mean is its own.
+        l.record_batch_loss(0, 3.0);
+        assert_eq!(l.mean_loss(0), Some(3.0));
+    }
+
+    #[test]
+    fn loss_count_is_independent_of_step_resets() {
+        // The loss denominator must NOT be `steps`: the CPU path resets
+        // steps before the dispatch fold, which would divide the window's
+        // loss by an already-zeroed count.
+        let mut l = WindowLedger::new(1);
+        l.record_batch(0, 1.0, 0.0);
+        l.record_batch_loss(0, 4.0);
+        l.record_batch(0, 1.0, 0.0);
+        l.record_batch_loss(0, 6.0);
+        l.reset_steps(); // backend-specific, mid-window
+        assert_eq!(l.steps(0), 0);
+        assert_eq!(l.mean_loss(0), Some(5.0)); // unaffected
     }
 
     #[test]

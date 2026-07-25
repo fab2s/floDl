@@ -570,6 +570,9 @@ impl Trainer {
             (None, true) => b = b.eval_every(crate::distributed::ddp_run::EvalCadence::Epochs(1)),
             (None, false) => {}
         }
+        if let Some(n) = cfg.reports_per_epoch {
+            b = b.reports_per_epoch(n);
+        }
         if let Some(ds) = cfg.eval_dataset {
             b = b.eval_dataset(ds);
         }

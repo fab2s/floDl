@@ -130,6 +130,25 @@ throughput curves, batch-share distribution, VRAM, and ElChe anchor
 evolution. No extra wiring - just open `http://<launcher-host>:3000`
 and follow the whole cluster.
 
+### Sub-epoch reports
+
+The curves above plot one point per **epoch**. When an epoch is long — or
+when there is only one (single-pass LLM training) — ask the controller for
+intermediate points:
+
+```rust
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .num_epochs(1)
+    .reports_per_epoch(20)   // ~20 loss points across the run
+    .run()?;
+```
+
+Reports fire at reduce boundaries, up to `n` per epoch, carrying per-rank
+loss / throughput aggregated up a `root → host → rank` tree. Off by
+default, and the per-epoch feed is unchanged either way. Details:
+[DDP guide → Sub-epoch reports](../ddp.md#sub-epoch-reports---reports_per_epoch).
+
 ### Embedding the graph
 
 To show the graph architecture in the dashboard:

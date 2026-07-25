@@ -801,6 +801,9 @@ fn run_unified(
     if let Some(gb) = config.disk_stage_gb {
         builder = builder.disk_stage(gb);
     }
+    if let Some(n) = config.reports_per_epoch {
+        builder = builder.reports_per_epoch(n);
+    }
     if config.augment_noise > 0.0 {
         let sigma = config.augment_noise as f32;
         builder = builder.transform(move |mut rows, keys| {

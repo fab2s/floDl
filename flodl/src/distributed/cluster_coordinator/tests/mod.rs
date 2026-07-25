@@ -29,6 +29,7 @@ mod lost_broadcast;
 mod reduce_stall;
 mod resource_plumb;
 mod shutdown_gate;
+mod window_report;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).
 pub(super) const TEST_SALT: SessionSalt = [

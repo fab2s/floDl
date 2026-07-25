@@ -316,6 +316,9 @@ pub struct RunConfig {
     /// Local-disk overflow tier under each rank's sample cache in GB
     /// (`--disk-stage`). `None` = library default (off).
     pub disk_stage_gb: Option<u64>,
+    /// Sub-epoch monitor reports per epoch (`--reports-per-epoch`).
+    /// `None` = library default (off, per-epoch reporting only).
+    pub reports_per_epoch: Option<usize>,
     /// Execution tier (`--tier managed|cooperative`). `Managed` (default)
     /// runs `builder.run()`; `Cooperative` runs `builder.into_worker()` and
     /// hand-drives the loop. Both share the identical builder config, so a
