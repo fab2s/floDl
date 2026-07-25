@@ -23,6 +23,7 @@
 //! monitor.finish();
 //! ```
 
+pub mod cadence;
 pub mod format;
 pub mod record;
 pub mod resources;
