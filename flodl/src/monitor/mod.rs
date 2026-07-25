@@ -24,6 +24,7 @@
 //! ```
 
 pub mod cadence;
+pub mod event_lane;
 pub mod format;
 pub mod record;
 pub mod record_log;

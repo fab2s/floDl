@@ -343,6 +343,25 @@ impl ClusterCoordinator {
         let d_raw = report.max_relative_delta();
         self.update_epoch_d_aggregator(d_raw, k_max);
         let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
+
+        // `drift` alert. The trigger is the guard's own `NudgeDown` verdict,
+        // not a raw `d_raw` threshold invented here: the configured guard IS
+        // the divergence threshold (TrendGuard's `divergence_threshold`, MSF's
+        // λ̂, NoGuard's silence), and a second coordinator-side threshold would
+        // read a different scale and disagree with it. `SuppressGrowth` is a
+        // hold, not a correction, so it stays informational. A sustained bad
+        // regime nudges every cycle — the lane's collapse window is what keeps
+        // that to one alert per window.
+        if let ConvergenceAction::NudgeDown { factor } = action {
+            self.emit_alert(
+                crate::monitor::event_lane::EventClass::Drift,
+                "root".to_string(),
+                format!(
+                    "divergence {d_raw:.3e} — convergence guard nudged the \
+                     anchor down (x{factor})",
+                ),
+            );
+        }
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::Divergence {
                 d_raw,
@@ -443,10 +462,7 @@ impl ClusterCoordinator {
             })
             .collect();
 
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts = super::alerts::now_ms();
         let tree = super::window_records::build_window_tree(&stats);
         let records = tree.flat_records(ts, self.avg_count, Some(in_flight_epoch));
         if let Some(sink) = self.dashboard_sink.as_ref() {

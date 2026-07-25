@@ -499,6 +499,35 @@ Files stay plain JSONL while live (gzip cannot be appended to or cheaply
 tailed). In a containerized run, point `dir` at a **mounted** path — a
 container-local path is written inside the container and vanishes with it.
 
+### Alerts in the same stream
+
+Metrics records are `kind: "node"`. The stream also carries
+`kind: "event"` records — the alert lane — written to the **same** files,
+because an alert's `path` is the node it happened to:
+
+```json
+{"v":1,"ts":1737766000000,"sev":"critical","path":"root/flodl-pascal/rank2",
+ "kind":"event","class":"rank_lost","detail":"rank 2 declared dead — heartbeat stale (>30s)","count":1}
+```
+
+| `class`        | `sev`    | raised when                                                 |
+|----------------|----------|-------------------------------------------------------------|
+| `rank_lost`    | critical | a rank was declared dead (heartbeat staleness or child exit) |
+| `control_drop` | critical | a control broadcast did not reach every live rank            |
+| `drift`        | warn     | the convergence guard had to correct the anchor              |
+| `overflow`     | warn     | alerts were dropped by the live cap (never silent)           |
+
+So `jq 'select(.kind=="event")' runs/exp1/records/root/*/*.log` is the
+run's incident list, and a rank's own log holds its metrics *and* the
+alert that ended it, in order. Alerts are always printed to stdout too —
+you do not need `-v`, and you do not need `record_log`, to see them.
+
+The lane is bounded: repeats of the same `(class, path)` within 10s
+collapse into one record (the first occurrence is never delayed; the
+absorbed repeats ride the `count` of the next one, so counts sum to the
+true total), and at most 200 live entries are retained. There is no knob
+— an alert stream you have to tune is one you cannot trust.
+
 ---
 
 ## CUDA-free GPU detection - `flodl::sys::detect_gpus`

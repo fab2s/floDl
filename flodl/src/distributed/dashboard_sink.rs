@@ -87,6 +87,19 @@ pub trait DashboardSink: Send + Sync {
         let _ = records;
     }
 
+    /// Alert-lane records (`kind: "event"`) — rank loss, divergence drift, a
+    /// dropped control broadcast. Same path-keyed stream as
+    /// [`Self::push_window_records`] (so they persist and ship to log sinks
+    /// unchanged), but a separate feed for the portal: an alert is an
+    /// interruption, not a data point on a curve.
+    ///
+    /// Already collapsed and capped by
+    /// [`crate::monitor::event_lane::EventLane`] upstream, so the call rate
+    /// is bounded no matter how bad the run gets. Default = no-op.
+    fn push_events(&self, records: Vec<serde_json::Value>) {
+        let _ = records;
+    }
+
     /// Signal end-of-training to the dashboard so the SSE `complete`
     /// event fires (browser stops the elapsed counter, switches the
     /// status dot to "done"). Called by the launcher after every rank
@@ -130,6 +143,11 @@ pub struct ClusterDashboardSink {
     /// Held so the portal can serve the current tree by path; streaming
     /// them live is a later slice.
     latest_window_records: Mutex<Vec<serde_json::Value>>,
+    /// The run's alert feed, oldest first, bounded by
+    /// [`crate::monitor::event_lane::MAX_EVENTS`]. The coordinator's lane
+    /// bounds each `(class, path)`; this bounds the accumulation across the
+    /// whole run so a long unhealthy run cannot grow the sink without limit.
+    recent_events: Mutex<Vec<serde_json::Value>>,
     /// Optional append-only JSONL persistence for the record stream. The
     /// same records that go live also land on disk when the user opted in
     /// (`record_log_dir`); `None` keeps the stream live-only.
@@ -168,6 +186,7 @@ impl ClusterDashboardSink {
             per_rank_hardware: Mutex::new(vec![None; world_size]),
             per_rank_resources: Mutex::new(vec![None; world_size]),
             latest_window_records: Mutex::new(Vec::new()),
+            recent_events: Mutex::new(Vec::new()),
             record_log: None,
             start_time: Instant::now(),
         }
@@ -370,6 +389,24 @@ impl DashboardSink for ClusterDashboardSink {
             log.append(&records);
         }
         *self.latest_window_records.lock().unwrap() = records;
+    }
+
+    fn push_events(&self, records: Vec<serde_json::Value>) {
+        // No log line here — the coordinator already printed one per alert
+        // (it does so with or without a sink attached, so a headless cluster
+        // run stays as loud as a dashboard one).
+        //
+        // Same stream as the node records: the log routes by `path`, so an
+        // alert lands in its origin node's file interleaved with its metrics.
+        if let Some(log) = &self.record_log {
+            log.append(&records);
+        }
+        let mut feed = self.recent_events.lock().unwrap();
+        feed.extend(records);
+        let overflow = feed.len().saturating_sub(crate::monitor::event_lane::MAX_EVENTS);
+        if overflow > 0 {
+            feed.drain(0..overflow);
+        }
     }
 
     fn push_epoch_metrics(
@@ -587,6 +624,49 @@ mod tests {
         let tail = log.tail("root", 10);
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[1]["tick"], 2);
+    }
+
+    /// Alerts share the node tree with metrics: an event lands in its origin
+    /// node's file, interleaved with that node's `node` records, because the
+    /// log routes on `path` alone.
+    #[test]
+    fn events_persist_beside_the_metrics_of_their_origin_node() {
+        let d = TempDir::new("events");
+        let log = Arc::new(RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES));
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_record_log(Some(Arc::clone(&log)));
+
+        sink.push_window_records(window(1));
+        sink.push_events(vec![json!({
+            "v": 1, "ts": 7, "sev": "critical", "path": "root/rank0",
+            "kind": "event", "class": "rank_lost", "detail": "died", "count": 1,
+        })]);
+        sink.shutdown();
+
+        let tail = log.tail("root/rank0", 10);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["kind"], "node");
+        assert_eq!(tail[1]["kind"], "event");
+        assert_eq!(tail[1]["class"], "rank_lost");
+        // The root node's own log is untouched by a rank-scoped alert.
+        assert_eq!(log.tail("root", 10).len(), 1);
+    }
+
+    /// The sink's alert feed is bounded: a long unhealthy run cannot grow it
+    /// past the lane's cap, and the newest alerts are the ones kept.
+    #[test]
+    fn the_event_feed_is_bounded_newest_wins() {
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1);
+        let n = crate::monitor::event_lane::MAX_EVENTS;
+        for i in 0..(n + 10) {
+            sink.push_events(vec![json!({
+                "v": 1, "ts": i, "path": "root", "kind": "event",
+                "class": "drift", "detail": "d", "count": 1,
+            })]);
+        }
+        let feed = sink.recent_events.lock().unwrap();
+        assert_eq!(feed.len(), n);
+        assert_eq!(feed[n - 1]["ts"], n + 9);
     }
 
     /// Without a record log the sink is live-only — no files, no panic.
