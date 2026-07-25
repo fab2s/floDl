@@ -681,6 +681,17 @@ where
         self
     }
 
+    /// Emit `n` sub-epoch monitor reports per epoch, at reduce
+    /// boundaries — the loss / throughput curve *between* epoch points.
+    /// Set it for long epochs and for single-epoch (one-pass LLM)
+    /// training, where the per-epoch curve is a single point. `0`
+    /// disables (the default); the per-epoch feed is unaffected either
+    /// way.
+    pub fn reports_per_epoch(mut self, n: usize) -> Self {
+        self.config = self.config.with_reports_per_epoch(n);
+        self
+    }
+
     /// Rank-side eval callback. Fires on the rank chosen by
     /// [`EpochCallbackPolicy`] at the cadence set by
     /// [`Self::eval_every`].

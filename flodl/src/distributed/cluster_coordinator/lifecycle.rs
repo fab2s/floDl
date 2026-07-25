@@ -412,6 +412,23 @@ impl ClusterCoordinator {
             metrics_sink_tx: config.metrics_sink_tx.clone(),
             eval_result_fn: config.eval_result_fn.clone(),
             eval_every_epochs: config.eval_every_epochs,
+            // Sub-epoch report cadence. The scheduler's `epoch_work` is
+            // steps-per-epoch — known ahead from the dataset, so the report
+            // interval is a pure function of config, not of observed
+            // progress. `report_interval(.., 1)` IS steps-per-epoch (one
+            // report per epoch = one interval), and carries the degenerate
+            // guard: a zero batch_size yields a non-finite work, which the
+            // scheduler treats as "never fire".
+            report_scheduler: config.reports_per_epoch.map(|x| {
+                let steps_per_epoch = crate::monitor::cadence::report_interval(
+                    config.total_samples,
+                    config.batch_size,
+                    1,
+                );
+                crate::monitor::cadence::ReportScheduler::new(x, steps_per_epoch)
+            }),
+            report_in_epoch_steps: 0.0,
+            report_epoch_seen: 0,
             metrics_device_indices: (0..world_size as u8).collect(),
             control_streams: streams,
             rank_to_conn,

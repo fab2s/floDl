@@ -76,7 +76,12 @@ impl ClusterCoordinator {
                 self.last_step_count[rank] =
                     self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
-                let _ = batch_loss; // monitoring only in this slice
+                // Sub-epoch loss feed: accumulate the per-batch loss into
+                // the window so the monitor record emitted at the reduce
+                // boundary carries a real loss curve between epochs (an
+                // epoch-only curve is a single point for 1-epoch LLM runs).
+                // Monitoring-only — no scheduling authority reads it.
+                self.window.record_batch_loss(rank, batch_loss);
                 let _ = param_norm;
                 self.cycle.note_batch_ack(rank, step_count, sync_divergence);
             }

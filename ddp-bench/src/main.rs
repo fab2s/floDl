@@ -257,6 +257,13 @@ struct Cli {
     #[option]
     disk_stage: Option<u64>,
 
+    /// Sub-epoch monitor reports per epoch (flodl
+    /// `.reports_per_epoch`): the controller emits N per-window metric
+    /// reports across each epoch, at reduce boundaries — the loss curve
+    /// *between* epoch points. Default: library default (off).
+    #[option]
+    reports_per_epoch: Option<usize>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -974,6 +981,7 @@ fn run() -> flodl::tensor::Result<()> {
                 ram_max_usage: cli.ram_max_usage,
                 sample_cache: cli.sample_cache,
                 disk_stage_gb: cli.disk_stage,
+                reports_per_epoch: cli.reports_per_epoch,
                 tier,
             };
 

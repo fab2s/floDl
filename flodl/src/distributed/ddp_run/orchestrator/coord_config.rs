@@ -164,6 +164,9 @@ pub(crate) fn build_coord_config_from_builder(
     if let Some(every) = config.eval_every_epochs {
         coord_config = coord_config.eval_every_epochs(every);
     }
+    if let Some(n) = config.reports_per_epoch {
+        coord_config = coord_config.reports_per_epoch(n);
+    }
     if let Some(f) = eval_result_fn {
         coord_config = coord_config.eval_result_fn(f);
     }

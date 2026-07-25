@@ -198,6 +198,18 @@ pub struct ClusterCoordinatorConfig {
     /// every `n` epochs from `dispatch_epoch`. `None` or `0` disables.
     pub eval_every_epochs: Option<usize>,
 
+    /// Sub-epoch monitor-report cadence: how many per-window records to
+    /// emit per epoch. `Some(x)` reports at the first reduce boundary
+    /// past each `epoch_work / x` slice of realized work; `None` or `0`
+    /// disables sub-epoch reporting (per-epoch metrics are unaffected
+    /// either way).
+    ///
+    /// Expressed per-epoch rather than in steps because the step count
+    /// per epoch is a derived quantity the user should not have to
+    /// compute; a single-epoch run degenerates to "x reports over the
+    /// whole run", which is the point for one-pass LLM training.
+    pub reports_per_epoch: Option<usize>,
+
     /// Which rank should fire user-supplied per-epoch callbacks
     /// (`epoch_fn` / `checkpoint_fn` / `eval_fn`). Default
     /// [`EpochCallbackPolicy::Fastest`] — coord runtime-resolves the
@@ -348,6 +360,7 @@ impl ClusterCoordinatorConfig {
             metrics_sink_tx: None,
             eval_result_fn: None,
             eval_every_epochs: None,
+            reports_per_epoch: None,
             epoch_callback_policy:
                 crate::distributed::ddp_run::EpochCallbackPolicy::default(),
             progressive: None,
@@ -444,6 +457,13 @@ impl ClusterCoordinatorConfig {
     /// Eval cadence in epochs. `0` disables.
     pub fn eval_every_epochs(mut self, n: usize) -> Self {
         self.eval_every_epochs = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Sub-epoch monitor reports per epoch. `0` disables.
+    /// See [`Self::reports_per_epoch`].
+    pub fn reports_per_epoch(mut self, n: usize) -> Self {
+        self.reports_per_epoch = if n == 0 { None } else { Some(n) };
         self
     }
 

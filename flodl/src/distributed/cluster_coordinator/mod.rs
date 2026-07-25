@@ -98,6 +98,7 @@ mod epoch_dispatch;
 mod event_loop;
 mod lifecycle;
 mod window_ledger;
+mod window_records;
 #[cfg(test)]
 mod test_helpers;
 
@@ -652,6 +653,16 @@ pub struct ClusterCoordinator {
     /// `ControlMsgWire::ExecuteEvalCallback` every `n` epochs from
     /// `dispatch_epoch`. `None` = disabled.
     eval_every_epochs: Option<usize>,
+    /// Sub-epoch monitor-report cadence, `None` = disabled. Consulted at
+    /// each reduce boundary; see [`config::ClusterCoordinatorConfig::reports_per_epoch`].
+    report_scheduler: Option<crate::monitor::cadence::ReportScheduler>,
+    /// Realized work (steps) accumulated in the current epoch, the signal
+    /// [`Self::report_scheduler`] thresholds on. Reset when the in-flight
+    /// epoch advances. Monitoring-only — never read by scheduling.
+    report_in_epoch_steps: f64,
+    /// In-flight epoch the report cadence last saw, to detect the epoch
+    /// rollover that resets the scheduler and the step accumulator.
+    report_epoch_seen: usize,
     /// CUDA device indices per rank, captured at construction for the
     /// `EpochMetrics::device_indices` field. Currently `0..world_size`
     /// (one device per rank, assigned by global_rank); the

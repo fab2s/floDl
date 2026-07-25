@@ -531,6 +531,13 @@ pub struct TrainerConfig<M: Module> {
     /// Set explicitly to space evals out.
     pub eval_every: Option<usize>,
 
+    /// Sub-epoch monitor reports per epoch: up to `n` per-window metric
+    /// reports at reduce boundaries, filling the curve *between* epoch
+    /// points. `None` or `0` = off (per-epoch reporting only). Decisive
+    /// for single-epoch (one-pass LLM) runs, where the per-epoch feed is
+    /// a single point.
+    pub reports_per_epoch: Option<usize>,
+
     /// Which rank fires user-supplied per-epoch callbacks. Default
     /// [`EpochCallbackPolicy::Fastest`].
     pub epoch_callback_policy: EpochCallbackPolicy,
@@ -597,6 +604,7 @@ impl<M: Module> TrainerConfig<M> {
             eval_dataset: None,
             eval_result_fn: None,
             eval_every: None,
+            reports_per_epoch: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,
             cluster: None,
@@ -717,6 +725,13 @@ impl<M: Module> TrainerConfig<M> {
     /// Set the eval cadence in epochs (see the `eval_every` field for
     /// the default when an `eval_fn` is registered without a cadence).
     pub fn eval_every(mut self, n: usize) -> Self { self.eval_every = Some(n); self }
+
+    /// Emit up to `n` sub-epoch monitor reports per epoch, at reduce
+    /// boundaries (see the `reports_per_epoch` field). `0` disables.
+    pub fn reports_per_epoch(mut self, n: usize) -> Self {
+        self.reports_per_epoch = if n == 0 { None } else { Some(n) };
+        self
+    }
     /// Override which rank fires per-epoch callbacks.
     pub fn epoch_callback_policy(mut self, p: EpochCallbackPolicy) -> Self {
         self.epoch_callback_policy = p;

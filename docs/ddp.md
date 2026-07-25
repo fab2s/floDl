@@ -315,6 +315,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.outer_optimizer(factory)` | `Fn() -> Box<dyn OuterOptimizer>` | Outer-loop optimizer on the consensus (SlowMo / DiLoCo). Default = plain work-weighted averaging (`OuterAvg`). See [Outer optimizer](#outer-optimizer---slowmo--diloco). |
 | `.checkpoint_at_epoch(n)` | `usize` | One-shot coverage-granular checkpoint at the epoch any rank first reaches (progressive modes). Pairs with `.save_path`. |
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
+| `.reports_per_epoch(n)` | `usize` | Emit up to `n` sub-epoch monitor reports per epoch, at reduce boundaries (`0` = off, the default). Fills the curve *between* epoch points — see [Sub-epoch reports](#sub-epoch-reports---reports_per_epoch). |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
 | `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` - same knob as the solo loader's `vram_max_usage`. |
@@ -407,6 +408,51 @@ Controls which rank executes per-epoch callbacks (`checkpoint_fn`,
 | `per_rank_throughput` | `Vec<f64>` | Batches per second per rank. |
 | `per_rank_batch_share` | `Vec<f64>` | Fraction of total batches handled per rank. |
 | `device_indices` | `Vec<u8>` | CUDA device index for each rank. |
+
+---
+
+## Sub-epoch reports - `reports_per_epoch`
+
+`metrics_fn` and the dashboard are driven by the **per-epoch** feed, which
+is one data point per pass over the dataset. For a long epoch — and
+decisively for **single-epoch (one-pass LLM) training** — that is a curve
+with one point. `reports_per_epoch(n)` adds a *second*, finer feed:
+
+```rust
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .num_epochs(1)              // one pass over a token corpus
+    .reports_per_epoch(20)      // ~20 loss points across the run
+    .run()?;
+```
+
+- **Cadence.** A report fires at the first **reduce boundary** past each
+  `epoch_work / n` slice of realized work (`epoch_work` = steps per epoch,
+  known ahead from the dataset). Early small windows accumulate across
+  several reduces; the rate settles toward one report per window as the
+  cadence window grows. Reports always land *at* a sync boundary, never
+  mid-window, and they ride the existing step clock — reporting observes
+  the cadence, it never gates or delays it.
+- **At most `n` per epoch.** An epoch that ends with residual work below
+  the final threshold simply reports fewer times. That is not a gap: the
+  epoch-boundary point comes from the per-epoch feed, so the two feeds
+  compose — sub-epoch fills the interior, per-epoch marks the boundary.
+- **Content.** Each report is a path-keyed node tree (`root` → host → rank,
+  collapsing to `root` → rank on a single host) carrying per-rank `loss`,
+  `throughput`, `compute_only_ms` and `batch_share`, with each interior
+  node aggregating **its direct children only**. Cross-rank means are
+  weighted by realized work, so a hierarchical rollup equals the flat one.
+  A metric a rank did not measure this window is **absent**, never zeroed.
+- **Cost.** Zero extra wire traffic — the per-batch loss already reaches
+  the controller on the existing timing frames. Disabled (the default) the
+  whole path is one `Option` check per reduce.
+- **Scope.** Cluster / auto-promoted multi-GPU runs (the controller path).
+  The per-epoch `metrics_fn` contract is untouched. In `ddp-bench`:
+  `--reports-per-epoch N`.
+
+Aggregation vocabulary (`Reduction`, the node record schema) lives in
+`flodl::monitor::record`; the cadence scheduler in
+`flodl::monitor::cadence`.
 
 ---
 

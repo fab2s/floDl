@@ -375,6 +375,83 @@ impl ClusterCoordinator {
                 });
             }
         }
+
+        // Sub-epoch monitor report, gated by the `reports_per_epoch`
+        // cadence. Last in the head so it observes the window's final
+        // state (post `global_step` / `avg_count` bump) and can never
+        // perturb the feedback path above it. Reads the ledger before
+        // `finish_averaging_tail` resets it.
+        self.maybe_emit_window_report(cycle_batches, in_flight_epoch);
+    }
+
+    /// Emit one per-window monitor record tree when the
+    /// `reports_per_epoch` cadence fires at this reduce boundary.
+    ///
+    /// Rides the existing step clock as a read-only observer: it consumes
+    /// the same `cycle_batches` the window just realized and never gates,
+    /// delays, or reschedules anything. Disabled (`reports_per_epoch`
+    /// unset) it costs one `Option` check per cycle.
+    ///
+    /// The `epoch` field is a label; a marker for "this tick closed the
+    /// epoch" belongs to the slice that folds the per-epoch feed into the
+    /// same record stream (the per-epoch `push_epoch_metrics` channel is
+    /// untouched here).
+    fn maybe_emit_window_report(&mut self, cycle_batches: usize, in_flight_epoch: usize) {
+        if self.report_scheduler.is_none() || self.dashboard_sink.is_none() {
+            return;
+        }
+        // Epoch rollover: restart the cadence so every epoch gets its own
+        // `reports_per_epoch` budget (a single-epoch run simply never rolls).
+        if self.report_epoch_seen != in_flight_epoch {
+            self.report_epoch_seen = in_flight_epoch;
+            self.report_in_epoch_steps = 0.0;
+            if let Some(s) = self.report_scheduler.as_mut() {
+                s.reset_epoch();
+            }
+        }
+        self.report_in_epoch_steps += cycle_batches as f64;
+        let in_epoch_work = self.report_in_epoch_steps;
+        let fires = self
+            .report_scheduler
+            .as_mut()
+            .is_some_and(|s| s.on_sync(in_epoch_work));
+        if !fires {
+            return;
+        }
+
+        let stats: Vec<super::window_records::WindowRankStat> = (0..self.world_size)
+            .map(|r| {
+                // Marginal delivered rate = the honest per-rank capacity
+                // signal (same feed ElChe schedules on), in samples/ms.
+                let throughput = if self.window.has_delivered_sample(r) {
+                    let ms = self.window.delivered_ms(r);
+                    let batches = self.window.delivered_batches(r);
+                    Some((batches * self.batch_size) as f64 / ms)
+                } else {
+                    None
+                };
+                super::window_records::WindowRankStat {
+                    rank: r,
+                    host: self.rank_hosts.get(r).cloned().unwrap_or_default(),
+                    device: self.metrics_device_indices.get(r).copied(),
+                    alive: !self.is_dead(r),
+                    steps: self.window.steps(r),
+                    mean_loss: self.window.mean_loss(r),
+                    throughput,
+                    compute_only_ms: self.window.wall_ms(r),
+                }
+            })
+            .collect();
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let tree = super::window_records::build_window_tree(&stats);
+        let records = tree.flat_records(ts, self.avg_count, Some(in_flight_epoch));
+        if let Some(sink) = self.dashboard_sink.as_ref() {
+            sink.push_window_records(records);
+        }
     }
 
     /// Shared second half of `finish_averaging_nccl` / `finish_averaging_cpu`:
