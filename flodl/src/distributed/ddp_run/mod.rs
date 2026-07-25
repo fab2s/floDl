@@ -599,6 +599,20 @@ pub struct DdpRunConfig {
     /// [`DdpBuilder::reports_per_epoch`].
     pub reports_per_epoch: Option<usize>,
 
+    /// Directory for the persisted monitor record stream. `Some(dir)`
+    /// appends every emitted record as JSONL under a node tree mirroring
+    /// its `path` (`root.log`, `root/<host>/rank0.log`, …); `None` (the
+    /// default) keeps the stream live-only. Builder sugar:
+    /// [`DdpBuilder::record_log`].
+    pub record_log_dir: Option<String>,
+
+    /// Per-node byte cap for the persisted record stream: each node's log
+    /// is a drop-oldest ring bounded to this many bytes, so a long run can
+    /// never fill the disk. `None` =
+    /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES).
+    /// A tree of `N` nodes bounds to `N * max_log_size`.
+    pub max_log_size: Option<u64>,
+
     /// Checkpoint bundle stem for resume. When set, the cluster
     /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
     /// the controller with the saved trajectory state (epoch,
@@ -661,6 +675,8 @@ impl DdpRunConfig {
             epoch_callback_policy: EpochCallbackPolicy::default(),
             eval_every_epochs: None,
             reports_per_epoch: None,
+            record_log_dir: None,
+            max_log_size: None,
             resume_from: None,
             checkpoint_at_epoch: None,
         }
@@ -804,6 +820,15 @@ impl DdpRunConfig {
     /// [`DdpBuilder::reports_per_epoch`].
     pub fn with_reports_per_epoch(mut self, n: usize) -> Self {
         self.reports_per_epoch = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Persist the monitor record stream as JSONL under `dir`, each node
+    /// capped at `max_bytes` (drop-oldest). `max_bytes` of `0` uses
+    /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES).
+    pub fn with_record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
+        self.record_log_dir = Some(dir.into());
+        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
         self
     }
 

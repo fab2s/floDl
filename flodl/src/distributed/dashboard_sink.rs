@@ -130,6 +130,10 @@ pub struct ClusterDashboardSink {
     /// Held so the portal can serve the current tree by path; streaming
     /// them live is a later slice.
     latest_window_records: Mutex<Vec<serde_json::Value>>,
+    /// Optional append-only JSONL persistence for the record stream. The
+    /// same records that go live also land on disk when the user opted in
+    /// (`record_log_dir`); `None` keeps the stream live-only.
+    record_log: Option<Arc<crate::monitor::record_log::RecordLog>>,
     /// Wall-clock start (used to compute ETA in pushed epoch records).
     start_time: Instant,
 }
@@ -164,8 +168,20 @@ impl ClusterDashboardSink {
             per_rank_hardware: Mutex::new(vec![None; world_size]),
             per_rank_resources: Mutex::new(vec![None; world_size]),
             latest_window_records: Mutex::new(Vec::new()),
+            record_log: None,
             start_time: Instant::now(),
         }
+    }
+
+    /// Attach (or clear) the append-only record-stream persistence. The
+    /// launcher builds the log from `record_log_dir`; `None` leaves the
+    /// stream live-only.
+    pub fn with_record_log(
+        mut self,
+        log: Option<Arc<crate::monitor::record_log::RecordLog>>,
+    ) -> Self {
+        self.record_log = log;
+        self
     }
 
     /// Resolve `(host, local_rank)` for a global rank from the world
@@ -323,6 +339,11 @@ impl DashboardSink for ClusterDashboardSink {
     }
 
     fn shutdown(&self) {
+        // Flush the record stream before the dashboard goes down, so the
+        // final window's records are on disk for the post-run explorer.
+        if let Some(log) = &self.record_log {
+            log.flush();
+        }
         let mut mon = self.monitor.lock().unwrap();
         mon.shutdown_dashboard_server();
     }
@@ -343,6 +364,10 @@ impl DashboardSink for ClusterDashboardSink {
                 m["throughput"],
                 root["work"],
             );
+        }
+        // One producer, two sinks: the same records go live and to disk.
+        if let Some(log) = &self.record_log {
+            log.append(&records);
         }
         *self.latest_window_records.lock().unwrap() = records;
     }
@@ -492,5 +517,87 @@ impl DashboardSink for ClusterDashboardSink {
         let _ = duration_secs; // reserved for future ETA recalibration
         let mut mon = self.monitor.lock().unwrap();
         mon.log_epoch_record(record);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributed::ClusterBuilder;
+    use crate::monitor::record_log::{DEFAULT_MAX_LOG_BYTES, RecordLog};
+    use serde_json::json;
+
+    /// Unique temp dir per test, removed on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("flodl-sinklog-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cluster() -> Arc<FullCluster> {
+        Arc::new(
+            ClusterBuilder::new()
+                .controller("127.0.0.1")
+                .port(29500)
+                .done()
+                .host("exa")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/opt/flodl")
+                .done()
+                .build()
+                .expect("test cluster builds"),
+        )
+    }
+
+    fn window(tick: u64) -> Vec<serde_json::Value> {
+        vec![
+            json!({"v":1,"kind":"node","path":"root","tick":tick,"metrics":{"loss":0.5}}),
+            json!({"v":1,"kind":"node","path":"root/rank0","tick":tick,"metrics":{"loss":0.5}}),
+        ]
+    }
+
+    /// With a record log attached, pushed window records land on disk in
+    /// the node tree — the live stream and the history share one producer.
+    #[test]
+    fn window_records_persist_to_the_node_tree() {
+        let d = TempDir::new("persist");
+        let log = Arc::new(RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES));
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_record_log(Some(Arc::clone(&log)));
+
+        sink.push_window_records(window(1));
+        sink.push_window_records(window(2));
+        sink.shutdown(); // flushes
+
+        assert!(d.0.join("root.log").is_file());
+        assert!(d.0.join("root/rank0.log").is_file());
+        // Tail-read resume sees both windows, newest last.
+        let tail = log.tail("root", 10);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1]["tick"], 2);
+    }
+
+    /// Without a record log the sink is live-only — no files, no panic.
+    #[test]
+    fn no_record_log_means_live_only() {
+        let d = TempDir::new("liveonly");
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1);
+        sink.push_window_records(window(1));
+        sink.shutdown();
+        assert!(!d.0.join("root.log").exists());
+        // The latest window is still held in memory for the portal.
+        assert_eq!(sink.latest_window_records.lock().unwrap().len(), 2);
     }
 }

@@ -26,6 +26,7 @@
 pub mod cadence;
 pub mod format;
 pub mod record;
+pub mod record_log;
 pub mod resources;
 pub mod timeline;
 mod server;

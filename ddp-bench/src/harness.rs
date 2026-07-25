@@ -804,6 +804,9 @@ fn run_unified(
     if let Some(n) = config.reports_per_epoch {
         builder = builder.reports_per_epoch(n);
     }
+    if let Some(dir) = config.record_log_dir.as_deref() {
+        builder = builder.record_log(dir, 0); // 0 = library default cap
+    }
     if config.augment_noise > 0.0 {
         let sigma = config.augment_noise as f32;
         builder = builder.transform(move |mut rows, keys| {

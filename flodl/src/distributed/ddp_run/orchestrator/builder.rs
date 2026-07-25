@@ -692,6 +692,17 @@ where
         self
     }
 
+    /// Persist the monitor record stream as append-only JSONL under `dir`:
+    /// one file per node, mirroring each record's `path`
+    /// (`root.log`, `root/<host>/rank0.log`, …). Each node's log is a
+    /// drop-oldest ring capped at `max_bytes` (`0` =
+    /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES)),
+    /// so a long run can never fill the disk. Off by default.
+    pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
+        self.config = self.config.with_record_log(dir, max_bytes);
+        self
+    }
+
     /// Rank-side eval callback. Fires on the rank chosen by
     /// [`EpochCallbackPolicy`] at the cadence set by
     /// [`Self::eval_every`].

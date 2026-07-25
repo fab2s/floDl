@@ -538,6 +538,16 @@ pub struct TrainerConfig<M: Module> {
     /// a single point.
     pub reports_per_epoch: Option<usize>,
 
+    /// Directory for the persisted monitor record stream (append-only
+    /// JSONL, one bounded file per node mirroring its `path`). `None` =
+    /// live-only, no persistence.
+    pub record_log_dir: Option<String>,
+
+    /// Per-node byte cap for the persisted record stream (drop-oldest
+    /// ring), so a long run cannot fill the disk. `None` =
+    /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES).
+    pub max_log_size: Option<u64>,
+
     /// Which rank fires user-supplied per-epoch callbacks. Default
     /// [`EpochCallbackPolicy::Fastest`].
     pub epoch_callback_policy: EpochCallbackPolicy,
@@ -605,6 +615,8 @@ impl<M: Module> TrainerConfig<M> {
             eval_result_fn: None,
             eval_every: None,
             reports_per_epoch: None,
+            record_log_dir: None,
+            max_log_size: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,
             cluster: None,
@@ -730,6 +742,14 @@ impl<M: Module> TrainerConfig<M> {
     /// boundaries (see the `reports_per_epoch` field). `0` disables.
     pub fn reports_per_epoch(mut self, n: usize) -> Self {
         self.reports_per_epoch = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Persist the monitor record stream as JSONL under `dir`, each node
+    /// capped at `max_bytes` (drop-oldest; `0` = the library default).
+    pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
+        self.record_log_dir = Some(dir.into());
+        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
         self
     }
     /// Override which rank fires per-epoch callbacks.

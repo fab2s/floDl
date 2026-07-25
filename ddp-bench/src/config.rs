@@ -319,6 +319,9 @@ pub struct RunConfig {
     /// Sub-epoch monitor reports per epoch (`--reports-per-epoch`).
     /// `None` = library default (off, per-epoch reporting only).
     pub reports_per_epoch: Option<usize>,
+    /// Directory for the persisted monitor record stream (`--record-log`).
+    /// `None` = library default (live-only, nothing written).
+    pub record_log_dir: Option<String>,
     /// Execution tier (`--tier managed|cooperative`). `Managed` (default)
     /// runs `builder.run()`; `Cooperative` runs `builder.into_worker()` and
     /// hand-drives the loop. Both share the identical builder config, so a
