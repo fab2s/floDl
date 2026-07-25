@@ -316,6 +316,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.checkpoint_at_epoch(n)` | `usize` | One-shot coverage-granular checkpoint at the epoch any rank first reaches (progressive modes). Pairs with `.save_path`. |
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.reports_per_epoch(n)` | `usize` | Emit up to `n` sub-epoch monitor reports per epoch, at reduce boundaries (`0` = off, the default). Fills the curve *between* epoch points — see [Sub-epoch reports](#sub-epoch-reports---reports_per_epoch). |
+| `.record_log(dir, max_bytes)` | `(String, u64)` | Persist the monitor record stream as append-only JSONL under `dir`, one drop-oldest ring per node capped at `max_bytes` (`0` = default). Off by default — see [Persisting the record stream](#persisting-the-record-stream---record_log). |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
 | `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` - same knob as the solo loader's `vram_max_usage`. |
@@ -453,6 +454,50 @@ Trainer::builder(model_factory, optim_factory, train_step)
 Aggregation vocabulary (`Reduction`, the node record schema) lives in
 `flodl::monitor::record`; the cadence scheduler in
 `flodl::monitor::cadence`.
+
+---
+
+## Persisting the record stream - `record_log`
+
+Reports are live-only unless you ask for them on disk:
+
+```rust
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .reports_per_epoch(20)
+    .record_log("runs/exp1/records", 0)   // 0 = default per-node cap
+    .run()?;
+```
+
+A record's `path` **is** its filesystem path, so the run leaves a tree
+that mirrors the cluster:
+
+```text
+runs/exp1/records/
+  root.log                      # cohort aggregate, one JSON per line
+  root/exa-cuda.log             # host aggregate
+  root/exa-cuda/rank0.log       # rank leaf, raw values
+  root/flodl-pascal.log
+  root/flodl-pascal/rank1.log
+  root/flodl-pascal/rank2.log
+```
+
+- **JSONL, one record per line.** Each line is a standalone JSON object
+  carrying `ts` / `sev` / `path`, so the files ingest into fluentd / GCP
+  Cloud Logging as-is, and `jq` works on them directly.
+- **Bounded, drop-oldest.** Each node's log is a ring capped at
+  `max_bytes` (default 32 MiB): when the active segment fills it rotates
+  and the oldest is dropped. A long run **cannot fill the disk** — the
+  whole tree bounds to `nodes × max_bytes`.
+- **Never fails training.** Every I/O error here is swallowed and warned
+  once. A full or read-only disk costs you observability, nothing else.
+- **Tail-read resume.** Every `node` record is an absolute snapshot, so
+  catching up is reading the last N lines
+  (`RecordLog::tail(path, n)`) — no index, no checkpoint replay.
+
+Files stay plain JSONL while live (gzip cannot be appended to or cheaply
+tailed). In a containerized run, point `dir` at a **mounted** path — a
+container-local path is written inside the container and vanishes with it.
 
 ---
 

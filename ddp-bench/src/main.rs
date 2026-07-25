@@ -264,6 +264,14 @@ struct Cli {
     #[option]
     reports_per_epoch: Option<usize>,
 
+    /// Persist the monitor record stream as append-only JSONL under this
+    /// directory (flodl `.record_log`): one bounded, drop-oldest file per
+    /// node, mirroring each record's path (`root.log`,
+    /// `root/<host>/rank0.log`). Pair with `--reports-per-epoch`.
+    /// Default: library default (live-only, nothing written).
+    #[option]
+    record_log: Option<String>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -982,6 +990,7 @@ fn run() -> flodl::tensor::Result<()> {
                 sample_cache: cli.sample_cache,
                 disk_stage_gb: cli.disk_stage,
                 reports_per_epoch: cli.reports_per_epoch,
+                record_log_dir: cli.record_log.clone(),
                 tier,
             };
 

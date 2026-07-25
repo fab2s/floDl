@@ -573,6 +573,9 @@ impl Trainer {
         if let Some(n) = cfg.reports_per_epoch {
             b = b.reports_per_epoch(n);
         }
+        if let Some(dir) = cfg.record_log_dir {
+            b = b.record_log(dir, cfg.max_log_size.unwrap_or(0));
+        }
         if let Some(ds) = cfg.eval_dataset {
             b = b.eval_dataset(ds);
         }

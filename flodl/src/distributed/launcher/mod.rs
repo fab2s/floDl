@@ -1198,12 +1198,23 @@ pub fn run_launcher_with_config(
         // that binds the HTTP port lazily on the first rank-emitted
         // `DashboardRegister` frame; absent that the sink stays idle
         // and the dashboard is simply never served.
+        // Persisted record stream: opt-in via `record_log_dir`. The sink
+        // writes each emitted record to its node's bounded log, so the
+        // live stream and the on-disk history share one producer.
+        let record_log = config.record_log_dir.as_ref().map(|dir| {
+            Arc::new(crate::monitor::record_log::RecordLog::new(
+                dir,
+                config
+                    .max_log_size
+                    .unwrap_or(crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES),
+            ))
+        });
         let dashboard_sink: Arc<dyn crate::distributed::DashboardSink> =
             Arc::new(crate::distributed::ClusterDashboardSink::new(
                 Arc::new(world.clone()),
                 me.clone(),
                 config.num_epochs,
-            ));
+            ).with_record_log(record_log));
         dashboard_sink_outer = Some(Arc::clone(&dashboard_sink));
         config = config.dashboard_sink(Arc::clone(&dashboard_sink));
 

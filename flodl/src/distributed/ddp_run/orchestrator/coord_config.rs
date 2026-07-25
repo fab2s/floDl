@@ -167,6 +167,9 @@ pub(crate) fn build_coord_config_from_builder(
     if let Some(n) = config.reports_per_epoch {
         coord_config = coord_config.reports_per_epoch(n);
     }
+    if let Some(dir) = config.record_log_dir.clone() {
+        coord_config = coord_config.record_log(dir, config.max_log_size.unwrap_or(0));
+    }
     if let Some(f) = eval_result_fn {
         coord_config = coord_config.eval_result_fn(f);
     }

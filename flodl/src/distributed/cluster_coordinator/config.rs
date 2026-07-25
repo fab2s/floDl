@@ -210,6 +210,16 @@ pub struct ClusterCoordinatorConfig {
     /// whole run", which is the point for one-pass LLM training.
     pub reports_per_epoch: Option<usize>,
 
+    /// Directory for the persisted monitor record stream, or `None` for
+    /// live-only. Read by the **launcher** (which owns the dashboard sink
+    /// the records flow through), not by the coordinator itself — this is
+    /// the controller-scope config bag that carries it there.
+    pub record_log_dir: Option<String>,
+
+    /// Per-node byte cap for the persisted record stream (drop-oldest
+    /// ring). `None` = the library default.
+    pub max_log_size: Option<u64>,
+
     /// Which rank should fire user-supplied per-epoch callbacks
     /// (`epoch_fn` / `checkpoint_fn` / `eval_fn`). Default
     /// [`EpochCallbackPolicy::Fastest`] — coord runtime-resolves the
@@ -361,6 +371,8 @@ impl ClusterCoordinatorConfig {
             eval_result_fn: None,
             eval_every_epochs: None,
             reports_per_epoch: None,
+            record_log_dir: None,
+            max_log_size: None,
             epoch_callback_policy:
                 crate::distributed::ddp_run::EpochCallbackPolicy::default(),
             progressive: None,
@@ -464,6 +476,14 @@ impl ClusterCoordinatorConfig {
     /// See [`Self::reports_per_epoch`].
     pub fn reports_per_epoch(mut self, n: usize) -> Self {
         self.reports_per_epoch = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Persist the monitor record stream as JSONL under `dir`, each node
+    /// capped at `max_bytes` (`0` = library default).
+    pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
+        self.record_log_dir = Some(dir.into());
+        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
         self
     }
 
