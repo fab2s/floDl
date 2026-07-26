@@ -80,6 +80,15 @@ pub fn run(
         &format!("{}/fdl.yml.example", name),
         &fdl_yml_example_template(name, mode),
     )?;
+    // Native mode generates no docker-compose, so there is nothing to read a
+    // `.env`. Docker modes get the template that documents the knobs their
+    // compose actually substitutes.
+    if mode != Mode::Native {
+        write_file(
+            &format!("{}/.env.example", name),
+            &env_example_template(mode),
+        )?;
+    }
     write_fdl_bootstrap(name)?;
 
     if include_hf {
@@ -460,6 +469,11 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # cargo's default); Mac hosts set it in `.env` to keep `ld` within what
       # a virtiofs-backed workspace can serve. See docs/mac-apple-silicon.md.
       - CARGO_BUILD_JOBS
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
 
   cuda:
     build:
@@ -474,6 +488,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     working_dir: /workspace
     stdin_open: true
     tty: true
+    environment:
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
     deploy:
       resources:
         reservations:
@@ -506,6 +526,11 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # concurrent `ld` lookups — the linker reports `cannot find -ltorch`
       # spuriously. Unset on Linux native (empty → cargo's default).
       - CARGO_BUILD_JOBS
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
 
   cuda:
     build:
@@ -523,6 +548,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     working_dir: /workspace
     stdin_open: true
     tty: true
+    environment:
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
     deploy:
       resources:
         reservations:
@@ -661,6 +692,61 @@ WORKDIR /workspace
 /// `CUDA_TAG`, etc.) are derived from `libtorch/.active` by
 /// `flodl-cli/src/run.rs::libtorch_env` before each `docker compose run`
 /// (Docker modes) or exported into the child process (native mode).
+/// `.env.example` for a scaffolded project: the compose knobs that this
+/// mode's generated `docker-compose.yml` actually substitutes, and no others.
+/// Committed template, gitignored working copy — the same convention as
+/// `fdl.yml.example`.
+fn env_example_template(mode: Mode) -> String {
+    let mut s = String::from(
+        "# Local Docker environment overrides for docker-compose.yml.
+# Copy this to `.env` (gitignored) and uncomment what you need:
+#   cp .env.example .env
+# docker-compose auto-reads `.env` from this directory. This `.env.example`
+# is only a template; compose never reads it directly.
+
+# Host user/group mapping, so files created in the container are owned by you
+# rather than root. Defaults to 1000:1000 when unset; macOS is usually 501:20
+# (`id -u` / `id -g`).
+#UID=1000
+#GID=1000
+",
+    );
+    if mode == Mode::Mounted {
+        s.push_str(
+            "
+# libtorch mount points (host paths). Defaults live in docker-compose.yml.
+# Override to point at a different variant, e.g. an extracted linux-aarch64
+# build on Apple Silicon.
+#LIBTORCH_CPU_PATH=./libtorch/precompiled/cpu
+#LIBTORCH_HOST_PATH=./libtorch/precompiled/cu128
+
+# CUDA base image version and image tag for the `cuda` service.
+# Only affects direct `docker compose` calls: `fdl` derives both from the active
+# libtorch variant's `.arch` metadata and overrides whatever is set here.
+#CUDA_VERSION=12.8.0
+#CUDA_TAG=12.8
+",
+        );
+    }
+    s.push_str(
+        "
+# Throttle cargo build/link parallelism. Leave unset on Linux (uses all cores).
+# On Apple Silicon via Docker/OrbStack, set to 2 to avoid spurious
+# \"cannot find -ltorch\" linker errors caused by virtiofs mount latency.
+#CARGO_BUILD_JOBS=2
+
+# flodl log verbosity. `fdl -v/-vv/...` sets this per invocation; setting it
+# here makes a level stick without the flag.
+#FLODL_VERBOSITY=1
+
+# Scale every distributed network timeout (socket setup, coordinator deadlines).
+# Raise it on slow or congested links where the 30s LAN defaults are too tight.
+#FLODL_NET_TIMEOUT_SCALE=2
+",
+    );
+    s
+}
+
 fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
     let use_docker = matches!(mode, Mode::Mounted | Mode::Docker);
     let (cpu_svc, cuda_svc) = if use_docker {

@@ -792,6 +792,7 @@ supports. If `nvidia-smi` works, floDl trains on it.
 | **Scaling to multi-GPU** | [Multi-GPU Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md) then [Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md) |
 | **Bringing a HuggingFace model** | [HuggingFace Integration](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/14-flodl-hf.md): load BERT, RoBERTa, DistilBERT, ALBERT, XLM-R, or DeBERTa-v2; classify, NER, QA, or fill-mask; fine-tune and round-trip back to the HF ecosystem |
 | **Just show me code** | [`quickstart`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/quickstart/) or [`showcase`](https://github.com/flodl-labs/flodl/tree/main/flodl/examples/showcase/) |
+| **Forking or hacking on flodl itself** | [CONTRIBUTING.md](https://github.com/flodl-labs/flodl/blob/main/CONTRIBUTING.md) - clone-to-`fdl test` in four commands, the `*.example` templates you copy locally, and the gates a PR has to pass |
 
 ### Tutorials
 

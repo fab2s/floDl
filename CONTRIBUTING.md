@@ -17,8 +17,28 @@ cd flodl
 ```
 
 You do **not** need Rust or libtorch installed on the host machine.
-`fdl --help` lists every command; `fdl.yml.example` shows the manifest
-that declares them.
+`fdl --help` lists every command.
+
+### Committed templates, local copies
+
+Two files follow the same convention: the `*.example` is committed, your
+working copy is gitignored, and you make it by copying.
+
+| Committed | Your copy | Holds |
+|-----------|-----------|-------|
+| `fdl.yml.example` | `fdl.yml` | the command manifest `fdl` reads (`fdl` copies it for you on first run) |
+| `.env.example` | `.env` | per-machine `docker-compose` values |
+
+Nothing in `.env` is required on a stock single-user Linux box, so copy it only
+when you need one of two things. Your own `UID`/`GID`, so files the container
+writes into the bind-mounted workspace belong to you rather than root — compose
+defaults to `1000:1000`, correct on most Linux boxes and wrong on macOS, where
+it is `501:20`. Or `CARGO_BUILD_JOBS`, which Apple Silicon hosts need; see
+[docs/mac-apple-silicon.md](docs/mac-apple-silicon.md).
+
+```bash
+cp .env.example .env    # then uncomment what applies
+```
 
 ## Development Workflow
 
