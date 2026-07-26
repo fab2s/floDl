@@ -439,6 +439,14 @@ pub(super) fn outbound_loop(
         } else {
             None
         };
+    // Sub-epoch resource pacing. Resources also ride the per-epoch metrics
+    // frame, but a single-pass LLM run has ONE epoch — that path would yield a
+    // single GPU/VRAM reading for a run lasting hours, the same dead end
+    // `reports_per_epoch` fixes for loss. So sample on a wall-clock throttle
+    // here, decoupled from the epoch boundary. `sample()` reads /proc/stat
+    // plus the already-running NVML poller's accumulator, so this costs a
+    // frame, not a device query.
+    let mut last_resource_emit: Option<std::time::Instant> = None;
     // recv_timeout so we can periodically check the shutdown flag and
     // service the lower-frequency metrics channel between timing
     // frames. Single thread = serial writes on `stream`; no socket-
@@ -473,6 +481,36 @@ pub(super) fn outbound_loop(
                 // Metrics sender dropped; timing channel may still be
                 // alive (e.g. heartbeats during teardown). Fall through
                 // to timing drain — timing's Disconnected arm exits.
+            }
+        }
+        // Due on the writer's own 250ms tick, so it fires whether or not the
+        // training loop is producing frames — a rank stuck in a long barrier
+        // keeps reporting its resources.
+        if let Some(sampler) = resource_sampler.as_ref() {
+            let due = last_resource_emit.is_none_or(|t| {
+                t.elapsed() >= Duration::from_millis(super::RESOURCE_SAMPLE_INTERVAL_MS)
+            });
+            if due {
+                let sample = {
+                    let mut s = sampler.lock().unwrap();
+                    let mut sample = s.sample();
+                    trim_sample_to_assigned_device(&mut sample, assigned_device_idx);
+                    sample
+                };
+                last_resource_emit = Some(std::time::Instant::now());
+                if let Err(e) = write_timing_wire(
+                    stream,
+                    salt,
+                    &crate::distributed::wire::TimingMsgWire::ResourceSample {
+                        rank: rank as u64,
+                        sample: sample.into(),
+                    },
+                ) {
+                    crate::verbose!(
+                        "cluster_worker: outbound r{rank} resource write error: {e}"
+                    );
+                    return;
+                }
             }
         }
         match timing_rx.recv_timeout(Duration::from_millis(250)) {
@@ -510,9 +548,7 @@ pub(super) fn write_timing(
     salt: &SessionSalt,
     msg: TimingMsg,
 ) -> Result<()> {
-    let wire = timing_msg_to_wire(msg);
-    let frame = ControlFrame::encode(salt, MsgKind::Timing, &wire)?;
-    write_framed_control(stream, &frame)
+    write_timing_wire(stream, salt, &timing_msg_to_wire(msg))
 }
 
 pub(super) fn write_metrics(
@@ -528,29 +564,39 @@ pub(super) fn write_metrics(
         // copies the GPU poller's accumulator. No collective; cheap.
         let mut s = sampler.lock().unwrap();
         let mut sample = s.sample();
-        // When CUDA_VISIBLE_DEVICES isn't scoped per rank, the sampler
-        // returns one snapshot per physical device — but only the
-        // rank's assigned device carries this process's allocator
-        // stats. Strip foreign-device entries so the dashboard sink's
-        // `gpus.first()` lands on the correct GPU. Only filter when
-        // there is something to disambiguate: a scoped-down rank
-        // (`CUDA_VISIBLE_DEVICES=<phys>`, the launcher's per-child
-        // spawn recipe) already sees exactly its own device, and its
-        // snapshot carries the PHYSICAL index while
-        // `assigned_device_idx` carries the remapped runtime index
-        // (`my_rank` returns `CUDA(0)` for scoped children) — matching
-        // them would empty the list for every rank whose physical
-        // device isn't 0 (observed: pascal r2 shipped no GPU slice at
-        // all, blinding both the dashboard tab and the timeline).
-        if sample.gpus.len() > 1 {
-            if let Some(target) = assigned_device_idx {
-                sample.gpus.retain(|g| g.device_index == target);
-            }
-        }
+        trim_sample_to_assigned_device(&mut sample, assigned_device_idx);
         wire.resources = Some(sample.into());
     }
     let frame = ControlFrame::encode(salt, MsgKind::Metrics, &wire)?;
     write_framed_control(stream, &frame)
+}
+
+/// Strip foreign-device GPU entries from a resource sample.
+///
+/// When `CUDA_VISIBLE_DEVICES` isn't scoped per rank, the sampler returns one
+/// snapshot per physical device — but only the rank's assigned device carries
+/// this process's allocator stats, and consumers take `gpus.first()`. Only
+/// filter when there is something to disambiguate: a scoped-down rank
+/// (`CUDA_VISIBLE_DEVICES=<phys>`, the launcher's per-child spawn recipe)
+/// already sees exactly its own device, and its snapshot carries the PHYSICAL
+/// index while `assigned_device_idx` carries the remapped runtime index
+/// (`my_rank` returns `CUDA(0)` for scoped children) — matching them would
+/// empty the list for every rank whose physical device isn't 0 (observed:
+/// pascal r2 shipped no GPU slice at all, blinding both the dashboard tab and
+/// the timeline).
+///
+/// Shared by both emit paths (the per-epoch metrics piggy-back and the
+/// sub-epoch `ResourceSample` frame) so the two cannot disagree about which
+/// device a rank is reporting.
+pub(super) fn trim_sample_to_assigned_device(
+    sample: &mut crate::monitor::ResourceSample,
+    assigned_device_idx: Option<u8>,
+) {
+    if sample.gpus.len() > 1 {
+        if let Some(target) = assigned_device_idx {
+            sample.gpus.retain(|g| g.device_index == target);
+        }
+    }
 }
 
 /// Emit the rank-side dashboard setup sequence — `DashboardRegister`

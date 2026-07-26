@@ -43,7 +43,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::DashboardRegister { rank, .. }
             | TimingMsgWire::DashboardSetSvg { rank, .. }
             | TimingMsgWire::DashboardSetMetadata { rank, .. }
-            | TimingMsgWire::DashboardSetHardware { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::DashboardSetHardware { rank, .. }
+            | TimingMsgWire::ResourceSample { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness {
             if r < self.last_heartbeat.len() {
@@ -269,6 +270,47 @@ impl ClusterCoordinator {
                     sink.set_hardware(rank as usize, summary);
                 }
             }
+            TimingMsgWire::ResourceSample { rank, sample } => {
+                let rank = rank as usize;
+                if rank < self.world_size {
+                    self.absorb_resource_sample(rank, sample);
+                }
+            }
+        }
+    }
+
+    /// Absorb one rank's resource sample, from whichever cadence delivered it
+    /// (the per-epoch `MetricsMsgWire` piggy-back or the sub-epoch
+    /// `TimingMsgWire::ResourceSample` frame). One place so the two paths
+    /// cannot drift: the timeline persists it host-qualified, the dashboard
+    /// sink renders per-rank tabs, and the coordinator retains it for the next
+    /// window record.
+    pub(super) fn absorb_resource_sample(
+        &mut self,
+        rank: usize,
+        wire_sample: crate::distributed::wire::ResourceSampleWire,
+    ) {
+        if let Some(tl) = &self.timeline {
+            let host = self.rank_hosts.get(rank).map(String::as_str).unwrap_or("");
+            let sample: crate::monitor::ResourceSample = wire_sample.clone().into();
+            tl.rank_sample(rank, host, &sample);
+        }
+        // Retain for the window-report builder. Marked fresh so a window
+        // record carries a sample only ONCE — repeating the last value on
+        // every report would smear one reading across the whole epoch, which
+        // is exactly what the sub-epoch cadence exists to avoid.
+        if let Some(slot) = self.latest_res.get_mut(rank) {
+            *slot = Some((
+                crate::monitor::record::Res {
+                    gpu_util: wire_sample.gpu_util_percent.map(|v| v as f64),
+                    vram_alloc: wire_sample.vram_allocated_bytes.map(|v| v as f64),
+                    vram_total: wire_sample.vram_total_bytes.map(|v| v as f64),
+                },
+                true,
+            ));
+        }
+        if let Some(sink) = &self.dashboard_sink {
+            sink.push_resource_sample(rank, wire_sample);
         }
     }
 
@@ -671,19 +713,7 @@ impl ClusterCoordinator {
             // remote hosts' GPU/VRAM activity — the harness's local
             // poller cannot see them).
             if let Some(wire_sample) = wire.resources.clone() {
-                if let Some(tl) = &self.timeline {
-                    let host = self
-                        .rank_hosts
-                        .get(rank)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    let sample: crate::monitor::ResourceSample =
-                        wire_sample.clone().into();
-                    tl.rank_sample(rank, host, &sample);
-                }
-                if let Some(sink) = &self.dashboard_sink {
-                    sink.push_resource_sample(rank, wire_sample);
-                }
+                self.absorb_resource_sample(rank, wire_sample);
             }
             let msg = crate::distributed::ddp_run::MetricsMsg {
                 rank,

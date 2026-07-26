@@ -168,7 +168,7 @@ pub struct Res {
 }
 
 /// One rank's raw contribution to the tree at a tick — the builder input.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Leaf {
     /// Path segments **below root**, leaf id last: `["flodl-pascal","rank1"]`,
     /// `["rank0"]`, or `[]` for a single-node root-only run (root *is* the leaf).
@@ -184,6 +184,12 @@ pub struct Leaf {
     pub device: Option<u8>,
     /// Whether this rank is currently alive.
     pub alive: bool,
+    /// Human label for this node, when the path segment alone is not
+    /// informative — a rank's GPU model, say. The path is the *identity*; this
+    /// is what a legend shows next to it, which on a heterogeneous rig is the
+    /// difference between "rank0, rank1" and "rank0 · RTX 5060 Ti, rank1 · GP106".
+    /// Interior nodes leave it absent: a host's path segment IS its name.
+    pub label: Option<String>,
 }
 
 /// A node in the path-keyed record tree. A **leaf** (`children` empty) carries
@@ -195,6 +201,14 @@ pub struct NodeRecord {
     /// Full path from root, e.g. `["root","flodl-pascal","rank1"]`.
     pub path: Vec<String>,
     /// Σ subtree realized work (a `Sum`; the `Mean` weight for the parent).
+    ///
+    /// **A per-record interval quantity, not a series.** Its unit is whatever
+    /// the producer weighted with — absolute steps for a sub-epoch window
+    /// report, `batch_share` (summing to 1.0) for an epoch-boundary record,
+    /// because [`EpochMetrics`] carries shares and not per-rank sample counts.
+    /// Each record's tree is internally consistent, so every rollup is exact
+    /// either way; but the two cadences are not on a common scale, so `work` is
+    /// meaningful *per row* and must not be plotted as one curve across them.
     pub work: f64,
     /// Metric values — raw at a leaf, aggregated over direct children at interior.
     pub metrics: BTreeMap<String, f64>,
@@ -207,6 +221,14 @@ pub struct NodeRecord {
     /// Whether this node is alive: a leaf's own liveness; an interior node is
     /// alive iff any direct child is.
     pub alive: bool,
+    /// Human label for a legend at the parent's level (see [`Leaf::label`]).
+    pub label: Option<String>,
+    /// `true` on records emitted at an **epoch boundary** (the per-epoch feed),
+    /// `false` on sub-epoch window reports. Both cadences share one per-level
+    /// stream — a dense interior filled by window reports, punctuated by epoch
+    /// rows — so a consumer needs to tell them apart to mark an epoch on a
+    /// chart or in a log table.
+    pub epoch_complete: bool,
 }
 
 impl NodeRecord {
@@ -231,7 +253,7 @@ impl NodeRecord {
     pub fn to_record_json(
         &self,
         ts: u64,
-        tick: u64,
+        tick: Option<u64>,
         epoch: Option<usize>,
         sev: Severity,
     ) -> Value {
@@ -241,9 +263,20 @@ impl NodeRecord {
         obj.insert("sev".into(), json!(sev.as_str()));
         obj.insert("path".into(), json!(self.path.join("/")));
         obj.insert("kind".into(), json!("node"));
-        obj.insert("tick".into(), json!(tick));
+        // `tick` is the sub-epoch window index; epoch-boundary records have no
+        // window of their own, so it is absent there. `ts` is the axis both
+        // cadences share.
+        if let Some(t) = tick {
+            obj.insert("tick".into(), json!(t));
+        }
         if let Some(e) = epoch {
             obj.insert("epoch".into(), json!(e));
+        }
+        if self.epoch_complete {
+            obj.insert("epoch_complete".into(), json!(true));
+        }
+        if let Some(ref l) = self.label {
+            obj.insert("label".into(), json!(l));
         }
 
         let mut metrics = Map::new();
@@ -281,32 +314,49 @@ impl NodeRecord {
 
     /// Flat records for the WHOLE subtree (this node + all descendants),
     /// root-first — the JSONL the stream / persistence layer appends.
-    pub fn flat_records(&self, ts: u64, tick: u64, epoch: Option<usize>) -> Vec<Value> {
+    pub fn flat_records(&self, ts: u64, tick: Option<u64>, epoch: Option<usize>) -> Vec<Value> {
         let mut out = Vec::new();
         self.push_flat(ts, tick, epoch, &mut out);
         out
     }
 
-    fn push_flat(&self, ts: u64, tick: u64, epoch: Option<usize>, out: &mut Vec<Value>) {
+    fn push_flat(&self, ts: u64, tick: Option<u64>, epoch: Option<usize>, out: &mut Vec<Value>) {
         out.push(self.to_record_json(ts, tick, epoch, Severity::Info));
         for c in &self.children {
             c.push_flat(ts, tick, epoch, out);
         }
     }
 
-    /// Build the tree from an aggregated [`EpochMetrics`] — the data the
-    /// coordinator already holds (PR1a bridge). `hosts[rank]` names each rank's
-    /// host tier; pass `None` for a single-host run. Work is
-    /// `per_rank_batch_share` (samples-proportional; the weighted mean is
-    /// identical to using absolute samples). A single-rank single-host run
-    /// collapses to root-only (root carries the one rank's values).
+    /// Build the tree from an aggregated [`EpochMetrics`] — the **epoch-boundary**
+    /// half of the record stream, carrying what only the per-epoch feed has:
+    /// user scalars (per-rank *and* aggregated) and the resource sample.
+    ///
+    /// `hosts[rank]` names each rank's host; tiering follows [`cohort_tiering`],
+    /// the *same* rule the sub-epoch window tree uses, so a rank has ONE path
+    /// across both cadences and the two feeds interleave in one per-level
+    /// stream instead of splitting each rank in two. `extras[rank]` carries the
+    /// per-rank resource sample + legend label. Work is `per_rank_batch_share`
+    /// (samples-proportional; the weighted mean is identical to using absolute
+    /// samples).
+    ///
+    /// `avg_loss` and `scalars` are the controller's **batch-weighted** means
+    /// across ranks — the same law [`Reduction::Mean`] applies with
+    /// `batch_share` as the weight — so they are injected at the root for keys
+    /// the per-rank rollup did not produce. `loss` is always such a key:
+    /// [`EpochMetrics`] has no per-rank loss, only the aggregate, so without
+    /// this the tree would carry no loss at any level. Where a key exists both
+    /// per-rank and aggregated, the rollup wins (it is the measured tree), and
+    /// the two agree by construction.
     pub fn from_epoch_metrics(
         m: &EpochMetrics,
         hosts: Option<&[String]>,
         user_reductions: &Reductions,
+        extras: &[RankExtras],
     ) -> NodeRecord {
         let n = m.device_indices.len();
-        let root_only = n == 1 && hosts.is_none();
+        let host_refs: Vec<&str> = (0..n)
+            .map(|r| hosts.and_then(|hs| hs.get(r)).map(String::as_str).unwrap_or(""))
+            .collect();
         let leaves: Vec<Leaf> = (0..n)
             .map(|r| {
                 let mut metrics: BTreeMap<String, f64> = m
@@ -326,29 +376,87 @@ impl NodeRecord {
                 if let Some(&c) = m.per_rank_compute_only_ms.get(r) {
                     metrics.insert("compute_only_ms".into(), c);
                 }
-                let work = m.per_rank_batch_share.get(r).copied().unwrap_or(0.0);
-                let path = if root_only {
-                    Vec::new()
-                } else {
-                    let mut p = Vec::new();
-                    if let Some(h) = hosts.and_then(|hs| hs.get(r)) {
-                        p.push(h.clone());
-                    }
-                    p.push(format!("rank{r}"));
-                    p
-                };
+                let extra = extras.get(r);
                 Leaf {
-                    path,
-                    work,
+                    path: leaf_path_segments(r, &host_refs),
+                    work: m.per_rank_batch_share.get(r).copied().unwrap_or(0.0),
                     metrics,
-                    res: Res::default(),
+                    res: extra.map(|e| e.res).unwrap_or_default(),
                     device: m.device_indices.get(r).copied(),
                     alive: true,
+                    label: extra.and_then(|e| e.label.clone()),
                 }
             })
             .collect();
-        build_tree(&leaves, user_reductions)
+
+        let mut root = build_tree(&leaves, user_reductions);
+        root.metrics.entry("loss".to_string()).or_insert(m.avg_loss);
+        for (k, v) in &m.scalars {
+            root.metrics.entry(k.clone()).or_insert(*v);
+        }
+        root.mark_epoch_complete();
+        root
     }
+
+    /// Flag this node and every descendant as an epoch-boundary record.
+    fn mark_epoch_complete(&mut self) {
+        self.epoch_complete = true;
+        for c in &mut self.children {
+            c.mark_epoch_complete();
+        }
+    }
+}
+
+/// Per-rank additions the metrics feed does not carry: the resource sample and
+/// the legend label. Kept as one struct so the builder signature does not grow
+/// a positional slice per field.
+#[derive(Debug, Clone, Default)]
+pub struct RankExtras {
+    /// Resource sample for this rank (each field absent when unsampled).
+    pub res: Res,
+    /// Human label for a legend — typically the GPU model.
+    pub label: Option<String>,
+}
+
+/// The cohort's tree shape from its per-rank host list (index = rank; an empty
+/// string means "host unknown"): `(multi_host, root_only)`.
+///
+/// A host tier appears only when the cohort spans **more than one** host, and a
+/// lone rank on a single host collapses to root-only (the root *is* the leaf).
+///
+/// **Every producer of a record path must use this.** Two producers that tier
+/// differently would give one rank two paths in the same stream — the metrics
+/// would silently split in half rather than interleave.
+pub fn cohort_tiering(hosts: &[&str]) -> (bool, bool) {
+    let mut named: Vec<&str> = hosts.iter().copied().filter(|h| !h.is_empty()).collect();
+    named.sort_unstable();
+    named.dedup();
+    let multi_host = named.len() > 1;
+    (multi_host, hosts.len() == 1 && !multi_host)
+}
+
+/// Path segments **below root** for one rank's leaf, under [`cohort_tiering`]:
+/// `[]` (root-only), `["rankN"]`, or `["<host>","rankN"]`.
+pub fn leaf_path_segments(rank: usize, hosts: &[&str]) -> Vec<String> {
+    let (multi_host, root_only) = cohort_tiering(hosts);
+    if root_only {
+        return Vec::new();
+    }
+    let host = hosts.get(rank).copied().unwrap_or("");
+    let mut p = Vec::new();
+    if multi_host && !host.is_empty() {
+        p.push(host.to_string());
+    }
+    p.push(format!("rank{rank}"));
+    p
+}
+
+/// Full record path (`root`, `root/rankN`, or `root/<host>/rankN`) for one
+/// rank's leaf — [`leaf_path_segments`] joined under the root.
+pub fn rank_record_path(rank: usize, hosts: &[&str]) -> String {
+    let mut p = vec!["root".to_string()];
+    p.extend(leaf_path_segments(rank, hosts));
+    p.join("/")
 }
 
 /// Build the path-keyed record tree from per-rank leaves, aggregating each
@@ -386,6 +494,8 @@ fn build_node(
             children: Vec::new(),
             device: leaf.device,
             alive: leaf.alive,
+            label: leaf.label.clone(),
+            epoch_complete: false,
         };
     }
 
@@ -450,7 +560,11 @@ fn aggregate(path: Vec<String>, children: Vec<NodeRecord>, user: &Reductions) ->
         res,
         children,
         device: None,
+        // An interior node's path segment is its name (a host), so it needs no
+        // separate label; `epoch_complete` is stamped by the epoch builder.
+        label: None,
         alive,
+        epoch_complete: false,
     }
 }
 
@@ -486,6 +600,7 @@ mod tests {
             res: Res::default(),
             device: None,
             alive: true,
+            label: None,
         }
     }
 
@@ -609,12 +724,12 @@ mod tests {
         }
         // Interior records serialize with children/alive counts; leaves with
         // device/alive — the "same page at every level" shape.
-        let root_json = root.to_record_json(0, 0, None, Severity::Info);
+        let root_json = root.to_record_json(0, Some(0), None, Severity::Info);
         assert!(root_json.get("children").is_some());
         assert!(root_json.get("metrics").is_some());
         assert!(root_json.get("work").is_some());
         let leaf_node = &root.children[0].children[0];
-        let leaf_json = leaf_node.to_record_json(0, 0, None, Severity::Info);
+        let leaf_json = leaf_node.to_record_json(0, Some(0), None, Severity::Info);
         assert!(leaf_json.get("alive").is_some());
         assert!(leaf_json.get("children").is_none());
     }
@@ -663,6 +778,7 @@ mod tests {
             },
             device: None,
             alive: true,
+            label: None,
         };
         // Distinct leaf ids so they are separate children.
         let mut a = mk(Some(80.0), Some(1000.0), 3.0);
@@ -690,7 +806,7 @@ mod tests {
             &Reductions::new(),
         );
         // root, h1, rank0, rank1 = 4 records.
-        let recs = root.flat_records(1234, 7, Some(3));
+        let recs = root.flat_records(1234, Some(7), Some(3));
         assert_eq!(recs.len(), 4);
         let paths: BTreeSet<String> = recs
             .iter()
@@ -714,11 +830,11 @@ mod tests {
         l.alive = false;
         let root = build_tree(&[l], &Reductions::new()); // root-only? no: path non-empty
         // path ["rank0"] -> root -> rank0
-        let rec = root.children[0].to_record_json(0, 0, None, Severity::Info);
+        let rec = root.children[0].to_record_json(0, Some(0), None, Severity::Info);
         assert_eq!(rec["device"], json!(1));
         assert_eq!(rec["alive"], json!(false));
         // Interior root reflects the dead child in its alive count.
-        let root_rec = root.to_record_json(0, 0, None, Severity::Info);
+        let root_rec = root.to_record_json(0, Some(0), None, Severity::Info);
         assert_eq!(root_rec["alive"], json!(0));
         assert_eq!(root_rec["children"], json!(1));
     }
@@ -761,7 +877,7 @@ mod tests {
     #[test]
     fn from_epoch_metrics_builds_weighted_tree() {
         let em = epoch_metrics_2ranks();
-        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new());
+        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(root.children.len(), 2);
         // work = batch_share, sums to 1.0.
         assert!((root.work - 1.0).abs() < 1e-12);
@@ -780,11 +896,148 @@ mod tests {
     fn from_epoch_metrics_hosts_tier() {
         let em = epoch_metrics_2ranks();
         let hosts = vec!["hostA".to_string(), "hostB".to_string()];
-        let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new());
+        let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
         // root -> hostA -> rank0 ; root -> hostB -> rank1
         assert_eq!(root.children.len(), 2);
         let host_a = root.children.iter().find(|c| c.path.last().unwrap() == "hostA").unwrap();
         assert_eq!(host_a.children.len(), 1);
         assert_eq!(host_a.children[0].path, vec!["root", "hostA", "rank0"]);
+    }
+
+    /// Co-hosted ranks get NO host tier, even though `hosts` is `Some` — the
+    /// tier is a property of the cohort spanning >1 host, not of whether the
+    /// caller happened to know host names. This is what keeps the epoch feed's
+    /// paths identical to the sub-epoch window feed's; before
+    /// [`cohort_tiering`] was shared, this case produced `root/h1/rank0` here
+    /// and `root/rank0` there, splitting one rank into two paths in one stream.
+    #[test]
+    fn co_hosted_ranks_get_no_host_tier() {
+        let em = epoch_metrics_2ranks();
+        let hosts = vec!["h1".to_string(), "h1".to_string()];
+        let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
+        let paths: Vec<String> =
+            root.children.iter().map(|c| c.path.join("/")).collect();
+        assert_eq!(paths, vec!["root/rank0", "root/rank1"]);
+    }
+
+    /// The shared shaping helpers must agree with the tree they describe, in
+    /// every cohort shape — the sub-epoch feed, the alert lane, and the epoch
+    /// feed all address nodes through them.
+    #[test]
+    fn path_helpers_match_the_built_tree() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["h1"],                 // lone rank => root-only
+            vec!["h1", "h1"],           // single host => flat
+            vec!["h1", "h2"],           // multi host => host tier
+            vec!["", ""],               // hosts unknown => flat
+        ];
+        for hosts in cases {
+            let leaves: Vec<Leaf> = (0..hosts.len())
+                .map(|r| Leaf {
+                    path: leaf_path_segments(r, &hosts),
+                    work: 1.0,
+                    alive: true,
+                    ..Default::default()
+                })
+                .collect();
+            let root = build_tree(&leaves, &Reductions::new());
+            let mut built = Vec::new();
+            collect_leaf_paths(&root, &mut built);
+            let expected: Vec<String> =
+                (0..hosts.len()).map(|r| rank_record_path(r, &hosts)).collect();
+            let mut expected_sorted = expected.clone();
+            expected_sorted.sort();
+            expected_sorted.dedup();
+            built.sort();
+            assert_eq!(built, expected_sorted, "hosts={hosts:?}");
+        }
+    }
+
+    fn collect_leaf_paths(n: &NodeRecord, out: &mut Vec<String>) {
+        if n.is_leaf() {
+            out.push(n.path.join("/"));
+        }
+        for c in &n.children {
+            collect_leaf_paths(c, out);
+        }
+    }
+
+    /// `EpochMetrics` has no per-rank loss — only the aggregate — so without
+    /// injection the tree would carry no loss at ANY level.
+    #[test]
+    fn root_aggregates_fill_keys_the_rollup_cannot_produce() {
+        let mut em = epoch_metrics_2ranks();
+        em.scalars.insert("eval_acc".to_string(), 0.91);
+        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
+        assert_eq!(m(&root, "loss"), Some(0.3), "avg_loss injected at root");
+        assert_eq!(m(&root, "eval_acc"), Some(0.91), "root-only scalar injected");
+        // Injection is root-only: a rank never reported these.
+        assert_eq!(m(&root.children[0], "loss"), None);
+        assert_eq!(m(&root.children[0], "eval_acc"), None);
+    }
+
+    /// Where a key exists BOTH per-rank and in the aggregate, the measured
+    /// rollup wins — and the two agree, because `scalars` is a batch-weighted
+    /// mean and the tree's `Mean` is weighted by `batch_share`. Same law.
+    #[test]
+    fn rollup_wins_over_injection_and_the_two_agree() {
+        let mut em = epoch_metrics_2ranks();
+        // acc rolls up to 0.90*0.75 + 0.70*0.25 = 0.85; the controller's own
+        // batch-weighted aggregate is the same number.
+        em.scalars.insert("acc".to_string(), 0.85);
+        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
+        assert!((m(&root, "acc").unwrap() - 0.85).abs() < 1e-12);
+    }
+
+    #[test]
+    fn epoch_records_are_marked_complete_at_every_level() {
+        let em = epoch_metrics_2ranks();
+        let hosts = vec!["hostA".to_string(), "hostB".to_string()];
+        let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
+        assert!(root.epoch_complete);
+        assert!(root.children.iter().all(|h| h.epoch_complete));
+        assert!(root.children.iter().all(|h| h.children.iter().all(|r| r.epoch_complete)));
+        // ...and it reaches the wire, while a window record omits it entirely.
+        let recs = root.flat_records(1, None, Some(4));
+        assert!(recs.iter().all(|r| r["epoch_complete"] == true));
+        assert!(recs.iter().all(|r| r.get("tick").is_none()), "no window index");
+        let window = build_tree(
+            &[Leaf { path: vec!["rank0".into()], work: 1.0, alive: true, ..Default::default() }],
+            &Reductions::new(),
+        );
+        assert!(window.flat_records(1, Some(7), Some(4))[0].get("epoch_complete").is_none());
+    }
+
+    #[test]
+    fn res_and_label_ride_the_epoch_leaves_and_roll_up() {
+        let em = epoch_metrics_2ranks();
+        let extras = vec![
+            RankExtras {
+                res: Res { gpu_util: Some(90.0), vram_alloc: Some(1000.0), vram_total: Some(4000.0) },
+                label: Some("RTX 5060 Ti".to_string()),
+            },
+            RankExtras {
+                res: Res { gpu_util: Some(50.0), vram_alloc: Some(500.0), vram_total: Some(6000.0) },
+                label: Some("GP106".to_string()),
+            },
+        ];
+        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &extras);
+        // gpu_util is a work-weighted Mean: 90*0.75 + 50*0.25 = 80.
+        assert!((root.res.gpu_util.unwrap() - 80.0).abs() < 1e-9);
+        // VRAM sums across the cohort.
+        assert_eq!(root.res.vram_alloc, Some(1500.0));
+        assert_eq!(root.res.vram_total, Some(10000.0));
+        // The label is a LEAF property — a legend at the parent's level reads
+        // it there; the interior node's own path segment is its name.
+        let r0 = &root.children[0];
+        assert_eq!(r0.label.as_deref(), Some("RTX 5060 Ti"));
+        assert_eq!(root.label, None);
+        let rec = r0.to_record_json(0, None, None, Severity::Info);
+        assert_eq!(rec["label"], "RTX 5060 Ti");
+        assert_eq!(rec["res"]["gpu_util"], 90.0);
+        // An unsampled rank contributes no res at all rather than zeros.
+        let bare = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
+        assert_eq!(bare.res.gpu_util, None);
+        assert!(bare.children[0].to_record_json(0, None, None, Severity::Info).get("res").is_none());
     }
 }

@@ -187,6 +187,38 @@ Metrics are scoped to depth 1 (a level renders from its direct children), but
 too. You should not have to be looking at the right level to find out a rank
 died.
 
+#### Two cadences, one stream per level
+
+Every level's stream carries **both** report cadences, interleaved:
+
+| | sub-epoch window report | epoch-boundary record |
+|---|---|---|
+| when | at reduce boundaries, up to `reports_per_epoch` | once per epoch |
+| marked | `tick: <n>` | `epoch_complete: true` |
+| carries | loss, throughput, compute_only_ms, batch_share, `res` when freshly sampled | all of that **plus** user scalars (`record_scalar`, eval metrics) |
+
+So the dense curve comes from the window reports and the epoch rows punctuate
+it — `jq 'select(.epoch_complete)'` gives you just the epoch series.
+
+Resources (`gpu_util` / `vram_alloc` / `vram_total`) are sampled on their own
+~500 ms cadence, independent of both, so a **single-epoch** run gets a GPU/VRAM
+curve rather than one reading for the whole run. A record carries `res` only
+when a fresh sample arrived since the last one reported: repeating the previous
+value would smear one reading across the epoch, so absent stays absent instead.
+
+`GET /node?path=<p>` folds the two together into the node's **current state** —
+each field showing its most recent reading — so a gauge does not blink off
+between epochs. `/history` and `/stream` keep them as separate rows, which is
+what makes a level's log readable.
+
+Nodes also carry an optional `label` (a rank's GPU model), so a legend at any
+level can read `rank0 · RTX 5060 Ti` instead of just `rank0`.
+
+One caveat: `work` is a **per-record interval** quantity, and its unit differs
+by cadence (steps for a window, batch-share for an epoch). Every rollup is
+exact within a record — it is the aggregation weight — but do not plot it as a
+single curve across both.
+
 ### Embedding the graph
 
 To show the graph architecture in the dashboard:

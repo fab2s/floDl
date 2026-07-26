@@ -1423,6 +1423,27 @@ pub enum TimingMsgWire {
         rank: u64,
         summary: String,
     },
+    /// Rank → coord resource sample, on a **sub-epoch** cadence.
+    ///
+    /// Resources also ride [`MetricsMsgWire::resources`], but that frame is
+    /// per-EPOCH — and a single-pass LLM run has exactly one epoch, so that
+    /// path yields exactly ONE GPU/VRAM reading for a run that may last hours.
+    /// This frame decouples the sampling cadence from the epoch boundary so
+    /// per-window records carry live resources, the same reason
+    /// `reports_per_epoch` exists for loss.
+    ///
+    /// Emitted from the writer loop on a fixed wall-clock throttle
+    /// ([`crate::distributed::cluster_worker::RESOURCE_SAMPLE_INTERVAL_MS`]),
+    /// only when a sampler exists (dashboard opt-in or `rank_resources`).
+    /// `sample()` reads `/proc/stat` plus the already-running NVML poller's
+    /// accumulator, so the cost is a frame, not a device query.
+    ///
+    /// Appended last on purpose: bincode keys enum variants by index, so new
+    /// variants must go at the end to leave existing indices untouched.
+    ResourceSample {
+        rank: u64,
+        sample: ResourceSampleWire,
+    },
 }
 
 /// Per-GPU snapshot wire mirror of [`crate::monitor::resources::GpuSnapshot`].

@@ -438,6 +438,19 @@ impl ClusterCoordinator {
             return;
         }
 
+        // Take each rank's resource sample if a fresh one arrived since the
+        // last report, clearing the flag so the next window leaves `res`
+        // absent rather than repeating a stale reading.
+        let res_per_rank: Vec<crate::monitor::record::Res> = (0..self.world_size)
+            .map(|r| match self.latest_res.get_mut(r) {
+                Some(Some((res, fresh @ true))) => {
+                    *fresh = false;
+                    *res
+                }
+                _ => crate::monitor::record::Res::default(),
+            })
+            .collect();
+
         let stats: Vec<super::window_records::WindowRankStat> = (0..self.world_size)
             .map(|r| {
                 // Marginal delivered rate = the honest per-rank capacity
@@ -458,13 +471,14 @@ impl ClusterCoordinator {
                     mean_loss: self.window.mean_loss(r),
                     throughput,
                     compute_only_ms: self.window.wall_ms(r),
+                    res: res_per_rank[r],
                 }
             })
             .collect();
 
         let ts = super::alerts::now_ms();
         let tree = super::window_records::build_window_tree(&stats);
-        let records = tree.flat_records(ts, self.avg_count, Some(in_flight_epoch));
+        let records = tree.flat_records(ts, Some(self.avg_count), Some(in_flight_epoch));
         if let Some(sink) = self.dashboard_sink.as_ref() {
             sink.push_window_records(records);
         }

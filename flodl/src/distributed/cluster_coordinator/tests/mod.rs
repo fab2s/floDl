@@ -108,6 +108,7 @@ fn timing_wire_rank(msg: &TimingMsgWire) -> u32 {
         | TimingMsgWire::Intent { rank, .. }
         | TimingMsgWire::Heartbeat { rank, .. }
         | TimingMsgWire::SnapshotReady { rank }
+        | TimingMsgWire::ResourceSample { rank, .. }
         | TimingMsgWire::EvalResult { rank, .. }
         | TimingMsgWire::CheckpointResult { rank, .. }
         | TimingMsgWire::NewNcclIdGenerated { rank, .. }

@@ -19,7 +19,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::monitor::record::{build_tree, Leaf, NodeRecord, Reductions, Res};
+use crate::monitor::record::{
+    build_tree, leaf_path_segments, Leaf, NodeRecord, Reductions, Res,
+};
+
+pub(super) use crate::monitor::record::rank_record_path;
 
 /// One rank's window slice, as read off the coordinator's ledger.
 #[derive(Debug, Clone, Default)]
@@ -41,6 +45,12 @@ pub(super) struct WindowRankStat {
     pub throughput: Option<f64>,
     /// Compute-only wall (ms) accumulated this window.
     pub compute_only_ms: f64,
+    /// Resource sample, present only when a **fresh** one arrived since the
+    /// last window record for this rank. Repeating the previous value would
+    /// smear one reading across the epoch — the very thing the sub-epoch
+    /// cadence exists to avoid — so a window with no new sample leaves it
+    /// absent and the consumer's last-known-per-field view carries the gauge.
+    pub res: Res,
 }
 
 /// Shape per-rank window stats into the path-keyed record tree.
@@ -55,8 +65,12 @@ pub(super) struct WindowRankStat {
 /// each node carries the same field set.
 pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
     let total_steps: usize = stats.iter().map(|s| s.steps).sum();
-    let hosts: Vec<&str> = stats.iter().map(|s| s.host.as_str()).collect();
-    let (multi_host, root_only) = cohort_tiering(&hosts);
+    // Host list indexed BY RANK (not by position in `stats`), so the shared
+    // path shaping is independent of the order stats arrive in.
+    let mut hosts: Vec<&str> = vec![""; stats.iter().map(|s| s.rank + 1).max().unwrap_or(0)];
+    for s in stats {
+        hosts[s.rank] = s.host.as_str();
+    }
 
     let leaves: Vec<Leaf> = stats
         .iter()
@@ -78,23 +92,19 @@ pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
                     s.steps as f64 / total_steps as f64,
                 );
             }
-            let path = if root_only {
-                Vec::new()
-            } else {
-                let mut p = Vec::new();
-                if multi_host {
-                    p.push(s.host.clone());
-                }
-                p.push(format!("rank{}", s.rank));
-                p
-            };
             Leaf {
-                path,
+                // Shared with the epoch-boundary builder, so a rank has ONE
+                // path across both cadences and the two feeds interleave.
+                path: leaf_path_segments(s.rank, &hosts),
                 work: s.steps as f64,
                 metrics,
-                res: Res::default(),
+                res: s.res,
                 device: s.device,
                 alive: s.alive,
+                // The legend label is a property of the NODE, not of a
+                // measurement, so it rides the epoch record at this same path
+                // (last-known-wins) rather than being repeated per window.
+                label: None,
             }
         })
         .collect();
@@ -102,36 +112,6 @@ pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
     build_tree(&leaves, &Reductions::new())
 }
 
-/// The cohort's tree shape from its per-rank host list (index = rank; an
-/// empty string means "host unknown"): `(multi_host, root_only)`.
-///
-/// A host tier appears only when the cohort spans **more than one** host, and
-/// a lone rank on a single host collapses to root-only (the root *is* the
-/// leaf). Shared with [`rank_record_path`] so an alert's origin path is
-/// exactly the node path the portal drills into — a `rank_lost` on a path the
-/// tree never emits would be un-navigable.
-fn cohort_tiering(hosts: &[&str]) -> (bool, bool) {
-    let mut named: Vec<&str> = hosts.iter().copied().filter(|h| !h.is_empty()).collect();
-    named.sort_unstable();
-    named.dedup();
-    let multi_host = named.len() > 1;
-    (multi_host, hosts.len() == 1 && !multi_host)
-}
-
-/// Full record path (`root`, `root/rankN`, or `root/<host>/rankN`) of one
-/// rank's leaf, under the same tiering [`build_window_tree`] applies.
-pub(super) fn rank_record_path(rank: usize, hosts: &[&str]) -> String {
-    let (multi_host, root_only) = cohort_tiering(hosts);
-    if root_only {
-        return "root".to_string();
-    }
-    let host = hosts.get(rank).copied().unwrap_or("");
-    if multi_host && !host.is_empty() {
-        format!("root/{host}/rank{rank}")
-    } else {
-        format!("root/rank{rank}")
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -147,6 +127,7 @@ mod tests {
             mean_loss: loss,
             throughput: Some(10.0),
             compute_only_ms: 5.0,
+            res: Res::default(),
         }
     }
 
