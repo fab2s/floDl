@@ -85,6 +85,17 @@ use crate::distributed::nccl_session::PendingNcclSession;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
+/// Wall-clock throttle for the rank's sub-epoch resource frame
+/// ([`crate::distributed::wire::TimingMsgWire::ResourceSample`]).
+///
+/// Fixed rather than derived from `reports_per_epoch`: the cadence knob lives
+/// on the coordinator, and a rank that cannot see it still needs to report
+/// resources — including while blocked in a long barrier. 500ms is finer than
+/// any report cadence that matters on a long run and costs 2 small frames per
+/// rank per second, while `sample()` itself is a `/proc/stat` read plus a copy
+/// of the already-running NVML poller's accumulator.
+pub(crate) const RESOURCE_SAMPLE_INTERVAL_MS: u64 = 500;
+
 // ---------------------------------------------------------------------------
 // ClusterWorker
 // ---------------------------------------------------------------------------

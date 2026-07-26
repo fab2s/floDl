@@ -707,6 +707,12 @@ pub struct ClusterCoordinator {
     /// `TimingMsgWire::Dashboard*` frame and per-epoch resource sample
     /// to it. `None` ⇒ no dashboard (legacy / headless cluster runs).
     pub(super) dashboard_sink: Option<Arc<dyn crate::distributed::DashboardSink>>,
+    /// Latest resource sample per rank plus a "not yet reported in a window
+    /// record" flag. Fed by [`Self::absorb_resource_sample`] from either
+    /// cadence; drained by the window-report builder, which attaches a sample
+    /// once and then leaves `res` absent until a fresh one arrives (a repeated
+    /// value would smear one reading across the epoch).
+    latest_res: Vec<Option<(crate::monitor::record::Res, bool)>>,
     /// Bounded, collapsing alert buffer feeding the record stream's `event`
     /// lane (rank loss, drift, dropped control broadcasts). Always present:
     /// it costs nothing idle, and the cohort's alert history should not

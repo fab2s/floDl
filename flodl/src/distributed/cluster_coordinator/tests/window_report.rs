@@ -25,6 +25,21 @@ fn batch(coord: &mut ClusterCoordinator, rank: u64, loss: f64) {
     });
 }
 
+/// A resource sample as it arrives off the wire.
+fn resource_wire(
+    util: f32,
+    alloc: u64,
+    total: u64,
+) -> crate::distributed::wire::ResourceSampleWire {
+    crate::monitor::ResourceSample {
+        gpu_util_percent: Some(util),
+        vram_allocated_bytes: Some(alloc),
+        vram_total_bytes: Some(total),
+        ..Default::default()
+    }
+    .into()
+}
+
 /// A 2-rank coord whose epoch is 10 steps (100 samples / batch 10), with
 /// `reports_per_epoch` reports per epoch, wired to a capturing sink.
 fn coord_with_cadence(reports_per_epoch: usize) -> (ClusterCoordinator, Arc<StubSink>) {
@@ -150,6 +165,73 @@ fn silent_rank_is_absent_from_the_report_not_zero() {
         "unmeasured rank carries no loss key: {r1}",
     );
     assert_eq!(r1["work"].as_f64().unwrap(), 0.0);
+}
+
+/// Resources must reach WINDOW records, not only epoch ones: a single-pass LLM
+/// run has one epoch, so the epoch cadence alone would give one GPU/VRAM
+/// reading for the whole run — the exact gap `reports_per_epoch` exists to
+/// close for loss.
+#[test]
+fn a_fresh_resource_sample_reaches_the_window_record() {
+    let (mut coord, sink) = coord_with_cadence(2);
+    coord.absorb_resource_sample(0, resource_wire(90.0, 4_000_000_000, 8_000_000_000));
+    coord.absorb_resource_sample(1, resource_wire(50.0, 1_000_000_000, 6_000_000_000));
+    for _ in 0..5 {
+        batch(&mut coord, 0, 0.4);
+    }
+    coord.finish_averaging_head();
+
+    let root = sink.last_root();
+    // gpu_util is a work-weighted Mean, and only rank0 did work this window,
+    // so the cohort figure is rank0's.
+    assert_eq!(root["res"]["gpu_util"], 90.0);
+    // VRAM sums over the reporting ranks.
+    assert_eq!(root["res"]["vram_alloc"], 5_000_000_000.0);
+    assert_eq!(root["res"]["vram_total"], 14_000_000_000.0);
+    let r1 = sink
+        .last()
+        .into_iter()
+        .find(|r| r["path"] == "root/rank1")
+        .unwrap();
+    assert_eq!(r1["res"]["gpu_util"], 50.0);
+}
+
+/// A sample is reported ONCE. Repeating the last value on every window would
+/// smear one reading across the epoch — precisely what this cadence avoids —
+/// so a window with no fresh sample leaves `res` absent (absent≠zero), and the
+/// consumer's last-known-per-field view carries the gauge.
+#[test]
+fn a_stale_sample_is_not_repeated_on_the_next_window() {
+    // x=4 over a 10-step epoch => thresholds at 2.5/5/7.5/10 steps, so three
+    // 3-step windows each report and stay inside the per-epoch budget.
+    let (mut coord, sink) = coord_with_cadence(4);
+    let window = |coord: &mut ClusterCoordinator| {
+        coord.reset_window_for_test();
+        for _ in 0..3 {
+            batch(coord, 0, 0.4);
+        }
+        coord.finish_averaging_head();
+    };
+
+    coord.absorb_resource_sample(0, resource_wire(90.0, 4_000_000_000, 8_000_000_000));
+    window(&mut coord);
+    assert_eq!(sink.count(), 1);
+    assert_eq!(sink.last_root()["res"]["gpu_util"], 90.0);
+
+    // Second window, no new sample.
+    window(&mut coord);
+    assert_eq!(sink.count(), 2);
+    assert!(
+        sink.last_root().get("res").is_none(),
+        "no fresh sample => no res at all: {}",
+        sink.last_root(),
+    );
+
+    // A new sample makes the next window report again.
+    coord.absorb_resource_sample(0, resource_wire(70.0, 4_000_000_000, 8_000_000_000));
+    window(&mut coord);
+    assert_eq!(sink.count(), 3);
+    assert_eq!(sink.last_root()["res"]["gpu_util"], 70.0);
 }
 
 #[test]

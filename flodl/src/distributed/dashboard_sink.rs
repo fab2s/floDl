@@ -109,6 +109,19 @@ pub trait DashboardSink: Send + Sync {
     fn shutdown(&self) {}
 }
 
+/// Trim vendor boilerplate off a GPU model so a legend entry stays short
+/// (`NVIDIA GeForce RTX 5060 Ti` → `RTX 5060 Ti`). Mirrors the dashboard's own
+/// `shortGpuName`.
+fn short_gpu_name(name: &str) -> String {
+    let mut s = name.trim();
+    for prefix in ["NVIDIA ", "GeForce "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+        }
+    }
+    s.to_string()
+}
+
 /// Concrete [`DashboardSink`] that owns a launcher-hosted [`Monitor`]
 /// + per-rank state.
 ///
@@ -201,6 +214,71 @@ impl ClusterDashboardSink {
     ) -> Self {
         self.record_log = log;
         self
+    }
+
+    /// Per-rank host names indexed by global rank, as the record tree's path
+    /// shaping expects.
+    fn record_hosts(&self) -> Vec<String> {
+        let mut hosts = vec![String::new(); self.cluster.world_size()];
+        for worker in &self.cluster.workers {
+            for &r in &worker.ranks {
+                if let Some(slot) = hosts.get_mut(r) {
+                    *slot = worker.host.clone();
+                }
+            }
+        }
+        hosts
+    }
+
+    /// Per-rank resource + legend extras for the epoch record tree, read off
+    /// the samples the ranks piggy-back on their metrics reports.
+    ///
+    /// These are sampled once per epoch, which is exactly this record's
+    /// cadence — so the values are fresh here, where smearing them across every
+    /// sub-epoch window report would have invented data between samples.
+    fn record_extras(&self) -> Vec<crate::monitor::record::RankExtras> {
+        let map = self.per_rank_resources.lock().unwrap();
+        map.iter()
+            .map(|s| {
+                let Some(sample) = s else {
+                    return crate::monitor::record::RankExtras::default();
+                };
+                crate::monitor::record::RankExtras {
+                    res: crate::monitor::record::Res {
+                        // absent≠zero: an unsampled field stays None and is
+                        // excluded from the rollup, never averaged in as 0.
+                        gpu_util: sample.gpu_util_percent.map(|v| v as f64),
+                        vram_alloc: sample.vram_allocated_bytes.map(|v| v as f64),
+                        vram_total: sample.vram_total_bytes.map(|v| v as f64),
+                    },
+                    label: sample.gpus.first().map(|g| short_gpu_name(&g.name)),
+                }
+            })
+            .collect()
+    }
+
+    /// Build and ship the epoch-boundary record tree to the live record plane
+    /// and the persisted log — the same two sinks the window reports use.
+    fn push_epoch_records(&self, metrics: &crate::distributed::ddp_run::EpochMetrics) {
+        let hosts = self.record_hosts();
+        let extras = self.record_extras();
+        let tree = crate::monitor::record::NodeRecord::from_epoch_metrics(
+            metrics,
+            Some(&hosts),
+            &crate::monitor::record::Reductions::new(),
+            &extras,
+        );
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // No `tick`: an epoch record closes an epoch, it does not belong to a
+        // sub-epoch window. `ts` is the axis both cadences share.
+        let records = tree.flat_records(ts, None, Some(metrics.epoch));
+        self.monitor.lock().unwrap().push_records(records.clone());
+        if let Some(log) = &self.record_log {
+            log.append(&records);
+        }
     }
 
     /// Resolve `(host, local_rank)` for a global rank from the world
@@ -548,6 +626,12 @@ impl DashboardSink for ClusterDashboardSink {
             combined
         };
 
+        // The epoch-boundary half of the record stream. This is the ONLY feed
+        // carrying user scalars and the resource sample, so without it a level
+        // view has framework metrics and nothing else. Same tree, same paths as
+        // the sub-epoch window reports — they interleave per level.
+        self.push_epoch_records(metrics);
+
         let duration_secs = self.start_time.elapsed().as_secs_f64();
         let record = EpochRecord {
             epoch: metrics.epoch,
@@ -672,6 +756,121 @@ mod tests {
         let feed = sink.recent_events.lock().unwrap();
         assert_eq!(feed.len(), n);
         assert_eq!(feed[n - 1]["ts"], n + 9);
+    }
+
+    /// Two hosts, two ranks — so the epoch tree gets a host tier and the
+    /// per-host paths are exercised.
+    fn cluster2() -> Arc<FullCluster> {
+        Arc::new(
+            ClusterBuilder::new()
+                .controller("127.0.0.1")
+                .port(29501)
+                .done()
+                .host("exa")
+                .ranks([0])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/opt/flodl")
+                .done()
+                .host("pascal")
+                .ranks([1])
+                .devices([0])
+                .nccl_socket_ifname("lo")
+                .path("/opt/flodl")
+                .done()
+                .build()
+                .expect("2-host test cluster builds"),
+        )
+    }
+
+    fn epoch_metrics2() -> crate::distributed::ddp_run::EpochMetrics {
+        let mut scalars = std::collections::HashMap::new();
+        scalars.insert("eval_acc".to_string(), 0.87);
+        crate::distributed::ddp_run::EpochMetrics {
+            epoch: 2,
+            scalars,
+            per_rank: vec![Default::default(), Default::default()],
+            avg_loss: 0.25,
+            epoch_ms: 500.0,
+            per_rank_throughput: vec![12.0, 4.0],
+            per_rank_batch_share: vec![0.75, 0.25],
+            per_rank_share_complete_ms: vec![480.0, 490.0],
+            per_rank_compute_only_ms: vec![400.0, 410.0],
+            per_rank_data_starve_ms: vec![10.0, 60.0],
+            device_indices: vec![0, 0],
+        }
+    }
+
+    fn sample_with_gpu(util: f32, alloc: u64, name: &str) -> ResourceSampleWire {
+        let mut s = ResourceSample {
+            gpu_util_percent: Some(util),
+            vram_allocated_bytes: Some(alloc),
+            vram_total_bytes: Some(8_000_000_000),
+            ..Default::default()
+        };
+        s.gpus.push(crate::monitor::GpuSnapshot { name: name.to_string(), ..Default::default() });
+        s.into()
+    }
+
+    /// The per-epoch feed is the ONLY source of user scalars and the resource
+    /// sample, so it must also become records — otherwise a level view has
+    /// framework metrics and nothing else.
+    #[test]
+    fn epoch_metrics_also_become_records_on_both_sinks() {
+        let d = TempDir::new("epochrec");
+        let log = Arc::new(RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES));
+        let sink = ClusterDashboardSink::new(cluster2(), "exa".to_string(), 4)
+            .with_record_log(Some(Arc::clone(&log)));
+
+        sink.push_resource_sample(0, sample_with_gpu(90.0, 5_000_000_000, "NVIDIA GeForce RTX 5060 Ti"));
+        sink.push_resource_sample(1, sample_with_gpu(50.0, 1_000_000_000, "NVIDIA GeForce GTX 1060"));
+        sink.push_epoch_metrics(&epoch_metrics2());
+        sink.shutdown();
+
+        // Same path shaping as the window feed: two hosts => a host tier.
+        let root = log.tail("root", 10);
+        assert_eq!(root.len(), 1, "one epoch record at root");
+        let r = &root[0];
+        assert_eq!(r["epoch_complete"], true, "marked as an epoch boundary");
+        assert!(r.get("tick").is_none(), "an epoch record has no window index");
+        assert_eq!(r["epoch"], 2);
+        // avg_loss injected (EpochMetrics has no per-rank loss at all) and the
+        // root-only user scalar carried.
+        assert_eq!(r["metrics"]["loss"], 0.25);
+        assert_eq!(r["metrics"]["eval_acc"], 0.87);
+        // throughput sums; gpu_util is the work-weighted mean 90*.75+50*.25=80.
+        assert_eq!(r["metrics"]["throughput"], 16.0);
+        assert!((r["res"]["gpu_util"].as_f64().unwrap() - 80.0).abs() < 1e-9);
+        assert_eq!(r["res"]["vram_alloc"], 6_000_000_000.0);
+
+        // The leaf carries its own device + a short legend label.
+        let leaf = log.tail("root/exa/rank0", 10);
+        assert_eq!(leaf.len(), 1);
+        assert_eq!(leaf[0]["label"], "RTX 5060 Ti", "vendor prefixes trimmed");
+        assert_eq!(leaf[0]["res"]["gpu_util"], 90.0);
+        assert!(log.tail("root/pascal/rank1", 10)[0]["label"] == "GTX 1060");
+    }
+
+    /// An unsampled rank must contribute no `res` at all rather than zeros —
+    /// absent≠zero survives the sink hop.
+    #[test]
+    fn an_unsampled_rank_contributes_no_res() {
+        let d = TempDir::new("nores");
+        let log = Arc::new(RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES));
+        let sink = ClusterDashboardSink::new(cluster2(), "exa".to_string(), 4)
+            .with_record_log(Some(Arc::clone(&log)));
+        sink.push_epoch_metrics(&epoch_metrics2());
+        sink.shutdown();
+        let r = &log.tail("root", 10)[0];
+        assert!(r.get("res").is_none(), "no resource fields anywhere: {r}");
+        assert!(log.tail("root/exa/rank0", 10)[0].get("label").is_none());
+    }
+
+    #[test]
+    fn short_gpu_name_trims_vendor_prefixes() {
+        assert_eq!(short_gpu_name("NVIDIA GeForce RTX 5060 Ti"), "RTX 5060 Ti");
+        assert_eq!(short_gpu_name("NVIDIA GP106"), "GP106");
+        assert_eq!(short_gpu_name("  Radeon RX 7900  "), "Radeon RX 7900");
     }
 
     /// Without a record log the sink is live-only — no files, no panic.

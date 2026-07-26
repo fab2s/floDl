@@ -82,6 +82,73 @@ fn parent_of(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(p, _)| p)
 }
 
+/// The latest record at one path from **each** cadence.
+///
+/// One node is described by two feeds that carry different fields: sub-epoch
+/// window reports (dense; framework metrics) and epoch-boundary records
+/// (sparse; user scalars + the resource sample). Keeping a single "latest"
+/// slot would make the two overwrite each other, so a viewer's gauges would
+/// blink — with `reports_per_epoch(20)`, GPU / VRAM / accuracy would be absent
+/// 19 ticks out of 20 despite having been measured. So both are kept, and
+/// [`NodeLatest::merged`] answers "what is this node doing right now" as
+/// last-known-per-field, which is what a gauge means.
+#[derive(Debug, Default, Clone)]
+struct NodeLatest {
+    window: Option<Value>,
+    epoch: Option<Value>,
+}
+
+impl NodeLatest {
+    fn store(&mut self, rec: Value) {
+        if rec.get("epoch_complete").and_then(Value::as_bool) == Some(true) {
+            self.epoch = Some(rec);
+        } else {
+            self.window = Some(rec);
+        }
+    }
+
+    /// Both cadences folded into one snapshot: the newer record's fields win,
+    /// the older fills only what the newer never measured. A field absent from
+    /// both stays absent — merging never invents a value.
+    fn merged(&self) -> Option<Value> {
+        match (&self.window, &self.epoch) {
+            (None, None) => None,
+            (Some(v), None) | (None, Some(v)) => Some(v.clone()),
+            (Some(w), Some(e)) => {
+                let ts = |v: &Value| v.get("ts").and_then(Value::as_u64).unwrap_or(0);
+                let (older, newer) = if ts(w) <= ts(e) { (w, e) } else { (e, w) };
+                let mut out = older.clone();
+                overlay(&mut out, newer);
+                // `epoch_complete` describes the RECORD that carried a field,
+                // not the node's current state. Left in, a viewer would read
+                // "we are at an epoch boundary" for the whole span between
+                // epochs. It stays on the history rows, where it belongs.
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("epoch_complete");
+                }
+                Some(out)
+            }
+        }
+    }
+}
+
+/// Overlay `newer` onto `base`, recursing one level into nested objects so
+/// `metrics` / `res` merge key-wise instead of the whole map being replaced.
+fn overlay(base: &mut Value, newer: &Value) {
+    let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), newer.as_object()) else {
+        *base = newer.clone();
+        return;
+    };
+    for (k, v) in new_obj {
+        match (base_obj.get_mut(k), v.as_object()) {
+            (Some(slot), Some(_)) if slot.is_object() => overlay(slot, v),
+            _ => {
+                base_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
 /// Live path-addressable record view. Plain (no interior locking) — the
 /// server owns it behind its own lock, like every other piece of shared
 /// dashboard state.
@@ -89,8 +156,9 @@ fn parent_of(path: &str) -> Option<&str> {
 pub struct RecordStore {
     /// Arrival-ordered ring, newest last. Bounded by [`MAX_RECORDS`].
     ring: std::collections::VecDeque<Value>,
-    /// Latest `node` record per path — the "current state" index.
-    latest: HashMap<String, Value>,
+    /// Latest `node` record per path, **per cadence** — the "current state"
+    /// index. See [`NodeLatest`] for why one slot is not enough.
+    latest: HashMap<String, NodeLatest>,
     /// The `meta` record, if the producer has emitted one. Replayed into
     /// every subscriber's preamble. Absent is meaningful: it says "no
     /// non-core reduction declarations", and core reductions are implicit.
@@ -124,8 +192,10 @@ impl RecordStore {
                 // A known path always updates; a new one is admitted only
                 // under the cap, so a malformed producer cannot grow the
                 // index without bound.
-                if self.latest.contains_key(path) || self.latest.len() < MAX_PATHS {
-                    self.latest.insert(path.to_string(), rec.clone());
+                if let Some(slot) = self.latest.get_mut(path) {
+                    slot.store(rec.clone());
+                } else if self.latest.len() < MAX_PATHS {
+                    self.latest.entry(path.to_string()).or_default().store(rec.clone());
                 } else {
                     self.path_cap_hit = true;
                 }
@@ -148,19 +218,23 @@ impl RecordStore {
         std::mem::take(&mut self.path_cap_hit)
     }
 
-    /// Latest `node` record at exactly `path`.
-    pub fn node(&self, path: &str) -> Option<&Value> {
-        self.latest.get(path)
+    /// Current state at exactly `path`: the latest sub-epoch window report and
+    /// the latest epoch-boundary record folded into one snapshot, newer fields
+    /// winning and older ones filling only what the newer never measured. So a
+    /// dense window report never blanks out the resource sample and user
+    /// scalars that only the epoch record carries.
+    pub fn node(&self, path: &str) -> Option<Value> {
+        self.latest.get(path).and_then(NodeLatest::merged)
     }
 
-    /// Latest `node` record of each direct child of `path`, ordered by path
-    /// so a rendered level is stable across polls.
-    pub fn children(&self, path: &str) -> Vec<&Value> {
-        let mut kids: Vec<(&str, &Value)> = self
+    /// Current state of each direct child of `path`, ordered by path so a
+    /// rendered level is stable across polls.
+    pub fn children(&self, path: &str) -> Vec<Value> {
+        let mut kids: Vec<(&str, Value)> = self
             .latest
             .iter()
             .filter(|(p, _)| parent_of(p) == Some(path))
-            .map(|(p, v)| (p.as_str(), v))
+            .filter_map(|(p, v)| v.merged().map(|m| (p.as_str(), m)))
             .collect();
         kids.sort_unstable_by_key(|(p, _)| *p);
         kids.into_iter().map(|(_, v)| v).collect()
@@ -173,8 +247,8 @@ impl RecordStore {
     pub fn snapshot(&self, path: &str) -> Value {
         json!({
             "path": path,
-            "node": self.node(path).cloned().unwrap_or(Value::Null),
-            "children": self.children(path).into_iter().cloned().collect::<Vec<_>>(),
+            "node": self.node(path).unwrap_or(Value::Null),
+            "children": self.children(path),
         })
     }
 
@@ -375,6 +449,89 @@ mod tests {
         assert_eq!(s.meta().unwrap()["reductions"]["acc"], "mean");
         // `meta` is state, not history — it does not enter the ring.
         assert!(s.history("root", 10).is_empty());
+    }
+
+    fn epoch_node(path: &str, ts: u64) -> Value {
+        json!({ "v": 1, "kind": "node", "path": path, "ts": ts, "epoch": 3,
+                "epoch_complete": true, "work": 1.0, "label": "RTX 5060 Ti",
+                "metrics": { "loss": 0.4, "accuracy": 0.9 },
+                "res": { "gpu_util": 84.0, "vram_alloc": 5000.0 } })
+    }
+    fn window_node(path: &str, ts: u64, tick: u64) -> Value {
+        json!({ "v": 1, "kind": "node", "path": path, "ts": ts, "tick": tick,
+                "work": 10.0, "metrics": { "loss": 0.31, "throughput": 21.0 } })
+    }
+
+    /// The whole point of keeping both cadences: a window report must not blank
+    /// out the resource sample and user scalars that only the epoch record
+    /// carries. With reports_per_epoch(20) the naive single-slot index would
+    /// show them 1 tick in 20.
+    #[test]
+    fn a_window_report_does_not_blank_the_epoch_fields() {
+        let mut s = RecordStore::new();
+        s.insert(epoch_node("root/rank0", 100));
+        s.insert(window_node("root/rank0", 200, 7));
+        let n = s.node("root/rank0").unwrap();
+        // Newer window record wins on the fields it measures...
+        assert_eq!(n["metrics"]["loss"], 0.31);
+        assert_eq!(n["metrics"]["throughput"], 21.0);
+        assert_eq!(n["tick"], 7);
+        assert_eq!(n["work"], 10.0);
+        // ...and the epoch-only fields survive rather than blinking out.
+        assert_eq!(n["metrics"]["accuracy"], 0.9);
+        assert_eq!(n["res"]["gpu_util"], 84.0);
+        assert_eq!(n["label"], "RTX 5060 Ti");
+        // But record provenance does NOT survive: a merged snapshot is the
+        // node's current state, not "we are at an epoch boundary".
+        assert!(n.get("epoch_complete").is_none(), "{n}");
+        assert!(
+            s.history("root/rank0", 10)
+                .iter()
+                .any(|r| r.get("epoch_complete").and_then(Value::as_bool) == Some(true)),
+            "the flag stays on the history row",
+        );
+    }
+
+    /// Order-independence: an epoch record arriving after a window report must
+    /// not lose the window's dense metrics either.
+    #[test]
+    fn merge_is_by_timestamp_not_arrival() {
+        let mut s = RecordStore::new();
+        s.insert(window_node("root/rank0", 200, 7));
+        s.insert(epoch_node("root/rank0", 100)); // older, arrives later
+        let n = s.node("root/rank0").unwrap();
+        assert_eq!(n["metrics"]["loss"], 0.31, "newer window loss still wins");
+        assert_eq!(n["metrics"]["accuracy"], 0.9);
+        assert_eq!(n["res"]["gpu_util"], 84.0);
+    }
+
+    /// Merging fills gaps; it never invents a value.
+    #[test]
+    fn a_field_absent_from_both_stays_absent() {
+        let mut s = RecordStore::new();
+        s.insert(window_node("root/rank0", 100, 1));
+        s.insert(epoch_node("root/rank0", 200));
+        let n = s.node("root/rank0").unwrap();
+        assert!(n["metrics"].get("data_starve").is_none());
+        assert!(n["res"].get("vram_total").is_none());
+    }
+
+    /// History is untouched by the merge — each record stays its own row, which
+    /// is what makes the two cadences interleave in a level's log.
+    #[test]
+    fn history_keeps_both_cadences_as_separate_rows() {
+        let mut s = RecordStore::new();
+        s.insert(window_node("root", 100, 1));
+        s.insert(window_node("root", 200, 2));
+        s.insert(epoch_node("root", 300));
+        s.insert(window_node("root", 400, 3));
+        let h = s.history("root", 10);
+        assert_eq!(h.len(), 4);
+        let marks: Vec<bool> = h
+            .iter()
+            .map(|r| r.get("epoch_complete").and_then(Value::as_bool) == Some(true))
+            .collect();
+        assert_eq!(marks, vec![false, false, true, false], "epoch row is marked");
     }
 
     #[test]
