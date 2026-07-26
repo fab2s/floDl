@@ -961,10 +961,12 @@ impl Monitor {
         let archive_block = format!("<script>{}</script>", neutralize_script_close(&archive_consts));
 
         let template = include_str!("dashboard.html");
+        // `replacen(.., 1)`: the archive constants belong ahead of the FIRST
+        // script block only (see the same note in `server::serve_html`).
         let html = template
             .replace("<title>floDl Training Dashboard</title>",
                      "<title>floDl Training Report</title>")
-            .replace("<script>", &format!("{}\n<script>", archive_block));
+            .replacen("<script>", &format!("{}\n<script>", archive_block), 1);
 
         Ok(html)
     }
@@ -1193,6 +1195,72 @@ mod tests {
         // closing tags, never immediately preceded by our payload text.
         assert!(!html.contains("evil</script>"), "raw label breakout present");
         assert!(!html.contains("meta</script>"), "raw metadata breakout present");
+    }
+
+    /// The baked archive is the portal's fallback level source: with no record
+    /// plane it builds the tree from `gpus[]`, one child per device. That makes
+    /// these field names a producer/consumer contract between this serializer
+    /// and `dashboard.html` — renaming one here silently empties the page.
+    #[test]
+    fn archive_data_carries_what_the_page_builds_its_fallback_tree_from() {
+        let mut monitor = Monitor::new(1);
+        monitor.log_epoch_record(EpochRecord {
+            epoch: 0,
+            duration_secs: 1.5,
+            metrics: vec![("loss".to_string(), 0.25)],
+            resources: ResourceSample {
+                cpu_percent: Some(42.0),
+                ram_used_bytes: Some(8 << 30),
+                ram_total_bytes: Some(32 << 30),
+                gpu_util_percent: Some(77.0),
+                vram_allocated_bytes: Some(1 << 30),
+                vram_total_bytes: Some(6 << 30),
+                aggregate_rank: Some(0),
+                gpus: vec![
+                    GpuSnapshot {
+                        device_index: 0,
+                        name: "NVIDIA GeForce RTX 5060 Ti".to_string(),
+                        util_percent: Some(80.0),
+                        vram_allocated_bytes: Some(1 << 30),
+                        vram_total_bytes: Some(16 << 30),
+                    },
+                    GpuSnapshot {
+                        device_index: 1,
+                        name: "NVIDIA GeForce GTX 1060 6GB".to_string(),
+                        util_percent: Some(60.0),
+                        vram_allocated_bytes: Some(1 << 29),
+                        vram_total_bytes: Some(6 << 30),
+                    },
+                ],
+            },
+            gpu_metrics: vec![
+                GpuMetrics { device_index: 0, throughput: 35.2, chunk_ratio: 0.54, shard_size: 34 },
+                GpuMetrics { device_index: 1, throughput: 14.8, chunk_ratio: 0.46, shard_size: 30 },
+            ],
+        });
+
+        let html = monitor.build_archive().unwrap();
+        let data = html
+            .split_once("const ARCHIVE_DATA=")
+            .and_then(|(_, r)| r.split_once(";\n"))
+            .map(|(d, _)| d)
+            .expect("ARCHIVE_DATA absent");
+        let rows: serde_json::Value = serde_json::from_str(data).expect("ARCHIVE_DATA not JSON");
+
+        let row = &rows[0];
+        // Run clock + host gauges (the page reads these whatever the mode).
+        for key in ["epoch", "total", "duration"] {
+            assert!(!row[key].is_null(), "archive row lost {key}");
+        }
+        for key in ["cpu", "ram_used", "ram_total", "gpu", "vram_alloc", "vram_total"] {
+            assert!(!row["resources"][key].is_null(), "archive resources lost {key}");
+        }
+        assert_eq!(row["metrics"]["loss"], 0.25);
+        // Two devices, so the page tiers into `root/gpu0` + `root/gpu1`.
+        assert_eq!(row["gpus"].as_array().map(Vec::len), Some(2));
+        for key in ["dev", "name", "util", "vram_alloc", "vram_total", "throughput", "chunk"] {
+            assert!(!row["gpus"][0][key].is_null(), "archive gpu entry lost {key}");
+        }
     }
 
     #[test]

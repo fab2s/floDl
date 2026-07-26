@@ -97,11 +97,47 @@ monitor.serve(3000)?;  // http://localhost:3000
 Open `http://localhost:3000` in a browser. The dashboard shows:
 
 - **Header**: epoch counter, progress bar, ETA, elapsed time
-- **Training metrics chart**: live-updating canvas chart of all logged metrics
-- **Resource chart**: CPU%, GPU%, RAM%, VRAM% over time
+- **Breadcrumb**: which level you are looking at, and the way back up
+- **Metrics chart**: live-updating canvas chart of this level's metrics
+- **Resource chart**: GPU% and VRAM% over time (plus CPU/RAM at the run level)
 - **Resource bars**: current values with percentage fill
-- **Epoch log table**: all epochs, newest first
+- **Children**: the level below, compared on one metric and drillable
+- **Log table**: this level's rows, newest first
+- **Alerts**: rank losses, drift, dropped control frames — whole run, at any level
 - **Graph SVG**: collapsible architecture diagram (if provided)
+
+### One view, repeated per level
+
+The page is a **portal**: every level renders the same way, and the
+breadcrumb is the record `path`. A single-GPU run is just the run level.
+A cluster run starts at `root` and drills down — click a child row to
+descend, a breadcrumb segment to come back:
+
+```
+root                          the cohort: work-weighted roll-up of every host
+root/flodl-pascal             one host: roll-up of the ranks on it
+root/flodl-pascal/rank1       one rank: its own measurements, nothing averaged
+```
+
+Each level is linkable (`#path=root/flodl-pascal/rank1`) and the browser's
+Back button walks the levels.
+
+Two details make the levels readable:
+
+- **The legend says what it is showing.** At an interior level a metric is a
+  roll-up over the direct children, so the legend names the reduction
+  (`loss (mean)`, `throughput (sum)`); at a leaf it is a raw measurement and
+  the legend is the bare key. Children are named by their path segment plus
+  the label the producer attached, e.g. `rank1 · GTX 1060 6GB`.
+- **`work` is a column, never a curve.** It is a per-record interval quantity
+  whose unit differs by cadence (steps for a sub-epoch window, batch share for
+  an epoch boundary), so plotting the two as one series would compare
+  different units.
+
+Host CPU and RAM are per-host facts that deliberately do not live in the
+record tree (summing co-hosted ranks would double-count them). They show as
+gauges — cohort mean / cohort total in a cluster run — rather than as a curve
+on an axis they do not share.
 
 ### How it works
 
@@ -109,13 +145,18 @@ The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozil
 
 1. `monitor.serve(port)` spawns a background listener thread
 2. Each browser connection gets its own handler thread
-3. `GET /` serves the dashboard HTML (all JS/CSS inline, ~16 KB)
+3. `GET /` serves the dashboard HTML (all JS/CSS inline, ~53 KB)
 4. `GET /events` holds the connection open as an SSE stream
 5. Each `monitor.log(...)` pushes a JSON event to all connected clients
 6. The browser JS updates the charts and log in real time
 
-Alongside that whole-run feed sits a path-scoped one — see
-[Querying the run by path](#querying-the-run-by-path).
+`/events` is the **run clock**: epoch counter, ETA, elapsed, completion, and
+the host resource gauges. The levels come from the path-scoped feed alongside
+it — see [Querying the run by path](#querying-the-run-by-path). A run without
+a record plane (any single-process run, and the baked HTML archive) has no
+levels to browse, so the page builds them from the epoch feed instead: the run
+level, plus one child per device when the run reports two or more. Same
+renderer either way.
 
 ### Late join
 
@@ -127,11 +168,15 @@ handler replays all past epoch events before switching to live streaming.
 `monitor.serve(port)` works the same way on single-host multi-GPU and
 multi-host clusters: **one URL covers the whole run**. When the
 launcher fans out to multiple rank processes (auto-promoted on 2+
-GPUs, or via `fdl @cluster <cmd>`), the dashboard automatically grows
-per-rank tabs labeled by host and local-rank (`host: lr=N gr=M`), with
-throughput curves, batch-share distribution, VRAM, and ElChe anchor
-evolution. No extra wiring - just open `http://<launcher-host>:3000`
-and follow the whole cluster.
+GPUs, or via `fdl @cluster <cmd>`), the dashboard grows the levels
+described above — hosts under `root`, ranks under each host, each with
+throughput, batch share, VRAM and GPU utilization. No extra wiring: open
+`http://<launcher-host>:3000` and drill down.
+
+The page subscribes to the level you are on, so a 3-rank rig and a
+300-rank rig cost the same to watch. It keeps one extra subscription
+pinned at `root`, because alerts are scoped to the whole subtree there —
+a rank loss deep in an unwatched branch still reaches you.
 
 ### Sub-epoch reports
 

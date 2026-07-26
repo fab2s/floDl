@@ -544,6 +544,12 @@ so a query costs `O(children)` and not `O(cluster)` at any depth — and
 read-then-subscribe has no seam. Details:
 [monitor tutorial → Querying the run by path](tutorials/09-monitor.md#querying-the-run-by-path).
 
+The dashboard at that same port **is** these paths, rendered: one view
+repeated per level, a breadcrumb for navigation, and a drill-down that
+re-subscribes to the child path. It watches the level you are on rather
+than the whole cluster, so cost does not grow with rank count. See
+[monitor tutorial → One view, repeated per level](tutorials/09-monitor.md#one-view-repeated-per-level).
+
 ---
 
 ## CUDA-free GPU detection - `flodl::sys::detect_gpus`
