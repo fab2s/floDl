@@ -354,6 +354,91 @@ fn test_gate_equal_weights() {
     assert!((data[1] - 10.0).abs() < 1e-5, "gate[1]=10, got {}", data[1]);
 }
 
+// --- Batched soft routing ---
+//
+// Issue #32 hid behind batch size 1 in every switch test. The same blind spot
+// covers `gate`: with `[1, N]` weights broadcasting over `[1, D, N]` expert
+// outputs, correct per-sample gating and a broadcast that applies one row's
+// weights to the whole batch produce identical numbers. Row-distinct weights
+// over more than one row are what make the contract observable at all.
+
+/// Gives each row its own expert weights: even rows favour expert 0, odd rows
+/// favour expert 1. Row-distinct by construction, so any cross-row mixing or
+/// mis-broadcast changes the result.
+struct RowRouter;
+impl Module for RowRouter {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let rows = input.shape()[0];
+        let mut w = Vec::with_capacity(rows as usize * 2);
+        for r in 0..rows {
+            if r % 2 == 0 {
+                w.extend_from_slice(&[0.25, 0.75]);
+            } else {
+                w.extend_from_slice(&[0.75, 0.25]);
+            }
+        }
+        Ok(Variable::new(from_f32(&w, &[rows, 2]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+#[test]
+fn test_gate_weights_are_per_sample() {
+    let graph = FlowBuilder::from(Identity)
+        .gate(RowRouter, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    // row 0: 0.25*2x + 0.75*3x = 2.75x ; row 1: 0.75*2x + 0.25*3x = 2.25x.
+    // Swapping the rows' weights would give 2.25x / 2.75x instead.
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, want) in [2.75, 5.5, 22.5, 45.0].iter().enumerate() {
+        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_gate_backward_batched() {
+    // Every row must receive gradient through its own mixture weights.
+    let graph = FlowBuilder::from(Identity)
+        .gate(RowRouter, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
+    graph.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+
+    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    for (i, want) in [2.75, 2.75, 2.25, 2.25].iter().enumerate() {
+        assert!((g[i] - want).abs() < 1e-4, "elem {i} grad: want {want}, got {}", g[i]);
+    }
+}
+
+#[test]
+fn test_threshold_halt_batched_is_whole_batch() {
+    // ThresholdHalt reduces over the whole state (max of all elements), so one
+    // hot row halts the batch. That is the documented contract, pinned here so
+    // a later per-row reading has to confront it deliberately rather than
+    // discover it. Per-sample halting would need masked state updates.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .while_cond(ThresholdHalt::new(50.0), 5)
+        .build()
+        .unwrap();
+
+    // Row 1 already exceeds the threshold, so no row iterates.
+    let x = Variable::new(from_f32(&[1.0, 2.0, 60.0, 70.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, want) in [1.0, 2.0, 60.0, 70.0].iter().enumerate() {
+        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
 #[test]
 fn test_gate_backward() {
     let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
@@ -810,5 +895,37 @@ fn test_loop_rejects_non_scalar_condition() {
         err.contains("2 values") && err.contains("whole batch"),
         "error must explain the scalar contract, got: {err}"
     );
+}
+
+#[test]
+fn test_loop_until_rejects_non_scalar_condition() {
+    // until_cond reads the condition on a different code path than while_cond.
+    // Both were changed to reject a per-row halt decision, so both are pinned.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .until_cond(PerRowHalt, 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let err = graph.forward(&x).unwrap_err().to_string();
+    assert!(
+        err.contains("2 values") && err.contains("whole batch"),
+        "error must explain the scalar contract, got: {err}"
+    );
+}
+
+#[test]
+fn test_loop_until_batched_pooled_halt() {
+    // The until path with a batched state and a pooling condition.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+        .until_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![3, 2]);
 }
 
