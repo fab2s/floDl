@@ -114,6 +114,9 @@ The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozil
 5. Each `monitor.log(...)` pushes a JSON event to all connected clients
 6. The browser JS updates the charts and log in real time
 
+Alongside that whole-run feed sits a path-scoped one — see
+[Querying the run by path](#querying-the-run-by-path).
+
 ### Late join
 
 If you open the dashboard mid-training, it catches up instantly. The SSE
@@ -148,6 +151,41 @@ Reports fire at reduce boundaries, up to `n` per epoch, carrying per-rank
 loss / throughput aggregated up a `root → host → rank` tree. Off by
 default, and the per-epoch feed is unchanged either way. Details:
 [DDP guide → Sub-epoch reports](../ddp.md#sub-epoch-reports---reports_per_epoch).
+
+### Querying the run by path
+
+Those reports also land in a **path-addressable record plane** on the same
+port, so you can read any level of the cluster without a browser:
+
+```
+GET /paths                       # every node path currently reporting
+GET /node?path=root              # one level: this node + its direct children
+GET /node?path=root/exa/rank0    # drill in — same shape at any depth
+GET /history?path=root&n=200     # the last N records for that level
+GET /stream?path=root/exa        # SSE, live, scoped to that level
+```
+
+```console
+$ curl -s localhost:3000/paths
+["root","root/exa","root/exa/rank0","root/pascal","root/pascal/rank1"]
+```
+
+Two properties are worth knowing, because they are what make this usable at
+any scale:
+
+- **A level costs `O(children)`, never `O(cluster)`.** `/node` answers with
+  the node's own aggregate plus one record per *direct* child — the same
+  "aggregate over direct children only" rule that lets the tree render
+  identically at every depth. A root query on a 1000-rank run returns as much
+  data as one on a 3-rank run.
+- **`/history` returns exactly what `/stream` would have sent.** They share
+  one scoping rule, so "read the history, then subscribe" has no gap and no
+  duplicate at the handover.
+
+Metrics are scoped to depth 1 (a level renders from its direct children), but
+**alerts are not**: a `rank_lost` deep in the tree reaches a `root` subscriber
+too. You should not have to be looking at the right level to find out a rank
+died.
 
 ### Embedding the graph
 

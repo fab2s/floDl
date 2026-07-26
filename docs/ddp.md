@@ -528,6 +528,22 @@ absorbed repeats ride the `count` of the next one, so counts sum to the
 true total), and at most 200 live entries are retained. There is no knob
 — an alert stream you have to tune is one you cannot trust.
 
+### Reading the stream live, by path
+
+`record_log` is the stream's history on disk. Its live twin is served on
+the dashboard port, addressed by the same paths:
+
+```
+GET /paths                       GET /history?path=root&n=200
+GET /node?path=root/exa          GET /stream?path=root/exa    (SSE)
+```
+
+`/node` answers with one level — that node plus its **direct children**,
+so a query costs `O(children)` and not `O(cluster)` at any depth — and
+`/history` returns exactly what `/stream` would have sent, so
+read-then-subscribe has no seam. Details:
+[monitor tutorial → Querying the run by path](tutorials/09-monitor.md#querying-the-run-by-path).
+
 ---
 
 ## CUDA-free GPU detection - `flodl::sys::detect_gpus`

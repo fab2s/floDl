@@ -384,7 +384,9 @@ impl DashboardSink for ClusterDashboardSink {
                 root["work"],
             );
         }
-        // One producer, two sinks: the same records go live and to disk.
+        // One producer, three sinks: the same records go to the live record
+        // plane (path-scoped SSE), to disk, and to the latest-window slot.
+        self.monitor.lock().unwrap().push_records(records.clone());
         if let Some(log) = &self.record_log {
             log.append(&records);
         }
@@ -396,8 +398,11 @@ impl DashboardSink for ClusterDashboardSink {
         // (it does so with or without a sink attached, so a headless cluster
         // run stays as loud as a dashboard one).
         //
-        // Same stream as the node records: the log routes by `path`, so an
-        // alert lands in its origin node's file interleaved with its metrics.
+        // Same stream as the node records, live and on disk alike: the record
+        // plane scopes by `path` and the log routes by `path`, so an alert
+        // reaches its origin node's viewer and lands in its origin node's
+        // file, interleaved with that node's metrics.
+        self.monitor.lock().unwrap().push_records(records.clone());
         if let Some(log) = &self.record_log {
             log.append(&records);
         }
