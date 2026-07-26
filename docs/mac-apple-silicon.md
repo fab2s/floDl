@@ -96,6 +96,10 @@ EOF
 Adjust `UID` / `GID` to your account (`id -u` / `id -g`). The `.env` file is
 gitignored — it's host-specific.
 
+Those three values are all a Mac needs. `.env.example` at the repo root is the
+full reference if you want the other compose knobs (libtorch variant overrides,
+CUDA image tag, verbosity).
+
 ### 4. Build the dev image
 
 ```bash
