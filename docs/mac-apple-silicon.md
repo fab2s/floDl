@@ -166,11 +166,12 @@ ls -la libtorch/precompiled/cpu                 # should be a symlink
 
 ### `error[E0308]: mismatched types ... expected *const u8, found *const i8`
 
-This is a portability bug fixed in this repository: `c_char` is `u8` on Linux
-aarch64 and `i8` on Linux x86_64, so the hard-coded `*mut i8` FFI signatures
-need a `*const std::ffi::c_char` cast at every `CStr::from_ptr` call site.
-The fixes are in `flodl/src/{tensor,nn}/`. If you see this error on a fork,
-make sure your branch contains those casts.
+A portability bug, fixed at the source since 0.6.0: `c_char` is `u8` on Linux
+aarch64 and `i8` on Linux x86_64, and `flodl-sys` used to hardcode `*mut i8` in
+every extern signature returning a C string. Those signatures now say
+`*mut c_char`, so on aarch64 the crate simply compiles and no call site needs a
+cast of its own. If you hit this error, your checkout predates 0.6.0 — update
+rather than adding casts locally.
 
 ### `cargo` slow even after the first build
 
