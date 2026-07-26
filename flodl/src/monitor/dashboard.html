@@ -25,12 +25,31 @@ display:flex;flex-direction:column;gap:8px}
 border-radius:3px;overflow:hidden}
 .progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width 0.3s}
 
+/* Breadcrumb navigation — one bar for every level, replacing per-device tabs */
+.crumbs{background:var(--card);border-bottom:1px solid var(--border);padding:9px 24px;
+display:flex;align-items:center;gap:6px;overflow-x:auto;white-space:nowrap;font-size:12px}
+.crumb{color:var(--accent);cursor:pointer;padding:3px 8px;border-radius:4px;
+transition:background 0.15s;user-select:none}
+.crumb:hover{background:rgba(108,140,255,0.12)}
+.crumb.here{color:var(--text);font-weight:600;cursor:default}
+.crumb.here:hover{background:none}
+.crumb-sep{color:var(--dim);opacity:0.6}
+.crumb-note{color:var(--dim);margin-left:8px;font-size:11px;font-family:monospace}
+.crumb-badge{margin-left:auto;font-size:11px;padding:3px 9px;border-radius:10px;
+background:rgba(248,113,113,0.15);color:var(--red);cursor:pointer;display:none}
+.crumb-badge.warn{background:rgba(251,191,36,0.15);color:var(--yellow)}
+.crumb-badge.on{display:inline-block}
+
 /* Layout */
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 24px}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;overflow:hidden}
-.card h2{font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--dim);margin-bottom:12px}
+.card h2{font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--dim);margin-bottom:12px;
+display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.card h2 .sub{text-transform:none;letter-spacing:0;font-weight:400;opacity:0.8}
 .full-width{grid-column:1/-1}
+select{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;
+font-size:11px;padding:2px 6px;font-family:inherit}
 
 /* Charts */
 canvas{width:100%;height:260px;cursor:crosshair}
@@ -41,11 +60,12 @@ user-select:none;padding:2px 6px;border-radius:4px;transition:opacity 0.2s,backg
 .legend-item.dimmed{opacity:0.3}
 .legend-item.solo{background:rgba(108,140,255,0.15)}
 .legend-dot{width:8px;height:8px;border-radius:50%}
+.empty{color:var(--dim);font-size:12px;padding:24px 0;text-align:center}
 
 /* Resource bars */
-.res-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.res-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
 .res-item{display:flex;flex-direction:column;gap:4px}
-.res-label{display:flex;justify-content:space-between;font-size:11px;color:var(--dim)}
+.res-label{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);gap:8px}
 .res-bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden}
 .res-fill{height:100%;border-radius:4px;transition:width 0.5s}
 .res-fill.cpu{background:var(--accent)}
@@ -53,15 +73,26 @@ user-select:none;padding:2px 6px;border-radius:4px;transition:opacity 0.2s,backg
 .res-fill.gpu{background:var(--green)}
 .res-fill.vram{background:var(--yellow)}
 
-/* Log table */
-.log-wrap{max-height:300px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
-.log-wrap::-webkit-scrollbar{width:6px}
-.log-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+/* Tables (children / log / alerts) */
+.scroll-wrap{max-height:300px;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.scroll-wrap::-webkit-scrollbar{width:6px;height:6px}
+.scroll-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
-th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;
-border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--card)}
-td{padding:5px 8px;border-bottom:1px solid var(--border)}
+th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;white-space:nowrap;
+border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--card);z-index:1}
+td{padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 tr:hover td{background:rgba(108,140,255,0.05)}
+tr.drill{cursor:pointer}
+tr.drill:hover td{background:rgba(108,140,255,0.12)}
+tr.epoch-row td{border-left:2px solid var(--accent)}
+tr.epoch-row td:first-child{font-weight:600}
+tr.dead td{color:var(--red)}
+.node-cell{color:var(--accent)}
+.node-cell .lbl{color:var(--dim);font-size:11px;margin-left:6px}
+.sev-critical{color:var(--red)}
+.sev-warn{color:var(--yellow)}
+.sev-info{color:var(--dim)}
+.res-cell{color:var(--dim);font-size:11px}
 
 /* SVG toggle */
 .svg-toggle{cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px}
@@ -81,40 +112,6 @@ border:1px solid var(--border);white-space:nowrap;backdrop-filter:blur(8px)}
 animation:pulse 2s ease-in-out infinite}
 .status-dot.done{background:var(--dim);animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-
-/* Tab bar */
-.tab-bar{display:none;background:var(--card);border-bottom:1px solid var(--border);
-padding:0 24px;gap:0;overflow-x:auto;white-space:nowrap}
-.tab-bar.visible{display:flex}
-.tab{padding:10px 18px;font-size:12px;color:var(--dim);cursor:pointer;
-border-bottom:2px solid transparent;transition:color 0.15s,border-color 0.15s;
-user-select:none;font-weight:500}
-.tab:hover{color:var(--text)}
-.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-.tab-view{display:none}
-.tab-view.active{display:block}
-
-/* GPU summary (Home tab) */
-.gpu-summary-wrap{max-height:280px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
-.gpu-summary-wrap::-webkit-scrollbar{width:6px}
-.gpu-summary-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.gpu-summary{display:grid;gap:10px}
-.gpu-row{display:flex;align-items:center;gap:12px;padding:8px 12px;
-background:rgba(42,45,58,0.4);border-radius:6px;font-size:12px}
-.gpu-row .gpu-name{min-width:100px;color:var(--dim);font-size:11px;white-space:nowrap;
-overflow:hidden;text-overflow:ellipsis;max-width:180px}
-.gpu-row .gpu-stat{display:flex;flex-direction:column;align-items:center;gap:1px;min-width:64px}
-.gpu-row .gpu-stat-label{font-size:9px;text-transform:uppercase;color:var(--dim);letter-spacing:0.3px}
-.gpu-row .gpu-stat-value{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
-.gpu-row .gpu-vram-bar{flex:1;height:8px;background:var(--border);border-radius:4px;
-overflow:hidden;min-width:80px}
-.gpu-row .gpu-vram-fill{height:100%;border-radius:4px;transition:width 0.5s}
-.gpu-row.fastest .gpu-stat-value{color:var(--green)}
-.gpu-row.slowest .gpu-stat-value.throughput-val{color:var(--yellow)}
-
-/* Per-GPU tab layout */
-.gpu-tab-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 24px}
-@media(max-width:900px){.gpu-tab-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -128,55 +125,79 @@ overflow:hidden;min-width:80px}
     </div>
     <div class="stat">
       <div class="stat-label">Epoch</div>
-      <div class="stat-value" id="epochNum">—</div>
+      <div class="stat-value" id="epochNum">&mdash;</div>
     </div>
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="stat">
       <div class="stat-label">ETA</div>
-      <div class="stat-value" id="etaDisplay">—</div>
+      <div class="stat-value" id="etaDisplay">&mdash;</div>
     </div>
     <div class="stat">
       <div class="stat-label">Elapsed</div>
-      <div class="stat-value" id="elapsedDisplay">—</div>
+      <div class="stat-value" id="elapsedDisplay">&mdash;</div>
     </div>
   </div>
   <div class="hw-info" id="hwInfo" style="display:none"></div>
 </div>
 
-<div class="tab-bar" id="tabBar">
-  <div class="tab active" data-tab="home" onclick="switchTab('home')">Home</div>
+<div class="crumbs" id="crumbs">
+  <span class="crumb here">root</span>
+  <span class="crumb-badge" id="alertBadge" onclick="scrollToAlerts()"></span>
 </div>
 
-<div id="homeView" class="tab-view active">
 <div class="grid">
   <div class="card">
-    <h2>Training Metrics</h2>
+    <h2>Metrics <span class="sub" id="metricsScope"></span></h2>
     <canvas id="metricsChart"></canvas>
     <div class="legend" id="metricsLegend"></div>
   </div>
 
   <div class="card">
-    <h2>Resources</h2>
+    <h2>Resources <span class="sub" id="resourceScope"></span></h2>
     <canvas id="resourceChart"></canvas>
     <div class="legend" id="resourceLegend"></div>
     <div class="res-grid" id="resGrid">
-      <div class="res-item"><div class="res-label"><span>CPU</span><span id="cpuVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span id="cpuLabel">CPU</span><span id="cpuVal">&mdash;</span></div>
         <div class="res-bar"><div class="res-fill cpu" id="cpuBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>RAM</span><span id="ramVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span id="ramLabel">RAM</span><span id="ramVal">&mdash;</span></div>
         <div class="res-bar"><div class="res-fill ram" id="ramBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>GPU</span><span id="gpuVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>GPU</span><span id="gpuVal">&mdash;</span></div>
         <div class="res-bar"><div class="res-fill gpu" id="gpuBar" style="width:0"></div></div></div>
-      <div class="res-item"><div class="res-label"><span>VRAM</span><span id="vramVal">—</span></div>
+      <div class="res-item"><div class="res-label"><span>VRAM</span><span id="vramVal">&mdash;</span></div>
         <div class="res-bar"><div class="res-fill vram" id="vramBar" style="width:0"></div></div></div>
     </div>
   </div>
 
-  <div class="card full-width">
-    <h2>Epoch Log</h2>
-    <div class="log-wrap" id="logWrap">
+  <div class="card full-width" id="childrenCard" style="display:none">
+    <h2>Children <span class="sub" id="childrenCount"></span>
+      <span class="sub">compare</span> <select id="compareMetric" onchange="onCompareChange()"></select></h2>
+    <canvas id="childrenChart"></canvas>
+    <div class="legend" id="childrenLegend"></div>
+    <div class="scroll-wrap" style="margin-top:12px">
       <table>
-        <thead><tr id="logHeader"><th>Epoch</th><th>Duration</th></tr></thead>
+        <thead><tr id="childrenHeader"></tr></thead>
+        <tbody id="childrenBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card full-width">
+    <h2>Log <span class="sub" id="logScope"></span></h2>
+    <div class="scroll-wrap">
+      <table>
+        <thead><tr id="logHeader"></tr></thead>
         <tbody id="logBody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="logEmpty">waiting for the first record...</div>
+  </div>
+
+  <div class="card full-width" id="alertsCard" style="display:none">
+    <h2>Alerts <span class="sub">whole run, deepest origin path</span></h2>
+    <div class="scroll-wrap">
+      <table>
+        <thead><tr><th>When</th><th>Class</th><th>Origin</th><th>Detail</th><th>Count</th></tr></thead>
+        <tbody id="alertsBody"></tbody>
       </table>
     </div>
   </div>
@@ -188,13 +209,6 @@ overflow:hidden;min-width:80px}
     </details>
   </div>
 
-  <div class="card full-width" id="gpuSummaryCard" style="display:none">
-    <h2>GPU Overview</h2>
-    <div class="gpu-summary-wrap">
-      <div class="gpu-summary" id="gpuSummary"></div>
-    </div>
-  </div>
-
   <div class="card full-width" id="svgCard" style="display:none">
     <div class="svg-toggle" id="svgToggle" onclick="toggleSvg()">
       <span class="arrow">&#9654;</span>
@@ -203,266 +217,373 @@ overflow:hidden;min-width:80px}
     <div class="svg-container" id="svgContainer"></div>
   </div>
 </div>
-</div><!-- /homeView -->
-
-<div id="gpuTabContainer"></div>
 
 <div class="tooltip" id="tooltip"></div>
 
 <script>
-// State
-const epochs=[];
-const metricSeries={};  // name -> [values]
-const resourceSeries={cpu:[],gpu:[],ram:[],vram:[]};
-// Raw byte values for RAM/VRAM (for absolute-scale display when solo'd)
-const resourceRaw={ram_used:[],ram_total:[],vram_alloc:[],vram_total:[]};
+// ===========================================================================
+// floDl monitoring portal
+//
+// One recursive view over the record stream: every level renders the same way
+// (its own metrics + resources plotted, its children compared and drillable,
+// its log listing epoch and sub-epoch rows interleaved). Navigation is the
+// record `path` — a breadcrumb, not per-device tabs.
+//
+// Three data owners, no overlap:
+//   * `/events`  — the run clock: epoch/total, ETA, elapsed, completion, and
+//                  host CPU/RAM (per-host facts that are deliberately not in
+//                  the record tree, so they show as gauges only).
+//   * `/stream?path=` + `/history?path=` — every level's rows, children and
+//                  alerts. The record plane exists in cluster runs.
+//   * `/events` again, as a FALLBACK level source when no record plane exists
+//                  (single-process runs, and the baked HTML archive): each
+//                  epoch becomes a root row, and `gpus[]` becomes one child
+//                  per device, so the same renderer covers both.
+// ===========================================================================
+
 const COLORS=['#6c8cff','#f87171','#34d399','#fbbf24','#a78bfa','#fb923c','#67e8f9','#f472b6','#86efac','#fcd34d','#c4b5fd','#fdba74'];
 const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24'};
-let metricNames=[];
+const ROOT='root';
+// Rows retained per node. Bounds the DOM and the chart point count on a long
+// run; the durable history is the record log on disk, not this page.
+const MAX_ROWS=2000;
+// Log rows rendered at once. The charts still use every retained row; this only
+// bounds the DOM the log table rebuilds on each update. Never silent — the card
+// says how many of how many are shown.
+const MAX_LOG_ROWS=500;
+const HISTORY_N=2048;
+
+// --- Store -----------------------------------------------------------------
+// path -> node. Rows are the interleaved cadences (window reports + epoch
+// boundaries) in `t` order; `metricKeys` is the union seen at this path.
+const NODES=new Map();
+// Alert stream, newest first, collapsed per (class, path).
+const ALERTS=new Map();
+// Wall-clock origin (ms) for the record axis; `null` until the first record.
+let T0=null;
+// Latches true on the first `node` record — from then on the record plane owns
+// every level and the `/events` fallback tree is dropped (different clock).
+let recordMode=false;
+let META=null;
+// Host resources from `/events`: last values only (see the header comment).
+let HOST={cpu:null,ram_used:null,ram_total:null,gpu:null,vram_alloc:null,vram_total:null};
+// Cumulative epoch time, the `/events` fallback axis (epoch JSON has no `ts`),
+// and the epochs already folded into it. `/events` replays its whole history on
+// every connect, and EventSource reconnects on its own after any drop — so the
+// epoch number, not the running clock, is what makes a row unique.
+let legacyT=0;
+const legacySeen=new Set();
+// Device identity pushed before the first epoch (LIVE_GPU_INIT): dev -> {name, vram_total}.
+const GPU_INIT=new Map();
+
+let current=ROOT;
+let levelSse=null;
+let rootSse=null;
+let compareKey=null;
+const soloState={metricsChart:null,resourceChart:null,childrenChart:null};
 let startTime=null;
 let elapsedTimer=null;
-// Solo filter: {chartId: seriesName|null}. null = show all.
-const soloState={metricsChart:null,resourceChart:null};
-let _skipDraw=false;
+let renderQueued=false;
 
-// Multi-GPU state
-const gpuSeries={};   // deviceIndex -> {vram:[], throughput:[], chunk:[], util:[], name:''}
-let gpuCount=0;
-let activeTab='home';
-
-// --- Epoch processing (shared by live SSE and archive replay) ---
-function processEpoch(d){
-  epochs.push(d);
-  if(!startTime)startTime=Date.now()-(d.epoch*d.duration*1000);
-  const names=Object.keys(d.metrics||{});
-  names.forEach(n=>{
-    if(!metricSeries[n]){metricSeries[n]=[];metricNames.push(n)}
-    metricSeries[n].push(d.metrics[n]);
-  });
-  const r=d.resources||{};
-  resourceSeries.cpu.push(r.cpu!=null?r.cpu:null);
-  resourceSeries.gpu.push(r.gpu!=null?r.gpu:null);
-  resourceSeries.ram.push(r.ram_used!=null&&r.ram_total?r.ram_used/r.ram_total*100:null);
-  resourceSeries.vram.push(r.vram_alloc!=null&&r.vram_total?r.vram_alloc/r.vram_total*100:null);
-  resourceRaw.ram_used.push(r.ram_used||null);
-  resourceRaw.ram_total.push(r.ram_total||null);
-  resourceRaw.vram_alloc.push(r.vram_alloc||null);
-  resourceRaw.vram_total.push(r.vram_total||null);
-  // GPU data extraction
-  if(d.gpus&&d.gpus.length>0){
-    if(gpuCount===0)initGpuTabs(d.gpus);
-    d.gpus.forEach(g=>{
-      const idx=g.dev!=null?g.dev:0;
-      const s=gpuSeries[idx];
-      if(!s)return;
-      s.vram.push(g.vram_alloc!=null?g.vram_alloc:null);
-      s.throughput.push(g.throughput!=null?g.throughput:null);
-      s.chunk.push(g.chunk!=null?g.chunk*100:null);
-      s.util.push(g.util!=null?g.util:null);
-      if(g.name&&!s.name)s.name=g.name;
-      s.vram_total=g.vram_total||s.vram_total||null;
-    });
-  }
-  updateHeader(d);
-  updateResources(r);
-  updateLog(d);
-  if(!_skipDraw){drawMetrics();drawResources();updateGpuSummary();drawGpuTabs()}
-  ensureLogHeaders();
+// How a metric key rolls up over a node's direct children. Mirrors
+// `record::core_reduction`; anything else is a user metric, whose declared
+// reduction rides the `meta` record (default mean). Shown in an interior
+// level's legend, where a metric IS a roll-up — never at a leaf, where it is
+// a raw measurement.
+const CORE_REDUCTION={throughput:'sum',batch_share:'sum',loss:'mean',
+                      data_starve:'max',compute_only_ms:'max'};
+function reductionOf(key){
+  if(CORE_REDUCTION[key])return CORE_REDUCTION[key];
+  if(META&&META.reductions&&META.reductions[key])return META.reductions[key];
+  return 'mean';
 }
+
+function parentOf(path){
+  const i=path.lastIndexOf('/');
+  return i<0?null:path.slice(0,i);
+}
+/// Numeric-aware compare, so `rank2` sorts before `rank10` in every legend and
+/// table (plain lexicographic order scrambles a double-digit cohort).
+function natCmp(a,b){
+  const re=/(\d+)|(\D+)/g;
+  const as=String(a).match(re)||[],bs=String(b).match(re)||[];
+  for(let i=0;i<Math.min(as.length,bs.length);i++){
+    const x=as[i],y=bs[i];
+    const nx=/^\d/.test(x),ny=/^\d/.test(y);
+    if(nx&&ny){const d=parseInt(x,10)-parseInt(y,10);if(d)return d}
+    else if(x!==y)return x<y?-1:1;
+  }
+  return as.length-bs.length;
+}
+function lastSeg(path){
+  const i=path.lastIndexOf('/');
+  return i<0?path:path.slice(i+1);
+}
+function nodeOf(path){
+  let n=NODES.get(path);
+  if(n)return n;
+  n={path,rows:[],keys:new Set(),metricKeys:new Set(),resKeys:new Set(),
+     children:new Set(),label:null,device:null,alive:null,isLeaf:null,lastRow:null};
+  NODES.set(path,n);
+  // Creating a node creates its ancestors, so a deep `/history` fetch still
+  // yields a walkable breadcrumb even if no ancestor record arrived yet.
+  const p=parentOf(path);
+  if(p)nodeOf(p).children.add(path);
+  return n;
+}
+
+/// Insert one row, ignoring a repeat. Duplicates are expected by design: the
+/// server registers a `/stream` subscriber BEFORE replaying its preamble (a
+/// lost record is unrecoverable, a duplicated one is not, since every node
+/// record is an absolute snapshot) and the root subscription overlaps the
+/// level one. Absolute snapshots are idempotent, but APPENDING one twice
+/// would double-plot — so the identity check lives here.
+function addRow(path,row){
+  const n=nodeOf(path);
+  const key=row.ts+'|'+row.tick+'|'+row.epoch1+'|'+(row.ec?1:0);
+  if(n.keys.has(key))return false;
+  row.key=key;
+  n.keys.add(key);
+  // Binary insert by `t`: a level's history preamble arrives after the live
+  // rows that opened the subscription, so arrival order is not time order.
+  let lo=0,hi=n.rows.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(n.rows[mid].t<=row.t)lo=mid+1;else hi=mid}
+  n.rows.splice(lo,0,row);
+  while(n.rows.length>MAX_ROWS){const drop=n.rows.shift();n.keys.delete(drop.key)}
+  for(const k in row.metrics)n.metricKeys.add(k);
+  for(const k in row.res)n.resKeys.add(k);
+  if(!n.lastRow||row.t>=n.lastRow.t)n.lastRow=row;
+  return true;
+}
+
+// --- Ingest: record plane --------------------------------------------------
+function ingestRecord(rec){
+  if(!rec||typeof rec!=='object')return;
+  if(rec.kind==='meta'){META=rec;return}
+  if(rec.kind==='event'){ingestAlert(rec);return}
+  if(rec.kind!=='node')return;
+  if(!recordMode)latchRecordMode();
+  if(T0===null)T0=rec.ts||0;
+  const n=nodeOf(rec.path);
+  // Node identity is last-known-wins: `label` rides the epoch record only, so
+  // a window report must not blank it.
+  if(rec.label!=null)n.label=rec.label;
+  if(rec.device!=null)n.device=rec.device;
+  // A leaf carries `alive` as a bool; an interior node as a live-child count.
+  if(typeof rec.alive==='boolean'){n.isLeaf=true;n.alive=rec.alive}
+  else if(rec.alive!=null){n.isLeaf=false;n.aliveCount=rec.alive;n.childCount=rec.children}
+  addRow(rec.path,{
+    t:((rec.ts||0)-T0)/1000,
+    ts:rec.ts||0,
+    epoch1:rec.epoch!=null?rec.epoch+1:null,   // records carry a 0-based epoch
+    tick:rec.tick!=null?rec.tick:null,
+    ec:rec.epoch_complete===true,
+    metrics:rec.metrics||{},
+    res:rec.res||{},
+    work:rec.work!=null?rec.work:null,
+  });
+  scheduleRender();
+}
+
+/// Drop the `/events` fallback tree on the first record. The two sources put
+/// rows on different clocks (cumulative epoch duration vs the producer's
+/// wall-clock `ts`), so keeping both would plot one series against two axes.
+/// Nothing is lost: the level's `/history` preamble re-supplies the past.
+function latchRecordMode(){
+  recordMode=true;
+  NODES.clear();
+  T0=null;
+  const wasDeep=current!==ROOT;
+  current=ROOT;
+  if(levelSse){levelSse.close();levelSse=null}
+  // A fallback-tree path (`root/gpu0`) does not exist in the record tree, so
+  // send the viewer back to root rather than leaving them on a dead level.
+  if(wasDeep)location.hash='#path='+encodeURIComponent(ROOT);
+}
+
+/// Alerts collapse per (class, path). Stream `count` is an INCREMENT (the
+/// occurrences the record represents), so the running total is their sum.
+function ingestAlert(rec){
+  const key=rec.class+'|'+rec.path;
+  const cur=ALERTS.get(key);
+  const add=rec.count!=null?rec.count:1;
+  if(cur&&cur.ts>=rec.ts){cur.total+=add}
+  else ALERTS.set(key,{class:rec.class,path:rec.path,sev:rec.sev,detail:rec.detail,
+                       ts:rec.ts,total:(cur?cur.total:0)+add});
+  scheduleRender();
+}
+
+// --- Ingest: `/events` epoch feed -----------------------------------------
+function ingestEpoch(d){
+  updateHeader(d);
+  const r=d.resources||{};
+  HOST={cpu:r.cpu!=null?r.cpu:null,
+        ram_used:r.ram_used!=null?r.ram_used:null,
+        ram_total:r.ram_total!=null?r.ram_total:null,
+        gpu:r.gpu!=null?r.gpu:null,
+        vram_alloc:r.vram_alloc!=null?r.vram_alloc:null,
+        vram_total:r.vram_total!=null?r.vram_total:null};
+  for(const g of d.gpus||[]){
+    if(g.dev==null)continue;
+    const cur=GPU_INIT.get(g.dev)||{};
+    GPU_INIT.set(g.dev,{name:g.name||cur.name,vram_total:g.vram_total!=null?g.vram_total:cur.vram_total});
+  }
+  // The record plane owns the levels once it exists; this feed stays the run
+  // clock and the host gauges, and contributes no rows (they would duplicate
+  // the epoch records at the same paths).
+  if(!recordMode)ingestEpochAsLevels(d,r);
+  scheduleRender();
+}
+
+/// Fallback tree for a run with no record plane: the epoch becomes a root row,
+/// and `gpus[]` becomes one child per device. Mirrors the record plane's own
+/// tiering rule — a lone device collapses into root rather than adding a level
+/// that repeats it.
+function ingestEpochAsLevels(d,r){
+  // A replayed epoch is already on the axis; re-adding it would both duplicate
+  // the row and push every later epoch further along a clock that only ever
+  // grows. The header still tracks the replay (it is absolute, not cumulative).
+  if(legacySeen.has(d.epoch))return;
+  legacySeen.add(d.epoch);
+  legacyT+=d.duration||0;
+  const gpus=d.gpus||[];
+  const tiered=gpus.length>=2;
+  const rootRes={};
+  if(r.cpu!=null)rootRes.cpu=r.cpu;
+  if(r.ram_used!=null)rootRes.ram_used=r.ram_used;
+  if(r.ram_total!=null)rootRes.ram_total=r.ram_total;
+  if(r.gpu!=null)rootRes.gpu_util=r.gpu;
+  if(r.vram_alloc!=null)rootRes.vram_alloc=r.vram_alloc;
+  if(r.vram_total!=null)rootRes.vram_total=r.vram_total;
+  addRow(ROOT,{t:legacyT,ts:Math.round(legacyT*1000),epoch1:d.epoch,tick:null,ec:true,
+               metrics:cleanMetrics(d.metrics),res:rootRes,work:null});
+  const rootNode=nodeOf(ROOT);
+  if(!tiered)rootNode.isLeaf=gpus.length<=1;
+  if(!tiered)return;
+  rootNode.isLeaf=false;
+  for(const g of gpus){
+    if(g.dev==null)continue;
+    // `gpu<dev>` names what the epoch feed actually reports: a GPU-shaped
+    // entry at index `dev`. In a live single-process run that is a physical
+    // device; in a cluster run's baked archive it is a rank (the feed rewrites
+    // `dev` to the global rank and puts `host:lr=.. gr=..` in the name, which
+    // then shows in the legend).
+    const path=ROOT+'/gpu'+g.dev;
+    const kid=nodeOf(path);
+    kid.isLeaf=true;
+    kid.alive=true;
+    kid.device=g.dev;
+    const init=GPU_INIT.get(g.dev)||{};
+    if(init.name)kid.label=shortGpuName(init.name);
+    const metrics={};
+    if(g.throughput!=null)metrics.throughput=g.throughput;
+    if(g.chunk!=null)metrics.batch_share=g.chunk;
+    const res={};
+    if(g.util!=null)res.gpu_util=g.util;
+    if(g.vram_alloc!=null)res.vram_alloc=g.vram_alloc;
+    const vt=g.vram_total!=null?g.vram_total:init.vram_total;
+    if(vt!=null)res.vram_total=vt;
+    addRow(path,{t:legacyT,ts:Math.round(legacyT*1000),epoch1:d.epoch,tick:null,ec:true,
+                 metrics,res,work:null});
+  }
+}
+
+/// `/events` writes `null` for a non-finite metric (absent != zero); drop the
+/// key rather than carrying a null into a series.
+function cleanMetrics(m){
+  const out={};
+  for(const k in m||{})if(m[k]!=null)out[k]=m[k];
+  return out;
+}
+
 function markComplete(msg){
   document.getElementById('statusDot').classList.add('done');
   document.getElementById('statusText').textContent=msg||'Complete';
   if(elapsedTimer){clearInterval(elapsedTimer);elapsedTimer=null}
 }
-function showSvg(svg){
-  document.getElementById('svgCard').style.display='block';
-  const c=document.getElementById('svgContainer');
-  c.innerHTML=svg;
-  if(document.getElementById('svgToggle').classList.contains('open')){
-    c.style.maxHeight=c.scrollHeight+'px';
-  }
-}
 
-// --- Tab switching ---
-function switchTab(id){
-  activeTab=id;
-  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===id));
-  document.getElementById('homeView').classList.toggle('active',id==='home');
-  document.querySelectorAll('.gpu-tab-view').forEach(v=>v.classList.toggle('active',v.id==='gpu-view-'+id));
-  if(id==='home'){drawMetrics();drawResources()}
-  else{drawGpuTabs()}
+// --- Navigation ------------------------------------------------------------
+function pathFromHash(){
+  const h=(location.hash||'').replace(/^#/,'');
+  if(!h)return ROOT;
+  const m=/^path=(.*)$/.exec(h);
+  return m?decodeURIComponent(m[1]):ROOT;
 }
-
-// --- GPU tab initialization (called once on first epoch with gpus) ---
-function initGpuTabs(gpus){
-  if(gpuCount>0)return; // already initialized
-  gpuCount=gpus.length;
-  if(gpuCount<2)return; // single GPU: no tabs needed
-  const bar=document.getElementById('tabBar');
-  bar.classList.add('visible');
-  const container=document.getElementById('gpuTabContainer');
-  gpus.forEach((g,i)=>{
-    const idx=g.dev!=null?g.dev:i;
-    gpuSeries[idx]={vram:[],throughput:[],chunk:[],util:[],name:g.name||'GPU '+idx,vram_total:g.vram_total||null};
-    // Tab button
-    const tab=document.createElement('div');
-    tab.className='tab';
-    tab.dataset.tab='gpu'+idx;
-    tab.textContent=g.name?shortGpuName(g.name):'GPU '+idx;
-    tab.onclick=()=>switchTab('gpu'+idx);
-    bar.appendChild(tab);
-    // Tab view with 4 charts
-    const view=document.createElement('div');
-    view.id='gpu-view-gpu'+idx;
-    view.className='gpu-tab-view tab-view';
-    view.innerHTML=
-      '<div class="gpu-tab-grid">'+
-      '<div class="card"><h2>VRAM Usage</h2><canvas id="gpuVram'+idx+'" style="width:100%;height:260px"></canvas></div>'+
-      '<div class="card"><h2>Utilization</h2><canvas id="gpuUtil'+idx+'" style="width:100%;height:260px"></canvas></div>'+
-      '<div class="card"><h2>Throughput (samples/ms)</h2><canvas id="gpuThroughput'+idx+'" style="width:100%;height:260px"></canvas></div>'+
-      '<div class="card"><h2>Batch Share (%)</h2><canvas id="gpuChunk'+idx+'" style="width:100%;height:260px"></canvas></div>'+
-      '</div>';
-    container.appendChild(view);
-  });
-  document.getElementById('gpuSummaryCard').style.display='block';
-  updateGpuSummary();
+function navigate(path){
+  // Route through the hash so a level is linkable and Back works.
+  const target='#path='+encodeURIComponent(path);
+  if(location.hash===target)setLevel(path);
+  else location.hash=target;
 }
-
-function shortGpuName(name){
-  return name.replace(/^NVIDIA\s+/i,'').replace(/GeForce\s+/i,'');
+function setLevel(path){
+  current=path||ROOT;
+  nodeOf(current);
+  subscribeLevel(current);
+  render();
 }
+window.addEventListener('hashchange',()=>setLevel(pathFromHash()));
 
-// --- GPU summary bar (Home tab) ---
-function updateGpuSummary(){
-  if(gpuCount<2)return;
-  const el=document.getElementById('gpuSummary');
-  // Find fastest/slowest by throughput
-  let maxT=-1,minT=Infinity,maxIdx=-1,minIdx=-1;
-  for(const idx in gpuSeries){
-    const s=gpuSeries[idx];
-    const last=s.throughput.length>0?s.throughput[s.throughput.length-1]:null;
-    if(last!=null&&last>maxT){maxT=last;maxIdx=+idx}
-    if(last!=null&&last<minT){minT=last;minIdx=+idx}
-  }
+function renderCrumbs(){
+  const el=document.getElementById('crumbs');
+  const badge=document.getElementById('alertBadge');
+  const segs=current.split('/');
   let html='';
-  for(const idx in gpuSeries){
-    const s=gpuSeries[idx];
-    const lastVram=s.vram.length>0?s.vram[s.vram.length-1]:null;
-    const lastThru=s.throughput.length>0?s.throughput[s.throughput.length-1]:null;
-    const lastChunk=s.chunk.length>0?s.chunk[s.chunk.length-1]:null;
-    const lastUtil=s.util.length>0?s.util[s.util.length-1]:null;
-    const vramPct=lastVram!=null&&s.vram_total?(lastVram/s.vram_total*100):0;
-    const vramColor=vramPct>95?'var(--red)':vramPct>80?'var(--yellow)':'var(--green)';
-    const isFastest=+idx===maxIdx&&gpuCount>1;
-    const isSlowest=+idx===minIdx&&gpuCount>1&&minIdx!==maxIdx;
-    html+='<div class="gpu-row'+(isFastest?' fastest':'')+(isSlowest?' slowest':'')+'">';
-    html+='<span class="gpu-name" title="'+s.name+'">'+(s.name?shortGpuName(s.name):'GPU '+idx)+'</span>';
-    html+='<div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:'+vramPct.toFixed(1)+'%;background:'+vramColor+'"></div></div>';
-    html+='<div class="gpu-stat"><span class="gpu-stat-label">VRAM</span><span class="gpu-stat-value">'+(lastVram!=null?fmtBytes(lastVram):'\u2014')+'</span></div>';
-    html+='<div class="gpu-stat"><span class="gpu-stat-label">Util</span><span class="gpu-stat-value">'+(lastUtil!=null?lastUtil.toFixed(0)+'%':'\u2014')+'</span></div>';
-    html+='<div class="gpu-stat"><span class="gpu-stat-label">Throughput</span><span class="gpu-stat-value throughput-val">'+(lastThru!=null?lastThru.toFixed(2):'\u2014')+'</span></div>';
-    html+='<div class="gpu-stat"><span class="gpu-stat-label">Share</span><span class="gpu-stat-value">'+(lastChunk!=null?lastChunk.toFixed(1)+'%':'\u2014')+'</span></div>';
-    html+='</div>';
+  for(let i=0;i<segs.length;i++){
+    const p=segs.slice(0,i+1).join('/');
+    const here=i===segs.length-1;
+    if(i>0)html+='<span class="crumb-sep">/</span>';
+    html+='<span class="crumb'+(here?' here':'')+'" data-path="'+esc(p)+'">'+esc(segs[i])+'</span>';
   }
+  const n=NODES.get(current);
+  const note=[];
+  if(n&&n.label)note.push(n.label);
+  if(n&&n.device!=null)note.push('dev '+n.device);
+  if(n&&n.isLeaf===false&&n.childCount!=null)note.push(n.aliveCount+'/'+n.childCount+' alive');
+  if(n&&n.isLeaf===true&&n.alive===false)note.push('LOST');
+  if(note.length)html+='<span class="crumb-note">'+esc(note.join(' · '))+'</span>';
   el.innerHTML=html;
+  el.appendChild(badge);
+  el.querySelectorAll('.crumb:not(.here)').forEach(c=>{
+    c.onclick=()=>navigate(c.dataset.path);
+  });
 }
 
-// --- Per-GPU tab charts ---
-function drawGpuTabs(){
-  if(gpuCount<2)return;
-  for(const idx in gpuSeries){
-    const tabId='gpu'+idx;
-    if(activeTab!==tabId)continue;
-    const s=gpuSeries[idx];
-    // VRAM chart (bytes)
-    const vramRef=s.vram_total?{value:s.vram_total,dotted:false,color:'rgba(248,113,113,0.7)',label:'Physical VRAM'}:null;
-    drawChart('gpuVram'+idx,{vram:s.vram},[RES_COLORS.vram],['vram'],false,fmtBytes,vramRef);
-    // Utilization chart (%)
-    drawChart('gpuUtil'+idx,{util:s.util},[RES_COLORS.gpu],['util'],true,v=>v.toFixed(0)+'%');
-    // Throughput chart
-    drawChart('gpuThroughput'+idx,{throughput:s.throughput},[COLORS[0]],['throughput'],false);
-    // Chunk ratio chart (%)
-    drawChart('gpuChunk'+idx,{share:s.chunk},[COLORS[4]],['share'],true,v=>v.toFixed(1)+'%');
-  }
+// --- Subscriptions ---------------------------------------------------------
+// Two record subscriptions, on purpose:
+//   * `rootSse` is pinned for the whole session. `/stream` scopes NODE records
+//     to the level and its direct children, but EVENT records to the whole
+//     subtree — so a root subscription is the one place that sees every alert,
+//     whatever level the viewer is on. It is also the alert lane's only
+//     consumer: alert counts are increments and cannot be deduplicated by
+//     identity, so exactly one subscription may feed them.
+//   * `levelSse` follows navigation, and is skipped at root (already covered).
+function subscribeRoot(){
+  rootSse=new EventSource('/stream?path='+encodeURIComponent(ROOT));
+  rootSse.addEventListener('record',e=>{try{ingestRecord(JSON.parse(e.data))}catch(err){}});
+}
+function subscribeLevel(path){
+  if(levelSse){levelSse.close();levelSse=null}
+  if(path===ROOT||!rootSse)return;
+  const enc=encodeURIComponent(path);
+  levelSse=new EventSource('/stream?path='+enc);
+  levelSse.addEventListener('record',e=>{
+    try{
+      const rec=JSON.parse(e.data);
+      // The pinned root subscription owns the alert lane.
+      if(rec.kind!=='event')ingestRecord(rec);
+    }catch(err){}
+  });
+  // Subscribe first, then backfill: the same duplicate-over-loss ordering the
+  // server uses for its own preamble, and `addRow` absorbs the overlap.
+  fetch('/history?path='+enc+'&n='+HISTORY_N)
+    .then(r=>r.ok?r.json():[])
+    .then(rows=>{for(const r of rows)if(r.kind!=='event')ingestRecord(r)})
+    .catch(()=>{});
 }
 
-// --- Data source: live SSE or archive replay ---
-// ARCHIVE_DATA is injected by monitor.save_html(); if absent, connect live.
-if(typeof ARCHIVE_DATA!=='undefined'){
-  _skipDraw=true;
-  let archiveErr=null;
-  for(let i=0;i<ARCHIVE_DATA.length;i++){
-    try{processEpoch(ARCHIVE_DATA[i])}
-    catch(e){archiveErr=e;console.error('processEpoch failed at index '+i+':',e);break}
-  }
-  _skipDraw=false;
-  try{drawMetrics();drawResources();updateGpuSummary();drawGpuTabs()}catch(e){console.error('drawMetrics/drawResources:',e);archiveErr=archiveErr||e}
-  // Set elapsed from sum of epoch durations (wall-clock startTime is meaningless in archive)
-  const totalElapsed=ARCHIVE_DATA.reduce((s,d)=>s+(d.duration||0),0);
-  document.getElementById('elapsedDisplay').textContent=fmtDur(totalElapsed);
-  markComplete(archiveErr?'Archive error — see console':(ARCHIVE_COMPLETE||'Complete'));
-  if(typeof ARCHIVE_SVG==='string'){try{showSvg(ARCHIVE_SVG)}catch(e){console.error('showSvg:',e)}}
-  // Re-render after layout to ensure correct canvas dimensions
-  requestAnimationFrame(()=>{try{drawMetrics();drawResources();updateGpuSummary();drawGpuTabs()}catch(e){console.error('rAF redraw:',e)}});
-  if(archiveErr){
-    const d=document.createElement('div');
-    d.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1a1d27;color:#f87171;padding:24px;border-radius:8px;border:1px solid #f87171;z-index:999;font-family:monospace;max-width:80%;white-space:pre-wrap';
-    d.textContent='Archive replay error at epoch '+(epochs.length+1)+':\n'+archiveErr.message+'\n\nCheck browser console (F12) for details.\nProcessed '+epochs.length+'/'+ARCHIVE_DATA.length+' epochs.';
-    document.body.appendChild(d);
-  }
-}else{
-  const es=new EventSource('/events');
-  es.addEventListener('epoch',e=>processEpoch(JSON.parse(e.data)));
-  es.addEventListener('complete',()=>markComplete());
-  if(!elapsedTimer)elapsedTimer=setInterval(updateElapsed,1000);
-  fetch('/graph.svg').then(r=>{if(r.ok)return r.text();throw 0}).then(showSvg).catch(()=>{});
-}
-
-// --- Label/Hash/Metadata ---
-function applyLabelHash(label,hash){
-  const h1=document.querySelector('.header h1');
-  if(!h1)return;
-  const short=hash?hash.substring(0,8):null;
-  if(label&&short)h1.innerHTML='floDl <span>'+label+' ['+short+']</span>';
-  else if(short)h1.innerHTML='floDl <span>['+short+']</span>';
-  if(label||short){
-    const t=label?(short?label+' ['+short+']':'['+short+']'):'floDl';
-    document.title='floDl'+(label?' \u2014 '+label:'')+(short?' ['+short+']':'');
-  }
-}
-function showMeta(meta){
-  if(!meta)return;
-  const card=document.getElementById('metaCard');
-  const pre=document.getElementById('metaPre');
-  if(!card||!pre)return;
-  try{pre.textContent=typeof meta==='string'?meta:JSON.stringify(meta,null,2)}
-  catch(e){pre.textContent=String(meta)}
-  card.style.display='block';
-}
-function showHardware(hw){
-  if(!hw)return;
-  const el=document.getElementById('hwInfo');
-  if(!el)return;
-  el.textContent=hw;
-  el.style.display='block';
-}
-// Apply from archive constants
-if(typeof ARCHIVE_LABEL!=='undefined'||typeof ARCHIVE_HASH!=='undefined'){
-  applyLabelHash(typeof ARCHIVE_LABEL!=='undefined'?ARCHIVE_LABEL:null,typeof ARCHIVE_HASH!=='undefined'?ARCHIVE_HASH:null);
-}
-if(typeof ARCHIVE_META!=='undefined'&&ARCHIVE_META!==null){showMeta(ARCHIVE_META)}
-if(typeof ARCHIVE_HARDWARE!=='undefined'){showHardware(ARCHIVE_HARDWARE)}
-// Apply from live server injection
-if(typeof LIVE_LABEL!=='undefined'||typeof LIVE_HASH!=='undefined'){
-  applyLabelHash(typeof LIVE_LABEL!=='undefined'?LIVE_LABEL:null,typeof LIVE_HASH!=='undefined'?LIVE_HASH:null);
-}
-if(typeof LIVE_HARDWARE!=='undefined'){showHardware(LIVE_HARDWARE)}
-if(typeof LIVE_META!=='undefined'&&LIVE_META!==null){showMeta(LIVE_META)}
-if(typeof LIVE_GPU_INIT!=='undefined'&&LIVE_GPU_INIT!==null){initGpuTabs(LIVE_GPU_INIT)}
-if(typeof ARCHIVE_GPU_INIT!=='undefined'&&ARCHIVE_GPU_INIT!==null){initGpuTabs(ARCHIVE_GPU_INIT)}
-
-// --- Header ---
+// --- Header ----------------------------------------------------------------
 function updateHeader(d){
+  if(!startTime&&d.duration!=null)startTime=Date.now()-(d.epoch*d.duration*1000);
   document.getElementById('epochNum').textContent=d.epoch+'/'+d.total;
   document.getElementById('progressFill').style.width=(d.epoch/d.total*100)+'%';
   document.getElementById('statusDot').classList.remove('done');
@@ -470,230 +591,479 @@ function updateHeader(d){
   if(d.eta!=null)document.getElementById('etaDisplay').textContent=fmtDur(d.eta);
   updateElapsed();
 }
-
 function updateElapsed(){
   if(!startTime)return;
-  const s=(Date.now()-startTime)/1000;
-  document.getElementById('elapsedDisplay').textContent=fmtDur(s);
+  document.getElementById('elapsedDisplay').textContent=fmtDur((Date.now()-startTime)/1000);
 }
 
-// --- Resources ---
-function updateResources(r){
-  setBar('cpu',r.cpu);
-  setBar('gpu',r.gpu);
-  if(r.ram_used!=null&&r.ram_total){
-    const pct=r.ram_used/r.ram_total*100;
-    document.getElementById('ramBar').style.width=pct+'%';
-    document.getElementById('ramVal').textContent=fmtBytes(r.ram_used)+'/'+fmtBytes(r.ram_total);
-  }
-  if(r.vram_alloc!=null){
-    const total=r.vram_total||0;
-    const pct=total>0?Math.min(r.vram_alloc/total*100,100):0;
-    const spill=total>0&&r.vram_alloc>total?r.vram_alloc-total:0;
-    const bar=document.getElementById('vramBar');
-    bar.style.width=pct+'%';
-    bar.style.background=spill>0?'var(--red)':'var(--yellow)';
-    document.getElementById('vramVal').textContent=fmtBytes(r.vram_alloc)+' / '+fmtBytes(spill);
-  }
+// --- Series helpers --------------------------------------------------------
+function seriesOf(node,group,key){
+  const out=[];
+  for(const r of node.rows){const v=r[group][key];if(v!=null)out.push({t:r.t,v,row:r})}
+  return out;
 }
-function setBar(id,val){
-  if(val==null)return;
-  document.getElementById(id+'Bar').style.width=val+'%';
-  document.getElementById(id+'Val').textContent=val.toFixed(0)+'%';
+/// Percentage series from a used/total pair; absent either side means absent.
+function pctSeries(node,usedKey,totalKey){
+  const out=[];
+  for(const r of node.rows){
+    const u=r.res[usedKey],tt=r.res[totalKey];
+    if(u!=null&&tt)out.push({t:r.t,v:u/tt*100,row:r});
+  }
+  return out;
+}
+function epochMarks(node){
+  const out=[];
+  for(const r of node.rows)if(r.ec&&r.epoch1!=null)out.push({t:r.t,label:'e'+r.epoch1});
+  return out;
+}
+function metricKeys(node){
+  return Array.from(node.metricKeys).sort();
+}
+function lastOf(series){
+  return series.length?series[series.length-1].v:null;
 }
 
-// --- Log table ---
-var logHeadersSet=false;
-function ensureLogHeaders(){
-  if(logHeadersSet||metricNames.length===0)return;
-  logHeadersSet=true;
-  const hdr=document.getElementById('logHeader');
-  metricNames.forEach(n=>{const th=document.createElement('th');th.textContent=n;hdr.appendChild(th)});
-  const thRes=document.createElement('th');thRes.textContent='Resources';hdr.appendChild(thRes);
+// --- Render ----------------------------------------------------------------
+function scheduleRender(){
+  if(renderQueued)return;
+  renderQueued=true;
+  requestAnimationFrame(()=>{renderQueued=false;render()});
 }
-function updateLog(d){
-  const body=document.getElementById('logBody');
-  const tr=document.createElement('tr');
-  let html='<td>'+d.epoch+'/'+d.total+'</td><td>'+fmtDur(d.duration)+'</td>';
-  metricNames.forEach(n=>{
-    const v=d.metrics&&d.metrics[n]!=null?fmtVal(d.metrics[n]):'—';
-    html+='<td>'+v+'</td>';
+function render(){
+  renderCrumbs();
+  const scope=current===ROOT?'run total':lastSeg(current);
+  document.getElementById('metricsScope').textContent=scope;
+  document.getElementById('resourceScope').textContent=scope;
+  const total=nodeOf(current).rows.length;
+  document.getElementById('logScope').textContent=
+    (recordMode?'epoch + sub-epoch rows, newest first':'epoch rows, newest first')+
+    (total>MAX_LOG_ROWS?' — showing newest '+MAX_LOG_ROWS+' of '+total:'');
+  drawMetrics();
+  drawResources();
+  renderChildren();
+  renderLog();
+  renderAlerts();
+  // Run-scoped cards describe the whole run, not a level.
+  const atRoot=current===ROOT;
+  for(const id of ['metaCard','svgCard']){
+    const el=document.getElementById(id);
+    if(el.dataset.have==='1')el.style.display=atRoot?'block':'none';
+  }
+}
+
+function drawMetrics(){
+  const node=nodeOf(current);
+  const keys=metricKeys(node);
+  const series={},labels={};
+  // Level-aware legend: at an interior node every metric is a work-weighted
+  // roll-up over the direct children, so the legend names the reduction. At a
+  // leaf it is a raw measurement and the bare key is the honest label.
+  const interior=node.isLeaf===false;
+  for(const k of keys){
+    series[k]=seriesOf(node,'metrics',k);
+    labels[k]=interior?k+' ('+reductionOf(k)+')':k;
+  }
+  const solo=soloState.metricsChart;
+  drawChart('metricsChart',series,COLORS,{
+    marks:epochMarks(node),
+    yFmt:solo?fmtForKey(solo):null,
+    labels,
   });
-  const r=d.resources||{};
-  let res=[];
-  if(r.cpu!=null)res.push('CPU:'+r.cpu.toFixed(0)+'%');
-  if(r.gpu!=null)res.push('GPU:'+r.gpu.toFixed(0)+'%');
-  if(r.vram_alloc!=null){
-    const spill=r.vram_total&&r.vram_alloc>r.vram_total?r.vram_alloc-r.vram_total:0;
-    res.push('VRAM:'+fmtBytes(r.vram_alloc)+'/'+fmtBytes(spill));
-  }
-  html+='<td style="color:var(--dim);font-size:11px">'+res.join(' ')+'</td>';
-  tr.innerHTML=html;
-  body.insertBefore(tr,body.firstChild);
+  updateLegend('metricsLegend',keys,COLORS,'metricsChart',drawMetrics,labels);
 }
 
-// --- Charts ---
-function drawChart(canvasId,series,colors,labels,isPercent,yFmt,refLine){
+function drawResources(){
+  const node=nodeOf(current);
+  const solo=soloState.resourceChart;
+  const names=[],series={},colors=[];
+  const add=(name,s,color)=>{if(s.length){names.push(name);series[name]=s;colors.push(color)}};
+  add('gpu',seriesOf(node,'res','gpu_util'),RES_COLORS.gpu);
+  add('vram',pctSeries(node,'vram_alloc','vram_total'),RES_COLORS.vram);
+  // cpu / ram exist only where the level's own rows carry them (the `/events`
+  // fallback root). They are per-host facts outside the record tree, so in a
+  // cluster run they appear as gauges only, never as a curve on an axis they
+  // do not share.
+  add('cpu',seriesOf(node,'res','cpu'),RES_COLORS.cpu);
+  add('ram',pctSeries(node,'ram_used','ram_total'),RES_COLORS.ram);
+
+  const vramTotal=lastResValue(node,'vram_total');
+  let drawn=series,drawColors=colors,pct=true,yFmt=null,ref=null;
+  if(solo==='vram'&&vramTotal){
+    // Solo VRAM: absolute bytes against the physical limit.
+    drawn={vram:seriesOf(node,'res','vram_alloc')};drawColors=[RES_COLORS.vram];pct=false;
+    yFmt=fmtBytes;ref={value:vramTotal,dotted:false,color:'rgba(248,113,113,0.7)',label:'Physical VRAM'};
+  }else if(solo==='ram'){
+    drawn={ram:seriesOf(node,'res','ram_used')};drawColors=[RES_COLORS.ram];pct=false;yFmt=fmtBytes;
+  }else if(solo==='gpu'||solo==='cpu'){
+    drawn={};drawn[solo]=series[solo]||[];drawColors=[RES_COLORS[solo]];yFmt=pctFmt;
+  }else if(names.includes('vram')&&vramTotal){
+    ref={value:100,dotted:true,color:'rgba(248,113,113,0.4)',label:'VRAM limit'};
+  }
+  // Whatever branch ran, the drawn key set is named exactly as the legend is,
+  // so `soloState` alone drives the filtering inside drawChart.
+  drawChart('resourceChart',drawn,drawColors,{
+    percent:pct,yFmt:yFmt||(pct?pctFmt:null),refLine:ref,marks:epochMarks(node),
+  });
+  updateLegend('resourceLegend',names,colors,'resourceChart',drawResources,
+               {cpu:'CPU',gpu:'GPU',ram:'RAM',vram:'VRAM'});
+  updateGauges(node);
+}
+
+function lastResValue(node,key){
+  for(let i=node.rows.length-1;i>=0;i--){const v=node.rows[i].res[key];if(v!=null)return v}
+  return null;
+}
+
+/// Gauges are last-known values. GPU / VRAM follow the level (drilling into a
+/// rank shows that rank's card); CPU / RAM come from the run feed, whose scope
+/// is the cohort in a cluster run and the host in a single-process one.
+function updateGauges(node){
+  const cohort=recordMode;
+  document.getElementById('cpuLabel').textContent=cohort?'CPU (cohort mean)':'CPU';
+  document.getElementById('ramLabel').textContent=cohort?'RAM (cohort)':'RAM';
+  setBar('cpu',HOST.cpu,pctFmt);
+  if(HOST.ram_used!=null&&HOST.ram_total){
+    document.getElementById('ramBar').style.width=(HOST.ram_used/HOST.ram_total*100)+'%';
+    document.getElementById('ramVal').textContent=fmtBytes(HOST.ram_used)+' / '+fmtBytes(HOST.ram_total);
+  }
+  const util=lastResValue(node,'gpu_util');
+  setBar('gpu',util!=null?util:(current===ROOT?HOST.gpu:null),pctFmt);
+  const alloc=lastResValue(node,'vram_alloc');
+  const total=lastResValue(node,'vram_total');
+  const useAlloc=alloc!=null?alloc:(current===ROOT?HOST.vram_alloc:null);
+  const useTotal=total!=null?total:(current===ROOT?HOST.vram_total:null);
+  if(useAlloc!=null){
+    const t=useTotal||0;
+    const p=t>0?Math.min(useAlloc/t*100,100):0;
+    const spill=t>0&&useAlloc>t?useAlloc-t:0;
+    const bar=document.getElementById('vramBar');
+    bar.style.width=p+'%';
+    bar.style.background=spill>0?'var(--red)':'var(--yellow)';
+    document.getElementById('vramVal').textContent=fmtBytes(useAlloc)+(t>0?' / '+fmtBytes(t):'');
+  }
+}
+function setBar(id,val,fmt){
+  if(val==null)return;
+  document.getElementById(id+'Bar').style.width=Math.min(val,100)+'%';
+  document.getElementById(id+'Val').textContent=fmt(val);
+}
+
+// --- Children --------------------------------------------------------------
+function childPaths(node){
+  return Array.from(node.children).sort(natCmp);
+}
+function renderChildren(){
+  const node=nodeOf(current);
+  const kids=childPaths(node);
+  const card=document.getElementById('childrenCard');
+  if(!kids.length){card.style.display='none';return}
+  card.style.display='block';
+
+  // Level-aware legend: the child's own path segment, plus its label (the GPU
+  // model the producer attached) when there is one.
+  const labels={},keySet=new Set(),resSet=new Set();
+  for(const p of kids){
+    const k=NODES.get(p);
+    labels[p]=childLegend(p);
+    if(k)for(const m of k.metricKeys)keySet.add(m);
+    if(k)for(const m of k.resKeys)resSet.add(m);
+  }
+  const metricCols=Array.from(keySet).sort();
+  const options=metricCols.slice();
+  if(resSet.has('gpu_util'))options.push('gpu_util');
+  if(resSet.has('vram_alloc'))options.push('vram_alloc');
+  syncCompareOptions(options);
+
+  const series={},colors=[],names=[];
+  const isRes=compareKey==='gpu_util'||compareKey==='vram_alloc';
+  kids.forEach((p,i)=>{
+    const k=NODES.get(p);
+    if(!k)return;
+    const s=isRes?seriesOf(k,'res',compareKey):seriesOf(k,'metrics',compareKey);
+    if(!s.length)return;
+    names.push(p);series[p]=s;colors.push(COLORS[i%COLORS.length]);
+  });
+  drawChart('childrenChart',series,colors,{
+    marks:epochMarks(node),yFmt:fmtForKey(compareKey),labels,
+  });
+  updateLegend('childrenLegend',names,colors,'childrenChart',renderChildren,labels);
+
+  const alive=kids.filter(p=>NODES.get(p)&&NODES.get(p).alive!==false).length;
+  document.getElementById('childrenCount').textContent=
+    kids.length+(alive!==kids.length?' ('+alive+' alive)':'');
+
+  const cols=['node','dev','work'].concat(metricCols).concat(['gpu','vram']);
+  const hdr=document.getElementById('childrenHeader');
+  hdr.innerHTML=cols.map(c=>'<th>'+esc(c)+'</th>').join('');
+  const body=document.getElementById('childrenBody');
+  body.innerHTML='';
+  for(const p of kids){
+    const k=NODES.get(p);
+    const last=k&&k.lastRow;
+    const tr=document.createElement('tr');
+    tr.className='drill'+(k&&k.alive===false?' dead':'');
+    let html='<td class="node-cell">'+esc(lastSeg(p))+
+             (k&&k.label?'<span class="lbl">'+esc(k.label)+'</span>':'')+'</td>';
+    html+='<td>'+(k&&k.device!=null?k.device:'—')+'</td>';
+    html+='<td>'+(last&&last.work!=null?fmtVal(last.work):'—')+'</td>';
+    for(const key of metricCols){
+      const v=lastMetric(k,key);
+      html+='<td>'+(v!=null?fmtForKey(key)(v):'—')+'</td>';
+    }
+    const u=k?lastResValue(k,'gpu_util'):null;
+    html+='<td>'+(u!=null?pctFmt(u):'—')+'</td>';
+    const a=k?lastResValue(k,'vram_alloc'):null;
+    html+='<td>'+(a!=null?fmtBytes(a):'—')+'</td>';
+    tr.innerHTML=html;
+    tr.onclick=()=>navigate(p);
+    body.appendChild(tr);
+  }
+}
+function childLegend(path){
+  const k=NODES.get(path);
+  const seg=lastSeg(path);
+  return k&&k.label?seg+' · '+k.label:seg;
+}
+function lastMetric(node,key){
+  if(!node)return null;
+  for(let i=node.rows.length-1;i>=0;i--){const v=node.rows[i].metrics[key];if(v!=null)return v}
+  return null;
+}
+function syncCompareOptions(options){
+  const sel=document.getElementById('compareMetric');
+  const want=options.join('|');
+  if(sel.dataset.opts!==want){
+    sel.dataset.opts=want;
+    sel.innerHTML=options.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join('');
+  }
+  if(!compareKey||!options.includes(compareKey)){
+    compareKey=['loss','throughput','batch_share'].find(k=>options.includes(k))||options[0]||null;
+  }
+  if(compareKey)sel.value=compareKey;
+}
+function onCompareChange(){
+  compareKey=document.getElementById('compareMetric').value;
+  soloState.childrenChart=null;
+  renderChildren();
+}
+
+// --- Log -------------------------------------------------------------------
+function renderLog(){
+  const node=nodeOf(current);
+  const keys=metricKeys(node);
+  const empty=document.getElementById('logEmpty');
+  const header=document.getElementById('logHeader');
+  const body=document.getElementById('logBody');
+  if(!node.rows.length){
+    empty.style.display='block';header.innerHTML='';body.innerHTML='';return;
+  }
+  empty.style.display='none';
+  const cols=['t','epoch'];
+  if(recordMode)cols.push('window','work');
+  const cells=cols.concat(keys).concat(['res']);
+  header.innerHTML=cells.map(c=>'<th>'+esc(c)+'</th>').join('');
+  const stop=Math.max(0,node.rows.length-MAX_LOG_ROWS);
+  let html='';
+  for(let i=node.rows.length-1;i>=stop;i--){
+    const r=node.rows[i];
+    let tds='<td>'+fmtDur(r.t)+'</td>';
+    tds+='<td>'+(r.epoch1!=null?r.epoch1:'—')+'</td>';
+    if(recordMode){
+      tds+='<td>'+(r.tick!=null?r.tick:'—')+'</td>';
+      // `work` is a per-record interval quantity whose unit differs by cadence
+      // (steps for a window, batch share for an epoch), so it is a column and
+      // never a curve.
+      tds+='<td>'+(r.work!=null?fmtVal(r.work):'—')+'</td>';
+    }
+    for(const k of keys){
+      const v=r.metrics[k];
+      tds+='<td>'+(v!=null?fmtForKey(k)(v):'—')+'</td>';
+    }
+    tds+='<td class="res-cell">'+esc(resSummary(r.res))+'</td>';
+    html+='<tr class="'+(r.ec?'epoch-row':'')+'">'+tds+'</tr>';
+  }
+  body.innerHTML=html;
+}
+function resSummary(res){
+  const out=[];
+  if(res.cpu!=null)out.push('CPU:'+res.cpu.toFixed(0)+'%');
+  if(res.gpu_util!=null)out.push('GPU:'+res.gpu_util.toFixed(0)+'%');
+  if(res.vram_alloc!=null){
+    const t=res.vram_total;
+    out.push('VRAM:'+fmtBytes(res.vram_alloc)+(t?'/'+fmtBytes(t):''));
+  }
+  if(res.ram_used!=null&&res.ram_total)out.push('RAM:'+fmtBytes(res.ram_used));
+  return out.join(' ');
+}
+
+// --- Alerts ----------------------------------------------------------------
+function renderAlerts(){
+  const card=document.getElementById('alertsCard');
+  const badge=document.getElementById('alertBadge');
+  const list=Array.from(ALERTS.values()).sort((a,b)=>b.ts-a.ts);
+  if(!list.length){card.style.display='none';badge.classList.remove('on');return}
+  card.style.display='block';
+  const critical=list.filter(a=>a.sev==='critical').length;
+  badge.classList.add('on');
+  badge.classList.toggle('warn',critical===0);
+  badge.textContent=critical>0?critical+' critical':list.length+' alert'+(list.length>1?'s':'');
+  const body=document.getElementById('alertsBody');
+  body.innerHTML='';
+  for(const a of list){
+    const tr=document.createElement('tr');
+    let html='<td class="res-cell">'+esc(fmtClock(a.ts))+'</td>';
+    html+='<td class="sev-'+esc(a.sev)+'">'+esc(a.class)+'</td>';
+    html+='<td class="node-cell">'+esc(a.path)+'</td>';
+    html+='<td class="res-cell">'+esc(a.detail||'')+'</td>';
+    html+='<td>'+a.total+'</td>';
+    tr.innerHTML=html;
+    // The origin path is a real node in the tree, so an alert is a jump to it.
+    if(NODES.has(a.path)||a.path===ROOT){
+      tr.className='drill';
+      tr.onclick=()=>navigate(a.path);
+    }
+    body.appendChild(tr);
+  }
+}
+function scrollToAlerts(){
+  const card=document.getElementById('alertsCard');
+  if(card.style.display!=='none')card.scrollIntoView({behavior:'smooth',block:'center'});
+}
+
+// --- Chart engine ----------------------------------------------------------
+// Series are `{name: [{t, v}]}` on a shared elapsed-seconds axis — the only
+// axis the two cadences have in common. Epoch boundaries become the x labels
+// (`e3`), so the chart still reads in epochs while staying metric in time.
+function drawChart(canvasId,series,colors,opts){
+  opts=opts||{};
   const canvas=document.getElementById(canvasId);
+  if(!canvas)return;
   const ctx=canvas.getContext('2d');
   const dpr=window.devicePixelRatio||1;
   const rect=canvas.getBoundingClientRect();
-  canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;
+  canvas.width=Math.max(1,rect.width*dpr);canvas.height=Math.max(1,rect.height*dpr);
   ctx.scale(dpr,dpr);
   const W=rect.width,H=rect.height;
-  const M={top:10,right:12,bottom:24,left:yFmt?70:48};
+  const M={top:10,right:12,bottom:24,left:opts.yFmt?70:52};
   const pw=W-M.left-M.right,ph=H-M.top-M.bottom;
   ctx.clearRect(0,0,W,H);
 
   const allNames=Object.keys(series);
-  if(allNames.length===0)return;
-  const solo=soloState[canvasId]||null;
-  const names=solo?allNames.filter(n=>n===solo):allNames;
-  let maxEp=0,minV=Infinity,maxV=-Infinity;
-  // Scale axes to visible series only
-  names.forEach(n=>{
-    const vals=series[n];
-    maxEp=Math.max(maxEp,vals.length);
-    vals.forEach(v=>{if(v!=null){minV=Math.min(minV,v);maxV=Math.max(maxV,v)}});
-  });
-  // maxEp from all series (so X axis stays stable)
-  allNames.forEach(n=>{maxEp=Math.max(maxEp,series[n].length)});
+  const solo=soloState[canvasId];
+  const visible=allNames.filter(n=>!solo||n===solo);
+  let minT=Infinity,maxT=-Infinity,minV=Infinity,maxV=-Infinity;
+  for(const n of allNames)for(const p of series[n]){
+    if(p.t<minT)minT=p.t;if(p.t>maxT)maxT=p.t;
+  }
+  for(const n of visible)for(const p of series[n]){
+    if(p.v<minV)minV=p.v;if(p.v>maxV)maxV=p.v;
+  }
+  if(!isFinite(minT)){
+    ctx.fillStyle='#8b8fa3';ctx.font='12px -apple-system,sans-serif';ctx.textAlign='center';
+    ctx.fillText('no data yet',W/2,H/2);
+    canvas._layout=null;
+    return;
+  }
   if(!isFinite(minV)){minV=0;maxV=1}
   if(minV===maxV){minV-=1;maxV+=1}
-  if(isPercent){minV=Math.min(0,minV);maxV=Math.max(100,maxV)}
-  if(refLine!=null){minV=Math.min(minV,refLine.value);maxV=Math.max(maxV,refLine.value)}
+  if(opts.percent){minV=Math.min(0,minV);maxV=Math.max(100,maxV)}
+  if(opts.refLine!=null){minV=Math.min(minV,opts.refLine.value);maxV=Math.max(maxV,opts.refLine.value)}
   const pad=(maxV-minV)*0.05;minV-=pad;maxV+=pad;
-  // Byte-scale charts (yFmt=fmtBytes) can never be negative — clamp
-  // minV so a small allocation under a large reference line (e.g. a
-  // 100 MB VRAM trend under a 6 GB physical-VRAM ref) doesn't get a
-  // 5% padding pushed below zero, which renders as nonsense
-  // "-200 MB" gridlines. Don't clamp for percent / signed metrics.
-  if(yFmt===fmtBytes){minV=Math.max(0,minV)}
-  const xScale=i=>M.left+(i/Math.max(1,maxEp-1))*pw;
+  // Byte scales can never be negative: padding under a large reference line
+  // would otherwise render nonsense "-200 MB" gridlines.
+  if(opts.yFmt===fmtBytes)minV=Math.max(0,minV);
+  const span=Math.max(1e-9,maxT-minT);
+  const xScale=t=>M.left+((t-minT)/span)*pw;
   const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
 
-  // Grid
-  const yLabel=yFmt||fmtVal;
+  const yLabel=opts.yFmt||fmtVal;
   ctx.strokeStyle='rgba(42,45,58,0.8)';ctx.lineWidth=1;
-  const yTicks=4;
-  for(let i=0;i<=yTicks;i++){
-    const v=minV+(maxV-minV)*i/yTicks;
+  for(let i=0;i<=4;i++){
+    const v=minV+(maxV-minV)*i/4;
     const y=yScale(v);
     ctx.beginPath();ctx.moveTo(M.left,y);ctx.lineTo(W-M.right,y);ctx.stroke();
     ctx.fillStyle='#8b8fa3';ctx.font='10px -apple-system,sans-serif';ctx.textAlign='right';
     ctx.fillText(yLabel(v),M.left-6,y+3);
   }
-  // X labels
-  const xStep=Math.max(1,Math.floor(maxEp/8));
-  ctx.textAlign='center';
-  for(let i=0;i<maxEp;i+=xStep){
-    ctx.fillStyle='#8b8fa3';ctx.font='10px -apple-system,sans-serif';
-    ctx.fillText(''+(i+1),xScale(i),H-M.bottom+14);
+
+  // X axis: epoch boundaries when we have them, plain elapsed otherwise.
+  const marks=(opts.marks||[]).filter(m=>m.t>=minT&&m.t<=maxT);
+  ctx.textAlign='center';ctx.font='10px -apple-system,sans-serif';
+  if(marks.length){
+    const step=Math.max(1,Math.ceil(marks.length/8));
+    for(let i=0;i<marks.length;i+=step){
+      const m=marks[i],x=xScale(m.t);
+      ctx.strokeStyle='rgba(108,140,255,0.13)';
+      ctx.beginPath();ctx.moveTo(x,M.top);ctx.lineTo(x,M.top+ph);ctx.stroke();
+      ctx.fillStyle='#8b8fa3';ctx.fillText(m.label,x,H-M.bottom+14);
+    }
+  }else{
+    for(let i=0;i<=4;i++){
+      const t=minT+span*i/4;
+      ctx.fillStyle='#8b8fa3';ctx.fillText(fmtDur(t),xScale(t),H-M.bottom+14);
+    }
   }
 
-  // Reference line (e.g., physical VRAM limit)
-  if(refLine!=null){
-    const ry=yScale(refLine.value);
+  if(opts.refLine!=null){
+    const ry=yScale(opts.refLine.value);
     if(ry>=M.top&&ry<=M.top+ph){
       ctx.save();
-      ctx.strokeStyle=refLine.color||'#8b8fa3';
+      ctx.strokeStyle=opts.refLine.color||'#8b8fa3';
       ctx.lineWidth=1.5;
-      if(refLine.dotted)ctx.setLineDash([6,4]);
+      if(opts.refLine.dotted)ctx.setLineDash([6,4]);
       ctx.beginPath();ctx.moveTo(M.left,ry);ctx.lineTo(W-M.right,ry);ctx.stroke();
       ctx.setLineDash([]);
-      if(refLine.label){
-        ctx.fillStyle=refLine.color||'#8b8fa3';
-        ctx.font='9px -apple-system,sans-serif';
-        ctx.textAlign='right';
-        ctx.fillText(refLine.label,W-M.right,ry-4);
+      if(opts.refLine.label){
+        ctx.fillStyle=opts.refLine.color||'#8b8fa3';
+        ctx.font='9px -apple-system,sans-serif';ctx.textAlign='right';
+        ctx.fillText(opts.refLine.label,W-M.right,ry-4);
       }
       ctx.restore();
     }
   }
 
-  // Lines (filtered by solo state — names already filtered above)
   allNames.forEach((n,si)=>{
     if(solo&&solo!==n)return;
-    const vals=series[n];
-    const color=colors[si%colors.length];
+    const pts=series[n];
+    if(!pts.length)return;
+    const color=colors[si%colors.length]||COLORS[si%COLORS.length];
     ctx.strokeStyle=color;ctx.lineWidth=solo?3:2;ctx.beginPath();
-    let started=false;
-    vals.forEach((v,i)=>{
-      if(v==null)return;
-      const x=xScale(i),y=yScale(v);
-      if(!started){ctx.moveTo(x,y);started=true}else{ctx.lineTo(x,y)}
+    pts.forEach((p,i)=>{
+      const x=xScale(p.t),y=yScale(p.v);
+      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
     });
     ctx.stroke();
-    // Dots for last point
-    if(vals.length>0){
-      const last=vals[vals.length-1];
-      if(last!=null){
-        ctx.fillStyle=color;ctx.beginPath();
-        ctx.arc(xScale(vals.length-1),yScale(last),3,0,Math.PI*2);ctx.fill();
-      }
-    }
+    const last=pts[pts.length-1];
+    ctx.fillStyle=color;ctx.beginPath();
+    ctx.arc(xScale(last.t),yScale(last.v),3,0,Math.PI*2);ctx.fill();
   });
 
-  // Store layout for tooltip
-  canvas._layout={xScale,yScale,maxEp,minV,maxV,series,names:allNames,colors,solo,yFmt:yLabel};
-}
-
-function drawMetrics(){
-  drawChart('metricsChart',metricSeries,COLORS,metricNames,false);
-  updateLegend('metricsLegend',metricNames,COLORS,'metricsChart',drawMetrics);
-}
-function drawResources(){
-  const resNames=['cpu','gpu','ram','vram'];
-  const resLabels={cpu:'CPU',gpu:'GPU',ram:'RAM',vram:'VRAM'};
-  const resColors=[RES_COLORS.cpu,RES_COLORS.gpu,RES_COLORS.ram,RES_COLORS.vram];
-  const solo=soloState['resourceChart'];
-  const lastTotal=resourceRaw.vram_total.length>0?resourceRaw.vram_total[resourceRaw.vram_total.length-1]:null;
-  if(solo==='ram'){
-    const byteSeries={};
-    byteSeries['ram']=resourceRaw.ram_used;
-    drawChart('resourceChart',byteSeries,[RES_COLORS.ram],['ram'],false,fmtBytes);
-  }else if(solo==='vram'){
-    // Solo VRAM: byte scale with solid physical-limit line
-    const byteSeries={};
-    byteSeries['vram']=resourceRaw.vram_alloc;
-    const vramRef=lastTotal?{value:lastTotal,dotted:false,color:'rgba(248,113,113,0.7)',label:'Physical VRAM'}:null;
-    drawChart('resourceChart',byteSeries,[RES_COLORS.vram],['vram'],false,fmtBytes,vramRef);
-  }else if(solo==='cpu'||solo==='gpu'){
-    // Solo percentage metric with % suffix on axis
-    const pctSeries={};
-    pctSeries[solo]=resourceSeries[solo];
-    drawChart('resourceChart',pctSeries,
-      [solo==='cpu'?RES_COLORS.cpu:RES_COLORS.gpu],
-      [solo],true,v=>v.toFixed(0)+'%');
-  }else{
-    // Combined view: dotted VRAM limit at 100%
-    const vramRef=lastTotal?{value:100,dotted:true,color:'rgba(248,113,113,0.4)',label:'VRAM limit'}:null;
-    drawChart('resourceChart',resourceSeries,resColors,resNames,true,null,vramRef);
-  }
-  updateLegend('resourceLegend',resNames,resColors,'resourceChart',drawResources,resLabels);
+  canvas._layout={xScale,minT,maxT,series,names:allNames,colors,solo,
+                  yFmt:yLabel,labels:opts.labels||null};
 }
 
 function updateLegend(id,names,colors,chartId,redrawFn,labels){
   const el=document.getElementById(id);
-  // Rebuild if count changed
-  if(el.children.length!==names.length){
+  const want=names.join('|');
+  if(el.dataset.names!==want){
+    el.dataset.names=want;
     el.innerHTML='';
     names.forEach((n,i)=>{
-      const item=document.createElement('div');item.className='legend-item';
+      const item=document.createElement('div');
+      item.className='legend-item';
       item.dataset.name=n;
-      const dot=document.createElement('div');dot.className='legend-dot';
-      dot.style.background=colors[i%colors.length];
-      const label=(labels&&labels[n])||n;
-      item.appendChild(dot);item.appendChild(document.createTextNode(label));
+      const dot=document.createElement('div');
+      dot.className='legend-dot';
+      dot.style.background=colors[i%colors.length]||COLORS[i%COLORS.length];
+      item.appendChild(dot);
+      item.appendChild(document.createTextNode((labels&&labels[n])||n));
       item.addEventListener('click',()=>{
-        const cur=soloState[chartId];
-        soloState[chartId]=(cur===n)?null:n;
+        soloState[chartId]=soloState[chartId]===n?null:n;
         redrawFn();
       });
       el.appendChild(item);
     });
   }
-  // Update visual state
   const solo=soloState[chartId];
   Array.from(el.children).forEach(item=>{
     const n=item.dataset.name;
@@ -702,52 +1072,101 @@ function updateLegend(id,names,colors,chartId,redrawFn,labels){
   });
 }
 
-// --- Tooltip ---
-['metricsChart','resourceChart'].forEach(id=>{
+// --- Tooltip ---------------------------------------------------------------
+['metricsChart','resourceChart','childrenChart'].forEach(id=>{
   const canvas=document.getElementById(id);
+  if(!canvas)return;
   canvas.addEventListener('mousemove',e=>{
-    const L=canvas._layout;if(!L)return;
+    const L=canvas._layout;
+    const tip=document.getElementById('tooltip');
+    if(!L){tip.style.display='none';return}
     const rect=canvas.getBoundingClientRect();
     const mx=e.clientX-rect.left;
-    let best=Infinity,bestI=-1;
-    for(let i=0;i<L.maxEp;i++){
-      const d=Math.abs(L.xScale(i)-mx);
-      if(d<best){best=d;bestI=i}
-    }
-    if(best>30){tooltip.style.display='none';return}
-    let html='<b>Epoch '+(bestI+1)+'</b>';
-    const tipFmt=L.yFmt||fmtVal;
-    L.names.forEach((n,si)=>{
-      if(L.solo&&L.solo!==n)return;
-      const v=L.series[n][bestI];
-      if(v!=null){
-        const c=L.colors[si%L.colors.length];
-        html+='<br><span style="color:'+c+'">&#9632;</span> '+n+': '+tipFmt(v);
+    // Nearest point in x across the visible series.
+    let best=Infinity,bestRow=null,bestT=null;
+    for(const n of L.names){
+      if(L.solo&&L.solo!==n)continue;
+      for(const p of L.series[n]){
+        const d=Math.abs(L.xScale(p.t)-mx);
+        if(d<best){best=d;bestRow=p.row||null;bestT=p.t}
       }
-    });
-    const tip=document.getElementById('tooltip');
+    }
+    if(best>30||bestT==null){tip.style.display='none';return}
+    let html='<b>'+rowTitle(bestRow,bestT)+'</b>';
+    const fmt=L.yFmt||fmtVal;
+    for(const n of L.names){
+      if(L.solo&&L.solo!==n)continue;
+      // Match by the same instant, so a series that did not report at this
+      // point stays absent instead of showing a neighbour's value.
+      const p=L.series[n].find(q=>q.t===bestT);
+      if(!p)continue;
+      const c=L.colors[L.names.indexOf(n)%L.colors.length]||COLORS[0];
+      const name=(L.labels&&L.labels[n])||n;
+      html+='<br><span style="color:'+c+'">&#9632;</span> '+esc(name)+': '+fmt(p.v);
+    }
     tip.innerHTML=html;tip.style.display='block';
     let tx=e.clientX+14,ty=e.clientY-10;
-    const tw=tip.offsetWidth,th=tip.offsetHeight;
-    if(tx+tw>window.innerWidth)tx=e.clientX-tw-14;
-    if(ty+th>window.innerHeight)ty=e.clientY-th-10;
+    if(tx+tip.offsetWidth>window.innerWidth)tx=e.clientX-tip.offsetWidth-14;
+    if(ty+tip.offsetHeight>window.innerHeight)ty=e.clientY-tip.offsetHeight-10;
     tip.style.left=tx+'px';tip.style.top=ty+'px';
   });
   canvas.addEventListener('mouseleave',()=>{document.getElementById('tooltip').style.display='none'});
 });
-
-// --- SVG toggle ---
-function toggleSvg(){
-  const t=document.getElementById('svgToggle');
-  const c=document.getElementById('svgContainer');
-  const opening=!t.classList.contains('open');
-  t.classList.toggle('open');
-  if(opening){c.style.maxHeight=c.scrollHeight+'px'}
-  else{c.style.maxHeight='0'}
+function rowTitle(row,t){
+  const bits=[];
+  if(row&&row.epoch1!=null)bits.push('epoch '+row.epoch1);
+  if(row&&row.tick!=null)bits.push('window '+row.tick);
+  bits.push(fmtDur(t));
+  return esc(bits.join(' · '));
 }
 
-// --- Formatters ---
+// --- Label / metadata / graph ---------------------------------------------
+function applyLabelHash(label,hash){
+  const h1=document.querySelector('.header h1');
+  if(!h1)return;
+  const short=hash?hash.substring(0,8):null;
+  if(label&&short)h1.innerHTML='floDl <span>'+esc(label)+' ['+esc(short)+']</span>';
+  else if(short)h1.innerHTML='floDl <span>['+esc(short)+']</span>';
+  if(label||short)document.title='floDl'+(label?' - '+label:'')+(short?' ['+short+']':'');
+}
+function showMeta(meta){
+  if(!meta)return;
+  const card=document.getElementById('metaCard'),pre=document.getElementById('metaPre');
+  if(!card||!pre)return;
+  try{pre.textContent=typeof meta==='string'?meta:JSON.stringify(meta,null,2)}
+  catch(e){pre.textContent=String(meta)}
+  card.dataset.have='1';
+  card.style.display=current===ROOT?'block':'none';
+}
+function showHardware(hw){
+  if(!hw)return;
+  const el=document.getElementById('hwInfo');
+  if(!el)return;
+  el.textContent=hw;el.style.display='block';
+}
+function showSvg(svg){
+  const card=document.getElementById('svgCard'),c=document.getElementById('svgContainer');
+  card.dataset.have='1';
+  card.style.display=current===ROOT?'block':'none';
+  c.innerHTML=svg;
+  if(document.getElementById('svgToggle').classList.contains('open'))c.style.maxHeight=c.scrollHeight+'px';
+}
+function toggleSvg(){
+  const t=document.getElementById('svgToggle'),c=document.getElementById('svgContainer');
+  const opening=!t.classList.contains('open');
+  t.classList.toggle('open');
+  c.style.maxHeight=opening?c.scrollHeight+'px':'0';
+}
+function seedGpuInit(list){
+  for(const g of list||[]){
+    if(g.dev==null)continue;
+    GPU_INIT.set(g.dev,{name:g.name,vram_total:g.vram_total});
+  }
+}
+
+// --- Formatters ------------------------------------------------------------
 function fmtDur(s){
+  if(s==null)return '—';
   if(s<1)return Math.round(s*1000)+'ms';
   if(s<60){const w=Math.floor(s);const f=Math.floor((s-w)*10);return f>0?w+'.'+f+'s':w+'s'}
   const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=Math.floor(s%60);
@@ -761,17 +1180,91 @@ function fmtBytes(b){
   return Math.round(b/1024)+' KB';
 }
 function fmtVal(v){
+  if(v==null)return '—';
   if(Math.abs(v)<0.001&&v!==0)return v.toExponential(2);
   if(Math.abs(v)>=1000)return v.toFixed(1);
-  if(Math.abs(v)>=1)return v.toFixed(4);
   return v.toFixed(4);
 }
+function pctFmt(v){return v.toFixed(0)+'%'}
+/// Unit by key name: the record schema names resources and shares explicitly,
+/// so the axis formatter follows from the key rather than from a per-chart flag.
+function fmtForKey(k){
+  if(k==null)return fmtVal;
+  if(k==='cpu'||k==='gpu_util')return pctFmt;
+  if(k==='batch_share')return v=>(v*100).toFixed(1)+'%';
+  if(k.indexOf('vram')===0||k.indexOf('ram_')===0)return fmtBytes;
+  if(k.indexOf('_ms')>0)return v=>fmtDur(v/1000);
+  return fmtVal;
+}
+function fmtClock(ms){
+  if(!ms)return '—';
+  const d=new Date(ms);
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+
+         ':'+String(d.getSeconds()).padStart(2,'0');
+}
+function esc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function shortGpuName(name){
+  return String(name||'').replace(/^NVIDIA\s+/i,'').replace(/GeForce\s+/i,'');
+}
 
-// --- Resize ---
-window.addEventListener('resize',()=>{
-  if(activeTab==='home'){drawMetrics();drawResources()}
-  else{drawGpuTabs()}
-});
+// --- Boot ------------------------------------------------------------------
+// Injected constants first: they carry identity and device names the very
+// first record / epoch then builds on.
+if(typeof ARCHIVE_LABEL!=='undefined'||typeof ARCHIVE_HASH!=='undefined'){
+  applyLabelHash(typeof ARCHIVE_LABEL!=='undefined'?ARCHIVE_LABEL:null,
+                 typeof ARCHIVE_HASH!=='undefined'?ARCHIVE_HASH:null);
+}
+if(typeof LIVE_LABEL!=='undefined'||typeof LIVE_HASH!=='undefined'){
+  applyLabelHash(typeof LIVE_LABEL!=='undefined'?LIVE_LABEL:null,
+                 typeof LIVE_HASH!=='undefined'?LIVE_HASH:null);
+}
+if(typeof ARCHIVE_HARDWARE!=='undefined')showHardware(ARCHIVE_HARDWARE);
+if(typeof LIVE_HARDWARE!=='undefined')showHardware(LIVE_HARDWARE);
+if(typeof ARCHIVE_META!=='undefined'&&ARCHIVE_META!==null)showMeta(ARCHIVE_META);
+if(typeof LIVE_META!=='undefined'&&LIVE_META!==null)showMeta(LIVE_META);
+if(typeof ARCHIVE_GPU_INIT!=='undefined'&&ARCHIVE_GPU_INIT!==null)seedGpuInit(ARCHIVE_GPU_INIT);
+if(typeof LIVE_GPU_INIT!=='undefined'&&LIVE_GPU_INIT!==null)seedGpuInit(LIVE_GPU_INIT);
+
+current=pathFromHash();
+
+// ARCHIVE_DATA is injected by monitor.save_html(): replay it instead of
+// connecting. The baked archive carries epochs, so it lands on the same
+// `/events` fallback path a single-process live run uses.
+if(typeof ARCHIVE_DATA!=='undefined'){
+  let archiveErr=null,done=0;
+  for(let i=0;i<ARCHIVE_DATA.length;i++){
+    try{ingestEpoch(ARCHIVE_DATA[i]);done++}
+    catch(e){archiveErr=e;console.error('ingestEpoch failed at index '+i+':',e);break}
+  }
+  try{render()}catch(e){console.error('render:',e);archiveErr=archiveErr||e}
+  // Wall-clock elapsed is meaningless in an archive: sum the epoch durations.
+  document.getElementById('elapsedDisplay').textContent=
+    fmtDur(ARCHIVE_DATA.reduce((s,d)=>s+(d.duration||0),0));
+  markComplete(archiveErr?'Archive error - see console':
+    (typeof ARCHIVE_COMPLETE!=='undefined'?ARCHIVE_COMPLETE:'Complete'));
+  if(typeof ARCHIVE_SVG==='string'){try{showSvg(ARCHIVE_SVG)}catch(e){console.error('showSvg:',e)}}
+  requestAnimationFrame(()=>{try{render()}catch(e){console.error('rAF render:',e)}});
+  if(archiveErr){
+    const d=document.createElement('div');
+    d.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1a1d27;color:#f87171;padding:24px;border-radius:8px;border:1px solid #f87171;z-index:999;font-family:monospace;max-width:80%;white-space:pre-wrap';
+    d.textContent='Archive replay error at epoch '+(done+1)+':\n'+archiveErr.message+
+      '\n\nCheck browser console (F12) for details.\nProcessed '+done+'/'+ARCHIVE_DATA.length+' epochs.';
+    document.body.appendChild(d);
+  }
+}else{
+  const es=new EventSource('/events');
+  es.addEventListener('epoch',e=>{try{ingestEpoch(JSON.parse(e.data))}catch(err){}});
+  es.addEventListener('complete',()=>markComplete());
+  subscribeRoot();
+  setLevel(current);
+  if(!elapsedTimer)elapsedTimer=setInterval(updateElapsed,1000);
+  fetch('/graph.svg').then(r=>{if(r.ok)return r.text();throw 0}).then(showSvg).catch(()=>{});
+}
+
+window.addEventListener('resize',()=>scheduleRender());
 </script>
 </body>
 </html>

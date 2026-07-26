@@ -535,7 +535,11 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
             label_js, hash_js, hw_js, meta_js, gpu_init_js,
         ));
         let inject = format!("<script>{}</script>\n", consts);
-        DASHBOARD_HTML.replace("<script>", &format!("{}<script>", inject))
+        // `replacen(.., 1)`: the constants must land ahead of the FIRST script
+        // block only. A plain `replace` prepended them to every `<script>` in
+        // the page, which was invisible only while the template happened to
+        // have exactly one.
+        DASHBOARD_HTML.replacen("<script>", &format!("{}<script>", inject), 1)
     } else {
         DASHBOARD_HTML.to_string()
     };
@@ -691,6 +695,93 @@ mod tests {
         // A malformed escape keeps the '%' rather than eating a character.
         assert_eq!(query_param("path=a%zz", "path").as_deref(), Some("a%zz"));
         assert_eq!(query_param("path=a%", "path").as_deref(), Some("a%"));
+    }
+
+    // --- the portal page's contract with its two injectors ---
+
+    #[test]
+    fn the_page_declares_exactly_one_script_block() {
+        // Both injectors (`serve_html` here, `Monitor::build_archive`) prepend
+        // their constants to the first `<script>`. More than one block in the
+        // template would put the page's own code before the constants it reads
+        // — a silent "ARCHIVE_DATA is not defined" — so the count is pinned.
+        assert_eq!(DASHBOARD_HTML.matches("<script>").count(), 1);
+        assert_eq!(DASHBOARD_HTML.matches("</script>").count(), 1);
+    }
+
+    #[test]
+    fn the_page_reads_the_record_plane_and_the_epoch_feed() {
+        // The portal renders levels from the record plane and keeps the epoch
+        // feed as the run clock / fallback level source. Losing either
+        // reference silently reduces the page to half a dashboard, which no
+        // Rust-side test would otherwise notice.
+        for needle in [
+            "'/stream?path='",
+            "'/history?path='",
+            "EventSource('/events')",
+            "ARCHIVE_DATA",
+            "LIVE_GPU_INIT",
+        ] {
+            assert!(DASHBOARD_HTML.contains(needle), "page lost {needle}");
+        }
+    }
+
+    /// The page is a single string constant with no build step, so a typo'd
+    /// element id or a handler that lost its function fails **silently** in the
+    /// browser — no Rust gate would see it. These two are string-checkable, so
+    /// they are checked here rather than discovered on a rig run.
+    #[test]
+    fn the_page_only_reaches_for_elements_and_handlers_it_has() {
+        let (markup, js) = {
+            let open = DASHBOARD_HTML.find("<script>").unwrap() + "<script>".len();
+            let close = DASHBOARD_HTML.find("</script>").unwrap();
+            (
+                format!("{}{}", &DASHBOARD_HTML[..open], &DASHBOARD_HTML[close..]),
+                &DASHBOARD_HTML[open..close],
+            )
+        };
+
+        /// Every `<needle><id><term>` occurrence's id, e.g. `id="foo"`.
+        fn ids(hay: &str, needle: &str, term: char) -> Vec<String> {
+            hay.match_indices(needle)
+                .filter_map(|(i, _)| {
+                    let rest = &hay[i + needle.len()..];
+                    rest.find(term).map(|e| rest[..e].to_string())
+                })
+                .collect()
+        }
+
+        let declared = ids(&markup, "id=\"", '"');
+        for want in ids(js, "getElementById('", '\'') {
+            assert!(
+                declared.contains(&want),
+                "the page calls getElementById('{want}') but declares no such id",
+            );
+        }
+        for handler in ids(&markup, "onclick=\"", '(')
+            .into_iter()
+            .chain(ids(&markup, "onchange=\"", '('))
+        {
+            assert!(
+                js.contains(&format!("function {handler}(")),
+                "inline handler {handler}() has no function in the page script",
+            );
+        }
+    }
+
+    #[test]
+    fn serve_html_injects_constants_once_ahead_of_the_page() {
+        let mut srv = DashboardServer::start(0).expect("bind");
+        let addr = srv.addr;
+        srv.set_hardware("2x GPU test rig".to_string());
+
+        let body = get_until(addr, "/", "LIVE_HARDWARE");
+        assert_eq!(body.matches("const LIVE_HARDWARE=").count(), 1);
+        // Constants first, page code second: the page reads them at load.
+        let consts = body.find("const LIVE_HARDWARE=").unwrap();
+        let boot = body.find("floDl monitoring portal").unwrap();
+        assert!(consts < boot, "constants injected after the page body");
+        srv.shutdown();
     }
 
     // --- portal record plane, over real TCP ---
