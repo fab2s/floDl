@@ -482,3 +482,86 @@ fn test_loop_body_emit_dup_panics() {
 
 // --- Router tests ---
 
+
+// --- Batched loop control ---
+//
+// Loop tests ran almost entirely at batch size 1, the same blind spot that hid
+// issue #32. A loop advances one state tensor for every row together, so what
+// these pin is that rows stay independent through the iterations and that the
+// gradient reaches all of them.
+
+#[test]
+fn test_loop_for_batched() {
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .for_n(3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+        let want = base * 8.0; // doubled three times
+        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_loop_for_backward_batched() {
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .for_n(3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
+    graph.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+
+    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    for (i, v) in g.iter().enumerate() {
+        assert!((v - 8.0).abs() < 1e-5, "elem {i} grad: want 8, got {v}");
+    }
+}
+
+#[test]
+fn test_loop_traces_batched_keep_full_batch() {
+    // Regression guard, not a bug hunt: traces hold one Variable per iteration,
+    // and a future memory optimization that narrowed or reduced them (keeping
+    // one row, or a summary) would still satisfy every batch-1 trace test. The
+    // shape assertion is what pins the whole batch; the row-distinct values pin
+    // that iterations do not mix rows.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(TracingDoubler::new())
+        .for_n(3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    let traces = graph.traces("any").unwrap();
+    assert_eq!(traces.len(), 3, "3 iterations = 3 traces");
+
+    // Doubling row-wise each iteration: 2x, 4x, 8x of the original rows.
+    for (iter, trace) in traces.iter().enumerate() {
+        assert_eq!(
+            trace.shape(),
+            vec![2, 2],
+            "trace {iter} must keep the whole batch"
+        );
+        let factor = 2.0f32.powi(iter as i32 + 1);
+        let d = trace.data().to_f32_vec().unwrap();
+        for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
+            let want = base * factor;
+            assert!(
+                (d[i] - want).abs() < 1e-4,
+                "trace {iter} elem {i}: want {want}, got {}",
+                d[i]
+            );
+        }
+    }
+}

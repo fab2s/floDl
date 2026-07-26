@@ -571,8 +571,17 @@ impl FlowBuilder {
         LoopBuilder::new(self, Box::new(body))
     }
 
-    /// Hard routing: router selects one branch, others are skipped.
-    /// Router must output a scalar 0-based branch index.
+    /// Hard routing: only the selected branch(es) run, the rest are skipped.
+    ///
+    /// The router emits 0-based branch indices — either a single scalar index
+    /// for the whole stream, or one index per row of dim 0, which dispatches
+    /// each sample to its own branch and runs only the branches that received
+    /// rows.
+    ///
+    /// Under per-sample routing a branch sees only its own rows, so any
+    /// batch-dependent layer inside it (BatchNorm especially) computes
+    /// statistics over that sub-batch, and a branch that received no rows does
+    /// not run — no buffer update, no gradient for it that step.
     pub fn switch(
         self,
         router: impl Module + 'static,

@@ -15,6 +15,26 @@ pub(crate) type NodeFn = Box<dyn Fn(&[Variable]) -> Result<Vec<Variable>>>;
 pub(crate) type RefForwardFn =
     Rc<dyn Fn(&Variable, &HashMap<String, Variable>) -> Result<Variable>>;
 
+/// Sum Using refs into the stream, in ref-name order.
+///
+/// The order is load-bearing: `HashMap` iteration order is randomized per
+/// process, and float addition is not associative, so summing refs in map
+/// order makes the result differ run to run at the same seed. That is visible
+/// in soft routing weights and can flip a discrete branch choice outright in
+/// hard routing, so named-ref accumulation always walks a sorted key list.
+pub(crate) fn sum_named_refs(
+    input: &Variable,
+    refs: &HashMap<String, Variable>,
+) -> Result<Variable> {
+    let mut names: Vec<&String> = refs.keys().collect();
+    names.sort();
+    let mut combined = input.clone();
+    for name in names {
+        combined = combined.add(&refs[name])?;
+    }
+    Ok(combined)
+}
+
 /// Named per-iteration trace buffers, keyed by emit name.
 /// Populated by loop nodes whose body implements [`crate::nn::LoopBody`]
 /// and publishes via [`crate::nn::TraceEmit::publish`]. Distinct from

@@ -9,6 +9,32 @@ use crate::tensor::Result;
 use super::node::*;
 use super::FlowBuilder;
 
+/// Read a loop condition's halt decision for one iteration.
+///
+/// The loop advances a single state tensor for the whole batch, so the halt
+/// decision is batch-level and the condition must resolve to one number. A
+/// per-sample condition output is rejected loudly rather than silently letting
+/// row 0 decide the iteration count for every sample.
+fn halt_decision(halt: &Variable, iteration: usize) -> Result<bool> {
+    let data = halt.data();
+    if data.numel() != 1 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "loop condition at iteration {}: condition returned {} values (shape \
+             {:?}) but the loop halts for the whole batch — reduce the condition to \
+             a single scalar (e.g. mean over the batch)",
+            iteration,
+            data.numel(),
+            halt.shape()
+        )));
+    }
+    let value = data.item().map_err(|e| {
+        crate::tensor::TensorError::new(&format!(
+            "loop condition at iteration {iteration}: {e}"
+        ))
+    })?;
+    Ok(value > 0.0)
+}
+
 /// Builder for loop constructs. Created by [`FlowBuilder::loop_body`].
 pub struct LoopBuilder {
     fb: FlowBuilder,
@@ -275,13 +301,7 @@ fn make_while_loop_func(
         body.reset();
         for i in 0..max_iter {
             let halt = cond.forward(&state)?;
-            let halt_val = halt.data().to_f32_vec().map_err(|e| {
-                crate::tensor::TensorError::new(&format!(
-                    "loop condition at iteration {}: {}",
-                    i, e
-                ))
-            })?;
-            if !halt_val.is_empty() && halt_val[0] > 0.0 {
+            if halt_decision(&halt, i)? {
                 break;
             }
             state = dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf)
@@ -315,13 +335,7 @@ fn make_until_loop_func(
             // Skip condition check on last iteration
             if i < max_iter - 1 {
                 let halt = cond.forward(&state)?;
-                let halt_val = halt.data().to_f32_vec().map_err(|e| {
-                    crate::tensor::TensorError::new(&format!(
-                        "loop condition at iteration {}: {}",
-                        i, e
-                    ))
-                })?;
-                if !halt_val.is_empty() && halt_val[0] > 0.0 {
+                if halt_decision(&halt, i)? {
                     break;
                 }
             }

@@ -625,3 +625,101 @@ impl Module for TracingDoubler {
 
 
 
+
+// --- Batched merge and ref wiring ---
+//
+// Both combine tensors, and at batch size 1 a row-wise combination and a
+// broadcast of row 0 agree. Row-distinct inputs are what separate them.
+
+#[test]
+fn test_split_merge_mean_batched() {
+    let graph = FlowBuilder::from(Identity)
+        .split(vec![Box::new(Doubler), Box::new(Tripler)])
+        .merge(MergeOp::Mean)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
+        let want = base * 2.5; // (2x + 3x) / 2, row by row
+        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_using_ref_is_row_wise_batched() {
+    let graph = FlowBuilder::from(Identity)
+        .tag("ctx")
+        .through(AddRefModule)
+        .using(&["ctx"])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
+        let want = base * 2.0; // stream + ctx, and ctx is the stream here
+        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_split_merge_add_batched() {
+    // MergeOp::Add is element-wise today, so this cannot fail against the
+    // current implementation. It is here as a regression guard: `gate` in this
+    // same module already vectorizes a combine via stack + broadcast + sum_dim,
+    // and if the merge machinery ever gets that treatment, per-row correctness
+    // stops being free. Mean was covered; Add is the other half of the path.
+    let graph = FlowBuilder::from(Identity)
+        .split(vec![Box::new(Doubler), Box::new(Tripler)])
+        .merge(MergeOp::Add)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
+        let want = base * 5.0; // 2x + 3x, row by row
+        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_fork_batched_main_and_side_are_row_wise() {
+    // Fork hands the same batch to a side module while the main stream carries
+    // on. Row-distinct values pin that neither path mixes rows, and that
+    // advancing the main stream does not disturb the side output — `Tensor`'s
+    // Clone is shallow, so aliasing is precisely the hazard a future in-place
+    // optimization on either path would introduce.
+    let graph = FlowBuilder::from(Identity)
+        .fork(Tripler)
+        .tag("side")
+        .through(Doubler)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, -2.0, 10.0, -20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    let main = y.data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, -2.0, 10.0, -20.0].iter().enumerate() {
+        let want = base * 2.0;
+        assert!((main[i] - want).abs() < 1e-5, "main elem {i}: want {want}, got {}", main[i]);
+    }
+
+    let side = graph.tagged("side").unwrap().data().to_f32_vec().unwrap();
+    for (i, base) in [1.0f32, -2.0, 10.0, -20.0].iter().enumerate() {
+        let want = base * 3.0;
+        assert!((side[i] - want).abs() < 1e-5, "side elem {i}: want {want}, got {}", side[i]);
+    }
+}

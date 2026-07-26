@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::autograd::Variable;
 use crate::nn::Module;
-use crate::tensor::Result;
+use crate::tensor::{Result, Tensor, TensorError};
 
 use super::node::*;
 use super::FlowBuilder;
@@ -80,6 +80,64 @@ pub(super) fn wire_switch(
     fb
 }
 
+/// Validate one raw router output value as a 0-based branch index.
+///
+/// `row` names the offending sample when the router routes per-sample, so a
+/// bad index points at the row that produced it instead of the whole batch.
+fn branch_index(value: f64, n_branches: usize, row: Option<usize>) -> Result<usize> {
+    let at = match row {
+        Some(r) => format!(" for row {r}"),
+        None => String::new(),
+    };
+    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 {
+        return Err(TensorError::new(&format!(
+            "switch: router produced {value}{at}, which is not a whole 0-based \
+             branch index"
+        )));
+    }
+    let idx = value as usize;
+    if idx >= n_branches {
+        return Err(TensorError::new(&format!(
+            "switch: router selected branch {}{} but only {} branches exist",
+            idx,
+            at,
+            n_branches
+        )));
+    }
+    Ok(idx)
+}
+
+/// Bucket row ids by the branch each row selected, preserving row order.
+fn group_rows(idx: &[f64], n_branches: usize) -> Result<Vec<Vec<i64>>> {
+    let mut groups = vec![Vec::new(); n_branches];
+    for (row, &value) in idx.iter().enumerate() {
+        groups[branch_index(value, n_branches, Some(row))?].push(row as i64);
+    }
+    Ok(groups)
+}
+
+/// The single branch every row picked, if the routing is unanimous.
+fn unanimous(groups: &[Vec<i64>]) -> Option<usize> {
+    let mut hit = None;
+    for (b, rows) in groups.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        if hit.is_some() {
+            return None;
+        }
+        hit = Some(b);
+    }
+    hit
+}
+
+/// Route a stream through the branch(es) its router selected.
+///
+/// A selector may emit either a scalar index — one branch for the whole
+/// stream — or one index per row of dim 0, which dispatches each sample to
+/// its own branch. Per-sample dispatch gathers each branch's rows, runs only
+/// the branches that actually received rows, then restores the original row
+/// order. Unselected branches never run: that is the compute saving.
 fn switch_route(
     router: &Rc<dyn Module>,
     stream: &Variable,
@@ -96,16 +154,83 @@ fn switch_route(
         router.forward(stream)?
     };
 
-    let idx = route_out.data().item()? as usize;
-    if idx >= branches.len() {
-        return Err(crate::tensor::TensorError::new(&format!(
-            "switch: router selected branch {} but only {} branches exist",
-            idx,
-            branches.len()
+    let route_data = route_out.data();
+    if route_data.numel() == 0 {
+        return Err(TensorError::new(&format!(
+            "switch: router emitted no branch index (stream shape {:?})",
+            stream.shape()
+        )));
+    }
+    // to_f64_vec casts on device, so f32 selectors and Int64 argmax outputs
+    // both arrive as exact whole numbers rather than reinterpreted bytes.
+    let idx = route_data.to_f64_vec()?;
+
+    // Scalar index: the batch is the unit of decision. Cheapest path — no
+    // gather, no reassembly, and the only shape a 1-D (unbatched) stream can
+    // produce.
+    if idx.len() == 1 {
+        return branches[branch_index(idx[0], branches.len(), None)?].forward(stream);
+    }
+
+    let shape = stream.shape();
+    let rows = shape.first().copied().unwrap_or(0);
+    if idx.len() as i64 != rows {
+        return Err(TensorError::new(&format!(
+            "switch: router emitted {} branch indices but the stream has {} rows \
+             (shape {:?}) — a selector must emit either one scalar index for the \
+             whole batch or exactly one index per row",
+            idx.len(),
+            rows,
+            shape
         )));
     }
 
-    branches[idx].forward(stream)
+    let groups = group_rows(&idx, branches.len())?;
+
+    // Every row picked the same branch: equivalent to the scalar path, and
+    // gathering would only copy the batch to hand back the same rows in the
+    // same order.
+    if let Some(b) = unanimous(&groups) {
+        return branches[b].forward(stream);
+    }
+
+    let device = stream.device();
+    let mut order: Vec<i64> = Vec::with_capacity(rows as usize);
+    let mut outputs: Vec<Variable> = Vec::new();
+    for (b, branch_rows) in groups.iter().enumerate() {
+        if branch_rows.is_empty() {
+            continue;
+        }
+        let index = Tensor::from_i64(branch_rows, &[branch_rows.len() as i64], device)?;
+        let sub_batch = stream.index_select(0, &index)?;
+        outputs.push(branches[b].forward(&sub_batch)?);
+        order.extend_from_slice(branch_rows);
+    }
+
+    let branch_outputs: Vec<&Variable> = outputs.iter().collect();
+    let grouped = Variable::cat_many(&branch_outputs, 0).map_err(|e| {
+        TensorError::new(&format!(
+            "switch: could not reassemble per-sample branch outputs ({e}) — every \
+             branch must map a row to the same output shape"
+        ))
+    })?;
+    if grouped.shape().first().copied().unwrap_or(0) != rows {
+        return Err(TensorError::new(&format!(
+            "switch: branches returned {} rows for a {}-row stream — per-sample \
+             routing needs one output row per input row",
+            grouped.shape().first().copied().unwrap_or(0),
+            rows
+        )));
+    }
+
+    // Branch outputs are stacked in branch order; invert the gather order to
+    // put every row back where it came from. index_select carries gradients,
+    // so the reorder stays inside the autograd graph.
+    let mut inverse = vec![0i64; rows as usize];
+    for (position, &row) in order.iter().enumerate() {
+        inverse[row as usize] = position as i64;
+    }
+    grouped.index_select(0, &Tensor::from_i64(&inverse, &[rows], device)?)
 }
 
 fn make_switch_func(

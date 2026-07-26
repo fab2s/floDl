@@ -37,11 +37,7 @@ impl NamedInputModule for StateAdd {
         input: &Variable,
         refs: &HashMap<String, Variable>,
     ) -> Result<Variable> {
-        let mut result = input.clone();
-        for v in refs.values() {
-            result = result.add(v)?;
-        }
-        Ok(result)
+        super::node::sum_named_refs(input, refs)
     }
 
 }

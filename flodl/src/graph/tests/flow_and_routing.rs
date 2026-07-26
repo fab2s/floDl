@@ -354,6 +354,91 @@ fn test_gate_equal_weights() {
     assert!((data[1] - 10.0).abs() < 1e-5, "gate[1]=10, got {}", data[1]);
 }
 
+// --- Batched soft routing ---
+//
+// Issue #32 hid behind batch size 1 in every switch test. The same blind spot
+// covers `gate`: with `[1, N]` weights broadcasting over `[1, D, N]` expert
+// outputs, correct per-sample gating and a broadcast that applies one row's
+// weights to the whole batch produce identical numbers. Row-distinct weights
+// over more than one row are what make the contract observable at all.
+
+/// Gives each row its own expert weights: even rows favour expert 0, odd rows
+/// favour expert 1. Row-distinct by construction, so any cross-row mixing or
+/// mis-broadcast changes the result.
+struct RowRouter;
+impl Module for RowRouter {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let rows = input.shape()[0];
+        let mut w = Vec::with_capacity(rows as usize * 2);
+        for r in 0..rows {
+            if r % 2 == 0 {
+                w.extend_from_slice(&[0.25, 0.75]);
+            } else {
+                w.extend_from_slice(&[0.75, 0.25]);
+            }
+        }
+        Ok(Variable::new(from_f32(&w, &[rows, 2]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+#[test]
+fn test_gate_weights_are_per_sample() {
+    let graph = FlowBuilder::from(Identity)
+        .gate(RowRouter, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 10.0, 20.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![2, 2]);
+
+    // row 0: 0.25*2x + 0.75*3x = 2.75x ; row 1: 0.75*2x + 0.25*3x = 2.25x.
+    // Swapping the rows' weights would give 2.25x / 2.75x instead.
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, want) in [2.75, 5.5, 22.5, 45.0].iter().enumerate() {
+        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
+#[test]
+fn test_gate_backward_batched() {
+    // Every row must receive gradient through its own mixture weights.
+    let graph = FlowBuilder::from(Identity)
+        .gate(RowRouter, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
+    graph.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+
+    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    for (i, want) in [2.75, 2.75, 2.25, 2.25].iter().enumerate() {
+        assert!((g[i] - want).abs() < 1e-4, "elem {i} grad: want {want}, got {}", g[i]);
+    }
+}
+
+#[test]
+fn test_threshold_halt_batched_is_whole_batch() {
+    // ThresholdHalt reduces over the whole state (max of all elements), so one
+    // hot row halts the batch. That is the documented contract, pinned here so
+    // a later per-row reading has to confront it deliberately rather than
+    // discover it. Per-sample halting would need masked state updates.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .while_cond(ThresholdHalt::new(50.0), 5)
+        .build()
+        .unwrap();
+
+    // Row 1 already exceeds the threshold, so no row iterates.
+    let x = Variable::new(from_f32(&[1.0, 2.0, 60.0, 70.0], &[2, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    let d = y.data().to_f32_vec().unwrap();
+    for (i, want) in [1.0, 2.0, 60.0, 70.0].iter().enumerate() {
+        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+    }
+}
+
 #[test]
 fn test_gate_backward() {
     let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
@@ -491,6 +576,202 @@ fn test_argmax_selector_switch() {
     assert_eq!(graph.parameters().len(), 2);
 }
 
+// --- Per-sample switch routing (issue #32) ---
+
+/// Routes each row by the sign of its first feature: negative → branch 0,
+/// non-negative → branch 1. Deterministic, so dispatch is assertable.
+pub(super) struct SignSelector;
+impl Module for SignSelector {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let rows = input.shape()[0];
+        let data = input.data().to_f32_vec()?;
+        let cols = data.len() / rows as usize;
+        let idx: Vec<f32> = (0..rows as usize)
+            .map(|r| if data[r * cols] < 0.0 { 0.0 } else { 1.0 })
+            .collect();
+        Ok(Variable::new(from_f32(&idx, &[rows]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+/// Emits `count` indices regardless of the stream's row count.
+struct BadCountSelector { count: i64 }
+impl Module for BadCountSelector {
+    fn forward(&self, _input: &Variable) -> Result<Variable> {
+        let idx = vec![0.0f32; self.count as usize];
+        Ok(Variable::new(from_f32(&idx, &[self.count]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+/// Emits a per-row index that names a branch that does not exist.
+struct OutOfRangeSelector;
+impl Module for OutOfRangeSelector {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let rows = input.shape()[0];
+        let mut idx = vec![0.0f32; rows as usize];
+        idx[1] = 7.0; // row 1 asks for branch 7
+        Ok(Variable::new(from_f32(&idx, &[rows]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+#[test]
+fn test_switch_per_sample_dispatch() {
+    // Rows 0 and 2 are negative → Doubler; rows 1 and 3 → Tripler.
+    let graph = FlowBuilder::from(Identity)
+        .switch(SignSelector, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(
+        from_f32(&[-1.0, -2.0, 1.0, 2.0, -3.0, -4.0, 3.0, 4.0], &[4, 2]),
+        false,
+    );
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![4, 2]);
+
+    // Each row must carry its own branch's factor, in the original row order.
+    let d = y.data().to_f32_vec().unwrap();
+    let expect = [
+        -2.0, -4.0, // row 0: doubled
+        3.0, 6.0,   // row 1: tripled
+        -6.0, -8.0, // row 2: doubled
+        9.0, 12.0,  // row 3: tripled
+    ];
+    for (i, want) in expect.iter().enumerate() {
+        assert!(
+            (d[i] - want).abs() < 1e-5,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
+    }
+}
+
+#[test]
+fn test_switch_per_sample_gradient() {
+    // Gradients must reach every row through whichever branch ran it.
+    let graph = FlowBuilder::from(Identity)
+        .switch(SignSelector, vec![Box::new(Doubler), Box::new(Tripler)])
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[-1.0, -2.0, 1.0, 2.0], &[2, 2]), true);
+    let y = graph.forward(&x).unwrap();
+    y.sum().unwrap().backward().unwrap();
+
+    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    // Row 0 went through Doubler (d/dx = 2), row 1 through Tripler (d/dx = 3).
+    assert!((g[0] - 2.0).abs() < 1e-5, "row 0 grad: got {}", g[0]);
+    assert!((g[1] - 2.0).abs() < 1e-5, "row 0 grad: got {}", g[1]);
+    assert!((g[2] - 3.0).abs() < 1e-5, "row 1 grad: got {}", g[2]);
+    assert!((g[3] - 3.0).abs() < 1e-5, "row 1 grad: got {}", g[3]);
+}
+
+#[test]
+fn test_argmax_selector_emits_one_index_per_sample() {
+    // Regression for issue #32: the selector used to flatten [B, n] logits and
+    // return a single flat argmax, so the "branch index" scaled with batch size.
+    let sel = ArgmaxSelector::on_device(3, 2, crate::tensor::test_device()).unwrap();
+    let x = Variable::new(
+        from_f32(
+            &[
+                1.0, 2.0, 3.0, -1.0, -2.0, -3.0, 0.5, 0.0, -0.5, 4.0, -4.0, 1.0, 2.0,
+                2.0, 2.0, -1.0, 3.0, 0.0,
+            ],
+            &[6, 3],
+        ),
+        false,
+    );
+
+    let out = sel.forward(&x).unwrap();
+    assert_eq!(out.data().numel(), 6, "one branch index per row, not one flat index");
+    for v in out.data().to_f64_vec().unwrap() {
+        assert!((0.0..2.0).contains(&v), "branch index {v} outside [0, 2)");
+    }
+}
+
+#[test]
+fn test_argmax_selector_switch_batched() {
+    // The issue #32 reproduction, scaled down: batch >> branch count used to
+    // yield an out-of-bounds branch index.
+    let graph = FlowBuilder::from(Linear::on_device(16, 8, crate::tensor::test_device()).unwrap())
+        .switch(
+            ArgmaxSelector::on_device(8, 2, crate::tensor::test_device()).unwrap(),
+            vec![
+                Box::new(Linear::on_device(8, 8, crate::tensor::test_device()).unwrap()),
+                Box::new(Linear::on_device(8, 8, crate::tensor::test_device()).unwrap()),
+            ],
+        )
+        .build()
+        .unwrap();
+
+    let x = Variable::new(
+        Tensor::randn(&[32, 16], crate::tensor::test_opts()).unwrap(),
+        false,
+    );
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![32, 8], "every input row must yield one output row");
+}
+
+#[test]
+fn test_switch_index_count_mismatch_errors() {
+    let graph = FlowBuilder::from(Identity)
+        .switch(
+            BadCountSelector { count: 3 },
+            vec![Box::new(Doubler), Box::new(Tripler)],
+        )
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let err = graph.forward(&x).unwrap_err().to_string();
+    assert!(
+        err.contains("3 branch indices") && err.contains("2 rows"),
+        "error must name the mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn test_switch_per_sample_out_of_range_errors() {
+    let graph = FlowBuilder::from(Identity)
+        .switch(
+            OutOfRangeSelector,
+            vec![Box::new(Doubler), Box::new(Tripler)],
+        )
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let err = graph.forward(&x).unwrap_err().to_string();
+    assert!(
+        err.contains("branch 7") && err.contains("row 1"),
+        "error must name the branch and the offending row, got: {err}"
+    );
+}
+
+#[test]
+fn test_argmax_selector_accepts_using_refs() {
+    // ArgmaxSelector implements NamedInputModule, so .using() on a switch it
+    // routes must build — the tutorial documents exactly this shape.
+    let graph = FlowBuilder::from(Linear::on_device(4, 6, crate::tensor::test_device()).unwrap())
+        .tag("features")
+        .switch(
+            ArgmaxSelector::on_device(6, 2, crate::tensor::test_device()).unwrap(),
+            vec![
+                Box::new(Linear::on_device(6, 6, crate::tensor::test_device()).unwrap()),
+                Box::new(Linear::on_device(6, 6, crate::tensor::test_device()).unwrap()),
+            ],
+        )
+        .using(&["features"])
+        .build()
+        .expect("switch with ArgmaxSelector must accept .using() refs");
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![1, 6]);
+}
+
 // --- Halt tests ---
 
 
@@ -560,5 +841,91 @@ fn test_learned_halt_parameters() {
     // Body Linear: 2 params, LearnedHalt Linear(2→1): 2 params = 4
     let params = graph.parameters();
     assert_eq!(params.len(), 4);
+}
+
+/// Halt condition that returns one value per row instead of a scalar.
+struct PerRowHalt;
+impl Module for PerRowHalt {
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let rows = input.shape()[0];
+        Ok(Variable::new(from_f32(&vec![-1.0; rows as usize], &[rows]), false))
+    }
+    fn parameters(&self) -> Vec<Parameter> { vec![] }
+}
+
+#[test]
+fn test_learned_halt_pools_batched_state() {
+    // A batched state gives LearnedHalt one probe per row; it must pool them
+    // into the single scalar the loop needs instead of letting row 0 decide.
+    let halt = LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap();
+    let batched = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]), false);
+
+    let decision = halt.forward(&batched).unwrap();
+    assert_eq!(
+        decision.data().numel(),
+        1,
+        "halt decision must be one scalar for the whole batch"
+    );
+}
+
+#[test]
+fn test_learned_halt_loop_runs_batched() {
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+        .while_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![3, 2]);
+}
+
+#[test]
+fn test_loop_rejects_non_scalar_condition() {
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .while_cond(PerRowHalt, 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let err = graph.forward(&x).unwrap_err().to_string();
+    assert!(
+        err.contains("2 values") && err.contains("whole batch"),
+        "error must explain the scalar contract, got: {err}"
+    );
+}
+
+#[test]
+fn test_loop_until_rejects_non_scalar_condition() {
+    // until_cond reads the condition on a different code path than while_cond.
+    // Both were changed to reject a per-row halt decision, so both are pinned.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Doubler)
+        .until_cond(PerRowHalt, 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), false);
+    let err = graph.forward(&x).unwrap_err().to_string();
+    assert!(
+        err.contains("2 values") && err.contains("whole batch"),
+        "error must explain the scalar contract, got: {err}"
+    );
+}
+
+#[test]
+fn test_loop_until_batched_pooled_halt() {
+    // The until path with a batched state and a pooling condition.
+    let graph = FlowBuilder::from(Identity)
+        .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
+        .until_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 3)
+        .build()
+        .unwrap();
+
+    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]), false);
+    let y = graph.forward(&x).unwrap();
+    assert_eq!(y.shape(), vec![3, 2]);
 }
 
