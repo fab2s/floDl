@@ -28,6 +28,7 @@ pub mod event_lane;
 pub mod format;
 pub mod record;
 pub mod record_log;
+pub mod record_store;
 pub mod resources;
 pub mod timeline;
 mod server;
@@ -395,6 +396,18 @@ impl Monitor {
         port: u16,
     ) -> std::io::Result<()> {
         self.bind_dashboard_locally(port)
+    }
+
+    /// Feed path-keyed monitor records into the dashboard's record plane,
+    /// where they serve `/node` / `/history` / `/stream?path=`.
+    ///
+    /// No-op when no server is bound, so a headless run pays nothing. The
+    /// caller keeps owning persistence — this is the *live* half of the
+    /// stream, [`crate::monitor::record_log::RecordLog`] is the durable one.
+    pub(crate) fn push_records(&mut self, records: Vec<serde_json::Value>) {
+        if let Some(ref srv) = self.server {
+            srv.push_records(records);
+        }
     }
 
     /// Shut the dashboard's HTTP server down + emit the SSE `complete`
