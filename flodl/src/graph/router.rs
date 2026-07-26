@@ -60,11 +60,7 @@ impl NamedInputModule for SoftmaxRouter {
         input: &Variable,
         refs: &HashMap<String, Variable>,
     ) -> Result<Variable> {
-        let mut combined = input.clone();
-        for v in refs.values() {
-            combined = combined.add(v)?;
-        }
-        self.forward(&combined)
+        self.forward(&super::node::sum_named_refs(input, refs)?)
     }
 }
 
@@ -112,11 +108,7 @@ impl NamedInputModule for SigmoidRouter {
         input: &Variable,
         refs: &HashMap<String, Variable>,
     ) -> Result<Variable> {
-        let mut combined = input.clone();
-        for v in refs.values() {
-            combined = combined.add(v)?;
-        }
-        self.forward(&combined)
+        self.forward(&super::node::sum_named_refs(input, refs)?)
     }
 }
 
@@ -147,10 +139,18 @@ impl Module for FixedSelector {
 
 /// Learnable branch selector for Switch via argmax.
 ///
-/// Projects input to `num_branches` logits and selects the one with
-/// the highest value. Selection is non-differentiable — gradients flow
-/// through the selected branch only. The projection parameters are
-/// included in Parameters() for policy-gradient training.
+/// Projects input to `num_branches` logits and selects the highest one
+/// **per sample**: a `[Batch, features]` stream yields one branch index per
+/// row, so each sample is routed to its own branch and only the branches that
+/// received rows run. An unbatched `[features]` stream yields a single index.
+/// Selection is non-differentiable — gradients flow through whichever branch
+/// each sample was routed to. The projection parameters are included in
+/// Parameters() for policy-gradient training.
+///
+/// Routing is per row of dim 0. A stream with more than one leading dim
+/// (e.g. `[Batch, Time, features]`) yields one index per (row, step), which
+/// Switch rejects with a loud error rather than misroute — flatten the
+/// leading dims into rows first if per-step routing is what you want.
 pub struct ArgmaxSelector {
     proj: Rc<Linear>,
 }
@@ -174,20 +174,29 @@ impl Module for ArgmaxSelector {
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let logits = self.proj.forward(input)?;
-        let data = logits.data().to_f32_vec()?;
-        let best = data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        Ok(Variable::new(
-            Tensor::from_f32(&[best as f32], &[1], input.device())?,
-            false,
-        ))
+        let data = logits.data();
+        // Reduce over the branch-logit dim only: [B, n] -> [B] (one index per
+        // sample), [n] -> scalar. Flattening first would make the index depend
+        // on batch size instead of naming a branch.
+        let dim = data.ndim() as i32 - 1;
+        Ok(Variable::new(data.argmax(dim, false)?, false))
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
         vec![self.proj.clone()]
+    }
+
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
+}
+
+impl NamedInputModule for ArgmaxSelector {
+    fn forward_named(
+        &self,
+        input: &Variable,
+        refs: &HashMap<String, Variable>,
+    ) -> Result<Variable> {
+        self.forward(&super::node::sum_named_refs(input, refs)?)
     }
 }

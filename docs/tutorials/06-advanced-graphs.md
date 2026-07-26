@@ -331,10 +331,28 @@ let g = FlowBuilder::from(Linear::new(4, 8)?).tag("features")
 
 Key properties:
 
-- **The router returns a 0-based branch index.**
-- **Selection is non-differentiable.** Gradients flow through the
-  selected branch only.
+- **The router returns 0-based branch indices** — either a single scalar
+  index for the whole stream, or one index per row of dim 0.
+- **Per-sample routing is the batched default.** With one index per row,
+  each sample goes to its own branch, only the branches that received rows
+  run, and rows come back in their original order. `ArgmaxSelector` routes
+  per sample; `FixedSelector` emits a scalar.
+- **Selection is non-differentiable.** Gradients flow through whichever
+  branch each sample was routed to.
 - **Using refs go to the router**, not the branches.
+
+A selector that emits neither one index nor one-per-row is a loud error, as
+is a per-row index naming a branch that does not exist (the error names the
+offending row).
+
+One consequence of per-sample routing to keep in mind: a branch sees only the
+rows routed to it, so batch-dependent layers inside a branch (BatchNorm above
+all) compute their statistics over that sub-batch, not the full batch - and a
+branch that received no rows does not run at all, so its buffers do not update
+and its parameters get no gradient that step. This is inherent to conditional
+computation, not a flodl quirk, but it means a branch that wins only a couple
+of rows per batch trains on very noisy statistics. Prefer LayerNorm inside
+switch branches, or keep the routing distribution balanced.
 
 ### Built-in selectors
 
@@ -344,11 +362,17 @@ Key properties:
 switch(FixedSelector::new(0), modules![branch_a, branch_b])
 ```
 
-**ArgmaxSelector(dim, n)** - learnable projection, picks highest logit:
+**ArgmaxSelector(dim, n)** - learnable projection, picks the highest logit
+per sample:
 
 ```rust
 switch(ArgmaxSelector::new(hidden, 3)?, modules![...])
 ```
+
+Routing is per row of dim 0. A stream with extra leading dims (for example
+`[Batch, Time, features]`) yields one index per (row, step), which switch
+rejects rather than misroute - flatten the leading dims into rows first if
+per-step routing is what you want.
 
 ### Build-time validation
 

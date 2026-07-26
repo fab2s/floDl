@@ -46,6 +46,12 @@ impl Module for ThresholdHalt {
 /// A linear probe projects the state to a scalar — iteration stops when
 /// the output is positive. Fully differentiable.
 ///
+/// The decision is **batch-level**: a loop advances one state tensor for every
+/// sample together, so a batched state's per-sample probe outputs are averaged
+/// into the single scalar the loop needs. Per-sample halting (true ACT, where
+/// each sample stops on its own iteration) would need masked state updates and
+/// is not what this construct does.
+///
 /// ```ignore
 /// FlowBuilder::from(body)
 ///     .loop_body(body).until_cond(LearnedHalt::new(hidden_dim)?, 20)
@@ -72,7 +78,14 @@ impl Module for LearnedHalt {
     fn name(&self) -> &str { "learned_halt" }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        self.proj.forward(input)
+        let probe = self.proj.forward(input)?;
+        if probe.data().numel() == 1 {
+            return Ok(probe);
+        }
+        // Batched state: pool the per-sample probes rather than let row 0
+        // decide the iteration count for the whole batch. mean() keeps every
+        // sample in the gradient path.
+        probe.mean()
     }
 
     fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
