@@ -401,6 +401,10 @@ fn gitignore_template(mode: Mode) -> String {
 # Local fdl config (fdl.yml.example is committed; fdl copies it on first run)
 fdl.yml
 fdl.yaml
+
+# Local docker-compose env (per-machine: UID/GID, libtorch variant override,
+# cargo job throttle)
+.env
 ",
     );
     match mode {
@@ -451,6 +455,11 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     working_dir: /workspace
     stdin_open: true
     tty: true
+    environment:
+      # Throttle cargo's link parallelism. Unset on Linux native (empty →
+      # cargo's default); Mac hosts set it in `.env` to keep `ld` within what
+      # a virtiofs-backed workspace can serve. See docs/mac-apple-silicon.md.
+      - CARGO_BUILD_JOBS
 
   cuda:
     build:
@@ -491,6 +500,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     working_dir: /workspace
     stdin_open: true
     tty: true
+    environment:
+      # Throttle cargo's link parallelism. Required on macOS Docker / OrbStack,
+      # where the virtiofs-mounted libtorch directory cannot serve many
+      # concurrent `ld` lookups — the linker reports `cannot find -ltorch`
+      # spuriously. Unset on Linux native (empty → cargo's default).
+      - CARGO_BUILD_JOBS
 
   cuda:
     build:
