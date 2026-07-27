@@ -3,9 +3,11 @@ docker: cuda
 # Cargo entry: `compile: true` lets fdl auto-probe the binary's own
 # `--fdl-schema` output, so `fdl ddp-bench --help` (and tab-completion) reflect
 # the actual CLI — the binary is the single source of truth, no hand-written
-# schema to drift out of sync with the code. The first `-h` after an fdl.yml
-# change compiles once in the cuda container; the result is then cached
-# (.fdl/schema-cache/, gitignored) and subsequent `-h` are fast.
+# schema to drift out of sync with the code. The first `-h` after this file OR
+# any of the crate's sources change compiles once in the cuda container; the
+# result is then cached (.fdl/schema-cache/, gitignored) and subsequent `-h`
+# are fast. Adding a flag therefore shows up in `-h` on its own — no yml touch,
+# no manual cache delete.
 compile: true
 entry: cargo run --release --features cuda --
 
