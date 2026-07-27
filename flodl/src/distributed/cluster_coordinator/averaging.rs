@@ -17,6 +17,21 @@ use crate::tensor::Result;
 
 use super::{ClusterCoordinator, EpochDSummary};
 
+/// The epoch a reduce cycle's work belongs to.
+///
+/// `last_aggregated + 1` is the epoch in flight — until the final epoch has
+/// been aggregated, when nothing is in flight and a reduce still settling
+/// carries the last epoch's residual work. Unclamped, that trailing window
+/// report (and any alert riding the same value) is filed under an epoch the
+/// run never runs: a 40-epoch run ended with a window row labelled epoch 41.
+/// The work in that row is real; the epoch it was filed under was not.
+fn in_flight_epoch(last_aggregated: Option<usize>, num_epochs: usize) -> usize {
+    match last_aggregated {
+        Some(e) => (e + 1).min(num_epochs.saturating_sub(1)),
+        None => 0,
+    }
+}
+
 impl ClusterCoordinator {
     /// Per-AllReduce d-aggregator update. Called once per
     /// `finish_averaging_{nccl,cpu}` after the convergence guard's
@@ -342,7 +357,8 @@ impl ClusterCoordinator {
         // λ̂ from observables now that the guard pipeline is plural.
         let d_raw = report.max_relative_delta();
         self.update_epoch_d_aggregator(d_raw, k_max);
-        let in_flight_epoch = self.last_aggregated_epoch.map(|e| e + 1).unwrap_or(0);
+        let in_flight_epoch =
+            in_flight_epoch(self.last_aggregated_epoch, self.num_epochs);
 
         // `drift` alert. The trigger is the guard's own `NudgeDown` verdict,
         // not a raw `d_raw` threshold invented here: the configured guard IS
@@ -660,5 +676,32 @@ impl ClusterCoordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_flight_epoch;
+
+    /// Rig runs reproduce the trailing window only by timing accident (three
+    /// verification runs across two models never produced one), so the clamp
+    /// is pinned on the arithmetic instead of on a race.
+    #[test]
+    fn in_flight_epoch_never_names_an_epoch_the_run_does_not_run() {
+        // Nothing aggregated yet: epoch 0 is in flight.
+        assert_eq!(in_flight_epoch(None, 40), 0);
+        // Mid-run: the next epoch is genuinely in flight.
+        assert_eq!(in_flight_epoch(Some(0), 40), 1);
+        assert_eq!(in_flight_epoch(Some(38), 40), 39);
+        // The regression: with the final epoch aggregated nothing is in
+        // flight, and a reduce still settling belongs to the last real epoch.
+        // Unclamped this returned 40 on a 40-epoch run (0-based 0..=39),
+        // which the dashboard rendered as "epoch 41".
+        assert_eq!(in_flight_epoch(Some(39), 40), 39);
+        // Single-epoch run: the only valid epoch is 0.
+        assert_eq!(in_flight_epoch(Some(0), 1), 0);
+        // Degenerate epoch count must not underflow.
+        assert_eq!(in_flight_epoch(Some(0), 0), 0);
+        assert_eq!(in_flight_epoch(None, 0), 0);
     }
 }

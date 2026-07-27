@@ -99,7 +99,12 @@ tr.dead td{color:var(--red)}
 .svg-toggle .arrow{transition:transform 0.2s;font-size:10px}
 .svg-toggle.open .arrow{transform:rotate(90deg)}
 .svg-container{max-height:0;overflow:hidden;transition:max-height 0.3s ease;background:#fff;border-radius:6px;margin-top:8px}
-.svg-container svg{width:100%;height:auto}
+/* A deep model's graph is a tall, narrow ribbon (ResNet-56 renders ~272pt
+   wide by ~7500pt high). `width:100%` upscaled that thinness to the card
+   width and multiplied the height by the same factor, so the card grew to
+   tens of thousands of pixels. Render at natural size, shrink only when the
+   graph is genuinely wider than the card, and centre the column. */
+.svg-container svg{max-width:100%;height:auto;display:block;margin:0 auto}
 
 /* Tooltip */
 .tooltip{position:fixed;background:rgba(26,29,39,0.95);color:var(--text);padding:8px 12px;
@@ -171,6 +176,7 @@ animation:pulse 2s ease-in-out infinite}
   <div class="card full-width" id="childrenCard" style="display:none">
     <h2>Children <span class="sub" id="childrenCount"></span>
       <span class="sub">compare</span> <select id="compareMetric" onchange="onCompareChange()"></select></h2>
+    <div class="sub" id="childrenNote" style="display:none;margin-bottom:8px"></div>
     <canvas id="childrenChart"></canvas>
     <div class="legend" id="childrenLegend"></div>
     <div class="scroll-wrap" style="margin-top:12px">
@@ -278,6 +284,9 @@ const GPU_INIT=new Map();
 
 let current=ROOT;
 let levelSse=null;
+// Set when the current level's stream or history fetch could not be reached,
+// so an empty children view can distinguish "not loaded" from "no children".
+let levelUnreachable=false;
 let rootSse=null;
 let compareKey=null;
 const soloState={metricsChart:null,resourceChart:null,childrenChart:null};
@@ -563,6 +572,7 @@ function subscribeRoot(){
 }
 function subscribeLevel(path){
   if(levelSse){levelSse.close();levelSse=null}
+  levelUnreachable=false;
   if(path===ROOT||!rootSse)return;
   const enc=encodeURIComponent(path);
   levelSse=new EventSource('/stream?path='+enc);
@@ -573,12 +583,17 @@ function subscribeLevel(path){
       if(rec.kind!=='event')ingestRecord(rec);
     }catch(err){}
   });
+  // A level's records are fetched when you open it, so once the run's server
+  // is gone a level never visited while live has nothing to show. Remember
+  // that the reach failed so the children view can say so rather than render
+  // as an empty node (see `renderChildren`).
+  levelSse.addEventListener('error',()=>{levelUnreachable=true;scheduleRender()});
   // Subscribe first, then backfill: the same duplicate-over-loss ordering the
   // server uses for its own preamble, and `addRow` absorbs the overlap.
   fetch('/history?path='+enc+'&n='+HISTORY_N)
     .then(r=>r.ok?r.json():[])
     .then(rows=>{for(const r of rows)if(r.kind!=='event')ingestRecord(r)})
-    .catch(()=>{});
+    .catch(()=>{levelUnreachable=true;scheduleRender()});
 }
 
 // --- Header ----------------------------------------------------------------
@@ -638,6 +653,7 @@ function render(){
   document.getElementById('logScope').textContent=
     (recordMode?'epoch + sub-epoch rows, newest first':'epoch rows, newest first')+
     (total>MAX_LOG_ROWS?' — showing newest '+MAX_LOG_ROWS+' of '+total:'');
+  renderHardware();
   drawMetrics();
   drawResources();
   renderChildren();
@@ -756,8 +772,31 @@ function renderChildren(){
   const node=nodeOf(current);
   const kids=childPaths(node);
   const card=document.getElementById('childrenCard');
-  if(!kids.length){card.style.display='none';return}
+  const note=document.getElementById('childrenNote');
+  if(!kids.length){
+    // A node that declares children but has none loaded is not a childless
+    // node — the level was never fetched. Saying so beats hiding the card and
+    // letting it read as "this rank has nothing under it".
+    const declared=node.childCount;
+    if(declared>0){
+      card.style.display='block';
+      note.style.display='block';
+      note.textContent=levelUnreachable
+        ? declared+' children reported, none loaded — the dashboard server is not answering. '+
+          'A level is fetched when you open it, so one never opened while the run was live '+
+          'has no data once the run ends.'
+        : declared+' children reported, waiting for their records…';
+      document.getElementById('childrenCount').textContent=declared;
+      document.getElementById('childrenHeader').innerHTML='';
+      document.getElementById('childrenBody').innerHTML='';
+      drawChart('childrenChart',{},[],{});
+      updateLegend('childrenLegend',[],[],'childrenChart',renderChildren,{});
+      return;
+    }
+    card.style.display='none';return;
+  }
   card.style.display='block';
+  note.style.display='none';
 
   // Level-aware legend: the child's own path segment, plus its label (the GPU
   // model the producer attached) when there is one.
@@ -1138,24 +1177,81 @@ function showMeta(meta){
   card.dataset.have='1';
   card.style.display=current===ROOT?'block':'none';
 }
+// The producer composes one cohort-wide hardware string
+// (`host: <cpu> | gr=N lr=M: <gpu> | host2: <cpu> | …` in cluster mode, plain
+// `<cpu> | <gpu> …` single-process). Kept verbatim as the source of truth and
+// scoped per level by `hwForLevel` below.
+let HARDWARE=null;
 function showHardware(hw){
   if(!hw)return;
+  HARDWARE=hw;
+  renderHardware();
+}
+/// Is this segment of the hardware string a rank's GPU entry?
+function isGpuSeg(s){return /^gr=\d+\s+lr=\d+:/.test(s)}
+/// Host name a `host: <cpu>` segment describes, or null.
+function hostOfSeg(s){const m=s.match(/^([^:]+):\s*(.*)$/);return m&&!isGpuSeg(s)?m[1]:null}
+/// Level-scoped hardware line.
+///
+/// The GPUs a level owns fall straight out of the record plane's depth-1
+/// scoping, so this needs no extra wire data: a rank carries its own `label`,
+/// a host's GPUs are its direct children's labels, and root's direct children
+/// are hosts, which carry none — which is exactly why root reads as CPU-only.
+/// A cohort-wide GPU list at every level was claiming a rank owns three GPUs.
+function hwForLevel(){
+  if(!HARDWARE)return null;
+  const segs=HARDWARE.split(' | ').map(s=>s.trim()).filter(Boolean);
+  if(!recordMode)return HARDWARE;          // no levels to scope to
+  // CPU side: the host this level sits on, or every host at root. The
+  // single-process form carries no `gr=` markers and no host prefixes, so its
+  // GPU segments would otherwise read as CPUs — there, only the first segment
+  // is the CPU and the rest are GPUs the record plane will re-derive.
+  const clustered=segs.some(isGpuSeg);
+  const host=current===ROOT?null:current.split('/')[1];
+  const cpus=clustered
+    ? segs.filter(s=>!isGpuSeg(s))
+          .filter(s=>{const h=hostOfSeg(s);return !host||!h||h===host})
+    : segs.slice(0,1);
+  // GPU side: this node's own label at a leaf, its children's at an interior.
+  const node=nodeOf(current);
+  const gpus=[];
+  if(node.label)gpus.push(node.label);
+  else for(const p of childPaths(node)){const k=NODES.get(p);if(k&&k.label)gpus.push(k.label)}
+  const counted=[];
+  for(const g of gpus){
+    const last=counted[counted.length-1];
+    if(last&&last.name===g)last.n++;else counted.push({name:g,n:1});
+  }
+  return cpus.concat(counted.map(c=>c.n>1?c.n+'x '+c.name:c.name)).join(' | ');
+}
+function renderHardware(){
   const el=document.getElementById('hwInfo');
   if(!el)return;
-  el.textContent=hw;el.style.display='block';
+  const line=hwForLevel();
+  if(!line){el.style.display='none';return}
+  el.textContent=line;el.style.display='block';
 }
+// Opened height is capped to most of the viewport: a deep model's graph is
+// taller than any screen, so the card scrolls internally instead of pushing
+// every other card thousands of pixels down the page.
+function svgOpenHeight(c){return Math.min(c.scrollHeight,Math.round(window.innerHeight*0.7))}
 function showSvg(svg){
   const card=document.getElementById('svgCard'),c=document.getElementById('svgContainer');
   card.dataset.have='1';
   card.style.display=current===ROOT?'block':'none';
   c.innerHTML=svg;
-  if(document.getElementById('svgToggle').classList.contains('open'))c.style.maxHeight=c.scrollHeight+'px';
+  if(document.getElementById('svgToggle').classList.contains('open')){
+    c.style.overflowY='auto';
+    c.style.maxHeight=svgOpenHeight(c)+'px';
+  }
 }
 function toggleSvg(){
   const t=document.getElementById('svgToggle'),c=document.getElementById('svgContainer');
   const opening=!t.classList.contains('open');
   t.classList.toggle('open');
-  c.style.maxHeight=opening?c.scrollHeight+'px':'0';
+  // Hidden while collapsing so the scrollbar doesn't flicker on the way out.
+  c.style.overflowY=opening?'auto':'hidden';
+  c.style.maxHeight=opening?svgOpenHeight(c)+'px':'0';
 }
 function seedGpuInit(list){
   for(const g of list||[]){

@@ -274,7 +274,28 @@ monitor.serve(3000)?;
 monitor.watch(&model);  // generates SVG, sends to dashboard
 ```
 
-The SVG appears in a collapsible section at the bottom of the dashboard.
+The SVG appears in a collapsible section at the bottom of the dashboard. It is
+**run-scoped, not level-scoped**: the architecture describes the whole run, so
+the portal shows it at the root level only and never repeats it per host or per
+rank. The same holds for the "Training Configuration" card fed by
+`set_metadata`.
+
+A deep model's graph is a tall, narrow ribbon (ResNet-56 renders roughly 272 ×
+7500 points), so the card renders it at natural size and scrolls internally
+rather than scaling it to the card width.
+
+`watch` also derives the parameter counts (`total` / `trainable` / `frozen`)
+and publishes them into the same configuration card, so this works with no
+`set_metadata` call at all. When you do call both, order does not matter and
+your own keys win on collision:
+
+```rust
+monitor.set_metadata(serde_json::json!({ "lr": 0.1, "seed": 42 }));
+monitor.watch(&model);   // adds `parameters`, keeps `lr` / `seed`
+```
+
+Graphviz (`dot`) must be installed for the SVG; when it is missing, `watch`
+still publishes the parameter counts and simply omits the drawing.
 
 For a timing-annotated heat map (green/yellow/red by execution time), enable
 profiling during training and use `finish_with`:
