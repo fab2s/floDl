@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use flodl::autograd::Variable;
 use flodl::distributed::{ApplyPolicy, AverageBackend, Trainer};
+use flodl::graph::GraphExt;
 use flodl::monitor::{Monitor, Timeline};
 use flodl::nn::{Module, Optimizer, Parameter};
 use flodl::tensor::{Device, Result, Tensor, TensorError};
@@ -38,6 +39,72 @@ fn is_cluster_launcher() -> bool {
 fn is_cluster_rank() -> bool {
     std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
         && std::env::var_os("FLODL_INTERNAL_LOCAL_RANK").is_some()
+}
+
+/// Give the dashboard the two run-scoped things it can render but cannot
+/// derive: the hyperparameters, and — for graph-built models — the
+/// architecture SVG. Both describe the run as a whole, so the portal shows
+/// them at root only and never breaks them down per node.
+///
+/// Two orderings are load-bearing here:
+///
+/// 1. `set_metadata` *replaces* the metadata blob while `watch()` *merges*
+///    parameter counts into it, so the config must be set before `watch()`
+///    or the merged `total`/`trainable`/`frozen` counts are clobbered.
+/// 2. The SVG probe builds a throwaway replica on `Device::CPU`. The graph
+///    is structure, not weights, so a CPU replica renders exactly what the
+///    ranks train — and CPU keeps this inside the no-CUDA-before-`run`
+///    rule, which this process must obey because on cluster fan-out the
+///    launcher exits without ever training.
+///
+/// Non-graph models (`lenet`, `resnet`) have no graph to draw: `as_graph()`
+/// returns `None` and the card simply stays hidden. Graphviz is likewise
+/// optional — `watch()` is a silent no-op when `dot` is missing, which is
+/// why this is best-effort and never fails the run.
+fn describe_run(
+    monitor: &mut Monitor,
+    model_def: &ModelDef,
+    mode_str: &str,
+    config: &RunConfig,
+    actual_batches: usize,
+) {
+    // `actual_batches`, not `config.batches_per_epoch`: the latter is the CLI
+    // *override* and reads 0 when the run uses the dataset-derived count.
+    let mut meta = serde_json::json!({
+        "model": model_def.name,
+        "mode": mode_str,
+        "epochs": config.epochs,
+        "batch_size": config.batch_size,
+        "batches_per_epoch": actual_batches,
+        "lr": config.lr,
+        "seed": config.seed,
+    });
+    // Optional knobs only when set, so the card stays readable: a field
+    // that is present means someone chose it.
+    if let Some(obj) = meta.as_object_mut() {
+        if config.augment > 1 {
+            obj.insert("augment".into(), config.augment.into());
+        }
+        if let Some(a) = config.max_anchor {
+            obj.insert("max_anchor".into(), a.into());
+        }
+        if let Some(a) = config.min_anchor {
+            obj.insert("min_anchor".into(), a.into());
+        }
+        if config.meta_controller {
+            obj.insert("meta_controller".into(), true.into());
+        }
+    }
+    monitor.set_metadata(meta);
+
+    match (model_def.build)(Device::CPU) {
+        Ok(probe) => {
+            if let Some(graph) = probe.as_graph() {
+                monitor.watch(graph);
+            }
+        }
+        Err(e) => eprintln!("  note: graph architecture unavailable ({e})"),
+    }
 }
 
 /// One-line role banner for operator visibility. Printed once per run
@@ -266,6 +333,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         monitor
             .serve(port)
             .map_err(|e| TensorError::new(&format!("monitor serve: {e}")))?;
+        describe_run(&mut monitor, model_def, &mode_str, config, actual_batches);
     }
 
     let start = Instant::now();

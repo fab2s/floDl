@@ -206,7 +206,14 @@ pub struct Monitor {
     server: Option<server::DashboardServer>,
     save_html: Option<String>,
     svg_snapshot: Option<String>,
+    /// Published blob: [`Self::param_info`] merged under
+    /// [`Self::user_metadata`]. Kept as the single read source for the
+    /// archive + injected constants.
     metadata: Option<serde_json::Value>,
+    /// Exactly what the user handed to [`Self::set_metadata`].
+    user_metadata: Option<serde_json::Value>,
+    /// Parameter counts derived from the watched graph.
+    param_info: Option<serde_json::Value>,
     graph_label: Option<String>,
     graph_hash: Option<String>,
     hardware: String,
@@ -268,6 +275,8 @@ impl Monitor {
             save_html: None,
             svg_snapshot: None,
             metadata: None,
+            user_metadata: None,
+            param_info: None,
             graph_label: None,
             graph_hash: None,
             hardware,
@@ -464,16 +473,48 @@ impl Monitor {
 
     /// Attach arbitrary JSON metadata (hyperparameters, config, etc.)
     /// that will be included in the live dashboard and HTML archive.
+    /// Replaces any metadata previously set here. Parameter counts captured
+    /// by [`Self::watch`] are kept alongside it, so the two may be called in
+    /// either order.
     pub fn set_metadata(&mut self, meta: serde_json::Value) {
+        self.user_metadata = Some(meta);
+        self.publish_metadata();
+    }
+
+    /// Merge the derived parameter counts under the user's blob (user keys
+    /// win on collision) and push the result everywhere it is read.
+    ///
+    /// Both writers funnel through here so the call order of `set_metadata`
+    /// and `watch` cannot matter. Previously `set_metadata` replaced the blob
+    /// outright while the parameter capture merged into it, so the natural
+    /// reading order — `watch(&model)` then `set_metadata(cfg)` — silently
+    /// dropped the counts.
+    ///
+    /// The cluster stash is not optional: on the launcher `serve()` returns
+    /// early and `self.server` is `None` (the `ClusterDashboardSink` owns the
+    /// real server), so a server-only push reaches nothing on exactly the
+    /// runs that have the most to report.
+    fn publish_metadata(&mut self) {
+        use serde_json::Value;
+        let merged = match (&self.param_info, &self.user_metadata) {
+            (Some(Value::Object(params)), Some(Value::Object(user))) => {
+                let mut base = params.clone();
+                base.extend(user.clone());
+                Value::Object(base)
+            }
+            (_, Some(user)) => user.clone(),
+            (Some(params), None) => params.clone(),
+            (None, None) => return,
+        };
         if Self::in_cluster_mode() {
             crate::distributed::cluster_dashboard_emit::stash_metadata(
-                meta.to_string(),
+                merged.to_string(),
             );
         }
         if let Some(ref srv) = self.server {
-            srv.set_metadata(meta.to_string());
+            srv.set_metadata(merged.to_string());
         }
-        self.metadata = Some(meta);
+        self.metadata = Some(merged);
     }
 
     /// Display the graph architecture in the dashboard (and HTML archive).
@@ -581,7 +622,7 @@ impl Monitor {
         self.capture_param_info(graph);
     }
 
-    /// Build parameter summary and merge into metadata.
+    /// Derive the parameter summary from the watched graph and republish.
     fn capture_param_info(&mut self, graph: &Graph) {
         use crate::nn::Module;
 
@@ -603,25 +644,8 @@ impl Monitor {
             }
         });
 
-        // Merge into existing metadata (user-set fields take precedence)
-        let merged = match &self.metadata {
-            Some(existing) => {
-                if let (serde_json::Value::Object(mut base), serde_json::Value::Object(extra)) =
-                    (param_info.clone(), existing.clone())
-                {
-                    base.extend(extra);
-                    serde_json::Value::Object(base)
-                } else {
-                    existing.clone()
-                }
-            }
-            None => param_info,
-        };
-
-        if let Some(ref srv) = self.server {
-            srv.set_metadata(merged.to_string());
-        }
-        self.metadata = Some(merged);
+        self.param_info = Some(param_info);
+        self.publish_metadata();
     }
 
     /// Log an epoch's results. Prints a one-line summary and pushes data
@@ -1344,6 +1368,73 @@ mod tests {
         assert_eq!(monitor.graph_label.as_deref(), Some("test-model"));
         assert!(monitor.graph_hash.is_some());
         assert_eq!(monitor.graph_hash.as_ref().unwrap().len(), 64);
+    }
+
+    /// Config and parameter counts must both survive, whichever order the
+    /// two writers run in. `set_metadata` used to replace the blob that
+    /// `watch` had merged into, so `watch(&model)` followed by
+    /// `set_metadata(cfg)` — the order a user reads as natural — silently
+    /// dropped `parameters` and nobody noticed, because the archive test
+    /// below uses that order and only asserts on the config keys.
+    #[test]
+    fn metadata_and_parameter_counts_survive_either_call_order() {
+        use crate::*;
+
+        let dev = crate::tensor::test_device();
+        let build = || {
+            FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
+                .label("order-test")
+                .through(Linear::on_device(4, 2, dev).unwrap())
+                .build()
+                .unwrap()
+        };
+        let cfg = || serde_json::json!({ "lr": 0.1, "seed": 42 });
+
+        let mut watch_first = Monitor::new(5);
+        watch_first.watch(&build());
+        watch_first.set_metadata(cfg());
+
+        let mut meta_first = Monitor::new(5);
+        meta_first.set_metadata(cfg());
+        meta_first.watch(&build());
+
+        for (order, monitor) in [("watch-first", &watch_first), ("meta-first", &meta_first)] {
+            let meta = monitor.metadata.as_ref()
+                .unwrap_or_else(|| panic!("{order}: no metadata published"));
+            assert_eq!(
+                meta["lr"], 0.1,
+                "{order}: user config must survive the parameter merge",
+            );
+            assert_eq!(meta["seed"], 42, "{order}: user config lost");
+            // Linear(2,4) + Linear(4,2) = (2*4+4) + (4*2+2) = 12 + 10 = 22.
+            assert_eq!(
+                meta["parameters"]["total"], 22,
+                "{order}: parameter counts must survive set_metadata",
+            );
+            assert_eq!(meta["parameters"]["trainable"], 22, "{order}: trainable lost");
+            assert_eq!(meta["parameters"]["frozen"], 0, "{order}: frozen lost");
+        }
+    }
+
+    /// A user key must beat the derived one rather than the merge order
+    /// deciding it — the counts are a fallback, not an override.
+    #[test]
+    fn user_metadata_wins_over_the_derived_parameter_block() {
+        use crate::*;
+
+        let dev = crate::tensor::test_device();
+        let model = FlowBuilder::from(Linear::on_device(2, 4, dev).unwrap())
+            .build()
+            .unwrap();
+
+        let mut monitor = Monitor::new(5);
+        monitor.watch(&model);
+        monitor.set_metadata(serde_json::json!({ "parameters": "counted by hand" }));
+
+        assert_eq!(
+            monitor.metadata.as_ref().unwrap()["parameters"],
+            "counted by hand",
+        );
     }
 
     #[test]
