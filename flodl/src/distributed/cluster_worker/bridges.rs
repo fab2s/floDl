@@ -421,18 +421,30 @@ pub(super) fn outbound_loop(
             crate::tensor::Device::CUDA(idx) => Some(idx),
             _ => None,
         });
+    // Ship whatever the harness stashed, gated on there being something to
+    // ship rather than on a dashboard port.
+    //
+    // `emit_dashboard_setup` already port-gates the one frame that needs a port
+    // (`DashboardRegister`); the SVG / metadata / hardware are wanted by the
+    // SAVED ARCHIVE too, which binds no HTTP server at all. Gating the whole
+    // sequence on `port` made `--save-dashboard` without `--monitor` produce a
+    // page with no graph and no hyperparameters — the persisted dashboard
+    // silently depending on a live one.
+    let has_setup_payload = pending.port.is_some()
+        || pending.svg.is_some()
+        || pending.metadata_json.is_some()
+        || pending.hardware.is_some();
+    if has_setup_payload {
+        emit_dashboard_setup(stream, salt, rank, &pending, assigned_device_idx);
+    }
     // Sampling turns on for either consumer of the samples: the live
     // dashboard the user requested via `monitor.serve(port)`, or the
     // controller's timeline persistence requested through the
-    // envelope's `rank_resources` flag. The dashboard emit sequence
-    // stays port-gated — the flag wants samples, not an HTTP bind.
+    // envelope's `rank_resources` flag.
     let want_resources = pending.port.is_some()
         || envelope.as_ref().is_some_and(|c| c.rank_resources);
     let resource_sampler: Option<std::sync::Mutex<crate::monitor::ResourceSampler>> =
         if want_resources {
-            if pending.port.is_some() {
-                emit_dashboard_setup(stream, salt, rank, &pending, assigned_device_idx);
-            }
             Some(std::sync::Mutex::new(
                 crate::monitor::ResourceSampler::new(),
             ))

@@ -1214,7 +1214,11 @@ pub fn run_launcher_with_config(
                 Arc::new(world.clone()),
                 me.clone(),
                 config.num_epochs,
-            ).with_record_log(record_log));
+            )
+            .with_record_log(record_log)
+            .with_scalar_reductions(config.scalar_reductions.clone())
+            .with_dashboard_html(config.dashboard_html.clone())
+            .with_dashboard_theme(config.dashboard_theme.clone()));
         dashboard_sink_outer = Some(Arc::clone(&dashboard_sink));
         config = config.dashboard_sink(Arc::clone(&dashboard_sink));
 

@@ -272,6 +272,29 @@ struct Cli {
     #[option]
     record_log: Option<String>,
 
+    /// Save the run's dashboard as one self-contained HTML file
+    /// (`<run_dir>/dashboard.html`, beside `timeline.html`): the portal with
+    /// every level, both metric cadences, and the model graph SVG baked in.
+    /// Open it directly in a browser — no server, no sibling files.
+    ///
+    /// Written at teardown, so it captures the whole run. Bounded by the live
+    /// record ring, so the file stays attachable however long the run was.
+    /// Deliberately no path argument: the location is fixed beside the run's
+    /// other artifacts, which sidesteps the `--record-log` path ambiguity (a
+    /// relative path resolves against the launcher's CWD, and an absolute host
+    /// path does not exist inside the container or on a remote worker).
+    #[option]
+    save_dashboard: bool,
+
+    /// Theme the saved dashboard opens with: "light", "dark", or "auto".
+    ///
+    /// Unset, the saved page follows the reader's OS preference
+    /// (`prefers-color-scheme`), exactly as the live dashboard does. Pass
+    /// "light" when the artifact is headed for a paper — a figure should not
+    /// change appearance with the reviewer's OS. Requires `--save-dashboard`.
+    #[option]
+    dashboard_theme: Option<String>,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required for the MSF
     /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
@@ -991,6 +1014,8 @@ fn run() -> flodl::tensor::Result<()> {
                 disk_stage_gb: cli.disk_stage,
                 reports_per_epoch: cli.reports_per_epoch,
                 record_log_dir: cli.record_log.clone(),
+                save_dashboard: cli.save_dashboard,
+                dashboard_theme: cli.dashboard_theme.clone(),
                 tier,
             };
 

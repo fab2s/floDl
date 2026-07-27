@@ -153,15 +153,31 @@ The server uses raw TCP sockets and [Server-Sent Events](https://developer.mozil
 `/events` is the **run clock**: epoch counter, ETA, elapsed, completion, and
 the host resource gauges. The levels come from the path-scoped feed alongside
 it — see [Querying the run by path](#querying-the-run-by-path). A run without
-a record plane (any single-process run, and the baked HTML archive) has no
-levels to browse, so the page builds them from the epoch feed instead: the run
-level, plus one child per device when the run reports two or more. Same
-renderer either way.
+a record plane (any single-process run) has no levels to browse, so the page
+builds them from the epoch feed instead: the run level, plus one child per
+device when the run reports two or more. Same renderer either way — and the
+same applies to a [saved archive](#dashboard-archive), which carries whichever
+of the two the run produced.
 
 ### Late join
 
 If you open the dashboard mid-training, it catches up instantly. The SSE
 handler replays all past epoch events before switching to live streaming.
+
+### Light and dark
+
+The toggle sits at the top right of the header. Your choice is remembered per
+browser and always wins from then on.
+
+Unset, the page follows your OS via `prefers-color-scheme` — so a dark desktop
+gets the dark dashboard, which is the better place to watch a long run, and a
+light desktop gets the light one without having to ask. The palette is the same
+one flodl.dev uses, under the same variable names.
+
+The charts follow too. Canvas has no CSS cascade, so the chart colours are
+resolved from the stylesheet on each render rather than hardcoded, and the
+series palette swaps for a darker ramp in light mode — the pale end of the dark
+ramp is unreadable on white.
 
 ### Multi-GPU and cluster runs
 
@@ -364,7 +380,8 @@ for record in monitor.history() {
 ### Dashboard archive
 
 Save the full dashboard as a self-contained HTML file - all charts, resource
-graphs, epoch log, and graph SVG baked in. Open it in any browser, no server.
+graphs, epoch log, and graph SVG baked in. Open it in any browser, no server,
+no sibling files.
 
 ```rust
 monitor.save_html("training_report.html");  // set before training
@@ -372,8 +389,60 @@ monitor.save_html("training_report.html");  // set before training
 monitor.finish();  // writes the archive
 ```
 
-The archive is written automatically when `finish()` is called. It's the same
-dashboard you see live, but frozen at the final state with all data pre-loaded.
+The archive is written automatically when `finish()` is called. It is the same
+dashboard you saw live, frozen at the final state — including the **record
+plane**, so a saved cluster run is the full portal: every level browsable, both
+metric cadences interleaved, `#path=` deep links working. It is not a flattened
+screenshot of the root view.
+
+**It cannot grow without bound.** The record plane is a ring
+(`record_store::MAX_RECORDS`), so a long run shortens the archive's *horizon*
+rather than enlarging its *file* — which is what keeps it one attachable
+artifact regardless of how long you trained.
+
+#### On a cluster run
+
+Ask for it through the builder, not through your own `Monitor`:
+
+```rust
+Trainer::builder(model, opt, step)
+    .save_dashboard("runs/exp1/dashboard.html")
+```
+
+Your `Monitor` has neither the dashboard server nor the records on a cluster run
+— `serve()` returns early there and the launcher's internal sink owns both — so
+`monitor.save_html(...)` would write a page with no levels and no curves. The
+builder routes the request to the sink that has the data. `ddp-bench` exposes
+this as `--save-dashboard`.
+
+Either way it needs **no dashboard port**: persisting a dashboard does not
+require serving one.
+
+#### Theme, and the publication case
+
+A saved page follows the reader's OS by default, exactly as the live one does.
+Pin it when the artifact is headed somewhere with a fixed look — a figure in a
+paper should not change appearance with the reviewer's desktop:
+
+```rust
+Trainer::builder(model, opt, step)
+    .save_dashboard("runs/exp1/dashboard.html")
+    .dashboard_theme("light")          // "light" | "dark" | "auto"
+```
+
+`ddp-bench` exposes it as `--dashboard-theme light`.
+
+You do not have to decide at training time. Every saved page carries the choice
+as a single line near the top, so re-theming an artifact you already have is one
+edit:
+
+```js
+const ARCHIVE_THEME=null;      // null = follow the reader's OS
+                               // "light" to pin it for publication
+```
+
+The reader's own toggle still overrides whatever is pinned — pinning sets the
+*default*, it does not take the control away.
 
 ### Training log
 

@@ -109,6 +109,14 @@ pub trait DashboardSink: Send + Sync {
     fn shutdown(&self) {}
 }
 
+/// Wall-clock milliseconds since the epoch — the axis every record shares.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Trim vendor boilerplate off a GPU model so a legend entry stays short
 /// (`NVIDIA GeForce RTX 5060 Ti` → `RTX 5060 Ti`). Mirrors the dashboard's own
 /// `shortGpuName`.
@@ -165,6 +173,19 @@ pub struct ClusterDashboardSink {
     /// same records that go live also land on disk when the user opted in
     /// (`record_log_dir`); `None` keeps the stream live-only.
     record_log: Option<Arc<crate::monitor::record_log::RecordLog>>,
+    /// Where to write the self-contained dashboard archive at teardown, or
+    /// `None` for live-only. Sink-driven because on a cluster run this is the
+    /// only `Monitor` holding the epochs and the record plane.
+    dashboard_html: Option<String>,
+    /// Non-core roll-up declarations for user scalars. Applied when building
+    /// the epoch record tree (the only cadence carrying user scalars) and
+    /// published once as the stream's `meta` record so consumers roll up the
+    /// same way the controller did.
+    scalar_reductions: crate::monitor::record::Reductions,
+    /// Whether the `meta` record has been published yet. It is emitted lazily
+    /// with the first record push rather than at construction, so it carries a
+    /// timestamp from the same clock as the records it describes.
+    meta_published: Mutex<bool>,
     /// Wall-clock start (used to compute ETA in pushed epoch records).
     start_time: Instant,
 }
@@ -201,6 +222,9 @@ impl ClusterDashboardSink {
             latest_window_records: Mutex::new(Vec::new()),
             recent_events: Mutex::new(Vec::new()),
             record_log: None,
+            dashboard_html: None,
+            scalar_reductions: crate::monitor::record::Reductions::new(),
+            meta_published: Mutex::new(false),
             start_time: Instant::now(),
         }
     }
@@ -214,6 +238,64 @@ impl ClusterDashboardSink {
     ) -> Self {
         self.record_log = log;
         self
+    }
+
+    /// Write a self-contained dashboard archive to `path` at teardown, or
+    /// `None` for live-only.
+    pub fn with_dashboard_html(mut self, path: Option<String>) -> Self {
+        self.dashboard_html = path;
+        self
+    }
+
+    /// Pin the saved archive's theme. `None` leaves it to the reader's OS.
+    pub fn with_dashboard_theme(self, theme: Option<String>) -> Self {
+        if let Some(t) = theme {
+            self.monitor.lock().unwrap().set_archive_theme(&t);
+        }
+        self
+    }
+
+    /// Install the user-scalar roll-up declarations from the run config.
+    pub fn with_scalar_reductions(
+        mut self,
+        reductions: crate::monitor::record::Reductions,
+    ) -> Self {
+        self.scalar_reductions = reductions;
+        self
+    }
+
+    /// Publish the `meta` record once, ahead of the first data record.
+    ///
+    /// The record plane keeps it as a standing declaration and replays it into
+    /// every SSE subscriber's preamble, so a viewer can never interpret a
+    /// record without first knowing how it rolls up. Emitting it lazily (rather
+    /// than at construction) keeps it on the same clock as the records, and
+    /// keeps it out of runs that never push one.
+    /// The `meta` record, the first time only; `None` on every later call.
+    ///
+    /// Split from the push so the once-only semantics are observable without a
+    /// bound server (`Monitor::push_records` is a no-op when none is attached,
+    /// so a test asserting through it would pass vacuously).
+    fn take_meta_record(&self, ts: u64) -> Option<serde_json::Value> {
+        let mut done = self.meta_published.lock().unwrap();
+        if *done {
+            return None;
+        }
+        *done = true;
+        Some(crate::monitor::record::meta_record(&self.scalar_reductions, ts))
+    }
+
+    /// Publish the declarations to the live record plane, once per run.
+    ///
+    /// Deliberately **not** written to the record log: a `meta` record carries
+    /// no `path` (it describes the whole stream, not a node), and
+    /// `RecordLog::append` skips pathless records, so persisting it here would
+    /// be a silent no-op. The saved archive bakes the declarations explicitly
+    /// instead.
+    fn publish_meta_once(&self, ts: u64) {
+        if let Some(meta) = self.take_meta_record(ts) {
+            self.monitor.lock().unwrap().push_records(vec![meta]);
+        }
     }
 
     /// Per-rank host names indexed by global rank, as the record tree's path
@@ -262,16 +344,18 @@ impl ClusterDashboardSink {
     fn push_epoch_records(&self, metrics: &crate::distributed::ddp_run::EpochMetrics) {
         let hosts = self.record_hosts();
         let extras = self.record_extras();
+        // The epoch cadence is the ONLY one carrying user scalars
+        // (`WindowRankStat` has no scalars field), so this is the one place a
+        // non-core reduction can change an answer. Undeclared keys still fall
+        // through to `Mean`.
         let tree = crate::monitor::record::NodeRecord::from_epoch_metrics(
             metrics,
             Some(&hosts),
-            &crate::monitor::record::Reductions::new(),
+            &self.scalar_reductions,
             &extras,
         );
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts = now_ms();
+        self.publish_meta_once(ts);
         // No `tick`: an epoch record closes an epoch, it does not belong to a
         // sub-epoch window. `ts` is the axis both cadences share.
         let records = tree.flat_records(ts, None, Some(metrics.epoch));
@@ -442,7 +526,13 @@ impl DashboardSink for ClusterDashboardSink {
             log.flush();
         }
         let mut mon = self.monitor.lock().unwrap();
+        // Server down FIRST: it drains the record-push channel, so the archive
+        // below sees the whole run including the final window rather than
+        // whatever happened to be applied already.
         mon.shutdown_dashboard_server();
+        if let Some(path) = &self.dashboard_html {
+            mon.write_archive_now(path);
+        }
     }
 
     fn push_window_records(&self, records: Vec<serde_json::Value>) {
@@ -462,6 +552,16 @@ impl DashboardSink for ClusterDashboardSink {
                 root["work"],
             );
         }
+        // Window records precede the first epoch record, so the declaration
+        // has to be published from here too or a viewer that connects during
+        // epoch 0 interprets records without it. Fall back to the local clock
+        // rather than skipping when a record carries no `ts` — a missing
+        // timestamp must not silently cost the whole stream its declarations.
+        let ts = records
+            .first()
+            .and_then(|r| r["ts"].as_u64())
+            .unwrap_or_else(now_ms);
+        self.publish_meta_once(ts);
         // One producer, three sinks: the same records go to the live record
         // plane (path-scoped SSE), to disk, and to the latest-window slot.
         self.monitor.lock().unwrap().push_records(records.clone());
@@ -713,6 +813,103 @@ mod tests {
         let tail = log.tail("root", 10);
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[1]["tick"], 2);
+    }
+
+    /// A declared roll-up must actually change the cross-rank answer, and the
+    /// undeclared default must stay `Mean`.
+    ///
+    /// This is the defect the declaration exists to fix: both `build_tree` call
+    /// sites used to pass an empty map, so a **count** was averaged across
+    /// ranks while the portal's legend asserted `(mean)` — wrong, and stated
+    /// rather than merely implied.
+    #[test]
+    fn a_declared_reduction_changes_the_rollup_and_mean_stays_the_default() {
+        use crate::monitor::record::{Leaf, Reduction, Reductions, Res, build_tree};
+
+        let leaves: Vec<Leaf> = [("rank0", 10.0), ("rank1", 30.0)]
+            .iter()
+            .map(|(name, v)| Leaf {
+                path: vec![name.to_string()],
+                work: 1.0,
+                metrics: [
+                    ("tokens_seen".to_string(), *v),
+                    ("undeclared".to_string(), *v),
+                ]
+                .into_iter()
+                .collect(),
+                res: Res::default(),
+                device: None,
+                alive: true,
+                label: None,
+            })
+            .collect();
+
+        let mut declared = Reductions::new();
+        declared.insert("tokens_seen".to_string(), Reduction::Sum);
+
+        let with = build_tree(&leaves, &declared);
+        let without = build_tree(&leaves, &Reductions::new());
+
+        // Declared Sum: the count adds up.
+        assert_eq!(with.metrics.get("tokens_seen"), Some(&40.0));
+        // Undeclared: still the work-weighted mean, in the same tree.
+        assert_eq!(with.metrics.get("undeclared"), Some(&20.0));
+        // And without the declaration the count is silently averaged — the bug.
+        assert_eq!(without.metrics.get("tokens_seen"), Some(&20.0));
+    }
+
+    /// The declarations must reach consumers, which means a `meta` record ahead
+    /// of any data record. Nothing emitted one before this change, so
+    /// `reductionOf` in the page always fell through to `'mean'`.
+    #[test]
+    fn the_sink_publishes_the_reduction_declarations_exactly_once() {
+        use crate::monitor::record::Reduction;
+
+        let mut declared = crate::monitor::record::Reductions::new();
+        declared.insert("tokens_seen".to_string(), Reduction::Sum);
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_scalar_reductions(declared);
+
+        // First record push claims the declaration...
+        sink.push_window_records(window(1));
+        // ...and it is not re-emitted on any later push, at either cadence.
+        sink.push_window_records(window(2));
+        assert!(
+            sink.take_meta_record(1).is_none(),
+            "meta must be published once per run, not once per push",
+        );
+
+        // The declaration itself, as a consumer receives it.
+        let fresh = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_scalar_reductions({
+                let mut r = crate::monitor::record::Reductions::new();
+                r.insert("tokens_seen".to_string(), Reduction::Sum);
+                r
+            });
+        let meta = fresh.take_meta_record(7).expect("first call yields the meta");
+        assert_eq!(meta["kind"], "meta");
+        assert_eq!(meta["ts"], 7);
+        assert_eq!(meta["reductions"]["tokens_seen"], "sum");
+    }
+
+    /// A `meta` record carries no `path`, and `RecordLog::append` skips
+    /// pathless records — so it must not be handed to the log at all rather
+    /// than being appended and silently dropped.
+    #[test]
+    fn meta_is_not_written_to_the_record_log() {
+        let d = TempDir::new("meta-nolog");
+        let log = Arc::new(RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES));
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_record_log(Some(Arc::clone(&log)))
+            .with_scalar_reductions(crate::monitor::record::Reductions::new());
+
+        sink.push_window_records(window(1));
+        sink.shutdown();
+
+        // Only the node record for this path; no stray pathless line.
+        let tail = log.tail("root", 10);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0]["kind"], "node");
     }
 
     /// Alerts share the node tree with metrics: an event lands in its origin

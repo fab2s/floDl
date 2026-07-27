@@ -703,6 +703,54 @@ where
         self
     }
 
+    /// Save the run's dashboard as one self-contained HTML file at teardown.
+    ///
+    /// Carries the epoch feed, the record plane (so the saved page is the
+    /// portal, with real levels and both cadences) and the graph SVG inline —
+    /// no server, no sibling files. Bounded by the live record ring, so the
+    /// artifact stays attachable however long the run was.
+    pub fn save_dashboard(mut self, path: impl Into<String>) -> Self {
+        self.config = self.config.with_dashboard_html(path);
+        self
+    }
+
+    /// Pin the theme the saved dashboard opens with: `"light"`, `"dark"`, or
+    /// `"auto"`.
+    ///
+    /// Unset, the saved page follows the reader's `prefers-color-scheme`, exactly
+    /// as the live dashboard does. Pin `"light"` when the artifact is headed for a
+    /// paper — a figure should not change appearance with the reviewer's OS.
+    pub fn dashboard_theme(mut self, theme: impl Into<String>) -> Self {
+        self.config = self.config.with_dashboard_theme(theme);
+        self
+    }
+
+    /// Declare how a **user scalar** rolls up across ranks in the record tree.
+    ///
+    /// Non-core keys default to `Mean`, which is wrong for a count and for an
+    /// extremum — and the portal *states* the reduction in its legend, so an
+    /// undeclared count reads as `tokens_seen (mean)` and asserts something
+    /// false. Declaring it here fixes the roll-up and reaches every consumer:
+    /// the declarations ride the record stream's `meta` record, which each SSE
+    /// subscriber receives ahead of any data record.
+    ///
+    /// Core keys (`loss`, `throughput`, `batch_share`, `data_starve`,
+    /// `compute_only_ms`) are authoritative and ignore any declaration here.
+    ///
+    /// ```ignore
+    /// Trainer::builder(model, opt, step)
+    ///     .scalar_reduction("tokens_seen", Reduction::Sum)
+    ///     .scalar_reduction("peak_mem_gb", Reduction::Max)
+    /// ```
+    pub fn scalar_reduction(
+        mut self,
+        key: impl Into<String>,
+        reduction: crate::monitor::record::Reduction,
+    ) -> Self {
+        self.config = self.config.with_scalar_reduction(key, reduction);
+        self
+    }
+
     /// Rank-side eval callback. Fires on the rank chosen by
     /// [`EpochCallbackPolicy`] at the cadence set by
     /// [`Self::eval_every`].

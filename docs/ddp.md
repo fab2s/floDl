@@ -317,6 +317,9 @@ let cfg = TrainerConfig::new(dataset)
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.reports_per_epoch(n)` | `usize` | Emit up to `n` sub-epoch monitor reports per epoch, at reduce boundaries (`0` = off, the default). Fills the curve *between* epoch points — see [Sub-epoch reports](#sub-epoch-reports---reports_per_epoch). |
 | `.record_log(dir, max_bytes)` | `(String, u64)` | Persist the monitor record stream as append-only JSONL under `dir`, one drop-oldest ring per node capped at `max_bytes` (`0` = default). Off by default — see [Persisting the record stream](#persisting-the-record-stream---record_log). |
+| `.save_dashboard(path)` | `String` | Write the run's dashboard as one self-contained HTML file at teardown (the full portal, no server, no sibling files). Off by default — see [Saving the dashboard](#saving-the-dashboard---save_dashboard). |
+| `.dashboard_theme(theme)` | `String` | Pin the saved dashboard's theme (`"light"` / `"dark"` / `"auto"`). Unset, a saved page follows the reader's `prefers-color-scheme`. `"light"` is the publication setting. |
+| `.scalar_reduction(key, r)` | `(String, Reduction)` | Declare how a **user scalar** rolls up across ranks (`Sum` / `Max` / `Min` / `Mean` / `Last`). Repeatable. Non-core keys default to `Mean`, which is wrong for a count — see [Declaring how a scalar rolls up](#declaring-how-a-scalar-rolls-up---scalar_reduction). |
 | `.timeline(t)` | `Arc<Timeline>` | Inject DDP events into a profiler stream. |
 | `.with_vram_pool(b)` | `bool` | Device-resident sample pool on each rank (default `true`; `FLODL_VRAM_POOL=off` is the runtime kill-switch). |
 | `.with_vram_max_usage(f)` | `f64` | Fraction of total VRAM each rank's data plane (prefetch channel + sample pool) may use. Default `0.90`, clamped to `[0.50, 0.99]` - same knob as the solo loader's `vram_max_usage`. |
@@ -328,7 +331,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.cluster(c)` | `FullCluster` | Programmatic cluster topology (overrides any active overlay). |
 
 `TrainerConfig::cluster(full)` is the seam for programmatic
-multi-host launches (see [Programmatic clusters](#programmatic-clusters-clusterbuilder)
+multi-host launches (see [Programmatic clusters](#programmatic-clusters---clusterbuilder)
 below).
 
 ---
@@ -543,6 +546,75 @@ so a query costs `O(children)` and not `O(cluster)` at any depth — and
 `/history` returns exactly what `/stream` would have sent, so
 read-then-subscribe has no seam. Details:
 [monitor tutorial → Querying the run by path](tutorials/09-monitor.md#querying-the-run-by-path).
+
+## Saving the dashboard - `save_dashboard`
+
+`record_log` gives you the stream as JSONL. `save_dashboard` gives you the
+**page**: one self-contained HTML file carrying the whole portal — every level
+browsable, both metric cadences interleaved, the model graph SVG and the
+hyperparameters inline. Open it in a browser with no server and no sibling
+files.
+
+```rust
+Trainer::builder(model, opt, step)
+    .save_dashboard("runs/exp1/dashboard.html")
+```
+
+`ddp-bench` exposes it as `--save-dashboard`, which writes
+`<run_dir>/dashboard.html` beside `timeline.html`.
+
+Three properties make it safe to leave on:
+
+- **It needs no dashboard port.** Persisting a dashboard does not require
+  serving one, so a headless cluster run produces the same artifact.
+- **It cannot grow without bound.** The record plane is a ring, so a longer run
+  shortens the archive's *horizon* rather than enlarging its *file* — which is
+  what keeps it attachable to a ticket.
+- **It is written at teardown**, after the record stream has drained, so it
+  captures the end of the run rather than whatever had been flushed early.
+
+Ask for it through the **builder**, not through your own `Monitor`: on a cluster
+run `Monitor::serve` returns early and the launcher's sink owns the server and
+the records, so `monitor.save_html(...)` would write a page with no levels.
+
+### Theme
+
+The saved page follows the reader's OS by default, exactly as the live
+dashboard does, and carries a toggle. Pin it when the artifact is headed
+somewhere with a fixed look — a figure in a paper should not change appearance
+with the reviewer's desktop:
+
+```rust
+    .save_dashboard("runs/exp1/dashboard.html")
+    .dashboard_theme("light")
+```
+
+Nothing is locked in at training time: every saved page exposes the choice as a
+single line near the top (`const ARCHIVE_THEME=null;`), so re-theming an
+artifact you already have is one edit, and the reader's own toggle still
+overrides whatever is pinned.
+
+## Declaring how a scalar rolls up - `scalar_reduction`
+
+Framework metrics have authoritative reductions (`loss` is a work-weighted
+mean, `throughput` sums, `data_starve` takes the worst rank). **Your** scalars
+cannot be guessed, so they default to `Mean` — right for a rate or an accuracy,
+wrong for a count or an extremum:
+
+```rust
+Trainer::builder(model, opt, step)
+    .scalar_reduction("tokens_seen", Reduction::Sum)
+    .scalar_reduction("peak_mem_gb", Reduction::Max)
+```
+
+This matters more than a wrong number usually would, because the portal
+**states** the reduction in its legend: an undeclared count renders as
+`tokens_seen (mean)`, asserting something false rather than merely being off.
+
+Declarations reach every consumer automatically — they ride the record stream's
+`meta` record, which each subscriber receives ahead of any data record, so a
+viewer can never interpret a metric without knowing how it was rolled up. Core
+keys ignore any declaration here.
 
 The dashboard at that same port **is** these paths, rendered: one view
 repeated per level, a breadcrumb for navigation, and a drill-down that

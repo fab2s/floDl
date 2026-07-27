@@ -548,6 +548,26 @@ pub struct TrainerConfig<M: Module> {
     /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES).
     pub max_log_size: Option<u64>,
 
+    /// Where to write the self-contained dashboard archive at teardown, or
+    /// `None` for live-only. One HTML file carrying the epoch feed, the record
+    /// plane and the graph SVG, openable with no server.
+    pub dashboard_html: Option<String>,
+
+    /// Theme the saved dashboard opens with: `None` (default) follows the
+    /// reader's `prefers-color-scheme`; `"light"` pins it for publication.
+    pub dashboard_theme: Option<String>,
+
+    /// How each **user scalar** rolls up across ranks in the record tree.
+    ///
+    /// Non-core keys default to
+    /// [`Reduction::Mean`](crate::monitor::record::Reduction::Mean), which is
+    /// wrong for a count (`tokens_seen`) or an extremum (`peak_mem_gb`) — and
+    /// the portal *states* the reduction in its legend, so an undeclared count
+    /// asserts something false rather than merely getting it wrong quietly.
+    /// Declarations reach every consumer via the record stream's `meta` record.
+    /// Empty by default; core keys ignore any entry here.
+    pub scalar_reductions: crate::monitor::record::Reductions,
+
     /// Which rank fires user-supplied per-epoch callbacks. Default
     /// [`EpochCallbackPolicy::Fastest`].
     pub epoch_callback_policy: EpochCallbackPolicy,
@@ -616,6 +636,9 @@ impl<M: Module> TrainerConfig<M> {
             eval_every: None,
             reports_per_epoch: None,
             record_log_dir: None,
+            dashboard_html: None,
+            dashboard_theme: None,
+            scalar_reductions: crate::monitor::record::Reductions::new(),
             max_log_size: None,
             epoch_callback_policy: EpochCallbackPolicy::default(),
             timeline: None,

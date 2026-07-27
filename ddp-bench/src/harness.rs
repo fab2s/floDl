@@ -333,7 +333,32 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         monitor
             .serve(port)
             .map_err(|e| TensorError::new(&format!("monitor serve: {e}")))?;
+    }
+    // Run-scoped cards (hyperparameters + the model graph SVG) belong to the
+    // ARTIFACT as much as to the live page, so this is gated on either sink
+    // wanting them — not on a dashboard port. A saved archive with no
+    // architecture and no config would be the poorer half of the same feature.
+    if config.monitor_port.is_some() || config.save_dashboard {
         describe_run(&mut monitor, model_def, &mode_str, config, actual_batches);
+    }
+
+    // Self-contained dashboard archive, beside the run's other artifacts.
+    //
+    // Which Monitor can write it depends on the mode, and getting this wrong
+    // yields an empty page rather than an error: a solo run is in-process, so
+    // THIS Monitor owns the dashboard server and the record plane. The builder
+    // path fans out to rank children, where `Monitor::serve` returns early and
+    // the `ClusterDashboardSink` owns both — so there the archive has to be
+    // requested through the builder, and asking this Monitor for it would bake
+    // a page with no levels and no curves.
+    let dashboard_path = config
+        .save_dashboard
+        .then(|| format!("{run_dir}/dashboard.html"));
+    if let (Some(path), DdpMode::Solo(_)) = (&dashboard_path, mode) {
+        monitor.save_html(path);
+        if let Some(theme) = config.dashboard_theme.as_deref() {
+            monitor.set_archive_theme(theme);
+        }
     }
 
     let start = Instant::now();
@@ -358,6 +383,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             config,
             &timeline,
             &mut monitor,
+            dashboard_path.as_deref(),
         ),
     };
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -785,6 +811,7 @@ fn run_unified(
     config: &RunConfig,
     timeline: &Arc<Timeline>,
     monitor: &mut Monitor,
+    dashboard_path: Option<&str>,
 ) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let build_fn = model_def.build;
     let train_fn_ptr = model_def.train_fn;
@@ -874,6 +901,12 @@ fn run_unified(
     }
     if let Some(dir) = config.record_log_dir.as_deref() {
         builder = builder.record_log(dir, 0); // 0 = library default cap
+    }
+    if let Some(path) = dashboard_path {
+        builder = builder.save_dashboard(path);
+        if let Some(theme) = config.dashboard_theme.as_deref() {
+            builder = builder.dashboard_theme(theme);
+        }
     }
     if config.augment_noise > 0.0 {
         let sigma = config.augment_noise as f32;

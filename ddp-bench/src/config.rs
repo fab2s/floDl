@@ -322,6 +322,14 @@ pub struct RunConfig {
     /// Directory for the persisted monitor record stream (`--record-log`).
     /// `None` = library default (live-only, nothing written).
     pub record_log_dir: Option<String>,
+    /// Save the self-contained dashboard archive to `<run_dir>/dashboard.html`
+    /// (`--save-dashboard`). The location is fixed beside the run's other
+    /// artifacts rather than configurable, so it cannot inherit the
+    /// `--record-log` path ambiguity across launcher / container / worker.
+    pub save_dashboard: bool,
+    /// Theme pinned into the saved dashboard (`--dashboard-theme`). `None`
+    /// leaves it to the reader's `prefers-color-scheme`.
+    pub dashboard_theme: Option<String>,
     /// Execution tier (`--tier managed|cooperative`). `Managed` (default)
     /// runs `builder.run()`; `Cooperative` runs `builder.into_worker()` and
     /// hand-drives the loop. Both share the identical builder config, so a

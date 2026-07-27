@@ -576,6 +576,15 @@ impl Trainer {
         if let Some(dir) = cfg.record_log_dir {
             b = b.record_log(dir, cfg.max_log_size.unwrap_or(0));
         }
+        if let Some(path) = cfg.dashboard_html {
+            b = b.save_dashboard(path);
+        }
+        if let Some(theme) = cfg.dashboard_theme {
+            b = b.dashboard_theme(theme);
+        }
+        for (key, reduction) in cfg.scalar_reductions {
+            b = b.scalar_reduction(key, reduction);
+        }
         if let Some(ds) = cfg.eval_dataset {
             b = b.eval_dataset(ds);
         }
