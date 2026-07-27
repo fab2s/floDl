@@ -900,9 +900,10 @@ impl Monitor {
     /// bake an empty page. The sink drives this instead, from the `Monitor` that
     /// actually holds the epochs and the record plane.
     ///
-    /// Call **after** shutting the server down, so the record plane has caught
-    /// up with everything pushed; see
-    /// [`DashboardServer::records_snapshot`](crate::monitor::server::DashboardServer::records_snapshot).
+    /// Call **after** shutting the server down: `push_records` hands records to
+    /// the server's message handler over a channel, and `shutdown` is what
+    /// drains that channel and joins the handler, so snapshotting first would
+    /// silently lose whatever tail was still in flight.
     pub(crate) fn write_archive_now(&self, path: &str) {
         match self.build_archive() {
             Ok(html) => {

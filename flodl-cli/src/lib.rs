@@ -134,8 +134,9 @@ pub mod prebuild;
 pub mod schema;
 
 /// `--fdl-schema` binary contract and per-command cache mechanics.
-/// Caches live at `<cmd_dir>/.fdl/schema-cache/<cmd>.json` with
-/// mtime + binary hash metadata for staleness detection.
+/// Caches live at `<cmd_dir>/.fdl/schema-cache/<cmd>.json`; staleness is
+/// mtime-based against the command's config AND, for a `compile: true`
+/// command, the sources its schema is compiled from.
 pub mod schema_cache;
 
 /// First-run and reconfiguration wizard (`fdl setup`).

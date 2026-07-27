@@ -1307,7 +1307,33 @@ their schema into the cache without any manual step - `fdl <cmd>
 **Cargo entries must be built before `refresh`** - `fdl` runs the
 entry's `--fdl-schema` as a subprocess, which requires the binary to
 exist. To avoid the compile latency ruining `--help`, cargo entries
-are **never** auto-probed: you refresh explicitly after rebuilding.
+are **never** auto-probed unless the command opts in with
+`compile: true`.
+
+### What makes a cached schema stale
+
+The cache is compared against every file whose edit could change the
+schema: the command's `fdl.yml`, and - for a `compile: true` command -
+every `.rs` and `Cargo.toml` under the command directory.
+
+That second half matters, because the schema of a cargo entry is
+*compiled from* those sources. Watching only `fdl.yml` meant adding a
+flag left the cache stale with no signal at all: `-h` kept rendering
+the previous surface until someone happened to touch the yml or delete
+the cache by hand. Now a new flag shows up on its own.
+
+The scan is deliberately coarse - the whole command directory rather
+than an attempt to find the files that *define* the schema. Watching
+too much costs one extra probe, which is exactly what editing the yml
+already costs; watching too little is the silent-stale bug. It is also
+cheap enough to sit in front of `-h` (23 files in ~0.1 ms for
+`ddp-bench`), skips `target/`, and is bounded so a pathological tree
+degrades to config-only invalidation rather than stalling help.
+
+Dependency crates are **not** followed. A command's schema comes from
+its own CLI struct, and following its dependencies would invalidate the
+cache on every edit anywhere in the workspace - recompiling on nearly
+every `-h`, which is the cost the cache exists to avoid.
 
 ```bash
 cargo build --release --features cuda

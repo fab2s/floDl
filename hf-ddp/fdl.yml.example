@@ -3,7 +3,8 @@ docker: cuda
 # Cargo entry with a derived CLI (FdlArgs / parse_or_schema): `compile: true`
 # lets fdl auto-probe the binary's own `--fdl-schema`, so `fdl hf-ddp --help`
 # reflects the actual CLI — the binary is the single source of truth, no
-# inline schema to drift. First `-h` after an fdl.yml change compiles once in
-# the cuda container, then caches (.fdl/schema-cache/, gitignored).
+# inline schema to drift. First `-h` after this file or any crate source
+# changes compiles once in the cuda container, then caches
+# (.fdl/schema-cache/, gitignored).
 compile: true
 entry: cargo run --release --features cuda --

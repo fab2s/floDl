@@ -102,13 +102,22 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
         .and_then(|n| n.to_str())
         .unwrap_or("_");
     let cache = crate::schema_cache::cache_path(dir, cmd_name);
-    // Reference mtimes: config files that, when edited, might invalidate
-    // the cached schema (e.g. changing `entry:` to point somewhere else).
-    let refs: Vec<std::path::PathBuf> = CONFIG_NAMES
+    // Reference mtimes: everything whose edit could change the cached schema.
+    //
+    // The config file, because `entry:` might now point somewhere else — and,
+    // when the binary declares its own surface, the sources that surface is
+    // compiled from. Watching only the config meant editing a CLI struct left
+    // the cache stale with NO signal: `-h` kept rendering the previous flags
+    // until someone happened to touch the yml. Silent and repeatedly confusing,
+    // since the binary itself was correct all along.
+    let mut refs: Vec<std::path::PathBuf> = CONFIG_NAMES
         .iter()
         .map(|n| dir.join(n))
         .filter(|p| p.exists())
         .collect();
+    if cfg.compile.unwrap_or(false) {
+        refs.extend(crate::schema_cache::schema_source_refs(dir));
+    }
     if !crate::schema_cache::is_stale(&cache, &refs) {
         if let Some(cached) = crate::schema_cache::read_cache(&cache) {
             cfg.schema = Some(cached);

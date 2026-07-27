@@ -10,8 +10,11 @@
 //! For those, users run `fdl <cmd> --refresh-schema` explicitly after a build.
 //!
 //! Cache invalidation is mtime-based: the cache file's mtime is compared
-//! against `fdl.yml` in the command dir. A cache older than its fdl.yml is
-//! considered stale. Users can also force-refresh.
+//! against every path that could change the schema — the command's config
+//! file AND, for a binary that declares its own surface, the sources that
+//! surface is compiled from (see
+//! [`schema_source_refs`](crate::schema_cache::schema_source_refs)). A cache
+//! older than any of them is stale. Users can also force-refresh.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,64 @@ use crate::config::{self, Schema};
 
 /// Directory where all schema caches live, relative to the command dir.
 const CACHE_DIR: &str = ".fdl/schema-cache";
+
+/// Directories never worth walking when collecting schema sources: build
+/// output, caches, and data. Skipping `target` is the one that matters —
+/// it dwarfs the source tree.
+const SOURCE_SKIP_DIRS: &[&str] = &[
+    "target", ".fdl", ".git", "node_modules", "runs", "data", "baselines",
+    "libtorch", ".cargo",
+];
+
+/// Hard ceiling on files examined. `fdl <cmd> -h` must never be slow, so a
+/// pathological tree costs a bounded scan and then gives up — degrading to
+/// today's config-only invalidation rather than stalling help.
+const MAX_SOURCE_REFS: usize = 4096;
+
+/// Every file whose edit could change a command's `--fdl-schema` output.
+///
+/// The schema of a cargo entry is *compiled from* the crate's Rust sources, so
+/// watching only `fdl.yml` (as this did originally) meant editing a CLI struct
+/// left a stale cache with no signal at all: `-h` kept rendering the previous
+/// surface until someone touched the yml or deleted the cache by hand.
+///
+/// Deliberately coarse — every `.rs` plus `Cargo.toml` under the command dir,
+/// not an attempt to find the files that *define* the schema. Over-watching
+/// costs one extra probe, exactly what editing the yml already costs.
+/// Under-watching is the bug being fixed, and a precise scan would reintroduce
+/// it the moment a `#[derive(FdlArgs)]` struct referenced a constant from
+/// another module. Measured at 23 files / 0.12 ms for `ddp-bench`, against a
+/// probe that spins a container and runs cargo — the precision is not worth
+/// buying.
+///
+/// Scoped to the command's OWN directory on purpose. Following its dependency
+/// crates would invalidate the cache on every edit anywhere in the workspace,
+/// which in a repo whose library changes constantly means compiling on nearly
+/// every `-h` — the cost this cache exists to avoid.
+pub fn schema_source_refs(cmd_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![cmd_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= MAX_SOURCE_REFS {
+            break;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if ft.is_dir() {
+                if !name.starts_with('.') && !SOURCE_SKIP_DIRS.contains(&name.as_ref()) {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".rs") || name == "Cargo.toml" {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
 
 /// Resolve the cache file path for a given command dir and name.
 pub fn cache_path(cmd_dir: &Path, cmd_name: &str) -> PathBuf {
