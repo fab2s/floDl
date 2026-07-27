@@ -267,6 +267,20 @@ impl RecordStore {
         out
     }
 
+    /// Every retained record, oldest first — the whole ring, for baking a
+    /// self-contained archive.
+    ///
+    /// Excludes the `meta` record, which lives in its own slot (see
+    /// [`Self::meta`]) because it is a standing declaration rather than a point
+    /// in the stream. An archive wants both, `meta` first.
+    ///
+    /// Bounded by [`MAX_RECORDS`] by construction, which is what lets the
+    /// archive stay one attachable artifact no matter how long the run was:
+    /// the horizon shortens, the file does not grow.
+    pub fn all(&self) -> impl Iterator<Item = &Value> {
+        self.ring.iter()
+    }
+
     /// Every path currently known to carry a `node` record, sorted — the
     /// portal's navigation index.
     pub fn paths(&self) -> Vec<&str> {

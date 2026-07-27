@@ -7,7 +7,19 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e6eb;--dim:#8b8fa3;
---accent:#6c8cff;--green:#34d399;--red:#f87171;--yellow:#fbbf24;--purple:#a78bfa}
+--accent:#6c8cff;--green:#34d399;--red:#f87171;--yellow:#fbbf24;--purple:#a78bfa;
+--cyan:#67e8f9;
+/* Tooltip and the SVG card's paper both need to flip with the theme; they were
+   the only two places assuming a dark page. */
+--tooltip-bg:rgba(26,29,39,0.95);--paper:#fff}
+/* Light theme. Values lifted verbatim from flodl.dev
+   (`site/assets/css/style.css`), which already declares this palette under the
+   same variable names — so the dashboard and the site stay one product rather
+   than two takes on a similar idea. */
+:root[data-theme="light"]{--bg:#fbfbfc;--card:#ffffff;--border:#dde0e8;
+--text:#1a1d27;--dim:#5a5f72;--accent:#3656c7;--green:#0e9968;--red:#c93c3c;
+--yellow:#8f5b10;--purple:#6e4ad0;--cyan:#0b7b95;
+--tooltip-bg:rgba(26,29,39,0.95);--paper:#fbfbfc}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 background:var(--bg);color:var(--text);padding:0;min-height:100vh}
 
@@ -94,11 +106,23 @@ tr.dead td{color:var(--red)}
 .sev-info{color:var(--dim)}
 .res-cell{color:var(--dim);font-size:11px}
 
+/* Theme toggle — same markup, icons and behaviour as flodl.dev's nav toggle. */
+.theme-toggle{margin-left:auto;background:none;border:none;color:var(--dim);cursor:pointer;padding:6px;
+display:inline-flex;align-items:center;border-radius:4px;line-height:0;
+transition:color 0.15s,background 0.15s}
+.theme-toggle:hover{color:var(--text);background:rgba(108,140,255,0.08)}
+.theme-toggle svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;
+stroke-linecap:round;stroke-linejoin:round}
+.theme-toggle .sun{display:inline-block}
+.theme-toggle .moon{display:none}
+:root[data-theme="light"] .theme-toggle .sun{display:none}
+:root[data-theme="light"] .theme-toggle .moon{display:inline-block}
+
 /* SVG toggle */
 .svg-toggle{cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px}
 .svg-toggle .arrow{transition:transform 0.2s;font-size:10px}
 .svg-toggle.open .arrow{transform:rotate(90deg)}
-.svg-container{max-height:0;overflow:hidden;transition:max-height 0.3s ease;background:#fff;border-radius:6px;margin-top:8px}
+.svg-container{max-height:0;overflow:hidden;transition:max-height 0.3s ease;background:var(--paper);border-radius:6px;margin-top:8px}
 /* A deep model's graph is a tall, narrow ribbon (ResNet-56 renders ~272pt
    wide by ~7500pt high). `width:100%` upscaled that thinness to the card
    width and multiplied the height by the same factor, so the card grew to
@@ -107,7 +131,7 @@ tr.dead td{color:var(--red)}
 .svg-container svg{max-width:100%;height:auto;display:block;margin:0 auto}
 
 /* Tooltip */
-.tooltip{position:fixed;background:rgba(26,29,39,0.95);color:var(--text);padding:8px 12px;
+.tooltip{position:fixed;background:var(--tooltip-bg);color:#e4e6eb;padding:8px 12px;
 border-radius:6px;font-size:11px;pointer-events:none;display:none;z-index:100;
 border:1px solid var(--border);white-space:nowrap;backdrop-filter:blur(8px)}
 
@@ -118,6 +142,29 @@ animation:pulse 2s ease-in-out infinite}
 .status-dot.done{background:var(--dim);animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
 </style>
+<script>
+// Resolve the theme BEFORE the body paints, or the page flashes the wrong one.
+//
+// Precedence, narrowest intent first:
+//   1. the reader's own toggle (localStorage) — always wins, per browser
+//   2. ARCHIVE_THEME — baked at save time; an artifact gets a FIXED look, so a
+//      saved page renders the same on every machine it is opened on. Absent on
+//      the live page; may be "auto" to opt an artifact into (3) deliberately.
+//   3. prefers-color-scheme — the OS preference, the friendly live default
+//   4. dark
+(function(){
+  var t=null;
+  try{t=localStorage.getItem('flodl-theme')}catch(e){}
+  if(t!=='light'&&t!=='dark'){
+    t=(typeof ARCHIVE_THEME!=='undefined'&&ARCHIVE_THEME)?ARCHIVE_THEME:'auto';
+    if(t==='auto'){
+      t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches)
+        ?'light':'dark';
+    }
+  }
+  if(t==='light')document.documentElement.setAttribute('data-theme','light');
+})();
+</script>
 </head>
 <body>
 
@@ -141,6 +188,10 @@ animation:pulse 2s ease-in-out infinite}
       <div class="stat-label">Elapsed</div>
       <div class="stat-value" id="elapsedDisplay">&mdash;</div>
     </div>
+    <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Toggle light/dark theme">
+      <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg class="moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
   </div>
   <div class="hw-info" id="hwInfo" style="display:none"></div>
 </div>
@@ -247,7 +298,48 @@ animation:pulse 2s ease-in-out infinite}
 //                  per device, so the same renderer covers both.
 // ===========================================================================
 
-const COLORS=['#6c8cff','#f87171','#34d399','#fbbf24','#a78bfa','#fb923c','#67e8f9','#f472b6','#86efac','#fcd34d','#c4b5fd','#fdba74'];
+// Series palettes. The dark ramp ends in pale tints that wash out on white, so
+// light gets its own — anchored on flodl.dev's light accents and darkened rather
+// than inverted. Twelve either way, same order, so a series keeps its position.
+const COLORS_DARK=['#6c8cff','#f87171','#34d399','#fbbf24','#a78bfa','#fb923c','#67e8f9','#f472b6','#86efac','#fcd34d','#c4b5fd','#fdba74'];
+const COLORS_LIGHT=['#3656c7','#c93c3c','#0e9968','#8f5b10','#6e4ad0','#b4530c','#0b7b95','#b83280','#12734f','#8a6d0f','#5b3fa8','#9a4a12'];
+/// Chart-drawing colours cannot be `var(--…)` — canvas has no CSS cascade. Read
+/// them once per render (never per stroke) and let the CSS stay the single
+/// source of truth for the palette.
+let THEME={};
+function refreshTheme(){
+  const light=document.documentElement.getAttribute('data-theme')==='light';
+  const cs=getComputedStyle(document.documentElement);
+  const v=(n,fb)=>{const x=cs.getPropertyValue(n).trim();return x||fb};
+  THEME={
+    light,
+    dim:v('--dim',light?'#5a5f72':THEME.dim),
+    text:v('--text',light?'#1a1d27':'#e4e6eb'),
+    grid:light?'rgba(221,224,232,0.9)':'rgba(42,45,58,0.8)',
+    ref:light?'rgba(201,60,60,0.7)':'rgba(248,113,113,0.7)',
+    refDim:light?'rgba(201,60,60,0.45)':'rgba(248,113,113,0.4)',
+    series:light?COLORS_LIGHT:COLORS_DARK,
+  };
+}
+refreshTheme();
+/// `COLORS` stays the name every call site already uses; it just follows the
+/// theme now.
+const COLORS=new Proxy([],{
+  get(_,k){
+    const s=THEME.series||COLORS_DARK;
+    return k==='length'?s.length:s[k];
+  },
+});
+function toggleTheme(){
+  const root=document.documentElement;
+  const light=root.getAttribute('data-theme')==='light';
+  if(light)root.removeAttribute('data-theme');else root.setAttribute('data-theme','light');
+  try{localStorage.setItem('flodl-theme',light?'dark':'light')}catch(e){}
+  // Canvases hold no CSS-derived state, so they must be redrawn, not restyled.
+  refreshTheme();
+  for(const k in soloState)soloState[k]=null;
+  render();
+}
 const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24'};
 const ROOT='root';
 // Rows retained per node. Bounds the DOM and the chart point count on a long
@@ -707,13 +799,13 @@ function drawResources(){
   if(solo==='vram'&&vramTotal){
     // Solo VRAM: absolute bytes against the physical limit.
     drawn={vram:seriesOf(node,'res','vram_alloc')};drawColors=[RES_COLORS.vram];pct=false;
-    yFmt=fmtBytes;ref={value:vramTotal,dotted:false,color:'rgba(248,113,113,0.7)',label:'Physical VRAM'};
+    yFmt=fmtBytes;ref={value:vramTotal,dotted:false,color:THEME.ref,label:'Physical VRAM'};
   }else if(solo==='ram'){
     drawn={ram:seriesOf(node,'res','ram_used')};drawColors=[RES_COLORS.ram];pct=false;yFmt=fmtBytes;
   }else if(solo==='gpu'||solo==='cpu'){
     drawn={};drawn[solo]=series[solo]||[];drawColors=[RES_COLORS[solo]];yFmt=pctFmt;
   }else if(names.includes('vram')&&vramTotal){
-    ref={value:100,dotted:true,color:'rgba(248,113,113,0.4)',label:'VRAM limit'};
+    ref={value:100,dotted:true,color:THEME.refDim,label:'VRAM limit'};
   }
   // Whatever branch ran, the drawn key set is named exactly as the legend is,
   // so `soloState` alone drives the filtering inside drawChart.
@@ -998,7 +1090,7 @@ function drawChart(canvasId,series,colors,opts){
     if(p.v<minV)minV=p.v;if(p.v>maxV)maxV=p.v;
   }
   if(!isFinite(minT)){
-    ctx.fillStyle='#8b8fa3';ctx.font='12px -apple-system,sans-serif';ctx.textAlign='center';
+    ctx.fillStyle=THEME.dim;ctx.font='12px -apple-system,sans-serif';ctx.textAlign='center';
     ctx.fillText('no data yet',W/2,H/2);
     canvas._layout=null;
     return;
@@ -1016,12 +1108,12 @@ function drawChart(canvasId,series,colors,opts){
   const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
 
   const yLabel=opts.yFmt||fmtVal;
-  ctx.strokeStyle='rgba(42,45,58,0.8)';ctx.lineWidth=1;
+  ctx.strokeStyle=THEME.grid;ctx.lineWidth=1;
   for(let i=0;i<=4;i++){
     const v=minV+(maxV-minV)*i/4;
     const y=yScale(v);
     ctx.beginPath();ctx.moveTo(M.left,y);ctx.lineTo(W-M.right,y);ctx.stroke();
-    ctx.fillStyle='#8b8fa3';ctx.font='10px -apple-system,sans-serif';ctx.textAlign='right';
+    ctx.fillStyle=THEME.dim;ctx.font='10px -apple-system,sans-serif';ctx.textAlign='right';
     ctx.fillText(yLabel(v),M.left-6,y+3);
   }
 
@@ -1034,12 +1126,12 @@ function drawChart(canvasId,series,colors,opts){
       const m=marks[i],x=xScale(m.t);
       ctx.strokeStyle='rgba(108,140,255,0.13)';
       ctx.beginPath();ctx.moveTo(x,M.top);ctx.lineTo(x,M.top+ph);ctx.stroke();
-      ctx.fillStyle='#8b8fa3';ctx.fillText(m.label,x,H-M.bottom+14);
+      ctx.fillStyle=THEME.dim;ctx.fillText(m.label,x,H-M.bottom+14);
     }
   }else{
     for(let i=0;i<=4;i++){
       const t=minT+span*i/4;
-      ctx.fillStyle='#8b8fa3';ctx.fillText(fmtDur(t),xScale(t),H-M.bottom+14);
+      ctx.fillStyle=THEME.dim;ctx.fillText(fmtDur(t),xScale(t),H-M.bottom+14);
     }
   }
 
@@ -1047,13 +1139,13 @@ function drawChart(canvasId,series,colors,opts){
     const ry=yScale(opts.refLine.value);
     if(ry>=M.top&&ry<=M.top+ph){
       ctx.save();
-      ctx.strokeStyle=opts.refLine.color||'#8b8fa3';
+      ctx.strokeStyle=opts.refLine.color||THEME.dim;
       ctx.lineWidth=1.5;
       if(opts.refLine.dotted)ctx.setLineDash([6,4]);
       ctx.beginPath();ctx.moveTo(M.left,ry);ctx.lineTo(W-M.right,ry);ctx.stroke();
       ctx.setLineDash([]);
       if(opts.refLine.label){
-        ctx.fillStyle=opts.refLine.color||'#8b8fa3';
+        ctx.fillStyle=opts.refLine.color||THEME.dim;
         ctx.font='9px -apple-system,sans-serif';ctx.textAlign='right';
         ctx.fillText(opts.refLine.label,W-M.right,ry-4);
       }
@@ -1191,6 +1283,12 @@ function showHardware(hw){
 function isGpuSeg(s){return /^gr=\d+\s+lr=\d+:/.test(s)}
 /// Host name a `host: <cpu>` segment describes, or null.
 function hostOfSeg(s){const m=s.match(/^([^:]+):\s*(.*)$/);return m&&!isGpuSeg(s)?m[1]:null}
+/// Does the record tree carry a host tier (`root/<host>/<rank>`)? A single-host
+/// cohort collapses to `root/<rank>`, so depth is the discriminator.
+function hasHostTier(){
+  for(const p of NODES.keys())if(p.split('/').length>=3)return true;
+  return false;
+}
 /// Level-scoped hardware line.
 ///
 /// The GPUs a level owns fall straight out of the record plane's depth-1
@@ -1208,10 +1306,16 @@ function hwForLevel(){
   // is the CPU and the rest are GPUs the record plane will re-derive.
   const clustered=segs.some(isGpuSeg);
   const host=current===ROOT?null:current.split('/')[1];
+  // An unattributed string (single-process form) describes ONE box. That is the
+  // right answer at every level of a single-host run, but on a cohort with a
+  // host tier it would claim the controller's CPU at a remote rank's level — so
+  // there, show it at root only and omit rather than assert. Reachable when a
+  // rank never shipped its hardware (died early, or an archive built before it
+  // arrived); the GPU side still resolves from the per-node labels.
   const cpus=clustered
     ? segs.filter(s=>!isGpuSeg(s))
           .filter(s=>{const h=hostOfSeg(s);return !host||!h||h===host})
-    : segs.slice(0,1);
+    : (current===ROOT||!hasHostTier()?segs.slice(0,1):[]);
   // GPU side: this node's own label at a leaf, its children's at an interior.
   const node=nodeOf(current);
   const gpus=[];
@@ -1330,10 +1434,31 @@ current=pathFromHash();
 // connecting. The baked archive carries epochs, so it lands on the same
 // `/events` fallback path a single-process live run uses.
 if(typeof ARCHIVE_DATA!=='undefined'){
+  // A baked record plane makes the saved page the PORTAL rather than the
+  // epoch-feed fallback: real levels, both cadences interleaved, the `meta`
+  // reduction declarations. Enter record mode BEFORE replaying the epoch feed
+  // so that feed contributes only the run clock and the host gauges — exactly
+  // the division of labour it has live, since the record plane owns levels.
+  //
+  // Deliberately not via `latchRecordMode()`: that exists to abandon the
+  // fallback tree *mid-run* and sends a deep-linked viewer back to root. Every
+  // level is baked here, so a `#path=` link into a saved page must keep working.
+  const archRecords=(typeof ARCHIVE_RECORDS!=='undefined'&&Array.isArray(ARCHIVE_RECORDS))
+    ?ARCHIVE_RECORDS:[];
+  if(archRecords.length)recordMode=true;
+
   let archiveErr=null,done=0;
   for(let i=0;i<ARCHIVE_DATA.length;i++){
     try{ingestEpoch(ARCHIVE_DATA[i]);done++}
     catch(e){archiveErr=e;console.error('ingestEpoch failed at index '+i+':',e);break}
+  }
+  for(let i=0;i<archRecords.length;i++){
+    try{ingestRecord(archRecords[i])}
+    catch(e){
+      archiveErr=archiveErr||e;
+      console.error('ingestRecord failed at index '+i+':',e);
+      break;
+    }
   }
   try{render()}catch(e){console.error('render:',e);archiveErr=archiveErr||e}
   // Wall-clock elapsed is meaningless in an archive: sum the epoch durations.

@@ -170,6 +170,15 @@ pub(crate) fn build_coord_config_from_builder(
     if let Some(dir) = config.record_log_dir.clone() {
         coord_config = coord_config.record_log(dir, config.max_log_size.unwrap_or(0));
     }
+    if let Some(path) = config.dashboard_html.clone() {
+        coord_config = coord_config.dashboard_html(path);
+    }
+    if let Some(theme) = config.dashboard_theme.clone() {
+        coord_config = coord_config.dashboard_theme(theme);
+    }
+    if !config.scalar_reductions.is_empty() {
+        coord_config = coord_config.scalar_reductions(config.scalar_reductions.clone());
+    }
     if let Some(f) = eval_result_fn {
         coord_config = coord_config.eval_result_fn(f);
     }

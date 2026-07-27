@@ -220,6 +220,21 @@ pub struct ClusterCoordinatorConfig {
     /// ring). `None` = the library default.
     pub max_log_size: Option<u64>,
 
+    /// Where the launcher writes the self-contained dashboard archive at
+    /// teardown. Like `record_log_dir`, carried here for the launcher rather
+    /// than used by the coordinator itself.
+    pub dashboard_html: Option<String>,
+
+    /// Theme pinned into the saved archive, carried to the launcher alongside
+    /// `dashboard_html`. `None` = leave it to the reader's OS preference.
+    pub dashboard_theme: Option<String>,
+
+    /// User-scalar roll-up declarations. Like `record_log_dir`, read by the
+    /// **launcher** (which owns the dashboard sink the records flow through)
+    /// rather than by the coordinator itself; this is the controller-scope bag
+    /// that carries them there. Empty = every non-core key rolls up as `Mean`.
+    pub scalar_reductions: crate::monitor::record::Reductions,
+
     /// Which rank should fire user-supplied per-epoch callbacks
     /// (`epoch_fn` / `checkpoint_fn` / `eval_fn`). Default
     /// [`EpochCallbackPolicy::Fastest`] — coord runtime-resolves the
@@ -372,6 +387,9 @@ impl ClusterCoordinatorConfig {
             eval_every_epochs: None,
             reports_per_epoch: None,
             record_log_dir: None,
+            dashboard_html: None,
+            dashboard_theme: None,
+            scalar_reductions: crate::monitor::record::Reductions::new(),
             max_log_size: None,
             epoch_callback_policy:
                 crate::distributed::ddp_run::EpochCallbackPolicy::default(),
@@ -484,6 +502,27 @@ impl ClusterCoordinatorConfig {
     pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
         self.record_log_dir = Some(dir.into());
         self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
+        self
+    }
+
+    /// Carry the dashboard-archive path through to the launcher.
+    pub fn dashboard_html(mut self, path: impl Into<String>) -> Self {
+        self.dashboard_html = Some(path.into());
+        self
+    }
+
+    /// Carry the archive theme through to the launcher.
+    pub fn dashboard_theme(mut self, theme: impl Into<String>) -> Self {
+        self.dashboard_theme = Some(theme.into());
+        self
+    }
+
+    /// Carry the user-scalar roll-up declarations through to the launcher.
+    pub fn scalar_reductions(
+        mut self,
+        reductions: crate::monitor::record::Reductions,
+    ) -> Self {
+        self.scalar_reductions = reductions;
         self
     }
 

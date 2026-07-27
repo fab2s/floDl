@@ -23,9 +23,11 @@ use std::sync::Mutex;
 /// rendezvous.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingDashboardConfig {
-    /// HTTP port the user requested via `monitor.serve(port)`. `None`
-    /// = user has not opted into the live dashboard; the cluster_worker
-    /// skips every Dashboard* emit and resource sampling stays off.
+    /// HTTP port the user requested via `monitor.serve(port)`. `None` = no live
+    /// dashboard: `DashboardRegister` is not emitted and resource sampling stays
+    /// off. The other `Dashboard*` emits are NOT port-gated — the saved archive
+    /// wants the SVG / metadata / hardware and binds no server, so gating them
+    /// on a port produced a persisted dashboard with no graph and no config.
     pub port: Option<u16>,
     /// Graph SVG bytes the user pushed via `monitor.watch(&model)` (or
     /// `monitor.set_svg(&svg)`).

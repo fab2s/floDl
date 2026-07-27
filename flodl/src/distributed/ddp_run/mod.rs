@@ -613,6 +613,28 @@ pub struct DdpRunConfig {
     /// A tree of `N` nodes bounds to `N * max_log_size`.
     pub max_log_size: Option<u64>,
 
+    /// Where to write the self-contained dashboard archive at teardown, or
+    /// `None` for live-only. One HTML file carrying the epoch feed, the record
+    /// plane, and the graph SVG — the run's dashboard as an attachable artifact.
+    pub dashboard_html: Option<String>,
+
+    /// Theme the saved archive opens with: `None` (default) leaves it to the
+    /// reader's `prefers-color-scheme`; `"light"` / `"dark"` pin it. `"light"` is
+    /// the publication setting — a figure in a paper wants to be light on a
+    /// reviewer's dark laptop.
+    pub dashboard_theme: Option<String>,
+
+    /// How each **non-core** metric key rolls up across ranks in the record
+    /// tree. Core keys (`loss`, `throughput`, `batch_share`, `data_starve`,
+    /// `compute_only_ms`) are authoritative and cannot be overridden; anything
+    /// else — every user scalar — defaults to
+    /// [`Reduction::Mean`](crate::monitor::record::Reduction::Mean), which is
+    /// wrong for a **count** (tokens seen, samples processed) and for an
+    /// **extremum** (peak memory). Declaring it here both fixes the roll-up and
+    /// reaches every consumer, because the declarations ride the record
+    /// stream's `meta` record.
+    pub scalar_reductions: crate::monitor::record::Reductions,
+
     /// Checkpoint bundle stem for resume. When set, the cluster
     /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
     /// the controller with the saved trajectory state (epoch,
@@ -677,6 +699,9 @@ impl DdpRunConfig {
             reports_per_epoch: None,
             record_log_dir: None,
             max_log_size: None,
+            dashboard_html: None,
+            dashboard_theme: None,
+            scalar_reductions: crate::monitor::record::Reductions::new(),
             resume_from: None,
             checkpoint_at_epoch: None,
         }
@@ -829,6 +854,30 @@ impl DdpRunConfig {
     pub fn with_record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
         self.record_log_dir = Some(dir.into());
         self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
+        self
+    }
+
+    /// Save the self-contained dashboard archive to `path` at teardown.
+    pub fn with_dashboard_html(mut self, path: impl Into<String>) -> Self {
+        self.dashboard_html = Some(path.into());
+        self
+    }
+
+    /// Pin the saved archive's theme (`"light"`, `"dark"`, or `"auto"`).
+    pub fn with_dashboard_theme(mut self, theme: impl Into<String>) -> Self {
+        self.dashboard_theme = Some(theme.into());
+        self
+    }
+
+    /// Declare how one non-core metric key rolls up across ranks. Repeatable;
+    /// a later declaration for the same key replaces the earlier one. Core keys
+    /// are authoritative and silently keep their own reduction.
+    pub fn with_scalar_reduction(
+        mut self,
+        key: impl Into<String>,
+        reduction: crate::monitor::record::Reduction,
+    ) -> Self {
+        self.scalar_reductions.insert(key.into(), reduction);
         self
     }
 

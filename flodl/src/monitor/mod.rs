@@ -204,12 +204,22 @@ pub struct Monitor {
     start_time: Instant,
     sampler: ResourceSampler,
     server: Option<server::DashboardServer>,
+    /// The record plane, owned here rather than by the HTTP server so it
+    /// survives a headless run: `--save-dashboard` with no `--monitor` port must
+    /// still bake the levels. Shared with the server (same `Arc`) when one is
+    /// bound, so there is exactly one store either way.
+    records: std::sync::Arc<std::sync::Mutex<record_store::RecordStore>>,
     save_html: Option<String>,
     svg_snapshot: Option<String>,
     /// Published blob: [`Self::param_info`] merged under
     /// [`Self::user_metadata`]. Kept as the single read source for the
     /// archive + injected constants.
     metadata: Option<serde_json::Value>,
+    /// Theme baked into the saved archive, or `None` (the default) to leave the
+    /// choice to the reader: the page then follows `prefers-color-scheme` exactly
+    /// as the live dashboard does. Only an explicit knob — or a hand edit of the
+    /// one constant in the saved file — pins it, which is the publication case.
+    archive_theme: Option<String>,
     /// Exactly what the user handed to [`Self::set_metadata`].
     user_metadata: Option<serde_json::Value>,
     /// Parameter counts derived from the watched graph.
@@ -272,9 +282,13 @@ impl Monitor {
             start_time: Instant::now(),
             sampler: ResourceSampler::new(),
             server: None,
+            records: std::sync::Arc::new(std::sync::Mutex::new(
+                record_store::RecordStore::new(),
+            )),
             save_html: None,
             svg_snapshot: None,
             metadata: None,
+            archive_theme: None,
             user_metadata: None,
             param_info: None,
             graph_label: None,
@@ -414,9 +428,25 @@ impl Monitor {
     /// caller keeps owning persistence — this is the *live* half of the
     /// stream, [`crate::monitor::record_log::RecordLog`] is the durable one.
     pub(crate) fn push_records(&mut self, records: Vec<serde_json::Value>) {
-        if let Some(ref srv) = self.server {
-            srv.push_records(records);
+        // With a server bound, its message handler owns insertion (it needs the
+        // records anyway to fan out to `/stream` subscribers) and writes into
+        // this same shared store — inserting here too would double every row.
+        // Headless, nobody else would, and the archive would come out empty.
+        match self.server {
+            Some(ref srv) => srv.push_records(records),
+            None => self.records.lock().unwrap().insert_all(&records),
         }
+    }
+
+    /// The record plane flattened for the archive: the `meta` declaration first,
+    /// then every retained record oldest-first.
+    ///
+    /// Reads the Monitor's own store, so this works with or without a bound
+    /// server. When one IS bound, call after shutting it down: `push_records`
+    /// crosses a channel and `shutdown` is what drains it.
+    fn records_snapshot(&self) -> Vec<serde_json::Value> {
+        let store = self.records.lock().unwrap();
+        store.meta().into_iter().chain(store.all()).cloned().collect()
     }
 
     /// Shut the dashboard's HTTP server down + emit the SSE `complete`
@@ -437,7 +467,10 @@ impl Monitor {
     /// initial header / gpu_init injection; the calling surface
     /// decides whether to print a URL line.
     fn bind_dashboard_locally(&mut self, port: u16) -> std::io::Result<()> {
-        let srv = server::DashboardServer::start(port)?;
+        let srv = server::DashboardServer::start_with_records(
+            port,
+            std::sync::Arc::clone(&self.records),
+        )?;
         srv.set_hardware(self.hardware.clone());
 
         // Sample GPU hardware for immediate tab init (before epoch 1).
@@ -469,6 +502,22 @@ impl Monitor {
     /// ```
     pub fn save_html(&mut self, path: &str) {
         self.save_html = Some(path.to_string());
+    }
+
+    /// Theme the saved archive opens with: `"dark"` (default), `"light"`, or
+    /// `"auto"` (follow the reader's `prefers-color-scheme`).
+    ///
+    /// `"light"` is the publication setting — a figure in a paper appendix wants
+    /// to be light on a reviewer's dark laptop. Unrecognized values fall back to
+    /// `"dark"` loudly rather than silently theming the page at random.
+    pub fn set_archive_theme(&mut self, theme: &str) {
+        match theme {
+            "dark" | "light" | "auto" => self.archive_theme = Some(theme.to_string()),
+            other => eprintln!(
+                "  warning: unknown dashboard theme {other:?} (expected \"dark\", \
+                 \"light\" or \"auto\"); keeping \"dark\""
+            ),
+        }
     }
 
     /// Attach arbitrary JSON metadata (hyperparameters, config, etc.)
@@ -818,6 +867,16 @@ impl Monitor {
             crate::msg!("{}", line);
         }
 
+        // Order is load-bearing: shut the server down BEFORE building the
+        // archive. `push_records` hands records to the message handler over a
+        // channel, and `shutdown` drains that channel (FIFO) and joins the
+        // handler — so snapshotting the record plane first would silently drop
+        // however much of the tail was still in flight, which is exactly the
+        // end of the run the archive is most wanted for.
+        if let Some(ref mut srv) = self.server {
+            srv.shutdown();
+        }
+
         // Save HTML archive
         if let Some(ref path) = self.save_html {
             match self.build_archive() {
@@ -831,9 +890,29 @@ impl Monitor {
                 Err(e) => eprintln!("  warning: failed to build dashboard archive: {}", e),
             }
         }
+    }
 
-        if let Some(ref mut srv) = self.server {
-            srv.shutdown();
+    /// Write the self-contained archive now, for the cluster path.
+    ///
+    /// On a cluster run the *user's* `Monitor` has neither the dashboard server
+    /// nor any records (its `serve()` returns early — the
+    /// `ClusterDashboardSink` owns the real server), so `save_html` on it would
+    /// bake an empty page. The sink drives this instead, from the `Monitor` that
+    /// actually holds the epochs and the record plane.
+    ///
+    /// Call **after** shutting the server down, so the record plane has caught
+    /// up with everything pushed; see
+    /// [`DashboardServer::records_snapshot`](crate::monitor::server::DashboardServer::records_snapshot).
+    pub(crate) fn write_archive_now(&self, path: &str) {
+        match self.build_archive() {
+            Ok(html) => {
+                if let Err(e) = std::fs::write(path, html) {
+                    eprintln!("  warning: failed to save dashboard archive: {e}");
+                } else {
+                    crate::msg!("  saved dashboard: {path}");
+                }
+            }
+            Err(e) => eprintln!("  warning: failed to build dashboard archive: {e}"),
         }
     }
 
@@ -929,6 +1008,24 @@ impl Monitor {
         }
         data_json.push(']');
 
+        // The record plane, so a saved page is the PORTAL rather than the
+        // epoch-feed fallback: real levels, both cadences interleaved, the
+        // `meta` reduction declarations. Bounded by the live ring
+        // (`record_store::MAX_RECORDS`), so the archive stays one attachable
+        // artifact however long the run was — the horizon shortens, the file
+        // does not grow. Empty for a run with no record plane (single-process),
+        // where the page keeps building levels from the epoch feed.
+        let records_json = {
+            let snap = self.records_snapshot();
+            let mut s = String::from("[");
+            for (i, rec) in snap.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                let _ = write!(s, "{rec}");
+            }
+            s.push(']');
+            s
+        };
+
         // SVG as a JS template literal (backtick / ${ escaping is
         // template-literal safety; the </script> neutralization is applied
         // once to the whole assembled block below).
@@ -972,8 +1069,13 @@ impl Monitor {
         // constant — data, svg, label, hash, metadata, hardware — could
         // otherwise close the tag early; the HTML parser ignores JS quoting).
         let archive_consts = format!(
-            "\nconst ARCHIVE_DATA={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
+            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
+            match &self.archive_theme {
+                Some(t) => format!("\"{t}\""),
+                None => "null".to_string(),
+            },
             data_json,
+            records_json,
             svg_js,
             format_eta(total_time),
             label_js,
@@ -1435,6 +1537,111 @@ mod tests {
             monitor.metadata.as_ref().unwrap()["parameters"],
             "counted by hand",
         );
+    }
+
+    /// The saved page must not pin a theme unless the author asked for one.
+    ///
+    /// Default is `null`, which the page's init reads as "fall through to
+    /// `prefers-color-scheme`" — so an archive follows the reader's OS exactly as
+    /// the live dashboard does, and only an explicit knob (or a hand edit of this
+    /// one constant in the saved file) overrides it. That hand edit is the
+    /// documented publishing path, so the constant has to stay a single obvious
+    /// literal.
+    #[test]
+    fn the_archive_leaves_the_theme_to_the_reader_unless_told_otherwise() {
+        let mut m = Monitor::new(1);
+        m.log(0, Duration::from_millis(1), &[("loss", 1.0)]);
+        assert!(
+            m.build_archive().unwrap().contains("const ARCHIVE_THEME=null;"),
+            "an unconfigured archive must not pin a theme",
+        );
+
+        for theme in ["light", "dark", "auto"] {
+            let mut m = Monitor::new(1);
+            m.set_archive_theme(theme);
+            m.log(0, Duration::from_millis(1), &[("loss", 1.0)]);
+            assert!(
+                m.build_archive()
+                    .unwrap()
+                    .contains(&format!("const ARCHIVE_THEME=\"{theme}\";")),
+                "{theme} must be baked verbatim",
+            );
+        }
+
+        // A typo must not silently theme the page at random.
+        let mut m = Monitor::new(1);
+        m.set_archive_theme("darkk");
+        m.log(0, Duration::from_millis(1), &[("loss", 1.0)]);
+        assert!(m.build_archive().unwrap().contains("const ARCHIVE_THEME=null;"));
+    }
+
+    /// A headless run must still bake its levels.
+    ///
+    /// The record plane used to live inside the HTTP server, so
+    /// `--save-dashboard` without `--monitor` produced an archive with
+    /// `ARCHIVE_RECORDS=[]` — a "persisted dashboard" that silently required a
+    /// live one. Caught on the rig, not by a test, hence this one.
+    #[test]
+    fn a_headless_run_still_bakes_the_record_plane() {
+        let mut monitor = Monitor::new(1);
+        assert!(monitor.server.is_none(), "no port: no server by construction");
+
+        monitor.push_records(vec![
+            serde_json::json!({"v":1,"ts":5,"kind":"meta","reductions":{"tokens":"sum"}}),
+            serde_json::json!({"v":1,"ts":6,"kind":"node","path":"root","work":1.0,
+                               "metrics":{"loss":0.5}}),
+            serde_json::json!({"v":1,"ts":6,"kind":"node","path":"root/rank0","work":1.0,
+                               "metrics":{"loss":0.5}}),
+        ]);
+        monitor.log(0, Duration::from_millis(10), &[("loss", 0.5)]);
+
+        let html = monitor.build_archive().unwrap();
+        let recs = html
+            .split_once("const ARCHIVE_RECORDS=")
+            .and_then(|(_, r)| r.split_once(";\n"))
+            .map(|(d, _)| d)
+            .expect("ARCHIVE_RECORDS absent");
+        assert!(recs.len() > 2, "headless archive must not be an empty array");
+        // meta first, so a consumer knows the roll-ups before reading a record.
+        assert!(recs.starts_with("[{\"kind\":\"meta\"") || recs.contains("\"kind\":\"meta\""));
+        assert!(recs.contains("root/rank0"), "levels must survive into the archive");
+    }
+
+    /// The archive must carry the record plane, and the page must read it under
+    /// the name the archive writes. A renamed constant fails **silently** in a
+    /// browser (the page just falls back to the epoch tree), so the contract is
+    /// checked here rather than discovered on a saved run.
+    #[test]
+    fn archive_carries_the_record_plane_the_page_reads() {
+        let template = include_str!("dashboard.html");
+        assert!(
+            template.contains("ARCHIVE_RECORDS"),
+            "the page must read the baked record plane",
+        );
+        // Entering record mode from baked records must NOT go through
+        // latchRecordMode(): that resets a deep-linked viewer to root, and every
+        // level is present in an archive so `#path=` has to keep working.
+        let boot = template
+            .split_once("const archRecords=")
+            .map(|(_, r)| r)
+            .expect("archive boot reads ARCHIVE_RECORDS into a local");
+        let boot = &boot[..boot.len().min(600)];
+        assert!(
+            boot.contains("recordMode=true"),
+            "archive boot must enter record mode directly",
+        );
+        assert!(
+            !boot.contains("latchRecordMode"),
+            "archive boot must not latch (it would reset a #path= deep link)",
+        );
+
+        // A Monitor with no server has no record plane, so the constant is still
+        // emitted (the page tests `Array.isArray` + length) but empty — the
+        // single-process case, where the epoch feed keeps owning the levels.
+        let mut monitor = Monitor::new(1);
+        monitor.log(0, Duration::from_millis(10), &[("loss", 1.0)]);
+        let html = monitor.build_archive().unwrap();
+        assert!(html.contains("const ARCHIVE_RECORDS=[]"));
     }
 
     #[test]

@@ -94,7 +94,7 @@ struct SharedState {
     sse_senders: Mutex<Vec<SseClient>>,
     /// Live path-addressable view of the record stream, serving `/node`,
     /// `/history`, and each `/stream` subscriber's catch-up preamble.
-    records: Mutex<RecordStore>,
+    records: Arc<Mutex<RecordStore>>,
     /// Graph label for dashboard header.
     label: Mutex<Option<String>>,
     /// Structural hash for dashboard header.
@@ -153,11 +153,24 @@ pub(crate) fn dashboard_bind_is_loopback() -> bool {
 }
 
 impl DashboardServer {
-    /// Start the dashboard server on the given port.
-    ///
-    /// Binds loopback by default; widen via `FLODL_DASHBOARD_BIND`
-    /// (see [`resolve_dashboard_bind`]).
+    /// Start with a private record store. Test convenience only — production
+    /// goes through [`Self::start_with_records`] so the store is owned by the
+    /// [`Monitor`](crate::monitor::Monitor) and outlives the server.
+    #[cfg(test)]
     pub fn start(port: u16) -> std::io::Result<Self> {
+        Self::start_with_records(port, Arc::new(Mutex::new(RecordStore::new())))
+    }
+
+    /// Bind sharing an externally-owned record store.
+    ///
+    /// The store must outlive the server, because the record plane is a data
+    /// structure and not an HTTP concern: a headless run keeps recording into it
+    /// with no server bound, which is what lets the saved archive carry the
+    /// levels without a live dashboard port.
+    pub fn start_with_records(
+        port: u16,
+        records: Arc<Mutex<RecordStore>>,
+    ) -> std::io::Result<Self> {
         let bind = resolve_dashboard_bind();
         let listener = TcpListener::bind((bind.as_str(), port))?;
         let addr = listener.local_addr()?;
@@ -172,7 +185,7 @@ impl DashboardServer {
             hardware: Mutex::new(None),
             metadata: Mutex::new(None),
             gpu_init: Mutex::new(None),
-            records: Mutex::new(RecordStore::new()),
+            records,
             shutting_down: AtomicBool::new(false),
         });
 
@@ -700,13 +713,31 @@ mod tests {
     // --- the portal page's contract with its two injectors ---
 
     #[test]
-    fn the_page_declares_exactly_one_script_block() {
+    fn injected_constants_land_ahead_of_the_first_reader() {
         // Both injectors (`serve_html` here, `Monitor::build_archive`) prepend
-        // their constants to the first `<script>`. More than one block in the
-        // template would put the page's own code before the constants it reads
-        // — a silent "ARCHIVE_DATA is not defined" — so the count is pinned.
-        assert_eq!(DASHBOARD_HTML.matches("<script>").count(), 1);
-        assert_eq!(DASHBOARD_HTML.matches("</script>").count(), 1);
+        // their constants to the FIRST `<script>` via `replacen(.., 1)`, so that
+        // block must be the earliest one that READS a constant — otherwise the
+        // page runs before the values exist, which surfaces as a silent
+        // "ARCHIVE_* is not defined" in a browser and nowhere else.
+        //
+        // The theme init is deliberately first: it reads `ARCHIVE_THEME` and has
+        // to run before the body paints, or the page flashes the wrong theme.
+        let first = DASHBOARD_HTML.find("<script>").expect("no script block");
+        let first_body = &DASHBOARD_HTML[first..];
+        let first_body = &first_body[..first_body.find("</script>").unwrap()];
+        assert!(
+            first_body.contains("ARCHIVE_THEME"),
+            "the first script block must be the theme init (it reads ARCHIVE_THEME)",
+        );
+        assert!(
+            first_body.contains("data-theme"),
+            "the theme init must set data-theme before the body paints",
+        );
+        // Balanced tags, so the split in the sibling test cannot run off the end.
+        assert_eq!(
+            DASHBOARD_HTML.matches("<script>").count(),
+            DASHBOARD_HTML.matches("</script>").count(),
+        );
     }
 
     #[test]
@@ -732,14 +763,24 @@ mod tests {
     /// they are checked here rather than discovered on a rig run.
     #[test]
     fn the_page_only_reaches_for_elements_and_handlers_it_has() {
+        // Every script block counts as "js" and everything else as markup: the
+        // page has more than one block (theme init + the page proper), and a
+        // handler defined in either satisfies an inline `onclick`.
         let (markup, js) = {
-            let open = DASHBOARD_HTML.find("<script>").unwrap() + "<script>".len();
-            let close = DASHBOARD_HTML.find("</script>").unwrap();
-            (
-                format!("{}{}", &DASHBOARD_HTML[..open], &DASHBOARD_HTML[close..]),
-                &DASHBOARD_HTML[open..close],
-            )
+            let mut markup = String::new();
+            let mut js = String::new();
+            let mut rest = DASHBOARD_HTML;
+            while let Some(open) = rest.find("<script>") {
+                markup.push_str(&rest[..open]);
+                let after = &rest[open + "<script>".len()..];
+                let close = after.find("</script>").expect("unclosed <script>");
+                js.push_str(&after[..close]);
+                rest = &after[close + "</script>".len()..];
+            }
+            markup.push_str(rest);
+            (markup, js)
         };
+        let js = js.as_str();
 
         /// Every `<needle><id><term>` occurrence's id, e.g. `id="foo"`.
         fn ids(hay: &str, needle: &str, term: char) -> Vec<String> {
