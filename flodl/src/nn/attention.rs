@@ -170,20 +170,42 @@ impl MultiheadAttention {
             None => (q, k),
         };
 
-        // Attention scores: [batch, heads, seq_q, seq_k]
-        let k_t = k.transpose(2, 3)?;
-        let mut scores = q.matmul(&k_t)?.mul_scalar(self.scale)?;
-
-        // Apply mask (true/non-zero positions are filled with -inf)
-        if let Some(m) = mask {
-            scores = scores.masked_fill(m, f64::NEG_INFINITY)?;
-        }
-
-        // Softmax over key dimension
-        let attn = scores.softmax(-1)?;
-
-        // Weighted sum of values: [batch, heads, seq_q, head_dim]
-        let out = attn.matmul(&v)?;
+        // Attention core: libtorch's fused scaled-dot-product attention,
+        // which picks flash / mem-efficient / math per device + dtype. The
+        // point of the fused call over the explicit matmul→softmax→matmul
+        // chain is memory, not speed: the chain holds TWO
+        // [batch, heads, seq_q, seq_k] tensors (scores + probs) through
+        // backward — ~300MB of the OLMo-150M seq-256 batch-4 envelope,
+        // double at batch 8 — while the fused backends never materialize
+        // them. The math fallback matches the old chain.
+        //
+        // Mask conversion: this module's contract is true/non-zero = MASKED,
+        // which is the INVERSE of SDPA's boolean convention (true =
+        // participate). Rather than invert (and depend on the caller's mask
+        // dtype), the mask becomes an ADDITIVE float mask — 0 where
+        // attended, -inf where masked — the exact math `masked_fill` +
+        // softmax applied, and only [seq_q, seq_k]-sized.
+        let add_mask = match mask {
+            Some(m) => Some(
+                Tensor::zeros(
+                    &m.shape(),
+                    crate::tensor::TensorOptions {
+                        dtype: crate::tensor::DType::Float32,
+                        device: m.device(),
+                    },
+                )?
+                .masked_fill(m, f64::NEG_INFINITY)?,
+            ),
+            None => None,
+        };
+        // [batch, heads, seq_q, head_dim]
+        let out = crate::autograd::scaled_dot_product_attention(
+            &q, &k, &v,
+            add_mask.as_ref(),
+            /*dropout_p=*/0.0,
+            /*is_causal=*/false,
+            Some(self.scale),
+        )?;
 
         // Reshape back: [batch, seq_q, embed_dim]
         let out = out.transpose(1, 2)?
@@ -315,6 +337,49 @@ mod tests {
         assert_eq!(y.shape(), vec![2, 5, 8]);
         y.sum().unwrap().backward().unwrap();
         assert_eq!(x.grad().unwrap().shape(), vec![2, 5, 8]);
+    }
+
+    /// The fused SDPA core must match the explicit
+    /// matmul→scale→mask→softmax→matmul chain it replaced — same math,
+    /// without holding [batch, heads, seq_q, seq_k] through backward. The
+    /// reference below IS the pre-SDPA implementation, verbatim, including
+    /// the module's true=masked → additive-mask conversion.
+    #[test]
+    fn test_sdpa_core_matches_explicit_score_chain() {
+        let opts = crate::tensor::test_opts();
+        let (b, h, lq, lk, e) = (2, 3, 5, 6, 4);
+        let q = Tensor::randn(&[b, h, lq, e], opts).unwrap();
+        let k = Tensor::randn(&[b, h, lk, e], opts).unwrap();
+        let v = Tensor::randn(&[b, h, lk, e], opts).unwrap();
+        let scale = 1.0 / (e as f64).sqrt();
+        // Non-square skip pattern in the module's convention (non-zero = masked).
+        let mask = Tensor::ones(&[lq, lk], opts).unwrap().triu(2).unwrap();
+
+        for m in [None, Some(&mask)] {
+            let mut scores = q
+                .matmul(&k.transpose(2, 3).unwrap()).unwrap()
+                .mul_scalar(scale).unwrap();
+            if let Some(m) = m {
+                scores = scores.masked_fill(m, f64::NEG_INFINITY).unwrap();
+            }
+            let reference = scores.softmax(-1).unwrap().matmul(&v).unwrap();
+
+            let add_mask = m.map(|m| {
+                Tensor::zeros(&m.shape(), opts).unwrap()
+                    .masked_fill(m, f64::NEG_INFINITY).unwrap()
+            });
+            let fused = Tensor::scaled_dot_product_attention(
+                &q, &k, &v, add_mask.as_ref(), 0.0, false, Some(scale),
+            ).unwrap();
+
+            let diff = fused.sub(&reference).unwrap().abs().unwrap()
+                .max().unwrap().item().unwrap();
+            assert!(
+                diff < 1e-5,
+                "SDPA diverged from the explicit chain (masked={}): max |Δ| = {diff}",
+                m.is_some(),
+            );
+        }
     }
 
     #[test]
