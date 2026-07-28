@@ -24,7 +24,7 @@ use flodl::data::datasets::{TokenDtype, TokenShards};
 use flodl::data::BatchDataSet;
 use flodl::nn::{
     AdamW, CosineScheduler, Embedding, Linear, Module, MultiheadAttention,
-    Parameter, RMSNorm, RotaryEmbedding, WarmupScheduler,
+    Parameter, RMSNorm, RotaryEmbedding, SwiGLU, WarmupScheduler,
 };
 use flodl::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
@@ -32,17 +32,20 @@ use super::{DatasetConfig, ModelDef};
 use crate::config::ModelDefaults;
 use crate::download::{ensure_olmo_eval, ensure_olmo_train, OLMO_TRAIN_BYTES};
 
-const D_MODEL: i64 = 768;
-const N_HEADS: i64 = 12;
-const HEAD_DIM: i64 = D_MODEL / N_HEADS; // 64
-const N_LAYERS: usize = 12;
+// `pub(super)` so `olmo_graph` builds from the SAME numbers rather than its
+// own copy. A parity claim between the two arms is only worth anything if a
+// changed hyperparameter cannot land in one and miss the other.
+pub(super) const D_MODEL: i64 = 768;
+pub(super) const N_HEADS: i64 = 12;
+pub(super) const HEAD_DIM: i64 = D_MODEL / N_HEADS; // 64
+pub(super) const N_LAYERS: usize = 12;
 /// OLMo mlp_ratio 8: ff_proj widens to 8 * d_model, the SwiGLU gate
 /// halves it to an effective intermediate of 4 * d_model.
-const MLP_HIDDEN: i64 = 8 * D_MODEL; // 6144, gate-split to 3072
-const EMBEDDING_SIZE: i64 = 50_304; // vocab 50,280 padded (OLMo convention)
-const LN_EPS: f64 = 1e-6;
-const ROPE_THETA: f64 = 10_000.0;
-const SEQ_LEN: usize = 256;
+pub(super) const MLP_HIDDEN: i64 = 8 * D_MODEL; // 6144, gate-split to 3072
+pub(super) const EMBEDDING_SIZE: i64 = 50_304; // vocab 50,280 padded (OLMo convention)
+pub(super) const LN_EPS: f64 = 1e-6;
+pub(super) const ROPE_THETA: f64 = 10_000.0;
+pub(super) const SEQ_LEN: usize = 256;
 
 pub fn def() -> ModelDef {
     ModelDef {
@@ -92,17 +95,17 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
     Ok(Box::new(Olmo::new(device)?))
 }
 
-fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
+pub(super) fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
     let shard = ensure_olmo_train(&cfg.data_dir)?;
     Ok(Arc::new(TokenShards::open_raw(&[shard], TokenDtype::U16, SEQ_LEN)?))
 }
 
-fn make_eval_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
+pub(super) fn make_eval_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
     let shard = ensure_olmo_eval(&cfg.data_dir)?;
     Ok(Arc::new(TokenShards::open_raw(&[shard], TokenDtype::U16, SEQ_LEN)?))
 }
 
-fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
+pub(super) fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
     let input = Variable::new(batch[0].to_dtype(DType::Int64)?, false);
     let target = batch[1].to_dtype(DType::Int64)?;
 
@@ -114,7 +117,7 @@ fn train_step(model: &dyn Module, batch: &[Tensor]) -> Result<Variable> {
 }
 
 /// Held-out C4-en CE loss (lower is better; exp(this) = perplexity).
-fn eval_loss(model: &dyn Module, batch: &[Tensor]) -> Result<f64> {
+pub(super) fn eval_loss(model: &dyn Module, batch: &[Tensor]) -> Result<f64> {
     train_step(model, batch)?.item()
 }
 
@@ -150,10 +153,16 @@ impl OlmoBlock {
 
         // Pre-norm SwiGLU FFN + residual. OLMo's SwiGLU:
         // h, gate = ff_proj(x).chunk(2); ff_out(silu(gate) * h).
+        //
+        // Shares `nn::SwiGLU` with the graph arm ON PURPOSE. The eager/graph
+        // comparison is an experiment, and it should vary ONE thing — the
+        // engine. Keeping a second, inline copy of the gate here would vary
+        // two, so a divergence could not be attributed. The independent
+        // implementation that keeps the gate honest is `scripts/olmo_control.py`,
+        // which is a different language and framework entirely.
         let normed = self.ff_norm.forward(&x)?;
         let proj = self.ff_proj.forward(&normed)?;
-        let halves = proj.chunk(2, -1)?;
-        let gated = halves[1].silu()?.mul(&halves[0])?;
+        let gated = SwiGLU.forward(&proj)?;
         let ff = self.ff_out.forward(&gated)?;
         x.add(&ff)
     }

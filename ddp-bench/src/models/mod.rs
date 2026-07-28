@@ -10,6 +10,7 @@ pub mod lenet;
 pub mod logistic;
 pub mod mlp;
 pub mod olmo;
+pub mod olmo_graph;
 pub mod resnet;
 pub mod resnet_graph;
 
@@ -112,6 +113,7 @@ pub fn all_models() -> Vec<ModelDef> {
         gpt_nano::def(),
         conv_ae::def(),
         olmo::def(),
+        olmo_graph::def(),
     ]
 }
 
@@ -139,5 +141,6 @@ pub fn model_names() -> Vec<&'static str> {
         "gpt-nano",
         "conv-ae",
         "olmo",
+        "olmo-graph",
     ]
 }
