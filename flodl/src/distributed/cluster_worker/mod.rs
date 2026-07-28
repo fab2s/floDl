@@ -683,6 +683,21 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 snap_per * 1e3,
                 ctrl_msgs,
             );
+            // Rank memory identity, one read at teardown. RSS double-counts
+            // pages shared with co-hosted ranks (libtorch .so text, CUDA
+            // driver mappings — physically ONE copy per host); PSS and the
+            // private/shared split are what per-host RAM budget arithmetic
+            // actually needs. A big rss−pss gap means the "N × rank RSS"
+            // model overstates the host bill by roughly that gap per
+            // additional co-hosted rank.
+            if let Some((rss, pss, shared, private)) = smaps_rollup_kb() {
+                let gb = |kb: u64| kb as f64 / (1024.0 * 1024.0);
+                eprintln!(
+                    "[worker-mem] rank={} rss={:.2}GB pss={:.2}GB \
+                     private={:.2}GB shared={:.2}GB",
+                    inner.rank(), gb(rss), gb(pss), gb(private), gb(shared),
+                );
+            }
         }
 
         let final_snapshot = self.teardown(exit_clean.is_ok());
@@ -822,6 +837,28 @@ impl<M: Module> Drop for ClusterWorker<M> {
             let _ = handle.join();
         }
     }
+}
+
+/// One-shot `/proc/self/smaps_rollup` read for the `[worker-mem]` teardown
+/// line: `(rss, pss, shared, private)` in kB, `None` off Linux or on any
+/// parse surprise (the line is diagnostic; never fail teardown over it).
+fn smaps_rollup_kb() -> Option<(u64, u64, u64, u64)> {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let (mut rss, mut pss) = (None, None);
+    let (mut shared, mut private) = (0u64, 0u64);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(key), Some(val)) = (it.next(), it.next()) else { continue };
+        let Ok(kb) = val.parse::<u64>() else { continue };
+        match key {
+            "Rss:" => rss = Some(kb),
+            "Pss:" => pss = Some(kb),
+            "Shared_Clean:" | "Shared_Dirty:" => shared += kb,
+            "Private_Clean:" | "Private_Dirty:" => private += kb,
+            _ => {}
+        }
+    }
+    Some((rss?, pss?, shared, private))
 }
 
 

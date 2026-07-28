@@ -532,7 +532,11 @@ impl Tensor {
     /// - `key`: `[*, Lk, E]`
     /// - `value`: `[*, Lk, Ev]`
     /// - `attn_mask`: optional `[*, Lq, Lk]` (broadcastable); additive float
-    ///   or boolean. Bool masks mark positions to skip.
+    ///   (added to the scores pre-softmax: 0 = attend, `-inf` = skip) or
+    ///   boolean, where **`true` = participate** (libtorch's convention —
+    ///   the INVERSE of `masked_fill`-style "true = masked" masks such as
+    ///   `nn::MultiheadAttention`'s, which converts to an additive mask at
+    ///   the boundary for exactly this reason).
     /// - Output: `[*, Lq, Ev]`.
     ///
     /// `dropout_p`: applied to attention probs (0.0 = disabled).
