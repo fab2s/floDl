@@ -9,6 +9,18 @@
 # PASCAL_SKIP (models with no pascal solos at all; default "resnet"),
 # PASCAL_BIN / PASCAL_LIB (remote binary + libtorch lib dir).
 #
+# Every cell also saves its self-contained portal to
+# <cell>/dashboard.html (`--save-dashboard`). Timing-safe: the cluster
+# path builds its dashboard sink unconditionally, so the flag adds only
+# the run-scoped cards (built before the timer starts) and one file
+# write at teardown — the published wall-times are unchanged. For the
+# same reason `--reports-per-epoch` is deliberately NOT set here: it
+# emits on the hot path at the reduce boundary, and a benchmark whose
+# numbers get published must not carry monitoring overhead. Run a
+# dedicated showcase cell with it when a richer portal is wanted.
+# The archives follow the reader's `prefers-color-scheme`; pin one for
+# publication by editing its baked `ARCHIVE_THEME` rather than re-running.
+#
 # Phase 1: 7 full-suite models x 6 DDP modes (incl. cpu-async-diloco) +
 #          resnet parity cell, via `fdl @cluster` (sequential cells, one
 #          fdl invocation per cell — the rendezvous-lifetime bug rules
@@ -74,7 +86,7 @@ for entry in $MODELS; do
     # invalid for a benchmark cell. Reject it and delete the cell dir
     # so a resume re-runs it.
     cell_log=$(mktemp)
-    timeout 5400 ./fdl @cluster ddp-bench --model "$m" $(mode_args "$mode") --epochs "$e" --seed 42 --output "$OUT" 2>&1 | tee "$cell_log"
+    timeout 5400 ./fdl @cluster ddp-bench --model "$m" $(mode_args "$mode") --epochs "$e" --seed 42 --output "$OUT" --save-dashboard 2>&1 | tee "$cell_log"
     rc=${PIPESTATUS[0]}
     degraded=$(grep -c "finished DEGRADED\|child exit(s) tolerated\|device-side assert" "$cell_log")
     rm -f "$cell_log"
@@ -100,7 +112,7 @@ echo "$(ts) PHASE1 DONE"
     m=${entry%%:*}; e=${entry##*:}
     if cell_done "$m" "solo-0"; then echo "$(ts) SKIP $m/solo-0 (done)"; continue; fi
     echo "$(ts) START $m/solo-0 (epochs=$e)"
-    timeout 7200 ./fdl ddp-bench --model "$m" --mode solo-0 --epochs "$e" --seed 42 --output "$OUT"
+    timeout 7200 ./fdl ddp-bench --model "$m" --mode solo-0 --epochs "$e" --seed 42 --output "$OUT" --save-dashboard
     rc=$?
     if [ $rc -eq 0 ] && cell_done "$m" "solo-0"; then
       echo "$(ts) OK $m/solo-0"
@@ -137,7 +149,8 @@ PASCAL_SKIP=${PASCAL_SKIP-"resnet"}
       ssh -o BatchMode=yes flodl-pascal \
         "mkdir -p ~/solo-sweep && cd ~/solo-sweep && \
          LD_LIBRARY_PATH=$PLIB timeout 10800 $PBIN --model $m --mode solo-$pdev \
-         --epochs $e --seed 42 --output runs --data-dir /mnt/rdl/ddp-bench/data"
+         --epochs $e --seed 42 --output runs --data-dir /mnt/rdl/ddp-bench/data \
+         --save-dashboard"
       rc=$?
       if [ $rc -ne 0 ]; then echo "$(ts) FAIL $m/$pub rc=$rc"; continue; fi
       mkdir -p "$ABS_OUT/$m/$pub"
