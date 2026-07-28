@@ -529,6 +529,18 @@ impl DdpHandle {
                 // Model frames ride bf16 when configured (Control frames
                 // — including the initial broadcast below — stay f32).
                 client.set_bf16_wire(config.elche.bf16_wire);
+                // Barrier-paced CUDA consumers decode Model replies into
+                // reused pinned staging, making `load_averaged`'s
+                // `copy_(non_blocking)` a true async H2D (a pageable
+                // source degrades to a synchronous bounce copy). Async
+                // keeps the fresh-alloc decode: its control channel has
+                // two producers with only per-producer FIFO, so a second
+                // Update can be live while the first is unapplied — a
+                // single staging set cannot survive that (see
+                // `set_pinned_decode`'s single-consumer contract).
+                client.set_pinned_decode(
+                    device.is_cuda() && policy.is_barrier_paced(),
+                );
                 Some(client)
             }
             None => None,

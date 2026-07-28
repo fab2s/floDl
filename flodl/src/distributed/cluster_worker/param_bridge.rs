@@ -181,7 +181,12 @@ pub(super) fn param_bridge_loop(
         let avg_params = if total_n == 0.0 {
             params.clone()
         } else {
-            match sumcount_reduce(&mut client, &params, my_w) {
+            match sumcount_reduce(
+                &mut client,
+                &params,
+                my_w,
+                crate::distributed::cpu_reduce::DECODE_SLOT_PARAMS,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -233,7 +238,12 @@ pub(super) fn param_bridge_loop(
             let subset: Vec<Tensor> =
                 f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
             let my_indicator = crate::distributed::realized_work::mover_mass(n_i as f64);
-            match sumcount_reduce(&mut client, &subset, my_indicator) {
+            match sumcount_reduce(
+                &mut client,
+                &subset,
+                my_indicator,
+                crate::distributed::cpu_reduce::DECODE_SLOT_BUFFERS,
+            ) {
                 Ok(reduced) => {
                     let mut merged = buffers.clone();
                     for (k, &i) in f32_buffer_idx.iter().enumerate() {
@@ -309,16 +319,26 @@ pub(super) fn param_bridge_loop(
 /// clones of `tensors` when the round realized no work (returned mass
 /// `0.0`, e.g. every accepted contributor was idle) — the caller keeps
 /// its local state, mirroring the all-idle collective skip.
+///
+/// `decode_slot` tags which reused decode-staging set this round's
+/// reply lands in when the client has pinned decode enabled (see
+/// [`CpuReduceClient::arm_pinned_decode`]); the params and buffers
+/// reduces of one window must not share a slot. A no-op on clients
+/// without pinned decode (the reply decodes into fresh allocs).
+///
+/// [`CpuReduceClient::arm_pinned_decode`]: crate::distributed::cpu_reduce::CpuReduceClient::arm_pinned_decode
 pub(crate) fn sumcount_reduce(
     client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
     tensors: &[Tensor],
     my_weight: f64,
+    decode_slot: usize,
 ) -> Result<Vec<Tensor>> {
     // The `my_weight` pre-scale is FUSED into the streaming wire encode
     // (byte-level, per tensor) — no model-sized scaled scratch exists,
     // and reading `tensors` (the pinned snapshot staging) at stream time
     // is this window's single consumption of it.
     let refs: Vec<&Tensor> = tensors.iter().collect();
+    client.arm_pinned_decode(decode_slot);
     let (consensus, realized) = client.all_reduce_scaled(
         &refs,
         my_weight,

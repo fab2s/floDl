@@ -171,6 +171,19 @@ pub(super) fn make_test_worker_with(
     world_size: usize,
     dataset_size: usize,
 ) -> (GpuWorker<Linear>, WorkerChannels) {
+    make_test_worker_customized(rank, world_size, dataset_size, |_| {})
+}
+
+/// [`make_test_worker_with`] with a config tweak applied before
+/// construction — for tests exercising config-gated behavior the fixed
+/// defaults can't reach (e.g. the EASGD blend needs `policy: Async` +
+/// `easgd_alpha` to pass the constructor's single authoritative gate).
+pub(super) fn make_test_worker_customized(
+    rank: usize,
+    world_size: usize,
+    dataset_size: usize,
+    tweak: impl FnOnce(&mut WorkerConfig),
+) -> (GpuWorker<Linear>, WorkerChannels) {
     let dev = test_device();
 
     // Build a temporary model to extract initial params
@@ -183,7 +196,7 @@ pub(super) fn make_test_worker_with(
         .collect();
     drop(tmp_model);
 
-    let config = WorkerConfig {
+    let mut config = WorkerConfig {
         rank,
         world_size,
         device: dev,
@@ -210,6 +223,7 @@ pub(super) fn make_test_worker_with(
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
+    tweak(&mut config);
 
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), channels) =
         GpuWorker::<Linear>::channels();

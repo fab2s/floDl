@@ -80,6 +80,60 @@ fn test_worker_load_averaged() {
 }
 
 #[test]
+fn test_worker_load_averaged_easgd_blends() {
+    // EASGD elastic blend: `W := (1-α)·W + α·W_avg`, per element. This is
+    // the first value-level pin of the `Some(alpha)` arm (every other
+    // worker fixture passes `easgd_alpha: None`), added with the
+    // per-tensor streaming writeback so the staging rework is proven
+    // against the math, not just against compiling. The reshaped narrow
+    // views of ONE flat staging buffer must deliver exactly what the
+    // full-model staging did.
+    let alpha = 0.25;
+    let (mut worker, _ch) = make_test_worker_customized(0, 1, 4, |c| {
+        // The constructor's single authoritative gate only passes
+        // easgd_alpha through under Async.
+        c.policy = ApplyPolicy::Async;
+        c.easgd_alpha = Some(alpha);
+    });
+
+    // Capture pre-blend values (read out immediately: snapshot staging is
+    // reused, a later snapshot overwrites these handles).
+    let pre_w = worker.param_vars[0].data().to_f32_vec().unwrap();
+    let pre_b = worker.param_vars[1].data().to_f32_vec().unwrap();
+
+    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let avg_w = Tensor::full(&[2, 4], 3.0, cpu).unwrap();
+    let avg_b = Tensor::full(&[2], -1.0, cpu).unwrap();
+    let update = AveragedParams {
+        params: vec![avg_w, avg_b],
+        buffers: vec![],
+        version: 7,
+    };
+    worker.load_averaged(&update).unwrap();
+
+    if let Device::CUDA(idx) = test_device() {
+        crate::tensor::cuda_synchronize(idx);
+    }
+
+    let post_w = worker.param_vars[0].data().to_f32_vec().unwrap();
+    let post_b = worker.param_vars[1].data().to_f32_vec().unwrap();
+    for (i, (pre, post)) in pre_w.iter().zip(&post_w).enumerate() {
+        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * 3.0;
+        assert!(
+            (post - want).abs() < 1e-5,
+            "weight[{i}]: want {want}, got {post} (pre {pre})"
+        );
+    }
+    for (i, (pre, post)) in pre_b.iter().zip(&post_b).enumerate() {
+        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * -1.0;
+        assert!(
+            (post - want).abs() < 1e-5,
+            "bias[{i}]: want {want}, got {post} (pre {pre})"
+        );
+    }
+}
+
+#[test]
 fn test_update_subtracts_snapshot_steps_not_zeroes() {
     // cpu-async overshoot accounting: steps taken AFTER the snapshot but
     // BEFORE the Update survive the EASGD blend, so their mass must stay in

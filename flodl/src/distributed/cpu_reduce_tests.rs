@@ -524,6 +524,154 @@
         }
     }
 
+    /// Pinned-decode staging end-to-end: with `set_pinned_decode(true)`
+    /// and per-round arming, the consensus values are identical to the
+    /// fresh-alloc path, AND round N's returned tensors alias the
+    /// reused staging — round N+1's decode overwrites them in place
+    /// (the documented single-consumer contract, pinned as behavior so
+    /// a "fix" silently switching to fresh allocs shows up here).
+    #[test]
+    fn pinned_decode_reuses_staging_and_keeps_values() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, v1: f32, v2: f32| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_pinned_decode(true);
+                    let a = Tensor::from_f32(&[v1, v1], &[2], Device::CPU).unwrap();
+                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
+                    let round1 = c
+                        .all_reduce_scaled(&[&a], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    let round1_vals = round1[0].to_f32_vec().unwrap();
+                    let b = Tensor::from_f32(&[v2, v2], &[2], Device::CPU).unwrap();
+                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
+                    let round2 = c
+                        .all_reduce_scaled(&[&b], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    (round1_vals, round1, round2)
+                })
+            };
+            let t0 = spawn(0, 2.0, 10.0);
+            let t1 = spawn(1, 4.0, 14.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, (round1_vals, round1, round2)) in [(0, &r0), (1, &r1)] {
+            assert_eq!(
+                *round1_vals,
+                vec![3.0, 3.0],
+                "rank {rank} round-1 consensus"
+            );
+            assert_eq!(
+                round2[0].to_f32_vec().unwrap(),
+                vec![12.0, 12.0],
+                "rank {rank} round-2 consensus"
+            );
+            // Round 2 decoded into the SAME staging, so round 1's handle
+            // now reads round 2's values — the aliasing IS the reuse.
+            assert_eq!(
+                round1[0].to_f32_vec().unwrap(),
+                vec![12.0, 12.0],
+                "rank {rank} staging reuse (round-1 handle aliases round-2 decode)"
+            );
+        }
+    }
+
+    /// Two frames with IDENTICAL schemas must not clobber each other's
+    /// staging: slots are caller-tagged precisely because a
+    /// BatchNorm-style model's buffers frame can carry the exact shape
+    /// list of its params frame. A schema-keyed cache would decode the
+    /// buffers round into the params staging while the params consensus
+    /// is still unconsumed — silently shipping buffer values as params.
+    #[test]
+    fn pinned_decode_slots_do_not_collide_on_identical_schemas() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, p: f32, b: f32| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_pinned_decode(true);
+                    // "Params" round into slot 0.
+                    let pt = Tensor::from_f32(&[p], &[1], Device::CPU).unwrap();
+                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
+                    let params = c
+                        .all_reduce_scaled(&[&pt], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    // "Buffers" round, SAME schema, slot 1.
+                    let bt = Tensor::from_f32(&[b], &[1], Device::CPU).unwrap();
+                    c.arm_pinned_decode(DECODE_SLOT_BUFFERS);
+                    let buffers = c
+                        .all_reduce_scaled(&[&bt], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    (params, buffers)
+                })
+            };
+            let t0 = spawn(0, 2.0, 100.0);
+            let t1 = spawn(1, 4.0, 200.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, (params, buffers)) in [(0, &r0), (1, &r1)] {
+            assert_eq!(
+                buffers[0].to_f32_vec().unwrap(),
+                vec![150.0],
+                "rank {rank} buffers consensus"
+            );
+            // Would read 150.0 if both rounds shared one staging set.
+            assert_eq!(
+                params[0].to_f32_vec().unwrap(),
+                vec![3.0],
+                "rank {rank} params consensus survives the buffers decode"
+            );
+        }
+    }
+
+    /// bf16 wire + pinned decode: the upcast lands via `copy_` directly
+    /// in the f32 staging (no intermediate f32 alloc); values chosen
+    /// bf16-exact, returned dtype stays f32.
+    #[test]
+    fn pinned_decode_bf16_wire_upcasts_into_staging() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, vals: [f32; 2]| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_bf16_wire(true);
+                    c.set_pinned_decode(true);
+                    let t = Tensor::from_f32(&vals, &[2], Device::CPU).unwrap();
+                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
+                    c.all_reduce_scaled(&[&t], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0
+                })
+            };
+            let t0 = spawn(0, [2.0, 8.0]);
+            let t1 = spawn(1, [4.0, 16.0]);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, tensors) in [(0, &r0), (1, &r1)] {
+            assert_eq!(
+                tensors[0].dtype(),
+                crate::tensor::DType::Float32,
+                "rank {rank} staging decode returns f32"
+            );
+            assert_eq!(
+                tensors[0].to_f32_vec().unwrap(),
+                vec![3.0, 12.0],
+                "rank {rank} consensus"
+            );
+        }
+    }
+
     /// A length prefix that DISAGREES with its frame body must be a
     /// loud named error in both directions — the streamed reader parses
     /// straight off the socket, so drift here would otherwise be a
@@ -666,7 +814,7 @@
         c.all_reduce_per_rank_f64(&mut counts).unwrap();
         let my_w = gamma_mass(n_i as f64, gamma);
         let t = Tensor::from_f32(&[t_val], &[1], Device::CPU).unwrap();
-        let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w)
+        let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w, DECODE_SLOT_PARAMS)
             .unwrap()[0]
             .to_f32_vec()
             .unwrap()[0];
@@ -766,6 +914,7 @@
                             &mut c,
                             std::slice::from_ref(&bt),
                             1.0,
+                            DECODE_SLOT_BUFFERS,
                         )
                         .unwrap()[0]
                             .to_f32_vec()
