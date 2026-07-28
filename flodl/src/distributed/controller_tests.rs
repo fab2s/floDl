@@ -735,6 +735,67 @@
         }
     }
 
+    /// The zeros-streaming broadcast contribution must be wire-identical
+    /// to shipping actual `zeros_like` payloads — same schema, same MAC,
+    /// same bytes — so the controller, relay fold, and schema checks
+    /// cannot tell (and need not know) that the sender never materialized
+    /// a zeros model. Pins `broadcast_from_root`'s non-root path.
+    #[test]
+    fn zeros_emitter_streams_the_same_bytes_a_zeros_model_would() {
+        let frame = RoundFrame {
+            tensors: vec![
+                TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![2, 3],
+                    bytes: f32_slice_to_payload_bytes(&[0.0f32; 6], DTYPE_F32).unwrap(),
+                },
+                TensorPayload {
+                    dtype: DTYPE_F32,
+                    shape: vec![4],
+                    bytes: f32_slice_to_payload_bytes(&[0.0f32; 4], DTYPE_F32).unwrap(),
+                },
+            ],
+            kind: RoundKind::Control,
+            weight: 0.0,
+        };
+        let mut via_model = Vec::new();
+        write_round_frame(&mut via_model, &frame, &TEST_SALT).unwrap();
+
+        let parts: Vec<PayloadPart<'_>> = frame
+            .tensors
+            .iter()
+            .map(|t| PayloadPart {
+                dtype: t.dtype,
+                shape: &t.shape,
+                nbytes: t.bytes.len() as u64,
+            })
+            .collect();
+        // Deliberately tiny chunk so multi-write payload assembly is
+        // exercised, not just the single-write case.
+        let zeros = [0u8; 5];
+        let mut via_emitter = Vec::new();
+        write_round_frame_streamed(
+            &mut via_emitter,
+            RoundKind::Control,
+            0.0,
+            &parts,
+            &TEST_SALT,
+            &mut |ti, tee| {
+                let mut left = parts[ti].nbytes;
+                while left > 0 {
+                    let n = left.min(zeros.len() as u64) as usize;
+                    std::io::Write::write_all(tee, &zeros[..n])
+                        .map_err(|e| TensorError::new(&e.to_string()))?;
+                    left -= n as u64;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(via_model, via_emitter, "zeros wire bytes must be identical");
+    }
+
     /// An emitter that writes a different byte count than its declared
     /// `nbytes` must error loudly — the length prefix is already on the
     /// wire by then, so silence would mean a desynced stream instead of

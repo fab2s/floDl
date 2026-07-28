@@ -6,7 +6,12 @@ is `make release-check`.
 
 ## Pre-flight
 
-1. Bump the workspace version in `Cargo.toml` (`version = "X.Y.Z"`).
+1. Bump the workspace version in `Cargo.toml` (`version = "X.Y.Z"`) —
+   **plus the four hardcoded dep-version companions** (the `=` pins make a
+   miss fail loudly at resolve, but they are part of the bump, not a
+   surprise): `flodl-sys = { version = ... }` in `flodl/Cargo.toml`,
+   `flodl-cli-macros "=..."` in `flodl-cli/Cargo.toml`, and `flodl "=..."` +
+   `flodl-cli "=..."` in `flodl-hf/Cargo.toml`.
 2. Rename the `[Unreleased]` CHANGELOG heading to `[X.Y.Z] - YYYY-MM-DD`
    and add a fresh empty `[Unreleased]` above.
 3. Commit both edits on `main`.
