@@ -511,32 +511,34 @@ fn serve_paths(stream: &mut TcpStream, state: &SharedState) {
 
 /// Serve the dashboard HTML, injecting label/hash/metadata constants if set.
 fn serve_html(stream: &mut TcpStream, state: &SharedState) {
-    let label = state.label.lock().unwrap();
-    let hash = state.hash.lock().unwrap();
-    let hardware = state.hardware.lock().unwrap();
-    let metadata = state.metadata.lock().unwrap();
-    let gpu_init = state.gpu_init.lock().unwrap();
+    // Cloned out from under the locks before any socket write — the message
+    // thread sets every one of these under its own lock.
+    let label = state.label.lock().unwrap().clone();
+    let hash = state.hash.lock().unwrap().clone();
+    let hardware = state.hardware.lock().unwrap().clone();
+    let metadata = state.metadata.lock().unwrap().clone();
+    let gpu_init = state.gpu_init.lock().unwrap().clone();
 
     let has_inject = label.is_some() || hash.is_some() || hardware.is_some()
         || metadata.is_some() || gpu_init.is_some();
     let body = if has_inject {
-        let label_js = match &*label {
+        let label_js = match &label {
             Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
             None => "null".to_string(),
         };
-        let hash_js = match &*hash {
+        let hash_js = match &hash {
             Some(h) => format!("\"{}\"", h),
             None => "null".to_string(),
         };
-        let hw_js = match &*hardware {
+        let hw_js = match &hardware {
             Some(h) => format!("\"{}\"", h.replace('\\', "\\\\").replace('"', "\\\"")),
             None => "null".to_string(),
         };
-        let meta_js = match &*metadata {
+        let meta_js = match &metadata {
             Some(m) => m.clone(),
             None => "null".to_string(),
         };
-        let gpu_init_js = match &*gpu_init {
+        let gpu_init_js = match &gpu_init {
             Some(j) => j.clone(),
             None => "null".to_string(),
         };
@@ -582,21 +584,16 @@ fn serve_sse(mut stream: TcpStream, state: &SharedState, scope: Option<String>) 
         return;
     }
 
-    // `/events`: preamble THEN register. The epoch series is keyed by epoch
-    // number and plotted as a series, so a duplicated epoch at the handover
-    // would double-plot — the pre-existing ordering is the right one here.
-    if scope.is_none() {
-        let epochs = state.epochs.lock().unwrap();
-        for json in epochs.iter() {
-            let event = format!("event: epoch\ndata: {}\n\n", json);
-            if stream.write_all(event.as_bytes()).is_err() {
-                return;
-            }
-        }
-        let _ = stream.flush();
-    }
-
-    // Register for future events (bounded — see SSE_CLIENT_QUEUE).
+    // Register THEN preamble, both feeds. An event arriving in the gap must
+    // not be LOST (it will never be replayed to this client), and it cannot
+    // be harmful if duplicated: every `node` record is an absolute snapshot,
+    // and the epoch feed's consumers already key on the epoch number because
+    // an `EventSource` reconnect replays the whole history. Loss is
+    // unrecoverable, a duplicate is not. (The previous preamble-then-register
+    // order on `/events` never actually prevented the duplicate/miss — the
+    // message thread releases the epochs lock before broadcasting — it only
+    // held the epochs lock across socket writes, letting one stalled client
+    // freeze the message thread and, with it, the whole record plane.)
     let (tx, rx) = mpsc::sync_channel::<String>(SSE_CLIENT_QUEUE);
     {
         let mut senders = state.sse_senders.lock().unwrap();
@@ -612,32 +609,36 @@ fn serve_sse(mut stream: TcpStream, state: &SharedState, scope: Option<String>) 
         });
     }
 
-    // `/stream`: register THEN preamble — the opposite order, deliberately.
-    // A record arriving in that gap must not be LOST, and it cannot be
-    // harmful if duplicated: every `node` record is an absolute snapshot, so
-    // re-applying one is idempotent. Loss is unrecoverable, a duplicate is
-    // not. The snapshot is copied out from under the lock before any socket
-    // write, so a stalled client can never freeze the record plane.
-    if let Some(path) = scope.as_deref() {
-        let preamble: Vec<String> = {
+    // Preamble, copied out from under the lock before any socket write, so a
+    // stalled client can never hold a producer-side lock.
+    let preamble: Vec<String> = match scope.as_deref() {
+        // `/events`: the epoch history.
+        None => state
+            .epochs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|json| format!("event: epoch\ndata: {json}\n\n"))
+            .collect(),
+        // `/stream`: `meta` first — it declares how to roll up, so a client
+        // must have it before interpreting any record. Replayed per client
+        // rather than assumed-received, since a viewer connects at any time.
+        Some(path) => {
             let store = state.records.lock().unwrap();
-            // `meta` first: it declares how to roll up, so a client must have
-            // it before interpreting any record. Replayed per client rather
-            // than assumed-received, since a viewer connects at any time.
             store
                 .meta()
                 .into_iter()
                 .chain(store.history(path, DEFAULT_HISTORY))
                 .map(|r| format!("event: record\ndata: {r}\n\n"))
                 .collect()
-        };
-        for event in preamble {
-            if stream.write_all(event.as_bytes()).is_err() {
-                return;
-            }
         }
-        let _ = stream.flush();
+    };
+    for event in preamble {
+        if stream.write_all(event.as_bytes()).is_err() {
+            return;
+        }
     }
+    let _ = stream.flush();
 
     // Block on receiving events until the client disconnects
     for event in rx {
@@ -650,8 +651,10 @@ fn serve_sse(mut stream: TcpStream, state: &SharedState, scope: Option<String>) 
 
 /// Serve the current SVG graph.
 fn serve_svg(stream: &mut TcpStream, state: &SharedState) {
-    let svg = state.svg.lock().unwrap();
-    if let Some(ref s) = *svg {
+    // Cloned out from under the lock before the write — the message thread
+    // sets the SVG under this lock.
+    let svg = state.svg.lock().unwrap().clone();
+    if let Some(s) = svg {
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\n\r\n{}",
             s.len(),
@@ -665,8 +668,12 @@ fn serve_svg(stream: &mut TcpStream, state: &SharedState) {
 
 /// Serve all epoch history as JSON (for late-connecting dashboards).
 fn serve_history(stream: &mut TcpStream, state: &SharedState) {
-    let epochs = state.epochs.lock().unwrap();
-    let body = format!("[{}]", epochs.join(","));
+    // Body built under the lock, written outside it (same rule as the
+    // record-plane endpoints): the message thread needs this lock.
+    let body = {
+        let epochs = state.epochs.lock().unwrap();
+        format!("[{}]", epochs.join(","))
+    };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
@@ -839,9 +846,13 @@ mod tests {
     }
 
     /// Poll a GET until its body contains `needle`, so tests never depend on
-    /// the message thread's timing.
+    /// the message thread's timing. The budget (500 × 20ms = 10s) is sized
+    /// for a full parallel suite run, where the message thread can be
+    /// starved well past the 2s that once flaked here — the assertion is
+    /// deterministic once the needle appears, so a generous cap costs
+    /// nothing on the happy path.
     fn get_until(addr: SocketAddr, target: &str, needle: &str) -> String {
-        for _ in 0..100 {
+        for _ in 0..500 {
             let body = get(addr, target);
             if body.contains(needle) {
                 return body;

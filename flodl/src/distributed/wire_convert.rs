@@ -228,7 +228,7 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
             Ok(Some(ControlMsg::ShutdownWithSave { reason }))
         }
         ControlMsgWire::EpochAggregated(metrics_wire) => {
-            Ok(Some(ControlMsg::EpochAggregated(metrics_wire.into())))
+            Ok(Some(ControlMsg::EpochAggregated(Box::new((*metrics_wire).into()))))
         }
         ControlMsgWire::EvalBroadcast { epoch, metric } => Ok(Some(
             ControlMsg::EvalBroadcast { epoch: epoch as usize, metric },
@@ -292,6 +292,8 @@ impl From<EpochMetrics> for EpochMetricsWire {
             per_rank_compute_only_ms: m.per_rank_compute_only_ms,
             per_rank_data_starve_ms: m.per_rank_data_starve_ms,
             device_indices: m.device_indices,
+            per_rank_loss: m.per_rank_loss,
+            per_rank_samples: m.per_rank_samples.iter().map(|&s| s as u64).collect(),
         }
     }
 }
@@ -304,6 +306,8 @@ impl From<EpochMetricsWire> for EpochMetrics {
             per_rank: w.per_rank,
             avg_loss: w.avg_loss,
             epoch_ms: w.epoch_ms,
+            per_rank_loss: w.per_rank_loss,
+            per_rank_samples: w.per_rank_samples.iter().map(|&s| s as usize).collect(),
             per_rank_throughput: w.per_rank_throughput,
             per_rank_batch_share: w.per_rank_batch_share,
             per_rank_share_complete_ms: w.per_rank_share_complete_ms,

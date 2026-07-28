@@ -120,15 +120,19 @@ pub(crate) fn aggregate_epoch_metrics(
         rank_batches[r] += m.batches_processed;
         rank_samples[r] += m.samples_processed;
         rank_loss_sum[r] += m.avg_loss * m.batches_processed as f64;
-        // Max time across chunks (sequential within a rank). Mirrors
-        // existing epoch_ms aggregation: chunk messages report monotonic
-        // cumulative-from-epoch-start times in progressive dispatch, so the
-        // largest is the rank's epoch total. The new fields use the same
-        // convention so the worker can populate them consistently.
-        rank_time_ms[r] = rank_time_ms[r].max(m.epoch_ms);
-        rank_share_complete_ms[r] = rank_share_complete_ms[r].max(m.share_complete_ms);
-        rank_compute_only_ms[r] = rank_compute_only_ms[r].max(m.compute_only_ms);
-        rank_data_starve_ms[r] = rank_data_starve_ms[r].max(m.data_starve_ms);
+        // Sum across chunks (sequential within a rank). Each message's
+        // durations cover ONE chunk — the worker's `EpochState` is fresh
+        // per `EpochPlan` — so the rank's epoch total is the sum. The old
+        // `max()` fold assumed cumulative-from-epoch-start values and
+        // reported only the largest chunk in progressive dispatch (and
+        // divided epoch-summed samples by one chunk's time in the
+        // throughput below). Between-chunk gaps are not covered by any
+        // chunk's wall; epoch_ms is therefore a lower bound in progressive
+        // mode, tight because dispatch re-plans back-to-back.
+        rank_time_ms[r] += m.epoch_ms;
+        rank_share_complete_ms[r] += m.share_complete_ms;
+        rank_compute_only_ms[r] += m.compute_only_ms;
+        rank_data_starve_ms[r] += m.data_starve_ms;
         for (k, (sum, count)) in &m.scalars {
             let entry = rank_scalars[r].entry(k.clone()).or_insert((0.0, 0));
             entry.0 += sum;
@@ -145,6 +149,18 @@ pub(crate) fn aggregate_epoch_metrics(
     } else {
         0.0
     };
+
+    // Per-rank batch-weighted mean loss. A rank with no batches this epoch
+    // yields None (absent, not zero) so downstream means exclude it.
+    let per_rank_loss: Vec<Option<f64>> = (0..world_size)
+        .map(|r| {
+            if rank_batches[r] > 0 {
+                Some(rank_loss_sum[r] / rank_batches[r] as f64)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Max epoch_ms across ranks
     let epoch_ms = rank_time_ms.iter().copied().fold(0.0_f64, f64::max);
@@ -196,7 +212,6 @@ pub(crate) fn aggregate_epoch_metrics(
     //
     // Falls back to epoch_ms when share_complete_ms wasn't populated (legacy
     // call sites or test fixtures using the old MetricsMsg shape).
-    let total_samples: usize = rank_samples.iter().sum();
     let per_rank_throughput: Vec<f64> = (0..world_size).map(|r| {
         let denom = if rank_share_complete_ms[r] > 0.0 {
             rank_share_complete_ms[r]
@@ -220,10 +235,11 @@ pub(crate) fn aggregate_epoch_metrics(
     } else {
         vec![1.0 / world_size as f64; world_size]
     };
-    let _ = total_samples; // retained above for per_rank_throughput
 
     EpochMetrics {
         epoch, scalars, per_rank, avg_loss, epoch_ms,
+        per_rank_loss,
+        per_rank_samples: rank_samples,
         per_rank_throughput, per_rank_batch_share,
         per_rank_share_complete_ms: rank_share_complete_ms,
         per_rank_compute_only_ms: rank_compute_only_ms,
@@ -283,6 +299,11 @@ mod tests {
         assert!((m.per_rank[0]["loss"] - 1.0).abs() < 1e-9);
         assert!((m.per_rank[1]["loss"] - 2.0).abs() < 1e-9);
 
+        // Per-rank loss (batch-weighted within the rank) and realized samples.
+        assert!((m.per_rank_loss[0].unwrap() - 0.5).abs() < 1e-9);
+        assert!((m.per_rank_loss[1].unwrap() - 0.7).abs() < 1e-9);
+        assert_eq!(m.per_rank_samples, vec![1920, 1280]);
+
         // Throughput: rank 0 = 1920/1000 = 1.92, rank 1 = 1280/1200 ~= 1.0667
         assert!((m.per_rank_throughput[0] - 1.92).abs() < 1e-9);
         assert!((m.per_rank_throughput[1] - 1280.0 / 1200.0).abs() < 1e-9);
@@ -307,16 +328,16 @@ mod tests {
                 epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
                 scalars: [("loss".to_string(), (2.0, 2_usize))].into(),
             },
-            // Rank 0 chunk 2
+            // Rank 0 chunk 2 (durations are per-chunk, NOT cumulative)
             MetricsMsg {
                 rank: 0, epoch: 0, avg_loss: 0.4, batches_processed: 20,
-                epoch_ms: 600.0, share_complete_ms: 600.0, compute_only_ms: 600.0, data_starve_ms: 0.0, samples_processed: 640,
+                epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
                 scalars: [("loss".to_string(), (1.6, 2_usize))].into(),
             },
             // Rank 0 chunk 3
             MetricsMsg {
                 rank: 0, epoch: 0, avg_loss: 0.6, batches_processed: 20,
-                epoch_ms: 900.0, share_complete_ms: 900.0, compute_only_ms: 900.0, data_starve_ms: 0.0, samples_processed: 640,
+                epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
                 scalars: [("loss".to_string(), (1.8, 2_usize))].into(),
             },
             // Rank 1 chunk 1
@@ -328,7 +349,7 @@ mod tests {
             // Rank 1 chunk 2
             MetricsMsg {
                 rank: 1, epoch: 0, avg_loss: 0.8, batches_processed: 20,
-                epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0, samples_processed: 640,
+                epoch_ms: 500.0, share_complete_ms: 500.0, compute_only_ms: 500.0, data_starve_ms: 0.0, samples_processed: 640,
                 scalars: [("loss".to_string(), (3.2, 2_usize))].into(),
             },
         ];
@@ -343,8 +364,9 @@ mod tests {
         assert_eq!(m.per_rank.len(), 2);
         assert_eq!(m.device_indices, vec![0, 1]);
 
-        // Rank 0: 60 batches, 1920 samples, max time 900ms
-        // Rank 1: 40 batches, 1280 samples, max time 1000ms
+        // Rank 0: 60 batches, 1920 samples, summed chunk time 3×300 = 900ms
+        // Rank 1: 40 batches, 1280 samples, summed chunk time 2×500 = 1000ms
+        // (the old max() fold would have divided epoch samples by ONE chunk)
         assert!((m.per_rank_throughput[0] - 1920.0 / 900.0).abs() < 1e-6);
         assert!((m.per_rank_throughput[1] - 1280.0 / 1000.0).abs() < 1e-6);
 
@@ -352,7 +374,7 @@ mod tests {
         assert!((m.per_rank_batch_share[0] - 0.6).abs() < 1e-9);
         assert!((m.per_rank_batch_share[1] - 0.4).abs() < 1e-9);
 
-        // Max epoch_ms across ranks
+        // epoch_ms: per-rank chunk sums, then max across ranks
         assert_eq!(m.epoch_ms, 1000.0);
 
         // Scalars: rank 0 loss mean = (2.0+1.6+1.8)/(2+2+2) = 5.4/6 = 0.9

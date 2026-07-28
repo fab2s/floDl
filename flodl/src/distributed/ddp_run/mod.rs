@@ -1193,6 +1193,12 @@ pub(crate) enum TimingMsg {
 /// Epoch-end metrics sent from a GPU worker to the coordinator.
 ///
 /// Fire-and-forget: worker sends this and immediately starts the next epoch.
+///
+/// **Scope of the duration fields**: one message covers one *chunk* (an
+/// [`EpochPlan`]'s worth of work). Non-progressive dispatch sends one chunk
+/// per epoch, so message == epoch; progressive dispatch sends many, and the
+/// aggregator **sums** chunks per rank to recover epoch totals (chunks run
+/// sequentially within a rank). Nothing here is cumulative-from-epoch-start.
 #[derive(Clone, Debug, Default)]
 pub struct MetricsMsg {
     /// Which GPU sent this.
@@ -1220,12 +1226,16 @@ pub struct MetricsMsg {
     /// step durations, ms). Diagnostic only — not used by the balancer.
     /// Useful for capacity / saturation analysis.
     pub compute_only_ms: f64,
-    /// Cumulative time the rank was blocked waiting for data (ms).
+    /// Time the rank was blocked waiting for data this chunk (ms).
     /// On the prefetch path this is time spent in `recv()` on the prefetch
-    /// channel; on the sync path this is time spent in `dataset.get_batch()`
-    /// plus host-to-device transfer. Diagnostic only: surfacing this drives
-    /// prefetch-tuning decisions, not balancer share allocation. Feeding
-    /// it back to the balancer would create a contaminated control loop.
+    /// channel, MINUS control handling serviced while waiting (param-plane
+    /// transport is not starvation). On the sync path it is
+    /// `dataset.get_batch()` plus host-to-device transfer — a blocking
+    /// pageable H2D also absorbs GPU queue drain there, so treat the sync
+    /// path's value as an upper bound on true data wait. Diagnostic only:
+    /// surfacing this drives prefetch-tuning decisions, not balancer share
+    /// allocation. Feeding it back to the balancer would create a
+    /// contaminated control loop.
     pub data_starve_ms: f64,
     /// Named scalar metrics recorded via [`record_scalar()`] during this epoch.
     /// Each value is `(sum, count)` for computing the mean.
@@ -1412,8 +1422,9 @@ pub(crate) enum ControlMsg {
     /// cross-rank view (user-facing UX parity: `monitor.log(&model)`
     /// shows the same aggregated view regardless of single-GPU /
     /// local-multi-GPU / cluster). See
-    /// `EpochAggregated`.
-    EpochAggregated(EpochMetrics),
+    /// `EpochAggregated`. Boxed: this variant is ~10 Vecs + 2 maps and
+    /// would otherwise set the size of every `ControlMsg` in flight.
+    EpochAggregated(Box<EpochMetrics>),
     /// Coord-broadcast eval result for a completed callback (final canonical
     /// eval or an intent-/cadence-driven one). The cooperative [`Worker`]
     /// forwards this to its eval stream so `poll_eval()` surfaces the

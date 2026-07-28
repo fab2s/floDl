@@ -876,7 +876,7 @@ impl ClusterCoordinator {
             let wire_metrics: crate::distributed::wire::EpochMetricsWire =
                 metrics.clone().into();
             if let Err(e) = self.broadcast_control(
-                &ControlMsgWire::EpochAggregated(wire_metrics),
+                &ControlMsgWire::EpochAggregated(Box::new(wire_metrics)),
             ) {
                 crate::verbose!(
                     "  ddp: EpochAggregated broadcast (epoch {epoch_key}) failed: {}",

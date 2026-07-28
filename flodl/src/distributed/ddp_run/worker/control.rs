@@ -347,10 +347,10 @@ impl<M: Module> GpuWorker<M> {
                 // write consumes `metrics`. A dropped receiver is benign (the
                 // user stopped polling); this never blocks the control drain.
                 if let Some(tx) = &self.metrics_stream_tx {
-                    let _ = tx.send(metrics.clone());
+                    let _ = tx.send((*metrics).clone());
                 }
                 if let Ok(mut slot) = self.aggregated_metrics.lock() {
-                    *slot = Some(metrics);
+                    *slot = Some(*metrics);
                 }
             }
             ControlMsg::EvalBroadcast { epoch, metric } => {

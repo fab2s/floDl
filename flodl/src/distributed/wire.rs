@@ -1168,7 +1168,7 @@ pub enum ControlMsgWire {
     /// process-per-rank cluster mode. User code stays identical:
     /// `monitor.log(epoch, dur, &model)` sees the aggregated view
     /// regardless of single-GPU / local-multi-GPU / cluster.
-    EpochAggregated(EpochMetricsWire),
+    EpochAggregated(Box<EpochMetricsWire>),
     /// Coord-broadcast eval result for a completed callback (the final
     /// canonical eval, or any intent-/cadence-driven eval). Emitted right
     /// after the elected rank's [`TimingMsgWire::EvalResult`] reaches the
@@ -1581,6 +1581,10 @@ pub struct EpochMetricsWire {
     pub per_rank_compute_only_ms: Vec<f64>,
     pub per_rank_data_starve_ms: Vec<f64>,
     pub device_indices: Vec<u8>,
+    // Appended after the fields above (bincode is positional); a cohort is
+    // always one build, so this is layout hygiene, not a compat mechanism.
+    pub per_rank_loss: Vec<Option<f64>>,
+    pub per_rank_samples: Vec<u64>,
 }
 
 

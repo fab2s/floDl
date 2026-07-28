@@ -447,6 +447,15 @@ impl<M: Module> GpuWorker<M> {
             }
 
             let wait_start = Instant::now();
+            // Control work handled while waiting is NOT data starvation: a
+            // window's `Update` (H2D writeback), `RequestParams` (full D2H
+            // snapshot) or a SyncNow collective landing in this loop is
+            // param-plane transport, and booking it as data wait made slow
+            // ranks read as I/O-starved (the pascal "58s/epoch data wait").
+            // It stays inside `last_data_ms` — the delivered-cost ledger
+            // deliberately prices compute + data + transport — and is only
+            // subtracted from the starve diagnostic below.
+            let mut control_ms = 0.0_f64;
             // Stuck-detector (debug): if we spin here waiting for a
             // prefetched batch that never arrives, dump the worker's
             // state once so the tight-window fold freeze can be
@@ -460,10 +469,12 @@ impl<M: Module> GpuWorker<M> {
                     Ok(batch) => break batch
                         .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let ctl_start = Instant::now();
                         if self.handle_control()? {
                             st.shutdown = true;
                             return Ok(None);
                         }
+                        control_ms += ctl_start.elapsed().as_secs_f64() * 1000.0;
                         stuck_polls += 1;
                         if self.prof_enabled && stuck_polls >= 300 && !stuck_dumped {
                             stuck_dumped = true;
@@ -488,8 +499,12 @@ impl<M: Module> GpuWorker<M> {
                 }
             };
             // Per-batch DATA wall for the delivered feed (prefetch stall).
+            // Full wall including control — ElChe schedules on delivered
+            // cost (compute + data + transport), so the ledger keeps it.
             st.last_data_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
-            st.data_starve_ms_total += st.last_data_ms;
+            // The starve diagnostic excludes it — that time was spent
+            // working the param plane, not starving for data.
+            st.data_starve_ms_total += (st.last_data_ms - control_ms).max(0.0);
 
             // Ensure compute stream waits for async H2D copy to finish
             #[cfg(feature = "cuda")]
