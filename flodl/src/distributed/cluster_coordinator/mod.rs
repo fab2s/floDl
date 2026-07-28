@@ -244,6 +244,31 @@ struct NcclRendezvousPending {
     tried_generators: Vec<usize>,
 }
 
+/// A pinned final-window allocation (see the `final_window_plan` field).
+///
+/// Carries the `batch_counts` it was computed FROM, because the pin is
+/// only coherent while those counts hold: the tail-allocation design
+/// ("no boundary window ever falls back") assumes the window schedule is
+/// stable between the pin and the fire, and a mid-epoch anchor commit /
+/// `recompute_batch_counts` breaks that silently — the gate then demands
+/// live-count steps from a rank the stale plan allocated nothing
+/// (2026-07-29 tail-crumb deadlock). `refresh_final_window_plan`
+/// compares live counts against `pinned_counts` and re-pins from the
+/// live remainder on any divergence, whatever mutated them (growth
+/// commit, nudge, election) — snapshot-compare beats hooking every
+/// ElChe mutation site.
+#[derive(Debug)]
+struct FinalWindowPlan {
+    /// Epoch this plan covers; a plan never outlives its epoch.
+    epoch: usize,
+    /// Per-rank batch allocation for the final window. A rank at 0 sits
+    /// the window out (dispatch serves it nothing; the firing gate
+    /// treats it as quiesced).
+    alloc: Vec<usize>,
+    /// `el_che.batch_counts()` at pin time — the staleness sentinel.
+    pinned_counts: Vec<usize>,
+}
+
 /// Externally-reported rank deaths, pushed by the launcher's child
 /// supervision the instant a rank process exits (vs the coordinator's
 /// ~30s heartbeat-staleness detection) and drained by the coordinator
@@ -628,16 +653,18 @@ pub struct ClusterCoordinator {
     /// without amortising it.
     min_chunk_batches: usize,
     /// Barrier-paced (Cadence) only: the pre-computed allocation for an
-    /// epoch's FINAL reduce window, as `(epoch, per-rank batches)`. When the
-    /// pool drops to within one window of empty, the whole remainder is
-    /// dispatched as a single coherent window sized so no rank ends at
-    /// exactly 1 step (the delivered-feed fallback trigger). Computed ONCE
-    /// at window start (so the per-rank, pool-draining dispatch loop cannot
-    /// shear a proportional split into degenerate scraps) by
-    /// [`ClusterCoordinator::refresh_final_window_plan`] and read by
-    /// [`ClusterCoordinator::compute_chunk_batches`]. `None` outside the
+    /// epoch's FINAL reduce window. When the pool drops to within one window
+    /// of empty, the whole remainder is dispatched as a single coherent
+    /// window sized so no rank ends at exactly 1 step (the delivered-feed
+    /// fallback trigger). Computed at window start (so the per-rank,
+    /// pool-draining dispatch loop cannot shear a proportional split into
+    /// degenerate scraps) by
+    /// [`ClusterCoordinator::refresh_final_window_plan`], read by
+    /// [`ClusterCoordinator::compute_chunk_batches`] and the
+    /// `should_average` quiescence rule, and RE-pinned when `batch_counts`
+    /// diverge from [`FinalWindowPlan::pinned_counts`]. `None` outside the
     /// final window. See `docs/design/epoch-tail-allocation.md`.
-    final_window_plan: Option<(usize, Vec<usize>)>,
+    final_window_plan: Option<FinalWindowPlan>,
     /// User-supplied per-epoch metrics callback (controller-side). Fires
     /// after each successful aggregation. `None` = no callback wired.
     metrics_fn: Option<crate::distributed::ddp_run::MetricsFn>,
