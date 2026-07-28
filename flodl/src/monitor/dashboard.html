@@ -51,6 +51,18 @@ transition:background 0.15s;user-select:none}
 background:rgba(248,113,113,0.15);color:var(--red);cursor:pointer;display:none}
 .crumb-badge.warn{background:rgba(251,191,36,0.15);color:var(--yellow)}
 .crumb-badge.on{display:inline-block}
+/* Immediate children, one click below the breadcrumb. The children CARD
+   compares them; this is the navigation twin — drilling down should not
+   require scrolling to a chart first. Hidden at a leaf. */
+.kidbar{background:var(--card);border-bottom:1px solid var(--border);
+        padding:7px 24px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.kidbar-label{color:var(--dim);font-size:11px;text-transform:uppercase;
+              letter-spacing:0.5px;margin-right:2px}
+.kid{color:var(--accent);cursor:pointer;padding:3px 9px;border-radius:4px;
+     font-size:12px;border:1px solid var(--border)}
+.kid:hover{background:rgba(108,140,255,0.12)}
+.kid.lost{color:var(--dim);text-decoration:line-through}
+.kid-note{color:var(--dim);font-size:11px;margin-left:3px}
 
 /* Layout */
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 24px}
@@ -200,6 +212,8 @@ animation:pulse 2s ease-in-out infinite}
   <span class="crumb here">root</span>
   <span class="crumb-badge" id="alertBadge" onclick="scrollToAlerts()"></span>
 </div>
+
+<div class="kidbar" id="kidbar" style="display:none"></div>
 
 <div class="grid">
   <div class="card">
@@ -647,6 +661,38 @@ function renderCrumbs(){
   el.querySelectorAll('.crumb:not(.here)').forEach(c=>{
     c.onclick=()=>navigate(c.dataset.path);
   });
+  renderKidBar();
+}
+
+// Immediate children as navigation chips, directly under the breadcrumb.
+// The children card already compares them and is clickable, but it sits below
+// the charts — drilling down should not mean scrolling to a chart first. The
+// breadcrumb walks UP, this walks DOWN, and together they make every adjacent
+// level reachable without scrolling.
+//
+// Only LOADED children can be linked (a level is fetched when opened), so when
+// the node declares more than arrived we say so rather than quietly showing a
+// short list — the same absent≠zero honesty the children card uses.
+function renderKidBar(){
+  const bar=document.getElementById('kidbar');
+  const node=NODES.get(current);
+  const kids=node?childPaths(node):[];
+  if(!kids.length){bar.style.display='none';bar.innerHTML='';return}
+  let html='<span class="kidbar-label">in here</span>';
+  for(const p of kids){
+    const k=NODES.get(p);
+    const lost=k&&k.isLeaf===true&&k.alive===false;
+    const seg=p.split('/').pop();
+    html+='<span class="kid'+(lost?' lost':'')+'" data-path="'+esc(p)+'" title="'+esc(p)+'">'
+        +esc(seg)+(k&&k.label?' <span class="kid-note">'+esc(k.label)+'</span>':'')+'</span>';
+  }
+  const declared=node.childCount;
+  if(declared!=null&&declared>kids.length){
+    html+='<span class="kid-note">'+(declared-kids.length)+' more not loaded</span>';
+  }
+  bar.innerHTML=html;
+  bar.style.display='flex';
+  bar.querySelectorAll('.kid').forEach(c=>{c.onclick=()=>navigate(c.dataset.path)});
 }
 
 // --- Subscriptions ---------------------------------------------------------

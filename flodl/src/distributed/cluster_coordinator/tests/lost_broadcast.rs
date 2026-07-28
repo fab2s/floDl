@@ -1,13 +1,14 @@
 //! Unit tests for the dropped best-effort broadcast trace: a failed
 //! control broadcast to a live rank bumps `lost_broadcasts` and emits a
 //! `LostBroadcast` timeline event, while a failed `Shutdown` (an expected
-//! teardown race, not lost live coordination) is exempt.
+//! teardown race, not lost live coordination) is exempt — as is anything
+//! sent once shutdown has already been broadcast.
 
 use crate::distributed::ddp::ElChe;
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::monitor::{EventKind, Timeline};
 
-use super::super::{ClusterCoordinator, ClusterCoordinatorConfig};
+use super::super::{ClusterCoordinator, ClusterCoordinatorConfig, RunPhase};
 use super::ControlMsgWire;
 
 fn coord_with_timeline(
@@ -52,6 +53,57 @@ fn failed_broadcast_records_counter_and_timeline_event() {
         })
         .collect();
     assert_eq!(lost, vec![("SyncNow".to_string(), 2)]);
+}
+
+/// A heartbeat that misses ranks AFTER shutdown was broadcast is a teardown
+/// race, not lost coordination — the ranks are supposed to be gone.
+///
+/// From the rig: a 3-rank run that completed perfectly raised `[critical]
+/// control_drop root — CoordHeartbeat did not reach 2 live rank(s)` one log
+/// line after both of that host's ranks exited cleanly. `is_dead` only knows
+/// heartbeat staleness, so a cleanly finished rank still counts as live and
+/// its closed socket read as a dropped signal. Wiring twin of the predicate
+/// matrix in `lifecycle::tests` — this pins the call site, those pin the rule.
+#[test]
+fn broadcast_failure_after_shutdown_initiated_is_exempt() {
+    let tl = Timeline::new(1000);
+    let mut coord = coord_with_timeline(2, tl.clone());
+    coord.run_phase = RunPhase::ShutdownInitiated;
+
+    let _ = coord.broadcast_control(&ControlMsgWire::CoordHeartbeat);
+    assert_eq!(
+        coord.lost_broadcasts, 0,
+        "a teardown-phase heartbeat miss must not be traced",
+    );
+
+    let (_samples, events) = tl.drain();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::LostBroadcast { .. })),
+        "no LostBroadcast event once shutdown has been broadcast",
+    );
+}
+
+/// The guard is phase-scoped, not message-scoped: the SAME heartbeat missing
+/// mid-run is still a real dropped signal and must still be traced. Without
+/// this, "fix the false positive" could silently become "mute the lane".
+#[test]
+fn the_same_heartbeat_miss_before_shutdown_is_traced() {
+    let tl = Timeline::new(1000);
+    let mut coord = coord_with_timeline(2, tl.clone());
+
+    let _ = coord.broadcast_control(&ControlMsgWire::CoordHeartbeat);
+    assert_eq!(coord.lost_broadcasts, 1, "mid-run heartbeat miss is traced");
+
+    let (_samples, events) = tl.drain();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::LostBroadcast { control, .. }
+                              if control == "CoordHeartbeat")),
+        "mid-run heartbeat miss emits a LostBroadcast event",
+    );
 }
 
 #[test]

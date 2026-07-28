@@ -516,13 +516,9 @@ impl ClusterCoordinator {
         if failed.is_empty() {
             Ok(())
         } else {
-            // Structured trace of a dropped best-effort broadcast: a
-            // silently lost SyncNow / DeclareDead can leave the survivor
-            // cohort waiting on a signal that never arrives. Shutdown is
-            // exempt — a failed Shutdown send is an
-            // expected teardown race (the rank already exited), not lost
-            // live coordination.
-            if !matches!(msg, ControlMsgWire::Shutdown) {
+            // Structured trace of a dropped best-effort broadcast (see
+            // `alerts_lost_broadcast` for which drops are worth alerting on).
+            if alerts_lost_broadcast(msg, self.run_phase) {
                 self.note_lost_broadcast(control_label(msg), failed.len());
             }
             Err(TensorError::new(&format!(
@@ -590,6 +586,30 @@ impl ClusterCoordinator {
 /// [`EventKind::LostBroadcast`](crate::monitor::EventKind::LostBroadcast)
 /// timeline trace. Exhaustive on purpose: a new `ControlMsgWire` variant
 /// forces a label here rather than silently rendering as `"other"`.
+/// Whether a failed best-effort broadcast deserves a `control_drop` alert.
+///
+/// A silently lost `SyncNow` / `DeclareDead` can leave the survivor cohort
+/// waiting on a signal that never arrives, so mid-run drops are worth
+/// shouting about. Two cases are not:
+///
+/// - `Shutdown` itself: a failed Shutdown send means the rank already exited,
+///   which is the outcome Shutdown was asking for.
+/// - **anything sent after shutdown was broadcast**: ranks are expected to be
+///   exiting, and [`ClusterCoordinator::is_dead`] only knows heartbeat
+///   staleness — a rank that finished *cleanly* is neither dead nor
+///   reachable, so its closed socket would otherwise be reported as a lost
+///   live-coordination signal.
+///
+/// The second case is why this exists. A 3-rank run that completed perfectly
+/// raised `[critical] control_drop root — CoordHeartbeat did not reach 2 live
+/// rank(s)` one log line after both of that host's ranks exited cleanly. A
+/// clean run must not paint a red alert in the portal: an alert lane that
+/// cries wolf trains the operator to ignore it, which costs more than the
+/// missing trace ever would.
+fn alerts_lost_broadcast(msg: &ControlMsgWire, phase: RunPhase) -> bool {
+    !matches!(msg, ControlMsgWire::Shutdown) && phase != RunPhase::ShutdownInitiated
+}
+
 fn control_label(msg: &ControlMsgWire) -> &'static str {
     match msg {
         ControlMsgWire::RequestParams => "RequestParams",
@@ -612,5 +632,62 @@ fn control_label(msg: &ControlMsgWire) -> &'static str {
         ControlMsgWire::StageAdvisory { .. } => "StageAdvisory",
         ControlMsgWire::SaveConsensusModel { .. } => "SaveConsensusModel",
         ControlMsgWire::CoordHeartbeat => "CoordHeartbeat",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rig case this predicate exists for: a 3-rank run that finished
+    /// cleanly still had its coordinator beacon at ranks that had already
+    /// exited, and the miss was classified `[critical] control_drop`.
+    /// A perfect run must not paint a red alert in the portal.
+    #[test]
+    fn a_heartbeat_missed_during_teardown_is_not_an_alert() {
+        assert!(!alerts_lost_broadcast(
+            &ControlMsgWire::CoordHeartbeat,
+            RunPhase::ShutdownInitiated
+        ));
+    }
+
+    /// The same miss BEFORE shutdown is a genuine lost signal — the point of
+    /// the lane. Guards against fixing the false positive by muting the lane.
+    #[test]
+    fn the_same_heartbeat_missed_mid_run_still_alerts() {
+        assert!(alerts_lost_broadcast(
+            &ControlMsgWire::CoordHeartbeat,
+            RunPhase::Training
+        ));
+        assert!(alerts_lost_broadcast(
+            &ControlMsgWire::CoordHeartbeat,
+            RunPhase::FinalEvalDispatched
+        ));
+    }
+
+    /// A lost `SyncNow` can park the survivor cohort on a signal that never
+    /// arrives, so it must keep alerting in every pre-shutdown phase.
+    #[test]
+    fn losing_a_coordination_signal_mid_run_still_alerts() {
+        for phase in [RunPhase::Training, RunPhase::FinalEvalDispatched] {
+            assert!(alerts_lost_broadcast(&ControlMsgWire::SyncNow, phase));
+            assert!(alerts_lost_broadcast(
+                &ControlMsgWire::DeclareDead { rank: 1 },
+                phase
+            ));
+        }
+    }
+
+    /// Shutdown's own failure was already exempt in every phase; a failed
+    /// Shutdown send means the rank did what Shutdown asked.
+    #[test]
+    fn a_failed_shutdown_send_is_never_an_alert() {
+        for phase in [
+            RunPhase::Training,
+            RunPhase::FinalEvalDispatched,
+            RunPhase::ShutdownInitiated,
+        ] {
+            assert!(!alerts_lost_broadcast(&ControlMsgWire::Shutdown, phase));
+        }
     }
 }
