@@ -786,9 +786,13 @@ function scheduleRender(){
   renderQueued=true;
   requestAnimationFrame(()=>{renderQueued=false;render()});
 }
+/// The level a card is describing. Shared because `drawMetrics` re-sets the
+/// metrics one on its own (a legend click redraws that chart WITHOUT going
+/// through `render`), and the two must not drift.
+function scopeLabel(){return current===ROOT?'run total':lastSeg(current)}
 function render(){
   renderCrumbs();
-  const scope=current===ROOT?'run total':lastSeg(current);
+  const scope=scopeLabel();
   document.getElementById('metricsScope').textContent=scope;
   document.getElementById('resourceScope').textContent=scope;
   const total=nodeOf(current).rows.length;
@@ -822,12 +826,27 @@ function drawMetrics(){
     labels[k]=interior?k+' ('+reductionOf(k)+')':k;
   }
   const solo=soloState.metricsChart;
+  // The only chart with mixed units on one canvas — loss, throughput,
+  // batch_share and compute_only_ms span five orders of magnitude, so a shared
+  // axis shows the milliseconds and flattens everything else. Each curve gets
+  // the full height instead; click one in the legend for its true axis.
   drawChart('metricsChart',series,COLORS,{
     marks:epochMarks(node),
     yFmt:solo?fmtForKey(solo):null,
+    normalize:true,
     labels,
   });
   updateLegend('metricsLegend',keys,COLORS,'metricsChart',drawMetrics,labels);
+  // Say so, rather than letting a 0-100% axis imply the metrics ARE
+  // percentages. Sets the WHOLE label rather than appending: a legend click
+  // redraws this chart without going through `render`, so an append would
+  // stack up across toggles.
+  const scopeEl=document.getElementById('metricsScope');
+  if(scopeEl){
+    const scaling=!solo&&keys.length>1;
+    scopeEl.textContent=scopeLabel()+
+      (scaling?' · each curve scaled to its own range, click one for real values':'');
+  }
 }
 
 function drawResources(){
@@ -1144,9 +1163,36 @@ function drawChart(canvasId,series,colors,opts){
   const allNames=Object.keys(series);
   const solo=soloState[canvasId];
   const visible=allNames.filter(n=>!solo||n===solo);
+  // Independent per-series scaling, for charts that opt in.
+  //
+  // Mixed-unit series share no meaningful axis: loss ~5, throughput ~0.05 and
+  // compute_only_ms ~1e5 on one linear scale means the milliseconds saturate it
+  // and every other curve is a flat line on the floor. Giving each series the
+  // full height shows all four shapes at once, which is the view you actually
+  // want when everything is displayed.
+  //
+  // Opt-in per chart, because it is WRONG where a shared scale is real: the
+  // resource chart's series are all percentages, and the children chart
+  // compares ONE metric across children — normalising either would destroy a
+  // comparison the reader is relying on.
+  //
+  // Soloing a series drops back to its true axis, so exact magnitudes are
+  // always one click away, and the tooltip reports raw values in every mode.
+  const scaled=!!opts.normalize&&!solo&&visible.length>1;
   let minT=Infinity,maxT=-Infinity,minV=Infinity,maxV=-Infinity;
   for(const n of allNames)for(const p of series[n]){
     if(p.t<minT)minT=p.t;if(p.t>maxT)maxT=p.t;
+  }
+  // Per-series extents, only needed in scaled mode.
+  const range={};
+  if(scaled)for(const n of visible){
+    let lo=Infinity,hi=-Infinity;
+    for(const p of series[n]){if(p.v<lo)lo=p.v;if(p.v>hi)hi=p.v}
+    // A series that never varies would divide by zero; widening it parks the
+    // flat line mid-height rather than stretching noise across the canvas.
+    if(!isFinite(lo)){lo=0;hi=1}
+    if(lo===hi){lo-=1;hi+=1}
+    range[n]=[lo,hi];
   }
   for(const n of visible)for(const p of series[n]){
     if(p.v<minV)minV=p.v;if(p.v>maxV)maxV=p.v;
@@ -1160,14 +1206,25 @@ function drawChart(canvasId,series,colors,opts){
   if(!isFinite(minV)){minV=0;maxV=1}
   if(minV===maxV){minV-=1;maxV+=1}
   if(opts.percent){minV=Math.min(0,minV);maxV=Math.max(100,maxV)}
-  if(opts.refLine!=null){minV=Math.min(minV,opts.refLine.value);maxV=Math.max(maxV,opts.refLine.value)}
-  const pad=(maxV-minV)*0.05;minV-=pad;maxV+=pad;
+  if(opts.refLine!=null&&!scaled){minV=Math.min(minV,opts.refLine.value);maxV=Math.max(maxV,opts.refLine.value)}
+  // In scaled mode the axis is a fraction of each series' own range, so the
+  // shared 0..1 is the axis and the 5% padding belongs to no series.
+  if(scaled){minV=0;maxV=1}
+  else{const pad=(maxV-minV)*0.05;minV-=pad;maxV+=pad}
   // Byte scales can never be negative: padding under a large reference line
   // would otherwise render nonsense "-200 MB" gridlines.
   if(opts.yFmt===fmtBytes)minV=Math.max(0,minV);
   const span=Math.max(1e-9,maxT-minT);
   const xScale=t=>M.left+((t-minT)/span)*pw;
   const yScale=v=>M.top+ph-(v-minV)/(maxV-minV)*ph;
+  // Series-aware placement: in scaled mode each series maps its OWN range onto
+  // the full height; otherwise every series shares the axis above.
+  const yOf=(n,v)=>{
+    if(!scaled)return yScale(v);
+    const r=range[n];
+    if(!r)return yScale(v);
+    return M.top+ph-((v-r[0])/(r[1]-r[0]))*ph;
+  };
 
   const yLabel=opts.yFmt||fmtVal;
   ctx.strokeStyle=THEME.grid;ctx.lineWidth=1;
@@ -1176,7 +1233,9 @@ function drawChart(canvasId,series,colors,opts){
     const y=yScale(v);
     ctx.beginPath();ctx.moveTo(M.left,y);ctx.lineTo(W-M.right,y);ctx.stroke();
     ctx.fillStyle=THEME.dim;ctx.font='10px -apple-system,sans-serif';ctx.textAlign='right';
-    ctx.fillText(yLabel(v),M.left-6,y+3);
+    // Absolute values would be a lie when each curve has its own range: label
+    // the axis as the fraction of a series' own span that it is.
+    ctx.fillText(scaled?Math.round(i/4*100)+'%':yLabel(v),M.left-6,y+3);
   }
 
   // X axis: epoch boundaries when we have them, plain elapsed otherwise.
@@ -1197,7 +1256,11 @@ function drawChart(canvasId,series,colors,opts){
     }
   }
 
-  if(opts.refLine!=null){
+  // A reference line is a value on a shared axis; in scaled mode there is no
+  // shared axis for it to sit on, so it is omitted rather than drawn somewhere
+  // arbitrary. (No opted-in chart uses one today; this keeps it honest if one
+  // ever does.)
+  if(opts.refLine!=null&&!scaled){
     const ry=yScale(opts.refLine.value);
     if(ry>=M.top&&ry<=M.top+ph){
       ctx.save();
@@ -1222,13 +1285,13 @@ function drawChart(canvasId,series,colors,opts){
     const color=colors[si%colors.length]||COLORS[si%COLORS.length];
     ctx.strokeStyle=color;ctx.lineWidth=solo?3:2;ctx.beginPath();
     pts.forEach((p,i)=>{
-      const x=xScale(p.t),y=yScale(p.v);
+      const x=xScale(p.t),y=yOf(n,p.v);
       if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
     });
     ctx.stroke();
     const last=pts[pts.length-1];
     ctx.fillStyle=color;ctx.beginPath();
-    ctx.arc(xScale(last.t),yScale(last.v),3,0,Math.PI*2);ctx.fill();
+    ctx.arc(xScale(last.t),yOf(n,last.v),3,0,Math.PI*2);ctx.fill();
   });
 
   canvas._layout={xScale,minT,maxT,series,names:allNames,colors,solo,
