@@ -295,19 +295,19 @@ impl ClusterCoordinator {
             let sample: crate::monitor::ResourceSample = wire_sample.clone().into();
             tl.rank_sample(rank, host, &sample);
         }
-        // Retain for the window-report builder. Marked fresh so a window
-        // record carries a sample only ONCE — repeating the last value on
-        // every report would smear one reading across the whole epoch, which
-        // is exactly what the sub-epoch cadence exists to avoid.
-        if let Some(slot) = self.latest_res.get_mut(rank) {
-            *slot = Some((
-                crate::monitor::record::Res {
-                    gpu_util: wire_sample.gpu_util_percent.map(|v| v as f64),
-                    vram_alloc: wire_sample.vram_allocated_bytes.map(|v| v as f64),
-                    vram_total: wire_sample.vram_total_bytes.map(|v| v as f64),
-                },
-                true,
-            ));
+        // Accumulate for the window-report builder rather than overwriting.
+        // Ranks sample every ~500ms but a window publishes far less often, so
+        // keeping only the latest reading reported whatever the gauge happened
+        // to read at publication time — on a cadence run that is usually
+        // mid-sync, which is why a GPU busy for a minute rendered as one spike.
+        // The accumulator drains at publication, so a window with no sample
+        // still leaves `res` absent instead of repeating a stale value.
+        if let Some(acc) = self.latest_res.get_mut(rank) {
+            acc.push(
+                wire_sample.gpu_util_percent.map(|v| v as f64),
+                wire_sample.vram_allocated_bytes.map(|v| v as f64),
+                wire_sample.vram_total_bytes.map(|v| v as f64),
+            );
         }
         if let Some(sink) = &self.dashboard_sink {
             sink.push_resource_sample(rank, wire_sample);

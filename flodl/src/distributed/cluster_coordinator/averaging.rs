@@ -454,16 +454,13 @@ impl ClusterCoordinator {
             return;
         }
 
-        // Take each rank's resource sample if a fresh one arrived since the
-        // last report, clearing the flag so the next window leaves `res`
-        // absent rather than repeating a stale reading.
+        // Drain each rank's accumulated interval. Draining resets, so the next
+        // window summarises only its own samples and a window that saw none
+        // leaves `res` absent rather than repeating a stale reading.
         let res_per_rank: Vec<crate::monitor::record::Res> = (0..self.world_size)
             .map(|r| match self.latest_res.get_mut(r) {
-                Some(Some((res, fresh @ true))) => {
-                    *fresh = false;
-                    *res
-                }
-                _ => crate::monitor::record::Res::default(),
+                Some(acc) => acc.take(),
+                None => crate::monitor::record::Res::default(),
             })
             .collect();
 

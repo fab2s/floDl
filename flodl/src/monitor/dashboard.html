@@ -354,7 +354,11 @@ function toggleTheme(){
   for(const k in soloState)soloState[k]=null;
   render();
 }
-const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24'};
+// `gpu peak` shares the gpu hue at lower saturation: it is the same quantity
+// seen a different way (interval max vs interval mean), so it should read as a
+// companion to the gpu line rather than a fifth unrelated series.
+const RES_COLORS={cpu:'#6c8cff',ram:'#a78bfa',gpu:'#34d399',vram:'#fbbf24',
+                  gpuPeak:'#a7f3d0'};
 const ROOT='root';
 // Rows retained per node. Bounds the DOM and the chart point count on a long
 // run; the durable history is the record log on disk, not this page.
@@ -832,6 +836,13 @@ function drawResources(){
   const names=[],series={},colors=[];
   const add=(name,s,color)=>{if(s.length){names.push(name);series[name]=s;colors.push(color)}};
   add('gpu',seriesOf(node,'res','gpu_util'),RES_COLORS.gpu);
+  // Each point is an INTERVAL, not an instant: `gpu` is the mean over the
+  // window, `gpu peak` the max. Both matter and neither implies the other —
+  // a device pegged for most of a window between two idle syncs has a modest
+  // mean and a peak of 100, and reporting only one of them is how a busy GPU
+  // came to look idle. Absent on archives written before peaks existed, and
+  // `add` skips empty series, so those pages simply keep one gpu line.
+  add('gpu peak',seriesOf(node,'res','gpu_util_max'),RES_COLORS.gpuPeak);
   add('vram',pctSeries(node,'vram_alloc','vram_total'),RES_COLORS.vram);
   // cpu / ram exist only where the level's own rows carry them (the `/events`
   // fallback root). They are per-host facts outside the record tree, so in a
@@ -848,8 +859,13 @@ function drawResources(){
     yFmt=fmtBytes;ref={value:vramTotal,dotted:false,color:THEME.ref,label:'Physical VRAM'};
   }else if(solo==='ram'){
     drawn={ram:seriesOf(node,'res','ram_used')};drawColors=[RES_COLORS.ram];pct=false;yFmt=fmtBytes;
-  }else if(solo==='gpu'||solo==='cpu'){
-    drawn={};drawn[solo]=series[solo]||[];drawColors=[RES_COLORS[solo]];yFmt=pctFmt;
+  }else if(solo==='gpu'||solo==='cpu'||solo==='gpu peak'){
+    // Colour comes from the parallel `names`/`colors` arrays rather than
+    // `RES_COLORS[solo]`: a series' DISPLAY name need not be a palette key
+    // (`gpu peak` isn't), and indexing the palette by display name silently
+    // yields undefined instead of failing.
+    drawn={};drawn[solo]=series[solo]||[];
+    drawColors=[colors[names.indexOf(solo)]];yFmt=pctFmt;
   }else if(names.includes('vram')&&vramTotal){
     ref={value:100,dotted:true,color:THEME.refDim,label:'VRAM limit'};
   }
@@ -859,7 +875,7 @@ function drawResources(){
     percent:pct,yFmt:yFmt||(pct?pctFmt:null),refLine:ref,marks:epochMarks(node),
   });
   updateLegend('resourceLegend',names,colors,'resourceChart',drawResources,
-               {cpu:'CPU',gpu:'GPU',ram:'RAM',vram:'VRAM'});
+               {cpu:'CPU',gpu:'GPU (mean)',ram:'RAM',vram:'VRAM','gpu peak':'GPU (peak)'});
   updateGauges(node);
 }
 
@@ -1345,12 +1361,19 @@ function hasHostTier(){
 function hwForLevel(){
   if(!HARDWARE)return null;
   const segs=HARDWARE.split(' | ').map(s=>s.trim()).filter(Boolean);
-  if(!recordMode)return HARDWARE;          // no levels to scope to
+  // `recordMode` only flips on the FIRST record, but `/events` delivers the
+  // hardware string before that — so gating purely on it painted the whole
+  // cohort inventory for a beat and then collapsed to the level's scope, which
+  // reads as losing information rather than as scoping. The string says which
+  // it is: the cluster form carries `gr=N lr=M:` GPU markers. When it does,
+  // scope from the first paint; the single-process form has no levels to scope
+  // to and keeps its verbatim passthrough whether or not records ever arrive.
+  const clustered=segs.some(isGpuSeg);
+  if(!recordMode&&!clustered)return HARDWARE;
   // CPU side: the host this level sits on, or every host at root. The
   // single-process form carries no `gr=` markers and no host prefixes, so its
   // GPU segments would otherwise read as CPUs — there, only the first segment
   // is the CPU and the rest are GPUs the record plane will re-derive.
-  const clustered=segs.some(isGpuSeg);
   const host=current===ROOT?null:current.split('/')[1];
   // An unattributed string (single-process form) describes ONE box. That is the
   // right answer at every level of a single-host run, but on a cohort with a

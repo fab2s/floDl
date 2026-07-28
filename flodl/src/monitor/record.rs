@@ -156,15 +156,87 @@ fn reduction_for(key: &str, user: &Reductions) -> Reduction {
 pub type Reductions = BTreeMap<String, Reduction>;
 
 /// Resource fields for one node; each **absent** (`None`) when unsampled
-/// (absent≠zero). `gpu_util` aggregates by `Mean`, VRAM by `Sum`.
+/// (absent≠zero). `gpu_util` aggregates by `Mean`, VRAM by `Sum`, and the
+/// `_max` peaks by `Max`.
+///
+/// The gauges are sampled far more often than they are published (every
+/// ~500ms on each rank, published once per reduce window or epoch), so each
+/// field summarises an *interval*, not an instant. See [`ResAcc`] for how the
+/// interval is accumulated and [`crate::monitor::envelope`] for why the
+/// latest-wins alternative misreports a busy GPU as an idle one.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Res {
-    /// GPU utilization percent (mean over reporting children).
+    /// GPU utilization percent, mean over the interval (then `Mean` over
+    /// reporting children).
     pub gpu_util: Option<f64>,
-    /// Allocated VRAM bytes (sum over reporting children).
+    /// Peak GPU utilization percent over the interval (then `Max` over
+    /// children — "was anything under this node pegged").
+    pub gpu_util_max: Option<f64>,
+    /// Allocated VRAM bytes, mean over the interval (then `Sum` over
+    /// reporting children).
     pub vram_alloc: Option<f64>,
-    /// Total VRAM bytes (sum over reporting children).
+    /// Peak allocated VRAM bytes over the interval (then `Sum` over children,
+    /// matching `vram_alloc` — the cohort's summed high-water mark, which is
+    /// the number that answers "did we come close to OOM").
+    pub vram_alloc_max: Option<f64>,
+    /// Total VRAM bytes (sum over reporting children). Constant per device,
+    /// so it carries no envelope.
     pub vram_total: Option<f64>,
+}
+
+/// Accumulates one rank's resource samples into a [`Res`] for the next
+/// publication.
+///
+/// One per (rank, consumer): [`take`](Self::take) drains, so the window-report
+/// consumer and the epoch-record consumer each need their own — a shared
+/// accumulator would let whichever publishes first blank the interval for the
+/// other. Both are fed from the same arriving sample.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResAcc {
+    gpu_util: crate::monitor::envelope::EnvelopeAcc,
+    vram_alloc: crate::monitor::envelope::EnvelopeAcc,
+    vram_total: crate::monitor::envelope::EnvelopeAcc,
+}
+
+impl ResAcc {
+    /// Fold one arriving sample in. Absent fields stay absent.
+    pub fn push(
+        &mut self,
+        gpu_util: Option<f64>,
+        vram_alloc: Option<f64>,
+        vram_total: Option<f64>,
+    ) {
+        self.gpu_util.push_opt(gpu_util);
+        self.vram_alloc.push_opt(vram_alloc);
+        self.vram_total.push_opt(vram_total);
+    }
+
+    /// Did anything arrive since the last drain?
+    ///
+    /// Replaces the previous explicit "fresh" flag: a window that saw no
+    /// sample must leave `res` absent rather than repeat a stale reading, and
+    /// "the accumulator is empty" states that directly.
+    pub fn is_empty(&self) -> bool {
+        self.gpu_util.count() == 0
+            && self.vram_alloc.count() == 0
+            && self.vram_total.count() == 0
+    }
+
+    /// Drain the interval into a [`Res`], resetting for the next one.
+    ///
+    /// `vram_total` takes the max purely as a stable pick — it is a constant
+    /// per device, so mean/min/max coincide except across a device swap.
+    pub fn take(&mut self) -> Res {
+        let gpu = self.gpu_util.take();
+        let alloc = self.vram_alloc.take();
+        Res {
+            gpu_util: gpu.map(|e| e.mean),
+            gpu_util_max: gpu.map(|e| e.max),
+            vram_alloc: alloc.map(|e| e.mean),
+            vram_alloc_max: alloc.map(|e| e.max),
+            vram_total: self.vram_total.take().map(|e| e.max),
+        }
+    }
 }
 
 /// One rank's raw contribution to the tree at a tick — the builder input.
@@ -290,8 +362,14 @@ impl NodeRecord {
         if let Some(v) = self.res.gpu_util {
             res.insert("gpu_util".into(), json!(v));
         }
+        if let Some(v) = self.res.gpu_util_max {
+            res.insert("gpu_util_max".into(), json!(v));
+        }
         if let Some(v) = self.res.vram_alloc {
             res.insert("vram_alloc".into(), json!(v));
+        }
+        if let Some(v) = self.res.vram_alloc_max {
+            res.insert("vram_alloc_max".into(), json!(v));
         }
         if let Some(v) = self.res.vram_total {
             res.insert("vram_total".into(), json!(v));
@@ -549,7 +627,17 @@ fn aggregate(path: Vec<String>, children: Vec<NodeRecord>, user: &Reductions) ->
 
     let res = Res {
         gpu_util: Reduction::Mean.reduce(&res_contribs(&children, |r| r.gpu_util)),
+        // Max, not Mean: the question a peak answers is "was ANYTHING under
+        // this node pegged", and averaging peaks across children destroys
+        // exactly that — a busy rank beside three idle ones would read as
+        // quarter-busy. Same reasoning as `data_starve`.
+        gpu_util_max: Reduction::Max.reduce(&res_contribs(&children, |r| r.gpu_util_max)),
         vram_alloc: Reduction::Sum.reduce(&res_contribs(&children, |r| r.vram_alloc)),
+        // Sum, matching `vram_alloc`: the cohort's summed high-water mark.
+        // Strictly this is sum-of-peaks rather than peak-of-sum (they differ
+        // when ranks peak at different moments), and sum-of-peaks is the
+        // conservative one — it answers "how much VRAM did we need to have".
+        vram_alloc_max: Reduction::Sum.reduce(&res_contribs(&children, |r| r.vram_alloc_max)),
         vram_total: Reduction::Sum.reduce(&res_contribs(&children, |r| r.vram_total)),
     };
 
@@ -773,7 +861,9 @@ mod tests {
             metrics: BTreeMap::new(),
             res: Res {
                 gpu_util: util,
+                gpu_util_max: util,
                 vram_alloc: alloc,
+                vram_alloc_max: alloc,
                 vram_total: None,
             },
             device: None,
@@ -1013,19 +1103,38 @@ mod tests {
         let em = epoch_metrics_2ranks();
         let extras = vec![
             RankExtras {
-                res: Res { gpu_util: Some(90.0), vram_alloc: Some(1000.0), vram_total: Some(4000.0) },
+                res: Res {
+                    gpu_util: Some(90.0),
+                    gpu_util_max: Some(95.0),
+                    vram_alloc: Some(1000.0),
+                    vram_alloc_max: Some(1200.0),
+                    vram_total: Some(4000.0),
+                },
                 label: Some("RTX 5060 Ti".to_string()),
             },
             RankExtras {
-                res: Res { gpu_util: Some(50.0), vram_alloc: Some(500.0), vram_total: Some(6000.0) },
+                res: Res {
+                    gpu_util: Some(50.0),
+                    gpu_util_max: Some(99.0),
+                    vram_alloc: Some(500.0),
+                    vram_alloc_max: Some(600.0),
+                    vram_total: Some(6000.0),
+                },
                 label: Some("GP106".to_string()),
             },
         ];
         let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &extras);
         // gpu_util is a work-weighted Mean: 90*0.75 + 50*0.25 = 80.
         assert!((root.res.gpu_util.unwrap() - 80.0).abs() < 1e-9);
-        // VRAM sums across the cohort.
+        // The PEAK takes Max, not Mean. rank1 deliberately has the LOWER mean
+        // (50) and the HIGHER peak (99), so a Mean roll-up here would give
+        // 96 — the assertion only passes for Max, which is the property that
+        // makes "was anything under this node pegged" answerable.
+        assert_eq!(root.res.gpu_util_max, Some(99.0));
+        // VRAM sums across the cohort, peak included (sum-of-peaks = how much
+        // VRAM the cohort needed to have available).
         assert_eq!(root.res.vram_alloc, Some(1500.0));
+        assert_eq!(root.res.vram_alloc_max, Some(1800.0));
         assert_eq!(root.res.vram_total, Some(10000.0));
         // The label is a LEAF property — a legend at the parent's level reads
         // it there; the interior node's own path segment is its name.
@@ -1039,5 +1148,57 @@ mod tests {
         let bare = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(bare.res.gpu_util, None);
         assert!(bare.children[0].to_record_json(0, None, None, Severity::Info).get("res").is_none());
+    }
+
+    /// The interval, not the last reading. This is the whole point of `ResAcc`:
+    /// ranks sample every ~500ms but publish far less often, so a GPU busy for
+    /// most of an interval used to render as whatever it read at publication
+    /// time — usually mid-sync, hence idle.
+    #[test]
+    fn res_acc_publishes_the_interval_not_the_last_reading() {
+        let mut acc = ResAcc::default();
+        for util in [100.0, 100.0, 100.0, 0.0] {
+            acc.push(Some(util), Some(2_000.0), Some(6_000.0));
+        }
+        let res = acc.take();
+        assert_eq!(res.gpu_util, Some(75.0), "mean over the interval");
+        assert_eq!(
+            res.gpu_util_max,
+            Some(100.0),
+            "the busy stretch survives; latest-wins would have reported 0",
+        );
+        assert_eq!(res.vram_total, Some(6_000.0));
+    }
+
+    /// Replaces the old explicit `fresh` flag. A window that saw no sample must
+    /// leave `res` absent rather than repeat the previous value — repeating one
+    /// reading across an epoch is exactly what the sub-epoch cadence exists to
+    /// avoid, so this guards the property, not the mechanism that provided it.
+    #[test]
+    fn res_acc_drains_so_a_sampleless_interval_stays_absent() {
+        let mut acc = ResAcc::default();
+        acc.push(Some(80.0), Some(1_000.0), Some(4_000.0));
+        assert!(!acc.is_empty());
+        assert_eq!(acc.take().gpu_util, Some(80.0));
+
+        // Nothing arrived since. Every field must be absent, NOT 80 again.
+        assert!(acc.is_empty());
+        let second = acc.take();
+        assert_eq!(second, Res::default());
+        assert_eq!(second.gpu_util, None);
+        assert_eq!(second.gpu_util_max, None);
+    }
+
+    /// Fields are independent: a rank reporting GPU but no VRAM must not have
+    /// the VRAM fields invented as zeros, which would then Sum into the parent.
+    #[test]
+    fn res_acc_keeps_absent_fields_absent() {
+        let mut acc = ResAcc::default();
+        acc.push(Some(60.0), None, None);
+        let res = acc.take();
+        assert_eq!(res.gpu_util, Some(60.0));
+        assert_eq!(res.vram_alloc, None);
+        assert_eq!(res.vram_alloc_max, None);
+        assert_eq!(res.vram_total, None);
     }
 }

@@ -159,7 +159,22 @@ pub struct ClusterDashboardSink {
     /// Per-rank hardware summary strings, indexed by global rank.
     per_rank_hardware: Mutex<Vec<Option<String>>>,
     /// Per-rank latest resource sample, indexed by global rank.
+    ///
+    /// Latest-wins on purpose here: this feeds the `/events` gauges and the
+    /// per-GPU tabs, which ask "what is it doing right now". The record tree
+    /// asks a different question — what happened over the interval — and is
+    /// served by [`Self::per_rank_res_acc`] instead.
     per_rank_resources: Mutex<Vec<Option<ResourceSample>>>,
+    /// Per-rank resource accumulator for the EPOCH record tree, indexed by
+    /// global rank.
+    ///
+    /// Separate from the coordinator's window accumulator because draining is
+    /// destructive and the two publish on different cadences: one shared
+    /// accumulator would let whichever fired first blank the interval for the
+    /// other. Both are fed from the same arriving sample, so an epoch record
+    /// summarises the whole epoch while each window record summarises its own
+    /// slice.
+    per_rank_res_acc: Mutex<Vec<crate::monitor::record::ResAcc>>,
     /// Flat records of the most recent sub-epoch window tree (root first).
     /// Held so the portal can serve the current tree by path; streaming
     /// them live is a later slice.
@@ -219,6 +234,10 @@ impl ClusterDashboardSink {
             svg_installed: Mutex::new(false),
             per_rank_hardware: Mutex::new(vec![None; world_size]),
             per_rank_resources: Mutex::new(vec![None; world_size]),
+            per_rank_res_acc: Mutex::new(vec![
+                crate::monitor::record::ResAcc::default();
+                world_size
+            ]),
             latest_window_records: Mutex::new(Vec::new()),
             recent_events: Mutex::new(Vec::new()),
             record_log: None,
@@ -312,29 +331,32 @@ impl ClusterDashboardSink {
         hosts
     }
 
-    /// Per-rank resource + legend extras for the epoch record tree, read off
-    /// the samples the ranks piggy-back on their metrics reports.
+    /// Per-rank resource + legend extras for the epoch record tree.
     ///
-    /// These are sampled once per epoch, which is exactly this record's
-    /// cadence — so the values are fresh here, where smearing them across every
-    /// sub-epoch window report would have invented data between samples.
+    /// Resources drain from the per-rank accumulator, so an epoch record
+    /// carries the min/mean/max envelope of every sample taken during that
+    /// epoch rather than whichever reading happened to be latest when the
+    /// epoch closed. Draining resets, so the next epoch summarises only its
+    /// own samples, and an epoch that saw none yields an all-absent `Res`.
+    ///
+    /// The legend label still comes from the latest sample: it names the
+    /// device, which is a property of the node rather than a measurement, so
+    /// it has no interval to summarise.
     fn record_extras(&self) -> Vec<crate::monitor::record::RankExtras> {
+        let mut acc = self.per_rank_res_acc.lock().unwrap();
         let map = self.per_rank_resources.lock().unwrap();
-        map.iter()
-            .map(|s| {
-                let Some(sample) = s else {
-                    return crate::monitor::record::RankExtras::default();
-                };
-                crate::monitor::record::RankExtras {
-                    res: crate::monitor::record::Res {
-                        // absent≠zero: an unsampled field stays None and is
-                        // excluded from the rollup, never averaged in as 0.
-                        gpu_util: sample.gpu_util_percent.map(|v| v as f64),
-                        vram_alloc: sample.vram_allocated_bytes.map(|v| v as f64),
-                        vram_total: sample.vram_total_bytes.map(|v| v as f64),
-                    },
-                    label: sample.gpus.first().map(|g| short_gpu_name(&g.name)),
-                }
+        (0..map.len())
+            .map(|r| crate::monitor::record::RankExtras {
+                // absent≠zero: an unsampled field stays None and is excluded
+                // from the rollup, never averaged in as 0.
+                res: acc
+                    .get_mut(r)
+                    .map(|a| a.take())
+                    .unwrap_or_default(),
+                label: map[r]
+                    .as_ref()
+                    .and_then(|s| s.gpus.first())
+                    .map(|g| short_gpu_name(&g.name)),
             })
             .collect()
     }
@@ -513,6 +535,20 @@ impl DashboardSink for ClusterDashboardSink {
 
     fn push_resource_sample(&self, rank: usize, sample: ResourceSampleWire) {
         let sample: ResourceSample = sample.into();
+        // Two consumers, two shapes. The gauges want the latest reading; the
+        // epoch record wants the interval, so the sample also folds into an
+        // accumulator that the record drains. Keeping only the latest here
+        // was what made a busy GPU render as an idle one.
+        {
+            let mut acc = self.per_rank_res_acc.lock().unwrap();
+            if let Some(a) = acc.get_mut(rank) {
+                a.push(
+                    sample.gpu_util_percent.map(|v| v as f64),
+                    sample.vram_allocated_bytes.map(|v| v as f64),
+                    sample.vram_total_bytes.map(|v| v as f64),
+                );
+            }
+        }
         let mut map = self.per_rank_resources.lock().unwrap();
         if rank < map.len() {
             map[rank] = Some(sample);
