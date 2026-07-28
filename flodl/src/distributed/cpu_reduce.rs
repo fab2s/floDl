@@ -561,29 +561,91 @@ impl CpuReduceClient {
                 self.world_size,
             )));
         }
-        // Build the per-rank contribution: root sends a copy of its
-        // values, non-root ranks send zeros_like. Tensors are moved to
-        // CPU via tensors_to_round_frame downstream; the copies are
-        // short-lived (single-round scratch).
-        let contribution: Vec<Tensor> = if self.rank_id == root {
-            tensors
-                .iter()
-                .map(|t| {
-                    let copy = Tensor::zeros_like(t)?;
-                    copy.copy_(t, false)?;
-                    Ok(copy)
-                })
-                .collect::<Result<Vec<_>>>()?
+        // Root ships its live tensors directly — the streamed encode reads
+        // them without mutation, so the zeros_like + copy_ scratch this
+        // path used to build (a full model copy at formation) bought
+        // nothing. Non-root ranks contribute all-zeros, and since the wire
+        // bytes of a zeros model ARE just zeros, they stream literal zero
+        // bytes from the shapes alone (`stream_zeros_frame`) instead of
+        // materializing a zeros_like model first — at 190M params that
+        // scratch was ~762MB per non-root rank, landing exactly on the
+        // formation-time RAM peak (data staging + CUDA init + first
+        // window). The wire bytes are bit-identical either way (pinned by
+        // `zeros_frame_streams_the_same_bytes_a_zeros_model_would`).
+        if self.rank_id == root {
+            Ok(self
+                .all_reduce_weighted(tensors, RoundKind::Control, 0.0)?
+                .0)
         } else {
-            tensors
-                .iter()
-                .map(|t| Tensor::zeros_like(t))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let refs: Vec<&Tensor> = contribution.iter().collect();
-        Ok(self
-            .all_reduce_weighted(&refs, RoundKind::Control, 0.0)?
-            .0)
+            Ok(self.stream_zeros_frame(tensors, RoundKind::Control, 0.0)?.0)
+        }
+    }
+
+    /// Ship a frame whose payloads are all zeros — schema (shapes, dtype,
+    /// kind, weight) taken from `tensors`, payload bytes produced as
+    /// literal zeros without materializing a zeros model — and return the
+    /// reduced reply. Wire-identical to
+    /// [`Self::all_reduce_weighted`] over `zeros_like` copies of
+    /// `tensors`; the peak send-side transient drops from a full model to
+    /// one 1MB chunk.
+    fn stream_zeros_frame(
+        &mut self,
+        tensors: &[&Tensor],
+        kind: RoundKind,
+        weight: f64,
+    ) -> Result<(Vec<Tensor>, f64)> {
+        let t0 = Instant::now();
+        let wire_dtype = self.wire_dtype_for(kind);
+        let elem = controller::payload_element_size(wire_dtype)? as u64;
+        let shapes: Vec<Vec<u32>> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| wire_shape(i, t))
+            .collect::<Result<_>>()?;
+        let parts: Vec<controller::PayloadPart<'_>> = tensors
+            .iter()
+            .zip(shapes.iter())
+            .map(|(t, shape)| controller::PayloadPart {
+                dtype: wire_dtype,
+                shape,
+                nbytes: t.numel() as u64 * elem,
+            })
+            .collect();
+        let sent_bytes: u64 = parts.iter().map(|p| p.nbytes).sum();
+
+        crate::distributed::relay::mux::write_len_prefix(
+            &mut self.stream,
+            controller::round_frame_wire_len(&parts),
+        )?;
+        // One reused chunk of zero bytes; a zeros payload of any size is
+        // that chunk written ceil(nbytes / len) times.
+        let zeros = vec![0u8; 1 << 20];
+        controller::write_round_frame_streamed(
+            &mut self.stream,
+            kind,
+            weight,
+            &parts,
+            &self.salt,
+            &mut |ti, tee| {
+                let mut left = parts[ti].nbytes;
+                while left > 0 {
+                    let n = left.min(zeros.len() as u64) as usize;
+                    tee.write_all(&zeros[..n])
+                        .map_err(|e| TensorError::new(&e.to_string()))?;
+                    left -= n as u64;
+                }
+                Ok(())
+            },
+        )?;
+
+        let (out, weight, decode_ns) = self.read_reduced_tensors()?;
+        if self.prof_enabled {
+            self.prof_wire_ns += t0.elapsed().as_nanos().saturating_sub(decode_ns);
+            self.prof_deserialize_ns += decode_ns;
+            self.prof_bytes += sent_bytes;
+            self.prof_count += 1;
+        }
+        Ok((out, weight))
     }
 
     /// AllReduce-gather a per-rank `f64` measurement vector across the
