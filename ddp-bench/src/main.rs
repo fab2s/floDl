@@ -30,7 +30,8 @@ struct Cli {
     #[option]
     epochs: Option<usize>,
 
-    /// Override batches per epoch.
+    /// Unsupported (loud error): epoch length is the dataset; use
+    /// --epochs / --batch-size to scale a run.
     #[option]
     batches: Option<usize>,
 
@@ -699,6 +700,19 @@ fn run() -> flodl::tensor::Result<()> {
     let mode_filter = cli.mode.clone();
     let epochs = cli.epochs;
     let batches = cli.batches;
+    // Every registered model loads a real dataset whose length defines the
+    // epoch; no dataset factory honors a --batches override. Accepting it
+    // silently trained the full dataset while recording N batches into the
+    // run metadata — a corrupted artifact, worse than a refusal. Reject
+    // until a model actually truncates its epoch to the override.
+    if let Some(n) = batches {
+        return Err(flodl::tensor::TensorError::new(&format!(
+            "--batches {n} is not supported: every model's epoch is its \
+             dataset (or staged slice) and no dataset honors the override, \
+             so the run would train the full epoch while REPORTING {n} \
+             batches. Scale runs with --epochs / --batch-size instead.",
+        )));
+    }
     let batch_size = cli.batch_size;
     let output = cli.output.clone();
     let data_dir = cli.data_dir.clone();

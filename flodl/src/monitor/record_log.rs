@@ -147,7 +147,7 @@ impl RecordLog {
     /// Open (creating parents) the active segment for a node, resuming its
     /// byte count from the existing file so a restart does not blow the cap.
     fn open_node(&self, rel: &Path) -> Option<NodeFile> {
-        let path = self.dir.join(rel).with_extension("log");
+        let path = node_log_path(&self.dir, rel);
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
@@ -197,7 +197,7 @@ impl RecordLog {
         let Some(rel) = safe_relative_path(path) else {
             return Vec::new();
         };
-        let active = self.dir.join(rel).with_extension("log");
+        let active = node_log_path(&self.dir, &rel);
         let mut lines: std::collections::VecDeque<String> =
             std::collections::VecDeque::with_capacity(n);
         for seg in [rotated_path(&active), active] {
@@ -261,6 +261,18 @@ fn rotate(nf: &mut NodeFile) {
 fn rotated_path(active: &Path) -> PathBuf {
     let mut s = active.as_os_str().to_os_string();
     s.push(".1");
+    PathBuf::from(s)
+}
+
+/// `<dir>/<rel>.log` with `.log` APPENDED to the last segment — never
+/// `Path::with_extension`, which REPLACES anything after a dot in the node
+/// name. Node names include hostnames, and dotted hostnames are normal
+/// (cluster.yml IPs/FQDNs): `with_extension` would map both `10.0.0.5` and
+/// `10.0.0.6` to `10.0.0.log`, silently interleaving two hosts' histories
+/// in one file (append and tail agreeing on the wrong file).
+fn node_log_path(dir: &Path, rel: &Path) -> PathBuf {
+    let mut s = dir.join(rel).into_os_string();
+    s.push(".log");
     PathBuf::from(s)
 }
 
@@ -472,5 +484,25 @@ mod tests {
         log.append(&[rec("root/rank0", 1)]); // parent "root" is a file
         log.flush();
         assert!(log.tail("root/rank0", 5).is_empty());
+    }
+
+    /// Dotted node names (IP / FQDN hosts out of cluster.yml) must each get
+    /// their own file. `Path::with_extension` REPLACED everything after the
+    /// last dot, mapping `10.0.0.5` and `10.0.0.6` onto one `10.0.0.log` and
+    /// silently interleaving two hosts' histories.
+    #[test]
+    fn dotted_hostnames_do_not_collide() {
+        let d = TempDir::new("dottedhosts");
+        let log = RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES);
+        log.append(&[rec("root/10.0.0.5", 1), rec("root/10.0.0.6", 2)]);
+        log.flush();
+        assert!(d.0.join("root/10.0.0.5.log").is_file());
+        assert!(d.0.join("root/10.0.0.6.log").is_file());
+        let five = log.tail("root/10.0.0.5", 10);
+        let six = log.tail("root/10.0.0.6", 10);
+        assert_eq!(five.len(), 1);
+        assert_eq!(six.len(), 1);
+        assert_eq!(five[0]["tick"], 1);
+        assert_eq!(six[0]["tick"], 2);
     }
 }

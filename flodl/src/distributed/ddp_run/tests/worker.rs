@@ -370,6 +370,8 @@ fn epoch_metrics_fixture(epoch: usize, avg_loss: f64) -> EpochMetrics {
         scalars: HashMap::new(),
         per_rank: vec![],
         avg_loss,
+        per_rank_loss: vec![],
+        per_rank_samples: vec![],
         epoch_ms: 0.0,
         per_rank_throughput: vec![],
         per_rank_batch_share: vec![],
@@ -394,10 +396,10 @@ fn test_worker_metrics_stream_forwards_every_epoch() {
     // Two aggregated epochs arrive on the control channel (as the coordinator
     // broadcasts them); a single handle_control drain processes both.
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(0, 0.9)))
+        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(0, 0.9))))
         .unwrap();
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(1, 0.5)))
+        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(1, 0.5))))
         .unwrap();
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
@@ -422,7 +424,7 @@ fn test_worker_metrics_slot_without_stream() {
     let (mut worker, ch) = make_test_worker();
     // No enable_metrics_stream(): metrics_stream_tx stays None.
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(epoch_metrics_fixture(3, 0.1)))
+        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(3, 0.1))))
         .unwrap();
     worker.handle_control().unwrap();
     let latest = worker.aggregated_metrics().lock().unwrap().clone();

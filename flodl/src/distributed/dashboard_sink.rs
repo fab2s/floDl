@@ -1024,6 +1024,8 @@ mod tests {
             scalars,
             per_rank: vec![Default::default(), Default::default()],
             avg_loss: 0.25,
+            per_rank_loss: vec![Some(0.2), Some(0.4)],
+            per_rank_samples: vec![750, 250],
             epoch_ms: 500.0,
             per_rank_throughput: vec![12.0, 4.0],
             per_rank_batch_share: vec![0.75, 0.25],
@@ -1067,8 +1069,9 @@ mod tests {
         assert_eq!(r["epoch_complete"], true, "marked as an epoch boundary");
         assert!(r.get("tick").is_none(), "an epoch record has no window index");
         assert_eq!(r["epoch"], 2);
-        // avg_loss injected (EpochMetrics has no per-rank loss at all) and the
-        // root-only user scalar carried.
+        // loss rolls up from the per-rank leaves (0.2*750 + 0.4*250 over
+        // 1000 = 0.25, agreeing with avg_loss) and the root-only user
+        // scalar is injected.
         assert_eq!(r["metrics"]["loss"], 0.25);
         assert_eq!(r["metrics"]["eval_acc"], 0.87);
         // throughput sums; gpu_util is the work-weighted mean 90*.75+50*.25=80.
@@ -1081,6 +1084,9 @@ mod tests {
         assert_eq!(leaf.len(), 1);
         assert_eq!(leaf[0]["label"], "RTX 5060 Ti", "vendor prefixes trimmed");
         assert_eq!(leaf[0]["res"]["gpu_util"], 90.0);
+        // The epoch row carries the rank's OWN loss — previously the loss
+        // series had a hole at every epoch boundary below root.
+        assert_eq!(leaf[0]["metrics"]["loss"], 0.2);
         assert!(log.tail("root/pascal/rank1", 10)[0]["label"] == "GTX 1060");
     }
 

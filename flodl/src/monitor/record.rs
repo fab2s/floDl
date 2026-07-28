@@ -413,18 +413,20 @@ impl NodeRecord {
     /// the *same* rule the sub-epoch window tree uses, so a rank has ONE path
     /// across both cadences and the two feeds interleave in one per-level
     /// stream instead of splitting each rank in two. `extras[rank]` carries the
-    /// per-rank resource sample + legend label. Work is `per_rank_batch_share`
-    /// (samples-proportional; the weighted mean is identical to using absolute
-    /// samples).
+    /// per-rank resource sample + legend label. Work is `per_rank_samples` —
+    /// linear **realized** work, the design's exact Mean weight — falling back
+    /// to `per_rank_batch_share` only when the samples vec is absent (a
+    /// hand-built [`EpochMetrics`]); allocation is a scheduling artifact and
+    /// realized ≠ allocated under progressive tail-steal or a dead rank.
     ///
+    /// Leaves carry `per_rank_loss` where measured (`None` stays absent — a
+    /// rank with no batches is excluded from the mean, never zeroed).
     /// `avg_loss` and `scalars` are the controller's **batch-weighted** means
-    /// across ranks — the same law [`Reduction::Mean`] applies with
-    /// `batch_share` as the weight — so they are injected at the root for keys
-    /// the per-rank rollup did not produce. `loss` is always such a key:
-    /// [`EpochMetrics`] has no per-rank loss, only the aggregate, so without
-    /// this the tree would carry no loss at any level. Where a key exists both
-    /// per-rank and aggregated, the rollup wins (it is the measured tree), and
-    /// the two agree by construction.
+    /// across ranks; they are injected at the root only for keys the per-rank
+    /// rollup did not produce. Where a key exists in both, the rollup wins (it
+    /// is the measured tree): its samples-weighted mean equals the injected
+    /// batch-weighted value exactly under uniform batch fill, and where the
+    /// two differ (partial final batches) samples is the exact weight.
     pub fn from_epoch_metrics(
         m: &EpochMetrics,
         hosts: Option<&[String]>,
@@ -454,10 +456,18 @@ impl NodeRecord {
                 if let Some(&c) = m.per_rank_compute_only_ms.get(r) {
                     metrics.insert("compute_only_ms".into(), c);
                 }
+                if let Some(&Some(l)) = m.per_rank_loss.get(r) {
+                    metrics.insert("loss".into(), l);
+                }
                 let extra = extras.get(r);
+                let work = if m.per_rank_samples.len() == n {
+                    m.per_rank_samples[r] as f64
+                } else {
+                    m.per_rank_batch_share.get(r).copied().unwrap_or(0.0)
+                };
                 Leaf {
                     path: leaf_path_segments(r, &host_refs),
-                    work: m.per_rank_batch_share.get(r).copied().unwrap_or(0.0),
+                    work,
                     metrics,
                     res: extra.map(|e| e.res).unwrap_or_default(),
                     device: m.device_indices.get(r).copied(),
@@ -954,6 +964,10 @@ mod tests {
             scalars: std::collections::HashMap::new(),
             per_rank,
             avg_loss: 0.3,
+            // Rank losses whose samples-weighted mean equals avg_loss
+            // (uniform batch fill): 0.2*750 + 0.6*250 over 1000 = 0.3.
+            per_rank_loss: vec![Some(0.2), Some(0.6)],
+            per_rank_samples: vec![750, 250],
             epoch_ms: 100.0,
             per_rank_throughput: vec![10.0, 4.0],
             per_rank_batch_share: vec![0.75, 0.25],
@@ -969,17 +983,40 @@ mod tests {
         let em = epoch_metrics_2ranks();
         let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(root.children.len(), 2);
-        // work = batch_share, sums to 1.0.
-        assert!((root.work - 1.0).abs() < 1e-12);
+        // work = realized samples, sums over ranks.
+        assert!((root.work - 1000.0).abs() < 1e-12);
         // throughput sums.
         assert!((m(&root, "throughput").unwrap() - 14.0).abs() < 1e-9);
-        // acc work-weighted: 0.90*0.75 + 0.70*0.25 = 0.85.
+        // acc work-weighted: (0.90*750 + 0.70*250) / 1000 = 0.85.
         assert!((m(&root, "acc").unwrap() - 0.85).abs() < 1e-12);
         // data_starve Max surfaces the worst rank.
         assert_eq!(m(&root, "data_starve"), Some(40.0));
         // device index carried onto the leaf.
         let rank1 = root.children.iter().find(|c| c.path.last().unwrap() == "rank1").unwrap();
         assert_eq!(rank1.device, Some(1));
+        // loss reaches the leaves (was the epoch-row hole at every non-root
+        // level) and rolls up to root by the same weighted mean — the rollup,
+        // not the avg_loss injection, though the two agree here.
+        assert_eq!(m(rank1, "loss"), Some(0.6));
+        assert!((m(&root, "loss").unwrap() - 0.3).abs() < 1e-12);
+    }
+
+    /// A hand-built `EpochMetrics` without `per_rank_samples` (wrong length)
+    /// falls back to `batch_share` as the work weight, and a rank whose loss
+    /// is `None` gets no loss key — absent, never zero.
+    #[test]
+    fn from_epoch_metrics_degenerate_inputs() {
+        let mut em = epoch_metrics_2ranks();
+        em.per_rank_samples = vec![];
+        em.per_rank_loss = vec![Some(0.2), None];
+        let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
+        assert!((root.work - 1.0).abs() < 1e-12);
+        let rank1 = root.children.iter().find(|c| c.path.last().unwrap() == "rank1").unwrap();
+        assert!(!rank1.metrics.contains_key("loss"));
+        // Only rank0 measured loss; the mean covers reporting children alone.
+        let rank0 = root.children.iter().find(|c| c.path.last().unwrap() == "rank0").unwrap();
+        assert_eq!(m(rank0, "loss"), Some(0.2));
+        assert!((m(&root, "loss").unwrap() - 0.2).abs() < 1e-12);
     }
 
     #[test]
@@ -1052,11 +1089,13 @@ mod tests {
         }
     }
 
-    /// `EpochMetrics` has no per-rank loss — only the aggregate — so without
-    /// injection the tree would carry no loss at ANY level.
+    /// Root injection covers keys the rollup cannot produce — a root-only
+    /// aggregate scalar, or `avg_loss` when no rank measured a loss (the
+    /// pre-`per_rank_loss` shape, still reachable from hand-built metrics).
     #[test]
     fn root_aggregates_fill_keys_the_rollup_cannot_produce() {
         let mut em = epoch_metrics_2ranks();
+        em.per_rank_loss = vec![None, None];
         em.scalars.insert("eval_acc".to_string(), 0.91);
         let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(m(&root, "loss"), Some(0.3), "avg_loss injected at root");
@@ -1067,8 +1106,9 @@ mod tests {
     }
 
     /// Where a key exists BOTH per-rank and in the aggregate, the measured
-    /// rollup wins — and the two agree, because `scalars` is a batch-weighted
-    /// mean and the tree's `Mean` is weighted by `batch_share`. Same law.
+    /// rollup wins — and the two agree under uniform batch fill, because
+    /// `scalars` is a batch-weighted mean and the tree's `Mean` is weighted
+    /// by realized samples. Same law, same proportions.
     #[test]
     fn rollup_wins_over_injection_and_the_two_agree() {
         let mut em = epoch_metrics_2ranks();

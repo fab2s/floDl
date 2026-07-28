@@ -58,6 +58,12 @@ pub struct EpochMetrics {
     pub per_rank: Vec<HashMap<String, f64>>,
     /// Average loss across all ranks (batch-weighted).
     pub avg_loss: f64,
+    /// Per-rank batch-weighted mean loss (index = rank). `None` for a rank
+    /// that processed no batches this epoch (absent, not zero).
+    pub per_rank_loss: Vec<Option<f64>>,
+    /// Per-rank realized samples this epoch (index = rank) — the linear
+    /// realized-work weight behind every per-rank aggregate.
+    pub per_rank_samples: Vec<usize>,
     /// Wall-clock epoch time (ms), max across ranks.
     pub epoch_ms: f64,
     /// Per-rank throughput in samples/ms (index = rank). Computed from

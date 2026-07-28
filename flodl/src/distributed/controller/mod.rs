@@ -840,10 +840,13 @@ fn average_and_scatter(
         }
         None => averaged,
     };
-    // The consensus frame is identical for every rank; serialize once and
-    // forward the same bytes once per surviving connection.
+    // The consensus frame is identical for every rank; serialize once, wrap
+    // once, and forward the same record to every surviving connection —
+    // `write_to` borrows, so cloning the model-sized buffer per connection
+    // was pure alloc+memcpy churn (n_conns × frame bytes per window).
     let mut buf: Vec<u8> = Vec::new();
     write_round_frame(&mut buf, &averaged, salt)?;
+    let record = MuxRecord::broadcast(buf);
     // ELASTIC SCATTER: a write failure (including a zero-progress stall
     // tripping the socket's write timeout) marks that CONNECTION broken
     // and declares its ranks dead, and the scatter continues to the
@@ -856,9 +859,7 @@ fn average_and_scatter(
         if ranks.iter().all(|r| dead_ranks.is_dead(*r)) {
             continue; // fully-dead host — no one to deliver to
         }
-        if let Err(e) =
-            MuxRecord::broadcast(buf.clone()).write_to(&mut conn_writes[ci], salt)
-        {
+        if let Err(e) = record.write_to(&mut conn_writes[ci], salt) {
             eprintln!(
                 "cluster_controller: consensus broadcast to relay {ci} \
                  (ranks {ranks:?}) failed ({e}); declaring its ranks dead and \
