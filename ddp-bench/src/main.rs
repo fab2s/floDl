@@ -238,8 +238,9 @@ struct Cli {
     /// Fraction of available host RAM each rank's staging tiers may
     /// retain (flodl `.ram_max_usage`, clamped to [0.0, 0.90]);
     /// co-hosted ranks split it by schedule share. Default 0.50; 0.0
-    /// disables staging retention. A/B lever for the unified budget
-    /// policy.
+    /// disables staging retention AND the delivery reader ring
+    /// (single-stage fetch, the pre-ring shape). A/B lever for the
+    /// unified budget policy.
     #[option]
     ram_max_usage: Option<f64>,
 

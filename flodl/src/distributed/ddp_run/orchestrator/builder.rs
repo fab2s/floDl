@@ -517,11 +517,11 @@ where
         self
     }
 
-    /// Host-RAM share for each rank's staging tiers (see
-    /// [`DdpRunConfig::ram_max_usage`]). Same knob as
+    /// Host-RAM share for each rank's staging tiers and delivery
+    /// reader ring (see [`DdpRunConfig::ram_max_usage`]). Same knob as
     /// `DataLoaderBuilder::ram_max_usage` on the solo path; default
     /// `0.50`, clamped to `[0.0, 0.90]`; `0.0` disables staging
-    /// retention.
+    /// retention and keeps delivery single-stage.
     pub fn ram_max_usage(mut self, max_usage: f64) -> Self {
         self.config = self.config.with_ram_max_usage(max_usage);
         self
