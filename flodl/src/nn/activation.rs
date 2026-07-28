@@ -239,6 +239,86 @@ impl Module for SiLU {
     }
 }
 
+/// SwiGLU gate: split the last dimension in half and return
+/// `value * silu(gate)`. Halves the width, so `[.., 2n] -> [.., n]`.
+///
+/// The gating half of a SwiGLU feed-forward block, not the whole block — it
+/// carries no parameters, so it composes between the two projections a
+/// transformer FFN already has:
+///
+/// ```text
+/// Linear(d -> 2h)  ->  SwiGLU  ->  Linear(h -> d)
+/// ```
+///
+/// Keeping the projections outside is what lets the same module serve both a
+/// hand-written `forward` and a [`FlowBuilder`](crate::FlowBuilder) graph,
+/// where it appears as one node rather than an exploded split-and-multiply
+/// subgraph.
+///
+/// # Which half is the gate
+///
+/// **First half is the value, second half is the gate** — `chunk(2, -1)` then
+/// `x[0] * silu(x[1])`. This follows OLMo and the fused-projection convention
+/// generally: a single `ff_proj` emits `[value | gate]` in that order.
+///
+/// It matters. LLaMA-style implementations with *separate* `gate_proj` and
+/// `up_proj` compute `silu(gate_proj(x)) * up_proj(x)`, which is the same
+/// formula but reaches it from two tensors, so there is no ordering to get
+/// wrong. Fused ones have to pick, and picking the other way silently trains
+/// a different (still-plausible) network — the loss curve looks fine, the
+/// weights are not interchangeable with the reference. If you are porting a
+/// checkpoint, check the source's chunk order.
+///
+/// # Panics / errors
+///
+/// Errors when the last dimension is odd, since there is no way to split it
+/// into a value and a gate.
+///
+/// ```
+/// use flodl::nn::{Module, SwiGLU};
+/// use flodl::autograd::Variable;
+/// use flodl::tensor::{Device, Tensor};
+///
+/// // [1, 4] -> [1, 2]: value = [1, 2], gate = [3, 4].
+/// let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], Device::CPU)?;
+/// let y = SwiGLU.forward(&Variable::new(t, false))?;
+/// assert_eq!(y.shape(), vec![1, 2]);
+/// # Ok::<(), flodl::tensor::TensorError>(())
+/// ```
+pub struct SwiGLU;
+
+impl Default for SwiGLU {
+    fn default() -> Self {
+        SwiGLU
+    }
+}
+
+impl SwiGLU {
+    /// Create a SwiGLU gating module.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Module for SwiGLU {
+    fn name(&self) -> &str { "swiglu" }
+
+    fn forward(&self, input: &Variable) -> Result<Variable> {
+        let shape = input.shape();
+        let last = *shape.last().ok_or_else(|| {
+            crate::tensor::TensorError::new("SwiGLU expects a tensor with at least one dimension")
+        })?;
+        if last % 2 != 0 {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "SwiGLU needs an even last dimension to split into value and gate, got {last} \
+                 (shape {shape:?}) — the projection feeding it should emit 2x the block width"
+            )));
+        }
+        let halves = input.chunk(2, -1)?;
+        halves[1].silu()?.mul(&halves[0])
+    }
+}
+
 /// Leaky ReLU: `max(0, x) + negative_slope * min(0, x)`.
 pub struct LeakyReLU {
     negative_slope: f64,
@@ -527,6 +607,48 @@ impl Module for PReLU {
 mod tests {
     use super::*;
     use crate::tensor::{Tensor, test_device};
+
+    /// Pins the ORDER, which is the part that fails silently. Value is the
+    /// first half, gate the second: `x[0] * silu(x[1])`. Swapping them still
+    /// trains and still converges — it is just a different network, and the
+    /// weights stop being interchangeable with the reference implementation.
+    #[test]
+    fn test_swiglu_gates_with_the_second_half() {
+        // value = [1, 2], gate = [3, 4]  ->  [1*silu(3), 2*silu(4)]
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], test_device()).unwrap();
+        let y = SwiGLU.forward(&Variable::new(t, false)).unwrap();
+        assert_eq!(y.shape(), vec![1, 2], "the last dim halves");
+        let got = y.data().to_f32_vec().unwrap();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        assert!((got[0] - 1.0 * silu(3.0)).abs() < 1e-5, "got {got:?}");
+        assert!((got[1] - 2.0 * silu(4.0)).abs() < 1e-5, "got {got:?}");
+        // The swapped reading would be [3*silu(1), 4*silu(2)] — check we are
+        // not accidentally that, since both are plausible-looking outputs.
+        assert!((got[0] - 3.0 * silu(1.0)).abs() > 1e-3, "value/gate are swapped");
+    }
+
+    #[test]
+    fn test_swiglu_rejects_an_odd_last_dim() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], test_device()).unwrap();
+        let err = SwiGLU
+            .forward(&Variable::new(t, false))
+            .expect_err("an odd width cannot split into value and gate");
+        assert!(err.to_string().contains("even last dimension"), "{err}");
+    }
+
+    /// Gradients must reach BOTH halves — the value linearly, the gate through
+    /// silu'. A split that detached either side would still forward correctly
+    /// and quietly train half the projection.
+    #[test]
+    fn test_swiglu_backward_reaches_both_halves() {
+        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], test_device()).unwrap();
+        let x = Variable::new(t, true);
+        SwiGLU.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+        let g = x.grad().expect("input must receive a gradient").to_f32_vec().unwrap();
+        assert_eq!(g.len(), 4);
+        assert!(g[0].abs() > 1e-6 && g[1].abs() > 1e-6, "value half unreached: {g:?}");
+        assert!(g[2].abs() > 1e-6 && g[3].abs() > 1e-6, "gate half unreached: {g:?}");
+    }
 
     #[test]
     fn test_leaky_relu_module() {

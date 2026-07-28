@@ -58,7 +58,7 @@ pub use parameter::Parameter;
 pub use buffer::Buffer;
 pub use linear::Linear;
 pub use activation::{
-    Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU,
+    Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU, SwiGLU,
     LeakyReLU, ELU, Softplus, Mish,
     SELU, Hardswish, Hardsigmoid, PReLU,
     Softmax, LogSoftmax, Flatten,
