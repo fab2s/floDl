@@ -80,6 +80,17 @@ const GROWTH_REARM_STABLE: usize = 5;
 /// few cycles without overshooting the knee on one noisy sample.
 const GROWTH_STEP_CAP: f64 = 2.0;
 
+/// Signal margin required for a window-pressure proposal to fire during
+/// `Warmup`, as a multiple of `overhead_target`. Set to [`GROWTH_STEP_CAP`]
+/// on purpose: clearing it means `scale = overhead/target ≥ cap`, so every
+/// early proposal is already cap-clamped — acting before the trust window
+/// fills is allowed exactly where noise cannot change the decision. A
+/// sync-swamped cohort (tiny model, expensive reduce: overhead near 1.0)
+/// starts amortizing on its second window instead of its sixth, while
+/// borderline pressure near the knee — where jittery early readings could
+/// flip the sign — keeps the full five-calibration patience.
+const WARMUP_GROWTH_MARGIN: f64 = GROWTH_STEP_CAP;
+
 // Anchor swaps are gated by `Phase::Stable` (≥5 calibrations). Stable starts
 // at the 6th `report_timing` call, by which point each rank has a full
 // 5-sample trust window AND the noisiest first sample (kernel JIT, cuBLAS
@@ -1218,13 +1229,32 @@ impl ElChe {
         // growth before it lands, and latches growth off until convergence
         // is robustly clean again.
         //
-        // Gated to `Phase::Stable+` because the multiplicative
-        // `scale = overhead / target` compounds noise dramatically on
-        // sparse early readings (the historical 10→22 anchor jump on
-        // the first measurement). Held off until each rank has a full
-        // trust window of evidence.
+        // Gated on the SECOND calibration rather than `Phase::Stable`. The
+        // noise hazard this gate used to own — the historical pre-cap 10→22
+        // single-shot jump on one sparse reading — is owned by
+        // [`GROWTH_STEP_CAP`] now (×2/cycle at most), every step still needs
+        // the convergence guard's blessing to land, and the Shrink
+        // hysteresis unwinds an overshoot. Election keeps the full `Stable`
+        // gate (cold-start skew can crown the wrong anchor; see
+        // `allow_election` above) — growth is different in kind: its signal
+        // is dominated by the measured reduce+fill wall, orders of magnitude
+        // above per-batch noise whenever it matters, and cold-start skew
+        // inflates the anchor's marginal, which UNDER-proposes — the error
+        // direction is the safe one. Holding growth through the full trust
+        // window instead cost one full reduce per window across every
+        // cluster run's first five windows: the exact overhead this term
+        // exists to amortize, paid at the run phase where windows are
+        // smallest and the ratio is worst (measured 78% overhead ×5 windows
+        // on the 3-rank OLMo rig, 2026-07-28). Two disciplines keep the
+        // early path honest: the first report never proposes (its sync_ms
+        // can carry cohort-formation cost, and one sample is a reading, not
+        // a trend), and a warmup proposal must clear the target by
+        // [`WARMUP_GROWTH_MARGIN`] — borderline pressure waits for the full
+        // trust window exactly as before.
         self.proposed_anchor = None;
-        if self.phase >= Phase::Stable {
+        if self.phase >= Phase::Stable
+            || (self.phase == Phase::Warmup && self.calibration_count >= 1)
+        {
             self.proposed_anchor = self.propose_anchor(sync_ms);
         }
         // The fill is a one-window signal: consume it so a stale value can't
@@ -1406,7 +1436,16 @@ impl ElChe {
             return None;
         }
         let overhead = fixed / denom;
-        if overhead <= self.overhead_target {
+        // Before `Stable`, only an unambiguous signal may act (see
+        // [`WARMUP_GROWTH_MARGIN`]); the scale below still divides by the
+        // real target, so a warmup proposal that clears the margin is
+        // cap-clamped by construction.
+        let fire_at = if self.phase >= Phase::Stable {
+            self.overhead_target
+        } else {
+            self.overhead_target * WARMUP_GROWTH_MARGIN
+        };
+        if overhead <= fire_at {
             return None;
         }
         let scale = (overhead / self.overhead_target).min(GROWTH_STEP_CAP);
@@ -1775,6 +1814,91 @@ mod window_growth_policy_tests {
         assert!(
             el_sync.propose_anchor(10.0).is_none(),
             "Sync must never propose window-pressure growth"
+        );
+    }
+
+    // Growth proposals start at the SECOND calibration, not at `Stable`:
+    // waiting the full trust window paid one whole reduce per window across
+    // every run's first five windows — at exactly the run phase where the
+    // window is smallest and the overhead ratio worst. GROWTH_STEP_CAP,
+    // the guard verdict, and the Shrink hysteresis own the noise hazard the
+    // Stable gate used to double-cover.
+    #[test]
+    fn warmup_proposes_growth_from_the_second_calibration() {
+        let mut el = ElChe::new(2, 10);
+        // Report #1: high overhead, but a first reading is not a trend —
+        // its sync can carry cohort-formation cost. No proposal.
+        let bc = el.batch_counts().to_vec();
+        el.report_timing(&[1000.0, 1000.0], &bc, 5000.0);
+        assert_eq!(el.phase, Phase::Warmup);
+        assert!(
+            el.proposed_anchor.is_none(),
+            "the first report must never propose growth"
+        );
+
+        // Report #2: still deep in Warmup (Stable needs 5), overhead
+        // 5000/(10·100 + 5000) = 0.83 ≫ target. The proposal fires now and
+        // is capped at ×2 like any other cycle.
+        let bc = el.batch_counts().to_vec();
+        el.report_timing(&[1000.0, 1000.0], &bc, 5000.0);
+        assert_eq!(el.phase, Phase::Warmup);
+        assert!(
+            matches!(el.proposed_anchor, Some(ProposedAnchor::Grow(20))),
+            "second calibration must propose capped growth, got {:?}",
+            el.proposed_anchor,
+        );
+
+        // And it still lands only through the guard-verdict pipeline.
+        el.commit_proposed_anchor();
+        assert_eq!(el.anchor(), 20);
+    }
+
+    // The guard stays authoritative during Warmup exactly as in Stable: a
+    // veto drops the early proposal without touching the anchor.
+    #[test]
+    fn warmup_growth_still_dies_on_a_guard_veto() {
+        let mut el = ElChe::new(2, 10);
+        let bc = el.batch_counts().to_vec();
+        el.report_timing(&[1000.0, 1000.0], &bc, 5000.0);
+        let bc = el.batch_counts().to_vec();
+        el.report_timing(&[1000.0, 1000.0], &bc, 5000.0);
+        assert!(matches!(el.proposed_anchor, Some(ProposedAnchor::Grow(_))));
+
+        el.veto_proposed_growth();
+        assert_eq!(el.anchor(), 10, "a vetoed warmup proposal must not land");
+    }
+
+    // Borderline pressure keeps the old patience: an overhead above target
+    // but under WARMUP_GROWTH_MARGIN × target must not act during Warmup —
+    // that is the regime where jittery early readings could flip the sign,
+    // and the trust-window wait is exactly the right answer there. The same
+    // reading fires once Stable is reached.
+    #[test]
+    fn borderline_warmup_pressure_waits_for_stable() {
+        let mut el = ElChe::new(2, 10).with_overhead_target(0.10);
+        // window_compute = 10·100 = 1000ms; sync 150 → overhead
+        // 150/1150 ≈ 0.13: above target 0.10, below the 0.20 warmup bar.
+        // Proposals are evaluated BEFORE the calibration count advances the
+        // phase, so all five warmup reports (and not just four) see the
+        // warmup bar — the first Stable-bar evaluation is the sixth report,
+        // exactly where the old `Stable`-only gate first proposed.
+        for i in 0..5 {
+            let bc = el.batch_counts().to_vec();
+            el.report_timing(&[1000.0, 1000.0], &bc, 150.0);
+            assert!(
+                el.proposed_anchor.is_none(),
+                "borderline pressure proposed during warmup (report #{})",
+                i + 1,
+            );
+        }
+        assert_eq!(el.phase, Phase::Stable);
+        // Sixth report evaluates under the plain target: now it proposes.
+        let bc = el.batch_counts().to_vec();
+        el.report_timing(&[1000.0, 1000.0], &bc, 150.0);
+        assert!(
+            matches!(el.proposed_anchor, Some(ProposedAnchor::Grow(_))),
+            "the same pressure must fire once Stable, got {:?}",
+            el.proposed_anchor,
         );
     }
 }

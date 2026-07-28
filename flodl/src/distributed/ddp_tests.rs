@@ -329,9 +329,9 @@
         let mut c = ElChe::new(2, 10)
             .with_overhead_target(0.10);
 
-        // Auto-tune is gated to Phase::Stable+ to prevent warmup over-reaction.
-        // Prime with five low-overhead reports of equal-speed timings to reach
-        // Stable, then issue the high-overhead trigger.
+        // Prime with five low-overhead reports of equal-speed timings (below
+        // target, so no growth fires during warmup either), then issue the
+        // high-overhead trigger from Stable.
         for _ in 0..5 {
             let bc = c.batch_counts().to_vec();
             c.report_timing(&[1000.0, 1000.0], &bc, 5.0);
