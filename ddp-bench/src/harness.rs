@@ -632,6 +632,13 @@ fn run_baseline_solo(
     monitor: &mut Monitor,
 ) -> Result<(f64, Vec<f64>, Vec<String>)> {
     let device = Device::CUDA(gpu_idx as u8);
+    // Seed IMMEDIATELY before construction: weight init draws from libtorch's
+    // generator, and nothing else was seeding it, so `--seed` reached the data
+    // path and left the model random every run. Measured before this line:
+    // three runs of `olmo --batches 1 --seed 42` gave 11.0448 / 10.9921 /
+    // 10.9241 — a spread wider than the differences between models we were
+    // comparing, which makes any single-seed differential noise.
+    flodl::manual_seed(config.seed);
     let model = (model_def.build)(device)?;
     let params = model.parameters();
     let mut optimizer = (model_def.optimizer)(&params, config.lr);
@@ -834,7 +841,14 @@ fn run_unified(
     // This closure runs on every replica device AND on the launcher's CPU
     // schema probe, so the load lands on each rank's own device.
     let resume_stem = config.resume_from.clone();
+    let factory_seed = config.seed;
     let model_factory = move |device: Device| -> Result<Box<dyn Module>> {
+        // Same seed on EVERY replica, deliberately: DDP requires all ranks to
+        // start from identical weights, and this closure runs once per rank
+        // process. Offsetting per rank here would silently start the cohort
+        // from divergent models and leave the first reduce to average them.
+        // Data order is varied by the partitioner, not by this seed.
+        flodl::manual_seed(factory_seed);
         let model = build_fn(device)?;
         if let Some(stem) = resume_stem.as_ref() {
             let path = flodl::distributed::CheckpointBundle::model_path(stem);
