@@ -123,3 +123,59 @@ fn failed_shutdown_broadcast_is_exempt() {
         "no LostBroadcast event for a failed Shutdown",
     );
 }
+
+/// A rank that latched a clean `Exiting` left by protocol: it must not be
+/// addressed at all, so its closed relay can neither fail the broadcast nor
+/// bump the trace. From the rig: every probe run's final `EvalBroadcast`
+/// reported `failed for 2 of 3 ranks (Broken pipe)` — the two pascal workers
+/// had already exited cleanly and the coordinator knew it.
+#[test]
+fn an_exited_rank_is_not_addressed_and_cannot_fail_a_broadcast() {
+    let tl = Timeline::new(1000);
+    let mut coord = coord_with_timeline(2, tl.clone());
+    coord.exited[1] = true;
+
+    // Rank 0 is live and streamless, so the broadcast still fails — but
+    // only for rank 0. The exited rank contributes nothing.
+    let err = coord
+        .broadcast_control(&ControlMsgWire::SyncNow)
+        .expect_err("live streamless rank still fails the send");
+    let msg = err.to_string();
+    assert!(msg.contains("rank 0"), "live rank named: {msg}");
+    assert!(!msg.contains("rank 1"), "exited rank must not appear: {msg}");
+
+    let (_samples, events) = tl.drain();
+    let failures: Vec<usize> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::LostBroadcast { failures, .. } => Some(*failures),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures, vec![1], "one live miss traced, not two");
+}
+
+/// The observed teardown shape end to end: every worker already exited
+/// cleanly when the final `EvalBroadcast` fires. Nothing is addressed, so
+/// the broadcast SUCCEEDS (vacuously) instead of reporting a scary
+/// multi-rank failure out of a perfect run.
+#[test]
+fn a_broadcast_to_a_fully_exited_cohort_is_a_clean_no_op() {
+    let tl = Timeline::new(1000);
+    let mut coord = coord_with_timeline(2, tl.clone());
+    coord.exited[0] = true;
+    coord.exited[1] = true;
+
+    coord
+        .broadcast_control(&ControlMsgWire::EvalBroadcast { epoch: 1, metric: 8.19 })
+        .expect("no live addressee means nothing can fail");
+    assert_eq!(coord.lost_broadcasts, 0);
+
+    let (_samples, events) = tl.drain();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::LostBroadcast { .. })),
+        "no LostBroadcast event for a fully-exited cohort",
+    );
+}

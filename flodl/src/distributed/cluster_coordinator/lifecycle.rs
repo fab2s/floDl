@@ -501,6 +501,15 @@ impl ClusterCoordinator {
     pub(super) fn broadcast_control(&mut self, msg: &ControlMsgWire) -> Result<()> {
         let mut failed: Vec<String> = Vec::new();
         for rank in 0..self.world_size {
+            // A rank that latched a clean `Exiting` has left by protocol:
+            // its relay is closing or closed, so a write either breaks
+            // (broken pipe) or lands in a buffer nobody will drain. Skip
+            // it — end-of-run broadcasts (the final `EvalBroadcast`
+            // racing worker exit was the observed case) otherwise
+            // manufacture failure reports out of a normal teardown.
+            if self.exited[rank] {
+                continue;
+            }
             let dead = self.is_dead(rank);
             if let Err(e) = self.send_control(rank, msg) {
                 if dead {
