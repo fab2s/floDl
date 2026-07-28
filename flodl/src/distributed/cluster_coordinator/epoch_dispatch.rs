@@ -5,7 +5,7 @@ use crate::distributed::ddp_run::ApplyPolicy;
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
-use super::ClusterCoordinator;
+use super::{ClusterCoordinator, FinalWindowPlan};
 
 /// One rank's pre-composed post-reduce `Update` payload: the folded
 /// next-window chunk (Cadence atomic dispatch; `None` otherwise) plus
@@ -773,15 +773,35 @@ impl ClusterCoordinator {
             self.final_window_plan = None;
             return;
         }
-        // Already planned for this epoch: keep the window-start split (the
-        // live `rem` has since drained as ranks took their slots).
-        if matches!(&self.final_window_plan, Some((e, _)) if *e == epoch) {
+        // Already planned for this epoch AND the schedule it was computed
+        // from still holds: keep the window-start split (the live `rem` has
+        // since drained as ranks took their slots). A `batch_counts` change
+        // between pin and fire — a mid-epoch anchor-growth commit, a nudge,
+        // an election — makes the pin STALE: dispatch would keep serving
+        // slots sized for a schedule the firing gate no longer checks
+        // against (the 2026-07-29 tail-crumb deadlock). Re-pin from the
+        // live remainder + live counts instead; allocations are over
+        // REMAINING batches, so already-served slots are never re-counted,
+        // and the reduce barrier still holds over-quota ranks whatever
+        // their fresh slot says.
+        if matches!(
+            &self.final_window_plan,
+            Some(plan) if plan.epoch == epoch && plan.pinned_counts == counts
+        ) {
             return;
         }
         let alive: Vec<bool> =
             (0..self.world_size).map(|r| !self.is_dead(r)).collect();
         let alloc = final_window_alloc(rem, counts, &alive);
-        self.final_window_plan = Some((epoch, alloc));
+        crate::debug!(
+            "  ddp: final-window plan pinned | epoch={epoch} rem={rem} \
+             counts={counts:?} alloc={alloc:?}",
+        );
+        self.final_window_plan = Some(FinalWindowPlan {
+            epoch,
+            alloc,
+            pinned_counts: counts.to_vec(),
+        });
     }
 
     /// Compute how many batches the next chunk for `rank` in `epoch`
@@ -954,9 +974,9 @@ impl ClusterCoordinator {
         // (including `cap_to_reduce_budget` — the plan IS the final word, and
         // its fold crumb deliberately runs one batch past the reduce budget on
         // a slow rank). See `docs/design/epoch-tail-allocation.md`.
-        if let Some((plan_epoch, plan)) = self.final_window_plan.as_ref() {
-            if *plan_epoch == epoch {
-                return plan.get(rank).copied().unwrap_or(0);
+        if let Some(plan) = self.final_window_plan.as_ref() {
+            if plan.epoch == epoch {
+                return plan.alloc.get(rank).copied().unwrap_or(0);
             }
         }
 

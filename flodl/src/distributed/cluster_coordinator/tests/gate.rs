@@ -254,3 +254,116 @@ fn quiesced_zero_step_tail_rank_does_not_block_reduce() {
         "a 0-step rank that can still get work must block the gate",
     );
 }
+
+/// The 2026-07-29 tail-crumb deadlock, deterministically: a final-window
+/// plan that allocates a rank ZERO batches makes that rank structurally
+/// unable to step again this epoch (dispatch serves only the plan), so it
+/// must count as quiesced even while the pool still holds its peers'
+/// batches. Before the fix, `is_rank_quiesced` demanded `remaining() == 0`,
+/// the slot-0 rank read as a live blocker, and the cohort froze: the mover
+/// held at the reduce barrier, the crumb unreachable, `avg_count` flat for
+/// the rest of the run (4/30 repro in the CPU cadence smoke).
+#[test]
+fn slot_zero_final_window_rank_does_not_block_the_gate() {
+    let world_size = 2;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 2),
+        )
+        .no_divergence_guard(),
+    );
+    // counts = [2, 2] (equal-split anchor); 3 batches remain: inside the
+    // final-window regime (rem < Σcounts + world). The no-lone-1
+    // consolidation collapses the split to one 3-slot mover + one 0-slot
+    // sit-out.
+    coord.install_chunk_pool_for_test(0, 3);
+    for r in 0..world_size {
+        coord.set_rank_epoch_for_test(r, 0);
+    }
+    coord.refresh_final_window_plan_for_test(0);
+    let sizes: Vec<usize> = (0..world_size)
+        .map(|r| coord.compute_chunk_batches_for_test(r, 0))
+        .collect();
+    let zero = sizes.iter().position(|&n| n == 0).expect(
+        "precondition: the plan consolidates a lone-1 into a 0-slot sit-out",
+    );
+    let mover = 1 - zero;
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+
+    // The freeze state: mover at its full window, sit-out at 0, pool NOT
+    // drained (the mover's slot is still in it).
+    coord.set_steps_since_avg_for_test(mover, counts[mover]);
+    coord.set_steps_since_avg_for_test(zero, 0);
+    assert!(
+        coord.should_average(),
+        "a slot-0 final-window rank must not block the gate \
+         (sizes={sizes:?}, counts={counts:?})",
+    );
+
+    // Narrowness: the MOVER's slot is nonzero, so at 0 steps it still
+    // blocks — slot-0 is the only new quiescence, a rank with reachable
+    // work keeps gating.
+    coord.set_steps_since_avg_for_test(mover, 0);
+    assert!(
+        !coord.should_average(),
+        "a 0-step rank holding a NONZERO plan slot must still block \
+         (sizes={sizes:?})",
+    );
+}
+
+/// A `batch_counts` change between the plan's pin and its fire (mid-epoch
+/// anchor-growth commit, nudge, election) makes the pinned split stale:
+/// dispatch would keep serving slots sized for a schedule the gate no
+/// longer checks against. `refresh_final_window_plan` must re-pin from the
+/// live remainder + live counts. Before the fix it kept any plan pinned
+/// for the same epoch unconditionally.
+#[test]
+fn stale_final_window_plan_repins_when_counts_change() {
+    let world_size = 2;
+    let mut coord = ClusterCoordinator::for_test(
+        ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 2),
+        )
+        .no_divergence_guard(),
+    );
+    // Pin under the equal-split schedule [2, 2] with an exact-window
+    // remainder: alloc == the schedule itself.
+    coord.install_chunk_pool_for_test(0, 4);
+    for r in 0..world_size {
+        coord.set_rank_epoch_for_test(r, 0);
+    }
+    coord.refresh_final_window_plan_for_test(0);
+    let before: Vec<usize> = (0..world_size)
+        .map(|r| coord.compute_chunk_batches_for_test(r, 0))
+        .collect();
+    assert_eq!(before.iter().sum::<usize>(), 4, "coverage exact: {before:?}");
+
+    // The schedule changes underneath the pin (what a mid-epoch anchor
+    // commit does): rank 0 measures far faster, recompute skews counts.
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[100.0, 1000.0], &[2, 2], 10.0);
+    let counts = coord.el_che_for_test().batch_counts().to_vec();
+    assert_ne!(counts, vec![2, 2], "precondition: counts changed");
+
+    coord.refresh_final_window_plan_for_test(0);
+    let after: Vec<usize> = (0..world_size)
+        .map(|r| coord.compute_chunk_batches_for_test(r, 0))
+        .collect();
+    assert_eq!(
+        after.iter().sum::<usize>(),
+        4,
+        "re-pin still covers the whole remainder: {after:?}",
+    );
+    assert_ne!(
+        after, before,
+        "the plan must be re-derived from the live counts \
+         (counts={counts:?}), not kept from the stale pin",
+    );
+}

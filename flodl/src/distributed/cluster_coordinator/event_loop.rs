@@ -406,14 +406,23 @@ impl ClusterCoordinator {
         for r in 0..self.world_size {
             let steps = self.window.steps(r);
             let window = counts.get(r).copied().unwrap_or(0);
+            // Mirror the REAL gate's verdict, quiescence included — a dump
+            // that says "blocks gate" for a rank `should_average` actually
+            // excludes (or vice versa) sends the reader down the wrong
+            // deadlock. The 2026-07-29 tail-crumb freeze was diagnosed by
+            // inferring the missing verdicts from dispatch timing; this
+            // states them.
+            let quiesced = self.progressive && self.is_rank_quiesced(r);
             let gate = if self.is_dead(r) {
                 "dead"
+            } else if steps >= window {
+                "ready"
+            } else if quiesced {
+                "quiesced (excluded from gate)"
             } else if steps == 0 {
                 "ZERO (blocks gate)"
-            } else if steps < window {
-                "BELOW-WINDOW (blocks gate)"
             } else {
-                "ready"
+                "BELOW-WINDOW (blocks gate)"
             };
             eprintln!(
                 "  rank {r}: epoch={} steps_since_avg={} window(counts)={} \
@@ -428,6 +437,19 @@ impl ClusterCoordinator {
                 "  pool epoch={epoch}: remaining={} in_flight={inflight:?}",
                 pool.remaining(),
             );
+        }
+        // The pinned final-window split, when one is in force: the gate and
+        // dispatch both consult it at the epoch tail, so a stall dump
+        // without it hides exactly the allocation that decides who can
+        // still step (a slot-0 rank structurally cannot).
+        match &self.final_window_plan {
+            Some(plan) => {
+                eprintln!(
+                    "  final-window plan: epoch={} alloc={:?} pinned_counts={:?}",
+                    plan.epoch, plan.alloc, plan.pinned_counts,
+                );
+            }
+            None => eprintln!("  final-window plan: none"),
         }
     }
 
@@ -503,7 +525,8 @@ impl ClusterCoordinator {
     }
 
     /// A rank can take no more steps in its current epoch: no chunk is in
-    /// flight for it anywhere AND its epoch's pool is drained. Used by
+    /// flight for it anywhere AND either its epoch's pool is drained OR the
+    /// pinned final-window plan allocates it zero batches. Used by
     /// [`Self::should_average`] to exclude edge-schedule zero/short tail
     /// ranks from the firing gate (so they cannot block the reduce while
     /// the movers sit at the barrier). The rank's epoch pool must EXIST and
@@ -511,14 +534,40 @@ impl ClusterCoordinator {
     /// rank is done; `should_average` runs before `drain_metrics_and_aggregate`
     /// removes a finished epoch's pool, so at a real tail the drained pool is
     /// still present).
+    ///
+    /// The plan-slot-0 clause: once a final-window plan is pinned for the
+    /// rank's epoch, `compute_chunk_batches` serves ONLY the plan — a rank
+    /// whose slot is 0 gets `None` from dispatch for the rest of the epoch
+    /// no matter what the pool still holds, so "pool not drained" says
+    /// nothing about whether THIS rank can step again. Without this clause a
+    /// crumb stranded in a barrier-held peer's slot kept `remaining() > 0`,
+    /// the slot-0 rank read as a live blocker, and the cohort deadlocked
+    /// (found 2026-07-29: a mid-epoch anchor-growth commit re-derived
+    /// `batch_counts` after the plan was pinned — `[2,2]→[3,2]→[2,2]` — so
+    /// the gate demanded steps the plan never allocated; 4/30 repro in
+    /// `end_to_end_cadence_cpu_via_coord_smoke`, 30s stall, dispatch-starved
+    /// rank at 0/2 beside a 1-batch pool). Deliberately narrow: a rank with
+    /// a NONZERO slot — even partially served — still holds reachable work
+    /// and must keep blocking the gate; the design's sit-out rule
+    /// (docs/design/epoch-tail-allocation.md, "excluded as non-movers")
+    /// already covered slot-0 ranks for the averaging weights, this extends
+    /// it to the firing gate.
     fn is_rank_quiesced(&self, r: usize) -> bool {
         let no_in_flight = !self.chunk_pools.values().any(|p| p.in_flight(r) > 0);
+        if !no_in_flight {
+            return false;
+        }
         let epoch = self.rank_epoch[r];
         let pool_drained = self
             .chunk_pools
             .get(&epoch)
             .is_some_and(|p| p.remaining() == 0);
-        no_in_flight && pool_drained
+        let plan_slot_zero = matches!(
+            &self.final_window_plan,
+            Some(plan)
+                if plan.epoch == epoch && plan.alloc.get(r).copied().unwrap_or(0) == 0
+        );
+        pool_drained || plan_slot_zero
     }
 
     /// Throttle fast workers. NCCL backend is a no-op (the collective
