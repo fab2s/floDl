@@ -250,6 +250,31 @@ impl<M: Module> GpuWorker<M> {
         // the historical placement at the top of the sync branch.
         let measuring_peak = self.activation_peak_bytes == 0 && self.device.is_cuda();
 
+        // Reader ring: the same two-stage policy as the solo streaming
+        // loader (this path only exists on CUDA targets — the constructor
+        // gates `prefetch` on it), sized fresh per plan boundary from live
+        // MemAvailable and capped at the flow-buffer depth. The cap is
+        // unconditional here where the solo loader conditions it on its
+        // sample cache: this path always has a retained tier beside the
+        // ring (the stager's pinned cache + stream pool), so the ring is a
+        // jitter absorber, never a capacity tier. Its (bounded) bytes are
+        // seen by the stager's next advisory refresh, which re-probes
+        // MemAvailable — the anchored law self-corrects rather than
+        // double-claims. `--ram-max-usage 0` keeps the single-stage shape
+        // (the sizing returns 0), same kill-switch semantics as solo.
+        let ring_slots = if self.prefetch.is_some() {
+            crate::data::budget::ring_slots_from_ram(
+                self.per_sample_bytes,
+                self.batch_size,
+                self.ram_max_usage,
+                crate::sys::mem_info().map(|m| m.available_bytes),
+                num_batches,
+            )
+            .min(crate::data::budget::RING_SLOTS_WITH_CACHE)
+        } else {
+            0
+        };
+
         // Recalculate prefetch depth at each plan boundary (VRAM may vary).
         // Cap at num_batches: no point buffering more than the chunk contains.
         // Depth 0 means VRAM is too tight for any prefetch buffer.
@@ -264,9 +289,18 @@ impl<M: Module> GpuWorker<M> {
                 pw.set_prefetch_depth(0);
                 false
             } else {
+                // Reserve 0, NOT `activation_peak_bytes`: this branch only runs
+                // once a step has executed (the `== 0` arm above owns the
+                // uncalibrated case), so the caching allocator is already
+                // holding the activation blocks and the probe's `used` counts
+                // them. Passing the measured peak here charged it twice and
+                // drove the budget to zero on any card whose model footprint
+                // approaches the cap. Same policy as the solo loader's
+                // post-honest-resize probe (`loader.rs`, "probe accounts for
+                // step memory itself").
                 let vram_depth = crate::data::prefetch_depth_from_vram(
                     self.per_sample_bytes, self.batch_size, self.device,
-                    self.vram_max_usage, self.activation_peak_bytes,
+                    self.vram_max_usage, 0,
                 );
                 let mut depth = vram_depth.min(num_batches);
                 // On the pool-install chunk the channel collapses to
@@ -281,6 +315,33 @@ impl<M: Module> GpuWorker<M> {
                         depth.min(crate::data::vram_pool::FLOW_RESERVE_BATCHES as usize);
                 }
                 pw.set_prefetch_depth(depth);
+                // The governor's verdict is otherwise invisible: a depth of 0
+                // silently downgrades the feed to the synchronous path, where
+                // the whole data cost lands on the training thread instead of
+                // overlapping. That reads as "this GPU is slow", not as "its
+                // prefetch was switched off", so say which one it is.
+                // Probe only when the line will actually be emitted: the
+                // sizing call above already spent one `cudaMemGetInfo`, and a
+                // diagnostic must not add a second to every chunk boundary.
+                let (used, total) = if crate::log::enabled(crate::log::Verbosity::Debug) {
+                    crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
+                crate::debug!(
+                    "  ddp-worker: rank {} prefetch depth={} ring={} (vram_depth={} chunk={} \
+                     batch={}KB activation_peak={}MB max_usage={:.2} \
+                     used={}MB cap={}MB free={}MB){}",
+                    self.rank, depth, ring_slots, vram_depth, num_batches,
+                    (self.per_sample_bytes * self.batch_size) >> 10,
+                    self.activation_peak_bytes >> 20,
+                    self.vram_max_usage,
+                    used >> 20,
+                    ((total as f64 * self.vram_max_usage) as u64) >> 20,
+                    total.saturating_sub(used) >> 20,
+                    if depth == 0 { " -> SYNC FALLBACK (data cost unoverlapped)" } else { "" },
+                );
                 depth > 0
             }
         } else {
@@ -323,7 +384,7 @@ impl<M: Module> GpuWorker<M> {
             // start_distributed_epoch creates a fresh bounded channel whose
             // capacity equals the prefetch depth (VRAM budget). The prefetch
             // thread fills it; SyncSender blocks when VRAM is full.
-            let rx = prefetch.start_distributed_epoch();
+            let rx = prefetch.start_distributed_epoch(ring_slots);
             for batch_idx in 0..num_batches {
                 let start = batch_idx * self.batch_size;
                 let end = start + self.batch_size;

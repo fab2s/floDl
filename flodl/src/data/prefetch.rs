@@ -197,8 +197,15 @@ pub(crate) enum WorkerCmd {
     /// Open a distributed epoch: install the batch sender, then wait for
     /// `LoadBatch` commands. The channel stays open until the next
     /// `StartEpoch`/`StartDistributedEpoch`/`Stop`.
+    ///
+    /// `ring_slots > 0` enables the two-stage pipeline for the epoch's
+    /// `LoadBatch` stream: a reader thread fetches ahead into a bounded
+    /// pageable-RAM ring while this thread runs the device transfers —
+    /// the same shape as the solo `StartEpoch` path, streamed instead
+    /// of fixed at spawn. `0` keeps fetch + transfer on one thread.
     StartDistributedEpoch {
         batch_tx: mpsc::SyncSender<Result<PrefetchedBatch>>,
+        ring_slots: usize,
     },
     /// Load a single batch (distributed mode). Worker sends the result on
     /// the channel from the preceding `StartDistributedEpoch`.
@@ -300,11 +307,20 @@ impl PrefetchWorker {
 
     /// Open a distributed epoch: create one channel that persists across
     /// all batches. Follow with [`Self::load_batch()`] calls per batch.
-    pub fn start_distributed_epoch(&self) -> mpsc::Receiver<Result<PrefetchedBatch>> {
+    ///
+    /// `ring_slots > 0` puts a reader thread in front of the transfer
+    /// stage for this epoch (two-stage pipeline, see the module docs);
+    /// `0` keeps fetch + transfer serialized on the worker thread.
+    pub fn start_distributed_epoch(
+        &self,
+        ring_slots: usize,
+    ) -> mpsc::Receiver<Result<PrefetchedBatch>> {
         let (batch_tx, batch_rx) =
             mpsc::sync_channel::<Result<PrefetchedBatch>>(self.prefetch_depth);
 
-        let _ = self.cmd_tx.send(WorkerCmd::StartDistributedEpoch { batch_tx });
+        let _ = self
+            .cmd_tx
+            .send(WorkerCmd::StartDistributedEpoch { batch_tx, ring_slots });
 
         batch_rx
     }
@@ -374,6 +390,10 @@ fn worker_loop(
 
     // Distributed epoch channel, kept alive across LoadBatch commands.
     let mut dist_tx: Option<mpsc::SyncSender<Result<PrefetchedBatch>>> = None;
+    // Distributed two-stage state: the reader thread + pageable ring in
+    // front of this thread's transfer stage. One per distributed epoch,
+    // torn down (reader joined) at every epoch transition.
+    let mut dist_ring: Option<DistRing> = None;
 
     // One purity probe per worker (debug builds): the retained tiers —
     // and this worker's VRAM sample pool in particular — serve rows by
@@ -390,7 +410,19 @@ fn worker_loop(
         }
     };
 
-    for cmd in &cmd_rx {
+    // Commands normally arrive off `cmd_rx`; the LoadBatch pump below
+    // may pull one it cannot handle mid-pipeline (an epoch transition,
+    // Stop) and park it here for this loop to process next.
+    let mut deferred: Option<WorkerCmd> = None;
+
+    loop {
+        let cmd = match deferred.take() {
+            Some(c) => c,
+            None => match cmd_rx.recv() {
+                Ok(c) => c,
+                Err(_) => break, // owner gone
+            },
+        };
         match cmd {
             WorkerCmd::StartEpoch {
                 indices,
@@ -401,6 +433,9 @@ fn worker_loop(
                 ring_slots,
             } => {
                 dist_tx = None; // close any distributed channel
+                if let Some(r) = dist_ring.take() {
+                    r.teardown();
+                }
 
                 // Per-epoch counter reset lives HERE, not in the
                 // consumer's `begin_epoch` — see
@@ -449,12 +484,21 @@ fn worker_loop(
                 pool.epoch_report();
                 // batch_tx is dropped here, closing the epoch's channel.
             }
-            WorkerCmd::StartDistributedEpoch { batch_tx } => {
+            WorkerCmd::StartDistributedEpoch { batch_tx, ring_slots } => {
                 // Epoch boundary on the coordinator-paced path: report
                 // the closing epoch's pool telemetry before the next
-                // one starts.
+                // one starts. The previous epoch's reader (if any) is
+                // joined before the new one exists — a stale reader
+                // must not still hold the dataset when the next epoch's
+                // fetches begin.
                 pool.epoch_report();
+                if let Some(r) = dist_ring.take() {
+                    r.teardown();
+                }
                 dist_tx = Some(batch_tx);
+                if ring_slots > 0 {
+                    dist_ring = Some(DistRing::spawn(&dataset, ring_slots, augment));
+                }
             }
             WorkerCmd::InstallVramPool { reserve_bytes } => {
                 pool.install_with_reserve(reserve_bytes);
@@ -465,13 +509,119 @@ fn worker_loop(
                     purity_probed = true;
                     probe_purity(&indices);
                 }
-                if let Some(ref tx) = dist_tx {
-                    // Same transient-OOM patience as the epoch path; the
-                    // coordinator paces in-flight batches here, so there
-                    // is no governor target to shrink — drain patience
-                    // first, then the pool's slab eviction is the only
-                    // remaining relief valve (last resort: only once
-                    // half the retry budget is spent).
+                let Some(tx) = dist_tx.clone() else {
+                    continue; // consumer gone; drop silently, as before
+                };
+                if let Some(mut ring) = dist_ring.take() {
+                    // Two-stage pump. One command at a time gives NO
+                    // overlap — the reader would always be exactly one
+                    // fetch behind this thread — so the pump forwards
+                    // every already-queued `LoadBatch` (the consumer
+                    // submits the whole chunk in one burst) and then
+                    // alternates: feed the reader, transfer one ready
+                    // batch, until nothing is owed.
+                    let mut consumer_gone = false;
+                    ring.submit(indices);
+                    'pump: while ring.pending > 0 {
+                        loop {
+                            match cmd_rx.try_recv() {
+                                Ok(WorkerCmd::LoadBatch { indices }) => ring.submit(indices),
+                                Ok(WorkerCmd::InstallVramPool { reserve_bytes }) => {
+                                    pool.install_with_reserve(reserve_bytes);
+                                }
+                                // An epoch transition or Stop: the rest
+                                // of this chunk is abandoned. Park the
+                                // command for the outer loop, whose arm
+                                // also tears the ring down.
+                                Ok(other) => {
+                                    deferred = Some(other);
+                                    break 'pump;
+                                }
+                                // Empty: reader has all known work.
+                                // Disconnected: the owner is gone, but
+                                // Drop always sends Stop first, so just
+                                // finish what is owed.
+                                Err(mpsc::TryRecvError::Empty)
+                                | Err(mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        let cpu_batch = match ring.ring_rx.recv() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                // Reader died with work owed (a panic that
+                                // escaped the fetch guard). The batches
+                                // will never come — surface one loud error
+                                // instead of leaving the consumer waiting.
+                                let err: Result<PrefetchedBatch> = Err(TensorError::new(
+                                    "prefetch reader thread died mid-epoch",
+                                ));
+                                let _ = send_or_stop(&tx, err, stop);
+                                consumer_gone = true;
+                                break 'pump;
+                            }
+                        };
+                        ring.pending -= 1;
+                        // Same transient-OOM patience as the single-stage
+                        // arm below, but only the transfer half retries —
+                        // the batch is already in RAM.
+                        let result = match cpu_batch {
+                            Ok((picks, tensors)) => {
+                                let samples = crate::data::picks_to_samples(&picks, augment);
+                                if device.is_cuda() {
+                                    retry_on_oom(
+                                        &mut pool,
+                                        |pool| {
+                                            transfer_batch(
+                                                &picks,
+                                                &samples,
+                                                &tensors,
+                                                device,
+                                                pool,
+                                                #[cfg(feature = "cuda")]
+                                                copy_stream.as_ref(),
+                                            )
+                                        },
+                                        dist_oom_relief,
+                                    )
+                                } else {
+                                    transfer_batch(
+                                        &picks,
+                                        &samples,
+                                        &tensors,
+                                        device,
+                                        &mut pool,
+                                        #[cfg(feature = "cuda")]
+                                        copy_stream.as_ref(),
+                                    )
+                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match send_or_stop(&tx, result, stop) {
+                            SendOutcome::Sent => {}
+                            SendOutcome::Disconnected => {
+                                consumer_gone = true;
+                                break 'pump;
+                            }
+                            SendOutcome::Stopping => {
+                                ring.teardown();
+                                return;
+                            }
+                        }
+                    }
+                    if consumer_gone {
+                        dist_tx = None;
+                        ring.teardown();
+                    } else {
+                        // Drained, or preempted by a deferred epoch
+                        // transition — either way the ring goes back so
+                        // the next arm (a later `LoadBatch` burst, or
+                        // the transition's own teardown) finds it.
+                        dist_ring = Some(ring);
+                    }
+                } else {
+                    // Single-stage: fetch + transfer serialized on this
+                    // thread, transient-OOM patience around both halves.
                     let result = if device.is_cuda() {
                         retry_on_oom(
                             &mut pool,
@@ -486,13 +636,7 @@ fn worker_loop(
                                     copy_stream.as_ref(),
                                 )
                             },
-                            |pool, attempt| {
-                                crate::tensor::cuda_empty_cache();
-                                thread::sleep(OOM_RETRY_SLEEP);
-                                if attempt >= OOM_RETRY_ATTEMPTS / 2 {
-                                    pool.evict_one_slab();
-                                }
-                            },
+                            dist_oom_relief,
                         )
                     } else {
                         fetch_and_transfer(
@@ -505,7 +649,7 @@ fn worker_loop(
                             copy_stream.as_ref(),
                         )
                     };
-                    match send_or_stop(tx, result, stop) {
+                    match send_or_stop(&tx, result, stop) {
                         SendOutcome::Sent => {}
                         SendOutcome::Disconnected => dist_tx = None, // consumer dropped
                         SendOutcome::Stopping => return,
@@ -517,14 +661,15 @@ fn worker_loop(
                 // report otherwise fires at the NEXT epoch start, which
                 // never comes).
                 pool.epoch_report();
+                if let Some(r) = dist_ring.take() {
+                    r.teardown();
+                }
                 break;
             }
         }
     }
 }
 
-/// Single-stage epoch: fetch and transfer serialized on the worker
-/// thread. Used when `ring_slots == 0` (CPU targets, where the batch
 /// Outcome of a stop-aware batch send.
 enum SendOutcome {
     Sent,
@@ -560,6 +705,8 @@ fn send_or_stop(
     }
 }
 
+/// Single-stage epoch: fetch and transfer serialized on the worker
+/// thread. Used when `ring_slots == 0` (CPU targets, where the batch
 /// channel itself is the read-ahead buffer and there is no transfer
 /// stage to overlap; or a RAM budget too tight for a reader ring).
 #[allow(clippy::too_many_arguments)]
@@ -730,6 +877,79 @@ fn reader_loop(
         if ring_tx.send(result).is_err() {
             break;
         }
+    }
+}
+
+/// The distributed path's two-stage pipeline state: a reader thread
+/// fetching `LoadBatch` picks ahead of the transfer stage through a
+/// bounded pageable-RAM ring — `run_two_stage_epoch`'s shape with the
+/// index stream arriving over a channel instead of fixed at spawn (the
+/// coordinator-paced path learns its batches as `LoadBatch` commands).
+/// Owned by the worker loop, one per distributed epoch.
+struct DistRing {
+    /// Index feed to the reader. Unbounded on purpose: picks are a few
+    /// hundred bytes each, and the RING is what bounds RAM in flight.
+    idx_tx: mpsc::Sender<Vec<usize>>,
+    /// Ready CPU batches, reader → transfer stage. Capacity `ring_slots`.
+    ring_rx: mpsc::Receiver<Result<(Vec<usize>, Vec<Tensor>)>>,
+    reader: JoinHandle<()>,
+    /// Batches handed to the reader and not yet transferred — what the
+    /// pump still owes the consumer.
+    pending: usize,
+}
+
+impl DistRing {
+    fn spawn(dataset: &Arc<dyn BatchDataSet>, ring_slots: usize, augment: usize) -> Self {
+        let (idx_tx, idx_rx) = mpsc::channel::<Vec<usize>>();
+        let (ring_tx, ring_rx) =
+            mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
+        let reader_dataset = Arc::clone(dataset);
+        let reader = thread::spawn(move || {
+            // Same contract as `reader_loop`: pure dataset I/O — no
+            // pinning, no device work — so the storage wait here
+            // genuinely overlaps the transfer stage's CPU work. Errors
+            // ride the ring like batches; a failed send means the
+            // transfer stage is gone.
+            for picks in idx_rx {
+                let samples = crate::data::picks_to_samples(&picks, augment);
+                let result = guarded_get_batch(reader_dataset.as_ref(), &samples)
+                    .map(|tensors| (picks, tensors));
+                if ring_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        DistRing { idx_tx, ring_rx, reader, pending: 0 }
+    }
+
+    /// Hand one batch's picks to the reader.
+    fn submit(&mut self, picks: Vec<usize>) {
+        if self.idx_tx.send(picks).is_ok() {
+            self.pending += 1;
+        }
+    }
+
+    /// Close the feed, unblock the reader, and join it. Anything still
+    /// pending is dropped — every caller is an epoch transition or a
+    /// teardown, where the consumer has already abandoned those batches.
+    fn teardown(self) {
+        drop(self.idx_tx);
+        drop(self.ring_rx);
+        let _ = self.reader.join();
+    }
+}
+
+/// The distributed path's transient-OOM relief, shared by its
+/// single-stage (refetch + retransfer) and two-stage (retransfer only)
+/// arms. No governor target exists to shrink on this path — the
+/// coordinator paces in-flight batches — so drain patience comes first,
+/// and the pool's slab eviction is the only remaining relief valve
+/// (last resort: only once half the retry budget is spent).
+fn dist_oom_relief(pool: &mut VramSamplePool, attempt: usize) {
+    crate::tensor::cuda_empty_cache();
+    thread::sleep(OOM_RETRY_SLEEP);
+    if attempt >= OOM_RETRY_ATTEMPTS / 2 {
+        pool.evict_one_slab();
     }
 }
 
@@ -1005,7 +1225,7 @@ mod tests {
         // still complete via the teardown latch — a plain blocking send
         // made this join hang forever.
         let w = PrefetchWorker::new(Arc::new(TinyBatch), Device::CPU, 1, false, 1);
-        let rx = w.start_distributed_epoch();
+        let rx = w.start_distributed_epoch(0);
         w.load_batch(vec![0]); // fills the depth-1 channel
         w.load_batch(vec![1]); // worker wedges in this send
         w.load_batch(vec![2]);
@@ -1020,5 +1240,135 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("PrefetchWorker::drop hung — teardown latch failed");
         drop(rx);
+    }
+
+    #[test]
+    fn drop_unwedges_ring_pump_blocked_on_full_channel() {
+        // The two-stage twin of the test above: the pump is wedged in the
+        // batch send with a live reader behind it. Drop must unwind BOTH
+        // threads — the stop latch frees the pump, whose teardown drains
+        // the ring so the reader's send fails instead of blocking forever.
+        let w = PrefetchWorker::new(Arc::new(TinyBatch), Device::CPU, 1, false, 1);
+        let rx = w.start_distributed_epoch(2);
+        for i in 0..6 {
+            w.load_batch(vec![i]);
+        }
+        thread::sleep(Duration::from_millis(200));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(w);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("PrefetchWorker::drop hung with a ring active");
+        drop(rx);
+    }
+
+    #[test]
+    fn distributed_ring_delivers_in_order_with_content() {
+        // The pump reorders NOTHING: batches come back in submission
+        // order carrying the rows their picks name, across enough
+        // batches to cycle the ring several times.
+        let w = PrefetchWorker::new(Arc::new(TinyBatch), Device::CPU, 4, false, 1);
+        let rx = w.start_distributed_epoch(2);
+        let batches: Vec<Vec<usize>> = (0..8).map(|i| vec![2 * i, 2 * i + 1]).collect();
+        for b in &batches {
+            w.load_batch(b.clone());
+        }
+        for expected in &batches {
+            let got = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("batch never arrived")
+                .expect("batch errored");
+            assert_eq!(&got.picks, expected);
+            let vals = got.tensors[0].to_f32_vec().unwrap();
+            let want: Vec<f32> = expected.iter().map(|&i| i as f32).collect();
+            assert_eq!(vals, want);
+        }
+    }
+
+    /// Counts `get_batch` calls and makes each one slow — the test twin
+    /// of remote storage, so a test can observe how far ahead of
+    /// consumption each pipeline shape actually reads.
+    struct SlowCountingBatch {
+        fetched: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+    impl BatchDataSet for SlowCountingBatch {
+        fn len(&self) -> usize {
+            64
+        }
+        fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
+            thread::sleep(self.delay);
+            self.fetched.fetch_add(1, Ordering::SeqCst);
+            let vals: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
+            Ok(vec![Tensor::from_f32(
+                &vals,
+                &[vals.len() as i64],
+                Device::CPU,
+            )?])
+        }
+    }
+
+    #[test]
+    fn distributed_ring_reader_fetches_ahead_of_a_stalled_consumer() {
+        // The point of the ring: with the batch channel full (depth 1,
+        // nothing consumed), a single-stage worker holds at most 2 fetched
+        // batches — one in the channel, one wedged in the send — while the
+        // two-stage reader keeps reading and parks ready batches in the
+        // ring. The bounds are structural; the fetch delay only pins the
+        // interleaving (all 6 submissions land, microseconds, before the
+        // reader clears its first 50ms fetch).
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let delay = Duration::from_millis(50);
+
+        // Single-stage baseline: the fetch count is pinned at 2.
+        let w = PrefetchWorker::new(
+            Arc::new(SlowCountingBatch { fetched: Arc::clone(&fetched), delay }),
+            Device::CPU,
+            1,
+            false,
+            1,
+        );
+        let rx = w.start_distributed_epoch(0);
+        for i in 0..6 {
+            w.load_batch(vec![i]);
+        }
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            fetched.load(Ordering::SeqCst) <= 2,
+            "single-stage read past its structural bound: {}",
+            fetched.load(Ordering::SeqCst),
+        );
+        drop(rx);
+        drop(w);
+
+        // Two-stage, same stall: ring 3 + the reader's hands + the wedged
+        // send + the channel slot — at least 5 reads with zero consumption.
+        fetched.store(0, Ordering::SeqCst);
+        let w = PrefetchWorker::new(
+            Arc::new(SlowCountingBatch { fetched: Arc::clone(&fetched), delay }),
+            Device::CPU,
+            1,
+            false,
+            1,
+        );
+        let rx = w.start_distributed_epoch(3);
+        for i in 0..6 {
+            w.load_batch(vec![i]);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fetched.load(Ordering::SeqCst) < 5 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader never ran ahead: {} fetched",
+                fetched.load(Ordering::SeqCst),
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(rx);
+        drop(w);
     }
 }

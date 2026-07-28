@@ -513,8 +513,10 @@ pub struct DdpRunConfig {
     pub vram_max_usage: f64,
     /// Fraction of currently **available** host RAM each rank's staging
     /// tiers may retain (co-hosted ranks split it consumption-
-    /// proportionally); `0.0` disables staging retention. Default:
-    /// `0.50` (the solo loader's `ram_max_usage` default).
+    /// proportionally); the delivery reader ring sizes from the same
+    /// share. `0.0` disables staging retention and the ring (single-
+    /// stage fetch). Default: `0.50` (the solo loader's
+    /// `ram_max_usage` default).
     pub ram_max_usage: f64,
     /// Pinned RAM sample retention in each rank's staging tier (see
     /// [`crate::distributed::TrainerConfig::sample_cache`]). `false`

@@ -311,6 +311,9 @@ pub struct GpuWorker<M: Module> {
     /// [`super::WorkerConfig::vram_max_usage`]); feeds the per-plan
     /// prefetch-depth sizing.
     vram_max_usage: f64,
+    /// Host-RAM share for this worker's data plane; feeds the per-plan
+    /// reader-ring sizing (same knob the stager budgets from).
+    ram_max_usage: f64,
     /// Measured activation peak (activations + gradients) from training.
     /// Used as a reserve in the VRAM gauge so prefetch doesn't fill
     /// memory that forward/backward will need. Zero = not yet measured;

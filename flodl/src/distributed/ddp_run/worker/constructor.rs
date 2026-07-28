@@ -411,6 +411,7 @@ impl<M: Module> GpuWorker<M> {
             stager,
             per_sample_bytes,
             vram_max_usage: config.vram_max_usage,
+            ram_max_usage: config.ram_max_usage,
             activation_peak_bytes: 0,
             // Nothing to signal when the pool is off: pre-latch so the
             // install boundary (and its flow-reserve depth collapse)

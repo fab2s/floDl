@@ -120,6 +120,18 @@ pub(crate) fn ring_slots_from_ram(
     (budget / batch_bytes).min(epoch_batches as u64) as usize
 }
 
+/// The smallest in-flight window that still overlaps data with compute: one
+/// batch under the training step while the next is in transit. Below this the
+/// feed is not a pipeline at all — the caller takes the synchronous path and
+/// pays fetch + H2D inline on the training thread.
+const DOUBLE_BUFFER: usize = 2;
+
+/// Physical VRAM headroom the rate-matcher floor demands per byte it holds.
+/// At 256x a 16KB batch pair asks for 8MB free — nothing next to a card that
+/// can hold the model at all — while a model with hundred-MB batches never
+/// clears the bar and keeps the synchronous fallback it needs.
+const FLOOR_FREE_RATIO: usize = 256;
+
 /// Compute prefetch depth from VRAM usage cap.
 ///
 /// `max_usage` is the fraction of **total** VRAM to use (default 0.90).
@@ -128,7 +140,14 @@ pub(crate) fn ring_slots_from_ram(
 /// activation memory and gradients.
 ///
 /// Called at each `epoch()` boundary. By that point the model, optimizer,
-/// and any other allocations are done, so current usage is the real baseline.
+/// and any other allocations are done, so current usage is the real baseline
+/// — which is why callers past their first step pass `activation_reserve = 0`:
+/// the caching allocator is already holding those blocks and `used` counts
+/// them, so subtracting the peak again would charge it twice.
+///
+/// A budget too small for one batch does not disable the feed outright; see
+/// [`DOUBLE_BUFFER`] for the rate-matcher floor that keeps a tight card
+/// pipelined.
 pub(crate) fn prefetch_depth_from_vram(
     per_sample_bytes: usize,
     batch_size: usize,
@@ -137,12 +156,12 @@ pub(crate) fn prefetch_depth_from_vram(
     activation_reserve: usize,
 ) -> usize {
     if !device.is_cuda() {
-        return 2; // CPU: just double-buffer
+        return DOUBLE_BUFFER; // CPU: no VRAM to budget, just overlap
     }
 
     let batch_bytes = per_sample_bytes * batch_size;
     if batch_bytes == 0 {
-        return 2;
+        return DOUBLE_BUFFER; // unpriceable batch: overlap, claim nothing
     }
 
     let idx = device.index() as i32;
@@ -150,10 +169,49 @@ pub(crate) fn prefetch_depth_from_vram(
     let (used, total) = crate::tensor::cuda_memory_info_idx(idx)
         .unwrap_or((u64::MAX, 0));
 
+    depth_from_probe(used, total, max_usage, activation_reserve, batch_bytes)
+}
+
+/// The sizing policy, split from the probe so it is testable at the exact
+/// numbers a rig produced. `used` / `total` are as [`crate::tensor::cuda_memory_info_idx`]
+/// reports them (used first, driver-level, counting everything the caching
+/// allocator has reserved).
+fn depth_from_probe(
+    used: u64,
+    total: u64,
+    max_usage: f64,
+    activation_reserve: usize,
+    batch_bytes: usize,
+) -> usize {
     let cap = (total as f64 * max_usage.clamp(0.5, 0.99)) as usize;
     let budget = cap.saturating_sub(used as usize + activation_reserve);
 
-    budget / batch_bytes
+    let depth = budget / batch_bytes;
+    if depth > 0 {
+        return depth;
+    }
+
+    // Rate-matcher floor. `budget` is a CAPACITY-claim ceiling — what the
+    // sample pool and the resident tier may lay claim to. A double-buffered
+    // flow window is not a capacity claim; it is the thing that lets data
+    // overlap compute at all ("with a capacity tier active, prefetch depth is
+    // a rate-matcher, not a capacity claim" — `vram_pool`). Once a model's own
+    // footprint sits above the cap, `budget` saturates to zero and every batch
+    // takes the synchronous fetch+H2D path — measured at 45% of delivered wall
+    // on a GTX 1060 running OLMo-150M, given up to protect 32KB.
+    //
+    // So the floor is priced against PHYSICAL free rather than the cap, and
+    // taken only while it is negligible there: it can never be the reason a
+    // training step OOMs, and the governor's OOM halving stays the backstop.
+    // A failed probe reports `used = u64::MAX` with `total = 0`, so `free`
+    // saturates to 0 and the floor is declined — the safe direction.
+    let free = total.saturating_sub(used) as usize;
+    let floor_bytes = DOUBLE_BUFFER.saturating_mul(batch_bytes);
+    if floor_bytes.saturating_mul(FLOOR_FREE_RATIO) <= free {
+        DOUBLE_BUFFER
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +279,70 @@ pub(crate) fn retain_rows(rows: &[Tensor]) -> Result<(Vec<Tensor>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The numbers a 3-rank olmo/cpu-cadence rig run reported at a plan
+    // boundary (2026-07-28), so the regression is pinned to a real card and
+    // not to a hypothetical one.
+    const PASCAL_USED: u64 = 5592 << 20; // GTX 1060 6GB, OLMo-150M + AdamW
+    const PASCAL_TOTAL: u64 = 6_360_465_408; // cudaMemGetInfo total, not nvidia-smi's
+    const OLMO_ACTIVATION_PEAK: usize = 1682 << 20;
+    const OLMO_BATCH_BYTES: usize = 16 << 10; // seq 256 x batch 4, 2 int64 tensors
+
+    #[test]
+    fn a_model_above_the_cap_still_gets_a_double_buffer() {
+        // `used` exceeds 0.90 x total on its own here (5592MB vs 5459MB), so
+        // the capacity budget is zero however the reserve is set. Refusing the
+        // feed over that cost 45% of delivered wall on the rig, to protect
+        // 32KB out of 473MB physically free.
+        let cap = (PASCAL_TOTAL as f64 * 0.90) as usize;
+        assert!(PASCAL_USED as usize > cap, "premise: the model alone is over the cap");
+
+        let depth = depth_from_probe(PASCAL_USED, PASCAL_TOTAL, 0.90, 0, OLMO_BATCH_BYTES);
+        assert_eq!(depth, DOUBLE_BUFFER);
+
+        // And the floor holds even when a caller still passes the peak, so a
+        // missed call site degrades to "pipelined" rather than "synchronous".
+        let with_reserve = depth_from_probe(
+            PASCAL_USED, PASCAL_TOTAL, 0.90, OLMO_ACTIVATION_PEAK, OLMO_BATCH_BYTES,
+        );
+        assert_eq!(with_reserve, DOUBLE_BUFFER);
+    }
+
+    #[test]
+    fn the_activation_peak_is_what_drove_the_budget_to_zero() {
+        // Same card with the model's steady state comfortably under the cap:
+        // reserve 0 buys real depth, subtracting the peak a second time takes
+        // it away. This is the double-count the DDP worker path was making.
+        let used = 3 << 30; // 3GiB resident, ~2.3GiB under the cap
+        let honest = depth_from_probe(used, PASCAL_TOTAL, 0.90, 0, OLMO_BATCH_BYTES);
+        let double_counted = depth_from_probe(
+            used, PASCAL_TOTAL, 0.90, OLMO_ACTIVATION_PEAK, OLMO_BATCH_BYTES,
+        );
+        assert!(honest > 100_000, "honest probe should afford the whole chunk: {honest}");
+        assert!(
+            double_counted < honest / 2,
+            "charging the peak twice must visibly shrink the budget: {double_counted} vs {honest}",
+        );
+    }
+
+    #[test]
+    fn a_batch_too_large_for_the_headroom_keeps_the_sync_fallback() {
+        // The floor is not a blanket "always prefetch": when one batch is a
+        // real fraction of what is free, buffering two could be why a step
+        // OOMs, and the synchronous path is the correct answer.
+        let free = PASCAL_TOTAL - PASCAL_USED; // 473MB
+        let fat_batch = (free / 4) as usize;
+        let depth = depth_from_probe(PASCAL_USED, PASCAL_TOTAL, 0.90, 0, fat_batch);
+        assert_eq!(depth, 0);
+    }
+
+    #[test]
+    fn a_failed_probe_declines_the_floor() {
+        // `cuda_memory_info_idx` failure surfaces as (u64::MAX, 0). Free
+        // saturates to 0, so the floor must not be handed out on no data.
+        let depth = depth_from_probe(u64::MAX, 0, 0.90, 0, OLMO_BATCH_BYTES);
+        assert_eq!(depth, 0);
+    }
 
     #[test]
     fn anchored_budget_is_a_fixed_point_both_ways() {
