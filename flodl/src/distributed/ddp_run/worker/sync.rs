@@ -390,6 +390,17 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// Uses `copy_(non_blocking=true)` on the comm stream for GPU overlap.
     /// Records a `CudaEvent` so the compute stream waits before the next forward.
+    ///
+    /// The overlap is only real when the SOURCE is pinned — a pageable
+    /// source silently degrades `cudaMemcpyAsync` to a synchronous
+    /// bounce copy. On barrier-paced CUDA runs the update tensors are
+    /// the reduce client's reused pinned decode staging (see
+    /// `CpuReduceClient::set_pinned_decode`; all-idle keep-local rounds
+    /// ship the pinned snapshot staging), so the copies below are true
+    /// async H2D. Their in-flight window is closed by the existing
+    /// fences: `sync_before_forward` host-syncs before the next step,
+    /// and `snapshot_params`' entry fence retires any straggler before
+    /// the staging can be overwritten by the next round's decode.
     pub fn load_averaged(&mut self, update: &AveragedParams) -> Result<()> {
         if update.params.len() != self.param_vars.len() {
             return Err(TensorError::new(&format!(
@@ -445,23 +456,51 @@ impl<M: Module> GpuWorker<M> {
                     }
                 }
                 Some(alpha) => {
-                    let mut avg_staged: Vec<crate::tensor::Tensor> =
-                        Vec::with_capacity(update.params.len());
-                    let mut dst_handles: Vec<crate::tensor::Tensor> =
-                        Vec::with_capacity(update.params.len());
+                    // Per-tensor streaming writeback: ONE reusable staging
+                    // buffer sized to the largest param, then copy → lerp
+                    // per tensor. The blend needs the averaged values on
+                    // the GPU before the in-place lerp can read them, but
+                    // it never needs them all AT ONCE — staging the whole
+                    // model (the previous form) held a full model copy of
+                    // VRAM transient per window (~762MB at 190M params)
+                    // where the largest single param (~150MB embedding)
+                    // suffices. Everything here is enqueued on comm_stream
+                    // (the guard above), so stream order serializes the
+                    // buffer reuse: copy_(i+1) cannot overwrite the staging
+                    // before lerp(i) has read it, and the buffer's drop at
+                    // scope end frees to the same stream's pool — the same
+                    // lifetime pattern the previous staging vec relied on.
+                    // Cost: one lerp launch per param instead of one fused
+                    // foreach — once per reduce window, noise.
+                    let max_numel = update
+                        .params
+                        .iter()
+                        .map(|t| t.numel())
+                        .max()
+                        .unwrap_or(0);
+                    // Flat f32 staging: the CPU averaging plane delivers f32
+                    // consensus tensors and trainable params are f32; a
+                    // non-f32 param would fail the lerp loudly, not blend
+                    // wrong.
+                    let staging = Tensor::empty(
+                        &[max_numel],
+                        TensorOptions {
+                            dtype: crate::tensor::DType::Float32,
+                            device: self.device,
+                        },
+                    )?;
                     for (var, src) in self.param_vars.iter().zip(&update.params) {
                         let dst = var.data();
-                        // zeros_like allocates a same-shape/dtype/device
-                        // tensor; we immediately overwrite via copy_ so the
-                        // initial zeroing is unused (no `empty_like` in flodl).
-                        let avg_gpu = crate::tensor::Tensor::zeros_like(&dst)?;
-                        avg_gpu.copy_(src, non_blocking)?;
-                        avg_staged.push(avg_gpu);
-                        dst_handles.push(dst);
+                        let staged = staging
+                            .narrow(0, 0, src.numel())?
+                            .reshape(&dst.shape())?;
+                        staged.copy_(src, non_blocking)?;
+                        crate::tensor::Tensor::foreach_lerp_scalar_(
+                            std::slice::from_ref(&dst),
+                            std::slice::from_ref(&staged),
+                            alpha,
+                        )?;
                     }
-                    crate::tensor::Tensor::foreach_lerp_scalar_(
-                        &dst_handles, &avg_staged, alpha,
-                    )?;
                 }
             }
         }

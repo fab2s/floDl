@@ -34,7 +34,14 @@ use crate::distributed::controller::{
     PROTOCOL_VERSION, RoundFrame, RoundKind, TensorPayload,
 };
 use crate::distributed::wire::SessionSalt;
-use crate::tensor::{DType, Device, Result, Tensor, TensorError};
+use crate::tensor::{DType, Device, Result, Tensor, TensorError, TensorOptions};
+
+/// Decode-slot tags for [`CpuReduceClient::arm_pinned_decode`]: one
+/// reusable staging set per Model-frame kind the param bridge reduces
+/// each window. Caller-tagged rather than schema-keyed — see the
+/// collision note on `arm_pinned_decode`.
+pub const DECODE_SLOT_PARAMS: usize = 0;
+pub const DECODE_SLOT_BUFFERS: usize = 1;
 
 /// Per-read deadline for the long-running reduce loop (replaces the
 /// previously-cleared timeout). A vanished controller or relay must not
@@ -91,6 +98,23 @@ pub struct CpuReduceClient {
     /// cohort — a dtype mix surfaces as a loud schema error at the first
     /// fold.
     model_wire_dtype: u8,
+    /// Reused decode staging for armed Model-frame replies (see
+    /// [`Self::set_pinned_decode`] / [`Self::arm_pinned_decode`]):
+    /// per-slot sets of f32 CPU tensors — pinned (page-locked) when the
+    /// platform allows — that replies decode INTO instead of fresh
+    /// allocs. Pinned staging is what turns the consumer's
+    /// `copy_(non_blocking)` writeback into a true `cudaMemcpyAsync`
+    /// (from a pageable source it silently degrades to a synchronous
+    /// bounce copy), and the reuse removes a model-sized fresh alloc
+    /// per reduce window.
+    pinned_decode: bool,
+    decode_slots: Vec<Vec<Tensor>>,
+    /// One-shot arm: which slot the NEXT reply decodes into. Consumed
+    /// by `read_reduced_tensors`; `None` = fresh-alloc decode.
+    armed_decode_slot: Option<usize>,
+    /// Once-per-run notice latch for staging that could not be pinned
+    /// (the reuse still holds; only the async-H2D property is lost).
+    pinned_decode_fallback_logged: bool,
 }
 
 
@@ -165,6 +189,10 @@ impl CpuReduceClient {
             prof_count: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             model_wire_dtype: DTYPE_F32,
+            pinned_decode: false,
+            decode_slots: Vec::new(),
+            armed_decode_slot: None,
+            pinned_decode_fallback_logged: false,
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -236,6 +264,47 @@ impl CpuReduceClient {
     /// f32 regardless. Must be set identically on every rank.
     pub fn set_bf16_wire(&mut self, on: bool) {
         self.model_wire_dtype = if on { DTYPE_BF16 } else { DTYPE_F32 };
+    }
+
+    /// Enable reused decode staging for armed replies (see
+    /// [`Self::arm_pinned_decode`]): reply tensors decode into per-slot
+    /// f32 staging buffers — pinned when the platform allows — instead
+    /// of fresh CPU allocs, so the consumer's `copy_(non_blocking)`
+    /// writeback becomes a true async H2D and the model-sized decode
+    /// alloc per window disappears.
+    ///
+    /// SINGLE-CONSUMER CONTRACT: the returned tensors are shallow
+    /// clones of the staging — the next armed reply on the same slot
+    /// OVERWRITES them in place. Callers must fully consume a round's
+    /// tensors (including retiring any in-flight H2D reading them)
+    /// before the slot's next round begins. The barrier-paced policies
+    /// (`Sync` / `Cadence`) satisfy this structurally: the worker
+    /// cannot be asked for snapshot N+1 before applying Update N, and
+    /// `snapshot_params`' entry fences host-sync the comm stream —
+    /// retiring the writeback — before the bridge can start the round
+    /// that would overwrite the staging. `Async` does NOT (its control
+    /// channel has two producers with only per-producer FIFO, so
+    /// `RequestParams(N+1)` can interleave ahead of `Update(N)`,
+    /// leaving two Updates live at once); keep this off there until a
+    /// double-buffered variant exists.
+    pub fn set_pinned_decode(&mut self, on: bool) {
+        self.pinned_decode = on;
+    }
+
+    /// Arm the NEXT reply to decode into reused staging slot `slot`
+    /// ([`DECODE_SLOT_PARAMS`] / [`DECODE_SLOT_BUFFERS`]). One-shot:
+    /// consumed by the next reply read; un-armed reads (count gathers,
+    /// formation broadcasts, external callers) keep the fresh-alloc
+    /// decode. Slots are CALLER-tagged rather than schema-keyed
+    /// because a model's buffers frame can carry the exact shape list
+    /// of its params frame (BatchNorm-style per-channel shapes) — a
+    /// schema key would collide the two and silently ship buffer
+    /// values as params. No-op unless [`Self::set_pinned_decode`]
+    /// enabled staging.
+    pub fn arm_pinned_decode(&mut self, slot: usize) {
+        if self.pinned_decode {
+            self.armed_decode_slot = Some(slot);
+        }
     }
 
     /// Send this rank's frame for the current round and receive the
@@ -438,6 +507,12 @@ impl CpuReduceClient {
     /// time (accumulated inside the sink, `-vvv` gated) lets the caller
     /// split its wire/deserialize profile even though the two phases
     /// now interleave.
+    ///
+    /// When a staging slot is armed (see [`Self::arm_pinned_decode`]),
+    /// each payload decodes INTO that slot's reused buffer instead of a
+    /// fresh alloc; a per-payload staging failure falls back to the
+    /// fresh path for that payload (values identical either way), with
+    /// a once-per-run notice if the buffers could not be pinned.
     fn read_reduced_tensors(&mut self) -> Result<(Vec<Tensor>, f64, u128)> {
         let Some(len) =
             crate::distributed::relay::mux::read_len_prefix(&mut self.stream)?
@@ -448,16 +523,32 @@ impl CpuReduceClient {
                  triggered cluster-wide shutdown mid-round)",
             ));
         };
+        // One-shot: an error path below leaves the client un-armed, so a
+        // stale arm can never bleed into an unrelated later reply.
+        let mut staging = match self.armed_decode_slot.take() {
+            Some(s) => {
+                if self.decode_slots.len() <= s {
+                    self.decode_slots.resize_with(s + 1, Vec::new);
+                }
+                Some(&mut self.decode_slots[s])
+            }
+            None => None,
+        };
         let prof = self.prof_enabled;
         let mut decode_ns: u128 = 0;
         let mut out: Vec<Tensor> = Vec::new();
+        let mut pin_fallback: Option<String> = None;
         let mut body = (&mut self.stream).take(len as u64);
         let hdr = controller::read_round_frame_streamed(
             &mut body,
             &self.salt,
             &mut |i, payload| {
                 let tp = Instant::now();
-                out.push(payload_to_cpu_tensor(i, &payload)?);
+                let t = match staging.as_deref_mut() {
+                    Some(slot) => decode_into_slot(i, &payload, slot, &mut pin_fallback)?,
+                    None => payload_to_cpu_tensor(i, &payload)?,
+                };
+                out.push(t);
                 if prof {
                     decode_ns += tp.elapsed().as_nanos();
                 }
@@ -467,6 +558,17 @@ impl CpuReduceClient {
         )?;
         let leftover = body.limit();
         finish_framed_body(hdr.is_some(), leftover)?;
+        if let Some(msg) = pin_fallback
+            && !self.pinned_decode_fallback_logged
+        {
+            self.pinned_decode_fallback_logged = true;
+            eprintln!(
+                "flodl cpu_reduce: rank {} decode staging could not be pinned \
+                 ({msg}); reusing pageable staging (H2D writeback degrades to \
+                 a synchronous bounce copy)",
+                self.rank_id,
+            );
+        }
         let (_kind, weight) = hdr.expect("finish_framed_body verified Some");
         Ok((out, weight, decode_ns))
     }
@@ -904,16 +1006,7 @@ pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
 /// Shared per-payload body of [`round_frame_to_tensors`] and the
 /// draining streamed decode in `CpuReduceClient`.
 fn payload_to_cpu_tensor(i: usize, p: &TensorPayload) -> Result<Tensor> {
-    let dtype = match p.dtype {
-        DTYPE_F32 => DType::Float32,
-        DTYPE_BF16 => DType::BFloat16,
-        other => {
-            return Err(TensorError::new(&format!(
-                "cpu_reduce: payload[{i}] unsupported wire dtype tag {other} \
-                 (0 = f32, 1 = bf16)"
-            )));
-        }
-    };
+    let dtype = payload_wire_dtype(i, p)?;
     let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
     let t = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
         .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
@@ -921,6 +1014,88 @@ fn payload_to_cpu_tensor(i: usize, p: &TensorPayload) -> Result<Tensor> {
         Ok(t)
     } else {
         t.to_dtype(DType::Float32)
+    }
+}
+
+/// Map payload `p`'s wire dtype tag to the tensor dtype its bytes
+/// carry; loud error (naming the payload index) on unknown tags.
+fn payload_wire_dtype(i: usize, p: &TensorPayload) -> Result<DType> {
+    match p.dtype {
+        DTYPE_F32 => Ok(DType::Float32),
+        DTYPE_BF16 => Ok(DType::BFloat16),
+        other => Err(TensorError::new(&format!(
+            "cpu_reduce: payload[{i}] unsupported wire dtype tag {other} \
+             (0 = f32, 1 = bf16)"
+        ))),
+    }
+}
+
+/// Decode ONE payload into `slot[i]` — a REUSED f32 CPU staging tensor
+/// (pinned when the platform allows, see [`reused_decode_buffer`]) —
+/// and return a shallow clone of it. The buffer is allocated on first
+/// use and replaced if the payload shape ever changes at its index
+/// (the model schema is fixed for a run, so in practice each buffer is
+/// allocated exactly once). Under a bf16 wire the `copy_` performs the
+/// upcast directly into the staging — same work as the fresh-alloc
+/// path, one transient fewer; under an f32 wire the `from_blob`
+/// transient costs one extra host memcpy — the price of a stable,
+/// pinned destination for the consumer's async H2D.
+fn decode_into_slot(
+    i: usize,
+    p: &TensorPayload,
+    slot: &mut Vec<Tensor>,
+    pin_fallback: &mut Option<String>,
+) -> Result<Tensor> {
+    let dtype = payload_wire_dtype(i, p)?;
+    let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+    let wire = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
+        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
+    if i > slot.len() {
+        // The streamed reader hands payloads out in order; a hole means
+        // that contract broke, not that the frame is malformed.
+        return Err(TensorError::new(&format!(
+            "cpu_reduce: decode staging skipped an index (payload {i}, \
+             staged {})",
+            slot.len(),
+        )));
+    }
+    if i == slot.len() {
+        slot.push(reused_decode_buffer(&shape, pin_fallback)?);
+    } else if slot[i].shape() != shape {
+        slot[i] = reused_decode_buffer(&shape, pin_fallback)?;
+    }
+    let dst = &slot[i];
+    dst.copy_(&wire, false)?;
+    Ok(dst.clone())
+}
+
+/// Allocate one reusable f32 CPU decode staging tensor, pinned
+/// (page-locked) when the platform allows. Pinned is what makes the
+/// consumer's `copy_(non_blocking)` H2D a true `cudaMemcpyAsync`; when
+/// pinning fails (no CUDA runtime), the plain buffer keeps the reuse —
+/// no per-window model-sized alloc — and the caller records the
+/// failure for a once-per-run notice.
+fn reused_decode_buffer(
+    shape: &[i64],
+    pin_fallback: &mut Option<String>,
+) -> Result<Tensor> {
+    let opts = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
+    let plain = Tensor::empty(shape, opts)?;
+    match plain.pin_memory() {
+        Ok(pinned) => Ok(pinned),
+        Err(e) => {
+            if pin_fallback.is_none() {
+                // First line only: libtorch appends a multi-screen C++
+                // backtrace to c10 errors, useless in a one-shot notice.
+                let msg = e.to_string();
+                *pin_fallback =
+                    Some(msg.lines().next().unwrap_or("").to_string());
+            }
+            Ok(plain)
+        }
     }
 }
 
