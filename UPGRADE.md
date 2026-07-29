@@ -1,17 +1,82 @@
 # Upgrading floDl
 
-Two upgrades are documented here, newest first: the unreleased
-process-model distributed rewrite, then the 0.5.0 CLI maturity pass.
+Three upgrades are documented here, newest first: the 0.7.0 monitor
+record surface, the 0.6.0 process-model distributed rewrite, then the
+0.5.0 CLI maturity pass.
 
 ---
 
-## Upgrading past 0.5.x (unreleased): the process-model distributed rewrite
+## Upgrading to floDl 0.7.0 (the monitor record surface)
+
+0.7.0 is additive almost everywhere: the recursive dashboard portal, the
+path-addressed record plane, `record_log`, `save_dashboard`,
+`reports_per_epoch`, RoPE / SwiGLU / `TokenShards`, and the CPU-plane
+memory work all arrive without touching existing signatures. Two public
+items in `flodl::monitor::record` did change shape, and both fail at
+compile time rather than silently.
+
+If you do not name `flodl::monitor::record` directly, there is nothing
+to do.
+
+### `Res` gained two public fields
+
+`Res` grew `gpu_util_max` and `vram_alloc_max: Option<f64>` so a resource
+point summarises an *interval* rather than an instant (the previous
+latest-wins reading was usually sampled at a reduce boundary, which is
+exactly when a GPU sits idle, so a busy card reported as quiet). It is
+not `#[non_exhaustive]`, so reading fields is unaffected but struct-literal
+construction breaks:
+
+```rust
+// before
+let res = Res { gpu_util, vram_alloc, vram_total };
+
+// now: fill the envelope fields, or let Default cover them
+let res = Res { gpu_util, vram_alloc, vram_total, ..Default::default() };
+```
+
+The `..Default::default()` form is also future-proof against further
+envelope fields.
+
+### `NodeRecord::to_record_json` / `flat_records` take `Option<u64>` for `tick`
+
+An epoch record closes an epoch rather than belonging to a sub-epoch
+window, so it genuinely carries no window index, and `0` would have been
+indistinguishable from the first window:
+
+```rust
+// before
+node.flat_records(ts, tick, epoch);
+
+// now
+node.flat_records(ts, Some(tick), epoch);   // a sub-epoch window record
+node.flat_records(ts, None, epoch);         // an epoch-boundary record
+```
+
+### Two behavior changes worth knowing (no API change)
+
+- **`MultiheadAttention` routes through fused scaled-dot-product
+  attention.** The mask contract is unchanged (`true` / non-zero =
+  masked). The fused backends reorder reductions, so loss curves can
+  shift within kernel-level noise, the same class of drift GPU training
+  already has between runs. If you pin exact loss values in a test,
+  expect to re-baseline.
+- **Graph `switch` dispatches per sample.** `ArgmaxSelector` now emits
+  one index per row and only the branches that received rows run
+  ([#32](https://github.com/flodl-labs/flodl/issues/32)). Whole-batch
+  switching is still supported and still the cheaper path (a scalar
+  index, `FixedSelector`, an unbatched stream, or unanimous per-sample
+  routing all skip gather and reassembly). A custom selector that
+  returns neither a single index nor exactly one per row is now a loud
+  error instead of routing the batch somewhere arbitrary.
+
+---
+
+## Upgrading to floDl 0.6.0: the process-model distributed rewrite
 
 This is the largest pre-1.0 change to the `flodl` crate's public
 surface. Single-device and single-host code is unaffected; the breaks
-are all in the multi-GPU / cluster distributed layer. Removal targets
-are not version-pinned (the release is unversioned as of writing); this
-guide describes the shape of each change.
+are all in the multi-GPU / cluster distributed layer.
 
 ### The in-process multi-GPU engine is gone; multi-GPU is process-per-rank
 
@@ -82,6 +147,29 @@ each rank's per-epoch partition from the shared dataset). Build a plain
 `DataLoader` / pass the dataset to `Trainer::builder(...).dataset(...)`;
 the framework shards it.
 
+### Removed: the NCCL async mode
+
+`ddp-bench`'s `nccl-async` and the `Async` policy on the NCCL backend are
+gone. Cross-epoch lookahead on NCCL delivered near-zero real-world
+speedup over `nccl-cadence` while complicating the dispatch path.
+`ElCheMode` never carries an `NcclAsync` variant. The genuine async mode
+is `cpu_async` (decoupled averaging on a separate channel):
+
+| Removed | Replacement |
+|---|---|
+| `nccl-async` / `Async` on the NCCL backend | `ElCheConfig::nccl_cadence()` (same backend, bounded overhead) or `ElCheConfig::cpu_async()` (real decoupled averaging) |
+
+### Removed: the graph-embedded loss hook and cluster state
+
+`Graph::set_loss_fn` / `Graph::has_loss_fn` and the `LossContext` type
+are gone; they were the vestigial distributed-gather loss hook and had no
+remaining driver once the setup tier went. The graph-embedded
+`cluster_ddp` / `cluster_el_che` state and the cluster branches of
+`Graph::step` went with them, so **`Graph::step` is single-device only**.
+`HasGraph` is unaffected. Distributed loss now lives in the `train_step`
+closure you hand to `Trainer::builder(...)`, which is where the
+controller can see it.
+
 ### cluster.yml: structured `controller:` / `workers:` schema
 
 The flat top-level keys are replaced by nested blocks:
@@ -118,7 +206,7 @@ floDl 0.5.0 is the **fdl CLI maturity pass**. The framework API stays
 compatible with 0.4.0; the only breaking change lives in the `fdl.yml`
 manifest and the `#[derive(FdlArgs)]` attribute contract.
 
-## TL;DR
+### TL;DR
 
 1. Rename `scripts:` → `commands:` in your `fdl.yml`, wrapping each
    value in a `run:` field.
@@ -133,7 +221,7 @@ That's it. Everything else is additive.
 
 ---
 
-## 1. `scripts:` → `commands:` in `fdl.yml`
+### 1. `scripts:` → `commands:` in `fdl.yml`
 
 In 0.4.0, `fdl.yml` had two top-level maps:
 
@@ -145,7 +233,7 @@ kinds, chosen by which fields the entry sets: `run:` (shell), `path:`
 (nested project), or preset (`ddp:` / `training:` / `output:` /
 `options:` merging over an enclosing `entry:`).
 
-### Minimal migration
+#### Minimal migration
 
 ```yaml
 # 0.4.0 ---------------------------------------------------
@@ -169,7 +257,7 @@ commands:
     run: cargo test --features cuda
 ```
 
-### Rules of the three kinds
+#### Rules of the three kinds
 
 | Kind    | Set                              | Argv forwarded? | Notes                                                           |
 |---------|----------------------------------|-----------------|-----------------------------------------------------------------|
@@ -194,7 +282,7 @@ rule failed.
 
 ---
 
-## 2. Reserved CLI flags in `#[derive(FdlArgs)]`
+### 2. Reserved CLI flags in `#[derive(FdlArgs)]`
 
 In 0.4.0, a struct field named `help` silently overrode `--help`. In
 0.5.0 the following longs and shorts are **reserved** and cannot be
@@ -231,7 +319,7 @@ explicitly or let the derive skip the short.
 
 ---
 
-## 3. Environment overlays (optional, new)
+### 3. Environment overlays (optional, new)
 
 If you already maintained per-environment `fdl.yml` files manually
 (e.g. `fdl.local.yml`, `fdl.ci.yml`), 0.5.0 now loads them on top of
@@ -250,7 +338,7 @@ new overlay before running a long job.
 
 ---
 
-## 4. New top-level commands (informational)
+### 4. New top-level commands (informational)
 
 None of these replace existing commands; they are new conveniences
 that existed as no-ops or were simply absent in 0.4.0:
@@ -264,7 +352,7 @@ that existed as no-ops or were simply absent in 0.4.0:
 
 ---
 
-## 5. `flodl-cli-macros` on crates.io
+### 5. `flodl-cli-macros` on crates.io
 
 0.5.0 adds one new published crate:
 
@@ -282,7 +370,7 @@ pre-compiled bootstrap: `curl -sL https://flodl.dev/fdl -o fdl`.
 
 ---
 
-## 6. Framework changes
+### 6. Framework changes
 
 No breaking changes to the `flodl` crate in 0.5.0. The CHANGELOG has
 no `### Removed` or `### Changed (breaking)` entries outside of the
