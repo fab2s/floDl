@@ -34,30 +34,79 @@ pub(crate) fn divergence_triple(
         )));
     }
 
-    // pre_norm BEFORE the foreach_add_list_ subtracts post from `pre`.
-    let pre_norm_tensors = Tensor::foreach_norm(pre, 2.0)?;
-    let mut pre_sq = 0.0f64;
-    for n in &pre_norm_tensors {
-        let v: f64 = n.item()?;
-        pre_sq += v * v;
-    }
+    // A bf16-wire consensus arrives as bf16 tensors (the decode lands
+    // verbatim in the bf16 snapshot staging). The foreach fast route
+    // needs uniform dtypes, and a whole-list upcast would materialize a
+    // model-sized f32 transient per window — the exact size class the
+    // pinned-decode rig regression indicted. The mixed path below runs
+    // the SAME math one tensor at a time (foreach over single-element
+    // slices), holding at most one upcast transient; norms are computed
+    // on the f32 image so the triple keeps f32 precision (a norm READ
+    // from a bf16 result tensor would round to ~3 digits). Values are
+    // identical either way: the bf16 tensors hold bf16-representable
+    // numbers whichever dtype carries them. This once-per-window CPU
+    // work loses only foreach batching, which buys nothing here.
+    let uniform_f32 = post
+        .iter()
+        .all(|t| t.dtype() == crate::tensor::DType::Float32);
+
+    let (pre_sq, diff_sq, post_sq) = if uniform_f32 {
+        // pre_norm BEFORE the foreach_add_list_ subtracts post from `pre`.
+        let pre_norm_tensors = Tensor::foreach_norm(pre, 2.0)?;
+        let mut pre_sq = 0.0f64;
+        for n in &pre_norm_tensors {
+            let v: f64 = n.item()?;
+            pre_sq += v * v;
+        }
+
+        // pre[i] += -1 * post[i]  →  pre[i] = pre - post.
+        Tensor::foreach_add_list_(pre, post, -1.0)?;
+        let diff_norms = Tensor::foreach_norm(pre, 2.0)?;
+        let post_norms = Tensor::foreach_norm(post, 2.0)?;
+
+        let mut diff_sq = 0.0f64;
+        for n in &diff_norms {
+            let v: f64 = n.item()?;
+            diff_sq += v * v;
+        }
+        let mut post_sq = 0.0f64;
+        for n in &post_norms {
+            let v: f64 = n.item()?;
+            post_sq += v * v;
+        }
+        (pre_sq, diff_sq, post_sq)
+    } else {
+        let mut pre_sq = 0.0f64;
+        let mut diff_sq = 0.0f64;
+        let mut post_sq = 0.0f64;
+        for (p, q) in pre.iter().zip(post.iter()) {
+            let pre_n: f64 =
+                Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
+            pre_sq += pre_n * pre_n;
+            // One upcast transient at a time; shallow clone when
+            // already f32 (mixed lists — f32 buffers among bf16 params
+            // — never reach here today, but per-tensor is free).
+            let q32 = if q.dtype() == crate::tensor::DType::Float32 {
+                q.clone()
+            } else {
+                q.to_dtype(crate::tensor::DType::Float32)?
+            };
+            Tensor::foreach_add_list_(
+                std::slice::from_ref(p),
+                std::slice::from_ref(&q32),
+                -1.0,
+            )?;
+            let diff_n: f64 =
+                Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
+            diff_sq += diff_n * diff_n;
+            let post_n: f64 =
+                Tensor::foreach_norm(std::slice::from_ref(&q32), 2.0)?[0].item()?;
+            post_sq += post_n * post_n;
+        }
+        (pre_sq, diff_sq, post_sq)
+    };
+
     let pre_norm = pre_sq.sqrt();
-
-    // pre[i] += -1 * post[i]  →  pre[i] = pre - post.
-    Tensor::foreach_add_list_(pre, post, -1.0)?;
-    let diff_norms = Tensor::foreach_norm(pre, 2.0)?;
-    let post_norms = Tensor::foreach_norm(post, 2.0)?;
-
-    let mut diff_sq = 0.0f64;
-    for n in &diff_norms {
-        let v: f64 = n.item()?;
-        diff_sq += v * v;
-    }
-    let mut post_sq = 0.0f64;
-    for n in &post_norms {
-        let v: f64 = n.item()?;
-        post_sq += v * v;
-    }
     let post_norm = post_sq.sqrt();
     let divergence = if post_norm > 1e-10 {
         diff_sq.sqrt() / post_norm
@@ -110,5 +159,39 @@ mod tests {
         let (d, post_n, _) = divergence_triple(&pre, &post).unwrap();
         assert_eq!(d, 0.0, "post_norm ~ 0 must not divide");
         assert!(post_n.unwrap() < 1e-9);
+    }
+
+    /// A bf16 post list (the decode-into-request consensus under
+    /// `bf16_wire` lands verbatim in the bf16 snapshot staging) must
+    /// produce the SAME triple as the equivalent f32 list — the mixed
+    /// path runs the identical math per tensor, and bf16-exact values
+    /// leave nothing to rounding. Multi-tensor, so the per-tensor
+    /// accumulation across the list is exercised too.
+    #[test]
+    fn bf16_post_matches_f32_reference() {
+        // All values bf16-exact.
+        let pre_a = [t(&[3.0, 4.0]), t(&[1.0, 2.0])];
+        let post_f32 = [t(&[6.0, 8.0]), t(&[2.0, 4.0])];
+        let reference = divergence_triple(&pre_a, &post_f32).unwrap();
+
+        let pre_b = [t(&[3.0, 4.0]), t(&[1.0, 2.0])];
+        let post_bf16: Vec<Tensor> = post_f32
+            .iter()
+            .map(|p| p.to_dtype(crate::tensor::DType::BFloat16).unwrap())
+            .collect();
+        let mixed = divergence_triple(&pre_b, &post_bf16).unwrap();
+
+        assert!((mixed.0 - reference.0).abs() < 1e-6, "divergence");
+        assert!(
+            (mixed.1.unwrap() - reference.1.unwrap()).abs() < 1e-6,
+            "post_norm"
+        );
+        assert!(
+            (mixed.2.unwrap() - reference.2.unwrap()).abs() < 1e-6,
+            "pre_norm"
+        );
+        // The scratch mutation contract holds on the mixed path too:
+        // pre became pre - post, in f32.
+        assert_eq!(pre_b[0].to_f32_vec().unwrap(), vec![-3.0, -4.0]);
     }
 }

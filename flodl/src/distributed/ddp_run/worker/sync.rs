@@ -36,6 +36,44 @@ fn pinned_like(t: &Tensor, as_bf16: bool) -> Result<Tensor> {
     Tensor::empty(&t.shape(), opts)?.pin_memory()
 }
 
+/// H2D-copy `src` (CPU staging) into `dst` (GPU param), staging a bf16
+/// source through a flat device-side `bounce` slice first.
+///
+/// The bounce is load-bearing, not an optimization: libtorch's `copy_`
+/// casts on the SOURCE device for a cross-device + cross-dtype copy
+/// (`copy_requires_temporaries`: `src.to(dst.dtype())` runs on src), so
+/// a direct `f32-GPU ← bf16-pinned-CPU` copy materializes a PAGEABLE
+/// f32 temp on the host and sync-bounces it — losing the async-H2D
+/// property AND the halved bytes. (It is the mirror image of the
+/// mechanism the bf16 SNAPSHOT staging exploits: `bf16-CPU ← f32-GPU`
+/// casts on the GPU and ships half the bytes D2H.) Staging the raw
+/// bf16 through the device keeps the H2D a pure pinned memcpy at half
+/// the f32 width, then upcasts in a stream-ordered device kernel.
+/// Everything is enqueued on the caller's current stream (comm_stream),
+/// so stream order serializes the bounce-slice reuse across params —
+/// same lifetime pattern as the EASGD staging below.
+///
+/// Same-dtype sources (f32 wire, buffers) take the direct `copy_` —
+/// already a pure pinned memcpy. A `None` bounce (CPU device, or no
+/// bf16 params in the update) also copies directly: without an H2D leg
+/// the source-side cast is just a plain CPU cast, nothing to rescue.
+fn h2d_copy_via_bounce(
+    dst: &Tensor,
+    src: &Tensor,
+    bounce: Option<&Tensor>,
+    non_blocking: bool,
+) -> Result<()> {
+    if let Some(b) = bounce
+        && src.dtype() == crate::tensor::DType::BFloat16
+        && dst.dtype() != src.dtype()
+    {
+        let staged = b.narrow(0, 0, src.numel())?.reshape(&dst.shape())?;
+        staged.copy_(src, non_blocking)?;
+        return dst.copy_(&staged, non_blocking);
+    }
+    dst.copy_(src, non_blocking)
+}
+
 /// Work-weighted in-place AllReduce of the params across the NCCL
 /// cohort, as ONE fused collective: each rank's contribution is
 /// premultiplied INSIDE the collective by its normalized work factor
@@ -393,18 +431,19 @@ impl<M: Module> GpuWorker<M> {
     ///
     /// The overlap is only real when the SOURCE is pinned — a pageable
     /// source silently degrades `cudaMemcpyAsync` to a synchronous
-    /// bounce copy. On barrier-paced CUDA runs the update tensors are
-    /// pinned staging: under f32 wire the consensus decodes back into
-    /// the pinned SNAPSHOT staging itself (see
+    /// bounce copy. On barrier-paced CUDA runs the update tensors ARE
+    /// the pinned SNAPSHOT staging: the consensus decodes back into the
+    /// buffers the rank streamed from (see
     /// `CpuReduceClient::set_decode_into_request` — zero marginal
-    /// locked memory), under bf16 wire into the reduce client's own
-    /// RAM-gated f32 decode staging (`set_pinned_decode`); all-idle
-    /// keep-local rounds ship the pinned snapshot staging on both. The
-    /// copies below are therefore true async H2D, and their in-flight
-    /// window is closed by the existing fences: `sync_before_forward`
-    /// host-syncs before the next step, and `snapshot_params`' entry
-    /// fence retires any straggler before the staging can be
-    /// overwritten by the next round's D2H or decode.
+    /// locked memory; all-idle keep-local rounds ship the same staging
+    /// unreduced). The copies below are therefore true async H2D — a
+    /// bf16-wire update additionally staging through the device-side
+    /// bounce (`h2d_copy_via_bounce`) so the dtype hop never falls back
+    /// to a pageable host cast — and their in-flight window is closed
+    /// by the existing fences: `sync_before_forward` host-syncs before
+    /// the next step, and `snapshot_params`' entry fence retires any
+    /// straggler before the staging can be overwritten by the next
+    /// round's D2H or decode.
     pub fn load_averaged(&mut self, update: &AveragedParams) -> Result<()> {
         if update.params.len() != self.param_vars.len() {
             return Err(TensorError::new(&format!(
@@ -426,6 +465,33 @@ impl<M: Module> GpuWorker<M> {
         let non_blocking = self.comm_stream.is_some();
         // Set comm stream as current if available (copy_ respects current stream)
         let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+
+        // Flat device-side bf16 bounce for bf16-wire updates (see
+        // `h2d_copy_via_bounce` for why a direct copy_ would pageable-
+        // bounce instead): ONE buffer sized to the largest bf16 param,
+        // allocated per window like the EASGD staging below (the drop at
+        // scope end frees to the comm stream's pool). CUDA-only — on the
+        // CPU device there is no H2D leg to rescue.
+        let bf16_bounce: Option<Tensor> = if non_blocking {
+            update
+                .params
+                .iter()
+                .filter(|t| t.dtype() == crate::tensor::DType::BFloat16)
+                .map(|t| t.numel())
+                .max()
+                .map(|max_numel| {
+                    Tensor::empty(
+                        &[max_numel],
+                        TensorOptions {
+                            dtype: crate::tensor::DType::BFloat16,
+                            device: self.device,
+                        },
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         // no_grad: parameters are leaf tensors with requires_grad=true
         //
@@ -456,7 +522,12 @@ impl<M: Module> GpuWorker<M> {
             match self.easgd_alpha {
                 None => {
                     for (var, src) in self.param_vars.iter().zip(&update.params) {
-                        var.data().copy_(src, non_blocking)?;
+                        h2d_copy_via_bounce(
+                            &var.data(),
+                            src,
+                            bf16_bounce.as_ref(),
+                            non_blocking,
+                        )?;
                     }
                 }
                 Some(alpha) => {
@@ -482,10 +553,10 @@ impl<M: Module> GpuWorker<M> {
                         .map(|t| t.numel())
                         .max()
                         .unwrap_or(0);
-                    // Flat f32 staging: the CPU averaging plane delivers f32
-                    // consensus tensors and trainable params are f32; a
-                    // non-f32 param would fail the lerp loudly, not blend
-                    // wrong.
+                    // Flat f32 staging: trainable params are f32 and the
+                    // lerp reads f32 (a bf16-wire consensus upcasts into
+                    // this staging via the bounce below); a non-f32 param
+                    // would fail the lerp loudly, not blend wrong.
                     let staging = Tensor::empty(
                         &[max_numel],
                         TensorOptions {
@@ -498,7 +569,16 @@ impl<M: Module> GpuWorker<M> {
                         let staged = staging
                             .narrow(0, 0, src.numel())?
                             .reshape(&dst.shape())?;
-                        staged.copy_(src, non_blocking)?;
+                        // A bf16 update hops CPU-bf16 → GPU-bf16 (pinned
+                        // memcpy) → this f32 staging (device upcast) —
+                        // the same bounce as the overwrite path, so the
+                        // lerp always reads f32.
+                        h2d_copy_via_bounce(
+                            &staged,
+                            src,
+                            bf16_bounce.as_ref(),
+                            non_blocking,
+                        )?;
                         crate::tensor::Tensor::foreach_lerp_scalar_(
                             std::slice::from_ref(&dst),
                             std::slice::from_ref(&staged),

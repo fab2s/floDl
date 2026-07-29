@@ -559,12 +559,11 @@
         }
     }
 
-    /// The elided-payload decode helpers: zeros of the declared shape
-    /// from `round_frame_to_tensors` (fresh alloc), and `zero_`-written
-    /// staging from `decode_into_slot` — including OVERWRITING stale
-    /// nonzero values a previous round left in the reused buffer.
+    /// The elided-payload fresh decode: zeros of the declared shape
+    /// from `round_frame_to_tensors`. (The staging-destination variant
+    /// is pinned by `decode_into_dst_zeroes_the_destination_on_elided_payload`.)
     #[test]
-    fn elided_payloads_decode_to_zeros_fresh_and_into_staging() {
+    fn elided_payloads_decode_to_zeros_fresh() {
         let elided = TensorPayload {
             dtype: DTYPE_F32,
             shape: vec![2, 2],
@@ -578,104 +577,36 @@
         let fresh = round_frame_to_tensors(&frame).unwrap();
         assert_eq!(fresh[0].shape(), vec![2_i64, 2]);
         assert_eq!(fresh[0].to_f32_vec().unwrap(), vec![0.0f32; 4]);
-
-        let mut slot: Vec<Tensor> = Vec::new();
-        let mut pin_fallback = None;
-        // Prior round leaves nonzero staging content behind.
-        let full = TensorPayload {
-            dtype: DTYPE_F32,
-            shape: vec![2, 2],
-            bytes: f32_to_bytes(&[7.0, 7.0, 7.0, 7.0]),
-        };
-        let prev = decode_into_slot(0, &full, &mut slot, &mut pin_fallback).unwrap();
-        assert_eq!(prev.to_f32_vec().unwrap(), vec![7.0f32; 4]);
-        // The elided payload must zero the REUSED buffer, not trust it.
-        let out = decode_into_slot(0, &elided, &mut slot, &mut pin_fallback).unwrap();
-        assert_eq!(out.to_f32_vec().unwrap(), vec![0.0f32; 4]);
     }
 
-    /// Pinned-decode staging end-to-end: with `set_pinned_decode(true)`
-    /// and per-round arming, the consensus values are identical to the
-    /// fresh-alloc path, AND round N's returned tensors alias the
-    /// reused staging — round N+1's decode overwrites them in place
-    /// (the documented single-consumer contract, pinned as behavior so
-    /// a "fix" silently switching to fresh allocs shows up here).
+    /// Two rounds with IDENTICAL schemas must not clobber each other's
+    /// staging: the params and buffers frames of one window can carry
+    /// the exact same shape list (BatchNorm-style per-channel shapes),
+    /// and a schema-keyed destination cache would decode the buffers
+    /// round into the params staging while the params consensus is
+    /// still unconsumed — silently shipping buffer values as params.
+    /// With decode-into-request the separation is structural (each
+    /// round's destinations are the tensors IT streamed); this pins
+    /// that contract against any future destination-caching "cleanup".
     #[test]
-    fn pinned_decode_reuses_staging_and_keeps_values() {
-        use crate::distributed::controller::RoundKind;
-        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
-            let spawn = |rank: u32, v1: f32, v2: f32| {
-                thread::spawn(move || {
-                    let mut c =
-                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
-                    c.set_pinned_decode(true);
-                    let a = Tensor::from_f32(&[v1, v1], &[2], Device::CPU).unwrap();
-                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
-                    let round1 = c
-                        .all_reduce_scaled(&[&a], 1.0, RoundKind::Model, 1.0)
-                        .unwrap()
-                        .0;
-                    let round1_vals = round1[0].to_f32_vec().unwrap();
-                    let b = Tensor::from_f32(&[v2, v2], &[2], Device::CPU).unwrap();
-                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
-                    let round2 = c
-                        .all_reduce_scaled(&[&b], 1.0, RoundKind::Model, 1.0)
-                        .unwrap()
-                        .0;
-                    (round1_vals, round1, round2)
-                })
-            };
-            let t0 = spawn(0, 2.0, 10.0);
-            let t1 = spawn(1, 4.0, 14.0);
-            (t0.join().unwrap(), t1.join().unwrap())
-        });
-
-        for (rank, (round1_vals, round1, round2)) in [(0, &r0), (1, &r1)] {
-            assert_eq!(
-                *round1_vals,
-                vec![3.0, 3.0],
-                "rank {rank} round-1 consensus"
-            );
-            assert_eq!(
-                round2[0].to_f32_vec().unwrap(),
-                vec![12.0, 12.0],
-                "rank {rank} round-2 consensus"
-            );
-            // Round 2 decoded into the SAME staging, so round 1's handle
-            // now reads round 2's values — the aliasing IS the reuse.
-            assert_eq!(
-                round1[0].to_f32_vec().unwrap(),
-                vec![12.0, 12.0],
-                "rank {rank} staging reuse (round-1 handle aliases round-2 decode)"
-            );
-        }
-    }
-
-    /// Two frames with IDENTICAL schemas must not clobber each other's
-    /// staging: slots are caller-tagged precisely because a
-    /// BatchNorm-style model's buffers frame can carry the exact shape
-    /// list of its params frame. A schema-keyed cache would decode the
-    /// buffers round into the params staging while the params consensus
-    /// is still unconsumed — silently shipping buffer values as params.
-    #[test]
-    fn pinned_decode_slots_do_not_collide_on_identical_schemas() {
+    fn decode_into_request_keeps_identical_schema_rounds_separate() {
         use crate::distributed::controller::RoundKind;
         let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
             let spawn = |rank: u32, p: f32, b: f32| {
                 thread::spawn(move || {
                     let mut c =
                         CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
-                    c.set_pinned_decode(true);
-                    // "Params" round into slot 0.
+                    c.set_decode_into_request(true);
+                    // "Params" round.
                     let pt = Tensor::from_f32(&[p], &[1], Device::CPU).unwrap();
-                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
+                    c.arm_decode_into(std::slice::from_ref(&pt));
                     let params = c
                         .all_reduce_scaled(&[&pt], 1.0, RoundKind::Model, 1.0)
                         .unwrap()
                         .0;
-                    // "Buffers" round, SAME schema, slot 1.
+                    // "Buffers" round, SAME schema, its own staging.
                     let bt = Tensor::from_f32(&[b], &[1], Device::CPU).unwrap();
-                    c.arm_pinned_decode(DECODE_SLOT_BUFFERS);
+                    c.arm_decode_into(std::slice::from_ref(&bt));
                     let buffers = c
                         .all_reduce_scaled(&[&bt], 1.0, RoundKind::Model, 1.0)
                         .unwrap()
@@ -694,7 +625,7 @@
                 vec![150.0],
                 "rank {rank} buffers consensus"
             );
-            // Would read 150.0 if both rounds shared one staging set.
+            // Would read 150.0 if the rounds shared one staging.
             assert_eq!(
                 params[0].to_f32_vec().unwrap(),
                 vec![3.0],
@@ -732,11 +663,14 @@
         );
     }
 
-    /// bf16 wire + pinned decode: the upcast lands via `copy_` directly
-    /// in the f32 staging (no intermediate f32 alloc); values chosen
-    /// bf16-exact, returned dtype stays f32.
+    /// bf16 wire + decode-into-request: the production shape — the
+    /// snapshot staging is bf16 under `bf16_wire`, the reply is bf16 on
+    /// the wire, and the decode lands VERBATIM (memcpy, no upcast, no
+    /// information loss: the controller folded in f32 and quantized to
+    /// the wire dtype either way). The consensus lives in the bf16
+    /// staging the rank streamed from; values chosen bf16-exact.
     #[test]
-    fn pinned_decode_bf16_wire_upcasts_into_staging() {
+    fn decode_into_request_bf16_wire_lands_verbatim_in_bf16_staging() {
         use crate::distributed::controller::RoundKind;
         let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
             let spawn = |rank: u32, vals: [f32; 2]| {
@@ -744,12 +678,24 @@
                     let mut c =
                         CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
                     c.set_bf16_wire(true);
-                    c.set_pinned_decode(true);
-                    let t = Tensor::from_f32(&vals, &[2], Device::CPU).unwrap();
-                    c.arm_pinned_decode(DECODE_SLOT_PARAMS);
-                    c.all_reduce_scaled(&[&t], 1.0, RoundKind::Model, 1.0)
+                    c.set_decode_into_request(true);
+                    // The bf16 "snapshot staging" (what `pinned_like`
+                    // allocates for params under bf16_wire).
+                    let s = Tensor::from_f32(&vals, &[2], Device::CPU)
                         .unwrap()
-                        .0
+                        .to_dtype(crate::tensor::DType::BFloat16)
+                        .unwrap();
+                    c.arm_decode_into(std::slice::from_ref(&s));
+                    let out = c
+                        .all_reduce_scaled(&[&s], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    let staging_vals = s
+                        .to_dtype(crate::tensor::DType::Float32)
+                        .unwrap()
+                        .to_f32_vec()
+                        .unwrap();
+                    (out, staging_vals)
                 })
             };
             let t0 = spawn(0, [2.0, 8.0]);
@@ -757,18 +703,52 @@
             (t0.join().unwrap(), t1.join().unwrap())
         });
 
-        for (rank, tensors) in [(0, &r0), (1, &r1)] {
+        for (rank, (tensors, staging_vals)) in [(0, &r0), (1, &r1)] {
             assert_eq!(
                 tensors[0].dtype(),
-                crate::tensor::DType::Float32,
-                "rank {rank} staging decode returns f32"
+                crate::tensor::DType::BFloat16,
+                "rank {rank} verbatim decode keeps the staging dtype"
             );
             assert_eq!(
-                tensors[0].to_f32_vec().unwrap(),
+                tensors[0]
+                    .to_dtype(crate::tensor::DType::Float32)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap(),
                 vec![3.0, 12.0],
                 "rank {rank} consensus"
             );
+            assert_eq!(
+                *staging_vals,
+                vec![3.0, 12.0],
+                "rank {rank} consensus landed IN the bf16 staging"
+            );
         }
+    }
+
+    /// A bf16 payload into an f32 destination upcasts via `copy_` — the
+    /// buffers staging under `bf16_wire`, which stays f32.
+    #[test]
+    fn decode_into_dst_upcasts_bf16_payload_into_f32_destination() {
+        // 3.0 and 12.0 are bf16-exact.
+        let bf16_bytes = Tensor::from_f32(&[3.0, 12.0], &[2], Device::CPU)
+            .unwrap()
+            .to_dtype(crate::tensor::DType::BFloat16)
+            .unwrap()
+            .to_blob()
+            .unwrap();
+        let payload = TensorPayload {
+            dtype: crate::distributed::controller::DTYPE_BF16,
+            shape: vec![2],
+            bytes: bf16_bytes,
+        };
+        let dst = Tensor::from_f32(&[7.0, 7.0], &[2], Device::CPU).unwrap();
+        let mut fb = None;
+        let out =
+            decode_into_dst(0, &payload, std::slice::from_ref(&dst), &mut fb).unwrap();
+        assert!(fb.is_none(), "bf16→f32 is a legitimate pairing");
+        assert_eq!(out.dtype(), crate::tensor::DType::Float32);
+        assert_eq!(dst.to_f32_vec().unwrap(), vec![3.0, 12.0]);
     }
 
     /// RAM-neutral decode end-to-end: with `set_decode_into_request`,
@@ -792,7 +772,7 @@
                     // Persistent "snapshot staging": written with local
                     // values each window, reduced, decoded back into.
                     let s = Tensor::from_f32(&[v1, v1], &[2], Device::CPU).unwrap();
-                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    c.arm_decode_into(std::slice::from_ref(&s));
                     let round1 = c
                         .all_reduce_scaled(&[&s], 1.0, RoundKind::Model, 1.0)
                         .unwrap()
@@ -802,7 +782,7 @@
                     // the same staging.
                     let next = Tensor::from_f32(&[v2, v2], &[2], Device::CPU).unwrap();
                     s.copy_(&next, false).unwrap();
-                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    c.arm_decode_into(std::slice::from_ref(&s));
                     let round2 = c
                         .all_reduce_scaled(&[&s], 1.0, RoundKind::Model, 1.0)
                         .unwrap()
@@ -853,7 +833,7 @@
                         CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
                     c.set_decode_into_request(true);
                     let s = Tensor::from_f32(&[v, v], &[2], Device::CPU).unwrap();
-                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    c.arm_decode_into(std::slice::from_ref(&s));
                     // Every rank idle: elided frames, realized mass 0.
                     let (out, mass) = c
                         .all_reduce_scaled(&[&s], 0.0, RoundKind::Model, 0.0)
@@ -895,7 +875,10 @@
             shape: vec![2, 2],
             bytes: f32_to_bytes(&[1.0, 2.0, 3.0, 4.0]),
         };
-        // Degenerate dtype: bf16 destination is refused, values land fresh.
+        // Downcast pairing: an f32 payload must not land in a bf16
+        // destination (silent quantization of the consensus) — refused,
+        // values land fresh. (bf16 payload → bf16 dst is the legitimate
+        // verbatim pairing, pinned by the bf16-wire e2e test.)
         let bf16_dst = Tensor::from_f32(&[7.0; 4], &[2, 2], Device::CPU)
             .unwrap()
             .to_dtype(crate::tensor::DType::BFloat16)
@@ -1097,7 +1080,7 @@
         c.all_reduce_per_rank_f64(&mut counts).unwrap();
         let my_w = gamma_mass(n_i as f64, gamma);
         let t = Tensor::from_f32(&[t_val], &[1], Device::CPU).unwrap();
-        let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w, DECODE_SLOT_PARAMS)
+        let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w)
             .unwrap()[0]
             .to_f32_vec()
             .unwrap()[0];
@@ -1197,7 +1180,6 @@
                             &mut c,
                             std::slice::from_ref(&bt),
                             1.0,
-                            DECODE_SLOT_BUFFERS,
                         )
                         .unwrap()[0]
                             .to_f32_vec()

@@ -36,16 +36,17 @@ use crate::distributed::controller::{
 use crate::distributed::wire::SessionSalt;
 use crate::tensor::{DType, Device, Result, Tensor, TensorError, TensorOptions};
 
-/// Decode-slot tags for [`CpuReduceClient::arm_pinned_decode`]: one
-/// reusable staging set per Model-frame kind the param bridge reduces
-/// each window. Caller-tagged rather than schema-keyed — see the
-/// collision note on `arm_pinned_decode`.
-pub const DECODE_SLOT_PARAMS: usize = 0;
-pub const DECODE_SLOT_BUFFERS: usize = 1;
-
-/// Whether this host can afford the pinned decode staging without
-/// pushing itself into swap — the RAM-affordability gate on
-/// [`CpuReduceClient::set_pinned_decode`].
+/// Whether this host can afford a page-locked model-copy staging
+/// without pushing itself into swap.
+///
+/// HISTORICAL for the consensus decode it was written to gate: the
+/// decode now lands in the snapshot staging itself
+/// ([`CpuReduceClient::set_decode_into_request`], zero marginal locked
+/// memory), so nothing consults this helper on that path anymore. Kept
+/// (with its test) because the reasoning outlives the call site: the
+/// snapshot staging is the REMAINING locked resident, and a future
+/// RAM-tight host may want the same MemAvailable-anchored affordability
+/// question asked about it.
 ///
 /// `staging_bytes` is the f32 model wire size (the staging is always
 /// f32 whatever the wire dtype), `local_ranks` how many ranks share
@@ -79,6 +80,7 @@ pub const DECODE_SLOT_BUFFERS: usize = 1;
 /// and the rig re-run reproduced the regression (B5, epoch 317s vs
 /// 290-293s baseline). Factor 6 (need 8.5GB > 7.3GB) refuses it at
 /// the anchor the ranks actually read.
+#[allow(dead_code)] // kept deliberately (see HISTORICAL above); pinned by its test
 pub fn pinned_decode_affordable(
     staging_bytes: u64,
     local_ranks: usize,
@@ -146,28 +148,14 @@ pub struct CpuReduceClient {
     /// cohort — a dtype mix surfaces as a loud schema error at the first
     /// fold.
     model_wire_dtype: u8,
-    /// Reused decode staging for armed Model-frame replies (see
-    /// [`Self::set_pinned_decode`] / [`Self::arm_pinned_decode`]):
-    /// per-slot sets of f32 CPU tensors — pinned (page-locked) when the
-    /// platform allows — that replies decode INTO instead of fresh
-    /// allocs. Pinned staging is what turns the consumer's
-    /// `copy_(non_blocking)` writeback into a true `cudaMemcpyAsync`
-    /// (from a pageable source it silently degrades to a synchronous
-    /// bounce copy), and the reuse removes a model-sized fresh alloc
-    /// per reduce window.
-    pinned_decode: bool,
-    decode_slots: Vec<Vec<Tensor>>,
-    /// One-shot arm: which slot the NEXT reply decodes into. Consumed
-    /// by `read_reduced_tensors`; `None` = fresh-alloc decode.
-    armed_decode_slot: Option<usize>,
-    /// Once-per-run notice latch for staging that could not be pinned
-    /// (the reuse still holds; only the async-H2D property is lost).
-    pinned_decode_fallback_logged: bool,
     /// RAM-neutral decode mode (see [`Self::set_decode_into_request`]):
     /// armed Model replies decode into the REQUEST tensors themselves —
-    /// the caller's snapshot staging — instead of client-owned slots.
-    /// Zero marginal locked memory; the reply schema mirrors the sent
-    /// frame by protocol, so the destinations always fit.
+    /// the caller's pinned snapshot staging. Zero marginal locked
+    /// memory; the reply schema mirrors the sent frame by protocol, so
+    /// the destinations always fit. Pinned staging is what turns the
+    /// consumer's `copy_(non_blocking)` writeback into a true
+    /// `cudaMemcpyAsync` (from a pageable source it silently degrades
+    /// to a synchronous bounce copy).
     decode_into_request: bool,
     /// One-shot arm for `decode_into_request`: shallow clones of the
     /// request tensors the NEXT reply decodes into. Consumed by
@@ -251,10 +239,6 @@ impl CpuReduceClient {
             prof_count: 0,
             prof_enabled: crate::log::enabled(crate::log::Verbosity::Debug),
             model_wire_dtype: DTYPE_F32,
-            pinned_decode: false,
-            decode_slots: Vec::new(),
-            armed_decode_slot: None,
-            pinned_decode_fallback_logged: false,
             decode_into_request: false,
             armed_decode_dsts: None,
             decode_dst_fallback_logged: false,
@@ -331,52 +315,31 @@ impl CpuReduceClient {
         self.model_wire_dtype = if on { DTYPE_BF16 } else { DTYPE_F32 };
     }
 
-    /// Enable reused decode staging for armed replies (see
-    /// [`Self::arm_pinned_decode`]): reply tensors decode into per-slot
-    /// f32 staging buffers — pinned when the platform allows — instead
-    /// of fresh CPU allocs, so the consumer's `copy_(non_blocking)`
-    /// writeback becomes a true async H2D and the model-sized decode
-    /// alloc per window disappears.
-    ///
-    /// SINGLE-CONSUMER CONTRACT: the returned tensors are shallow
-    /// clones of the staging — the next armed reply on the same slot
-    /// OVERWRITES them in place. Callers must fully consume a round's
-    /// tensors (including retiring any in-flight H2D reading them)
-    /// before the slot's next round begins. The barrier-paced policies
-    /// (`Sync` / `Cadence`) satisfy this structurally: the worker
-    /// cannot be asked for snapshot N+1 before applying Update N, and
-    /// `snapshot_params`' entry fences host-sync the comm stream —
-    /// retiring the writeback — before the bridge can start the round
-    /// that would overwrite the staging. `Async` does NOT (its control
-    /// channel has two producers with only per-producer FIFO, so
-    /// `RequestParams(N+1)` can interleave ahead of `Update(N)`,
-    /// leaving two Updates live at once); keep this off there until a
-    /// double-buffered variant exists.
-    pub fn set_pinned_decode(&mut self, on: bool) {
-        self.pinned_decode = on;
-    }
-
-    /// Enable the RAM-neutral decode mode: armed Model replies decode
+    /// Enable the RAM-neutral pinned decode: armed Model replies decode
     /// into the REQUEST tensors themselves (see
     /// [`Self::arm_decode_into`]) — the caller's pinned snapshot
-    /// staging — instead of a client-owned staging set. The staging's
-    /// bytes are dead by decode time (the streamed encode consumed them
-    /// before the blocking reply read began), so this buys the same
-    /// async-H2D writeback as [`Self::set_pinned_decode`] with ZERO
-    /// marginal locked memory — no RAM-affordability gate needed.
+    /// staging. The staging's bytes are dead by decode time (the
+    /// streamed encode consumed them before the blocking reply read
+    /// began), so the consumer's `copy_(non_blocking)` writeback
+    /// becomes a true async H2D at ZERO marginal locked memory — no
+    /// RAM-affordability gate needed (the retired slot-staging
+    /// predecessor locked a second model copy per rank, which thrashed
+    /// RAM-tight hosts into swap).
     ///
-    /// Same single-consumer contract as `set_pinned_decode` (the
-    /// returned tensors alias the destinations; the caller's next
-    /// window overwrites them), with the same `Async`-policy exclusion.
-    /// Takes precedence over the slot-based mode when both are set.
-    ///
-    /// f32 wire only for now: under `bf16_wire` the params snapshot
-    /// staging is bf16 and cannot hold the f32 decode the divergence
-    /// math and writeback consume today — bf16 keeps the slot mode
-    /// (and its gate) until the staged bf16 writeback lands (PR-B of
-    /// `.design/consensus-decode-snapshot-staging.md`). Enforced by
-    /// the caller's wiring, not here: a bf16 destination is refused
-    /// per payload (fresh-alloc fallback, once-per-run notice).
+    /// SINGLE-CONSUMER CONTRACT: the returned tensors are shallow
+    /// clones of the destinations — the caller's next window OVERWRITES
+    /// them in place (its own D2H snapshot, then the next decode).
+    /// Callers must fully consume a round's tensors (including retiring
+    /// any in-flight H2D reading them) before the next round begins.
+    /// The barrier-paced policies (`Sync` / `Cadence`) satisfy this
+    /// structurally: the worker cannot be asked for snapshot N+1 before
+    /// applying Update N, and `snapshot_params`' entry fences host-sync
+    /// the comm stream — retiring the writeback — before the bridge can
+    /// start the round that would overwrite the staging. `Async` does
+    /// NOT (its control channel has two producers with only
+    /// per-producer FIFO, so `RequestParams(N+1)` can interleave ahead
+    /// of `Update(N)`, leaving two Updates live at once); keep this off
+    /// there until a double-buffered variant exists.
     pub fn set_decode_into_request(&mut self, on: bool) {
         self.decode_into_request = on;
     }
@@ -385,12 +348,10 @@ impl CpuReduceClient {
     /// caller is about to stream up, whose reply mirrors their schema
     /// by protocol. One-shot: consumed by the next reply read; error
     /// paths leave the client un-armed. Holds shallow clones, so the
-    /// decode writes through to the caller's staging storage.
-    ///
-    /// Falls back to the slot-based arm ([`Self::arm_pinned_decode`],
-    /// tagged by `slot`) when [`Self::set_decode_into_request`] is off,
-    /// so callers wire ONE arm point and the client's mode decides.
-    /// No-op when neither mode is enabled (fresh-alloc decode).
+    /// decode writes through to the caller's staging storage. No-op
+    /// unless [`Self::set_decode_into_request`] enabled the mode
+    /// (un-armed reads — count gathers, formation broadcasts — keep
+    /// the fresh-alloc decode either way).
     ///
     /// The reply's realized-work mass guards the destinations: a
     /// zero-mass round's payloads are meaningless zeros the caller
@@ -398,27 +359,9 @@ impl CpuReduceClient {
     /// the very tensors keep-local returns — the weight rides the wire
     /// ahead of the payloads, and an unrealized round decodes fresh,
     /// leaving `dsts` untouched (see `read_reduced_tensors`).
-    pub fn arm_decode_into(&mut self, dsts: &[Tensor], slot: usize) {
+    pub fn arm_decode_into(&mut self, dsts: &[Tensor]) {
         if self.decode_into_request {
             self.armed_decode_dsts = Some(dsts.to_vec());
-        } else {
-            self.arm_pinned_decode(slot);
-        }
-    }
-
-    /// Arm the NEXT reply to decode into reused staging slot `slot`
-    /// ([`DECODE_SLOT_PARAMS`] / [`DECODE_SLOT_BUFFERS`]). One-shot:
-    /// consumed by the next reply read; un-armed reads (count gathers,
-    /// formation broadcasts, external callers) keep the fresh-alloc
-    /// decode. Slots are CALLER-tagged rather than schema-keyed
-    /// because a model's buffers frame can carry the exact shape list
-    /// of its params frame (BatchNorm-style per-channel shapes) — a
-    /// schema key would collide the two and silently ship buffer
-    /// values as params. No-op unless [`Self::set_pinned_decode`]
-    /// enabled staging.
-    pub fn arm_pinned_decode(&mut self, slot: usize) {
-        if self.pinned_decode {
-            self.armed_decode_slot = Some(slot);
         }
     }
 
@@ -638,12 +581,6 @@ impl CpuReduceClient {
     /// split its wire/deserialize profile even though the two phases
     /// now interleave.
     ///
-    /// When a staging slot is armed (see [`Self::arm_pinned_decode`]),
-    /// each payload decodes INTO that slot's reused buffer instead of a
-    /// fresh alloc; a per-payload staging failure falls back to the
-    /// fresh path for that payload (values identical either way), with
-    /// a once-per-run notice if the buffers could not be pinned.
-    ///
     /// When request destinations are armed (see
     /// [`Self::arm_decode_into`]), each payload decodes into its
     /// destination tensor — UNLESS the frame's realized-work weight is
@@ -656,9 +593,7 @@ impl CpuReduceClient {
     /// inert buffering under the reader's MAC-before-use contract (a
     /// forged weight at worst wastes a fresh alloc, or clobbers staging
     /// on a frame that then fails MAC and tears the round down; no
-    /// snapshot path ever reads stale staging content). The slot mode
-    /// needs no such guard: keep-local returns the caller's own
-    /// tensors, never the slot staging.
+    /// snapshot path ever reads stale staging content).
     fn read_reduced_tensors(&mut self) -> Result<(Vec<Tensor>, f64, u128)> {
         let Some(len) =
             crate::distributed::relay::mux::read_len_prefix(&mut self.stream)?
@@ -672,19 +607,9 @@ impl CpuReduceClient {
         // One-shot: an error path below leaves the client un-armed, so a
         // stale arm can never bleed into an unrelated later reply.
         let armed_dsts = self.armed_decode_dsts.take();
-        let mut staging = match self.armed_decode_slot.take() {
-            Some(s) => {
-                if self.decode_slots.len() <= s {
-                    self.decode_slots.resize_with(s + 1, Vec::new);
-                }
-                Some(&mut self.decode_slots[s])
-            }
-            None => None,
-        };
         let prof = self.prof_enabled;
         let mut decode_ns: u128 = 0;
         let mut out: Vec<Tensor> = Vec::new();
-        let mut pin_fallback: Option<String> = None;
         let mut dst_fallback: Option<String> = None;
         // Realized-work mass off the frame header, set before the first
         // payload reaches the sink (Cell: the header and payload
@@ -703,15 +628,11 @@ impl CpuReduceClient {
                 let realized = crate::distributed::realized_work::is_realized(
                     hdr_weight.get(),
                 );
-                let t = match (armed_dsts.as_deref(), staging.as_deref_mut()) {
-                    (Some(dsts), _) if realized => {
+                let t = match armed_dsts.as_deref() {
+                    Some(dsts) if realized => {
                         decode_into_dst(i, &payload, dsts, &mut dst_fallback)?
                     }
-                    (Some(_), _) => payload_to_cpu_tensor(i, &payload)?,
-                    (None, Some(slot)) => {
-                        decode_into_slot(i, &payload, slot, &mut pin_fallback)?
-                    }
-                    (None, None) => payload_to_cpu_tensor(i, &payload)?,
+                    _ => payload_to_cpu_tensor(i, &payload)?,
                 };
                 out.push(t);
                 if prof {
@@ -723,17 +644,6 @@ impl CpuReduceClient {
         )?;
         let leftover = body.limit();
         finish_framed_body(hdr.is_some(), leftover)?;
-        if let Some(msg) = pin_fallback
-            && !self.pinned_decode_fallback_logged
-        {
-            self.pinned_decode_fallback_logged = true;
-            eprintln!(
-                "flodl cpu_reduce: rank {} decode staging could not be pinned \
-                 ({msg}); reusing pageable staging (H2D writeback degrades to \
-                 a synchronous bounce copy)",
-                self.rank_id,
-            );
-        }
         if let Some(msg) = dst_fallback
             && !self.decode_dst_fallback_logged
         {
@@ -1215,16 +1125,25 @@ fn payload_wire_dtype(i: usize, p: &TensorPayload) -> Result<DType> {
 /// clone of it. The reply mirrors the sent frame's schema by protocol,
 /// so a shape mismatch is a LOUD wire-drift error, never a realloc
 /// (reallocating caller-owned staging would silently break the
-/// aliasing the RAM-neutral decode rides on). Under a bf16 wire the
-/// `copy_` upcasts into the f32 destination, same as the slot path.
+/// aliasing the RAM-neutral decode rides on).
+///
+/// Dtype pairings: matching wire/destination dtypes decode as a plain
+/// memcpy (f32 wire → f32 staging; bf16 wire → the bf16 params
+/// staging, VERBATIM — the fold ran in f32 controller-side and the
+/// reply is bf16 on the wire regardless, so the bf16 staging holds
+/// exactly the information an upcast copy would); a bf16 payload into
+/// an f32 destination upcasts via `copy_` (the buffers staging, which
+/// stays f32 under a bf16 wire).
 ///
 /// Refused destinations (fresh-alloc fallback + once-per-run notice
 /// via `fallback`): non-CPU — the degenerate double-failure snapshot
 /// path can ship live CUDA tensors, and decoding into those would
 /// write the consensus into live params from the bridge thread on the
-/// wrong stream; non-f32 — the decode output contract is f32 (the
-/// divergence math and writeback consume f32 today), which a bf16
-/// destination would silently quantize.
+/// wrong stream; any pairing that would DOWNCAST (an f32 payload into
+/// a narrower destination would silently quantize the consensus —
+/// structurally impossible today, since the staging is only bf16 when
+/// the wire is, but guarded rather than assumed); unknown destination
+/// dtypes.
 fn decode_into_dst(
     i: usize,
     p: &TensorPayload,
@@ -1240,10 +1159,14 @@ fn decode_into_dst(
             dsts.len(),
         )));
     };
-    if dst.device() != Device::CPU || dst.dtype() != DType::Float32 {
+    let dst_ok = dst.device() == Device::CPU
+        && (dst.dtype() == dtype
+            || (dst.dtype() == DType::Float32 && dtype == DType::BFloat16));
+    if !dst_ok {
         if fallback.is_none() {
             *fallback = Some(format!(
-                "dst[{i}] is {:?} on {:?} (need f32 on CPU)",
+                "dst[{i}] is {:?} on {:?} against a {dtype:?} payload \
+                 (need CPU, same dtype or an f32 dst for a bf16 payload)",
                 dst.dtype(),
                 dst.device(),
             ));
@@ -1267,81 +1190,6 @@ fn decode_into_dst(
         .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
     dst.copy_(&wire, false)?;
     Ok(dst.clone())
-}
-
-/// Decode ONE payload into `slot[i]` — a REUSED f32 CPU staging tensor
-/// (pinned when the platform allows, see [`reused_decode_buffer`]) —
-/// and return a shallow clone of it. The buffer is allocated on first
-/// use and replaced if the payload shape ever changes at its index
-/// (the model schema is fixed for a run, so in practice each buffer is
-/// allocated exactly once). Under a bf16 wire the `copy_` performs the
-/// upcast directly into the staging — same work as the fresh-alloc
-/// path, one transient fewer; under an f32 wire the `from_blob`
-/// transient costs one extra host memcpy — the price of a stable,
-/// pinned destination for the consumer's async H2D.
-fn decode_into_slot(
-    i: usize,
-    p: &TensorPayload,
-    slot: &mut Vec<Tensor>,
-    pin_fallback: &mut Option<String>,
-) -> Result<Tensor> {
-    let dtype = payload_wire_dtype(i, p)?;
-    let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
-    if i > slot.len() {
-        // The streamed reader hands payloads out in order; a hole means
-        // that contract broke, not that the frame is malformed.
-        return Err(TensorError::new(&format!(
-            "cpu_reduce: decode staging skipped an index (payload {i}, \
-             staged {})",
-            slot.len(),
-        )));
-    }
-    if i == slot.len() {
-        slot.push(reused_decode_buffer(&shape, pin_fallback)?);
-    } else if slot[i].shape() != shape {
-        slot[i] = reused_decode_buffer(&shape, pin_fallback)?;
-    }
-    let dst = &slot[i];
-    if p.is_elided() && p.numel() > 0 {
-        // Wire zero-elision: no bytes came — the payload is zeros of
-        // its declared shape, written straight into the staging.
-        dst.zero_()?;
-        return Ok(dst.clone());
-    }
-    let wire = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
-        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
-    dst.copy_(&wire, false)?;
-    Ok(dst.clone())
-}
-
-/// Allocate one reusable f32 CPU decode staging tensor, pinned
-/// (page-locked) when the platform allows. Pinned is what makes the
-/// consumer's `copy_(non_blocking)` H2D a true `cudaMemcpyAsync`; when
-/// pinning fails (no CUDA runtime), the plain buffer keeps the reuse —
-/// no per-window model-sized alloc — and the caller records the
-/// failure for a once-per-run notice.
-fn reused_decode_buffer(
-    shape: &[i64],
-    pin_fallback: &mut Option<String>,
-) -> Result<Tensor> {
-    let opts = TensorOptions {
-        dtype: DType::Float32,
-        device: Device::CPU,
-    };
-    let plain = Tensor::empty(shape, opts)?;
-    match plain.pin_memory() {
-        Ok(pinned) => Ok(pinned),
-        Err(e) => {
-            if pin_fallback.is_none() {
-                // First line only: libtorch appends a multi-screen C++
-                // backtrace to c10 errors, useless in a one-shot notice.
-                let msg = e.to_string();
-                *pin_fallback =
-                    Some(msg.lines().next().unwrap_or("").to_string());
-            }
-            Ok(plain)
-        }
-    }
 }
 
 #[cfg(test)]

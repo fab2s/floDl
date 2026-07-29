@@ -80,6 +80,55 @@ fn test_worker_load_averaged() {
 }
 
 #[test]
+fn test_worker_load_averaged_bf16_update() {
+    // A bf16-wire consensus arrives as bf16 CPU tensors (the decode
+    // lands verbatim in the bf16 snapshot staging). On CUDA the
+    // writeback must stage through the device-side bf16 bounce — a
+    // direct copy_ would cast on the SOURCE device into a pageable f32
+    // temp (see `h2d_copy_via_bounce`) — and on CPU the direct copy_
+    // upcast is fine; the values must land identically either way.
+    // All values bf16-exact, so nothing is lost to rounding.
+    let (mut worker, _ch) = make_test_worker();
+
+    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let new_weight = Tensor::full(&[2, 4], 3.0, cpu)
+        .unwrap()
+        .to_dtype(DType::BFloat16)
+        .unwrap();
+    let new_bias = Tensor::full(&[2], -1.0, cpu)
+        .unwrap()
+        .to_dtype(DType::BFloat16)
+        .unwrap();
+
+    let update = AveragedParams {
+        params: vec![new_weight, new_bias],
+        buffers: vec![],
+        version: 43,
+    };
+    worker.load_averaged(&update).unwrap();
+
+    if let Device::CUDA(idx) = test_device() {
+        crate::tensor::cuda_synchronize(idx);
+    }
+
+    // Params stay f32 and carry the bf16-exact consensus values.
+    let w = worker.param_vars[0].data();
+    assert_eq!(w.dtype(), DType::Float32);
+    for (i, v) in w.to_f32_vec().unwrap().iter().enumerate() {
+        assert!((v - 3.0).abs() < 1e-6, "weight[{i}]: want 3.0, got {v}");
+    }
+    for (i, v) in worker.param_vars[1]
+        .data()
+        .to_f32_vec()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert!((v + 1.0).abs() < 1e-6, "bias[{i}]: want -1.0, got {v}");
+    }
+}
+
+#[test]
 fn test_worker_load_averaged_easgd_blends() {
     // EASGD elastic blend: `W := (1-α)·W + α·W_avg`, per element. This is
     // the first value-level pin of the `Some(alpha)` arm (every other
@@ -134,6 +183,52 @@ fn test_worker_load_averaged_easgd_blends() {
         assert!(
             (post - want).abs() < 1e-5,
             "bias[{i}]: want {want}, got {post} (pre {pre})"
+        );
+    }
+}
+
+#[test]
+fn test_worker_load_averaged_easgd_blends_bf16_update() {
+    // EASGD blend fed a bf16-wire consensus: the update hops through the
+    // bf16 bounce into the f32 lerp staging (on CUDA), so the lerp always
+    // reads f32 — the blend math must match the f32-update test exactly
+    // when the averaged values are bf16-exact.
+    let alpha = 0.25;
+    let (mut worker, _ch) = make_test_worker_customized(0, 1, 4, |c| {
+        c.policy = ApplyPolicy::Async;
+        c.easgd_alpha = Some(alpha);
+    });
+
+    let pre_w = worker.param_vars[0].data().to_f32_vec().unwrap();
+
+    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let avg_w_val = 3.0; // bf16-exact
+    let update = AveragedParams {
+        params: vec![
+            Tensor::full(&[2, 4], avg_w_val, cpu)
+                .unwrap()
+                .to_dtype(DType::BFloat16)
+                .unwrap(),
+            Tensor::full(&[2], -1.0, cpu)
+                .unwrap()
+                .to_dtype(DType::BFloat16)
+                .unwrap(),
+        ],
+        buffers: vec![],
+        version: 8,
+    };
+    worker.load_averaged(&update).unwrap();
+
+    if let Device::CUDA(idx) = test_device() {
+        crate::tensor::cuda_synchronize(idx);
+    }
+
+    let post_w = worker.param_vars[0].data().to_f32_vec().unwrap();
+    for (i, (pre, post)) in pre_w.iter().zip(&post_w).enumerate() {
+        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * avg_w_val as f32;
+        assert!(
+            (post - want).abs() < 1e-5,
+            "weight[{i}]: want {want}, got {post} (pre {pre})"
         );
     }
 }
