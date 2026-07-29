@@ -171,6 +171,46 @@ commands:
     }
 
     #[test]
+    fn discovery_allows_empty_workers_and_parses_its_knobs() {
+        // A roster-free controller block: discovery mode, join
+        // credential, loopback-only bind — the C2 cloud shape.
+        let yaml = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /tmp/test-discovery
+    join:
+      discovery: true
+      min_rank_start: 2
+      token: 0123456789abcdef0123456789abcdef
+      tunnel_only: true
+  workers: []
+";
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let cluster = cfg.cluster.as_ref().unwrap();
+        cluster
+            .validate()
+            .expect("empty workers must pass under discovery");
+        let join = cluster.controller.join.as_ref().expect("join block");
+        assert_eq!(join.discovery, Some(true));
+        assert_eq!(join.min_rank_start, Some(2));
+        assert_eq!(
+            join.token.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(join.tunnel_only, Some(true));
+        // The knobs survive the canonical JSON hand-off to the launcher.
+        let json = serde_json::to_value(cluster).unwrap();
+        assert_eq!(json["controller"]["join"]["discovery"], true);
+        assert_eq!(json["controller"]["join"]["tunnel_only"], true);
+        assert_eq!(
+            json["controller"]["join"]["token"],
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
     fn validate_rejects_missing_socket_ifname_when_multi_host() {
         let mut cfg: ProjectConfig =
             serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();

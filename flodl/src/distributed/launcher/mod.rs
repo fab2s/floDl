@@ -538,29 +538,104 @@ fn validate_tunnel_topology(
         .all(|w| w.tunnel))
 }
 
+/// Validate the discovery-family knob combinations and resolve the
+/// run's session salt: the configured `token` verbatim, or a fresh
+/// 128-bit salt. Loud on contradictions — `tunnel_only` outside
+/// discovery mode (an enumerated roster already infers the bind scope
+/// from its `tunnel:` flags), a token alongside `open_admission: true`
+/// (a configured credential means admission checks it), and a token
+/// that is not exactly [`SESSION_SALT_BYTES`] of hex.
+///
+/// [`SESSION_SALT_BYTES`]: crate::distributed::wire::SESSION_SALT_BYTES
+fn resolve_session_salt(
+    knobs: &JoinKnobs,
+) -> Result<crate::distributed::wire::SessionSalt> {
+    let discovery = knobs.discovery.unwrap_or(false);
+    if knobs.tunnel_only.unwrap_or(false) && !discovery {
+        return Err(TensorError::new(
+            "cluster launcher: `controller.join.tunnel_only` is a \
+             discovery-mode knob — an enumerated roster already infers the \
+             bind scope from its per-worker `tunnel:` flags",
+        ));
+    }
+    if knobs.token.is_some() && knobs.open_admission == Some(true) {
+        return Err(TensorError::new(
+            "cluster launcher: `controller.join.token` and `open_admission: \
+             true` contradict — a configured token means admission is \
+             credential-authenticated; drop one of them",
+        ));
+    }
+    match &knobs.token {
+        Some(hex) => {
+            let bytes =
+                crate::distributed::cluster::hex_decode(hex.trim()).map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: controller.join.token hex-decode \
+                         failed: {e}"
+                    ))
+                })?;
+            let want = crate::distributed::wire::SESSION_SALT_BYTES;
+            let got = bytes.len();
+            <[u8; crate::distributed::wire::SESSION_SALT_BYTES]>::try_from(bytes)
+                .map_err(|_| {
+                    TensorError::new(&format!(
+                        "cluster launcher: controller.join.token must be \
+                         {want} bytes ({} hex chars), got {got} bytes",
+                        want * 2,
+                    ))
+                })
+        }
+        None => Ok(crate::distributed::wire::generate_session_salt()),
+    }
+}
+
 /// Fan-out derivation of the join-window quorum knobs: the configured
 /// topology IS the capacity fan-out just started, so by default the
 /// window closes the instant all of it is in (zero added latency vs the
 /// direct-spawn era) and the run cannot start below it (same
 /// all-or-nothing semantics). Every `controller.join:` field the user
 /// set overrides its derived default; the hard cap stretches to cover
-/// an enlarged window rather than failing validation.
+/// an enlarged window rather than failing validation. Discovery mode
+/// derives from the window instead of the roster: the quorum must be
+/// explicit and the early-close target stays unset unless asked for.
 fn derive_join_config(
     knobs: Option<&JoinKnobs>,
     capacity: usize,
-) -> crate::distributed::membership::JoinConfig {
+) -> Result<crate::distributed::membership::JoinConfig> {
     let defaults = crate::distributed::membership::JoinConfig::default();
     let knobs = knobs.cloned().unwrap_or_default();
     let join_timeout_secs = knobs.join_timeout_secs.unwrap_or(defaults.join_timeout_secs);
-    crate::distributed::membership::JoinConfig {
-        min_rank_start: knobs.min_rank_start.unwrap_or(capacity),
+    let discovery = knobs.discovery.unwrap_or(false);
+    // Discovery has no roster capacity to derive the quorum from, and
+    // silently defaulting it would let a single walk-in start a world
+    // meant for eight — the operator states it. The early-close target
+    // stays unset unless asked for: with an unknown fleet the full
+    // window runs (target-count auto-close remains available when the
+    // provisioned count IS known).
+    let (min_rank_start, target_ranks) = if discovery {
+        let quorum = knobs.min_rank_start.ok_or_else(|| {
+            TensorError::new(
+                "cluster launcher: `controller.join.discovery: true` requires \
+                 an explicit `min_rank_start` — a roster-free window has no \
+                 configured capacity to derive the quorum from",
+            )
+        })?;
+        (quorum, knobs.target_ranks)
+    } else {
+        (
+            knobs.min_rank_start.unwrap_or(capacity),
+            Some(knobs.target_ranks.unwrap_or(capacity)),
+        )
+    };
+    Ok(crate::distributed::membership::JoinConfig {
+        min_rank_start,
         join_timeout_secs,
-        target_ranks: Some(knobs.target_ranks.unwrap_or(capacity)),
+        target_ranks,
         max_join_timeout_secs: knobs
             .max_join_timeout_secs
             .unwrap_or(defaults.max_join_timeout_secs.max(join_timeout_secs)),
         open_admission: knobs.open_admission.unwrap_or(false),
-    }
+    })
 }
 
 /// Build the formed world's topology from the join-window membership.
@@ -574,6 +649,7 @@ fn synthesize_world<'a>(
     config: &FullCluster,
     members: impl Iterator<Item = &'a crate::distributed::membership::JoinedMember>,
     salt: crate::distributed::wire::SessionSalt,
+    bind_loopback: bool,
 ) -> FullCluster {
     let workers: Vec<FullWorker> = members
         .map(|m| match config.workers.iter().find(|w| w.host == m.host) {
@@ -590,7 +666,12 @@ fn synthesize_world<'a>(
                 path: String::new(),
                 arch: None,
                 ssh: None,
-                tunnel: false,
+                // On a loopback-bound mux a walk-in can only have
+                // arrived through an sshd forward, so its rank children
+                // must dial their loopback end of that forward too — a
+                // config-host address would point at a port that is
+                // unreachable except through sshd.
+                tunnel: bind_loopback,
                 env: Default::default(),
             },
         })
@@ -659,11 +740,16 @@ pub fn run_launcher_with_config(
     use crate::distributed::membership;
 
     claim_cluster_entry("launcher")?;
-    // Fresh 128-bit session salt per launcher invocation. Becomes the
-    // HMAC key for every cross-process control + data frame; handed to
-    // workers at admission (pre-shared via the agent spec in rig mode,
-    // in the accept reply under open admission).
-    let salt = crate::distributed::wire::generate_session_salt();
+    // Discovery-family knobs, validated before anything binds or spawns.
+    let knobs = full.controller.join.clone().unwrap_or_default();
+    let tunnel_only = knobs.tunnel_only.unwrap_or(false);
+    // Session salt: the HMAC key for every cross-process control + data
+    // frame, handed to workers at admission (pre-shared via the agent
+    // spec in rig mode, in the accept reply under open admission). A
+    // configured join token IS the salt — injected at fleet-create time
+    // so walk-ins can present it — otherwise a fresh 128-bit salt is
+    // generated per launcher invocation.
+    let salt = resolve_session_salt(&knobs)?;
     let full = full.with_session_salt(salt);
     let me = crate::distributed::cluster::resolve_hostname()?;
 
@@ -679,8 +765,35 @@ pub fn run_launcher_with_config(
     let relay_data_channel = has_coord && !backend_is_nccl;
 
     // Tunnel topology validation (loud, before anything binds or
-    // spawns) + the resulting controller bind scope.
-    let bind_loopback = validate_tunnel_topology(&full, &me, backend_is_nccl)?;
+    // spawns) + the resulting controller bind scope. `tunnel_only`
+    // forces the loopback bind with no roster to infer it from; it
+    // rides the same CPU-mode constraint as per-worker tunnels (NCCL's
+    // peer-to-peer data plane cannot ride a controller tunnel).
+    if tunnel_only && backend_is_nccl {
+        return Err(TensorError::new(
+            "cluster launcher: `controller.join.tunnel_only` requires a CPU \
+             ElChe mode (cpu_sync / cpu_cadence / cpu_async) — NCCL's data \
+             plane is peer-to-peer and cannot ride a controller tunnel",
+        ));
+    }
+    // A loopback-bound mux is unreachable except through sshd, so any
+    // enumerated remote worker that is not itself tunneled could never
+    // dial in — its fan-out agent would idle the window to the hard cap.
+    if tunnel_only
+        && let Some(w) = full
+            .workers
+            .iter()
+            .find(|w| w.host != me && !w.tunnel && !w.ranks.is_empty())
+    {
+        return Err(TensorError::new(&format!(
+            "cluster launcher: `controller.join.tunnel_only` binds the \
+             controller loopback-only, but enumerated worker {:?} is not \
+             `tunnel: true` and could never reach it",
+            w.host,
+        )));
+    }
+    let bind_loopback =
+        validate_tunnel_topology(&full, &me, backend_is_nccl)? || tunnel_only;
 
     // Single-port mux: every controller-side channel (join, NCCL
     // rendezvous, CPU-reduce data, coordinator control) accepts on ONE
@@ -771,8 +884,17 @@ pub fn run_launcher_with_config(
     let join_config = derive_join_config(
         full.controller.join.as_ref(),
         capacity,
-    );
-    let open_admission = membership::resolve_open_admission(&join_config, bind_loopback);
+    )?;
+    // A configured token forces credential-authenticated admission even
+    // behind a loopback bind: the sshd guardrail and the token are
+    // LAYERS (reachability + possession), not alternatives — an
+    // operator who configured a credential gets a window that checks
+    // it. Without a token, bind scope decides as usual.
+    let open_admission = if knobs.token.is_some() {
+        false
+    } else {
+        membership::resolve_open_admission(&join_config, bind_loopback)
+    };
     let gate_config = join_config.clone();
     let gate_salt = salt;
     let gate_abort = Arc::clone(&abort);
@@ -1056,6 +1178,7 @@ pub fn run_launcher_with_config(
         &full,
         formed_workers.iter().map(|aw| &aw.member),
         salt,
+        bind_loopback,
     );
     let my_host_idx = world.workers.iter().position(|h| h.host == me);
 

@@ -135,6 +135,27 @@
 #                      A loopback bind (all workers tunneled) is open by
 #                      construction: reachability through sshd IS the
 #                      authentication.
+#   discovery:         roster-free formation — the window alone defines
+#                      the world. `workers:` may be empty; walk-ins
+#                      self-register against the bind address + credential
+#                      (an enumerated roster still fans out as usual and
+#                      walk-ins join alongside it). Requires an explicit
+#                      `min_rank_start` (no capacity to derive the quorum
+#                      from) and closes only on `target_ranks` or the
+#                      window — set a target when the provisioned count
+#                      is known.
+#   token:             pre-shared session salt, hex (32 chars / 16 bytes),
+#                      replacing the per-run generated salt. Inject it at
+#                      fleet-create time; walk-ins present it as their
+#                      join credential. Forces credential-checked
+#                      admission even behind sshd (the guardrails and the
+#                      token are layers, not alternatives); contradicts
+#                      `open_admission: true` (loud error).
+#   tunnel_only:       discovery-only — bind the controller loopback-only
+#                      with no roster to infer it from: every walk-in must
+#                      arrive through an sshd-carried forward, making
+#                      reachability itself the authentication. Requires a
+#                      CPU averaging mode (like per-worker `tunnel: true`).
 
 cluster:
   controller:
