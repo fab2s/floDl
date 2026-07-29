@@ -529,18 +529,8 @@ impl DdpHandle {
                 // Model frames ride bf16 when configured (Control frames
                 // — including the initial broadcast below — stay f32).
                 client.set_bf16_wire(config.elche.bf16_wire);
-                // Barrier-paced CUDA consumers decode Model replies into
-                // reused pinned staging, making `load_averaged`'s
-                // `copy_(non_blocking)` a true async H2D (a pageable
-                // source degrades to a synchronous bounce copy). Async
-                // keeps the fresh-alloc decode: its control channel has
-                // two producers with only per-producer FIFO, so a second
-                // Update can be live while the first is unapplied — a
-                // single staging set cannot survive that (see
-                // `set_pinned_decode`'s single-consumer contract).
-                client.set_pinned_decode(
-                    device.is_cuda() && policy.is_barrier_paced(),
-                );
+                // Pinned decode is armed below, once the model exists and
+                // its staging size is known (the RAM gate needs it).
                 Some(client)
             }
             None => None,
@@ -559,11 +549,53 @@ impl DdpHandle {
             .buffers().iter().map(|b| b.get()).collect();
         // Model-derived frame ceiling for this rank's length-prefixed readers,
         // installed BEFORE the first framed read (the bootstrap consensus).
-        {
+        // The f32 wire byte total doubles as the pinned-decode staging size
+        // (the decode staging is always f32 whatever the wire dtype).
+        let staging_bytes = {
             use crate::distributed::wire;
             let wire_bytes = wire::tensors_wire_bytes(&initial_params_local)
                 + wire::tensors_wire_bytes(&initial_buffers_local);
             wire::set_frame_ceiling(wire::derive_frame_ceiling(wire_bytes));
+            wire_bytes
+        };
+        // Barrier-paced CUDA consumers decode Model replies into reused
+        // PINNED staging, making `load_averaged`'s `copy_(non_blocking)` a
+        // true async H2D (a pageable source degrades to a synchronous
+        // bounce copy) — but only when this host can afford to lock a
+        // model copy per local rank: locked pages are unswappable, and on
+        // a RAM-tight host they evict the per-window working set instead
+        // (measured on the rig as +6-8% epoch wall, all of it swap thrash
+        // inside the reduce windows — see `pinned_decode_affordable`).
+        // The fallback is the known-good fresh-alloc decode. Async always
+        // keeps fresh-alloc decode: its control channel has two producers
+        // with only per-producer FIFO, so a second Update can be live
+        // while the first is unapplied — a single staging set cannot
+        // survive that (see `set_pinned_decode`'s single-consumer
+        // contract).
+        if let Some(client) = &mut cpu_client
+            && device.is_cuda()
+            && policy.is_barrier_paced()
+        {
+            let local_ranks = cluster
+                .this_worker()
+                .map(|w| w.ranks.len())
+                .unwrap_or(1);
+            let affordable = crate::sys::mem_info().is_some_and(|m| {
+                crate::distributed::cpu_reduce::pinned_decode_affordable(
+                    staging_bytes as u64,
+                    local_ranks,
+                    m.available_bytes,
+                )
+            });
+            client.set_pinned_decode(affordable);
+            if !affordable {
+                crate::verbose!(
+                    "ddp: rank {global_rank} pinned consensus decode disabled \
+                     (RAM headroom: staging {}MB x {local_ranks} local rank(s) \
+                     needs more MemAvailable); using fresh-alloc decode",
+                    staging_bytes / (1 << 20),
+                );
+            }
         }
         match (&nccl_comm, &mut cpu_client) {
             (Some(comm), _) => {
