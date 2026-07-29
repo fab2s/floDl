@@ -7,40 +7,116 @@ use std::fmt::Write;
 use crate::analyze::{RankResStats, RunAnalysis};
 use super::ModelRef;
 
-/// A run's rank-derived stats for remote hosts only — hosts the
-/// controller's dense local poller cannot see. Without a controller
-/// stamp (timelines predating it) every host-qualified entry counts as
-/// remote: truthful columns, possibly duplicating a local device's
-/// coverage. Empty-host entries (depositor had no topology) are
-/// skipped — they cannot be labeled.
-fn remote_rank_stats(r: &RunAnalysis) -> impl Iterator<Item = &RankResStats> {
-    r.rank_res.iter().filter(|s| {
-        !s.host.is_empty() && Some(s.host.as_str()) != r.controller_host.as_deref()
-    })
+/// A run's host-qualified rank stats. Empty-host entries (depositor
+/// had no topology) are skipped — they cannot be labeled.
+fn hosted_rank_stats(r: &RunAnalysis) -> impl Iterator<Item = &RankResStats> {
+    r.rank_res.iter().filter(|s| !s.host.is_empty())
 }
 
-/// Rank stats on the controller's own host — the devices that fold into
-/// the dense `GPUd` columns. Empty when there is no controller stamp
-/// (then every host-qualified rank is remote instead).
-fn local_rank_stats(r: &RunAnalysis) -> impl Iterator<Item = &RankResStats> {
-    r.rank_res.iter().filter(move |s| {
-        r.controller_host.as_deref().is_some_and(|c| s.host == c)
-    })
-}
-
-/// The bare-`GPUd` device set for a run: the local poller's devices,
-/// unioned with any controller-host rank devices that fold in. Both are
-/// host-physical indices in the controller box's NVML domain (same
-/// box), so they share a numbering — the union never conflates hosts.
-fn local_device_union(r: &RunAnalysis) -> Vec<u8> {
-    let mut devices: Vec<u8> = r.gpu_devices.clone();
-    for s in local_rank_stats(r) {
-        if !devices.contains(&s.device) {
-            devices.push(s.device);
+/// Physical-device fingerprints from every host-qualified rank sample
+/// in `runs`: `(device id, VRAM total) → host`. Fingerprints that
+/// collide across hosts (two boxes with the same device index AND the
+/// same VRAM size) are removed — identity folding only ever acts on a
+/// unique physical match, never a guess.
+fn host_fingerprints(runs: &[RunAnalysis]) -> Vec<((u8, u64), String)> {
+    let mut prints: Vec<((u8, u64), String)> = Vec::new();
+    let mut dead: Vec<(u8, u64)> = Vec::new();
+    for r in runs {
+        for s in hosted_rank_stats(r) {
+            let Some(vt) = s.vram_total else { continue };
+            let key = (s.device, vt);
+            if dead.contains(&key) {
+                continue;
+            }
+            match prints.iter().position(|(k, _)| *k == key) {
+                Some(i) if prints[i].1 != s.host => {
+                    prints.remove(i);
+                    dead.push(key);
+                }
+                Some(_) => {}
+                None => prints.push((key, s.host.clone())),
+            }
         }
     }
-    devices.sort_unstable();
-    devices
+    prints
+}
+
+/// The host that owns a run's DENSE (local-poller) devices, so they can
+/// render under host-qualified columns instead of ambiguous bare
+/// `GPUd` labels (a bare column means different hardware depending on
+/// which box a row's poller ran on — pascal solos vs the controller).
+///
+/// Resolution order: the controller stamp when present; otherwise the
+/// physical fingerprint `(device id, VRAM total)` of every dense device
+/// matched against the group's rank-reported samples — all dense
+/// devices must resolve to the SAME single host (one poller, one box),
+/// anything else returns `None` and the run keeps bare columns plus the
+/// legend.
+fn dense_host(r: &RunAnalysis, prints: &[((u8, u64), String)]) -> Option<String> {
+    if let Some(h) = &r.controller_host {
+        return Some(h.clone());
+    }
+    let mut host: Option<&str> = None;
+    for v in &r.vram_stats {
+        let key = (v.device, v.total);
+        let h = prints.iter().find(|(k, _)| *k == key).map(|(_, h)| h.as_str())?;
+        match host {
+            None => host = Some(h),
+            Some(prev) if prev != h => return None,
+            Some(_) => {}
+        }
+    }
+    // Every dense device carries a vram_stats entry (same sample
+    // stream), so an empty vram_stats means no dense devices — nothing
+    // to label either way.
+    if r.gpu_devices.is_empty() {
+        return None;
+    }
+    host.map(str::to_string)
+}
+
+/// `(hosted columns, bare fallback columns, per-run dense hosts)` —
+/// the return shape of [`gpu_columns`].
+type GpuColumns = (Vec<(String, u8)>, Vec<u8>, Vec<Option<String>>);
+
+/// The unified GPU column set for a group of runs: host-qualified
+/// `(host, device)` columns from rank samples AND from dense devices
+/// whose host resolved (see [`dense_host`]), plus bare `device`
+/// leftovers for dense devices that could not be attributed.
+fn gpu_columns(
+    runs: &[RunAnalysis],
+    prints: &[((u8, u64), String)],
+) -> GpuColumns {
+    let dense_hosts: Vec<Option<String>> =
+        runs.iter().map(|r| dense_host(r, prints)).collect();
+    let mut hosted: Vec<(String, u8)> = Vec::new();
+    let mut bare: Vec<u8> = Vec::new();
+    for (r, dh) in runs.iter().zip(&dense_hosts) {
+        for s in hosted_rank_stats(r) {
+            let key = (s.host.clone(), s.device);
+            if !hosted.contains(&key) {
+                hosted.push(key);
+            }
+        }
+        for d in &r.gpu_devices {
+            match dh {
+                Some(h) => {
+                    let key = (h.clone(), *d);
+                    if !hosted.contains(&key) {
+                        hosted.push(key);
+                    }
+                }
+                None => {
+                    if !bare.contains(d) {
+                        bare.push(*d);
+                    }
+                }
+            }
+        }
+    }
+    hosted.sort();
+    bare.sort_unstable();
+    (hosted, bare, dense_hosts)
 }
 
 /// Merge rank-derived VRAM stats for one (host, device) into
@@ -115,51 +191,32 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
         let _ = writeln!(md, "> Published: {}\n", r.note);
     }
 
-    // Header — one column per sampled device id (union across the group's
-    // runs), labeled by the host-physical id the timeline recorded. A run
-    // that never sampled a device renders `-` (not sampled), never a fake 0%.
-    // Includes controller-host rank devices that fold into these columns.
-    let mut devices: Vec<u8> = Vec::new();
-    for r in runs {
-        for d in local_device_union(r) {
-            if !devices.contains(&d) {
-                devices.push(d);
-            }
-        }
-    }
-    devices.sort_unstable();
-
-    // Remote-host columns from rank-reported samples, keyed by
-    // (host, device) — device ids collide across hosts, so a bare
-    // device id can never label a remote column.
-    let mut remote: Vec<(String, u8)> = Vec::new();
-    for r in runs {
-        for s in remote_rank_stats(r) {
-            let key = (s.host.clone(), s.device);
-            if !remote.contains(&key) {
-                remote.push(key);
-            }
-        }
-    }
-    remote.sort();
+    // Header — one column per PHYSICAL device: host-qualified wherever
+    // the device's box is known (rank samples carry it; dense-poller
+    // devices resolve via the controller stamp or the group's physical
+    // fingerprints — see `dense_host`), bare `GPUd` only as the
+    // fallback for dense devices no identity reached. A run that never
+    // sampled a device renders `-` (not sampled), never a fake 0%.
+    let prints = host_fingerprints(runs);
+    let (hosted, bare, dense_hosts) = gpu_columns(runs, &prints);
 
     let _ = write!(md, "| Mode | Loss |");
     if has_eval { md.push_str(" Eval |"); }
     if has_delta { md.push_str(" vs Ref |"); }
     md.push_str(" Total (s) | Syncs | Avg Sync (ms) |");
-    for d in &devices { let _ = write!(md, " GPU{d} |"); }
-    for (h, d) in &remote { let _ = write!(md, " {h}:GPU{d} |"); }
+    for (h, d) in &hosted { let _ = write!(md, " {h}:GPU{d} |"); }
+    for d in &bare { let _ = write!(md, " GPU{d} |"); }
     md.push_str(" Idle (s) |\n");
 
     let _ = write!(md, "|------|------|");
     if has_eval { md.push_str("------|"); }
     if has_delta { md.push_str("--------|"); }
     md.push_str("-----------|-------|--------------|");
-    for _ in &devices { md.push_str("------|"); }
-    for _ in &remote { md.push_str("------|"); }
+    for _ in &hosted { md.push_str("------|"); }
+    for _ in &bare { md.push_str("------|"); }
     md.push_str("----------|\n");
 
-    for r in runs {
+    for (r, dh) in runs.iter().zip(&dense_hosts) {
         // `+ 0.0` normalizes the negative zero that an empty-iterator
         // `sum::<f64>()` yields (common now: a dedicated controller with
         // GPU polling gated off has no idle_by_cause entries) so the
@@ -198,35 +255,27 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
             r.sync_count,
             r.avg_sync_ms,
         );
-        for d in &devices {
-            match r.gpu_devices.iter().position(|x| x == d) {
-                Some(i) => {
-                    let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
-                    let _ = write!(md, " {pct:.0}% |");
-                }
-                // Not in the dense poller, but a controller-host rank
-                // folds here: use its sparse mean util (`~` marker).
-                None => match local_rank_stats(r)
-                    .filter(|s| s.device == *d)
-                    .find_map(|s| s.mean_util)
-                {
-                    Some(u) => { let _ = write!(md, " ~{u:.0}% |"); }
-                    None => md.push_str(" - |"),
-                },
+        // Hosted cells: the dense poller's active% wins when this run's
+        // dense devices resolved to the column's host (dense sampling,
+        // no `~`); otherwise the sparse rank-reported MEAN util (`~`
+        // marks reduce-window cadence). NVML's util is already a ~1s
+        // rolling mean, so a sparse sample above the 5% active
+        // threshold is near-certain on any working GPU — the dense
+        // active% indicator degenerates to ~100% at sparse cadence,
+        // while the mean of an already-time-averaged signal is the
+        // honest sparse duty-cycle estimator. Ranks sharing a device
+        // merge sample-count-weighted (1:1 in practice).
+        for (h, d) in &hosted {
+            if dh.as_deref() == Some(h.as_str())
+                && let Some(i) = r.gpu_devices.iter().position(|x| x == d)
+            {
+                let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
+                let _ = write!(md, " {pct:.0}% |");
+                continue;
             }
-        }
-        // Remote cells: sparse MEAN util (`~` marks reduce-window
-        // cadence). NVML's util is already a ~1s rolling mean, so a
-        // sparse sample above the 5% active threshold is near-certain
-        // on any working GPU — the dense columns' active% indicator
-        // degenerates to ~100% here, while the mean of an
-        // already-time-averaged signal is the honest sparse duty-cycle
-        // estimator. Ranks sharing a device merge sample-count-weighted
-        // (1:1 in practice).
-        for (h, d) in &remote {
             let mut w = 0usize;
             let mut sum = 0.0;
-            for s in remote_rank_stats(r)
+            for s in hosted_rank_stats(r)
                 .filter(|s| &s.host == h && s.device == *d)
             {
                 if let Some(u) = s.mean_util {
@@ -238,6 +287,16 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
                 let _ = write!(md, " ~{:.0}% |", sum / w as f64);
             } else {
                 md.push_str(" - |");
+            }
+        }
+        // Bare fallback columns: dense devices whose box stayed unknown.
+        for d in &bare {
+            match (dh.is_none(), r.gpu_devices.iter().position(|x| x == d)) {
+                (true, Some(i)) => {
+                    let pct = r.gpu_active_pct.get(i).copied().unwrap_or(0.0);
+                    let _ = write!(md, " {pct:.0}% |");
+                }
+                _ => md.push_str(" - |"),
             }
         }
         let _ = writeln!(md, " {total_idle_s:.1} |");
@@ -397,8 +456,36 @@ pub(super) fn write_best_mode(md: &mut String, groups: &[(String, Vec<RunAnalysi
             });
 
             let (fast_time, fast_mode) = match fastest {
-                Some(r) => (format!("{:.1}s", r.total_ms as f64 / 1000.0), r.mode.as_str()),
-                None => ("-".to_string(), "-"),
+                Some(r) => (
+                    format!("{:.1}s", r.total_ms as f64 / 1000.0),
+                    r.mode.clone(),
+                ),
+                // Nothing inside the band: name the closest mode and
+                // its eval gap instead of a bare dash that reads as
+                // missing data (a RELATIVE 2% band is microscopic on a
+                // near-zero loss-like eval — conv-ae's reconstruction
+                // MSE was the motivating case).
+                None => {
+                    let closest = solo_eval.and_then(|se| {
+                        full_runs.iter()
+                            .filter(|r| !r.mode.starts_with("solo"))
+                            .filter_map(|r| r.final_eval.map(|v| (r, v)))
+                            .min_by(|(_, a), (_, b)| {
+                                let da = if higher_is_better { se - a } else { a - se };
+                                let db = if higher_is_better { se - b } else { b - se };
+                                da.partial_cmp(&db).unwrap()
+                            })
+                            .map(|(r, v)| {
+                                let gap = if se.abs() > 1e-12 {
+                                    format!("{:+.1}%", (v - se) / se * 100.0)
+                                } else {
+                                    format!("{v:+.4} abs")
+                                };
+                                format!("none ≤2% (closest: {} {gap} eval)", r.mode)
+                            })
+                    });
+                    ("-".to_string(), closest.unwrap_or_else(|| "-".to_string()))
+                }
             };
 
             let _ = writeln!(md, "| {model} | {best_eval} | {best_mode} | {fast_time} | {fast_mode} |");
@@ -424,6 +511,17 @@ pub(super) fn write_best_mode(md: &mut String, groups: &[(String, Vec<RunAnalysi
         }
     }
     md.push('\n');
+    if has_eval {
+        md.push_str(
+            "\"Fastest (within 2% of solo-0)\" = the fastest NON-solo mode \
+whose final eval gives up no more than 2% relative quality vs solo-0 \
+(a better-than-solo eval always qualifies) — i.e. the speed a DDP mode \
+buys without paying for it in quality. The band is relative, so it is \
+strict to the point of unreachable for near-zero loss-like evals \
+(a reconstruction MSE of 0.0006 leaves a ±0.00001 band); when no mode \
+qualifies, the closest one and its eval gap are named instead.\n\n",
+        );
+    }
 }
 
 /// Eval quality table: eval difference vs solo-0 per model/mode.
@@ -607,56 +705,44 @@ because DDP runs only eval once at the end.\n\n");
 /// actual allocator bytes. Remote devices get their own
 /// `host:GPUd`-keyed columns.
 pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
-    // Columns keyed by sampled device id (union across every run), same
-    // convention as the per-model table: `-` = device not sampled by that
-    // run's timeline.
-    let mut devices: Vec<u8> = Vec::new();
-    let mut remote: Vec<(String, u8)> = Vec::new();
-    for (_, runs) in groups {
-        for r in runs {
-            for d in local_device_union(r) {
-                if !devices.contains(&d) {
-                    devices.push(d);
-                }
-            }
-            for s in remote_rank_stats(r) {
-                let key = (s.host.clone(), s.device);
-                if !remote.contains(&key) {
-                    remote.push(key);
-                }
-            }
-        }
-    }
-    devices.sort_unstable();
-    remote.sort();
+    // Same unified column convention as the per-model tables:
+    // host-qualified wherever the device's box is known, bare `GPUd`
+    // only for unattributed dense devices; `-` = not sampled.
+    let all_runs: Vec<RunAnalysis> = groups
+        .iter()
+        .flat_map(|(_, runs)| runs.iter().cloned())
+        .collect();
+    let prints = host_fingerprints(&all_runs);
+    let (hosted, bare, dense_hosts) = gpu_columns(&all_runs, &prints);
 
     md.push_str("| Model | Mode |");
-    for d in &devices { let _ = write!(md, " GPU{d} Peak (MB) | GPU{d} Mean (MB) |"); }
-    for (h, d) in &remote { let _ = write!(md, " {h}:GPU{d} Peak (MB) | {h}:GPU{d} Mean (MB) |"); }
+    for (h, d) in &hosted { let _ = write!(md, " {h}:GPU{d} Peak (MB) | {h}:GPU{d} Mean (MB) |"); }
+    for d in &bare { let _ = write!(md, " GPU{d} Peak (MB) | GPU{d} Mean (MB) |"); }
     md.push('\n');
     md.push_str("|-------|------|");
-    for _ in 0..(devices.len() + remote.len()) { md.push_str("---------------|---------------|"); }
+    for _ in 0..(hosted.len() + bare.len()) { md.push_str("---------------|---------------|"); }
     md.push('\n');
 
+    let mut run_i = 0usize;
     for (model, runs) in groups {
         for r in runs {
+            let dh = &dense_hosts[run_i];
+            run_i += 1;
             let any_nonzero = r.vram_stats.iter().any(|v| v.peak_allocated > 0)
                 || r.rank_res.iter().any(|s| s.peak_allocated.is_some());
             if !any_nonzero { continue; }
 
             let _ = write!(md, "| {} | {} |", model, r.mode);
-            for d in &devices {
-                // Rank-reported allocator bytes win when present for a
-                // controller-host device — the local poller's reading is
-                // the controller process's own (empty) allocator in any
-                // multi-process run.
-                let rank_derived = r.controller_host.as_deref().and_then(|ctrl| {
-                    merged_rank_vram(
-                        r.rank_res
-                            .iter()
-                            .filter(|s| s.host == ctrl && s.device == *d),
-                    )
-                });
+            for (h, d) in &hosted {
+                // Rank-reported allocator bytes win whenever a rank on
+                // this (host, device) sampled them — the dense poller's
+                // reading is its own process's allocator, which is empty
+                // in any multi-process run. Dense fills in solo runs
+                // (single process: the poller's allocator IS the run's).
+                let rank_derived = merged_rank_vram(
+                    hosted_rank_stats(r)
+                        .filter(|s| &s.host == h && s.device == *d),
+                );
                 if let Some((peak, mean, _)) = rank_derived {
                     let _ = write!(
                         md,
@@ -666,7 +752,14 @@ pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalys
                     );
                     continue;
                 }
-                match r.vram_stats.iter().find(|v| v.device == *d && v.peak_allocated > 0) {
+                let dense = (dh.as_deref() == Some(h.as_str()))
+                    .then(|| {
+                        r.vram_stats
+                            .iter()
+                            .find(|v| v.device == *d && v.peak_allocated > 0)
+                    })
+                    .flatten();
+                match dense {
                     Some(s) => {
                         let _ = write!(
                             md,
@@ -678,17 +771,22 @@ pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalys
                     None => md.push_str(" - | - |"),
                 }
             }
-            for (h, d) in &remote {
-                let stats = merged_rank_vram(
-                    remote_rank_stats(r).filter(|s| &s.host == h && s.device == *d),
-                );
-                match stats {
-                    Some((peak, mean, _)) => {
+            for d in &bare {
+                let dense = dh
+                    .is_none()
+                    .then(|| {
+                        r.vram_stats
+                            .iter()
+                            .find(|v| v.device == *d && v.peak_allocated > 0)
+                    })
+                    .flatten();
+                match dense {
+                    Some(s) => {
                         let _ = write!(
                             md,
                             " {} | {} |",
-                            peak / (1024 * 1024),
-                            mean / (1024 * 1024),
+                            s.peak_allocated / (1024 * 1024),
+                            s.mean_allocated / (1024 * 1024),
                         );
                     }
                     None => md.push_str(" - | - |"),
@@ -701,9 +799,13 @@ pub(super) fn write_vram_table(md: &mut String, groups: &[(String, Vec<RunAnalys
 }
 
 pub(super) fn write_idle_analysis(md: &mut String, model: &str, runs: &[RunAnalysis]) {
-    // Only show runs with idle gaps
+    // Only show runs with REPORTABLE gaps: the row loop below drops
+    // Startup-classified gaps, so gating on any-gap-at-all printed a
+    // header over an empty table for every run whose only >=500ms gaps
+    // were startup (the 2026-07-29 sweep report's empty idle section).
     let runs_with_gaps: Vec<&RunAnalysis> = runs.iter()
-        .filter(|r| !r.idle_gaps.is_empty())
+        .filter(|r| r.idle_gaps.iter()
+            .any(|g| !matches!(g.cause, crate::analyze::IdleCause::Startup)))
         .collect();
 
     if runs_with_gaps.is_empty() {
@@ -738,6 +840,21 @@ pub(super) fn write_idle_analysis(md: &mut String, model: &str, runs: &[RunAnaly
 }
 
 pub(super) fn write_idle_breakdown(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
+    // No rows → no table: headers over nothing read as broken output,
+    // not as "no idle worth reporting" (same class as the idle-analysis
+    // header fix). Say the good news explicitly instead.
+    let any_rows = groups.iter().any(|(_, runs)| {
+        runs.iter()
+            .filter(|r| !r.mode.starts_with("solo"))
+            .any(|r| r.idle_by_cause.iter().any(|c| c.total_ms >= 500.0))
+    });
+    if !any_rows {
+        md.push_str(
+            "No non-solo run accumulated >=0.5s of classified idle on a \
+dense-sampled device.\n\n",
+        );
+        return;
+    }
     md.push_str("| Model | Mode | GPU | Epoch Boundary | Sync | CPU Avg | Unexplained | Total Idle |\n");
     md.push_str("|-------|------|-----|---------------|------|---------|-------------|------------|\n");
 
@@ -856,18 +973,97 @@ mod tests {
         a
     }
 
-    /// With a controller stamp, the controller's own rank folds into
-    /// the dense local column (no `ctrl-host:GPU0` column); only the
-    /// genuinely remote host gets a `host:GPUd` column.
+    /// With a controller stamp, every device renders HOST-QUALIFIED —
+    /// the controller's rank included (`ctrl-host:GPU0`); no bare
+    /// `GPUd` column exists. (The pre-2026-07-29 convention folded the
+    /// controller's ranks into a bare dense column instead — a bare
+    /// label that meant different hardware depending on which box a
+    /// row's poller ran on, the ambiguity this scheme retired.)
     #[test]
     fn model_table_folds_controller_host() {
         let runs = vec![cluster_run(Some("ctrl-host"))];
         let mut md = String::new();
         write_model_table(&mut md, "olmo", &runs, None);
         assert!(md.contains("remote-host:GPU0"), "remote column missing:\n{md}");
-        assert!(!md.contains("ctrl-host:GPU0"), "controller host must fold:\n{md}");
-        // The remote util renders as a sparse mean with the ~ marker.
+        assert!(md.contains("ctrl-host:GPU0"), "controller column missing:\n{md}");
+        assert!(!md.contains("| GPU0 |"), "no bare column may remain:\n{md}");
+        // Both utils render as sparse means with the ~ marker (the
+        // fixture has no dense samples).
         assert!(md.contains("~80%"), "remote util missing:\n{md}");
+        assert!(md.contains("~70%"), "controller-host util missing:\n{md}");
+    }
+
+    /// A solo run's DENSE devices attribute to their host via the
+    /// physical fingerprint (device id + VRAM total) matched against a
+    /// sibling cluster run's rank samples — the pascal-solo case that
+    /// motivated the scheme: without it, solo rows rendered their
+    /// pascal-local device ids under the same bare columns as the
+    /// controller box's devices.
+    #[test]
+    fn model_table_attributes_solo_dense_by_fingerprint() {
+        // Cluster run: a rank on "pascal" device 0 with a 6GB card.
+        let mut cluster = empty_analysis("olmo", "cpu-cadence");
+        cluster.rank_res = vec![RankResStats {
+            rank: 1,
+            host: "pascal".to_string(),
+            device: 0,
+            mean_util: Some(50.0),
+            peak_allocated: Some(3_000_000_000),
+            mean_allocated: Some(3_000_000_000),
+            vram_total: Some(6_000_000_000),
+            n_samples: 5,
+        }];
+        // Solo run: dense poller sampled device 0 with the same 6GB
+        // total — physically the same card.
+        let mut solo = empty_analysis("olmo", "solo-1");
+        solo.gpu_devices = vec![0];
+        solo.gpu_active_pct = vec![97.0];
+        solo.vram_stats = vec![crate::analyze::VramStats {
+            device: 0,
+            peak_allocated: 2_000_000_000,
+            mean_allocated: 1_500_000_000,
+            total: 6_000_000_000,
+        }];
+        let runs = vec![cluster, solo];
+        let mut md = String::new();
+        write_model_table(&mut md, "olmo", &runs, None);
+        assert!(md.contains("pascal:GPU0"), "fingerprint column missing:\n{md}");
+        assert!(!md.contains("| GPU0 |"), "solo dense must not stay bare:\n{md}");
+        // The solo row's dense reading lands qualified and UNmarked
+        // (dense sampling, not sparse).
+        assert!(md.contains(" 97% |"), "solo dense util missing:\n{md}");
+    }
+
+    /// An ambiguous fingerprint (same device id + same VRAM total seen
+    /// on two hosts) must NOT fold — the run keeps the bare fallback
+    /// column rather than guessing a box.
+    #[test]
+    fn model_table_ambiguous_fingerprint_stays_bare() {
+        let mk_rank = |host: &str| RankResStats {
+            rank: 0,
+            host: host.to_string(),
+            device: 0,
+            mean_util: Some(50.0),
+            peak_allocated: None,
+            mean_allocated: None,
+            vram_total: Some(6_000_000_000),
+            n_samples: 1,
+        };
+        let mut cluster = empty_analysis("olmo", "cpu-cadence");
+        cluster.rank_res = vec![mk_rank("box-a"), mk_rank("box-b")];
+        let mut solo = empty_analysis("olmo", "solo-1");
+        solo.gpu_devices = vec![0];
+        solo.gpu_active_pct = vec![97.0];
+        solo.vram_stats = vec![crate::analyze::VramStats {
+            device: 0,
+            peak_allocated: 2_000_000_000,
+            mean_allocated: 1_500_000_000,
+            total: 6_000_000_000,
+        }];
+        let runs = vec![cluster, solo];
+        let mut md = String::new();
+        write_model_table(&mut md, "olmo", &runs, None);
+        assert!(md.contains("| GPU0 |"), "ambiguous print must fall back to bare:\n{md}");
     }
 
     /// Without a stamp (solo-named rig / pre-stamp file), every
