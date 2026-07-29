@@ -93,7 +93,14 @@ pub(crate) const ROUND_FRAME_MAGIC: u32 = 0xF10D_17F1;
 /// footer keyed by the session salt; a session-salt disagreement
 /// surfaces as an `HMAC verification failed` error on the first
 /// round-trip.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 added the wire zero-elision: a payload may declare `nbytes = 0`
+/// while its shape has elements, meaning all zeros of the declared
+/// dtype/shape (see [`TensorPayload::bytes`]). A v2 reader folds such
+/// a frame into a loud schema error rather than misreading it, but the
+/// version bump moves the mixed-version failure to the handshake —
+/// first contact, named cause — instead of the first idle window.
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 
 /// dtype tag for f32 in the wire protocol — the default and the only
 /// dtype [`RoundKind::Control`] traffic ever rides (count gathers carry
@@ -879,7 +886,14 @@ fn average_and_scatter(
     // scatters normally but is never part of the model. No-op when unarmed; the
     // reduce loop never blocks on the disk write.
     if let Some(f) = forge {
-        if averaged.kind == RoundKind::Model {
+        // Zero-mass guard: a round that realized no work scatters a
+        // meaningless (elided-zeros) frame that every rank answers by
+        // keeping its local state — the checkpoint is a consensus
+        // consumer too, so it must skip the same way rather than
+        // accumulate zeros into the `.fdl`.
+        if averaged.kind == RoundKind::Model
+            && crate::distributed::realized_work::is_realized(averaged.weight)
+        {
             // Stash this cycle's outer momentum (if captured above) so the
             // forge writes `<stem>.outer.fdl` alongside `<stem>.fdl` when the
             // accumulation completes.

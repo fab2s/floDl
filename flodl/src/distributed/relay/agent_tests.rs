@@ -557,6 +557,96 @@ fn incremental_fold_matches_sum_frames() {
     }
 }
 
+/// An all-elided round (every local rank shipped `nbytes = 0` zeros —
+/// formation broadcast on a non-root host, or every rank idle) must
+/// ship its host fold STILL ELIDED: the elision composes through the
+/// fold tier instead of the relay rematerializing (and uplinking) a
+/// model of zero bytes.
+#[test]
+fn an_all_elided_round_ships_elided_through_the_fold() {
+    let elided = |weight: f64| RoundFrame {
+        tensors: vec![TensorPayload {
+            dtype: DTYPE_F32,
+            shape: vec![3],
+            bytes: Vec::new(),
+        }],
+        kind: RoundKind::Model,
+        weight,
+    };
+    let ctx = FoldCtx::new(vec![0, 1], SALT);
+    let (tx, rx) = mpsc::sync_channel(4);
+    ctx.deposit(0, &frame_blob(&elided(0.0)), &tx).unwrap();
+    ctx.deposit(1, &frame_blob(&elided(0.0)), &tx).unwrap();
+    let MuxRecord::HostFrame { payload } = rx.try_recv().unwrap() else {
+        panic!("expected HostFrame after the completing deposit");
+    };
+    let shipped = parse_frame(&payload);
+    assert!(
+        shipped.tensors[0].is_elided(),
+        "an all-elided round must ship elided"
+    );
+    assert_eq!(shipped.tensors[0].shape, vec![3], "schema must survive");
+    assert_eq!(shipped.weight, 0.0);
+}
+
+/// Elided deposits merge with full ones in ANY arrival order —
+/// exercising every lazy-promotion transition: an elided SEED promoted
+/// to zeros by a later full deposit, a full seed left verbatim by an
+/// elided deposit, and a full-seed promotion triggered after an elided
+/// deposit already passed. Each order must ship exactly `sum_frames`
+/// of the same frames.
+#[test]
+fn elided_deposits_merge_with_full_ones_in_any_order() {
+    for dtype in [DTYPE_F32, DTYPE_BF16] {
+        let mk = |vals: &[f32], weight: f64| RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype,
+                shape: vec![vals.len() as u32],
+                bytes: f32_slice_to_payload_bytes(vals, dtype).unwrap(),
+            }],
+            kind: RoundKind::Model,
+            weight,
+        };
+        let elided = RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype,
+                shape: vec![3],
+                bytes: Vec::new(),
+            }],
+            kind: RoundKind::Model,
+            weight: 0.0,
+        };
+        let f0 = mk(&[1.5, -2.0, 8.0], 3.0);
+        let f2 = mk(&[0.5, 4.0, -16.0], 1.0);
+
+        // (deposit order, expected sum operands) — sum_frames is
+        // order-insensitive, the fold must be too.
+        let orders: Vec<Vec<&RoundFrame>> = vec![
+            vec![&elided, &f0],       // elided seed → promoted to zeros
+            vec![&f0, &elided],       // full seed stays verbatim (no promotion)
+            vec![&f0, &elided, &f2],  // promotion fires AFTER an elided pass
+        ];
+        for order in orders {
+            let ranks: Vec<u32> = (0..order.len() as u32).collect();
+            let ctx = FoldCtx::new(ranks.clone(), SALT);
+            let (tx, rx) = mpsc::sync_channel(4);
+            for (r, f) in ranks.iter().zip(order.iter()) {
+                ctx.deposit(*r, &frame_blob(f), &tx).unwrap();
+            }
+            let MuxRecord::HostFrame { payload } = rx.try_recv().unwrap() else {
+                panic!("expected HostFrame after the completing deposit");
+            };
+            let expected = sum_frames(&order).unwrap();
+            assert_eq!(
+                parse_frame(&payload),
+                expected,
+                "dtype {dtype}, order of {} deposits",
+                order.len()
+            );
+        }
+    }
+}
+
 /// A cohort mixing wire dtypes (some ranks `bf16_wire`, some not) must
 /// die loudly at the first fold, not average garbage.
 #[test]

@@ -361,12 +361,15 @@ struct HostFold {
 /// The round's FIRST deposit is held verbatim as its wire payloads
 /// (`Seed`) — on a bf16 wire that is HALF the f32 image, and it is what
 /// the barrier hold phase (seconds long, while later ranks compute) has
-/// resident. The f32 sums only materialize when a SECOND deposit
-/// arrives (`Sums`). A single-rank host therefore never builds the f32
-/// image at all: its fold ships the seed verbatim — byte-identical to
-/// decode + re-encode, since the bf16 codec round-trips its own output
-/// exactly — which makes the relay tier nearly free on 1-GPU-per-node
-/// topologies (the cloud shape).
+/// resident. The f32 sums only materialize when a second NON-ELIDED
+/// deposit arrives (`Sums`) — elided deposits (wire zero-elision) merge
+/// nothing, so they never force the promotion. A single-rank host
+/// therefore never builds the f32 image at all: its fold ships the seed
+/// verbatim — byte-identical to decode + re-encode, since the bf16
+/// codec round-trips its own output exactly — which makes the relay
+/// tier nearly free on 1-GPU-per-node topologies (the cloud shape). The
+/// same seed-verbatim ship carries an all-elided round upstream still
+/// elided, whatever the host's rank count.
 enum FoldPayloads {
     /// First deposit, verbatim wire payloads (dtype + shape double as
     /// the schema later deposits are validated against).
@@ -417,6 +420,15 @@ impl HostFold {
     /// are decoded into the f32 sums and freed before the next one is
     /// read — the deposited frame never exists as a `RoundFrame`.
     ///
+    /// Elided payloads (wire zero-elision — an idle rank's zero-mass
+    /// contribution, a formation-broadcast zeros frame) are zeros by
+    /// schema and merge nothing: they ride the schema checks alone, and
+    /// seed→sums promotion is LAZY (it fires at the round's first
+    /// non-elided post-seed payload). A round whose every deposit is
+    /// elided therefore keeps its seed verbatim and ships still elided
+    /// — the elision composes through the fold tier instead of
+    /// rematerializing a model of zero bytes.
+    ///
     /// Loud error on any schema disagreement with the pinned first
     /// deposit — tensor count, dtype, shape, byte length, or
     /// [`RoundKind`] — same contract as `sum_frames` (a mismatch means
@@ -453,47 +465,84 @@ impl HostFold {
             return Ok(());
         };
 
-        // Second deposit promotes the seed to f32 sums; later deposits
-        // merge straight in. Either way the incoming frame streams
-        // payload-by-payload and is never materialized.
-        if let FoldPayloads::Seed(seed) = &mut f.payloads {
-            let mut schema: Vec<FoldSchema> = Vec::with_capacity(seed.len());
-            let mut sums: Vec<Vec<f32>> = Vec::with_capacity(seed.len());
-            for p in seed.iter_mut() {
-                sums.push(controller::payload_to_f32(p)?);
-                schema.push(FoldSchema {
-                    dtype: p.dtype,
-                    shape: std::mem::take(&mut p.shape),
-                });
-                // Drain the seed as the f32 image grows instead of
-                // holding both whole.
-                p.bytes = Vec::new();
-            }
-            f.payloads = FoldPayloads::Sums { schema, sums };
-        }
-        let FoldPayloads::Sums { schema, sums } = &mut f.payloads else {
-            unreachable!("seed promoted just above");
+        // Second and later deposits stream payload-by-payload and are
+        // never materialized. Seed→sums promotion is lazy (see the doc
+        // above): it fires at the first non-elided post-seed payload,
+        // and an elided seed promotes to zeros of its declared shape
+        // (`payload_to_f32` sizes from numel) when a full deposit does
+        // arrive.
+        let payloads = &mut f.payloads;
+        let expected = match &*payloads {
+            FoldPayloads::Seed(seed) => seed.len(),
+            FoldPayloads::Sums { schema, .. } => schema.len(),
         };
-
-        let expected = schema.len();
         let mut seen = 0usize;
         let hdr = controller::read_round_frame_streamed(
             &mut &blob[..],
             salt,
             &mut |ti, p| {
-                let (Some(sc), Some(sum)) = (schema.get(ti), sums.get_mut(ti)) else {
-                    return Err(TensorError::new(&format!(
-                        "relay fold: rank {rank} frame carries more than {expected} \
-                         tensors (schema pinned by the round's first deposit)"
-                    )));
+                // Schema check against whichever form the fold holds;
+                // the borrow ends with this block so promotion below
+                // can take the payloads mutably.
+                {
+                    let (want_dtype, want_shape): (u8, &[u32]) = match &*payloads {
+                        FoldPayloads::Seed(seed) => match seed.get(ti) {
+                            Some(s) => (s.dtype, &s.shape),
+                            None => {
+                                return Err(TensorError::new(&format!(
+                                    "relay fold: rank {rank} frame carries more than \
+                                     {expected} tensors (schema pinned by the round's \
+                                     first deposit)"
+                                )));
+                            }
+                        },
+                        FoldPayloads::Sums { schema, .. } => match schema.get(ti) {
+                            Some(sc) => (sc.dtype, &sc.shape),
+                            None => {
+                                return Err(TensorError::new(&format!(
+                                    "relay fold: rank {rank} frame carries more than \
+                                     {expected} tensors (schema pinned by the round's \
+                                     first deposit)"
+                                )));
+                            }
+                        },
+                    };
+                    fold_schema_check(rank, ti, p.dtype, &p.shape, want_dtype, want_shape)?;
+                }
+                seen = ti + 1;
+                if p.is_elided() {
+                    // Zeros by schema — nothing to merge, and the seed
+                    // (whatever its form) stays exactly as it was.
+                    return Ok(());
+                }
+                if let FoldPayloads::Seed(seed) = payloads {
+                    let mut schema: Vec<FoldSchema> = Vec::with_capacity(seed.len());
+                    let mut sums: Vec<Vec<f32>> = Vec::with_capacity(seed.len());
+                    for sp in seed.iter_mut() {
+                        sums.push(controller::payload_to_f32(sp).map_err(|e| {
+                            TensorError::new(&format!("relay fold: seed promotion: {e}"))
+                        })?);
+                        schema.push(FoldSchema {
+                            dtype: sp.dtype,
+                            shape: std::mem::take(&mut sp.shape),
+                        });
+                        // Drain the seed as the f32 image grows instead
+                        // of holding both whole.
+                        sp.bytes = Vec::new();
+                    }
+                    *payloads = FoldPayloads::Sums { schema, sums };
+                }
+                let FoldPayloads::Sums { sums, .. } = payloads else {
+                    unreachable!("promoted just above");
                 };
-                fold_schema_check(rank, ti, p.dtype, &p.shape, sc.dtype, &sc.shape)?;
+                let sum = sums
+                    .get_mut(ti)
+                    .expect("bounds established by the schema match above");
                 // Byte-length agreement is enforced inside the
                 // accumulate (payload bytes vs sums numel).
                 controller::accumulate_payload_into(&p, sum).map_err(|e| {
                     TensorError::new(&format!("relay fold: rank {rank} tensor[{ti}]: {e}"))
                 })?;
-                seen = ti + 1;
                 Ok(())
             },
         )?;

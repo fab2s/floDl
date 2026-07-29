@@ -735,65 +735,141 @@
         }
     }
 
-    /// The zeros-streaming broadcast contribution must be wire-identical
-    /// to shipping actual `zeros_like` payloads — same schema, same MAC,
-    /// same bytes — so the controller, relay fold, and schema checks
-    /// cannot tell (and need not know) that the sender never materialized
-    /// a zeros model. Pins `broadcast_from_root`'s non-root path.
+    /// An elided frame (`nbytes = 0` per payload, schema intact) must
+    /// FOLD identically to shipping actual `zeros_like` payloads — same
+    /// consensus, byte for byte — in every mix: elided-with-full,
+    /// all-elided, and for both wire dtypes. Pins the wire zero-elision
+    /// semantics `broadcast_from_root`'s non-root path (and the idle
+    /// rank's zero-mass contribution) rely on.
     #[test]
-    fn zeros_emitter_streams_the_same_bytes_a_zeros_model_would() {
+    fn an_elided_frame_folds_identically_to_a_zeros_model() {
+        for dtype in [DTYPE_F32, DTYPE_BF16] {
+            let values = RoundFrame {
+                tensors: vec![
+                    TensorPayload {
+                        dtype,
+                        shape: vec![2, 3],
+                        bytes: f32_slice_to_payload_bytes(&[1.5f32; 6], dtype).unwrap(),
+                    },
+                    TensorPayload {
+                        dtype,
+                        shape: vec![4],
+                        bytes: f32_slice_to_payload_bytes(&[-2.0f32; 4], dtype).unwrap(),
+                    },
+                ],
+                kind: RoundKind::Control,
+                weight: 0.0,
+            };
+            let zeros = RoundFrame {
+                tensors: vec![
+                    TensorPayload {
+                        dtype,
+                        shape: vec![2, 3],
+                        bytes: f32_slice_to_payload_bytes(&[0.0f32; 6], dtype).unwrap(),
+                    },
+                    TensorPayload {
+                        dtype,
+                        shape: vec![4],
+                        bytes: f32_slice_to_payload_bytes(&[0.0f32; 4], dtype).unwrap(),
+                    },
+                ],
+                kind: RoundKind::Control,
+                weight: 0.0,
+            };
+            let elided = RoundFrame {
+                tensors: vec![
+                    TensorPayload {
+                        dtype,
+                        shape: vec![2, 3],
+                        bytes: Vec::new(),
+                    },
+                    TensorPayload {
+                        dtype,
+                        shape: vec![4],
+                        bytes: Vec::new(),
+                    },
+                ],
+                kind: RoundKind::Control,
+                weight: 0.0,
+            };
+            assert!(elided.tensors.iter().all(|t| t.is_elided()));
+
+            let via_zeros = sum_frames(&[&values, &zeros]).unwrap();
+            let via_elided = sum_frames(&[&values, &elided]).unwrap();
+            assert_eq!(
+                via_zeros, via_elided,
+                "dtype {dtype}: elided must fold exactly like zeros"
+            );
+            // Either operand order — the elided frame may be frame 0
+            // (it pins the schema the others validate against).
+            let elided_first = sum_frames(&[&elided, &values]).unwrap();
+            assert_eq!(
+                via_zeros.tensors, elided_first.tensors,
+                "dtype {dtype}: elided-as-reference must fold the same"
+            );
+        }
+    }
+
+    /// Zeros + zeros = zeros: a round whose every frame elided a tensor
+    /// keeps that tensor elided in the sum — the elision composes
+    /// through fold tiers (relay → controller → scatter) instead of
+    /// rematerializing a model of zero bytes at the first fold.
+    #[test]
+    fn an_all_elided_round_sums_to_an_elided_frame() {
+        let elided = |weight: f64| RoundFrame {
+            tensors: vec![TensorPayload {
+                dtype: DTYPE_F32,
+                shape: vec![3, 2],
+                bytes: Vec::new(),
+            }],
+            kind: RoundKind::Model,
+            weight,
+        };
+        let a = elided(0.0);
+        let b = elided(0.0);
+        let sum = sum_frames(&[&a, &b]).unwrap();
+        assert!(
+            sum.tensors[0].is_elided(),
+            "all-elided inputs must produce an elided sum"
+        );
+        assert_eq!(sum.tensors[0].shape, vec![3, 2], "schema must survive");
+        assert_eq!(sum.weight, 0.0);
+        // And the elided sum still DECODES as zeros of its shape.
+        assert_eq!(payload_to_f32(&sum.tensors[0]).unwrap(), vec![0.0f32; 6]);
+    }
+
+    /// An elided frame round-trips the wire: `nbytes = 0` per payload,
+    /// schema + MAC intact, and the whole frame is schema-sized — the
+    /// wire cost of a 190M-param zeros contribution drops from the
+    /// model's bytes to its shape list.
+    #[test]
+    fn an_elided_frame_round_trips_the_wire_schema_sized() {
         let frame = RoundFrame {
             tensors: vec![
                 TensorPayload {
                     dtype: DTYPE_F32,
-                    shape: vec![2, 3],
-                    bytes: f32_slice_to_payload_bytes(&[0.0f32; 6], DTYPE_F32).unwrap(),
+                    shape: vec![64, 128],
+                    bytes: Vec::new(),
                 },
                 TensorPayload {
-                    dtype: DTYPE_F32,
-                    shape: vec![4],
-                    bytes: f32_slice_to_payload_bytes(&[0.0f32; 4], DTYPE_F32).unwrap(),
+                    dtype: DTYPE_BF16,
+                    shape: vec![512],
+                    bytes: Vec::new(),
                 },
             ],
-            kind: RoundKind::Control,
+            kind: RoundKind::Model,
             weight: 0.0,
         };
-        let mut via_model = Vec::new();
-        write_round_frame(&mut via_model, &frame, &TEST_SALT).unwrap();
-
-        let parts: Vec<PayloadPart<'_>> = frame
-            .tensors
-            .iter()
-            .map(|t| PayloadPart {
-                dtype: t.dtype,
-                shape: &t.shape,
-                nbytes: t.bytes.len() as u64,
-            })
-            .collect();
-        // Deliberately tiny chunk so multi-write payload assembly is
-        // exercised, not just the single-write case.
-        let zeros = [0u8; 5];
-        let mut via_emitter = Vec::new();
-        write_round_frame_streamed(
-            &mut via_emitter,
-            RoundKind::Control,
-            0.0,
-            &parts,
-            &TEST_SALT,
-            &mut |ti, tee| {
-                let mut left = parts[ti].nbytes;
-                while left > 0 {
-                    let n = left.min(zeros.len() as u64) as usize;
-                    std::io::Write::write_all(tee, &zeros[..n])
-                        .map_err(|e| TensorError::new(&e.to_string()))?;
-                    left -= n as u64;
-                }
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(via_model, via_emitter, "zeros wire bytes must be identical");
+        let mut buf = Vec::new();
+        write_round_frame(&mut buf, &frame, &TEST_SALT).unwrap();
+        // hdr(8) + kind(1) + weight(8) + t0(2 + 2*4 + 8) + t1(2 + 1*4 + 8)
+        // + footer(8) = 57 — no payload bytes at all.
+        assert_eq!(buf.len(), 57, "elided frame must be schema-sized");
+        let parsed = read_round_frame(&mut buf.as_slice(), &TEST_SALT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, frame, "elision must survive the round-trip");
+        assert!(parsed.tensors.iter().all(|t| t.is_elided()));
     }
 
     /// An emitter that writes a different byte count than its declared

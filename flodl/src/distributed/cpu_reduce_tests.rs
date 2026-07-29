@@ -524,6 +524,76 @@
         }
     }
 
+    /// An idle rank (γ-mass 0) ships its contribution ELIDED — schema
+    /// only, no payload bytes — and the consensus is exactly the
+    /// mover's values (mass 3, sum 3·T, divide by 3): fold-identical to
+    /// the legacy scale-by-zero payload, through a REAL relay fold and
+    /// controller reduce. Also pins the elision's one semantic delta:
+    /// the idle rank's local values are NaN here, and the legacy path
+    /// would have forwarded `0.0 × NaN = NaN` into the sum — an elided
+    /// contribution is true zeros, so the consensus stays clean.
+    #[test]
+    fn an_idle_rank_ships_elided_and_cannot_poison_the_consensus() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, vals: [f32; 2], w: f64| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    let t = Tensor::from_f32(&vals, &[2], Device::CPU).unwrap();
+                    c.all_reduce_scaled(&[&t], w, RoundKind::Model, w).unwrap()
+                })
+            };
+            let t0 = spawn(0, [2.0, 8.0], 3.0);
+            let t1 = spawn(1, [f32::NAN, f32::NAN], 0.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, (tensors, mass)) in [(0, &r0), (1, &r1)] {
+            assert_eq!(*mass, 3.0, "rank {rank} accepted mass (mover only)");
+            assert_eq!(
+                tensors[0].to_f32_vec().unwrap(),
+                vec![2.0, 8.0],
+                "rank {rank} consensus must be the mover's values, NaN-free"
+            );
+        }
+    }
+
+    /// The elided-payload decode helpers: zeros of the declared shape
+    /// from `round_frame_to_tensors` (fresh alloc), and `zero_`-written
+    /// staging from `decode_into_slot` — including OVERWRITING stale
+    /// nonzero values a previous round left in the reused buffer.
+    #[test]
+    fn elided_payloads_decode_to_zeros_fresh_and_into_staging() {
+        let elided = TensorPayload {
+            dtype: DTYPE_F32,
+            shape: vec![2, 2],
+            bytes: Vec::new(),
+        };
+        let frame = RoundFrame {
+            tensors: vec![elided.clone()],
+            kind: crate::distributed::controller::RoundKind::Model,
+            weight: 0.0,
+        };
+        let fresh = round_frame_to_tensors(&frame).unwrap();
+        assert_eq!(fresh[0].shape(), vec![2_i64, 2]);
+        assert_eq!(fresh[0].to_f32_vec().unwrap(), vec![0.0f32; 4]);
+
+        let mut slot: Vec<Tensor> = Vec::new();
+        let mut pin_fallback = None;
+        // Prior round leaves nonzero staging content behind.
+        let full = TensorPayload {
+            dtype: DTYPE_F32,
+            shape: vec![2, 2],
+            bytes: f32_to_bytes(&[7.0, 7.0, 7.0, 7.0]),
+        };
+        let prev = decode_into_slot(0, &full, &mut slot, &mut pin_fallback).unwrap();
+        assert_eq!(prev.to_f32_vec().unwrap(), vec![7.0f32; 4]);
+        // The elided payload must zero the REUSED buffer, not trust it.
+        let out = decode_into_slot(0, &elided, &mut slot, &mut pin_fallback).unwrap();
+        assert_eq!(out.to_f32_vec().unwrap(), vec![0.0f32; 4]);
+    }
+
     /// Pinned-decode staging end-to-end: with `set_pinned_decode(true)`
     /// and per-round arming, the consensus values are identical to the
     /// fresh-alloc path, AND round N's returned tensors alias the
