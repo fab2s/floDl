@@ -382,14 +382,15 @@ pub struct GpuWorker<M: Module> {
     /// Idle -> Pending -> Idle cycle), so reuse never aliases an
     /// in-flight snapshot.
     ///
-    /// On the f32-wire barrier-paced path the same window admits one
-    /// more writer and reader THROUGH this shared storage: the reduce
+    /// On the barrier-paced path the same window admits one more
+    /// writer and reader THROUGH this shared storage: the reduce
     /// client decodes the consensus reply back INTO these buffers
     /// (`CpuReduceClient::set_decode_into_request` — the snapshot bytes
-    /// are dead once the streamed encode has read them), and
-    /// `load_averaged`'s async H2D then reads them; the next window's
-    /// `snapshot_params` entry fence retires that H2D before the D2H
-    /// overwrite. Same invariant, zero extra locked memory.
+    /// are dead once the streamed encode has read them; a bf16-wire
+    /// reply lands verbatim in the bf16 staging), and `load_averaged`'s
+    /// async H2D then reads them; the next window's `snapshot_params`
+    /// entry fence retires that H2D before the D2H overwrite. Same
+    /// invariant, zero extra locked memory.
     /// Empty on CPU device / non-CPU-averaging setups (the readout falls
     /// back to a per-tensor passthrough).
     ///

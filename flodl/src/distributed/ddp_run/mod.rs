@@ -1278,7 +1278,10 @@ pub struct EpochPlan {
 
 /// Averaged parameters sent from the coordinator to a GPU worker (CPU averaging path only).
 ///
-/// Contains pinned CPU tensors. Worker copies them into its Variables via `copy_(non_blocking=true)`.
+/// Contains pinned CPU tensors — bf16 under `bf16_wire` (the consensus
+/// decodes verbatim into the bf16 snapshot staging; the worker's
+/// writeback upcasts device-side, see `h2d_copy_via_bounce`). Worker
+/// copies them into its Variables via `copy_(non_blocking=true)`.
 #[derive(Clone, Debug)]
 pub struct AveragedParams {
     /// Averaged parameter tensors (pinned CPU memory).
