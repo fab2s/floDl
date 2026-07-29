@@ -11,6 +11,8 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <ATen/detail/CUDAHooksInterface.h>
+#include <ATen/Context.h>
+#include <mutex>
 #endif
 
 // --- Convolution ---
@@ -630,6 +632,28 @@ extern "C" char* flodl_cuda_mem_info(int device_index,
 
 // --- CUDA caching allocator stats ---
 
+#ifdef FLODL_BUILD_CUDA
+// getDeviceStats reads the allocator's per-device table, which libtorch
+// populates during its lazy CUDA init; each entry is published only after
+// the DeviceCachingAllocator constructor finishes its driver calls. A
+// monitor thread probing during that first-touch init reads a null entry
+// and dies locking its mutex (rank-0 SIGSEGV at cluster formation,
+// 2026-07-29: NCCL creates the primary context mid-ncclCommInitRank, so a
+// context-existence gate alone opens while torch's allocator init is still
+// pending or in flight). hasPrimaryContext stays as the passive pre-check
+// so processes that never touch CUDA (the cluster launcher must stay
+// CUDA-free) trigger nothing; lazyInitDevice then serializes with torch's
+// once-guarded init, after which the stats read cannot race it.
+static bool allocator_ready(int device_index) {
+    if (!at::detail::getCUDAHooks().hasPrimaryContext(
+            (c10::DeviceIndex)device_index)) {
+        return false;
+    }
+    at::globalContext().lazyInitDevice(at::kCUDA);
+    return true;
+}
+#endif
+
 extern "C" char* flodl_cuda_alloc_bytes(int device_index,
                                          uint64_t* allocated_bytes) {
 #ifdef FLODL_BUILD_CUDA
@@ -637,6 +661,9 @@ extern "C" char* flodl_cuda_alloc_bytes(int device_index,
         return make_error("CUDA not available");
     }
     try {
+        if (!allocator_ready(device_index)) {
+            return make_error("CUDA allocator not initialized (no context on device)");
+        }
         auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
             (c10::DeviceIndex)device_index);
         // reserved_bytes = total memory grabbed from CUDA driver (including
@@ -664,6 +691,9 @@ extern "C" char* flodl_cuda_active_bytes(int device_index,
         return make_error("CUDA not available");
     }
     try {
+        if (!allocator_ready(device_index)) {
+            return make_error("CUDA allocator not initialized (no context on device)");
+        }
         auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
             (c10::DeviceIndex)device_index);
         *active_bytes = (uint64_t)stats.allocated_bytes[0].current;
@@ -688,6 +718,9 @@ extern "C" char* flodl_cuda_peak_active_bytes(int device_index,
         return make_error("CUDA not available");
     }
     try {
+        if (!allocator_ready(device_index)) {
+            return make_error("CUDA allocator not initialized (no context on device)");
+        }
         auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
             (c10::DeviceIndex)device_index);
         *peak_bytes = (uint64_t)stats.allocated_bytes[0].peak;
@@ -712,6 +745,9 @@ extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
         return make_error("CUDA not available");
     }
     try {
+        if (!allocator_ready(device_index)) {
+            return make_error("CUDA allocator not initialized (no context on device)");
+        }
         auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
             (c10::DeviceIndex)device_index);
         *peak_bytes = (uint64_t)stats.reserved_bytes[0].peak;
@@ -732,7 +768,10 @@ extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
 extern "C" void flodl_cuda_reset_peak_stats(int device_index) {
     try {
 #ifdef FLODL_BUILD_CUDA
-    c10::cuda::CUDACachingAllocator::resetPeakStats((c10::DeviceIndex)device_index);
+    // No context or allocator yet means no peaks to reset; stay passive.
+    if (allocator_ready(device_index)) {
+        c10::cuda::CUDACachingAllocator::resetPeakStats((c10::DeviceIndex)device_index);
+    }
 #else
     (void)device_index;
 #endif
@@ -768,7 +807,6 @@ namespace {
     struct NvmlMem { unsigned long long total; unsigned long long free_b; unsigned long long used; };
 
     struct NvmlState {
-        bool tried = false;
         bool ok = false;
         nvml_ret_t (*init)(void) = nullptr;
         nvml_ret_t (*getHandle)(unsigned int, nvml_device_t*) = nullptr;
@@ -778,17 +816,21 @@ namespace {
     };
     static NvmlState nvml;
 
+    // call_once: several monitor threads take their first sample
+    // concurrently, and a plain tried-flag lets a second thread read
+    // half-published state (or run a second nvmlInit_v2) mid-load.
     static void nvml_try_load() {
-        if (nvml.tried) return;
-        nvml.tried = true;
-        void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
-        if (!lib) return;
-        nvml.init      = (decltype(nvml.init))dlsym(lib, "nvmlInit_v2");
-        nvml.getHandle = (decltype(nvml.getHandle))dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
-        nvml.getUtil   = (decltype(nvml.getUtil))dlsym(lib, "nvmlDeviceGetUtilizationRates");
-        nvml.getMemInfo = (decltype(nvml.getMemInfo))dlsym(lib, "nvmlDeviceGetMemoryInfo");
-        if (!nvml.init || !nvml.getHandle || !nvml.getUtil) return;
-        nvml.ok = (nvml.init() == 0);
+        static std::once_flag load_flag;
+        std::call_once(load_flag, [] {
+            void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+            if (!lib) return;
+            nvml.init      = (decltype(nvml.init))dlsym(lib, "nvmlInit_v2");
+            nvml.getHandle = (decltype(nvml.getHandle))dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
+            nvml.getUtil   = (decltype(nvml.getUtil))dlsym(lib, "nvmlDeviceGetUtilizationRates");
+            nvml.getMemInfo = (decltype(nvml.getMemInfo))dlsym(lib, "nvmlDeviceGetMemoryInfo");
+            if (!nvml.init || !nvml.getHandle || !nvml.getUtil) return;
+            nvml.ok = (nvml.init() == 0);
+        });
     }
 } // anonymous namespace
 #endif
