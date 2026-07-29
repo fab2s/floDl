@@ -300,7 +300,15 @@ fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &
         .iter()
         .map(|p| {
             if p.dtype == DTYPE_F32 {
-                Ok(None)
+                if p.is_elided() && p.numel() > 0 {
+                    // Wire zero-elision: no bytes to borrow — materialize
+                    // the zeros for disk. Unreachable from the tap (a
+                    // realized round's consensus is never elided), kept
+                    // so the writer is total over every valid payload.
+                    Ok(Some(vec![0u8; p.numel() * 4]))
+                } else {
+                    Ok(None)
+                }
             } else {
                 let vals = crate::distributed::controller::payload_to_f32(p)?;
                 Ok(Some(

@@ -89,6 +89,20 @@ pub struct TensorPayload {
     /// Tensor shape.
     pub shape: Vec<u32>,
     /// Raw tensor bytes (native byte order).
+    ///
+    /// EMPTY while the shape declares elements = **wire zero-elision**:
+    /// the payload is all zeros of the declared dtype/shape and no
+    /// payload bytes crossed the wire (`nbytes = 0` on the frame, with
+    /// the schema intact and MAC-covered). Senders that KNOW their
+    /// payload is structurally zeros — the formation broadcast's
+    /// non-root ranks, an idle rank's zero-mass contribution, the
+    /// zero-mass scatter — declare it instead of shipping (and MACing)
+    /// a model of zero bytes; the fold reads elided as "adds nothing",
+    /// which is IEEE-exact (accumulating ±0.0 changes no accumulator
+    /// bit). One deliberate semantic delta: an elided contribution is
+    /// TRUE zeros — the legacy scale-by-zero path would forward a
+    /// poisoned sender's `0.0 × NaN = NaN` into the consensus, elision
+    /// cannot.
     pub bytes: Vec<u8>,
 }
 
@@ -96,6 +110,14 @@ impl TensorPayload {
     /// Number of element-slots in the tensor (product of shape dims).
     pub fn numel(&self) -> usize {
         self.shape.iter().map(|d| *d as usize).product()
+    }
+
+    /// Wire zero-elision (see [`Self::bytes`]): no payload bytes — the
+    /// tensor reads as all zeros of the declared dtype/shape. True for
+    /// zero-numel tensors too, where both readings coincide (zeros of
+    /// nothing IS nothing).
+    pub fn is_elided(&self) -> bool {
+        self.bytes.is_empty()
     }
 }
 
@@ -550,7 +572,12 @@ pub(crate) fn sum_frames(frames: &[&RoundFrame]) -> Result<RoundFrame> {
                     b.shape, a.shape
                 )));
             }
-            if a.bytes.len() != b.bytes.len() {
+            // Wire zero-elision: an elided payload (no bytes) is valid
+            // alongside full payloads of the same dtype/shape schema;
+            // two FULL payloads must still agree byte-for-byte in
+            // length. (Full-payload byte count vs shape numel is
+            // enforced per frame inside the accumulate below.)
+            if !a.is_elided() && !b.is_elided() && a.bytes.len() != b.bytes.len() {
                 return Err(TensorError::new(&format!(
                     "cluster_controller: frame {i} tensor[{ti}] nbytes {} != frame 0 nbytes {}",
                     b.bytes.len(),
@@ -571,12 +598,29 @@ pub(crate) fn sum_frames(frames: &[&RoundFrame]) -> Result<RoundFrame> {
         })?;
         let shape = ref_frame.tensors[ti].shape.clone();
         let numel = ref_frame.tensors[ti].numel();
-        if numel * elem != ref_frame.tensors[ti].bytes.len() {
+        if !ref_frame.tensors[ti].is_elided()
+            && numel * elem != ref_frame.tensors[ti].bytes.len()
+        {
             return Err(TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] shape {shape:?} numel*element_size {} != nbytes {}",
                 numel * elem,
                 ref_frame.tensors[ti].bytes.len()
             )));
+        }
+        // Wire zero-elision, fold-through: zeros + zeros = zeros. When
+        // every accepted frame elided this tensor, the sum is
+        // structurally zeros too, so it STAYS elided — no bytes
+        // materialize here, and the frame keeps its elided form through
+        // every fold tier and the final scatter (elision is a member of
+        // the fold monoid, so it composes through hierarchical relay
+        // tiers exactly like the mass algebra does).
+        if frames.iter().all(|f| f.tensors[ti].is_elided()) {
+            out_tensors.push(TensorPayload {
+                dtype,
+                shape,
+                bytes: Vec::new(),
+            });
+            continue;
         }
         let mut accum: Vec<f32> = vec![0.0; numel];
         for f in frames.iter() {
@@ -672,6 +716,13 @@ pub(crate) fn accumulate_payload_into(
     payload: &TensorPayload,
     accum: &mut [f32],
 ) -> Result<()> {
+    // Wire zero-elision: an elided payload IS zeros of its declared
+    // schema, and adding zeros is adding nothing (IEEE-exact — ±0.0
+    // changes no accumulator bit). Shape agreement was the caller's
+    // schema check; there are no bytes left to length-check.
+    if payload.is_elided() {
+        return Ok(());
+    }
     let elem = payload_element_size(payload.dtype)?;
     if payload.bytes.len() != accum.len() * elem {
         return Err(TensorError::new(&format!(
@@ -697,16 +748,19 @@ pub(crate) fn accumulate_payload_into(
 }
 
 /// Decode a payload into an owned f32 vector (exact for both dtypes —
-/// bf16 upcasts losslessly).
+/// bf16 upcasts losslessly). Sized from the declared SHAPE, not the
+/// byte count, so an elided payload decodes to zeros of its numel and
+/// a full payload whose bytes disagree with its shape errs loudly.
 pub(crate) fn payload_to_f32(payload: &TensorPayload) -> Result<Vec<f32>> {
     let elem = payload_element_size(payload.dtype)?;
-    if payload.bytes.len() % elem != 0 {
+    let numel = payload.numel();
+    if !payload.is_elided() && payload.bytes.len() != numel * elem {
         return Err(TensorError::new(&format!(
-            "payload byte count {} not divisible by element size {elem}",
+            "payload byte count {} != shape numel {numel} x element size {elem}",
             payload.bytes.len(),
         )));
     }
-    let mut out = vec![0.0f32; payload.bytes.len() / elem];
+    let mut out = vec![0.0f32; numel];
     accumulate_payload_into(payload, &mut out)?;
     Ok(out)
 }

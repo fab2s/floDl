@@ -438,6 +438,16 @@ impl CpuReduceClient {
     /// (e.g. the f32 passthrough-staging fallback under bf16 wire) the
     /// scale runs on-tensor first so the wire cast stays the single
     /// rounding stage.
+    ///
+    /// `scale == 0.0` — the idle rank's contribution (`γ-mass` 0 for 0
+    /// optimizer steps) — ships as an ELIDED frame: the payloads are
+    /// structurally zeros, so only the schema crosses the wire
+    /// (`nbytes = 0`, see
+    /// [`TensorPayload::bytes`](crate::distributed::controller::TensorPayload::bytes))
+    /// and the tensors are never read, scaled, or MAC'd. The fold
+    /// treats elided as zeros, so the round is unchanged — except that
+    /// a NaN-poisoned idle rank can no longer forward `0.0 × NaN = NaN`
+    /// into the consensus, which is strictly better isolation.
     pub fn all_reduce_scaled(
         &mut self,
         tensors: &[&Tensor],
@@ -445,6 +455,11 @@ impl CpuReduceClient {
         kind: RoundKind,
         weight: f64,
     ) -> Result<(Vec<Tensor>, f64)> {
+        // Idle contribution (see the doc above): every payload is
+        // structurally `0.0 · T` — declare it instead of encoding it.
+        if scale == 0.0 {
+            return self.stream_zeros_frame(tensors, kind, weight);
+        }
         let t0 = Instant::now();
         let wire_dtype = self.wire_dtype_for(kind);
         let wire_tensor_dtype = wire_tensor_dtype(wire_dtype)?;
@@ -714,14 +729,15 @@ impl CpuReduceClient {
         // Root ships its live tensors directly — the streamed encode reads
         // them without mutation, so the zeros_like + copy_ scratch this
         // path used to build (a full model copy at formation) bought
-        // nothing. Non-root ranks contribute all-zeros, and since the wire
-        // bytes of a zeros model ARE just zeros, they stream literal zero
-        // bytes from the shapes alone (`stream_zeros_frame`) instead of
-        // materializing a zeros_like model first — at 190M params that
-        // scratch was ~762MB per non-root rank, landing exactly on the
-        // formation-time RAM peak (data staging + CUDA init + first
-        // window). The wire bytes are bit-identical either way (pinned by
-        // `zeros_frame_streams_the_same_bytes_a_zeros_model_would`).
+        // nothing. Non-root ranks contribute all-zeros as an ELIDED frame
+        // (`stream_zeros_frame`): schema only, `nbytes = 0` per payload —
+        // no zeros model materialized (at 190M params that scratch was
+        // ~762MB per rank, landing exactly on the formation-time RAM
+        // peak) AND no zero bytes on the wire (the same 762MB per rank
+        // used to cross the uplink and be HMAC'd on both ends). The fold
+        // reads elided as zeros, so the summed broadcast is fold-identical
+        // to shipping a zeros model (pinned by
+        // `an_elided_frame_folds_identically_to_a_zeros_model`).
         if self.rank_id == root {
             Ok(self
                 .all_reduce_weighted(tensors, RoundKind::Control, 0.0)?
@@ -731,13 +747,15 @@ impl CpuReduceClient {
         }
     }
 
-    /// Ship a frame whose payloads are all zeros — schema (shapes, dtype,
-    /// kind, weight) taken from `tensors`, payload bytes produced as
-    /// literal zeros without materializing a zeros model — and return the
-    /// reduced reply. Wire-identical to
-    /// [`Self::all_reduce_weighted`] over `zeros_like` copies of
-    /// `tensors`; the peak send-side transient drops from a full model to
-    /// one 1MB chunk.
+    /// Ship an ELIDED frame — schema (shapes, dtype, kind, weight) taken
+    /// from `tensors`, every payload declared `nbytes = 0` (the wire
+    /// zero-elision: all zeros of the declared schema, see
+    /// [`TensorPayload::bytes`]) — and return the reduced reply.
+    /// Fold-identical to [`Self::all_reduce_weighted`] over `zeros_like`
+    /// copies of `tensors`, but the frame is schema-sized: no zero bytes
+    /// cross the wire and neither end MACs or folds a model of zeros.
+    ///
+    /// [`TensorPayload::bytes`]: crate::distributed::controller::TensorPayload::bytes
     fn stream_zeros_frame(
         &mut self,
         tensors: &[&Tensor],
@@ -746,46 +764,34 @@ impl CpuReduceClient {
     ) -> Result<(Vec<Tensor>, f64)> {
         let t0 = Instant::now();
         let wire_dtype = self.wire_dtype_for(kind);
-        let elem = controller::payload_element_size(wire_dtype)? as u64;
         let shapes: Vec<Vec<u32>> = tensors
             .iter()
             .enumerate()
             .map(|(i, t)| wire_shape(i, t))
             .collect::<Result<_>>()?;
-        let parts: Vec<controller::PayloadPart<'_>> = tensors
+        let parts: Vec<controller::PayloadPart<'_>> = shapes
             .iter()
-            .zip(shapes.iter())
-            .map(|(t, shape)| controller::PayloadPart {
+            .map(|shape| controller::PayloadPart {
                 dtype: wire_dtype,
                 shape,
-                nbytes: t.numel() as u64 * elem,
+                nbytes: 0,
             })
             .collect();
-        let sent_bytes: u64 = parts.iter().map(|p| p.nbytes).sum();
+        let sent_bytes: u64 = 0;
 
         crate::distributed::relay::mux::write_len_prefix(
             &mut self.stream,
             controller::round_frame_wire_len(&parts),
         )?;
-        // One reused chunk of zero bytes; a zeros payload of any size is
-        // that chunk written ceil(nbytes / len) times.
-        let zeros = vec![0u8; 1 << 20];
         controller::write_round_frame_streamed(
             &mut self.stream,
             kind,
             weight,
             &parts,
             &self.salt,
-            &mut |ti, tee| {
-                let mut left = parts[ti].nbytes;
-                while left > 0 {
-                    let n = left.min(zeros.len() as u64) as usize;
-                    tee.write_all(&zeros[..n])
-                        .map_err(|e| TensorError::new(&e.to_string()))?;
-                    left -= n as u64;
-                }
-                Ok(())
-            },
+            // Elided payloads carry no bytes — the emitter has nothing
+            // to write (the declared-nbytes check holds at 0).
+            &mut |_ti, _tee| Ok(()),
         )?;
 
         let (out, weight, decode_ns) = self.read_reduced_tensors()?;
@@ -1051,11 +1057,23 @@ pub fn round_frame_to_tensors(frame: &RoundFrame) -> Result<Vec<Tensor>> {
 
 /// Decode ONE payload into an f32 CPU tensor: `from_blob` at the wire
 /// dtype (validates shape-vs-byte-count loudly), bf16 upcast to f32.
+/// An elided payload (wire zero-elision, no bytes) decodes to zeros of
+/// its declared shape — zeros carry no dtype rounding, so f32 directly.
 /// Shared per-payload body of [`round_frame_to_tensors`] and the
 /// draining streamed decode in `CpuReduceClient`.
 fn payload_to_cpu_tensor(i: usize, p: &TensorPayload) -> Result<Tensor> {
     let dtype = payload_wire_dtype(i, p)?;
     let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+    if p.is_elided() && p.numel() > 0 {
+        return Tensor::zeros(
+            &shape,
+            TensorOptions {
+                dtype: DType::Float32,
+                device: Device::CPU,
+            },
+        )
+        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")));
+    }
     let t = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
         .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
     if dtype == DType::Float32 {
@@ -1096,8 +1114,6 @@ fn decode_into_slot(
 ) -> Result<Tensor> {
     let dtype = payload_wire_dtype(i, p)?;
     let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
-    let wire = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
-        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
     if i > slot.len() {
         // The streamed reader hands payloads out in order; a hole means
         // that contract broke, not that the frame is malformed.
@@ -1113,6 +1129,14 @@ fn decode_into_slot(
         slot[i] = reused_decode_buffer(&shape, pin_fallback)?;
     }
     let dst = &slot[i];
+    if p.is_elided() && p.numel() > 0 {
+        // Wire zero-elision: no bytes came — the payload is zeros of
+        // its declared shape, written straight into the staging.
+        dst.zero_()?;
+        return Ok(dst.clone());
+    }
+    let wire = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
+        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
     dst.copy_(&wire, false)?;
     Ok(dst.clone())
 }
