@@ -102,8 +102,13 @@ fn test_worker_load_averaged_easgd_blends() {
     let pre_b = worker.param_vars[1].data().to_f32_vec().unwrap();
 
     let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
-    let avg_w = Tensor::full(&[2, 4], 3.0, cpu).unwrap();
-    let avg_b = Tensor::full(&[2], -1.0, cpu).unwrap();
+    // Named once and reused by the expectations below: the assertion has to
+    // blend against the SAME values the update carries, and two copies of a
+    // literal can drift apart without failing.
+    let avg_w_val = 3.0;
+    let avg_b_val = -1.0;
+    let avg_w = Tensor::full(&[2, 4], avg_w_val, cpu).unwrap();
+    let avg_b = Tensor::full(&[2], avg_b_val, cpu).unwrap();
     let update = AveragedParams {
         params: vec![avg_w, avg_b],
         buffers: vec![],
@@ -118,14 +123,14 @@ fn test_worker_load_averaged_easgd_blends() {
     let post_w = worker.param_vars[0].data().to_f32_vec().unwrap();
     let post_b = worker.param_vars[1].data().to_f32_vec().unwrap();
     for (i, (pre, post)) in pre_w.iter().zip(&post_w).enumerate() {
-        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * 3.0;
+        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * avg_w_val as f32;
         assert!(
             (post - want).abs() < 1e-5,
             "weight[{i}]: want {want}, got {post} (pre {pre})"
         );
     }
     for (i, (pre, post)) in pre_b.iter().zip(&post_b).enumerate() {
-        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * -1.0;
+        let want = (1.0 - alpha) as f32 * pre + alpha as f32 * avg_b_val as f32;
         assert!(
             (post - want).abs() < 1e-5,
             "bias[{i}]: want {want}, got {post} (pre {pre})"

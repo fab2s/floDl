@@ -23,7 +23,7 @@ cuda = ["flodl-sys/cuda"]
 rng = ["rand"]
 
 [dependencies]
-flodl-sys = { version = "0.6.0", path = "../flodl-sys" }
+flodl-sys = { version = "0.7.0", path = "../flodl-sys" }
 indexmap = "2"
 flate2 = "1"
 hmac-sha256 = "1"

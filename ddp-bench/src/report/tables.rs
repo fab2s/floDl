@@ -217,13 +217,18 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
     md.push_str("----------|\n");
 
     for (r, dh) in runs.iter().zip(&dense_hosts) {
-        // `+ 0.0` normalizes the negative zero that an empty-iterator
-        // `sum::<f64>()` yields (common now: a dedicated controller with
-        // GPU polling gated off has no idle_by_cause entries) so the
-        // cell renders "0.0", not "-0.0".
-        let total_idle_s: f64 = r.idle_by_cause.iter()
-            .map(|c| c.total_ms)
-            .sum::<f64>() / 1000.0 + 0.0;
+        // Idle detection reads the DENSE timeline samples: `idle_by_cause`
+        // carries one entry per device in `gpu_devices`, which is itself the
+        // union of devices the local poller sampled. So an empty
+        // `gpu_devices` means the gap detector had no input at all, which is
+        // routine now that a dedicated controller gates its GPU poll off
+        // (every GPU column on such a run is rank-reported and sparse).
+        // Summing nothing yields 0.0, and printing that would state a
+        // measured zero where nothing was measured — the same absent-is-not
+        // -zero rule the GPU columns already follow with `-`.
+        let total_idle_s: Option<f64> = (!r.gpu_devices.is_empty()).then(|| {
+            r.idle_by_cause.iter().map(|c| c.total_ms).sum::<f64>() / 1000.0
+        });
 
         let _ = write!(md, "| {} | {:.6} |", r.mode, r.final_loss);
 
@@ -299,7 +304,10 @@ pub(super) fn write_model_table(md: &mut String, model: &str, runs: &[RunAnalysi
                 _ => md.push_str(" - |"),
             }
         }
-        let _ = writeln!(md, " {total_idle_s:.1} |");
+        match total_idle_s {
+            Some(s) => { let _ = writeln!(md, " {s:.1} |"); }
+            None => md.push_str(" - |\n"),
+        }
     }
     md.push('\n');
 }
@@ -839,20 +847,58 @@ pub(super) fn write_idle_analysis(md: &mut String, model: &str, runs: &[RunAnaly
     md.push('\n');
 }
 
+/// `(runs carrying a dense-sampled GPU, total runs)`. `gpu_devices` is the
+/// union of devices the local poller recorded and every idle figure derives
+/// from it, so this is the idle sections' actual coverage. Reported rather
+/// than reduced to a boolean because the interesting case is PARTIAL: a
+/// cluster sweep whose controller gates its poll off has dense data on its
+/// solo rows only, and "no gap was detected" then describes those rows while
+/// reading as though it described the sweep.
+pub(super) fn dense_coverage(groups: &[(String, Vec<RunAnalysis>)]) -> (usize, usize) {
+    let mut dense = 0;
+    let mut total = 0;
+    for (_, runs) in groups {
+        for r in runs {
+            total += 1;
+            if !r.gpu_devices.is_empty() {
+                dense += 1;
+            }
+        }
+    }
+    (dense, total)
+}
+
 pub(super) fn write_idle_breakdown(md: &mut String, groups: &[(String, Vec<RunAnalysis>)]) {
     // No rows → no table: headers over nothing read as broken output,
     // not as "no idle worth reporting" (same class as the idle-analysis
-    // header fix). Say the good news explicitly instead.
+    // header fix). Say the good news explicitly instead - but only when
+    // there was something to find it in. This table covers non-solo runs, so
+    // scope the dense check the same way: a cluster sweep whose controller
+    // gated its poll off has dense data on the solo rows alone, and claiming
+    // a clean result from those would be claiming it for runs nothing looked at.
     let any_rows = groups.iter().any(|(_, runs)| {
         runs.iter()
             .filter(|r| !r.mode.starts_with("solo"))
             .any(|r| r.idle_by_cause.iter().any(|c| c.total_ms >= 500.0))
     });
     if !any_rows {
-        md.push_str(
-            "No non-solo run accumulated >=0.5s of classified idle on a \
+        let any_dense_ddp = groups.iter().any(|(_, runs)| {
+            runs.iter()
+                .filter(|r| !r.mode.starts_with("solo"))
+                .any(|r| !r.gpu_devices.is_empty())
+        });
+        if any_dense_ddp {
+            md.push_str(
+                "No non-solo run accumulated >=0.5s of classified idle on a \
 dense-sampled device.\n\n",
-        );
+            );
+        } else {
+            md.push_str(
+                "**Not measured in this sweep.** No non-solo run carried a \
+dense-sampled device, so there was nothing to classify - see the note under \
+GPU Idle Analysis.\n\n",
+            );
+        }
         return;
     }
     md.push_str("| Model | Mode | GPU | Epoch Boundary | Sync | CPU Avg | Unexplained | Total Idle |\n");

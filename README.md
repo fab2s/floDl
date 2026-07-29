@@ -35,18 +35,28 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 ---
 
-> **What's new** - full re-architecture of the distributed layer to
-> process-per-rank with elastic membership, plus the same single
-> entry (`Trainer::builder(...).run()`) now scales from CPU to
-> single-host multi-GPU (auto-promoted on 2+ visible GPUs) to
-> multi-host clusters via `fdl.cluster.yml` or `ClusterBuilder`.
-> ElChe collapsed to `ElCheMode` (five modes,
-> default `NcclCadence`); convergence guard is now authoritative over
-> `overhead_target`; per-epoch callbacks default to the fastest rank
-> (free compute on heterogeneous rigs). New CLI: `fdl probe` (cluster
-> readiness audit), `fdl nccl build` (libnccl source builder for
-> heterogeneous-NCCL clusters), `fdl --gpus` (global GPU scope
-> override), `fdl @cluster <cmd>` (multi-host fan-out). See the
+> **What's new** - the training monitor became a **recursive portal**:
+> one view repeated at every level of a run (`root` → host → rank),
+> addressed by path, where a page subscribes to one level so a
+> 300-rank run costs the same to watch as a 3-rank one. The same
+> record plane comes out three other ways: over HTTP
+> (`/paths`, `/node`, `/history`, `/stream`), on disk as a bounded
+> JSONL tree whose file layout *is* the record path
+> (`record_log`), and as **one self-contained HTML file** with every
+> level browsable offline (`save_dashboard`). Plus an alert lane
+> (rank loss, drift, dropped control), sub-epoch reports between
+> epoch points (`reports_per_epoch`), and a light theme.
+> A memory pass on the CPU averaging plane removes roughly 2 GB of
+> per-rank transients from the sync barrier at 190M params (streaming
+> wire codec on both legs, pinned consensus staging, incremental
+> relay fold, optional `bf16_wire`), and `MultiheadAttention` now
+> routes through fused scaled-dot-product attention. New:
+> `RotaryEmbedding` (RoPE), `SwiGLU`, `TokenShards` for pre-tokenized
+> corpora, and an [Apple Silicon path](docs/mac-apple-silicon.md).
+> Notable fixes: `switch` now dispatches **per sample**
+> ([#32](https://github.com/flodl-labs/flodl/issues/32)), model init
+> is reproducible from a seed, and two cluster faults are closed (a
+> formation-time crash and an epoch-tail deadlock). See the
 > CHANGELOG and [DDP Reference](docs/ddp.md) for the full surface.
 
 ---
@@ -379,14 +389,38 @@ monitor.finish();
     <img src="https://raw.githubusercontent.com/flodl-labs/flodl/main/docs/dashboard.gif" alt="floDl live training dashboard - click for interactive version" width="800">
   </a>
 </p>
-<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> - real data from a 100-epoch training run</em></p>
+<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> - real data from a 200-epoch ResNet-20 run across 3 GPUs on 2 hosts, then the same view at every level of the cluster</em></p>
 
 The live dashboard updates via Server-Sent Events (no WebSocket, no npm),
 tracks CPU/GPU/RAM/VRAM, and supports late join - open it mid-training and
 all past epochs backfill instantly.
 
+**One view, repeated at every level.** On a multi-GPU or multi-host run the
+page becomes a portal: `root` rolls up every host, each host rolls up its
+ranks, and a rank shows its own raw measurements. The breadcrumb *is* the
+record path, every level is linkable (`#path=root/host-b/rank1`), and the
+legend says what it is showing - `loss (mean)` and `throughput (sum)` at an
+interior node, bare keys at a leaf. The page subscribes to the level you are
+on, so watching a 300-rank run costs what watching a 3-rank one costs, while
+alerts stay scoped to the whole subtree so a rank death in a branch you are
+not looking at still reaches you.
+
+The same records are addressable and persistable, all off by default:
+
 ```rust
-monitor.save_html("training_report.html");  // self-contained archive
+Trainer::builder(model_factory, optim_factory, train_step)
+    .reports_per_epoch(20)              // loss curve *between* epoch points
+    .record_log("runs/records", 0)      // JSONL tree; a record's path IS its file path (0 = default 32 MiB/node cap)
+    .save_dashboard("runs/dash.html")   // the whole portal as ONE offline file
+    .run()?;
+```
+
+`GET /paths`, `/node?path=`, `/history?path=&n=` and `/stream?path=` (SSE)
+expose the same plane to anything that speaks HTTP; a `/node` query costs
+`O(children)`, not `O(cluster)`.
+
+```rust
+monitor.save_html("training_report.html");  // epoch-feed archive
 monitor.export_csv("training.csv")?;         // for external analysis
 ```
 
@@ -440,7 +474,9 @@ the **[Observation example](https://github.com/flodl-labs/flodl/tree/main/flodl/
 The **same `Trainer::builder` call** scales from CPU to N GPUs on one
 host to N GPUs across many hosts. On a host with 2+ visible CUDA
 devices, floDl auto-promotes to process-per-rank fan-out
-automatically - zero training-loop changes.
+automatically - zero training-loop changes. To scope which devices a
+run may use, `fdl --gpus 0,1 <cmd>` (or `--gpus all`) works on any
+command, at any position.
 
 ```rust
 // Universal entry: works on CPU, 1 GPU, N GPUs single-host, N GPUs multi-host.
@@ -465,11 +501,18 @@ case.
 modes for A/B testing:
 
 ```rust
-.elche(ElCheConfig::cpu_async().easgd_alpha(0.6))   // best-in-class on reference rig
+.elche(ElCheConfig::cpu_async().easgd_alpha(0.6))   // fastest on the reference rig
 .elche(ElCheConfig::nccl_cadence())                 // default; slow rank anchors, fast ranks fill the window
 .elche(ElCheConfig::nccl_sync())                    // per-batch AllReduce baseline
 .elche(ElCheConfig::cpu_cadence())                  // CPU-mediated cadence (no NVLink/P2P needed)
+.elche(ElCheConfig::cpu_async().bf16_wire(true))    // halve the CPU-plane payload at every hop
 ```
+
+An **outer optimizer** (SlowMo or DiLoCo, applied to the consensus between
+reduce rounds via `.outer_optimizer(...)`) rides on top of any CPU-averaging
+mode and is what takes the accuracy crown in the benchmark below. See the
+[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)
+for the factory shape.
 
 **Multi-host clusters.** Add an `fdl.cluster.yml` next to your
 `fdl.yml`, or build the topology programmatically with
@@ -502,11 +545,12 @@ See the **[Multi-GPU Tutorial](https://github.com/flodl-labs/flodl/blob/main/doc
 ### Validation suite - `ddp-bench`
 
 The repo ships with [`ddp-bench/`](https://github.com/flodl-labs/flodl/tree/main/ddp-bench),
-a workspace member that reproduces published training setups (Logistic /
-MLP / LeNet-5 / ResNet-20 / Char-RNN / GPT-nano / Conv-AE on MNIST,
-CIFAR-10, Shakespeare) to build scientifically valid solo baselines, then
-measures DDP/ElChe convergence quality against them across all 8
-backend × policy combinations:
+a standalone validation vehicle (deliberately outside the published
+workspace) that reproduces published training setups (Logistic / MLP /
+LeNet-5 / ResNet-20 eager and graph-built / Char-RNN / GPT-nano /
+Conv-AE / OLMo-150M on MNIST, CIFAR-10, Shakespeare, olmo-mix) to build
+scientifically valid solo baselines, then measures DDP/ElChe convergence
+quality against them across six DDP modes:
 
 ```bash
 fdl ddp-bench --list                       # list models and modes
@@ -518,7 +562,8 @@ fdl ddp-bench --report runs/report.md      # convergence report from saved runs
 
 Every run produces a high-frequency `Timeline` (CPU/GPU utilization, sync
 events, anchor changes, idle gaps) saved as JSON / CSV / interactive HTML
-under `runs/<model>/<mode>/`.
+under `runs/<model>/<mode>/`, and with `--save-dashboard` each cell also
+leaves a self-contained `dashboard.html` portal beside it.
 
 ### Built-in datasets
 
@@ -576,8 +621,8 @@ offline `safetensors`-only (no network, no async runtime, no TLS).
 Inside an existing flodl project, `fdl add flodl-hf --playground`
 scaffolds a side crate with a runnable `AutoModel` example so you can
 verify a real checkpoint loads before wiring it into your main code;
-`fdl add flodl-hf --install` appends `flodl-hf = "=0.5.3"` to your
-root `Cargo.toml`.
+`fdl add flodl-hf --install` appends `flodl-hf` to your root
+`Cargo.toml`, pinned to the exact version of the flodl you are running.
 
 ```bash
 fdl add flodl-hf --playground   # try it: ./flodl-hf/ sandbox crate
@@ -650,24 +695,32 @@ dispatch-bound architectures (transformer -31%, mlp -29%), graph routing
 
 ### Multi-GPU (DDP)
 
-ResNet-20 on CIFAR-10, 200 epochs - heterogeneous GPUs (RTX 5060 Ti +
-GTX 1060, 2.5x speed ratio). Published reference: 91.25%
+ResNet-20 on CIFAR-10, 200 epochs - three mismatched GPUs spanning two
+hosts (an RTX 5060 Ti on one, two GTX 1060s in a VM on the other, the
+slowest behind a PCIe x1 riser), coordinated over TCP as a real cluster.
+Published reference: 91.25%
 ([He et al. 2015](https://arxiv.org/abs/1512.03385), Table 6):
 
 | Mode | Eval | vs Published | Time | vs Solo-0 |
 |---|---:|---:|---:|---:|
-| solo-0 (fast GPU only) | 91.66% | +0.41% | 3127s | - |
-| nccl-cadence | **92.42%** | **+1.17%** | 2650s | 1.2x |
-| cpu-async | **92.43%** | **+1.18%** | 2614s | 1.2x |
-| cpu-cadence | **92.04%** | **+0.79%** | 2670s | 1.2x |
+| solo-0 (fast GPU only) | 91.46% | +0.21% | 696s | - |
+| cpu-async-diloco | **92.29%** | **+1.04%** | 500s | 1.39x |
+| cpu-async | **91.56%** | **+0.31%** | 498s | 1.40x |
+| cpu-cadence | **91.79%** | **+0.54%** | 503s | 1.38x |
+| nccl-cadence | **91.78%** | **+0.53%** | 512s | 1.36x |
 
 Every ElChe mode surpasses published accuracy while finishing faster
-than the fast GPU alone. 200 epochs is where ElChe's proportional
-scheduling has room to calibrate and shine - shorter models (logistic
-through gpt-nano) confirm DDP convergence across architectures.
+than the fast GPU alone, and the DiLoCo outer optimizer takes the
+accuracy crown while stopping at twice the solo run's training loss:
+each replica only sees its own data partition, so replica-private
+memorization is averaged away every round while shared structure
+survives. 200 epochs is where ElChe's proportional scheduling has room
+to calibrate - shorter models (logistic through gpt-nano) confirm DDP
+convergence across architectures.
 
 **[DDP Benchmark Report](https://github.com/flodl-labs/flodl/blob/main/docs/ddp-benchmark.md)** -
-full results for 8 models across 9 DDP modes
+full results for 8 models across six DDP modes plus solo baselines,
+seeded and reproducible at initialization
 
 ## Why Rust for Deep Learning?
 
@@ -771,7 +824,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 117 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam)
-- 1027 library tests, zero clippy warnings - all tests run on both CPU and CUDA
+- 1992 library tests in `flodl` (2634 across the workspace), zero clippy warnings - all tests run on both CPU and CUDA
 
 ### Hardware Compatibility
 
@@ -839,13 +892,15 @@ supports. If `nvidia-smi` works, floDl trains on it.
 +-----------------------------------------------------------+
 |  User Code / Model Definitions                            |
 +-----------------------------------------------------------+
-|  monitor/  ETA, resource tracking, live web dashboard     |
+|  monitor/  ETA, resources, recursive dashboard portal     |
 +-----------------------------------------------------------+
 |  graph/    Fluent builder, graph tree, execution, DOT/SVG |
 +-----------------------------------------------------------+
 |  data/     DataLoader, resident/streaming, prefetch       |
 +-----------------------------------------------------------+
-|  nn/       Modules, losses, optimizers, DDP, NCCL         |
+|  distributed/  Trainer tiers, ElChe, cluster, NCCL        |
++-----------------------------------------------------------+
+|  nn/       Modules, losses, optimizers, schedulers        |
 +-----------------------------------------------------------+
 |  autograd/ Reverse-mode AD, gradient tracking             |
 +-----------------------------------------------------------+

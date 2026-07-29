@@ -1239,6 +1239,10 @@ pub fn print_project_help(
         style::green(&format!("{:<18}", "@<name>"))
     );
     eprintln!(
+        "    {}  Scope visible GPUs, e.g. 0,1 or all (any position)",
+        style::green(&format!("{:<18}", "--gpus <spec>"))
+    );
+    eprintln!(
         "    {}  Verbose output",
         style::green(&format!("{:<18}", "-v"))
     );
