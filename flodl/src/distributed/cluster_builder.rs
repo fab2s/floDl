@@ -145,9 +145,15 @@ impl ClusterBuilder {
                 "ClusterBuilder: controller.path must be non-empty",
             ));
         }
-        if self.workers.is_empty() {
+        let discovery = self
+            .controller
+            .join
+            .as_ref()
+            .is_some_and(|j| j.discovery == Some(true));
+        if self.workers.is_empty() && !discovery {
             return Err(TensorError::new(
-                "ClusterBuilder: at least one worker required",
+                "ClusterBuilder: at least one worker required (a roster-free \
+                 window needs `.discovery(true)` on the controller)",
             ));
         }
         // Explicit-devices length check: a host with explicit device
@@ -397,6 +403,33 @@ impl ControllerBuilder {
     /// YAML `controller.join.open_admission`.
     pub fn open_admission(mut self, open: bool) -> Self {
         self.join.open_admission = Some(open);
+        self
+    }
+
+    /// Roster-free formation: the join window alone defines the world
+    /// (the `workers:` list may be empty; walk-ins self-register).
+    /// Requires an explicit [`Self::min_rank_start`]. Mirrors YAML
+    /// `controller.join.discovery`.
+    pub fn discovery(mut self, on: bool) -> Self {
+        self.join.discovery = Some(on);
+        self
+    }
+
+    /// Pre-shared session salt, hex (32 chars / 16 bytes), replacing the
+    /// per-run generated salt so walk-ins can present it as their join
+    /// credential. Forces authenticated admission even on a loopback
+    /// bind. Mirrors YAML `controller.join.token`.
+    pub fn join_token(mut self, token_hex: impl Into<String>) -> Self {
+        self.join.token = Some(token_hex.into());
+        self
+    }
+
+    /// Bind the controller mux loopback-only in discovery mode: every
+    /// walk-in must arrive through an sshd-carried forward, making
+    /// reachability itself the authentication. Requires a CPU averaging
+    /// mode. Mirrors YAML `controller.join.tunnel_only`.
+    pub fn tunnel_only(mut self, on: bool) -> Self {
+        self.join.tunnel_only = Some(on);
         self
     }
 

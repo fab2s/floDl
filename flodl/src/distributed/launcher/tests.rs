@@ -100,9 +100,55 @@
     }
 
     #[test]
+    fn discovery_knobs_parse_and_gate_the_empty_roster() {
+        // The discovery family round-trips like every other knob.
+        let mut val = canonical_full_json();
+        val["controller"]["join"] = json!({
+            "discovery": true,
+            "min_rank_start": 2,
+            "token": "0123456789abcdef0123456789abcdef",
+            "tunnel_only": true,
+        });
+        let full = FullCluster::from_value(&val).unwrap();
+        let knobs = full.controller.join.as_ref().expect("join block parsed");
+        assert_eq!(knobs.discovery, Some(true));
+        assert_eq!(
+            knobs.token.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(knobs.tunnel_only, Some(true));
+        let back = FullCluster::from_value(&full.to_json()).unwrap();
+        assert_eq!(back.controller.join, full.controller.join);
+
+        // An empty roster is exactly what discovery mode is for...
+        let mut val = canonical_full_json();
+        val["controller"]["join"] = json!({ "discovery": true, "min_rank_start": 1 });
+        val["workers"] = json!([]);
+        let full = FullCluster::from_value(&val).unwrap();
+        assert!(full.workers.is_empty());
+        assert_eq!(full.world_size(), 0);
+
+        // ...and stays a loud config error without it.
+        let mut val = canonical_full_json();
+        val["workers"] = json!([]);
+        let msg = FullCluster::from_value(&val).unwrap_err().to_string();
+        assert!(msg.contains("discovery"), "got: {msg}");
+
+        // Wrong-typed discovery knobs are loud.
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "discovery": "yes" });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("boolean"), "got: {msg}");
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "token": 42 });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("hex string"), "got: {msg}");
+    }
+
+    #[test]
     fn join_config_derivation_defaults_to_capacity_all_or_nothing() {
         // No knobs: quorum = target = capacity, stock timeouts.
-        let cfg = super::derive_join_config(None, 3);
+        let cfg = super::derive_join_config(None, 3).unwrap();
         assert_eq!(cfg.min_rank_start, 3);
         assert_eq!(cfg.target_ranks, Some(3));
         assert_eq!(cfg.join_timeout_secs, 300);
@@ -111,17 +157,93 @@
 
         // Partial overrides keep the rest derived.
         let knobs = JoinKnobs { min_rank_start: Some(2), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3);
+        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
         assert_eq!(cfg.min_rank_start, 2);
         assert_eq!(cfg.target_ranks, Some(3));
 
         // An enlarged window stretches the default hard cap instead of
         // tripping the cap >= window validation.
         let knobs = JoinKnobs { join_timeout_secs: Some(900), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3);
+        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
         assert_eq!(cfg.join_timeout_secs, 900);
         assert_eq!(cfg.max_join_timeout_secs, 900);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn join_config_derivation_discovery_semantics() {
+        // Discovery with an explicit quorum: target stays unset (the
+        // full window runs on an unknown fleet).
+        let knobs = JoinKnobs {
+            discovery: Some(true),
+            min_rank_start: Some(2),
+            ..Default::default()
+        };
+        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        assert_eq!(cfg.min_rank_start, 2);
+        assert_eq!(cfg.target_ranks, None);
+        cfg.validate().unwrap();
+
+        // Discovery + an explicit target keeps the early close.
+        let knobs = JoinKnobs {
+            discovery: Some(true),
+            min_rank_start: Some(2),
+            target_ranks: Some(4),
+            ..Default::default()
+        };
+        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        assert_eq!(cfg.target_ranks, Some(4));
+
+        // Discovery without a quorum is loud — no capacity to derive from.
+        let knobs = JoinKnobs { discovery: Some(true), ..Default::default() };
+        let msg = super::derive_join_config(Some(&knobs), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("min_rank_start"), "got: {msg}");
+    }
+
+    #[test]
+    fn session_salt_resolution_and_knob_contradictions() {
+        // A configured token IS the salt, verbatim.
+        let knobs = JoinKnobs {
+            token: Some("0123456789abcdef0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let salt = super::resolve_session_salt(&knobs).unwrap();
+        assert_eq!(
+            crate::distributed::wire::salt_to_hex(&salt),
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        // No token: fresh salts, distinct per invocation.
+        let a = super::resolve_session_salt(&JoinKnobs::default()).unwrap();
+        let b = super::resolve_session_salt(&JoinKnobs::default()).unwrap();
+        assert_ne!(a, b);
+
+        // Wrong-length token is loud.
+        let knobs = JoinKnobs { token: Some("abcd".into()), ..Default::default() };
+        let msg = super::resolve_session_salt(&knobs).unwrap_err().to_string();
+        assert!(msg.contains("32 hex chars"), "got: {msg}");
+
+        // token + open_admission contradict.
+        let knobs = JoinKnobs {
+            token: Some("0123456789abcdef0123456789abcdef".into()),
+            open_admission: Some(true),
+            ..Default::default()
+        };
+        let msg = super::resolve_session_salt(&knobs).unwrap_err().to_string();
+        assert!(msg.contains("contradict"), "got: {msg}");
+
+        // tunnel_only outside discovery mode is loud.
+        let knobs = JoinKnobs { tunnel_only: Some(true), ..Default::default() };
+        let msg = super::resolve_session_salt(&knobs).unwrap_err().to_string();
+        assert!(msg.contains("discovery-mode knob"), "got: {msg}");
+        let knobs = JoinKnobs {
+            tunnel_only: Some(true),
+            discovery: Some(true),
+            ..Default::default()
+        };
+        super::resolve_session_salt(&knobs).unwrap();
     }
 
     #[test]
@@ -157,7 +279,7 @@
                 joined_at_secs: 2,
             },
         ];
-        let world = super::synthesize_world(&full, members.iter(), salt);
+        let world = super::synthesize_world(&full, members.iter(), salt, false);
         assert_eq!(world.world_size(), 4);
         assert_eq!(world.salt, salt);
         // Admission order defines the worker order + rank assignment.
@@ -176,6 +298,14 @@
         assert!(!world.workers[1].tunnel);
         assert_eq!(world.workers[2].host, "host-a");
         assert_eq!(world.workers[2].ranks, vec![3]);
+
+        // On a loopback-bound mux the walk-in can only have arrived
+        // through an sshd forward, so its synthesized entry is tunneled
+        // (rank children dial their loopback end of the forward) while
+        // config-matched hosts keep their own `tunnel:` flag.
+        let world = super::synthesize_world(&full, members.iter(), salt, true);
+        assert!(world.workers[1].tunnel, "walk-in must inherit the tunnel");
+        assert!(!world.workers[0].tunnel, "config host keeps its own flag");
     }
 
     fn canonical_full_json() -> serde_json::Value {

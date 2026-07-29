@@ -139,6 +139,27 @@ pub struct JoinKnobs {
     /// Accept joins without pre-shared-salt authentication on a
     /// non-loopback bind. Loudly warned; see the trust model.
     pub open_admission: Option<bool>,
+    /// Roster-free formation: the window alone defines the world. The
+    /// `workers:` list may be empty (walk-ins self-register against
+    /// `bind addr + credential`); an enumerated roster is still fanned
+    /// out as usual and walk-ins join alongside it. Requires an
+    /// explicit `min_rank_start` — with no roster there is no capacity
+    /// to derive the quorum from.
+    pub discovery: Option<bool>,
+    /// Pre-shared session salt, hex (32 chars / 16 bytes). Replaces the
+    /// launcher's per-run generated salt so a credential can be injected
+    /// at fleet-create time and presented by walk-ins (`fdl join
+    /// --token`). Forces authenticated admission even on a loopback
+    /// bind (layered with the sshd guardrails, not an alternative to
+    /// them); mutually exclusive with `open_admission: true`.
+    pub token: Option<String>,
+    /// Bind the controller mux loopback-only with no enumerated tunnel
+    /// workers to infer it from: every walk-in must arrive through an
+    /// sshd-carried forward, making reachability itself the
+    /// authentication. Discovery-only knob (a roster infers the bind
+    /// scope from its `tunnel:` flags); requires a CPU averaging mode,
+    /// exactly like per-worker `tunnel: true`.
+    pub tunnel_only: Option<bool>,
 }
 
 impl FullCluster {
@@ -290,9 +311,13 @@ impl FullCluster {
             .get("workers")
             .and_then(|v| v.as_array())
             .ok_or_else(|| TensorError::new("cluster launcher: workers (array) required"))?;
-        if workers_val.is_empty() {
+        let discovery = controller_join
+            .as_ref()
+            .is_some_and(|j| j.discovery == Some(true));
+        if workers_val.is_empty() && !discovery {
             return Err(TensorError::new(
-                "cluster launcher: workers must be non-empty",
+                "cluster launcher: workers must be non-empty (a roster-free \
+                 window needs `controller.join.discovery: true`)",
             ));
         }
 
@@ -464,6 +489,15 @@ impl FullCluster {
             }
             if let Some(b) = j.open_admission {
                 join_obj.insert("open_admission".into(), serde_json::Value::Bool(b));
+            }
+            if let Some(b) = j.discovery {
+                join_obj.insert("discovery".into(), serde_json::Value::Bool(b));
+            }
+            if let Some(t) = &j.token {
+                join_obj.insert("token".into(), serde_json::Value::String(t.clone()));
+            }
+            if let Some(b) = j.tunnel_only {
+                join_obj.insert("tunnel_only".into(), serde_json::Value::Bool(b));
             }
             if !join_obj.is_empty() {
                 controller_obj.insert("join".into(), serde_json::Value::Object(join_obj));
@@ -678,23 +712,36 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
             },
         }
     };
-    let open_admission = match obj.get("open_admission") {
+    let boolean = |key: &str| -> Result<Option<bool>> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+            Some(other) => Err(TensorError::new(&format!(
+                "cluster launcher: controller.join.{key} must be a \
+                 boolean, got {other}"
+            ))),
+        }
+    };
+    let token = match obj.get("token") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(other) => {
             return Err(TensorError::new(&format!(
-                "cluster launcher: controller.join.open_admission must be a \
-                 boolean, got {other}"
+                "cluster launcher: controller.join.token must be a hex \
+                 string, got {other}"
             )));
         }
     };
     // Unknown keys are a config typo waiting to silently no-op a knob.
-    const KNOWN: [&str; 5] = [
+    const KNOWN: [&str; 8] = [
         "min_rank_start",
         "join_timeout",
         "target_ranks",
         "max_join_timeout",
         "open_admission",
+        "discovery",
+        "token",
+        "tunnel_only",
     ];
     for k in obj.keys() {
         if !KNOWN.contains(&k.as_str()) {
@@ -709,7 +756,10 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
         join_timeout_secs: uint("join_timeout")?,
         target_ranks: uint("target_ranks")?.map(|n| n as usize),
         max_join_timeout_secs: uint("max_join_timeout")?,
-        open_admission,
+        open_admission: boolean("open_admission")?,
+        discovery: boolean("discovery")?,
+        token,
+        tunnel_only: boolean("tunnel_only")?,
     }))
 }
 

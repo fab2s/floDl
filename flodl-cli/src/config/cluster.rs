@@ -180,6 +180,23 @@ pub struct ClusterJoin {
     /// non-loopback bind (loudly warned by flodl).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_admission: Option<bool>,
+    /// Roster-free formation: the join window alone defines the world,
+    /// so `workers:` may be empty (walk-ins self-register via `fdl
+    /// join`). Requires an explicit `min_rank_start` — there is no
+    /// configured capacity to derive the quorum from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<bool>,
+    /// Pre-shared session salt, hex (32 chars / 16 bytes). Injected at
+    /// fleet-create time and presented by walk-ins as their join
+    /// credential; forces authenticated admission even behind sshd.
+    /// Mutually exclusive with `open_admission: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Discovery-only: bind the controller loopback-only so every
+    /// walk-in must arrive through an sshd-carried forward
+    /// (reachability = authentication). Requires a CPU averaging mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_only: Option<bool>,
 }
 
 impl ClusterController {
@@ -480,8 +497,15 @@ impl ClusterConfig {
         if self.controller.path.trim().is_empty() {
             return Err("cluster.controller.path must be non-empty".into());
         }
-        if self.workers.is_empty() {
-            return Err("cluster.workers must be non-empty".into());
+        let discovery = self
+            .controller
+            .join
+            .as_ref()
+            .is_some_and(|j| j.discovery == Some(true));
+        if self.workers.is_empty() && !discovery {
+            return Err("cluster.workers must be non-empty (a roster-free \
+                        window needs `controller.join.discovery: true`)"
+                .into());
         }
         // Reserved-env-key check: a user env map must not carry a key the
         // launcher owns per-rank. The launcher applies user env after its

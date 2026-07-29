@@ -928,6 +928,9 @@ the window open for extra dial-in workers:
 | `target_ranks` | The window closes the moment this many ranks are in. Raise it above capacity to wait for self-deployed workers. | configured capacity |
 | `max_join_timeout` | Hard cap in seconds; quorum still unmet when it expires fails the run loudly. | 600 (or the window length when set higher) |
 | `open_admission` | Accept joins without the pre-shared session salt on a non-loopback bind (loudly warned). | false |
+| `discovery` | Roster-free formation: the window alone defines the world, so `workers:` may be empty (walk-ins self-register). Requires an explicit `min_rank_start`; the window closes only on `target_ranks` or expiry. | false |
+| `token` | Pre-shared session salt, hex (32 chars / 16 bytes), replacing the per-run generated salt so a fleet-create-injected credential can be presented by walk-ins. Forces credential-checked admission even behind sshd; contradicts `open_admission: true` (loud error). | generated per run |
+| `tunnel_only` | Discovery-only: bind the controller loopback-only so walk-ins must arrive through sshd forwards (reachability = authentication). Requires a CPU averaging mode. | false |
 
 Admission is authenticated by the join frames' HMAC key: fan-out
 agents receive the per-run session salt through their SSH session, so
@@ -947,6 +950,14 @@ its own GPUs, joins, receives the formed-world artifacts, and spawns
 its relay and rank children - the training code is byte-identical to
 the fan-out path. Pair it with `target_ranks` above the configured
 capacity (or a bare-bones one-host config) so the window waits for it.
+
+`discovery: true` takes that shape to its limit: no roster at all. The
+controller opens the window from its bind address plus the join
+credential (`token`, or sshd reachability under `tunnel_only`), holds
+it for `join_timeout` seconds, and the world is whoever walked in -
+the cloud shape, where worker addresses do not exist before the VMs
+boot. Fan-out and discovery compose: an enumerated rig fans out as
+usual while cloud legs self-register into the same window.
 
 One contract for user binaries: `Trainer::run` dispatches the cluster
 roles (agent, relay, rank) internally, so a binary that goes straight
