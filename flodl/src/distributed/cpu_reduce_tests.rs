@@ -771,6 +771,190 @@
         }
     }
 
+    /// RAM-neutral decode end-to-end: with `set_decode_into_request`,
+    /// the consensus decodes INTO the request tensor itself — the same
+    /// storage the production bridge streams from (the snapshot
+    /// staging). Pins three behaviors: the request tensor holds the
+    /// consensus after the round (the decode landed in place, zero new
+    /// staging), the returned handles alias it, and the next window's
+    /// cycle (local write → reduce) reuses the same storage so round
+    /// 1's handles read round 2's consensus — the single-consumer
+    /// contract as observable behavior, like the slot-mode test above.
+    #[test]
+    fn decode_into_request_lands_the_consensus_in_the_request_tensor() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, v1: f32, v2: f32| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_decode_into_request(true);
+                    // Persistent "snapshot staging": written with local
+                    // values each window, reduced, decoded back into.
+                    let s = Tensor::from_f32(&[v1, v1], &[2], Device::CPU).unwrap();
+                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    let round1 = c
+                        .all_reduce_scaled(&[&s], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    let staging_after_r1 = s.to_f32_vec().unwrap();
+                    // Next window: the "D2H" lands new local values in
+                    // the same staging.
+                    let next = Tensor::from_f32(&[v2, v2], &[2], Device::CPU).unwrap();
+                    s.copy_(&next, false).unwrap();
+                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    let round2 = c
+                        .all_reduce_scaled(&[&s], 1.0, RoundKind::Model, 1.0)
+                        .unwrap()
+                        .0;
+                    (staging_after_r1, round1, round2)
+                })
+            };
+            let t0 = spawn(0, 2.0, 10.0);
+            let t1 = spawn(1, 4.0, 14.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, (staging_after_r1, round1, round2)) in [(0, &r0), (1, &r1)] {
+            assert_eq!(
+                *staging_after_r1,
+                vec![3.0, 3.0],
+                "rank {rank} request tensor holds the round-1 consensus"
+            );
+            assert_eq!(
+                round2[0].to_f32_vec().unwrap(),
+                vec![12.0, 12.0],
+                "rank {rank} round-2 consensus"
+            );
+            // Round 2 decoded into the SAME storage, so round 1's handle
+            // now reads round 2's values — the aliasing IS the reuse.
+            assert_eq!(
+                round1[0].to_f32_vec().unwrap(),
+                vec![12.0, 12.0],
+                "rank {rank} round-1 handle aliases the round-2 decode"
+            );
+        }
+    }
+
+    /// The zero-mass guard: a round that realized no work returns
+    /// meaningless zeros that `sumcount_reduce` keep-locals over — and
+    /// with decode-into-request the armed destinations ARE the tensors
+    /// keep-local returns, so the zeros must decode FRESH and leave the
+    /// staging untouched. Without the guard (the reply's weight rides
+    /// the wire ahead of the payloads precisely for this) every rank
+    /// would silently adopt a zeroed model on such a round.
+    #[test]
+    fn a_zero_mass_round_leaves_armed_destinations_untouched() {
+        use crate::distributed::controller::RoundKind;
+        let (r0, r1) = with_relayed_controller(2, vec![0, 1], TEST_SALT, |addr| {
+            let spawn = |rank: u32, v: f32| {
+                thread::spawn(move || {
+                    let mut c =
+                        CpuReduceClient::connect(addr, rank, 2, TEST_SALT).unwrap();
+                    c.set_decode_into_request(true);
+                    let s = Tensor::from_f32(&[v, v], &[2], Device::CPU).unwrap();
+                    c.arm_decode_into(std::slice::from_ref(&s), DECODE_SLOT_PARAMS);
+                    // Every rank idle: elided frames, realized mass 0.
+                    let (out, mass) = c
+                        .all_reduce_scaled(&[&s], 0.0, RoundKind::Model, 0.0)
+                        .unwrap();
+                    (s.to_f32_vec().unwrap(), out[0].to_f32_vec().unwrap(), mass)
+                })
+            };
+            let t0 = spawn(0, 2.0);
+            let t1 = spawn(1, 8.0);
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for (rank, v, (staging, out, mass)) in [(0, 2.0f32, &r0), (1, 8.0f32, &r1)] {
+            assert_eq!(*mass, 0.0, "rank {rank} realized mass");
+            assert_eq!(
+                *staging,
+                vec![v, v],
+                "rank {rank} armed staging keeps its local values (keep-local \
+                 hands these back — a zeroed staging here is the clobber bug)"
+            );
+            assert_eq!(
+                *out,
+                vec![0.0, 0.0],
+                "rank {rank} zero-mass reply decodes fresh zeros"
+            );
+        }
+    }
+
+    /// `decode_into_dst` guards: a degenerate destination (non-f32
+    /// stand-in for the non-CPU/non-f32 class the double-failure
+    /// snapshot path can ship) falls back to a fresh decode without
+    /// touching the destination; a shape mismatch against caller-owned
+    /// staging is a LOUD error, never a realloc (a silent realloc would
+    /// break the aliasing the RAM-neutral decode rides on).
+    #[test]
+    fn decode_into_dst_refuses_degenerate_and_drifted_destinations() {
+        let payload = TensorPayload {
+            dtype: DTYPE_F32,
+            shape: vec![2, 2],
+            bytes: f32_to_bytes(&[1.0, 2.0, 3.0, 4.0]),
+        };
+        // Degenerate dtype: bf16 destination is refused, values land fresh.
+        let bf16_dst = Tensor::from_f32(&[7.0; 4], &[2, 2], Device::CPU)
+            .unwrap()
+            .to_dtype(crate::tensor::DType::BFloat16)
+            .unwrap();
+        let mut fb = None;
+        let out =
+            decode_into_dst(0, &payload, std::slice::from_ref(&bf16_dst), &mut fb)
+                .unwrap();
+        assert_eq!(out.dtype(), crate::tensor::DType::Float32);
+        assert_eq!(out.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(fb.is_some(), "refusal must be recorded for the notice");
+        assert_eq!(
+            bf16_dst.to_dtype(crate::tensor::DType::Float32).unwrap()
+                .to_f32_vec().unwrap(),
+            vec![7.0; 4],
+            "refused destination stays untouched"
+        );
+        // Shape drift: loud error, destination untouched.
+        let drifted = Tensor::from_f32(&[7.0; 3], &[3], Device::CPU).unwrap();
+        let mut fb = None;
+        let err = decode_into_dst(0, &payload, std::slice::from_ref(&drifted), &mut fb)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("schema drift"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(drifted.to_f32_vec().unwrap(), vec![7.0; 3]);
+        // More payloads than destinations: loud error.
+        let mut fb = None;
+        let err = decode_into_dst(1, &payload, &[], &mut fb).unwrap_err();
+        assert!(
+            err.to_string().contains("no armed decode destination"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An elided reply payload (mass realized, values structurally
+    /// zero) must zero the armed destination IN PLACE — stale values
+    /// from the previous window must not survive as "consensus".
+    #[test]
+    fn decode_into_dst_zeroes_the_destination_on_elided_payload() {
+        let dst = Tensor::from_f32(&[7.0; 4], &[2, 2], Device::CPU).unwrap();
+        let elided = TensorPayload {
+            dtype: DTYPE_F32,
+            shape: vec![2, 2],
+            bytes: Vec::new(),
+        };
+        let mut fb = None;
+        let out =
+            decode_into_dst(0, &elided, std::slice::from_ref(&dst), &mut fb).unwrap();
+        assert_eq!(out.to_f32_vec().unwrap(), vec![0.0; 4]);
+        assert_eq!(
+            dst.to_f32_vec().unwrap(),
+            vec![0.0; 4],
+            "the zeroing happened in the destination itself"
+        );
+        assert!(fb.is_none());
+    }
+
     /// A length prefix that DISAGREES with its frame body must be a
     /// loud named error in both directions — the streamed reader parses
     /// straight off the socket, so drift here would otherwise be a

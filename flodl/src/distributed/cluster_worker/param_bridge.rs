@@ -320,13 +320,18 @@ pub(super) fn param_bridge_loop(
 /// `0.0`, e.g. every accepted contributor was idle) — the caller keeps
 /// its local state, mirroring the all-idle collective skip.
 ///
-/// `decode_slot` tags which reused decode-staging set this round's
-/// reply lands in when the client has pinned decode enabled (see
-/// [`CpuReduceClient::arm_pinned_decode`]); the params and buffers
-/// reduces of one window must not share a slot. A no-op on clients
-/// without pinned decode (the reply decodes into fresh allocs).
+/// The reply decodes into whatever staging the client's mode selects
+/// (see [`CpuReduceClient::arm_decode_into`]): with decode-into-request
+/// (f32 wire), into `tensors` THEMSELVES — the pinned snapshot staging,
+/// whose bytes are dead once the streamed encode has read them, making
+/// the writeback H2D truly async with zero marginal locked RAM; with
+/// slot-based pinned decode (bf16 wire, RAM-gated), into the client's
+/// per-`decode_slot` staging (params and buffers of one window must not
+/// share a slot); with neither, into fresh allocs. On a zero-mass round
+/// the client leaves `tensors` untouched (fresh decode), so the
+/// keep-local return below hands back genuinely local state.
 ///
-/// [`CpuReduceClient::arm_pinned_decode`]: crate::distributed::cpu_reduce::CpuReduceClient::arm_pinned_decode
+/// [`CpuReduceClient::arm_decode_into`]: crate::distributed::cpu_reduce::CpuReduceClient::arm_decode_into
 pub(crate) fn sumcount_reduce(
     client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
     tensors: &[Tensor],
@@ -338,7 +343,7 @@ pub(crate) fn sumcount_reduce(
     // and reading `tensors` (the pinned snapshot staging) at stream time
     // is this window's single consumption of it.
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    client.arm_pinned_decode(decode_slot);
+    client.arm_decode_into(tensors, decode_slot);
     let (consensus, realized) = client.all_reduce_scaled(
         &refs,
         my_weight,

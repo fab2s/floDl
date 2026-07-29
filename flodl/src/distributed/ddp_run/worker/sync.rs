@@ -394,13 +394,17 @@ impl<M: Module> GpuWorker<M> {
     /// The overlap is only real when the SOURCE is pinned — a pageable
     /// source silently degrades `cudaMemcpyAsync` to a synchronous
     /// bounce copy. On barrier-paced CUDA runs the update tensors are
-    /// the reduce client's reused pinned decode staging (see
-    /// `CpuReduceClient::set_pinned_decode`; all-idle keep-local rounds
-    /// ship the pinned snapshot staging), so the copies below are true
-    /// async H2D. Their in-flight window is closed by the existing
-    /// fences: `sync_before_forward` host-syncs before the next step,
-    /// and `snapshot_params`' entry fence retires any straggler before
-    /// the staging can be overwritten by the next round's decode.
+    /// pinned staging: under f32 wire the consensus decodes back into
+    /// the pinned SNAPSHOT staging itself (see
+    /// `CpuReduceClient::set_decode_into_request` — zero marginal
+    /// locked memory), under bf16 wire into the reduce client's own
+    /// RAM-gated f32 decode staging (`set_pinned_decode`); all-idle
+    /// keep-local rounds ship the pinned snapshot staging on both. The
+    /// copies below are therefore true async H2D, and their in-flight
+    /// window is closed by the existing fences: `sync_before_forward`
+    /// host-syncs before the next step, and `snapshot_params`' entry
+    /// fence retires any straggler before the staging can be
+    /// overwritten by the next round's D2H or decode.
     pub fn load_averaged(&mut self, update: &AveragedParams) -> Result<()> {
         if update.params.len() != self.param_vars.len() {
             return Err(TensorError::new(&format!(

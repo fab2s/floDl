@@ -139,7 +139,7 @@ pub(crate) fn read_round_frame<R: Read>(
     salt: &SessionSalt,
 ) -> Result<Option<RoundFrame>> {
     let mut tensors = Vec::new();
-    match read_round_frame_streamed(stream, salt, &mut |_, payload| {
+    match read_round_frame_streamed(stream, salt, None, &mut |_, payload| {
         tensors.push(payload);
         Ok(())
     })? {
@@ -170,9 +170,19 @@ pub(crate) fn read_round_frame<R: Read>(
 ///
 /// Returns `Ok(None)` on clean EOF before the header, `Ok(Some((kind,
 /// weight)))` after the footer authenticates.
+///
+/// `on_header` (optional) fires once, after the frame's kind + weight
+/// parse and BEFORE any payload reaches `sink`. The wire layout puts
+/// the realized-work weight ahead of the tensor list precisely so a
+/// receiver can pick a decode DESTINATION per round (e.g. reused
+/// staging vs fresh allocs for a zero-mass reply) without buffering the
+/// frame. Same MAC-before-use exposure as `sink`: the values are
+/// UNAUTHENTICATED at callback time — they may steer inert buffering
+/// only, never be adopted as data.
 pub(crate) fn read_round_frame_streamed<R: Read>(
     stream: &mut R,
     salt: &SessionSalt,
+    on_header: Option<&mut dyn FnMut(RoundKind, f64)>,
     sink: &mut dyn FnMut(usize, TensorPayload) -> Result<()>,
 ) -> Result<Option<(RoundKind, f64)>> {
     let mut mac = HMAC::new(salt.as_slice());
@@ -228,6 +238,9 @@ pub(crate) fn read_round_frame_streamed<R: Read>(
             "cluster_controller: frame weight {weight} is not a finite non-negative \
              realized-work mass"
         )));
+    }
+    if let Some(cb) = on_header {
+        cb(kind, weight);
     }
 
     let mut total_bytes: usize = 0;
