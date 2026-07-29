@@ -1,8 +1,8 @@
 ---
 layout: default
 title: DDP Benchmark
-description: "8 models, 6 DDP modes, 63 runs across a 3-GPU two-host cluster. DiLoCo takes the accuracy crown at 92.36% on ResNet-20, beating the fast GPU alone on both accuracy and wall time."
-last_modified_at: 2026-07-22T23:45:00+02:00
+description: "8 models, 6 DDP modes, 63 runs across a 3-GPU two-host cluster. DiLoCo takes the accuracy crown at 92.29% on ResNet-20: +0.83pp over the fast GPU alone while finishing 28% sooner."
+last_modified_at: 2026-07-29T10:30:00+02:00
 ---
 
 <section class="section">
@@ -59,24 +59,25 @@ last_modified_at: 2026-07-22T23:45:00+02:00
         </tr>
       </thead>
       <tbody>
-        <tr><td>solo-0 (5060 Ti)</td><td>92.10%</td><td>+0.85pp</td><td>699s</td><td>1.0x</td></tr>
-        <tr><td>solo-1 (1060)</td><td>91.70%</td><td>+0.45pp</td><td>3186s</td><td>0.22x</td></tr>
-        <tr><td>solo-2 (1060, x1 riser)</td><td>91.94%</td><td>+0.69pp</td><td>3318s</td><td>0.21x</td></tr>
-        <tr class="bench-highlight"><td><strong>cpu-async-diloco</strong></td><td><strong>92.36%</strong></td><td><strong>+1.11pp</strong></td><td><strong>524s</strong></td><td><strong>1.33x</strong></td></tr>
-        <tr class="bench-highlight"><td><strong>cpu-cadence</strong></td><td>91.67%</td><td>+0.42pp</td><td><strong>512s</strong></td><td><strong>1.37x</strong></td></tr>
-        <tr><td>cpu-async</td><td>92.08%</td><td>+0.83pp</td><td>529s</td><td>1.32x</td></tr>
-        <tr><td>nccl-cadence</td><td>92.06%</td><td>+0.81pp</td><td>548s</td><td>1.28x</td></tr>
-        <tr><td>nccl-sync</td><td>91.98%</td><td>+0.73pp</td><td>1173s</td><td>0.60x</td></tr>
-        <tr><td>cpu-sync</td><td>91.62%</td><td>+0.37pp</td><td>1650s</td><td>0.42x</td></tr>
+        <tr><td>solo-0 (5060 Ti)</td><td>91.46%</td><td>+0.21pp</td><td>696s</td><td>1.0x</td></tr>
+        <tr class="bench-highlight"><td><strong>cpu-async-diloco</strong></td><td><strong>92.29%</strong></td><td><strong>+1.04pp</strong></td><td><strong>500s</strong></td><td><strong>1.39x</strong></td></tr>
+        <tr class="bench-highlight"><td><strong>cpu-async</strong></td><td>91.56%</td><td>+0.31pp</td><td><strong>498s</strong></td><td><strong>1.40x</strong></td></tr>
+        <tr><td>cpu-cadence</td><td>91.79%</td><td>+0.54pp</td><td>503s</td><td>1.38x</td></tr>
+        <tr><td>nccl-cadence</td><td>91.78%</td><td>+0.53pp</td><td>512s</td><td>1.36x</td></tr>
+        <tr><td>nccl-sync</td><td>91.60%</td><td>+0.35pp</td><td>1137s</td><td>0.61x</td></tr>
+        <tr><td>cpu-sync</td><td>91.59%</td><td>+0.34pp</td><td>1607s</td><td>0.43x</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
-      Eval = held-out test accuracy (10K samples). Speedup relative to solo-0
-      (which pays per-epoch eval; its training-only time is 670s). Every mode
-      beats the paper; the cluster beats the fast GPU alone on wall time while
-      the slowest card would need 55 minutes for the same run. The <code>*-sync</code>
-      modes reduce once per slow-rank step, so they pay the rendezvous
-      thousands of times &mdash; correctness baselines, not speed contenders.
+      Sweep of 2026-07-29. Eval = held-out test accuracy (10K samples).
+      Speedup relative to solo-0 (which pays per-epoch eval). Every mode
+      beats the paper, and the async family now leads on wall time:
+      the averaged-model writeback streams through reused staging instead of
+      materializing model-sized copies. The 1060 solo baselines are deferred
+      this pass (hours each behind the x1 riser; the earlier sweep measured
+      ~0.2x). The <code>*-sync</code> modes reduce once per slow-rank step,
+      so they pay the rendezvous thousands of times &mdash; correctness
+      baselines, not speed contenders.
     </p>
   </div>
 </section>
@@ -95,16 +96,17 @@ last_modified_at: 2026-07-22T23:45:00+02:00
 
   <div style="max-width: 720px; margin: 1.5rem auto;">
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8;">
-      Solo-0 reached exactly 92.36% at epoch 159 &mdash; then spent the last 40
-      epochs trading it away: training loss kept halving (0.025 &rarr; 0.012)
-      while eval slid back to 92.10%. Textbook overfitting-in-time.
-      <code>cpu-async-diloco</code> ends at that same 92.36% &mdash; and holds it.
-      Each replica only sees its own data partition, so whatever one replica
-      memorizes, the others did not: the consensus average attenuates
-      replica-private memorization every round while shared structure survives.
-      DiLoCo's outer Nesterov momentum smooths the consensus trajectory on top.
-      The distributed run is, in effect, a solo run with perfect early stopping
-      &mdash; without needing to know when to stop, and faster.
+      Solo-0 drove its training loss all the way down to 0.013, and
+      lands at 91.46% eval. <code>cpu-async-diloco</code> stops at 0.026,
+      twice the training loss, and lands at 92.29%: it memorized measurably
+      less and generalized measurably more, +0.83pp with 28% less wall time.
+      The mechanism: each replica only sees its own data partition, so
+      whatever one replica memorizes, the others did not. The
+      consensus average attenuates replica-private memorization every round
+      while shared structure survives, and DiLoCo's outer Nesterov momentum
+      smooths the consensus trajectory on top. The distributed run behaves
+      like a solo run with built-in regularization, no early-stopping
+      oracle required, and faster.
     </p>
   </div>
 </section>
@@ -133,16 +135,16 @@ last_modified_at: 2026-07-22T23:45:00+02:00
         </tr>
       </thead>
       <tbody>
-        <tr><td>solo-0 (5060 Ti)</td><td>91.73%</td><td>+0.48pp</td><td>689s</td></tr>
-        <tr><td>nccl-cadence</td><td>91.60%</td><td>+0.35pp</td><td>536s</td></tr>
+        <tr><td>solo-0 (5060 Ti)</td><td>91.41%</td><td>+0.16pp</td><td>685s</td></tr>
+        <tr><td>nccl-cadence</td><td>92.08%</td><td>+0.83pp</td><td>510s</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
-      <code>Trainer::builder()</code> path, no Graph required. The eager and graph
-      engines land within 0.1% of each other on both wall time and eval
-      (compare the graph flavor's cpu-sync 1650.2s vs the eager 1648.4s from
-      the same sweep), so the full mode suite runs on the graph flavor and the
-      eager model keeps these two parity cells.
+      <code>Trainer::builder()</code> path, no Graph required. The eager and
+      graph engines land within 1.6% on wall time (solo-0: 685s eager vs 696s
+      graph; nccl-cadence: 510s vs 512s) and within single-seed run noise on
+      eval, so the full mode suite runs on the graph flavor and the eager
+      model keeps these two parity cells.
     </p>
   </div>
 </section>
@@ -164,17 +166,17 @@ last_modified_at: 2026-07-22T23:45:00+02:00
     <div class="wyg-card">
       <h3>Sync</h3>
       <p>Equal data split; the reduce fires as soon as every alive rank has made at least one step. Degenerates to classic DDP on homogeneous rigs; on mixed hardware the fast GPU runs several steps per reduce inside its equal share, then idles. Correctness baseline.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 91.98%, 1173s (NCCL) / 91.62%, 1650s (CPU)</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 91.60%, 1137s (NCCL) / 91.59%, 1607s (CPU)</p>
     </div>
     <div class="wyg-card">
       <h3>Cadence</h3>
-      <p>Data dispatched proportionally to measured throughput; the reduce fires once every rank completes its planned window. The slow card anchors the interval, the fast card contributes proportionally more. Fastest wall time on this rig.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.06%, 548s (NCCL) / 91.67%, 512s (CPU)</p>
+      <p>Data dispatched proportionally to measured throughput; the reduce fires once every rank completes its planned window. The slow card anchors the interval, the fast card contributes proportionally more.</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 91.78%, 512s (NCCL) / 91.79%, 503s (CPU)</p>
     </div>
     <div class="wyg-card">
       <h3>Async (+ DiLoCo)</h3>
-      <p>Cadence plus bounded overshoot and barrier-free application, with EASGD elastic blending on by default. A few percent of wall behind cadence (the divergence guard grows its window more cautiously); add the DiLoCo outer optimizer for the best eval of every mode tested.</p>
-      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 92.08%, 529s / 92.36%, 524s with DiLoCo</p>
+      <p>Cadence plus bounded overshoot and barrier-free application, with EASGD elastic blending on by default: the averaged model streams back through reused staging while ranks keep training, taking the reduce barrier off the wall clock. Fastest wall time on this rig; add the DiLoCo outer optimizer for the best eval of every mode tested.</p>
+      <p style="color: var(--dim); font-size: 13px; margin-top: 0.5rem;">ResNet-20 Graph: 91.56%, 498s / 92.29%, 500s with DiLoCo</p>
     </div>
   </div>
 </section>
@@ -206,12 +208,12 @@ last_modified_at: 2026-07-22T23:45:00+02:00
         </tr>
       </thead>
       <tbody>
-        <tr><td>LeNet-5 (MNIST)</td><td>~99%</td><td>98.74%</td><td>98.94%</td><td>cpu-sync</td><td>8.0s</td><td>cpu-async-diloco</td></tr>
-        <tr><td>MLP (MNIST)</td><td>~97%</td><td>97.14%</td><td>97.41%</td><td>cpu-async-diloco</td><td>7.0s</td><td>cpu-async</td></tr>
-        <tr><td>Logistic (MNIST)</td><td>~92%</td><td>92.36%</td><td>92.30%</td><td>cpu-async-diloco</td><td>7.0s</td><td>cpu-async-diloco</td></tr>
-        <tr><td>Conv AE (MNIST)</td><td>&mdash;</td><td>0.0006</td><td>0.0008</td><td>cpu-sync</td><td>&mdash;</td><td>&mdash;</td></tr>
-        <tr><td>GPT-nano (Shakespeare)</td><td>~1.5&ndash;2.0</td><td>1.7599</td><td>1.8144</td><td>cpu-async-diloco</td><td>&mdash;</td><td>&mdash;</td></tr>
-        <tr><td>Char-RNN (Shakespeare)</td><td>~1.5</td><td>1.7245</td><td>1.5670</td><td>cpu-sync</td><td>31.5s</td><td>nccl-cadence</td></tr>
+        <tr><td>LeNet-5 (MNIST)</td><td>~99%</td><td>98.70%</td><td>98.94%</td><td>nccl-sync</td><td>5.3s</td><td>cpu-cadence</td></tr>
+        <tr><td>MLP (MNIST)</td><td>~97%</td><td>96.28%</td><td>97.42%</td><td>cpu-async-diloco</td><td>4.4s</td><td>cpu-async</td></tr>
+        <tr><td>Logistic (MNIST)</td><td>~92%</td><td>92.43%</td><td>92.30%</td><td>cpu-async-diloco</td><td>4.4s</td><td>cpu-async</td></tr>
+        <tr><td>Conv AE (MNIST)</td><td>&mdash;</td><td>0.0006</td><td>0.0007</td><td>nccl-sync</td><td>&mdash;</td><td>&mdash;</td></tr>
+        <tr><td>GPT-nano (Shakespeare)</td><td>~1.5&ndash;2.0</td><td>1.7543</td><td>1.7773</td><td>cpu-async-diloco</td><td>48.6s</td><td>cpu-async-diloco</td></tr>
+        <tr><td>Char-RNN (Shakespeare)</td><td>~1.5</td><td>1.7457</td><td>1.5604</td><td>nccl-sync</td><td>29.4s</td><td>nccl-cadence</td></tr>
       </tbody>
     </table>
     <p class="bench-note">
@@ -251,11 +253,15 @@ last_modified_at: 2026-07-22T23:45:00+02:00
       same eval function on the same test data.
     </p>
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8; margin-top: 1rem;">
-      <strong>GPU utilization</strong>: Sampled at 100ms intervals. The sampler runs
-      on the controller host, so cluster rows carry the controller GPU's
-      utilization; remote-rank activity is rank-reported (allocation shares,
-      throughput) and fully covered in the report's per-rank schedule and
-      trajectory charts.
+      <strong>GPU utilization</strong>: every physical device is covered,
+      host-qualified. The controller box is sampled densely at 100ms; every
+      rank additionally reports its own GPU samples over the metrics wire at
+      reduce-window cadence, so remote devices carry an honest sparse duty
+      cycle (marked <code>~</code> in the report). Records were collected
+      live for the whole of every run and archived as each cell's
+      self-contained portal at teardown; no live server ran and per-window
+      report emission was off, so published wall times carry zero monitoring
+      overhead.
     </p>
     <p style="color: var(--dim); font-size: 15px; line-height: 1.8; margin-top: 1rem;">
       <strong>Reproducibility</strong>: Seed 42, deterministic data loading, identical
