@@ -587,6 +587,7 @@ pub(crate) fn print_usage() {
     println!();
     println!("GLOBAL OPTIONS:");
     println!("    --env <name>       Use fdl.<name>.yml overlay (also: FDL_ENV=<name>)");
+    println!("    --gpus <spec>      Scope visible GPUs, e.g. 0,1 or all (any position)");
     println!("    --ansi             Force ANSI color output");
     println!("    --no-ansi          Disable ANSI color output");
     println!("    -v                 Verbose output (DDP sync, data loading detail)");

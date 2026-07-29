@@ -11,6 +11,7 @@ mod tables;
 mod elche;
 
 use tables::{
+    dense_coverage,
     write_speed_ratio, write_model_table, write_loss_ratio_table, write_missing_runs,
     write_best_mode, write_eval_ratio_table, write_epoch_trajectory, write_speedup_table,
     write_vram_table, write_idle_analysis, write_idle_breakdown, write_per_rank_table,
@@ -255,7 +256,8 @@ attributed to their host by the controller stamp or by physical fingerprint \
 (no matching fingerprint, or an ambiguous one) and then means \"the box that \
 run's poller happened to run on\". Idle = total time with <5% utilization, \
 dense-sampled devices only (the sparse remote cadence cannot support gap \
-detection).\n\n");
+detection); `-` there means the run carried no dense-sampled device at all, so \
+its idle time was never measured - not that it was zero.\n\n");
     for (model, runs) in groups {
         write_model_table(&mut md, model, runs, references.get(model));
     }
@@ -329,15 +331,53 @@ allocations); solo rows from the local poller.\n\n");
                 .any(|g| !matches!(g.cause, crate::analyze::IdleCause::Startup))
         })
     });
-    if any_gaps {
-        for (model, runs) in groups {
-            write_idle_analysis(&mut md, model, runs);
+    let (dense_runs, total_runs) = dense_coverage(groups);
+    if dense_runs > 0 {
+        if any_gaps {
+            for (model, runs) in groups {
+                write_idle_analysis(&mut md, model, runs);
+            }
+        } else {
+            // Explicit good news beats a heading over nothing.
+            md.push_str(
+                "No non-startup idle gap >= 500ms was detected on any \
+dense-sampled device.\n\n",
+            );
+        }
+        // Partial coverage is the case that misleads: whatever the section
+        // above says, it says it about the dense-sampled runs only, while
+        // reading as a statement about the sweep. Name the scope. (A cluster
+        // sweep with a dedicated controller lands here with its solo rows
+        // dense and every cluster row unexamined.)
+        if dense_runs < total_runs {
+            let _ = write!(
+                md,
+                "**Coverage: {dense_runs} of {total_runs} runs.** The other \
+{} carried no dense-sampled device and were not examined - they read `-` in \
+the Idle column, and nothing above describes them. Gap detection reads the \
+local poller's timeline, and a dedicated controller (one owning no local \
+ranks) polls CPU/RAM only, by design, precisely so it does not report GPUs \
+another node trains on. Co-locate the controller with a rank to measure those \
+runs.\n\n",
+                total_runs - dense_runs,
+            );
         }
     } else {
-        // Explicit good news beats a heading over nothing.
+        // No dense device anywhere: a silent section here reads as the good
+        // news above, which is the one thing this sweep cannot claim. Gap
+        // detection needs the dense local poll, and a dedicated controller
+        // (one owning no local ranks) gates that poll off, so every GPU
+        // figure in the report came from the ranks' sparse reporting. State
+        // the absence of a data source rather than a negative finding.
         md.push_str(
-            "No non-startup idle gap >= 500ms was detected on any \
-dense-sampled device.\n\n",
+            "**Not measured in this sweep.** No run carried a dense-sampled \
+device, so the gap detector had no input: idle detection reads the local \
+poller's timeline, and a dedicated controller (one owning no local ranks) \
+polls CPU/RAM only, by design, precisely so it does not report GPUs another \
+node trains on. Every GPU figure above is therefore rank-reported and sparse, \
+and the sparse cadence cannot support gap detection. This section says nothing \
+about whether the cards went idle. Run a cell with the controller co-located \
+with a rank to measure it.\n\n",
         );
     }
 
