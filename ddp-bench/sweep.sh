@@ -99,13 +99,24 @@ for entry in $MODELS; do
     else
       echo "$(ts) FAIL $m/$mode rc=$rc degraded=$degraded"
       rm -rf "${ABS_OUT:?}/$m/$mode"
-      sleep 5
+      # The agent wrapper's own kill-trap needs up to 10s to KILL its
+      # child after a rank crash; probing at 5s aborted the whole sweep
+      # on strays that clear themselves (2026-07-29 night, twice). 15s
+      # separates self-clearing wrappers from a genuinely wedged
+      # launcher, which still aborts below.
+      sleep 15
       if strays; then
         echo "$(ts) ABORT-DIRTY: leftover ddp-bench processes after failed cell — manual cleanup needed:"
         pgrep -af 'release/ddp-benc[h]'
         exit 1
       fi
+      echo "$(ts) CONTINUE (strays cleared; cell will retry on the next sweep pass)"
     fi
+    # Settle window between cluster cells: rank-0 SIGSEGV at NCCL/CUDA
+    # init was observed exactly on cells starting within ~1s of the
+    # previous cell's teardown (2026-07-29 night, 2/2 crashes back-to-
+    # back vs a clean start ~100s cold) — give the driver a beat.
+    sleep 10
   done
 done
 echo "$(ts) PHASE1 DONE"

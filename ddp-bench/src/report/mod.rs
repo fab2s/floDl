@@ -210,13 +210,22 @@ reduce (NOT per-batch lockstep DDP -- on heterogeneous rigs the fast GPU runs se
 per reduce within its equal share, then idles once it is exhausted; degenerates to classic \
 DDP on homogeneous rigs). `*-cadence` = throughput-proportional dispatch, reduce fires once \
 every rank completes its planned ElChe window. `cpu-async` = cadence plus bounded overshoot \
-and decoupled averaging. `cpu-async` is expected to trail `cpu-cadence` on fixed-epoch wall \
-time, most visibly on short runs: async's weight-space divergence runs higher by nature \
-(EASGD blending, decoupled application), so the convergence guard grows its reduce window \
-more slowly -- more reduces early in the run -- and each reduce triggers mid-flight \
-(in-flight drain plus snapshot transport against continued streaming). The surplus \
-amortizes as the window reaches the epoch cap on longer runs. Async's edge is jitter \
-tolerance when rank speeds fluctuate, not steady-state wall time.\n\n");
+and decoupled averaging: ranks keep training while the average round-trips, and the EASGD \
+blend folds the consensus back into whatever local progress accumulated meanwhile, so the \
+reduce barrier mostly leaves the wall clock. Async's remaining per-window costs are the \
+snapshot D2H and the blend's writeback staging -- both stream through reused buffers \
+(pinned snapshot staging; a single largest-tensor GPU staging buffer for the blend) rather \
+than materializing model-sized copies. Its structural trade is higher weight-space \
+divergence (decoupled application), which the convergence guard prices by growing the \
+reduce window more slowly early in a run; whether async or cadence wins fixed-epoch wall \
+time on a given rig is therefore an empirical question the tables answer, not a rule. \
+Async additionally tolerates rank-speed jitter that would stall a barrier-paced mode.\n\n\
+**Monitoring during these runs**: the record plane was live for the entire duration of \
+every cell -- the cluster path collects dashboard records unconditionally at reduce-window \
+cadence, and each cell's self-contained portal (`dashboard.html` beside its artifacts) \
+was written from those records at teardown. No live dashboard server was serving during \
+the runs and per-window report emission was off, so the published wall times carry zero \
+monitoring overhead on the hot path.\n\n");
 
     // Charts (focus model) - trajectories the tables can't show without
     // exploding; each image links its SVG next to the report.
@@ -235,13 +244,18 @@ tolerance when rank speeds fluctuate, not steady-state wall time.\n\n");
     // Per-model comparison
     md.push_str("## Per-Model Results\n\n");
     md.push_str("GPU columns = compute utilization % (not load); `-` = device not \
-sampled by that run. Bare `GPUd` columns are the controller host's devices, \
-sampled densely by the local poller and labeled by host-physical device id. \
-`host:GPUd` columns are remote-host devices: the mean compute utilization over \
-rank-reported samples that ride the metrics wire at reduce-window cadence (~one \
-sample per window) - the `~` prefix marks that sparseness: direction, not \
-precision. Idle = total time with <5% utilization, controller-host devices only \
-(the sparse remote cadence cannot support gap detection).\n\n");
+sampled by that run. Every column names a physical device as `host:GPUd`; a \
+row's value is dense-poller data when that run's poller ran on the column's \
+box (plain %), otherwise the mean over rank-reported samples riding the \
+metrics wire at reduce-window cadence (~one sample per window) - the `~` \
+prefix marks that sparseness: direction, not precision. Dense devices are \
+attributed to their host by the controller stamp or by physical fingerprint \
+(device id + VRAM size, matched against the group's rank samples); a bare \
+`GPUd` column appears only if a run's dense devices could not be attributed \
+(no matching fingerprint, or an ambiguous one) and then means \"the box that \
+run's poller happened to run on\". Idle = total time with <5% utilization, \
+dense-sampled devices only (the sparse remote cadence cannot support gap \
+detection).\n\n");
     for (model, runs) in groups {
         write_model_table(&mut md, model, runs, references.get(model));
     }
@@ -308,8 +322,23 @@ allocations); solo rows from the local poller.\n\n");
     // Idle analysis (the main event)
     md.push_str("## GPU Idle Analysis\n\n");
     md.push_str("Idle gaps >= 500ms, classified by nearest event.\n\n");
-    for (model, runs) in groups {
-        write_idle_analysis(&mut md, model, runs);
+    let any_gaps = groups.iter().any(|(_, runs)| {
+        runs.iter().any(|r| {
+            r.idle_gaps
+                .iter()
+                .any(|g| !matches!(g.cause, crate::analyze::IdleCause::Startup))
+        })
+    });
+    if any_gaps {
+        for (model, runs) in groups {
+            write_idle_analysis(&mut md, model, runs);
+        }
+    } else {
+        // Explicit good news beats a heading over nothing.
+        md.push_str(
+            "No non-startup idle gap >= 500ms was detected on any \
+dense-sampled device.\n\n",
+        );
     }
 
     // Idle summary by cause
