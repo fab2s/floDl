@@ -446,6 +446,7 @@ impl HostFold {
             let hdr = controller::read_round_frame_streamed(
                 &mut &blob[..],
                 salt,
+                None,
                 &mut |_, p| {
                     payloads.push(p);
                     Ok(())
@@ -480,6 +481,7 @@ impl HostFold {
         let hdr = controller::read_round_frame_streamed(
             &mut &blob[..],
             salt,
+            None,
             &mut |ti, p| {
                 // Schema check against whichever form the fold holds;
                 // the borrow ends with this block so promotion below

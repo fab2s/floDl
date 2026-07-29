@@ -558,43 +558,57 @@ impl DdpHandle {
             wire::set_frame_ceiling(wire::derive_frame_ceiling(wire_bytes));
             wire_bytes
         };
-        // Barrier-paced CUDA consumers decode Model replies into reused
-        // PINNED staging, making `load_averaged`'s `copy_(non_blocking)` a
-        // true async H2D (a pageable source degrades to a synchronous
-        // bounce copy) — but only when this host can afford to lock a
-        // model copy per local rank: locked pages are unswappable, and on
-        // a RAM-tight host they evict the per-window working set instead
-        // (measured on the rig as +6-8% epoch wall, all of it swap thrash
-        // inside the reduce windows — see `pinned_decode_affordable`).
-        // The fallback is the known-good fresh-alloc decode. Async always
-        // keeps fresh-alloc decode: its control channel has two producers
-        // with only per-producer FIFO, so a second Update can be live
-        // while the first is unapplied — a single staging set cannot
-        // survive that (see `set_pinned_decode`'s single-consumer
-        // contract).
+        // Barrier-paced CUDA consumers decode Model replies into PINNED
+        // staging, making `load_averaged`'s `copy_(non_blocking)` a true
+        // async H2D (a pageable source degrades to a synchronous bounce
+        // copy). Which staging depends on the wire dtype:
+        //
+        // - f32 wire: the reply decodes into the SNAPSHOT staging itself
+        //   (`set_decode_into_request`) — its bytes are dead once the
+        //   streamed encode has read them, so this locks ZERO marginal
+        //   memory and needs no RAM gate (the gated predecessor's locked
+        //   second model copy is what thrashed the RAM-tight rig host,
+        //   +6-8% epoch wall of reduce-window swap — see
+        //   `pinned_decode_affordable`'s calibration note).
+        // - bf16 wire: the params snapshot staging is bf16 and cannot
+        //   hold the f32 decode the divergence math and writeback
+        //   consume, so the reply decodes into the client's own f32
+        //   slot staging (`set_pinned_decode`) — one locked model copy
+        //   per rank, affordable-gated, until the staged bf16 writeback
+        //   lands (PR-B, `.design/consensus-decode-snapshot-staging.md`).
+        //
+        // Async always keeps fresh-alloc decode: its control channel has
+        // two producers with only per-producer FIFO, so a second Update
+        // can be live while the first is unapplied — a single staging
+        // set cannot survive that (see `set_pinned_decode`'s
+        // single-consumer contract).
         if let Some(client) = &mut cpu_client
             && device.is_cuda()
             && policy.is_barrier_paced()
         {
-            let local_ranks = cluster
-                .this_worker()
-                .map(|w| w.ranks.len())
-                .unwrap_or(1);
-            let affordable = crate::sys::mem_info().is_some_and(|m| {
-                crate::distributed::cpu_reduce::pinned_decode_affordable(
-                    staging_bytes as u64,
-                    local_ranks,
-                    m.available_bytes,
-                )
-            });
-            client.set_pinned_decode(affordable);
-            if !affordable {
-                crate::verbose!(
-                    "ddp: rank {global_rank} pinned consensus decode disabled \
-                     (RAM headroom: staging {}MB x {local_ranks} local rank(s) \
-                     needs more MemAvailable); using fresh-alloc decode",
-                    staging_bytes / (1 << 20),
-                );
+            if !config.elche.bf16_wire {
+                client.set_decode_into_request(true);
+            } else {
+                let local_ranks = cluster
+                    .this_worker()
+                    .map(|w| w.ranks.len())
+                    .unwrap_or(1);
+                let affordable = crate::sys::mem_info().is_some_and(|m| {
+                    crate::distributed::cpu_reduce::pinned_decode_affordable(
+                        staging_bytes as u64,
+                        local_ranks,
+                        m.available_bytes,
+                    )
+                });
+                client.set_pinned_decode(affordable);
+                if !affordable {
+                    crate::verbose!(
+                        "ddp: rank {global_rank} pinned consensus decode disabled \
+                         (RAM headroom: staging {}MB x {local_ranks} local rank(s) \
+                         needs more MemAvailable); using fresh-alloc decode",
+                        staging_bytes / (1 << 20),
+                    );
+                }
             }
         }
         match (&nccl_comm, &mut cpu_client) {

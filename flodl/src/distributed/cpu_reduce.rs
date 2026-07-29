@@ -163,6 +163,20 @@ pub struct CpuReduceClient {
     /// Once-per-run notice latch for staging that could not be pinned
     /// (the reuse still holds; only the async-H2D property is lost).
     pinned_decode_fallback_logged: bool,
+    /// RAM-neutral decode mode (see [`Self::set_decode_into_request`]):
+    /// armed Model replies decode into the REQUEST tensors themselves —
+    /// the caller's snapshot staging — instead of client-owned slots.
+    /// Zero marginal locked memory; the reply schema mirrors the sent
+    /// frame by protocol, so the destinations always fit.
+    decode_into_request: bool,
+    /// One-shot arm for `decode_into_request`: shallow clones of the
+    /// request tensors the NEXT reply decodes into. Consumed by
+    /// `read_reduced_tensors`; error paths leave the client un-armed.
+    armed_decode_dsts: Option<Vec<Tensor>>,
+    /// Once-per-run notice latch for an armed destination the decode
+    /// refused (non-CPU / non-f32 — the degenerate snapshot-fallback
+    /// class); values still land via fresh allocs.
+    decode_dst_fallback_logged: bool,
 }
 
 
@@ -241,6 +255,9 @@ impl CpuReduceClient {
             decode_slots: Vec::new(),
             armed_decode_slot: None,
             pinned_decode_fallback_logged: false,
+            decode_into_request: false,
+            armed_decode_dsts: None,
+            decode_dst_fallback_logged: false,
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -337,6 +354,56 @@ impl CpuReduceClient {
     /// double-buffered variant exists.
     pub fn set_pinned_decode(&mut self, on: bool) {
         self.pinned_decode = on;
+    }
+
+    /// Enable the RAM-neutral decode mode: armed Model replies decode
+    /// into the REQUEST tensors themselves (see
+    /// [`Self::arm_decode_into`]) — the caller's pinned snapshot
+    /// staging — instead of a client-owned staging set. The staging's
+    /// bytes are dead by decode time (the streamed encode consumed them
+    /// before the blocking reply read began), so this buys the same
+    /// async-H2D writeback as [`Self::set_pinned_decode`] with ZERO
+    /// marginal locked memory — no RAM-affordability gate needed.
+    ///
+    /// Same single-consumer contract as `set_pinned_decode` (the
+    /// returned tensors alias the destinations; the caller's next
+    /// window overwrites them), with the same `Async`-policy exclusion.
+    /// Takes precedence over the slot-based mode when both are set.
+    ///
+    /// f32 wire only for now: under `bf16_wire` the params snapshot
+    /// staging is bf16 and cannot hold the f32 decode the divergence
+    /// math and writeback consume today — bf16 keeps the slot mode
+    /// (and its gate) until the staged bf16 writeback lands (PR-B of
+    /// `.design/consensus-decode-snapshot-staging.md`). Enforced by
+    /// the caller's wiring, not here: a bf16 destination is refused
+    /// per payload (fresh-alloc fallback, once-per-run notice).
+    pub fn set_decode_into_request(&mut self, on: bool) {
+        self.decode_into_request = on;
+    }
+
+    /// Arm the NEXT reply to decode into `dsts` — the tensors the
+    /// caller is about to stream up, whose reply mirrors their schema
+    /// by protocol. One-shot: consumed by the next reply read; error
+    /// paths leave the client un-armed. Holds shallow clones, so the
+    /// decode writes through to the caller's staging storage.
+    ///
+    /// Falls back to the slot-based arm ([`Self::arm_pinned_decode`],
+    /// tagged by `slot`) when [`Self::set_decode_into_request`] is off,
+    /// so callers wire ONE arm point and the client's mode decides.
+    /// No-op when neither mode is enabled (fresh-alloc decode).
+    ///
+    /// The reply's realized-work mass guards the destinations: a
+    /// zero-mass round's payloads are meaningless zeros the caller
+    /// keep-locals over, and decoding them into `dsts` would CLOBBER
+    /// the very tensors keep-local returns — the weight rides the wire
+    /// ahead of the payloads, and an unrealized round decodes fresh,
+    /// leaving `dsts` untouched (see `read_reduced_tensors`).
+    pub fn arm_decode_into(&mut self, dsts: &[Tensor], slot: usize) {
+        if self.decode_into_request {
+            self.armed_decode_dsts = Some(dsts.to_vec());
+        } else {
+            self.arm_pinned_decode(slot);
+        }
     }
 
     /// Arm the NEXT reply to decode into reused staging slot `slot`
@@ -576,6 +643,22 @@ impl CpuReduceClient {
     /// fresh alloc; a per-payload staging failure falls back to the
     /// fresh path for that payload (values identical either way), with
     /// a once-per-run notice if the buffers could not be pinned.
+    ///
+    /// When request destinations are armed (see
+    /// [`Self::arm_decode_into`]), each payload decodes into its
+    /// destination tensor — UNLESS the frame's realized-work weight is
+    /// zero: a zero-mass reply's payloads are meaningless zeros the
+    /// caller keep-locals over, and the destinations are exactly the
+    /// tensors keep-local returns, so an unrealized round decodes fresh
+    /// and leaves them untouched. The weight is read off the frame
+    /// header AHEAD of the payloads and is unauthenticated until the
+    /// footer verifies — steering the decode DESTINATION with it is
+    /// inert buffering under the reader's MAC-before-use contract (a
+    /// forged weight at worst wastes a fresh alloc, or clobbers staging
+    /// on a frame that then fails MAC and tears the round down; no
+    /// snapshot path ever reads stale staging content). The slot mode
+    /// needs no such guard: keep-local returns the caller's own
+    /// tensors, never the slot staging.
     fn read_reduced_tensors(&mut self) -> Result<(Vec<Tensor>, f64, u128)> {
         let Some(len) =
             crate::distributed::relay::mux::read_len_prefix(&mut self.stream)?
@@ -588,6 +671,7 @@ impl CpuReduceClient {
         };
         // One-shot: an error path below leaves the client un-armed, so a
         // stale arm can never bleed into an unrelated later reply.
+        let armed_dsts = self.armed_decode_dsts.take();
         let mut staging = match self.armed_decode_slot.take() {
             Some(s) => {
                 if self.decode_slots.len() <= s {
@@ -601,15 +685,33 @@ impl CpuReduceClient {
         let mut decode_ns: u128 = 0;
         let mut out: Vec<Tensor> = Vec::new();
         let mut pin_fallback: Option<String> = None;
+        let mut dst_fallback: Option<String> = None;
+        // Realized-work mass off the frame header, set before the first
+        // payload reaches the sink (Cell: the header and payload
+        // closures both capture it). NAN until the header parses, and
+        // `is_realized(NAN)` is false — fail-safe to the fresh path.
+        let hdr_weight = std::cell::Cell::new(f64::NAN);
+        let mut on_header =
+            |_k: controller::RoundKind, w: f64| hdr_weight.set(w);
         let mut body = (&mut self.stream).take(len as u64);
         let hdr = controller::read_round_frame_streamed(
             &mut body,
             &self.salt,
+            Some(&mut on_header),
             &mut |i, payload| {
                 let tp = Instant::now();
-                let t = match staging.as_deref_mut() {
-                    Some(slot) => decode_into_slot(i, &payload, slot, &mut pin_fallback)?,
-                    None => payload_to_cpu_tensor(i, &payload)?,
+                let realized = crate::distributed::realized_work::is_realized(
+                    hdr_weight.get(),
+                );
+                let t = match (armed_dsts.as_deref(), staging.as_deref_mut()) {
+                    (Some(dsts), _) if realized => {
+                        decode_into_dst(i, &payload, dsts, &mut dst_fallback)?
+                    }
+                    (Some(_), _) => payload_to_cpu_tensor(i, &payload)?,
+                    (None, Some(slot)) => {
+                        decode_into_slot(i, &payload, slot, &mut pin_fallback)?
+                    }
+                    (None, None) => payload_to_cpu_tensor(i, &payload)?,
                 };
                 out.push(t);
                 if prof {
@@ -629,6 +731,17 @@ impl CpuReduceClient {
                 "flodl cpu_reduce: rank {} decode staging could not be pinned \
                  ({msg}); reusing pageable staging (H2D writeback degrades to \
                  a synchronous bounce copy)",
+                self.rank_id,
+            );
+        }
+        if let Some(msg) = dst_fallback
+            && !self.decode_dst_fallback_logged
+        {
+            self.decode_dst_fallback_logged = true;
+            eprintln!(
+                "flodl cpu_reduce: rank {} armed decode destination refused \
+                 ({msg}); decoded into fresh allocs instead (staging reuse and \
+                 async H2D writeback lost for those payloads)",
                 self.rank_id,
             );
         }
@@ -1094,6 +1207,66 @@ fn payload_wire_dtype(i: usize, p: &TensorPayload) -> Result<DType> {
              (0 = f32, 1 = bf16)"
         ))),
     }
+}
+
+/// Decode ONE payload into `dsts[i]` — a caller-owned destination (the
+/// request tensor whose reply payload this is: the rank's pinned
+/// snapshot staging on the production path) — and return a shallow
+/// clone of it. The reply mirrors the sent frame's schema by protocol,
+/// so a shape mismatch is a LOUD wire-drift error, never a realloc
+/// (reallocating caller-owned staging would silently break the
+/// aliasing the RAM-neutral decode rides on). Under a bf16 wire the
+/// `copy_` upcasts into the f32 destination, same as the slot path.
+///
+/// Refused destinations (fresh-alloc fallback + once-per-run notice
+/// via `fallback`): non-CPU — the degenerate double-failure snapshot
+/// path can ship live CUDA tensors, and decoding into those would
+/// write the consensus into live params from the bridge thread on the
+/// wrong stream; non-f32 — the decode output contract is f32 (the
+/// divergence math and writeback consume f32 today), which a bf16
+/// destination would silently quantize.
+fn decode_into_dst(
+    i: usize,
+    p: &TensorPayload,
+    dsts: &[Tensor],
+    fallback: &mut Option<String>,
+) -> Result<Tensor> {
+    let dtype = payload_wire_dtype(i, p)?;
+    let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+    let Some(dst) = dsts.get(i) else {
+        return Err(TensorError::new(&format!(
+            "cpu_reduce: reply payload[{i}] has no armed decode destination \
+             ({} were armed); reply/request schema drift",
+            dsts.len(),
+        )));
+    };
+    if dst.device() != Device::CPU || dst.dtype() != DType::Float32 {
+        if fallback.is_none() {
+            *fallback = Some(format!(
+                "dst[{i}] is {:?} on {:?} (need f32 on CPU)",
+                dst.dtype(),
+                dst.device(),
+            ));
+        }
+        return payload_to_cpu_tensor(i, p);
+    }
+    if dst.shape() != shape {
+        return Err(TensorError::new(&format!(
+            "cpu_reduce: reply payload[{i}] shape {shape:?} != armed \
+             destination shape {:?}; reply/request schema drift",
+            dst.shape(),
+        )));
+    }
+    if p.is_elided() && p.numel() > 0 {
+        // Wire zero-elision: no bytes came — the payload is zeros of
+        // its declared shape, written straight into the destination.
+        dst.zero_()?;
+        return Ok(dst.clone());
+    }
+    let wire = Tensor::from_blob(&p.bytes, &shape, dtype, Device::CPU)
+        .map_err(|e| TensorError::new(&format!("cpu_reduce: payload[{i}]: {e}")))?;
+    dst.copy_(&wire, false)?;
+    Ok(dst.clone())
 }
 
 /// Decode ONE payload into `slot[i]` — a REUSED f32 CPU staging tensor
