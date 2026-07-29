@@ -206,6 +206,22 @@ last_modified_at: 2026-04-28T21:22:12+02:00
       <a href="https://github.com/fab2s/fbrl/tree/5c58d71">fbrl@5c58d71</a>.
     </p>
   </div>
+</section>
+
+<hr class="divider">
+
+<!-- Current benchmark dashboard archive -->
+<section class="section" style="text-align: center;">
+  <h2 class="section-title">The dashboard, from the published sweep</h2>
+  <p class="section-sub">
+    The archived portal of a ResNet-20 (graph-built) run: 200 epochs
+    under <code>cpu-async-diloco</code> (DiLoCo outer optimizer over
+    asynchronous CPU averaging) on a heterogeneous 2-host cluster: an
+    RTX 5060 Ti and two GTX 1060s coordinated over TCP. Records were
+    collected live for the whole run at reduce-window cadence and archived
+    at teardown; drill into hosts, ranks, and the model graph;
+    every level is the real data.
+  </p>
 
   <div class="dash-embed" style="margin-top: 2rem;">
     <iframe src="{{ '/assets/benchmark-dashboard.html' | relative_url }}"

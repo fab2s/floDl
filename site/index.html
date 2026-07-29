@@ -415,8 +415,14 @@ commands:
             loading="lazy"></iframe>
   </div>
   <p class="bench-note" style="margin-top: 0.5rem;">
-    Live dashboard from an earlier FBRL letter model run (v0.1.1, GTX 1060),
-    19% faster with the training monitor running.
+    Real artifact, not a mock: the archived portal of a ResNet-20
+    (graph-built) training run: 200 epochs under <code>cpu-async-diloco</code>
+    (DiLoCo outer optimizer over asynchronous CPU averaging) on a
+    heterogeneous 2-host cluster: an RTX 5060 Ti and two GTX 1060s
+    coordinated over TCP. Records were collected live throughout the run
+    and archived at teardown; drill into hosts, ranks, and the model
+    graph; every level is the real data. From the published
+    <a href="{{ '/ddp-benchmark' | relative_url }}">DDP benchmark sweep</a>.
   </p>
 </section>
 

@@ -515,8 +515,8 @@ pub(super) fn write_best_mode(md: &mut String, groups: &[(String, Vec<RunAnalysi
         md.push_str(
             "\"Fastest (within 2% of solo-0)\" = the fastest NON-solo mode \
 whose final eval gives up no more than 2% relative quality vs solo-0 \
-(a better-than-solo eval always qualifies) — i.e. the speed a DDP mode \
-buys without paying for it in quality. The band is relative, so it is \
+(a better-than-solo eval always qualifies): the speed a DDP mode buys \
+without paying for it in quality. The band is relative, so it is \
 strict to the point of unreachable for near-zero loss-like evals \
 (a reconstruction MSE of 0.0006 leaves a ±0.00001 band); when no mode \
 qualifies, the closest one and its eval gap are named instead.\n\n",
