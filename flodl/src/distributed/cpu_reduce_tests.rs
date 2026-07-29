@@ -633,6 +633,35 @@
         }
     }
 
+    /// The RAM-affordability gate at the rig's MEASURED numbers
+    /// (2026-07-29 A/B): two 190M ranks (727MiB f32 staging each) on
+    /// the 9.4GB VM must be refused at the availability the ranks
+    /// ACTUALLY read — ~7.3GB at rank start, before the run's own
+    /// working set allocates. That configuration, ungated, swapped 2GB
+    /// and cost +6-8% epoch wall; a first-cut gate sized against the
+    /// mid-formation availability (~5.8GB, which no rank ever observes)
+    /// passed it and reproduced the regression on the rig (B5). One
+    /// rank on a RAM-rich host must pass. The per-rank reads race at
+    /// formation, so the gate budgets the whole host (× local_ranks).
+    #[test]
+    fn pinned_decode_gate_at_the_rig_numbers() {
+        let mb = 1u64 << 20;
+        let gb = 1u64 << 30;
+        // pascal VM: 2 local ranks, 727MiB staging, ~7.3GB available
+        // at rank start (the real anchor) — must refuse.
+        assert!(!pinned_decode_affordable(727 * mb, 2, 73 * gb / 10));
+        // exa: 1 local rank, same staging, ~13GB available — must pass.
+        assert!(pinned_decode_affordable(727 * mb, 1, 13 * gb));
+        // A small model is affordable even on the tight VM.
+        assert!(pinned_decode_affordable(10 * mb, 2, 73 * gb / 10));
+        // Degenerate local_ranks=0 clamps to 1, never divides the need
+        // to zero (a zero need would enable everywhere).
+        assert_eq!(
+            pinned_decode_affordable(727 * mb, 0, 73 * gb / 10),
+            pinned_decode_affordable(727 * mb, 1, 73 * gb / 10),
+        );
+    }
+
     /// bf16 wire + pinned decode: the upcast lands via `copy_` directly
     /// in the f32 staging (no intermediate f32 alloc); values chosen
     /// bf16-exact, returned dtype stays f32.

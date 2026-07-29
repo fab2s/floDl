@@ -43,6 +43,54 @@ use crate::tensor::{DType, Device, Result, Tensor, TensorError, TensorOptions};
 pub const DECODE_SLOT_PARAMS: usize = 0;
 pub const DECODE_SLOT_BUFFERS: usize = 1;
 
+/// Whether this host can afford the pinned decode staging without
+/// pushing itself into swap — the RAM-affordability gate on
+/// [`CpuReduceClient::set_pinned_decode`].
+///
+/// `staging_bytes` is the f32 model wire size (the staging is always
+/// f32 whatever the wire dtype), `local_ranks` how many ranks share
+/// this host (each locks its own staging; the per-rank MemAvailable
+/// reads race each other at formation, so each rank must budget for
+/// the whole host), `mem_available_bytes` the kernel's `MemAvailable`.
+///
+/// The headroom factor counts real residents per rank, not magic —
+/// and it must do so against `MemAvailable` AS READ AT RANK START,
+/// before the run's own working set has allocated (the reads race the
+/// formation allocations, so the honest anchor is the pre-run value).
+/// Per rank: the decode staging itself locks 1× — and because locked
+/// pages are unswappable, the kernel evicts OTHER pages under
+/// pressure, so the gate must also cover what the reduce path
+/// re-touches EVERY window and cannot afford to have evicted: the
+/// pinned snapshot staging (1×), the pre-sync divergence scratch (1×),
+/// and the streamed wire transient (1×); the remaining 2× stands in
+/// for the per-rank runtime overhead MemAvailable must also fund
+/// (CUDA host context, allocator arenas, data staging — ~1.5GB at the
+/// model sizes where this gate can trip at all; at small stagings the
+/// stand-in undercounts it, but small stagings pass every gate).
+///
+/// Rig calibration (2026-07-29, olmo 190M ⇒ 727MiB staging, two ranks
+/// on a 9.4GB VM reading ~7.3GB available at rank start): ungated
+/// pinned decode pushed 2GB to swap (vs 0.8GB baseline) and the
+/// per-window scratch thrash cost +6-8% of epoch wall, entirely inside
+/// the reduce windows — compute, data starvation, and VRAM stayed
+/// arm-identical. A first cut of this gate at factor 4 (need 5.8GB)
+/// did NOT refuse that host — because it was sized against the
+/// mid-formation availability (~5.8GB), which no rank ever observes —
+/// and the rig re-run reproduced the regression (B5, epoch 317s vs
+/// 290-293s baseline). Factor 6 (need 8.5GB > 7.3GB) refuses it at
+/// the anchor the ranks actually read.
+pub fn pinned_decode_affordable(
+    staging_bytes: u64,
+    local_ranks: usize,
+    mem_available_bytes: u64,
+) -> bool {
+    const HEADROOM_FACTOR: u64 = 6;
+    let need = staging_bytes
+        .saturating_mul(local_ranks.max(1) as u64)
+        .saturating_mul(HEADROOM_FACTOR);
+    mem_available_bytes > need
+}
+
 /// Per-read deadline for the long-running reduce loop (replaces the
 /// previously-cleared timeout). A vanished controller or relay must not
 /// park the rank forever: the coordinator-side ReduceStall ceiling cannot
