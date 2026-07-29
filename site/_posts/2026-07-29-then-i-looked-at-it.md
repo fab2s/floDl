@@ -36,16 +36,14 @@ resources plotted, its children compared on one metric and clickable, and its
 log listing epoch and sub-epoch rows interleaved on the one axis the two
 cadences share.
 
-The property that makes it a portal rather than a tree view is that the page
-subscribes to **one level**. A query returns the node's own aggregate plus one
+A query returns the node's own aggregate plus one
 record per direct child, so watching `root` on a 300-rank run costs exactly what
 watching `root` on a 3-rank run costs. Drilling in is the same call, re-scoped.
 Alerts are the deliberate exception: a subscription pinned at `root` carries
 rank losses, drift and dropped control frames from the whole subtree, because you
 should not have to be looking at the right level to learn a rank died.
 
-Two details were needed to make the levels honest rather than merely pretty. At
-an interior node every metric is a roll-up, so the legend names the reduction it
+At an interior node every metric is a roll-up, so the legend names the reduction it
 used (`loss (mean)`, `throughput (sum)`); at a leaf it is a raw measurement and
 the legend is the bare key. And cross-rank means are weighted by realized work,
 with every node carrying its own weight, so a hierarchical roll-up equals the
@@ -76,15 +74,13 @@ teardown by the flagship cell of the published sweep, 200 epochs of ResNet-20
 under DiLoCo across three GPUs on two hosts. Drill into the hosts and the ranks.
 Every level is the run's real data.
 
-Because the archive is meant to end up in a paper or a ticket, it also grew a
-light theme and follows the reader's desktop by default, and
+It also grew a light theme and follows the reader's desktop by default, and
 `dashboard_theme("light")` pins it so a figure does not change appearance with
 the reviewer's OS. The reader's own toggle still wins, because pinning sets a
 default rather than removing a control.
 
 ## Then I looked at it
 
-An observability layer's first real job is to catch its own instruments lying.
 This one earned its keep before it shipped. Five numbers this project was
 reporting, several of them in the last post's benchmark report, turned out to be
 measuring something other than what they claimed.
@@ -140,14 +136,13 @@ two-batch flow window is a rate-matcher rather than a capacity claim and is
 priced against physical free memory instead (32KB against 473MB free, in that
 case).
 
-This one deserves its honest ending: **it is not a throughput win.** Wall time
-moved 420.7s to 419.8s and per-rank utilization did not move. A blocking
-host-to-device copy from pageable memory cannot begin until previously queued
-kernels on that stream drain, so much of what was reported as data starvation
-was the previous step's GPU work waiting under another name. What the fix buys
-is that a rank's compute-versus-data split now means what it says, and that a
-silent, un-overridable degradation is gone. Treat `data_starve` on a rank
-without a prefetch channel as an upper bound.
+**It is not a throughput win.** Wall time moved 420.7s to 419.8s and per-rank 
+utilization did not move. A blocking host-to-device copy from pageable memory 
+cannot begin until previously queued kernels on that stream drain, so much of 
+what was reported as data starvation was the previous step's GPU work waiting 
+under another name. What the fix buys is that a rank's compute-versus-data split 
+now means what it says, and that a silent, un-overridable degradation is gone. 
+Treat `data_starve` on a rank without a prefetch channel as an upper bound.
 
 **Progressive-dispatch timings reported the largest chunk as the epoch total.**
 The coordinator folded per-chunk durations with `max()`, on the assumption they
