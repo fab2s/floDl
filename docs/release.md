@@ -32,12 +32,13 @@ Scripts, in order:
 |---|---------------------|-----------------------------------------------------------------|
 | 01 | `01-git.sh`         | No uncommitted changes; target tag doesn't exist; branch sanity. |
 | 02 | `02-version-sync.sh`| `Cargo.toml` version matches a dated `## [X.Y.Z] - YYYY-MM-DD` CHANGELOG header. |
-| 03 | `03-lint-docs.sh`   | No stale `make <target>` refs, no hardcoded user paths, every `` `fdl <cmd>` `` in docs resolves. |
-| 04 | `04-shell.sh`       | `sh -n` clean on every tracked `.sh`; `shellcheck` advisory. |
+| 03 | `03-lint-docs.sh`   | No stale `make <target>` refs, no hardcoded user paths, every `` `fdl <cmd>` `` in docs resolves, and every doc link, heading anchor, code fence and `/guide/` URL is valid. |
+| 04 | `04-shell.sh`       | `sh -n` clean on every tracked `.sh` outside `ci/release/` (those run anyway); `shellcheck` advisory. |
 | 05 | `05-ci.sh`          | Delegates to `fdl ci` (cargo build + test + clippy + strict rustdoc). |
 | 06 | `06-scaffold.sh`    | `make test-init`: `fdl init` generates expected files, `docker compose config` parses. |
 | 07 | `07-docs-rs.sh`     | `make docs-rs`: nightly rustdoc build simulating docs.rs. |
 | 08 | `08-publish-dry.sh` | `cargo publish --dry-run` per workspace crate in dep order. |
+| 09 | `09-skill-assets.sh`| `flodl-cli/assets/skills/` matches its `ai/` sources, so a released `fdl` does not ship a stale `/port` skill. |
 
 To iterate on a single check without running the whole suite:
 
@@ -57,8 +58,18 @@ sh ci/release/03-lint-docs.sh
   checkout path into a script. Swap for `"$(dirname "$0")/.."` in
   shell, `(Resolve-Path "$PSScriptRoot\..").Path` in PowerShell, or
   `env::current_dir()` in Rust.
-- **`03-lint-docs` C (fdl cmd)** - a `fdl bench-cpu`-style leftover
-  in docs after the command was removed. Update or drop the mention.
+- **`03-lint-docs` C (fdl cmd)** - docs reference a subcommand that no
+  longer exists. The historical case was `bench-cpu`, superseded by the
+  `cpu` preset of `fdl bench`. Update or drop the mention. Extraction is
+  fence-aware, so a `fdl <cmd>` inside a fenced `fdl.yml` sample - a
+  user-defined project command, not a built-in - is correctly ignored.
+- **`03-lint-docs` D (links/anchors)** - a link target, heading anchor,
+  code fence or `/guide/` URL broke. Anchors are the common one: renaming
+  a heading silently invalidates every link into it, and splitting a doc
+  does it wholesale. Guide URLs are checked against the permalinks in
+  `site/_stubs/`, so moving a page needs those references updated too -
+  including the ones outside `docs/` (crate READMEs, blog posts, the
+  `fdl init` scaffold).
 - **`08-publish-dry` missing `version =`** - a `path = "../foo"` dep
   without a `version = "X.Y.Z"` companion - crates.io requires both.
 

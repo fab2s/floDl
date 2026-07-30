@@ -139,10 +139,16 @@ impl RingBuffer {
 }
 
 /// Lifecycle phase of the cadence balancer. Probe = no calibrations yet,
-/// Warmup = first few calibrations (election allowed but anchor stays sticky
-/// until the Stable threshold), Stable = normal operation including
-/// overhead auto-tune, Mature = long-running steady state. Phase ordering
-/// is monotonic and supports `>=` comparisons for gating logic.
+/// Warmup = first few calibrations (the anchor pin is held; growth may act
+/// from the second calibration if it clears the margin), Stable = normal
+/// operation including anchor election and overhead auto-tune at the real
+/// target, Mature = long-running steady state. Phase ordering is monotonic
+/// and supports `>=` comparisons for gating logic.
+///
+/// Mature gates the same ElChe actions as Stable; the difference lives in
+/// the LR-aware meta-controller, which reads the phase to pick a gentler
+/// nudge factor and a shorter sustain count as trust accumulates (see
+/// `lr_event_meta::base_factor_for` / `sustain_k_for`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
     serde::Serialize, serde::Deserialize,
@@ -1325,9 +1331,10 @@ impl ElChe {
     }
 
     /// Phase transition rules. Probe→Warmup at first calibration; Warmup→Stable
-    /// at 5 calibrations; Stable→Mature at 20. Per-phase parameter tightening
-    /// (locked anchor in Warmup, stricter Mature thresholds) is a possible
-    /// future refinement; today phases gate election and the auto-tune.
+    /// at 5 calibrations; Stable→Mature at 20. Inside ElChe, phases gate anchor
+    /// election, window growth and the auto-tune's fire threshold; the LR-aware
+    /// meta-controller additionally reads the phase for per-phase parameter
+    /// tightening (nudge factor and sustain count).
     fn advance_phase(&mut self) {
         let next = match self.phase {
             Phase::Probe => Phase::Warmup,

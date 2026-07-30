@@ -1,7 +1,11 @@
 #!/bin/sh
 # Shell-script hygiene:
-#   - `sh -n` on every tracked `.sh` file (syntax check).
+#   - `sh -n` (syntax check) on every tracked `.sh` OUTSIDE ci/release/.
 #   - `shellcheck -S warning` if installed (advisory, never fails).
+#
+# The ci/release/ scripts are excluded: run-all.sh executes each of them on
+# every suite run, so a syntax error there fails the suite directly rather
+# than needing a separate check.
 
 set -u
 cd "$(git rev-parse --show-toplevel)"

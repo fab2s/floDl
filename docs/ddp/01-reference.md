@@ -763,6 +763,46 @@ TrainerConfig::new(dataset)
 The controller writes meta atomically alongside the model + optimizer
 files. Compatible with `.meta.json` from any prior flodl run.
 
+A resume restores more than weights. The meta file carries the balancer's
+learned trajectory, so the cadence controller comes back **calibrated**
+rather than starting over at `Probe`:
+
+```mermaid
+flowchart LR
+    subgraph w["controller writes, atomically at a reduce"]
+        F1["stem.fdl<br/>params + buffers + optimizer state"]
+        F2["stem.meta.json<br/>epoch, global step, ElCheState"]
+        F3["stem.config.json<br/>optional, written by flodl-hf export"]
+        F1 ~~~ F2 ~~~ F3
+    end
+    subgraph r["resume_from restores"]
+        M["model + optimizer"]
+        E["ElChe: phase, calibration_count,<br/>anchor, partition_ratios"]
+        C["convergence guard: trend_history"]
+        M ~~~ E ~~~ C
+    end
+    OUT["the balancer resumes calibrated -<br/>a resumed run does not pay the<br/>Probe to Stable warmup again"]
+
+    F1 --> M
+    F2 --> E
+    F2 --> C
+    E --> OUT
+    C --> OUT
+
+    classDef file fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef rest fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef out fill:#fff3e0,stroke:#ffa726,color:#e65100
+    class F1,F2,F3 file
+    class M,E,C rest
+    class OUT out
+```
+
+The restore is strict about cohort shape: a snapshot taken at one
+`world_size` is rejected loudly rather than reinterpreted, since
+`partition_ratios` are per-rank and would otherwise be silently
+misapplied. See [Phase lifecycle](03-internals.md#phase-lifecycle) for what
+each restored phase unlocks.
+
 ### `SaveReason`
 
 | Variant | Trigger |

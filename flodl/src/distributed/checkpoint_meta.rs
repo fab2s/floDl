@@ -92,8 +92,14 @@ pub struct CoverageBlock {
 
 /// ElChe trajectory snapshot for Cadence/Async resume.
 ///
-/// Captured on `ShutdownWithSave` so a future resume API can restore the
-/// heterogeneous-cadence trajectory without re-calibrating from scratch.
+/// Captured on `ShutdownWithSave` and at every mid-run checkpoint so a
+/// resume restores the heterogeneous-cadence trajectory instead of
+/// re-calibrating from scratch. The resume path is wired: the launcher reads
+/// it into `start_elche_state` and the coordinator applies it through
+/// [`ElChe::restore_from_state`](crate::distributed::ElChe::restore_from_state)
+/// at construction, so a resumed run comes back at its saved phase rather
+/// than at `Probe`.
+///
 /// Wired into [`CheckpointMeta`] as an optional field — None for Sync
 /// (no ElChe state) and for binaries that don't populate it.
 ///

@@ -4,16 +4,47 @@ The cadence balancer has two control layers.
 
 ### Phase lifecycle
 
-`Probe → Warmup → Stable → Mature`. Monotonic and `>=`-comparable.
-Gates the more aggressive controllers (anchor swaps, `relax_up`) to
-`>= Stable`.
+The balancer earns trust over time. Phases are monotonic (a phase never
+regresses) and `>=`-comparable, so gating logic reads as "at least Stable".
+Transitions are driven purely by how many calibrations have landed:
 
-| Phase | When | Behavior |
-|---|---|---|
-| `Probe` | No calibrations yet | Equal split, gather first timings. |
-| `Warmup` | First few calibrations | Sticky anchor, conservative adjustments. |
-| `Stable` | Steady state | Normal overhead auto-tune with hysteresis. `relax_up` and meta-controller swaps activate here. |
-| `Mature` | Long-running steady state | Same as Stable; signal for telemetry. |
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Probe
+    Probe --> Warmup : first calibration
+    Warmup --> Stable : 5 calibrations
+    Stable --> Mature : 20 calibrations
+```
+
+Two consumers read the phase, and they move in **opposite directions** as
+confidence accumulates: ElChe progressively *unlocks* actions, while the
+LR-aware meta-controller progressively *softens* its corrections and lowers
+the evidence bar for acting on them.
+
+| Phase | ElChe unlocks | Meta-controller nudge | Sustain `K` |
+|---|---|---|---|
+| `Probe` | Equal split; gather first timings. No calibration-driven action. | `0.3` (defensive; excluded at the call site) | 5 |
+| `Warmup` | Anchor pin **held** - the initial pick stands. Window growth allowed from the second calibration, but a proposal must clear the overhead target by a margin. | `0.3` | 5 |
+| `Stable` | Anchor **election** opens. Auto-tune fires at the real overhead target. Hysteresis on anchor changes. `relax_up` activates. | `0.5` | 3 |
+| `Mature` | Same gates as Stable. | `0.7` | 2 |
+
+Reading the last two columns: the nudge factor is a multiplicative anchor
+shrink, so a **lower** number is a **harsher** correction - an untrusted phase
+cuts hard (`0.3`) while a trusted one eases off (`0.7`). Sustain `K` is how
+many consecutive divergence verdicts must agree before the pattern fires, so a
+cautious phase demands more evidence (5) and a confident one reacts sooner (2).
+`Mature` therefore is **not** behaviourally identical to `Stable`: it gates the
+same ElChe actions, but it is the gentlest and fastest-reacting phase in the
+meta-controller.
+
+Why the anchor pin is held through `Warmup`: cold-start noise on the
+larger or newer GPU can transiently make it look slow, and an election
+running on that noise would flip the anchor away from the genuinely slow
+rank. Growth is deliberately *not* held to the same gate - its signal is
+dominated by the measured reduce wall, and cold-start skew inflates the
+anchor's marginal cost, which **under**-proposes. That is the safe error
+direction, so growth opens earlier.
 
 ### Anchor auto-tune
 

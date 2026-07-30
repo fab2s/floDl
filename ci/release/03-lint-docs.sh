@@ -1,5 +1,5 @@
 #!/bin/sh
-# Documentation drift detector. Three independent checks:
+# Documentation drift detector. Four independent checks:
 #
 #   A. Stale `make <target>` references    -- any `make FOO` in tracked
 #      files where FOO is not declared in the root Makefile and not on
@@ -9,11 +9,19 @@
 #      into committed files.
 #   C. `fdl <cmd>` references resolve      -- every ``fdl <cmd>`` token in
 #      docs/README must be a command `fdl` currently recognizes.
+#   D. Links, anchors, fences, guide URLs  -- delegated to lint_doc_links.py,
+#      which needs a real markdown parse (fence tracking + GitHub slugging)
+#      that shell cannot do honestly. See that file's header for why each
+#      check exists and which shipped failure it guards.
 #
-# CHANGELOG.md is excluded from all three -- it records historical
-# state, which may legitimately reference removed targets.
+# CHANGELOG.md is excluded from all four -- it records historical
+# state, which may legitimately reference removed targets or old file names.
 
 set -u
+# Resolve our own directory BEFORE the cd: run-all.sh invokes us as
+# `./03-lint-docs.sh` from ci/release, so a $0-relative path computed after
+# chdir'ing to the repo root would point at the wrong place.
+CHECK_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(git rev-parse --show-toplevel)"
 
 FAIL=0
@@ -65,11 +73,19 @@ if [ -n "$HARDCODED" ]; then
 fi
 
 # --- C. `fdl <cmd>` references resolve ---
-if command -v fdl >/dev/null 2>&1; then
-    REFS=$(git grep -hoE '`fdl [a-z][a-z0-9-]*' \
-        -- 'docs/**/*.md' 'README.md' 'flodl-cli/README.md' 'ROADMAP.md' \
-           ':!docs/design' \
-        2>/dev/null | awk '{print $2}' | tr -d '`' | sort -u)
+# Extraction is delegated to lint_doc_links.py --fdl-refs, which strips code
+# fences. It has to: docs show illustrative `fdl.yml` manifests whose comments
+# reference USER-DEFINED project commands (`fdl train`), and those are not
+# flodl built-ins. A fence-blind grep reads them as broken built-ins.
+#
+# That grep also carried a silent coverage hole worth remembering: its pathspec
+# was `docs/**/*.md`, and git's `**` still requires the literal `/`, so the 8
+# top-level `docs/*.md` files were never checked at all. The python scope is
+# `docs/` recursive.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "WARN: python3 not on PATH; skipping fdl-cmd-ref check"
+elif command -v fdl >/dev/null 2>&1; then
+    REFS=$(python3 "$CHECK_DIR/lint_doc_links.py" --fdl-refs)
 
     BROKEN=""
     for cmd in $REFS; do
@@ -86,6 +102,15 @@ if command -v fdl >/dev/null 2>&1; then
     fi
 else
     echo "WARN: fdl not on PATH; skipping fdl-cmd-ref check"
+fi
+
+# --- D. Links, anchors, code fences, guide URLs ---
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$CHECK_DIR/lint_doc_links.py"; then
+        FAIL=1
+    fi
+else
+    echo "WARN: python3 not on PATH; skipping doc link/anchor check"
 fi
 
 [ "$FAIL" = 0 ] && echo "PASS: docs lint clean"
