@@ -1,6 +1,6 @@
 //! `fdl join` — self-deploy this box as a dial-in worker.
 //!
-//! The worker-side walk-in for a discovery window (see docs/ddp.md):
+//! The worker-side walk-in for a discovery window (see docs/ddp/01-reference.md):
 //! dials the controller's mux port, offers this host's GPUs, and — once
 //! admitted — the training binary takes over in agent role (it joins,
 //! then spawns and supervises this host's relay and rank children; see

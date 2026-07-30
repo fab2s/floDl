@@ -1119,6 +1119,16 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
 .highlight { background: var(--bg-alt); border-radius: 8px; }
 .highlight pre { margin: 0; font-size: 14px; }
 
+/* Rouge emits div.highlighter-rouge > div.highlight > pre, and the `margin: 0`
+   above is right (the visual box is .highlight, so the inner pre must not add
+   its own gap) — but neither wrapper carried a bottom margin, so the whole
+   construct contributed NOTHING below itself. The space above a code block was
+   just the preceding paragraph's margin, which made following text sit flush
+   against it. Match the 16px paragraph rhythm on the wrappers instead.
+   Parent/child bottom margins collapse here, so this stays 16px, not 32px. */
+.content .highlighter-rouge,
+.content .highlight { margin-bottom: 16px; }
+
 /* tokens */
 .highlight .k,
 .highlight .kd,

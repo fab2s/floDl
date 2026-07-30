@@ -14,17 +14,17 @@ permalink: /guide/
 <h2 style="font-size: 16px; border: none; padding: 0; margin-bottom: 16px;">Coming from PyTorch</h2>
 
 <div class="guide-grid">
-  <a href="{{ '/guide/porting' | relative_url }}" class="guide-card">
+  <a href="{{ '/guide/pytorch/porting' | relative_url }}" class="guide-card">
     <span class="num">Coming from PyTorch</span>
     <h3>Porting from PyTorch</h3>
     <p>Module mapping, FlowBuilder patterns, training-loop translation. AI-assisted via /port.</p>
   </a>
-  <a href="{{ '/guide/rust-primer' | relative_url }}" class="guide-card">
+  <a href="{{ '/guide/pytorch/rust-primer' | relative_url }}" class="guide-card">
     <span class="num">Coming from PyTorch</span>
     <h3>Rust for PyTorch Users</h3>
     <p>10 Rust patterns in 15 minutes. Everything you need to write training scripts.</p>
   </a>
-  <a href="{{ '/guide/migration' | relative_url }}" class="guide-card">
+  <a href="{{ '/guide/pytorch/migration' | relative_url }}" class="guide-card">
     <span class="num">Coming from PyTorch</span>
     <h3>PyTorch Migration Reference</h3>
     <p>Side-by-side PyTorch vs floDl for every concept, operation, and pattern.</p>
@@ -134,10 +134,35 @@ permalink: /guide/
 <h2 style="font-size: 16px; border: none; padding: 0; margin-bottom: 16px;">CLI</h2>
 
 <div class="guide-grid">
-  <a href="{{ '/guide/cli' | relative_url }}" class="guide-card">
+  <a href="{{ '/guide/cli/install' | relative_url }}" class="guide-card">
     <span class="num">CLI</span>
-    <h3>The floDl CLI</h3>
-    <p>fdl commands, environment overlays, fdl.yml schema, libtorch management.</p>
+    <h3>Install and Global Flags</h3>
+    <p>Installing fdl, the global flags every command accepts, and update checks.</p>
+  </a>
+  <a href="{{ '/guide/cli/setup' | relative_url }}" class="guide-card">
+    <span class="num">CLI</span>
+    <h3>Project and libtorch Commands</h3>
+    <p>fdl setup, libtorch build/download, init, add, diagnose - plus the libtorch directory layout.</p>
+  </a>
+  <a href="{{ '/guide/cli/cluster' | relative_url }}" class="guide-card">
+    <span class="num">CLI</span>
+    <h3>Cluster and Hardware Commands</h3>
+    <p>fdl probe, status, start, join, nccl, --gpus, and @cluster multi-host fan-out.</p>
+  </a>
+  <a href="{{ '/guide/cli/tooling' | relative_url }}" class="guide-card">
+    <span class="num">CLI</span>
+    <h3>Introspection and Tooling</h3>
+    <p>fdl api-ref for the generated API surface, skill install for AI assistants, shell completions.</p>
+  </a>
+  <a href="{{ '/guide/cli/manifest' | relative_url }}" class="guide-card">
+    <span class="num">CLI</span>
+    <h3>The fdl.yml Manifest</h3>
+    <p>Command kinds, declaring flags in Rust with FdlArgs, environment overlays, presets, schema caching.</p>
+  </a>
+  <a href="{{ '/guide/cli/source' | relative_url }}" class="guide-card">
+    <span class="num">CLI</span>
+    <h3>Working in the Source Checkout</h3>
+    <p>The contributor loop: tests, CUDA suites, benchmarks, the DDP validation suite, HF gates.</p>
   </a>
 </div>
 

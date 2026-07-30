@@ -94,5 +94,5 @@ be indexed first.
 
 - Post the release link on `@flodl_dev` (X) and `r/rust`.
 - If the release changes install instructions, refresh
-  `docs/cli.md` and `flodl-cli/README.md` on the same commit.
+  `docs/cli/01-install.md` and `flodl-cli/README.md` on the same commit.
 - Open a `post-0.X.Y` todo note for anything deferred during the cut.

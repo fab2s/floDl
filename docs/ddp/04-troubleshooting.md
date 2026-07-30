@@ -89,4 +89,4 @@ If `fdl @cluster` runs hang several epochs in, the cause is usually:
 
 ---
 
-Previous: [Internals and Expert APIs](03-internals.md) | Next: [The floDl CLI](../cli.md)
+Previous: [Internals and Expert APIs](03-internals.md) | Next: [Install and Global Flags](../cli/01-install.md)

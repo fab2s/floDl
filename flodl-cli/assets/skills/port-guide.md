@@ -405,7 +405,7 @@ while the controller keeps cadence, partition, eval-election, and
 checkpointing.
 
 For the full DDP surface (policies, backends, convergence guard, metrics,
-live monitor integration, troubleshooting), see `docs/ddp.md`.
+live monitor integration, troubleshooting), see `docs/ddp/01-reference.md`.
 
 ### Data Loading
 

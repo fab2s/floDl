@@ -392,7 +392,7 @@ fdl @cluster train           # SSHes each worker, pre-builds, fans out
 launcher trampoline takes care of fan-out, NCCL rendezvous, and
 controller binding. See [DDP Reference: Multi-host
 clusters](../ddp/02-cluster-guide.md) and [CLI Reference: cluster
-commands](../cli.md) for the full surface.
+commands](../cli/01-install.md) for the full surface.
 
 For programmatic clusters (tests, embedded launchers without a yml on
 disk), use `ClusterBuilder`:

@@ -83,7 +83,7 @@ Decoder: ConvTranspose2d(32,16,3,s=2,p=1,op=1) -> ReLU -> ConvTranspose2d(16,1,3
 
 Each mode maps 1:1 to an `ElCheMode` variant in `flodl`. The framework
 default is `nccl-cadence` (`ElCheConfig::default()`). See
-[DDP Reference: ElCheMode](../docs/ddp.md#elchemode--cadence--backend-in-one-name)
+[DDP Reference: ElCheMode](../docs/ddp/01-reference.md#elchemode---cadence--backend-in-one-name)
 for full semantics.
 
 | Mode | `ElCheMode` | Description |

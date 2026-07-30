@@ -625,4 +625,4 @@ detector's job, not the stall ceiling's.
 
 ---
 
-Previous: [The floDl CLI](../cli.md) | Next: [Mac / Apple Silicon](../mac-apple-silicon.md)
+Previous: [Working in the Source Checkout](../cli/06-source-checkout.md) | Next: [Mac / Apple Silicon](../mac-apple-silicon.md)

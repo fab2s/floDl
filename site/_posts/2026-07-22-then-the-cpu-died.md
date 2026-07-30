@@ -95,9 +95,9 @@ sync-cadence charts lives in
 For the complete list of what landed, from the one-port mux and SSH-tunneled
 workers to `fdl probe` / `fdl status` / `fdl nccl build`, see the
 [changelog](https://github.com/flodl-labs/flodl/blob/main/CHANGELOG.md). To
-run it: the [distributed training reference](/guide/ddp-reference) covers
+run it: the [distributed training reference](/guide/ddp/reference) covers
 everything from one GPU to a cluster, and
-[`fdl setup`](/guide/cli) gets you from clone to training.
+[`fdl setup`](/guide/cli/install) gets you from clone to training.
 
 flodl remains a two-being effort: human direction, AI implementation. The
 dead CPU contributed the roadmap.

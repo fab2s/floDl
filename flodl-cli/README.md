@@ -25,7 +25,7 @@ That alone gives you a working libtorch installation usable from any
 Rust (tch-rs), C++, or Python project. The flodl framework
 ([flodl.dev](https://flodl.dev)) builds on top with `fdl setup`,
 `fdl init`, and the `fdl.yml` manifest format covered in the
-[full CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md).
+[full CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/01-install.md).
 
 ## Design principles
 
@@ -86,7 +86,7 @@ equally to the flodl source checkout and to anything you scaffolded with
   in the [`flodl-cli-macros`](https://crates.io/crates/flodl-cli-macros)
   crate (re-exported here) -- see its
   [README](https://github.com/flodl-labs/flodl/blob/main/flodl-cli-macros/README.md)
-  or the [CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md#declaring-flags-in-rust)
+  or the [CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/05-manifest.md#declaring-flags-in-rust)
   for the full attribute surface and a worked example.
 
 ### For multi-GPU and cluster training
@@ -113,9 +113,9 @@ equally to the flodl source checkout and to anything you scaffolded with
   SSHes each worker, fans out, supervises rank children, tears them
   down on parent exit.
 
-See the [DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)
+See the [DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp/01-reference.md)
 for the topology side and the
-[CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md)
+[CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/01-install.md)
 for the full command surface.
 
 ### In the flodl source checkout specifically
@@ -259,7 +259,7 @@ Override with `--cpu` or `--cuda <version>`.
 
 ## Links
 
-- [Full CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli.md) - every command, every flag, with examples
+- [Full CLI reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/01-install.md) - every command, every flag, with examples
 - [floDl framework](https://flodl.dev) - the Rust deep learning framework `fdl` was built for
 - [GitHub Releases](https://github.com/flodl-labs/flodl/releases) - pre-compiled binaries
 - [GitHub repository](https://github.com/flodl-labs/flodl)

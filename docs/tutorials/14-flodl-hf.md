@@ -702,7 +702,7 @@ those three are on the next ergonomics pass.
 
 - [`flodl-hf` crate README](https://github.com/flodl-labs/flodl/blob/main/flodl-hf/README.md)
 - [flodl-hf examples](https://github.com/flodl-labs/flodl/tree/main/flodl-hf/examples)
-- [The floDl CLI](../cli.md) (see `fdl add`, `fdl flodl-hf`, `fdl test-live`)
+- [The floDl CLI](../cli/01-install.md) (see `fdl add`, `fdl flodl-hf`, `fdl test-live`)
 - [Multi-GPU DDP](11-multi-gpu.md) (the same `Trainer` entry point
   distributes the fine-tune walkthrough across N devices - heads
   `impl Module`)

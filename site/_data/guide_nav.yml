@@ -109,9 +109,24 @@ groups:
     open: false
     numbered: false
     members:
-      - stub: "cli"
-        title: "The floDl CLI"
-        blurb: "fdl commands, environment overlays, fdl.yml schema, libtorch management."
+      - stub: "cli-install"
+        title: "Install and Global Flags"
+        blurb: "Installing fdl, the global flags every command accepts, and update checks."
+      - stub: "cli-setup"
+        title: "Project and libtorch Commands"
+        blurb: "fdl setup, libtorch build/download, init, add, diagnose - plus the libtorch directory layout."
+      - stub: "cli-cluster"
+        title: "Cluster and Hardware Commands"
+        blurb: "fdl probe, status, start, join, nccl, --gpus, and @cluster multi-host fan-out."
+      - stub: "cli-tooling"
+        title: "Introspection and Tooling"
+        blurb: "fdl api-ref for the generated API surface, skill install for AI assistants, shell completions."
+      - stub: "cli-manifest"
+        title: "The fdl.yml Manifest"
+        blurb: "Command kinds, declaring flags in Rust with FdlArgs, environment overlays, presets, schema caching."
+      - stub: "cli-source"
+        title: "Working in the Source Checkout"
+        blurb: "The contributor loop: tests, CUDA suites, benchmarks, the DDP validation suite, HF gates."
 
   - label: "Internals"
     fold: true

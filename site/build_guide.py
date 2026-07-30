@@ -50,54 +50,11 @@ GITHUB_PREFIXES = [
     ("ai/", "https://github.com/flodl-labs/flodl/blob/main/ai/"),
 ]
 
-# Legacy regex rewrites, for anything the structural pass above cannot resolve
-# (targets that are not real repo paths). Order matters — anchored variants
-# before bare filenames. New splits should NOT need entries here.
-LINK_REWRITES = [
-    (r"\(00-rust-primer\.md\)", "(/guide/rust-primer)"),
-    (r"\(01-tensors\.md\)", "(/guide/tensors)"),
-    (r"\(02-autograd\.md\)", "(/guide/autograd)"),
-    (r"\(03-modules\.md\)", "(/guide/modules)"),
-    (r"\(04-training\.md(#[^)]+)\)", r"(/guide/training\1)"),
-    (r"\(04-training\.md\)", "(/guide/training)"),
-    (r"\(05-graph-builder\.md\)", "(/guide/graph-builder)"),
-    (r"\(06-advanced-graphs\.md\)", "(/guide/advanced-graphs)"),
-    (r"\(07-visualization\.md\)", "(/guide/visualization)"),
-    (r"\(08-utilities\.md\)", "(/guide/utilities)"),
-    (r"\(09-monitor\.md\)", "(/guide/monitor)"),
-    (r"\(10-graph-tree\.md(#[^)]+)\)", r"(/guide/graph-tree\1)"),
-    (r"\(10-graph-tree\.md\)", "(/guide/graph-tree)"),
-    (r"\(11-multi-gpu\.md\)", "(/guide/multi-gpu)"),
-    (r"\(12-async-ddp\.md\)", "(/guide/async-ddp)"),
-    (r"\(13-data-loading\.md\)", "(/guide/data-loading)"),
-    (r"\(14-flodl-hf\.md\)", "(/guide/flodl-hf)"),
-    (r"\(\.\./pytorch_migration\.md\)", "(/guide/migration)"),
-    # From docs/distributed/ (architecture.md) — one level deeper than tutorials/.
-    (r"\(\.\./ddp\.md(#[^)]+)\)", r"(/guide/ddp-reference\1)"),
-    (r"\(\.\./ddp\.md\)", "(/guide/ddp-reference)"),
-    (r"\(\.\./tutorials/11-multi-gpu\.md\)", "(/guide/multi-gpu)"),
-    (r"\(\.\./troubleshooting\.md\)", "(/guide/troubleshooting)"),
-    # Relative links to examples (from tutorials)
-    (r"\(\.\./\.\./flodl/examples/([^)]+)\)", r"(https://github.com/flodl-labs/flodl/tree/main/flodl/examples/\1)"),
-    # From docs/ root level (troubleshooting.md, pytorch_migration.md)
-    (r"\(ddp\.md\)", "(/guide/ddp-reference)"),
-    (r"\(ddp\.md(#[^)]+)\)", r"(/guide/ddp-reference\1)"),
-    # ddp-benchmark.md is not a guide page; the site carries a hand-built
-    # summary at /ddp-benchmark (full report stays on GitHub).
-    (r"\(ddp-benchmark\.md\)", "(/ddp-benchmark)"),
-    (r"\(pytorch_migration\.md\)", "(/guide/migration)"),
-    (r"\(troubleshooting\.md\)", "(/guide/troubleshooting)"),
-    (r"\(tutorials/00-rust-primer\.md\)", "(/guide/rust-primer)"),
-    (r"\(tutorials/01-tensors\.md\)", "(/guide/tensors)"),
-    (r"\(tutorials/10-graph-tree\.md\)", "(/guide/graph-tree)"),
-    (r"\(tutorials/11-multi-gpu\.md\)", "(/guide/multi-gpu)"),
-    (r"\(tutorials/12-async-ddp\.md\)", "(/guide/async-ddp)"),
-    (r"\(tutorials/13-data-loading\.md\)", "(/guide/data-loading)"),
-    (r"\(tutorials/14-flodl-hf\.md\)", "(/guide/flodl-hf)"),
-    (r"\(cli\.md(#[^)]+)\)", r"(/guide/cli\1)"),
-    (r"\(cli\.md\)", "(/guide/cli)"),
-    (r"\(design/trainer-execution-tiers\.md\)", "(https://github.com/flodl-labs/flodl/blob/main/docs/design/trainer-execution-tiers.md)"),
-]
+# Legacy regex rewrites. The structural pass in rewrite_links() resolves every
+# target that is a real repo path, which made all of the former entries here
+# redundant — they were one pattern per (source depth x target) pair. Kept as an
+# escape hatch for targets that are NOT repo paths; empty is the healthy state.
+LINK_REWRITES = []
 
 NAV_LINE_RE = re.compile(
     r"^(Next:|Previous[ a-z]*:|\[.*?\]\(.*?\)[ |]*$)"
@@ -681,6 +638,15 @@ def main():
             f.write(content)
 
         count += 1
+
+    # Prune generated pages whose stub is gone. Without this a removed stub
+    # leaves its page behind and Jekyll keeps publishing the stale URL — exactly
+    # what happened to /guide/cli when cli.md was split into cli/.
+    expected = {f"{stub}.md" for stub, _t, _g in chain}
+    for leftover in sorted(os.listdir(GUIDE_DIR)):
+        if leftover.endswith(".md") and leftover not in expected:
+            os.remove(os.path.join(GUIDE_DIR, leftover))
+            print(f"pruned stale generated page: site/guide/{leftover}")
 
     render_sidebar(groups, permalinks)
     render_guide_index(groups, permalinks)
