@@ -23,6 +23,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STUBS_DIR = os.path.join(REPO_ROOT, "site", "_stubs")
 GUIDE_DIR = os.path.join(REPO_ROOT, "site", "guide")
 
+# Borrow the fence-aware reader from the docs linter rather than writing a second
+# one. There must be exactly ONE fence-aware markdown parser in this repo: a
+# second is a second thing that can be fence-blind, and fence blindness has
+# already cost this project three times (phantom anchors, a wrong section
+# line-count, a release gate). `lint_doc_links` guards its own entry point, so
+# importing it runs nothing.
+sys.path.insert(0, os.path.join(REPO_ROOT, "ci", "release"))
+from lint_doc_links import strip_fences, slugify  # noqa: E402
+
 # Embedded skill assets: flodl-cli/assets/skills/ is the copy include_str!'d
 # into the fdl binary (the out-of-repo fallback for `fdl skill install`).
 # crates.io only packages the crate dir, so it cannot include_str! ../../ai/;
@@ -286,6 +295,55 @@ def inject_nav(frontmatter, prev, nxt):
     return "".join(lines)
 
 
+def page_anchors(content):
+    """`## ` headings of a doc as (id, title) pairs, for the sidebar's third level.
+
+    H2 only: H3 would nest a table of contents inside a nav. Fence-aware, because
+    docs quote command output containing `##` lines — `docs/cli/04-tooling-commands.md`
+    has a literal `## Modules (nn)` inside a ```text block that is sample
+    `fdl api-ref` output, not a heading.
+
+    The slugs come from the same GitHub-style slugifier the anchor validator uses.
+    That is safe here because kramdown's `auto_ids` agrees with it across this
+    corpus, verified against the built HTML on the awkward cases: triple dashes
+    (`sub-epoch-reports---reports_per_epoch`), preserved underscores, and
+    `fdl---gpus`. If that ever diverges, these nav links break silently, so the
+    check to re-run is `grep -oE '<h2 id="[^"]*"' site/_site/guide/<page>.html`.
+    """
+    out = []
+    for _lineno, line in strip_fences(content.split("\n"))[0]:
+        m = re.match(r"^##\s+(.*?)\s*#*\s*$", line)
+        if not m:
+            continue
+        title = m.group(1)
+        slug = slugify(title)
+        if slug:
+            out.append((slug, title))
+    return out
+
+
+def inject_anchors(frontmatter, anchors):
+    """Write the page's H2 list into its frontmatter as a YAML list of maps.
+
+    Titles are quoted and internal quotes stripped: Jekyll's Psych is stricter
+    than a hand-rolled reader and a bare `:` in a scalar is a build-breaking
+    parse error, which this build has already been bitten by once.
+    """
+    if not anchors:
+        return frontmatter
+    add = ["anchors:\n"]
+    for slug, title in anchors:
+        clean = re.sub(r'\s+', ' ', title.replace('`', '').replace('"', "'")).strip()
+        add.append(f'  - id: "{slug}"\n')
+        add.append(f'    title: "{clean}"\n')
+    lines = frontmatter.splitlines(keepends=True)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == "---":
+            lines[i:i] = add
+            break
+    return "".join(lines)
+
+
 def git_last_modified(path):
     """ISO-8601 timestamp of the last commit touching `path`, or None if not in git."""
     try:
@@ -363,6 +421,17 @@ def render_sidebar(groups, permalinks):
             links.append(
                 f"    <a href=\"{{{{ '{url}' | relative_url }}}}\""
                 f"{{% if page.url == '{url}' %}} class=\"active\"{{% endif %}}>{esc(text)}</a>"
+            )
+            # Third level: the page's own H2s, from its `anchors` frontmatter
+            # (written by inject_anchors). Guarded on the active page, so the
+            # in-document list exists only for the page the reader is on — it is
+            # "already open" by construction, with no JS and no extra fold.
+            links.append(
+                f"    {{% if page.url == '{url}' and page.anchors %}}"
+                '<span class="sidebar-anchors">'
+                "{% for a in page.anchors %}"
+                '<a href="#{{ a.id }}">{{ a.title }}</a>'
+                "{% endfor %}</span>{% endif %}"
             )
 
         if g["fold"]:
@@ -627,6 +696,10 @@ def main():
         nxt = ((permalinks[chain[idx + 1][0]], chain[idx + 1][1])
                if idx + 1 < len(chain) else None)
         clean_frontmatter = inject_nav(clean_frontmatter, prev, nxt)
+        # Anchors come from the REWRITTEN content, so the H2 set matches the page
+        # Jekyll will actually render (link rewriting does not touch headings, but
+        # the nav-tail strip can remove trailing sections).
+        clean_frontmatter = inject_anchors(clean_frontmatter, page_anchors(content))
 
         lastmod = git_last_modified(source_path)
         if lastmod:

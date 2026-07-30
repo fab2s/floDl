@@ -121,10 +121,7 @@ only concerned with the process tree it produces.
 
 ```mermaid
 flowchart TB
-    subgraph launchbox["Launcher process (no CUDA)"]
-        L["Role::Launcher<br/>join window -> world synthesis -> supervision"]
-        C["cluster_coordinator<br/>(scheduler + averaging)<br/>one mux port: join + rendezvous +<br/>data + control + HTTP status"]
-    end
+    L["Role::Launcher<br/>join window -> world synthesis -> supervision"]
 
     subgraph host0["Host 0 (launcher-local)"]
         W0["Role::Rank GPU0<br/>GpuWorker"]
@@ -138,30 +135,57 @@ flowchart TB
         W3["Role::Rank GPU1<br/>GpuWorker"]
     end
 
-    L -.->|ONE SSH session| A1
     L -.->|"local spawn<br/>(in-process join)"| W0
     L -.->|"local spawn<br/>(in-process join)"| W1
+    L -.->|ONE SSH session| A1
     A1 -.->|spawns after WorldFormed| R1
     A1 -.->|spawns after WorldFormed| W2
     A1 -.->|spawns after WorldFormed| W3
 
-    A1 <-->|join channel stays open:<br/>host control link| C
-    W0 <-->|in-process channels| C
-    W1 <-->|in-process channels| C
-    W2 <-->|loopback| R1
-    W3 <-->|loopback| R1
-    R1 <-->|one muxed TCP conn<br/>MuxRecord frames| C
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class L,A1,R1 actor
+    class W0,W1,W2,W3 good
+    classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
+    class host0,host1 group
+```
 
-    %% Stack the hosts instead of letting dagre put them side by side: with
-    %% both wired to the launcher they land on one rank and the chart sprawls.
-    host0 ~~~ host1
+Note the asymmetry the tree makes obvious: launcher-local ranks are **direct**
+children of the launcher, while a remote host's children are spawned one hop
+further out, by its agent, and only after `WorldFormed`.
+
+Spawning is only half of it. The **channel** topology over those same processes
+is a different shape, and it is the one the reduce travels:
+
+```mermaid
+flowchart LR
+    C["cluster_coordinator<br/>(scheduler + averaging)<br/>one mux port: join + rendezvous +<br/>data + control + HTTP status"]
+
+    subgraph host0c["Host 0 (launcher-local)"]
+        W0c["Rank GPU0"]
+        W1c["Rank GPU1"]
+    end
+
+    subgraph host1c["Host 1 (remote)"]
+        A1c["Agent"]
+        R1c["Relay<br/>first fold tier of the reduce"]
+        W2c["Rank GPU0"]
+        W3c["Rank GPU1"]
+    end
+
+    W0c <-->|in-process channels| C
+    W1c <-->|in-process channels| C
+    A1c <-->|"join channel stays open:<br/>host control link"| C
+    W2c <-->|loopback| R1c
+    W3c <-->|loopback| R1c
+    R1c <-->|"one muxed TCP conn<br/>MuxRecord frames"| C
 
     classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
     classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
-    class L,C,A1,R1 actor
-    class W0,W1,W2,W3 good
+    class C,A1c,R1c actor
+    class W0c,W1c,W2c,W3c good
     classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
-    class launchbox,host0,host1 group
+    class host0c,host1c group
 ```
 
 The agent's join connection stays open past formation as the **host control

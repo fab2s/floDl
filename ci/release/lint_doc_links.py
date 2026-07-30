@@ -165,7 +165,14 @@ def slugify(text):
 
     s = s.lower()
     s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
-    return s.strip().replace(" ", "-")
+    # Do NOT strip here. Dropping punctuation can leave whitespace behind, and
+    # both renderers hyphenate it rather than trimming it: `## 4. Closures: `|| {}``
+    # loses `|`/`{`/`}` and keeps TWO trailing spaces, so kramdown and
+    # github-slugger both emit `4-closures--`. A `.strip()` at this point produced
+    # `4-closures`, which matches neither — it would pass a link that is broken on
+    # both surfaces and fail the one that works. (The heading text is already
+    # trimmed at the top of this function; that part is correct.)
+    return s.replace(" ", "-")
 
 
 def anchors_of(path):

@@ -4,6 +4,16 @@ layout: default
 
 <div class="guide-layout">
   {% include sidebar.html %}
+  <!-- Narrow-width access to the guide nav. Below 900px the sidebar becomes an
+       off-canvas drawer, and this is the only way to reach it, so the handle is
+       always present rather than hover- or scroll-dependent. Bottom-left keeps it
+       clear of the page title and within thumb reach. -->
+  <button class="sidebar-toggle" id="sidebarToggle"
+          aria-controls="sidebar" aria-expanded="false" aria-label="Guide navigation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    <span>Guide</span>
+  </button>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
   <main class="guide-content content">
     {{ content }}
 
@@ -39,6 +49,53 @@ layout: default
         groups.forEach(function (other) { if (other !== d) other.open = false; });
       });
     });
+  })();
+
+  // Narrow-width drawer. CSS keeps the handle and backdrop inert above 900px, so
+  // this needs no breakpoint of its own — one state, interpreted by the media
+  // query.
+  (function () {
+    var btn = document.getElementById('sidebarToggle');
+    var sb = document.getElementById('sidebar');
+    var bd = document.getElementById('sidebarBackdrop');
+    if (!btn || !sb) return;
+
+    function setOpen(open) {
+      sb.classList.toggle('open', open);
+      if (bd) bd.classList.toggle('visible', open);
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      // Freeze the page behind the drawer. The CSS rule for this class lives
+      // inside the 900px media query, so it cannot affect the desktop sticky
+      // sidebar even if the class outlived the drawer.
+      document.documentElement.classList.toggle('nav-locked', open);
+    }
+
+    btn.addEventListener('click', function () {
+      setOpen(!sb.classList.contains('open'));
+    });
+    if (bd) bd.addEventListener('click', function () { setOpen(false); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') setOpen(false);
+    });
+
+    // Closing on a link is not optional: the third-level entries are same-page
+    // `#anchor` links, which do NOT reload, so the drawer would otherwise stay
+    // parked over the heading the reader just jumped to. Only <a> counts —
+    // <summary> clicks expand a group and must leave the drawer open.
+    sb.addEventListener('click', function (e) {
+      if (e.target.closest('a')) setOpen(false);
+    });
+
+    // Growing past the breakpoint must close the drawer, not just restyle it: the
+    // sidebar returns to being a normal column while `.visible` would leave the
+    // backdrop covering the page — and the handle that dismisses it is hidden
+    // above 900px, so the reader would be stuck behind an undismissable overlay.
+    if (window.matchMedia) {
+      var wide = window.matchMedia('(min-width: 901px)');
+      var onWide = function (e) { if (e.matches) setOpen(false); };
+      if (wide.addEventListener) wide.addEventListener('change', onWide);
+      else if (wide.addListener) wide.addListener(onWide);
+    }
   })();
 </script>
 
