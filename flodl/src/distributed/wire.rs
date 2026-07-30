@@ -134,6 +134,12 @@ pub(crate) const CHANNEL_MAGIC_JOIN: u32 = 0xF10D_17E3;
 /// `distributed::status` for the responder.
 pub(crate) const CHANNEL_MAGIC_HTTP_GET: u32 = u32::from_le_bytes(*b"GET ");
 
+/// HTTP POSTs route to the same status responder as GETs: the one
+/// mutation on that surface is the authenticated operator start switch
+/// (`POST /start`, `fdl start`) arming the staging hold's topology
+/// freeze. See `distributed::status` for the auth model.
+pub(crate) const CHANNEL_MAGIC_HTTP_POST: u32 = u32::from_le_bytes(*b"POST");
+
 // ---------------------------------------------------------------------------
 // Cleartext guard
 // ---------------------------------------------------------------------------

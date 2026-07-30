@@ -13,7 +13,7 @@ use flodl_cli::{
 
 use builtins::{
     AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, ProbeArgs, SetupArgs,
-    SkillInstallArgs, StatusArgs,
+    SkillInstallArgs, StartArgs, StatusArgs,
 };
 
 use std::env;
@@ -191,6 +191,11 @@ fn main() -> ExitCode {
         "status" => {
             let cli: StatusArgs = parse_sub("fdl status", &args[1..]);
             let code = status::run(cli.json, cli.addr.as_deref());
+            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        "start" => {
+            let cli: StartArgs = parse_sub("fdl start", &args[1..]);
+            let code = status::run_start(cli.addr.as_deref(), cli.token.as_deref());
             if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "api-ref" => {

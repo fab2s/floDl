@@ -65,6 +65,47 @@ pub fn run(json: bool, addr_override: Option<&str>) -> i32 {
     1
 }
 
+/// Run `fdl start`: fire the operator start switch of a staging run.
+/// Same address resolution as `fdl status`; the refusal reasons the
+/// controller sends back (auto mode, quorum not met, window closed,
+/// bad token) ARE the UX, so they print verbatim.
+pub fn run_start(addr_override: Option<&str>, token: Option<&str>) -> i32 {
+    let (candidates, origin) = resolve_candidates(addr_override);
+
+    let mut last_err = String::new();
+    for addr in &candidates {
+        match post_start(addr, token) {
+            Ok(body) => {
+                let joined = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["joined_ranks"].as_u64());
+                match joined {
+                    Some(n) => println!(
+                        "start armed @ {addr} — the world forms with the \
+                         {n} rank(s) staged (watch `fdl status`)",
+                    ),
+                    None => println!("start armed @ {addr} — {body}"),
+                }
+                return 0;
+            }
+            // A served refusal means the controller WAS found — its
+            // reason (auto mode, quorum, bad token) is the answer, and
+            // trying further addresses would only mask it behind a
+            // connect error.
+            Err(e) if e.starts_with("endpoint answered") => {
+                crate::cli_error!("start refused @ {addr}: {e}");
+                return 1;
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    crate::cli_error!(
+        "start not armed at {} ({origin}): {last_err}",
+        candidates.join(" / "),
+    );
+    1
+}
+
 /// Resolve the ordered list of addresses to try + a human tag saying
 /// where they came from (for the failure message).
 fn resolve_candidates(addr_override: Option<&str>) -> (Vec<String>, String) {
@@ -114,6 +155,34 @@ fn load_cluster_for_env(env_name: &str) -> Option<config::ClusterConfig> {
 /// One HTTP GET of `/state.json`. Hand-rolled over TcpStream: the
 /// endpoint is plain HTTP on a cleartext port, no TLS involved.
 fn fetch_state(addr: &str) -> Result<String, String> {
+    http_round_trip(
+        addr,
+        &format!(
+            "GET /state.json HTTP/1.1\r\nHost: {addr}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    )
+}
+
+/// One `POST /start` (the operator start switch), token as a query
+/// param when given.
+fn post_start(addr: &str, token: Option<&str>) -> Result<String, String> {
+    let path = match token {
+        Some(t) => format!("/start?token={t}"),
+        None => "/start".to_string(),
+    };
+    http_round_trip(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\n\
+             Connection: close\r\nContent-Length: 0\r\n\r\n"
+        ),
+    )
+}
+
+/// Send one request, read the whole response, return the body on 200
+/// and `Err(status — body)` otherwise.
+fn http_round_trip(addr: &str, request: &str) -> Result<String, String> {
     let sock_addr = addr
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {addr}: {e}"))?
@@ -126,13 +195,7 @@ fn fetch_state(addr: &str) -> Result<String, String> {
         .and_then(|()| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
         .map_err(|e| format!("socket setup: {e}"))?;
     stream
-        .write_all(
-            format!(
-                "GET /state.json HTTP/1.1\r\nHost: {addr}\r\n\
-                 Connection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
+        .write_all(request.as_bytes())
         .map_err(|e| format!("send request: {e}"))?;
     let mut response = String::new();
     stream
@@ -173,7 +236,7 @@ fn print_status(addr: &str, body: &str) {
     let phase = state["phase"].as_str().unwrap_or("unknown");
     let painted_phase = match phase {
         "training" | "done" => style::green(phase),
-        "waiting" | "forming" => style::yellow(phase),
+        "waiting" | "staging" | "forming" => style::yellow(phase),
         "failed" => style::red(phase),
         other => other.to_string(),
     };
@@ -195,7 +258,7 @@ fn print_status(addr: &str, body: &str) {
     );
     // The countdown is only meaningful while the window is open; once
     // formed, the snapshot's remaining-times are frozen at formation.
-    if phase == "waiting" {
+    if phase == "waiting" || phase == "staging" {
         let fmt_remaining = |v: &serde_json::Value| match v.as_u64() {
             Some(s) => format!("{s}s left"),
             None => "expired".to_string(),
@@ -205,6 +268,23 @@ fn print_status(addr: &str, body: &str) {
             fmt_remaining(&state["window_remaining_secs"]),
             fmt_remaining(&state["cap_remaining_secs"]),
         );
+    }
+    // Operator start switch: only rendered when the run has one (older
+    // flodl snapshots have no start_mode field — absent ≠ auto).
+    if let Some(mode) = state["start_mode"].as_str() {
+        if mode != "auto" {
+            let armed = state["start_armed"].as_bool().unwrap_or(false);
+            if armed {
+                println!("  start: {mode} — armed (forming at the next poll)");
+            } else if phase == "staging" {
+                println!(
+                    "  start: {mode} — {}",
+                    style::bold("roster startable, fire with `fdl start`"),
+                );
+            } else if phase == "waiting" {
+                println!("  start: {mode} — waiting for quorum");
+            }
+        }
     }
 
     let Some(members) = state["members"].as_array() else {

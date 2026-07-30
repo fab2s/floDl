@@ -19,7 +19,18 @@
 //! read run metadata (phase, host names, GPU inventory) — the same
 //! class of information the training dashboard exposes, and strictly
 //! less than what the cleartext training frames on that port already
-//! carry. The endpoint is read-only and never mutates run state.
+//! carry.
+//!
+//! The read surface never mutates run state. The one mutation is the
+//! **operator start switch**: `POST /start` (`fdl start`) arms the
+//! staging hold's topology freeze under `start: manual | hybrid`.
+//! Authentication mirrors the join trust model: a loopback peer is
+//! trusted (the local operator, or someone already authenticated by
+//! sshd), any other peer must present the session credential
+//! (`?token=<salt-hex>` — the `join.token` on runs meant to be started
+//! remotely). Arming is idempotent and quorum-gated at BOTH layers
+//! (refused here for operator feedback, re-checked by the window's
+//! verdict poll, which is the authority).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -27,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::membership::MembershipSnapshot;
+use super::membership::{ClusterPhase, MembershipSnapshot, StartMode};
 use super::port_mux::StreamSource;
 use super::wire::scaled_deadline_secs;
 
@@ -43,13 +54,27 @@ const REQUEST_TIMEOUT_SECS: u64 = 5;
 /// request line is all we route on; anything longer is header noise.
 const MAX_REQUEST_BYTES: usize = 2048;
 
+/// Operator start-switch wiring, configured by the launcher before the
+/// window opens. `mode` gates whether `POST /start` is meaningful at
+/// all; `token_hex` is the non-loopback credential (the session salt).
+struct StartSwitch {
+    mode: StartMode,
+    token_hex: String,
+}
+
 /// Shared, cloneable slot holding the latest membership state as
 /// pre-serialized JSON. The controller publishes transitions; the HTTP
 /// responder (and the debug log) serve the SAME string, so the log and
-/// the HTTP surface can never disagree.
+/// the HTTP surface can never disagree. Also carries the operator
+/// start switch: the HTTP responder arms it, the join window polls it.
 #[derive(Clone, Default)]
 pub(crate) struct StatusBoard {
     state_json: Arc<Mutex<Option<String>>>,
+    /// Typed twin of `state_json`, for the `POST /start` handler's
+    /// phase/quorum gating (parsing the JSON back would be silly).
+    latest: Arc<Mutex<Option<MembershipSnapshot>>>,
+    start: Arc<Mutex<Option<StartSwitch>>>,
+    start_requested: Arc<AtomicBool>,
 }
 
 impl StatusBoard {
@@ -69,11 +94,25 @@ impl StatusBoard {
             crate::debug!("cluster membership: state {js}");
         }
         *self.state_json.lock().unwrap() = Some(js);
+        *self.latest.lock().unwrap() = Some(snapshot.clone());
     }
 
     /// Latest published state, if any.
     pub fn state_json(&self) -> Option<String> {
         self.state_json.lock().unwrap().clone()
+    }
+
+    /// Wire the operator start switch (launcher, before the window
+    /// opens). Without this call `POST /start` answers "no start switch
+    /// this run" — e.g. paths that never run a join window.
+    pub fn configure_start(&self, mode: StartMode, token_hex: String) {
+        *self.start.lock().unwrap() = Some(StartSwitch { mode, token_hex });
+    }
+
+    /// Whether the operator has armed the start switch. Polled by the
+    /// join window's verdict loop.
+    pub fn start_requested(&self) -> bool {
+        self.start_requested.load(Ordering::SeqCst)
     }
 }
 
@@ -111,23 +150,39 @@ fn answer_status_request(mut stream: TcpStream, board: &StatusBoard) {
     {
         return;
     }
-    let Some(path) = read_request_path(&mut stream) else {
+    let Some((method, target)) = read_request_line(&mut stream) else {
         return;
     };
+    // Split `/start?token=...` into path + query.
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target.as_str(), None),
+    };
 
-    let (status_line, body) = match path.as_str() {
+    let (status_line, body) = match (method.as_str(), path) {
         // `/` answers too: someone pointing a browser at the training
         // port should find the state, not a hang.
-        "/state.json" | "/" => match board.state_json() {
+        ("GET", "/state.json") | ("GET", "/") => match board.state_json() {
             Some(js) => ("200 OK", js),
             None => (
                 "503 Service Unavailable",
                 r#"{"error":"no membership state published yet"}"#.to_string(),
             ),
         },
+        ("POST", "/start") => {
+            // Trust mirrors join admission: a loopback peer got here
+            // through sshd (or IS the controller host); anyone else
+            // must present the session credential.
+            let peer_is_loopback = stream
+                .peer_addr()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(false);
+            handle_start(peer_is_loopback, query, board)
+        }
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","endpoints":["/state.json"]}"#.to_string(),
+            r#"{"error":"not found","endpoints":["GET /state.json","POST /start"]}"#
+                .to_string(),
         ),
     };
     let response = format!(
@@ -143,9 +198,87 @@ fn answer_status_request(mut stream: TcpStream, board: &StatusBoard) {
     let _ = stream.flush();
 }
 
-/// Read up to the end of the request line and extract the path token
-/// (`GET <path> HTTP/1.1`). `None` on a malformed or truncated request.
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+/// The operator start switch: authenticate, gate on mode/phase/quorum,
+/// arm. Every refusal names its reason — the operator is reading this
+/// in a terminal through `fdl start`. `peer_is_loopback` is the
+/// caller-resolved trust scope (see the dispatch site).
+fn handle_start(
+    peer_is_loopback: bool,
+    query: Option<&str>,
+    board: &StatusBoard,
+) -> (&'static str, String) {
+    let start = board.start.lock().unwrap();
+    let Some(switch) = start.as_ref() else {
+        return (
+            "409 Conflict",
+            r#"{"error":"no start switch this run (no join window with a start mode)"}"#
+                .to_string(),
+        );
+    };
+    if switch.mode == StartMode::Auto {
+        return (
+            "409 Conflict",
+            r#"{"error":"start mode is auto — the window closes on target/expiry; set `controller.join.start: manual` (or hybrid) to hold for an operator start"}"#
+                .to_string(),
+        );
+    }
+    if !peer_is_loopback {
+        let presented = query.and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("token="))
+        });
+        if presented != Some(switch.token_hex.as_str()) {
+            return (
+                "403 Forbidden",
+                r#"{"error":"start refused: non-loopback peer without a valid token (pass --token, or fire from the controller host / through the sshd tunnel)"}"#
+                    .to_string(),
+            );
+        }
+    }
+    let latest = board.latest.lock().unwrap();
+    let Some(snap) = latest.as_ref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"no membership state published yet"}"#.to_string(),
+        );
+    };
+    match snap.phase {
+        ClusterPhase::Waiting | ClusterPhase::Staging => {}
+        phase => {
+            return (
+                "409 Conflict",
+                format!(
+                    r#"{{"error":"window is not open (phase: {})"}}"#,
+                    serde_json::to_string(&phase)
+                        .unwrap_or_default()
+                        .trim_matches('"'),
+                ),
+            );
+        }
+    }
+    if snap.joined_ranks < snap.min_rank_start {
+        return (
+            "409 Conflict",
+            format!(
+                r#"{{"error":"quorum not met: {}/{} ranks joined — check fdl status and fire again"}}"#,
+                snap.joined_ranks, snap.min_rank_start,
+            ),
+        );
+    }
+    board.start_requested.store(true, Ordering::SeqCst);
+    (
+        "200 OK",
+        format!(
+            r#"{{"armed":true,"joined_ranks":{},"min_rank_start":{}}}"#,
+            snap.joined_ranks, snap.min_rank_start,
+        ),
+    )
+}
+
+/// Read up to the end of the request line and extract the method + path
+/// tokens (`GET <path> HTTP/1.1`). `None` on a malformed or truncated
+/// request.
+fn read_request_line(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 256];
     while !buf.windows(2).any(|w| w == b"\r\n")
@@ -159,7 +292,10 @@ fn read_request_path(stream: &mut TcpStream) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&buf);
     let line = text.lines().next()?;
-    line.split_whitespace().nth(1).map(str::to_string)
+    let mut tokens = line.split_whitespace();
+    let method = tokens.next()?.to_string();
+    let path = tokens.next()?.to_string();
+    Some((method, path))
 }
 
 #[cfg(test)]
@@ -177,6 +313,8 @@ mod tests {
             target_ranks: Some(3),
             window_remaining_secs: Some(120),
             cap_remaining_secs: Some(400),
+            start_mode: StartMode::Auto,
+            start_armed: false,
             members: vec![MemberSnapshot {
                 host: "node-a".to_string(),
                 ranks: vec![0],
@@ -266,5 +404,126 @@ mod tests {
         let response = http_get(board, "/metrics");
         assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
         assert!(response.contains("/state.json"), "{response}");
+    }
+
+    /// POST against the live responder (loopback peer by construction).
+    fn http_post(board: StatusBoard, path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let source = StreamSource::from_listener(listener, "test").unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_c = Arc::clone(&abort);
+        let server = std::thread::spawn(move || {
+            serve_status(source, board, abort_c);
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\
+                     Content-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        drop(stream);
+
+        abort.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        response
+    }
+
+    fn staged_snapshot(mode: StartMode, joined: usize) -> MembershipSnapshot {
+        MembershipSnapshot {
+            phase: ClusterPhase::Staging,
+            joined_ranks: joined,
+            start_mode: mode,
+            ..snapshot(ClusterPhase::Staging)
+        }
+    }
+
+    #[test]
+    fn start_arms_a_staged_manual_window_from_loopback() {
+        let board = StatusBoard::new();
+        board.configure_start(StartMode::Manual, "aa".repeat(16));
+        board.publish(&staged_snapshot(StartMode::Manual, 3));
+        assert!(!board.start_requested());
+        let response = http_post(board.clone(), "/start");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains(r#""armed":true"#), "{response}");
+        assert!(board.start_requested(), "flag must be armed");
+    }
+
+    #[test]
+    fn start_refusals_name_their_reason() {
+        // Unconfigured switch (no join window ran).
+        let board = StatusBoard::new();
+        board.publish(&snapshot(ClusterPhase::Waiting));
+        let response = http_post(board, "/start");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("no start switch"), "{response}");
+
+        // Auto mode: the clock owns the close.
+        let board = StatusBoard::new();
+        board.configure_start(StartMode::Auto, "aa".repeat(16));
+        board.publish(&snapshot(ClusterPhase::Waiting));
+        let response = http_post(board.clone(), "/start");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("auto"), "{response}");
+        assert!(!board.start_requested());
+
+        // Quorum unmet: counts in the reply.
+        let board = StatusBoard::new();
+        board.configure_start(StartMode::Manual, "aa".repeat(16));
+        board.publish(&MembershipSnapshot {
+            joined_ranks: 1,
+            ..staged_snapshot(StartMode::Manual, 1)
+        });
+        let response = http_post(board.clone(), "/start");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("quorum not met: 1/3"), "{response}");
+        assert!(!board.start_requested());
+
+        // Window already closed.
+        let board = StatusBoard::new();
+        board.configure_start(StartMode::Manual, "aa".repeat(16));
+        board.publish(&MembershipSnapshot {
+            phase: ClusterPhase::Training,
+            ..staged_snapshot(StartMode::Manual, 3)
+        });
+        let response = http_post(board.clone(), "/start");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("not open"), "{response}");
+        assert!(!board.start_requested());
+    }
+
+    #[test]
+    fn start_auth_requires_the_token_off_loopback() {
+        // Non-loopback peers are exercised directly on the handler (a
+        // test TCP peer is always loopback).
+        let board = StatusBoard::new();
+        board.configure_start(StartMode::Manual, "deadbeef".repeat(4));
+        board.publish(&staged_snapshot(StartMode::Manual, 3));
+
+        // No token → refused.
+        let (code, body) = handle_start(false, None, &board);
+        assert!(code.starts_with("403"), "{code} {body}");
+        assert!(!board.start_requested());
+        // Wrong token → refused.
+        let (code, _) =
+            handle_start(false, Some("token=wrong"), &board);
+        assert!(code.starts_with("403"), "{code}");
+        assert!(!board.start_requested());
+        // Right token → armed.
+        let (code, body) = handle_start(
+            false,
+            Some(&format!("token={}", "deadbeef".repeat(4))),
+            &board,
+        );
+        assert!(code.starts_with("200"), "{code} {body}");
+        assert!(board.start_requested());
     }
 }

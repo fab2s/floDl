@@ -160,6 +160,11 @@ pub struct JoinKnobs {
     /// scope from its `tunnel:` flags); requires a CPU averaging mode,
     /// exactly like per-worker `tunnel: true`.
     pub tunnel_only: Option<bool>,
+    /// Who closes the window once quorum is met (`start:` in YAML):
+    /// `auto` (clock — target/expiry, the default), `manual` (only the
+    /// operator, via `fdl start`), or `hybrid` (clock, operator may
+    /// fire earlier).
+    pub start: Option<crate::distributed::membership::StartMode>,
 }
 
 impl FullCluster {
@@ -499,6 +504,15 @@ impl FullCluster {
             if let Some(b) = j.tunnel_only {
                 join_obj.insert("tunnel_only".into(), serde_json::Value::Bool(b));
             }
+            if let Some(m) = j.start {
+                use crate::distributed::membership::StartMode;
+                let s = match m {
+                    StartMode::Auto => "auto",
+                    StartMode::Manual => "manual",
+                    StartMode::Hybrid => "hybrid",
+                };
+                join_obj.insert("start".into(), serde_json::Value::String(s.into()));
+            }
             if !join_obj.is_empty() {
                 controller_obj.insert("join".into(), serde_json::Value::Object(join_obj));
             }
@@ -732,8 +746,28 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
             )));
         }
     };
+    let start = match obj.get("start") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(match s.as_str() {
+            "auto" => crate::distributed::membership::StartMode::Auto,
+            "manual" => crate::distributed::membership::StartMode::Manual,
+            "hybrid" => crate::distributed::membership::StartMode::Hybrid,
+            other => {
+                return Err(TensorError::new(&format!(
+                    "cluster launcher: controller.join.start must be one of \
+                     \"auto\" | \"manual\" | \"hybrid\", got {other:?}"
+                )));
+            }
+        }),
+        Some(other) => {
+            return Err(TensorError::new(&format!(
+                "cluster launcher: controller.join.start must be a string \
+                 (\"auto\" | \"manual\" | \"hybrid\"), got {other}"
+            )));
+        }
+    };
     // Unknown keys are a config typo waiting to silently no-op a knob.
-    const KNOWN: [&str; 8] = [
+    const KNOWN: [&str; 9] = [
         "min_rank_start",
         "join_timeout",
         "target_ranks",
@@ -742,6 +776,7 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
         "discovery",
         "token",
         "tunnel_only",
+        "start",
     ];
     for k in obj.keys() {
         if !KNOWN.contains(&k.as_str()) {
@@ -760,6 +795,7 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
         discovery: boolean("discovery")?,
         token,
         tunnel_only: boolean("tunnel_only")?,
+        start,
     }))
 }
 

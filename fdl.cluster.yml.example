@@ -156,6 +156,18 @@
 #                      arrive through an sshd-carried forward, making
 #                      reachability itself the authentication. Requires a
 #                      CPU averaging mode (like per-worker `tunnel: true`).
+#   start:             who closes the window once quorum is met.
+#                      `auto` (default): the clock — target/expiry, as
+#                      always. `manual`: only the operator, via `fdl
+#                      start`; the roster HOLDS at quorum (phase
+#                      `staging` in `fdl status`), window expiry keeps
+#                      holding, and the hard cap bounds the exposure
+#                      (never started = loud failure; raise
+#                      `max_join_timeout` for a longer hold). Refuses
+#                      `target_ranks`. `hybrid`: the clock still closes
+#                      as in auto AND the operator may fire earlier.
+#                      The scavenged-credit case — start when the roster
+#                      is "full enough" — is `manual` + a generous cap.
 
 cluster:
   controller:

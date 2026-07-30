@@ -163,10 +163,10 @@ fn verdict_target_closes_early() {
     let config = JoinConfig { target_ranks: Some(2), ..test_config() };
     let mut ledger = MembershipLedger::new(config, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
-    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP), WindowVerdict::Open);
+    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
     admit_host(&mut ledger, "b", 1).unwrap();
     assert!(matches!(
-        ledger.verdict(Duration::ZERO, WINDOW, CAP),
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
         WindowVerdict::Formed(_)
     ));
 }
@@ -178,12 +178,12 @@ fn verdict_quorum_early_does_not_close_the_window() {
     let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     assert_eq!(
-        ledger.verdict(Duration::from_secs(10), WINDOW, CAP),
+        ledger.verdict(Duration::from_secs(10), WINDOW, CAP, false),
         WindowVerdict::Open
     );
     // The moment the window expires, quorum forms the world.
     assert!(matches!(
-        ledger.verdict(WINDOW, WINDOW, CAP),
+        ledger.verdict(WINDOW, WINDOW, CAP, false),
         WindowVerdict::Formed(_)
     ));
 }
@@ -195,11 +195,11 @@ fn verdict_grace_range_waits_for_quorum_then_forms() {
     admit_host(&mut ledger, "a", 1).unwrap();
     // Window expired below quorum, cap not yet: keep waiting.
     let in_grace = WINDOW + Duration::from_secs(30);
-    assert_eq!(ledger.verdict(in_grace, WINDOW, CAP), WindowVerdict::Open);
+    assert_eq!(ledger.verdict(in_grace, WINDOW, CAP, false), WindowVerdict::Open);
     // Quorum arriving in the grace range forms immediately.
     admit_host(&mut ledger, "b", 1).unwrap();
     assert!(matches!(
-        ledger.verdict(in_grace, WINDOW, CAP),
+        ledger.verdict(in_grace, WINDOW, CAP, false),
         WindowVerdict::Formed(_)
     ));
 }
@@ -209,13 +209,128 @@ fn verdict_cap_expiry_fails_loudly() {
     let config = JoinConfig { min_rank_start: 2, ..test_config() };
     let mut ledger = MembershipLedger::new(config, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
-    match ledger.verdict(CAP, WINDOW, CAP) {
+    match ledger.verdict(CAP, WINDOW, CAP, false) {
         WindowVerdict::Failed(why) => {
             assert!(why.contains("quorum not met"), "got: {why}");
             assert!(why.contains("1/2"), "got: {why}");
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+#[test]
+fn verdict_manual_holds_until_operator_start() {
+    use crate::distributed::membership::StartMode;
+    let config = JoinConfig {
+        min_rank_start: 1,
+        start_mode: StartMode::Manual,
+        ..test_config()
+    };
+    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    admit_host(&mut ledger, "a", 1).unwrap();
+    // Quorum met, window expired: a manual hold stays open where auto
+    // would have formed.
+    assert_eq!(ledger.verdict(WINDOW, WINDOW, CAP, false), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(WINDOW + Duration::from_secs(60), WINDOW, CAP, false),
+        WindowVerdict::Open
+    );
+    // The operator fires: formed, at any point in the open range.
+    assert!(matches!(
+        ledger.verdict(Duration::from_secs(5), WINDOW, CAP, true),
+        WindowVerdict::Formed("operator start")
+    ));
+    // Never fired: the cap bounds the exposure with a distinct reason.
+    match ledger.verdict(CAP, WINDOW, CAP, false) {
+        WindowVerdict::Failed(why) => {
+            assert!(why.contains("operator start not received"), "got: {why}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    // The staging phase names the hold; quorum-met + manual = staging.
+    assert_eq!(ledger.open_phase(), ClusterPhase::Staging);
+}
+
+#[test]
+fn verdict_manual_start_is_quorum_gated() {
+    use crate::distributed::membership::StartMode;
+    let config = JoinConfig {
+        min_rank_start: 2,
+        start_mode: StartMode::Manual,
+        ..test_config()
+    };
+    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    admit_host(&mut ledger, "a", 1).unwrap();
+    // Armed below quorum: inert (the HTTP layer refuses this too, but
+    // the verdict is the authority).
+    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, true), WindowVerdict::Open);
+    assert_eq!(ledger.open_phase(), ClusterPhase::Waiting);
+    admit_host(&mut ledger, "b", 1).unwrap();
+    assert!(matches!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, true),
+        WindowVerdict::Formed("operator start")
+    ));
+}
+
+#[test]
+fn verdict_hybrid_keeps_the_clock_and_adds_the_operator() {
+    use crate::distributed::membership::StartMode;
+    let config = JoinConfig {
+        min_rank_start: 1,
+        target_ranks: Some(3),
+        start_mode: StartMode::Hybrid,
+        ..test_config()
+    };
+    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    admit_host(&mut ledger, "a", 1).unwrap();
+    // Clock semantics intact: below target, inside the window → open.
+    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
+    // Startable while waiting = staging.
+    assert_eq!(ledger.open_phase(), ClusterPhase::Staging);
+    // Operator fires early with quorum.
+    assert!(matches!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, true),
+        WindowVerdict::Formed("operator start")
+    ));
+    // Or the clock still closes on its own (window expiry with quorum).
+    assert!(matches!(
+        ledger.verdict(WINDOW, WINDOW, CAP, false),
+        WindowVerdict::Formed(_)
+    ));
+    // Target auto-close survives in hybrid.
+    admit_host(&mut ledger, "b", 1).unwrap();
+    admit_host(&mut ledger, "c", 1).unwrap();
+    assert!(matches!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
+        WindowVerdict::Formed("target ranks reached")
+    ));
+}
+
+#[test]
+fn verdict_auto_ignores_the_start_switch() {
+    // The HTTP layer refuses /start in auto mode; if a flag ever leaks
+    // through anyway, the verdict must not honor it.
+    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    admit_host(&mut ledger, "a", 1).unwrap();
+    assert_eq!(
+        ledger.verdict(Duration::from_secs(1), WINDOW, CAP, true),
+        WindowVerdict::Open
+    );
+    assert_eq!(ledger.open_phase(), ClusterPhase::Waiting);
+}
+
+#[test]
+fn manual_mode_refuses_target_ranks() {
+    use crate::distributed::membership::StartMode;
+    let config = JoinConfig {
+        start_mode: StartMode::Manual,
+        target_ranks: Some(2),
+        min_rank_start: 1,
+        ..test_config()
+    };
+    let msg = config.validate().unwrap_err().to_string();
+    assert!(msg.contains("manual"), "got: {msg}");
+    assert!(msg.contains("target_ranks"), "got: {msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +355,7 @@ fn snapshot_serializes_phase_and_countdowns() {
     let mut ledger = MembershipLedger::new(config, None).unwrap();
     admit_host(&mut ledger, "a", 2).unwrap();
 
-    let snap = ledger.snapshot(ClusterPhase::Waiting, Duration::from_secs(10));
+    let snap = ledger.snapshot(ClusterPhase::Waiting, Duration::from_secs(10), false);
     assert_eq!(snap.joined_ranks, 2);
     assert_eq!(snap.joined_hosts, 1);
     assert_eq!(snap.target_ranks, Some(3));
@@ -252,11 +367,12 @@ fn snapshot_serializes_phase_and_countdowns() {
 
     // Past both deadlines the countdowns render as exhausted, and every
     // lifecycle phase has a stable snake_case rendering.
-    let late = ledger.snapshot(ClusterPhase::Failed, Duration::from_secs(100_000));
+    let late = ledger.snapshot(ClusterPhase::Failed, Duration::from_secs(100_000), false);
     assert_eq!(late.window_remaining_secs, None);
     assert_eq!(late.cap_remaining_secs, None);
     for (phase, expect) in [
         (ClusterPhase::Waiting, "waiting"),
+        (ClusterPhase::Staging, "staging"),
         (ClusterPhase::Forming, "forming"),
         (ClusterPhase::Training, "training"),
         (ClusterPhase::Done, "done"),

@@ -197,6 +197,13 @@ pub struct ClusterJoin {
     /// (reachability = authentication). Requires a CPU averaging mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_only: Option<bool>,
+    /// Who closes the window once quorum is met: `auto` (clock —
+    /// target/expiry, the default), `manual` (only the operator, via
+    /// `fdl start`; refuses `target_ranks`), or `hybrid` (clock, and
+    /// the operator may fire earlier). flodl owns the semantics; fdl
+    /// validates the value so a typo dies before any host is touched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
 }
 
 impl ClusterController {
@@ -506,6 +513,19 @@ impl ClusterConfig {
             return Err("cluster.workers must be non-empty (a roster-free \
                         window needs `controller.join.discovery: true`)"
                 .into());
+        }
+        if let Some(start) = self
+            .controller
+            .join
+            .as_ref()
+            .and_then(|j| j.start.as_deref())
+        {
+            if !matches!(start, "auto" | "manual" | "hybrid") {
+                return Err(format!(
+                    "cluster.controller.join.start must be one of \
+                     auto | manual | hybrid, got {start:?}"
+                ));
+            }
         }
         // Reserved-env-key check: a user env map must not carry a key the
         // launcher owns per-rank. The launcher applies user env after its

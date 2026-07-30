@@ -69,6 +69,11 @@ pub use checkpoint_forge::load_consensus_checkpoint;
 pub use checkpoint_forge::load_outer_momentum;
 pub use cluster::{WorkerBlock, LocalCluster, is_reserved_cluster_env_key};
 pub use launcher::{FullCluster, FullWorker, Role};
+/// Join-window start-switch mode (`controller.join.start:` — auto /
+/// manual / hybrid). Public because [`ClusterBuilder::controller`]'s
+/// `start_mode(...)` setter and the [`launcher::JoinKnobs`] mirror take
+/// it; the window semantics live on the enum's docs.
+pub use membership::StartMode;
 pub use max_failure::MaxFailureThreshold;
 pub use outer_optimizer::{NesterovMomentum, OuterAvg, OuterOptimizer, SlowMomentum};
 // CUDA stream/event primitives live in `tensor` (they are device-runtime

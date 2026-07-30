@@ -80,6 +80,30 @@ fn http_get_routes_to_status_leg_with_request_intact() {
 }
 
 #[test]
+fn http_post_routes_to_the_same_status_leg() {
+    let (_mux, accept, port) = start_test_mux();
+
+    // `fdl start` fires a POST at the same responder — the leading
+    // "POST" routes there exactly like "GET ", request intact.
+    let request = b"POST /start HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n";
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.set_nodelay(true).unwrap();
+    client.write_all(request).unwrap();
+
+    let mut routed = accept
+        .status
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HTTP POST routed to status leg");
+    routed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = vec![0u8; request.len()];
+    routed.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, request);
+    drop(client);
+}
+
+#[test]
 fn unknown_magic_dropped_and_dispatcher_continues() {
     let (_mux, accept, port) = start_test_mux();
 
