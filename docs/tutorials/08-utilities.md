@@ -1,8 +1,10 @@
 # Training Utilities
 
 This tutorial covers the utilities that sit around the training loop:
-gradient clipping, checkpointing, weight initialization, and trend-based
-training control.
+gradient clipping, checkpointing, weight initialization, LR scheduling,
+reproducibility, trend-based training control, verbosity-gated logging,
+peak-VRAM profiling, and CUDA Graphs. [Training](04-training.md) covers the
+loop itself and points here for each of these.
 
 > **Prerequisites**: [Training](04-training.md) introduces the
 > backward/step loop. [The Graph Builder](05-graph-builder.md)
@@ -36,6 +38,12 @@ optimizer.step()?;
 ```
 
 Use `clip_grad_norm` as the default - it preserves gradient direction.
+
+Both are batched under the hood: `clip_grad_norm` uses `_foreach_norm` +
+`_foreach_mul_`, so it costs two kernels regardless of how many parameters
+the model has, instead of the `2N` a naive per-parameter loop would launch.
+That matters most on CUDA, where launch overhead dominates for many small
+per-parameter operations.
 
 ## Checkpoints
 
@@ -245,15 +253,27 @@ rng.normal(0.0, 1.0)    // Gaussian sample
 
 ### Full reproducibility setup
 
+Seed both sides, and build the model *after* seeding so weight
+initialization is covered too:
+
 ```rust
 fn main() -> Result<()> {
-    flodl::manual_seed(42);
-    let mut rng = Rng::seed(42);
+    flodl::manual_seed(42);        // libtorch: rand, randn, dropout, weight init
+    let mut rng = Rng::seed(42);   // CPU side: shuffling, augmentation
 
-    let model = build_model()?;  // weight init uses the seed
+    let model = build_model()?;    // built after seeding - weight init uses it
+
+    // Shuffle training order deterministically
+    let mut indices: Vec<usize> = (0..dataset_len).collect();
+    rng.shuffle(&mut indices);
     // ...
+    Ok(())
 }
 ```
+
+The split is the whole story: `manual_seed` covers every libtorch operation
+(tensor creation, dropout masks, weight init), `Rng` covers everything else
+(data order, augmentation parameters). Seed both and a run is reproducible.
 
 ## LR Scheduling
 
@@ -296,6 +316,19 @@ Step-based schedulers implement the `Scheduler` trait:
 ```rust
 pub trait Scheduler {
     fn lr(&self, step: usize) -> f64;
+}
+```
+
+Because nothing is hidden, wiring one into a loop is explicit - ask for the
+step's LR, hand it to the optimizer:
+
+```rust
+let scheduler = CosineScheduler::new(0.001, 1e-6, 100);  // base_lr, min_lr, total_steps
+
+for step in 0..100 {
+    let lr = scheduler.lr(step);
+    optimizer.set_lr(lr);
+    // ... forward, backward, optimizer.step()
 }
 ```
 
