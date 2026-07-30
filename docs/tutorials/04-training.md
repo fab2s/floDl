@@ -133,22 +133,16 @@ below).
 
 ## Gradient Clipping
 
-Prevent exploding gradients by clipping after backward and before the
-optimizer step:
+Prevent exploding gradients by clipping between `backward()` and
+`optimizer.step()`:
 
 ```rust
-// Scale gradients so total L2 norm <= max_norm
-clip_grad_norm(&params, 1.0)?;
-
-// Clamp each gradient element to [-max_val, max_val]
-clip_grad_value(&params, 0.5)?;
+clip_grad_norm(&params, 1.0)?;   // scale so total L2 norm <= max_norm
 ```
 
-Under the hood, `clip_grad_norm` uses `_foreach_norm` + `_foreach_mul_`
-internally - two kernels total regardless of the number of parameters,
-instead of 2N kernels with a naive per-parameter approach. This is
-particularly beneficial on CUDA where kernel launch overhead dominates
-for small per-parameter operations.
+`clip_grad_value` clamps per element instead. See
+[Utilities - Gradient clipping](08-utilities.md#gradient-clipping) for when
+to pick which, and why both cost two kernels rather than `2N`.
 
 ## Device Placement
 
@@ -434,76 +428,31 @@ everywhere the parameter is referenced.
 
 ## Checkpoints
 
-Save and restore model parameters using named checkpoints:
+Save and restore parameters, buffers, and a structural hash in one call:
 
 ```rust
-// Save - includes all parameters, buffers, and structural hash
 model.save_checkpoint("/tmp/model.fdl")?;
-
-// Load - validates architecture, returns a report
-let report = model.load_checkpoint("/tmp/model.fdl")?;
+let report = model.load_checkpoint("/tmp/model.fdl")?;  // validates, returns LoadReport
 ```
 
-For custom destinations (network, in-memory buffer), the lower-level API is available:
-
-```rust
-let named = model.named_parameters();
-let buffers = model.named_buffers();
-let hash = Some(model.structural_hash());
-save_checkpoint(&mut writer, &named, &buffers, hash)?;
-let report = load_checkpoint(&mut reader, &named, &buffers, hash)?;
-```
-
-### Partial loading (transfer learning)
-
-Named checkpoints match by qualified name, so you can load a subset of parameters from a different model using `Graph::named_parameters()`:
-
-```rust
-// Save with qualified names
-model.save_checkpoint("/tmp/model.fdl")?;
-
-// Load into a different model - matches by name
-// Use the lower-level API with None hash to skip architecture validation
-let new_named = new_model.named_parameters();
-let new_buffers = new_model.named_buffers();
-let report = load_checkpoint_file("/tmp/model.fdl", &new_named, &new_buffers, None)?;
-
-println!("loaded: {:?}", report.loaded);   // matched and loaded
-println!("skipped: {:?}", report.skipped); // in checkpoint, not in model
-println!("missing: {:?}", report.missing); // in model, not in checkpoint
-
-// Freeze transferred params, train the rest
-for (name, param) in &new_named {
-    if report.loaded.contains(name) {
-        param.freeze()?;
-    }
-}
-```
-
-Named parameters use the tag name as prefix when available (`"encoder/weight"`),
-otherwise the node ID (`"linear_1/weight"`). Shape mismatches on matched names
-are errors.
+[Utilities - Checkpoints](08-utilities.md#checkpoints) covers the rest: the
+lower-level `io::Write`/`io::Read` API for custom destinations, partial loading
+for transfer learning, freezing what transferred, periodic saves, and
+non-blocking background saves with `CpuWorker`.
 
 ## LR Scheduling
 
-Schedulers compute learning rates without owning the optimizer - they are
-pure calculators:
+Schedulers are pure calculators - they never own the optimizer. You ask for
+the step's LR and set it yourself:
 
 ```rust
 let scheduler = CosineScheduler::new(0.001, 1e-6, 100);  // base_lr, min_lr, total_steps
-
-for step in 0..100 {
-    let lr = scheduler.lr(step);
-    optimizer.set_lr(lr);
-}
+optimizer.set_lr(scheduler.lr(step));
 ```
 
-Compose with warmup:
-
-```rust
-let inner = CosineScheduler::new(0.001, 1e-6, 100);
-let scheduler = WarmupScheduler::new(inner, 0.001, 10);  // inner, target_lr, warmup_steps
-```
+[Utilities - LR Scheduling](08-utilities.md#lr-scheduling) has the full
+catalogue (step decay, cosine, exponential, multi-step, one-cycle, cyclic,
+warmup composition, plateau) and the `Scheduler` trait.
 
 ## Mixed Precision Training
 
@@ -631,36 +580,16 @@ model.end_epoch();  // increment epoch counter, reset step count
 
 ## Reproducibility
 
-For deterministic training, seed both libtorch and CPU-side RNG at the start:
+Seed libtorch and the CPU-side RNG before building the model - weight
+initialization draws on the seed too:
 
 ```rust
-use flodl::*;
-
-fn main() -> Result<()> {
-    // Seed libtorch: controls rand, randn, dropout, weight init
-    manual_seed(42);
-
-    // CPU-side RNG: controls data shuffling, augmentation
-    let mut rng = Rng::seed(42);
-
-    // Build model AFTER seeding - weight initialization uses the seed
-    let model = FlowBuilder::from(Linear::new(2, 16)?)
-        .through(GELU)
-        .through(Linear::new(16, 2)?)
-        .build()?;
-
-    // Shuffle training data deterministically
-    let mut indices: Vec<usize> = (0..dataset_len).collect();
-    rng.shuffle(&mut indices);
-
-    // ...
-    Ok(())
-}
+manual_seed(42);                // libtorch: rand, randn, dropout, weight init
+let mut rng = Rng::seed(42);    // CPU side: shuffling, augmentation
 ```
 
-`manual_seed` covers all libtorch operations (tensor creation, dropout masks,
-weight initialization). `Rng` covers everything else (data loading order,
-augmentation parameters). Together they give full reproducibility.
+[Utilities - Reproducibility](08-utilities.md#reproducibility) has the full
+recipe, `Rng`'s method surface, and CUDA re-seeding.
 
 ## Complete Example
 
