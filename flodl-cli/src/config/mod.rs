@@ -18,7 +18,8 @@ mod tests;
 
 pub use cluster::{
     ClusterConfig, ClusterController, ClusterWorker, DdpConfig, LocalDevices, OutputConfig,
-    SpeedHint, SshConfig, TrainingConfig, DEFAULT_CONTROLLER_PORT, DEFAULT_DATA_PATH,
+    SpeedHint, SshConfig, TrainingConfig, WorkerJoin, DEFAULT_CONTROLLER_PORT,
+    DEFAULT_DATA_PATH,
 };
 pub use command::{load_command, load_command_with_env};
 pub use loading::{

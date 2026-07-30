@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::cluster::{ClusterConfig, DdpConfig, OutputConfig, TrainingConfig};
+use super::cluster::{ClusterConfig, DdpConfig, OutputConfig, TrainingConfig, WorkerJoin};
 
 /// Root fdl.yaml at project root.
 ///
@@ -33,6 +33,13 @@ pub struct ProjectConfig {
     /// the base `fdl.yml`.
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Worker-side dial-in defaults for `fdl join` (self-deployed
+    /// workers joining a discovery window). The mirror image of
+    /// `cluster.controller.join:` — that block opens the window, this
+    /// one walks in. Typically lives in the fdl.yml of a golden image
+    /// so a boot-time `fdl join` needs no flags.
+    #[serde(default)]
+    pub join: Option<WorkerJoin>,
 }
 
 // ── Sub-command config ──────────────────────────────────────────────────

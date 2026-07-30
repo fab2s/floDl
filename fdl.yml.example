@@ -101,3 +101,30 @@ commands:
   self-build:
     description: Rebuild fdl CLI after changes
     run: cargo install --path flodl-cli
+
+# ---------------------------------------------------------------------------
+# join: worker-side dial-in defaults for `fdl join` (self-deployed
+# workers walking into a controller's join window — the mirror image of
+# a cluster overlay's `controller.join:`). Bake it into a golden image
+# so a boot-time `fdl join` needs no flags; every field is overridable
+# on the command line (flags win). See docs/ddp.md "Walking in".
+# ---------------------------------------------------------------------------
+# join:
+#   controller: 10.0.0.1:1337       # controller mux address, host[:port]
+#                                   # (under ssh: as seen FROM the ssh host;
+#                                   # default 127.0.0.1:1337)
+#   ssh:                            # optional tunnel hop: local `-L` forward
+#     target: ctrl.example.com      # of the controller port through this host
+#     user: flodl-join
+#     identity_file: /etc/flodl/join_key
+#     # port: 22
+#     # options: ["StrictHostKeyChecking=accept-new"]
+#   token: <hex>                    # pre-shared credential (the run's
+#                                   # controller.join.token); unset = open admission
+#   bin: target/release/train       # training binary run in agent role (required)
+#   args: ["--model", "resnet"]     # the binary's own arguments (a `--` tail
+#                                   # on the command line replaces this list)
+#   # host: worker-7                # logical roster name (default: hostname)
+#   # devices: [0, 1]               # CUDA ids to offer (default: all GPUs)
+#   # persist: true                 # re-dial with backoff when the agent
+#   #                               # exits — the systemd / fleet mode

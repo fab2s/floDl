@@ -95,6 +95,10 @@ pub mod probe;
 /// `state.json` (membership + lifecycle phase) and pretty-prints it.
 pub mod status;
 
+/// Self-deployed worker dial-in (`fdl join`): tunnel bring-up, agent
+/// bootstrap-spec synthesis, training-binary supervision.
+pub mod join;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

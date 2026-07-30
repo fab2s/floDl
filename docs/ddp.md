@@ -943,14 +943,16 @@ that hand-out to a network bind: any peer that can reach the port can
 then join (and therefore influence) the run, which is why flodl warns
 loudly - sound only on a fully trusted segment.
 
-A **self-deployed worker** needs nothing but the controller address: a
-process started on any GPU host with `FLODL_INTERNAL_AGENT_JSON` set
-to the hex-encoded spec `{"host": "...", "controller_host": "...",
-"controller_port": 1337}` (see `AgentSpec` in the API docs) resolves
-its own GPUs, joins, receives the formed-world artifacts, and spawns
-its relay and rank children - the training code is byte-identical to
-the fan-out path. Pair it with `target_ranks` above the configured
-capacity (or a bare-bones one-host config) so the window waits for it.
+A **self-deployed worker** needs nothing but the controller address:
+`fdl join` (below) starts one on any GPU host. Under the hood it is a
+process started with `FLODL_INTERNAL_AGENT_JSON` set to the
+hex-encoded spec `{"host": "...", "controller_host": "...",
+"controller_port": 1337}` (see `AgentSpec` in the API docs) - it
+resolves its own GPUs, joins, receives the formed-world artifacts, and
+spawns its relay and rank children; the training code is
+byte-identical to the fan-out path. Pair it with `target_ranks` above
+the configured capacity (or a bare-bones one-host config) so the
+window waits for it.
 
 `discovery: true` takes that shape to its limit: no roster at all. The
 controller opens the window from its bind address plus the join
@@ -973,6 +975,51 @@ needed; from anywhere else pass `--token` with the run's `join.token`.
 Refusals name their reason - auto mode, quorum not met, window already
 closed - and arming below quorum is refused rather than queued, so the
 operator always knows what they started.
+
+**Walking in: `fdl join`.** The worker-side command for all of the
+above - it dials a window, offers the box's GPUs, and runs your
+training binary in agent role:
+
+```bash
+# Direct dial (LAN / trusted segment), authenticated by the run token:
+fdl join 10.0.0.1:1337 --token <hex> --bin target/release/train -- --model resnet
+
+# Through a guardrailed sshd on the controller box (reachability =
+# authentication; the controller binds loopback under `tunnel_only`):
+fdl join --ssh flodl-join@ctrl.example.com --bin target/release/train
+```
+
+`--ssh [user@]host[:port]` brings up a local `ssh -L` forward of the
+controller port (fresh per attempt, `ExitOnForwardFailure`, never a
+password prompt) and dials through it; the positional address is then
+the controller as seen FROM the ssh host, defaulting to
+`127.0.0.1:1337` - the sshd-on-the-controller-box convention.
+Arguments after `--` go to the binary verbatim and must match the run:
+rank children re-enter the binary with them. `--devices 0,1` scopes
+the offer (default: every GPU on the box), `--host` names the worker
+in the roster, and when fdl runs inside a project the active
+libtorch's `lib/` rides `LD_LIBRARY_PATH` automatically.
+
+Every flag defaults from a top-level `join:` block in fdl.yml, so a
+golden image bakes the whole recipe and boots into bare `fdl join`:
+
+```yaml
+join:
+  ssh:                        # full ssh shape: target / port / user /
+    target: ctrl.example.com  #   identity_file / options
+    user: flodl-join
+    identity_file: /etc/flodl/join_key
+  bin: target/release/train
+  args: ["--model", "resnet"]
+  persist: true               # re-dial with backoff when the agent
+                              #   exits — the systemd loop
+```
+
+With `persist` the command never gives up: no window open yet, run
+finished, controller rebooted - the agent exits, `fdl join` backs off
+(5s doubling to 60s) and dials again, so a fleet of workers can sit
+ready before the operator ever launches, walk into the staging hold,
+and be re-armed for the next run the moment one ends.
 
 One contract for user binaries: `Trainer::run` dispatches the cluster
 roles (agent, relay, rank) internally, so a binary that goes straight

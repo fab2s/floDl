@@ -8,12 +8,13 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
-    overlay, parse_or_schema_from, probe, run, setup, skill, status, style, update_check,
+    join, overlay, parse_or_schema_from, probe, run, setup, skill, status, style,
+    update_check,
 };
 
 use builtins::{
-    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, ProbeArgs, SetupArgs,
-    SkillInstallArgs, StartArgs, StatusArgs,
+    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, ProbeArgs,
+    SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
 };
 
 use std::env;
@@ -197,6 +198,19 @@ fn main() -> ExitCode {
             let cli: StartArgs = parse_sub("fdl start", &args[1..]);
             let code = status::run_start(cli.addr.as_deref(), cli.token.as_deref());
             if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        "join" => {
+            // Everything after a standalone `--` belongs to the training
+            // binary verbatim; split it off before the flag parser runs.
+            // An empty tail is still an explicit tail (replaces the
+            // config block's `args:`), hence the Option.
+            let (head, tail) = match args.iter().position(|a| a == "--") {
+                Some(i) => (&args[..i], Some(&args[i + 1..])),
+                None => (&args[..], None),
+            };
+            let cli: JoinArgs = parse_sub("fdl join", &head[1..]);
+            let code = join::run(&cli, tail);
+            ExitCode::from(code.clamp(0, 255) as u8)
         }
         "api-ref" => {
             let cli: ApiRefArgs = parse_sub("fdl api-ref", &args[1..]);

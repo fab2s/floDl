@@ -168,6 +168,10 @@
 #                      as in auto AND the operator may fire earlier.
 #                      The scavenged-credit case — start when the roster
 #                      is "full enough" — is `manual` + a generous cap.
+#
+# The worker side of this window is `fdl join` (its defaults live in a
+# top-level `join:` block of the WORKER's fdl.yml — see fdl.yml.example
+# and docs/ddp.md "Walking in").
 
 cluster:
   controller:
