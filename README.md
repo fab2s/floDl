@@ -57,7 +57,7 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 > ([#32](https://github.com/flodl-labs/flodl/issues/32)), model init
 > is reproducible from a seed, and two cluster faults are closed (a
 > formation-time crash and an epoch-tail deadlock). See the
-> CHANGELOG and [DDP Reference](docs/ddp.md) for the full surface.
+> CHANGELOG and [DDP Reference](docs/ddp/01-reference.md) for the full surface.
 
 ---
 
@@ -511,7 +511,7 @@ modes for A/B testing:
 An **outer optimizer** (SlowMo or DiLoCo, applied to the consensus between
 reduce rounds via `.outer_optimizer(...)`) rides on top of any CPU-averaging
 mode and is what takes the accuracy crown in the benchmark below. See the
-[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)
+[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp/01-reference.md)
 for the factory shape.
 
 **Multi-host clusters.** Add an `fdl.cluster.yml` next to your
@@ -540,7 +540,7 @@ membership only shrinks, rejoin/scale-up is not yet implemented).
 See the **[Multi-GPU Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)**,
 **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
 **[Data Loading Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/13-data-loading.md)**, and
-**[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp.md)**.
+**[DDP Reference](https://github.com/flodl-labs/flodl/blob/main/docs/ddp/01-reference.md)**.
 
 ### Validation suite - `ddp-bench`
 

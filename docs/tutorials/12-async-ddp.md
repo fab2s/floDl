@@ -10,7 +10,7 @@ knobs that earn their keep on real heterogeneous deployments.
 
 > **Time**: ~25 minutes.
 
-> **Canonical reference**: [DDP Reference](../ddp.md).
+> **Canonical reference**: [DDP Reference](../ddp/01-reference.md).
 
 > **Runnable example**: [`auto_promote`](../../flodl/examples/auto_promote/) is the
 > binary the cluster path promotes; nothing in it changes between single-host and
@@ -24,7 +24,7 @@ split with the reduce firing as soon as every alive rank has made at
 least one step since the last one — classic per-batch DDP on a
 homogeneous rig, but NOT per-batch lockstep on a heterogeneous one
 (the fast GPU runs several work-weighted steps per reduce; see
-[What "sync" means](../ddp.md#elchemode---cadence--backend-in-one-name)).
+[What "sync" means](../ddp/01-reference.md#elchemode---cadence--backend-in-one-name)).
 ElChe's job is to keep AllReduce overhead bounded while respecting
 weight-space divergence.
 
@@ -101,7 +101,7 @@ So `SuppressGrowth` doesn't just *not relax up* - it actively vetoes
 the overhead-tune growth before it lands. The convergence guard is
 authoritative over `overhead_target` by construction. See [DDP
 Reference: Guard authority over
-`overhead_target`](../ddp.md#guard-authority-over-overhead_target).
+`overhead_target`](../ddp/01-reference.md#guard-authority-over-overhead_target).
 
 ### LR-aware meta-controller
 
@@ -223,7 +223,7 @@ fdl @cluster probe           # SSHes each worker; aggregates GPU + libtorch + NC
 
 The structured schema with `controller:` and `workers[]:` blocks. See
 [DDP Reference: Multi-host
-clusters](../ddp.md#multi-host-clusters) for the full field listing.
+clusters](../ddp/02-cluster-guide.md) for the full field listing.
 
 Key conventions:
 

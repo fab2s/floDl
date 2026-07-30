@@ -15,7 +15,7 @@
 > balancer's allocation view: it equals delivered work under
 > cadence/async; under sync it is ElChe's capacity shadow (dispatch
 > stays equal). See
-> [What "sync" means in flodl](ddp.md#elchemode---cadence--backend-in-one-name).
+> [What "sync" means in flodl](ddp/01-reference.md#elchemode---cadence--backend-in-one-name).
 >
 > This sweep ran on a 3-GPU heterogeneous rig spanning two hosts - an
 > RTX 5060 Ti on the controller host and two GTX 1060s inside a VM on

@@ -215,7 +215,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
 Reports fire at reduce boundaries, up to `n` per epoch, carrying per-rank
 loss / throughput aggregated up a `root → host → rank` tree. Off by
 default, and the per-epoch feed is unchanged either way. Details:
-[DDP guide → Sub-epoch reports](../ddp.md#sub-epoch-reports---reports_per_epoch).
+[DDP guide → Sub-epoch reports](../ddp/01-reference.md#sub-epoch-reports---reports_per_epoch).
 
 ### Querying the run by path
 

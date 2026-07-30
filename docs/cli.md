@@ -710,7 +710,7 @@ Every flag defaults from a top-level `join:` block in `fdl.yml` (see
 Exit code: the agent's own — **0** when this host's ranks all finished
 cleanly. Under `--persist` the command only returns on setup errors.
 Full protocol walkthrough, trust model, and the join-sshd guardrail
-recipe: [DDP reference](ddp.md#dial-in-membership-the-join-window).
+recipe: [DDP reference](ddp/02-cluster-guide.md#dial-in-membership-the-join-window).
 
 ### `fdl nccl`
 
@@ -818,7 +818,7 @@ known fresh, or when iterating on a build-only issue).
 3. `fdl @cluster <cmd>` - fan out.
 
 See [DDP Reference: Multi-host
-clusters](ddp.md#multi-host-clusters) for the `fdl.cluster.yml`
+clusters](ddp/02-cluster-guide.md) for the `fdl.cluster.yml`
 schema and conventions.
 
 ### `fdl api-ref`
@@ -1323,7 +1323,7 @@ shape - `mode`, `model`, `epochs`, `batch-size`, etc. The set of
 accepted `mode` values mirrors `ElCheMode` (five modes:
 `nccl-sync` / `nccl-cadence` / `cpu-sync` / `cpu-cadence` /
 `cpu-async`) plus the `solo-N` single-GPU baselines. See
-[DDP Reference: ElCheMode](ddp.md#elchemode--cadence--backend-in-one-name)
+[DDP Reference: ElCheMode](ddp/01-reference.md#elchemode---cadence--backend-in-one-name)
 for the mode semantics.
 
 ### `fdl config`
@@ -1642,4 +1642,4 @@ for your platform.
 
 ---
 
-Previous: [Distributed Training Reference](ddp.md) | Next: [Distributed Architecture](distributed/architecture.md)
+Previous: [Troubleshooting](ddp/04-troubleshooting.md) | Next: [Distributed Architecture](distributed/architecture.md)

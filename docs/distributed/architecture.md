@@ -4,7 +4,7 @@
 > engine is built, for contributors and for anyone debugging a cluster run. You
 > do not need any of it to train on multiple GPUs - start from
 > [Multi-GPU Training](../tutorials/11-multi-gpu.md) for that, and the
-> [DDP reference](../ddp.md) for the configuration surface. Names here are
+> [DDP reference](../ddp/01-reference.md) for the configuration surface. Names here are
 > internal and change without notice.
 
 This document maps the **entire distributed pattern** - the data, the
@@ -116,7 +116,7 @@ than forming - and `Hybrid` allows both. Quorum met with the door still open
 and the operator holding the close is its own phase, `ClusterPhase::Staging`,
 between `Waiting` and `Forming`. The join window's own protocol, message
 sequence and phase machine are documented for operators in the
-[DDP reference](../ddp.md#dial-in-membership-the-join-window); this view is
+[DDP reference](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window); this view is
 only concerned with the process tree it produces.
 
 ```mermaid

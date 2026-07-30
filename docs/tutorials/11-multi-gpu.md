@@ -13,7 +13,7 @@ scales out to multi-host clusters via `fdl.cluster.yml` or
 
 > **Time**: ~20 minutes.
 
-> **Canonical reference**: [DDP Reference](../ddp.md) for the full
+> **Canonical reference**: [DDP Reference](../ddp/01-reference.md) for the full
 > knob surface.
 
 > **Runnable example**: [`auto_promote`](../../flodl/examples/auto_promote/) is the
@@ -204,7 +204,7 @@ ElChe then proposes an anchor adjustment:
 The convergence guard has the final say: rising weight-space
 divergence vetoes growth even when `overhead_target` would propose
 it. See [DDP Reference: Guard authority over
-`overhead_target`](../ddp.md#guard-authority-over-overhead_target).
+`overhead_target`](../ddp/01-reference.md#guard-authority-over-overhead_target).
 
 ## Tuning ElChe
 
@@ -230,7 +230,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
 ```
 
 Common knobs (full surface in [DDP
-Reference](../ddp.md#elcheconfig-knobs)):
+Reference](../ddp/01-reference.md#elcheconfig-knobs)):
 
 | Knob | Default | When to touch |
 |---|---|---|
@@ -248,10 +248,10 @@ The five DDP modes:
 |---|---|
 | `CpuAsync` | **Best in class** for convergence + wall-time on the reference rig; needs a decent CPU. Genuine async - averaging decoupled from the GPU pipeline. |
 | `NcclCadence` (default) | Strong NCCL default. Anchor-based scheduling; fast devices process proportionally more batches per averaging window. |
-| `NcclSync` | Tightest cadence (reduce per slow-rank step, equal data split — not per-batch lockstep; see [What "sync" means](../ddp.md#elchemode---cadence--backend-in-one-name)) - homogeneous rigs, correctness-first baseline |
+| `NcclSync` | Tightest cadence (reduce per slow-rank step, equal data split — not per-batch lockstep; see [What "sync" means](../ddp/01-reference.md#elchemode---cadence--backend-in-one-name)) - homogeneous rigs, correctness-first baseline |
 | `CpuSync`, `CpuCadence` | A/B against NCCL when peer-access is unavailable |
 
-See [A/B testing modes](../ddp.md#ab-testing-modes) for the suggested
+See [A/B testing modes](../ddp/03-internals.md#ab-testing-modes) for the suggested
 order and rationale.
 
 ## DataLoader integration
@@ -321,7 +321,7 @@ rigs). `eval_result_fn` receives the scalar result on the host.
 Pin a specific rank with `EpochCallbackPolicy::Rank(n)` - `n` is the
 **global rank index** (0..world_size), assigned sequentially by
 worker order in the cluster topology. See [DDP Reference:
-`EpochCallbackPolicy`](../ddp.md#epochcallbackpolicy).
+`EpochCallbackPolicy`](../ddp/01-reference.md#epochcallbackpolicy).
 
 ## Live dashboard
 
@@ -391,7 +391,7 @@ fdl @cluster train           # SSHes each worker, pre-builds, fans out
 `Trainer::run` is the **same call** on the worker - the multi-host
 launcher trampoline takes care of fan-out, NCCL rendezvous, and
 controller binding. See [DDP Reference: Multi-host
-clusters](../ddp.md#multi-host-clusters) and [CLI Reference: cluster
+clusters](../ddp/02-cluster-guide.md) and [CLI Reference: cluster
 commands](../cli.md) for the full surface.
 
 For programmatic clusters (tests, embedded launchers without a yml on
@@ -438,7 +438,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
 
 `<stem>.meta.json` carries ElCheState (phase, calibration trajectory,
 ring buffer) so a resumed run inherits ElChe's calibration. See
-[DDP Reference: Resume + checkpoints](../ddp.md#resume--checkpoints).
+[DDP Reference: Resume + checkpoints](../ddp/01-reference.md#resume--checkpoints).
 
 ## Manual control - `Ddp::wrap` (expert bypass)
 

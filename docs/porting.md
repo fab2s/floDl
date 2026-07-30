@@ -304,7 +304,7 @@ The default mode is `NcclCadence` - anchor-based scheduling with
 NCCL AllReduce at every cadence boundary. Other modes: `NcclSync`,
 `CpuSync`, `CpuCadence`, `CpuAsync` (best-in-class on the reference
 rig - genuine async via decoupled CPU averaging). See the
-[DDP Reference](ddp.md) for the full mode surface, convergence guard,
+[DDP Reference](ddp/01-reference.md) for the full mode surface, convergence guard,
 metrics, and live-monitor wiring, and [DDP Benchmark](ddp-benchmark.md)
 for results on mixed consumer hardware.
 
