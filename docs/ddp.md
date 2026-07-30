@@ -931,6 +931,7 @@ the window open for extra dial-in workers:
 | `discovery` | Roster-free formation: the window alone defines the world, so `workers:` may be empty (walk-ins self-register). Requires an explicit `min_rank_start`; the window closes only on `target_ranks` or expiry. | false |
 | `token` | Pre-shared session salt, hex (32 chars / 16 bytes), replacing the per-run generated salt so a fleet-create-injected credential can be presented by walk-ins. Forces credential-checked admission even behind sshd; contradicts `open_admission: true` (loud error). | generated per run |
 | `tunnel_only` | Discovery-only: bind the controller loopback-only so walk-ins must arrive through sshd forwards (reachability = authentication). Requires a CPU averaging mode. | false |
+| `start` | Who closes the window once quorum is met: `auto` (clock — target/expiry), `manual` (only the operator via `fdl start`; refuses `target_ranks`, holds through window expiry, fails loudly at the hard cap if never fired), `hybrid` (clock, and the operator may fire earlier). | auto |
 
 Admission is authenticated by the join frames' HMAC key: fan-out
 agents receive the per-run session salt through their SSH session, so
@@ -958,6 +959,20 @@ it for `join_timeout` seconds, and the world is whoever walked in -
 the cloud shape, where worker addresses do not exist before the VMs
 boot. Fan-out and discovery compose: an enumerated rig fans out as
 usual while cloud legs self-register into the same window.
+
+**The staging hold and `fdl start`.** With `start: manual` (or
+`hybrid`) the window becomes an operator surface: once quorum is met
+the run shows as `staging` in `fdl status` - the roster is startable
+but held - and `fdl start` fires the topology freeze. Manual is the
+scavenged-credit shape ("launch instances until the money runs out,
+start when the roster looks full enough"): the window never closes on
+its own, only the hard cap bounds the hold, so pair it with a generous
+`max_join_timeout`. Firing follows the same trust model as joining: on
+the controller host (or through the sshd tunnel) no credential is
+needed; from anywhere else pass `--token` with the run's `join.token`.
+Refusals name their reason - auto mode, quorum not met, window already
+closed - and arming below quorum is refused rather than queued, so the
+operator always knows what they started.
 
 One contract for user binaries: `Trainer::run` dispatches the cluster
 roles (agent, relay, rank) internally, so a binary that goes straight

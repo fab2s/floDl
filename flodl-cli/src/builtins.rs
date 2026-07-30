@@ -96,6 +96,31 @@ pub struct StatusArgs {
     pub addr: Option<String>,
 }
 
+/// Fire the operator start switch of a staging cluster run.
+///
+/// A join window opened with `controller.join.start: manual` (or
+/// `hybrid`) holds the roster once quorum is met instead of forming on
+/// the clock — inspect it with `fdl status`, then fire the topology
+/// freeze with this command. Refusals name their reason (auto mode,
+/// quorum not met, window already closed).
+///
+/// Trust mirrors join admission: fired from the controller host (or
+/// through the sshd tunnel) no credential is needed; from anywhere
+/// else pass `--token` (the run's `controller.join.token`).
+///
+/// Exit code: 0 when the start was armed; 1 otherwise.
+#[derive(crate::FdlArgs, Debug)]
+pub struct StartArgs {
+    /// Controller address, `host[:port]` (default port 1337).
+    /// Overrides the active env's `cluster.controller`.
+    #[option]
+    pub addr: Option<String>,
+    /// Session credential for a non-loopback fire (the run's
+    /// `controller.join.token`).
+    #[option]
+    pub token: Option<String>,
+}
+
 /// Generate flodl API reference.
 #[derive(crate::FdlArgs, Debug)]
 pub struct ApiRefArgs {
@@ -390,6 +415,13 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(StatusArgs::schema),
         },
         BuiltinSpec {
+            path: &["start"],
+            description: Some(
+                "Fire the start switch of a staging cluster run",
+            ),
+            schema_fn: Some(StartArgs::schema),
+        },
+        BuiltinSpec {
             path: &["install"],
             description: Some("Install or update fdl globally"),
             schema_fn: Some(InstallArgs::schema),
@@ -541,7 +573,7 @@ mod tests {
         // documents the coupling explicitly.
         let dispatched = [
             "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "api-ref", "init", "add", "install", "skill", "schema",
+            "start", "api-ref", "init", "add", "install", "skill", "schema",
             "completions", "autocomplete", "config", "version",
         ];
         for name in &dispatched {
@@ -561,8 +593,8 @@ mod tests {
             names,
             vec![
                 "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "install", "skill", "api-ref", "config",
-                "schema", "completions", "autocomplete",
+                "probe", "status", "start", "install", "skill", "api-ref",
+                "config", "schema", "completions", "autocomplete",
             ]
         );
     }

@@ -433,6 +433,19 @@ impl ControllerBuilder {
         self
     }
 
+    /// Who closes the join window once quorum is met: the clock
+    /// ([`StartMode::Auto`], default), the operator via `fdl start`
+    /// ([`StartMode::Manual`]), or either ([`StartMode::Hybrid`]).
+    /// Mirrors YAML `controller.join.start`.
+    ///
+    /// [`StartMode::Auto`]: crate::distributed::StartMode::Auto
+    /// [`StartMode::Manual`]: crate::distributed::StartMode::Manual
+    /// [`StartMode::Hybrid`]: crate::distributed::StartMode::Hybrid
+    pub fn start_mode(mut self, mode: crate::distributed::StartMode) -> Self {
+        self.join.start = Some(mode);
+        self
+    }
+
     /// Finalize the controller and return to the cluster builder.
     pub fn done(self) -> ClusterBuilder {
         let cwd = std::env::current_dir()

@@ -211,6 +211,41 @@ cluster:
     }
 
     #[test]
+    fn join_start_value_is_validated() {
+        let yaml_for = |start: &str| {
+            format!(
+                "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /tmp/test-start
+    join:
+      start: {start}
+  workers:
+    - host: solo
+      local_devices: [0]
+      nccl_socket_ifname: \"\"
+      path: /tmp/test-start
+"
+            )
+        };
+        for ok in ["auto", "manual", "hybrid"] {
+            let cfg: ProjectConfig = serde_yaml_ng::from_str(&yaml_for(ok)).unwrap();
+            cfg.cluster.as_ref().unwrap().validate().expect(ok);
+        }
+        let cfg: ProjectConfig =
+            serde_yaml_ng::from_str(&yaml_for("operator")).unwrap();
+        let err = cfg.cluster.as_ref().unwrap().validate().unwrap_err();
+        assert!(err.contains("auto | manual | hybrid"), "got: {err}");
+        // The value rides the hand-off verbatim (flodl re-validates).
+        let cfg: ProjectConfig =
+            serde_yaml_ng::from_str(&yaml_for("manual")).unwrap();
+        let json = serde_json::to_value(cfg.cluster.as_ref().unwrap()).unwrap();
+        assert_eq!(json["controller"]["join"]["start"], "manual");
+    }
+
+    #[test]
     fn validate_rejects_missing_socket_ifname_when_multi_host() {
         let mut cfg: ProjectConfig =
             serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();

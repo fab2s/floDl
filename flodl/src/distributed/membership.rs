@@ -84,6 +84,27 @@ const MAX_REJECTED_JOINS: usize = 1024;
 /// downstream.
 const MAX_RANKS_PER_JOIN: usize = 256;
 
+/// Who closes the join window once quorum is met: the clock, the
+/// operator, or either. Selected via `controller.join.start:`; the
+/// operator fires through `fdl start` (an authenticated POST on the
+/// controller's status endpoint).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartMode {
+    /// Today's clock-driven semantics: close on `target_ranks` or
+    /// window expiry with quorum. `fdl start` is refused.
+    #[default]
+    Auto,
+    /// Only the operator closes the window: `target_ranks` is refused
+    /// at validation and window expiry holds instead of forming. The
+    /// hard cap still bounds the exposure — quorum met but never
+    /// started fails loudly when it expires.
+    Manual,
+    /// Both: the clock closes as in `auto`, and the operator may fire
+    /// earlier (or simply wait for the clock) once quorum is met.
+    Hybrid,
+}
+
 /// Quorum knobs governing the join window. See the module docs for the
 /// window semantics; [`Self::validate`] enforces the cross-field
 /// invariants.
@@ -104,6 +125,8 @@ pub struct JoinConfig {
     /// loopback bind (reachability is the authentication); anywhere
     /// else it must be an explicit, loudly-warned choice.
     pub open_admission: bool,
+    /// Who closes the window once quorum is met (default [`StartMode::Auto`]).
+    pub start_mode: StartMode,
 }
 
 impl Default for JoinConfig {
@@ -114,6 +137,7 @@ impl Default for JoinConfig {
             target_ranks: None,
             max_join_timeout_secs: 600,
             open_admission: false,
+            start_mode: StartMode::Auto,
         }
     }
 }
@@ -145,6 +169,14 @@ impl JoinConfig {
                  ({}s) — the hard cap cannot expire before the window",
                 self.max_join_timeout_secs, self.join_timeout_secs,
             )));
+        }
+        if self.start_mode == StartMode::Manual && self.target_ranks.is_some() {
+            return Err(TensorError::new(
+                "cluster join: `start: manual` and `target_ranks` contradict \
+                 — the target is a clock-side auto-close and manual mode \
+                 hands the close to the operator; drop one of them (hybrid \
+                 keeps both)",
+            ));
         }
         Ok(())
     }
@@ -196,6 +228,10 @@ pub(crate) fn resolve_open_admission(config: &JoinConfig, bind_is_loopback: bool
 pub enum ClusterPhase {
     /// Join window open, collecting workers.
     Waiting,
+    /// Quorum met with the door still open and the operator holding the
+    /// close (`start: manual | hybrid`): the roster is startable — `fdl
+    /// start` fires the freeze (hybrid's clock still fires on its own).
+    Staging,
     /// Window closed with quorum; infrastructure starting.
     Forming,
     /// Ranks are training.
@@ -244,6 +280,11 @@ pub struct MembershipSnapshot {
     pub window_remaining_secs: Option<u64>,
     /// Seconds until the hard cap (`None` once expired).
     pub cap_remaining_secs: Option<u64>,
+    /// Who closes the window (`start:` knob echo).
+    pub start_mode: StartMode,
+    /// Whether the operator's start switch has been armed (`fdl start`
+    /// accepted; the freeze fires at the next quorum-met poll).
+    pub start_armed: bool,
     /// Per-host membership.
     pub members: Vec<MemberSnapshot>,
 }
@@ -408,17 +449,31 @@ impl MembershipLedger {
     /// Window decision for the current membership at `elapsed` time
     /// since window open. `window` / `cap` are the already-scaled
     /// durations for `join_timeout` / `max_join_timeout`.
+    /// `start_requested` is the operator's armed start switch (`fdl
+    /// start`) — honored with quorum under `manual` / `hybrid`, inert
+    /// under `auto` (the HTTP layer already refused it loudly).
     pub fn verdict(
         &self,
         elapsed: Duration,
         window: Duration,
         cap: Duration,
+        start_requested: bool,
     ) -> WindowVerdict {
         let joined = self.next_rank;
+        let manual = self.config.start_mode == StartMode::Manual;
+        // Operator start: quorum-gated, mode-gated, checked first so a
+        // manual hold past window expiry stays fireable.
+        if start_requested
+            && self.config.start_mode != StartMode::Auto
+            && joined >= self.config.min_rank_start
+        {
+            return WindowVerdict::Formed("operator start");
+        }
         // Early close on target: the launcher started exactly this much
-        // capacity, no reason to wait out the window.
+        // capacity, no reason to wait out the window. (Manual mode has
+        // no target — validate() refuses the combination.)
         if let Some(target) = self.config.target_ranks {
-            if joined >= target {
+            if !manual && joined >= target {
                 return WindowVerdict::Formed("target ranks reached");
             }
         }
@@ -427,15 +482,30 @@ impl MembershipLedger {
         if elapsed < window {
             return WindowVerdict::Open;
         }
-        if joined >= self.config.min_rank_start {
+        // Window expiry with quorum closes clock-driven modes; a manual
+        // hold keeps collecting until the operator fires (or the cap
+        // bounds the exposure).
+        if !manual && joined >= self.config.min_rank_start {
             return WindowVerdict::Formed("join window closed with quorum");
         }
-        // Grace range: window expired below quorum, keep waiting up to
-        // the hard cap. The settled-window semantics no longer apply —
-        // the first moment quorum is met here, the world forms (the
-        // quorum check above fires on the next poll).
+        // Grace range: window expired below quorum (or a manual hold),
+        // keep waiting up to the hard cap. The settled-window semantics
+        // no longer apply — the first moment quorum is met here, the
+        // world forms on the next poll (clock modes) or the operator's
+        // fire (manual).
         if elapsed < cap {
             return WindowVerdict::Open;
+        }
+        if manual && joined >= self.config.min_rank_start {
+            return WindowVerdict::Failed(format!(
+                "operator start not received: {joined} rank(s) staged with \
+                 quorum met, but `start: manual` got no `fdl start` within \
+                 the max_join_timeout hard cap ({}s scaled to {}s) — the \
+                 window bounds the exposure; raise max_join_timeout for a \
+                 longer hold",
+                self.config.max_join_timeout_secs,
+                cap.as_secs(),
+            ));
         }
         WindowVerdict::Failed(format!(
             "quorum not met: {joined}/{} ranks joined within the \
@@ -446,8 +516,28 @@ impl MembershipLedger {
         ))
     }
 
+    /// The phase an OPEN window is in right now: `Staging` once quorum
+    /// is met with the operator holding (or able to fire) the close,
+    /// `Waiting` otherwise. Closed-window phases (`Forming` onward) are
+    /// the caller's to assert.
+    pub fn open_phase(&self) -> ClusterPhase {
+        if self.config.start_mode != StartMode::Auto
+            && self.next_rank >= self.config.min_rank_start
+        {
+            ClusterPhase::Staging
+        } else {
+            ClusterPhase::Waiting
+        }
+    }
+
     /// Observability snapshot at `elapsed` time since window open.
-    pub fn snapshot(&self, phase: ClusterPhase, elapsed: Duration) -> MembershipSnapshot {
+    /// `start_armed` echoes the operator switch state into `state.json`.
+    pub fn snapshot(
+        &self,
+        phase: ClusterPhase,
+        elapsed: Duration,
+        start_armed: bool,
+    ) -> MembershipSnapshot {
         let window = Duration::from_secs(scaled_deadline_secs(self.config.join_timeout_secs));
         let cap = Duration::from_secs(scaled_deadline_secs(self.config.max_join_timeout_secs));
         let remaining = |limit: Duration| -> Option<u64> {
@@ -461,6 +551,8 @@ impl MembershipLedger {
             target_ranks: self.config.target_ranks,
             window_remaining_secs: remaining(window),
             cap_remaining_secs: remaining(cap),
+            start_mode: self.config.start_mode,
+            start_armed,
             members: self
                 .members
                 .iter()
@@ -561,15 +653,30 @@ pub(crate) fn run_join_window(
         cap.as_secs(),
         if pre_shared_salt { "pre-shared salt" } else { "open" },
     );
-    status.publish(&ledger.snapshot(ClusterPhase::Waiting, Duration::ZERO));
+    status.publish(&ledger.snapshot(ledger.open_phase(), Duration::ZERO, false));
 
+    // Operator start switch: armed by an authenticated `POST /start` on
+    // the status responder, observed here. Edge-tracked so the arming
+    // gets its own log line + snapshot publish.
+    let mut armed_seen = false;
     loop {
         let elapsed = started.elapsed();
-        match ledger.verdict(elapsed, window, cap) {
+        let armed = status.start_requested();
+        if armed && !armed_seen {
+            armed_seen = true;
+            eprintln!(
+                "cluster join: operator start armed ({} rank(s) in) — the \
+                 world forms at the next quorum-met poll",
+                ledger.joined_ranks(),
+            );
+            status.publish(&ledger.snapshot(ledger.open_phase(), elapsed, true));
+        }
+        match ledger.verdict(elapsed, window, cap, armed) {
             WindowVerdict::Open => {}
             WindowVerdict::Formed(reason) => {
                 let world_size = ledger.joined_ranks();
-                let snapshot = ledger.snapshot(ClusterPhase::Forming, elapsed);
+                let snapshot =
+                    ledger.snapshot(ClusterPhase::Forming, elapsed, armed);
                 let members = ledger.into_members();
                 eprintln!(
                     "cluster join: world formed — {world_size} ranks across \
@@ -584,7 +691,7 @@ pub(crate) fn run_join_window(
             WindowVerdict::Failed(why) => {
                 let msg = format!("cluster join: FAILED — {why}");
                 eprintln!("{msg}");
-                status.publish(&ledger.snapshot(ClusterPhase::Failed, elapsed));
+                status.publish(&ledger.snapshot(ClusterPhase::Failed, elapsed, armed));
                 abort_admitted(&mut admitted, salt, &why);
                 return Err(TensorError::new(&msg));
             }
@@ -592,7 +699,7 @@ pub(crate) fn run_join_window(
         if abort.load(Ordering::SeqCst) {
             let why = "launcher aborted before the world formed".to_string();
             status.publish(
-                &ledger.snapshot(ClusterPhase::Failed, started.elapsed()),
+                &ledger.snapshot(ClusterPhase::Failed, started.elapsed(), armed),
             );
             abort_admitted(&mut admitted, salt, &why);
             return Err(TensorError::new(&format!("cluster join: {why}")));
@@ -644,9 +751,11 @@ pub(crate) fn run_join_window(
                         None => format!(", quorum {}", config.min_rank_start),
                     },
                 );
-                status.publish(
-                    &ledger.snapshot(ClusterPhase::Waiting, started.elapsed()),
-                );
+                status.publish(&ledger.snapshot(
+                    ledger.open_phase(),
+                    started.elapsed(),
+                    armed_seen,
+                ));
                 admitted.push(AdmittedWorker { member, stream });
             }
             Err(why) => {

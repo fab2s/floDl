@@ -20,12 +20,12 @@
 //! magic immediately after `connect`, so sequential dispatch never
 //! stalls behind a legitimate peer.
 //!
-//! One channel is not flodl wire at all: a plain HTTP GET's leading
-//! `"GET "` bytes route to the status responder
+//! One channel is not flodl wire at all: a plain HTTP request's leading
+//! `"GET "` / `"POST"` bytes route to the status responder
 //! (`distributed::status`), which serves the run's membership state as
-//! `state.json` on this same port. For that leg the consumer does NOT
-//! strip a magic — the four bytes are part of the request line it
-//! reads.
+//! `state.json` and the operator start switch (`POST /start`) on this
+//! same port. For that leg the consumer does NOT strip a magic — the
+//! four bytes are part of the request line it reads.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +38,7 @@ use crate::tensor::{Result, TensorError};
 
 use super::wire::{
     CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_HTTP_GET,
-    CHANNEL_MAGIC_JOIN, CHANNEL_MAGIC_RENDEZVOUS,
+    CHANNEL_MAGIC_HTTP_POST, CHANNEL_MAGIC_JOIN, CHANNEL_MAGIC_RENDEZVOUS,
 };
 
 /// Poll cadence of the dispatcher's non-blocking accept loop.
@@ -62,10 +62,11 @@ pub(crate) struct MuxAccept {
     pub data: Receiver<TcpStream>,
     pub control: Receiver<TcpStream>,
     pub join: Receiver<TcpStream>,
-    /// Plain HTTP GETs (`fdl status`, curl, a browser) — an HTTP
-    /// request line's leading `"GET "` routes like any channel magic.
-    /// Unlike the flodl channels the consumer does NOT strip a magic:
-    /// the four bytes are part of the request it reads.
+    /// Plain HTTP requests (`fdl status` / `fdl start`, curl, a
+    /// browser) — a request line's leading `"GET "` / `"POST"` routes
+    /// like any channel magic. Unlike the flodl channels the consumer
+    /// does NOT strip a magic: the four bytes are part of the request
+    /// it reads.
     pub status: Receiver<TcpStream>,
 }
 
@@ -229,7 +230,7 @@ fn dispatch_one(
         CHANNEL_MAGIC_DATA => (data_tx, "data"),
         CHANNEL_MAGIC_CONTROL => (ctrl_tx, "control"),
         CHANNEL_MAGIC_JOIN => (join_tx, "join"),
-        CHANNEL_MAGIC_HTTP_GET => (status_tx, "status"),
+        CHANNEL_MAGIC_HTTP_GET | CHANNEL_MAGIC_HTTP_POST => (status_tx, "status"),
         other => {
             eprintln!(
                 "port_mux: dropping connection from {peer} (unknown channel \

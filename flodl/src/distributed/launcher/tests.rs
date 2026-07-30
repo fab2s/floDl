@@ -146,6 +146,60 @@
     }
 
     #[test]
+    fn start_mode_parses_and_rejects_unknown_values() {
+        use crate::distributed::membership::StartMode;
+        for (s, want) in [
+            ("auto", StartMode::Auto),
+            ("manual", StartMode::Manual),
+            ("hybrid", StartMode::Hybrid),
+        ] {
+            let mut val = canonical_full_json();
+            val["controller"]["join"] = json!({ "start": s });
+            let full = FullCluster::from_value(&val).unwrap();
+            assert_eq!(full.controller.join.as_ref().unwrap().start, Some(want));
+            // Round-trips through to_json.
+            let back = FullCluster::from_value(&full.to_json()).unwrap();
+            assert_eq!(back.controller.join, full.controller.join);
+        }
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "start": "operator" });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("auto"), "got: {msg}");
+        assert!(msg.contains("manual"), "got: {msg}");
+        let mut bad = canonical_full_json();
+        bad["controller"]["join"] = json!({ "start": 1 });
+        let msg = FullCluster::from_value(&bad).unwrap_err().to_string();
+        assert!(msg.contains("string"), "got: {msg}");
+    }
+
+    #[test]
+    fn manual_derivation_skips_the_capacity_target_default() {
+        use crate::distributed::membership::StartMode;
+        // Fan-out roster + manual: the capacity default for target_ranks
+        // must not apply (validate would refuse a combination the user
+        // never wrote); quorum still defaults to capacity.
+        let knobs = JoinKnobs {
+            start: Some(StartMode::Manual),
+            ..Default::default()
+        };
+        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        assert_eq!(cfg.min_rank_start, 3);
+        assert_eq!(cfg.target_ranks, None);
+        assert_eq!(cfg.start_mode, StartMode::Manual);
+        cfg.validate().unwrap();
+        // An EXPLICIT target under manual still reaches validate() and
+        // errors loudly there.
+        let knobs = JoinKnobs {
+            start: Some(StartMode::Manual),
+            target_ranks: Some(4),
+            ..Default::default()
+        };
+        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(msg.contains("manual"), "got: {msg}");
+    }
+
+    #[test]
     fn join_config_derivation_defaults_to_capacity_all_or_nothing() {
         // No knobs: quorum = target = capacity, stock timeouts.
         let cfg = super::derive_join_config(None, 3).unwrap();

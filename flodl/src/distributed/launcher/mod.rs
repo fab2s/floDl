@@ -621,6 +621,12 @@ fn derive_join_config(
             )
         })?;
         (quorum, knobs.target_ranks)
+    } else if knobs.start == Some(crate::distributed::membership::StartMode::Manual) {
+        // Manual mode has no clock-side auto-close: the capacity default
+        // for `target_ranks` must not apply, or validate() would refuse
+        // a combination the user never wrote. An EXPLICIT target still
+        // reaches validate() and errors loudly there.
+        (knobs.min_rank_start.unwrap_or(capacity), knobs.target_ranks)
     } else {
         (
             knobs.min_rank_start.unwrap_or(capacity),
@@ -635,6 +641,7 @@ fn derive_join_config(
             .max_join_timeout_secs
             .unwrap_or(defaults.max_join_timeout_secs.max(join_timeout_secs)),
         open_admission: knobs.open_admission.unwrap_or(false),
+        start_mode: knobs.start.unwrap_or_default(),
     })
 }
 
@@ -895,6 +902,14 @@ pub fn run_launcher_with_config(
     } else {
         membership::resolve_open_admission(&join_config, bind_loopback)
     };
+    // Wire the operator start switch: the status responder arms it
+    // (authenticated POST /start), the join window polls it. The
+    // credential is the session salt — under a configured `join.token`
+    // that is exactly the token the operator holds.
+    status_board.configure_start(
+        join_config.start_mode,
+        crate::distributed::wire::salt_to_hex(&salt),
+    );
     let gate_config = join_config.clone();
     let gate_salt = salt;
     let gate_abort = Arc::clone(&abort);
