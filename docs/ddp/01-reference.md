@@ -789,12 +789,12 @@ flowchart LR
     E --> OUT
     C --> OUT
 
-    classDef file fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
-    classDef rest fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
-    classDef out fill:#fff3e0,stroke:#ffa726,color:#e65100
-    class F1,F2,F3 file
-    class M,E,C rest
-    class OUT out
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class F1,F2,F3,M,E,C actor
+    class OUT good
+    classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
+    class w,r group
 ```
 
 The restore is strict about cohort shape: a snapshot taken at one

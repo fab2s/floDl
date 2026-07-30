@@ -3,6 +3,13 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
+  /* Diagram plate. Mermaid diagrams are a deliberately LIGHT figure in both
+     themes (see the .content .mermaid rule for why the palette cannot follow
+     the toggle), so this is the one surface that stays light on a dark page.
+     Theme-independent on purpose: dark-mode dimming is the veil's job alone
+     (one knob, not two stacked ones). Used by BOTH the in-page plate and its
+     full-window enlargement, so the same diagram never changes tone. */
+  --diagram-surface: #fcfcfd;
   --bg: #0f1117;
   --bg-alt: #0a0c10;
   --card: #1a1d27;
@@ -691,15 +698,57 @@ summary.sidebar-label:focus-visible {
    site's dark theme — in the page and in the overlay alike. (Making mermaid
    itself follow the light/dark toggle is a separate job: it needs a re-render
    from the source text, which is consumed at render time.) */
+/* Diagrams are a fixed LIGHT-surfaced figure in both themes, deliberately.
+   Their palette is hardcoded in the mermaid source (classDef hex) because
+   GitHub renders the same diagrams and never loads this stylesheet, so the
+   colours cannot follow the site's light/dark toggle without diverging from
+   the GitHub rendering. The plate is therefore theme-independent; the only
+   thing that follows the toggle is the dark-mode veil defined below. */
 .content .mermaid {
-  background: #fcfcfd;
+  background: var(--diagram-surface);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px;
   margin-bottom: 16px;
   text-align: center;
   overflow-x: auto;
+  position: relative;   /* anchors the dark-mode veil below */
 }
+
+
+/* Dark-mode luminance veil — the SINGLE knob for how dim the plate is on a dark
+   page. Raise the opacity to dim further; there is deliberately no second
+   mechanism (an earlier version also darkened --diagram-surface, so two stacked
+   dimmers fought over one job).
+   Why a veil and not just a darker surface colour: most of the plate's
+   brightness is the PASTEL NODE FILLS, not the backdrop, and those are locked in
+   the mermaid source (inline `!important`, unreachable from CSS — see the
+   palette note in CLAUDE.md). A veil composited over the whole figure dims
+   surface, nodes and labels together, which is the only way CSS can touch those
+   colours at all.
+   CEILING: the veil composites black over text AND its node fill, so contrast
+   ratios compress as it rises. Measured against WCAG AA (4.5:1) on every palette
+   pair, the worst pair (`cost`) holds 4.84:1 at the current 0.18 and 4.76:1 at
+   0.20 — so ~0.20 is the practical ceiling. Re-check if the palette changes.
+   Why a veil and NOT `filter: brightness()`: a filter on an ancestor forces the
+   subtree to rasterize, and the overlay's zoom is a CSS transform on the <svg> —
+   a rasterized subtree would zoom blurry, destroying the "vector-crisp at any
+   scale" property the zoom exists for. Compositing a sibling layer leaves the
+   SVG untouched. `pointer-events: none` keeps click-to-enlarge and label
+   selection working through it. */
+.content .mermaid::after,
+.diagram-modal-surface::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #000;
+  opacity: 0.18;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+:root[data-theme="light"] .content .mermaid::after,
+:root[data-theme="light"] .diagram-modal-surface::after { display: none; }
 
 .content .mermaid svg { max-width: 100%; height: auto; }
 
@@ -758,7 +807,7 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
 .diagram-modal-surface {
   position: absolute;
   inset: 32px;                 /* the "sensible margin" */
-  background: #fcfcfd;
+  background: var(--diagram-surface);
   border-radius: 10px;
   padding: 28px;
   display: flex;

@@ -155,6 +155,13 @@ flowchart TB
     %% Stack the hosts instead of letting dagre put them side by side: with
     %% both wired to the launcher they land on one rank and the chart sprawls.
     host0 ~~~ host1
+
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class L,C,A1,R1 actor
+    class W0,W1,W2,W3 good
+    classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
+    class launchbox,host0,host1 group
 ```
 
 The agent's join connection stays open past formation as the **host control
@@ -193,6 +200,7 @@ End to end for one cluster run: bootstrap rendezvous, then the repeating
 collapses the post-reduce control round-trip.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"actorBkg":"#e8eaf6","actorBorder":"#5c6bc0","actorTextColor":"#1a237e","signalColor":"#5c6bc0","signalTextColor":"#263238","noteBkgColor":"#eceff1","noteBorderColor":"#90a4ae","noteTextColor":"#37474f","labelBoxBkg":"#eceff1","labelBoxBorderColor":"#90a4ae","labelTextColor":"#37474f","activationBkgColor":"#e8f5e9","activationBorderColor":"#66bb6a"}}}%%
 sequenceDiagram
     participant L as Launcher
     participant C as Coordinator (control channel)
@@ -293,6 +301,11 @@ stateDiagram-v2
     Pending --> Idle: all acks in
     Pending --> Idle: stall ceiling
     Pending --> [*]: shutdown
+
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class Pending actor
+    class Idle good
 ```
 
 What each transition actually does - kept out of the diagram because state-machine
@@ -379,6 +392,13 @@ flowchart TB
     %% two backends read as parallel alternatives rather than a sequence.
     S --> N1
     S --> P1
+
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class S actor
+    class N4 good
+    classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
+    class nccl,cpu group
 ```
 
 Key asymmetries (each a hard-won fix):
@@ -439,6 +459,11 @@ flowchart LR
     C -->|"no (2..n)"| E["delivered_ms + delivered_batches<br/>the MARGINAL per-batch rate"]
     D --> F["fill_excess_ms<br/>excess over the marginal rate"]
     B --> G["wall_ms<br/>compute only (Sync feed)"]
+
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
+    class E good
+    class D,F cost
 ```
 
 Then the feed picks a scale and the scale drives the schedule:
@@ -453,6 +478,11 @@ flowchart LR
     L --> M["batch_counts[rank]<br/>= the reduce window"]
     M --> N["compute_chunk_batches<br/>dispatch exactly counts[rank]"]
     N --> O["reduce + epoch barriers<br/>reduce_step_budget"]
+
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
+    class J,M good
+    class I cost
 ```
 
 Four things constrain the anchor `recompute_batch_counts` settles on. They are
@@ -588,6 +618,15 @@ flowchart TB
 
     SWS["ShutdownWithSave { reason }"] --> SAVE["each rank writes checkpoint + CheckpointMeta"]
     SWS --> DR["dead/exiting rank writes RankDeathRecord sidecar<br/>save_path.rankN.death.json on exit 1"]
+
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
+    classDef note fill:#eceff1,stroke:#90a4ae,color:#37474f
+    class OK,SAVE good
+    class RZF,DEAD,SWS cost
+    class DR note
+    classDef group fill:#fafafa,stroke:#cfd8dc,color:#37474f
+    class boot,live,stall group
 ```
 
 The rendezvous deadline is `RENDEZVOUS_IDLE_TIMEOUT` (120s) with a
