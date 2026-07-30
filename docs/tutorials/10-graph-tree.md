@@ -323,6 +323,55 @@ execution buffers, and topological level execution remain exactly as they are.
 Tree operations (`parameters_at`, `freeze`, `tagged_at`, etc.) are explicit
 calls - they only run when you call them, never during forward/backward.
 
+## Putting it together
+
+Every feature above in one arc: train a component alone, nest it, load its weights,
+freeze the proven half, and give each part its own learning rate.
+
+```rust
+use flodl::*;
+
+// 1. Build and train the encoder standalone.
+let encoder = FlowBuilder::from(scan_module)
+    .tag("scan")
+    .through(read_module)
+    .tag("read")
+    .label("encoder")          // the label is what makes it a subgraph
+    .build()?;
+// ... train encoder ...
+encoder.save_checkpoint("encoder_v1.fdl.gz")?;
+
+// 2. Nest a fresh encoder of the same shape inside a larger model.
+let model = FlowBuilder::from(fresh_encoder)   // child "encoder" auto-registers
+    .through(classifier)
+    .label("classifier_v1")
+    .build()?;
+
+// 3. Load the pretrained weights into just that subgraph.
+let report = model.load_subgraph_checkpoint("encoder", "encoder_v1.fdl.gz")?;
+println!("loaded {} params into encoder", report.loaded.len());
+
+// 4. Freeze the proven read phase; let the scan phase keep adapting.
+model.freeze("encoder.read")?;
+
+// 5. One optimizer, three learning rates by path.
+let mut optimizer = Adam::with_groups()
+    .group(&model.parameters_at("classifier_v1")?, 1e-3)
+    .group(&model.parameters_at("encoder.scan")?, 1e-4)
+    // encoder.read is frozen - deliberately in no group
+    .build();
+
+// 6. Observation crosses the boundary: one flush covers the tree.
+model.record_at("encoder.loss", enc_loss)?;
+model.flush(&[]);
+let trend = model.trend_at("encoder.loss")?;
+```
+
+The shape to take away: **a label turns a graph into an addressable subgraph**, and
+every tree operation afterwards is a path - `freeze`, `parameters_at`,
+`load_subgraph_checkpoint`, `record_at`, `trend_at`. Nothing here reaches inside the
+child's internals; `"encoder.read"` is the whole interface.
+
 ## Quick reference
 
 | Method | Returns | Description |

@@ -2,8 +2,8 @@
 
 Canonical reference for flodl's multi-GPU and multi-host training surface.
 For progressive introductions, see
-[Tutorial 11: Multi-GPU Training](tutorials/11-multi-gpu.md) and
-[Tutorial 12: Heterogeneous & Multi-Host DDP](tutorials/12-async-ddp.md).
+[Multi-GPU Training](tutorials/11-multi-gpu.md) and
+[Heterogeneous & Multi-Host DDP](tutorials/12-async-ddp.md).
 
 flodl has one training entry - `Trainer::builder(...).run()` (chained
 form) or `Trainer::run(model_factory, optim_factory, train_fn, cfg)`
@@ -1512,7 +1512,7 @@ depth = clamp(free_vram * headroom / batch_bytes, 2, max_depth)
 - **OOM fallback**: if resident mode fails with CUDA OOM, automatically
   retries with streaming mode.
 
-See [Tutorial 13: Data Loading](tutorials/13-data-loading.md) for the
+See [Data Loading](tutorials/13-data-loading.md) for the
 full `DataLoader` reference.
 
 ---

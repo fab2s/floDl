@@ -6,7 +6,7 @@ on variables, a computation graph is built behind the scenes. Calling
 `backward()` walks that graph in reverse, accumulating gradients at each
 leaf variable.
 
-This tutorial builds on [Tutorial 1: Tensors](01-tensors.md).
+This tutorial builds on [Tensors](01-tensors.md).
 
 ## Variables
 
@@ -108,7 +108,7 @@ w.zero_grad();  // reset gradient to None
 ```
 
 In practice you will call `optimizer.zero_grad()` which does this for all
-parameters (see [Tutorial 4](04-training.md)).
+parameters (see [Training](04-training.md)).
 
 ## Detach
 

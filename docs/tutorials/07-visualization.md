@@ -8,6 +8,9 @@ when references, loops, and switches are involved.
 > [Advanced Graphs](06-advanced-graphs.md) introduce the constructs
 > shown in the diagrams.
 
+> **Runnable examples**: [`showcase`](../../flodl/examples/showcase/) and
+> [`flowbuilder_residual`](../../flodl/examples/flowbuilder_residual/) both emit SVG.
+
 ## Generating output
 
 Two methods on `Graph`:

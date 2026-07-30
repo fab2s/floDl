@@ -11,6 +11,10 @@ chains, parallel branches, residual connections, and per-element mapping.
 > [Training](04-training.md). You don't need to have read them - the
 > code here is self-contained - but they explain the building blocks.
 
+> **Runnable examples**:
+> [`flowbuilder_residual`](../../flodl/examples/flowbuilder_residual/) is an MLP with a
+> tagged residual block; [`quickstart`](../../flodl/examples/quickstart/) trains one.
+
 ## Your first graph
 
 ```rust
@@ -212,7 +216,7 @@ let params = model.parameters();
 let optimizer = Adam::new(&params, 0.001);
 model.train();
 
-// ... training loop (see Tutorial 04) ...
+// ... training loop (see the Training tutorial) ...
 
 // Evaluate.
 model.eval();
