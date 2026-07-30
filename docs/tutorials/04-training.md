@@ -2,7 +2,12 @@
 
 This tutorial puts everything together: loss functions, optimizers, gradient
 clipping, mixed precision training, and the training loop. It builds on
-[Tutorial 3: Modules](03-modules.md).
+[Modules](03-modules.md).
+
+> **Runnable examples**: [`sine_wave`](../../flodl/examples/sine_wave/) is the
+> shortest end-to-end loop, [`quickstart`](../../flodl/examples/quickstart/) adds a
+> monitor, and [`mixed_precision`](../../flodl/examples/mixed_precision/) shows
+> `GradScaler` in place.
 
 ## Loss Functions
 

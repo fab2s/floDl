@@ -4,7 +4,12 @@ The `nn` module provides neural network layers, activations, and the `Module`
 trait that unifies them all. Modules compose naturally - a model is a Module
 that contains other Modules.
 
-This tutorial builds on [Tutorial 2: Automatic Differentiation](02-autograd.md).
+This tutorial builds on [Automatic Differentiation](02-autograd.md).
+
+> **Runnable examples**: [`regression`](../../flodl/examples/regression/) builds
+> linear and logistic regression out of `Linear` plus the right loss, and
+> [`bio/dnaseq_conv1d`](../../flodl/examples/bio/dnaseq_conv1d/) is a `Conv1d` motif
+> classifier.
 
 ## The Module Trait
 
@@ -490,6 +495,47 @@ impl Module for RecurrentModule {
     // ...
 }
 ```
+
+## Putting it together
+
+The catalogue above is a parts list; this is a whole model built from it. A
+1-D CNN classifier, with the tensor shape after each stage so the arithmetic is
+checkable by eye:
+
+```rust
+use flodl::*;
+
+// Input: [B, 4, 200] - one-hot DNA, 4 channels, 200 positions.
+let model = FlowBuilder::from(Conv1d::new(4, 32, 5)?)          // -> [B, 32, 196]
+    .through(ReLU)
+    .through(Conv1d::configure(32, 64, 5).with_padding(2).done()?)  // -> [B, 64, 196]
+    .through(ReLU)
+    .through(MaxPool1d::new(2))                                // -> [B, 64, 98]
+    .through(Conv1d::configure(64, 128, 3).with_padding(1).done()?) // -> [B, 128, 98]
+    .through(ReLU)
+    .through(MaxPool1d::new(2))                                // -> [B, 128, 49]
+    .through(Flatten::new(1, -1))                              // -> [B, 128*49]
+    .through(Linear::new(128 * 49, 64)?)
+    .through(ReLU)
+    .through(Dropout::new(0.3))
+    .through(Linear::new(64, 1)?)
+    .through(Sigmoid)
+    .build()?;
+```
+
+Three things this shows that the per-layer sections cannot:
+
+- **Plain constructors and builders mix freely.** `Conv1d::new(4, 32, 5)?` when the
+  defaults suit, `Conv1d::configure(...).with_padding(2).done()?` when they do not.
+- **Activations are modules too**, so `ReLU` and `Sigmoid` sit in the chain rather
+  than being applied separately.
+- **`Dropout` needs no special handling here** - `model.train()` / `model.eval()`
+  switches it, along with every `BatchNorm` in the graph.
+
+This is the model from
+[`bio/dnaseq_conv1d`](../../flodl/examples/bio/dnaseq_conv1d/), which trains it end
+to end on synthetic motif data. [The Graph Builder](05-graph-builder.md) covers
+`FlowBuilder` itself - residuals, branches, and everything beyond a straight chain.
 
 ## Composing Modules Manually
 

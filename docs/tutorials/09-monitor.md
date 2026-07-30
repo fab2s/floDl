@@ -7,6 +7,10 @@ dependencies.
 > **Prerequisites**: [Training](04-training.md) covers the training loop.
 > [Utilities](08-utilities.md) covers observation and trends.
 
+> **Runnable examples**: [`quickstart`](../../flodl/examples/quickstart/) trains with
+> a live monitor; [`observation`](../../flodl/examples/observation/) adds trend queries
+> and early stopping.
+
 ## Basic Usage
 
 The monitor wraps your training loop with timing, ETA, and resource sampling.

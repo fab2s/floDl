@@ -16,6 +16,9 @@ scales out to multi-host clusters via `fdl.cluster.yml` or
 > **Canonical reference**: [DDP Reference](../ddp.md) for the full
 > knob surface.
 
+> **Runnable example**: [`auto_promote`](../../flodl/examples/auto_promote/) is the
+> same plain training code on 1 CPU, 1 GPU, or N GPUs - with zero distributed code in it.
+
 ## The one-liner
 
 ```rust
@@ -271,7 +274,7 @@ let loader = DataLoader::from_batch_dataset(dataset)
     .build()?;
 ```
 
-See [Tutorial 13: Data Loading](13-data-loading.md) for the full
+See [Data Loading](13-data-loading.md) for the full
 DataLoader surface.
 
 ## Host-side callbacks - `metrics_fn` / `eval_fn`
@@ -351,7 +354,7 @@ Trainer::builder(model_factory, optim_factory, train_step)
 
 The dashboard shows per-rank tabs (one per rank, per host), throughput
 curves, batch-share distribution, VRAM, and ElChe anchor evolution. See
-[Tutorial 9: Training Monitor](09-monitor.md) for the full surface.
+[Training Monitor](09-monitor.md) for the full surface.
 
 ## Scaling out - multi-host clusters
 

@@ -7,9 +7,12 @@ and forward references, loops, gated routing, and conditional branching.
 > basics - from, through, build, also, split/merge, tag, map, and
 > Graph-as-Module. Everything here builds on those primitives.
 
+> **Runnable example**: [`showcase`](../../flodl/examples/showcase/) exercises every
+> method of the fluent builder in one coherent graph.
+
 ## Tag and Using - backward references
 
-Tutorial 05 introduced `tag` for naming points in the flow. `using`
+The Graph Builder introduced `tag` for naming points in the flow. `using`
 consumes those names. When the tag appears *before* the using call in
 the builder chain, the value is wired directly - it is available in the
 same forward pass with no extra machinery:

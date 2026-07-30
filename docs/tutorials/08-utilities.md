@@ -10,6 +10,12 @@ loop itself and points here for each of these.
 > backward/step loop. [The Graph Builder](05-graph-builder.md)
 > introduces tags.
 
+> **Runnable examples**:
+> [`transfer_learning`](../../flodl/examples/transfer_learning/) covers checkpoint
+> save/partial load/freeze, [`schedulers`](../../flodl/examples/schedulers/) composes
+> warmup + cosine + plateau, and [`observation`](../../flodl/examples/observation/)
+> does collect/flush/trend/early-stop.
+
 ## Gradient clipping
 
 Deep models - especially those with loops or long chains - can suffer

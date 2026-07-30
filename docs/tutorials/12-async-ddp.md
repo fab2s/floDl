@@ -2,7 +2,7 @@
 
 When the rigs get interesting - mixed GPU generations, mixed hosts,
 mixed libtorch variants - the same `Trainer::builder` shape from
-[Tutorial 11](11-multi-gpu.md) keeps working. This tutorial covers the
+[Multi-GPU Training](11-multi-gpu.md) keeps working. This tutorial covers the
 knobs that earn their keep on real heterogeneous deployments.
 
 > **Prerequisites**: [Multi-GPU Training](11-multi-gpu.md). The
@@ -11,6 +11,10 @@ knobs that earn their keep on real heterogeneous deployments.
 > **Time**: ~25 minutes.
 
 > **Canonical reference**: [DDP Reference](../ddp.md).
+
+> **Runnable example**: [`auto_promote`](../../flodl/examples/auto_promote/) is the
+> binary the cluster path promotes; nothing in it changes between single-host and
+> multi-host.
 
 ## ElChe - the cadence balancer
 

@@ -420,7 +420,7 @@ let mut rng = Rng::seed(42);
 rng.shuffle(&mut data);
 ```
 
-See [Tutorial 4: Training](04-training.md) for full reproducibility setup.
+See [Training](04-training.md) for full reproducibility setup.
 
 ## cuDNN Benchmark Mode
 
