@@ -1,0 +1,88 @@
+# Roster-free cluster formation -- deep-merges onto fdl.yml.
+#
+# Usage:
+#   cp fdl.cluster-join.yml.example fdl.cluster-join.yml
+#   # set a token (below) and adjust min_rank_start to your fleet
+#   fdl @cluster-join <command>     # activates this overlay (`@` env selector)
+#   fdl --env cluster-join <cmd>    # equivalent (flag form)
+#   FDL_ENV=cluster-join fdl <cmd>  # equivalent (env-var form)
+#
+#   fdl status                      # watch the window: who has joined, phase
+#   fdl start                       # fire the run once the roster looks full
+#
+# Difference vs fdl.cluster.yml: that overlay ENUMERATES its rig, and the
+# launcher SSHes to each host. Here `workers:` is empty and **the window IS
+# the world** -- whoever walks in during it becomes the topology, ranks
+# assigned in admission order. This is the cloud shape: worker addresses do
+# not exist before the VMs boot, so there is no roster to write down. (The
+# two compose: an enumerated roster still fans out as usual while walk-ins
+# self-register into the same window.)
+#
+# The worker side is `fdl join` -- see fdl.yml.example's top-level `join:`
+# block and docs/ddp.md "Walking in". Two roads in, both shown below:
+#   - same box / private network:  fdl join <controller>:1337 --token <hex> \
+#                                    --bin <training-binary> -- <its args>
+#   - through a guardrailed sshd:  fdl join --ssh <user>@<sshd-host>:<port> \
+#                                    --token <hex> --bin <binary> -- <args>
+#
+# Per-key docs for everything under `join:` live in fdl.cluster.yml.example
+# (the `controller.join:` reference block). Only the choices that make this
+# overlay a *recipe* are explained here:
+#
+#   discovery: true    roster-free formation. Requires an explicit
+#                      `min_rank_start` -- with no configured capacity there
+#                      is nothing to derive a quorum from.
+#   start: manual      the operator closes the window, not the clock: at
+#                      quorum the run HOLDS in phase `staging` (visible in
+#                      `fdl status`) until `fdl start`. This is the
+#                      scavenged-credit shape -- launch instances until the
+#                      budget runs out, then start when the roster is full
+#                      enough. `max_join_timeout` still bounds the hold, and
+#                      never starting is a loud failure. Refuses
+#                      `target_ranks` (a closing target contradicts an
+#                      operator-owned close). Use `auto` to let the clock
+#                      close as usual, `hybrid` for both.
+#   tunnel_only: true  bind the controller loopback-only, so an sshd-carried
+#                      forward is the ONLY road in and reachability itself is
+#                      the authentication. NOTE: like any tunneled worker,
+#                      this REQUIRES a CPU averaging mode -- drop it if your
+#                      ranks must speak NCCL to each other. Comment it out
+#                      for a private-network fleet that dials the bind
+#                      address directly.
+#   token:             pre-shared session salt injected at fleet-create time,
+#                      replacing the per-run generated one, so a golden image
+#                      can boot straight into `fdl join`. The sshd guardrails
+#                      and the token are LAYERS, not alternatives.
+
+cluster:
+  controller:
+    host: 127.0.0.1                    # loopback; `tunnel_only` forces it anyway
+    port: 1337
+    path: /opt/flodl                   # controller's view of the project root
+    # docker: cuda                     # optional pre-flight build context
+    # arch: precompiled/cu128          # optional libtorch variant for pre-flight
+    join:
+      discovery: true                  # the window defines the world
+      min_rank_start: 2                # quorum in RANKS (not hosts); required here
+      start: manual                    # hold at quorum; `fdl start` fires it
+      join_timeout: 600                # window length, seconds
+      max_join_timeout: 1200           # hard cap on the staging hold
+      tunnel_only: true                # sshd forward is the only road in (CPU modes)
+      # REPLACE THIS. Generate with:  openssl rand -hex 16
+      token: 0123456789abcdef0123456789abcdef
+
+  workers: []                          # deliberately empty -- walk-ins fill it
+
+commands:
+  # The controller still enters the launcher path to OPEN the window, so the
+  # command it hosts is marked `cluster: true` exactly as in fdl.cluster.yml.
+  # With an empty roster there is simply nothing to fan out to; the launcher
+  # opens the window and waits for walk-ins instead.
+  ddp-bench:
+    cluster: true
+
+# NOTE: the token above is a published placeholder -- a run left with it is
+# credential-checked against a value anyone reading this repo knows. Replace
+# it before the overlay ever faces a network, and keep your fdl.cluster-join.yml
+# out of git (the .gitignore already covers `fdl.*.yml`; only this .example is
+# committed).
