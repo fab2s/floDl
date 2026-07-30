@@ -37,27 +37,12 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 > **What's new** - the training monitor became a **recursive portal**:
 > one view repeated at every level of a run (`root` → host → rank),
-> addressed by path, where a page subscribes to one level so a
-> 300-rank run costs the same to watch as a 3-rank one. The same
-> record plane comes out three other ways: over HTTP
-> (`/paths`, `/node`, `/history`, `/stream`), on disk as a bounded
-> JSONL tree whose file layout *is* the record path
-> (`record_log`), and as **one self-contained HTML file** with every
-> level browsable offline (`save_dashboard`). Plus an alert lane
-> (rank loss, drift, dropped control), sub-epoch reports between
-> epoch points (`reports_per_epoch`), and a light theme.
-> A memory pass on the CPU averaging plane removes roughly 2 GB of
-> per-rank transients from the sync barrier at 190M params (streaming
-> wire codec on both legs, pinned consensus staging, incremental
-> relay fold, optional `bf16_wire`), and `MultiheadAttention` now
-> routes through fused scaled-dot-product attention. New:
-> `RotaryEmbedding` (RoPE), `SwiGLU`, `TokenShards` for pre-tokenized
-> corpora, and an [Apple Silicon path](docs/mac-apple-silicon.md).
-> Notable fixes: `switch` now dispatches **per sample**
-> ([#32](https://github.com/flodl-labs/flodl/issues/32)), model init
-> is reproducible from a seed, and two cluster faults are closed (a
-> formation-time crash and an epoch-tail deadlock). See the
-> CHANGELOG and [DDP Reference](docs/ddp/01-reference.md) for the full surface.
+> addressed by path. A page subscribes to one level, so watching a
+> 300-rank run costs what watching a 3-rank one costs. The same record
+> plane is also reachable over HTTP, as a bounded JSONL tree on disk,
+> and as one self-contained offline HTML file.
+> See the [CHANGELOG](https://github.com/flodl-labs/flodl/blob/main/CHANGELOG.md)
+> for everything else in this release.
 
 ---
 
@@ -146,7 +131,7 @@ For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](docs/mac
 > switch between installs, compile from source for mixed GPU
 > architectures (e.g. sm_61 + sm_120 in one build), and emit a
 > machine-readable diagnostics report. No flodl buy-in required.
-> See [docs/cli/01-install.md § Standalone](docs/cli/02-setup-commands.md)
+> See [Setup commands](docs/cli/02-setup-commands.md)
 > and the [`flodl-cli` crate](https://crates.io/crates/flodl-cli).
 
 Both paths generate an annotated training template. Edit `src/main.rs` to
@@ -155,10 +140,10 @@ build your model:
 ```rust
 use flodl::*;
 
+// The builder itself is annotated under "The Graph Builder" below.
 let model = FlowBuilder::from(Linear::new(2, 16)?)
     .through(GELU)
-    .through(LayerNorm::new(16)?)
-    .also(Linear::new(16, 16)?)     // residual connection
+    .also(Linear::new(16, 16)?)
     .through(Linear::new(16, 2)?)
     .build()?;
 
@@ -207,7 +192,7 @@ For an explicit loop, `Ddp::wrap` gives per-rank gradient-sync control
 (the bypass tier). The cooperative tier - `Trainer::builder(...).into_worker()` -
 hands you the loop body while the controller stays authoritative over
 cadence, partition, eval-election, and checkpointing. See
-[Tutorial 4: Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
+[Training](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/04-training.md)
 for all three tiers (bypass / cooperative / managed).
 
 ## The Graph Builder
@@ -385,11 +370,11 @@ monitor.finish();
 ```
 
 <p align="center">
-  <a href="https://flodl.dev/benchmark">
+  <a href="https://flodl.dev/ddp-benchmark">
     <img src="https://raw.githubusercontent.com/flodl-labs/flodl/main/docs/dashboard.gif" alt="floDl live training dashboard - click for interactive version" width="800">
   </a>
 </p>
-<p align="center"><em><a href="https://flodl.dev/benchmark">Interactive benchmark dashboard</a> - real data from a 200-epoch ResNet-20 run across 3 GPUs on 2 hosts, then the same view at every level of the cluster</em></p>
+<p align="center"><em><a href="https://flodl.dev/ddp-benchmark">Interactive DDP dashboard</a> - real data from a 200-epoch ResNet-20 run across 3 GPUs on 2 hosts, then the same view at every level of the cluster</em></p>
 
 The live dashboard updates via Server-Sent Events (no WebSocket, no npm),
 tracks CPU/GPU/RAM/VRAM, and supports late join - open it mid-training and
@@ -550,7 +535,7 @@ workspace) that reproduces published training setups (Logistic / MLP /
 LeNet-5 / ResNet-20 eager and graph-built / Char-RNN / GPT-nano /
 Conv-AE / OLMo-150M on MNIST, CIFAR-10, Shakespeare, olmo-mix) to build
 scientifically valid solo baselines, then measures DDP/ElChe convergence
-quality against them across six DDP modes:
+quality against them across all five DDP modes:
 
 ```bash
 fdl ddp-bench --list                       # list models and modes
@@ -568,7 +553,7 @@ leaves a self-contained `dashboard.html` portal beside it.
 ### Built-in datasets
 
 The framework ships ready-to-use parsers for common benchmarks (all
-implement `BatchDataSet`, plug straight into `DataLoader::builder`):
+implement `BatchDataSet`, plug straight into `DataLoader::from_batch_dataset`):
 
 ```rust
 use flodl::data::datasets::{Cifar10, Mnist, Shakespeare};
@@ -719,7 +704,7 @@ to calibrate - shorter models (logistic through gpt-nano) confirm DDP
 convergence across architectures.
 
 **[DDP Benchmark Report](https://github.com/flodl-labs/flodl/blob/main/docs/ddp-benchmark.md)** -
-full results for 8 models across six DDP modes plus solo baselines,
+full results for 8 models across all five DDP modes plus solo baselines,
 seeded and reproducible at initialization
 
 ## Why Rust for Deep Learning?
@@ -804,7 +789,7 @@ codegen-units = 1
 |-----------|-------------|
 | `Trainer::builder(...).run()` | Universal entry. Same call scales from CPU to multi-host cluster. |
 | `Trainer::run(..., TrainerConfig)` | Config-bag form - same launcher, data-driven setup. |
-| `Ddp::wrap(&model, device, rank, &rdv)` | Low-level per-rank gradient-sync for manual control (GAN/RL). |
+| `Trainer::builder(...).into_worker()` | Cooperative tier - you own the loop body, the controller stays authoritative over cadence, partition, eval-election and checkpointing. |
 | `ElCheMode` | `NcclSync/Cadence`, `CpuSync/Cadence/Async`. Default `NcclCadence`. |
 | `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
 | `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
@@ -814,7 +799,7 @@ codegen-units = 1
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
 | `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
-| `Ddp::wrap` | Manual thread-based DDP primitive (per-rank gradient sync) for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
+| `Ddp::wrap(&model, device, rank, &rdv)` | Bypass tier - manual thread-based per-rank gradient sync, for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
 
 </details>
 
@@ -824,7 +809,7 @@ Every differentiable path is verified against finite-difference gradients:
 - 117 autograd op-level checks (every op + compositions)
 - Module-level checks (every NN module, input + parameter gradients)
 - Exact optimizer step verifications (SGD, Adam, AdamW, RMSprop, Adagrad, RAdam, NAdam)
-- 1992 library tests in `flodl` (2634 across the workspace), zero clippy warnings - all tests run on both CPU and CUDA
+- 2k+ library tests in `flodl` (2.7k+ across the workspace), zero clippy warnings - the suite runs on CPU and on CUDA, with NCCL/DDP and serial gates of their own
 
 ### Hardware Compatibility
 
@@ -920,13 +905,9 @@ collector?
 
 An [earlier attempt in Go](https://github.com/fab2s/goDl) proved the
 architecture - the graph builder, the module system, the observation engine -
-but hit a wall: Go's GC cannot manage GPU memory deterministically. That
-required building five layers of memory management infrastructure on top of
-the language, not with it.
-
-Rust solved this at the language level. `impl Drop for Tensor` replaced
-hundreds of lines of lifecycle management. The graph builder, module
-composition, and design philosophy carried forward; the memory fights didn't.
+but hit the GC wall described above. Rust solved it at the language level, so
+the graph builder, module composition, and design philosophy carried forward;
+the memory fights didn't.
 
 ## License
 
