@@ -33,7 +33,7 @@
     })();
   </script>
 </head>
-<body>
+<body{% if page.url contains '/guide' %} class="guide-page"{% endif %}>
 
 <header class="site-header">
   <nav>

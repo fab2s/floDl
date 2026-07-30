@@ -26,17 +26,16 @@ layout: default
   </main>
 </div>
 
-<style>
-  /* Diagram holders must not look like code blocks. */
-  .mermaid { background: transparent; border: 0; padding: 0; text-align: center; }
-  .mermaid svg { max-width: 100%; height: auto; }
-</style>
 <!-- Mermaid: render ```mermaid fences as diagrams, matching GitHub's
      native rendering of the same docs/ sources. kramdown+rouge emit
      them as plain code blocks (div.language-mermaid > pre > code or
      pre > code.language-mermaid); this rewrites those into
      <pre class="mermaid"> and loads mermaid only when the page
-     actually carries one. -->
+     actually carries one. Styles live in assets/css/style.css.
+
+     Rendered diagrams then become click/tap-to-enlarge: fitting a wide
+     diagram to the text column shrinks its labels past legibility, so the
+     full-size view opens in a modal <dialog>. -->
 <script type="module">
   const blocks = document.querySelectorAll(
     'div.language-mermaid pre > code, pre > code.language-mermaid'
@@ -55,5 +54,71 @@ layout: default
     }
     mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
     await mermaid.run({ querySelector: '.mermaid' });
+    enableDiagramZoom();
+  }
+
+  function enableDiagramZoom() {
+    // One <dialog> reused by every diagram. showModal() gives top-layer
+    // rendering, ::backdrop, Esc-to-close and focus handling for free.
+    const dialog = document.createElement('dialog');
+    dialog.className = 'diagram-modal';
+    dialog.setAttribute('aria-label', 'Enlarged diagram');
+    const surface = document.createElement('div');
+    surface.className = 'diagram-modal-surface';
+    const close = document.createElement('button');
+    close.className = 'diagram-modal-close';
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Close diagram');
+    close.textContent = '×';
+    dialog.append(close, surface);
+    document.body.append(dialog);
+
+    // The SVG is MOVED, not cloned. mermaid references its own arrowhead and
+    // marker defs by `url(#id)`; a clone would put duplicate ids in the
+    // document and those references resolve to the first match, so a cloned
+    // diagram can lose or borrow the wrong markers. Moving sidesteps it, and
+    // the node goes back to its holder on close.
+    let home = null, svg = null, inlineStyle = null;
+
+    function open(holder) {
+      svg = holder.querySelector('svg');
+      if (!svg) return;
+      home = holder;
+      inlineStyle = svg.getAttribute('style');
+      svg.removeAttribute('style');
+      surface.append(svg);
+      dialog.showModal();
+    }
+
+    function restore() {
+      if (!svg || !home) return;
+      if (inlineStyle === null) svg.removeAttribute('style');
+      else svg.setAttribute('style', inlineStyle);
+      home.prepend(svg);
+      svg = home = inlineStyle = null;
+    }
+
+    // `close` fires for the button, Esc, and dialog.close() alike.
+    dialog.addEventListener('close', restore);
+    close.addEventListener('click', () => dialog.close());
+    // Click anywhere in the view to dismiss - standard lightbox behaviour.
+    surface.addEventListener('click', () => dialog.close());
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+
+    for (const holder of document.querySelectorAll('.mermaid')) {
+      if (!holder.querySelector('svg')) continue;   // render failed; leave it alone
+      holder.dataset.zoomable = '';
+      holder.setAttribute('role', 'button');
+      holder.setAttribute('tabindex', '0');
+      holder.setAttribute('aria-label', 'Enlarge diagram');
+      const hint = document.createElement('span');
+      hint.className = 'mermaid-hint';
+      hint.textContent = 'Click to enlarge';
+      holder.append(hint);
+      holder.addEventListener('click', () => open(holder));
+      holder.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(holder); }
+      });
+    }
   }
 </script>

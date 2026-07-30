@@ -1,0 +1,117 @@
+# Single source of truth for guide navigation.
+#
+# This file defines the guide's groups, their order, and their members. Three
+# things are DERIVED from it and must never be hand-maintained again:
+#
+#   1. site/_includes/sidebar.html  — group folds + links + chapter numbers
+#   2. each page's prev/next        — injected into site/guide/*.md by build_guide.py
+#   3. docs/README.md               — the GitHub-side index and reading order
+#
+# Before this file existed, all three were separate hand-kept lists (plus the
+# NN- filename prefixes), and they had already drifted: a tutorial's nav label
+# named a doc by a title it no longer had, and the chapter number was stored
+# three times (filename, H1, sidebar).
+#
+# Fields per group:
+#   label     — sidebar heading
+#   fold      — render as a collapsible <details> group
+#   open      — fold's default state when it holds no active page
+#   numbered  — prefix members with their 1-based position in the sidebar
+#   members   — ordered; each has `stub` (basename in site/_stubs/) and `title`
+#
+# `title` here is the sidebar/nav label. The page's own <h1> comes from the
+# source markdown; permalinks live in the stubs.
+
+groups:
+  - label: "Coming from PyTorch"
+    fold: true
+    open: true
+    numbered: false
+    members:
+      - stub: "porting"
+        title: "Porting from PyTorch"
+        blurb: "Module mapping, FlowBuilder patterns, training-loop translation. AI-assisted via /port."
+      - stub: "rust-primer"
+        title: "Rust for PyTorch Users"
+        blurb: "10 Rust patterns in 15 minutes. Everything you need to write training scripts."
+      - stub: "migration"
+        title: "PyTorch Migration Reference"
+        blurb: "Side-by-side PyTorch vs floDl for every concept, operation, and pattern."
+
+  - label: "Tutorials"
+    fold: true
+    open: true
+    numbered: true
+    members:
+      - stub: "tensors"
+        title: "Tensors"
+        blurb: "Creation, operations, memory management, device transfer."
+      - stub: "autograd"
+        title: "Autograd"
+        blurb: "Variables, gradient tracking, backward pass, no_grad."
+      - stub: "modules"
+        title: "Modules"
+        blurb: "Linear, Conv2d, normalization, dropout, RNN cells, activations."
+      - stub: "training"
+        title: "Training"
+        blurb: "Losses, optimizers, the Trainer tiers, mixed precision, the full training loop."
+      - stub: "graph-builder"
+        title: "The Graph Builder"
+        blurb: "The fluent API: chains, residuals, parallel branches, mapping."
+      - stub: "advanced-graphs"
+        title: "Advanced Graphs"
+        blurb: "Forward references, loops, gates, switches, recurrent state."
+      - stub: "visualization"
+        title: "Visualization"
+        blurb: "DOT/SVG output, reading diagrams, profiling overlay."
+      - stub: "utilities"
+        title: "Utilities"
+        blurb: "Gradient clipping, checkpoints, initialization, LR scheduling, reproducibility, trend control."
+      - stub: "monitor"
+        title: "Training Monitor"
+        blurb: "ETA, resource tracking, live web dashboard, HTML export."
+      - stub: "graph-tree"
+        title: "Graph Tree"
+        blurb: "Hierarchical composition, freeze/thaw subtrees, subgraph checkpoints, cross-boundary observation."
+      - stub: "multi-gpu"
+        title: "Multi-GPU Training"
+        blurb: "Trainer::run / builder, process-per-rank auto-promote, ElChe, DataLoader integration."
+      - stub: "async-ddp"
+        title: "Heterogeneous & Multi-Host DDP"
+        blurb: "ElChe cadence, process-per-rank clusters, A/B-testable backends."
+      - stub: "data-loading"
+        title: "Data Loading"
+        blurb: "DataLoader, resident/streaming modes, VRAM-aware prefetch, DDP integration."
+      - stub: "flodl-hf"
+        title: "HuggingFace Integration"
+        blurb: "Load BERT, RoBERTa, DistilBERT, ALBERT, XLM-R or DeBERTa-v2; classify, NER, QA, fill-mask; fine-tune and round-trip back."
+
+  - label: "DDP Reference"
+    fold: true
+    open: false
+    numbered: false
+    members:
+      - stub: "ddp-reference"
+        title: "Distributed Training Reference"
+        blurb: "Cadence modes, average backends, configuration knobs, cluster deployment, troubleshooting."
+
+  - label: "CLI"
+    fold: true
+    open: false
+    numbered: false
+    members:
+      - stub: "cli"
+        title: "The floDl CLI"
+        blurb: "fdl commands, environment overlays, fdl.yml schema, libtorch management."
+
+  - label: "Platform & Help"
+    fold: false
+    open: true
+    numbered: false
+    members:
+      - stub: "mac-apple-silicon"
+        title: "Mac / Apple Silicon"
+        blurb: "Running flodl on Apple Silicon through the Docker CPU path."
+      - stub: "troubleshooting"
+        title: "Troubleshooting"
+        blurb: "Real error messages and how to fix them. Build, runtime, training."
