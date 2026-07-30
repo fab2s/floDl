@@ -104,6 +104,15 @@ groups:
         title: "The floDl CLI"
         blurb: "fdl commands, environment overlays, fdl.yml schema, libtorch management."
 
+  - label: "Internals"
+    fold: true
+    open: false
+    numbered: false
+    members:
+      - stub: "architecture"
+        title: "Distributed Architecture"
+        blurb: "Seven views of the distributed pattern: role topology, training lifecycle, reduce backends, ElChe scheduling, message catalog, failure handling."
+
   - label: "Platform & Help"
     fold: false
     open: true

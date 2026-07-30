@@ -216,4 +216,4 @@ be invoking `cargo` directly. This is fine for development, but `fdl build` /
 
 ---
 
-Previous: [The floDl CLI](cli.md) | Next: [Troubleshooting](troubleshooting.md)
+Previous: [Distributed Architecture](distributed/architecture.md) | Next: [Troubleshooting](troubleshooting.md)
