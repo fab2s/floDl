@@ -265,6 +265,41 @@ placement)? Pick one:
   [Multi-GPU](11-multi-gpu.md)).
 - **Single-device manual loop**: the pattern below.
 
+The choice comes down to two questions, and only the first one is really
+about your model:
+
+```mermaid
+flowchart TD
+    Q1{"Is your step shape one forward,<br/>one backward, one gated sync,<br/>one optimizer step?"}
+    Q2{"Do you want to write<br/>the loop body yourself?"}
+    MA["Managed<br/>Trainer::run / builder().run()<br/>the framework owns the loop"]
+    CO["Cooperative<br/>builder().into_worker()<br/>you own the loop body"]
+    BY["Bypass<br/>Ddp::wrap<br/>you own everything"]
+    WHY["multi-model or multi-optimizer with distinct<br/>sync cadences, custom collectives,<br/>dynamic resharding mid-run"]
+    SAME["same authoritative controller:<br/>cadence, partition, averaging and eval election<br/>are identical, so the trained model is identical"]
+
+    Q1 -- "no" --> BY
+    Q1 -- "yes" --> Q2
+    Q2 -- "no" --> MA
+    Q2 -- "yes" --> CO
+    BY -.- WHY
+    MA -.- SAME
+    CO -.- SAME
+
+    classDef tier fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef esc fill:#fff3e0,stroke:#ffa726,color:#e65100
+    classDef note fill:#eceff1,stroke:#90a4ae,color:#37474f
+    class MA,CO tier
+    class BY esc
+    class WHY,SAME note
+```
+
+Managed and cooperative are the **same engine** - they consult one
+authoritative controller, so switching between them changes who writes the
+`for` loop and nothing about the result. Bypass is a deliberate escape hatch
+for step shapes the controller cannot model, not a fallback when the others
+feel restrictive.
+
 `flodl-hf` task-head wrappers (e.g. `BertForSequenceClassification`)
 `impl Module` directly, so they ride the same `Trainer::builder(...)` /
 `Trainer::run(...)` entry - see
