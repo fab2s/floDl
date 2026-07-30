@@ -93,6 +93,46 @@ pub fn find_config_in(dir: &Path) -> Option<PathBuf> {
     CONFIG_NAMES.iter().map(|n| dir.join(n)).find(|c| c.is_file())
 }
 
+/// Walk up from `start` to the PROJECT-level config, stepping over
+/// command-level fdl.ymls on the way. A command directory (e.g.
+/// `ddp-bench/`) carries its own fdl.yml in [`CommandConfig`] shape —
+/// `entry:`/`compile:`/`docker:`/`run:` at top level — which is not a
+/// [`ProjectConfig`] and must not be mistaken for one: project-scoped
+/// consumers (`fdl join`'s `join:` block, `fdl status`'s `cluster:`)
+/// run happily from inside a command dir and need the config that OWNS
+/// those blocks, one or more levels up. A file that is neither shape
+/// (unreadable, malformed) is returned as the answer so the caller's
+/// loader reports it loudly rather than this walk silently skipping a
+/// broken project config.
+///
+/// [`CommandConfig`]: super::CommandConfig
+/// [`ProjectConfig`]: super::ProjectConfig
+pub fn find_project_config(start: &Path) -> Option<PathBuf> {
+    const COMMAND_MARKERS: &[&str] = &["entry", "compile", "docker", "run", "append"];
+    let mut dir = start.to_path_buf();
+    loop {
+        if let Some(candidate) = find_config_in(&dir) {
+            let is_command_shaped = std::fs::read_to_string(&candidate)
+                .ok()
+                .and_then(|raw| {
+                    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&raw).ok()
+                })
+                .and_then(|v| v.as_mapping().cloned())
+                .is_some_and(|map| {
+                    COMMAND_MARKERS.iter().any(|k| {
+                        map.contains_key(serde_yaml_ng::Value::String((*k).into()))
+                    })
+                });
+            if !is_command_shaped {
+                return Some(candidate);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Prompt the user to copy an example config to the real path.
 /// Returns true if the copy succeeded.
 pub(super) fn try_copy_example(example: &Path, target: &Path) -> bool {

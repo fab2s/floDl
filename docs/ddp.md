@@ -918,6 +918,92 @@ configured capacity, so the window closes the instant every configured
 rank is in (zero added latency) and the run cannot start below full
 strength.
 
+#### The big picture, end to end
+
+One run, every moving part - a discovery controller holding a manual
+window, one worker walking in through a guardrailed sshd tunnel
+(`fdl join --ssh`), the operator firing the start. Fan-out agents and
+direct-dial walk-ins enter the exact same sequence at the "dial +
+hello" step; only the road differs:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OP as Operator
+    participant CTRL as Controller<br/>(mux :1337)
+    participant SSHD as join sshd<br/>(guardrailed)
+    participant FJ as fdl join<br/>(worker box)
+    participant AG as Agent<br/>(training binary)
+    participant RR as Relay + Ranks
+
+    OP->>CTRL: fdl @cluster-x train …
+    activate CTRL
+    Note over CTRL: join window opens<br/>(status: waiting)
+    FJ->>SSHD: ssh -L ⟶ forward to 127.0.0.1:1337
+    FJ->>AG: exec binary in agent role<br/>(spec in env, never argv)
+    AG->>CTRL: dial + hello (HMAC: token / salt)
+    CTRL-->>AG: Accept — ranks assigned in admission order
+    Note over CTRL: quorum met<br/>(status: staging — held)
+    OP->>CTRL: fdl status  ⟶  "roster startable"
+    OP->>CTRL: fdl start (POST /start, authenticated)
+    CTRL-->>AG: WorldFormed — envelope + relay spec
+    Note over AG: rewrites controller address with<br/>the one THIS join provably used
+    AG->>RR: spawn relay + one rank per GPU
+    RR->>CTRL: relay dials in — training runs
+    RR-->>AG: children exit
+    AG-->>CTRL: RankExited reports, then link EOF
+    Note over CTRL: every host link closed<br/>= run complete
+    deactivate CTRL
+```
+
+Three properties worth reading off the picture:
+
+- **The join connection never closes.** The same TCP stream carries
+  the hello, the admission reply, the formed-world artifacts, per-rank
+  exit reports upstream, and abort orders downstream - and its EOF is
+  the host's exit event. A walk-in host is nobody's child process, so
+  that link IS how the controller supervises it: the run is over when
+  every host link has closed, and a failing run sends `Abort` down the
+  links instead of leaving agents to guess.
+- **The agent trusts its own road, not the controller's map.** The
+  formed-world artifacts name a controller address, but the controller
+  authors it from *its* view of the topology - wrong on a host whose
+  tunnel sits on an ephemeral local port, wrong behind NAT. The agent
+  rewrites that address with the one its own join just provably used,
+  so the relay dials a road that is known to work.
+- **Ranks never learn any of this exists.** Everything downstream of
+  `WorldFormed` is byte-identical to the fixed-topology era; the
+  training code cannot tell a walk-in world from an enumerated one.
+
+The window itself is a small state machine. `auto` runs entirely on
+the clock; `manual` inserts an operator-held `staging` phase between
+quorum and formation; `hybrid` is both (the clock still closes, the
+operator may fire earlier):
+
+```mermaid
+stateDiagram-v2
+    [*] --> waiting: window opens —<br/>joins accumulate
+    waiting --> forming: auto/hybrid —<br/>target or expiry, quorum met
+    waiting --> staging: manual/hybrid —<br/>quorum met
+    staging --> forming: fdl start
+    staging --> forming: hybrid —<br/>target or expiry
+    waiting --> failed: hard cap,<br/>quorum never met
+    staging --> failed: hard cap, start<br/>never fired (manual)
+    forming --> training: artifacts shipped,<br/>relays dialed in
+    training --> done: every host<br/>link closed
+    training --> failed: coordinator lost /<br/>cohort below tolerance
+    note right of staging
+        the hold: walk-ins are still
+        admitted, and window expiry
+        holds too (manual) — only
+        fdl start or the hard cap
+        ends it
+    end note
+```
+
+Every state here is what `fdl status` prints as the lifecycle phase,
+live from before the window opens to the terminal verdict.
+
 Override via `controller.join:` to allow degraded starts or to hold
 the window open for extra dial-in workers:
 
@@ -993,7 +1079,11 @@ fdl join --ssh flodl-join@ctrl.example.com --bin target/release/train
 controller port (fresh per attempt, `ExitOnForwardFailure`, never a
 password prompt) and dials through it; the positional address is then
 the controller as seen FROM the ssh host, defaulting to
-`127.0.0.1:1337` - the sshd-on-the-controller-box convention.
+`127.0.0.1:1337` - the sshd-on-the-controller-box convention. The
+forward's local port is ephemeral, which is safe because of the
+address rewrite in the walkthrough above: the agent stamps the
+formed-world artifacts with the address its own join used, so the
+relay dials through the same forward.
 Arguments after `--` go to the binary verbatim and must match the run:
 rank children re-enter the binary with them. `--devices 0,1` scopes
 the offer (default: every GPU on the box), `--host` names the worker
@@ -1020,6 +1110,53 @@ finished, controller rebooted - the agent exits, `fdl join` backs off
 (5s doubling to 60s) and dials again, so a fleet of workers can sit
 ready before the operator ever launches, walk into the staging hold,
 and be re-armed for the next run the moment one ends.
+
+**Guardrailing the join sshd.** When workers arrive from outside the
+private network, the sshd their tunnels land on is the trust boundary
+- under `tunnel_only` it is the ONLY door, which is the point. The
+recipe keeps a compromised join key from being worth anything more
+than a port forward:
+
+```
+# authorized_keys entry for the join key — both lines of defense in one:
+restrict,port-forwarding,permitopen="127.0.0.1:1337",command="/usr/sbin/nologin" ssh-ed25519 AAAA... flodl-join
+```
+
+`restrict` turns off everything sshd can hand out (pty, X11, agent
+forwarding, user rc) in one future-proof word; `port-forwarding` turns
+the single needed capability back on; `permitopen` pins it to the
+controller mux port and nothing else; the forced `command=` neutralizes
+command execution, so `ssh -N` (what `fdl join` runs) is the only
+useful thing the key can do. For a permanent setup, put the key on a
+dedicated no-shell user and repeat the same restrictions at the daemon
+level so a mistake in either layer is caught by the other:
+
+```
+# sshd_config
+Match User flodl-join
+    AllowTcpForwarding local
+    PermitOpen 127.0.0.1:1337
+    ForceCommand /usr/sbin/nologin
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+```
+
+Expose it on a non-standard external port (a router forward to the
+box's 22, or a dedicated sshd instance on its own port), and hand
+workers `fdl join --ssh flodl-join@host:<port> --identity <key>`.
+
+The ephemeral variant of the same recipe is a **dedicated sshd
+instance whose lifetime brackets the run**: its own config, its own
+port, an authorized_keys carrying ONLY join keys - brought up right
+before the window opens, torn down after the run ends. A container
+works (any image with sshd + `network_mode: host`); so does
+`sshd -f <own config>` on a >1024 port, which needs no root at all.
+One asymmetry to respect when bounding the window: closing the door is
+not closing the hallway. Established forwards ARE the tunneled
+workers' transport for the entire run - after the world forms, disable
+new admissions (drop the router rule, remove the key) but tear the
+sshd itself down only once the run is over.
 
 One contract for user binaries: `Trainer::run` dispatches the cluster
 roles (agent, relay, rank) internally, so a binary that goes straight
@@ -1129,9 +1266,11 @@ field listing.
 
 While a run is up, the controller port answers plain HTTP GETs with
 the run's membership state as `state.json` - lifecycle phase
-(`waiting` / `forming` / `training` / `done` / `failed`), who has
-joined with what hardware, and the join-window countdowns while it is
-still open:
+(`waiting` / `staging` / `forming` / `training` / `done` / `failed`),
+who has joined with what hardware, the join-window countdowns while it
+is still open, and the start switch's mode and armed state on manual /
+hybrid runs (a staging roster renders "startable, fire with
+`fdl start`"):
 
 ```bash
 fdl @cluster status              # pretty summary from the overlay's controller
@@ -1149,10 +1288,12 @@ cluster run @ 192.168.122.1:1337 - training
     node-b  ranks [1, 2]  2x GTX 1060 6GB  libtorch builds/sm61-sm120  joined +1s
 ```
 
-The endpoint is read-only and lives exactly as long as the launcher
-process: it is up from before the join window opens (so `waiting` and
-`forming` are observable), and connection-refused afterwards is the
-honest "no run listening" signal (`fdl status` exits 1 with a note).
+The endpoint lives exactly as long as the launcher process: it is up
+from before the join window opens (so `waiting` and `forming` are
+observable), and connection-refused afterwards is the honest "no run
+listening" signal (`fdl status` exits 1 with a note). GETs are
+read-only; the one write this surface carries is the authenticated
+`POST /start` behind `fdl start` (see the staging hold above).
 Reachability follows the port's bind scope - an all-tunneled run
 exposes it through sshd only. See
 [CLI reference](cli.md#fdl-status) for address resolution details.

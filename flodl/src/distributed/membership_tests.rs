@@ -429,6 +429,83 @@ fn join_messages_round_trip_through_control_frames() {
 // Join window I/O over real loopback sockets
 // ---------------------------------------------------------------------------
 
+/// Rig repro (C2-PR4): the full staging flow over a REAL port mux —
+/// join window + status responder on their mux legs, one walk-in,
+/// `POST /start` — then prove the DISPATCHER is still alive. The
+/// controller/coordinator legs only come up AFTER formation, so a
+/// dispatcher that dies anywhere in the staging flow surfaces as
+/// "port mux dispatcher exited" at coordinator start (observed live).
+#[test]
+fn operator_start_leaves_the_mux_dispatcher_alive() {
+    use crate::distributed::port_mux::PortMux;
+    use crate::distributed::wire::CHANNEL_MAGIC_CONTROL;
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let abort = Arc::new(AtomicBool::new(false));
+    let (mux, accept) = PortMux::start(listener, Arc::clone(&abort)).unwrap();
+    let port = mux.port();
+    let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
+
+    let board = crate::distributed::status::StatusBoard::new();
+    board.configure_start(StartMode::Manual, salt_to_hex(&salt));
+    let status_source = StreamSource::Mux(accept.status);
+    let board_srv = board.clone();
+    let abort_srv = Arc::clone(&abort);
+    let status_srv = std::thread::spawn(move || {
+        crate::distributed::status::serve_status(status_source, board_srv, abort_srv);
+    });
+
+    let config = JoinConfig {
+        min_rank_start: 1,
+        start_mode: StartMode::Manual,
+        join_timeout_secs: 30,
+        max_join_timeout_secs: 60,
+        ..test_config()
+    };
+    let join_source = StreamSource::Mux(accept.join);
+    let gate_salt = salt;
+    let gate_abort = Arc::clone(&abort);
+    let gate_board = board.clone();
+    let gate = std::thread::spawn(move || {
+        run_join_window(
+            &join_source, &config, &gate_salt, true, None, &gate_abort, &gate_board,
+        )
+    });
+
+    // Walk in (quorum met → staging hold), then fire the start switch
+    // from loopback, exactly as `fdl start` does on the controller box.
+    let (_conn, reply) = dial_and_join(port, &salt, "host-a", 1);
+    assert!(matches!(reply, JoinMsgWire::Accept { .. }));
+    let mut post = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    post.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    post.write_all(
+        b"POST /start HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+          Content-Length: 0\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    post.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let formed = gate.join().unwrap().expect("world forms on operator start");
+    assert_eq!(formed.world_size, 1);
+
+    // THE invariant: a fresh dial on another channel still routes —
+    // the dispatcher survived the staging flow.
+    let mut ctrl = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write_channel_magic(&mut ctrl, CHANNEL_MAGIC_CONTROL).unwrap();
+    let routed = accept.control.recv_timeout(Duration::from_secs(5));
+    assert!(
+        routed.is_ok(),
+        "mux dispatcher must survive operator start (got {routed:?})",
+    );
+
+    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = status_srv.join();
+    drop(mux);
+}
+
 fn spawn_window(
     config: JoinConfig,
     salt: SessionSalt,

@@ -224,13 +224,36 @@ pub(crate) fn join_world(
         )
     })?;
     match frame.decode::<JoinMsgWire>()? {
-        JoinMsgWire::WorldFormed { envelope_hex, relay_spec_hex } => Ok(JoinOutcome {
-            salt,
-            ranks,
-            envelope_hex,
-            relay_spec_hex,
-            stream,
-        }),
+        JoinMsgWire::WorldFormed { envelope_hex, relay_spec_hex } => {
+            // The controller authors dial addresses from ITS view of
+            // the topology, but only THIS agent knows the address that
+            // provably reaches the controller from THIS host — the one
+            // the join it just completed used. A walk-in's tunnel
+            // (`fdl join --ssh` forwards on an ephemeral local port)
+            // or a NAT'd controller make the authored address plain
+            // wrong on this host, and the relay dying on it takes the
+            // whole host down. Rewrite both artifacts with the
+            // join-verified address; fan-out agents rewrite to the
+            // values already in place (their tunnels bind the
+            // controller port itself), so this is a no-op there.
+            let envelope_hex = rewrite_envelope_controller(
+                &envelope_hex,
+                controller_host,
+                controller_port,
+            )?;
+            let relay_spec_hex = relay_spec_hex
+                .map(|hex| {
+                    rewrite_relay_controller(&hex, controller_host, controller_port)
+                })
+                .transpose()?;
+            Ok(JoinOutcome {
+                salt,
+                ranks,
+                envelope_hex,
+                relay_spec_hex,
+                stream,
+            })
+        }
         JoinMsgWire::Abort { reason } => Err(TensorError::new(&format!(
             "cluster agent: run aborted before world formation: {reason}"
         ))),
@@ -238,6 +261,54 @@ pub(crate) fn join_world(
             "cluster agent: expected WorldFormed or Abort, got {other:?}"
         ))),
     }
+}
+
+/// Rewrite the slim envelope's `controller.host` / `controller.port`
+/// with the join-verified address (see the call site in [`join_world`]).
+/// Loud on malformed artifacts — a truncated envelope must fail here,
+/// named, not in a rank child's parser.
+fn rewrite_envelope_controller(
+    envelope_hex: &str,
+    host: &str,
+    port: u16,
+) -> Result<String> {
+    let bytes = crate::distributed::cluster::hex_decode(envelope_hex)
+        .map_err(|e| TensorError::new(&format!("cluster agent: envelope hex: {e}")))?;
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| TensorError::new(&format!("cluster agent: envelope JSON: {e}")))?;
+    let Some(controller) = envelope
+        .get_mut("controller")
+        .and_then(|c| c.as_object_mut())
+    else {
+        return Err(TensorError::new(
+            "cluster agent: envelope carries no controller object",
+        ));
+    };
+    controller.insert("host".into(), serde_json::Value::String(host.to_string()));
+    controller.insert("port".into(), serde_json::Value::from(port));
+    let json = serde_json::to_string(&envelope).map_err(|e| {
+        TensorError::new(&format!("cluster agent: envelope re-encode: {e}"))
+    })?;
+    Ok(crate::distributed::cluster::hex_encode(json.as_bytes()))
+}
+
+/// Same rewrite for the relay spec: the relay is this host's out-dialer,
+/// so it must dial the road the join proved works.
+fn rewrite_relay_controller(
+    relay_spec_hex: &str,
+    host: &str,
+    port: u16,
+) -> Result<String> {
+    let bytes = crate::distributed::cluster::hex_decode(relay_spec_hex)
+        .map_err(|e| TensorError::new(&format!("cluster agent: relay spec hex: {e}")))?;
+    let mut spec: super::RelaySpec = serde_json::from_slice(&bytes)
+        .map_err(|e| TensorError::new(&format!("cluster agent: relay spec JSON: {e}")))?;
+    spec.controller_host = host.to_string();
+    spec.controller_port = port;
+    let json = serde_json::to_string(&spec).map_err(|e| {
+        TensorError::new(&format!("cluster agent: relay spec re-encode: {e}"))
+    })?;
+    Ok(crate::distributed::cluster::hex_encode(json.as_bytes()))
 }
 
 /// Resolve the physical devices this worker offers: an explicit list
@@ -723,6 +794,34 @@ mod tests {
         }
     }
 
+    /// Minimal controller-authored envelope, hex-encoded — the
+    /// controller's (possibly wrong-for-this-host) dial address baked
+    /// in, as `build_slim_envelope_for` does.
+    fn test_envelope_hex(host: &str, port: u16) -> String {
+        let envelope = serde_json::json!({
+            "controller": { "host": host, "port": port },
+            "world_size": 2,
+        });
+        crate::distributed::cluster::hex_encode(envelope.to_string().as_bytes())
+    }
+
+    /// Controller-authored relay spec, hex-encoded.
+    fn test_relay_hex(host: &str, port: u16) -> String {
+        let spec = super::super::RelaySpec {
+            host: "worker-x".to_string(),
+            controller_host: host.to_string(),
+            controller_port: port,
+            ranks: vec![3, 4],
+            salt_hex: salt_to_hex(&test_salt()),
+            world_size: 2,
+            data_channel: true,
+            frame_ceiling_bytes: 1024,
+        };
+        crate::distributed::cluster::hex_encode(
+            serde_json::to_string(&spec).unwrap().as_bytes(),
+        )
+    }
+
     /// A fake controller serving exactly one join dial: consume the
     /// channel magic, read the hello with `key`, then play back
     /// `replies` (the first keyed with `key`, the rest with `salt` —
@@ -795,16 +894,37 @@ mod tests {
                     formation_wait_secs: 60,
                 },
                 JoinMsgWire::WorldFormed {
-                    envelope_hex: "aa11".to_string(),
-                    relay_spec_hex: Some("bb22".to_string()),
+                    // Controller-authored addresses deliberately WRONG
+                    // for this host (the tunnel/NAT case): the agent
+                    // must rewrite both with the address the join
+                    // actually used.
+                    envelope_hex: test_envelope_hex("192.168.1.1", 1337),
+                    relay_spec_hex: Some(test_relay_hex("192.168.1.1", 1337)),
                 },
             ],
         );
         let outcome = join_world("127.0.0.1", port, None, test_hello()).unwrap();
         assert_eq!(outcome.salt, salt);
         assert_eq!(outcome.ranks, vec![3, 4]);
-        assert_eq!(outcome.envelope_hex, "aa11");
-        assert_eq!(outcome.relay_spec_hex.as_deref(), Some("bb22"));
+        // Join-verified address rewrite: the artifacts now dial where
+        // THIS join provably reached the controller.
+        let envelope: serde_json::Value = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(&outcome.envelope_hex).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope["controller"]["host"], "127.0.0.1");
+        assert_eq!(envelope["controller"]["port"], port);
+        assert_eq!(envelope["world_size"], 2, "other fields untouched");
+        let relay: super::super::RelaySpec = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(
+                outcome.relay_spec_hex.as_deref().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(relay.controller_host, "127.0.0.1");
+        assert_eq!(relay.controller_port, port);
+        assert_eq!(relay.ranks, vec![3, 4], "other fields untouched");
         // The controller saw the hello it was sent.
         assert_eq!(controller.join().unwrap(), test_hello());
     }
@@ -822,13 +942,14 @@ mod tests {
                     formation_wait_secs: 60,
                 },
                 JoinMsgWire::WorldFormed {
-                    envelope_hex: String::new(),
+                    envelope_hex: test_envelope_hex("10.0.0.1", 9000),
                     relay_spec_hex: None,
                 },
             ],
         );
         let outcome = join_world("127.0.0.1", port, Some(salt), test_hello()).unwrap();
         assert_eq!(outcome.salt, salt);
+        assert!(outcome.relay_spec_hex.is_none());
         controller.join().unwrap();
     }
 

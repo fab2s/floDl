@@ -617,11 +617,13 @@ per-host binary build, skippable with `--no-prebuild`.)
 ### `fdl status`
 
 Live status of a running cluster: lifecycle phase (`waiting` /
-`forming` / `training` / `done` / `failed`), who has joined with what
-hardware, and the join-window countdowns while it is still open. The
-controller serves the state as `state.json` over plain HTTP on its
-training port, so no extra port or config is involved — and `curl`
-works where fdl isn't installed.
+`staging` / `forming` / `training` / `done` / `failed`), who has
+joined with what hardware, the join-window countdowns while it is
+still open, and — on `start: manual` / `hybrid` runs — the start
+switch's state (a staging roster renders **"roster startable, fire
+with `fdl start`"**). The controller serves the state as `state.json`
+over plain HTTP on its training port, so no extra port or config is
+involved — and `curl` works where fdl isn't installed.
 
 ```bash
 fdl @cluster status              # controller from the overlay's cluster.yml
@@ -640,6 +642,75 @@ Exit code: **0** when the state was fetched and printed, **1** when no
 endpoint answered. The endpoint lives exactly as long as the launcher
 process — connection-refused after a run ends is the expected "no run
 listening" signal, not a fault.
+
+### `fdl start`
+
+Fire the operator start switch of a **staging** cluster run. A join
+window opened with `controller.join.start: manual` (or `hybrid`) holds
+the roster once quorum is met instead of forming on the clock — the
+scavenged-credit shape: launch instances until the money runs out,
+watch `fdl status`, start when the roster looks full enough.
+
+```bash
+fdl @cluster start               # controller from the overlay's cluster.yml
+fdl start --addr host[:port]     # explicit controller
+fdl start --token <hex>          # non-loopback fire: the run's join token
+```
+
+Trust mirrors join admission: fired from the controller box (or
+through the sshd tunnel) the loopback peer address is the credential
+and no token is needed; from anywhere else `--token` must match the
+run's `controller.join.token`. Address resolution is the same as
+[`fdl status`](#fdl-status).
+
+Refusals name their reason and are never queued — auto mode (no switch
+to fire), quorum not met (with counts), window already closed, bad
+token. Exit code: **0** when the start was armed (the world forms at
+the next poll — watch `fdl status`), **1** otherwise.
+
+### `fdl join`
+
+Join a cluster run's window as a **self-deployed worker**: the
+worker-side walk-in for discovery windows
+(`controller.join.discovery: true`), where the window alone defines
+the world and worker addresses need not exist in any roster. It dials
+the controller, offers the box's GPUs, and runs your training binary
+in agent role — the binary joins, then spawns and supervises this
+host's relay and rank children itself; training code downstream is
+byte-identical to the fan-out path.
+
+```bash
+# Direct dial (trusted segment), authenticated by the run token:
+fdl join 10.0.0.1:1337 --token <hex> --bin target/release/train -- --model resnet
+
+# Through a guardrailed sshd on the controller box (the controller
+# binds loopback under `tunnel_only`; reachability = authentication):
+fdl join --ssh flodl-join@ctrl.example.com --identity ~/.ssh/join_key \
+         --bin target/release/train -- --model resnet
+```
+
+- `--ssh [user@]host[:port]` brings up a local `ssh -L` forward of the
+  controller port (fresh per attempt, `ExitOnForwardFailure`, never a
+  password prompt) and dials through it. The positional controller
+  address is then as seen FROM the ssh host — default `127.0.0.1:1337`.
+- Arguments after `--` go to the binary verbatim and must match the
+  run: rank children re-enter the binary with them.
+- `--devices 0,1` scopes the GPUs offered (default: all);
+  `--host` names the worker in the roster (default: hostname).
+- `--persist` re-dials with backoff (5s doubling to 60s) whenever the
+  agent exits — no window open yet, run finished, controller rebooted —
+  the systemd / golden-image mode.
+- Inside a project, the active libtorch's `lib/` rides
+  `LD_LIBRARY_PATH` onto the binary automatically (`FDL_LIBTORCH_CASE`
+  honored) and its variant label rides the join hello.
+
+Every flag defaults from a top-level `join:` block in `fdl.yml` (see
+`fdl.yml.example`), so a golden image boots into bare `fdl join`.
+
+Exit code: the agent's own — **0** when this host's ranks all finished
+cleanly. Under `--persist` the command only returns on setup errors.
+Full protocol walkthrough, trust model, and the join-sshd guardrail
+recipe: [DDP reference](ddp.md#dial-in-membership-the-join-window).
 
 ### `fdl nccl`
 

@@ -24,8 +24,8 @@ pub use cluster::{
 pub use command::{load_command, load_command_with_env};
 pub use loading::{
     cluster_dispatch_enabled, config_layer_sources, find_config, find_config_in,
-    load_merged_value, load_project, load_project_with_env, resolve_cluster_dispatch,
-    resolve_config_layers,
+    find_project_config, load_merged_value, load_project, load_project_with_env,
+    resolve_cluster_dispatch, resolve_config_layers,
 };
 pub use schema::{
     validate_schema, ArgSpec, CommandConfig, CommandKind, CommandSpec, OptionSpec,
