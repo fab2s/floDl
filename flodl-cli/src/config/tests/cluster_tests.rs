@@ -246,6 +246,53 @@ cluster:
     }
 
     #[test]
+    fn worker_join_block_parses_and_defaults() {
+        // Full shape — the golden-image recipe.
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(
+            "\
+join:
+  controller: 127.0.0.1:1337
+  ssh:
+    target: ctrl.example.com
+    user: flodl-join
+    identity_file: /etc/flodl/join_key
+  token: 0123456789abcdef0123456789abcdef
+  bin: target/release/train
+  host: worker-7
+  devices: [0, 1]
+  persist: true
+  args: [\"--model\", \"lenet\"]
+",
+        )
+        .unwrap();
+        let join = cfg.join.expect("join block parsed");
+        assert_eq!(join.controller.as_deref(), Some("127.0.0.1:1337"));
+        let ssh = join.ssh.as_ref().unwrap();
+        assert_eq!(ssh.target.as_deref(), Some("ctrl.example.com"));
+        assert_eq!(ssh.user.as_deref(), Some("flodl-join"));
+        assert_eq!(join.bin.as_deref(), Some("target/release/train"));
+        assert_eq!(join.devices, Some(vec![0, 1]));
+        assert!(join.persist);
+        assert_eq!(join.args, vec!["--model".to_string(), "lenet".into()]);
+
+        // Minimal shape: everything defaulted, persist off, no args.
+        let cfg: ProjectConfig =
+            serde_yaml_ng::from_str("join:\n  bin: t/bin\n").unwrap();
+        let join = cfg.join.expect("minimal join block");
+        assert_eq!(join.bin.as_deref(), Some("t/bin"));
+        assert!(join.controller.is_none() && join.ssh.is_none());
+        assert!(!join.persist && join.args.is_empty());
+
+        // Typo'd keys die loudly (deny_unknown_fields).
+        let err = serde_yaml_ng::from_str::<ProjectConfig>(
+            "join:\n  binn: t/bin\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("binn"), "got: {err}");
+    }
+
+    #[test]
     fn validate_rejects_missing_socket_ifname_when_multi_host() {
         let mut cfg: ProjectConfig =
             serde_yaml_ng::from_str(canonical_cluster_yaml()).unwrap();

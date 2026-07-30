@@ -121,6 +121,60 @@ pub struct StartArgs {
     pub token: Option<String>,
 }
 
+/// Join a cluster run's window as a self-deployed worker.
+///
+/// Dials the controller's join channel, offers this box's GPUs, and
+/// runs the training binary (`--bin`) in agent role: the binary joins,
+/// then spawns and supervises this host's relay and rank children
+/// itself. Every flag defaults from the `join:` block of fdl.yml when
+/// present; flags win. Arguments after a standalone `--` go to the
+/// training binary verbatim (they must match the run — rank children
+/// re-enter the binary with them).
+///
+/// Trust, mirroring join admission: `--token` presents the run's
+/// pre-shared credential; `--ssh` reaches a loopback-bound controller
+/// through its guardrailed sshd (reachability = authentication); with
+/// neither, the controller must run open admission.
+///
+/// Exit code: the agent's exit code (0 = this host finished cleanly).
+/// `--persist` re-dials on every exit instead — the systemd /
+/// golden-image mode.
+#[derive(crate::FdlArgs, Debug)]
+pub struct JoinArgs {
+    /// Controller mux address, `host[:port]` (default port 1337).
+    /// With `--ssh`, the address as seen FROM the ssh host — the
+    /// default `127.0.0.1:1337` is the sshd-on-the-controller-box
+    /// convention.
+    #[arg]
+    pub controller: Option<String>,
+    /// SSH tunnel hop, `[user@]host[:port]`: brings up a local `-L`
+    /// forward of the controller port and dials through it.
+    #[option]
+    pub ssh: Option<String>,
+    /// Identity file for the tunnel (`ssh -i`).
+    #[option]
+    pub identity: Option<String>,
+    /// Pre-shared session credential (the run's
+    /// `controller.join.token`).
+    #[option]
+    pub token: Option<String>,
+    /// Training binary to run in agent role.
+    #[option]
+    pub bin: Option<String>,
+    /// Logical host name in the roster (default: this machine's
+    /// hostname).
+    #[option]
+    pub host: Option<String>,
+    /// CUDA device ids to offer, comma-separated (default: all GPUs
+    /// on this host).
+    #[option]
+    pub devices: Option<String>,
+    /// Keep re-dialing across runs with backoff instead of exiting
+    /// when the agent does.
+    #[option]
+    pub persist: bool,
+}
+
 /// Generate flodl API reference.
 #[derive(crate::FdlArgs, Debug)]
 pub struct ApiRefArgs {
@@ -422,6 +476,13 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(StartArgs::schema),
         },
         BuiltinSpec {
+            path: &["join"],
+            description: Some(
+                "Join a cluster run's window as a self-deployed worker",
+            ),
+            schema_fn: Some(JoinArgs::schema),
+        },
+        BuiltinSpec {
             path: &["install"],
             description: Some("Install or update fdl globally"),
             schema_fn: Some(InstallArgs::schema),
@@ -573,8 +634,8 @@ mod tests {
         // documents the coupling explicitly.
         let dispatched = [
             "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "start", "api-ref", "init", "add", "install", "skill", "schema",
-            "completions", "autocomplete", "config", "version",
+            "start", "join", "api-ref", "init", "add", "install", "skill",
+            "schema", "completions", "autocomplete", "config", "version",
         ];
         for name in &dispatched {
             assert!(
@@ -593,8 +654,8 @@ mod tests {
             names,
             vec![
                 "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "start", "install", "skill", "api-ref",
-                "config", "schema", "completions", "autocomplete",
+                "probe", "status", "start", "join", "install", "skill",
+                "api-ref", "config", "schema", "completions", "autocomplete",
             ]
         );
     }

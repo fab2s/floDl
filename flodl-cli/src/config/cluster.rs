@@ -214,6 +214,55 @@ impl ClusterController {
     }
 }
 
+/// Top-level `join:` block — the worker-side counterpart of
+/// `controller.join:`. Carries defaults for `fdl join` so a golden
+/// image (or a systemd unit) can bake the whole dial-in recipe into
+/// config and run bare `fdl join`. Every field is overridable on the
+/// command line; flags win over this block.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerJoin {
+    /// Controller mux address, `host[:port]` (default port 1337).
+    /// Under `ssh:` this is the address as seen FROM the ssh host —
+    /// usually loopback, the guardrailed-sshd-on-the-controller-box
+    /// case.
+    #[serde(default)]
+    pub controller: Option<String>,
+    /// SSH tunnel hop: `fdl join` brings up a local `-L` forward of
+    /// the controller mux port through this host and dials loopback.
+    /// Same shape as a worker's `ssh:` sub-block (target / port /
+    /// user / identity_file / options).
+    #[serde(default)]
+    pub ssh: Option<SshConfig>,
+    /// Pre-shared session credential (the run's
+    /// `controller.join.token`), hex. Unset = open admission (the
+    /// controller hands the salt out in the accept reply).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Training binary to run in agent role. The one field `fdl join`
+    /// cannot default: the binary IS the protocol (it dials, joins,
+    /// and spawns this host's relay + rank children itself).
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// Logical host name presented in the join hello (default: this
+    /// machine's hostname).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// CUDA device indices to offer, one rank each (default: every
+    /// GPU nvidia-smi sees).
+    #[serde(default)]
+    pub devices: Option<Vec<u8>>,
+    /// Keep dialing across runs: when the agent exits (run finished,
+    /// controller gone, no window open yet) `fdl join` backs off and
+    /// re-dials instead of exiting. The systemd / golden-image mode.
+    #[serde(default)]
+    pub persist: bool,
+    /// Arguments for the training binary (the binary's own training
+    /// flags). A `--` tail on the command line replaces this list.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// CUDA device indices on a host. Either explicit (a list of indices) or
 /// the `"all"` shorthand (auto-detect at startup on that host).
 ///

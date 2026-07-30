@@ -415,7 +415,7 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
 /// non-`yes` value, else `None`. flodl's remote ssh (dispatch + probes) is
 /// non-interactive, so a prompt hangs it; `BatchMode=yes` is the one truly
 /// required ssh option. Every other flodl default is freely overridable (M17).
-fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
+pub(crate) fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
     opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
         (k.trim().eq_ignore_ascii_case("BatchMode")
