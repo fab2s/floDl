@@ -78,8 +78,8 @@ flowchart TB
     end
 
     L -.->|ONE SSH session| A1
-    L -.->|local spawn<br/>(in-process join)| W0
-    L -.->|local spawn<br/>(in-process join)| W1
+    L -.->|"local spawn<br/>(in-process join)"| W0
+    L -.->|"local spawn<br/>(in-process join)"| W1
     A1 -.->|spawns after WorldFormed| R1
     A1 -.->|spawns after WorldFormed| W2
     A1 -.->|spawns after WorldFormed| W3

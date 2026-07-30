@@ -423,5 +423,5 @@ Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vr
 
 ---
 
-Previous: [DDP Builder](12-async-ddp.md) |
+Previous: [Heterogeneous & Multi-Host DDP](12-async-ddp.md) |
 Next: [Tutorial 14: HuggingFace Integration](14-flodl-hf.md)
