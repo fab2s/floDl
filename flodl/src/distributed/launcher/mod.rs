@@ -1370,6 +1370,21 @@ pub fn run_launcher_with_config(
         // writes each emitted record to its node's bounded log, so the
         // live stream and the on-disk history share one producer.
         let record_log = config.record_log_dir.as_ref().map(|dir| {
+            // Echo where the stream actually lands. A relative `--record-log`
+            // resolves against the LAUNCHER's cwd, not the directory the user
+            // typed it from -- which is how `ddp-bench/runs/x` silently becomes
+            // `ddp-bench/ddp-bench/runs/x`. The directory is created lazily on
+            // the first record, so resolve by joining cwd rather than
+            // canonicalizing: the path legitimately does not exist yet.
+            let resolved = std::path::Path::new(dir);
+            let resolved = if resolved.is_absolute() {
+                resolved.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(resolved))
+                    .unwrap_or_else(|_| resolved.to_path_buf())
+            };
+            eprintln!("cluster launcher: record log -> {}", resolved.display());
             Arc::new(crate::monitor::record_log::RecordLog::new(
                 dir,
                 config
