@@ -1060,7 +1060,7 @@ VRAM.
 5. **Multi-GPU data splitting.** Multi-GPU training is now implemented via
    `Trainer::builder()` / `Trainer::run()`. The `DataLoader` supports distributed
    mode with proportional epoch sharding across devices. See
-   [DDP Reference](../ddp.md) for details.
+   [DDP Reference](../ddp/01-reference.md) for details.
 
 6. **Double-buffer epoch boundary.** When `advance_epoch()` is called and
    the async prefetch hasn't finished, the CPU blocks. In practice the

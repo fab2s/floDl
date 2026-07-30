@@ -216,7 +216,7 @@ devices it auto-promotes to process-per-rank. For mode selection
 cadence (ElChe), and cluster topology (`fdl.cluster.yml` /
 `ClusterBuilder`), see [Multi-GPU Training](11-multi-gpu.md), the
 [Heterogeneous & Multi-Host DDP tutorial](12-async-ddp.md), and the
-[DDP Reference](../ddp.md).
+[DDP Reference](../ddp/01-reference.md).
 
 ### `TrainerConfig` - the config-bag form
 
@@ -243,7 +243,7 @@ Trainer::run(model_factory, optim_factory, train_step, cfg)?.join()?;
 
 Same launcher trampoline as `Trainer::builder(...).run()`. Pick
 whichever shape matches your call site. Full setter surface in [DDP
-Reference: `TrainerConfig<M>`](../ddp.md#trainerconfigm--the-umbrella).
+Reference: `TrainerConfig<M>`](../ddp/01-reference.md#trainerconfigm---the-umbrella).
 
 ## Keep your own loop
 

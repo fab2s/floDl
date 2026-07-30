@@ -31,7 +31,10 @@ material in reading order for browsing the repository directly.
 
 ## DDP Reference
 
-- [Distributed Training Reference](ddp.md)
+- [Configuration Reference](ddp/01-reference.md)
+- [Multi-Host Cluster Guide](ddp/02-cluster-guide.md)
+- [Internals and Expert APIs](ddp/03-internals.md)
+- [Troubleshooting](ddp/04-troubleshooting.md)
 
 ## CLI
 

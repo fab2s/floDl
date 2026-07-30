@@ -109,10 +109,25 @@ permalink: /guide/
 <h2 style="font-size: 16px; border: none; padding: 0; margin-bottom: 16px;">DDP Reference</h2>
 
 <div class="guide-grid">
-  <a href="{{ '/guide/ddp-reference' | relative_url }}" class="guide-card">
+  <a href="{{ '/guide/ddp/reference' | relative_url }}" class="guide-card">
     <span class="num">DDP Reference</span>
-    <h3>Distributed Training Reference</h3>
-    <p>Cadence modes, average backends, configuration knobs, cluster deployment, troubleshooting.</p>
+    <h3>Configuration Reference</h3>
+    <p>Cadence modes, average backends, every TrainerConfig and ElCheConfig knob, callbacks, resume, elastic membership.</p>
+  </a>
+  <a href="{{ '/guide/ddp/cluster-guide' | relative_url }}" class="guide-card">
+    <span class="num">DDP Reference</span>
+    <h3>Multi-Host Cluster Guide</h3>
+    <p>Deploying a real cluster: the join window, fdl.cluster.yml, sshd guardrails, per-case libtorch, probe and status.</p>
+  </a>
+  <a href="{{ '/guide/ddp/internals' | relative_url }}" class="guide-card">
+    <span class="num">DDP Reference</span>
+    <h3>Internals and Expert APIs</h3>
+    <p>ElChe phase machine, outer optimizer, A/B testing, Ddp::wrap, NCCL and CUDA primitives.</p>
+  </a>
+  <a href="{{ '/guide/ddp/troubleshooting' | relative_url }}" class="guide-card">
+    <span class="num">DDP Reference</span>
+    <h3>Troubleshooting</h3>
+    <p>NCCL init failures, version skew, CUDA context corruption, OOM, CPU-averaging timeouts, cluster hangs.</p>
   </a>
 </div>
 

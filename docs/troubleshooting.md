@@ -381,7 +381,7 @@ port collisions - most "it should work" cases land in its output.
 
 For deeper troubleshooting (NCCL init failure, parameter mismatch,
 CUDA context corruption, OOM on smaller GPU, cluster progressive
-hangs), see the [DDP Reference - Troubleshooting](ddp.md#troubleshooting)
+hangs), see the [DDP Reference - Troubleshooting](ddp/04-troubleshooting.md)
 section.
 
 Common quick fixes:
@@ -397,7 +397,7 @@ Common quick fixes:
 
 - **Examples:** `cargo run --example quickstart` and `cargo run --example sine_wave`
 - **Tutorials:** Start with [Rust for PyTorch Users](tutorials/00-rust-primer.md)
-- **Multi-GPU:** [DDP Reference](ddp.md) and [Multi-GPU Tutorial](tutorials/11-multi-gpu.md)
+- **Multi-GPU:** [DDP Reference](ddp/01-reference.md) and [Multi-GPU Tutorial](tutorials/11-multi-gpu.md)
 - **Migration guide:** [PyTorch -> floDl](pytorch_migration.md)
 - **Issues:** [github.com/flodl-labs/flodl/issues](https://github.com/flodl-labs/flodl/issues)
 

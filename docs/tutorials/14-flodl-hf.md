@@ -711,4 +711,4 @@ those three are on the next ergonomics pass.
 
 ---
 
-Previous: [Data Loading](13-data-loading.md) | Next: [Distributed Training Reference](../ddp.md)
+Previous: [Data Loading](13-data-loading.md) | Next: [Configuration Reference](../ddp/01-reference.md)

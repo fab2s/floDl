@@ -92,8 +92,17 @@ groups:
     numbered: false
     members:
       - stub: "ddp-reference"
-        title: "Distributed Training Reference"
-        blurb: "Cadence modes, average backends, configuration knobs, cluster deployment, troubleshooting."
+        title: "Configuration Reference"
+        blurb: "Cadence modes, average backends, every TrainerConfig and ElCheConfig knob, callbacks, resume, elastic membership."
+      - stub: "ddp-cluster-guide"
+        title: "Multi-Host Cluster Guide"
+        blurb: "Deploying a real cluster: the join window, fdl.cluster.yml, sshd guardrails, per-case libtorch, probe and status."
+      - stub: "ddp-internals"
+        title: "Internals and Expert APIs"
+        blurb: "ElChe phase machine, outer optimizer, A/B testing, Ddp::wrap, NCCL and CUDA primitives."
+      - stub: "ddp-troubleshooting"
+        title: "Troubleshooting"
+        blurb: "NCCL init failures, version skew, CUDA context corruption, OOM, CPU-averaging timeouts, cluster hangs."
 
   - label: "CLI"
     fold: true

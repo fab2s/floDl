@@ -35,8 +35,24 @@ SKILL_ASSETS = [
     ("ai/adapters/claude/port-skill.md", "flodl-cli/assets/skills/claude-port.md"),
 ]
 
-# Link rewrites: (pattern, replacement)
-# Order matters — anchored variants before bare filenames.
+# Non-guide link targets, keyed by REPO-RELATIVE resolved path so the rule is
+# depth-agnostic (see rewrite_links). These are docs that exist in the repo but
+# are not guide pages: the site carries hand-built summaries for the benchmarks,
+# and design notes / examples live on GitHub.
+NON_GUIDE_PAGES = {
+    "docs/ddp-benchmark.md": "/ddp-benchmark",
+    "docs/benchmark.md": "/benchmark",
+}
+
+GITHUB_PREFIXES = [
+    ("docs/design/", "https://github.com/flodl-labs/flodl/blob/main/docs/design/"),
+    ("flodl/examples/", "https://github.com/flodl-labs/flodl/tree/main/flodl/examples/"),
+    ("ai/", "https://github.com/flodl-labs/flodl/blob/main/ai/"),
+]
+
+# Legacy regex rewrites, for anything the structural pass above cannot resolve
+# (targets that are not real repo paths). Order matters — anchored variants
+# before bare filenames. New splits should NOT need entries here.
 LINK_REWRITES = [
     (r"\(00-rust-primer\.md\)", "(/guide/rust-primer)"),
     (r"\(01-tensors\.md\)", "(/guide/tensors)"),
@@ -209,8 +225,41 @@ def nav_chain(groups):
     return [(m["stub"], m["title"], g["label"]) for g in groups for m in g["members"]]
 
 
-def rewrite_links(text):
-    """Rewrite docs/ relative links to /guide/ absolute links."""
+def rewrite_links(text, source_rel=None, source_to_permalink=None):
+    """Rewrite docs/ relative links to /guide/ absolute links.
+
+    Guide-to-guide links are resolved STRUCTURALLY: a relative target is joined
+    against the source file's own directory, normalised, and looked up in the
+    manifest's source -> permalink map. That makes the rewrite depth-agnostic, so
+    splitting a doc into a subdirectory (docs/ddp.md -> docs/ddp/*.md) needs no
+    new rules — the previous hand-maintained regex table needed one pattern per
+    (source depth x target) pair and grew with every split.
+
+    LINK_REWRITES still handles targets that are NOT guide pages: runnable
+    examples and design docs, which resolve to GitHub URLs.
+    """
+    if source_rel and source_to_permalink:
+        src_dir = os.path.dirname(source_rel)
+
+        def sub(m):
+            label, target, anchor = m.group(1), m.group(2), m.group(3) or ''
+            resolved = os.path.normpath(os.path.join(src_dir, target))
+            permalink = source_to_permalink.get(resolved)
+            if permalink:
+                return f'[{label}]({permalink}{anchor})'
+            # Non-guide targets, resolved the same way so depth never matters:
+            # hand-built site pages, and repo paths that become GitHub URLs.
+            if resolved in NON_GUIDE_PAGES:
+                return f'[{label}]({NON_GUIDE_PAGES[resolved]}{anchor})'
+            for prefix, url in GITHUB_PREFIXES:
+                if resolved.startswith(prefix):
+                    return f'[{label}]({url}{resolved[len(prefix):]}{anchor})'
+            return m.group(0)
+
+        text = re.sub(
+            r'\[([^\]]*)\]\((?!https?://|mailto:|#)([^)#]+?)(#[a-z0-9_-]+)?\)',
+            sub, text)
+
     for pattern, replacement in LINK_REWRITES:
         text = re.sub(pattern, replacement, text)
     return text
@@ -592,6 +641,11 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    # source path -> permalink, for the structural link rewrite.
+    source_to_permalink = {
+        os.path.normpath(sources[stub]): permalinks[stub] for stub in sources
+    }
+
     # Settle the sources' own nav tails before reading them for the site build.
     write_source_nav_tails(chain, sources)
 
@@ -608,7 +662,7 @@ def main():
         with open(source_path) as f:
             content = f.read()
 
-        content = rewrite_links(content)
+        content = rewrite_links(content, source_rel, source_to_permalink)
         content = strip_trailing_nav(content)
         clean_frontmatter = strip_source_from_frontmatter(frontmatter)
 
