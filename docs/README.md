@@ -38,7 +38,12 @@ material in reading order for browsing the repository directly.
 
 ## CLI
 
-- [The floDl CLI](cli.md)
+- [Install and Global Flags](cli/01-install.md)
+- [Project and libtorch Commands](cli/02-setup-commands.md)
+- [Cluster and Hardware Commands](cli/03-cluster-commands.md)
+- [Introspection and Tooling](cli/04-tooling-commands.md)
+- [The fdl.yml Manifest](cli/05-manifest.md)
+- [Working in the Source Checkout](cli/06-source-checkout.md)
 
 ## Internals
 

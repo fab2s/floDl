@@ -97,17 +97,17 @@ last_modified_at: 2026-04-28T21:22:12+02:00
     <div class="wyg-card">
       <h3>1. Install the CLI</h3>
       <p>One curl, zero Rust on your host. <code>fdl</code> auto-detects your GPU, downloads the matching libtorch, and scaffolds a Docker-ready project.</p>
-      <p><a href="{{ '/guide/cli' | relative_url }}">fdl reference &rarr;</a></p>
+      <p><a href="{{ '/guide/cli/install' | relative_url }}">fdl reference &rarr;</a></p>
     </div>
     <div class="wyg-card">
       <h3>2. Let an AI port it</h3>
       <p>Drop your PyTorch script into your AI coding assistant. In Claude Code, run <code>/port</code>. In any other tool, point the agent at the skill guide. The skill reads the source, classifies each block (model, data, training, DDP), maps to flodl, and writes a complete Rust project.</p>
-      <p><a href="{{ '/guide/porting' | relative_url }}">Porting guide &rarr;</a></p>
+      <p><a href="{{ '/guide/pytorch/porting' | relative_url }}">Porting guide &rarr;</a></p>
     </div>
     <div class="wyg-card">
       <h3>3. See the full mapping</h3>
       <p>Every PyTorch module, loss, optimizer, scheduler, and training pattern mapped to its flodl equivalent. For the hands-on reader.</p>
-      <p><a href="{{ '/guide/migration' | relative_url }}">PyTorch migration &rarr;</a></p>
+      <p><a href="{{ '/guide/pytorch/migration' | relative_url }}">PyTorch migration &rarr;</a></p>
     </div>
   </div>
 
@@ -182,7 +182,7 @@ cargo build</pre>
   </div>
 
   <p style="margin-top: 1.2rem;">
-    <a href="{{ '/guide/cli' | relative_url }}#1-standalone-no-project-required" class="btn btn-outline" style="font-size: 14px;">
+    <a href="{{ '/guide/cli/install' | relative_url }}#1-standalone-no-project-required" class="btn btn-outline" style="font-size: 14px;">
       Standalone reference &rarr;
     </a>
     <a href="https://crates.io/crates/flodl-cli" target="_blank" class="btn btn-outline" style="font-size: 14px;">
@@ -392,7 +392,7 @@ commands:
     <a href="{{ '/ddp-benchmark' | relative_url }}" class="btn btn-outline" style="font-size: 14px;">
       DDP benchmark report &rarr;
     </a>
-    <a href="{{ '/guide/ddp-reference' | relative_url }}" class="btn btn-outline" style="font-size: 14px;">
+    <a href="{{ '/guide/ddp/reference' | relative_url }}" class="btn btn-outline" style="font-size: 14px;">
       DDP reference &rarr;
     </a>
   </p>

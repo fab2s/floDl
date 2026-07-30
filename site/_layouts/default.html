@@ -43,7 +43,7 @@
     </button>
     <div class="nav-links">
       <a href="{{ '/guide/' | relative_url }}" {% if page.url contains '/guide' %}class="active"{% endif %}>Guide</a>
-      <a href="{{ '/guide/migration' | relative_url }}">PyTorch &rarr; Rust</a>
+      <a href="{{ '/guide/pytorch/migration' | relative_url }}">PyTorch &rarr; Rust</a>
       <div class="nav-dropdown{% if page.url == '/benchmark' or page.url == '/ddp-benchmark' %} active{% endif %}">
         <span>Benchmarks &#9662;</span>
         <div class="nav-dropdown-menu">

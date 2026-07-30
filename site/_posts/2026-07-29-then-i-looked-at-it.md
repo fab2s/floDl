@@ -355,7 +355,7 @@ against the sources the schema is actually compiled from.
 The full list, at the depth this post does not go to, is in the
 [changelog](https://github.com/flodl-labs/flodl/blob/main/CHANGELOG.md). To run
 any of it: the [monitor guide](/guide/monitor) covers the portal, the archive,
-and the path API, the [distributed reference](/guide/ddp-reference) covers one
-GPU to a cluster, and [`fdl setup`](/guide/cli) gets you from clone to training.
+and the path API, the [distributed reference](/guide/ddp/reference) covers one
+GPU to a cluster, and [`fdl setup`](/guide/cli/install) gets you from clone to training.
 
 flodl remains a two-being effort: human direction, AI implementation. This time the instruments contributed the roadmap.

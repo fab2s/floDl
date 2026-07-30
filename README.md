@@ -119,7 +119,7 @@ curl -sL https://flodl.dev/fdl -o fdl && chmod +x fdl
 The `fdl` script auto-downloads a pre-compiled CLI binary (~750KB, pure Rust,
 no libtorch dependency). It detects your GPUs, downloads the right libtorch
 variant, and configures Docker or native builds. See the [full CLI
-reference](docs/cli.md) for all commands.
+reference](docs/cli/01-install.md) for all commands.
 
 **One-liner with Docker** (no Rust, no setup):
 
@@ -146,7 +146,7 @@ For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](docs/mac
 > switch between installs, compile from source for mixed GPU
 > architectures (e.g. sm_61 + sm_120 in one build), and emit a
 > machine-readable diagnostics report. No flodl buy-in required.
-> See [docs/cli.md § Standalone](docs/cli.md#1-standalone-no-project-required)
+> See [docs/cli/01-install.md § Standalone](docs/cli/02-setup-commands.md)
 > and the [`flodl-cli` crate](https://crates.io/crates/flodl-cli).
 
 Both paths generate an annotated training template. Edit `src/main.rs` to

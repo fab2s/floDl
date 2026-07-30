@@ -26,7 +26,7 @@ nodes with bounded convergence and graceful failure.
 > **Status**: this axis has **shipped**. `OuterOptimizer` (`OuterAvg` /
 > `SlowMomentum` / `NesterovMomentum`), the `.outer_optimizer()` setter, and
 > the `<stem>.outer.fdl` momentum sidecar are live — see
-> [`docs/ddp.md`](../ddp/03-internals.md#outer-optimizer---slowmo--diloco). The prose
+> [`docs/ddp/03-internals.md`](../ddp/03-internals.md#outer-optimizer---slowmo--diloco). The prose
 > below is the originating design; the meta-step rendezvous axis further down
 > remains future work.
 

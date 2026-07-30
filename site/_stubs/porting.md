@@ -1,6 +1,6 @@
 ---
 layout: guide
 title: "Porting from PyTorch"
-permalink: /guide/porting
+permalink: /guide/pytorch/porting
 source: docs/porting.md
 ---

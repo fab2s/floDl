@@ -113,7 +113,7 @@ Before writing code, decide:
      own the loop body while the controller schedules, use
      `Trainer::builder(...).into_worker()?` (cooperative tier).
    - See `ai/skills/port/guide.md` Phase 3 "Distributed Training" for the
-     full mapping and `docs/ddp.md` for the reference.
+     full mapping and `docs/ddp/01-reference.md` for the reference.
 
 ## Step 5: Generate the Port
 

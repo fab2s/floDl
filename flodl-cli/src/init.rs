@@ -180,7 +180,7 @@ fn print_next_steps(name: &str, mode: Mode, include_hf: bool) {
     println!("Guides:");
     println!("  Tutorials:         https://flodl.dev/guide/tensors");
     println!("  Graph Tree:        https://flodl.dev/guide/graph-tree");
-    println!("  PyTorch migration: https://flodl.dev/guide/migration");
+    println!("  PyTorch migration: https://flodl.dev/guide/pytorch/migration");
     println!("  Troubleshooting:   https://flodl.dev/guide/troubleshooting");
 }
 
@@ -329,7 +329,7 @@ fn main_rs_template() -> String {
 //! This is a starting point for your model. Edit the architecture,
 //! data loading, and training loop to fit your task.
 //!
-//! New to Rust? Read: https://flodl.dev/guide/rust-primer
+//! New to Rust? Read: https://flodl.dev/guide/pytorch/rust-primer
 //! Stuck?       Read: https://flodl.dev/guide/troubleshooting
 
 use flodl::*;

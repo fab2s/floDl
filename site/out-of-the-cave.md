@@ -112,6 +112,6 @@ You won't go back.
 ## Where to go next
 
 - **[Get Started]({{ '/guide/' | relative_url }})** - the guide, start to finish
-- **[Install `fdl`]({{ '/guide/cli' | relative_url }})** - one curl, zero Rust on your host
+- **[Install `fdl`]({{ '/guide/cli/install' | relative_url }})** - one curl, zero Rust on your host
 - **[flodl on GitHub](https://github.com/flodl-labs/flodl)** - source, issues, contributions
 - **[The DDP benchmark]({{ '/ddp-benchmark' | relative_url }})** - numbers behind the prose
