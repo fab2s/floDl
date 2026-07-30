@@ -18,6 +18,15 @@
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   --max-w: 1120px;
+  /* Guide geometry. ONE knob sets the content width: everything in the guide
+     column — prose, code blocks, tables, diagrams, heading rules — lines up on
+     --guide-measure, and the shell is derived from it. Wide code and wide
+     tables scroll inside their own box rather than widening the column, so
+     there is no reason for any element to run wider than the text. Bump
+     --guide-measure alone to widen the whole guide. */
+  --guide-measure: 880px;
+  --guide-pad: 48px;
+  --sidebar-w: 220px;
 }
 
 /* ── Light theme (optional, opt-in via <html data-theme="light">) ── */
@@ -76,7 +85,16 @@
 :root[data-theme="light"] .theme-toggle .sun { display: none; }
 :root[data-theme="light"] .theme-toggle .moon { display: inline-block; }
 
-html { scroll-behavior: smooth; overflow-x: hidden; }
+/* NO overflow-x here, and none on body — deliberate, load-bearing.
+   `position: sticky` (the guide sidebar) resolves against its nearest scroll
+   container. Any non-`visible` overflow on an ancestor creates one, and the
+   spec leaves no usable escape: with one axis `hidden` the other's `visible`
+   computes to `auto`, and with one axis `clip` the other computes to
+   `hidden` — every combination makes html/body a scroll container and the
+   sidebar scrolls away. So both axes must stay `visible` here, and runaway
+   horizontal content is contained per element instead (see the code-block
+   and table rules at the end of this file). */
+html { scroll-behavior: smooth; }
 
 body {
   font-family: var(--font);
@@ -86,8 +104,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  overflow-x: hidden;
-  max-width: 100vw;
+  max-width: 100vw;   /* no overflow-x — see the note on html above */
 }
 
 a { color: var(--accent); text-decoration: none; transition: color 0.15s; }
@@ -557,12 +574,19 @@ a:hover { color: var(--cyan); }
 /* ── Guide layout ───────────────────────────────── */
 
 .guide-layout {
-  max-width: var(--max-w);
+  /* sidebar + content padding + text measure */
+  max-width: calc(var(--sidebar-w) + 2 * var(--guide-pad) + var(--guide-measure));
   margin: 0 auto;
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: var(--sidebar-w) 1fr;
   gap: 0;
   min-height: calc(100vh - 56px);
+}
+
+/* Guide pages widen the header shell to match, so the sidebar's left edge
+   still lines up with the logo instead of hanging outside it. */
+body.guide-page .site-header nav {
+  max-width: calc(var(--sidebar-w) + 2 * var(--guide-pad) + var(--guide-measure));
 }
 
 .sidebar {
@@ -570,6 +594,10 @@ a:hover { color: var(--cyan); }
   padding: 32px 20px;
   position: sticky;
   top: 56px;
+  /* Grid items stretch by default; a box already as tall as its row has no
+     slack to stick within. Pin to the row start and give it one viewport of
+     height, so it stays put and scrolls internally when the nav is taller. */
+  align-self: start;
   height: calc(100vh - 56px);
   overflow-y: auto;
   scrollbar-width: thin;
@@ -588,6 +616,45 @@ a:hover { color: var(--cyan); }
   padding: 0 8px;
 }
 
+/* Foldable groups: <details>/<summary>, so the open/closed state is the
+   browser's own — no JS. The default disclosure triangle is replaced with a
+   chevron that rotates, kept on the right so labels stay left-aligned with
+   the non-folding groups. */
+details.sidebar-group > summary.sidebar-label {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  user-select: none;
+  border-radius: 4px;
+  padding: 4px 8px;
+  transition: color 0.1s, background 0.1s;
+}
+
+details.sidebar-group > summary.sidebar-label::-webkit-details-marker { display: none; }
+details.sidebar-group > summary.sidebar-label:hover { color: var(--text); }
+
+details.sidebar-group > summary.sidebar-label::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.15s;
+  flex: none;
+  opacity: 0.7;
+}
+
+details.sidebar-group[open] > summary.sidebar-label::after { transform: rotate(45deg); }
+
+summary.sidebar-label:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .sidebar a {
   display: block;
   padding: 5px 8px;
@@ -602,10 +669,116 @@ a:hover { color: var(--cyan); }
 .sidebar a.active { color: var(--accent); background: rgba(108, 140, 255, 0.1); }
 
 .guide-content {
-  padding: 40px 48px 80px;
-  max-width: 780px;
+  padding: 40px var(--guide-pad) 80px;
+  max-width: calc(var(--guide-measure) + 2 * var(--guide-pad));
   min-width: 0;
 }
+
+/* ── Mermaid diagrams ───────────────────────────── */
+
+/* mermaid's `neutral` theme draws dark strokes and dark text on a transparent
+   ground, so a diagram needs its own light surface to stay legible under the
+   site's dark theme — in the page and in the overlay alike. (Making mermaid
+   itself follow the light/dark toggle is a separate job: it needs a re-render
+   from the source text, which is consumed at render time.) */
+.content .mermaid {
+  background: #fcfcfd;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  text-align: center;
+  overflow-x: auto;
+}
+
+.content .mermaid svg { max-width: 100%; height: auto; }
+
+/* Fitting a wide diagram to the column shrinks its text to nothing, so the
+   holder is a button that opens the diagram full-window. */
+.content .mermaid[data-zoomable] { cursor: zoom-in; transition: border-color 0.12s; }
+.content .mermaid[data-zoomable]:hover { border-color: var(--accent); }
+.content .mermaid[data-zoomable]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+/* Always visible, not hover-only: on touch there is no hover, and nothing
+   else signals that the diagram is interactive. */
+.mermaid-hint {
+  display: block;
+  margin-top: 10px;
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #9aa0b4;
+  user-select: none;
+}
+
+dialog.diagram-modal {
+  width: 100vw;
+  height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
+
+.diagram-modal-surface {
+  position: absolute;
+  inset: 32px;                 /* the "sensible margin" */
+  background: #fcfcfd;
+  border-radius: 10px;
+  padding: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+
+/* mermaid pins an inline max-width on the <svg>; the overlay has to beat it,
+   hence !important. width+height 100% plus the viewBox letterboxes the
+   diagram to fit the surface without distortion. */
+.diagram-modal-surface svg {
+  width: 100%;
+  height: 100%;
+  max-width: none !important;
+  max-height: none;
+}
+
+.diagram-modal-close {
+  position: absolute;
+  top: 40px;
+  right: 40px;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 600 20px/1 var(--font);
+  color: #3a3f52;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d5d8e2;
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.diagram-modal-close:hover { background: #fff; color: #000; }
+.diagram-modal-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 700px) {
+  .diagram-modal-surface { inset: 10px; padding: 12px; }
+  .diagram-modal-close { top: 16px; right: 16px; }
+}
+
 
 /* ── Guide index cards ──────────────────────────── */
 
@@ -752,6 +925,15 @@ a:hover { color: var(--cyan); }
   border-collapse: collapse;
   margin-bottom: 16px;
   font-size: 14px;
+  /* Scroll a too-wide table inside its own column at EVERY width, not just on
+     mobile. This used to be a <=700px rule only, with html/body
+     `overflow-x: hidden` masking the desktop case — and that mask had to go so
+     the sidebar could stick. Wide reference tables (the DDP knob lists) are
+     exactly the content that needs it. */
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .content th {
@@ -1151,10 +1333,18 @@ pre {
    with min-width:0. Force explicit width:100% to anchor sections to
    body width regardless of inner content. max-width:1120 still caps
    on desktop via the existing .section rule. */
-body > section, body > hr, body > header, body > footer {
+body > section, body > hr, body > header, body > footer, body > .guide-layout {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
+}
+
+/* .guide-layout carries its own cap; this only stops wide inner content from
+   stretching it past the viewport. Re-assert the cap after the width:100%
+   above, and keep the grid's content column shrinkable. */
+body > .guide-layout {
+  max-width: calc(var(--sidebar-w) + 2 * var(--guide-pad) + var(--guide-measure));
+  min-width: 0;
 }
 
 .bench-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -1166,10 +1356,6 @@ body > section, body > hr, body > header, body > footer {
   code { overflow-wrap: anywhere; word-break: break-word; }
 
   .bench-table table { min-width: 480px; }
-  .content table {
-    display: block;
-    max-width: 100%;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-  }
+  /* `.content table` scrolling is unconditional now (see the Tables rule),
+     so there is nothing mobile-specific left to add here. */
 }
