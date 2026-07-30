@@ -392,8 +392,7 @@ changed layer sizes, retrain instead.
 
 The graph tree is the foundation for progressive model composition -
 training layers independently, checkpointing them, and composing them
-into larger models with fine-grained training control. See the
-[design document](../design/graph-tree.md) for the full architecture.
+into larger models with fine-grained training control.
 
 ---
 
