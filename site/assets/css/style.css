@@ -334,6 +334,7 @@ a:hover { color: var(--cyan); }
   font-family: var(--mono);
   font-size: 12px;
   color: var(--accent);
+  min-height: 26px;
   outline: none;
   transition: border-color 0.15s;
 }
@@ -352,6 +353,10 @@ a:hover { color: var(--cyan); }
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1;
+  /* Measured at 19px tall, under WCAG 2.2 Target Size (Minimum) of 24x24 — and
+     this is the homepage's install-command Copy control, so it is worth a real
+     target. The paired input gets the same height so the row stays aligned. */
+  min-height: 26px;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 
@@ -1235,6 +1240,8 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
   gap: 12px 20px;
   margin-bottom: 12px;
   padding: 0 16px;
+  /* Footer links measured 21px tall, under the 24px WCAG 2.2 floor. */
+  line-height: 24px;
 }
 
 /* ── Syntax highlighting (Rouge) ────────────────── */
@@ -1362,6 +1369,12 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
   }
 
   .sidebar.open { transform: translateX(0); }
+
+  /* Thumb room inside the drawer. The third level measured 24px tall — legal by
+     WCAG 2.2 but tight for touch, and the drawer is the touch surface. Desktop
+     keeps its tighter density (the sidebar there is a pointer target). */
+  .sidebar a { padding-top: 7px; padding-bottom: 7px; }
+  .sidebar-anchors a { padding-top: 6px; padding-bottom: 6px; }
 
   /* Freeze the page behind an open drawer. Deliberately scoped INSIDE this media
      query: `overflow` on html/body makes them a scroll container and would defeat
@@ -1595,10 +1608,19 @@ pre {
    with min-width:0. Force explicit width:100% to anchor sections to
    body width regardless of inner content. max-width:1120 still caps
    on desktop via the existing .section rule. */
-body > section, body > hr, body > header, body > footer, body > .guide-layout {
+body > section, body > hr, body > header, body > footer, body > .guide-layout,
+body > main {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
+  /* `body` is a flex column, so a child with intrinsically wide content grows
+     past the viewport via `min-width: auto`. THIS LIST IS HAND-MAINTAINED and
+     every top-level container must be on it: `.guide-layout` had to be added
+     once, and `body > main` (blog posts + thesis) was still missing — measured
+     780px wide inside a 375px viewport, scrolling the whole page sideways on 12
+     pages. Element selectors keep specificity low (0,0,2) so a container's own
+     cap (.blog-content's 780px) still wins on desktop. */
+  min-width: 0;
 }
 
 /* .guide-layout carries its own cap; this only stops wide inner content from
@@ -1610,6 +1632,21 @@ body > .guide-layout {
 }
 
 .bench-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* Very narrow screens: long unbreakable identifiers in PROSE push the page
+   sideways. Measured at 320px: `CUBLAS_STATUS_EXECUTION_FAILED` inside a <strong>
+   was 327px wide on its own, and these SCREAMING_SNAKE names (error codes, env
+   vars, type paths) are everywhere in this corpus. `anywhere` rather than
+   `break-word` because it also shrinks min-content sizing, which is what stops
+   the CONTAINER from stretching.
+   Deliberately prose-only: fenced code keeps its horizontal scroll, since
+   breaking a command sample mid-token would misrepresent what to type. */
+@media (max-width: 480px) {
+  .content p, .content li, .content strong, .content em,
+  .content td, .content th, .content h1, .content h2, .content h3 {
+    overflow-wrap: anywhere;
+  }
+}
 
 @media (max-width: 700px) {
   /* Inline <code> tokens with internal spaces (e.g. "FDL_ENV=ci fdl test")
