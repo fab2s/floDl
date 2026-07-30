@@ -56,8 +56,8 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(120);
 /// orchestration failure. `--persist` only returns on setup errors —
 /// agent exits re-dial forever.
 pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
-    let block = match load_join_block() {
-        Ok(b) => b,
+    let (block, project_root) = match load_join_block() {
+        Ok(pair) => pair,
         Err(e) => {
             crate::cli_error!("{e}");
             return 1;
@@ -98,12 +98,13 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         return 1;
     }
 
-    // Local active libtorch (honors FDL_LIBTORCH_CASE): its lib/ rides
+    // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
+    // project root the config walk found: its lib/ rides
     // LD_LIBRARY_PATH on the child, and its variant label rides the
     // join hello. Absent (fdl running outside a project) the child env
     // is left untouched — the binary may carry an rpath or the caller's
     // environment already provides the libs.
-    let libtorch = resolve_local_libtorch();
+    let libtorch = resolve_local_libtorch(project_root.as_deref());
 
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -255,20 +256,28 @@ fn resolve_effective(
     })
 }
 
-/// Load the top-level `join:` block from the project config (base
-/// fdl.yml merged with the active env overlay when one is selected).
-/// `Ok(None)` when there is no project — flags carry everything then; a
-/// present-but-broken config is a loud error, not a silent fallback
-/// (the operator may be relying on `join.bin`).
-fn load_join_block() -> Result<Option<WorkerJoin>, String> {
-    let ctx = Context::resolve();
-    let Some(config_path) = config::find_config(&ctx.root) else {
-        return Ok(None);
+/// Load the top-level `join:` block from the PROJECT config (base
+/// fdl.yml merged with the active env overlay when one is selected),
+/// plus the directory it lives in (the project root — where libtorch/
+/// is anchored). The walk steps over command-level fdl.ymls
+/// ([`config::find_project_config`]): `fdl join` typically runs from
+/// the command dir the training binary expects as cwd (e.g.
+/// `ddp-bench/`), whose own fdl.yml is a command config that neither
+/// carries a `join:` block nor marks the libtorch root. `Ok(None)`
+/// root/block when there is no project at all — flags carry everything
+/// then; a present-but-broken project config is a loud error, not a
+/// silent fallback (the operator may be relying on `join.bin`).
+fn load_join_block() -> Result<(Option<WorkerJoin>, Option<PathBuf>), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("cannot read the current directory: {e}"))?;
+    let Some(config_path) = config::find_project_config(&cwd) else {
+        return Ok((None, None));
     };
     let env_name = std::env::var("FDL_ENV").ok().filter(|s| !s.trim().is_empty());
     let project = config::load_project_with_env(&config_path, env_name.as_deref())
         .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
-    Ok(project.join)
+    let root = config_path.parent().map(Path::to_path_buf);
+    Ok((project.join, root))
 }
 
 /// Parse `host[:port]`, default port [`DEFAULT_CONTROLLER_PORT`] —
@@ -371,11 +380,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Active libtorch of this box: `(lib dir to prepend on
-/// LD_LIBRARY_PATH, variant label for the hello)`.
-fn resolve_local_libtorch() -> Option<(PathBuf, String)> {
-    let ctx = Context::resolve();
-    let info = crate::libtorch::detect::read_active(&ctx.root)?;
-    let lib = ctx.root.join("libtorch").join(&info.path).join("lib");
+/// LD_LIBRARY_PATH, variant label for the hello)`. Anchored on the
+/// project root when the config walk found one (a command-dir cwd's
+/// `Context::resolve` would stop a level too low); the plain context
+/// fallback covers project-less setups (`~/.flodl`).
+fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, String)> {
+    let root = match project_root {
+        Some(r) => r.to_path_buf(),
+        None => Context::resolve().root,
+    };
+    let info = crate::libtorch::detect::read_active(&root)?;
+    let lib = root.join("libtorch").join(&info.path).join("lib");
     lib.is_dir().then_some((lib, info.path))
 }
 

@@ -728,6 +728,36 @@ pub struct CoordSpec {
     >,
 }
 
+/// Tell every still-connected worker host to tear down: an Abort frame
+/// down the host control link (the agent's teardown trigger — it kills
+/// its relay and rank children on receipt), then a socket shutdown,
+/// which also unblocks the link's reader thread. Best-effort per link —
+/// a host that already vanished just fails the write.
+fn abort_worker_links(
+    links: &mut [(String, std::net::TcpStream)],
+    salt: &crate::distributed::wire::SessionSalt,
+    reason: &str,
+) {
+    for (host, link) in links {
+        let abort_msg = crate::distributed::wire::JoinMsgWire::Abort {
+            reason: reason.to_string(),
+        };
+        let send = crate::distributed::wire::ControlFrame::encode(
+            salt,
+            crate::distributed::wire::MsgKind::Join,
+            &abort_msg,
+        )
+        .and_then(|f| f.write_to(link));
+        if send.is_err() {
+            crate::verbose!(
+                "  cluster launcher: abort to worker host {host:?} failed \
+                 (already gone)"
+            );
+        }
+        let _ = link.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// Run this process as the cluster launcher: open the join window, fan
 /// out one worker agent per configured host (push-as-sugar — the agents
 /// dial back in like any self-deployed worker would), form the world,
@@ -1544,10 +1574,19 @@ pub fn run_launcher_with_config(
     // it into the coordinator's fast death queue.
     let frame_ceiling = crate::distributed::wire::frame_ceiling();
     let mut rank_exit_readers: Vec<thread::JoinHandle<()>> = Vec::new();
+    // Write halves of the host control links, kept OUTSIDE the reader
+    // threads: the failure path below uses them to send each connected
+    // host an Abort (its agent's teardown trigger) and shut the socket
+    // down, which also unblocks that link's reader. Best-effort — a
+    // link whose clone failed just closes later, at agent exit.
+    let mut worker_links: Vec<(String, std::net::TcpStream)> = Vec::new();
     for (idx, aw) in formed_workers.into_iter().enumerate() {
         let worker = &world.workers[idx];
         let member = aw.member;
         let mut stream = aw.stream;
+        if let Ok(link) = stream.try_clone() {
+            worker_links.push((member.host.clone(), link));
+        }
         let dial_host = controller_dial_host(worker);
         let envelope = build_slim_envelope_for(&world, worker, &dial_host, rank_resources);
         let envelope_hex = crate::distributed::cluster::hex_encode(
@@ -1713,6 +1752,10 @@ pub fn run_launcher_with_config(
         }
         cleanup_remote_hosts_parallel(remote_cleanup_targets.clone());
         abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Walk-in hosts are not covered by the process kills above —
+        // tell them to tear down and unblock their link readers (same
+        // mechanics as the main failure path below).
+        abort_worker_links(&mut worker_links, &salt, &e.to_string());
         if let Some(h) = coord_driver.take() {
             let _ = h.join();
         }
@@ -1749,9 +1792,38 @@ pub fn run_launcher_with_config(
         // is released instead of waiting on a brainless cohort.
         Some(Arc::clone(&abort)),
     );
+    // Walk-in workers (`fdl join`) are nobody's process children: their
+    // only tie to this launcher is the host control link, so its EOF IS
+    // their exit event. `supervise_children` returning does NOT mean
+    // the world is done — a discovery cohort can have ZERO process
+    // children, making supervision return the instant it starts; the
+    // teardown tail below would then abort a world that just formed
+    // (observed live: coordinator killed mid-start, ranks reset
+    // mid-write). Wait for every host control link to close before
+    // declaring the run over. On a failure verdict, don't wait — tell
+    // every connected host to tear down (the Abort frame is the agent's
+    // teardown trigger) and shut the sockets, which also unblocks the
+    // readers' blocking reads (this was the failure path's wedge: the
+    // final reader join used to block on agents nobody had told to
+    // die). A host that vanished without closing its TCP link can stall
+    // the success-path wait — the same exposure the coordinator's
+    // heartbeat machinery owns for the training plane, accepted here.
+    if let Some(err) = &any_failure {
+        abort_worker_links(&mut worker_links, &salt, &err.to_string());
+    }
+    for r in rank_exit_readers {
+        let _ = r.join();
+    }
+    drop(worker_links);
+
     // A coordinator start failure is the root cause of everything the
     // watchers just reaped — surface it as THE run error rather than the
-    // downstream child kill statuses.
+    // downstream child kill statuses. Folded AFTER the link wait: a
+    // coordinator that fails while walk-in hosts are still connected
+    // (e.g. its start aborts and the resulting cascade kills their
+    // ranks) records the root cause DURING the wait — folding earlier
+    // read `None` and declared the run a success (observed live: a
+    // relay-less formation reported `done` with zero syncs).
     let any_failure = match coord_fatal.lock().ok().and_then(|mut s| s.take()) {
         Some(root) => Some(TensorError::new(&format!(
             "cluster launcher: coordinator failed at formation — {root}"
@@ -1813,11 +1885,6 @@ pub fn run_launcher_with_config(
     }
     if let Some(h) = rdv_driver.take() {
         let _ = h.join();
-    }
-    // Control-link readers exit on their stream EOFs (every worker is
-    // gone by now).
-    for r in rank_exit_readers {
-        let _ = r.join();
     }
     if let Some(h) = status_server.take() {
         let _ = h.join();

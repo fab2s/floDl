@@ -4,6 +4,32 @@
 use super::*;
 
 #[test]
+fn find_project_config_steps_over_command_configs() {
+    // Project root fdl.yml + a command dir with its own fdl.yml (the
+    // ddp-bench shape). From inside the command dir, the walk must
+    // land on the PROJECT config, not the command one.
+    let tmp = TempDir::new();
+    let root_cfg = tmp.0.join("fdl.yml");
+    std::fs::write(&root_cfg, "description: proj\njoin:\n  bin: t/bin\n").unwrap();
+    let cmd_dir = tmp.0.join("bench");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(
+        cmd_dir.join("fdl.yml"),
+        "description: cmd\ndocker: cuda\ncompile: true\n",
+    )
+    .unwrap();
+
+    assert_eq!(find_project_config(&cmd_dir), Some(root_cfg.clone()));
+    // From the root itself: same answer.
+    assert_eq!(find_project_config(&tmp.0), Some(root_cfg.clone()));
+
+    // A malformed config is returned as the answer (the caller's loader
+    // reports it loudly) — never silently stepped over.
+    std::fs::write(&root_cfg, "not: [valid").unwrap();
+    assert_eq!(find_project_config(&tmp.0), Some(root_cfg));
+}
+
+#[test]
 fn resolve_config_layers_base_only() {
     let tmp = TempDir::new();
     let base = tmp.0.join("fdl.yml");

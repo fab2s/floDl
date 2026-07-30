@@ -18,7 +18,6 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::config::{self, DEFAULT_CONTROLLER_PORT};
-use crate::context::Context;
 use crate::style;
 
 /// Connect/read budget per attempt. Status answers are one small JSON
@@ -146,8 +145,11 @@ fn resolve_candidates(addr_override: Option<&str>) -> (Vec<String>, String) {
 }
 
 fn load_cluster_for_env(env_name: &str) -> Option<config::ClusterConfig> {
-    let ctx = Context::resolve();
-    let config_path = config::find_config(&ctx.root)?;
+    // Project-level walk (not the plain context): run from inside a
+    // command dir (e.g. ddp-bench/), the nearest fdl.yml is a command
+    // config with no `cluster:` — the block lives a level up.
+    let cwd = std::env::current_dir().ok()?;
+    let config_path = config::find_project_config(&cwd)?;
     let project = config::load_project_with_env(&config_path, Some(env_name)).ok()?;
     project.cluster
 }
@@ -272,7 +274,9 @@ fn print_status(addr: &str, body: &str) {
     // Operator start switch: only rendered when the run has one (older
     // flodl snapshots have no start_mode field — absent ≠ auto).
     if let Some(mode) = state["start_mode"].as_str() {
-        if mode != "auto" {
+        // Only meaningful while the window still holds — once the world
+        // forms, the switch is history.
+        if mode != "auto" && matches!(phase, "waiting" | "staging") {
             let armed = state["start_armed"].as_bool().unwrap_or(false);
             if armed {
                 println!("  start: {mode} — armed (forming at the next poll)");
