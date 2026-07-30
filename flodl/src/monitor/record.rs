@@ -552,48 +552,44 @@ pub fn rank_record_path(rank: usize, hosts: &[&str]) -> String {
 /// `user_reductions` names the reduction for non-core metric keys (default
 /// [`Reduction::Mean`]).
 pub fn build_tree(leaves: &[Leaf], user_reductions: &Reductions) -> NodeRecord {
-    let entries: Vec<(&[String], &Leaf)> =
-        leaves.iter().map(|l| (l.path.as_slice(), l)).collect();
+    let entries: Vec<Entry<'_>> = leaves.iter().map(|l| (l.path.as_slice(), l)).collect();
     build_node(&["root".to_string()], &entries, user_reductions)
 }
+
+/// One leaf mid-descent: its path segments still *below* the node being built,
+/// paired with the leaf. An empty remaining path means the leaf terminates at
+/// that node.
+type Entry<'a> = (&'a [String], &'a Leaf);
 
 /// Recursively build the node at `prefix` from `entries` (each pairs a
 /// remaining path with its leaf). An entry with empty remaining path terminates
 /// here (a leaf); otherwise entries group by their next segment into subtrees.
-fn build_node(
-    prefix: &[String],
-    entries: &[(&[String], &Leaf)],
-    user: &Reductions,
-) -> NodeRecord {
-    let nested: Vec<(&[String], &Leaf)> =
-        entries.iter().filter(|(p, _)| !p.is_empty()).copied().collect();
+///
+/// Malformed input — a path claimed by two producers at once — never panics and
+/// never silently drops a rank: see the collision handling below.
+fn build_node(prefix: &[String], entries: &[Entry<'_>], user: &Reductions) -> NodeRecord {
+    let (terminal, nested): (Vec<Entry<'_>>, Vec<Entry<'_>>) =
+        entries.iter().copied().partition(|(p, _)| p.is_empty());
 
     if nested.is_empty() {
         // Leaf node: exactly one terminal entry for well-formed input.
-        let leaf = entries
+        let leaf = terminal
             .first()
             .map(|(_, l)| *l)
             .expect("build_node: node has neither children nor a terminal leaf");
-        return NodeRecord {
-            path: prefix.to_vec(),
-            work: leaf.work,
-            metrics: leaf.metrics.clone(),
-            res: leaf.res,
-            children: Vec::new(),
-            device: leaf.device,
-            alive: leaf.alive,
-            label: leaf.label.clone(),
-            epoch_complete: false,
-        };
+        if terminal.len() > 1 {
+            warn_tree_collision(format!(
+                "{} leaves share the path `{}` -- keeping the first, the rest are \
+                 dropped. That path's metrics feed is split across producers",
+                terminal.len(),
+                prefix.join("/"),
+            ));
+        }
+        return leaf_node(prefix, leaf);
     }
 
-    debug_assert!(
-        entries.iter().all(|(p, _)| !p.is_empty()),
-        "build_node: a node is both a leaf and an interior (mixed paths)"
-    );
-
     // Group by next segment (BTreeMap keeps child order deterministic).
-    let mut groups: BTreeMap<String, Vec<(&[String], &Leaf)>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<Entry<'_>>> = BTreeMap::new();
     for (p, l) in &nested {
         let (head, tail) = p.split_first().expect("nested entry has a segment");
         groups.entry(head.clone()).or_default().push((tail, *l));
@@ -607,7 +603,56 @@ fn build_node(
         })
         .collect();
 
-    aggregate(prefix.to_vec(), children, user)
+    if terminal.is_empty() {
+        return aggregate(prefix.to_vec(), children, user);
+    }
+
+    // A terminal entry beside nested ones means two producers disagreed on
+    // tiering (`cohort_tiering`) and handed one node both its own numbers and
+    // children. This used to be a `debug_assert!` over a filter that walked on
+    // regardless, so release builds dropped that rank out of the tree without a
+    // word. Aggregating a monitoring artifact must not panic either (see
+    // `record_log`: a broken sink degrades observability, it never kills a run),
+    // so fold the stray mass into this node's roll-up and say so once.
+    //
+    // The fold is an aggregation input only: a record's path IS its file path,
+    // so emitting the stray as a child would append its lines to this node's own
+    // log. Its numbers survive in the parent; its individual record does not.
+    warn_tree_collision(format!(
+        "`{}` is both a leaf and an interior node -- its own numbers are folded \
+         into its roll-up, and it gets no record of its own. Two producers \
+         disagree on tiering; see `cohort_tiering`",
+        prefix.join("/"),
+    ));
+    let kept = children.len();
+    let mut inputs = children;
+    inputs.extend(terminal.iter().map(|(_, l)| leaf_node(prefix, l)));
+    let mut node = aggregate(prefix.to_vec(), inputs, user);
+    node.children.truncate(kept);
+    node
+}
+
+/// One rank's leaf as a node record at `prefix`.
+fn leaf_node(prefix: &[String], leaf: &Leaf) -> NodeRecord {
+    NodeRecord {
+        path: prefix.to_vec(),
+        work: leaf.work,
+        metrics: leaf.metrics.clone(),
+        res: leaf.res,
+        children: Vec::new(),
+        device: leaf.device,
+        alive: leaf.alive,
+        label: leaf.label.clone(),
+        epoch_complete: false,
+    }
+}
+
+/// Report a malformed record tree once per process. The producers that build
+/// the tree do so every tick, so an unthrottled warning would scroll the run
+/// away; one line naming the path is enough to find the offending producer.
+fn warn_tree_collision(msg: String) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| eprintln!("  warning: record tree: {msg} (reported once)"));
 }
 
 /// Aggregate an interior node from its already-built direct children.
@@ -775,6 +820,46 @@ mod tests {
         assert!((m(&root, "loss").unwrap() - 0.3).abs() < 1e-12);
         // throughput sums (core Sum), ignoring work.
         assert_eq!(m(&root, "throughput"), Some(14.0));
+    }
+
+    #[test]
+    fn mixed_leaf_and_interior_folds_instead_of_dropping() {
+        // Two producers disagreed on tiering: one emitted root-only (path []),
+        // the other a rank tier. Root is then both a leaf and an interior. The
+        // stray must land in the roll-up -- release builds used to filter it out
+        // and drop that rank's numbers silently.
+        let root = build_tree(
+            &[
+                leaf(&[], 3.0, &[("loss", 0.2)]),
+                leaf(&["rank1"], 1.0, &[("loss", 0.6)]),
+            ],
+            &Reductions::new(),
+        );
+        // Work carries both, so the weighted mean is over both:
+        // (0.2*3 + 0.6*1) / 4 = 0.3. Dropping the stray would give 0.6.
+        assert_eq!(root.work, 4.0);
+        assert!((m(&root, "loss").unwrap() - 0.3).abs() < 1e-12);
+        // ...but the stray gets no record of its own: its path would equal this
+        // node's, and a record's path is its log file.
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].path, vec!["root", "rank1"]);
+    }
+
+    #[test]
+    fn duplicate_leaf_paths_keep_the_first() {
+        // Same path from two producers -- the split-metrics-feed hazard named on
+        // `cohort_tiering`. Documented behavior is first-wins plus a warning,
+        // and above all no panic: this runs on the monitoring path.
+        let root = build_tree(
+            &[
+                leaf(&["rank0"], 3.0, &[("loss", 0.2)]),
+                leaf(&["rank0"], 1.0, &[("loss", 0.6)]),
+            ],
+            &Reductions::new(),
+        );
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].work, 3.0);
+        assert_eq!(m(&root.children[0], "loss"), Some(0.2));
     }
 
     #[test]
