@@ -102,6 +102,7 @@ direct-dial walk-ins enter the exact same sequence at the "dial +
 hello" step; only the road differs:
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"actorBkg":"#e8eaf6","actorBorder":"#5c6bc0","actorTextColor":"#1a237e","signalColor":"#5c6bc0","signalTextColor":"#263238","noteBkgColor":"#eceff1","noteBorderColor":"#90a4ae","noteTextColor":"#37474f","labelBoxBkg":"#eceff1","labelBoxBorderColor":"#90a4ae","labelTextColor":"#37474f","activationBkgColor":"#e8f5e9","activationBorderColor":"#66bb6a"}}}%%
 sequenceDiagram
     autonumber
     participant OP as Operator
@@ -174,6 +175,11 @@ stateDiagram-v2
         fdl start or the hard cap
         ends it
     end note
+
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
+    class done good
+    class failed cost
 ```
 
 Every state here is what `fdl status` prints as the lifecycle phase,

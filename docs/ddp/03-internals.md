@@ -15,6 +15,11 @@ stateDiagram-v2
     Probe --> Warmup : first calibration
     Warmup --> Stable : 5 calibrations
     Stable --> Mature : 20 calibrations
+
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    class Probe,Warmup actor
+    class Stable,Mature good
 ```
 
 Two consumers read the phase, and they move in **opposite directions** as

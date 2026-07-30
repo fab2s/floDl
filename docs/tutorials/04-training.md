@@ -286,11 +286,11 @@ flowchart TD
     MA -.- SAME
     CO -.- SAME
 
-    classDef tier fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
-    classDef esc fill:#fff3e0,stroke:#ffa726,color:#e65100
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
     classDef note fill:#eceff1,stroke:#90a4ae,color:#37474f
-    class MA,CO tier
-    class BY esc
+    class MA,CO good
+    class BY cost
     class WHY,SAME note
 ```
 

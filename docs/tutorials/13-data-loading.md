@@ -289,11 +289,11 @@ flowchart LR
     DISK -- "miss" --> DS
     DS --> UP
 
-    classDef tier fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
-    classDef win fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
-    classDef cost fill:#fff3e0,stroke:#ffa726,color:#e65100
-    class VP,RAM,DISK tier
-    class GATHER win
+    classDef actor fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef good fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#faf0e6,stroke:#c9924f,color:#8a5320
+    class NEED,VP,RAM,DISK,UP actor
+    class GATHER good
     class DS cost
 ```
 
