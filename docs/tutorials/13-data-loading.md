@@ -238,6 +238,113 @@ loader.auto_resize();
 The default cap of 90% leaves 10% headroom for activation memory,
 gradients, and CUDA allocator overhead.
 
+### The reader ring
+
+The streaming pipeline has one stage or two, depending on the target:
+
+- **Single stage** (CPU targets, and the distributed `LoadBatch` path): one
+  worker thread fetches from the dataset and forwards on the batch channel.
+  The channel itself is the read-ahead buffer.
+- **Two stages** (CUDA targets): a *reader* thread fetches batches into a
+  bounded pageable-RAM ring, and the *worker* thread drains the ring and runs
+  the device transfer - pin, async H2D, completion event.
+
+Splitting them lets storage-read latency overlap the transfer stage's CPU
+work, which raises the throughput ceiling from `1/(t_read + t_transfer)` to
+`1/max(t_read, t_transfer)`, and the ring absorbs read jitter from network
+storage.
+
+Note the two independent bounds, which is why the memory knobs are separate:
+the **ring bounds RAM in flight**, while the **depth governor above bounds
+VRAM in flight**. `ram_max_usage` covers the ring together with the sample
+cache below.
+
+## The staging cascade
+
+Prefetch depth bounds how much is *in flight*. The staging cascade is a
+separate mechanism that decides what stays **retained between epochs**.
+
+Streaming mode would otherwise re-read the whole dataset from storage on
+every epoch. Instead, three tiers retain samples **by index**, so later
+epochs get progressively cheaper. Batching happens above all of them, which
+is the point: a batch is not reusable across epochs (a reshuffle changes its
+composition) but a *sample* is.
+
+```mermaid
+flowchart LR
+    NEED["batch assembly<br/>needs sample i"]
+    VP{"VRAM<br/>sample pool"}
+    RAM{"RAM<br/>sample cache"}
+    DISK{"disk stage"}
+    DS["DataSet::get(i)<br/>storage read"]
+    GATHER["gather the row on device<br/>no PCIe, no host read"]
+    UP["pin + async H2D,<br/>then admit into the VRAM pool"]
+
+    NEED --> VP
+    VP -- "hit" --> GATHER
+    VP -- "miss" --> RAM
+    RAM -- "hit" --> UP
+    RAM -- "miss" --> DISK
+    DISK -- "hit" --> UP
+    DISK -- "miss" --> DS
+    DS --> UP
+
+    classDef tier fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    classDef win fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+    classDef cost fill:#fff3e0,stroke:#ffa726,color:#e65100
+    class VP,RAM,DISK tier
+    class GATHER win
+    class DS cost
+```
+
+| Tier | Lives in | A hit saves | Sized by | Knob |
+|---|---|---|---|---|
+| VRAM sample pool | leftover device memory | the PCIe transfer *and* the host read | what `vram_max_usage` leaves after prefetch | `.vram_pool(bool)` |
+| RAM sample cache | host RAM | the storage read | `ram_max_usage` (shared with the reader ring) | `.sample_cache(bool)` |
+| Disk stage | one append-only pack file | a slow/remote storage read | `.disk_stage(gb)`, off by default | `.disk_stage_dir(path)` |
+
+The VRAM pool fills for free. Every sample crosses PCIe at least once per
+epoch anyway, so the pool admits by copying rows device-to-device out of each
+just-uploaded batch, on the transfer stream: epoch 1 populates it as a side
+effect, and later epochs gather hits in place of uploading them.
+
+### Admission: fill until full, evict nothing
+
+Each tier admits until its budget is spent and then stops - no LRU, no
+scoring. That is not a simplification, it is optimal here. Under a uniform
+per-epoch reshuffle, every sample is touched exactly once per epoch in a
+fresh random order, so a tier holding `K` of `N` samples has an expected hit
+rate of `K/N` **for any** eviction policy. No choice of which `K` to keep
+beats any other, so admit-until-full delivers the same hit rate with zero
+churn. For the same reason, *which* tier a given sample lands in does not
+change the hit profile either - so the disk stage takes whatever the RAM
+cache had no budget for, and nothing rebalances them.
+
+The exception is the DDP staging path: the coordinator re-partitions per
+epoch, so a rank's assigned set changes, the `K`-set tie breaks, and the
+cache does evict. Under DDP the same knobs exist on the trainer
+(`TrainerConfig::with_sample_cache` / `with_disk_stage` / ...) and govern
+each rank with the same defaults.
+
+### Two things that switch the cascade off
+
+- **Resident mode.** The cache is dormant (zero budget, pure pass-through)
+  until the *streaming* loader installs a RAM budget. In resident mode the
+  dataset is already on the device, so there is nothing to retain.
+- **Implementing `BatchDataSet` directly.** Opaque batch datasets bypass the
+  per-sample adapter, and therefore the whole cascade, by design - flodl
+  cannot key by sample index through an interface that only speaks batches.
+  This is the real trade-off behind the two traits: `BatchDataSet` wins on
+  bulk-read efficiency *within* an epoch, `DataSet` wins on retention
+  *across* epochs. Bundled larger-than-RAM datasets implement `DataSet` for
+  exactly this reason.
+
+Because retention is keyed by index and re-served on later epochs, a
+`get()` that is not a pure function of its index has its first result frozen
+for the whole run - see
+[Why not augment inside `get()`?](#why-not-augment-inside-get) for the
+contract and the debug-build probe that enforces it.
+
 ## Shuffling and sampling
 
 By default, data is shuffled each epoch using a `RandomSampler` with
@@ -418,6 +525,7 @@ Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vr
 | `.is_resident()` | Whether in resident mode |
 | `.prefetch_depth()` | Current prefetch depth |
 | `.set_prefetch_depth(n)` | Override prefetch depth |
+| `.set_activation_reserve(bytes)` | Runtime twin of `.activation_reserve(bytes)`; an explicit value is fully trusted (no first-fill discount). No-op for resident loaders |
 | `.auto_resize()` | Re-probe VRAM and adapt prefetch |
 | `.names()` | Tensor names for each batch position |
 
