@@ -56,7 +56,10 @@ LINK_REWRITES = [
     (r"\(13-data-loading\.md\)", "(/guide/data-loading)"),
     (r"\(14-flodl-hf\.md\)", "(/guide/flodl-hf)"),
     (r"\(\.\./pytorch_migration\.md\)", "(/guide/migration)"),
+    # From docs/distributed/ (architecture.md) — one level deeper than tutorials/.
+    (r"\(\.\./ddp\.md(#[^)]+)\)", r"(/guide/ddp-reference\1)"),
     (r"\(\.\./ddp\.md\)", "(/guide/ddp-reference)"),
+    (r"\(\.\./tutorials/11-multi-gpu\.md\)", "(/guide/multi-gpu)"),
     (r"\(\.\./troubleshooting\.md\)", "(/guide/troubleshooting)"),
     # Relative links to examples (from tutorials)
     (r"\(\.\./\.\./flodl/examples/([^)]+)\)", r"(https://github.com/flodl-labs/flodl/tree/main/flodl/examples/\1)"),
@@ -332,8 +335,16 @@ def render_sidebar(groups, permalinks):
     JavaScript state to keep. The group holding the active page is forced open
     via Liquid so a fold never hides where the reader currently is.
     """
+    # Accordion default: only the group holding the active page is open, so a
+    # long group (Tutorials, 14 entries) cannot eat the viewport on someone
+    # else's page. `guide_page` distinguishes "on a guide page" from the /guide/
+    # landing page, where no group matches and the `open: true` ones show instead.
+    all_urls = [permalinks[m["stub"]] for g in groups for m in g["members"]]
+    any_active = " or ".join(f"page.url == '{u}'" for u in all_urls)
     out = [
         f"<!-- {GENERATED_BANNER}. Do not edit by hand. -->",
+        "{% assign guide_page = false %}",
+        f"{{% if {any_active} %}}{{% assign guide_page = true %}}{{% endif %}}",
         '<aside class="sidebar" id="sidebar">',
     ]
     for g in groups:
@@ -349,12 +360,14 @@ def render_sidebar(groups, permalinks):
             )
 
         if g["fold"]:
+            # Open when this group holds the active page. Groups flagged
+            # `open: true` additionally open on the landing page, where nothing
+            # is active and an all-collapsed sidebar would look broken.
+            cond = " or ".join(f"page.url == '{u}'" for u in urls)
             if g["open"]:
-                # Open by default: no need to test for the active page.
-                attr = " open"
+                attr = (f"{{% if {cond} %}} open"
+                        f"{{% elsif guide_page == false %}} open{{% endif %}}")
             else:
-                # Collapsed by default, but never collapsed over the active page.
-                cond = " or ".join(f"page.url == '{u}'" for u in urls)
                 attr = f"{{% if {cond} %}} open{{% endif %}}"
             out += [
                 f'  <details class="sidebar-group"{attr}>',

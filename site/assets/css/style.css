@@ -604,7 +604,12 @@ body.guide-page .site-header nav {
   scrollbar-color: var(--border) transparent;
 }
 
-.sidebar-group { margin-bottom: 24px; }
+/* Tight by default: with every fold collapsed the sidebar is just a list of
+   group headers, and a 24px gap on a ~23px header read as double-spaced.
+   Groups that are actually showing content get the wider gap back below. */
+.sidebar-group { margin-bottom: 4px; }
+details.sidebar-group[open],
+div.sidebar-group { margin-bottom: 18px; }
 
 .sidebar-label {
   font-size: 11px;
@@ -630,8 +635,13 @@ details.sidebar-group > summary.sidebar-label {
   user-select: none;
   border-radius: 4px;
   padding: 4px 8px;
+  /* No gap under a collapsed header — it only needs to breathe once its
+     links are visible (see the [open] rule below). */
+  margin-bottom: 0;
   transition: color 0.1s, background 0.1s;
 }
+
+details.sidebar-group[open] > summary.sidebar-label { margin-bottom: 6px; }
 
 details.sidebar-group > summary.sidebar-label::-webkit-details-marker { display: none; }
 details.sidebar-group > summary.sidebar-label:hover { color: var(--text); }
@@ -703,6 +713,20 @@ summary.sidebar-label:focus-visible {
   border-color: var(--accent);
 }
 
+/* In-page labels are selectable too, and say so with the cursor — the holder's
+   own `zoom-in` would otherwise cover them. Selecting a label does not open the
+   overlay (the click handler bails on a live selection). */
+.content .mermaid svg text,
+.content .mermaid svg tspan,
+.content .mermaid svg foreignObject,
+.content .mermaid svg foreignObject div,
+.content .mermaid svg .nodeLabel,
+.content .mermaid svg .edgeLabel {
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* Always visible, not hover-only: on touch there is no hover, and nothing
    else signals that the diagram is interactive. */
 .mermaid-hint {
@@ -741,6 +765,76 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
   align-items: center;
   justify-content: center;
   cursor: zoom-out;
+  overflow: hidden;            /* the transform pans inside this box */
+  touch-action: none;          /* pointer events drive the pan, not the browser */
+  /* Labels stay selectable so they can be copied out of a diagram; selection is
+     suppressed only for the duration of a pan (.panning), otherwise dragging
+     would sweep a selection instead of moving the view. */
+  user-select: text;
+}
+
+.diagram-modal-surface.zoomed { cursor: grab; }
+.diagram-modal-surface.panning { cursor: grabbing; user-select: none; }
+
+/* Mermaid renders flowchart labels as <foreignObject> divs (.nodeLabel /
+   .edgeLabel) and emits NO <text> at all; sequence and state diagrams do use
+   <text>/<tspan>. Cover both, and let these beat the surface's own cursor so
+   hovering a label reads as selectable text rather than as pan/zoom. */
+.diagram-modal-surface svg text,
+.diagram-modal-surface svg tspan,
+.diagram-modal-surface svg foreignObject,
+.diagram-modal-surface svg foreignObject div,
+.diagram-modal-surface svg .nodeLabel,
+.diagram-modal-surface svg .edgeLabel {
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* …but while a pan is in flight nothing is selectable, labels included. */
+.diagram-modal-surface.panning svg text,
+.diagram-modal-surface.panning svg tspan,
+.diagram-modal-surface.panning svg foreignObject,
+.diagram-modal-surface.panning svg foreignObject div,
+.diagram-modal-surface.panning svg .nodeLabel,
+.diagram-modal-surface.panning svg .edgeLabel {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* Sits in the dark band outside the diagram surface, on its own pill so it reads
+   regardless of what is behind it. Discoverability matters here: nothing else
+   tells you the view is zoomable. */
+.diagram-modal-legend {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 7px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(18, 21, 28, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font: 500 11px/1 var(--font);
+  letter-spacing: 0.3px;
+  color: rgba(255, 255, 255, 0.78);
+  pointer-events: none;
+  white-space: nowrap;
+  max-width: calc(100vw - 24px);
+  overflow: hidden;
+}
+
+.diagram-modal-zoom {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: #fff;
+}
+
+@media (max-width: 700px) {
+  .diagram-modal-legend { font-size: 10px; padding: 4px 9px; gap: 7px; }
 }
 
 /* mermaid pins an inline max-width on the <svg>; the overlay has to beat it,

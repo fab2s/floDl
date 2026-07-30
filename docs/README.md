@@ -37,6 +37,10 @@ material in reading order for browsing the repository directly.
 
 - [The floDl CLI](cli.md)
 
+## Internals
+
+- [Distributed Architecture](distributed/architecture.md)
+
 ## Platform & Help
 
 - [Mac / Apple Silicon](mac-apple-silicon.md)

@@ -1642,4 +1642,4 @@ for your platform.
 
 ---
 
-Previous: [Distributed Training Reference](ddp.md) | Next: [Mac / Apple Silicon](mac-apple-silicon.md)
+Previous: [Distributed Training Reference](ddp.md) | Next: [Distributed Architecture](distributed/architecture.md)

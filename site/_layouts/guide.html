@@ -26,6 +26,22 @@ layout: default
   </main>
 </div>
 
+<!-- Sidebar accordion: opening one group collapses the rest, so the nav can
+     never grow taller than the viewport. The server-side default (in the
+     generated sidebar) already opens only the active page's group; this keeps
+     that invariant while browsing without navigating. -->
+<script>
+  (function () {
+    var groups = document.querySelectorAll('.sidebar details.sidebar-group');
+    groups.forEach(function (d) {
+      d.addEventListener('toggle', function () {
+        if (!d.open) return;
+        groups.forEach(function (other) { if (other !== d) other.open = false; });
+      });
+    });
+  })();
+</script>
+
 <!-- Mermaid: render ```mermaid fences as diagrams, matching GitHub's
      native rendering of the same docs/ sources. kramdown+rouge emit
      them as plain code blocks (div.language-mermaid > pre > code or
@@ -70,7 +86,16 @@ layout: default
     close.type = 'button';
     close.setAttribute('aria-label', 'Close diagram');
     close.textContent = '×';
-    dialog.append(close, surface);
+    const legend = document.createElement('div');
+    legend.className = 'diagram-modal-legend';
+    legend.innerHTML = '<span><strong>scroll</strong> to zoom &middot; ' +
+      '<strong>drag</strong> to pan &middot; double-click toggles &middot; ' +
+      '<strong>0</strong> resets &middot; text is selectable &middot; ' +
+      '<strong>Esc</strong> closes</span>';
+    const hintZoom = document.createElement('span');
+    hintZoom.className = 'diagram-modal-zoom';
+    legend.append(hintZoom);
+    dialog.append(close, surface, legend);
     document.body.append(dialog);
 
     // The SVG is MOVED, not cloned. mermaid references its own arrowhead and
@@ -80,18 +105,56 @@ layout: default
     // the node goes back to its holder on close.
     let home = null, svg = null, inlineStyle = null;
 
+    // Pan/zoom state. Applied as a CSS transform on the <svg> so the diagram
+    // stays vector-crisp at any scale.
+    let scale = 1, tx = 0, ty = 0, dragging = false, moved = false, px = 0, py = 0;
+
+    // Label elements. Mermaid renders flowchart labels as <foreignObject> divs
+    // (`.nodeLabel` / `.edgeLabel`) with NO <text> nodes at all; sequence and
+    // state diagrams do use <text>/<tspan>. Both shapes have to be covered.
+    const LABEL_SEL = 'text, tspan, foreignObject, .nodeLabel, .edgeLabel';
+
+    function apply() {
+      svg.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      // Cursor is driven by CLASSES, never an inline style: an inline cursor
+      // beats every CSS rule, so the label's `cursor: text` could never win.
+      surface.classList.toggle('zoomed', scale > 1);
+      hintZoom.textContent = scale === 1 ? '' : `${Math.round(scale * 100)}%`;
+    }
+
+    function reset() { scale = 1; tx = 0; ty = 0; apply(); }
+
+    function zoomAt(factor, cx, cy) {
+      const next = Math.min(8, Math.max(1, scale * factor));
+      if (next === scale) return;
+      // Keep the point under the cursor fixed while scaling.
+      const r = surface.getBoundingClientRect();
+      const ox = cx - r.left - r.width / 2;
+      const oy = cy - r.top - r.height / 2;
+      const k = next / scale;
+      tx = ox - k * (ox - tx);
+      ty = oy - k * (oy - ty);
+      scale = next;
+      if (scale === 1) { tx = 0; ty = 0; }
+      apply();
+    }
+
     function open(holder) {
       svg = holder.querySelector('svg');
       if (!svg) return;
       home = holder;
       inlineStyle = svg.getAttribute('style');
       svg.removeAttribute('style');
+      svg.style.transformOrigin = 'center center';
       surface.append(svg);
+      reset();
       dialog.showModal();
     }
 
     function restore() {
       if (!svg || !home) return;
+      svg.style.transform = '';
+      svg.style.transformOrigin = '';
       if (inlineStyle === null) svg.removeAttribute('style');
       else svg.setAttribute('style', inlineStyle);
       home.prepend(svg);
@@ -101,9 +164,75 @@ layout: default
     // `close` fires for the button, Esc, and dialog.close() alike.
     dialog.addEventListener('close', restore);
     close.addEventListener('click', () => dialog.close());
-    // Click anywhere in the view to dismiss - standard lightbox behaviour.
-    surface.addEventListener('click', () => dialog.close());
     dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+
+    // Wheel zooms, drag pans. Click-to-dismiss survives, but only for a click
+    // that did not drag and only at 1x - otherwise panning would close the view.
+    surface.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
+    }, { passive: false });
+
+    surface.addEventListener('pointerdown', (e) => {
+      // Reset BEFORE the scale check. Leaving it inside the zoomed branch meant
+      // `moved` stayed true after a pan, so once you zoomed back to 1x the
+      // dismiss-click was suppressed forever - the cursor said zoom-out and
+      // nothing happened.
+      moved = false;
+      if (scale === 1) return;
+      // Pressing ON a label starts a text selection, not a pan - otherwise the
+      // pointer capture below swallows the drag and labels can never be
+      // selected while zoomed in. Empty space still pans.
+      if (e.target.closest && e.target.closest(LABEL_SEL)) return;
+      dragging = true; px = e.clientX; py = e.clientY;
+      surface.setPointerCapture(e.pointerId);
+      surface.classList.add('panning');
+      apply();
+    });
+    surface.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      tx += e.clientX - px; ty += e.clientY - py;
+      px = e.clientX; py = e.clientY;
+      moved = true;
+      apply();
+    });
+    surface.addEventListener('pointerup', (e) => {
+      const wasDrag = moved;
+      if (dragging) {
+        dragging = false;
+        surface.releasePointerCapture(e.pointerId);
+        surface.classList.remove('panning');
+        apply();
+      }
+      // Don't dismiss on the mouse-up that ends a text selection - the labels
+      // are selectable so people can copy them out.
+      const selecting = !window.getSelection().isCollapsed;
+      if (!wasDrag && !selecting && scale === 1) dialog.close();
+    });
+
+    // Double-click / double-tap toggles between fit and 2x at that point.
+    surface.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      if (scale > 1) reset(); else zoomAt(2, e.clientX, e.clientY);
+    });
+
+    // Keyboard: +/- zoom, 0 resets, arrows pan. Esc is the dialog's own.
+    dialog.addEventListener('keydown', (e) => {
+      const r = surface.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomAt(1.25, cx, cy); }
+      else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomAt(1 / 1.25, cx, cy); }
+      else if (e.key === '0') { e.preventDefault(); reset(); }
+      else if (e.key.startsWith('Arrow') && scale > 1) {
+        e.preventDefault();
+        const d = 60;
+        if (e.key === 'ArrowLeft') tx += d;
+        else if (e.key === 'ArrowRight') tx -= d;
+        else if (e.key === 'ArrowUp') ty += d;
+        else ty -= d;
+        apply();
+      }
+    });
 
     for (const holder of document.querySelectorAll('.mermaid')) {
       if (!holder.querySelector('svg')) continue;   // render failed; leave it alone
@@ -115,7 +244,12 @@ layout: default
       hint.className = 'mermaid-hint';
       hint.textContent = 'Click to enlarge';
       holder.append(hint);
-      holder.addEventListener('click', () => open(holder));
+      // Same courtesy as the overlay: a click that ends a text selection should
+      // not open the view out from under the person copying a label.
+      holder.addEventListener('click', () => {
+        if (!window.getSelection().isCollapsed) return;
+        open(holder);
+      });
       holder.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(holder); }
       });

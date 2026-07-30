@@ -1,5 +1,12 @@
 # Distributed architecture
 
+> **Internals, not a tutorial.** This page describes how flodl's distributed
+> engine is built, for contributors and for anyone debugging a cluster run. You
+> do not need any of it to train on multiple GPUs - start from
+> [Multi-GPU Training](../tutorials/11-multi-gpu.md) for that, and the
+> [DDP reference](../ddp.md) for the configuration surface. Names here are
+> internal and change without notice.
+
 This document maps the **entire distributed pattern** - the data, the
 communication, and the logic that move parameters between heterogeneous GPUs
 and hosts during DDP training.
@@ -40,7 +47,51 @@ parameterize everything below:
 > Source: `flodl/src/distributed/config.rs` (`ElCheMode`, `ElCheMode::split`),
 > `flodl/src/distributed/ddp_run/mod.rs` (`ApplyPolicy`, `AverageBackend`).
 
-[`ElCheConfig`]: ../../flodl/src/distributed/config.rs
+[`ElCheConfig`]: https://docs.rs/flodl/latest/flodl/distributed/struct.ElCheConfig.html
+
+### Realized work: the mass semantics both backends share
+
+Every reduce in this document is **work-weighted, not a plain average**, and both
+backends share one vocabulary for it. A *mass* is the scalar realized-work weight
+riding a contribution. The algebra has three moves and only three:
+
+1. **Pre-scale at the source.** The contributing unit scales its tensors by its
+   mass. On the CPU wire the mass travels atomically with them in the same frame;
+   on NCCL it is fused into the collective as a premultiply factor.
+2. **Sum through folds.** Scaled tensors and masses sum element-wise through any
+   number of fold tiers (per-host relay today). Summation is associative, so fold
+   depth never changes the result - no averaging-of-averages. **A fold tier that
+   divided would break the law below; only the root divides.**
+3. **Divide once**, by the summed mass of *exactly the contributions accepted into
+   that round*.
+
+The load-bearing law: **the sum and its divisor come from the same accepted
+contributions.** Work that was never accepted (dead rank, lost frame) enters
+neither, so they cannot disagree, whatever the cohort did between rounds.
+
+Mass is **policy-supplied**, and a sync runs **two rounds with different
+policies**:
+
+| round | mass | meaning |
+|---|---|---|
+| params | `gamma_mass(n, γ)` = `n^γ` over optimizer steps since the last sync | `γ = 1.0` (default) plain work-weighting; `γ = 0.0` unweighted average over movers; `γ = -1.0` per-step-equal |
+| buffers | `mover_mass(n)` = 0/1 indicator | moved ranks equal-weighted, idle excluded - never γ-weighted |
+
+Two rules are part of the vocabulary rather than implementation details:
+
+- **The idle guard.** A unit that did no work has zero mass for *any* policy
+  parameter. Left to raw `powf`, IEEE gives `0^0 = 1` (an idle unit voting at full
+  weight when `γ = 0`) and `0^{γ<0} = ∞` (poisoning the cohort mass into NaN).
+  Both backends import `gamma_mass` so the guard cannot drift between them.
+- **The zero-mass round rule** (`is_realized`). A round whose accepted mass is zero
+  realized nothing; its summed tensors are meaningless zeros and **receivers keep
+  their local state**.
+
+Where the divide happens is the one thing the backends do *not* share - see
+[view 4](#4-reduce-backends).
+
+> Source: `flodl/src/distributed/realized_work.rs` (`gamma_mass`, `mover_mass`,
+> `is_realized`), `controller/round_frame.rs` (`RoundFrame::weight`, `RoundKind`).
 
 ---
 
@@ -57,6 +108,16 @@ agents over SSH, and its defaults close the window the instant every
 configured rank is in); a self-deployed agent with nothing but the
 controller address joins the same way. The **coordinator** is the scheduler
 the ranks talk to.
+
+**Who closes the window is configurable.** `StartMode::Auto` (the default) is
+the clock-driven case described above. Under `Manual` only the operator closes
+it - `target_ranks` is refused at validation and window expiry *holds* rather
+than forming - and `Hybrid` allows both. Quorum met with the door still open
+and the operator holding the close is its own phase, `ClusterPhase::Staging`,
+between `Waiting` and `Forming`. The join window's own protocol, message
+sequence and phase machine are documented for operators in the
+[DDP reference](../ddp.md#dial-in-membership-the-join-window); this view is
+only concerned with the process tree it produces.
 
 ```mermaid
 flowchart TB
@@ -90,6 +151,10 @@ flowchart TB
     W2 <-->|loopback| R1
     W3 <-->|loopback| R1
     R1 <-->|one muxed TCP conn<br/>MuxRecord frames| C
+
+    %% Stack the hosts instead of letting dagre put them side by side: with
+    %% both wired to the launcher they land on one rank and the chart sprawls.
+    host0 ~~~ host1
 ```
 
 The agent's join connection stays open past formation as the **host control
@@ -114,8 +179,9 @@ reachability = the port's bind scope.
 
 > Source: `launcher/mod.rs` (`Role`, `dispatch()`), `launcher/agent.rs`
 > (`AgentSpec`, `run_agent`), `membership.rs` (`MembershipLedger`,
-> `run_join_window`), `status.rs` (`serve_status`), `relay/agent.rs`
-> (`ChannelKind`), `relay/mux.rs` (`MuxRecord`, `RelayControlMsg`).
+> `run_join_window`, `StartMode`, `ClusterPhase`), `status.rs`
+> (`serve_status`), `relay/agent.rs` (`ChannelKind`), `relay/mux.rs`
+> (`MuxRecord`, `RelayControlMsg`).
 
 ---
 
@@ -155,15 +221,21 @@ sequenceDiagram
     alt AverageBackend::Cpu
         C->>W: RequestParams (control channel)
         W->>C: SnapshotReady { rank }
-        W-->>D: RoundFrame (this rank's params, data channel)
-        D->>D: sum + divide by world_size (reduce thread)
-        D-->>W: averaged RoundFrame
+        Note over W: count gather (RoundKind::Control, pure sum)<br/>all-idle -> keep local, skip both rounds
+        W-->>D: RoundFrame { params scaled by gamma_mass, weight }
+        D->>D: sum tensors + sum masses, divide ONCE<br/>by accepted mass (reduce thread)
+        D-->>W: consensus RoundFrame
+        W-->>D: RoundFrame { f32 buffers scaled by mover_mass, weight }
+        D-->>W: consensus RoundFrame
         Note over W: param bridge synthesizes ControlMsg::Update(AveragedParams) -> load_averaged
         W->>C: SyncAck { rank, divergence, ... }
         C->>W: Update { version, next_plan: Some(plan) }
     else AverageBackend::Nccl
         C->>W: SyncNow
-        W->>W: in-place AllReduce on comm_stream
+        W->>W: COUNT collective: AllReduce[sum] of [Σn^γ, Σmover]
+        Note over W: not realized (cohort idle) -> return after ONE collective
+        W->>W: PARAM collective: AllReduce premul-sum, factor n^γ/Σn^γ
+        W->>W: BUFFER collective (only if f32 buffers): factor mover/Σmover
         W->>C: SyncAck { rank, step_count, divergence, ... }
         C->>W: StartEpoch(next plan)
     end
@@ -175,10 +247,20 @@ sequenceDiagram
 ```
 
 CPU averaging is a **data-channel star** (`ClusterController` /
-`CpuReduceClient`): each rank ships its params as a `RoundFrame`, the controller
-sums and divides by `world_size`, and the averaged frame returns on the same
-channel - the scheduler's `Update { version, next_plan }` carries only the next
-schedule, never the weights. The scheduler stays free throughout (see view 3).
+`CpuReduceClient`): each rank ships its contribution as a `RoundFrame` carrying
+the payloads *and* its mass, the controller sums both and divides once by the
+accepted mass, and the consensus frame returns on the same channel - the
+scheduler's `Update { version, next_plan }` carries only the next schedule, never
+the weights. The scheduler stays free throughout (see view 3).
+
+Two rounds run per sync, params then buffers, with the mass policies from
+[Realized work](#realized-work-the-mass-semantics-both-backends-share). On the CPU
+path only the **f32 subset** of buffers rides the reduce: the transport is
+f32-only, and non-f32 buffers (integer counters and the like) are deterministic
+values updated identically on every rank, so passing the local value through is
+correct rather than a dropped sync. The merge back is positional. The weight-space
+divergence triple is computed *between* the two rounds, so a buffer-round error
+cannot mask the params triple.
 
 The `share_complete_ms` in `MetricsMsg` (not `epoch_ms`) is the honest
 balancer denominator; ElChe's per-batch signal is the coordinator-measured
@@ -204,13 +286,24 @@ has landed - no background-thread join, the scheduler never owns the tensors.
 
 ```mermaid
 stateDiagram-v2
+    direction LR
     [*] --> Idle
-    Idle --> Pending: should_average()<br/>trigger_averaging broadcasts RequestParams<br/>snapshot last_step_count into nccl_sync_step
-    Pending --> Pending: poll_cpu_averaging each tick<br/>(scheduler keeps servicing check_throttle + timing)
-    Pending --> Idle: every alive rank's bridge SyncAck in<br/>finish_averaging_cpu + re-arm
-    Pending --> Idle: stalled past ceiling (10x heartbeat, >=300s)<br/>ShutdownWithSave(ReduceStall) -- see view 7
+    Idle --> Pending: should_average
+    Pending --> Pending: poll each tick
+    Pending --> Idle: all acks in
+    Pending --> Idle: stall ceiling
     Pending --> [*]: shutdown
 ```
+
+What each transition actually does - kept out of the diagram because state-machine
+edge labels do not wrap and collide at this length:
+
+| transition | mechanism |
+|---|---|
+| `Idle -> Pending` | `should_average()` fires; `trigger_averaging` broadcasts `RequestParams` and snapshots `last_step_count` into the cycle's step slot |
+| `Pending -> Pending` | `poll_cpu_averaging` runs every `tick` while the scheduler keeps servicing `check_throttle` and timing reports |
+| `Pending -> Idle` (normal) | every alive rank's bridge `SyncAck` has landed; `finish_averaging_cpu` finalizes and re-arms |
+| `Pending -> Idle` (stall) | parked past the ceiling (10x heartbeat, at least 300s) - `ShutdownWithSave(ReduceStall)`, see [view 7](#7-failure-handling) |
 
 **Invariants that keep this correct:**
 
@@ -221,14 +314,26 @@ stateDiagram-v2
   persistent pinned buffers; the `Idle -> Pending -> Idle` cycle issues exactly
   one `RequestParams` per cycle and the worker re-snapshots only after the
   `Update` round-trips back, so a snapshot is never overwritten while in flight.
-- **finalize on `nccl_sync_divergence`, not `nccl_ack`** - the CPU bridge
-  `SyncAck` (which populates `nccl_sync_divergence`) is the only signal the
-  AllReduce round-trip finished; its `step_count` is not meaningful for the
-  cadence clock, so re-arm is driven by `cpu_avg_state`, not the ack.
+- **finalize on the divergence evidence, not the raw ack** - the CPU bridge
+  `SyncAck` is the only signal the round-trip finished, and its `step_count` is
+  *not* meaningful for the cadence clock (the inner worker does not bump
+  `local_step` on `RequestParams`). Folding it into the coordinator's
+  `last_step_count` would poison the next cycle's step snapshot and wedge the
+  NCCL re-arm gate - a bug that happened once as an unguarded shared handler.
+  That knowledge now lives in `AvgCycleState::sync_ack_step_meaningful` rather
+  than as a backend `if` inside the event loop.
 
-> Source: `cluster_coordinator/mod.rs` (`CpuAvgState`),
-> `cluster_coordinator/averaging.rs` (`trigger_averaging`,
-> `poll_cpu_averaging`, `finish_averaging_cpu`).
+> Source: `cluster_coordinator/cycle_state.rs` (`AvgCycleState`, `CycleMachine`,
+> `CpuAvgPhase`), `cluster_coordinator/averaging.rs` (`trigger_averaging`),
+> `cluster_coordinator/cycle_cpu.rs` (`poll_cpu_averaging`,
+> `finish_averaging_cpu`).
+>
+> The two-state phase is `CpuAvgPhase { Idle, Pending }`, held inside
+> `CycleMachine::Cpu { phase, pending_since, throttled }`. Its sibling
+> `CycleMachine::NcclInline` has no interior phase at all - the collective paces
+> the cycle, so `finish_averaging_nccl` runs inline at trigger. Shared per-cycle
+> evidence (trigger instant, step snapshot, acks, divergence/norm triple,
+> measured latencies) lives on `AvgCycleState` alongside the machine.
 >
 > The single-host threaded path (`ddp_run/coordinator/{mod,cpu_avg}.rs`) still
 > ships a 3-state `Idle -> Collecting -> Computing` machine that gathers
@@ -245,50 +350,77 @@ scheduler stays free.** They are gated on `AverageBackend`, independent of
 pacing.
 
 ```mermaid
-flowchart LR
-    subgraph nccl["AverageBackend::Nccl -- inline collective"]
+flowchart TB
+    S["Coordinator: should_average() -> trigger_averaging"]
+
+    subgraph nccl["AverageBackend::Nccl -- symmetric collectives, NO root"]
         direction TB
-        N1["Coord: SyncNow broadcast"] --> N2["Worker: AllReduce in-place<br/>on comm_stream"]
-        N2 --> N3["Worker: record CudaEvent"]
-        N3 --> N4["Worker: SyncAck<br/>{ divergence, pre/post_norm }"]
-        N4 --> N5["finish_averaging_nccl<br/>INLINE in trigger_averaging<br/>(Cadence: after window-completion drain)"]
-        N5 --> N6["ElChe fed delivered_ms_accum (Cadence)<br/>/ wall_ms_accum (Sync)"]
+        N1["Coord: SyncNow broadcast"] --> N2["COUNT collective, ALWAYS<br/>AllReduce sum of the 2-element<br/>tensor [n^γ, mover]"]
+        N2 --> N3{"is_realized<br/>(Σn^γ)?"}
+        N3 -->|"no: whole cohort idle"| N4["return after ONE collective<br/>consensus already holds"]
+        N3 -->|yes| N5["PARAM collective<br/>all_reduce_premul_sum<br/>factor = n^γ / Σn^γ"]
+        N5 --> N6["BUFFER collective<br/>only if f32 buffers exist<br/>factor = mover / Σmover"]
+        N6 --> N7["Worker: record CudaEvent<br/>SyncAck { divergence, pre/post_norm }"]
+        N7 --> N8["finish_averaging_nccl<br/>INLINE at trigger"]
     end
 
-    subgraph cpu["AverageBackend::Cpu -- data-channel star + Idle/Pending scheduler"]
+    subgraph cpu["AverageBackend::Cpu -- data-channel star, root divides"]
         direction TB
         P1["Coord: RequestParams"] --> P2["Worker: snapshot_params<br/>async pinned D2H, single sync"]
-        P2 --> P3["Worker: SnapshotReady"]
-        P3 --> P4["Worker param bridge: ship RoundFrame<br/>(CpuReduceClient, data channel)"]
-        P4 --> P5["ClusterController: sum / world_size<br/>(reduce thread, NOT the scheduler)"]
-        P5 --> P6["Worker: synthesized Update(AveragedParams)<br/>+ Coord Update { version, next_plan }"]
-        P6 --> P7["Worker: load_averaged<br/>async GPU writeback"]
-        P7 --> P8["ElChe fed delivered_ms_accum<br/>(compute + data + transport)"]
+        P2 --> P3["Worker: SnapshotReady<br/>+ count gather (RoundKind::Control, pure sum)"]
+        P3 --> P4["Worker param bridge: stream RoundFrame<br/>mass pre-scale FUSED into the wire encode<br/>zero-mass contribution DECLARED, not encoded"]
+        P4 --> P5["Relay fold tier: sum tensors + masses<br/>seed held verbatim, NEVER divides"]
+        P5 --> P6["ClusterController: sum, then divide ONCE<br/>by the accepted mass<br/>(reduce thread, NOT the scheduler)"]
+        P6 --> P7["Worker: synthesized Update(AveragedParams)<br/>decode-into-staging + async GPU writeback"]
+        P7 --> P8["second round: f32 buffers, mover mass"]
     end
+
+    %% Both branches hang off one root, so they start on the same rank and the
+    %% two backends read as parallel alternatives rather than a sequence.
+    S --> N1
+    S --> P1
 ```
 
 Key asymmetries (each a hard-won fix):
 
+- **Where the divide happens - the deepest difference.** NCCL has **no root**:
+  the count collective gives every rank the same `Σn^γ`, so each rank
+  pre-normalizes locally by `n^γ / Σn^γ` and the premultiply is fused *inside*
+  the collective, leaving the output needing **no post-divide** at all (the old
+  scale-then-AllReduce-then-divide bookend kernels are gone). The CPU path
+  instead ships the mass with the payload and the **controller divides once** by
+  the accepted mass. Same algebra, opposite placement.
+- **Collective count is variable, and that is a hazard.** A NCCL sync issues up
+  to **three** collectives: COUNT always, PARAM unless the cohort is idle, BUFFER
+  only when the model has f32 buffers. A cohort desync therefore shows up as
+  ranks issuing a *different number* of collectives for the same `seq` - one rank
+  takes the idle skip and does one while its peers do two, leaving them waiting
+  on a phantom collective (NCCL busy-waits at 100% CPU with no peers). The
+  `-vvv` ENTER/EXIT logging per collective exists to pin exactly which one a
+  stuck rank parked in.
 - **Memory**: NCCL is zero-extra (in-place); CPU is `O(world_size *
   model_size)` host RAM at the star controller.
 - **Blocking**: NCCL sync at a collective barrier (fast GPU waits); CPU never
   blocks the scheduler - it parks in `Pending` (view 3) while the star reduces.
 - **Timing feed**: CPU+Cadence/Async and NCCL+Cadence ride the transport-aware
-  `delivered_ms_accum` feed (view 5). NCCL+Cadence earns it because
-  `trigger_averaging` now drains the window-completion frames (the deterministic
-  window-completion wait) *before* the inline `finish_averaging_nccl` consumes
-  the feed - the staleness that originally forced NCCL onto compute-only is
-  gone. `Sync` (either backend) and the hypothetical NCCL+Async stay on the
-  compute-only `wall_ms_accum` feed.
+  delivered feed (view 5); `Sync` on either backend stays on the compute-only
+  `wall_ms` feed. The delivered cost is accumulated **continuously from each
+  `Batch`**, so it is present at sync by construction - there is no
+  completion-frame race, and no drain step, for either backend.
 - **Snapshot readout** (CPU): `snapshot_params` does batched **async** D2H into
   reused **pinned** host buffers, then a single `synchronize()` per window -
-  not per-param synchronous copies.
+  not per-param synchronous copies. Under `bf16_wire` the D2H casts on the GPU
+  and ships half the bytes; every accumulator still sums in f32, bf16 existing
+  only at the wire and buffer boundary.
 
 > Source: `ddp_run/mod.rs` (`AverageBackend`),
-> `cluster_coordinator/averaging.rs` (`timing_feed`, `trigger_averaging`,
-> `finish_averaging_nccl`), `controller.rs` (`ClusterController`),
-> `cpu_reduce.rs` (`CpuReduceClient`), `cluster_worker.rs` (param bridge),
-> `ddp_run/worker/sync.rs` (`snapshot_params`, `load_averaged`).
+> `ddp_run/worker/sync.rs` (`weighted_allreduce_nccl`, `snapshot_params`,
+> `load_averaged`), `cluster_coordinator/averaging.rs` (`trigger_averaging`),
+> `cluster_coordinator/cycle_nccl.rs` (`finish_averaging_nccl`),
+> `controller/mod.rs` (`ClusterController`), `controller/round_frame.rs`
+> (`RoundFrame`, `RoundKind`, sum/divide-once), `cpu_reduce.rs`
+> (`CpuReduceClient::all_reduce_scaled`, `stream_zeros_frame`),
+> `cluster_worker/param_bridge.rs` (`sumcount_reduce`).
 
 ---
 
@@ -300,41 +432,75 @@ heterogeneous per-rank step counts**. The window is capped at one epoch so
 syncs never collapse below 1/epoch.
 
 ```mermaid
-flowchart TB
-    A["Per-rank timing signal"] --> B{backend + policy}
-    B -->|Cpu+Cadence/Async<br/>or Nccl+Cadence| C["delivered_ms_accum<br/>dispatch -> completion delta<br/>(compute + data + transport)"]
-    B -->|Sync any backend<br/>/ Nccl+Async| D["wall_ms_accum<br/>(compute only)"]
-    C --> E["report_timing"]
-    D --> E
-    E --> F["ms_per_batch_window<br/>(ring buffer, window-mean)"]
-    F --> G["recompute_batch_counts<br/>slow device = anchor<br/>fast devices range ahead"]
-    G --> H["batch_counts[rank]<br/>= reduce window"]
-    H --> I["compute_chunk_batches<br/>dispatch exactly counts[rank]"]
-    I --> J["reduce + epoch barriers<br/>(reduce_step_budget)"]
-
-    subgraph autotune["anchor auto-tune"]
-        K["overhead_target<br/>keep reduce under ~10% wall"] --> G
-        M["convergence_guard<br/>SuppressGrowth / NudgeDown"] --> G
-        N["set_max_total_batches<br/>cap: window at most 1 epoch"] --> H
-    end
-
-    P["Phase: Probe -> Warmup -> Stable -> Mature"] -.->|hysteresis| G
+flowchart LR
+    A["each Batch report<br/>batch_ms + data_ms"] --> B["WindowLedger::record_batch"]
+    B --> C{"first batch<br/>of the window?"}
+    C -->|yes| D["first_batch_ms<br/>the per-window FILL:<br/>control transit, plan pickup,<br/>prefetch spin-up, unpipelined H2D"]
+    C -->|"no (2..n)"| E["delivered_ms + delivered_batches<br/>the MARGINAL per-batch rate"]
+    D --> F["fill_excess_ms<br/>excess over the marginal rate"]
+    B --> G["wall_ms<br/>compute only (Sync feed)"]
 ```
+
+Then the feed picks a scale and the scale drives the schedule:
+
+```mermaid
+flowchart LR
+    H{"select_feed:<br/>delivered_coherent?"} -->|no| I["whole cohort drops<br/>to the compute scale"]
+    H -->|yes| J["PER RANK: with a delivered sample,<br/>feed delivered cost; without one,<br/>fall back to its own compute pair (0,0)<br/>as an attested non-mover"]
+    I --> K["ms_per_batch_window<br/>ring buffer, window-mean"]
+    J --> K
+    K --> L["recompute_batch_counts<br/>slow device = anchor<br/>fast devices range ahead"]
+    L --> M["batch_counts[rank]<br/>= the reduce window"]
+    M --> N["compute_chunk_batches<br/>dispatch exactly counts[rank]"]
+    N --> O["reduce + epoch barriers<br/>reduce_step_budget"]
+```
+
+Four things constrain the anchor `recompute_batch_counts` settles on. They are
+listed rather than drawn: as diagram nodes they each needed an edge back into the
+same box, which stretched the chart vertically and buried the main path.
+
+| constraint | effect |
+|---|---|
+| `overhead_target` | keeps the reduce under ~10% of wall time |
+| `convergence_guard` | `SuppressGrowth` / `NudgeDown` when convergence degrades |
+| `set_max_total_batches` | caps the window at one epoch, so syncs never collapse below 1/epoch |
+| `Phase` (`Probe -> Warmup -> Stable -> Mature`) | hysteresis: how readily the anchor is allowed to move at all |
 
 The delivered-cost feed is what closed the cpu-cadence idle prize: ranks pay
 compute + data + transport, but ElChe was scheduling on compute-only timing, so
-it over-allocated the fast RTX and left it idle at the barrier. Feeding the
-coordinator-measured dispatch-to-completion delta (which excludes the
-reduce-barrier wait) made cpu-cadence track nccl-cadence. NCCL+Cadence later
-joined the delivered feed too - its inline finish drains the window-completion
-frames first, so the spans are no longer stale by feed time. The feed is
-**all-or-none per window**: if any stepping rank lacks a closed delivered span,
-every rank falls back to the compute scale for that window (mixing the two
-scales would invert ElChe's relative allocation).
+it over-allocated the fast RTX and left it idle at the barrier. Scheduling on
+delivered cost instead made cpu-cadence track nccl-cadence, and NCCL+Cadence
+later joined the same feed.
 
-> Source: `el_che.rs` (`ElChe`, `Phase`, `recompute_batch_counts`),
-> `cluster_coordinator/epoch_dispatch.rs` (`compute_chunk_batches`,
-> `take_next_chunk_plan`), `cluster_coordinator/averaging.rs` (`timing_feed`).
+Two refinements matter, because both are easy to get backwards:
+
+- **The feed is marginal, not total.** The window's first batch is deliberately
+  *excluded* from the delivered accumulators, because it absorbs the fixed
+  per-window fill (control transit, plan pickup, prefetch spin-up, the first
+  unpipelined H2D). Batches `2..n` form the marginal rate ElChe schedules on, so
+  a fixed cost that does not scale with allocation cannot pollute the per-batch
+  cost that does. The first batch's excess over that rate is kept separately as
+  `fill_excess_ms`.
+- **Fallback is per rank, gated on coherence.** `select_feed` first asks whether
+  the window is `delivered_coherent`; if not, the *whole cohort* drops to the
+  compute scale for that window, because mixing the two scales would invert
+  ElChe's relative allocation. When it *is* coherent the selection is per rank:
+  a rank holding a delivered sample feeds delivered cost, and a rank without one
+  is a non-mover by the caller's attestation and contributes `(0, 0)` on either
+  scale.
+
+The ledger is **advisory scheduling state**: it drives *when* windows fire and
+*how* work is allocated. It is deliberately not the reduce's divisor - that is the
+mass computed rank-side at snapshot time and carried with the contribution
+([Realized work](#realized-work-the-mass-semantics-both-backends-share)). A rank
+the coordinator believes did `n` steps may realize a different count at its
+snapshot; the reduce is exact either way.
+
+> Source: `el_che.rs` (`ElChe`, `Phase`, `recompute_batch_counts`,
+> `WindowReport::select_feed`),
+> `cluster_coordinator/window_ledger.rs` (`WindowLedger::record_batch`,
+> `fill_excess_ms`), `cluster_coordinator/epoch_dispatch.rs`
+> (`compute_chunk_batches`, `take_next_chunk_plan`).
 
 ---
 
@@ -370,7 +536,7 @@ Every frame is tagged with a `MsgKind` and carried in an HMAC-signed
 | control | coord -> worker | `ControlMsg` | RequestParams, Update(AveragedParams), SyncNow, StartEpoch(EpochPlan), ExtendPartition, DeclareDead, NewNcclSession, RequestNewNcclId, Throttle, SetGlobalStep |
 | timing | worker -> coord | `TimingMsg` | Batch, SyncAck, SnapshotReady, Heartbeat, LrUpdate, Exiting, EvalResult, CheckpointResult |
 | metrics | worker -> coord | `MetricsMsg` | epoch, avg_loss, batches_processed, share_complete_ms, samples_processed |
-| data | both | `RoundFrame` | tensor payloads (ParamSnapshot, AveragedParams) |
+| data | both | `RoundFrame` | tensor payloads (ParamSnapshot, AveragedParams) **plus the realized-work mass** in `weight`, atomic with the contribution it scales |
 
 These are the inner `GpuWorker`'s channels, and they are present in **both**
 paths - the cluster path wraps the same `GpuWorker` and the `cluster_worker`
@@ -439,6 +605,7 @@ ended so a resume can reason about it:
 | `AllRanksLost` | the whole cohort died |
 | `SingleSurvivor` | only one rank left - no peer to average with |
 | `ReduceStall` | a reduce wedged past its ceiling (either backend) |
+| `Checkpoint` | a periodic / requested checkpoint, not a run-ending event |
 
 The two reduce-stall ceilings are twins: the CPU backend parks in
 `CpuAvgState::Pending` so its backstop lives in `poll_cpu_averaging`; the NCCL
@@ -454,4 +621,8 @@ detector's job, not the stall ceiling's.
 > (`ShutdownWithSave` broadcast), `checkpoint_meta.rs` (`SaveReason`,
 > `RankDeathRecord`), `ddp_run/orchestrator/rank_entry.rs` (death sidecar).
 
+<!-- nav: generated by site/build_guide.py — do not edit below -->
+
 ---
+
+Previous: [The floDl CLI](../cli.md) | Next: [Mac / Apple Silicon](../mac-apple-silicon.md)
