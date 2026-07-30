@@ -23,13 +23,38 @@
   <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f9e0;</text></svg>">
   <script>
-    // Apply stored theme preference before CSS loads to prevent flash.
+    // Resolve the theme before CSS loads, to prevent a flash.
+    //
+    // Precedence, narrowest intent first — deliberately the same ladder the
+    // benchmark dashboard uses (assets/benchmark-dashboard.html):
+    //   1. the reader's own toggle (localStorage) — always wins
+    //   2. prefers-color-scheme — the OS preference, the friendly default
+    //   3. dark
+    //
+    // The key is `flodl-theme`, SHARED with the dashboard on purpose: an
+    // embedded dashboard iframe is same-origin, so it reads this very value at
+    // load time and inherits the site's choice with no message passing. Writing
+    // a second key would let the two drift apart.
     (function() {
+      var t = null;
       try {
-        if (localStorage.getItem('theme') === 'light') {
-          document.documentElement.setAttribute('data-theme', 'light');
+        t = localStorage.getItem('flodl-theme');
+        if (t !== 'light' && t !== 'dark') {
+          // One-time migration off the pre-unification key.
+          var legacy = localStorage.getItem('theme');
+          if (legacy === 'light' || legacy === 'dark') {
+            t = legacy;
+            localStorage.setItem('flodl-theme', t);
+            localStorage.removeItem('theme');
+          }
         }
       } catch (e) {}
+      if (t !== 'light' && t !== 'dark') {
+        t = (window.matchMedia &&
+             window.matchMedia('(prefers-color-scheme: light)').matches)
+              ? 'light' : 'dark';
+      }
+      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
     })();
   </script>
 </head>
@@ -84,16 +109,41 @@
 </footer>
 
 <script>
-  function toggleTheme() {
-    var cur = document.documentElement.getAttribute('data-theme');
-    if (cur === 'light') {
-      document.documentElement.removeAttribute('data-theme');
-      try { localStorage.setItem('theme', 'dark'); } catch (e) {}
-    } else {
-      document.documentElement.setAttribute('data-theme', 'light');
-      try { localStorage.setItem('theme', 'light'); } catch (e) {}
-    }
+  // An embedded dashboard resolves its theme once, at load, and listens for
+  // nothing — so after the shared `flodl-theme` key changes it has to be
+  // re-loaded to pick the new value up. Re-assigning src is enough and avoids
+  // reaching into the child document.
+  function syncEmbeddedDashboards() {
+    var frames = document.querySelectorAll('iframe[src*="benchmark-dashboard"]');
+    for (var i = 0; i < frames.length; i++) frames[i].src = frames[i].src;
   }
+
+  function applyTheme(light) {
+    if (light) document.documentElement.setAttribute('data-theme', 'light');
+    else document.documentElement.removeAttribute('data-theme');
+    syncEmbeddedDashboards();
+  }
+
+  function toggleTheme() {
+    var light = document.documentElement.getAttribute('data-theme') !== 'light';
+    applyTheme(light);
+    try { localStorage.setItem('flodl-theme', light ? 'light' : 'dark'); } catch (e) {}
+  }
+
+  // Follow the OS live, but only while the reader has expressed no preference of
+  // their own — an explicit toggle outranks the system setting (precedence 1).
+  (function() {
+    if (!window.matchMedia) return;
+    var mq = window.matchMedia('(prefers-color-scheme: light)');
+    var onChange = function(e) {
+      var stored = null;
+      try { stored = localStorage.getItem('flodl-theme'); } catch (err) {}
+      if (stored === 'light' || stored === 'dark') return;
+      applyTheme(e.matches);
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  })();
 </script>
 
 </body>

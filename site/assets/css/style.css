@@ -25,6 +25,11 @@
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   --max-w: 1120px;
+  /* Header height. The header is `position: sticky`, so this value is also the
+     space a fragment jump has to skip (see html{scroll-padding-top}) and the
+     offset the sticky sidebar starts at. It was duplicated in 5 places; a
+     mismatch silently parks anchor targets underneath the header. */
+  --header-h: 56px;
   /* Guide geometry. ONE knob sets the content width: everything in the guide
      column — prose, code blocks, tables, diagrams, heading rules — lines up on
      --guide-measure, and the shell is derived from it. Wide code and wide
@@ -101,7 +106,15 @@
    sidebar scrolls away. So both axes must stay `visible` here, and runaway
    horizontal content is contained per element instead (see the code-block
    and table rules at the end of this file). */
-html { scroll-behavior: smooth; }
+html {
+  scroll-behavior: smooth;
+  /* The sticky header overlaps the top of the viewport, so a fragment jump
+     (`#heading` from the sidebar's third level, an in-page link, a shared deep
+     link) would leave its target sitting UNDERNEATH the header. scroll-padding
+     on the scroll container reserves that space for every anchor target on every
+     page — one rule, no per-element scroll-margin, no JS. */
+  scroll-padding-top: calc(var(--header-h) + 18px);
+}
 
 body {
   font-family: var(--font);
@@ -132,7 +145,7 @@ a:hover { color: var(--cyan); }
   max-width: var(--max-w);
   margin: 0 auto;
   padding: 0 24px;
-  height: 56px;
+  height: var(--header-h);
   display: flex;
   align-items: center;
   gap: 32px;
@@ -587,7 +600,7 @@ a:hover { color: var(--cyan); }
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
   gap: 0;
-  min-height: calc(100vh - 56px);
+  min-height: calc(100vh - var(--header-h));
 }
 
 /* Guide pages widen the header shell to match, so the sidebar's left edge
@@ -600,12 +613,12 @@ body.guide-page .site-header nav {
   border-right: 1px solid var(--border);
   padding: 32px 20px;
   position: sticky;
-  top: 56px;
+  top: var(--header-h);
   /* Grid items stretch by default; a box already as tall as its row has no
      slack to stick within. Pin to the row start and give it one viewport of
      height, so it stays put and scrolls internally when the nav is taller. */
   align-self: start;
-  height: calc(100vh - 56px);
+  height: calc(100vh - var(--header-h));
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
@@ -684,6 +697,67 @@ summary.sidebar-label:focus-visible {
 
 .sidebar a:hover { color: var(--text); background: rgba(108, 140, 255, 0.06); text-decoration: none; }
 .sidebar a.active { color: var(--accent); background: rgba(108, 140, 255, 0.1); }
+
+/* Third nav level: the active page's own H2s. Rendered only under the active
+   entry (see build_guide.render_sidebar), so it needs no fold of its own — it is
+   present exactly when the reader is on that page. A rule on the left ties the
+   list to its parent entry and keeps it from reading as a sibling group. */
+.sidebar-anchors {
+  display: block;
+  margin: 2px 0 8px 14px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.sidebar-anchors a {
+  padding: 3px 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--dim);
+  opacity: 0.85;
+}
+
+.sidebar-anchors a:hover { opacity: 1; }
+
+/* ── Narrow-width guide nav (drawer handle + backdrop) ──
+   Both are inert above 900px, where the sidebar is a normal column. See the
+   900px query for the drawer itself and for why this exists at all. */
+.sidebar-toggle, .sidebar-backdrop { display: none; }
+
+.sidebar-toggle {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 96;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  font: 600 13px/1 var(--font);
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+}
+
+.sidebar-toggle svg {
+  width: 16px; height: 16px;
+  fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round;
+}
+
+.sidebar-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 94;
+  background: rgba(8, 10, 14, 0.55);
+  /* Without this, a touch drag over the backdrop scrolls the page underneath. */
+  touch-action: none;
+}
+
+.sidebar-backdrop.visible { display: block; }
 
 .guide-content {
   padding: 40px var(--guide-pad) 80px;
@@ -1253,16 +1327,51 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
     grid-template-columns: 1fr;
   }
 
+  /* Off-canvas drawer. What was here before was `display: none` plus a
+     `.sidebar.open { display: block }` companion that NOTHING ever set — a dead
+     affordance, so on a narrow screen the guide nav was simply unreachable. It
+     slides over the content rather than pushing it, and closes on a link, on the
+     backdrop, or on Escape (see the toggle script in _layouts/guide.html). */
   .sidebar {
-    position: static;
-    height: auto;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    width: min(84vw, 300px);
+    /* Explicit height, NOT inferred from top+bottom. Relying on the stretch
+       (`top` + `bottom: 0` + `height: auto`) measured as content-height here —
+       1252px inside a 700px viewport — so the box ran off-screen with
+       scrollHeight == clientHeight and nothing to scroll. An explicit height is
+       unambiguous, and `dvh` additionally tracks mobile browser chrome
+       collapsing, which a vh-based stretch does not. The vh line is the fallback
+       for engines without dvh. */
+    height: calc(100vh - var(--header-h));
+    height: calc(100dvh - var(--header-h));
     padding: 20px;
-    display: none;
+    background: var(--card);
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+    overflow-y: auto;
+    /* The drawer owns the gesture. `overflow-y: auto` alone still CHAINS: when the
+       nav is short (the accordion keeps one group open, so it often does not
+       overflow) or when its scroll hits an end, the scroll falls through to the
+       document and the content moves behind the drawer instead. */
+    overscroll-behavior: contain;
+    z-index: 95;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
   }
 
-  .sidebar.open { display: block; }
+  .sidebar.open { transform: translateX(0); }
+
+  /* Freeze the page behind an open drawer. Deliberately scoped INSIDE this media
+     query: `overflow` on html/body makes them a scroll container and would defeat
+     the desktop sticky sidebar (see the long note on `html` near the top). Below
+     900px the sidebar is `position: fixed` and does not use sticky, so the lock is
+     safe here and structurally cannot leak upward. The toggle script also force-
+     closes when the viewport crosses back over 900px. */
+  html.nav-locked, html.nav-locked body { overflow: hidden; }
+
+  .sidebar-toggle { display: inline-flex; }
 
   .guide-content { padding: 24px; }
 
@@ -1271,7 +1380,7 @@ dialog.diagram-modal::backdrop { background: rgba(8, 10, 14, 0.82); }
     display: flex;
     flex-direction: column;
     position: absolute;
-    top: 56px;
+    top: var(--header-h);
     left: 0;
     right: 0;
     background: var(--card);
