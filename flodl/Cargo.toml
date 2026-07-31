@@ -24,6 +24,7 @@ rng = ["rand"]
 
 [dependencies]
 flodl-sys = { version = "0.7.0", path = "../flodl-sys" }
+flodl-hw = { version = "0.7.0", path = "../flodl-hw" }
 indexmap = "2"
 flate2 = "1"
 hmac-sha256 = "1"

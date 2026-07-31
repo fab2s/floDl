@@ -176,7 +176,7 @@ pub(crate) fn dispatch_config(
             (None, None) => {
                 // No YAML cluster, no --gpus, but the command opted into
                 // cluster mode. Print a one-line hint if N>=2 GPUs visible.
-                if let Ok(n) = gpus::count_visible_gpus_via_nvidia_smi() {
+                if let Ok(n) = gpus::local_gpu_count() {
                     if n >= 2 {
                         eprintln!(
                             "flodl: {n} GPUs visible but cluster mode is off; \

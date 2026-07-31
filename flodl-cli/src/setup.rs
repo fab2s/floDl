@@ -60,11 +60,10 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  GPUs:");
         for g in &gpus {
             println!(
-                "    [{}] {} -- sm_{}.{}, {}GB VRAM",
+                "    [{}] {} -- {}, {}GB VRAM",
                 g.index,
                 g.name,
-                g.sm_major,
-                g.sm_minor,
+                g.arch_label(),
                 g.total_memory_mb / 1024
             );
         }
@@ -148,9 +147,13 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         download::run_with_context(cpu_opts, &ctx)?;
 
         // CUDA libtorch
-        if !gpus.is_empty() {
-            let lo_major = gpus.iter().map(|g| g.sm_major).min().unwrap_or(0);
-            let hi_major = gpus.iter().map(|g| g.sm_major).max().unwrap_or(0);
+        // The variant table below is CUDA-only, so the capability span
+        // is taken over NVIDIA devices; a non-NVIDIA card contributes
+        // none and leaves this branch inert rather than skewing it.
+        let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
+        if !majors.is_empty() {
+            let lo_major = majors.iter().copied().min().unwrap_or(0);
+            let hi_major = majors.iter().copied().max().unwrap_or(0);
 
             if lo_major < 7 && hi_major >= 10 {
                 // Mixed architectures -- no single prebuilt covers both

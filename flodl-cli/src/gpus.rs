@@ -19,8 +19,6 @@
 //! Caller (`main.rs`) decides which mechanism applies based on whether the
 //! resolved command's `cluster:` chain enables dispatch.
 
-use std::process::Command;
-
 use crate::cluster::resolve_local_hostname;
 use crate::config::{
     ClusterConfig, ClusterController, ClusterWorker, LocalDevices,
@@ -87,51 +85,40 @@ impl GpusSpec {
         match self {
             GpusSpec::List(v) => Ok(v.clone()),
             GpusSpec::All => {
-                let count = count_visible_gpus_via_nvidia_smi()?;
-                if count == 0 {
-                    return Err(
-                        "--gpus all: nvidia-smi reports 0 GPUs visible. Install \
-                         NVIDIA drivers or specify devices explicitly (e.g. \
-                         --gpus 0)."
-                            .to_string(),
-                    );
-                }
-                if count > u8::MAX as usize {
+                // `require_devices` turns an empty sweep into the best
+                // available explanation: a driver that failed to
+                // enumerate, hardware present without its stack
+                // installed, or genuinely no GPU. An explicit `--gpus
+                // all` must fail loudly rather than resolve to zero.
+                let devices = local_gpu_count()
+                    .map_err(|e| format!("--gpus all: {e}"))?;
+                if devices > u8::MAX as usize {
                     return Err(format!(
-                        "--gpus all: nvidia-smi reports {count} GPUs which \
-                         exceeds the supported device-index range (0..255). \
-                         Specify devices explicitly via --gpus."
+                        "--gpus all: {devices} GPUs detected, which exceeds \
+                         the supported device-index range (0..255). Specify \
+                         devices explicitly via --gpus."
                     ));
                 }
-                Ok((0u8..count as u8).collect())
+                Ok((0u8..devices as u8).collect())
             }
         }
     }
 }
 
-/// Count visible CUDA devices via `nvidia-smi -L`.
+/// Number of GPUs on this box, or a caller-facing reason there are none.
 ///
-/// Each GPU is one line starting with `GPU <idx>:`. Returns the number of
-/// such lines. Loud error if nvidia-smi is missing or exits non-zero.
-pub fn count_visible_gpus_via_nvidia_smi() -> Result<usize, String> {
-    let out = Command::new("nvidia-smi")
-        .arg("-L")
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to run `nvidia-smi -L`: {e}. Install NVIDIA drivers \
-                 or specify devices explicitly (e.g. --gpus 0)."
-            )
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "`nvidia-smi -L` exited non-zero: {}",
-            stderr.trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().filter(|l| l.starts_with("GPU ")).count())
+/// One entry point for every "how many GPUs are here" question in fdl,
+/// across every vendor. The error is the point: an empty device list has
+/// several causes (no driver, driver present but its tool broken,
+/// hardware present without its stack installed, genuinely no card) and
+/// a command that was *asked* for GPUs must say which one it hit rather
+/// than silently resolving to zero.
+///
+/// Counts **physical** devices: `--gpus`/`local_devices` select from the
+/// full set, and applying a visibility mask here would make the
+/// selection depend on a mask the selection itself is about to set.
+pub fn local_gpu_count() -> Result<usize, String> {
+    flodl_hw::survey().require_devices().map(|d| d.len())
 }
 
 /// Build a `ClusterConfig` for single-host loopback from a list of physical

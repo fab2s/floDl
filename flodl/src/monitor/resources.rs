@@ -195,8 +195,8 @@ fn detect_gpu_statics() -> Vec<GpuStatic> {
         .into_iter()
         .map(|g| GpuStatic {
             physical_index: g.index,
+            total_bytes: Some(g.vram_bytes()),
             name: g.name,
-            total_bytes: Some(g.total_memory_mb * 1024 * 1024),
         })
         .collect()
 }

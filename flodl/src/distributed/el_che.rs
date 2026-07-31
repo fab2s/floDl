@@ -1586,11 +1586,11 @@ impl ElChe {
 
 /// Cold-start anchor selection from device hardware specs.
 ///
-/// Combines compute capability (sm_major × 100 + sm_minor × 10) and total
+/// Combines arch generation (`sm_86` → 86, `gfx1030` → 1030) and total
 /// VRAM in GB into a single ordinal score per rank. Higher score = better
 /// spec = faster GPU (likely). The slowest rank by score is the cold-start
-/// anchor pick. Compute capability dominates; VRAM tiebreaks within the
-/// same arch generation.
+/// anchor pick. Generation dominates; VRAM tiebreaks within the same arch
+/// generation. Single-vendor cohorts only, by construction.
 ///
 /// Returns `None` if any device-property query fails — the caller falls
 /// back to the rank-0 default (or whatever the existing logic produces).
@@ -1605,14 +1605,32 @@ mod spec_prior {
     fn score(device_index: i32, gpus: &[crate::sys::GpuInfo]) -> Option<f64> {
         let gpu = gpus.iter().find(|g| g.index as i32 == device_index)?;
         let vram_gb = gpu.vram_bytes() as f64 / 1_073_741_824.0;
-        Some((gpu.sm_major as f64) * 100.0 + (gpu.sm_minor as f64) * 10.0 + vram_gb)
+        // `generation()` orders hardware within a vendor (sm_86 -> 86,
+        // gfx1030 -> 1030). The ×10 keeps VRAM as a tiebreak inside one
+        // generation rather than letting a big-VRAM older card outrank a
+        // newer one. Callers guarantee a single vendor; see below.
+        Some((gpu.arch.generation() as f64) * 10.0 + vram_gb)
     }
 
     /// Rank with the lowest spec score across `device_indices`. Lowest-rank
     /// tiebreak when two ranks score equal. Returns `None` when any device
     /// query fails — caller falls back to current behavior.
+    ///
+    /// Also returns `None` for a **mixed-vendor** cohort. Arch generation
+    /// numbers are only meaningful within a vendor (`GpuArch::generation`
+    /// says so), so ranking an NVIDIA card against an AMD one by this
+    /// score would be arbitrary, and arbitrary is worse than absent here:
+    /// the caller's fallback is a defensible default, whereas a wrong
+    /// anchor pick makes every rank wait on it.
     pub(super) fn slowest_rank(device_indices: &[i32]) -> Option<usize> {
         let gpus = crate::sys::detect_gpus();
+        let cohort: Vec<&crate::sys::GpuInfo> = device_indices
+            .iter()
+            .filter_map(|&idx| gpus.iter().find(|g| g.index as i32 == idx))
+            .collect();
+        if cohort.windows(2).any(|w| w[0].vendor != w[1].vendor) {
+            return None;
+        }
         let scores: Option<Vec<(usize, f64)>> = device_indices
             .iter()
             .enumerate()

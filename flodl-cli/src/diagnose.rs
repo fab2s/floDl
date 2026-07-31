@@ -65,7 +65,7 @@ fn print_report(root: &Path, ctx: &Context) {
                 "  [{}] {} -- {}, {}GB VRAM",
                 d.index,
                 d.name,
-                d.sm_version(),
+                d.arch_label(),
                 vram_gb
             );
         }
@@ -110,22 +110,23 @@ fn print_report(root: &Path, ctx: &Context) {
             let archs = info.archs.as_deref().unwrap_or("");
             let mut all_ok = true;
             for d in &devices {
-                if detect::arch_compatible(d, archs) {
+                if d.covered_by(archs) {
                     println!(
                         "  GPU {} ({}, {}):  OK",
                         d.index,
                         d.short_name(),
-                        d.sm_version()
+                        d.arch_label()
                     );
                 } else {
                     all_ok = false;
-                    let arch_str = format!("{}.{}", d.sm_major, d.sm_minor);
                     println!(
                         "  GPU {} ({}, {}):  MISSING -- arch {} not in [{}]",
                         d.index,
                         d.short_name(),
-                        d.sm_version(),
-                        arch_str,
+                        d.arch_label(),
+                        // The archs= spelling, not the display one: this
+                        // names the token the user must add to the list.
+                        d.arch.archs_token(),
                         archs
                     );
                 }
@@ -186,13 +187,18 @@ fn print_json(root: &Path, ctx: &Context) {
         if i > 0 {
             b.push(',');
         }
-        let compatible = detect::arch_compatible(d, &archs);
+        let compatible = d.covered_by(&archs);
+        // `sm` is the legacy NVIDIA-only key, kept so an older reader
+        // does not lose the field; `vendor` + `arch` are the
+        // vendor-plural pair every new consumer should read.
         let _ = write!(
             b,
-            "{{\"index\":{},\"name\":\"{}\",\"sm\":\"{}\",\"vram_bytes\":{},\"arch_compatible\":{}}}",
+            "{{\"index\":{},\"name\":\"{}\",\"vendor\":\"{}\",\"arch\":\"{}\",\"sm\":\"{}\",\"vram_bytes\":{},\"arch_compatible\":{}}}",
             d.index,
             system::escape_json(&d.name),
-            d.sm_version(),
+            d.vendor.as_str(),
+            d.arch_label(),
+            d.sm_version().unwrap_or_default(),
             d.vram_bytes(),
             compatible
         );

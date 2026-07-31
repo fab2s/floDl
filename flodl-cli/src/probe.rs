@@ -30,6 +30,7 @@ use crate::config::{self, ClusterWorker, DEFAULT_DATA_PATH};
 use crate::context::Context;
 use crate::libtorch::detect::{self, LibtorchInfo};
 use crate::util::system::{self, GpuInfo};
+use flodl_hw::{GpuArch, GpuVendor};
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -324,14 +325,36 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
         for g in gpus {
             let index = g.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sm = g.get("sm").and_then(|v| v.as_str()).unwrap_or("sm_0");
-            let (sm_major, sm_minor) = parse_sm(sm);
             let total_memory_mb = g.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+            // `vendor` + `arch` are the vendor-plural pair. `sm` is the
+            // legacy NVIDIA-only key, still read so a probe against an
+            // older remote fdl keeps working.
+            let vendor = g
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .and_then(GpuVendor::parse)
+                .unwrap_or(GpuVendor::Nvidia);
+            let token = g
+                .get("arch")
+                .and_then(|v| v.as_str())
+                .or_else(|| g.get("sm").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            let Some(arch) = GpuArch::parse(vendor, token) else {
+                // A device we cannot place is worse than one we drop: an
+                // unparsed arch would silently compare as incompatible
+                // against every libtorch variant. Say so instead.
+                report.warnings.push(format!(
+                    "host {:?}: GPU {index} reports an unrecognized {vendor} arch \
+                     {token:?}; skipping it in the report",
+                    worker.host,
+                ));
+                continue;
+            };
             report.gpus.push(GpuInfo {
                 index,
+                vendor,
                 name,
-                sm_major,
-                sm_minor,
+                arch,
                 total_memory_mb,
             });
         }
@@ -431,22 +454,6 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
     }
 
     Ok(report)
-}
-
-fn parse_sm(s: &str) -> (u32, u32) {
-    // "sm_NNN" → (sm_major, sm_minor). sm_NN concatenates the two
-    // digits; reverse by treating last digit as minor when total
-    // string after "sm_" is 2 chars, else split major/minor on the
-    // canonical 2-digit minor convention NVIDIA uses (sm_120 = 12.0).
-    let n = s.trim_start_matches("sm_");
-    if let Ok(v) = n.parse::<u32>() {
-        // sm_120 -> 12.0; sm_61 -> 6.1; sm_90 -> 9.0; sm_86 -> 8.6.
-        // NVIDIA convention: last digit is minor.
-        let major = v / 10;
-        let minor = v % 10;
-        return (major, minor);
-    }
-    (0, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +959,7 @@ fn print_report(r: &ProbeReport) {
             "  [{}] {} — {}, {} MB",
             g.index,
             g.short_name(),
-            g.sm_version(),
+            g.arch_label(),
             g.total_memory_mb
         );
     }
@@ -1076,10 +1083,15 @@ fn report_to_json_object(r: &ProbeReport) -> String {
         if i > 0 { b.push(','); }
         let _ = write!(
             b,
-            "{{\"index\":{},\"name\":\"{}\",\"sm\":\"{}\",\"vram_mb\":{}}}",
+            "{{\"index\":{},\"name\":\"{}\",\"vendor\":\"{}\",\"arch\":\"{}\",\"sm\":\"{}\",\"vram_mb\":{}}}",
             g.index,
             system::escape_json(&g.name),
-            g.sm_version(),
+            g.vendor.as_str(),
+            g.arch_label(),
+            // Legacy NVIDIA-only key: an older `fdl` on the controller
+            // side reads this one. Empty on a non-NVIDIA device, which
+            // such a reader would have mis-handled anyway.
+            g.sm_version().unwrap_or_default(),
             g.total_memory_mb
         );
     }
@@ -1346,9 +1358,9 @@ mod tests {
             host: "h\tost".into(),
             gpus: vec![GpuInfo {
                 index: 0,
+                vendor: GpuVendor::Nvidia,
                 name: "Weird\tGPU \"X\"\r\n".into(),
-                sm_major: 8,
-                sm_minor: 6,
+                arch: GpuArch::Sm { major: 8, minor: 6 },
                 total_memory_mb: 1024,
             }],
             libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
@@ -1381,6 +1393,84 @@ mod tests {
             report.issues.iter().any(|i| i.contains("version skew")),
             "issues: {:?}",
             report.issues
+        );
+    }
+
+    /// Minimal worker fixture for the wire tests below.
+    fn wire_test_worker() -> ClusterWorker {
+        serde_yaml_ng::from_str(
+            "host: pascal\nlocal_devices: [0]\nnccl_socket_ifname: lo\npath: /opt/flodl",
+        )
+        .expect("minimal worker")
+    }
+
+    #[test]
+    fn gpu_wire_round_trips_both_vendors() {
+        // The probe JSON is a real wire: `fdl @cluster probe` SSHes and
+        // parses what the remote `fdl probe --json` emitted. Emit and
+        // parse must therefore agree for every vendor, or a remote AMD
+        // host reads back as something else.
+        let r = ProbeReport {
+            host: "h".into(),
+            gpus: vec![
+                GpuInfo {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    name: "NVIDIA GeForce RTX 5060 Ti".into(),
+                    arch: GpuArch::Sm { major: 12, minor: 0 },
+                    total_memory_mb: 16311,
+                },
+                GpuInfo {
+                    index: 1,
+                    vendor: GpuVendor::Amd,
+                    name: "AMD Radeon RX 6800".into(),
+                    arch: GpuArch::Gfx("gfx1030".into()),
+                    total_memory_mb: 16384,
+                },
+            ],
+            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
+            data_path: DataPathStatus {
+                path: PathBuf::from("/d"), exists: true, readable: true,
+                fs_type: None, skipped: false,
+            },
+            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            issues: vec![],
+            warnings: vec![],
+        };
+        let back = parse_remote_json(&report_to_json_object(&r), &wire_test_worker())
+            .expect("emitted JSON parses");
+        assert_eq!(back.gpus.len(), 2, "warnings: {:?}", back.warnings);
+        assert_eq!(back.gpus[0].arch, GpuArch::Sm { major: 12, minor: 0 });
+        assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);
+        assert_eq!(back.gpus[1].arch, GpuArch::Gfx("gfx1030".into()));
+        assert_eq!(back.gpus[1].vendor, GpuVendor::Amd);
+        assert_eq!(back.gpus[1].total_memory_mb, 16384);
+    }
+
+    #[test]
+    fn gpu_wire_reads_a_legacy_sm_only_remote() {
+        // An older `fdl` on the remote emits `sm` and no `vendor`/`arch`.
+        // It only ever ran on NVIDIA, so that is the right assumption.
+        let json = r#"{"host":"p","gpus":[{"index":0,"name":"A100","sm":"sm_80","vram_mb":81920}]}"#;
+        let back = parse_remote_json(json, &wire_test_worker()).expect("parses");
+        assert_eq!(back.gpus.len(), 1);
+        assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);
+        assert_eq!(back.gpus[0].arch, GpuArch::Sm { major: 8, minor: 0 });
+    }
+
+    #[test]
+    fn gpu_wire_warns_rather_than_inventing_an_arch() {
+        // An unrecognized arch must not fall through to a default: a
+        // bogus arch compares as incompatible with every libtorch
+        // variant, which reads as a hardware problem the user does not
+        // have.
+        let json = r#"{"host":"p","gpus":[{"index":0,"name":"X","vendor":"amd","arch":"wat","vram_mb":8}]}"#;
+        let back = parse_remote_json(json, &wire_test_worker()).expect("parses");
+        assert!(back.gpus.is_empty());
+        assert!(
+            back.warnings.iter().any(|w| w.contains("unrecognized")),
+            "warnings: {:?}",
+            back.warnings
         );
     }
 

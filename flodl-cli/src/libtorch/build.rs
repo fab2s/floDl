@@ -78,10 +78,13 @@ fn detect_arch_list() -> Result<String, String> {
         );
     }
 
-    // Collect unique compute capabilities, sorted numerically
+    // Collect unique compute capabilities, sorted numerically. This
+    // list feeds nvcc's TORCH_CUDA_ARCH_LIST, so it is NVIDIA-only by
+    // construction: a non-NVIDIA device contributes no capability and
+    // is skipped rather than defaulted to one.
     let mut caps: Vec<(u32, u32)> = gpus
         .iter()
-        .map(|g| (g.sm_major, g.sm_minor))
+        .filter_map(|g| Some((g.sm_major()?, g.sm_minor()?)))
         .collect();
     caps.sort();
     caps.dedup();
@@ -89,10 +92,7 @@ fn detect_arch_list() -> Result<String, String> {
 
     println!("  GPUs detected:");
     for g in &gpus {
-        println!(
-            "    [{}] {} (sm_{}.{})",
-            g.index, g.short_name(), g.sm_major, g.sm_minor
-        );
+        println!("    [{}] {} ({})", g.index, g.short_name(), g.arch_label());
     }
 
     Ok(caps.join(";"))

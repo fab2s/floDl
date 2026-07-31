@@ -626,18 +626,24 @@ than the whole cluster, so cost does not grow with rank count. See
 
 ## CUDA-free GPU detection - `flodl::sys::detect_gpus`
 
-`detect_gpus() -> Vec<GpuInfo>` shells out to `nvidia-smi` and returns
-per-device `(index, name, sm_version, vram_bytes)` without loading
-libtorch. Honors `CUDA_VISIBLE_DEVICES`, so the result matches the view
-the auto-promote path and child processes will see.
+`detect_gpus() -> Vec<GpuInfo>` enumerates GPUs without loading
+libtorch, returning per-device `index`, `vendor`, `name`, `arch` and
+`total_memory_mb`. Honors `CUDA_VISIBLE_DEVICES`, so the result matches
+the view the auto-promote path and child processes will see. Its sibling
+`detect_gpus_physical()` ignores visibility masks, which is what
+provisioning questions ("does this box's libtorch cover its cards") want.
+
+`arch` is vendor-shaped (`GpuArch::Sm { major, minor }` on NVIDIA), so
+`arch_label()` is the display form and `sm_major()` / `sm_minor()` return
+`Option` for the NVIDIA-specific consumers.
 
 ```rust
 use flodl::sys::detect_gpus;
 
 let gpus = detect_gpus();
 for g in &gpus {
-    eprintln!("GPU {}: {} (sm_{}, {} MB)",
-        g.index, g.name, g.sm_version, g.vram_bytes / 1_000_000);
+    eprintln!("GPU {}: {} ({}, {} MB)",
+        g.index, g.name, g.arch_label(), g.total_memory_mb);
 }
 
 // Use the count for partition planning, but do NOT instantiate

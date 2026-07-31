@@ -6,121 +6,22 @@ use std::path::Path;
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
-// GPU detection via nvidia-smi
+// GPU detection
 // ---------------------------------------------------------------------------
 //
-// NOTE: `GpuInfo` + `detect_gpus` + `parse_gpu_csv_row` are intentionally
-// duplicated in `flodl::sys` (flodl/src/sys.rs). flodl-cli must NOT depend on
-// flodl (that would pull flodl-sys → libtorch into the CLI, which has to build
-// and run before libtorch is installed). Keep the nvidia-smi query column
-// order + parse in sync with the copy there.
+// The implementation lives in the dependency-free `flodl-hw` crate, which
+// `flodl` depends on too. It does NOT pull libtorch, so fdl still builds and
+// runs before libtorch is installed. `GpuInfo` + the nvidia-smi parse used to
+// be hand-copied between here and `flodl::sys`, kept aligned by a comment;
+// there is now one source.
+//
+// Note the mapping: fdl's `detect_gpus` never honored `CUDA_VISIBLE_DEVICES`,
+// and that is correct for the questions fdl asks ("which libtorch variant
+// covers this box"), which a container mask must not change the answer to. It
+// is therefore `detect_gpus_physical` upstream. `flodl_hw::detect_gpus` is the
+// mask-honoring runtime view, used by `flodl`.
 
-pub struct GpuInfo {
-    pub index: u8,
-    pub name: String,
-    pub sm_major: u32,
-    pub sm_minor: u32,
-    pub total_memory_mb: u64,
-}
-
-impl GpuInfo {
-    pub fn sm_version(&self) -> String {
-        format!("sm_{}{}", self.sm_major, self.sm_minor)
-    }
-
-    pub fn vram_bytes(&self) -> u64 {
-        self.total_memory_mb * 1024 * 1024
-    }
-
-    pub fn short_name(&self) -> String {
-        self.name.replace("NVIDIA ", "").replace("GeForce ", "")
-    }
-}
-
-pub fn detect_gpus() -> Vec<GpuInfo> {
-    let output = match Command::new("nvidia-smi")
-        // `name` is queried LAST on purpose: it is the only field that can
-        // contain the `", "` field separator (e.g. a name with an embedded
-        // ", "). With it last, `splitn(4, ", ")` captures the whole name
-        // (commas and all) as the final cell — no CSV parser needed, since
-        // index / compute_cap / memory.total are comma-free by construction.
-        .args([
-            "--query-gpu=index,compute_cap,memory.total,name",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        // nvidia-smi ran but FAILED (driver/permission issue). Distinct from
-        // "not installed": tooling is present, yet the query errored. Warn —
-        // a silent empty here makes a real GPU rig look GPU-less (e.g.
-        // `Trainer::run` auto-promote silently falling back to single-device)
-        // with no clue why.
-        Ok(o) => {
-            eprintln!(
-                "flodl: nvidia-smi exited {} — treating as no GPUs (stderr: {})",
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim(),
-            );
-            return Vec::new();
-        }
-        // nvidia-smi not found / not runnable: no NVIDIA tooling. Normal on
-        // CPU-only hosts, so stay silent.
-        Err(_) => return Vec::new(),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let parsed = parse_gpu_csv_row(line);
-            if parsed.is_none() {
-                // A malformed row = a GPU silently dropped. Warn rather than
-                // vanish it.
-                eprintln!("flodl: could not parse an nvidia-smi GPU row, skipping: {line:?}");
-            }
-            parsed
-        })
-        .collect()
-}
-
-/// Parse one `index, compute_cap, memory.total, name` CSV row (nvidia-smi
-/// `--format=csv,noheader,nounits`; see the query in [`detect_gpus`] for why
-/// `name` is last). Returns None on any malformed field.
-fn parse_gpu_csv_row(line: &str) -> Option<GpuInfo> {
-    // `name` is last, so `splitn(4)` leaves any embedded ", " intact in the
-    // final cell — the first three cells are comma-free.
-    let parts: Vec<&str> = line.splitn(4, ", ").collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    let index: u8 = parts[0].trim().parse().ok()?;
-    let cap_parts: Vec<&str> = parts[1].trim().split('.').collect();
-    let sm_major: u32 = cap_parts.first()?.parse().ok()?;
-    let sm_minor: u32 = cap_parts.get(1)?.parse().ok()?;
-    let total_memory_mb: u64 = parts[2].trim().parse().ok()?;
-    let name = parts[3].trim().to_string();
-    Some(GpuInfo {
-        index,
-        name,
-        sm_major,
-        sm_minor,
-        total_memory_mb,
-    })
-}
-
-pub fn nvidia_driver_version() -> Option<String> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=driver_version", "--format=csv,noheader"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout);
-    Some(s.lines().next()?.trim().to_string())
-}
+pub use flodl_hw::{detect_gpus_physical as detect_gpus, nvidia_driver_version, GpuInfo};
 
 // ---------------------------------------------------------------------------
 // CPU
@@ -406,7 +307,7 @@ pub fn arch_dir_name(archs: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{arch_dir_name, escape_json, parse_gpu_csv_row};
+    use super::{arch_dir_name, escape_json};
 
     #[test]
     fn escape_json_passes_through_plain_ascii() {
@@ -455,36 +356,5 @@ mod tests {
         // A three-component cap and a two-digit minor both flatten correctly.
         assert_eq!(arch_dir_name("7.5"), "sm75");
         assert_eq!(arch_dir_name("8.0;8.6;9.0"), "sm80-sm86-sm90");
-    }
-
-    #[test]
-    fn parse_gpu_csv_row_parses_a_well_formed_row() {
-        // Column order: index, compute_cap, memory.total, name.
-        let g = parse_gpu_csv_row("0, 8.9, 24564, NVIDIA GeForce RTX 4090").unwrap();
-        assert_eq!(g.index, 0);
-        assert_eq!(g.name, "NVIDIA GeForce RTX 4090");
-        assert_eq!(g.sm_major, 8);
-        assert_eq!(g.sm_minor, 9);
-        assert_eq!(g.total_memory_mb, 24564);
-    }
-
-    #[test]
-    fn parse_gpu_csv_row_rejects_malformed() {
-        // Too few fields, and non-numeric where numbers are required.
-        assert!(parse_gpu_csv_row("0, 8.9, three").is_none());
-        assert!(parse_gpu_csv_row("x, 8.9, 24564, name").is_none());
-        assert!(parse_gpu_csv_row("0, notacap, 24564, name").is_none());
-    }
-
-    #[test]
-    fn parse_gpu_csv_row_keeps_comma_in_name() {
-        // `name` is queried last, so an embedded ", " stays in the final cell
-        // instead of truncating the row. splitn(4) stops after 3 separators.
-        let g = parse_gpu_csv_row("0, 8.0, 81920, NVIDIA A100, 80GB").unwrap();
-        assert_eq!(g.name, "NVIDIA A100, 80GB");
-        assert_eq!(g.index, 0);
-        assert_eq!(g.sm_major, 8);
-        assert_eq!(g.sm_minor, 0);
-        assert_eq!(g.total_memory_mb, 81920);
     }
 }

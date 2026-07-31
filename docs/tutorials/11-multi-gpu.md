@@ -100,8 +100,8 @@ use flodl::sys::detect_gpus;
 
 let gpus = detect_gpus();
 for g in &gpus {
-    eprintln!("GPU {}: {} (sm_{}, {} MB)",
-        g.index, g.name, g.sm_version, g.vram_bytes / 1_000_000);
+    eprintln!("GPU {}: {} ({}, {} MB)",
+        g.index, g.name, g.arch_label(), g.total_memory_mb);
 }
 
 if gpus.is_empty() {

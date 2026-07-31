@@ -50,7 +50,7 @@ fi
 
 # Workspace members are exactly the published crates (benchmarks,
 # ddp-bench, hf-ddp are workspace-excluded), so --workspace covers
-# flodl-sys, flodl-cli-macros, flodl, flodl-cli, flodl-hf.
+# flodl-hw, flodl-sys, flodl-cli-macros, flodl, flodl-cli, flodl-hf.
 echo "=== cargo publish --dry-run --workspace (in docker dev) ==="
 if ! docker compose run --rm -T dev cargo publish --dry-run --workspace ${RELEASE_PREP:+--allow-dirty}; then
     echo "FAIL: cargo publish --dry-run --workspace failed (see output above)"

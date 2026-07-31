@@ -133,7 +133,7 @@ pub(crate) fn arch_coverage(
     let mut archs_match = Vec::new();
     if let Some(archs) = &info.archs {
         for g in gpus {
-            let ok = arch_compatible(g, archs);
+            let ok = g.covered_by(archs);
             archs_match.push((g.index, ok));
             if !ok {
                 issues.push(format!(
@@ -142,7 +142,7 @@ pub(crate) fn arch_coverage(
                      compatible variant.",
                     g.index,
                     g.short_name(),
-                    g.sm_version(),
+                    g.arch_label(),
                     archs
                 ));
             }
@@ -180,13 +180,6 @@ pub fn list_variants(root: &Path) -> Vec<String> {
 
     variants.sort();
     variants
-}
-
-/// Check whether a GPU's compute capability is covered by the libtorch
-/// variant's compiled architectures (from the .arch file).
-pub fn arch_compatible(gpu: &GpuInfo, archs: &str) -> bool {
-    let exact = format!("{}.{}", gpu.sm_major, gpu.sm_minor);
-    archs.contains(&exact) || archs.contains(&format!("{}", gpu.sm_major))
 }
 
 /// Check whether a libtorch variant directory looks valid (has lib/).

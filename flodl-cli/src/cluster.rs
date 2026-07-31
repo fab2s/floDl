@@ -263,12 +263,12 @@ pub fn prepare_cluster_env(
 /// instead of SSHing back to ourselves.
 ///
 /// - `LocalDevices::Explicit(v)` → `v.len()`
-/// - `LocalDevices::All` → [`crate::gpus::count_visible_gpus_via_nvidia_smi`]
+/// - `LocalDevices::All` → [`crate::gpus::local_gpu_count`]
 ///   (result cached across workers since they all resolve to the same
 ///   local box in testing mode).
 ///
-/// Errors loudly on nvidia-smi failure or a 0 count (caller treats 0
-/// as misconfiguration — no GPUs visible to the test).
+/// Errors loudly when no GPU is detected, quoting the reason (caller
+/// treats 0 as misconfiguration — no GPUs visible to the test).
 fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, String> {
     let mut counts = Vec::with_capacity(cluster.workers.len());
     let mut cached_local: Option<usize> = None;
@@ -278,10 +278,10 @@ fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Stri
             config::LocalDevices::All => {
                 if cached_local.is_none() {
                     cached_local = Some(
-                        crate::gpus::count_visible_gpus_via_nvidia_smi().map_err(|e| {
+                        crate::gpus::local_gpu_count().map_err(|e| {
                             format!(
-                                "cluster.workers[{i}] ({:?}): local nvidia-smi \
-                                 probe failed: {e}",
+                                "cluster.workers[{i}] ({:?}): local GPU probe \
+                                 failed: {e}",
                                 w.host,
                             )
                         })?,

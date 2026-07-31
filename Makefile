@@ -43,8 +43,8 @@ COMPOSE = docker compose
 #    `[package.metadata.docs.rs]`. This is what the published docs.rs
 #    page would generate. Catches docsrs-specific breakage.
 #
-# 3. **docs.rs hosting pass (per-crate)** — flodl-sys, flodl-cli,
-#    flodl-cli-macros, flodl-hf each documented with `--cfg docsrs`
+# 3. **docs.rs hosting pass (per-crate)** — flodl-hw, flodl-sys,
+#    flodl-cli, flodl-cli-macros, flodl-hf each documented with `--cfg docsrs`
 #    and their docs.rs feature set. Plus a flodl `--all-features` pass
 #    to catch any cuda-gated breakage CI's default-feature build
 #    wouldn't see (rustdoc parses without GPU; flodl-sys's libtorch
@@ -54,6 +54,8 @@ docs-rs:
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
 		RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items && \
+		cargo +nightly rustdoc --lib -p flodl-hw \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-sys \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl \

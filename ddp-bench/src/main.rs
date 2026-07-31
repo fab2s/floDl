@@ -944,7 +944,7 @@ fn run() -> flodl::tensor::Result<()> {
             g.index,
             g.short_name(),
             g.vram_bytes() / (1024 * 1024 * 1024),
-            g.sm_version(),
+            g.arch_label(),
         );
     }
 

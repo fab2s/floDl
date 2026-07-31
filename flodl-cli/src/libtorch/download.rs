@@ -161,13 +161,31 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
 fn auto_detect_variant() -> &'static VariantSpec {
     let gpus = system::detect_gpus();
     if gpus.is_empty() {
-        println!("  No NVIDIA GPU detected. Using CPU variant.");
+        println!("  No GPU detected. Using CPU variant.");
         return &CPU_SPEC;
     }
 
-    // Find lowest and highest major compute capability
-    let lo_major = gpus.iter().map(|g| g.sm_major).min().unwrap_or(0);
-    let hi_major = gpus.iter().map(|g| g.sm_major).max().unwrap_or(0);
+    // Every variant below is an NVIDIA CUDA build, so the capability
+    // span is computed over NVIDIA devices only.
+    let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
+    if majors.is_empty() {
+        // A GPU box with no NVIDIA card. Falling through to CPU is the
+        // right variant, but say WHY, or this reads as "no GPU found"
+        // on a machine the user can see has one.
+        let other: Vec<String> = gpus
+            .iter()
+            .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+            .collect();
+        println!(
+            "  Detected a non-NVIDIA GPU ({}). `fdl libtorch download` only \n\
+             publishes CUDA and CPU variants today, so the CPU variant is \n\
+             selected. Use `--variant` to override.",
+            other.join(", "),
+        );
+        return &CPU_SPEC;
+    }
+    let lo_major = majors.iter().copied().min().unwrap_or(0);
+    let hi_major = majors.iter().copied().max().unwrap_or(0);
 
     // cu128 requires Volta+ (sm_70+), cu126 supports down to sm_50
     if lo_major >= 7 {
